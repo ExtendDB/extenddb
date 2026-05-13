@@ -322,8 +322,10 @@ impl<S: Send + 'static> axum_server::accept::Accept<tokio::net::TcpStream, S>
                     Ok((stream, service))
                 }
                 Ok(_) => {
-                    // Plain HTTP — send redirect and reject.
-                    send_https_redirect(&stream, addr);
+                    // Plain HTTP — read enough to extract Host header and path,
+                    // then redirect preserving the client's view of the hostname
+                    // (important for port-forwarding scenarios).
+                    send_https_redirect(&stream, addr).await;
                     Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "plain HTTP redirected to HTTPS",
@@ -335,16 +337,66 @@ impl<S: Send + 'static> axum_server::accept::Accept<tokio::net::TcpStream, S>
     }
 }
 
-/// Write an HTTP 301 redirect response to HTTPS on the raw TCP stream.
-fn send_https_redirect(stream: &tokio::net::TcpStream, addr: std::net::SocketAddr) {
-    let location = format!("https://{addr}/");
+/// Read the plain HTTP request headers from the stream and redirect to HTTPS,
+/// preserving the Host header so port-forwarding setups work correctly.
+async fn send_https_redirect(stream: &tokio::net::TcpStream, addr: std::net::SocketAddr) {
+    // Read enough of the request to find the Host header and request path.
+    // 2 KB is plenty for the request line + headers we care about.
+    let mut buf = [0u8; 2048];
+    let n = match stream.readable().await.and_then(|()| stream.try_read(&mut buf)) {
+        Ok(n) if n > 0 => n,
+        _ => {
+            // Fallback: couldn't read request, use local addr.
+            let _ = stream.try_write(
+                format!(
+                    "HTTP/1.1 301 Moved Permanently\r\n\
+                     Location: https://{addr}/\r\n\
+                     Content-Length: 0\r\n\
+                     Connection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            return;
+        }
+    };
+
+    let request = String::from_utf8_lossy(&buf[..n]);
+
+    // Extract the request path from the first line (e.g., "GET /console HTTP/1.1").
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/");
+
+    // Extract the Host header value.
+    let host = request
+        .lines()
+        .find_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("host:") {
+                Some(line[5..].trim())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            // No Host header — fall back to local addr (formatted in the buffer below).
+            ""
+        });
+
+    let location = if host.is_empty() {
+        format!("https://{addr}{path}")
+    } else {
+        format!("https://{host}{path}")
+    };
+
     let response = format!(
         "HTTP/1.1 301 Moved Permanently\r\n\
          Location: {location}\r\n\
          Content-Length: 0\r\n\
          Connection: close\r\n\r\n"
     );
-    // Best-effort write — if it fails, the client already got a connection error.
     let _ = stream.try_write(response.as_bytes());
 }
 

@@ -82,7 +82,7 @@ pub async fn login_submit<
 
     let (token, _csrf) = state.sessions.create(identity).await;
     let cookie = format!(
-        "extenddb_session={token}; Path=/console; HttpOnly; SameSite=Strict; Max-Age=28800"
+        "extenddb_session={token}; Path=/console; HttpOnly; SameSite=Strict; Secure; Max-Age=28800"
     );
 
     (
