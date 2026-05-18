@@ -109,7 +109,7 @@ fn insert_nested(
         .or_insert_with(|| AttributeValue::M(BTreeMap::new()));
 
     let mut current = entry;
-    for element in &path[1..path.len() - 1] {
+    for (i, element) in path[1..path.len() - 1].iter().enumerate() {
         match element {
             PathElement::Attribute(name) => {
                 let resolved = super::resolver::resolve_name_ref(name, maps)?;
@@ -122,9 +122,16 @@ fn insert_nested(
                 }
             }
             PathElement::Index(_) => {
-                // Intermediate list index: wrap remaining path in a single-element list
-                let remaining_value = value.clone();
-                *current = AttributeValue::L(vec![remaining_value]);
+                // Intermediate list index: build the remaining nested structure
+                // and wrap it in a single-element list.
+                // e.g., for path a.b[0].c with value "target":
+                //   remaining path after [0] is [.c]
+                //   build {"c": "target"} then wrap → [{"c": "target"}]
+                // i is the index within path[1..len-1], so the actual path
+                // index is 1 + i. Remaining elements start at 1 + i + 1.
+                let remaining = &path[1 + i + 1..];
+                let inner = build_remaining_structure(remaining, maps, value)?;
+                *current = AttributeValue::L(vec![inner]);
                 return Ok(());
             }
         }
@@ -145,6 +152,36 @@ fn insert_nested(
     }
 
     Ok(())
+}
+
+/// Build a nested attribute structure from a remaining path suffix and a leaf value.
+///
+/// For path elements `[Attribute("c"), Attribute("d")]` and value `"x"`,
+/// produces `{"c": {"d": "x"}}`.
+/// For path elements `[Index(_), Attribute("c")]` and value `"x"`,
+/// produces `[{"c": "x"}]`.
+fn build_remaining_structure(
+    remaining: &[PathElement],
+    maps: &ExpressionMaps,
+    value: &AttributeValue,
+) -> Result<AttributeValue, DynamoDbError> {
+    if remaining.is_empty() {
+        return Ok(value.clone());
+    }
+
+    match &remaining[0] {
+        PathElement::Attribute(name) => {
+            let resolved = super::resolver::resolve_name_ref(name, maps)?;
+            let inner = build_remaining_structure(&remaining[1..], maps, value)?;
+            let mut map = BTreeMap::new();
+            map.insert(resolved.into_owned(), inner);
+            Ok(AttributeValue::M(map))
+        }
+        PathElement::Index(_) => {
+            let inner = build_remaining_structure(&remaining[1..], maps, value)?;
+            Ok(AttributeValue::L(vec![inner]))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -278,5 +315,45 @@ mod tests {
         // Out-of-bounds index returns empty
         let result = project("mylist[5]", &item, HashMap::new()).unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn project_intermediate_list_index_preserves_nested_structure() {
+        // Path: a.b[0].c where a.b = [{"c": "target", "d": "other"}]
+        // Expected: {"a": {"b": [{"c": "target"}]}}
+        let mut inner_map = BTreeMap::new();
+        inner_map.insert("c".into(), AttributeValue::S("target".into()));
+        inner_map.insert("d".into(), AttributeValue::S("other".into()));
+
+        let mut a_map = BTreeMap::new();
+        a_map.insert(
+            "b".into(),
+            AttributeValue::L(vec![AttributeValue::M(inner_map)]),
+        );
+
+        let mut item = BTreeMap::new();
+        item.insert("pk".into(), AttributeValue::S("k1".into()));
+        item.insert("a".into(), AttributeValue::M(a_map));
+
+        let result = project("a.b[0].c", &item, HashMap::new()).unwrap();
+
+        // Should have {"a": {"b": [{"c": "target"}]}}
+        let a_val = result.get("a").expect("should have 'a'");
+        if let AttributeValue::M(a) = a_val {
+            let b_val = a.get("b").expect("should have 'b'");
+            if let AttributeValue::L(list) = b_val {
+                assert_eq!(list.len(), 1);
+                if let AttributeValue::M(elem) = &list[0] {
+                    assert_eq!(elem.get("c"), Some(&AttributeValue::S("target".into())));
+                    assert!(!elem.contains_key("d")); // "d" not projected
+                } else {
+                    panic!("Expected list element to be a Map, got {:?}", list[0]);
+                }
+            } else {
+                panic!("Expected 'b' to be a List, got {b_val:?}");
+            }
+        } else {
+            panic!("Expected 'a' to be a Map, got {a_val:?}");
+        }
     }
 }
