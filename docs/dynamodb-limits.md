@@ -6,10 +6,10 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 
 ## Legend
 
-- **Enforced**: vddb validates and rejects requests that exceed this limit
-- **Partial**: vddb enforces the limit in some but not all code paths
-- **Not enforced**: vddb accepts requests that would exceed this limit on real DynamoDB
-- **N/A**: Limit does not apply to vddb (e.g., provisioned throughput billing, global tables)
+- **Enforced**: ExtendDB validates and rejects requests that exceed this limit
+- **Partial**: ExtendDB enforces the limit in some but not all code paths
+- **Not enforced**: ExtendDB accepts requests that would exceed this limit on real DynamoDB
+- **N/A**: Limit does not apply to ExtendDB (e.g., provisioned throughput billing, global tables)
 
 ## Read/Write Throughput
 
@@ -17,33 +17,33 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 |-------|---------------|--------|-------|
 | Per-table RCU (provisioned) | 40,000 | Enforced | `LimitsConfig::per_table_max_rcu`, configurable |
 | Per-table WCU (provisioned) | 40,000 | Enforced | `LimitsConfig::per_table_max_wcu`, configurable |
-| Per-table read request units (on-demand) | 40,000 | N/A | vddb does not throttle on-demand reads |
-| Per-table write request units (on-demand) | 40,000 | N/A | vddb does not throttle on-demand writes |
+| Per-table read request units (on-demand) | 40,000 | N/A | ExtendDB does not throttle on-demand reads |
+| Per-table write request units (on-demand) | 40,000 | N/A | ExtendDB does not throttle on-demand writes |
 | Per-account RCU (provisioned) | 80,000 | Enforced | `LimitsConfig::per_account_max_rcu`, configurable |
 | Per-account WCU (provisioned) | 80,000 | Enforced | `LimitsConfig::per_account_max_wcu`, configurable |
 | Minimum throughput per table/GSI | 1 RCU / 1 WCU | Enforced | `validate_provisioned_throughput` rejects < 1 |
 | Provisioned capacity decrease limit | 27 per day (4 + 1/hour) | Not enforced | No decrease tracking implemented |
-| Reserved capacity per account | 1,000,000 units | N/A | vddb has no reserved capacity concept |
+| Reserved capacity per account | 1,000,000 units | N/A | ExtendDB has no reserved capacity concept |
 
 ## Tables
 
 | Limit | DynamoDB Value | Status | Notes |
 |-------|---------------|--------|-------|
 | Maximum tables per account per region | 2,500 (adjustable to 10,000) | Enforced | `LimitsConfig::max_tables_per_account`, configurable |
-| Table size | No practical limit | Enforced | vddb has no table size limit |
+| Table size | No practical limit | Enforced | ExtendDB has no table size limit |
 | Table name length | 3–255 characters | Enforced | `validate_table_name`, `LimitsConfig` |
 | Table name character set | `[a-zA-Z0-9_.-]` | Enforced | `validate_table_name_chars` |
 
 ## Items
 
-| Limit | DynamoDB Value | Status | Notes |
-|-------|---------------|--------|-------|
+| Limit | DynamoDB Value | Status | Notes                                                                         |
+|-------|---------------|--------|-------------------------------------------------------------------------------|
 | Maximum item size | 400 KB (409,600 bytes) | Enforced | `LimitsConfig::max_item_size_bytes`, validated on PutItem and post-UpdateItem |
-| Partition key size | 1–2,048 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_partition_key_size_bytes` |
-| Sort key size | 1–1,024 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_sort_key_size_bytes` |
-| Attribute name size | 1–64 KB (65,535 bytes) | Enforced | `validate_attribute_name_sizes`, `LimitsConfig::max_attribute_name_bytes` |
-| Attribute nesting depth | 32 levels | Not enforced | No nesting depth validation |
-| Number of attributes per item | No practical limit | Enforced | vddb has no per-item attribute count limit |
+| Partition key size | 1–2,048 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_partition_key_size_bytes`            |
+| Sort key size | 1–1,024 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_sort_key_size_bytes`                 |
+| Attribute name size | 1–64 KB (65,535 bytes) | Enforced | `validate_attribute_name_sizes`, `LimitsConfig::max_attribute_name_bytes`     |
+| Attribute nesting depth | 32 levels | Not enforced | No nesting depth validation                                                   |
+| Number of attributes per item | No practical limit | Enforced | ExtendDB has no per-item attribute count limit                                |
 
 ## Secondary Indexes
 
@@ -85,7 +85,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | TransactWriteItems: max items | 100 | Enforced | `MAX_TRANSACT_WRITE_ITEMS` in `transact_write_items.rs` |
 | TransactGetItems: max items | 100 | Enforced | `MAX_TRANSACT_GET_ITEMS` in `transact_get_items.rs` |
 | Transaction request size | 4 MB | Not enforced | No aggregate request size validation |
-| Items per transaction across tables | No limit on table count | Enforced | vddb supports cross-table transactions |
+| Items per transaction across tables | No limit on table count | Enforced | ExtendDB supports cross-table transactions |
 
 ## DynamoDB Streams
 
@@ -98,48 +98,48 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 
 ## API-Level Limits
 
-| Limit | DynamoDB Value | Status | Notes |
-|-------|---------------|--------|-------|
+| Limit | DynamoDB Value | Status | Notes                                    |
+|-------|---------------|--------|------------------------------------------|
 | ListTables: max per page | 100 | Enforced | `LimitsConfig::list_tables_max_per_page` |
-| DescribeTable: request rate | No specific limit | N/A | vddb does not rate-limit |
-| TagResource: max tags per resource | 50 | Not enforced | No tag count validation |
-| Tag key length | 1–128 characters | Not enforced | No tag key length validation |
-| Tag value length | 0–256 characters | Not enforced | No tag value length validation |
+| DescribeTable: request rate | No specific limit | N/A | ExtendDB does not rate-limit             |
+| TagResource: max tags per resource | 50 | Not enforced | No tag count validation                  |
+| Tag key length | 1–128 characters | Not enforced | No tag key length validation             |
+| Tag value length | 0–256 characters | Not enforced | No tag value length validation           |
 
 ## Import from Amazon S3
 
 | Limit | DynamoDB Value | Status | Notes |
 |-------|---------------|--------|-------|
-| Concurrent import jobs | 50 | N/A | vddb import is synchronous, single-threaded |
-| Max S3 objects per import | 50,000 | N/A | vddb imports from local files |
+| Concurrent import jobs | 50 | N/A | ExtendDB import is synchronous, single-threaded |
+| Max S3 objects per import | 50,000 | N/A | ExtendDB imports from local files |
 | Total import size | 15 TB (us-east-1/us-west-2/eu-west-1), 1 TB (other) | N/A | No size limit on local import |
 
 ## Table Export to Amazon S3
 
 | Limit | DynamoDB Value | Status | Notes |
 |-------|---------------|--------|-------|
-| Concurrent export tasks | 300 | N/A | vddb export is synchronous, single-threaded |
+| Concurrent export tasks | 300 | N/A | ExtendDB export is synchronous, single-threaded |
 | Total in-flight export size | 100 TB | N/A | No size limit on local export |
-| Incremental export window | 15 min – 24 hours | N/A | vddb does not support incremental export |
+| Incremental export window | 15 min – 24 hours | N/A | ExtendDB does not support incremental export |
 
 ## Backup and Restore
 
 | Limit | DynamoDB Value | Status | Notes |
 |-------|---------------|--------|-------|
-| Concurrent restores | 50 | N/A | vddb does not support backup/restore |
+| Concurrent restores | 50 | N/A | ExtendDB does not support backup/restore |
 
 ## Global Tables
 
 | Limit | DynamoDB Value | Status | Notes |
 |-------|---------------|--------|-------|
-| MRSC global tables | 400 | N/A | vddb does not support global tables |
-| Backfill data per account/region/day | 10 TB | N/A | vddb does not support global tables |
+| MRSC global tables | 400 | N/A | ExtendDB does not support global tables |
+| Backfill data per account/region/day | 10 TB | N/A | ExtendDB does not support global tables |
 
 ## Contributor Insights
 
 | Limit | DynamoDB Value | Status | Notes |
 |-------|---------------|--------|-------|
-| All Contributor Insights quotas | Various | N/A | vddb does not support Contributor Insights |
+| All Contributor Insights quotas | Various | N/A | ExtendDB does not support Contributor Insights |
 
 ## Summary
 

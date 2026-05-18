@@ -1,12 +1,12 @@
 # Differences from DynamoDB
 
-This document lists all known behavioral differences between extenddb and real
+This document lists all known behavioral differences between ExtendDB and real
 Amazon DynamoDB. Use it to understand what works identically and what requires
-adaptation when switching between extenddb and the real service.
+adaptation when switching between ExtendDB and the real service.
 
 ## Storage and Infrastructure
 
-| Area | DynamoDB | extenddb |
+| Area | DynamoDB | ExtendDB |
 |------|----------|------|
 | Storage backend | Proprietary distributed storage | PostgreSQL |
 | Backup/Restore | CreateBackup, RestoreTableFromBackup | Implemented: CreateBackup, DescribeBackup, ListBackups, DeleteBackup, RestoreTableFromBackup. Backups are stored as PostgreSQL table snapshots. DescribeContinuousBackups and UpdateContinuousBackups are implemented (track PITR enabled/disabled flag). RestoreTableToPointInTime returns an unsupported error — true point-in-time recovery is not implemented. |
@@ -16,7 +16,7 @@ adaptation when switching between extenddb and the real service.
 
 ## Authentication and Authorization
 
-| Area | DynamoDB | extenddb |
+| Area | DynamoDB | ExtendDB |
 |------|----------|------|
 | Credential management | AWS IAM console/API | `extenddb manage` CLI and `/management` REST API |
 | Access key prefixes | `AKIA` (long-term), `ASIA` (session) | `AKIAEXTENDDB` (long-term), `ASIAEXTENDDB` (session) |
@@ -27,7 +27,7 @@ adaptation when switching between extenddb and the real service.
 
 ## Import and Export
 
-| Area | DynamoDB | extenddb |
+| Area | DynamoDB | ExtendDB |
 |------|----------|------|
 | Import source | S3BucketSource (S3 bucket) | FileSource (local filesystem path) |
 | Export destination | S3 bucket | Local filesystem path |
@@ -38,14 +38,14 @@ adaptation when switching between extenddb and the real service.
 
 ## Control Plane
 
-| Area | DynamoDB | extenddb |
+| Area | DynamoDB | ExtendDB |
 |------|----------|------|
 | Table creation delay | Immediate for on-demand, seconds for provisioned | Configurable via `control_plane_delay_seconds` runtime setting (default: 5s) |
 | DeletionProtectionEnabled | Enforced | Enforced (accepted and stored, DeleteTable rejects when enabled) |
 
 ## Time to Live (TTL)
 
-| Area | DynamoDB | extenddb |
+| Area | DynamoDB | ExtendDB |
 |------|----------|------|
 | TTL attribute name | Any UTF-8 string (1–255 bytes) | Restricted to `[a-zA-Z0-9._-]+` (1–255 bytes). Names with spaces, quotes, or other special characters are rejected. This eliminates SQL injection risk in the TTL expression index. |
 | TTL deletion | Background process, items deleted within 48 hours of expiry | Background worker with indexed sweep, configurable target via `ttl_deletion_target_seconds` (default: 300s) |
@@ -54,20 +54,20 @@ adaptation when switching between extenddb and the real service.
 
 ## Tagging
 
-| Area | DynamoDB | extenddb |
+| Area | DynamoDB | ExtendDB |
 |------|----------|------|
 | TagResource / UntagResource | Validates resource ARN exists, returns `ResourceNotFoundException` for missing tables | Matches DynamoDB — validates resource ARN and returns `ResourceNotFoundException` for missing tables. |
 
 ## Secondary Indexes
 
-| Area | DynamoDB | extenddb |
+| Area | DynamoDB | ExtendDB |
 |------|----------|------|
 | GSI update propagation | Eventually consistent (milliseconds to seconds) | Per-GSI propagation delay. System default: `gsi_propagation_delay_ms` setting (default 10ms). Each GSI can override with its own `propagation_delay_ms` (stored in catalog). A value of 0 means synchronous (future sync GSI feature). |
 | Multi-part base table keys | Not supported | Preview extension (opt-in via `enable_multipart_keys` setting). Standard single/composite keys work identically. |
 
 ## Capacity and Throttling
 
-| Area | DynamoDB | extenddb |
+| Area | DynamoDB | ExtendDB |
 |------|----------|------|
 | Provisioned throughput | Token bucket per table/partition | Token bucket per table/partition, matching DynamoDB's burst and refill behavior |
 | On-demand capacity | Automatic scaling | Fixed initial burst capacity (4000 WCU / 12000 RCU), no auto-scaling |
@@ -86,7 +86,7 @@ The following operations return `UnknownOperationException`:
 
 ## Runtime Configuration
 
-extenddb exposes runtime settings that have no DynamoDB equivalent:
+ExtendDB exposes runtime settings that have no DynamoDB equivalent:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
@@ -100,7 +100,7 @@ extenddb exposes runtime settings that have no DynamoDB equivalent:
 
 ## Web Console
 
-extenddb includes a built-in web management console at `/console` for credential
+ExtendDB includes a built-in web management console at `/console` for credential
 and account management. DynamoDB uses the AWS Management Console.
 
 ---

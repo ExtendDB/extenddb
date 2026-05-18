@@ -4,8 +4,8 @@ This directory contains the authoritative design documents for ExtendDB (extendd
 
 ## Document Index
 
-| # | Document | Scope |
-|---|----------|-------|
+| #  | Document | Scope |
+|----|----------|-------|
 | 01 | [Requirements](01-requirements.md) | Wire protocol, operations, limits, data types, non-functional requirements |
 | 02 | [High-Level Design](02-high-level-design.md) | Architecture overview, crate structure, request lifecycle, key design decisions, technology choices |
 | 03 | [Core](03-component-core.md) | Types, expression engine, validation, capacity calculation, errors (`extenddb-core` crate) |
@@ -15,6 +15,9 @@ This directory contains the authoritative design documents for ExtendDB (extendd
 | 07 | [Streams](07-component-streams.md) | DynamoDB Streams design space — capture mechanism, shard management, retention (high-level; detailed design deferred) |
 | 08 | [Configuration](08-component-config.md) | TOML config, env vars, CLI, logging, metrics, health checks, deployment (VM, Kubernetes, Docker) |
 | 09 | [Testing](09-testing.md) | Test strategy, reference suites, golden files, multi-language test suites, coverage tracking |
+| 10 | [Licenses](10-dependency-licenses.md) | Licensing summary for third-party dependencies |
+| 11 | [Scaling](11-high-availability.md) | DRAFT document on scaling ExtendDB |
+
 
 ## How to Use These Docs
 

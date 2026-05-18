@@ -28,19 +28,16 @@ eval $(python3 devtools/provision-test-credentials)
 pytest tests/ -v
 ```
 
-### Using the orchestration test runner (recommended)
-
-From the orchestration repo (`amrith-vddb`):
+### Using the test runner script (recommended)
 
 ```bash
 export EXTENDDB_TEST_ENDPOINT=https://127.0.0.1:8000
 export EXTENDDB_ADMIN_USER=admin
 export EXTENDDB_ADMIN_PASSWORD=<password-from-init>
-devtools/run-tests --repo extenddb --all
+devtools/run-tests --extenddb --all
 ```
 
-The orchestration runner automatically provisions test credentials and
-configures the Java truststore for external tests.
+The test runner script automatically provisions test credentials and configures the Java truststore for external tests.
 
 ## Running against real DynamoDB
 
@@ -82,7 +79,7 @@ handles this automatically:
 
 - **Python tests:** `verify=False` is set on all boto3 and requests clients
   when the endpoint starts with `https://`.
-- **Java tests:** The orchestration runner creates a temporary Java truststore
+- **Java tests:** The test runner script creates a temporary Java truststore
   from the self-signed cert and passes it via `JAVA_TOOL_OPTIONS`.
 - **curl:** Health checks use `curl -sk` to accept self-signed certs.
 

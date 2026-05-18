@@ -102,43 +102,73 @@ Every source file must carry:
 
 ## Testing
 
-### Orchestrated Test Execution
+### Python Environment Setup
 
-All tests are run from the orchestration repo (`amrith-vddb`), never from the code repos directly. The `devtools/run-tests` script builds and tests in the target code repo but writes artifacts to the orchestration repo's `discussions/` directory.
+Python integration tests require a virtual environment with dependencies installed:
 
 ```bash
-# Run all test suites (Rust, pytest, external, comprehensive)
-devtools/run-tests --repo extenddb --all
-
-# Run individual suites
-devtools/run-tests --repo extenddb --rust
-devtools/run-tests --repo extenddb --pytest
-devtools/run-tests --repo extenddb --external
-devtools/run-tests --repo extenddb --comprehensive
-
-# Release build tests
-devtools/run-tests --repo extenddb --rust --release
+python3 -m venv ~/venvs/extenddb-venv
+source ~/venvs/extenddb-venv/bin/activate
+pip install -r requirements.txt
 ```
 
-**Prerequisites for integration tests (pytest, external, comprehensive):**
+Activate the virtual environment before running any test suites:
+
+```bash
+source ~/venvs/extenddb-venv/bin/activate
+```
+
+### Test Runner Script
+
+All tests should be run via `devtools/run-tests`, which handles credential provisioning, runtime configuration, and artifact collection.
+
+**Usage:**
+
+```bash
+# Run all test suites against local ExtendDB
+devtools/run-tests --extenddb --all
+
+# Run specific suites
+devtools/run-tests --extenddb --rust
+devtools/run-tests --extenddb --pytest
+devtools/run-tests --extenddb --external
+devtools/run-tests --extenddb --comprehensive
+devtools/run-tests --extenddb --rust-integration
+
+# Run against Amazon DynamoDB
+devtools/run-tests --real-dynamodb --pytest
+
+# Use release build
+devtools/run-tests --extenddb --rust --release
+
+# Filter tests
+devtools/run-tests --extenddb --pytest --filter test_put_item
+```
+
+**Prerequisites for integration tests (pytest, external, comprehensive, rust-integration):**
 
 1. A running extenddb server: `./target/debug/extenddb serve --config extenddb.toml`
 2. `EXTENDDB_TEST_ENDPOINT=https://localhost:8000`
 3. `EXTENDDB_ADMIN_PASSWORD=<password from extenddb init>`
 
 The `run-tests` script automatically:
+- Performs health check on the target endpoint
 - Provisions test credentials via `devtools/provision-test-credentials`
 - Creates a Java truststore for external tests (self-signed TLS cert)
 - Sets `control_plane_delay_seconds` to 0.05 for fast test cycles
-- Configures import/export paths for file operation tests
+- Sets `gsi_propagation_delay_ms` to 0 for immediate GSI updates
 - Enables throttling for production-like behavior
+- Configures import/export paths for file operation tests
+- Extracts and exports `EXTENDDB_TEST_PG_CONNECTION_STRING` for CLI lifecycle tests
 
 **Test artifacts** are written to `discussions/` with the code repo's HEAD commit hash:
-- `test-rust-<hash>.txt` — Rust test output
+- `test-rust-<hash>.txt` — Rust unit test output
+- `test-rust-integration-<hash>.txt` — Rust integration test output
 - `test-pytest-<hash>.txt` — Pytest output
 - `test-external-<hash>.json` — External test results (structured)
 - `test-external-<hash>.txt` — External test output (verbose)
 - `test-comprehensive-<hash>.txt` — Comprehensive test output
+- `test-cli-<hash>.txt` — CLI lifecycle test output
 
 ### Test Suites
 
@@ -155,11 +185,10 @@ The `run-tests` script automatically:
 The primary test suite is in Python, testing extenddb through the same AWS SDK interface that customers use.
 
 ```bash
-# Via orchestration (preferred)
-devtools/run-tests --repo extenddb --pytest
+# Via run-tests script (recommended)
+devtools/run-tests --extenddb --pytest
 
-# Direct execution (for development only — artifacts not captured)
-cd ../ExtendDB
+# Direct execution (for quick iteration during development)
 python3 -m pytest tests/ -v
 python3 -m pytest tests/test_put_item.py -v
 python3 -m pytest tests/test_put_item.py::test_put_item_basic -v
@@ -170,7 +199,7 @@ python3 -m pytest tests/test_put_item.py::test_put_item_basic -v
 A separate Python test suite in `tests/python/` provides broader coverage from a clean-room gap analysis:
 
 ```bash
-devtools/run-tests --repo extenddb --comprehensive
+devtools/run-tests --extenddb --comprehensive
 ```
 
 ### External Test Suites
@@ -178,11 +207,10 @@ devtools/run-tests --repo extenddb --comprehensive
 External test suites (Java) are registered in `external-suites.toml` and run via:
 
 ```bash
-# Via orchestration (preferred)
-devtools/run-tests --repo extenddb --external
+# Via run-tests script (recommended)
+devtools/run-tests --extenddb --external
 
-# Direct execution (for development only)
-cd ../ExtendDB
+# Direct execution (for quick iteration during development)
 python3 devtools/run-external-tests --verbose
 python3 devtools/run-external-tests --suite "Suite Name"
 python3 devtools/run-external-tests --dry-run
@@ -193,10 +221,10 @@ The external test runner parses Maven surefire XML reports as a fallback when `m
 ### Rust Unit Tests
 
 ```bash
-# Via orchestration (preferred)
-devtools/run-tests --repo extenddb --rust
+# Via run-tests script (recommended)
+devtools/run-tests --extenddb --rust
 
-# Direct execution (for development only)
+# Direct execution (for quick iteration during development)
 cargo test
 cargo test -p extenddb-core
 cargo test -p extenddb-engine
