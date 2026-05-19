@@ -96,9 +96,7 @@ fn resolve_to_value<'a>(
     match expr {
         Expr::Path(elements) => Ok(resolve_path(elements, item, maps)?.map(Cow::Borrowed)),
         Expr::Placeholder(name) => Ok(Some(Cow::Borrowed(maps.resolve_value(name)?))),
-        Expr::Function { name, args } if name == "size" => {
-            evaluate_size(args, item, maps).map(|v| Some(Cow::Owned(v)))
-        }
+        Expr::Function { name, args } if name == "size" => evaluate_size(args, item, maps),
         _ => Err(DynamoDbError::ValidationException(
             "Invalid ConditionExpression: expected path or value".to_owned(),
         )),
@@ -283,11 +281,15 @@ fn evaluate_function(
 }
 
 /// Evaluate the `size()` function, returning the size as a number `AttributeValue`.
-fn evaluate_size(
-    args: &[Expr],
-    item: &BTreeMap<String, AttributeValue>,
-    maps: &ExpressionMaps,
-) -> Result<AttributeValue, DynamoDbError> {
+///
+/// Returns `None` if the argument resolves to a missing attribute, matching
+/// DynamoDB's behavior where `size(nonexistent)` causes the enclosing
+/// comparison to evaluate to false (the item is skipped).
+fn evaluate_size<'a>(
+    args: &'a [Expr],
+    item: &'a BTreeMap<String, AttributeValue>,
+    maps: &'a ExpressionMaps,
+) -> Result<Option<Cow<'a, AttributeValue>>, DynamoDbError> {
     if args.len() != 1 {
         return Err(DynamoDbError::ValidationException(
             "Invalid ConditionExpression: size requires exactly one argument".to_owned(),
@@ -295,7 +297,8 @@ fn evaluate_size(
     }
     let val = resolve_to_value(&args[0], item, maps)?;
     let Some(ref v) = val else {
-        return Ok(AttributeValue::N("0".to_owned()));
+        // Attribute does not exist — propagate None so the comparison short-circuits.
+        return Ok(None);
     };
     let sz = match v.as_ref() {
         AttributeValue::S(s) => s.len(),
@@ -311,7 +314,7 @@ fn evaluate_size(
             ));
         }
     };
-    Ok(AttributeValue::N(sz.to_string()))
+    Ok(Some(Cow::Owned(AttributeValue::N(sz.to_string()))))
 }
 
 /// Return the `DynamoDB` type code for an `AttributeValue`.

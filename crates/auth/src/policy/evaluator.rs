@@ -398,7 +398,7 @@ mod tests {
         // Identity allows all, but boundary only allows GetItem
         assert_eq!(
             evaluate_policies(
-                &[identity.clone()],
+                std::slice::from_ref(&identity),
                 Some(&boundary),
                 None,
                 "dynamodb:GetItem",
@@ -462,7 +462,7 @@ mod tests {
         );
         assert_eq!(
             evaluate_policies(
-                &[role.clone()],
+                std::slice::from_ref(&role),
                 None,
                 Some(&session),
                 "dynamodb:GetItem",
@@ -555,7 +555,7 @@ mod tests {
         // All phases pass
         assert_eq!(
             evaluate_policies(
-                &[identity.clone()],
+                std::slice::from_ref(&identity),
                 Some(&boundary),
                 Some(&session),
                 "dynamodb:GetItem",
@@ -614,7 +614,7 @@ mod tests {
         );
         assert_eq!(
             evaluate_policies(
-                &[policy.clone()],
+                std::slice::from_ref(&policy),
                 None,
                 None,
                 "dynamodb:PutItem",
@@ -697,7 +697,7 @@ mod tests {
         let ctx = Ctx::empty().with("dynamodb:LeadingKeys", vec!["user-123"]);
         assert_eq!(
             evaluate_policies(
-                &[policy.clone()],
+                std::slice::from_ref(&policy),
                 None,
                 None,
                 "dynamodb:GetItem",

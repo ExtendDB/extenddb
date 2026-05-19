@@ -330,3 +330,23 @@ fn eq_both_missing_is_false() {
     let names = HashMap::from([("a".into(), "x".into()), ("b".into(), "y".into())]);
     assert!(!eval("#a = #b", &item, names, HashMap::new()).unwrap());
 }
+
+#[test]
+fn size_of_missing_attribute_returns_false() {
+    // DynamoDB: size(nonexistent) causes the comparison to evaluate to false
+    // (the item is skipped), not to return 0.
+    let item = simple_item(); // has "name", "age", "active" — no "missing"
+    let mut values = HashMap::new();
+    values.insert("zero".into(), AttributeValue::N("0".into()));
+    // size(missing) = :zero should be false (not true)
+    assert!(!eval("size(missing) = :zero", &item, HashMap::new(), values).unwrap());
+}
+
+#[test]
+fn size_of_missing_attribute_lt_returns_false() {
+    let item = simple_item();
+    let mut values = HashMap::new();
+    values.insert("one".into(), AttributeValue::N("1".into()));
+    // size(missing) < :one should be false
+    assert!(!eval("size(missing) < :one", &item, HashMap::new(), values).unwrap());
+}

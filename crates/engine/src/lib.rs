@@ -141,8 +141,6 @@ pub(crate) fn sanitize_storage_error(e: extenddb_storage::error::StorageError) -
     DynamoDbError::InternalServerError("Internal server error".to_owned())
 }
 
-/// Sideband metrics collected during operation dispatch.
-
 /// Map a serde deserialization error to the appropriate DynamoDB error type.
 ///
 /// Enum validation errors (produced by custom Deserialize impls) contain

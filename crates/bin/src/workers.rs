@@ -242,9 +242,7 @@ pub(crate) async fn metrics_flush_worker(
 }
 
 /// Background worker that deletes old login attempt records.
-pub(crate) async fn login_attempt_cleanup_worker(
-    store: Arc<dyn RateLimitStore>,
-) {
+pub(crate) async fn login_attempt_cleanup_worker(store: Arc<dyn RateLimitStore>) {
     use std::time::Duration;
 
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);

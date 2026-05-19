@@ -55,6 +55,14 @@ pub async fn handle_batch_get_item(
         }
     }
 
+    // Validate: total keys across all tables <= 100
+    let total_keys: usize = input.request_items.values().map(|ka| ka.keys.len()).sum();
+    if total_keys > MAX_BATCH_GET_KEYS {
+        return Err(DynamoDbError::ValidationException(
+            "Too many items requested for the BatchGetItem call".to_owned(),
+        ));
+    }
+
     // Validate: each table must have at least one key
     for (table_name, ka) in &input.request_items {
         if ka.keys.is_empty() {
@@ -120,12 +128,12 @@ pub async fn handle_batch_get_item(
             // Merge extra names with any user-provided names.
             None // extra_proj_names used directly below
         };
-        let maps = if !extra_proj_names.is_empty() {
+        let maps = if extra_proj_names.is_empty() {
+            build_expression_maps(ean, None)
+        } else {
             let mut merged = ka.expression_attribute_names.clone().unwrap_or_default();
             merged.extend(extra_proj_names);
             build_expression_maps(Some(&merged), None)
-        } else {
-            build_expression_maps(ean, None)
         };
 
         let mut table_items: Vec<Item> = Vec::new();

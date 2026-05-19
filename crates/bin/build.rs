@@ -15,13 +15,18 @@ fn main() {
         .args(["rev-parse", "--short", "HEAD"])
         .output()
         .ok()
-        .filter(|o| o.status.success()).map_or_else(|| "unknown".to_owned(), |o| String::from_utf8_lossy(&o.stdout).trim().to_owned());
+        .filter(|o| o.status.success())
+        .map_or_else(
+            || "unknown".to_owned(),
+            |o| String::from_utf8_lossy(&o.stdout).trim().to_owned(),
+        );
     println!("cargo:rustc-env=EXTENDDB_GIT_HASH={git_hash}");
 
     // Build timestamp (UTC, ISO 8601). Uses std::time to avoid shelling out
     // to `date`, which is not portable to Windows or minimal containers.
-    let build_time = SystemTime::now()
-        .duration_since(UNIX_EPOCH).map_or_else(|_| "unknown".to_owned(), |d| {
+    let build_time = SystemTime::now().duration_since(UNIX_EPOCH).map_or_else(
+        |_| "unknown".to_owned(),
+        |d| {
             let secs = d.as_secs();
             // Manual UTC formatting — avoids adding a build dependency.
             let days = secs / 86400;
@@ -49,7 +54,8 @@ fn main() {
             let y = if m <= 2 { y + 1 } else { y };
 
             format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
-        });
+        },
+    );
     println!("cargo:rustc-env=EXTENDDB_BUILD_TIME={build_time}");
 
     // No explicit rerun-if-changed directives — without them, Cargo re-runs

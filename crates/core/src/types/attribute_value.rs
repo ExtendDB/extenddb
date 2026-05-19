@@ -98,9 +98,11 @@ impl<'de> Visitor<'de> for AttributeValueVisitor {
                 let n = value
                     .as_str()
                     .ok_or_else(|| de::Error::custom("N value must be a string"))?;
-                let normalized = crate::validation::number::validate_and_normalize_number(n)
+                // Normalize valid numbers; store raw string for invalid ones so the
+                // validation layer can reject them with ValidationException.
+                let stored = crate::validation::number::validate_and_normalize_number(n)
                     .unwrap_or_else(|_| n.to_owned());
-                Ok(AttributeValue::N(normalized))
+                Ok(AttributeValue::N(stored))
             }
             "B" => {
                 let b64 = value
@@ -392,6 +394,29 @@ mod tests {
         let json = r#"{"X":"hello"}"#;
         let err = serde_json::from_str::<AttributeValue>(json).unwrap_err();
         assert!(err.to_string().contains("unknown"));
+    }
+
+    #[test]
+    fn invalid_number_accepted_at_deserialization() {
+        // Invalid numbers are accepted by the deserializer (stored raw)
+        // and rejected later by the validation layer as ValidationException.
+        let json = r#"{"N":"abc"}"#;
+        let val: AttributeValue = serde_json::from_str(json).unwrap();
+        assert_eq!(val, AttributeValue::N("abc".to_owned()));
+
+        let json = r#"{"N":"1E999"}"#;
+        let val: AttributeValue = serde_json::from_str(json).unwrap();
+        assert_eq!(val, AttributeValue::N("1E999".to_owned()));
+    }
+
+    #[test]
+    fn invalid_number_in_ns_accepted() {
+        let json = r#"{"NS":["1","abc"]}"#;
+        let val: AttributeValue = serde_json::from_str(json).unwrap();
+        match val {
+            AttributeValue::NS(set) => assert!(set.contains("abc")),
+            _ => panic!("expected NS"),
+        }
     }
 
     #[test]

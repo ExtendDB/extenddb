@@ -4,7 +4,7 @@
 //! `UpdateTable` operation handler.
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::types::{BillingMode, DescribeTableInput, UpdateTableInput};
+use extenddb_core::types::{BillingMode, UpdateTableInput};
 use serde_json::Value;
 
 use crate::OperationContext;
@@ -142,56 +142,13 @@ pub async fn handle_update_table(
         }
     }
 
-    // No-op rejection: setting same billing mode to PROVISIONED with same throughput
-    // values is rejected by DynamoDB.
-    if matches!(input.billing_mode, Some(BillingMode::Provisioned)) {
-        if let Some(ref tp) = input.provisioned_throughput {
-            let current = ctx
-                .storage
-                .describe_table(
-                    &ctx.account_id,
-                    DescribeTableInput {
-                        table_name: input.table_name.clone(),
-                    },
-                )
-                .await
-                .map_err(|e| match e {
-                    extenddb_storage::error::StorageError::TableNotFound(_) => {
-                        DynamoDbError::ResourceNotFoundException(
-                            "Requested resource not found".to_owned(),
-                        )
-                    }
-                    other => crate::sanitize_storage_error(other),
-                })?;
-            let current_tp = &current.provisioned_throughput;
-            let is_provisioned = current
-                .billing_mode_summary
-                .as_ref()
-                .map_or(true, |b| b.billing_mode == BillingMode::Provisioned);
-            if current_tp.read_capacity_units == tp.read_capacity_units
-                && current_tp.write_capacity_units == tp.write_capacity_units
-                && is_provisioned
-            {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "The provisioned throughput for the table will not change. The requested value equals the current value. \
-                     Current ReadCapacityUnits provisioned for the table: {}. Requested ReadCapacityUnits: {}. \
-                     Current WriteCapacityUnits provisioned for the table: {}. Requested WriteCapacityUnits: {}.",
-                    current_tp.read_capacity_units,
-                    tp.read_capacity_units,
-                    current_tp.write_capacity_units,
-                    tp.write_capacity_units
-                )));
-            }
-        }
-    }
-
     let desc = ctx
         .storage
         .update_table(&ctx.account_id, input)
         .await
         .map_err(|e| match e {
             extenddb_storage::error::StorageError::TableNotFound(_name) => {
-                DynamoDbError::ResourceNotFoundException(format!("Requested resource not found"))
+                DynamoDbError::ResourceNotFoundException("Requested resource not found".to_string())
             }
             extenddb_storage::error::StorageError::TableNotActive(name) => {
                 DynamoDbError::ResourceInUseException(format!(
@@ -207,6 +164,9 @@ pub async fn handle_update_table(
                 DynamoDbError::ResourceNotFoundException(format!(
                     "One or more parameter values were invalid: Index not found: {name}"
                 ))
+            }
+            extenddb_storage::error::StorageError::NoOpUpdate(msg) => {
+                DynamoDbError::ValidationException(msg)
             }
             other => {
                 tracing::error!(internal_error = %other, "storage internal error");

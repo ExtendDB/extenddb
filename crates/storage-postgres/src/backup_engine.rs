@@ -80,11 +80,11 @@ impl BackupEngine for PostgresEngine {
                 ts = epoch_millis()
             );
 
-        // Snapshot items from the data table.
-        let ddb_table = data_table_name(&table_id);
-        let ddb_table_unquoted = ddb_table.trim_matches('"');
-        let has_sk: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM information_schema.columns \
+            // Snapshot items from the data table.
+            let ddb_table = data_table_name(&table_id);
+            let ddb_table_unquoted = ddb_table.trim_matches('"');
+            let has_sk: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM information_schema.columns \
              WHERE table_name = $1 AND column_name = 'sk')",
             )
             .bind(ddb_table_unquoted)
@@ -419,9 +419,9 @@ impl BackupEngine for PostgresEngine {
 
             let desc = self.create_table(&account_id, create_input).await?;
 
-        let new_table_id = &desc.table_id;
-        let ddb_table = data_table_name(new_table_id);
-        let ddb_table_unquoted = ddb_table.trim_matches('"');
+            let new_table_id = &desc.table_id;
+            let ddb_table = data_table_name(new_table_id);
+            let ddb_table_unquoted = ddb_table.trim_matches('"');
 
             // Do NOT force ACTIVE — let the control plane handle the transition
             // (steering rule D-2: tests run with control_plane_delay_seconds > 0).
@@ -532,7 +532,7 @@ impl BackupEngine for PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
 
-            let pitr_enabled = pitr_row.map_or(false, |r| r.0);
+            let pitr_enabled = pitr_row.is_some_and(|r| r.0);
 
             #[allow(clippy::cast_precision_loss)]
             let now_epoch = std::time::SystemTime::now()

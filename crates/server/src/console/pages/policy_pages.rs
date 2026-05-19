@@ -316,6 +316,7 @@ async fn put_policy(
 }
 
 /// Delete a policy for any entity type.
+#[allow(clippy::too_many_arguments)]
 async fn delete_policy(
     state: &Arc<ConsoleState>,
     headers: &HeaderMap,

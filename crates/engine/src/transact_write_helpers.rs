@@ -9,8 +9,8 @@
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{ExpressionMaps, PathElement, UpdateAction};
 use extenddb_core::types::{
-    ReturnItemCollectionMetrics, ReturnValuesOnConditionCheckFailure, TableKeyInfo, extract_key,
-    item_size_bytes,
+    ReturnItemCollectionMetrics, ReturnValuesOnConditionCheckFailure, TableKeyInfo,
+    attribute_value_size, extract_key, item_size_bytes,
 };
 use extenddb_storage::TransactWriteOp;
 use hmac::{Hmac, Mac};
@@ -67,12 +67,29 @@ impl PreparedOp {
     }
 
     /// Approximate item size for transaction size limit enforcement.
+    ///
+    /// For Put operations, this returns the exact item size. For Update, Delete,
+    /// and ConditionCheck, the full item is not yet available at validation time
+    /// (it will be fetched during execution). DynamoDB's 4MB limit counts the
+    /// full item size as it exists or will exist post-mutation.
+    ///
+    /// To avoid bypassing the limit with updates that produce large items, we
+    /// include the size of expression attribute values as a lower-bound estimate
+    /// for the data being written by Update operations.
     pub(crate) fn item_size(&self) -> usize {
         match self {
             Self::Put { item, .. } => extenddb_core::types::item_size_bytes(item),
-            Self::Delete { key, .. }
-            | Self::Update { key, .. }
-            | Self::ConditionCheck { key, .. } => extenddb_core::types::item_size_bytes(key),
+            Self::Delete { key, .. } | Self::ConditionCheck { key, .. } => {
+                extenddb_core::types::item_size_bytes(key)
+            }
+            Self::Update { key, maps, .. } => {
+                // Use key size + expression attribute values size as a better
+                // approximation of the data involved in the update.
+                let key_size = extenddb_core::types::item_size_bytes(key);
+                let values_size: usize =
+                    maps.values.values().map(attribute_value_size).sum();
+                key_size + values_size
+            }
         }
     }
 

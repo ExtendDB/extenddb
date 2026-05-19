@@ -24,6 +24,8 @@ pub enum StorageError {
     IdempotentReplay,
     #[error("Idempotent parameter mismatch")]
     IdempotentMismatch,
+    #[error("No-op update: {0}")]
+    NoOpUpdate(String),
     #[error("Validation error: {0}")]
     Validation(String),
     #[error(

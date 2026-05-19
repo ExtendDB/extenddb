@@ -44,22 +44,54 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
             let (_absent_passes, base_op) = unwrap_if_exists(inner);
             match context_values {
                 None => true,
-                Some(vals) => vals.iter().all(|cv| {
-                    expanded_values
-                        .iter()
-                        .any(|pv| compare_single(base_op, cv, pv))
-                }),
+                Some(vals) => {
+                    if is_negative_operator(base_op) {
+                        // Negative operators: each context value must satisfy the
+                        // negative comparison against ALL policy values.
+                        // e.g. ForAllValues:StringNotEquals with ["admin","root"]
+                        // means "every context value is neither admin nor root".
+                        vals.iter().all(|cv| {
+                            expanded_values
+                                .iter()
+                                .all(|pv| compare_single(base_op, cv, pv))
+                        })
+                    } else {
+                        // Positive operators: each context value must match at
+                        // least one policy value.
+                        vals.iter().all(|cv| {
+                            expanded_values
+                                .iter()
+                                .any(|pv| compare_single(base_op, cv, pv))
+                        })
+                    }
+                }
             }
         }
         ConditionOperator::ForAnyValue(inner) => {
             let (absent_passes, base_op) = unwrap_if_exists(inner);
             match context_values {
                 None => absent_passes,
-                Some(vals) => vals.iter().any(|cv| {
-                    expanded_values
-                        .iter()
-                        .any(|pv| compare_single(base_op, cv, pv))
-                }),
+                Some(vals) => {
+                    if is_negative_operator(base_op) {
+                        // Negative operators: at least one context value must
+                        // satisfy the negative comparison against ALL policy values.
+                        // e.g. ForAnyValue:StringNotEquals with ["admin","root"]
+                        // means "at least one context value is neither admin nor root".
+                        vals.iter().any(|cv| {
+                            expanded_values
+                                .iter()
+                                .all(|pv| compare_single(base_op, cv, pv))
+                        })
+                    } else {
+                        // Positive operators: at least one context value must
+                        // match at least one policy value.
+                        vals.iter().any(|cv| {
+                            expanded_values
+                                .iter()
+                                .any(|pv| compare_single(base_op, cv, pv))
+                        })
+                    }
+                }
             }
         }
         ConditionOperator::IfExists(inner) => match context_values {
@@ -811,6 +843,83 @@ mod tests {
                 ConditionOperator::StringEquals,
                 "k",
                 vec!["${aws:PrincipalTag/Missing}"]
+            ),
+            &ctx
+        ));
+    }
+
+    // --- ForAllValues with negative operators ---
+
+    #[test]
+    fn for_all_values_string_not_equals_context_in_policy_set() {
+        // ForAllValues:StringNotEquals with context ["admin"] and policy ["admin", "root"]
+        // "admin" IS in the set, so the condition should be FALSE (deny applies).
+        let ctx = TestContext::new().with("k", vec!["admin"]);
+        assert!(!evaluate_condition(
+            &cond(
+                ConditionOperator::ForAllValues(Box::new(ConditionOperator::StringNotEquals)),
+                "k",
+                vec!["admin", "root"]
+            ),
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn for_all_values_string_not_equals_context_not_in_policy_set() {
+        // ForAllValues:StringNotEquals with context ["user"] and policy ["admin", "root"]
+        // "user" is NOT in the set, so the condition should be TRUE.
+        let ctx = TestContext::new().with("k", vec!["user"]);
+        assert!(evaluate_condition(
+            &cond(
+                ConditionOperator::ForAllValues(Box::new(ConditionOperator::StringNotEquals)),
+                "k",
+                vec!["admin", "root"]
+            ),
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn for_all_values_string_not_equals_mixed_context() {
+        // ForAllValues:StringNotEquals with context ["user", "admin"] and policy ["admin", "root"]
+        // "admin" IS in the set, so the condition should be FALSE.
+        let ctx = TestContext::new().with("k", vec!["user", "admin"]);
+        assert!(!evaluate_condition(
+            &cond(
+                ConditionOperator::ForAllValues(Box::new(ConditionOperator::StringNotEquals)),
+                "k",
+                vec!["admin", "root"]
+            ),
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn for_any_value_string_not_equals_all_in_set() {
+        // ForAnyValue:StringNotEquals with context ["admin", "root"] and policy ["admin", "root"]
+        // Both context values are in the policy set, so none satisfy "not in set" → FALSE.
+        let ctx = TestContext::new().with("k", vec!["admin", "root"]);
+        assert!(!evaluate_condition(
+            &cond(
+                ConditionOperator::ForAnyValue(Box::new(ConditionOperator::StringNotEquals)),
+                "k",
+                vec!["admin", "root"]
+            ),
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn for_any_value_string_not_equals_one_outside_set() {
+        // ForAnyValue:StringNotEquals with context ["admin", "user"] and policy ["admin", "root"]
+        // "user" is NOT in the set, so at least one satisfies "not in set" → TRUE.
+        let ctx = TestContext::new().with("k", vec!["admin", "user"]);
+        assert!(evaluate_condition(
+            &cond(
+                ConditionOperator::ForAnyValue(Box::new(ConditionOperator::StringNotEquals)),
+                "k",
+                vec!["admin", "root"]
             ),
             &ctx
         ));

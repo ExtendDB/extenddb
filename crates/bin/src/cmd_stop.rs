@@ -64,7 +64,9 @@ pub fn run(args: &StopArgs) {
         }
     };
 
-    let pid: i32 = if let Ok(p) = pid_str.parse() { p } else {
+    let pid: i32 = if let Ok(p) = pid_str.parse() {
+        p
+    } else {
         eprintln!("Invalid PID in {}: '{pid_str}'", pid_file.display());
         std::process::exit(1);
     };

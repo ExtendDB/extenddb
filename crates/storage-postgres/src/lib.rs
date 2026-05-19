@@ -157,6 +157,8 @@ impl PostgresEngine {
         let pool = PgPoolOptions::new()
             .max_connections(config.pool_size)
             .min_connections(min_conns)
+            .test_before_acquire(false)
+            .max_lifetime(std::time::Duration::from_secs(1800))
             .connect(&config.connection_string)
             .await
             .map_err(|e| StorageError::Connection(e.to_string()))?;
@@ -172,6 +174,8 @@ impl PostgresEngine {
             Ok(Some((data_conn,))) if !data_conn.is_empty() => PgPoolOptions::new()
                 .max_connections(config.pool_size)
                 .min_connections(min_conns)
+                .test_before_acquire(false)
+                .max_lifetime(std::time::Duration::from_secs(1800))
                 .connect(&data_conn)
                 .await
                 .map_err(|e| {
@@ -441,6 +445,8 @@ inventory::submit! {
                 let catalog_pool = PgPoolOptions::new()
                     .max_connections(catalog_pool_size)
                     .min_connections(catalog_pool_size.min(2))
+                    .test_before_acquire(false)
+                    .max_lifetime(std::time::Duration::from_secs(1800))
                     .connect(&connection_string)
                     .await
                     .map_err(|e| BackendError::ConnectionFailed {

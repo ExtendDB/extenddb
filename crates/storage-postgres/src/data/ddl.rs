@@ -13,6 +13,16 @@ use extenddb_storage::util::{sk_column, sk_column_n};
 use super::{all_sort_key_info, data_table_name, index_table_name};
 use crate::PostgresEngine;
 
+/// Row shape returned by the table-info query: (key_schema, attr_defs, status, table_id, stream_spec, has_lsi).
+type TableInfoRow = (
+    serde_json::Value,
+    serde_json::Value,
+    String,
+    String,
+    Option<serde_json::Value>,
+    Option<bool>,
+);
+
 impl PostgresEngine {
     /// Create the per-DynamoDB-table data table in `PostgreSQL`.
     ///
@@ -251,14 +261,7 @@ impl PostgresEngine {
         account_id: &str,
         table_name: &str,
     ) -> Result<TableKeyInfo, StorageError> {
-        let row: Option<(
-            serde_json::Value,
-            serde_json::Value,
-            String,
-            String,
-            Option<serde_json::Value>,
-            Option<bool>,
-        )> = sqlx::query_as(
+        let row: Option<TableInfoRow> = sqlx::query_as(
             "SELECT key_schema, attribute_definitions, table_status, table_id, \
              stream_specification, \
              EXISTS(SELECT 1 FROM indexes WHERE table_id = tables.table_id AND index_type = 'LSI') AS has_lsi \

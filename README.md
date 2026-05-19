@@ -2,7 +2,7 @@
 
 > **ExtendDB is an independent open source project managed by Amazon Web Services. It is not Amazon DynamoDB and does not contain any DynamoDB source code.** "DynamoDB" is a trademark of Amazon.com, Inc. ExtendDB is a clean-room implementation that speaks the DynamoDB wire protocol. Behavioral differences from the real service are documented in [Differences from DynamoDB](docs/differences-from-dynamodb.md).
 
-A production-grade DynamoDB-compatible API adapter backed by PostgreSQL. ExtendDB speaks the DynamoDB wire protocol — any AWS SDK, CLI, or tool that works with DynamoDB works with ExtendDB, unchanged.
+A DynamoDB-compatible API adapter, ExtendDB speaks the DynamoDB wire protocol — any AWS SDK, CLI, or tool that works with DynamoDB works with ExtendDB, unchanged.
 
 ## Use Cases
 
@@ -63,11 +63,11 @@ pip install -r requirements.txt
 
 ## Authentication Modes
 
-ExtendDB ships with builtin IAM authentication enabled by default. All requests must be signed with valid SigV4 credentials created via the management API.
+ExtendDB ships with builtin IAM-like authentication enabled by default. All requests must be signed with valid SigV4 credentials created via the management API.
 
 | Mode | Config | Description |
 |------|--------|-------------|
-| Builtin IAM | `auth.provider = "builtin"` | Full SigV4 signature verification with local credential store and IAM policy evaluation. This is the default and only supported mode. |
+| Builtin IAM-like | `auth.provider = "builtin"` | Full SigV4 signature verification with local credential store and IAM policy evaluation. This is the default and only supported mode. |
 
 ## Configuration
 

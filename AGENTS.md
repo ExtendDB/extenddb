@@ -93,6 +93,19 @@ cargo build --release
 
 Binary: `target/release/extenddb`
 
+### Unit Test
+
+```bash
+cargo test --workspace
+```
+
+### Lint
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+```
+
 ### Initialize (first time only)
 
 ```bash

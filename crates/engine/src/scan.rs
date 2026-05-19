@@ -88,6 +88,11 @@ pub async fn handle_scan(
                     "The parameter TotalSegments should be greater than or equal to 1".to_owned(),
                 ));
             }
+            if seg < 0 {
+                return Err(DynamoDbError::ValidationException(
+                    "The parameter Segment should be greater than or equal to 0".to_owned(),
+                ));
+            }
             if seg >= total {
                 return Err(DynamoDbError::ValidationException(format!(
                     "The Segment parameter is zero-based and must be less than parameter TotalSegments: \

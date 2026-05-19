@@ -180,7 +180,7 @@ pub fn tokenize_with_limit(input: &str, max_tokens: usize) -> Result<Vec<Token>,
             }
             other => {
                 let ch = other as char;
-                let near_start = if i > 5 { i - 5 } else { 0 };
+                let near_start = i.saturating_sub(5);
                 let near_end = std::cmp::min(i + 5, input.len());
                 let near = &input[near_start..near_end];
                 return Err(validation_err(&format!(
@@ -325,11 +325,24 @@ pub fn tokenize_for(
                 )?;
             }
             _ => {
-                let token_str = &input[i..i + 1];
-                let near_end = std::cmp::min(i + 2, input.len());
+                // Safety: use chars() to safely extract the character at this
+                // byte position, avoiding panics on multi-byte UTF-8 input.
+                let ch = input[i..].chars().next().unwrap_or('?');
+                let ch_len = ch.len_utf8();
+                let near_end = std::cmp::min(i + ch_len + 1, input.len());
+                // Clamp near_end to a valid char boundary
+                let near_end = if near_end <= input.len() {
+                    let mut end = near_end;
+                    while end < input.len() && !input.is_char_boundary(end) {
+                        end += 1;
+                    }
+                    if end > input.len() { input.len() } else { end }
+                } else {
+                    input.len()
+                };
                 let near = &input[i..near_end];
                 return Err(DynamoDbError::ValidationException(format!(
-                    "Invalid {expr_type}: Syntax error; token: \"{token_str}\", near: \"{near}\""
+                    "Invalid {expr_type}: Syntax error; token: \"{ch}\", near: \"{near}\""
                 )));
             }
         }
@@ -549,6 +562,27 @@ mod tests {
                 Token::Eq,
                 Token::Placeholder("v".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn tokenize_for_multibyte_utf8_does_not_panic() {
+        // Emoji (4-byte UTF-8) should produce a validation error, not a panic.
+        let err = tokenize_for("a = 😀", 4096, "ConditionExpression").unwrap_err();
+        assert!(
+            matches!(err, DynamoDbError::ValidationException(ref msg) if msg.contains("Syntax error"))
+        );
+
+        // Accented character (2-byte UTF-8)
+        let err = tokenize_for("café", 4096, "FilterExpression").unwrap_err();
+        assert!(
+            matches!(err, DynamoDbError::ValidationException(ref msg) if msg.contains("Syntax error"))
+        );
+
+        // Multi-byte at the very end
+        let err = tokenize_for("x + ñ", 4096, "UpdateExpression").unwrap_err();
+        assert!(
+            matches!(err, DynamoDbError::ValidationException(ref msg) if msg.contains("Syntax error"))
         );
     }
 }

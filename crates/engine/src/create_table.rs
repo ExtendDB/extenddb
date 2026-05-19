@@ -105,6 +105,7 @@ pub(crate) fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) ->
             }
         }
         StorageError::Validation(msg) => DynamoDbError::ValidationException(msg),
+        StorageError::NoOpUpdate(msg) => DynamoDbError::ValidationException(msg),
         StorageError::IdempotentReplay | StorageError::IdempotentMismatch => {
             // These are handled directly by the transact_write_items caller.
             // If they reach here, it's a programming error.

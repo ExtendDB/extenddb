@@ -45,6 +45,18 @@ use extenddb_core::types::{
 
 use error::StorageError;
 
+// Type aliases for complex return types used in trait methods.
+/// Result of an update/put/delete that may return old and/or new item images.
+pub type ItemPairResult = Result<(Option<Item>, Option<Item>), StorageError>;
+/// Result of a query or scan: items plus an optional last-evaluated-key for pagination.
+pub type QueryResult = Result<(Vec<Item>, Option<Item>), StorageError>;
+/// TTL table info: `(account_id, table_name, ttl_attribute)`.
+pub type TtlTableInfo = (String, String, String);
+/// Stream records result: records plus an optional next shard iterator.
+pub type StreamRecordsResult = Result<(Vec<StreamRecord>, Option<String>), StorageError>;
+/// Stream list result: summaries plus an optional next exclusive start ARN.
+pub type StreamListResult = Result<(Vec<StreamSummary>, Option<String>), StorageError>;
+
 /// Parameters for capturing a stream record within a data write transaction.
 ///
 /// When present, the storage backend inserts the stream record in the same
@@ -215,7 +227,7 @@ pub trait DataEngine: Send + Sync {
         condition: Option<&Expr>,
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
-    ) -> BoxFuture<'_, Result<(Option<Item>, Option<Item>), StorageError>>;
+    ) -> BoxFuture<'_, ItemPairResult>;
 
     /// Query items by partition key with optional sort key condition.
     ///
@@ -237,7 +249,7 @@ pub trait DataEngine: Send + Sync {
         limit: Option<i64>,
         exclusive_start_key: Option<&Item>,
         index_name: Option<&str>,
-    ) -> BoxFuture<'_, Result<(Vec<Item>, Option<Item>), StorageError>>;
+    ) -> BoxFuture<'_, QueryResult>;
 
     /// Scan all items in a table or index.
     ///
@@ -256,7 +268,7 @@ pub trait DataEngine: Send + Sync {
         segment: Option<i64>,
         total_segments: Option<i64>,
         index_name: Option<&str>,
-    ) -> BoxFuture<'_, Result<(Vec<Item>, Option<Item>), StorageError>>;
+    ) -> BoxFuture<'_, QueryResult>;
 
     /// Execute multiple get operations in a single consistent snapshot.
     ///
@@ -346,12 +358,12 @@ pub trait MetadataEngine: Send + Sync {
     /// List all tables with TTL enabled across all accounts: `(account_id, table_name, ttl_attribute)`.
     fn all_tables_with_ttl(
         &self,
-    ) -> BoxFuture<'_, Result<Vec<(String, String, String)>, StorageError>>;
+    ) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>>;
 
     /// List all tables with TTL enabled AND index ready: `(account_id, table_name, ttl_attribute)`.
     fn all_tables_with_ttl_index_ready(
         &self,
-    ) -> BoxFuture<'_, Result<Vec<(String, String, String)>, StorageError>>;
+    ) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>>;
 
     /// Create the TTL expression index concurrently for a table.
     /// Sets `ttl_index_ready = TRUE` on success.
@@ -413,7 +425,7 @@ pub trait StreamEngine: Send + Sync {
         shard_id: &str,
         after_sequence: Option<&str>,
         limit: i64,
-    ) -> BoxFuture<'_, Result<(Vec<StreamRecord>, Option<String>), StorageError>>;
+    ) -> BoxFuture<'_, StreamRecordsResult>;
 
     /// Describe a stream (shard list, status, view type).
     fn describe_stream(
@@ -429,7 +441,7 @@ pub trait StreamEngine: Send + Sync {
         table_name: Option<&str>,
         limit: i64,
         exclusive_start_stream_arn: Option<&str>,
-    ) -> BoxFuture<'_, Result<(Vec<StreamSummary>, Option<String>), StorageError>>;
+    ) -> BoxFuture<'_, StreamListResult>;
 
     /// Delete stream records older than the retention period.
     fn cleanup_expired_stream_records(

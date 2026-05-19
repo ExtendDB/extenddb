@@ -510,11 +510,10 @@ fn remove_nested(
                 let name = resolve_attr_name(&path[0], maps)?;
                 map.remove(&name);
             }
-            (PathElement::Index(idx), AttributeValue::L(list)) => {
-                if *idx < list.len() {
+            (PathElement::Index(idx), AttributeValue::L(list))
+                if *idx < list.len() => {
                     list.remove(*idx);
                 }
-            }
             _ => {} // No-op for type mismatch
         }
         return Ok(());
@@ -527,11 +526,10 @@ fn remove_nested(
                 remove_nested(next, &path[1..], maps)?;
             }
         }
-        (PathElement::Index(idx), AttributeValue::L(list)) => {
-            if *idx < list.len() {
+        (PathElement::Index(idx), AttributeValue::L(list))
+            if *idx < list.len() => {
                 remove_nested(&mut list[*idx], &path[1..], maps)?;
             }
-        }
         _ => {} // No-op
     }
     Ok(())
