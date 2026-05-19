@@ -158,7 +158,7 @@ fn validate_ttl_attribute_name(name: &str) -> Result<(), DynamoDbError> {
 fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
     match e {
         StorageError::TableNotFound(_name) => {
-            DynamoDbError::ResourceNotFoundException(format!("Requested resource not found"))
+            DynamoDbError::ResourceNotFoundException("Requested resource not found".to_string())
         }
         StorageError::TableNotActive(name) => {
             DynamoDbError::ResourceInUseException(format!("Table {name} is not in ACTIVE state"))

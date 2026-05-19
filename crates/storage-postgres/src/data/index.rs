@@ -239,15 +239,14 @@ pub(crate) async fn delete_index_row_multi(
     let base_pk_text = composite_pk_to_text(item, base_ks)?;
 
     let mut where_parts = vec!["base_pk = $1".to_owned()];
-    let mut param_idx = 2u32;
     for (i, &(_, sk_type)) in base_sks.iter().enumerate() {
+        let param_idx = (i as u32) + 2;
         let col = if i == 0 {
             format!("base_{}", sk_column(sk_type))
         } else {
             format!("base_{}", sk_column_n(i, sk_type))
         };
         where_parts.push(format!("{col} = ${param_idx}"));
-        param_idx += 1;
     }
 
     let sql = format!(

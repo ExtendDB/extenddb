@@ -176,8 +176,8 @@ impl DynamoDbError {
     /// - `ValidationException` → `com.amazon.coral.validate#`
     /// - Infrastructure/auth errors → `com.amazon.coral.service#`
     ///   (`SerializationException`, `UnknownOperationException`,
-    ///    `MissingAuthenticationToken`, `IncompleteSignature`,
-    ///    `InvalidSignatureException`)
+    ///   `MissingAuthenticationToken`, `IncompleteSignature`,
+    ///   `InvalidSignatureException`)
     /// - All other `DynamoDB` errors → `com.amazonaws.dynamodb.v20120810#`
     ///
     /// Verified against real DynamoDB 2026-05-04.

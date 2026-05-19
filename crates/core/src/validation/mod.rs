@@ -910,8 +910,7 @@ mod tests {
 
     #[test]
     fn multipart_table_keys_allowed_when_enabled() {
-        let mut limits = LimitsConfig::default();
-        limits.allow_multipart_table_keys = true;
+        let limits = LimitsConfig { allow_multipart_table_keys: true, ..Default::default() };
         let input = base_input(
             vec![
                 make_ks("pk1", KeyType::Hash),
@@ -1079,8 +1078,7 @@ mod tests {
 
     #[test]
     fn attribute_name_exceeding_limit_rejected() {
-        let mut limits = LimitsConfig::default();
-        limits.max_attribute_name_bytes = 10;
+        let limits = LimitsConfig { max_attribute_name_bytes: 10, ..Default::default() };
         let mut item = Item::new();
         item.insert("a".repeat(11), AttributeValue::S("v".to_owned()));
         let err = validate_attribute_name_sizes(&item, &limits).unwrap_err();

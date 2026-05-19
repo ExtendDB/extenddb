@@ -60,7 +60,7 @@ fn wildcard_match_impl(p: &[u8], v: &[u8], ignore_case: bool) -> bool {
         } else if pi < plen
             && (p[pi] == b'?'
                 || if ignore_case {
-                    p[pi].to_ascii_lowercase() == v[vi].to_ascii_lowercase()
+                    p[pi].eq_ignore_ascii_case(&v[vi])
                 } else {
                     p[pi] == v[vi]
                 })

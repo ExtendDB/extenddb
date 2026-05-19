@@ -18,6 +18,7 @@ use crate::PostgresEngine;
 
 impl PostgresEngine {
     /// Implementation of `DataEngine::update_item`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn update_item_impl(
         &self,
         key_info: &TableKeyInfo,

@@ -18,6 +18,7 @@ use crate::PostgresEngine;
 
 impl PostgresEngine {
     /// Implementation of `DataEngine::query`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn query_impl(
         &self,
         key_info: &TableKeyInfo,

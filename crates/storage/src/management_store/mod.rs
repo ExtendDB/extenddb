@@ -31,6 +31,14 @@ pub use types::{
 
 use futures::future::BoxFuture;
 
+// Type aliases for complex return types in management traits.
+/// User info: `(account_id, user_name, user_arn, has_password, created_at)`.
+pub type UserListEntry = (String, String, String, bool, time::OffsetDateTime);
+/// Group info: `(account_id, group_name, group_arn, created_at)`.
+pub type GroupListEntry = (String, String, String, time::OffsetDateTime);
+/// Role info: `(account_id, role_name, role_arn, assume_role_policy, created_at)`.
+pub type RoleListEntry = (String, String, String, serde_json::Value, time::OffsetDateTime);
+
 // ── Settings store ─────────────────────────────────────────────────────
 
 /// Runtime settings storage (e.g. `control_plane_delay_seconds`, `log_level`).
@@ -175,7 +183,7 @@ pub trait ManagementStore: Send + Sync {
     fn list_users(
         &self,
         account_id: &str,
-    ) -> BoxFuture<'_, OpResult<Vec<(String, String, String, bool, time::OffsetDateTime)>>>;
+    ) -> BoxFuture<'_, OpResult<Vec<UserListEntry>>>;
 
     fn get_user_detail(
         &self,
@@ -234,7 +242,7 @@ pub trait ManagementStore: Send + Sync {
     fn list_groups(
         &self,
         account_id: &str,
-    ) -> BoxFuture<'_, OpResult<Vec<(String, String, String, time::OffsetDateTime)>>>;
+    ) -> BoxFuture<'_, OpResult<Vec<GroupListEntry>>>;
 
     fn get_group_detail(
         &self,
@@ -271,18 +279,7 @@ pub trait ManagementStore: Send + Sync {
     fn list_roles(
         &self,
         account_id: &str,
-    ) -> BoxFuture<
-        '_,
-        OpResult<
-            Vec<(
-                String,
-                String,
-                String,
-                serde_json::Value,
-                time::OffsetDateTime,
-            )>,
-        >,
-    >;
+    ) -> BoxFuture<'_, OpResult<Vec<RoleListEntry>>>;
 
     fn get_role_detail(
         &self,

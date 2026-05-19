@@ -532,7 +532,7 @@ impl BackupEngine for PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
 
-            let pitr_enabled = pitr_row.map_or(false, |r| r.0);
+            let pitr_enabled = pitr_row.is_some_and(|r| r.0);
 
             #[allow(clippy::cast_precision_loss)]
             let now_epoch = std::time::SystemTime::now()
