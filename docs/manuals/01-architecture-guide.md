@@ -68,14 +68,23 @@ The `dispatch` function routes `X-Amz-Target` operation names to handlers.
 
 ### storage
 
-Trait definitions for the storage layer. Four sub-traits:
+Trait definitions for the storage layer. Thirteen storage traits partition backend responsibilities:
 
 - **TableEngine**: Table lifecycle (create, delete, describe, list, update)
 - **DataEngine**: Item CRUD (put, get, update, delete, query, scan, batch, transact)
 - **MetadataEngine**: Settings, TTL configuration, tagging
 - **StreamEngine**: Stream record persistence and retrieval
+- **WorkerStore**: Background worker coordination
+- **BackupEngine**: Backup and restore operations
+- **ManagementStore**: IAM and account management
+- **AdminStore**: Admin user and credential management
+- **SettingsStore**: Runtime settings persistence
+- **MetricsStore**: Metrics collection and retrieval
+- **RateLimitStore**: Rate limiting state
+- **AuthorizationStore**: Policy evaluation cache
+- **Bootstrapper**: Initial database setup
 
-Traits use RPITIT (Return Position Impl Trait In Trait) for zero-overhead async dispatch. The backend is selected at startup via enum dispatch in the `bin` crate.
+Traits use `BoxFuture` for object safety. Backends register at compile time via the `inventory` crate and are selected at startup by name. The `RuntimeHooks` trait allows backends to spawn backend-specific workers (PostgreSQL spawns 7).
 
 ### storage-postgres
 
@@ -157,7 +166,7 @@ The catalog version (currently 0.0.2) is stored in the `catalog_metadata` table 
 
 ### Storage
 
-Storage backends implement four traits (`TableEngine`, `DataEngine`, `MetadataEngine`, `StreamEngine`). The traits use RPITIT for zero-cost async dispatch. At startup, the `bin` crate selects the backend via configuration and wraps it in an enum dispatcher. Currently only PostgreSQL is implemented.
+Storage backends implement thirteen traits (see **storage** section above). The traits use `BoxFuture` for object safety. Backends register at compile time via the `inventory` crate, and the `bin` crate selects the backend by name at startup. Currently only PostgreSQL is implemented.
 
 ### Authentication
 

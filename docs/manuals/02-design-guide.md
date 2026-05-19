@@ -159,9 +159,9 @@ Stream records are retained for 24 hours. A background task runs hourly to delet
 
 All user-supplied strings are validated at the engine layer before reaching storage. The storage layer uses parameterized queries exclusively — no dynamic SQL construction with user input. See `docs/adr/sql-injection-defense.md`.
 
-### RPITIT vs async_trait
+### BoxFuture vs async_trait
 
-Storage traits use RPITIT (stable since Rust 1.75) for zero-overhead async dispatch on the hot data path. Auth traits use `#[async_trait]` for object safety — the per-request `Box<dyn Future>` cost is negligible compared to crypto operations.
+Storage traits use `BoxFuture` for object safety, allowing dynamic dispatch of storage backends. Auth traits use `#[async_trait]` for the same reason. The per-request allocation cost is negligible compared to I/O and crypto operations.
 
 ### Condition Evaluation Inside Transactions
 

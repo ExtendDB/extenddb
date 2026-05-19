@@ -6,7 +6,7 @@
 
 extenddb uses a fully trait-based storage abstraction. The default backend is PostgreSQL, implemented in the `storage-postgres` crate. This document explains the storage architecture, lists every trait a new backend must implement, and provides guidance for adding a new storage backend (e.g., Cassandra, SQLite, FoundationDB).
 
-As of v0.0.81, the server crate has **zero PostgreSQL dependency**. All database access goes through traits defined in the `storage` and `auth` crates. PostgreSQL-specific code lives exclusively in `storage-postgres` and the `bin` crate's wiring layer.
+As of v0.0.81, the server crate has **no direct PostgreSQL dependencies**. All database access goes through traits defined in the `storage` and `auth` crates. PostgreSQL-specific code lives exclusively in `storage-postgres` and the `bin` crate's wiring layer.
 
 ## Architecture Overview
 
@@ -26,7 +26,7 @@ The key architectural principle: neither the `engine` nor the `server` crate tou
 
 ## Trait Overview
 
-A new backend must implement **12 traits** across two categories:
+A new backend must implement **13 storage traits** plus the `CredentialStore` trait from the `auth` crate:
 
 **DynamoDB data path** (defined in `crates/storage/src/lib.rs`):
 1. `TableEngine` — table lifecycle
@@ -42,10 +42,13 @@ A new backend must implement **12 traits** across two categories:
 9. `MetricsStore` — historical metrics persistence and query
 10. `RateLimitStore` — login rate limiting and account lockout
 11. `AuthorizationStore` — policy lookups for authorization decisions
-12. `Bootstrapper` — database initialization, destruction, migration, verification
+12. `BackupEngine` — backup and restore operations
+13. `Bootstrapper` — database initialization, destruction, migration, verification
 
 **Additionally**, the `auth` crate defines:
-13. `CredentialStore` — access key and session credential lookup for SigV4 verification
+14. `CredentialStore` — access key and session credential lookup for SigV4 verification
+
+Backends register at compile time using the `inventory` crate and are selected by name at startup. The `RuntimeHooks` trait allows backends to spawn backend-specific workers (PostgreSQL spawns 7).
 
 ## DynamoDB Data Path Traits
 
@@ -226,6 +229,15 @@ Defined in `crates/storage/src/authorization_store.rs`. Policy lookups for autho
 | `get_user_policies` | Get all policies for a user (direct + group-inherited + role) |
 | `get_permissions_boundary` | Get the permissions boundary for a user or role |
 
+### BackupEngine
+
+Defined in `crates/storage/src/lib.rs`. Backup and restore operations:
+
+| Method | Purpose |
+|--------|---------|
+| `export_table` | Export table data to external storage |
+| `import_table` | Import table data from external storage |
+
 ### Bootstrapper
 
 Defined in `crates/storage/src/bootstrapper.rs`. Database lifecycle:
@@ -312,9 +324,32 @@ Implement `Bootstrapper` for database initialization, destruction, migration, an
 
 Implement the `CredentialStore` trait from the `auth` crate for SigV4 credential lookup.
 
-### Step 6: Wire It Up
+### Step 6: Register Your Backend
 
-Modify the `bin` crate's `cmd_serve.rs` to construct your backend's stores instead of the PostgreSQL ones. The server crate is backend-agnostic — it only sees trait objects.
+Backends register at compile time using the `inventory` crate. Implement the `ServerComponentsFactory` trait and use the `inventory::submit!` macro to register your backend:
+
+```rust
+use extenddb_storage::{ServerComponentsFactory, ServerComponentsRegistration};
+
+pub struct MyBackendFactory;
+
+impl ServerComponentsFactory for MyBackendFactory {
+    fn name(&self) -> &'static str {
+        "mybackend"
+    }
+    
+    fn create(&self, config: &Config) -> Result<ServerComponents, BackendError> {
+        // Construct your backend's stores
+        // Return ServerComponents with all trait implementations
+    }
+}
+
+inventory::submit! {
+    ServerComponentsRegistration::new(MyBackendFactory)
+}
+```
+
+The `bin` crate will discover your backend at startup and select it by name from the configuration.
 
 ### Step 7: Test
 
@@ -399,6 +434,7 @@ An honest assessment of where the PostgreSQL implementation makes backend-specif
 | `MetadataEngine` | `storage/src/lib.rs`                  | `PostgresEngine` | TTL, tags, table statistics |
 | `StreamEngine` | `storage/src/lib.rs`                  | `PostgresEngine` | DynamoDB Streams |
 | `WorkerStore` | `storage/src/lib.rs`                  | `PostgresEngine` | Background workers |
+| `BackupEngine` | `storage/src/lib.rs`                  | `PostgresEngine` | Backup and restore |
 | `ManagementStore` | `storage/src/management_store/mod.rs` | `PostgresCatalogStore` | IAM CRUD |
 | `AdminStore` | `storage/src/management_store/mod.rs` | `PostgresCatalogStore` | Admin users |
 | `SettingsStore` | `storage/src/management_store/mod.rs` | `PostgresCatalogStore` | Runtime settings |
@@ -408,4 +444,4 @@ An honest assessment of where the PostgreSQL implementation makes backend-specif
 | `Bootstrapper` | `storage/src/bootstrapper.rs`         | `PostgresBootstrapper` | Init, destroy, migrate |
 | `CredentialStore` | `auth/src/lib.rs`                     | `DbCredentialStore` | SigV4 credential lookup |
 
-All PostgreSQL-specific code lives in `crates/storage-postgres/`. The `server` crate has zero database dependency. The `bin` crate is the only place where concrete PostgreSQL types are constructed and wired together.
+All PostgreSQL-specific code lives in `crates/storage-postgres/`. The `server` crate has no direct database dependencies. Backends register at compile time via the `inventory` crate and are selected by name at startup.
