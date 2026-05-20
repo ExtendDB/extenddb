@@ -14,12 +14,14 @@ path = "src/main.rs"
 [features]
 default = ["postgres"]
 postgres = ["extenddb-storage-postgres"]
+route53 = ["extenddb-storage-route53"]
 
 [dependencies]
 extenddb-core = { workspace = true }
 extenddb-engine = { workspace = true }
 extenddb-storage = { workspace = true }
 extenddb-storage-postgres = { workspace = true, optional = true }
+extenddb-storage-route53 = { workspace = true, optional = true }
 extenddb-auth = { workspace = true }
 extenddb-server = { workspace = true }
 tokio = { workspace = true }
