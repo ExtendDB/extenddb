@@ -851,6 +851,7 @@ dependencies = [
  "extenddb-engine",
  "extenddb-server",
  "extenddb-storage",
+ "extenddb-storage-cassandra",
  "extenddb-storage-postgres",
  "libc",
  "rand 0.9.4",
@@ -965,6 +966,16 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "extenddb-storage-cassandra"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "extenddb-storage",
+ "inventory",
+ "tracing",
 ]
 
 [[package]]
