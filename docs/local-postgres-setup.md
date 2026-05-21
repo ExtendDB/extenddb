@@ -83,6 +83,57 @@ export EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING=\
 
 ---
 
+## Docker Setup (Alternative)
+
+A `docker-compose.yml` is provided at the repository root for a quick PostgreSQL setup with no manual installation.
+
+### Prerequisites
+
+- Docker Engine 20.10+ with Compose plugin (`docker compose`)
+
+### Start PostgreSQL
+
+```bash
+docker compose up -d
+```
+
+Wait for the container to be healthy:
+
+```bash
+docker compose ps
+```
+
+### Connection Details
+
+| Setting | Value |
+|---------|-------|
+| Host | `localhost` |
+| Port | `5432` |
+| Admin user | `postgres` |
+| Admin password | `extenddb-local-dev` |
+
+### Initialize ExtendDB
+
+Since the Docker container uses `postgres` as the superuser, pass it explicitly to `init`:
+
+```bash
+./target/release/extenddb init --config extenddb.toml \
+  --pg-user postgres \
+  --pg-pass extenddb-local-dev
+```
+
+### Stop and Clean Up
+
+```bash
+# Stop (preserves data)
+docker compose down
+
+# Stop and delete all data
+docker compose down -v
+```
+
+---
+
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
