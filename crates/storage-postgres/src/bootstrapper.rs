@@ -15,6 +15,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio::sync::OnceCell;
 
 use crate::CATALOG_VERSION;
+use crate::config::build_connection_url;
 use crate::migrations;
 
 /// Utilities for bootstrapping a PostgreSQL backend store.
@@ -82,11 +83,10 @@ impl PostgresBootstrapper {
 
     /// Build the connection URL for the application user and a named database.
     fn app_connection_url(&self, database: &str) -> String {
-        format!(
-            "postgresql://{}:{}@{}:{}/{}",
-            self.config.app_user,
-            self.config.app_password,
-            self.config.host,
+        build_connection_url(
+            &self.config.app_user,
+            &self.config.app_password,
+            &self.config.host,
             self.config.port,
             database,
         )
