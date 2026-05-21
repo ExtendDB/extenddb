@@ -411,10 +411,12 @@ fn set_path(
         return Ok(());
     }
 
-    // Navigate to the parent, then set the final element
-    let current = item
-        .entry(first_name)
-        .or_insert_with(|| AttributeValue::M(BTreeMap::new()));
+    // DynamoDB rejects SET into a path where the parent doesn't exist
+    let Some(current) = item.get_mut(&first_name) else {
+        return Err(DynamoDbError::ValidationException(
+            "The document path provided in the update expression is invalid for update".to_owned(),
+        ));
+    };
 
     set_nested(current, &path[1..], value, maps)
 }
@@ -510,10 +512,9 @@ fn remove_nested(
                 let name = resolve_attr_name(&path[0], maps)?;
                 map.remove(&name);
             }
-            (PathElement::Index(idx), AttributeValue::L(list))
-                if *idx < list.len() => {
-                    list.remove(*idx);
-                }
+            (PathElement::Index(idx), AttributeValue::L(list)) if *idx < list.len() => {
+                list.remove(*idx);
+            }
             _ => {} // No-op for type mismatch
         }
         return Ok(());
@@ -526,10 +527,9 @@ fn remove_nested(
                 remove_nested(next, &path[1..], maps)?;
             }
         }
-        (PathElement::Index(idx), AttributeValue::L(list))
-            if *idx < list.len() => {
-                remove_nested(&mut list[*idx], &path[1..], maps)?;
-            }
+        (PathElement::Index(idx), AttributeValue::L(list)) if *idx < list.len() => {
+            remove_nested(&mut list[*idx], &path[1..], maps)?;
+        }
         _ => {} // No-op
     }
     Ok(())
