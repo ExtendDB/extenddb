@@ -411,10 +411,12 @@ fn set_path(
         return Ok(());
     }
 
-    // Navigate to the parent, then set the final element
-    let current = item
-        .entry(first_name)
-        .or_insert_with(|| AttributeValue::M(BTreeMap::new()));
+    // DynamoDB rejects SET into a path where the parent doesn't exist
+    let Some(current) = item.get_mut(&first_name) else {
+        return Err(DynamoDbError::ValidationException(
+            "The document path provided in the update expression is invalid for update".to_owned(),
+        ));
+    };
 
     set_nested(current, &path[1..], value, maps)
 }
