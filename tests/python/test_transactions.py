@@ -262,3 +262,21 @@ class TestTransactGetItems:
         """Empty TransactItems is rejected (by boto3 or server)."""
         with pytest.raises((ClientError, ParamValidationError)):
             dynamodb_client.transact_get_items(TransactItems=[])
+
+    def test_transact_get_consumed_capacity(self, table_factory, dynamodb_client):
+        """TransactGetItems costs 2 RCU per item, including missing items."""
+        name = table_factory()
+        dynamodb_client.put_item(
+            TableName=name,
+            Item={"pk": {"S": "exists"}},
+        )
+        resp = dynamodb_client.transact_get_items(
+            ReturnConsumedCapacity="TOTAL",
+            TransactItems=[
+                {"Get": {"TableName": name, "Key": {"pk": {"S": "exists"}}}},
+                {"Get": {"TableName": name, "Key": {"pk": {"S": "missing"}}}},
+            ],
+        )
+        cap = resp["ConsumedCapacity"][0]
+        assert cap["CapacityUnits"] == 4.0
+        assert cap["ReadCapacityUnits"] == 4.0
