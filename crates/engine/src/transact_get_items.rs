@@ -153,7 +153,8 @@ pub async fn handle_transact_get_items(
                 )?;
                 let item = opt
                     .map(|item| apply_projection(&item, &projection, &maps))
-                    .transpose()?;
+                    .transpose()?
+                    .filter(|i| !i.is_empty());
                 Ok(ItemResponse { item })
             } else {
                 extenddb_core::expression::validate_unused_attributes(
