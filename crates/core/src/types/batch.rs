@@ -21,7 +21,11 @@ pub struct KeysAndAttributes {
     pub consistent_read: Option<bool>,
     #[serde(rename = "ProjectionExpression")]
     pub projection_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames")]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
     /// Legacy projection API. Superseded by `ProjectionExpression`.
     /// Cannot be used together with `ProjectionExpression`.

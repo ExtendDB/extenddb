@@ -46,7 +46,11 @@ pub struct TransactGet {
     pub table_name: String,
     #[serde(rename = "ProjectionExpression")]
     pub projection_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames")]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
 }
 
@@ -123,10 +127,18 @@ pub struct TransactConditionCheck {
     #[serde(rename = "ConditionExpression")]
     pub condition_expression: String,
     /// Attribute name substitutions.
-    #[serde(rename = "ExpressionAttributeNames")]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
     /// Attribute value substitutions.
-    #[serde(rename = "ExpressionAttributeValues")]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_values"
+    )]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     /// Controls whether the existing item is returned in the cancellation reason.
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
@@ -147,10 +159,18 @@ pub struct TransactPut {
     #[serde(rename = "ConditionExpression")]
     pub condition_expression: Option<String>,
     /// Attribute name substitutions.
-    #[serde(rename = "ExpressionAttributeNames")]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
     /// Attribute value substitutions.
-    #[serde(rename = "ExpressionAttributeValues")]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_values"
+    )]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     /// Controls whether the existing item is returned in the cancellation reason.
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
@@ -171,10 +191,18 @@ pub struct TransactDelete {
     #[serde(rename = "ConditionExpression")]
     pub condition_expression: Option<String>,
     /// Attribute name substitutions.
-    #[serde(rename = "ExpressionAttributeNames")]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
     /// Attribute value substitutions.
-    #[serde(rename = "ExpressionAttributeValues")]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_values"
+    )]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     /// Controls whether the existing item is returned in the cancellation reason.
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
@@ -198,10 +226,18 @@ pub struct TransactUpdate {
     #[serde(rename = "ConditionExpression")]
     pub condition_expression: Option<String>,
     /// Attribute name substitutions.
-    #[serde(rename = "ExpressionAttributeNames")]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
     /// Attribute value substitutions.
-    #[serde(rename = "ExpressionAttributeValues")]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_values"
+    )]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     /// Controls whether the existing item is returned in the cancellation reason.
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
