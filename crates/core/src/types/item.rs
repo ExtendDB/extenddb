@@ -335,7 +335,7 @@ pub fn item_size_bytes(item: &Item) -> usize {
 pub fn attribute_value_size(value: &AttributeValue) -> usize {
     match value {
         AttributeValue::S(s) => s.len(),
-        AttributeValue::N(n) => n.len(),
+        AttributeValue::N(n) => dynamodb_number_size(n),
         AttributeValue::B(b) => b.len(),
         AttributeValue::Bool(_) | AttributeValue::Null => 1,
         AttributeValue::L(list) => 3 + list.iter().map(attribute_value_size).sum::<usize>(),
@@ -346,7 +346,41 @@ pub fn attribute_value_size(value: &AttributeValue) -> usize {
                 .sum::<usize>()
         }
         AttributeValue::SS(set) => set.iter().map(String::len).sum(),
-        AttributeValue::NS(set) => set.iter().map(String::len).sum(),
+        AttributeValue::NS(set) => set.iter().map(|n| dynamodb_number_size(n)).sum(),
         AttributeValue::BS(set) => set.iter().map(Vec::len).sum(),
     }
+}
+
+/// Calculate the DynamoDB size of a number in bytes.
+///
+/// DynamoDB number sizing: approximately 1 byte per 2 significant digits + 1 byte.
+/// Zero is 1 byte. Negative numbers add 1 byte. Max 21 bytes.
+fn dynamodb_number_size(n: &str) -> usize {
+    let s = n.trim_start_matches('-');
+    let is_zero = s.chars().all(|c| c == '0' || c == '.');
+    if is_zero {
+        return 1;
+    }
+
+    let significant = if let Some(dot_pos) = s.find('.') {
+        let (int_part, frac_part) = s.split_at(dot_pos);
+        let frac = &frac_part[1..];
+        let int_trimmed = int_part.trim_start_matches('0');
+        let frac_trimmed = frac.trim_end_matches('0');
+        if int_trimmed.is_empty() {
+            let frac_sig = frac.trim_start_matches('0');
+            frac_sig.trim_end_matches('0').len()
+        } else {
+            format!("{int_trimmed}{frac_trimmed}").len()
+        }
+    } else {
+        let trimmed = s.trim_start_matches('0').trim_end_matches('0');
+        if trimmed.is_empty() { 1 } else { trimmed.len() }
+    };
+
+    let mut size = significant.div_ceil(2) + 1;
+    if n.starts_with('-') {
+        size += 1;
+    }
+    size.min(21)
 }

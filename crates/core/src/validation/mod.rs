@@ -462,10 +462,9 @@ pub fn validate_put_item(
 
     let size = item_size_bytes(&input.item);
     if size > limits.max_item_size_bytes {
-        return Err(DynamoDbError::ValidationException(format!(
-            "Item size has exceeded the maximum allowed size of {}",
-            limits.max_item_size_bytes
-        )));
+        return Err(DynamoDbError::ValidationException(
+            "Item size has exceeded the maximum allowed size".to_owned(),
+        ));
     }
 
     validate_key_sizes(&input.item, key_schema, limits)?;
@@ -774,9 +773,9 @@ fn key_value_byte_size(value: &AttributeValue) -> usize {
 pub fn validate_item_size(item: &Item, max_bytes: usize) -> Result<(), DynamoDbError> {
     let size = item_size_bytes(item);
     if size > max_bytes {
-        return Err(DynamoDbError::ValidationException(format!(
-            "Item size has exceeded the maximum allowed size of {max_bytes}"
-        )));
+        return Err(DynamoDbError::ValidationException(
+            "Item size has exceeded the maximum allowed size".to_owned(),
+        ));
     }
     Ok(())
 }
