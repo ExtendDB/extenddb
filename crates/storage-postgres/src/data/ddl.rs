@@ -229,6 +229,26 @@ impl PostgresEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
         }
 
+        // Index on base-table key columns to support efficient cascade deletes
+        // from `delete_index_row_multi`, whose predicate is
+        // `WHERE base_pk = $1 [AND base_sk_<type> = $n ...]`. The PK constraint
+        // and ordering index both lead with `pk`, so neither can serve this
+        // lookup — without this index PostgreSQL falls back to a Seq Scan.
+        let mut cascade_cols = vec!["base_pk".to_owned()];
+        for (i, &(_, sk_type)) in base_sks.iter().enumerate() {
+            let col = if i == 0 {
+                format!("base_{}", sk_column(sk_type))
+            } else {
+                format!("base_{}", sk_column_n(i, sk_type))
+            };
+            cascade_cols.push(col);
+        }
+        let cascade_idx = format!("CREATE INDEX ON {idx_table} ({})", cascade_cols.join(", "));
+        sqlx::query(&cascade_idx)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
         Ok(())
     }
 
