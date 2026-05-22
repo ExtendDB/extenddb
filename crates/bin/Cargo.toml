@@ -12,14 +12,16 @@ name = "extenddb"
 path = "src/main.rs"
 
 [features]
-default = ["postgres"]
+default = ["postgres", "sqlite"]
 postgres = ["extenddb-storage-postgres"]
+sqlite = ["extenddb-storage-sqlite"]
 
 [dependencies]
 extenddb-core = { workspace = true }
 extenddb-engine = { workspace = true }
 extenddb-storage = { workspace = true }
 extenddb-storage-postgres = { workspace = true, optional = true }
+extenddb-storage-sqlite = { workspace = true, optional = true }
 extenddb-auth = { workspace = true }
 extenddb-server = { workspace = true }
 tokio = { workspace = true }
