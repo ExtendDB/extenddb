@@ -9,6 +9,8 @@ REQ-TEST-001, REQ-TEST-002, REQ-TEST-003
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from botocore.exceptions import ClientError
 
