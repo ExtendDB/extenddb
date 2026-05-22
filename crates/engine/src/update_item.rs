@@ -152,10 +152,6 @@ pub async fn handle_update_item(
         input.return_values,
         ReturnValues::AllOld | ReturnValues::UpdatedOld
     );
-    let return_new = matches!(
-        input.return_values,
-        ReturnValues::AllNew | ReturnValues::UpdatedNew
-    );
 
     let view_type = stream_capture::stream_view_type(&key_info);
     let stream = view_type.map(|vt| extenddb_storage::StreamCapture {
@@ -164,7 +160,6 @@ pub async fn handle_update_item(
         region: ctx.region.clone(),
     });
     let need_old_for_stream = stream.is_some();
-    let need_new_for_stream = stream.is_some();
 
     let (old_item, new_item) = ctx
         .storage
@@ -173,7 +168,7 @@ pub async fn handle_update_item(
             &input.key,
             &actions,
             return_old || need_old_for_stream,
-            return_new || need_new_for_stream,
+            true, // always fetch new item for WCU calculation
             condition.as_ref(),
             &maps,
             stream.as_ref(),
