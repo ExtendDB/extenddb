@@ -298,8 +298,6 @@ mod tests {
         let result = project("mylist[5]", &item, HashMap::new()).unwrap();
         assert!(result.is_empty());
     }
-}
-
     #[test]
     fn project_list_index_into_map_preserves_structure() {
         let mut item = BTreeMap::new();
@@ -330,3 +328,4 @@ mod tests {
             other => panic!("Expected L, got {other:?}"),
         }
     }
+}

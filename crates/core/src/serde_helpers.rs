@@ -199,6 +199,7 @@ mod tests {
     fn values_with_colon_accepted() {
         let json = r#"{"values":{":v":{"S":"x"}}}"#;
         let result: Result<TestValues, _> = serde_json::from_str(json);
-        assert!(result.is_ok());
+        let parsed = result.unwrap();
+        assert!(parsed.values.is_some());
     }
 }
