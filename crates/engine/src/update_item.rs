@@ -274,17 +274,88 @@ fn filter_to_updated_attrs(item: &Item, actions: &[UpdateAction], maps: &Express
             | UpdateAction::Add { path, .. }
             | UpdateAction::Delete { path, .. } => path,
         };
-        if let Some(PathElement::Attribute(name)) = path.first() {
+        if path.is_empty() {
+            continue;
+        }
+        // Resolve the top-level attribute name
+        let top_name = match &path[0] {
+            PathElement::Attribute(name) => {
+                let resolved = name
+                    .strip_prefix('#')
+                    .and_then(|r| maps.names.get(r).map(String::as_str))
+                    .unwrap_or(name.as_str());
+                resolved.to_owned()
+            }
+            _ => continue,
+        };
+
+        // Top-level path (len == 1): return the whole attribute
+        if path.len() == 1 {
+            if let Some(val) = item.get(&top_name) {
+                result.insert(top_name, val.clone());
+            }
+            continue;
+        }
+
+        // Nested path: extract only the leaf value and wrap in path structure
+        let Some(top_val) = item.get(&top_name) else {
+            continue;
+        };
+        if let Some(leaf) = resolve_path_value(top_val, &path[1..], maps) {
+            let wrapped = wrap_leaf_in_path(&path[1..], &leaf, maps);
+            result.insert(top_name, wrapped);
+        }
+    }
+    result
+}
+
+/// Resolve a value at a nested path within an AttributeValue.
+fn resolve_path_value(
+    val: &AttributeValue,
+    path: &[PathElement],
+    maps: &ExpressionMaps,
+) -> Option<AttributeValue> {
+    if path.is_empty() {
+        return Some(val.clone());
+    }
+    match (&path[0], val) {
+        (PathElement::Attribute(name), AttributeValue::M(map)) => {
             let resolved = name
                 .strip_prefix('#')
                 .and_then(|r| maps.names.get(r).map(String::as_str))
                 .unwrap_or(name.as_str());
-            if let Some(val) = item.get(resolved) {
-                result.insert(resolved.to_owned(), val.clone());
-            }
+            map.get(resolved)
+                .and_then(|v| resolve_path_value(v, &path[1..], maps))
         }
+        (PathElement::Index(idx), AttributeValue::L(list)) => list
+            .get(*idx)
+            .and_then(|v| resolve_path_value(v, &path[1..], maps)),
+        _ => None,
     }
-    result
+}
+
+/// Wrap a leaf value in the path structure (building from inside out).
+fn wrap_leaf_in_path(
+    path: &[PathElement],
+    leaf: &AttributeValue,
+    maps: &ExpressionMaps,
+) -> AttributeValue {
+    if path.is_empty() {
+        return leaf.clone();
+    }
+    let inner = wrap_leaf_in_path(&path[1..], leaf, maps);
+    match &path[0] {
+        PathElement::Attribute(name) => {
+            let resolved = name
+                .strip_prefix('#')
+                .and_then(|r| maps.names.get(r).map(String::as_str))
+                .unwrap_or(name.as_str());
+            let mut map = std::collections::BTreeMap::new();
+            map.insert(resolved.to_owned(), inner);
+            AttributeValue::M(map)
+        }
+        PathElement::Index(_) => AttributeValue::L(vec![inner]),
+    }
 }
 
 /// Desugared legacy `AttributeUpdates`: (expression, values, names).
