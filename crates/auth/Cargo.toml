@@ -9,7 +9,9 @@ license.workspace = true
 
 [dependencies]
 extenddb-core = { workspace = true }
+extenddb-cache = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
 thiserror = { workspace = true }
 axum = { workspace = true }
 hmac = "0.12"
@@ -21,4 +23,5 @@ tracing = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+extenddb-cache = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

@@ -6,8 +6,13 @@
 //! Defines the `AuthProvider` trait for pluggable auth backends. Ships with
 //! `BuiltinAuthProvider` (full SigV4 verification with local credential store).
 
+pub mod cache_registry;
+pub mod credential_cache;
 pub mod policy;
 pub mod sigv4;
+
+pub use cache_registry::{AuthCacheRegistry, AuthzCacheInvalidator, TableKeyInfoCacheInvalidator};
+pub use credential_cache::CachedCredentialStore;
 
 use axum::http::HeaderMap;
 use extenddb_core::error::DynamoDbError;
@@ -69,6 +74,12 @@ pub struct StoredCredential {
     /// storage so the auth layer can produce the correct error response.
     #[zeroize(skip)]
     pub is_active: bool,
+    /// For session credentials: the absolute expiry time. Long-lived AKIA*
+    /// credentials set this to `None`. Auth checks this on every cache hit
+    /// so cached sessions don't outlive their `expires_at` window — the
+    /// storage layer's expiry check only fires on the cache-miss path.
+    #[zeroize(skip)]
+    pub expires_at: Option<time::OffsetDateTime>,
 }
 
 /// Trait for looking up credentials from storage.
@@ -149,7 +160,10 @@ impl<C: CredentialStore + 'static> AuthProvider for BuiltinAuthProvider<C> {
 
         // For session credentials, verify X-Amz-Security-Token matches the stored token.
         // CB-12: Session expiration is enforced at the credential store layer (fail-closed).
-        // Expired sessions are never returned — the store returns ExpiredTokenException directly.
+        // Expired sessions are never returned — the storage layer returns
+        // ExpiredTokenException on the cache-miss path, and CachedCredentialStore
+        // re-validates `expires_at` on every cache hit before returning so cached
+        // entries cannot survive past their issued lifetime.
         if credential.is_session {
             let token = headers
                 .get("x-amz-security-token")

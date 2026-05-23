@@ -16,6 +16,7 @@ default = ["postgres"]
 postgres = ["extenddb-storage-postgres"]
 
 [dependencies]
+extenddb-cache = { workspace = true }
 extenddb-core = { workspace = true }
 extenddb-engine = { workspace = true }
 extenddb-storage = { workspace = true }

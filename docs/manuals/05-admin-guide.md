@@ -83,6 +83,26 @@ These settings require a server restart to take effect.
 |-----|---------|-------------|
 | `provider` | `builtin` | Auth provider: `builtin` (SigV4 + IAM). The server refuses to start with `"none"`. |
 
+#### [auth.cache]
+
+In-memory stale-while-revalidate caches eliminate the per-request catalog roundtrip for credentials, IAM policies, principal/resource tags, and table key info. Self-induced changes (admin API and console mutations) propagate instantly via write-through invalidation; off-instance changes take up to `ttl_seconds` to propagate.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `true` | Master kill switch. When `false`, all caches operate in pass-through mode. |
+| `ttl_seconds` | `60` | Hard TTL — entries older than this trigger a fresh, request-blocking load. |
+| `soft_ttl_seconds` | `30` | Stale-but-usable threshold; older entries still serve immediately while a background task refreshes them. |
+| `negative_ttl_seconds` | `5` | Negative-cache TTL for "not found" results. |
+| `max_entries` | `10000` | Per-cache LRU cap. |
+
+Statistics are exposed at `/management/auth-cache-metrics` (JSON, admin-authenticated). The per-cache `pass_through` flag distinguishes "cache disabled" from "cache cold."
+
+**Invalidation timing**:
+
+- **Single-key invalidations** (e.g. `DeleteAccessKey`, `PutUserPolicy`) drop the cached entry immediately; the next request sees the post-mutation state.
+- **Fanout invalidations** (e.g. `DeleteAccount`, `DeleteRole` session sweep, `DeleteGroup` member fanout) are **asynchronous** — there is a small window (~ms) between the API returning success and the matching entries being evicted. For hard cutover (e.g. revoking a compromised key), prefer the single-key path (`DeleteAccessKey`) over the cascade.
+- **Off-instance changes** (multi-node deployments, or direct catalog writes) wait up to `ttl_seconds` to be observed locally.
+
 #### [server.tls]
 
 | Key | Default | Description |

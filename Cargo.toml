@@ -4,6 +4,7 @@
 resolver = "2"
 members = [
     "crates/core",
+    "crates/cache",
     "crates/engine",
     "crates/storage",
     "crates/storage-postgres",
@@ -21,6 +22,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 # Internal crates
 extenddb-core = { path = "crates/core" }
+extenddb-cache = { path = "crates/cache" }
 extenddb-engine = { path = "crates/engine" }
 extenddb-storage = { path = "crates/storage" }
 extenddb-storage-postgres = { path = "crates/storage-postgres" }
@@ -49,6 +51,9 @@ hyper = { version = "1" }
 
 # Database plugin registry
 inventory = "0.3"
+
+# Caching
+moka = { version = "0.12", features = ["future"] }
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "json", "time", "uuid", "bigdecimal"] }

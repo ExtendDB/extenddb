@@ -51,9 +51,12 @@ pub(crate) fn extract_table_name(input: &Value) -> Option<String> {
 /// Returns the pre-fetched `TableKeyInfo` for single-table item-level operations
 /// (P118 optimization #2). The caller passes this into `OperationContext` to
 /// avoid a redundant catalog roundtrip in the engine layer.
+///
+/// All authorization data is fetched via `state.authz_cache`, which sits on
+/// top of the underlying `AuthorizationStore` and serves cached, pre-parsed
+/// `PolicyDocument`s.
 pub(crate) async fn authorize_request(
     state: &AppState,
-    store: &dyn extenddb_storage::authorization_store::AuthorizationStore,
     identity: &extenddb_auth::AuthIdentity,
     input: &Value,
     operation: &str,
@@ -62,13 +65,16 @@ pub(crate) async fn authorize_request(
     let table_name = extract_table_name(input);
     let resource_arn = build_resource_arn(&state.region, account_id, table_name.as_deref());
 
-    // P118: Fetch table_key_info for item-level operations. The result is both
-    // used for LeadingKeys extraction here AND returned to the caller to avoid
-    // a redundant fetch in the engine layer.
+    // P118: Fetch table_key_info for item-level operations via the SWR cache.
+    // The result is used for LeadingKeys extraction here AND returned to the
+    // caller to avoid a redundant fetch in the engine layer.
     let key_info = match operation {
         "GetItem" | "PutItem" | "DeleteItem" | "UpdateItem" | "Query" | "Scan" => {
             if let Some(ref tn) = table_name {
-                state.storage.table_key_info(account_id, tn).await.ok()
+                state
+                    .table_key_info_cache
+                    .get_optional(account_id, tn)
+                    .await
             } else {
                 None
             }
@@ -98,7 +104,7 @@ pub(crate) async fn authorize_request(
         ..Default::default()
     };
     authorization::check_authorization(
-        store,
+        state.authz_cache.as_ref(),
         identity,
         operation,
         &resource_arn,

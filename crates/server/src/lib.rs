@@ -9,8 +9,10 @@
 //! Supports TLS via `axum-server` with rustls when configured.
 
 pub(crate) mod authorization;
+pub mod authz_cache;
 pub mod console;
 mod handler;
+pub mod key_info_cache;
 pub mod management;
 mod metrics_endpoint;
 pub mod rate_limit;
@@ -27,10 +29,13 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::{get, post};
-use extenddb_auth::AuthProvider;
+use extenddb_auth::{AuthCacheRegistry, AuthProvider};
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::metrics::MetricsCollector;
 use extenddb_core::throttle::ThrottleManager;
+
+pub use authz_cache::{AuthzCacheConfig, CachedAuthzStore, CachedSessionData};
+pub use key_info_cache::CachedTableKeyInfoStore;
 use serde_json::json;
 use tower::ServiceBuilder;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -59,6 +64,17 @@ pub struct AppState {
     pub export_paths: Arc<[Arc<std::path::PathBuf>]>,
     /// Token bucket throttle manager for provisioned throughput enforcement.
     pub throttle: Arc<ThrottleManager>,
+    /// Auth/authz cache handles. Used by the management API to issue
+    /// write-through invalidations after IAM mutations. Empty when caching
+    /// is disabled.
+    pub auth_cache: AuthCacheRegistry,
+    /// Authorization cache used by the request hot path. The same underlying
+    /// cache instance is referenced trait-object style by `auth_cache.authz`.
+    pub authz_cache: Arc<CachedAuthzStore>,
+    /// `TableKeyInfo` cache used by the request hot path and engine batch /
+    /// transact paths. Invalidated by control-plane handlers after Create /
+    /// Update / Delete table.
+    pub table_key_info_cache: Arc<CachedTableKeyInfoStore>,
     /// Static configuration entries from the `.toml` file for the console
     /// settings page. Each entry is `(key, display_value)` — sensitive values
     /// are pre-redacted by the caller.
@@ -95,6 +111,10 @@ pub async fn start_server(
 
     let tls_enabled = state.tls_enabled;
     let catalog_store = state.catalog_store.clone();
+    let auth_cache_for_mgmt = state.auth_cache.clone();
+    let auth_cache_for_console = state.auth_cache.clone();
+    let authz_cache_for_mgmt = state.authz_cache.clone();
+    let table_key_info_cache_for_mgmt = state.table_key_info_cache.clone();
     let version_info = state.version_info.clone();
     let docs_store = state.docs_store.clone();
     let listen_url = {
@@ -124,6 +144,11 @@ pub async fn start_server(
         .route("/", post(handler::handle_request))
         .layer(DefaultBodyLimit::max(DYNAMODB_BODY_LIMIT))
         .route("/health", get(health_check))
+        // REQ-OBS-005: Prometheus-compatible metrics endpoint. Public by
+        // design (Prometheus scrapers expect no auth on the scrape URL);
+        // operators who need stricter access should expose this on a
+        // separate bind via firewall/proxy. Returns aggregate metrics
+        // only; per-request data is in the management API.
         .route("/metrics", get(metrics_endpoint::metrics_endpoint))
         // S-6: Explicit small body limit for non-DynamoDB endpoints.
         .layer(DefaultBodyLimit::max(1024))
@@ -133,6 +158,9 @@ pub async fn start_server(
     if let Some(catalog_store) = catalog_store {
         let mgmt_state = Arc::new(management::ManagementState {
             catalog_store: catalog_store.clone(),
+            auth_cache: auth_cache_for_mgmt,
+            authz_cache: authz_cache_for_mgmt,
+            table_key_info_cache: table_key_info_cache_for_mgmt,
         });
         let mgmt_router = management::router().with_state(mgmt_state);
         app = app.nest("/management", mgmt_router);
@@ -144,6 +172,7 @@ pub async fn start_server(
             config_entries,
             catalog_store,
             docs_store: docs_store.clone(),
+            auth_cache: auth_cache_for_console,
         });
         let console_router = console::router().with_state(console_state);
         app = app

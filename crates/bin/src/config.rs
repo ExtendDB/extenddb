@@ -197,14 +197,77 @@ pub struct AuthConfig {
     /// authentication enabled.
     #[serde(default = "default_provider")]
     pub provider: String,
+    /// Configuration for the in-memory auth/authz caches. Optional; defaults
+    /// apply when absent.
+    #[serde(default)]
+    pub cache: AuthCacheConfigToml,
 }
 
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             provider: default_provider(),
+            cache: AuthCacheConfigToml::default(),
         }
     }
+}
+
+/// Configuration for the in-memory auth/authz caches (`[auth.cache]` section).
+///
+/// Each `*_seconds` field has a sensible default; operators only need to
+/// override values when they want to deviate from the docs. The configuration
+/// is static — values are read once at startup.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthCacheConfigToml {
+    /// Master switch. When `false`, all caches operate in pass-through mode
+    /// (fall through to the underlying store on every request) — useful as a
+    /// kill switch during incident response.
+    #[serde(default = "default_cache_enabled")]
+    pub enabled: bool,
+    /// Hard TTL: cached values older than this trigger a fresh load.
+    #[serde(default = "default_cache_ttl_seconds")]
+    pub ttl_seconds: u64,
+    /// Soft TTL: cached values older than this trigger a background refresh
+    /// while still returning the cached value to the caller.
+    #[serde(default = "default_cache_soft_ttl_seconds")]
+    pub soft_ttl_seconds: u64,
+    /// TTL applied to negative results (`Ok(None)` from the loader). Typically
+    /// shorter than `ttl_seconds` so newly-created entities become visible
+    /// quickly.
+    #[serde(default = "default_cache_negative_ttl_seconds")]
+    pub negative_ttl_seconds: u64,
+    /// Maximum entries per cache. When exceeded, LRU eviction kicks in.
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: u64,
+}
+
+impl Default for AuthCacheConfigToml {
+    fn default() -> Self {
+        Self {
+            enabled: default_cache_enabled(),
+            ttl_seconds: default_cache_ttl_seconds(),
+            soft_ttl_seconds: default_cache_soft_ttl_seconds(),
+            negative_ttl_seconds: default_cache_negative_ttl_seconds(),
+            max_entries: default_cache_max_entries(),
+        }
+    }
+}
+
+fn default_cache_enabled() -> bool {
+    true
+}
+fn default_cache_ttl_seconds() -> u64 {
+    60
+}
+fn default_cache_soft_ttl_seconds() -> u64 {
+    30
+}
+fn default_cache_negative_ttl_seconds() -> u64 {
+    5
+}
+fn default_cache_max_entries() -> u64 {
+    10_000
 }
 
 #[derive(Debug, Clone, Deserialize)]

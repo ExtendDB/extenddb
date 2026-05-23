@@ -265,6 +265,15 @@ pub struct OperationContext {
     /// Populated for single-table item-level operations; `None` for table-level
     /// and batch/transact operations.
     pub pre_fetched_key_info: Option<extenddb_core::types::TableKeyInfo>,
+    /// Auth/authz cache handles. Used by control-plane and tagging operations
+    /// to issue write-through cache invalidations after the underlying state
+    /// changes (e.g. `TagResource` invalidates the resource-tags cache).
+    pub auth_cache: extenddb_auth::AuthCacheRegistry,
+    /// Optional cached `TableKeyInfo` lookup. When set, batch / transact /
+    /// multi-table engine handlers route through this instead of calling
+    /// `storage.table_key_info` directly. When unset (e.g. unit tests), the
+    /// engine falls back to direct storage lookups.
+    pub table_key_info_lookup: Option<Arc<dyn extenddb_storage::TableKeyInfoLookup>>,
 }
 
 impl OperationContext {
@@ -279,6 +288,9 @@ impl OperationContext {
             if ki.table_name == table_name && *ki.account_id == *self.account_id {
                 return Ok(ki.clone());
             }
+        }
+        if let Some(ref lookup) = self.table_key_info_lookup {
+            return lookup.lookup(&self.account_id, table_name).await;
         }
         self.storage
             .table_key_info(&self.account_id, table_name)

@@ -141,6 +141,14 @@ pub(crate) async fn handle_restore_table_from_backup(
         .await
         .map_err(storage_err_to_dynamo)?;
 
+    // Drop any cached negative TableKeyInfo from a prior probe so subsequent
+    // requests against the restored table see it without TTL lag. Tags are
+    // not propagated through restore today; if that ever changes, also
+    // invalidate resource_tags for the new ARN — see handle_create_table.
+    ctx.auth_cache
+        .invalidate_table_key_info(&ctx.account_id, target_table_name)
+        .await;
+
     serialize_output(&json!({ "TableDescription": desc }))
 }
 

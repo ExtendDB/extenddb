@@ -331,12 +331,55 @@ pub async fn delete_user(
         return r;
     }
 
+    // Mirror management::iam_user::delete_user: snapshot the user's access
+    // keys BEFORE deletion so cache fanout can drop them after the cascade
+    // succeeds. The defensive principal-fanout below covers any keys
+    // created concurrently with this delete.
+    let access_key_ids: Vec<String> = match state
+        .catalog_store
+        .list_access_keys(&account_id, &user_name)
+        .await
+    {
+        Ok(rows) => rows.into_iter().map(|(id, _, _)| id).collect(),
+        Err(e) => {
+            tracing::warn!(
+                "console delete_user: list_access_keys failed before delete; cache invalidation will rely on TTL: {e:?}"
+            );
+            Vec::new()
+        }
+    };
+
     match state
         .catalog_store
         .delete_user(&account_id, &user_name)
         .await
     {
-        Ok(()) => Redirect::to(&format!("/console/accounts/{account_id}")).into_response(),
+        Ok(()) => {
+            for key_id in &access_key_ids {
+                state.auth_cache.invalidate_credential(key_id).await;
+            }
+            state
+                .auth_cache
+                .invalidate_principal_credentials(&account_id, &user_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_user_policies(&account_id, &user_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_user_group_policies(&account_id, &user_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_user_boundary(&account_id, &user_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_user_tags(&account_id, &user_name)
+                .await;
+            Redirect::to(&format!("/console/accounts/{account_id}")).into_response()
+        }
         Err(e) => {
             let nav = html::nav_bar(&identity_label(&session.identity));
             let content = format!(

@@ -45,9 +45,52 @@ pub fn evaluate_policies(
     resource_arn: &str,
     context: &impl ConditionContext,
 ) -> AuthzDecision {
-    // Collect all policies for the explicit deny scan
+    evaluate_with(
+        identity_policies.iter(),
+        permissions_boundary,
+        session_policy,
+        action,
+        resource_arn,
+        context,
+    )
+}
+
+/// Variant of [`evaluate_policies`] accepting `Arc<PolicyDocument>` slices.
+///
+/// Used by the request hot path with the parsed-document cache to avoid
+/// cloning policies out of `Arc` on every authorization decision.
+pub fn evaluate_policies_arc(
+    identity_policies: &[std::sync::Arc<PolicyDocument>],
+    permissions_boundary: Option<&PolicyDocument>,
+    session_policy: Option<&PolicyDocument>,
+    action: &str,
+    resource_arn: &str,
+    context: &impl ConditionContext,
+) -> AuthzDecision {
+    evaluate_with(
+        identity_policies.iter().map(std::sync::Arc::as_ref),
+        permissions_boundary,
+        session_policy,
+        action,
+        resource_arn,
+        context,
+    )
+}
+
+fn evaluate_with<'a, I>(
+    identity_policies: I,
+    permissions_boundary: Option<&'a PolicyDocument>,
+    session_policy: Option<&'a PolicyDocument>,
+    action: &str,
+    resource_arn: &str,
+    context: &impl ConditionContext,
+) -> AuthzDecision
+where
+    I: Iterator<Item = &'a PolicyDocument> + Clone,
+{
+    // Collect all policies for the explicit deny scan.
     let all_policies: Vec<&PolicyDocument> = identity_policies
-        .iter()
+        .clone()
         .chain(permissions_boundary)
         .chain(session_policy)
         .collect();

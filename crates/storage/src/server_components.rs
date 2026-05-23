@@ -11,7 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use extenddb_auth::AuthProvider;
+use extenddb_auth::CredentialStore;
 
 use crate::config::StorageConfig;
 use crate::hooks::ServerRuntimeHooks;
@@ -28,8 +28,10 @@ pub struct ServerComponents {
     /// Catalog store for management API operations
     pub catalog_store: Arc<dyn CatalogStore>,
 
-    /// Auth provider (wraps credential store internally)
-    pub auth_provider: Arc<dyn AuthProvider>,
+    /// Raw (uncached) credential store. The bin layer wraps this in
+    /// `CachedCredentialStore` using the operator-configured TTL before
+    /// constructing the auth provider.
+    pub credential_store: Arc<dyn CredentialStore>,
 
     /// Optional backend-specific runtime hooks for worker spawning
     pub runtime_hooks: Option<Box<dyn ServerRuntimeHooks>>,

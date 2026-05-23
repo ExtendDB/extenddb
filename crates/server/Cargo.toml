@@ -8,10 +8,12 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+extenddb-cache = { workspace = true }
 extenddb-core = { workspace = true }
 extenddb-engine = { workspace = true }
 extenddb-storage = { workspace = true }
 extenddb-auth = { workspace = true }
+futures = { workspace = true }
 axum = { workspace = true }
 async-trait = { workspace = true }
 tower = { workspace = true }
@@ -32,3 +34,6 @@ aes-gcm = { workspace = true }
 rand = { workspace = true }
 axum-server = { workspace = true }
 rustls = { workspace = true }
+
+[dev-dependencies]
+extenddb-cache = { workspace = true, features = ["test-util"] }

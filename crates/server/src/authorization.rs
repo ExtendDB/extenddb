@@ -4,18 +4,25 @@
 //! Authorization layer for DynamoDB requests.
 //!
 //! After authentication resolves an `AuthIdentity`, this module fetches the
-//! applicable IAM policies, permissions boundary, and session policy via the
-//! [`AuthorizationStore`] trait, builds a `RequestContext`, and evaluates
-//! authorization using the policy engine from `extenddb-auth`.
+//! applicable IAM policies, permissions boundary, and session policy via
+//! [`CachedAuthzStore`] (which sits on top of the storage [`AuthorizationStore`]
+//! trait), builds a `RequestContext`, and evaluates authorization using the
+//! policy engine from `extenddb-auth`.
+//!
+//! All policy documents are pre-parsed by the cache, so this layer never
+//! invokes `PolicyDocument::from_json` on the request hot path.
+//!
+//! See `docs/design/12-auth-authz-cache.md`.
 
 use std::collections::HashMap;
 
 use extenddb_auth::AuthIdentity;
 use extenddb_auth::policy::context::{RequestContext, RequestParams};
-use extenddb_auth::policy::document::PolicyDocument;
-use extenddb_auth::policy::evaluator::{AuthzDecision, evaluate_policies};
+use extenddb_auth::policy::evaluator::{AuthzDecision, evaluate_policies_arc};
 use extenddb_core::error::DynamoDbError;
-use extenddb_storage::authorization_store::AuthorizationStore;
+use extenddb_storage::management_store::OpError;
+
+use crate::authz_cache::{CachedAuthzStore, PolicyList, TagMap};
 
 /// Evaluate whether the authenticated identity is authorized for the given
 /// DynamoDB operation on the given resource.
@@ -24,7 +31,7 @@ use extenddb_storage::authorization_store::AuthorizationStore;
 /// evaluation algorithm runs: explicit deny → permissions boundary → session
 /// policy → identity allow → implicit deny.
 pub async fn check_authorization(
-    store: &dyn AuthorizationStore,
+    cache: &CachedAuthzStore,
     identity: &AuthIdentity,
     operation: &str,
     resource_arn: &str,
@@ -37,7 +44,7 @@ pub async fn check_authorization(
             user_name,
         } => {
             check_user_authorization(
-                store,
+                cache,
                 account_id,
                 user_name,
                 operation,
@@ -53,7 +60,7 @@ pub async fn check_authorization(
             session_name,
         } => {
             check_role_authorization(
-                store,
+                cache,
                 account_id,
                 role_name,
                 session_name,
@@ -68,7 +75,7 @@ pub async fn check_authorization(
 }
 
 async fn check_user_authorization(
-    store: &dyn AuthorizationStore,
+    cache: &CachedAuthzStore,
     account_id: &str,
     user_name: &str,
     operation: &str,
@@ -78,25 +85,39 @@ async fn check_user_authorization(
 ) -> Result<(), DynamoDbError> {
     let action = format!("dynamodb:{operation}");
 
-    // Fetch all 5 authz inputs concurrently — they are independent queries.
+    // Fetch all 5 authz inputs concurrently — they are independent cache
+    // lookups (or DB queries, on cold start). All come back pre-parsed.
     let (user_policies, group_policies, boundary, principal_tags, resource_tags) = tokio::try_join!(
-        fetch_policies(store.fetch_user_policies(account_id, user_name)),
-        fetch_policies(store.fetch_user_group_policies(account_id, user_name)),
-        fetch_boundary(store.fetch_user_boundary(account_id, user_name)),
-        fetch_tags(store.fetch_user_tags(account_id, user_name)),
-        fetch_resource_tags(store, resource_arn),
+        wrap_policies(cache.fetch_user_policies(account_id, user_name)),
+        wrap_policies(cache.fetch_user_group_policies(account_id, user_name)),
+        wrap_boundary(cache.fetch_user_boundary(account_id, user_name)),
+        wrap_tags(cache.fetch_user_tags(account_id, user_name)),
+        wrap_tags(cache.fetch_resource_tags(resource_arn)),
     )?;
 
-    // Combine identity policies.
-    let mut identity_policies = user_policies;
-    identity_policies.extend(group_policies);
+    // Combine identity policies. Each side is an `Arc<Vec<Arc<PolicyDocument>>>`;
+    // we build a single Vec<Arc<...>> for the evaluator. The per-element
+    // clones are atomic-only (Arc inner ref counts).
+    let mut identity_policies: Vec<
+        std::sync::Arc<extenddb_auth::policy::document::PolicyDocument>,
+    > = Vec::with_capacity(user_policies.len() + group_policies.len());
+    identity_policies.extend(user_policies.iter().cloned());
+    identity_policies.extend(group_policies.iter().cloned());
 
-    // Build request context.
-    let context = RequestContext::build(principal_tags, resource_tags, is_scan, params);
+    // Build request context. RequestContext::build expects owned HashMaps,
+    // so we deref through the Arc and clone once. This is the only place
+    // where the tag map allocation is unavoidable; future iterations could
+    // change RequestContext to hold Arc<HashMap<...>> for true zero-copy.
+    let context = RequestContext::build(
+        (*principal_tags).clone(),
+        (*resource_tags).clone(),
+        is_scan,
+        params,
+    );
 
-    let decision = evaluate_policies(
+    let decision = evaluate_policies_arc(
         &identity_policies,
-        boundary.as_ref(),
+        boundary.as_deref(),
         None,
         &action,
         resource_arn,
@@ -121,7 +142,7 @@ async fn check_user_authorization(
 
 #[allow(clippy::too_many_arguments)]
 async fn check_role_authorization(
-    store: &dyn AuthorizationStore,
+    cache: &CachedAuthzStore,
     account_id: &str,
     role_name: &str,
     session_name: &str,
@@ -132,21 +153,24 @@ async fn check_role_authorization(
 ) -> Result<(), DynamoDbError> {
     let action = format!("dynamodb:{operation}");
 
-    // Fetch all 4 authz inputs concurrently — they are independent queries.
     let (identity_policies, boundary, (session_policy, principal_tags), resource_tags) = tokio::try_join!(
-        fetch_policies(store.fetch_role_policies(account_id, role_name)),
-        fetch_boundary(store.fetch_role_boundary(account_id, role_name)),
-        fetch_session_data_and_tags(store, account_id, role_name, session_name),
-        fetch_resource_tags(store, resource_arn),
+        wrap_policies(cache.fetch_role_policies(account_id, role_name)),
+        wrap_boundary(cache.fetch_role_boundary(account_id, role_name)),
+        fetch_session_data_and_tags(cache, account_id, role_name, session_name),
+        wrap_tags(cache.fetch_resource_tags(resource_arn)),
     )?;
 
-    // Build request context.
-    let context = RequestContext::build(principal_tags, resource_tags, is_scan, params);
+    let context = RequestContext::build(principal_tags, (*resource_tags).clone(), is_scan, params);
 
-    let decision = evaluate_policies(
-        &identity_policies,
-        boundary.as_ref(),
-        session_policy.as_ref(),
+    // Convert the Arc<Vec<...>> to a slice for the evaluator. We materialize
+    // a fresh Vec to allow appending session_policy in the future without
+    // altering the cached value. For now the slice is read-only.
+    let identity_slice: Vec<std::sync::Arc<extenddb_auth::policy::document::PolicyDocument>> =
+        identity_policies.iter().cloned().collect();
+    let decision = evaluate_policies_arc(
+        &identity_slice,
+        boundary.as_deref(),
+        session_policy.as_deref(),
         &action,
         resource_arn,
         &context,
@@ -170,141 +194,87 @@ async fn check_role_authorization(
 }
 
 // ---------------------------------------------------------------------------
-// Helpers — convert store results to authorization types
+// Helpers — translate cache results to authorization-layer types
 // ---------------------------------------------------------------------------
 
-/// Parse policy JSON strings into `PolicyDocument`s. Fail closed on parse errors.
-async fn fetch_policies(
-    fut: impl std::future::Future<
-        Output = Result<Vec<String>, extenddb_storage::management_store::OpError>,
-    >,
-) -> Result<Vec<PolicyDocument>, DynamoDbError> {
-    let jsons = fut.await.map_err(|e| {
-        tracing::error!("Authorization: fetch policies failed: {e:?}");
-        DynamoDbError::InternalServerError("Internal error during authorization".to_owned())
-    })?;
-
-    let mut docs = Vec::with_capacity(jsons.len());
-    for json_str in &jsons {
-        match PolicyDocument::from_json(json_str) {
-            Ok(doc) => docs.push(doc),
-            Err(e) => {
-                // Fail closed: an unparseable stored policy denies access rather
-                // than being silently skipped.
-                tracing::error!("Authorization: unparseable policy: {e}");
-                return Err(DynamoDbError::AccessDeniedException(
-                    "Not authorized to perform this action (policy evaluation error)".to_owned(),
-                ));
-            }
+/// Translate an `OpResult` from the cache into a `DynamoDbError`.
+///
+/// Parse failures are reported by the cache as `OpError::Internal("policy
+/// parse failed: ...")`; those map to `AccessDeniedException` (fail-closed).
+/// Other internal errors map to `InternalServerError`.
+fn op_err_to_dynamo(e: OpError) -> DynamoDbError {
+    match &e {
+        OpError::Internal(msg) if msg.starts_with("policy parse failed") => {
+            tracing::error!("Authorization: {msg}");
+            DynamoDbError::AccessDeniedException(
+                "Not authorized to perform this action (policy evaluation error)".to_owned(),
+            )
+        }
+        _ => {
+            tracing::error!("Authorization: cache load failed: {e:?}");
+            DynamoDbError::InternalServerError("Internal error during authorization".to_owned())
         }
     }
-    Ok(docs)
 }
 
-/// Parse a boundary policy JSON string into a `PolicyDocument`. Fail closed on parse errors.
-async fn fetch_boundary(
+async fn wrap_policies(
+    fut: impl std::future::Future<Output = extenddb_storage::management_store::OpResult<PolicyList>>,
+) -> Result<PolicyList, DynamoDbError> {
+    fut.await.map_err(op_err_to_dynamo)
+}
+
+async fn wrap_boundary(
     fut: impl std::future::Future<
-        Output = Result<Option<String>, extenddb_storage::management_store::OpError>,
+        Output = extenddb_storage::management_store::OpResult<
+            Option<std::sync::Arc<extenddb_auth::policy::document::PolicyDocument>>,
+        >,
     >,
-) -> Result<Option<PolicyDocument>, DynamoDbError> {
-    let json = fut.await.map_err(|e| {
-        tracing::error!("Authorization: fetch boundary failed: {e:?}");
-        DynamoDbError::InternalServerError("Internal error during authorization".to_owned())
-    })?;
-
-    match json {
-        Some(json_str) => match PolicyDocument::from_json(&json_str) {
-            Ok(doc) => Ok(Some(doc)),
-            Err(e) => {
-                tracing::error!("Authorization: unparseable permissions boundary: {e}");
-                Err(DynamoDbError::AccessDeniedException(
-                    "Not authorized to perform this action (policy evaluation error)".to_owned(),
-                ))
-            }
-        },
-        None => Ok(None),
-    }
+) -> Result<Option<std::sync::Arc<extenddb_auth::policy::document::PolicyDocument>>, DynamoDbError>
+{
+    fut.await.map_err(op_err_to_dynamo)
 }
 
-/// Convert tag tuples to a `HashMap`.
-async fn fetch_tags(
-    fut: impl std::future::Future<
-        Output = Result<Vec<(String, String)>, extenddb_storage::management_store::OpError>,
-    >,
-) -> Result<HashMap<String, String>, DynamoDbError> {
-    let tags = fut.await.map_err(|e| {
-        tracing::error!("Authorization: fetch tags failed: {e:?}");
-        DynamoDbError::InternalServerError("Internal error during authorization".to_owned())
-    })?;
-    Ok(tags.into_iter().collect())
+async fn wrap_tags(
+    fut: impl std::future::Future<Output = extenddb_storage::management_store::OpResult<TagMap>>,
+) -> Result<TagMap, DynamoDbError> {
+    fut.await.map_err(op_err_to_dynamo)
 }
 
-/// Fetch resource tags, returning empty map for wildcard ARNs.
-async fn fetch_resource_tags(
-    store: &dyn AuthorizationStore,
-    resource_arn: &str,
-) -> Result<HashMap<String, String>, DynamoDbError> {
-    // Wildcard ARNs (e.g. table/*) have no specific resource to tag.
-    if resource_arn.ends_with("/*") {
-        return Ok(HashMap::new());
-    }
-    fetch_tags(store.fetch_resource_tags(resource_arn)).await
-}
-
-/// Fetch session data and merge role tags with session tags (session wins on conflict).
 async fn fetch_session_data_and_tags(
-    store: &dyn AuthorizationStore,
+    cache: &CachedAuthzStore,
     account_id: &str,
     role_name: &str,
     session_name: &str,
-) -> Result<(Option<PolicyDocument>, HashMap<String, String>), DynamoDbError> {
-    // Fetch role tags and session data concurrently (independent queries).
+) -> Result<
+    (
+        Option<std::sync::Arc<extenddb_auth::policy::document::PolicyDocument>>,
+        HashMap<String, String>,
+    ),
+    DynamoDbError,
+> {
+    // Fetch role tags and session data concurrently.
     let (role_tags, session_data) = tokio::try_join!(
+        wrap_tags(cache.fetch_role_tags(account_id, role_name)),
         async {
-            store
-                .fetch_role_tags(account_id, role_name)
-                .await
-                .map_err(|e| {
-                    tracing::error!("Authorization: fetch role tags failed: {e:?}");
-                    DynamoDbError::InternalServerError(
-                        "Internal error during authorization".to_owned(),
-                    )
-                })
-        },
-        async {
-            store
+            cache
                 .fetch_session_data(account_id, role_name, session_name)
                 .await
-                .map_err(|e| {
-                    tracing::error!("Authorization: fetch session data failed: {e:?}");
-                    DynamoDbError::InternalServerError(
-                        "Internal error during authorization".to_owned(),
-                    )
-                })
+                .map_err(op_err_to_dynamo)
         },
     )?;
-    let mut tags: HashMap<String, String> = role_tags.into_iter().collect();
 
+    // Merge: start from a clone of role tags (we need to mutate-and-overlay
+    // session tags). The clone happens once per request even if the session
+    // is absent — acceptable; merging into-place is the simplest semantics.
+    let mut tags: HashMap<String, String> = (*role_tags).clone();
     let mut session_policy = None;
     if let Some(data) = session_data {
-        // Parse session policy.
-        if let Some(json_str) = data.session_policy {
-            match PolicyDocument::from_json(&json_str) {
-                Ok(doc) => session_policy = Some(doc),
-                Err(e) => {
-                    tracing::error!("Authorization: unparseable session policy: {e}");
-                    return Err(DynamoDbError::AccessDeniedException(
-                        "Not authorized to perform this action (policy evaluation error)"
-                            .to_owned(),
-                    ));
-                }
-            }
-        }
-        // Merge session tags (session wins on conflict).
-        for (k, v) in data.session_tags {
-            tags.insert(k, v);
+        session_policy = data.session_policy.clone();
+        // Merge session tags (session wins on conflict). The session_data
+        // value is shared via Arc; iterate borrowed and clone-on-insert.
+        for (k, v) in &data.session_tags {
+            tags.insert(k.clone(), v.clone());
         }
     }
-
     Ok((session_policy, tags))
 }

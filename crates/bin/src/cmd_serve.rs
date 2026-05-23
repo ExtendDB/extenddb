@@ -252,8 +252,96 @@ async fn serve_inner(
 
     let storage = components.engine;
     let catalog_store = components.catalog_store;
-    let auth = components.auth_provider;
+    let cred_store = components.credential_store;
     let runtime_hooks = components.runtime_hooks;
+
+    // Build SwrCacheConfig values from the [auth.cache] TOML section.
+    let cache_cfg = &app_config.auth.cache;
+    let cache_enabled = cache_cfg.enabled;
+    let make_cache_cfg = |name: &'static str| -> extenddb_cache::SwrCacheConfig {
+        extenddb_cache::SwrCacheConfig {
+            ttl: std::time::Duration::from_secs(cache_cfg.ttl_seconds),
+            soft_ttl: std::time::Duration::from_secs(cache_cfg.soft_ttl_seconds),
+            negative_ttl: std::time::Duration::from_secs(cache_cfg.negative_ttl_seconds),
+            max_entries: cache_cfg.max_entries,
+            name,
+        }
+    };
+    // Validate config eagerly so misconfiguration fails fast at startup.
+    // Today every named subcache shares the same TTL/max_entries shape (only
+    // `name` differs), so a single `validate()` check suffices. If per-cache
+    // tuning is ever added, validate every constructed config here.
+    if let Err(e) = make_cache_cfg("__validate__").validate() {
+        anyhow::bail!(
+            "Invalid [auth.cache] configuration: {e}. Check ttl_seconds, \
+             soft_ttl_seconds, negative_ttl_seconds, max_entries."
+        );
+    }
+    if !cache_enabled {
+        tracing::warn!(
+            "auth.cache.enabled = false — auth/authz caches are in pass-through mode \
+             (every lookup hits the catalog directly)"
+        );
+    }
+
+    // Phase 2: Wrap the raw credential store. In pass-through mode the
+    // wrapper bypasses the cache and forwards every lookup to the inner
+    // store; otherwise it caches per the TOML config.
+    let cached_cred_store = Arc::new(if cache_enabled {
+        extenddb_auth::CachedCredentialStore::with_arc(cred_store, make_cache_cfg("credential"))
+    } else {
+        extenddb_auth::CachedCredentialStore::pass_through_arc(
+            cred_store,
+            make_cache_cfg("credential"),
+        )
+    });
+    let auth: Arc<dyn extenddb_auth::AuthProvider> = Arc::new(
+        extenddb_auth::BuiltinAuthProvider::new((*cached_cred_store).clone()),
+    );
+
+    // Phase 3: Build the authorization cache.
+    let authz_cache: Arc<extenddb_server::CachedAuthzStore> = {
+        let store: Arc<dyn extenddb_storage::authorization_store::AuthorizationStore> =
+            catalog_store.clone();
+        let cfg = extenddb_server::AuthzCacheConfig {
+            identity_policies: make_cache_cfg("identity_policies"),
+            group_policies: make_cache_cfg("group_policies"),
+            boundary: make_cache_cfg("boundary"),
+            principal_tags: make_cache_cfg("principal_tags"),
+            resource_tags: make_cache_cfg("resource_tags"),
+            session_data: make_cache_cfg("session_data"),
+        };
+        Arc::new(if cache_enabled {
+            extenddb_server::CachedAuthzStore::new(store, cfg)
+        } else {
+            extenddb_server::CachedAuthzStore::pass_through(store, cfg)
+        })
+    };
+
+    // Phase 4: Build the TableKeyInfo cache.
+    let table_key_info_cache: Arc<extenddb_server::CachedTableKeyInfoStore> =
+        Arc::new(if cache_enabled {
+            extenddb_server::CachedTableKeyInfoStore::new(
+                storage.clone(),
+                make_cache_cfg("table_key_info"),
+            )
+        } else {
+            extenddb_server::CachedTableKeyInfoStore::pass_through(
+                storage.clone(),
+                make_cache_cfg("table_key_info"),
+            )
+        });
+
+    // Assemble the cache registry threaded into AppState for write-through
+    // invalidations from the management API.
+    let auth_cache =
+        extenddb_auth::AuthCacheRegistry::empty()
+            .with_credential(cached_cred_store)
+            .with_authz_invalidator(
+                authz_cache.clone() as Arc<dyn extenddb_auth::AuthzCacheInvalidator>
+            )
+            .with_table_key_info_invalidator(table_key_info_cache.clone()
+                as Arc<dyn extenddb_auth::TableKeyInfoCacheInvalidator>);
 
     let data_db_info = runtime_hooks
         .as_ref()
@@ -405,6 +493,9 @@ async fn serve_inner(
         import_paths,
         export_paths,
         throttle: throttle.clone(),
+        auth_cache,
+        authz_cache,
+        table_key_info_cache,
         config_entries,
         docs_store,
     };

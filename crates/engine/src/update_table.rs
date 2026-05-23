@@ -142,6 +142,7 @@ pub async fn handle_update_table(
         }
     }
 
+    let table_name = input.table_name.clone();
     let desc = ctx
         .storage
         .update_table(&ctx.account_id, input)
@@ -173,6 +174,18 @@ pub async fn handle_update_table(
                 DynamoDbError::InternalServerError("Internal server error".to_owned())
             }
         })?;
+
+    // Drop the cached TableKeyInfo: index changes, stream-spec changes, and
+    // throughput changes all alter what the cached value contains.
+    //
+    // NOTE: UpdateTable does NOT currently accept Tags. If that ever
+    // changes, also invalidate `resource_tags` for the table ARN here —
+    // the request itself populates resource_tags during authorize_request,
+    // so a stale empty entry would otherwise hide the new tags. See
+    // handle_create_table for the same pattern.
+    ctx.auth_cache
+        .invalidate_table_key_info(&ctx.account_id, &table_name)
+        .await;
 
     let output = extenddb_core::types::UpdateTableOutput {
         table_description: desc,

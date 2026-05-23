@@ -60,6 +60,14 @@ pub async fn handle_import_table(
     let table_arn = table_desc.table_arn.clone();
     let table_id = table_desc.table_id.clone();
 
+    // Drop any cached negative TableKeyInfo from a prior probe so subsequent
+    // requests against the new table see it without TTL lag. (Tags aren't
+    // propagated through ImportTable today, so resource_tags doesn't need
+    // invalidation here — see create_table_input_from_params.)
+    ctx.auth_cache
+        .invalidate_table_key_info(&ctx.account_id, &tcp.table_name)
+        .await;
+
     wait_for_table_active(ctx, &tcp.table_name).await?;
 
     let key_info = ctx
