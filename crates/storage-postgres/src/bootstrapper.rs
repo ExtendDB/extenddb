@@ -206,7 +206,11 @@ impl Bootstrapper for PostgresBootstrapper {
 
     async fn run_data_migrations(&self) -> OpResult<()> {
         let pool = self.app_pool(&self.config.data_db).await?;
-        migrations::run_data_migrations(&pool).await
+        migrations::run_data_migrations(&pool).await?;
+        // Programmatic migrations need the catalog pool (to enumerate index
+        // tables) plus the data pool (where the `_ddb_*` tables live).
+        let catalog_pool = self.app_pool(&self.config.catalog_db).await?;
+        migrations::run_data_code_migrations(&catalog_pool, &pool).await
     }
 
     async fn pending_data_migrations(&self) -> OpResult<Vec<String>> {

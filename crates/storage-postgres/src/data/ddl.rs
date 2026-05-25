@@ -229,6 +229,28 @@ impl PostgresEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
         }
 
+        // Index on base table key columns for delete_index_row_multi lookups.
+        {
+            let mut base_key_cols = vec!["base_pk".to_owned()];
+            for (i, &(_, sk_type)) in base_sks.iter().enumerate() {
+                let col = if i == 0 {
+                    format!("base_{}", sk_column(sk_type))
+                } else {
+                    format!("base_{}", sk_column_n(i, sk_type))
+                };
+                base_key_cols.push(col);
+            }
+            let idx_name = format!("_ddb_{index_id}_base_key_idx");
+            let base_key_idx = format!(
+                "CREATE INDEX \"{idx_name}\" ON {idx_table} ({})",
+                base_key_cols.join(", ")
+            );
+            sqlx::query(&base_key_idx)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
+
         Ok(())
     }
 
