@@ -27,6 +27,15 @@ pub struct ServeArgs {
     /// Override server port
     #[arg(short, long)]
     port: Option<u16>,
+
+    /// Run in the foreground without daemonizing.
+    ///
+    /// Useful for running under a container or process supervisor (Docker,
+    /// Kubernetes, systemd Type=simple, runit, etc.). In foreground mode logs
+    /// are written to stderr instead of syslog so the supervisor can capture
+    /// them.
+    #[arg(long, alias = "no-daemon")]
+    foreground: bool,
 }
 
 /// Bind the listening socket, daemonize, then start the tokio runtime.
@@ -118,52 +127,65 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
     // P57 Bug 7 fix: Use execute() instead of start() so the parent can
     // verify the daemon child is healthy before exiting. start() exits the
     // parent immediately after fork, hiding child startup failures.
-    let daemon = Daemonize::new().pid_file(&pid_file);
-    match daemon.execute() {
-        daemonize::Outcome::Parent(Ok(_)) => {
-            // Parent process: wait for the PID file to appear (written by
-            // the grandchild after the double-fork), then verify the daemon
-            // is still alive. This catches crashes during early startup
-            // (bad config, missing tables, TLS cert errors).
-            return verify_daemon_started(&pid_file, &bind_addr);
-        }
-        daemonize::Outcome::Parent(Err(e)) => {
-            return Err(anyhow::anyhow!("Failed to daemonize: {e}"));
-        }
-        daemonize::Outcome::Child(Ok(_)) => {
-            // Child (daemon) process: continue to start the server.
-        }
-        daemonize::Outcome::Child(Err(e)) => {
-            return Err(anyhow::anyhow!("Failed to daemonize (child): {e}"));
-        }
-    }
-
-    // P57 Bug 3 fix: After daemonize, stderr is /dev/null. Install a panic
-    // hook that writes to syslog so panics are visible. Without this, the
-    // child process silently disappears on panic.
-    std::panic::set_hook(Box::new(|info| {
-        // Best-effort syslog write. We can't use tracing here because the
-        // subscriber may not be initialized yet (it's set up in serve_inner).
-        let msg = format!("extenddb panic: {info}");
-        // SAFETY: openlog/syslog are POSIX-standard C functions. The ident
-        // string is a static C string literal with 'static lifetime.
-        unsafe {
-            libc::openlog(
-                c"extenddb".as_ptr(),
-                libc::LOG_PID | libc::LOG_NDELAY,
-                libc::LOG_DAEMON,
-            );
-            // Use CString to ensure null-termination for the format arg.
-            if let Ok(cmsg) = std::ffi::CString::new(msg) {
-                libc::syslog(libc::LOG_CRIT, c"%s".as_ptr(), cmsg.as_ptr());
+    //
+    // When --foreground is set, skip daemonization entirely so the process
+    // can be supervised by Docker, Kubernetes, systemd Type=simple, etc.
+    // The PID file is still written below by `start_server`, and graceful
+    // shutdown on SIGINT/SIGTERM still works.
+    if !args.foreground {
+        let daemon = Daemonize::new().pid_file(&pid_file);
+        match daemon.execute() {
+            daemonize::Outcome::Parent(Ok(_)) => {
+                // Parent process: wait for the PID file to appear (written by
+                // the grandchild after the double-fork), then verify the daemon
+                // is still alive. This catches crashes during early startup
+                // (bad config, missing tables, TLS cert errors).
+                return verify_daemon_started(&pid_file, &bind_addr);
+            }
+            daemonize::Outcome::Parent(Err(e)) => {
+                return Err(anyhow::anyhow!("Failed to daemonize: {e}"));
+            }
+            daemonize::Outcome::Child(Ok(_)) => {
+                // Child (daemon) process: continue to start the server.
+            }
+            daemonize::Outcome::Child(Err(e)) => {
+                return Err(anyhow::anyhow!("Failed to daemonize (child): {e}"));
             }
         }
-    }));
+
+        // P57 Bug 3 fix: After daemonize, stderr is /dev/null. Install a panic
+        // hook that writes to syslog so panics are visible. Without this, the
+        // child process silently disappears on panic.
+        std::panic::set_hook(Box::new(|info| {
+            // Best-effort syslog write. We can't use tracing here because the
+            // subscriber may not be initialized yet (it's set up in serve_inner).
+            let msg = format!("extenddb panic: {info}");
+            // SAFETY: openlog/syslog are POSIX-standard C functions. The ident
+            // string is a static C string literal with 'static lifetime.
+            unsafe {
+                libc::openlog(
+                    c"extenddb".as_ptr(),
+                    libc::LOG_PID | libc::LOG_NDELAY,
+                    libc::LOG_DAEMON,
+                );
+                // Use CString to ensure null-termination for the format arg.
+                if let Ok(cmsg) = std::ffi::CString::new(msg) {
+                    libc::syslog(libc::LOG_CRIT, c"%s".as_ptr(), cmsg.as_ptr());
+                }
+            }
+        }));
+    }
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(serve(app_config, std_listener, port, run_dir))
+        .block_on(serve(
+            app_config,
+            std_listener,
+            port,
+            run_dir,
+            args.foreground,
+        ))
 }
 
 /// Async entry point: initializes syslog logging, storage, and auth, then
@@ -173,20 +195,27 @@ async fn serve(
     std_listener: TcpListener,
     port: u16,
     run_dir: String,
+    foreground: bool,
 ) -> anyhow::Result<()> {
     // CB-27: Clean up PID file if serve() fails before reaching the HTTP
     // server (e.g., Postgres connection failure). The PID file was already
     // written by Daemonize in run().
     let pid_path = pid_file_path(&run_dir, port);
     let backend = app_config.storage._backend.clone();
-    let result = serve_inner(app_config, std_listener, port, run_dir, backend).await;
+    let result = serve_inner(app_config, std_listener, port, run_dir, backend, foreground).await;
     if let Err(ref e) = result {
         let _ = std::fs::remove_file(&pid_path);
         // P57 Bug 7: Log fatal errors to syslog. After daemonize, stderr is
         // /dev/null so anyhow's error display is lost. Use tracing if
         // available, fall back to raw syslog if tracing isn't initialized yet.
+        // In foreground mode, also echo to stderr since the supervisor
+        // captures stderr rather than syslog.
         tracing::error!("extenddb fatal: {e:#}");
-        log_to_syslog_raw(&format!("extenddb fatal: {e:#}"));
+        if foreground {
+            eprintln!("extenddb fatal: {e:#}");
+        } else {
+            log_to_syslog_raw(&format!("extenddb fatal: {e:#}"));
+        }
     }
     result
 }
@@ -199,11 +228,24 @@ async fn serve_inner(
     port: u16,
     run_dir: String,
     backend: String,
+    foreground: bool,
 ) -> anyhow::Result<()> {
     let catalog_version = extenddb_storage::operations::catalog_version(&backend)
         .unwrap_or_else(|_| "unknown".to_string());
 
-    // Init logging (REQ-LOG-003, REQ-LOG-006) — always syslog in daemon mode.
+    // In foreground mode, daemonize was skipped so the PID file was never
+    // written. Write it now so `extenddb status`/`stop` and `start_server`'s
+    // graceful shutdown cleanup still work. The grandchild PID written by
+    // daemonize matches `std::process::id()` post-fork, so this stays
+    // consistent with daemon mode.
+    if foreground {
+        let pid_file = pid_file_path(&run_dir, port);
+        std::fs::write(&pid_file, format!("{}\n", std::process::id()))
+            .map_err(|e| anyhow::anyhow!("Failed to write PID file {}: {e}", pid_file.display()))?;
+    }
+
+    // Init logging (REQ-LOG-003, REQ-LOG-006) — syslog in daemon mode, stderr
+    // in foreground mode so a container/process supervisor can capture logs.
     // D-3: sqlx messages are controlled by an independent `sqlx_log_level`
     // runtime setting (default: warn). Both extenddb and sqlx messages use the
     // `extenddb` syslog identifier (POSIX syslog supports only one identity per
@@ -220,26 +262,44 @@ async fn serve_inner(
     let filter = EnvFilter::new(&filter_str);
     let (filter_layer, reload_handle) = reload::Layer::new(filter);
 
-    let syslog = Syslog::new(
-        c"extenddb",
-        Options::LOG_PID | Options::LOG_NDELAY,
-        Facility::Daemon,
-    )
-    .ok_or_else(|| {
-        anyhow::anyhow!("Failed to initialize syslog — another syslog logger may already be active")
-    })?;
-    if app_config.logging.format == "json" {
-        tracing_subscriber::registry()
-            .with(filter_layer)
-            .with(fmt::layer().json().without_time().with_writer(syslog))
-            .try_init()
-            .map_err(|e| anyhow::anyhow!("Failed to initialize tracing: {e}"))?;
+    if foreground {
+        if app_config.logging.format == "json" {
+            tracing_subscriber::registry()
+                .with(filter_layer)
+                .with(fmt::layer().json().with_writer(std::io::stderr))
+                .try_init()
+                .map_err(|e| anyhow::anyhow!("Failed to initialize tracing: {e}"))?;
+        } else {
+            tracing_subscriber::registry()
+                .with(filter_layer)
+                .with(fmt::layer().with_writer(std::io::stderr))
+                .try_init()
+                .map_err(|e| anyhow::anyhow!("Failed to initialize tracing: {e}"))?;
+        }
     } else {
-        tracing_subscriber::registry()
-            .with(filter_layer)
-            .with(fmt::layer().without_time().with_writer(syslog))
-            .try_init()
-            .map_err(|e| anyhow::anyhow!("Failed to initialize tracing: {e}"))?;
+        let syslog = Syslog::new(
+            c"extenddb",
+            Options::LOG_PID | Options::LOG_NDELAY,
+            Facility::Daemon,
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Failed to initialize syslog — another syslog logger may already be active"
+            )
+        })?;
+        if app_config.logging.format == "json" {
+            tracing_subscriber::registry()
+                .with(filter_layer)
+                .with(fmt::layer().json().without_time().with_writer(syslog))
+                .try_init()
+                .map_err(|e| anyhow::anyhow!("Failed to initialize tracing: {e}"))?;
+        } else {
+            tracing_subscriber::registry()
+                .with(filter_layer)
+                .with(fmt::layer().without_time().with_writer(syslog))
+                .try_init()
+                .map_err(|e| anyhow::anyhow!("Failed to initialize tracing: {e}"))?;
+        }
     }
 
     // Create server components via factory pattern
@@ -262,8 +322,9 @@ async fn serve_inner(
 
     // REQ-LOG-001: Startup banner with effective configuration.
     // REQ-LOG-002: Connection strings redact passwords.
+    let log_output = if foreground { "stderr" } else { "syslog" };
     tracing::info!(
-        "extenddb {} (catalog {}) starting — bind={}:{}, region={}, auth={}, catalog_db={}, data_db={}, log_output=syslog, log_level={}",
+        "extenddb {} (catalog {}) starting — bind={}:{}, region={}, auth={}, catalog_db={}, data_db={}, log_output={}, log_level={}",
         env!("CARGO_PKG_VERSION"),
         catalog_version,
         app_config.server.bind_addr,
@@ -272,6 +333,7 @@ async fn serve_inner(
         app_config.auth.provider,
         config::redact_password(&backend, app_config.storage.connection_config()),
         data_db_info,
+        log_output,
         app_config.logging.level,
     );
 
@@ -463,4 +525,69 @@ async fn serve_inner(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServeArgs;
+    use clap::Parser;
+
+    /// Test wrapper so clap has a top-level `Parser` to drive `ServeArgs`.
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: ServeArgs,
+    }
+
+    fn parse(argv: &[&str]) -> ServeArgs {
+        TestCli::try_parse_from(argv)
+            .expect("ServeArgs should parse from valid argv")
+            .args
+    }
+
+    #[test]
+    fn defaults_run_in_daemon_mode() {
+        // No --foreground flag preserves the historical daemon behavior so
+        // existing users and scripts are unaffected by the new flag.
+        let args = parse(&["extenddb-serve"]);
+        assert!(!args.foreground);
+        assert_eq!(args.config, "extenddb.toml");
+        assert!(args.port.is_none());
+    }
+
+    #[test]
+    fn foreground_flag_is_recognized() {
+        let args = parse(&["extenddb-serve", "--foreground"]);
+        assert!(args.foreground);
+    }
+
+    #[test]
+    fn no_daemon_alias_is_recognized() {
+        // The issue proposed either `--foreground` or `--no-daemon`; make
+        // sure the alias keeps working so users have a choice.
+        let args = parse(&["extenddb-serve", "--no-daemon"]);
+        assert!(args.foreground);
+    }
+
+    #[test]
+    fn foreground_combines_with_other_flags() {
+        let args = parse(&[
+            "extenddb-serve",
+            "--config",
+            "/etc/extenddb/extenddb.toml",
+            "--port",
+            "9000",
+            "--foreground",
+        ]);
+        assert!(args.foreground);
+        assert_eq!(args.config, "/etc/extenddb/extenddb.toml");
+        assert_eq!(args.port, Some(9000));
+    }
+
+    #[test]
+    fn unknown_flag_is_rejected() {
+        // Guard against accidental future renames silently dropping the flag.
+        let result = TestCli::try_parse_from(["extenddb-serve", "--daemon-off"]);
+        assert!(result.is_err());
+    }
 }
