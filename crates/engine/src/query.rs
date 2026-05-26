@@ -353,6 +353,13 @@ pub async fn handle_query(
         ExpressionMaps::new(names, values)
     };
 
+    // Validate begins_with operand types upfront (before any rows are read).
+    if let Some(ref f) = filter {
+        extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
+            |e| crate::expression_helpers::prefix_expression_error(e, "FilterExpression"),
+        )?;
+    }
+
     // Validate ExclusiveStartKey matches the key schema
     if let Some(ref start_key) = input.exclusive_start_key {
         let required = combined_lek_key_schema(&key_info.key_schema, index_info.as_ref());
