@@ -272,6 +272,13 @@ pub async fn handle_scan(
         validate_scan_exclusive_start_key(start_key, &key_info, index_info.as_ref())?;
     }
 
+    // Validate begins_with operand types upfront (before any rows are scanned).
+    if let Some(ref f) = filter {
+        extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
+            |e| crate::expression_helpers::prefix_expression_error(e, "FilterExpression"),
+        )?;
+    }
+
     // Scan storage
     let (raw_items, storage_last_key) = ctx
         .storage
