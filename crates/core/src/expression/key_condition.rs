@@ -258,6 +258,9 @@ pub enum SortKeyCondition {
 ///
 /// Returns `ValidationException` for syntax errors or unsupported constructs.
 pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbError> {
+    parser_common::check_redundant_parens(tokens)
+        .map_err(|body| validation_err(&format!("Invalid KeyConditionExpression: {body}")))?;
+
     // Strip outer parentheses: "(pk = :pk AND sk > :sk)" → "pk = :pk AND sk > :sk"
     let tokens = if tokens.len() >= 2
         && tokens[0] == Token::LParen
@@ -650,6 +653,35 @@ mod tests {
     use super::*;
     use crate::expression::tokenize;
     use std::collections::HashMap;
+
+    #[test]
+    fn key_condition_redundant_parens_rejected_with_canonical_message() {
+        for expr in ["((pk = :v))", "((#pk = :pk)) AND (#sk = :sk)"] {
+            let tokens = tokenize(expr).unwrap();
+            let err = parse_key_condition(&tokens).unwrap_err();
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg)
+                    if msg == "Invalid KeyConditionExpression: The expression has redundant parentheses;"),
+                "expr {expr}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_condition_valid_parens_accepted() {
+        for expr in [
+            "(pk = :v)",
+            "(#pk = :pk) AND (#sk = :sk)",
+            "(#pk = :pk AND #sk = :sk)",
+            "(#pk = :pk AND (#sk = :sk))",
+        ] {
+            let tokens = tokenize(expr).unwrap();
+            assert!(
+                parse_key_condition(&tokens).is_ok(),
+                "expr {expr} should parse"
+            );
+        }
+    }
 
     #[test]
     fn resolve_pk_sk_swaps_when_reversed() {
