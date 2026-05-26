@@ -161,3 +161,45 @@ pub fn prefix_expression_error(err: DynamoDbError, expr_type: &str) -> DynamoDbE
         other => other,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use extenddb_core::limits::LimitsConfig;
+
+    const CONDITION_REDUNDANT: &str =
+        "Invalid ConditionExpression: The expression has redundant parentheses;";
+
+    #[test]
+    fn condition_redundant_parens_rejected_with_canonical_message() {
+        let limits = LimitsConfig::default();
+        for expr in [
+            "((a = :v))",
+            "(((a = :v)))",
+            "((a = :v AND b = :v2))",
+            "((NOT (a = :v)))",
+        ] {
+            let err = parse_optional_condition(Some(expr), &limits).unwrap_err();
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg) if msg == CONDITION_REDUNDANT),
+                "expr {expr}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn condition_valid_parens_accepted() {
+        let limits = LimitsConfig::default();
+        for expr in [
+            "(a = :v)",
+            "(a = :v) AND (b = :v2)",
+            "((a = :v) AND (b = :v2))",
+            "(NOT (a = :v))",
+        ] {
+            assert!(
+                parse_optional_condition(Some(expr), &limits).is_ok(),
+                "expr {expr} should parse"
+            );
+        }
+    }
+}

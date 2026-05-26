@@ -525,4 +525,22 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn redundant_parens_use_canonical_message() {
+        for expr in [
+            "((a = :v))",
+            "(((a = :v)))",
+            "((a = :v AND b = :v2))",
+            "((NOT (a = :v)))",
+        ] {
+            let tokens = tokenize(expr).unwrap();
+            let err = parse_condition(&tokens).unwrap_err();
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg)
+                    if msg == "Invalid ConditionExpression: The expression has redundant parentheses;"),
+                "expr {expr}: got {err:?}"
+            );
+        }
+    }
 }
