@@ -81,6 +81,45 @@ pub fn expect_token(
     Ok(())
 }
 
+/// Reject redundant parentheses, matching DynamoDB: a parenthesised group whose
+/// entire content is itself a single parenthesised group, such as `((x))`.
+/// Returns the bare error body so each parser can prefix its own expression type.
+pub fn check_redundant_parens(tokens: &[Token]) -> Result<(), String> {
+    for (i, token) in tokens.iter().enumerate() {
+        if *token != Token::LParen {
+            continue;
+        }
+        // Unbalanced parentheses are left for the grammar parser to report.
+        let Some(close) = matching_rparen(tokens, i) else {
+            continue;
+        };
+        if i + 1 < close
+            && tokens[i + 1] == Token::LParen
+            && matching_rparen(tokens, i + 1) == Some(close - 1)
+        {
+            return Err("The expression has redundant parentheses;".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn matching_rparen(tokens: &[Token], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (k, token) in tokens.iter().enumerate().skip(open) {
+        match token {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(k);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn validation_err(msg: &str) -> DynamoDbError {
     DynamoDbError::ValidationException(format!("Invalid expression: {msg}"))
 }

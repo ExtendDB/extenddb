@@ -148,11 +148,17 @@ pub fn resolve_condition(
 }
 
 /// Prefix an expression error with the expression type, matching DynamoDB's format.
-/// If the error already starts with "Invalid", it's returned as-is.
+///
+/// `FilterExpression` shares the condition parser, so its errors arrive labelled
+/// `ConditionExpression`; those are relabelled to `expr_type`. Errors already
+/// labelled with another expression type, or non-expression validation errors,
+/// are returned unchanged.
 pub fn prefix_expression_error(err: DynamoDbError, expr_type: &str) -> DynamoDbError {
     match err {
         DynamoDbError::ValidationException(msg) => {
-            if msg.starts_with("Invalid ") || msg.starts_with("1 validation") {
+            if let Some(rest) = msg.strip_prefix("Invalid ConditionExpression:") {
+                DynamoDbError::ValidationException(format!("Invalid {expr_type}:{rest}"))
+            } else if msg.starts_with("Invalid ") || msg.starts_with("1 validation") {
                 DynamoDbError::ValidationException(msg)
             } else {
                 DynamoDbError::ValidationException(format!("Invalid {expr_type}: {msg}"))
@@ -201,5 +207,27 @@ mod tests {
                 "expr {expr} should parse"
             );
         }
+    }
+
+    #[test]
+    fn filter_redundant_parens_rejected_with_filter_label() {
+        let limits = LimitsConfig::default();
+        let err = parse_optional_filter(Some("((a = :v))"), &limits).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if msg == "Invalid FilterExpression: The expression has redundant parentheses;"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn filter_parser_errors_carry_filter_label() {
+        let limits = LimitsConfig::default();
+        let err = parse_optional_filter(Some("a"), &limits).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if msg.starts_with("Invalid FilterExpression:")),
+            "got {err:?}"
+        );
     }
 }
