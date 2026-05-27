@@ -10,7 +10,10 @@ use clap::Args;
 use daemonize::Daemonize;
 use extenddb_server::AppState;
 use syslog_tracing::{Facility, Options, Syslog};
-use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, reload, util::SubscriberInitExt};
+use tracing_subscriber::{
+    EnvFilter, Layer, fmt, fmt::writer::BoxMakeWriter, layer::SubscriberExt, reload,
+    util::SubscriberInitExt,
+};
 
 use crate::config;
 use crate::serve_helpers::{
@@ -100,23 +103,36 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         .set_nonblocking(true)
         .map_err(|e| anyhow::anyhow!("Failed to set listener non-blocking: {e}"))?;
 
-    // D-2: Print startup banner to stdout before daemonizing so the user
-    // gets confirmation the server is starting. P57 Bug 4 fix: say "starting"
-    // not "listening" — the server isn't actually accepting connections yet.
+    // D-2: Print startup banner before daemonizing so the user gets
+    // confirmation the server is starting. P57 Bug 4 fix: say "starting" not
+    // "listening" — the server isn't actually accepting connections yet.
+    //
+    // In daemon mode the banner goes to stdout (the user invoking `extenddb
+    // serve` reads it before the parent exits). In foreground mode we route
+    // it to stderr so a process supervisor receives banner and tracing logs
+    // on the same stream — mixing stdout and stderr makes container log
+    // capture noisier than necessary.
     let backend = &app_config.storage._backend;
     let catalog_version = extenddb_storage::operations::catalog_version(backend)
         .unwrap_or_else(|_| "unknown".to_string());
-    println!(
+    let banner_line1 = format!(
         "extenddb {} (catalog {}) starting on {}",
         env!("CARGO_PKG_VERSION"),
         catalog_version,
         bind_addr,
     );
-    println!(
+    let banner_line2 = format!(
         "  storage: {} ({})",
         backend,
         config::redact_password(backend, app_config.storage.connection_config()),
     );
+    if args.foreground {
+        eprintln!("{banner_line1}");
+        eprintln!("{banner_line2}");
+    } else {
+        println!("{banner_line1}");
+        println!("{banner_line2}");
+    }
 
     // D-3: Write PID file so `extenddb status` can report the daemon PID.
     let run_dir = config::expand_tilde(&app_config.server.run_dir);
@@ -262,20 +278,11 @@ async fn serve_inner(
     let filter = EnvFilter::new(&filter_str);
     let (filter_layer, reload_handle) = reload::Layer::new(filter);
 
-    if foreground {
-        if app_config.logging.format == "json" {
-            tracing_subscriber::registry()
-                .with(filter_layer)
-                .with(fmt::layer().json().with_writer(std::io::stderr))
-                .try_init()
-                .map_err(|e| anyhow::anyhow!("Failed to initialize tracing: {e}"))?;
-        } else {
-            tracing_subscriber::registry()
-                .with(filter_layer)
-                .with(fmt::layer().with_writer(std::io::stderr))
-                .try_init()
-                .map_err(|e| anyhow::anyhow!("Failed to initialize tracing: {e}"))?;
-        }
+    // Pick the writer first (foreground → stderr, daemon → syslog), then the
+    // format (text vs json). syslog supplies its own timestamps, so we strip
+    // them with `.without_time()` only on the syslog path.
+    let (writer, with_time): (BoxMakeWriter, bool) = if foreground {
+        (BoxMakeWriter::new(std::io::stderr), true)
     } else {
         let syslog = Syslog::new(
             c"extenddb",
@@ -287,20 +294,25 @@ async fn serve_inner(
                 "Failed to initialize syslog — another syslog logger may already be active"
             )
         })?;
-        if app_config.logging.format == "json" {
-            tracing_subscriber::registry()
-                .with(filter_layer)
-                .with(fmt::layer().json().without_time().with_writer(syslog))
-                .try_init()
-                .map_err(|e| anyhow::anyhow!("Failed to initialize tracing: {e}"))?;
-        } else {
-            tracing_subscriber::registry()
-                .with(filter_layer)
-                .with(fmt::layer().without_time().with_writer(syslog))
-                .try_init()
-                .map_err(|e| anyhow::anyhow!("Failed to initialize tracing: {e}"))?;
-        }
-    }
+        (BoxMakeWriter::new(syslog), false)
+    };
+
+    let fmt_layer = match (with_time, app_config.logging.format == "json") {
+        (true, true) => fmt::layer().json().with_writer(writer).boxed(),
+        (true, false) => fmt::layer().with_writer(writer).boxed(),
+        (false, true) => fmt::layer()
+            .json()
+            .without_time()
+            .with_writer(writer)
+            .boxed(),
+        (false, false) => fmt::layer().without_time().with_writer(writer).boxed(),
+    };
+
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(fmt_layer)
+        .try_init()
+        .map_err(|e| anyhow::anyhow!("Failed to initialize tracing: {e}"))?;
 
     // Create server components via factory pattern
     let components = extenddb_storage::create_server_components(
