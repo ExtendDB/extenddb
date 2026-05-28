@@ -140,7 +140,7 @@ pub async fn delete_group(
             // immediately.
             state
                 .auth_cache
-                .invalidate_users(&account_id, &members)
+                .invalidate_users_group_policies(&account_id, &members)
                 .await;
             StatusCode::NO_CONTENT.into_response()
         }

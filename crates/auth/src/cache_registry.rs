@@ -50,7 +50,7 @@ pub trait AuthzCacheInvalidator: Send + Sync {
         user_name: &'a str,
     ) -> BoxFuture<'a, ()>;
 
-    fn invalidate_users<'a>(
+    fn invalidate_users_group_policies<'a>(
         &'a self,
         account_id: &'a str,
         user_names: &'a [String],
@@ -198,9 +198,13 @@ impl AuthCacheRegistry {
         }
     }
 
-    pub async fn invalidate_users(&self, account_id: &str, user_names: &[String]) {
+    /// Fan out a group-membership-affecting event to the cached
+    /// `user_group_policies` entry for each member. See
+    /// [`AuthzCacheInvalidator::invalidate_users_group_policies`].
+    pub async fn invalidate_users_group_policies(&self, account_id: &str, user_names: &[String]) {
         if let Some(c) = &self.authz {
-            c.invalidate_users(account_id, user_names).await;
+            c.invalidate_users_group_policies(account_id, user_names)
+                .await;
         }
     }
 

@@ -282,7 +282,7 @@ pub async fn delete_group(
         Ok(()) => {
             state
                 .auth_cache
-                .invalidate_users(&account_id, &members)
+                .invalidate_users_group_policies(&account_id, &members)
                 .await;
             Redirect::to(&format!("/console/accounts/{account_id}")).into_response()
         }

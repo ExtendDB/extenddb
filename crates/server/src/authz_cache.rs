@@ -329,17 +329,21 @@ impl CachedAuthzStore {
             .await;
     }
 
-    /// Invalidate user-group-policy entries for **every** member of `group_name`.
+    /// Fan out a group-membership-affecting event (group deleted, group
+    /// policy attached/detached) to the cached `user_group_policies` entry
+    /// for each member.
     ///
-    /// Group-policy mutations (PutGroupPolicy, AttachGroupPolicy, etc.) affect
-    /// every user in that group. Since the cache key is `(account_id, user)`,
-    /// not group, we use `invalidate_if` over the user's group memberships.
-    /// In practice, the simpler approach is to take the set of member user
-    /// names from the caller (the management endpoint already had to list
-    /// them) and invalidate each.
-    pub async fn invalidate_users(&self, account_id: &str, user_names: &[String]) {
+    /// The `user_group_policies` cache is keyed by `(account_id, user_name)`,
+    /// not by group, because the loader flattens group membership at fetch
+    /// time. Callers pass the member list they already had to enumerate
+    /// (e.g. via `get_group_detail`) so we don't re-query.
+    ///
+    /// Per-user attributes that aren't touched by group events
+    /// (`user_policies`, `user_boundary`, `user_tags`) are intentionally
+    /// out of scope — they have their own invalidation methods called from
+    /// the corresponding per-user mutation sites.
+    pub async fn invalidate_users_group_policies(&self, account_id: &str, user_names: &[String]) {
         for u in user_names {
-            self.invalidate_user_policies(account_id, u).await;
             self.invalidate_user_group_policies(account_id, u).await;
         }
     }
@@ -523,12 +527,12 @@ impl extenddb_auth::AuthzCacheInvalidator for CachedAuthzStore {
         Box::pin(self.invalidate_user_group_policies(account_id, user_name))
     }
 
-    fn invalidate_users<'a>(
+    fn invalidate_users_group_policies<'a>(
         &'a self,
         account_id: &'a str,
         user_names: &'a [String],
     ) -> BoxFuture<'a, ()> {
-        Box::pin(self.invalidate_users(account_id, user_names))
+        Box::pin(self.invalidate_users_group_policies(account_id, user_names))
     }
 
     fn invalidate_user_boundary<'a>(

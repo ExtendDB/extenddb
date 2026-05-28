@@ -406,7 +406,7 @@ async fn invalidate_policy_caches(
             };
             state
                 .auth_cache
-                .invalidate_users(account_id, &members)
+                .invalidate_users_group_policies(account_id, &members)
                 .await;
         }
         _ => {}
