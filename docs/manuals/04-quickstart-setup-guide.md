@@ -149,10 +149,10 @@ Options:
 |------|---------|-------------|
 | `--catalog-db` | `extenddb_catalog` | Catalog database name |
 | `--data-db` | `<catalog>_data` | Data database name |
-| `--pg-host` | `localhost` | PostgreSQL host |
-| `--pg-port` | `5432` | PostgreSQL port |
-| `--pg-user` | `extenddb` | PostgreSQL user |
-| `--pg-password` | `extenddb-local-dev` | PostgreSQL password |
+| `--storage-host` | `localhost` | PostgreSQL host |
+| `--storage-port` | `5432` | PostgreSQL port |
+| `--storage-admin-user` | `extenddb` | PostgreSQL user |
+| `--storage-admin-password` | `extenddb-local-dev` | PostgreSQL password |
 
 The command generates `extenddb.toml` with the connection details. If `extenddb.toml` already exists, `init` loads defaults from it.
 

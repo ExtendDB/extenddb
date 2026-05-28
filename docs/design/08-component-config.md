@@ -49,6 +49,7 @@ Environment variables use double-underscore (`__`) as a nesting separator, prefi
 | `server.port` | `EXTENDDB__SERVER__PORT` |
 | `server.bind_addr` | `EXTENDDB__SERVER__BIND_ADDR` |
 | `storage.postgres.connection_string` | `EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING` |
+| `storage.tidb.connection_string` | `EXTENDDB__STORAGE__TIDB__CONNECTION_STRING` |
 | `storage.postgres.read_replica_url` | `EXTENDDB__STORAGE__POSTGRES__READ_REPLICA_URL` |
 | `auth.provider` | `EXTENDDB__AUTH__PROVIDER` |
 | `auth.encryption_key` | `EXTENDDB__AUTH__ENCRYPTION_KEY` |
@@ -105,7 +106,7 @@ global_rps = 0          # 0 = disabled
 per_table_rps = 0       # 0 = disabled
 
 [storage]
-backend = "postgres"     # "postgres" | future: "sqlite", "mysql"
+backend = "postgres"     # "postgres" | "tidb"
 
 [storage.postgres]
 connection_string = "postgresql://localhost:5432/extenddb"  # Set credentials via env var in production
@@ -116,6 +117,18 @@ read_replica_url = ""    # Optional: PostgreSQL streaming replica for eventually
 read_replica_pool_size = 20  # Pool size for the read replica (defaults to pool_size if unset)
 connection_timeout_secs = 5
 statement_timeout_secs = 30
+
+[storage.tidb]
+connection_string = "mysql://extenddb:extenddb-local-dev@localhost:4000/extenddb_catalog"
+pool_size = 20
+catalog_pool_size = 20
+
+[storage.tidb.backup]
+pd_endpoint = "127.0.0.1:2379"
+storage_uri = "local:///var/lib/extenddb/tidb-backups"
+binary = "tiup"
+component = "br"
+send_credentials_to_tikv = false
 
 [auth]
 provider = "builtin"     # "none" | "builtin" | "aws_iam" | future: "azure_ad"

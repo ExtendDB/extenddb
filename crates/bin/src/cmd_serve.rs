@@ -67,17 +67,14 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         );
     }
 
-    // Check backend is supported by this build
+    // Check backend is supported by this build.
     let backend = &app_config.storage._backend;
-    #[cfg(not(feature = "postgres"))]
-    if backend == "postgres" {
-        anyhow::bail!("PostgreSQL backend not enabled. Rebuild with --features postgres");
-    }
-    #[cfg(feature = "postgres")]
-    if backend != "postgres" {
+    let available_backends = extenddb_storage::operations::list_operations_backends();
+    if !available_backends.iter().any(|b| b == backend) {
         anyhow::bail!(
-            "Unknown backend '{}'. This build only supports 'postgres'.",
-            backend
+            "Unknown backend '{}'. This build supports: {}.",
+            backend,
+            available_backends.join(", ")
         );
     }
 
@@ -175,8 +172,8 @@ async fn serve(
     run_dir: String,
 ) -> anyhow::Result<()> {
     // CB-27: Clean up PID file if serve() fails before reaching the HTTP
-    // server (e.g., Postgres connection failure). The PID file was already
-    // written by Daemonize in run().
+    // server (for example, storage connection failure). The PID file was
+    // already written by Daemonize in run().
     let pid_path = pid_file_path(&run_dir, port);
     let backend = app_config.storage._backend.clone();
     let result = serve_inner(app_config, std_listener, port, run_dir, backend).await;
@@ -243,9 +240,11 @@ async fn serve_inner(
     }
 
     // Create server components via factory pattern
+    let runtime_storage_config =
+        config::RuntimeStorageConfig::new(app_config.storage.as_trait(), &app_config.limits);
     let components = extenddb_storage::create_server_components(
         &backend,
-        app_config.storage.as_trait(),
+        &runtime_storage_config,
         &app_config.server.region,
     )
     .await?;

@@ -9,7 +9,7 @@ This document describes the security architecture of extenddb, including the thr
 ### What extenddb Protects
 
 - **Data confidentiality**: Items stored in DynamoDB tables are accessible only to authenticated and authorized principals.
-- **Data integrity**: Write operations are atomic (including stream records, index updates, and side effects). Concurrent writes serialize on PostgreSQL row locks.
+- **Data integrity**: Write operations are atomic (including stream records, index updates, and side effects). Concurrent writes use the configured backend's transaction and locking model.
 - **Access control**: IAM policies enforce least-privilege access. Explicit Deny always takes precedence.
 - **Credential security**: Access key secrets are encrypted at rest (AES-256-GCM). Console passwords are hashed (bcrypt).
 - **Transport security**: TLS encrypts data in transit between clients and extenddb. TLS is mandatory — the server refuses to start without it.
@@ -17,14 +17,14 @@ This document describes the security architecture of extenddb, including the thr
 ### Trust Boundaries
 
 1. **Client ↔ extenddb**: Untrusted. All input is validated. SigV4 signatures are verified. IAM policies are evaluated.
-2. **extenddb ↔ PostgreSQL**: Trusted network. The PostgreSQL connection string contains credentials. Use TLS for the PostgreSQL connection in production (`sslmode=require` in the connection string).
+2. **extenddb ↔ storage backend**: Trusted network. The backend connection string contains credentials. Use backend transport encryption in production.
 3. **Admin ↔ Management API/Console**: Authenticated via admin credentials or IAM user credentials. CSRF tokens protect the web console.
 
 ### Out of Scope
 
-- **PostgreSQL security**: extenddb relies on PostgreSQL access controls and network security. Securing the PostgreSQL instance (firewall rules, TLS, authentication) is the operator's responsibility.
+- **Storage security**: extenddb relies on backend access controls and network security. Securing the storage cluster (firewall rules, TLS, authentication) is the operator's responsibility.
 - **Operating system security**: File permissions on `extenddb.toml`, TLS keys, and the PID file are the operator's responsibility.
-- **Key management**: Access key secrets are encrypted with a locally generated AES key stored in the catalog database. For HSM-grade key management, use a KMS-backed encryption layer at the PostgreSQL level.
+- **Key management**: Access key secrets are encrypted with a locally generated AES key stored in the catalog database. For HSM-grade key management, use a KMS-backed encryption layer at the storage backend level.
 
 ## Authentication
 
@@ -56,7 +56,7 @@ extenddb uses SigV4 signature verification with a local credential store and IAM
 - Secret keys encrypted with AES-256-GCM using a per-catalog encryption key
 - Encryption key generated during `extenddb init` and stored in the catalog database
 - Console passwords hashed with bcrypt (cost factor 12)
-- No in-process credential cache — every request reads directly from PostgreSQL
+- No in-process credential cache — every request reads directly from the catalog store
 
 ## Authorization
 
@@ -81,7 +81,7 @@ Policy sources collected for evaluation:
 
 - **Unparseable policies deny**: A stored policy that cannot be parsed results in access denied, not silent skip. A corrupted Deny policy still denies; a corrupted Allow policy is treated as absent.
 - **Auth before JSON parse**: SigV4 signature verification runs before the request body is parsed. Invalid signatures are rejected with constant-time comparison before any business logic executes.
-- **Concurrent policy fetching**: Identity policies, group policies, and permissions boundaries are fetched concurrently from PostgreSQL. All must succeed for evaluation to proceed.
+- **Concurrent policy fetching**: Identity policies, group policies, and permissions boundaries are fetched concurrently from the catalog store. All must succeed for evaluation to proceed.
 - **Constant-time rejection for inactive keys**: Inactive or expired access keys are rejected without timing differences that could reveal key existence.
 - **Policy document validation on write**: Policy documents are validated for JSON structure and size-capped (6,144 bytes) when attached via the management API. Invalid documents are rejected before storage.
 - **Expression depth and token limits**: Expression parsing enforces configurable depth (default 150) and token limits (default 4,096) to prevent resource exhaustion.
@@ -232,7 +232,9 @@ Import/export file paths are validated:
 
 ### Backup and Recovery
 
-extenddb stores all state in PostgreSQL. Use standard PostgreSQL tools for backup and recovery:
+Use the configured storage backend's native backup and recovery tools.
+
+For PostgreSQL:
 
 ```bash
 pg_dump extenddb_catalog > catalog_backup.sql
@@ -240,6 +242,8 @@ pg_dump extenddb_catalog_data > data_backup.sql
 ```
 
 Encryption keys are stored in the catalog database. A catalog backup includes the encryption key needed to decrypt access key secrets.
+
+For TiDB, use native BR-backed backups through `[storage.tidb.backup]` or operate BR directly for cluster-level recovery.
 
 ---
 

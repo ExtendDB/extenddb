@@ -6,12 +6,12 @@
 
 ### Dual-Database Architecture
 
-extenddb uses two PostgreSQL databases per deployment:
+extenddb uses a catalog/data database topology per deployment:
 
 - **Catalog database** (e.g., `extenddb_catalog`): All metadata — table definitions, indexes, accounts, IAM entities, settings, stream metadata, and schema history.
-- **Data database** (e.g., `extenddb_catalog_data`): User item data. Each DynamoDB table maps to a PostgreSQL table. GSI and LSI data are stored in separate PostgreSQL tables.
+- **Data database** (e.g., `extenddb_catalog_data`): User item data plus backend-specific secondary-index state. PostgreSQL stores base and secondary-index data in physical companion tables. TiDB stores item rows once and uses generated columns plus native secondary indexes.
 
-The data database connection string is stored in the catalog's `settings` table under the key `data_database_url`. This allows the catalog and data databases to live on different PostgreSQL instances.
+The data database connection string is stored in the catalog's `settings` table under the key `data_database_url`. This allows the catalog and data databases to live on different backend instances or clusters.
 
 ### Catalog Tables
 
@@ -41,14 +41,14 @@ The data database connection string is stored in the catalog's `settings` table 
 
 ### Data Tables
 
-Each DynamoDB table `T` in account `A` maps to a PostgreSQL table named `t_{table_id}` in the data database. The table has:
+Each DynamoDB table `T` in account `A` maps to a backend-owned physical table in the data database. The logical shape is:
 
 - `pk` column: Partition key value (stored as JSONB)
 - `sk` column: Sort key value (JSONB, nullable for hash-only tables)
 - `item` column: Full item as JSONB
 - Primary key: `(pk)` or `(pk, sk)`
 
-GSI tables are named `gsi_{table_id}_{index_name}` with the GSI key columns and a copy of projected attributes. LSI tables are named `lsi_{table_id}_{index_name}`.
+PostgreSQL GSI tables are named `gsi_{table_id}_{index_name}` with the GSI key columns and a copy of projected attributes. TiDB represents every DynamoDB secondary index definition as generated key columns plus a native secondary index on the base data table; GSI versus LSI is API metadata, not a separate TiDB physical path.
 
 ### Schema Conventions
 
@@ -132,7 +132,7 @@ Credential lookups (access key → encrypted secret) read directly from the data
 
 ### Record Capture
 
-Stream records are captured atomically with data writes. The engine constructs a `StreamCapture` struct with metadata (stream ARN, view type, shard ID, sequence number, keys). The storage backend persists the stream record in the same PostgreSQL transaction as the data write.
+Stream records are captured atomically with data writes. The engine constructs a `StreamCapture` struct with metadata (stream ARN, view type, shard ID, sequence number, keys). The storage backend persists the stream record in the same backend transaction as the data write.
 
 For UpdateItem, the `new_image` is not known until after `apply_update` runs inside the transaction, so the storage backend constructs the full `StreamRecord` after the update.
 
@@ -185,7 +185,6 @@ extenddb caches a small set of operational settings in memory to avoid per-reque
 
 | Setting | Mechanism | Refresh | Justification |
 |---------|-----------|---------|---------------|
-| `gsi_propagation_delay_ms` | `AtomicU64` | Background poller every 30s | Write-path hot path; briefly-stale value only affects GSI propagation timing |
 | `encryption_key` | `Arc<str>` loaded at startup | Never (immutable after `extenddb init`) | Decryption key for access key secrets; generated once, never changes |
 | `log_level` / `log_destination` | Tracing filter reload | Background poller every 30s | Observability tuning; stale value only delays log level changes |
 | `throttling_enabled` | `AtomicBool` | Background poller every 30s | Capacity management toggle; briefly-stale is safe |
@@ -199,7 +198,7 @@ Catalog state is never cached because correctness requires every request to see 
 - **Table metadata** (key schema, attribute definitions, status, billing mode): A stale cache could serve the wrong key schema after a table is deleted and recreated with the same name but different schema. The new table has a different `table_id`, different key schema, and different indexes — stale cache serves wrong schema, writes corrupt data, reads return garbage.
 - **IAM policies and credentials**: A revoked Deny policy still cached as absent creates a security gap. A deleted access key still cached as valid allows unauthorized access.
 - **Tags**: Tag-based authorization (`dynamodb:ResourceTag/*`) requires current tag values.
-- **GSI definitions**: Stale GSI metadata could route writes to wrong index tables.
+- **GSI definitions**: Stale GSI metadata could route reads or writes through the wrong backend-specific index shape.
 
 ### The Table-Name-Reuse Problem
 
@@ -212,11 +211,11 @@ The fundamental reason catalog state cannot be cached safely:
 5. Writes use wrong column layout → data corruption
 6. Reads return items with wrong attribute interpretation → garbage
 
-No safe TTL exists because delete-recreate can happen within milliseconds. Cross-instance invalidation (e.g., PostgreSQL LISTEN/NOTIFY) would be a prerequisite for any future catalog caching.
+No safe TTL exists because delete-recreate can happen within milliseconds. Cross-instance invalidation through backend-native change notifications would be a prerequisite for any future catalog caching.
 
 ### Multi-Instance Considerations
 
-extenddb does not enforce single-instance-per-catalog. Multiple extenddb instances may share the same PostgreSQL catalog. Any in-process cache of catalog state would be invisible to other instances. PostgreSQL's own buffer pool provides memory-resident access to hot rows, making application-level caching unnecessary for most workloads.
+extenddb does not enforce single-instance-per-catalog. Multiple extenddb instances may share the same catalog. Any in-process cache of catalog state would be invisible to other instances. Backend buffer pools provide memory-resident access to hot rows, making application-level caching unnecessary for most workloads.
 
 ### Future Considerations
 

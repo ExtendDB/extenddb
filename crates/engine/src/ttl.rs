@@ -44,9 +44,8 @@ pub async fn handle_describe_time_to_live(
 
 /// Handle `UpdateTimeToLive` — enable or disable TTL on a table attribute.
 ///
-/// When enabling, kicks off creation of a `PostgreSQL` expression index on the
-/// TTL attribute. When disabling, marks TTL disabled (sweeper stops) then
-/// drops the index.
+/// When enabling, kicks off backend-specific TTL lookup setup. When disabling,
+/// removes backend lookup/TTL artifacts before marking TTL disabled.
 ///
 /// # Errors
 ///
@@ -84,6 +83,13 @@ pub async fn handle_update_time_to_live(
         ));
     }
 
+    if !input.time_to_live_specification.enabled {
+        ctx.storage
+            .drop_ttl_index(&ctx.account_id, &input.table_name)
+            .await
+            .map_err(storage_to_dynamo)?;
+    }
+
     ctx.storage
         .update_ttl(
             &ctx.account_id,
@@ -95,9 +101,8 @@ pub async fn handle_update_time_to_live(
         .map_err(storage_to_dynamo)?;
 
     if input.time_to_live_specification.enabled {
-        // Kick off index creation (CONCURRENTLY — non-blocking for other database
-        // operations on the table, but the handler awaits completion).
-        // If it fails, the TTL sweeper will retry on its next cycle.
+        // Kick off backend-specific TTL lookup creation. If it fails, the TTL
+        // sweeper will retry on its next cycle.
         let account_id = ctx.account_id.clone();
         let table_name = input.table_name.clone();
         let attr = input.time_to_live_specification.attribute_name.clone();
@@ -107,16 +112,6 @@ pub async fn handle_update_time_to_live(
             .await
         {
             tracing::warn!("TTL index creation deferred for {table_name}: {e}");
-        }
-    } else {
-        // Disable path: metadata already updated (sweeper won't pick up this table).
-        // Drop the index. Safe because sweeper checks ttl_index_ready which is now FALSE.
-        if let Err(e) = ctx
-            .storage
-            .drop_ttl_index(&ctx.account_id, &input.table_name)
-            .await
-        {
-            tracing::warn!("TTL index drop failed for {}: {e}", input.table_name);
         }
     }
 
@@ -132,7 +127,7 @@ pub async fn handle_update_time_to_live(
 /// Validate a TTL attribute name.
 ///
 /// Real `DynamoDB` allows any UTF-8 (1–255 bytes). However, the TTL attribute
-/// name is interpolated into `PostgreSQL` DDL (expression index creation) where
+/// name is interpolated into backend DDL (TTL lookup/native TTL setup) where
 /// parameterized queries are not possible. We use a strict allowlist:
 /// `^[a-zA-Z0-9._-]+$` (1–255 bytes). This eliminates the entire class of
 /// SQL injection risk. See `docs/differences-from-dynamodb.md`.

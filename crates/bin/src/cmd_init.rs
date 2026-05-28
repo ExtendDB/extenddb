@@ -9,6 +9,7 @@
 use std::path::Path;
 
 use clap::Args;
+use extenddb_storage::bootstrapper::BootstrapOptions;
 
 use crate::config;
 use crate::init_helpers::{generate_config, generate_tls_cert_if_needed};
@@ -16,8 +17,8 @@ use crate::init_helpers::{generate_config, generate_tls_cert_if_needed};
 #[derive(Args)]
 #[allow(clippy::doc_markdown)] // Clap help text, not rustdoc
 pub struct InitArgs {
-    /// Storage backend (postgres) (default: postgres)
-    #[arg(long, default_value = "postgres")]
+    /// Storage backend name
+    #[arg(long)]
     backend: Option<String>,
 
     /// Data database name (default: extenddb)
@@ -28,21 +29,21 @@ pub struct InitArgs {
     #[arg(long)]
     catalog_db: Option<String>,
 
-    /// PostgreSQL host
-    #[arg(long)]
-    pg_host: Option<String>,
+    /// Storage host
+    #[arg(long = "storage-host")]
+    storage_host: Option<String>,
 
-    /// PostgreSQL port
-    #[arg(long)]
-    pg_port: Option<u16>,
+    /// Storage port
+    #[arg(long = "storage-port")]
+    storage_port: Option<u16>,
 
-    /// PostgreSQL admin user (for CREATE DATABASE)
-    #[arg(long)]
-    pg_user: Option<String>,
+    /// Storage admin user (for CREATE DATABASE)
+    #[arg(long = "storage-admin-user")]
+    storage_admin_user: Option<String>,
 
-    /// PostgreSQL admin password (required for remote/Aurora connections).
-    #[arg(long)]
-    pg_pass: Option<String>,
+    /// Storage admin password (required for remote connections).
+    #[arg(long = "storage-admin-password")]
+    storage_admin_password: Option<String>,
 
     /// extenddb application user
     #[arg(long)]
@@ -114,14 +115,14 @@ fn discover_docs_dir() -> Option<String> {
 
 /// Returns exit code: 0 = success, 255 = existing config preserved.
 pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
-    // Determine backend: CLI flag > config file > default
+    // Determine backend: CLI flag > config file > compiled default.
     let backend = if let Some(ref b) = args.backend {
         b.clone()
     } else if Path::new(&args.config).exists() {
         let app_config = config::load(&args.config)?;
         app_config.storage._backend
     } else {
-        "postgres".to_owned()
+        config::default_backend()
     };
 
     println!("=== extenddb init (backend: {backend}) ===");
@@ -136,14 +137,23 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
         return Ok(255);
     }
 
-    // Collect CLI args for backend-specific parsing
-    let cli_args: Vec<String> = std::env::args().collect();
-
     // Create bootstrapper via registry (no hardcoded match!)
-    let bootstrapper =
-        extenddb_storage::bootstrapper::create_bootstrapper(&backend, &args.config, &cli_args)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let bootstrapper = extenddb_storage::bootstrapper::create_bootstrapper(
+        &backend,
+        &args.config,
+        BootstrapOptions {
+            storage_host: args.storage_host.clone(),
+            storage_port: args.storage_port,
+            admin_user: args.storage_admin_user.clone(),
+            admin_password: args.storage_admin_password.clone(),
+            data_db: args.data_db.clone(),
+            catalog_db: args.catalog_db.clone(),
+            app_user: args.extenddb_user.clone(),
+            app_password: args.extenddb_pass.clone(),
+        },
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
     // Ensure application user exists.
     bootstrapper
@@ -234,9 +244,10 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
         );
     }
 
-    // Extract bind_addr from CLI args
-    let bind_addr =
-        extract_arg(&cli_args, "--bind-addr").unwrap_or_else(|| "127.0.0.1".to_string());
+    let bind_addr = args
+        .bind_addr
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1".to_string());
 
     // Generate self-signed TLS certificate if not already present.
     // Include the server bind address as a SAN so the cert matches the URL.
@@ -261,16 +272,17 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
     if Path::new(config_path).exists() {
         std::fs::remove_file(config_path)?;
     }
-    generate_config(config_path, &catalog_url, &bind_addr, docs_dir.as_deref())?;
+    generate_config(
+        config_path,
+        &backend,
+        &catalog_url,
+        &bind_addr,
+        docs_dir.as_deref(),
+    )?;
 
     println!(
         "\n=== extenddb init complete ===\nStart the server with: extenddb serve --config {config_path}"
     );
 
     Ok(0)
-}
-
-/// Extract a CLI argument value by flag name.
-fn extract_arg(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
 }

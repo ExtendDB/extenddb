@@ -16,7 +16,7 @@ extenddb always runs as a daemon. On startup it:
 2. Binds the TCP socket (port conflicts are reported before forking)
 3. Forks to background
 4. Initializes syslog logging
-5. Connects to PostgreSQL (catalog + data databases)
+5. Connects to the configured storage backend (catalog + data databases)
 6. Verifies catalog version matches the binary
 7. Starts the HTTP server
 8. Spawns background tasks (log level polling, stream cleanup, TTL expiry)
@@ -67,7 +67,7 @@ These settings require a server restart to take effect.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `backend` | `postgres` | Storage backend (only `postgres` supported) |
+| `backend` | `postgres` | Storage backend (`postgres` or `tidb`; PostgreSQL is the default) |
 
 #### [storage.postgres]
 
@@ -76,6 +76,33 @@ These settings require a server restart to take effect.
 | `connection_string` | `postgresql://extenddb:extenddb-local-dev@localhost:5432/extenddb_catalog` | Catalog database connection string |
 | `pool_size` | `20` | Maximum concurrent database connections (minimum: 10) |
 | `catalog_pool_size` | (= `pool_size`) | Maximum connections for management/authz pool (minimum: 10) |
+
+#### [storage.tidb]
+
+Available when the binary is built with the `tidb` feature.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `connection_string` | `mysql://extenddb:extenddb-local-dev@localhost:4000/extenddb_catalog` | Catalog database connection string |
+| `pool_size` | `20` | Maximum concurrent database connections (minimum: 10) |
+| `catalog_pool_size` | (= `pool_size`) | Maximum connections for management/authz pool (minimum: 10) |
+
+#### [storage.tidb.backup]
+
+TiDB backup and restore uses native BR, not a logical row-copy table. Configure these fields before using `CreateBackup` with the TiDB backend.
+`DeleteBackup` removes backup data directly only for `local://` or `file://`
+storage URIs. For S3, GCS, Azure Blob, and S3-compatible stores, configure
+object-store lifecycle management; ExtendDB will not mark remote BR backups
+deleted without a storage deleter.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `pd_endpoint` | unset | PD endpoint passed to BR, for example `127.0.0.1:2379` |
+| `storage_uri` | unset | Base URI for BR snapshot backups (`local://`, S3, GCS, Azure Blob, or compatible storage supported by BR) |
+| `log_storage_uri` | unset | Reserved for future cluster-level BR log backup orchestration; table-level PITR is not exposed by the TiDB backend |
+| `binary` | `tiup` | Executable used to run BR |
+| `component` | `br` | Component/subcommand after `binary`; set to `""` when `binary` is a direct `br` executable |
+| `send_credentials_to_tikv` | unset | Maps to BR `--send-credentials-to-tikv`; set `false` for IAM-role based S3 access |
 
 #### [auth]
 
@@ -113,6 +140,7 @@ Any config key can be overridden via environment variables using the `EXTENDDB__
 ```bash
 EXTENDDB__SERVER__PORT=9000
 EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING="postgresql://..."
+EXTENDDB__STORAGE__TIDB__CONNECTION_STRING="mysql://..."
 EXTENDDB__AUTH__PROVIDER=builtin
 ```
 
@@ -462,7 +490,7 @@ Another process is using the port. Find it with `ss -tlnp | grep :8000` and stop
 Error: error communicating with database
 ```
 
-Check that PostgreSQL is running and the connection string in `extenddb.toml` is correct.
+Check that the configured storage backend is running and the connection string in `extenddb.toml` is correct.
 
 **Catalog version mismatch:**
 
@@ -490,7 +518,7 @@ The IAM policy does not allow the operation. Check attached policies with `list-
 
 **Slow queries:**
 
-Check PostgreSQL query performance with `EXPLAIN ANALYZE`. Ensure indexes exist on key columns.
+Check the configured storage backend's query plan tools (`EXPLAIN ANALYZE` for PostgreSQL or TiDB). Ensure indexes exist on key columns.
 
 **High connection count:**
 
@@ -498,7 +526,9 @@ Increase `pool_size` in `extenddb.toml` or check for connection leaks.
 
 ### Data Recovery
 
-extenddb stores all data in PostgreSQL. Use standard PostgreSQL backup and recovery tools:
+Use the configured storage backend's native backup and recovery path.
+
+For PostgreSQL, use standard PostgreSQL tools:
 
 ```bash
 # Backup
@@ -509,6 +539,8 @@ pg_dump extenddb_catalog_data > data_backup.sql
 psql -f catalog_backup.sql extenddb_catalog
 psql -f data_backup.sql extenddb_catalog_data
 ```
+
+For TiDB, configure `[storage.tidb.backup]` and use DynamoDB-compatible backup APIs backed by native TiDB BR, or operate BR directly at the cluster level for full-cluster recovery.
 
 ---
 

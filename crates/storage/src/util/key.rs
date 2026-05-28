@@ -23,8 +23,7 @@ pub enum SortKeyValue {
 /// For single-attribute keys, returns the value directly (no encoding).
 /// For multi-attribute keys, uses netstring encoding: each part is encoded as
 /// `<decimal-length>:<value>,` and concatenated. This is provably collision-free
-/// regardless of value content, and compatible with PostgreSQL TEXT columns
-/// (no null bytes).
+/// regardless of value content, and compatible with SQL text columns.
 pub fn composite_pk_to_text(
     item: &Item,
     key_schema: &[KeySchemaElement],

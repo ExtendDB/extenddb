@@ -3,20 +3,20 @@
 **Version:** 3.0
 **Date:** 2026-05-19
 **Status:** Active
-**Crates:** `storage` (traits), `storage-postgres` (PostgreSQL backend)
+**Crates:** `storage` (traits), `storage-postgres` (PostgreSQL backend), `storage-tidb` (TiDB backend)
 
 ## 1. Purpose
 
 The storage layer provides a trait-based abstraction for all persistent data operations. Traits are defined in the
 `storage` crate with no database-specific dependencies. Backend implementations live in separate crates (e.g.,
-`storage-postgres`) and register themselves via a factory pattern using the `inventory` crate.
+`storage-postgres`, `storage-tidb`) and register themselves via a factory pattern using the `inventory` crate.
 
 The trait-based design allows new storage backends to be added by implementing the storage traits and registering a
 factory function, with no changes needed to the `engine` or `server` crates. The factory pattern enables runtime
 backend selection based on configuration.
 
-**Current status**: PostgreSQL is the only supported backend. The trait architecture and plugin infrastructure provide
-the foundation for future backend implementations.
+**Current status**: PostgreSQL is the default backend. TiDB is available as an optional in-tree backend selected with
+`storage.backend = "tidb"` when compiled with the `tidb` feature.
 
 ## 2. Storage Trait Hierarchy
 
@@ -77,6 +77,9 @@ Backends implement the individual traits, then implement the composite traits wi
 ```rust
 impl StorageEngine for PostgresEngine {}
 impl CatalogStore for PostgresEngine {}
+
+impl StorageEngine for TidbEngine {}
+impl CatalogStore for TidbEngine {}
 ```
 
 The `engine` crate receives `Arc<dyn StorageEngine>` for data operations. The `server` crate receives
@@ -139,11 +142,16 @@ written atomically with data writes when `stream` is `Some`.
 
 **WorkerStore** (background worker operations):
 - `process_control_plane_transitions` — handles table state transitions
-  (CREATING → ACTIVE, DELETING → deleted)
+  (CREATING → ACTIVE, UPDATING → ACTIVE, DELETING → deleted)
 
 **BackupEngine** (backup and restore):
 - `create_backup`, `describe_backup`, `list_backups`, `delete_backup`
 - `restore_table_from_backup`
+
+Backend implementations own the physical backup data plane. PostgreSQL keeps
+its existing implementation. TiDB uses native BR for snapshot data and keeps
+only ExtendDB metadata in the catalog; unsupported BR restore shapes are
+reported explicitly rather than emulated by item replay.
 
 ```rust
 pub trait WorkerStore: Send + Sync {
@@ -154,8 +162,8 @@ pub trait WorkerStore: Send + Sync {
 ```
 
 The `WorkerStore` trait provides operations needed by background workers. The `process_control_plane_transitions`
-method handles table state transitions (CREATING → ACTIVE, DELETING → deleted) and is called by the control plane
-poller worker.
+method handles table state transitions (CREATING → ACTIVE, UPDATING → ACTIVE, DELETING → deleted) and is called by the
+control plane poller worker.
 
 ## 3. Management and Operational Traits
 
@@ -392,16 +400,19 @@ The PostgreSQL backend uses two categories of tables:
   attributes, matching the DynamoDB model where key attributes are part of the
   item.
 
-- **GSI tables**: GSI tables include base table primary key columns (`base_pk`,
-  `base_sk_*`) as actual SQL columns (not just inside `item_data` JSONB). This
-  is required because: (1) GSI keys are not unique — two base table items can
-  project to the same GSI key, so the base table PK is needed for uniqueness;
-  (2) pagination requires a tiebreaker when GSI keys collide; (3) the base
-  table PK is needed to look up the full item for projections.
+- **Secondary indexes**: Backend implementations use the database-native shape
+  that preserves DynamoDB key ordering and pagination. PostgreSQL stores GSI
+  companion tables with base table primary key columns (`base_pk`, `base_sk_*`)
+  as actual SQL columns. TiDB stores each item once in the base table, exposes
+  index keys as generated columns over `item_data`, and creates native TiDB
+  secondary indexes over those generated columns plus the base key tie-breaker.
+  TiDB has no separate local-index physical path; GSI versus LSI remains
+  DynamoDB API metadata.
 
-- **GSI consistency**: GSI updates are asynchronous by default (10ms delay) to
-  match DynamoDB behavior. LSI updates are always synchronous. See §6 for
-  details on the propagation delay model.
+- **GSI consistency**: GSI write consistency is backend-specific. TiDB relies
+  on native secondary indexes, which are maintained by TiDB from the base row.
+  PostgreSQL can simulate asynchronous GSI propagation for compatibility
+  testing. LSI updates are always synchronous. See §6 for details.
 
 ### 5.2 Connection Pooling
 
@@ -562,30 +573,29 @@ migrations/
 
 ## 6. GSI Consistency Model
 
-**Decision:** GSI updates are **asynchronous by default** with a configurable
-propagation delay. LSI updates are always synchronous.
+**Decision:** GSI consistency is backend-specific. TiDB uses native secondary
+indexes maintained from the base table write. PostgreSQL can simulate
+DynamoDB-style asynchronous GSI propagation with a configurable delay. LSI
+updates are always synchronous.
 
 **Implementation:**
-- Each GSI has an optional `propagation_delay_ms` column in the `indexes` table
-- If `propagation_delay_ms` is `NULL` or negative, the system default is used
-  (default: 10ms, configurable via `gsi_propagation_delay_ms` setting)
-- If `propagation_delay_ms` is `0`, the GSI is updated synchronously in the
-  same transaction as the base table write
-- If `propagation_delay_ms` is positive, the GSI update is enqueued and applied
-  after a random delay within `[0, propagation_delay_ms]`
+- TiDB stores each item once and uses generated columns plus native secondary
+  indexes, leveraging TiDB's globally consistent transaction model.
+- PostgreSQL supports `gsi_propagation_delay_ms` for asynchronous compatibility
+  testing.
 - LSIs are always synchronous (delay is ignored) to match DynamoDB behavior
 
 **Rationale:**
-- **Matches DynamoDB semantics**: Real DynamoDB GSIs are eventually consistent
-  with propagation delays typically in the range of milliseconds to seconds
+- **Leverages backend strengths**: TiDB can keep secondary indexes transactionally
+  consistent without a worker queue.
+- **Matches DynamoDB semantics where useful**: PostgreSQL can still simulate
+  eventually consistent GSI propagation for compatibility testing.
 - **Surfaces real bugs**: Applications that incorrectly assume immediate GSI
-  consistency will fail in ExtendDB just as they would in production DynamoDB
-- **Configurable**: Can be set to 0ms for synchronous behavior when needed for
-  testing or specific use cases
+  consistency can be tested against the PostgreSQL async path.
 
 **Trade-off:** Asynchronous GSI updates add complexity (queue, workers, delay
-tracking) but provide higher fidelity to DynamoDB behavior. The synchronous
-mode (delay=0) is available for applications that need it.
+tracking) but provide higher fidelity to DynamoDB behavior. TiDB chooses the
+simpler transactional path as the default and only path.
 
 ### 6.1 Table Status Enforcement
 
@@ -593,12 +603,13 @@ All data plane operations (PutItem, GetItem, Query, etc.) must check `table_stat
 not `ACTIVE`, return `StorageError::TableNotActive` (mapped to `ResourceInUseException`). Control plane operations that
 modify the table (`UpdateTable`, `DeleteTable`) must:
 
-1. Atomically set `table_status` to `UPDATING` or `DELETING` (using `UPDATE ... WHERE table_status = 'ACTIVE'` — if
- zero rows affected, the table is already being modified, return `ResourceInUseException`)
-2. Perform the operation
-3. Set `table_status` back to `ACTIVE` (or remove the row for `DeleteTable`)
+1. Atomically move the catalog row out of `ACTIVE` (`UPDATING` or `DELETING`) before publishing any data-side work
+2. Persist the pending work in catalog metadata (`indexes.index_status`, stream specification, or table deletion state)
+3. Let the backend control-plane reconciler create, backfill, drop, or repair data artifacts, then set the table back to
+   `ACTIVE` or remove the row
 
-This prevents concurrent DDL operations on the same table.
+This prevents concurrent DDL operations on the same table and makes crash recovery a normal retry path rather than a
+cleanup special case.
 
 ### 6.1.1 Async Control Plane Transitions (Phase 1c)
 
@@ -614,8 +625,10 @@ When `NULL`, no transition is pending.
 (no extra round-trip).
 - `DeleteTable` sets `table_status = 'DELETING'` with a scheduled transition time. The row, its indexes, and tags are
 removed when the transition fires.
-- A background poller processes pending transitions. `CREATING → ACTIVE` is a single UPDATE; `DELETING → removed`
-uses `DELETE ... FOR UPDATE SKIP LOCKED ... RETURNING` for concurrent safety.
+- A background poller processes pending transitions. `CREATING → ACTIVE`
+  creates any missing data artifacts before activation. `UPDATING → ACTIVE`
+  reconciles pending GSI and stream work. `DELETING → removed` drops data
+  artifacts before deleting catalog metadata.
 - On startup, `process_control_plane_transitions()` recovers any in-flight
   operations from a previous server instance.
 - A partial index (`idx_tables_pending_transition ON tables
@@ -625,8 +638,7 @@ uses `DELETE ... FOR UPDATE SKIP LOCKED ... RETURNING` for concurrent safety.
 **Design decisions and future direction (from Phase 1c human review):**
 
 - The single-column approach works because each table has exactly one pending status transition at a time. Index-level
-transitions (e.g., GSI backfill) will need a separate `status_transition_at`
-on the `indexes` table when GSI operations are implemented.
+transitions are represented by `indexes.index_status` while the parent table is `UPDATING`.
 - The poller interval will be increased to 10 seconds at idle, with control
   plane operations poking the poller to wake up immediately and backoff
   appropriately (Phase 2).
@@ -647,9 +659,10 @@ for rows where `status_transition_at IS NOT NULL AND
 status_transition_at <= NOW()` and completes them immediately. Rows where
 `status_transition_at` is in the future are left for the background poller.
 
-This column-on-tables approach is sufficient while control plane operations map 1:1 to table status changes
-(`CREATING → ACTIVE`, `DELETING → removed`). A separate `control_plane_operations` table becomes necessary when:
-- Operations span multiple catalog entities (e.g., GSI backfill touches both `indexes` and data tables)
+This column-on-tables approach is sufficient while control plane operations are scoped to one table
+(`CREATING → ACTIVE`, `UPDATING → ACTIVE`, `DELETING → removed`). A separate `control_plane_operations` table becomes
+necessary when:
+- Operations span multiple tables or accounts
 - Operations have intermediate states beyond a single status flip (e.g., multi-step UpdateTable)
 - Audit or observability requires a history of completed operations, not just pending ones
 
@@ -660,13 +673,14 @@ full crash recovery.
 
 When `UpdateTable` adds a new GSI to a table with existing data:
 
-1. Set the new index status to `CREATING` in `indexes`
-2. Spawn a background task that scans the base table in batches (configurable batch size, default 1000)
-3. For each batch, INSERT the projected attributes into the new GSI table
-4. On completion, set index status to `ACTIVE`
-5. During backfill, writes to the base table also write to the new GSI table (the write path checks index status and
-includes `CREATING` indexes)
-6. Queries against a `CREATING` index return `ResourceNotFoundException` (matching DynamoDB behavior)
+1. Set the parent table to `UPDATING` and insert the new index with `index_status = 'CREATING'`
+2. Commit the catalog transaction so the pending operation is durable
+3. The control-plane reconciler performs the backend-native physical work
+4. TiDB adds generated columns and a native secondary index; TiDB's online DDL backfills and maintains the index from the
+   base table, so ExtendDB does not run a separate item-replay backfill
+5. PostgreSQL creates and backfills its companion index table
+6. On completion, the reconciler marks the index `ACTIVE` and returns the table to `ACTIVE`
+7. Queries against a `CREATING` index return `ResourceNotFoundException` (matching DynamoDB behavior)
 
 ## 7. Pagination Token Encoding
 
@@ -704,8 +718,9 @@ WHERE (pk = $gsi_pk AND sk_s > $gsi_sk)
 ```
 
 For GSI queries, the pagination key includes both the GSI key attributes and the base table primary key (needed to
-uniquely identify the position, since GSI keys are not unique). This is why the GSI PostgreSQL table includes `base_pk`
-and `base_sk_*` as actual columns.
+uniquely identify the position, since GSI keys are not unique). Backends must preserve this tie-breaker. PostgreSQL
+stores `base_pk` and `base_sk_*` as actual columns in companion GSI tables; TiDB includes the generated base-key columns
+in its native secondary indexes.
 
 ## 8. Parallel Scan Segment Assignment
 
@@ -754,7 +769,7 @@ CREATE INDEX ON _dynamodb_idempotency_tokens(created_at);
 1. Before executing a transaction, check if the token exists
 2. If found: return the stored response (idempotent replay)
 3. If not found: execute the transaction, store the token + response
-   atomically in the same PostgreSQL transaction
+   atomically in the same backend transaction
 4. Background cleanup: delete tokens older than 10 minutes (matching
    DynamoDB's idempotency window)
 
@@ -955,9 +970,13 @@ pub struct WorkerContext {
 
 **Backend-specific workers** (spawned via `RuntimeHooks`, access backend
 internals):
-- PostgreSQL spawns 7 workers (control plane poller, pool metrics, GSI delay
-  poller, TTL cleanup, stream cleanup, idempotency token cleanup, table size
-  refresh)
+- PostgreSQL spawns its control-plane poller, pool metrics, GSI delay poller,
+  TTL cleanup, stream cleanup, idempotency token cleanup, and table size refresh
+  workers
+- TiDB spawns its control-plane poller, table size refresh, stream-emitting
+  item TTL cleanup, and pool metrics workers; TiDB native TTL handles
+  non-streaming item TTL plus stream-record, idempotency-token, metrics,
+  login-attempt, and assume-role session retention
 - Other backends may spawn different workers or none at all
 
 Example PostgreSQL implementation:

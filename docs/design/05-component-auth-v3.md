@@ -12,7 +12,7 @@ The `auth` crate provides pluggable authentication and authorization for extendd
 
 The crate depends on `extenddb-core` (for types and errors) and `async_trait` (for object-safe async trait dispatch). It has no HTTP framework or storage dependencies.
 
-> **No caching.** All credential lookups, policy fetches, and identity resolution read directly from Postgres on every request. The latency is sub-millisecond for indexed lookups, and this approach eliminates stale-cache bugs and cache invalidation complexity entirely. Multiple extenddb instances sharing the same catalog see consistent data without coordination. If profiling under production load shows database round-trips are a bottleneck, caching can be added as a transparent layer without changing any interfaces.
+> **No caching.** All credential lookups, policy fetches, and identity resolution read directly from the catalog store on every request. The latency is sub-millisecond for indexed lookups, and this approach eliminates stale-cache bugs and cache invalidation complexity entirely. Multiple extenddb instances sharing the same catalog see consistent data without coordination. If profiling under production load shows database round-trips are a bottleneck, caching can be added as a transparent layer without changing any interfaces.
 
 ## 2. Key Design Decisions (from 2026-04-15 review session)
 
@@ -297,7 +297,7 @@ CREATE TABLE tables (
 
 ### 6.2 Data Table Naming
 
-Per-table Postgres tables change from `_ddb_{table_name}` to `_ddb_{account_id}_{table_name}` to avoid collisions between accounts.
+Per-table backend data tables change from `_ddb_{table_name}` to `_ddb_{account_id}_{table_name}` to avoid collisions between accounts.
 
 ### 6.3 Indexes, Streams, Tags
 
@@ -399,7 +399,7 @@ Flow:
 
 ## 10. Encryption Key Management
 
-Secret keys are encrypted at rest with AES-256-GCM. The encryption key is generated at `extenddb init` time and stored in the `settings` table. The threat model is: the Postgres database is the trust boundary. If an attacker can read the settings table, they already have access to all data.
+Secret keys are encrypted at rest with AES-256-GCM. The encryption key is generated at `extenddb init` time and stored in the `settings` table. The threat model is: the catalog database is the trust boundary. If an attacker can read the settings table, they already have access to all data.
 
 ```sql
 INSERT INTO settings (key, value) VALUES ('encryption_key', '<base64-encoded-32-byte-key>');

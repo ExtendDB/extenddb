@@ -8,7 +8,7 @@
 
 ## 1. Problem Statement
 
-extenddb currently operates as a single-process server backed by a single PostgreSQL instance. The steering documents note a `TODO(architecture)` about enforcing single-frontend-per-catalog vs. designing for multi-instance topology. This design addresses that open question and defines how extenddb scales from a single Raspberry Pi to a petabyte-scale cloud deployment with multiple replicas.
+extenddb currently operates as a single-process server backed by one configured storage backend. The steering documents note a `TODO(architecture)` about enforcing single-frontend-per-catalog vs. designing for multi-instance topology. This design addresses that open question and defines how extenddb scales from a single Raspberry Pi to a petabyte-scale cloud deployment with multiple replicas.
 
 ### Goals
 
@@ -97,7 +97,7 @@ This is the minimal mechanism needed to honor DynamoDB's consistency model. It w
 ### Model 1: Single Frontend, Single Catalog (Current)
 
 ```
-[Frontend] → [PostgreSQL]
+[Frontend] → [Storage Backend]
 ```
 
 - No HA. Single point of failure.
@@ -107,7 +107,7 @@ This is the minimal mechanism needed to honor DynamoDB's consistency model. It w
 
 ```
 [Frontend A] ─┐
-              ├→ [PostgreSQL Primary]
+              ├→ [Storage Backend]
 [Frontend B] ─┘
 ```
 
@@ -119,9 +119,9 @@ This is the minimal mechanism needed to honor DynamoDB's consistency model. It w
 ### Model 3: Multiple Frontends, Replicated Catalog
 
 ```
-[Frontend A] ─┐     ┌→ [PostgreSQL Primary] (writes + strong reads)
+[Frontend A] ─┐     ┌→ [Storage Primary] (writes + strong reads)
               ├─────┤
-[Frontend B] ─┘     └→ [PostgreSQL Replica] (eventually consistent reads)
+[Frontend B] ─┘     └→ [Storage Replica] (eventually consistent reads)
 ```
 
 - Full HA for both frontend and catalog.
@@ -131,14 +131,14 @@ This is the minimal mechanism needed to honor DynamoDB's consistency model. It w
 ### Model 4: Multiple Frontends, Natively-Clustered Catalog
 
 ```
-[Frontend A] ─┐     ┌→ [Cassandra Node 1]
-              ├─────┼→ [Cassandra Node 2]
-[Frontend B] ─┘     └→ [Cassandra Node 3]
+[Frontend A] ─┐     ┌→ [TiDB SQL Node]
+              ├─────┼→ [TiDB SQL Node]
+[Frontend B] ─┘     └→ [TiKV / PD Cluster]
 ```
 
-- Storage layer maps DynamoDB consistency to native consistency levels.
-  - `ConsistentRead = true` → `QUORUM` or `LOCAL_QUORUM`
-  - `ConsistentRead = false` → `ONE` or `LOCAL_ONE`
+- Storage layer maps DynamoDB consistency to backend-native semantics.
+  - `ConsistentRead = true` → route through the backend's strongly consistent read path
+  - `ConsistentRead = false` → route through any backend-supported eventually consistent path, or the same strong path if the backend is globally consistent
 - No separate primary/replica distinction — the storage adapter handles it.
 - Suitable for: large-scale deployments, multi-datacenter.
 
@@ -204,13 +204,13 @@ Each frontend maintains health checks against its catalog connections. If a repl
 
 ### D7: Connection Pool Sizing
 
-With N frontends each maintaining pools to 1 primary + M replicas, total connection count is N × (primary_pool_size + M × replica_pool_size). PostgreSQL's `max_connections` limit (default 100) can be exhausted quickly. Guidance:
+With N frontends each maintaining pools to 1 primary + M replicas, total connection count is N × (primary_pool_size + M × replica_pool_size). Backend connection limits can be exhausted quickly. Guidance:
 
 - **Small deployments (1-3 frontends):** Direct connections with pool size 5-10 per target. Total: 15-60 connections.
-- **Medium deployments (4-10 frontends):** Use PgBouncer or equivalent connection pooler between frontends and catalog. Pool size per frontend: 3-5 per target.
-- **Large deployments (10+ frontends):** PgBouncer required. Consider transaction-mode pooling. Document `max_connections` tuning.
+- **Medium deployments (4-10 frontends):** Use the backend's recommended connection pooler between frontends and catalog. Pool size per frontend: 3-5 per target.
+- **Large deployments (10+ frontends):** External connection pooling is required for backends with strict connection limits. Document backend-specific connection tuning.
 
-The `extenddb.toml` configuration accepts `pool_size` per connection target. The design does not mandate PgBouncer but documents it as a best practice for deployments with more than 3 frontends.
+The `extenddb.toml` configuration accepts `pool_size` per connection target. The design does not mandate a specific connection pooler; operators should follow backend-specific best practices for deployments with more than 3 frontends.
 
 ## 7. Alternatives Considered
 
@@ -241,7 +241,7 @@ The `extenddb.toml` configuration accepts `pool_size` per connection target. The
 **Rejected because:**
 - Violates the No Caching Rule.
 - Cache invalidation across frontends is the exact problem the No Caching Rule was designed to avoid.
-- PostgreSQL's buffer pool already provides memory-resident access to hot data.
+- Backend buffer pools already provide memory-resident access to hot data.
 
 ### A4: Single-Writer with Read Replicas at Frontend Level
 
@@ -314,7 +314,7 @@ impl ConsistencyLevel {
 
 **TransactGetItems:** DynamoDB requires `ConsistentRead = true` for all items in a `TransactGetItems` request. The operation is always strongly consistent. The storage adapter unconditionally routes `TransactGetItems` to the primary connection. This is not configurable — it is a DynamoDB API constraint.
 
-**Breaking change note:** This is a breaking change to the internal `DataEngine` trait. Since the trait is internal and there are no third-party implementations (only `storage-postgres`), no migration path is needed. The change is mechanical: add the parameter to the trait, the implementation, and all call sites in the engine.
+**Breaking change note:** This is a breaking change to the internal `DataEngine` trait. Since the trait is internal and current implementations live in-tree (`storage-postgres`, `storage-tidb`), no external migration path is needed. The change is mechanical: add the parameter to the trait, the implementations, and all call sites in the engine.
 
 **Alternatives considered and rejected:**
 
@@ -333,19 +333,19 @@ Any SQL statement that acquires locks (`SELECT ... FOR UPDATE`) routes to primar
 
 **Requirement:** In the near future, extenddb will support strongly consistent GSIs. A strongly consistent GSI has zero propagation delay — the write to the index commits atomically with the base table write. A strongly consistent read on such a GSI returns data current with the base table.
 
-**Current state:** The storage layer already supports synchronous GSI updates within the write transaction when `propagation_delay_ms = Some(0)` (or when the system default is 0). The `put_item`, `delete_item`, `update_item`, and `transact_write_items` paths all call `insert_index_row_multi`/`delete_index_row_multi` inside the same database transaction for indexes with zero delay. This is the foundation for strongly consistent GSIs.
+**Current state:** The storage layer supports backend-specific synchronous GSI maintenance. PostgreSQL can keep companion GSI tables in the write transaction when `propagation_delay_ms = Some(0)` (or when the system default is 0). TiDB stores each item once and relies on native secondary indexes generated from the base table row.
 
 **Interaction with HA consistency routing:**
 
-1. **Writes:** A write to a table with a strongly consistent GSI already commits both the base row and all GSI rows in a single PostgreSQL transaction on the primary. No change needed — writes always route to primary.
+1. **Writes:** A write to a table with a strongly consistent GSI commits the base row and secondary-index state atomically on the primary. PostgreSQL does this with companion-table writes; TiDB does it through native secondary indexes. No change needed — writes always route to primary.
 
 2. **Strongly consistent GSI reads (`ConsistentRead = true` on a GSI query/scan):** Today, DynamoDB rejects `ConsistentRead = true` on GSI queries with `ValidationException`: "Consistent reads are not supported on global secondary indexes." extenddb faithfully reproduces this rejection (tenet 1). When strongly consistent GSIs are introduced as a extenddb extension, `ConsistentRead = true` on a strongly consistent GSI query routes to the primary — same as any strongly consistent read. The routing logic in §8.2 handles this without modification.
 
 3. **Eventually consistent GSI reads (`ConsistentRead = false` on a GSI query/scan):** Routes to a replica. The replica may have replication lag, so the GSI data on the replica may be slightly behind the primary. This is acceptable — it matches the semantics of eventually consistent reads (the caller explicitly opted into potentially stale data). The GSI data on the replica is guaranteed to be consistent *with itself* (the base row and GSI row committed atomically on the primary, so they replicate together).
 
-4. **Replica consistency guarantee:** Because the base table write and the GSI write commit in the same PostgreSQL transaction, they appear on replicas atomically. A replica never shows a GSI row without the corresponding base row, or vice versa. This is a critical property: PostgreSQL streaming replication replays WAL records in commit order, so a single transaction's effects are visible atomically on replicas.
+4. **Replica consistency guarantee:** Because the base table write and secondary-index maintenance commit atomically, they appear on replicas atomically. PostgreSQL streaming replication replays WAL records in commit order, so a single transaction's effects are visible atomically on replicas. TiDB secondary indexes are part of the table's native replicated state.
 
-   **Important qualification:** This atomicity guarantee requires **physical streaming replication** (the default for PostgreSQL HA, and what Aurora PostgreSQL uses internally). Logical replication configurations must ensure that base table and GSI tables are replicated through the same subscription with `streaming = on` (not `parallel`). If the subscription uses `streaming = parallel`, transactions may be applied out of order. If the user has multiple subscriptions covering different tables, atomicity across subscriptions is not guaranteed. The design does not support split-subscription logical replication for tables with strongly consistent GSIs.
+   **Important qualification:** For PostgreSQL companion tables, this atomicity guarantee requires **physical streaming replication** (the default for PostgreSQL HA, and what Aurora PostgreSQL uses internally). Logical replication configurations must ensure that base table and GSI tables are replicated through the same subscription with `streaming = on` (not `parallel`). If the subscription uses `streaming = parallel`, transactions may be applied out of order. If the user has multiple subscriptions covering different tables, atomicity across subscriptions is not guaranteed. The design does not support split-subscription logical replication for tables with strongly consistent GSIs.
 
 **Design implications:**
 
@@ -426,7 +426,7 @@ This avoids adding yet another trait that every storage backend must implement. 
 
 **Scope:**
 - Verify all operations are safe under concurrent multi-frontend access (the No Caching Rule already ensures this, but explicit verification is needed for: control-plane transitions, TTL worker, GSI backfill worker, stream shard assignment).
-- Add distributed locking for background workers (only one frontend runs TTL cleanup, GSI backfill, etc. at a time) using PostgreSQL advisory locks.
+- Add distributed locking for background workers (only one frontend runs TTL cleanup, GSI backfill, etc. at a time) using backend-native advisory/session locks or an equivalent lease.
 - Document load balancer configuration (sticky sessions not required since frontends are stateless).
 - Add instance-id to metrics and logs for multi-frontend debugging.
 
@@ -445,7 +445,7 @@ With multiple frontends, these workers must not run concurrently on multiple ins
 
 ### Solution: Distributed Worker Locks (Global Granularity)
 
-Use PostgreSQL advisory locks (or equivalent per-backend) to ensure only one frontend runs each worker type at a time. **Lock granularity is global (one lock per worker type), not per-table.**
+Use backend-native advisory/session locks or an equivalent lease to ensure only one frontend runs each worker type at a time. **Lock granularity is global (one lock per worker type), not per-table.**
 
 **Rationale for global locks:**
 - The current TTL worker iterates all tables with TTL enabled. Per-table locking would require restructuring the worker loop.
@@ -491,13 +491,13 @@ impl WorkerType {
 }
 ```
 
-The `WorkerLock` trait follows the same pattern as `DataEngine` and `MetadataEngine` — defined in the `extenddb-storage` crate, implemented by `PostgresEngine`. Since the current architecture uses concrete types (not enum dispatch), `WorkerLock` is simply another trait that `PostgresEngine` implements.
+The `WorkerLock` trait follows the same pattern as `DataEngine` and `MetadataEngine` — defined in the `extenddb-storage` crate and implemented by each backend engine. Since the current architecture uses concrete backend types behind trait objects, `WorkerLock` is simply another trait that backend engines implement.
 
 Each frontend attempts to acquire the lock on its worker tick interval. If it gets the lock, it runs the worker. If not, it skips.
 
-**Lock lifecycle for PostgreSQL:** `pg_try_advisory_lock(worker_type_id)` with session-level locks. These locks are automatically released when the database connection drops (e.g., frontend crash). This means:
-- No explicit TTL/lease mechanism is needed for PostgreSQL.
-- A crashed frontend's locks are released when PostgreSQL cleans up the dead connection.
+**Lock lifecycle:** Prefer backend-native session locks that are automatically released when the storage connection drops. PostgreSQL can use `pg_try_advisory_lock(worker_type_id)`. TiDB can use a backend-native/session-scoped equivalent or fall back to a catalog lease when a session lock does not satisfy the worker's failure semantics. This means:
+- No explicit TTL/lease mechanism is needed when the backend provides crash-released session locks.
+- A crashed frontend's locks are released when the backend cleans up the dead connection.
 - The instance registry heartbeat (§13) is for **observability only**, not for lock management.
 
 ## 11. Failure Modes and Recovery
@@ -506,7 +506,7 @@ Each frontend attempts to acquire the lock on its worker tick interval. If it ge
 |---------|--------|----------|
 | Frontend crash | Requests to that frontend fail. Load balancer routes to others. | Restart frontend. No data loss. |
 | Replica catalog unavailable | Eventually-consistent reads fall back to primary. | Repair/replace replica. |
-| Primary catalog unavailable | Writes and strongly-consistent reads fail with 500. Eventually-consistent reads continue from replicas. | Promote replica to primary (PostgreSQL failover). |
+| Primary catalog unavailable | Writes and strongly-consistent reads fail with 500. Eventually-consistent reads continue from replicas. | Promote replica to primary using the backend's failover process. |
 | Network partition (frontend ↔ catalog) | Affected frontend returns 500. Others continue. | Resolve network issue. |
 | Split brain (two primaries) | Prevented by catalog's own replication protocol. extenddb does not manage catalog failover. | N/A — delegated to catalog HA. |
 
@@ -525,6 +525,7 @@ Each frontend attempts to acquire the lock on its worker tick interval. If it ge
 | Backend | Write Leader | Strong Read Leader | Eventually Consistent Read |
 |---------|-------------|-------------------|---------------------------|
 | PostgreSQL (streaming replication) | Primary node | Primary node | Any replica |
+| TiDB | TiDB transaction coordinator / region leaders | TiDB cluster | TiDB cluster |
 | Cassandra | Coordinator (any node) | QUORUM nodes | ONE node |
 | MongoDB (replica set) | Primary member | Primary member | Secondary preferred (falls back to primary if no secondaries available) |
 | Single PostgreSQL (no replicas) | The single node | The single node | The single node (no distinction) |
@@ -544,17 +545,17 @@ Each frontend attempts to acquire the lock on its worker tick interval. If it ge
 
 - Mixed storage backends in one deployment ✗
 - Frontend configured with replicas but no primary ✗
-- Multiple primaries in PostgreSQL mode ✗ (use catalog's own failover)
+- Multiple independent write leaders for one catalog ✗ (use the storage backend's own failover/consensus)
 
 ### Startup Validation
 
 On startup, each frontend:
 1. Connects to the primary catalog and verifies schema version.
-2. Connects to each configured replica and verifies it's replicating from the same primary (for PostgreSQL: check `pg_stat_wal_receiver`).
+2. Connects to each configured replica, if configured, and verifies it belongs to the same backend topology.
 3. Registers itself in a `extenddb_instances` table (instance_id, hostname, started_at, last_heartbeat).
 4. Begins heartbeat updates (every 30s).
 
-**Instance registry purpose:** The `extenddb_instances` table is for **observability and operational tooling only**. It answers "which frontends are running?" for operators. It is NOT used for lock management or coordination — PostgreSQL advisory locks (session-scoped, released on disconnect) handle that independently. Dead entries (heartbeat older than 5 minutes, configurable via `extenddb settings set instance_heartbeat_timeout_seconds`) are cleaned up periodically but their presence has no correctness impact.
+**Instance registry purpose:** The `extenddb_instances` table is for **observability and operational tooling only**. It answers "which frontends are running?" for operators. It is NOT used for lock management or coordination when the backend provides session-scoped locks; otherwise a dedicated backend lease table owns correctness. Dead entries (heartbeat older than 5 minutes, configurable via `extenddb settings set instance_heartbeat_timeout_seconds`) are cleaned up periodically but their presence has no correctness impact.
 
 ## 14. Observability
 
@@ -615,7 +616,7 @@ New metrics for HA monitoring:
 2. **Stage 2:** A deployment with 1 frontend + 1 primary + 1 replica correctly routes eventually-consistent reads to the replica and strongly-consistent reads to the primary. Verified by query logs. Strongly consistent GSI reads (`ConsistentRead = true` on a zero-delay GSI) route to primary. Eventually consistent GSI reads route to replica.
 3. **Stage 3:** Two frontends sharing a catalog can serve concurrent requests without data corruption. Background workers run on exactly one frontend at a time. Verified by concurrent load test.
 4. **Stages 4-5:** Storage backend passes the full test suite with the same pass rate as PostgreSQL.
-5. **GSI atomicity invariant:** On any replica, a base table row and its corresponding strongly consistent GSI rows are always visible atomically (never partially). Verified by a test that writes to a table with a strongly consistent GSI, then reads with `ConsistentRead = false` (which routes to a replica), confirming either both the base row and GSI row are visible or neither is. The test must use eventually consistent reads to target the replica — a strongly consistent read would route to primary and not test replica atomicity.
+5. **GSI atomicity invariant:** On any replica, a base table row and its corresponding strongly consistent secondary-index state are always visible atomically (never partially). Verified by a test that writes to a table with a strongly consistent GSI, then reads with `ConsistentRead = false` (which routes to a replica), confirming either both the base row and index entry/state are visible or neither is. The test must use eventually consistent reads to target the replica — a strongly consistent read would route to primary and not test replica atomicity.
 
 ## 17. Open Questions for Reviewer Deliberation
 
@@ -627,9 +628,9 @@ New metrics for HA monitoring:
 
 4. **Instance registry cleanup:** How long before a stale heartbeat entry is considered dead? **Proposed answer:** 5 minutes, configurable via settings. Dead entries are informational only (advisory locks handle real coordination).
 
-5. **Strongly consistent GSIs on non-PostgreSQL backends:** PostgreSQL guarantees that a single transaction's effects replicate atomically (WAL replay). Cassandra and MongoDB have different transaction semantics. For Cassandra, a logged batch provides atomicity across multiple partition keys (this is the purpose of logged batches), but with significant performance overhead due to batch log coordination on the coordinator and replica nodes. Lightweight transactions (LWT) are not applicable here — they provide compare-and-set semantics for conditional writes, not multi-row atomicity. For MongoDB, multi-document transactions provide the needed atomicity. **Proposed answer:** Each storage backend must guarantee that a base table write and its corresponding strongly consistent GSI writes are atomic. PostgreSQL: single transaction. Cassandra: logged batch (works across partitions, but with performance overhead). MongoDB: multi-document transaction. If a backend cannot provide this guarantee, strongly consistent GSIs are not supported on that backend — this must be surfaced at `CreateTable` time (reject the request), not discovered at write time.
+5. **Strongly consistent GSIs on non-PostgreSQL backends:** PostgreSQL guarantees that a single transaction's effects replicate atomically (WAL replay). TiDB's native secondary indexes are part of the base table's transactional state. Other databases may have different transaction semantics. **Proposed answer:** Each storage backend must guarantee that a base table write and its corresponding strongly consistent secondary-index state are atomic. PostgreSQL: single transaction. TiDB: native secondary indexes in the same transaction. If a backend cannot provide this guarantee, strongly consistent GSIs are not supported on that backend — this must be surfaced at `CreateTable` time (reject the request), not discovered at write time.
 
-6. **GSI write amplification under HA:** A table with N strongly consistent GSIs requires N+1 writes (base + N index rows) in a single transaction. With multiple frontends, the primary handles all these writes. Should the design address write amplification concerns? **Proposed answer:** This is an operational consideration, not a design change. Document that strongly consistent GSIs increase write load on the primary proportionally to the number of indexes. Connection pool sizing (D7) should account for this. Additionally, if a single base table item produces multiple GSI rows per index (e.g., a GSI keyed on elements of a list attribute), the transaction size grows further. PostgreSQL handles this well for typical workloads (1-5 GSIs, 1:1 base-to-GSI row mapping), but operators should be aware that large N (many GSIs) or large fan-out (many GSI rows per item) increases transaction duration and row-level lock contention under concurrent writes.
+6. **GSI write amplification under HA:** A table with N strongly consistent GSIs increases write work on the primary. PostgreSQL writes companion index rows in the same transaction. TiDB maintains native secondary indexes from the base row, so amplification is handled by TiDB's index maintenance path rather than ExtendDB item replay. **Proposed answer:** This is an operational consideration, not a design change. Document that strongly consistent GSIs increase primary write load proportionally to the number of indexes, with the exact physical cost owned by the backend.
 
 ### Resolved Questions
 

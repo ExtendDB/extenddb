@@ -327,7 +327,7 @@ pub fn dispatch(
             if !yes {
                 anyhow::bail!(
                     "--yes is required for import-access-key. This command stores a real AWS \
-                     secret access key in the local PostgreSQL database."
+                     secret access key in the configured storage backend."
                 );
             }
             c.req("POST", &format!("/management/accounts/{account_id}/users/{user_name}/access-keys/import"),

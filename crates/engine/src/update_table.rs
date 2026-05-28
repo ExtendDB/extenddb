@@ -90,6 +90,12 @@ pub async fn handle_update_table(
 
     // Validate GSI updates: each entry must have exactly one of Create, Update, or Delete.
     if let Some(updates) = &input.global_secondary_index_updates {
+        if updates.len() > 1 {
+            return Err(DynamoDbError::ValidationException(
+                "One or more parameter values were invalid: Only one GlobalSecondaryIndexUpdate can be specified per UpdateTable operation".to_owned(),
+            ));
+        }
+
         for update in updates {
             if update.create.is_some() && update.delete.is_some() {
                 return Err(DynamoDbError::ValidationException(

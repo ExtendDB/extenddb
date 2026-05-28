@@ -852,6 +852,7 @@ dependencies = [
  "extenddb-server",
  "extenddb-storage",
  "extenddb-storage-postgres",
+ "extenddb-storage-tidb",
  "libc",
  "rand 0.9.4",
  "rcgen",
@@ -990,6 +991,35 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "extenddb-storage-tidb"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "bcrypt",
+ "crc32fast",
+ "extenddb-auth",
+ "extenddb-core",
+ "extenddb-storage",
+ "futures",
+ "inventory",
+ "percent-encoding",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "time",
+ "tokio",
+ "toml",
+ "tracing",
+ "url",
  "uuid",
  "zeroize",
 ]

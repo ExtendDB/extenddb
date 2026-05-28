@@ -10,3 +10,4 @@ pdfs/
 docs/rendered/
 discussions/
 .DS_Store
+.gstack/

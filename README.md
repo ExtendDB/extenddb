@@ -9,7 +9,7 @@ A DynamoDB-compatible API adapter, ExtendDB speaks the DynamoDB wire protocol �
 - **Local development** — run DynamoDB workloads on your laptop with zero cloud dependency
 - **CI/CD pipelines** — deterministic integration tests against a DynamoDB-compatible backend
 - **Self-hosted deployments** — run DynamoDB workloads on your own infrastructure (on-premises, private cloud, edge)
-- **Multi-cloud** — use DynamoDB semantics on any cloud that runs PostgreSQL
+- **Multi-cloud** — use DynamoDB semantics on any cloud that runs a supported storage backend
 - **Air-gapped environments** — DynamoDB functionality with no internet connectivity
 
 ## Features
@@ -21,7 +21,7 @@ A DynamoDB-compatible API adapter, ExtendDB speaks the DynamoDB wire protocol �
 - CSRF protection, security headers, session management
 - Prometheus-compatible metrics endpoint
 - Daemon mode with syslog logging
-- PostgreSQL storage — use standard backup, replication, and HA tools
+- Pluggable storage backends — PostgreSQL by default, TiDB as an optional in-tree backend
 
 ## Quick Start
 
@@ -50,7 +50,7 @@ scripts/install-macos.sh   # macOS
 ## Prerequisites
 
 - Rust 1.85+ (`rustup update`)
-- PostgreSQL 14+ (see `docs/local-postgres-setup.md`)
+- A supported storage backend: PostgreSQL 14+ by default, or TiDB when building with the `tidb` feature
 - Python 3.10+ (for test suites and documentation)
 
 ### Python Environment
@@ -168,6 +168,7 @@ crates/
   engine/           — operation handlers
   storage/          — storage trait definitions
   storage-postgres/ — PostgreSQL backend
+  storage-tidb/     — TiDB backend
   auth/             — SigV4 verification, IAM policy engine
   server/           — HTTP server, management API, web console
   bin/              — CLI, config, daemon lifecycle

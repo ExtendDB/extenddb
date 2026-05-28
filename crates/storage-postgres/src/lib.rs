@@ -42,9 +42,9 @@ pub use credential_store::DbCredentialStore;
 inventory::submit! {
     extenddb_storage::bootstrapper::BackendRegistration {
         name: "postgres",
-        factory: |config_path, cli_args| {
+        factory: |config_path, options| {
             Box::pin(async move {
-                let store = PostgresBootstrapper::from_config(&config_path, &cli_args).await?;
+                let store = PostgresBootstrapper::from_config(&config_path, options).await?;
                 Ok(Box::new(store) as Box<dyn extenddb_storage::bootstrapper::Bootstrapper>)
             })
         }
@@ -68,6 +68,10 @@ inventory::submit! {
                 .map_err(|e: toml::de::Error| format!("Failed to parse postgres config: {}", e))?;
             Ok(Box::new(config) as Box<dyn extenddb_storage::config::StorageConfig>)
         },
+        default_config: || {
+            Box::new(PostgresStorageConfig::default()) as Box<dyn extenddb_storage::config::StorageConfig>
+        },
+        default_priority: Some(100),
     }
 }
 

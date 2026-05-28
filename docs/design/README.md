@@ -9,7 +9,7 @@ This directory contains the authoritative design documents for ExtendDB (extendd
 | 01 | [Requirements](01-requirements.md) | Wire protocol, operations, limits, data types, non-functional requirements |
 | 02 | [High-Level Design](02-high-level-design.md) | Architecture overview, crate structure, request lifecycle, key design decisions, technology choices |
 | 03 | [Core](03-component-core.md) | Types, expression engine, validation, capacity calculation, errors (`extenddb-core` crate) |
-| 04 | [Storage](04-component-storage.md) | StorageEngine traits, input/output types, PostgreSQL backend, schema design, pagination, GSI consistency (`extenddb-storage`, `extenddb-storage-postgres` crates) |
+| 04 | [Storage](04-component-storage.md) | StorageEngine traits, input/output types, PostgreSQL and TiDB backends, schema design, pagination, GSI consistency (`extenddb-storage`, `extenddb-storage-postgres`, `extenddb-storage-tidb` crates) |
 | 05 | [Auth](05-component-auth.md) | AuthProvider trait, SigV4 validation, IAM policy engine, credential encryption (`extenddb-auth` crate) |
 | 06 | [Server](06-component-server.md) | HTTP server, routing, middleware pipeline, response formatting, TLS, rate limiting, throughput tracking (`extenddb-server` crate) |
 | 07 | [Streams](07-component-streams.md) | DynamoDB Streams design space — capture mechanism, shard management, retention (high-level; detailed design deferred) |

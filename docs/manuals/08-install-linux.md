@@ -90,11 +90,11 @@ Do **not** hand-write `extenddb.toml` before running `init`.
 On most Linux systems the PostgreSQL admin user is `postgres`:
 
 ```bash
-./target/release/extenddb init --pg-user postgres
+./target/release/extenddb init --storage-admin-user postgres
 ```
 
 If you run PostgreSQL as your own user (e.g., Amazon Linux 2 with a
-user-owned data directory), omit `--pg-user` — it defaults to `$(whoami)`:
+user-owned data directory), omit `--storage-admin-user` — it defaults to `$(whoami)`:
 
 ```bash
 ./target/release/extenddb init
@@ -198,7 +198,7 @@ No data is lost; only the catalog schema is updated.
 |--------------------------------------------------------|---------------------------------------------------------------------|
 | `connection refused` on port 8000                      | Server not running. `./target/release/extenddb serve --config extenddb.toml`|
 | `Catalog version X.Y.Z (binary expects A.B.C)`        | `./target/release/extenddb migrate --config extenddb.toml`                  |
-| `role "postgres" does not exist`                       | Use `--pg-user $(whoami)` if PG runs as your user                   |
+| `role "postgres" does not exist`                       | Use `--storage-admin-user $(whoami)` if PG runs as your user                   |
 | `FATAL: Peer authentication failed`                    | Edit `pg_hba.conf` to allow `trust` or `md5` for local connections  |
 | DROP DATABASE hangs after hard kill                    | Check for lingering backends: `ps -eo pid,command \| grep postgres` |
 

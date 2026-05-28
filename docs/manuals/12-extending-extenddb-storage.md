@@ -4,13 +4,13 @@
 
 ## Introduction
 
-extenddb uses a fully trait-based storage abstraction. The default backend is PostgreSQL, implemented in the `storage-postgres` crate. This document explains the storage architecture, lists every trait a new backend must implement, and provides guidance for adding a new storage backend.
+extenddb uses a fully trait-based storage abstraction. The default backend is PostgreSQL, implemented in the `storage-postgres` crate. TiDB is available as an optional in-tree backend in `storage-tidb`. This document explains the storage architecture, lists every trait a new backend must implement, and provides guidance for adding a new storage backend.
 
-As of v0.0.81, the server crate has **no direct PostgreSQL dependencies**. All database access goes through traits defined in the `storage` and `auth` crates. PostgreSQL-specific code lives exclusively in `storage-postgres` and the `bin` crate's wiring layer.
+As of v0.0.81, the server crate has **no direct database driver dependencies**. All database access goes through traits defined in the `storage` and `auth` crates. Backend-specific code lives in backend crates such as `storage-postgres` and `storage-tidb`, with the `bin` crate acting as the wiring layer.
 
 ## Architecture Overview
 
-extenddb is organized as a Cargo workspace with seven crates:
+extenddb is organized as a Cargo workspace with eight crates:
 
 ```
 bin              → CLI entry point (init, serve, stop, migrate, manage, etc.)
@@ -20,9 +20,10 @@ core             → Types, expressions, validation (sync, no async runtime)
 auth             → SigV4 verification, policy evaluation (trait-based credential store)
 storage          → Trait definitions and backend-agnostic utilities (ARN construction, key parsing)
 storage-postgres → PostgreSQL implementation of all storage traits
+storage-tidb     → TiDB implementation of all storage traits
 ```
 
-The key architectural principle: neither the `engine` nor the `server` crate touches any database directly. They receive trait objects and call their methods. The `storage` crate defines these traits with no database dependencies, and provides backend-agnostic utilities in `storage::util` (ARN construction, partition/sort key parsing, netstring encoding) that any backend can reuse. The `storage-postgres` crate implements the traits. The `bin` crate is the wiring layer that creates concrete PostgreSQL stores and passes them to the server.
+The key architectural principle: neither the `engine` nor the `server` crate touches any database directly. They receive trait objects and call their methods. The `storage` crate defines these traits with no database dependencies, and provides backend-agnostic utilities in `storage::util` (ARN construction, partition/sort key parsing, netstring encoding) that any backend can reuse. Backend crates implement the traits. The `bin` crate is the wiring layer that creates concrete stores and passes them to the server.
 
 ## Trait Overview
 
@@ -33,7 +34,7 @@ A new backend must implement **13 storage traits** plus the `CredentialStore` tr
 2. `DataEngine` — item CRUD, query, scan, transactions
 3. `MetadataEngine` — TTL, tags, table statistics
 4. `StreamEngine` — DynamoDB Streams
-5. `WorkerStore` — background worker operations (GSI propagation, TTL cleanup)
+5. `WorkerStore` — background worker operations (control-plane transitions, TTL cleanup)
 
 **Management and operational** (defined in `crates/storage/src/`):
 6. `ManagementStore` — IAM CRUD (users, groups, roles, policies, access keys, accounts)
@@ -48,7 +49,7 @@ A new backend must implement **13 storage traits** plus the `CredentialStore` tr
 **Additionally**, the `auth` crate defines:
 14. `CredentialStore` — access key and session credential lookup for SigV4 verification
 
-Backends register at compile time using the `inventory` crate and are selected by name at startup. The `RuntimeHooks` trait allows backends to spawn backend-specific workers (PostgreSQL spawns 7).
+Backends register at compile time using the `inventory` crate and are selected by name at startup. The `RuntimeHooks` trait allows backends to spawn backend-specific workers.
 
 ## DynamoDB Data Path Traits
 
@@ -64,14 +65,14 @@ Table lifecycle operations:
 | `delete_table` | Delete a table and all its data |
 | `describe_table` | Return full table metadata (status, key schema, indexes, size, item count) |
 | `list_tables` | Paginated list of table names for an account |
-| `update_table` | Modify billing mode, throughput, deletion protection |
+| `update_table` | Modify billing mode, throughput, stream specification, deletion protection, and GSI create/delete |
 | `table_key_info` | Lightweight metadata fetch (key schema, attribute definitions) for data ops |
 | `index_info` | Fetch metadata for a specific secondary index |
 
 Key design decisions:
-- Tables have a lifecycle: CREATING → ACTIVE → DELETING → (gone). The `control_plane_delay_seconds` setting controls how long tables stay in CREATING before becoming ACTIVE.
+- Tables have a lifecycle: CREATING → ACTIVE → UPDATING → ACTIVE → DELETING → (gone). The `control_plane_delay_seconds` setting controls how long tables stay in CREATING before becoming ACTIVE.
 - Tables are scoped by `account_id`. Multi-tenancy is a first-class concern.
-- GSI creation can be asynchronous (CREATING → ACTIVE) with a configurable propagation delay.
+- GSI creation is a control-plane transition. Backends persist the catalog intent first, then reconcile data artifacts from that durable state. TiDB uses this path for crash-safe GSI backfill while keeping ordinary GSI writes transactional.
 
 ### DataEngine
 
@@ -116,7 +117,7 @@ TTL, tags, and table statistics:
 | `all_active_tables` | List active tables (all accounts) |
 
 Key design decisions:
-- TTL deletion is a background process. The engine calls `find_expired_items` periodically, then deletes each item via `DataEngine::delete_item` (which handles index sync and stream capture).
+- TTL deletion is backend-specific. Backends may use an indexed worker path, or a native database TTL feature when stream REMOVE records are not required. When a worker deletes expired items, it must call `DataEngine::delete_item` so index sync and stream capture remain correct.
 - Tags are stored by ARN string.
 - Table size refresh is a background operation that counts rows and sums sizes.
 
@@ -148,9 +149,7 @@ Background worker operations:
 
 | Method | Purpose |
 |--------|---------|
-| `activate_pending_tables` | Transition tables from CREATING to ACTIVE after delay |
-| `activate_pending_gsis` | Transition GSIs from CREATING to ACTIVE after delay |
-| `process_gsi_queue` | Process queued GSI index writes |
+| `process_control_plane_transitions` | Recover and advance pending table lifecycle transitions |
 
 ## Management and Operational Traits
 
@@ -297,7 +296,7 @@ Schema is managed via SQL migration files in `crates/storage-postgres/migrations
 | `003_auth.sql` | Full IAM schema (accounts, users, groups, roles, policies, access keys, sessions) |
 | `004_account_cascade.sql` | CASCADE constraints for account deletion |
 | `005_idempotency_tokens.sql` | idempotency_tokens table |
-| `006_gsi_propagation_delay.sql` | GSI async propagation support |
+| `006_gsi_consistency.sql` | Backend-specific GSI consistency metadata |
 | `007_stream_sequence.sql` | Stream sequence number generation |
 | `008_metrics.sql` | metrics_history table |
 | `009_login_attempts.sql` | login_attempts table for rate limiting |
@@ -407,21 +406,21 @@ The PostgreSQL implementation makes backend-specific choices. These are implemen
 
 ## Summary of Traits and Implementations
 
-| Trait | Defined In                            | PostgreSQL Implementation | Purpose |
-|-------|---------------------------------------|--------------------------|---------|
-| `TableEngine` | `storage/src/lib.rs`                  | `PostgresEngine` | Table lifecycle |
-| `DataEngine` | `storage/src/lib.rs`                  | `PostgresEngine` | Item CRUD, query, scan, transactions |
-| `MetadataEngine` | `storage/src/lib.rs`                  | `PostgresEngine` | TTL, tags, table statistics |
-| `StreamEngine` | `storage/src/lib.rs`                  | `PostgresEngine` | DynamoDB Streams |
-| `WorkerStore` | `storage/src/lib.rs`                  | `PostgresEngine` | Background workers |
-| `BackupEngine` | `storage/src/lib.rs`                  | `PostgresEngine` | Backup and restore |
-| `ManagementStore` | `storage/src/management_store/mod.rs` | `PostgresCatalogStore` | IAM CRUD |
-| `AdminStore` | `storage/src/management_store/mod.rs` | `PostgresCatalogStore` | Admin users |
-| `SettingsStore` | `storage/src/management_store/mod.rs` | `PostgresCatalogStore` | Runtime settings |
-| `MetricsStore` | `storage/src/management_store/mod.rs` | `PostgresCatalogStore` | Historical metrics |
-| `RateLimitStore` | `storage/src/management_store/mod.rs` | `PostgresCatalogStore` | Login rate limiting |
-| `AuthorizationStore` | `storage/src/authorization_store.rs`  | `PostgresCatalogStore` | Policy lookups |
-| `Bootstrapper` | `storage/src/bootstrapper.rs`         | `PostgresBootstrapper` | Init, destroy, migrate |
-| `CredentialStore` | `auth/src/lib.rs`                     | `DbCredentialStore` | SigV4 credential lookup |
+| Trait | Defined In | PostgreSQL Implementation | TiDB Implementation | Purpose |
+|-------|------------|---------------------------|---------------------|---------|
+| `TableEngine` | `storage/src/lib.rs` | `PostgresEngine` | `TidbEngine` | Table lifecycle |
+| `DataEngine` | `storage/src/lib.rs` | `PostgresEngine` | `TidbEngine` | Item CRUD, query, scan, transactions |
+| `MetadataEngine` | `storage/src/lib.rs` | `PostgresEngine` | `TidbEngine` | TTL, tags, table statistics |
+| `StreamEngine` | `storage/src/lib.rs` | `PostgresEngine` | `TidbEngine` | DynamoDB Streams |
+| `WorkerStore` | `storage/src/lib.rs` | `PostgresEngine` | `TidbEngine` | Background workers |
+| `BackupEngine` | `storage/src/lib.rs` | `PostgresEngine` | `TidbEngine` | Backup and restore |
+| `ManagementStore` | `storage/src/management_store/mod.rs` | `PostgresCatalogStore` | `TidbCatalogStore` | IAM CRUD |
+| `AdminStore` | `storage/src/management_store/mod.rs` | `PostgresCatalogStore` | `TidbCatalogStore` | Admin users |
+| `SettingsStore` | `storage/src/management_store/mod.rs` | `PostgresCatalogStore` | `TidbCatalogStore` | Runtime settings |
+| `MetricsStore` | `storage/src/management_store/mod.rs` | `PostgresCatalogStore` | `TidbCatalogStore` | Historical metrics |
+| `RateLimitStore` | `storage/src/management_store/mod.rs` | `PostgresCatalogStore` | `TidbCatalogStore` | Login rate limiting |
+| `AuthorizationStore` | `storage/src/authorization_store.rs` | `PostgresCatalogStore` | `TidbCatalogStore` | Policy lookups |
+| `Bootstrapper` | `storage/src/bootstrapper.rs` | `PostgresBootstrapper` | `TidbBootstrapper` | Init, destroy, migrate |
+| `CredentialStore` | `auth/src/lib.rs` | `DbCredentialStore` | `DbCredentialStore` | SigV4 credential lookup |
 
-All PostgreSQL-specific code lives in `crates/storage-postgres/`. The `server` crate has no direct database dependencies. Backends register at compile time via the `inventory` crate and are selected by name at startup.
+Backend-specific code lives in backend crates such as `crates/storage-postgres/` and `crates/storage-tidb/`. The `server` crate has no direct database dependencies. Backends register at compile time via the `inventory` crate and are selected by name at startup.

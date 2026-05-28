@@ -6,23 +6,23 @@ This guide covers deploying extenddb in various environments beyond local develo
 
 ## Architecture Overview
 
-extenddb is a single Rust binary that connects to PostgreSQL. All state lives in PostgreSQL — extenddb itself is stateless (no in-process caching). This means:
+extenddb is a single Rust binary that connects to a configured storage backend. All durable state lives in that backend — extenddb itself is stateless (no in-process caching). This means:
 
-- Multiple extenddb instances can share a PostgreSQL catalog (with caveats — see Multi-Instance below)
-- Standard PostgreSQL HA, backup, and replication tools provide durability
-- extenddb can run anywhere PostgreSQL is reachable
+- Multiple extenddb instances can share a catalog (with caveats — see Multi-Instance below)
+- Backend-native HA, backup, and replication tools provide durability
+- extenddb can run anywhere the configured storage backend is reachable
 
 ## Deployment Models
 
 ### Single-Node
 
-extenddb and PostgreSQL on the same host. Simplest setup, suitable for development, CI, and small workloads.
+extenddb and the storage backend on the same host. Simplest setup, suitable for development, CI, and small workloads.
 
 ```
 ┌─────────────────────────┐
 │  Host                   │
 │  ┌─────┐  ┌──────────┐ │
-│  │ extenddb│──│PostgreSQL │ │
+│  │ extenddb│──│Storage DB │ │
 │  └─────┘  └──────────┘ │
 └─────────────────────────┘
 ```
@@ -34,19 +34,19 @@ extenddb serve --config extenddb.toml
 
 ### Separated Database
 
-extenddb on an application server, PostgreSQL on a dedicated database server or managed service.
+extenddb on an application server, storage backend on a dedicated database server or managed service.
 
 ```
 ┌──────────┐       ┌──────────────┐
 │  App Host│──────▶│  DB Host     │
-│  extenddb    │       │  PostgreSQL  │
+│  extenddb    │       │  Storage DB  │
 └──────────┘       └──────────────┘
 ```
 
 ```bash
 extenddb init \
-  --pg-host db.example.com \
-  --pg-pass
+  --storage-host db.example.com \
+  --storage-admin-password
 ```
 
 Configure the connection string in `extenddb.toml`:
@@ -71,14 +71,33 @@ extenddb works with any PostgreSQL 14+ service:
 ```bash
 # Amazon RDS / Aurora example
 extenddb init \
-  --pg-host mydb.cluster-abc123.us-east-1.rds.amazonaws.com \
-  --pg-user extenddb_admin \
-  --pg-pass
+  --storage-host mydb.cluster-abc123.us-east-1.rds.amazonaws.com \
+  --storage-admin-user extenddb_admin \
+  --storage-admin-password
 ```
+
+### Managed TiDB
+
+When built with the `tidb` feature, extenddb can use TiDB's MySQL-compatible endpoint:
+
+```toml
+[storage]
+backend = "tidb"
+
+[storage.tidb]
+connection_string = "mysql://extenddb:<password>@tidb.example.com:4000/extenddb_catalog"
+
+[storage.tidb.backup]
+pd_endpoint = "pd.example.com:2379"
+storage_uri = "s3://extenddb-backups/prod"
+send_credentials_to_tikv = false
+```
+
+Use TiDB-native HA for the cluster and BR for physical backup/restore.
 
 ### Containerized
 
-extenddb runs in Docker or Kubernetes. The binary has no runtime dependencies beyond libc and network access to PostgreSQL.
+extenddb runs in Docker or Kubernetes. The binary has no runtime dependencies beyond libc and network access to the configured storage backend.
 
 Example Dockerfile:
 
@@ -124,7 +143,7 @@ For Kubernetes, run `extenddb init` as an init container or a one-time Job, then
 extenddb requires no internet connectivity. All functionality is self-contained in the binary. Build on a connected host, transfer the binary and `extenddb.toml` to the air-gapped environment, and run.
 
 Requirements in the air-gapped environment:
-- PostgreSQL 14+ (reachable from the extenddb host)
+- A supported storage backend reachable from the extenddb host
 - The `extenddb` binary (statically linked or with matching libc)
 
 ## Production Checklist
@@ -148,13 +167,13 @@ Requirements in the air-gapped environment:
 - [ ] Firewall: allow only necessary ports (extenddb port, PostgreSQL port)
 - [ ] Consider a reverse proxy (nginx, HAProxy) for TLS termination, rate limiting, and access logging
 
-### Database
+### Storage Backend
 
-- [ ] Use a dedicated PostgreSQL user for extenddb with minimal privileges
-- [ ] Configure PostgreSQL `max_connections` ≥ extenddb `pool_size` + 3
-- [ ] Enable PostgreSQL TLS
-- [ ] Set up automated backups (pg_dump, WAL archiving, or managed service snapshots)
-- [ ] Monitor PostgreSQL disk usage, connection count, and query performance
+- [ ] Use a dedicated backend user for extenddb with minimal privileges
+- [ ] Size backend connection limits for `pool_size + catalog_pool_size + workers`
+- [ ] Enable backend transport encryption
+- [ ] Set up automated backups with backend-native tools (PostgreSQL pg_dump/WAL or TiDB BR)
+- [ ] Monitor backend disk usage, connection count, replication health, and query performance
 
 ### Monitoring
 
@@ -203,12 +222,12 @@ sudo systemctl start extenddb
 
 ## Multi-Instance Considerations
 
-Multiple extenddb instances can connect to the same PostgreSQL catalog. However:
+Multiple extenddb instances can connect to the same catalog. However:
 
-- extenddb does not cache database state in-process — every request reads directly from PostgreSQL
+- extenddb does not cache database state in-process — every request reads directly from the storage backend
 - This means multiple instances see consistent data without cache invalidation
-- PostgreSQL's connection pool and row-level locking handle concurrent access
-- Ensure `pool_size × instance_count + 3 × instance_count ≤ PostgreSQL max_connections`
+- The storage backend's connection pool and transaction model handle concurrent access
+- Ensure `pool_size × instance_count + worker overhead` fits the backend's connection limits
 
 ## Performance Tuning
 
@@ -221,7 +240,7 @@ The default `pool_size = 20` is suitable for moderate workloads. For high-concur
 pool_size = 50  # Increase for higher concurrency
 ```
 
-Ensure PostgreSQL `max_connections` accommodates the total pool size plus overhead.
+Ensure the backend's connection limit accommodates the total pool size plus overhead.
 
 ### PostgreSQL Tuning
 

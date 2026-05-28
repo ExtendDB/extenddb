@@ -8,8 +8,8 @@
 //! TTL cleanup, table size refresh, stream record expiry, idempotency token
 //! cleanup, capacity warning, and metrics pruning.
 //!
-//! Workers are generic over storage traits so they are decoupled from the
-//! concrete `PostgresEngine` / `PostgresCatalogStore` types.
+//! Workers are generic over storage traits so they are decoupled from concrete
+//! backend engine and catalog-store types.
 
 use std::sync::Arc;
 

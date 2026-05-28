@@ -58,7 +58,15 @@ impl std::fmt::Display for BackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownBackend(b) => {
-                write!(f, "Unknown backend '{b}'. Available backends: postgres")
+                let available: Vec<&str> = inventory::iter::<ServerComponentsRegistration>
+                    .into_iter()
+                    .map(|r| r.backend)
+                    .collect();
+                write!(
+                    f,
+                    "Unknown backend '{b}'. Available backends: {}",
+                    available.join(", ")
+                )
             }
             Self::ConnectionFailed { backend, details } => {
                 write!(f, "Failed to connect to {backend}: {details}")
@@ -92,7 +100,7 @@ pub type ServerComponentsFactory =
 ///
 /// Backends submit this via inventory::submit! to register themselves.
 pub struct ServerComponentsRegistration {
-    /// Backend name (e.g., "postgres")
+    /// Backend name.
     pub backend: &'static str,
 
     /// Factory function that creates the backend components

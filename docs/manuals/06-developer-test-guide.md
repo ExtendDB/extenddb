@@ -156,7 +156,7 @@ The `run-tests` script automatically:
 - Provisions test credentials via `devtools/provision-test-credentials`
 - Creates a Java truststore for external tests (self-signed TLS cert)
 - Sets `control_plane_delay_seconds` to 0.05 for fast test cycles
-- Sets `gsi_propagation_delay_ms` to 0 for immediate GSI updates
+- Configures backend-specific test settings for immediate control-plane visibility
 - Enables throttling for production-like behavior
 - Configures import/export paths for file operation tests
 - Extracts and exports `EXTENDDB_TEST_PG_CONNECTION_STRING` for CLI lifecycle tests

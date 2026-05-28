@@ -451,6 +451,14 @@ The catalog database stores extenddb metadata: table definitions, indexes, tags,
 - REQ-PG-007: Support PostgreSQL 14+
 - REQ-PG-008: Support optional read replica connection for eventually consistent reads. When `read_replica_url` is configured, `ConsistentRead=false` reads (GetItem, Query, Scan, BatchGetItem) route to the replica pool. All writes and `ConsistentRead=true` reads always use the primary pool.
 
+### 8.3 TiDB Backend
+
+- REQ-TIDB-001: Use TiDB's MySQL-compatible SQL endpoint through the sqlx MySQL driver
+- REQ-TIDB-002: Use TiDB transactions for global consistency across base rows, secondary indexes, streams, and catalog updates
+- REQ-TIDB-003: Represent DynamoDB secondary indexes with generated columns and native TiDB secondary indexes; GSI versus LSI is API metadata, not separate physical index classes
+- REQ-TIDB-004: Use TiDB native TTL for non-streaming tables and retain an indexed worker path only when DynamoDB Streams REMOVE records must be emitted
+- REQ-TIDB-005: Use TiDB BR for native physical backup/restore instead of catalog row-copy backup data
+
 ## 9. Expression Engine Requirements
 
 - REQ-EXPR-001: Parse and evaluate `ConditionExpression` (comparisons, functions, logical operators)

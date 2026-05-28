@@ -1139,7 +1139,7 @@ $EXTENDDB settings list --config "$CONFIG" >/dev/null 2>&1; RC=$?
 assert_fail $RC "settings with missing config fails"
 
 # Init with invalid PG credentials
-$EXTENDDB init --config "$CONFIG" --overwrite --pg-user nonexistent_user --pg-host localhost >/dev/null 2>&1; RC=$?
+$EXTENDDB init --config "$CONFIG" --overwrite --storage-admin-user nonexistent_user --storage-host localhost >/dev/null 2>&1; RC=$?
 assert_fail $RC "init with bad PG user fails"
 rm -f "$CONFIG"
 

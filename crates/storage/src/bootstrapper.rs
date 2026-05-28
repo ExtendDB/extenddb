@@ -3,9 +3,10 @@
 
 //! Bootstrapper storage trait for init/destroy/migrate operations.
 //!
-//! These operations are inherently backend-specific (e.g., `CREATE DATABASE`
-//! is PostgreSQL DDL). The trait abstracts the high-level operations so the
-//! CLI commands don't depend on a specific storage backend.
+//! These operations are inherently backend-specific because database, schema,
+//! and role DDL differs across storage engines. The trait abstracts the
+//! high-level operations so the CLI commands don't depend on a specific
+//! storage backend.
 
 use async_trait::async_trait;
 
@@ -27,6 +28,23 @@ pub struct BootstrapConfig {
     pub data_db: String,
 }
 
+/// CLI-provided bootstrap overrides after argument parsing.
+///
+/// Storage backends merge these typed values with their config-file defaults.
+/// The CLI owns spelling, aliases, and `--flag=value` parsing; backend crates
+/// should not inspect raw process arguments.
+#[derive(Debug, Clone, Default)]
+pub struct BootstrapOptions {
+    pub storage_host: Option<String>,
+    pub storage_port: Option<u16>,
+    pub admin_user: Option<String>,
+    pub admin_password: Option<String>,
+    pub data_db: Option<String>,
+    pub catalog_db: Option<String>,
+    pub app_user: Option<String>,
+    pub app_password: Option<String>,
+}
+
 /// Result of a bootstrap admin user creation.
 #[derive(Debug)]
 pub struct AdminBootstrapResult {
@@ -44,7 +62,8 @@ pub struct AdminBootstrapResult {
 /// High-level bootstrap operations for storage backends.
 ///
 /// Covers the init, destroy, and migrate command paths. Implementations
-/// handle backend-specific DDL (e.g., `CREATE DATABASE` for PostgreSQL).
+/// handle backend-specific DDL such as creating databases, schemas, users,
+/// and grants.
 #[async_trait]
 pub trait Bootstrapper: Send + Sync {
     /// Ensure the application user exists in the storage backend.
@@ -117,19 +136,10 @@ use std::pin::Pin;
 use crate::error::StorageError;
 
 /// Factory function type for creating backend-specific bootstrappers.
-///
-/// # Parameters
-///
-/// * `config_path` - Path and file name of the extenddb configuration file (e.g. "extenddb.toml")
-/// * `cli_args` - Raw commandline arguments from `std::env::args().collect`
-///
-/// # Returns
-///
-/// A pinned future that resolves to either a boxed `Bootstrapper` or a `StorageError`.
 pub type BootstrapperFactory =
     fn(
         String,
-        Vec<String>,
+        BootstrapOptions,
     ) -> Pin<Box<dyn Future<Output = Result<Box<dyn Bootstrapper>, StorageError>> + Send>>;
 
 /// Backend bootstrapper registration entry.
@@ -149,12 +159,12 @@ inventory::collect!(BackendRegistration);
 pub async fn create_bootstrapper(
     backend: &str,
     config_path: &str,
-    cli_args: &[String],
+    options: BootstrapOptions,
 ) -> Result<Box<dyn Bootstrapper>, StorageError> {
     for registration in inventory::iter::<BackendRegistration> {
         if registration.name == backend {
             tracing::info!("Found registered backend: {}", backend);
-            return (registration.factory)(config_path.to_string(), cli_args.to_vec()).await;
+            return (registration.factory)(config_path.to_string(), options.clone()).await;
         }
     }
 

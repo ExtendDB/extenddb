@@ -4,13 +4,13 @@
 
 ## Overview
 
-extenddb (ExtendDB) is a standalone DynamoDB-compatible API server written in Rust. It receives DynamoDB wire protocol requests over HTTP/HTTPS, authenticates and authorizes them via SigV4 and a local IAM policy engine, executes operation logic in a backend-agnostic engine, and delegates persistence to a pluggable storage backend (currently PostgreSQL).
+extenddb (ExtendDB) is a standalone DynamoDB-compatible API server written in Rust. It receives DynamoDB wire protocol requests over HTTP/HTTPS, authenticates and authorizes them via SigV4 and a local IAM policy engine, executes operation logic in a backend-agnostic engine, and delegates persistence to a pluggable storage backend. PostgreSQL is the default backend; TiDB is available as an optional backend.
 
 extenddb runs as a daemon process, logging to syslog. It is designed for any environment where DynamoDB semantics are needed — local development, CI pipelines, self-hosted production, multi-cloud, or air-gapped deployments. Developers and applications point their AWS SDKs at extenddb and get identical DynamoDB behavior.
 
 ## Cargo Workspace
 
-The project is structured as a Cargo workspace with 7 crates. Crate boundaries enforce dependency rules at compile time.
+The project is structured as a Cargo workspace with 8 crates. Crate boundaries enforce dependency rules at compile time.
 
 ```
 extenddb/
@@ -19,6 +19,7 @@ extenddb/
 │   ├── engine/            Async operation handlers (PutItem, Query, etc.)
 │   ├── storage/           Storage trait definitions and backend-agnostic utilities
 │   ├── storage-postgres/  PostgreSQL backend implementation
+│   ├── storage-tidb/      TiDB backend implementation
 │   ├── auth/              AuthProvider trait, SigV4 verification, IAM policy engine
 │   ├── server/            HTTP server (axum), management API, web console
 │   └── bin/               CLI entry point, config loading, daemon lifecycle
@@ -35,6 +36,7 @@ bin ──→ server ──→ engine ──→ core
  │        └──→ storage
  │
  ├──→ storage-postgres ──→ storage ──→ core
+ ├──→ storage-tidb ──────→ storage ──→ core
  └──→ core
 ```
 
@@ -84,7 +86,7 @@ Trait definitions for the storage layer. Thirteen storage traits partition backe
 - **AuthorizationStore**: Policy evaluation cache
 - **Bootstrapper**: Initial database setup
 
-Traits use `BoxFuture` for object safety. Backends register at compile time via the `inventory` crate and are selected at startup by name. The `RuntimeHooks` trait allows backends to spawn backend-specific workers (PostgreSQL spawns 7).
+Traits use `BoxFuture` for object safety. Backends register at compile time via the `inventory` crate and are selected at startup by name. The `RuntimeHooks` trait allows backends to spawn backend-specific workers.
 
 ### storage-postgres
 
@@ -93,10 +95,18 @@ PostgreSQL implementation of all storage traits using `sqlx`. Features:
 - Dual-database architecture: catalog DB (metadata) + data DB (user items)
 - Schema migrations managed by version-stamped SQL files
 - Items stored as JSONB with indexed key columns
-- GSI/LSI implemented as separate PostgreSQL tables
+- GSI/LSI metadata in the catalog; physical index layout is backend-specific
 - Transactions use `SELECT FOR UPDATE` + single-transaction commits
 - Stream records stored in a dedicated table with background cleanup
 - All queries parameterized (no dynamic SQL construction)
+
+### storage-tidb
+
+TiDB implementation of the storage traits using the sqlx MySQL driver. It mirrors the PostgreSQL backend structure while using TiDB-compatible SQL, MySQL-style connection strings, `ON DUPLICATE KEY UPDATE` upserts, and TiDB/MySQL error classification. It is selected with `storage.backend = "tidb"` when the binary is built with the `tidb` feature.
+
+TiDB backups use BR as the physical backup data plane. ExtendDB stores backup
+metadata in the catalog and delegates snapshot data to BR storage; it does not
+copy items into catalog backup tables for TiDB.
 
 ### auth
 
@@ -125,7 +135,7 @@ Thin binary that wires everything together:
 - CLI parsing (clap): `serve`, `init`, `destroy`, `verify`, `migrate`, `status`, `settings`, `manage`, `version`
 - Configuration loading (TOML + env vars)
 - Daemon lifecycle (bind socket → fork → syslog → serve)
-- Background tasks (log level polling, throttling polling, GSI delay polling, stream record cleanup, TTL expiry, metrics persistence)
+- Background tasks (log level polling, throttling polling, stream record cleanup, TTL expiry, metrics persistence)
 
 ## Request Lifecycle
 
@@ -147,18 +157,18 @@ extenddb always runs as a daemon. There is no foreground mode.
 2. Bind TCP socket (port conflicts reported before forking)
 3. Fork to background via `daemonize`
 4. Initialize syslog logging
-5. Connect to PostgreSQL (catalog + data databases)
+5. Connect to the configured storage backend (catalog + data databases)
 6. Verify catalog version matches binary expectation
 7. Start axum server on the pre-bound socket
-8. Spawn background tasks (log level polling, throttling polling, GSI delay polling, stream cleanup, TTL expiry, metrics persistence)
+8. Spawn background tasks (log level polling, throttling polling, stream cleanup, TTL expiry, metrics persistence)
 9. On SIGTERM/SIGINT: drain connections (5s timeout), exit
 
 ## Catalog Model
 
-extenddb uses a dual-database architecture:
+extenddb uses a catalog/data storage architecture:
 
 - **Catalog database** (e.g., `extenddb_catalog`): Stores table metadata, account/user/group/role/policy definitions, access keys, settings, stream metadata, and metrics. Shared across all accounts.
-- **Data database** (e.g., `extenddb_catalog_data`): Stores user items, GSI/LSI data, and stream records. Each table gets its own PostgreSQL table.
+- **Data database** (e.g., `extenddb_catalog_data`): Stores user items, backend-specific secondary-index state, and stream records. PostgreSQL uses companion data/index tables. TiDB stores item rows once and uses generated columns plus native secondary indexes.
 
 The catalog version (currently 0.0.2) is stored in the `catalog_metadata` table and checked at startup. Version mismatches prevent the server from starting — run `extenddb migrate` to upgrade.
 
@@ -166,7 +176,7 @@ The catalog version (currently 0.0.2) is stored in the `catalog_metadata` table 
 
 ### Storage
 
-Storage backends implement thirteen traits (see **storage** section above). The traits use `BoxFuture` for object safety. Backends register at compile time via the `inventory` crate, and the `bin` crate selects the backend by name at startup. Currently only PostgreSQL is implemented.
+Storage backends implement thirteen traits (see **storage** section above). The traits use `BoxFuture` for object safety. Backends register at compile time via the `inventory` crate, and the `bin` crate selects the backend by name at startup. PostgreSQL is the default backend, and TiDB is available behind the optional `tidb` feature.
 
 ### Authentication
 
@@ -176,7 +186,7 @@ Auth providers implement the `AuthProvider` trait using `#[async_trait]` for obj
 
 ### Authentication
 
-SigV4 signature verification follows the AWS specification. Credentials are stored encrypted (AES-256-GCM) in PostgreSQL. Access key prefixes distinguish long-term (`VDAK`) from temporary (`VDSK`) credentials.
+SigV4 signature verification follows the AWS specification. Credentials are stored encrypted (AES-256-GCM) in the catalog database. Access key prefixes distinguish long-term (`VDAK`) from temporary (`VDSK`) credentials.
 
 ### Authorization
 
@@ -248,7 +258,7 @@ Configuration precedence: CLI flags > environment variables > config file > defa
 
 ## DynamoDB Streams
 
-extenddb implements DynamoDB Streams for change data capture. Stream records are captured atomically with data writes inside the same PostgreSQL transaction. Both the DynamoDB API and Streams API are served on the same port.
+extenddb implements DynamoDB Streams for change data capture. Stream records are captured atomically with data writes inside the backend transaction. Both the DynamoDB API and Streams API are served on the same port.
 
 Supported operations: `ListStreams`, `DescribeStream`, `GetShardIterator`, `GetRecords`.
 
@@ -256,14 +266,14 @@ Stream records are retained for 24 hours. A background worker cleans up expired 
 
 ## Deployment Models
 
-extenddb is a single-binary server that connects to PostgreSQL. Deployment options include:
+extenddb is a single-binary server that connects to a configured storage backend. Deployment options include:
 
-- **Single-node**: extenddb + PostgreSQL on the same host (development, small workloads)
-- **Separated**: extenddb on an application server, PostgreSQL on a dedicated database server or managed service (RDS, Aurora, Cloud SQL)
-- **Containerized**: Docker/Kubernetes with PostgreSQL as a sidecar or external service
+- **Single-node**: extenddb + storage backend on the same host (development, small workloads)
+- **Separated**: extenddb on an application server, storage backend on a dedicated database server or managed service
+- **Containerized**: Docker/Kubernetes with the storage backend as a sidecar or external service
 - **Air-gapped**: No internet connectivity required; all functionality is self-contained
 
-PostgreSQL provides the durability, replication, and backup capabilities. Use standard PostgreSQL HA tools (streaming replication, Patroni, managed services) for production availability.
+The storage backend provides durability, replication, and physical backup capabilities. Use backend-native HA tools: PostgreSQL streaming replication/managed services for PostgreSQL, and TiDB's PD/TiKV topology plus BR for TiDB.
 
 ---
 
