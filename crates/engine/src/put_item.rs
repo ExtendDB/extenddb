@@ -66,6 +66,8 @@ pub async fn handle_put_item(
             || msg.contains("contains duplicates")
             || msg.contains("Null attribute value")
             || msg.contains("validation error detected")
+            || msg.contains("must not be empty")
+            || msg.contains("Syntax error; key")
         {
             DynamoDbError::ValidationException(msg)
         } else {

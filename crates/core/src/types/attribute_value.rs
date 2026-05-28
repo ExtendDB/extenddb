@@ -161,6 +161,13 @@ impl<'de> Visitor<'de> for AttributeValueVisitor {
                             .unwrap_or_else(|_| s.to_owned()))
                     })
                     .collect::<Result<_, _>>()?;
+                if set.len() != arr.len() {
+                    let values: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+                    let repr = values.join(", ");
+                    return Err(de::Error::custom(format!(
+                        "One or more parameter values were invalid: Input collection [{repr}] contains duplicates."
+                    )));
+                }
                 Ok(AttributeValue::NS(set))
             }
             "BS" => {
@@ -183,6 +190,13 @@ impl<'de> Visitor<'de> for AttributeValueVisitor {
                             .map_err(|e| de::Error::custom(format!("invalid base64: {e}")))
                     })
                     .collect::<Result<_, _>>()?;
+                if set.len() != arr.len() {
+                    let values: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+                    let repr = values.join(", ");
+                    return Err(de::Error::custom(format!(
+                        "One or more parameter values were invalid: Input collection [{repr}] contains duplicates."
+                    )));
+                }
                 Ok(AttributeValue::BS(set))
             }
             "BOOL" => {

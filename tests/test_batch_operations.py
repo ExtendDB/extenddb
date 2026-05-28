@@ -375,6 +375,89 @@ class TestBatchWriteItem:
                 }
             )
         assert exc_info.value.response["Error"]["Code"] == "ValidationException"
+
+    def test_batch_write_rejects_empty_key_values(
+        self, dynamodb_client, create_and_cleanup_table
+    ):
+        """BatchWriteItem rejects empty key attribute values for both binary
+        and string types in both PutRequest and DeleteRequest"""
+
+        # Set up a binary-keyed table and a string-keyed table.
+        binary_table = f"extenddb-test-{uuid.uuid4().hex[:12]}"
+        create_and_cleanup_table(
+            binary_table,
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "B"}],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        )
+        wait_for_active(dynamodb_client, binary_table)
+
+        string_table = f"extenddb-test-{uuid.uuid4().hex[:12]}"
+        create_and_cleanup_table(
+            string_table,
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        )
+        wait_for_active(dynamodb_client, string_table)
+
+        # Empty binary in PutRequest — exercises validate_key_sizes.
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.batch_write_item(
+                RequestItems={
+                    binary_table: [
+                        {"PutRequest": {"Item": {"pk": {"B": b""}}}},
+                    ]
+                }
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException", err
+        assert "empty binary value" in err["Message"], err["Message"]
+        assert "Key: pk" in err["Message"], err["Message"]
+
+        # Empty binary in DeleteRequest — exercises validate_key_only via
+        # the validate_batch_key_only wrapper.
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.batch_write_item(
+                RequestItems={
+                    binary_table: [
+                        {"DeleteRequest": {"Key": {"pk": {"B": b""}}}},
+                    ]
+                }
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException", err
+        assert "empty binary value" in err["Message"], err["Message"]
+        assert "Key: pk" in err["Message"], err["Message"]
+
+        # Empty string in PutRequest — same validate_key_sizes path with the
+        # string-typed message variant.
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.batch_write_item(
+                RequestItems={
+                    string_table: [
+                        {"PutRequest": {"Item": {"pk": {"S": ""}}}},
+                    ]
+                }
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException", err
+        assert "empty string value" in err["Message"], err["Message"]
+        assert "Key: pk" in err["Message"], err["Message"]
+
+        # Empty string in DeleteRequest — exercises validate_key_only with the
+        # string-typed message variant. This is a NEW behavior the CR adds:
+        # validate_key_only previously had no empty-key check at all.
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.batch_write_item(
+                RequestItems={
+                    string_table: [
+                        {"DeleteRequest": {"Key": {"pk": {"S": ""}}}},
+                    ]
+                }
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException", err
+        assert "empty string value" in err["Message"], err["Message"]
+        assert "Key: pk" in err["Message"], err["Message"]
 # ── BatchGetItem key validation ───────────────────────────────────────
 class TestBatchGetItemKeyValidation:
     """Tests for BatchGetItem per-key validation (M2 fix)."""

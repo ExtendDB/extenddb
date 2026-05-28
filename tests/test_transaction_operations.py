@@ -372,3 +372,141 @@ def test_transact_write_condition_on_nonexistent_item(dynamodb_client, hash_tabl
     )
     resp = dynamodb_client.get_item(TableName=hash_table, Key={"pk": {"S": "tw-after-ghost"}})
     assert resp["Item"]["v"]["S"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# TransactGetItems — empty projection omits Item (0acc23c)
+# ---------------------------------------------------------------------------
+
+
+def test_transact_get_empty_projection_omits_item(dynamodb_client, hash_table):
+    """TransactGetItems with projection resolving to no attributes omits Item."""
+    dynamodb_client.put_item(
+        TableName=hash_table,
+        Item={"pk": {"S": "proj-empty"}, "real_attr": {"S": "value"}},
+    )
+    resp = dynamodb_client.transact_get_items(
+        TransactItems=[
+            {
+                "Get": {
+                    "TableName": hash_table,
+                    "Key": {"pk": {"S": "proj-empty"}},
+                    "ProjectionExpression": "nonexistent_attr",
+                }
+            }
+        ]
+    )
+    # Item exists but projection yields nothing — no Item key in response
+    assert "Item" not in resp["Responses"][0]
+
+
+def test_transact_get_valid_projection_includes_item(dynamodb_client, hash_table):
+    """TransactGetItems with projection resolving to attributes includes Item."""
+    dynamodb_client.put_item(
+        TableName=hash_table,
+        Item={"pk": {"S": "proj-valid"}, "a": {"S": "val"}},
+    )
+    resp = dynamodb_client.transact_get_items(
+        TransactItems=[
+            {
+                "Get": {
+                    "TableName": hash_table,
+                    "Key": {"pk": {"S": "proj-valid"}},
+                    "ProjectionExpression": "a",
+                }
+            }
+        ]
+    )
+    assert resp["Responses"][0]["Item"]["a"]["S"] == "val"
+
+
+def test_transact_get_missing_item_with_projection_omits_item(dynamodb_client, hash_table):
+    """TransactGetItems on missing item with projection still omits Item."""
+    resp = dynamodb_client.transact_get_items(
+        TransactItems=[
+            {
+                "Get": {
+                    "TableName": hash_table,
+                    "Key": {"pk": {"S": "truly-missing"}},
+                    "ProjectionExpression": "anything",
+                }
+            }
+        ]
+    )
+    assert "Item" not in resp["Responses"][0]
+
+
+# ---------------------------------------------------------------------------
+# TransactGetItems — consumed capacity uses 2x RCU (ff1eed1)
+# ---------------------------------------------------------------------------
+
+
+def test_transact_get_single_item_costs_2_rcu(dynamodb_client, hash_table):
+    """A single small existing item costs 2 RCU in TransactGetItems."""
+    dynamodb_client.put_item(
+        TableName=hash_table, Item={"pk": {"S": "rcu-single"}, "v": {"S": "x"}},
+    )
+    resp = dynamodb_client.transact_get_items(
+        ReturnConsumedCapacity="TOTAL",
+        TransactItems=[
+            {"Get": {"TableName": hash_table, "Key": {"pk": {"S": "rcu-single"}}}}
+        ],
+    )
+    cap = resp["ConsumedCapacity"][0]
+    assert cap["CapacityUnits"] == 2.0
+    assert cap["ReadCapacityUnits"] == 2.0
+
+
+def test_transact_get_missing_item_costs_2_rcu(dynamodb_client, hash_table):
+    """A missing item still costs 2 RCU in TransactGetItems."""
+    resp = dynamodb_client.transact_get_items(
+        ReturnConsumedCapacity="TOTAL",
+        TransactItems=[
+            {"Get": {"TableName": hash_table, "Key": {"pk": {"S": "rcu-ghost"}}}}
+        ],
+    )
+    cap = resp["ConsumedCapacity"][0]
+    assert cap["CapacityUnits"] == 2.0
+    assert cap["ReadCapacityUnits"] == 2.0
+
+
+def test_transact_get_two_items_costs_4_rcu(dynamodb_client, hash_table):
+    """Two items (one existing, one missing) cost 4 RCU total."""
+    dynamodb_client.put_item(
+        TableName=hash_table, Item={"pk": {"S": "rcu-pair"}},
+    )
+    resp = dynamodb_client.transact_get_items(
+        ReturnConsumedCapacity="TOTAL",
+        TransactItems=[
+            {"Get": {"TableName": hash_table, "Key": {"pk": {"S": "rcu-pair"}}}},
+            {"Get": {"TableName": hash_table, "Key": {"pk": {"S": "rcu-pair-miss"}}}},
+        ],
+    )
+    cap = resp["ConsumedCapacity"][0]
+    assert cap["CapacityUnits"] == 4.0
+    assert cap["ReadCapacityUnits"] == 4.0
+
+
+# ---------------------------------------------------------------------------
+# TransactGetItems — capacity breakdown includes RCU/WCU fields (34cec40)
+# ---------------------------------------------------------------------------
+
+
+def test_transact_get_indexes_capacity_has_rcu_field(dynamodb_client, hash_table):
+    """INDEXES-level capacity includes ReadCapacityUnits in Table breakdown."""
+    dynamodb_client.put_item(
+        TableName=hash_table, Item={"pk": {"S": "cap-idx"}},
+    )
+    resp = dynamodb_client.transact_get_items(
+        ReturnConsumedCapacity="INDEXES",
+        TransactItems=[
+            {"Get": {"TableName": hash_table, "Key": {"pk": {"S": "cap-idx"}}}}
+        ],
+    )
+    cap = resp["ConsumedCapacity"][0]
+    assert cap["ReadCapacityUnits"] == 2.0
+    # Table breakdown should also have ReadCapacityUnits
+    table_cap = cap.get("Table", {})
+    assert table_cap.get("ReadCapacityUnits") == 2.0
+    # WriteCapacityUnits should not be present for reads
+    assert table_cap.get("WriteCapacityUnits") is None

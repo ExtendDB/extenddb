@@ -631,6 +631,7 @@ pub fn validate_key_only(
             ))
         })?;
         validate_key_attribute_type(&ks.attribute_name, value, attr_defs)?;
+        validate_no_empty_key_value(&ks.attribute_name, value)?;
     }
     Ok(())
 }
@@ -718,6 +719,34 @@ fn validate_key_attribute_type(
     Ok(())
 }
 
+/// Validate that a key attribute value is not empty.
+///
+/// `DynamoDB` rejects empty-string and empty-binary values in key positions,
+/// returning a `ValidationException` with a type-specific error message.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` if `value` is an empty string
+/// (`S("")`) or empty binary (`B(<empty>)`).
+fn validate_no_empty_key_value(
+    attr_name: &str,
+    value: &AttributeValue,
+) -> Result<(), DynamoDbError> {
+    let kind = match value {
+        AttributeValue::S(s) if s.is_empty() => Some("string"),
+        AttributeValue::B(b) if b.is_empty() => Some("binary"),
+        _ => None,
+    };
+    if let Some(kind) = kind {
+        return Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values are not valid. \
+             The AttributeValue for a key attribute cannot contain an empty {kind} value. \
+             Key: {attr_name}"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate partition key and sort key sizes against limits.
 ///
 /// # Errors
@@ -730,12 +759,7 @@ pub fn validate_key_sizes(
 ) -> Result<(), DynamoDbError> {
     for ks in key_schema {
         if let Some(value) = item.get(&ks.attribute_name) {
-            if matches!(value, AttributeValue::S(s) if s.is_empty()) {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: {}",
-                    ks.attribute_name
-                )));
-            }
+            validate_no_empty_key_value(&ks.attribute_name, value)?;
             let size = key_value_byte_size(value);
             let (max_size, key_label) = match ks.key_type {
                 KeyType::Hash => (limits.max_partition_key_size_bytes, "partition key"),
@@ -1090,6 +1114,80 @@ mod tests {
         assert!(
             err.to_string().contains("Size of attribute name"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_key_sizes_rejects_empty_binary_partition_key() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::B(Vec::new()));
+        let err = validate_key_sizes(&item, &[make_ks("pk", KeyType::Hash)], &limits).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("empty binary value"), "got: {msg}");
+        assert!(msg.contains("Key: pk"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_key_sizes_still_rejects_empty_string_partition_key() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S(String::new()));
+        let err = validate_key_sizes(&item, &[make_ks("pk", KeyType::Hash)], &limits).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("empty string value"), "got: {msg}");
+        assert!(msg.contains("Key: pk"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_key_sizes_accepts_non_empty_binary_partition_key() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::B(vec![0x00]));
+        assert!(validate_key_sizes(&item, &[make_ks("pk", KeyType::Hash)], &limits).is_ok());
+    }
+
+    #[test]
+    fn validate_key_only_rejects_empty_binary_key() {
+        let mut key = Item::new();
+        key.insert("pk".to_owned(), AttributeValue::B(Vec::new()));
+        let err = validate_key_only(
+            &key,
+            &[make_ks("pk", KeyType::Hash)],
+            &[make_ad("pk", ScalarAttributeType::B)],
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("empty binary value"), "got: {msg}");
+        assert!(msg.contains("Key: pk"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_key_only_rejects_empty_string_key() {
+        let mut key = Item::new();
+        key.insert("pk".to_owned(), AttributeValue::S(String::new()));
+        let err = validate_key_only(
+            &key,
+            &[make_ks("pk", KeyType::Hash)],
+            &[make_ad("pk", ScalarAttributeType::S)],
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("empty string value"), "got: {msg}");
+        assert!(msg.contains("Key: pk"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_key_only_accepts_non_empty_binary_key() {
+        let mut key = Item::new();
+        key.insert("pk".to_owned(), AttributeValue::B(vec![0xff]));
+        assert!(
+            validate_key_only(
+                &key,
+                &[make_ks("pk", KeyType::Hash)],
+                &[make_ad("pk", ScalarAttributeType::B)],
+            )
+            .is_ok()
         );
     }
 }
