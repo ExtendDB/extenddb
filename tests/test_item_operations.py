@@ -395,6 +395,34 @@ class TestUpdateItem:
             )
         assert exc_info.value.response["Error"]["Code"] == "ValidationException"
 
+    def test_update_item_no_directives_upserts_key_only(self, dynamodb_client, upd_table):
+        """UpdateItem with only TableName + Key on a missing item upserts a key-only item."""
+        dynamodb_client.update_item(
+            TableName=upd_table,
+            Key={"pk": {"S": "noop-missing"}},
+        )
+        resp = dynamodb_client.get_item(
+            TableName=upd_table,
+            Key={"pk": {"S": "noop-missing"}},
+            ConsistentRead=True,
+        )
+        assert resp["Item"] == {"pk": {"S": "noop-missing"}}
+
+    def test_update_item_no_directives_noop_on_existing(self, dynamodb_client, upd_table):
+        """UpdateItem with only TableName + Key on an existing item is a no-op."""
+        original = {"pk": {"S": "noop-existing"}, "x": {"N": "42"}}
+        dynamodb_client.put_item(TableName=upd_table, Item=original)
+        dynamodb_client.update_item(
+            TableName=upd_table,
+            Key={"pk": {"S": "noop-existing"}},
+        )
+        resp = dynamodb_client.get_item(
+            TableName=upd_table,
+            Key={"pk": {"S": "noop-existing"}},
+            ConsistentRead=True,
+        )
+        assert resp["Item"] == original
+
     def test_update_item_condition_on_nonexistent_item(self, dynamodb_client, upd_table):
         """attribute_not_exists on a missing item succeeds (creates the item)."""
         dynamodb_client.update_item(
@@ -425,6 +453,53 @@ class TestUpdateItem:
         )
         resp = dynamodb_client.get_item(TableName=upd_table, Key={"pk": {"S": "ne-missing"}})
         assert resp["Item"]["data"]["S"] == "ok"
+
+    def test_update_item_remove_with_updated_new_omits_attributes(self, dynamodb_client, upd_table):
+        """REMOVE leaves nothing in UPDATED_NEW: Attributes field must be omitted, not returned as {}."""
+        dynamodb_client.put_item(
+            TableName=upd_table,
+            Item={"pk": {"S": "remove-empty"}, "map_attr": {"M": {"child": {"S": "old"}}}},
+        )
+        resp = dynamodb_client.update_item(
+            TableName=upd_table,
+            Key={"pk": {"S": "remove-empty"}},
+            UpdateExpression="REMOVE map_attr",
+            ReturnValues="UPDATED_NEW",
+        )
+        assert "Attributes" not in resp, f"expected Attributes omitted, got {resp.get('Attributes')!r}"
+
+    def test_update_item_set_new_attribute_with_updated_old_omits_attributes(
+        self, dynamodb_client, upd_table
+    ):
+        """SET on a brand-new attribute has no prior value: UPDATED_OLD must omit Attributes."""
+        dynamodb_client.put_item(
+            TableName=upd_table,
+            Item={"pk": {"S": "set-new-old"}},
+        )
+        resp = dynamodb_client.update_item(
+            TableName=upd_table,
+            Key={"pk": {"S": "set-new-old"}},
+            UpdateExpression="SET fresh_attr = :v",
+            ExpressionAttributeValues={":v": {"S": "new"}},
+            ReturnValues="UPDATED_OLD",
+        )
+        assert "Attributes" not in resp, f"expected Attributes omitted, got {resp.get('Attributes')!r}"
+
+    def test_update_item_legacy_delete_with_updated_new_omits_attributes(
+        self, dynamodb_client, upd_table
+    ):
+        """Legacy AttributeUpdates DELETE on a Map mirrors REMOVE: UPDATED_NEW must omit Attributes."""
+        dynamodb_client.put_item(
+            TableName=upd_table,
+            Item={"pk": {"S": "legacy-delete"}, "map_attr": {"M": {"child": {"S": "old"}}}},
+        )
+        resp = dynamodb_client.update_item(
+            TableName=upd_table,
+            Key={"pk": {"S": "legacy-delete"}},
+            AttributeUpdates={"map_attr": {"Action": "DELETE"}},
+            ReturnValues="UPDATED_NEW",
+        )
+        assert "Attributes" not in resp, f"expected Attributes omitted, got {resp.get('Attributes')!r}"
 
 
 # ---------------------------------------------------------------------------

@@ -535,23 +535,6 @@ pub fn validate_update_item(
 ) -> Result<(), DynamoDbError> {
     validate_table_name(&input.table_name, limits)?;
     validate_key_only(&input.key, key_schema, attr_defs)?;
-
-    // Either UpdateExpression or AttributeUpdates must be provided.
-    // Note: an empty string UpdateExpression is "provided" but will fail later
-    // with the correct "The expression can not be empty;" message from tokenize_for.
-    let has_update_expr = input.update_expression.is_some();
-    let has_attr_updates = input
-        .attribute_updates
-        .as_ref()
-        .is_some_and(|u| !u.is_empty());
-
-    if !has_update_expr && !has_attr_updates {
-        return Err(DynamoDbError::ValidationException(
-            "One or more parameter values were invalid: An UpdateExpression must be provided"
-                .to_owned(),
-        ));
-    }
-
     Ok(())
 }
 
@@ -1189,5 +1172,62 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    fn update_input_no_directives() -> UpdateItemInput {
+        UpdateItemInput {
+            table_name: "TestTable".to_owned(),
+            key: {
+                let mut k = Item::new();
+                k.insert("pk".to_owned(), AttributeValue::S("p".to_owned()));
+                k
+            },
+            update_expression: None,
+            condition_expression: None,
+            expression_attribute_names: None,
+            expression_attribute_values: None,
+            return_values: ReturnValues::None,
+            expected: None,
+            conditional_operator: None,
+            attribute_updates: None,
+            return_values_on_condition_check_failure: Default::default(),
+            return_consumed_capacity: Default::default(),
+            return_item_collection_metrics: Default::default(),
+        }
+    }
+
+    #[test]
+    fn update_item_no_update_expression_or_attribute_updates_accepted() {
+        // DynamoDB treats UpdateItem with only TableName + Key as a no-op
+        // upsert. Validation must not reject it.
+        let limits = LimitsConfig::default();
+        let key_schema = vec![make_ks("pk", KeyType::Hash)];
+        let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
+        let input = update_input_no_directives();
+        assert!(validate_update_item(&input, &limits, &key_schema, &attr_defs).is_ok());
+    }
+
+    #[test]
+    fn update_item_empty_attribute_updates_map_accepted() {
+        // An empty AttributeUpdates map is equivalent to no directives.
+        let limits = LimitsConfig::default();
+        let key_schema = vec![make_ks("pk", KeyType::Hash)];
+        let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
+        let mut input = update_input_no_directives();
+        input.attribute_updates = Some(std::collections::HashMap::new());
+        assert!(validate_update_item(&input, &limits, &key_schema, &attr_defs).is_ok());
+    }
+
+    #[test]
+    fn update_item_empty_string_update_expression_passes_validation() {
+        // Validation must let Some("") through so the engine's tokenize_for
+        // produces the DynamoDB-compatible "The expression can not be empty;"
+        // message. PR #24 (ef8b94f) protects this routing; we keep it.
+        let limits = LimitsConfig::default();
+        let key_schema = vec![make_ks("pk", KeyType::Hash)];
+        let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
+        let mut input = update_input_no_directives();
+        input.update_expression = Some(String::new());
+        assert!(validate_update_item(&input, &limits, &key_schema, &attr_defs).is_ok());
     }
 }
