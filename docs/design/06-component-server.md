@@ -301,16 +301,74 @@ Returns 200 when the server is accepting requests. Can optionally check storage 
 ### 7.2 Metrics
 
 ```
-GET /metrics → 200 OK (Prometheus text format)
+GET /metrics → 200 OK (application/json)
 ```
 
-Exposed metrics:
-- `dynamodb_requests_total{operation, status}` — request counter
-- `dynamodb_request_duration_seconds{operation}` — latency histogram
-- `dynamodb_consumed_rcu_milli_total{table}` — consumed read capacity (milli-RCU; divide by 1000 for RCU)
-- `dynamodb_consumed_wcu_milli_total{table}` — consumed write capacity (milli-WCU; divide by 1000 for WCU)
-- `dynamodb_active_connections` — current connection count
-- `dynamodb_errors_total{operation, error_type}` — error counter
+This is **not** Prometheus exposition format. The response is a custom JSON
+schema that uses DynamoDB CloudWatch-style metric names and dimensions.
+
+**Query parameters** (`MetricsQuery` in `crates/core/src/metrics/types.rs`):
+
+- `window`: `LastMinute` | `Last5Minutes` | `LastHour` | `LastDay` | `AllTime`
+- `start`, `end`: ISO 8601 (custom range, alternative to `window`)
+- `granularity`: `1m` | `5m` | `15m` | `1h` (auto-selected if omitted)
+- `table_name`: filter by table
+- `metric`: filter by metric name
+
+**Response shape** (`MetricsResponse`):
+
+```json
+{
+  "metrics":  [ { "metric": "SuccessfulRequestLatency",
+                  "dimensions": [ { "TableName": "Users" },
+                                  { "Operation":  "GetItem" } ],
+                  "window": "Last5Minutes",
+                  "sum": 26033.0, "count": 50, "min": 321.0, "max": 714.0 } ],
+  "buckets": [ { "timestamp": "2026-05-29T00:02:00Z",
+                  "metric": "SuccessfulRequestLatency",
+                  "dimensions": [ { "TableName": "Users" } ],
+                  "sum": 1234.0, "count": 5, "min": 200.0, "max": 410.0 } ],
+  "segments": [ { "operation": "GetItem", "count": 50,
+                  "avg": { "auth_us": 12.0, "authz_us": 4.0,
+                            "throttle_us": 1.0, "dispatch_us": 280.0,
+                            "response_us": 8.0, "total_us": 305.0 } } ],
+  "source":  "database"
+}
+```
+
+- `metrics` (`Vec<MetricSnapshot>`): aggregate over the requested window.
+- `buckets` (`Vec<MetricsBucket>`): time-series at the requested granularity
+  (omitted in the in-memory fallback path).
+- `segments` (`Vec<OperationSegments>`): per-operation latency breakdown
+  (auth / authz / throttle / dispatch / response in microseconds), in-memory only.
+- `source`: `"database"` when served from the persistent `MetricsStore`,
+  `"memory"` when served from the in-process `MetricsCollector` fallback.
+
+**Metric names** (from the `MetricName` enum in `crates/core/src/metrics/types.rs`):
+
+DynamoDB CloudWatch-aligned:
+- `ConsumedReadCapacityUnits`, `ConsumedWriteCapacityUnits`
+- `SuccessfulRequestLatency` (microseconds)
+- `SystemErrors`, `UserErrors`
+- `ThrottledRequests`, `ReadThrottleEvents`, `WriteThrottleEvents`
+- `ConditionalCheckFailedRequests`, `TransactionConflict`
+- `ReturnedItemCount`, `ReturnedBytes`
+- `TimeToLiveDeletedItemCount`, `TtlDeletionStaleness`
+
+ExtendDB-internal:
+- `RequestCount` (HTTP request count, dimension: `Operation`)
+- `StorageQueryCount`, `StorageQueryLatency` (dimensions: source, category)
+- `PoolActiveConnections`, `PoolIdleConnections`, `PoolAcquireLatency`
+- `WorkerLastSuccess`, `WorkerCycleLatency`, `WorkerErrorCount`
+
+**Dimensions** (from the `Dimension` enum):
+
+- `TableName(String)`
+- `GlobalSecondaryIndexName(String)`
+- `Operation(String)`
+
+Clients that need Prometheus, OpenMetrics, or CloudWatch wire formats must
+convert from this JSON externally.
 
 ## 8. Management API
 

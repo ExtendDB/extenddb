@@ -24,7 +24,6 @@ tracing = { workspace = true }
 crc32fast = { workspace = true }
 uuid = { workspace = true }
 metrics = { workspace = true }
-metrics-exporter-prometheus = { workspace = true }
 anyhow = { workspace = true }
 bcrypt = { workspace = true }
 base64 = { workspace = true }

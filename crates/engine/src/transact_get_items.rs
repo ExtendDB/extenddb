@@ -100,17 +100,21 @@ pub async fn handle_transact_get_items(
         .map_err(storage_err_to_dynamo)?;
 
     // Capacity metering: RCU rounded per item, then summed (M-1).
-    // TransactGetItems is always strongly consistent.
+    // Capacity metering: TransactGetItems costs 2 RCU per item (transactions
+    // double the read cost). Missing items still cost 2 RCU.
     let mut per_table_rcu: std::collections::HashMap<String, f64> =
         std::collections::HashMap::new();
     let rcu: f64 = items
         .iter()
         .zip(input.transact_items.iter())
-        .filter_map(|(opt, tgi)| opt.as_ref().map(|item| (item, &tgi.get.table_name)))
-        .map(|(item, table_name)| {
-            let item_rcu = capacity_helpers::read_capacity_units(item_size_bytes(item), true);
-            *per_table_rcu.entry(table_name.clone()).or_default() += item_rcu;
-            item_rcu
+        .map(|(opt, tgi)| {
+            let base_rcu = match opt {
+                Some(item) => capacity_helpers::read_capacity_units(item_size_bytes(item), true),
+                None => 1.0, // minimum 1 RCU for missing item
+            };
+            let txn_rcu = base_rcu * 2.0; // transactions cost 2x
+            *per_table_rcu.entry(tgi.get.table_name.clone()).or_default() += txn_rcu;
+            txn_rcu
         })
         .sum();
     let total_pre_proj_bytes: usize = items
@@ -153,7 +157,8 @@ pub async fn handle_transact_get_items(
                 )?;
                 let item = opt
                     .map(|item| apply_projection(&item, &projection, &maps))
-                    .transpose()?;
+                    .transpose()?
+                    .filter(|i| !i.is_empty());
                 Ok(ItemResponse { item })
             } else {
                 extenddb_core::expression::validate_unused_attributes(

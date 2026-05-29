@@ -121,9 +121,17 @@ pub struct PutItemInput {
     pub return_values: ReturnValues,
     #[serde(rename = "ConditionExpression")]
     pub condition_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames")]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ExpressionAttributeValues")]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_values"
+    )]
     pub expression_attribute_values: Option<HashMap<String, super::AttributeValue>>,
     #[serde(rename = "Expected")]
     pub expected: Option<HashMap<String, ExpectedAttributeValue>>,
@@ -171,7 +179,11 @@ pub struct GetItemInput {
     pub consistent_read: Option<bool>,
     #[serde(rename = "ProjectionExpression")]
     pub projection_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames")]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
     /// Legacy `AttributesToGet` — desugared to `ProjectionExpression`.
     #[serde(rename = "AttributesToGet")]
@@ -204,9 +216,17 @@ pub struct DeleteItemInput {
     pub return_values: ReturnValues,
     #[serde(rename = "ConditionExpression")]
     pub condition_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames")]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ExpressionAttributeValues")]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_values"
+    )]
     pub expression_attribute_values: Option<HashMap<String, super::AttributeValue>>,
     #[serde(rename = "Expected")]
     pub expected: Option<HashMap<String, ExpectedAttributeValue>>,
@@ -253,9 +273,17 @@ pub struct UpdateItemInput {
     pub update_expression: Option<String>,
     #[serde(rename = "ConditionExpression")]
     pub condition_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames")]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ExpressionAttributeValues")]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_values"
+    )]
     pub expression_attribute_values: Option<HashMap<String, super::AttributeValue>>,
     #[serde(rename = "ReturnValues", default)]
     pub return_values: ReturnValues,

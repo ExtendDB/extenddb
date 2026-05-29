@@ -121,17 +121,39 @@ pub async fn handle_update_item(
         &ctx.limits,
     )?;
 
-    // Parse the update expression
-    let update_expr = effective_update_expr.as_deref().unwrap_or("");
-    let update_tokens = tokenize_for(
-        update_expr,
-        ctx.limits.max_expression_tokens,
-        "UpdateExpression",
-    )?;
-    if ctx.limits.enforce_reserved_keywords {
-        validate_no_reserved_words(&update_tokens)?;
+    // No UpdateExpression and no AttributeUpdates: no-op upsert.
+    // Some("") still errors via tokenize_for.
+    let actions = if let Some(update_expr) = effective_update_expr.as_deref() {
+        let update_tokens = tokenize_for(
+            update_expr,
+            ctx.limits.max_expression_tokens,
+            "UpdateExpression",
+        )?;
+        if ctx.limits.enforce_reserved_keywords {
+            validate_no_reserved_words(&update_tokens)?;
+        }
+        parse_update_from(&update_tokens, update_expr)?
+    } else {
+        Vec::new()
+    };
+
+    // Amazon DynamoDB enforces nesting depth on values that are stored as item
+    // attributes. For UpdateExpression, walk each SET action's RHS to find the
+    // EAV placeholders it references, resolve them against `maps.values`, and
+    // validate those values' depth. Condition-only EAV is left alone.
+    {
+        let mut placeholders: Vec<String> = Vec::new();
+        for action in &actions {
+            if let UpdateAction::Set { value, .. } = action {
+                extenddb_core::expression::collect_value_placeholders(value, &mut placeholders);
+            }
+        }
+        let stored: Vec<&extenddb_core::types::AttributeValue> = placeholders
+            .iter()
+            .filter_map(|name| maps.values.get(name))
+            .collect();
+        extenddb_core::validation::validate_attribute_values_nesting_depth(stored)?;
     }
-    let actions = parse_update_from(&update_tokens, update_expr)?;
 
     if input.expected.is_none() || input.expected.as_ref().is_some_and(|m| m.is_empty()) {
         let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
@@ -152,10 +174,6 @@ pub async fn handle_update_item(
         input.return_values,
         ReturnValues::AllOld | ReturnValues::UpdatedOld
     );
-    let return_new = matches!(
-        input.return_values,
-        ReturnValues::AllNew | ReturnValues::UpdatedNew
-    );
 
     let view_type = stream_capture::stream_view_type(&key_info);
     let stream = view_type.map(|vt| extenddb_storage::StreamCapture {
@@ -164,7 +182,6 @@ pub async fn handle_update_item(
         region: ctx.region.clone(),
     });
     let need_old_for_stream = stream.is_some();
-    let need_new_for_stream = stream.is_some();
 
     let (old_item, new_item) = ctx
         .storage
@@ -173,7 +190,7 @@ pub async fn handle_update_item(
             &input.key,
             &actions,
             return_old || need_old_for_stream,
-            return_new || need_new_for_stream,
+            true, // always fetch new item for WCU calculation
             condition.as_ref(),
             &maps,
             stream.as_ref(),
@@ -197,12 +214,12 @@ pub async fn handle_update_item(
         ReturnValues::None => None,
         ReturnValues::AllOld => old_item,
         ReturnValues::AllNew => new_item,
-        ReturnValues::UpdatedOld => {
-            old_item.map(|item| filter_to_updated_attrs(&item, &actions, &maps))
-        }
-        ReturnValues::UpdatedNew => {
-            new_item.map(|item| filter_to_updated_attrs(&item, &actions, &maps))
-        }
+        ReturnValues::UpdatedOld => old_item
+            .map(|item| filter_to_updated_attrs(&item, &actions, &maps))
+            .filter(|item| !item.is_empty()),
+        ReturnValues::UpdatedNew => new_item
+            .map(|item| filter_to_updated_attrs(&item, &actions, &maps))
+            .filter(|item| !item.is_empty()),
     };
 
     let output = UpdateItemOutput {
@@ -279,17 +296,88 @@ fn filter_to_updated_attrs(item: &Item, actions: &[UpdateAction], maps: &Express
             | UpdateAction::Add { path, .. }
             | UpdateAction::Delete { path, .. } => path,
         };
-        if let Some(PathElement::Attribute(name)) = path.first() {
+        if path.is_empty() {
+            continue;
+        }
+        // Resolve the top-level attribute name
+        let top_name = match &path[0] {
+            PathElement::Attribute(name) => {
+                let resolved = name
+                    .strip_prefix('#')
+                    .and_then(|r| maps.names.get(r).map(String::as_str))
+                    .unwrap_or(name.as_str());
+                resolved.to_owned()
+            }
+            _ => continue,
+        };
+
+        // Top-level path (len == 1): return the whole attribute
+        if path.len() == 1 {
+            if let Some(val) = item.get(&top_name) {
+                result.insert(top_name, val.clone());
+            }
+            continue;
+        }
+
+        // Nested path: extract only the leaf value and wrap in path structure
+        let Some(top_val) = item.get(&top_name) else {
+            continue;
+        };
+        if let Some(leaf) = resolve_path_value(top_val, &path[1..], maps) {
+            let wrapped = wrap_leaf_in_path(&path[1..], &leaf, maps);
+            result.insert(top_name, wrapped);
+        }
+    }
+    result
+}
+
+/// Resolve a value at a nested path within an AttributeValue.
+fn resolve_path_value(
+    val: &AttributeValue,
+    path: &[PathElement],
+    maps: &ExpressionMaps,
+) -> Option<AttributeValue> {
+    if path.is_empty() {
+        return Some(val.clone());
+    }
+    match (&path[0], val) {
+        (PathElement::Attribute(name), AttributeValue::M(map)) => {
             let resolved = name
                 .strip_prefix('#')
                 .and_then(|r| maps.names.get(r).map(String::as_str))
                 .unwrap_or(name.as_str());
-            if let Some(val) = item.get(resolved) {
-                result.insert(resolved.to_owned(), val.clone());
-            }
+            map.get(resolved)
+                .and_then(|v| resolve_path_value(v, &path[1..], maps))
         }
+        (PathElement::Index(idx), AttributeValue::L(list)) => list
+            .get(*idx)
+            .and_then(|v| resolve_path_value(v, &path[1..], maps)),
+        _ => None,
     }
-    result
+}
+
+/// Wrap a leaf value in the path structure (building from inside out).
+fn wrap_leaf_in_path(
+    path: &[PathElement],
+    leaf: &AttributeValue,
+    maps: &ExpressionMaps,
+) -> AttributeValue {
+    if path.is_empty() {
+        return leaf.clone();
+    }
+    let inner = wrap_leaf_in_path(&path[1..], leaf, maps);
+    match &path[0] {
+        PathElement::Attribute(name) => {
+            let resolved = name
+                .strip_prefix('#')
+                .and_then(|r| maps.names.get(r).map(String::as_str))
+                .unwrap_or(name.as_str());
+            let mut map = std::collections::BTreeMap::new();
+            map.insert(resolved.to_owned(), inner);
+            AttributeValue::M(map)
+        }
+        PathElement::Index(_) => AttributeValue::L(vec![inner]),
+    }
 }
 
 /// Desugared legacy `AttributeUpdates`: (expression, values, names).

@@ -8,7 +8,7 @@
 //! `ConditionExpression`:
 //!
 //! - Partition key: `pk = :val` (equality only, required)
-//! - Sort key (optional): `sk op :val`, `sk BETWEEN :lo AND :hi`,
+//! - Sort key (optional): `sk op :val`, `:val op sk`, `sk BETWEEN :lo AND :hi`,
 //!   `begins_with(sk, :prefix)`
 //! - Only AND is allowed to combine PK and SK conditions
 //! - No OR, NOT, nested conditions, or other functions
@@ -258,6 +258,9 @@ pub enum SortKeyCondition {
 ///
 /// Returns `ValidationException` for syntax errors or unsupported constructs.
 pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbError> {
+    parser_common::check_redundant_parens(tokens)
+        .map_err(|body| validation_err(&format!("Invalid KeyConditionExpression: {body}")))?;
+
     // Strip outer parentheses: "(pk = :pk AND sk > :sk)" → "pk = :pk AND sk > :sk"
     let tokens = if tokens.len() >= 2
         && tokens[0] == Token::LParen
@@ -303,6 +306,11 @@ enum RawClause {
     Compare(Vec<PathElement>, CompareOp, Expr),
     Between(Vec<PathElement>, Expr, Expr),
     BeginsWith(Vec<PathElement>, Expr),
+}
+
+enum KeyOperand {
+    Path(Vec<PathElement>),
+    Value(Expr),
 }
 
 fn classify_single(clause: RawClause) -> Result<KeyCondition, DynamoDbError> {
@@ -468,14 +476,42 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
         }
     }
 
-    // path op value | path BETWEEN lo AND hi
-    let path = parse_key_operand_path(tokens, pos)?;
+    // path op :value | :value op path | path BETWEEN :lo AND :hi
+    let left = parse_key_operand(tokens, pos)?;
 
     if *pos >= tokens.len() {
         return Err(validation_err(
-            "Invalid KeyConditionExpression: expected operator after attribute path",
+            "Invalid KeyConditionExpression: expected operator after operand",
         ));
     }
+
+    let path = match left {
+        KeyOperand::Path(path) => path,
+        KeyOperand::Value(value) => {
+            let op = try_comparator(&tokens[*pos]).ok_or_else(|| {
+                validation_err("Invalid KeyConditionExpression: expected comparison operator")
+            })?;
+            // DynamoDB rejects <> in KeyConditionExpression — only =, <, <=, >, >=
+            // are valid key condition operators.
+            if op == CompareOp::Ne {
+                return Err(validation_err(
+                    "Invalid KeyConditionExpression: Unsupported operator on KeyCondition: NE",
+                ));
+            }
+            *pos += 1;
+
+            let path = parse_key_operand_path(tokens, pos)?;
+            // Key conditions are stored path-first, so reverse the operator when
+            // the source expression puts the value placeholder on the left.
+            let op = reverse_comparator(op);
+
+            return if op == CompareOp::Eq {
+                Ok(RawClause::Eq(path, value))
+            } else {
+                Ok(RawClause::Compare(path, op, value))
+            };
+        }
+    };
 
     // BETWEEN
     if tokens[*pos] == Token::Between {
@@ -508,10 +544,38 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
     }
 }
 
+fn parse_key_operand(tokens: &[Token], pos: &mut usize) -> Result<KeyOperand, DynamoDbError> {
+    if *pos >= tokens.len() {
+        return Err(validation_err(
+            "Invalid KeyConditionExpression: unexpected end of expression",
+        ));
+    }
+
+    match &tokens[*pos] {
+        Token::Ident(_) | Token::NameRef(_) => {
+            let path = parser_common::parse_path(tokens, pos)?;
+            Ok(KeyOperand::Path(path))
+        }
+        Token::Placeholder(_) => {
+            let value = parse_key_value(tokens, pos)?;
+            Ok(KeyOperand::Value(value))
+        }
+        _ => Err(validation_err(
+            "Invalid KeyConditionExpression: expected attribute path or value placeholder",
+        )),
+    }
+}
+
 fn parse_key_operand_path(
     tokens: &[Token],
     pos: &mut usize,
 ) -> Result<Vec<PathElement>, DynamoDbError> {
+    if *pos >= tokens.len() {
+        return Err(validation_err(
+            "Invalid KeyConditionExpression: expected attribute path",
+        ));
+    }
+
     match &tokens[*pos] {
         Token::Ident(_) | Token::NameRef(_) => parser_common::parse_path(tokens, pos),
         _ => Err(validation_err(
@@ -535,6 +599,17 @@ fn parse_key_value(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbEr
         _ => Err(validation_err(
             "Invalid KeyConditionExpression: key condition values must be expression attribute value placeholders",
         )),
+    }
+}
+
+fn reverse_comparator(op: CompareOp) -> CompareOp {
+    match op {
+        CompareOp::Eq => CompareOp::Eq,
+        CompareOp::Ne => CompareOp::Ne,
+        CompareOp::Lt => CompareOp::Gt,
+        CompareOp::Le => CompareOp::Ge,
+        CompareOp::Gt => CompareOp::Lt,
+        CompareOp::Ge => CompareOp::Le,
     }
 }
 
@@ -578,6 +653,35 @@ mod tests {
     use super::*;
     use crate::expression::tokenize;
     use std::collections::HashMap;
+
+    #[test]
+    fn key_condition_redundant_parens_rejected_with_canonical_message() {
+        for expr in ["((pk = :v))", "((#pk = :pk)) AND (#sk = :sk)"] {
+            let tokens = tokenize(expr).unwrap();
+            let err = parse_key_condition(&tokens).unwrap_err();
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg)
+                    if msg == "Invalid KeyConditionExpression: The expression has redundant parentheses;"),
+                "expr {expr}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_condition_valid_parens_accepted() {
+        for expr in [
+            "(pk = :v)",
+            "(#pk = :pk) AND (#sk = :sk)",
+            "(#pk = :pk AND #sk = :sk)",
+            "(#pk = :pk AND (#sk = :sk))",
+        ] {
+            let tokens = tokenize(expr).unwrap();
+            assert!(
+                parse_key_condition(&tokens).is_ok(),
+                "expr {expr} should parse"
+            );
+        }
+    }
 
     #[test]
     fn resolve_pk_sk_swaps_when_reversed() {
@@ -673,6 +777,46 @@ mod tests {
                 op: CompareOp::Gt, ..
             }) => {}
             other => panic!("expected Gt SK condition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_reversed_sort_key_comparison() {
+        let tokens = tokenize("pk = :pk AND :lo <= sk").unwrap();
+        let kc = parse_key_condition(&tokens).unwrap();
+
+        assert_eq!(kc.pk_path, vec![PathElement::Attribute("pk".to_owned())]);
+        match &kc.sk_condition {
+            Some(SortKeyCondition::Compare {
+                path,
+                op: CompareOp::Ge,
+                value: Expr::Placeholder(name),
+            }) => {
+                assert_eq!(path, &vec![PathElement::Attribute("sk".to_owned())]);
+                assert_eq!(name, "lo");
+            }
+            other => panic!("expected reversed Ge SK condition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_reversed_partition_key_equality() {
+        let tokens = tokenize(":pk = pk").unwrap();
+        let kc = parse_key_condition(&tokens).unwrap();
+
+        assert_eq!(kc.pk_path, vec![PathElement::Attribute("pk".to_owned())]);
+        assert_eq!(kc.pk_value, Expr::Placeholder("pk".to_owned()));
+    }
+
+    #[test]
+    fn reverse_comparator_maps_each_operator_and_is_involutive() {
+        use CompareOp::{Eq, Ge, Gt, Le, Lt, Ne};
+
+        let cases = [(Eq, Eq), (Ne, Ne), (Lt, Gt), (Le, Ge), (Gt, Lt), (Ge, Le)];
+
+        for (op, reversed) in cases {
+            assert_eq!(reverse_comparator(op), reversed);
+            assert_eq!(reverse_comparator(reverse_comparator(op)), op);
         }
     }
 

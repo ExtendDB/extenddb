@@ -26,6 +26,8 @@ pub async fn handle_create_table(
         let msg = e.to_string();
         if msg.contains("validation error detected")
             || msg.contains("parameter values were invalid")
+            || msg.contains("must not be empty")
+            || msg.contains("Syntax error; key")
         {
             DynamoDbError::ValidationException(msg)
         } else if msg.contains("missing field") && msg.contains("TableName") {

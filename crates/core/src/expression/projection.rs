@@ -76,8 +76,10 @@ pub fn apply_projection(
 /// Insert a value at a nested path in the result item, creating intermediate
 /// maps/lists as needed.
 ///
-/// DynamoDB projection semantics for list indices: projecting `mylist[N]`
-/// returns `{"mylist": [value]}` — a single-element list wrapping the value.
+/// DynamoDB projection semantics:
+/// - `mylist[N]` → `{"mylist": [value]}`
+/// - `mylist[N].attr` → `{"mylist": [{"attr": value}]}`
+/// - `mymap.attr` → `{"mymap": {"attr": value}}`
 fn insert_nested(
     result: &mut Item,
     path: &[PathElement],
@@ -95,56 +97,73 @@ fn insert_nested(
         return Ok(());
     }
 
-    if path.len() == 2 {
-        if let PathElement::Index(_) = &path[1] {
-            // mylist[N] → {"mylist": [value]}
-            result.insert(top_name, AttributeValue::L(vec![value.clone()]));
-            return Ok(());
+    // Build the value from the inside out, starting from the leaf.
+    let wrapped = wrap_from_tail(&path[1..], maps, value)?;
+    let entry = result.entry(top_name);
+    match entry {
+        std::collections::btree_map::Entry::Vacant(e) => {
+            e.insert(wrapped);
+        }
+        std::collections::btree_map::Entry::Occupied(mut e) => {
+            merge_projected(e.get_mut(), &wrapped);
         }
     }
+    Ok(())
+}
 
-    // For nested paths, we need to build the intermediate structure
-    let entry = result
-        .entry(top_name)
-        .or_insert_with(|| AttributeValue::M(BTreeMap::new()));
-
-    let mut current = entry;
-    for element in &path[1..path.len() - 1] {
-        match element {
-            PathElement::Attribute(name) => {
-                let resolved = super::resolver::resolve_name_ref(name, maps)?;
-                if let AttributeValue::M(map) = current {
-                    current = map
-                        .entry(resolved.into_owned())
-                        .or_insert_with(|| AttributeValue::M(BTreeMap::new()));
-                } else {
-                    return Ok(());
-                }
-            }
-            PathElement::Index(_) => {
-                // Intermediate list index: wrap remaining path in a single-element list
-                let remaining_value = value.clone();
-                *current = AttributeValue::L(vec![remaining_value]);
-                return Ok(());
-            }
-        }
+/// Build the nested structure from a path tail and a leaf value.
+/// E.g. for path `[Index(0), Attribute("val")]` and value `"target"`,
+/// produces `L([M({"val": "target"})])`.
+fn wrap_from_tail(
+    path: &[PathElement],
+    maps: &ExpressionMaps,
+    value: &AttributeValue,
+) -> Result<AttributeValue, DynamoDbError> {
+    if path.is_empty() {
+        return Ok(value.clone());
     }
 
-    // Set the final value
-    match &path[path.len() - 1] {
+    match &path[0] {
         PathElement::Attribute(name) => {
             let resolved = super::resolver::resolve_name_ref(name, maps)?;
-            if let AttributeValue::M(map) = current {
-                map.insert(resolved.into_owned(), value.clone());
-            }
+            let inner = wrap_from_tail(&path[1..], maps, value)?;
+            let mut map = BTreeMap::new();
+            map.insert(resolved.into_owned(), inner);
+            Ok(AttributeValue::M(map))
         }
         PathElement::Index(_) => {
-            // List index at leaf of a deeper path — wrap in single-element list
-            *current = AttributeValue::L(vec![value.clone()]);
+            let inner = wrap_from_tail(&path[1..], maps, value)?;
+            Ok(AttributeValue::L(vec![inner]))
         }
     }
+}
 
-    Ok(())
+/// Merge a projected value into an existing structure (for multiple projections
+/// on the same top-level attribute).
+fn merge_projected(existing: &mut AttributeValue, new: &AttributeValue) {
+    match (existing, new) {
+        (AttributeValue::M(existing_map), AttributeValue::M(new_map)) => {
+            for (k, v) in new_map {
+                match existing_map.get_mut(k) {
+                    Some(existing_v) => merge_projected(existing_v, v),
+                    None => {
+                        existing_map.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        (AttributeValue::L(existing_list), AttributeValue::L(new_list)) => {
+            // For list projections, DynamoDB merges into the single-element list
+            if existing_list.len() == 1 && new_list.len() == 1 {
+                merge_projected(&mut existing_list[0], &new_list[0]);
+            } else {
+                existing_list.extend(new_list.iter().cloned());
+            }
+        }
+        (existing, new) => {
+            *existing = new.clone();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -278,5 +297,35 @@ mod tests {
         // Out-of-bounds index returns empty
         let result = project("mylist[5]", &item, HashMap::new()).unwrap();
         assert!(result.is_empty());
+    }
+    #[test]
+    fn project_list_index_into_map_preserves_structure() {
+        let mut item = BTreeMap::new();
+        item.insert("pk".into(), AttributeValue::S("p".into()));
+        let mut map0 = BTreeMap::new();
+        map0.insert("val".into(), AttributeValue::S("target".into()));
+        map0.insert("x".into(), AttributeValue::S("0".into()));
+        let mut map1 = BTreeMap::new();
+        map1.insert("x".into(), AttributeValue::S("0".into()));
+        item.insert(
+            "a_list".into(),
+            AttributeValue::L(vec![AttributeValue::M(map0), AttributeValue::M(map1)]),
+        );
+
+        let result = project("a_list[0].val", &item, HashMap::new()).unwrap();
+        // Should preserve: {"a_list": [{"val": "target"}]}
+        match result.get("a_list") {
+            Some(AttributeValue::L(list)) => {
+                assert_eq!(list.len(), 1);
+                match &list[0] {
+                    AttributeValue::M(m) => {
+                        assert_eq!(m.get("val"), Some(&AttributeValue::S("target".into())));
+                        assert!(!m.contains_key("x"));
+                    }
+                    other => panic!("Expected M, got {other:?}"),
+                }
+            }
+            other => panic!("Expected L, got {other:?}"),
+        }
     }
 }

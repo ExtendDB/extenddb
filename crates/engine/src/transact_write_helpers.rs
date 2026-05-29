@@ -309,6 +309,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transact_condition_redundant_parens_rejected_with_canonical_message() {
+        let limits = extenddb_core::limits::LimitsConfig::default();
+        let err = parse_optional_condition(Some("((a = :v))"), &limits).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if msg == "Invalid ConditionExpression: The expression has redundant parentheses;"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
     fn validate_token_valid() {
         assert!(validate_client_request_token("abc-123").is_ok());
         assert!(validate_client_request_token("a").is_ok());

@@ -193,7 +193,6 @@ This file is a human-controlled policy input and must not be modified by agents.
 | md-5 | 0.10.6 | MIT OR Apache-2.0 | Yes |
 | memchr | 2.8.0 | Unlicense OR MIT | Yes |
 | metrics | 0.24.3 | MIT | Yes |
-| metrics-exporter-prometheus | 0.16.2 | MIT | Yes |
 | metrics-util | 0.19.1 | MIT | Yes |
 | mime | 0.3.17 | MIT OR Apache-2.0 | Yes |
 | minimal-lexical | 0.2.1 | MIT/Apache-2.0 | Yes |

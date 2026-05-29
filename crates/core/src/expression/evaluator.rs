@@ -53,6 +53,31 @@ pub fn evaluate_condition(
             let val = resolve_to_value(operand, item, maps)?;
             let lo = resolve_to_value(low, item, maps)?;
             let hi = resolve_to_value(high, item, maps)?;
+            // DynamoDB validates bounds when both are literal placeholders
+            if matches!(low.as_ref(), Expr::Placeholder(_))
+                && matches!(high.as_ref(), Expr::Placeholder(_))
+            {
+                if let (Some(l), Some(h)) = (lo.as_deref(), hi.as_deref()) {
+                    let l_type = attribute_type_code(l);
+                    let h_type = attribute_type_code(h);
+                    if l_type != h_type {
+                        return Err(DynamoDbError::ValidationException(format!(
+                            "Invalid ConditionExpression: The BETWEEN operator requires same data type for lower and upper bounds; lower bound operand: AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
+                            format_attribute_value(l),
+                            format_attribute_value(h)
+                        )));
+                    }
+                    let lpn = placeholder_numeric(low, maps);
+                    let hpn = placeholder_numeric(high, maps);
+                    if compare_values(l, h, CompareOp::Gt, lpn, hpn) {
+                        return Err(DynamoDbError::ValidationException(format!(
+                            "Invalid ConditionExpression: The BETWEEN operator requires upper bound to be greater than or equal to lower bound; lower bound operand: AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
+                            format_attribute_value(l),
+                            format_attribute_value(h)
+                        )));
+                    }
+                }
+            }
             match (&val, &lo, &hi) {
                 (Some(v), Some(l), Some(h)) => {
                     let vpn = placeholder_numeric(operand, maps);
@@ -357,6 +382,16 @@ fn attribute_type_code(val: &AttributeValue) -> &'static str {
         AttributeValue::SS(_) => "SS",
         AttributeValue::NS(_) => "NS",
         AttributeValue::BS(_) => "BS",
+    }
+}
+
+/// Format an `AttributeValue` for error messages (e.g. `N:5`, `S:hello`).
+fn format_attribute_value(val: &AttributeValue) -> String {
+    match val {
+        AttributeValue::S(s) => format!("S:{s}"),
+        AttributeValue::N(n) => format!("N:{n}"),
+        AttributeValue::B(_) => "B:<binary>".to_owned(),
+        _ => format!("{}:<value>", attribute_type_code(val)),
     }
 }
 

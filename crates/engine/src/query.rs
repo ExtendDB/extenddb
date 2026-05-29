@@ -20,7 +20,7 @@ use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
-use crate::index_helpers::combined_lek_key_schema;
+use crate::index_helpers::{combined_lek_key_schema, validate_query_exclusive_start_key};
 use crate::legacy_filter::{desugar_filter, desugar_key_conditions};
 use crate::read_helpers::apply_post_read;
 use crate::serialize_output;
@@ -353,16 +353,16 @@ pub async fn handle_query(
         ExpressionMaps::new(names, values)
     };
 
+    // Validate begins_with operand types upfront (before any rows are read).
+    if let Some(ref f) = filter {
+        extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
+            |e| crate::expression_helpers::prefix_expression_error(e, "FilterExpression"),
+        )?;
+    }
+
     // Validate ExclusiveStartKey matches the key schema
     if let Some(ref start_key) = input.exclusive_start_key {
-        let required = combined_lek_key_schema(&key_info.key_schema, index_info.as_ref());
-        for ks in &required {
-            if !start_key.contains_key(&ks.attribute_name) {
-                return Err(DynamoDbError::ValidationException(
-                    "The provided starting key is invalid".to_owned(),
-                ));
-            }
-        }
+        validate_query_exclusive_start_key(start_key, &key_info, index_info.as_ref())?;
     }
 
     // Query storage

@@ -113,6 +113,17 @@ class TestQuery:
         )
         assert resp["Count"] == 3
 
+    def test_query_reversed_sk_comparison(self, dynamodb_client, query_table):
+        resp = dynamodb_client.query(
+            TableName=query_table,
+            KeyConditionExpression="pk = :pk AND :lo <= sk",
+            ExpressionAttributeValues={
+                ":pk": {"S": "user-1"},
+                ":lo": {"N": "3"},
+            },
+        )
+        assert resp["Count"] == 8
+
     def test_query_sk_between(self, dynamodb_client, query_table):
         resp = dynamodb_client.query(
             TableName=query_table,

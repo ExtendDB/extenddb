@@ -22,7 +22,8 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::parse_update;
 use extenddb_core::types::{TransactWriteItem, TransactWriteItemsInput, TransactWriteItemsOutput};
 use extenddb_core::validation::{
-    validate_attribute_name_sizes, validate_item_size, validate_key_sizes,
+    validate_attribute_name_sizes, validate_attribute_values_nesting_depth,
+    validate_item_nesting_depth, validate_item_size, validate_key_sizes,
 };
 
 /// Maximum number of items in a single `TransactWriteItems` request.
@@ -208,6 +209,7 @@ async fn prepare_write_op(
             .table_key_info(&ctx.account_id, &put.table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
+        validate_item_nesting_depth(&put.item)?;
         validate_item_size(&put.item, ctx.limits.max_item_size_bytes)?;
         validate_attribute_name_sizes(&put.item, &ctx.limits)?;
         validate_key_sizes(&put.item, &key_info.key_schema, &ctx.limits)?;
@@ -295,6 +297,21 @@ async fn prepare_write_op(
             crate::expression_helpers::tokenize_expression(&upd.update_expression, &ctx.limits)?;
         let actions = parse_update(&update_tokens)?;
         validate_no_key_updates(&actions, &key_info, &maps)?;
+
+        // Validate nesting depth of EAV values that get stored via SET actions.
+        {
+            let mut placeholders: Vec<String> = Vec::new();
+            for action in &actions {
+                if let extenddb_core::expression::UpdateAction::Set { value, .. } = action {
+                    extenddb_core::expression::collect_value_placeholders(value, &mut placeholders);
+                }
+            }
+            let stored: Vec<&extenddb_core::types::AttributeValue> = placeholders
+                .iter()
+                .filter_map(|name| maps.values.get(name))
+                .collect();
+            validate_attribute_values_nesting_depth(stored)?;
+        }
         let condition = parse_optional_condition(upd.condition_expression.as_deref(), &ctx.limits)?;
         {
             let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();

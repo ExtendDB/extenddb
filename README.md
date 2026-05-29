@@ -15,11 +15,11 @@ A DynamoDB-compatible API adapter, ExtendDB speaks the DynamoDB wire protocol â€
 ## Features
 
 - Full DynamoDB wire protocol: CRUD, Query, Scan, Batch, Transactions, Streams, TTL, Import/Export
-- SigV4 authentication with local IAM: users, groups, roles, policies, permissions boundaries
+- SigV4 authentication with IAM compatibility: users, groups, roles, policies, permissions boundaries
 - Web management console for account and credential administration
 - TLS with automatic self-signed certificate generation (replaceable with CA-signed certs)
 - CSRF protection, security headers, session management
-- Prometheus-compatible metrics endpoint
+- JSON metrics endpoint with DynamoDB CloudWatch-style metric names and dimensions
 - Daemon mode with syslog logging, plus `--foreground` for container and supervisor environments
 - PostgreSQL storage â€” use standard backup, replication, and HA tools
 
@@ -120,7 +120,7 @@ Use this with Docker, Kubernetes, `systemd Type=simple`, runit, s6, or any other
 # Health check
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/health
 
-# Prometheus metrics
+# JSON metrics (DynamoDB CloudWatch-style)
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/metrics
 
 # Syslog (Linux)
@@ -205,6 +205,21 @@ Build PDFs:
 ```bash
 python3 docs/build-docs.py
 ```
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for build,
+test, and code-style requirements.
+
+ExtendDB uses two lightweight processes for tracking decisions:
+
+- **[ADRs](docs/adr/README.md)** record decisions that have been made.
+- **[RFCs](docs/rfcs/README.md)** propose changes that affect the wire protocol,
+  storage trait, auth model, on-disk format, public CLI, or any significant
+  new feature or subsystem. Substantial changes go through an RFC before
+  implementation.
+
+Code in protected paths is reviewed via [`.github/CODEOWNERS`](.github/CODEOWNERS).
 
 ## License
 

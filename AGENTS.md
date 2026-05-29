@@ -288,7 +288,7 @@ Or use the web console at `https://127.0.0.1:8000/console/`.
 # Health check
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/health
 
-# Prometheus metrics
+# JSON metrics (DynamoDB CloudWatch-style)
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/metrics
 
 # Syslog (Linux)
@@ -376,7 +376,7 @@ python3 docs/build-docs.py
 - **Database:** `sqlx` with compile-time query checking (PostgreSQL)
 - **HTTP:** `axum` + `tower` + `hyper`
 - **Logging:** `tracing` + `tracing-subscriber`
-- **Metrics:** `metrics` + `metrics-exporter-prometheus`
+- **Metrics:** in-memory `MetricsCollector` (`crates/core/src/metrics/`), exposed as JSON via `/metrics` with DynamoDB CloudWatch-style metric names and dimensions
 - **TLS:** `rustls` + `axum-server`
 
 ### Naming Conventions

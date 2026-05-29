@@ -21,6 +21,11 @@ Closes #
 - [ ] I have added or updated tests for new functionality
 - [ ] I have updated documentation if behavior changed
 - [ ] Breaking changes are noted below (if any)
+- [ ] If this changes the wire protocol, `Storage` trait, auth model, on-disk
+      format, or public CLI surface, an RFC has been accepted or is linked
+      below. Otherwise, an ADR captures the decision (link below).
+
+ADR / RFC: <!-- link or "n/a" -->
 
 ## Breaking changes
 

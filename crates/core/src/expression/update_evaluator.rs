@@ -108,7 +108,15 @@ fn evaluate_arithmetic(
         ArithOp::Sub => ld - rd,
     };
 
-    Ok(AttributeValue::N(result.to_string()))
+    let result_str = result.to_string();
+    // Validate the result is within DynamoDB's number range
+    crate::validation::number::validate_and_normalize_number(&result_str).map_err(|_| {
+        DynamoDbError::ValidationException(
+            "Number overflow. Attempting to store a number with magnitude larger than supported range".to_owned(),
+        )
+    })?;
+
+    Ok(AttributeValue::N(result_str))
 }
 
 /// Evaluate SET functions: `if_not_exists(path, value)`.
@@ -198,7 +206,15 @@ fn apply_add(
             let ad: bigdecimal::BigDecimal = add_n.parse().map_err(|_| {
                 DynamoDbError::ValidationException("Invalid numeric value in expression".to_owned())
             })?;
-            AttributeValue::N((ed + ad).to_string())
+            let result_str = (ed + ad).to_string();
+            crate::validation::number::validate_and_normalize_number(&result_str).map_err(
+                |_| {
+                    DynamoDbError::ValidationException(
+                        "Number overflow. Attempting to store a number with magnitude larger than supported range".to_owned(),
+                    )
+                },
+            )?;
+            AttributeValue::N(result_str)
         }
         // Set: union with existing
         (Some(AttributeValue::SS(existing_set)), AttributeValue::SS(add_set)) => {
@@ -411,10 +427,12 @@ fn set_path(
         return Ok(());
     }
 
-    // Navigate to the parent, then set the final element
-    let current = item
-        .entry(first_name)
-        .or_insert_with(|| AttributeValue::M(BTreeMap::new()));
+    // DynamoDB rejects SET into a path where the parent doesn't exist
+    let Some(current) = item.get_mut(&first_name) else {
+        return Err(DynamoDbError::ValidationException(
+            "The document path provided in the update expression is invalid for update".to_owned(),
+        ));
+    };
 
     set_nested(current, &path[1..], value, maps)
 }

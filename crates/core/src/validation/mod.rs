@@ -459,6 +459,7 @@ pub fn validate_put_item(
     validate_item_keys(&input.item, key_schema, attr_defs)?;
     validate_attribute_name_sizes(&input.item, limits)?;
     validate_item_numbers(&input.item)?;
+    validate_item_nesting_depth(&input.item)?;
 
     let size = item_size_bytes(&input.item);
     if size > limits.max_item_size_bytes {
@@ -536,20 +537,8 @@ pub fn validate_update_item(
     validate_table_name(&input.table_name, limits)?;
     validate_key_only(&input.key, key_schema, attr_defs)?;
 
-    // Either UpdateExpression or AttributeUpdates must be provided.
-    // Note: an empty string UpdateExpression is "provided" but will fail later
-    // with the correct "The expression can not be empty;" message from tokenize_for.
-    let has_update_expr = input.update_expression.is_some();
-    let has_attr_updates = input
-        .attribute_updates
-        .as_ref()
-        .is_some_and(|u| !u.is_empty());
-
-    if !has_update_expr && !has_attr_updates {
-        return Err(DynamoDbError::ValidationException(
-            "One or more parameter values were invalid: An UpdateExpression must be provided"
-                .to_owned(),
-        ));
+    if let Some(updates) = &input.attribute_updates {
+        validate_attribute_values_nesting_depth(updates.values().filter_map(|u| u.value.as_ref()))?;
     }
 
     Ok(())
@@ -631,6 +620,7 @@ pub fn validate_key_only(
             ))
         })?;
         validate_key_attribute_type(&ks.attribute_name, value, attr_defs)?;
+        validate_no_empty_key_value(&ks.attribute_name, value)?;
     }
     Ok(())
 }
@@ -718,6 +708,34 @@ fn validate_key_attribute_type(
     Ok(())
 }
 
+/// Validate that a key attribute value is not empty.
+///
+/// `DynamoDB` rejects empty-string and empty-binary values in key positions,
+/// returning a `ValidationException` with a type-specific error message.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` if `value` is an empty string
+/// (`S("")`) or empty binary (`B(<empty>)`).
+fn validate_no_empty_key_value(
+    attr_name: &str,
+    value: &AttributeValue,
+) -> Result<(), DynamoDbError> {
+    let kind = match value {
+        AttributeValue::S(s) if s.is_empty() => Some("string"),
+        AttributeValue::B(b) if b.is_empty() => Some("binary"),
+        _ => None,
+    };
+    if let Some(kind) = kind {
+        return Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values are not valid. \
+             The AttributeValue for a key attribute cannot contain an empty {kind} value. \
+             Key: {attr_name}"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate partition key and sort key sizes against limits.
 ///
 /// # Errors
@@ -730,12 +748,7 @@ pub fn validate_key_sizes(
 ) -> Result<(), DynamoDbError> {
     for ks in key_schema {
         if let Some(value) = item.get(&ks.attribute_name) {
-            if matches!(value, AttributeValue::S(s) if s.is_empty()) {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: {}",
-                    ks.attribute_name
-                )));
-            }
+            validate_no_empty_key_value(&ks.attribute_name, value)?;
             let size = key_value_byte_size(value);
             let (max_size, key_label) = match ks.key_type {
                 KeyType::Hash => (limits.max_partition_key_size_bytes, "partition key"),
@@ -828,6 +841,63 @@ fn validate_attribute_number(value: &AttributeValue) -> Result<(), DynamoDbError
         _ => {}
     }
     Ok(())
+}
+
+/// Maximum total nesting levels (M/L wrappers plus the leaf) DynamoDB allows.
+pub(crate) const MAX_ITEM_NESTING_DEPTH: usize = 32;
+
+/// Validate that no attribute value in `item` nests beyond `MAX_ITEM_NESTING_DEPTH`.
+pub fn validate_item_nesting_depth(item: &Item) -> Result<(), DynamoDbError> {
+    for value in item.values() {
+        check_attribute_value_depth(value, 0)?;
+    }
+    Ok(())
+}
+
+/// Validate nesting depth on attribute values introduced outside of an `Item`
+/// (`ExpressionAttributeValues`, `AttributeUpdates`, `Expected`).
+pub fn validate_attribute_values_nesting_depth<'a, I>(values: I) -> Result<(), DynamoDbError>
+where
+    I: IntoIterator<Item = &'a AttributeValue>,
+{
+    for v in values {
+        check_attribute_value_depth(v, 0)?;
+    }
+    Ok(())
+}
+
+fn check_attribute_value_depth(
+    value: &AttributeValue,
+    current_depth: usize,
+) -> Result<(), DynamoDbError> {
+    match value {
+        AttributeValue::M(map) => {
+            let next = current_depth + 1;
+            if next >= MAX_ITEM_NESTING_DEPTH {
+                return Err(nesting_depth_error());
+            }
+            for v in map.values() {
+                check_attribute_value_depth(v, next)?;
+            }
+        }
+        AttributeValue::L(list) => {
+            let next = current_depth + 1;
+            if next >= MAX_ITEM_NESTING_DEPTH {
+                return Err(nesting_depth_error());
+            }
+            for v in list {
+                check_attribute_value_depth(v, next)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn nesting_depth_error() -> DynamoDbError {
+    DynamoDbError::ValidationException(
+        "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit".to_owned(),
+    )
 }
 
 fn validate_unique_index_names(input: &CreateTableInput) -> Result<(), DynamoDbError> {
@@ -1089,6 +1159,281 @@ mod tests {
         let err = validate_attribute_name_sizes(&item, &limits).unwrap_err();
         assert!(
             err.to_string().contains("Size of attribute name"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_key_sizes_rejects_empty_binary_partition_key() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::B(Vec::new()));
+        let err = validate_key_sizes(&item, &[make_ks("pk", KeyType::Hash)], &limits).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("empty binary value"), "got: {msg}");
+        assert!(msg.contains("Key: pk"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_key_sizes_still_rejects_empty_string_partition_key() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S(String::new()));
+        let err = validate_key_sizes(&item, &[make_ks("pk", KeyType::Hash)], &limits).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("empty string value"), "got: {msg}");
+        assert!(msg.contains("Key: pk"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_key_sizes_accepts_non_empty_binary_partition_key() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::B(vec![0x00]));
+        assert!(validate_key_sizes(&item, &[make_ks("pk", KeyType::Hash)], &limits).is_ok());
+    }
+
+    #[test]
+    fn validate_key_only_rejects_empty_binary_key() {
+        let mut key = Item::new();
+        key.insert("pk".to_owned(), AttributeValue::B(Vec::new()));
+        let err = validate_key_only(
+            &key,
+            &[make_ks("pk", KeyType::Hash)],
+            &[make_ad("pk", ScalarAttributeType::B)],
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("empty binary value"), "got: {msg}");
+        assert!(msg.contains("Key: pk"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_key_only_rejects_empty_string_key() {
+        let mut key = Item::new();
+        key.insert("pk".to_owned(), AttributeValue::S(String::new()));
+        let err = validate_key_only(
+            &key,
+            &[make_ks("pk", KeyType::Hash)],
+            &[make_ad("pk", ScalarAttributeType::S)],
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("empty string value"), "got: {msg}");
+        assert!(msg.contains("Key: pk"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_key_only_accepts_non_empty_binary_key() {
+        let mut key = Item::new();
+        key.insert("pk".to_owned(), AttributeValue::B(vec![0xff]));
+        assert!(
+            validate_key_only(
+                &key,
+                &[make_ks("pk", KeyType::Hash)],
+                &[make_ad("pk", ScalarAttributeType::B)],
+            )
+            .is_ok()
+        );
+    }
+
+    fn update_input_no_directives() -> UpdateItemInput {
+        UpdateItemInput {
+            table_name: "TestTable".to_owned(),
+            key: {
+                let mut k = Item::new();
+                k.insert("pk".to_owned(), AttributeValue::S("p".to_owned()));
+                k
+            },
+            update_expression: None,
+            condition_expression: None,
+            expression_attribute_names: None,
+            expression_attribute_values: None,
+            return_values: ReturnValues::None,
+            expected: None,
+            conditional_operator: None,
+            attribute_updates: None,
+            return_values_on_condition_check_failure: Default::default(),
+            return_consumed_capacity: Default::default(),
+            return_item_collection_metrics: Default::default(),
+        }
+    }
+
+    #[test]
+    fn update_item_no_update_expression_or_attribute_updates_accepted() {
+        // DynamoDB treats UpdateItem with only TableName + Key as a no-op
+        // upsert. Validation must not reject it.
+        let limits = LimitsConfig::default();
+        let key_schema = vec![make_ks("pk", KeyType::Hash)];
+        let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
+        let input = update_input_no_directives();
+        assert!(validate_update_item(&input, &limits, &key_schema, &attr_defs).is_ok());
+    }
+
+    #[test]
+    fn update_item_empty_attribute_updates_map_accepted() {
+        // An empty AttributeUpdates map is equivalent to no directives.
+        let limits = LimitsConfig::default();
+        let key_schema = vec![make_ks("pk", KeyType::Hash)];
+        let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
+        let mut input = update_input_no_directives();
+        input.attribute_updates = Some(std::collections::HashMap::new());
+        assert!(validate_update_item(&input, &limits, &key_schema, &attr_defs).is_ok());
+    }
+
+    #[test]
+    fn update_item_empty_string_update_expression_passes_validation() {
+        // Validation must let Some("") through so the engine's tokenize_for
+        // produces the DynamoDB-compatible "The expression can not be empty;"
+        // message. PR #24 (ef8b94f) protects this routing; we keep it.
+        let limits = LimitsConfig::default();
+        let key_schema = vec![make_ks("pk", KeyType::Hash)];
+        let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
+        let mut input = update_input_no_directives();
+        input.update_expression = Some(String::new());
+        assert!(validate_update_item(&input, &limits, &key_schema, &attr_defs).is_ok());
+    }
+
+    fn nested_map(depth: usize) -> AttributeValue {
+        let mut leaf = AttributeValue::S("leaf".to_owned());
+        for _ in 0..depth {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert("a".to_owned(), leaf);
+            leaf = AttributeValue::M(m);
+        }
+        leaf
+    }
+
+    fn nested_list(depth: usize) -> AttributeValue {
+        let mut leaf = AttributeValue::S("leaf".to_owned());
+        for _ in 0..depth {
+            leaf = AttributeValue::L(vec![leaf]);
+        }
+        leaf
+    }
+
+    #[test]
+    fn nesting_depth_at_limit_accepted() {
+        // 31 wrappers + leaf = 32 total levels, DynamoDB's hard cap.
+        let mut item = Item::new();
+        item.insert("deep".to_owned(), nested_map(MAX_ITEM_NESTING_DEPTH - 1));
+        validate_item_nesting_depth(&item).expect("32 total levels must be accepted");
+    }
+
+    #[test]
+    fn nesting_depth_one_over_limit_rejected_for_map() {
+        let mut item = Item::new();
+        item.insert("deep".to_owned(), nested_map(MAX_ITEM_NESTING_DEPTH));
+        let err = validate_item_nesting_depth(&item).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Nesting Levels have exceeded supported limits"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn nesting_depth_one_over_limit_rejected_for_list() {
+        let mut item = Item::new();
+        item.insert("deep".to_owned(), nested_list(MAX_ITEM_NESTING_DEPTH));
+        let err = validate_item_nesting_depth(&item).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Nesting Levels have exceeded supported limits"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn nesting_depth_mixed_map_and_list_counted_together() {
+        let mut leaf = AttributeValue::S("leaf".to_owned());
+        for i in 0..MAX_ITEM_NESTING_DEPTH {
+            leaf = if i % 2 == 0 {
+                AttributeValue::L(vec![leaf])
+            } else {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("a".to_owned(), leaf);
+                AttributeValue::M(m)
+            };
+        }
+        let mut item = Item::new();
+        item.insert("deep".to_owned(), leaf);
+        let err = validate_item_nesting_depth(&item).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Nesting Levels have exceeded supported limits"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn nesting_depth_attribute_values_iterator_at_limit_accepted() {
+        let v = nested_map(MAX_ITEM_NESTING_DEPTH - 1);
+        validate_attribute_values_nesting_depth(std::iter::once(&v))
+            .expect("32 total levels via iterator must be accepted");
+    }
+
+    #[test]
+    fn nesting_depth_attribute_values_iterator_one_over_rejected() {
+        let v = nested_map(MAX_ITEM_NESTING_DEPTH);
+        let err = validate_attribute_values_nesting_depth(std::iter::once(&v)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Nesting Levels have exceeded supported limits"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn nesting_depth_visits_all_top_level_attributes() {
+        // Only one of three top-level attributes is over the limit. The
+        // recursion must inspect every attribute and reject.
+        let mut item = Item::new();
+        item.insert("shallow_a".to_owned(), AttributeValue::S("a".to_owned()));
+        item.insert("deep".to_owned(), nested_map(MAX_ITEM_NESTING_DEPTH));
+        item.insert("shallow_b".to_owned(), AttributeValue::N("42".to_owned()));
+        let err = validate_item_nesting_depth(&item).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Nesting Levels have exceeded supported limits"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn nesting_depth_visits_all_map_children() {
+        // A wide Map: many children, only one is over the limit.
+        let mut wide = std::collections::BTreeMap::new();
+        wide.insert("a".to_owned(), AttributeValue::S("x".to_owned()));
+        wide.insert("b".to_owned(), nested_map(MAX_ITEM_NESTING_DEPTH - 1));
+        wide.insert("c".to_owned(), nested_map(MAX_ITEM_NESTING_DEPTH));
+        wide.insert("d".to_owned(), AttributeValue::N("1".to_owned()));
+        let mut item = Item::new();
+        item.insert("wide".to_owned(), AttributeValue::M(wide));
+        let err = validate_item_nesting_depth(&item).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Nesting Levels have exceeded supported limits"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn nesting_depth_visits_all_list_elements() {
+        // A wide List: many elements, only one element is over the limit.
+        let wide = vec![
+            AttributeValue::S("x".to_owned()),
+            nested_map(MAX_ITEM_NESTING_DEPTH - 1),
+            AttributeValue::Bool(true),
+            nested_map(MAX_ITEM_NESTING_DEPTH),
+            AttributeValue::N("3".to_owned()),
+        ];
+        let mut item = Item::new();
+        item.insert("wide".to_owned(), AttributeValue::L(wide));
+        let err = validate_item_nesting_depth(&item).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Nesting Levels have exceeded supported limits"),
             "unexpected error: {err}"
         );
     }

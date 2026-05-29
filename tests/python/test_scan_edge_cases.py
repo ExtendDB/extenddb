@@ -259,3 +259,196 @@ class TestScanEdgeCases:
         assert err["Code"] == "ValidationException"
         assert err["Message"] == "The provided starting key is invalid"
         dynamodb_client.delete_table(TableName=name)
+
+    def test_scan_empty_exclusive_start_key(self, table_factory, dynamodb_client):
+        """Scan with an empty {} ExclusiveStartKey returns ValidationException."""
+        name = table_factory()
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.scan(TableName=name, ExclusiveStartKey={})
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == (
+            "The provided starting key is invalid: "
+            "The provided key element does not match the schema"
+        )
+
+    def test_query_empty_exclusive_start_key(self, table_factory, dynamodb_client):
+        """Query with an empty {} ExclusiveStartKey returns ValidationException."""
+        name = table_factory()
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.query(
+                TableName=name,
+                KeyConditionExpression="pk = :v",
+                ExpressionAttributeValues={":v": {"S": "x"}},
+                ExclusiveStartKey={},
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == "The provided starting key is invalid"
+
+    def test_scan_extra_attribute_in_exclusive_start_key(self, table_factory, dynamodb_client):
+        """Scan with a valid composite start key plus an extra non-key attr."""
+        name = table_factory(range_key="sk")
+        dynamodb_client.put_item(
+            TableName=name,
+            Item={"pk": {"S": "P"}, "sk": {"S": "S"}},
+        )
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.scan(
+                TableName=name,
+                ExclusiveStartKey={
+                    "pk": {"S": "P"},
+                    "sk": {"S": "S"},
+                    "extra": {"S": "junk"},
+                },
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == (
+            "The provided starting key is invalid: "
+            "The provided key element does not match the schema"
+        )
+
+    def test_query_extra_attribute_in_exclusive_start_key(self, table_factory, dynamodb_client):
+        """Query with a valid composite start key plus an extra non-key attr."""
+        name = table_factory(range_key="sk")
+        dynamodb_client.put_item(
+            TableName=name,
+            Item={"pk": {"S": "P"}, "sk": {"S": "S"}},
+        )
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.query(
+                TableName=name,
+                KeyConditionExpression="pk = :v",
+                ExpressionAttributeValues={":v": {"S": "P"}},
+                ExclusiveStartKey={
+                    "pk": {"S": "P"},
+                    "sk": {"S": "S"},
+                    "extra": {"S": "junk"},
+                },
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == "The provided starting key is invalid"
+
+    def test_scan_wrong_scalar_type_in_exclusive_start_key(
+        self, table_factory, dynamodb_client
+    ):
+        """Scan with PK declared S but supplied as N raises ValidationException."""
+        name = table_factory(range_key="sk")
+        dynamodb_client.put_item(
+            TableName=name,
+            Item={"pk": {"S": "P"}, "sk": {"S": "S"}},
+        )
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.scan(
+                TableName=name,
+                ExclusiveStartKey={
+                    "pk": {"N": "42"},
+                    "sk": {"S": "S"},
+                },
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == (
+            "The provided starting key is invalid: "
+            "The provided key element does not match the schema"
+        )
+
+    def test_query_wrong_scalar_type_in_exclusive_start_key(
+        self, table_factory, dynamodb_client
+    ):
+        """Query with PK declared S but supplied as N raises ValidationException."""
+        name = table_factory(range_key="sk")
+        dynamodb_client.put_item(
+            TableName=name,
+            Item={"pk": {"S": "P"}, "sk": {"S": "S"}},
+        )
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.query(
+                TableName=name,
+                KeyConditionExpression="pk = :v",
+                ExpressionAttributeValues={":v": {"S": "P"}},
+                ExclusiveStartKey={
+                    "pk": {"N": "42"},
+                    "sk": {"S": "S"},
+                },
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == "The provided starting key is invalid"
+
+    def test_scan_simple_table_extra_attribute_in_exclusive_start_key(
+        self, table_factory, dynamodb_client
+    ):
+        """Scan on a single-key table rejects an extra sk in the start key."""
+        name = table_factory()  # default: pk only
+        dynamodb_client.put_item(
+            TableName=name,
+            Item={"pk": {"S": "P"}},
+        )
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.scan(
+                TableName=name,
+                ExclusiveStartKey={"pk": {"S": "P"}, "sk": {"S": "S"}},
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == (
+            "The provided starting key is invalid: "
+            "The provided key element does not match the schema"
+        )
+
+    def test_query_simple_table_extra_attribute_in_exclusive_start_key(
+        self, table_factory, dynamodb_client
+    ):
+        """Query on a single-key table rejects an extra sk in the start key."""
+        name = table_factory()  # default: pk only
+        dynamodb_client.put_item(
+            TableName=name,
+            Item={"pk": {"S": "P"}},
+        )
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.query(
+                TableName=name,
+                KeyConditionExpression="pk = :v",
+                ExpressionAttributeValues={":v": {"S": "P"}},
+                ExclusiveStartKey={"pk": {"S": "P"}, "sk": {"S": "S"}},
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == "The provided starting key is invalid"
+
+    def test_scan_full_composite_exclusive_start_key_is_accepted(
+        self, table_factory, dynamodb_client
+    ):
+        """Sanity: a complete, well-typed ExclusiveStartKey paginates without error."""
+        name = table_factory(range_key="sk")
+        dynamodb_client.put_item(
+            TableName=name,
+            Item={"pk": {"S": "P"}, "sk": {"S": "S"}, "v": {"N": "1"}},
+        )
+        resp = dynamodb_client.scan(
+            TableName=name,
+            ExclusiveStartKey={"pk": {"S": "P"}, "sk": {"S": "S"}},
+        )
+        # Implementation detail: the storage layer is free to return zero or
+        # more items past the cursor. Contract under test is "no error".
+        assert "Items" in resp
+
+    def test_query_full_composite_exclusive_start_key_is_accepted(
+        self, table_factory, dynamodb_client
+    ):
+        """Sanity: a complete, well-typed Query ExclusiveStartKey paginates without error."""
+        name = table_factory(range_key="sk")
+        dynamodb_client.put_item(
+            TableName=name,
+            Item={"pk": {"S": "P"}, "sk": {"S": "S"}, "v": {"N": "1"}},
+        )
+        resp = dynamodb_client.query(
+            TableName=name,
+            KeyConditionExpression="pk = :v",
+            ExpressionAttributeValues={":v": {"S": "P"}},
+            ExclusiveStartKey={"pk": {"S": "P"}, "sk": {"S": "S"}},
+        )
+        assert "Items" in resp

@@ -80,7 +80,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 syslog-tracing = "0.3"
 metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
 
 # Config
 clap = { version = "4", features = ["derive"] }

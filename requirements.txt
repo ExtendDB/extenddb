@@ -4,12 +4,12 @@
 # Pinned for reproducibility; versions match the development environment.
 
 # Testing
-boto3==1.33.13
-pytest==7.4.4
-pytest-cov==4.1.0
-pytest-xdist==3.5.0
-requests==2.31.0
+boto3==1.43.14
+pytest==9.0.3
+pytest-cov==7.1.0
+pytest-xdist==3.8.0
+requests==2.34.2
 
 # Documentation (PDF build via docs/build-docs.py)
-Markdown==3.4.4
-WeasyPrint==52.5
+Markdown==3.10.2
+WeasyPrint==68.1

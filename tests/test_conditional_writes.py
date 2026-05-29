@@ -266,3 +266,136 @@ class TestConditionalPutItem:
             Key={"pk": {"S": "new"}, "sk": {"S": "1"}},
         )
         assert get["Item"]["data"]["S"] == "created"
+
+
+# ---------------------------------------------------------------------------
+# BETWEEN bounds validation (27a6d99)
+# ---------------------------------------------------------------------------
+
+
+class TestBetweenBoundsValidation:
+    """BETWEEN operator validates bounds ordering and type consistency."""
+
+    @pytest.fixture()
+    def between_table(self, dynamodb_client):
+        """Table for BETWEEN tests."""
+        name = f"extenddb-between-{uuid.uuid4().hex[:8]}"
+        dynamodb_client.create_table(
+            TableName=name,
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        wait_for_active(dynamodb_client, name)
+        yield name
+        try:
+            dynamodb_client.delete_table(TableName=name)
+            wait_for_deleted(dynamodb_client, name)
+        except Exception:
+            pass
+
+    def test_between_rejects_reversed_bounds(self, dynamodb_client, between_table):
+        """BETWEEN with lower > upper is rejected with ValidationException."""
+        dynamodb_client.put_item(
+            TableName=between_table,
+            Item={"pk": {"S": "k1"}, "v": {"N": "50"}},
+        )
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.delete_item(
+                TableName=between_table,
+                Key={"pk": {"S": "k1"}},
+                ConditionExpression="v BETWEEN :hi AND :lo",
+                ExpressionAttributeValues={":hi": {"N": "100"}, ":lo": {"N": "1"}},
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert "BETWEEN" in err["Message"]
+
+    def test_between_rejects_mismatched_types(self, dynamodb_client, between_table):
+        """BETWEEN with different types for lower and upper bounds is rejected."""
+        dynamodb_client.put_item(
+            TableName=between_table,
+            Item={"pk": {"S": "k2"}, "v": {"N": "50"}},
+        )
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.delete_item(
+                TableName=between_table,
+                Key={"pk": {"S": "k2"}},
+                ConditionExpression="v BETWEEN :lo AND :hi",
+                ExpressionAttributeValues={":lo": {"N": "1"}, ":hi": {"S": "100"}},
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert "BETWEEN" in err["Message"]
+        assert "same data type" in err["Message"]
+
+    def test_between_accepts_valid_bounds(self, dynamodb_client, between_table):
+        """BETWEEN with valid ordered same-type bounds succeeds."""
+        dynamodb_client.put_item(
+            TableName=between_table,
+            Item={"pk": {"S": "k3"}, "v": {"N": "50"}},
+        )
+        # v BETWEEN 1 AND 100 — should pass, item deleted
+        dynamodb_client.delete_item(
+            TableName=between_table,
+            Key={"pk": {"S": "k3"}},
+            ConditionExpression="v BETWEEN :lo AND :hi",
+            ExpressionAttributeValues={":lo": {"N": "1"}, ":hi": {"N": "100"}},
+        )
+        resp = dynamodb_client.get_item(TableName=between_table, Key={"pk": {"S": "k3"}})
+        assert "Item" not in resp
+
+    def test_between_accepts_equal_bounds(self, dynamodb_client, between_table):
+        """BETWEEN with lower == upper is valid (matches exact value)."""
+        dynamodb_client.put_item(
+            TableName=between_table,
+            Item={"pk": {"S": "k4"}, "v": {"N": "50"}},
+        )
+        # v BETWEEN 50 AND 50 — should pass
+        dynamodb_client.delete_item(
+            TableName=between_table,
+            Key={"pk": {"S": "k4"}},
+            ConditionExpression="v BETWEEN :lo AND :hi",
+            ExpressionAttributeValues={":lo": {"N": "50"}, ":hi": {"N": "50"}},
+        )
+        resp = dynamodb_client.get_item(TableName=between_table, Key={"pk": {"S": "k4"}})
+        assert "Item" not in resp
+
+    def test_between_string_bounds_reversed_rejected(self, dynamodb_client, between_table):
+        """BETWEEN with string bounds in wrong order is rejected."""
+        dynamodb_client.put_item(
+            TableName=between_table,
+            Item={"pk": {"S": "k5"}, "v": {"S": "m"}},
+        )
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.delete_item(
+                TableName=between_table,
+                Key={"pk": {"S": "k5"}},
+                ConditionExpression="v BETWEEN :lo AND :hi",
+                ExpressionAttributeValues={":lo": {"S": "z"}, ":hi": {"S": "a"}},
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert "BETWEEN" in err["Message"]
+
+    def test_between_in_update_condition(self, dynamodb_client, between_table):
+        """BETWEEN validation also applies in UpdateItem ConditionExpression."""
+        dynamodb_client.put_item(
+            TableName=between_table,
+            Item={"pk": {"S": "k6"}, "v": {"N": "10"}},
+        )
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.update_item(
+                TableName=between_table,
+                Key={"pk": {"S": "k6"}},
+                UpdateExpression="SET v = :new",
+                ConditionExpression="v BETWEEN :hi AND :lo",
+                ExpressionAttributeValues={
+                    ":new": {"N": "20"},
+                    ":hi": {"N": "100"},
+                    ":lo": {"N": "1"},
+                },
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert "BETWEEN" in err["Message"]
