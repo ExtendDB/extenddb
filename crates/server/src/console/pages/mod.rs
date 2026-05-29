@@ -10,6 +10,7 @@
 mod access_key_pages;
 mod account_pages;
 mod auth_pages;
+mod cache_pages;
 mod docs_page;
 mod group_pages;
 mod metrics_content;
@@ -24,6 +25,7 @@ pub use account_pages::{
     account_detail, create_account, dashboard, delete_account, list_accounts, new_account_form,
 };
 pub use auth_pages::{login_page, login_submit, logout};
+pub use cache_pages::{cache_page, invalidate_cache};
 pub use docs_page::{docs_page, docs_pdf, docs_view};
 pub use group_pages::{
     add_group_member, create_group, delete_group, group_detail, new_group_form, remove_group_member,

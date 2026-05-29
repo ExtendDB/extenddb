@@ -49,6 +49,12 @@ pub struct ConsoleState {
     /// management API calls. Without this, console-driven mutations leave
     /// stale entries in the cache for up to `auth.cache.ttl_seconds`.
     pub auth_cache: extenddb_auth::AuthCacheRegistry,
+    /// Concrete authorization cache handle. Required by the
+    /// `/console/cache` admin break-glass page so it can call the same
+    /// `apply` helper used by `POST /management/cache/invalidate`.
+    pub authz_cache: Arc<crate::CachedAuthzStore>,
+    /// Concrete TableKeyInfo cache handle. Same rationale as `authz_cache`.
+    pub table_key_info_cache: Arc<crate::CachedTableKeyInfoStore>,
 }
 
 /// Build the console router.
@@ -68,6 +74,10 @@ pub fn router() -> Router<Arc<ConsoleState>> {
         .route("/metrics", get(pages::metrics_page))
         // Settings (read-only, admin-only)
         .route("/settings", get(pages::settings_page))
+        // Cache (admin-only break-glass invalidation).
+        // See docs/design/12-auth-authz-cache.md §6.1.
+        .route("/cache", get(pages::cache_page))
+        .route("/cache/invalidate", post(pages::invalidate_cache))
         // Accounts
         .route("/accounts", get(pages::list_accounts))
         .route("/accounts/new", get(pages::new_account_form))

@@ -13,6 +13,7 @@ pub(crate) use account::generate_account_id;
 mod admin;
 mod assume_role;
 mod auth;
+pub mod cache_invalidate;
 mod cache_metrics;
 pub(crate) mod crypto;
 mod iam_group;
@@ -205,6 +206,9 @@ pub fn router() -> Router<Arc<ManagementState>> {
             "/auth-cache-metrics",
             get(cache_metrics::auth_cache_metrics),
         )
+        // Manual cache invalidation (admin only break-glass tool).
+        // See docs/design/12-auth-authz-cache.md §6.1.
+        .route("/cache/invalidate", post(cache_invalidate::invalidate))
 }
 
 /// Validate an IAM name: 1-128 chars, alphanumeric, hyphens, underscores, dots, plus, equals, at.

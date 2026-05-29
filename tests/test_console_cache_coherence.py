@@ -359,3 +359,103 @@ def test_console_add_group_member_propagates_group_policies(
             mgmt.delete_user(account_id, user)
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Console cache invalidation form (admin break-glass).
+# Mirrors POST /management/cache/invalidate; both call the same `apply`
+# helper. See docs/design/12-auth-authz-cache.md §6.1.
+# ---------------------------------------------------------------------------
+
+
+def test_console_cache_page_admin_only(auth_env):
+    """A non-logged-in browser is redirected to login; the form requires admin."""
+    endpoint, _, _ = auth_env
+    r = requests.get(
+        f"{endpoint}/console/cache",
+        verify=False,
+        timeout=30,
+        allow_redirects=False,
+    )
+    # Unauthenticated → redirect to login.
+    assert r.status_code in (302, 303), r.status_code
+
+
+def test_console_cache_invalidate_user(auth_env, mgmt, account_id, console):
+    """Submitting the cache form for scope=user returns the rendered success
+    page listing the touched subcaches."""
+    user = f"con-cache-{uuid.uuid4().hex[:8]}"
+    resp = mgmt.create_user(account_id, user, password=None)
+    assert resp.status_code == 201, resp.text
+    try:
+        r = console.post_form(
+            "/console/cache/invalidate",
+            {
+                "scope": "user",
+                "account_id": account_id,
+                "user_name": user,
+                "user_names": "",
+                "role_name": "",
+                "access_key_id": "",
+                "table_name": "",
+                "arn": "",
+                "confirm": "",
+            },
+        )
+        assert r.status_code == 200, r.text[:200]
+        # Success page lists every subcache the composite scope touched.
+        for label in (
+            "user_policies",
+            "user_group_policies",
+            "user_boundary",
+            "user_tags",
+            "principal_credentials",
+        ):
+            assert label in r.text, f"missing {label} in response"
+    finally:
+        try:
+            mgmt.delete_user(account_id, user)
+        except Exception:
+            pass
+
+
+def test_console_cache_invalidate_all_requires_typed_confirmation(
+    auth_env, mgmt, account_id, console
+):
+    """scope=all on the console form refuses without the typed token, accepts with it."""
+    # Refused without confirmation.
+    r = console.post_form(
+        "/console/cache/invalidate",
+        {
+            "scope": "all",
+            "account_id": "",
+            "user_name": "",
+            "user_names": "",
+            "role_name": "",
+            "access_key_id": "",
+            "table_name": "",
+            "arn": "",
+            "confirm": "wrong",
+        },
+    )
+    assert r.status_code == 200  # error page rendered
+    assert "INVALIDATE" in r.text  # error mentions the required token
+
+    # Accepted with the typed token.
+    r = console.post_form(
+        "/console/cache/invalidate",
+        {
+            "scope": "all",
+            "account_id": "",
+            "user_name": "",
+            "user_names": "",
+            "role_name": "",
+            "access_key_id": "",
+            "table_name": "",
+            "arn": "",
+            "confirm": "INVALIDATE",
+        },
+    )
+    assert r.status_code == 200, r.text[:200]
+    for label in ("authz", "table_key_info", "credentials"):
+        assert label in r.text

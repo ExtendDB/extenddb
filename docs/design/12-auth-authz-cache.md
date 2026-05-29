@@ -112,6 +112,73 @@ When the management API **or the web console** mutates IAM data, it invalidates 
 
 A cross-process invalidation channel is **not** added in this iteration. Multi-node deployments document the configured TTL as the worst-case lag.
 
+## 6.1. Manual invalidation: admin break-glass API
+
+Write-through hooks (§6) cover every IAM mutation we own. They do **not** cover off-instance changes on multi-node deployments before TTL kicks in, bugs in the write-through plumbing, or test scenarios that need a deterministic flush. For those cases, an admin-authenticated **manual invalidation API** complements the automatic hooks.
+
+Both the management API and the web console expose this surface; the CLI (`extenddb manage cache invalidate ...`) is a thin client over the management API. The console route and the management API route call the same handler logic, so behavior is identical regardless of how it's invoked. All three paths use the existing admin authentication mechanism (Basic auth for the API, session-based auth for the console — neither introduces a new auth path).
+
+### HTTP endpoint
+
+`POST /management/cache/invalidate` — admin-only, JSON body, returns 200 with an audit-friendly response or 400 on malformed scope.
+
+```json
+{ "scope": "<scope-tag>", "selectors": { ... } }
+```
+
+| `scope` | Required selectors | Maps to (in `AuthCacheRegistry`) |
+|---------|--------------------|----------------------------------|
+| `all` | (none; requires explicit confirmation) | every authz subcache + credentials + table_key_info |
+| `account` | `account_id` | `invalidate_account` |
+| `credential` | `access_key_id` | `invalidate_credential` |
+| `user` | `account_id`, `user_name` | composite: user_policies + user_group_policies + user_boundary + user_tags + principal_credentials |
+| `role` | `account_id`, `role_name` | composite: role_policies + role_boundary + role_tags + role_sessions + principal_credentials |
+| `group_members` | `account_id`, `user_names[]` | `invalidate_users_group_policies` |
+| `table_key_info` | `account_id`, `table_name` | `invalidate_table_key_info` |
+| `resource_tags` | `arn` | `invalidate_resource_tags` |
+
+Composite scopes (`user`, `role`) match what an operator most often actually wants when they reach for this tool ("forget everything about user X"). The narrow scopes are still exposed for surgical use. `all` is the broadest hammer and requires `--yes` from the CLI / a confirmation token from the console.
+
+### Response shape
+
+```json
+{ "scope": "user", "invalidated": ["user_policies", "user_group_policies", "user_boundary", "user_tags", "principal_credentials"] }
+```
+
+The `invalidated` array tells operators which subcaches were touched — useful for confirming that composite scopes did what was expected, and for the console UI's success banner.
+
+### Audit trail
+
+Every invocation logs at INFO via `tracing`:
+
+```
+auth_cache: admin-triggered invalidation scope=user account_id=... user_name=... admin=alice
+```
+
+Cache invalidation counters on each subcache (exposed via `/management/auth-cache-metrics`) also increase. The structured log line gives forensic context ("who flushed, when, why") that the counter alone cannot.
+
+### Behavior when caches are disabled
+
+When `auth.cache.enabled = false`, the cache layer is in pass-through mode and there is nothing to invalidate. The endpoint still returns 200 — the `AuthCacheRegistry` invalidate methods are no-ops in this state, and the operator's contract ("cache-driven staleness for X is now cleared") is trivially satisfied.
+
+### CLI
+
+```
+extenddb manage --user admin --password ... cache invalidate <scope> [...selectors]
+```
+
+Concrete subcommands match the `scope` taxonomy 1:1: `cache invalidate all --yes`, `cache invalidate account --account-id ...`, `cache invalidate user --account-id ... --user-name ...`, etc. The `all` form requires `--yes` mirroring `extenddb destroy` and `import-access-key`. Authentication is the standard admin Basic-auth flow shared with every other `manage` subcommand.
+
+### Console
+
+A new admin-only page at `/console/cache` renders a form whose scope `<select>` reveals the relevant selector inputs via JS. Submitting POSTs to `/console/cache/invalidate` (CSRF-protected, admin-gated). The page also shows a live read of `/management/auth-cache-metrics` so operators can see what's cached before flushing it. Submitting `scope=all` requires typing `INVALIDATE` into a confirmation field, mirroring the CLI's `--yes`.
+
+### What this is *not*
+
+- **Not cross-instance.** Manual invalidation only clears the local instance's caches. Operators of multi-frontend deployments must call this on each instance, or wait `ttl_seconds` for natural expiry. Cross-instance fanout is the same Appendix B work that's deferred from automatic invalidation; it would land for both paths together.
+- **Not a cache inspector.** "What's currently cached for user X?" has different threat-model implications (admin-readable mirror of cached credential material) and is out of scope.
+- **Not for routine use.** This is break-glass tooling; the write-through hooks (§6) remain the primary mechanism.
+
 ## 7. Configuration
 
 Static configuration in `extenddb.toml`:

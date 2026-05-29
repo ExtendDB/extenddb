@@ -469,6 +469,22 @@ impl CachedAuthzStore {
         }
     }
 
+    /// Drop every cached entry across every sub-cache. Used by the manual
+    /// `cache invalidate all` admin endpoint; not called from any normal
+    /// write-through path. The credential cache lives in `extenddb-auth`
+    /// and is swept separately by the caller.
+    pub fn invalidate_all(&self) {
+        self.user_policies.invalidate_all();
+        self.user_group_policies.invalidate_all();
+        self.user_boundary.invalidate_all();
+        self.user_tags.invalidate_all();
+        self.role_policies.invalidate_all();
+        self.role_boundary.invalidate_all();
+        self.role_tags.invalidate_all();
+        self.session_data.invalidate_all();
+        self.resource_tags.invalidate_all();
+    }
+
     /// Snapshot per-sub-cache counters for export to `/auth-cache-metrics`.
     /// Returns `None` if metrics are unavailable for any reason (currently
     /// always returns `Some`).

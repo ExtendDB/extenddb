@@ -252,6 +252,129 @@ def test_create_table_visible_to_authorized_caller_immediately(
     wait_for_deleted(ddb, table_name)
 
 
+# ---------------------------------------------------------------------------
+# Manual cache invalidation API (POST /management/cache/invalidate)
+# Covered by docs/design/12-auth-authz-cache.md §6.1.
+# ---------------------------------------------------------------------------
+
+
+def _metrics_invalidations(mgmt, subcache_path: list[str]) -> int:
+    """Read the auth-cache-metrics endpoint and walk to a subcache's
+    `invalidations` counter.
+
+    `subcache_path` example: `["authz", "user_policies"]` or `["credential"]`.
+    """
+    import requests
+    url = f"{mgmt.base_url}/auth-cache-metrics"
+    resp = requests.get(url, auth=mgmt.admin_auth,
+                        timeout=mgmt.timeout, verify=mgmt.verify)
+    assert resp.status_code == 200, resp.text
+    node = resp.json()
+    for k in subcache_path:
+        node = node[k]
+    return int(node["invalidations"])
+
+
+def test_manual_invalidate_user_increments_counters(auth_env, mgmt, account_id, user):
+    """scope=user touches each per-user authz subcache."""
+    endpoint, _, _ = auth_env
+    # Prime the per-user policy cache.
+    resp = mgmt.create_access_key(account_id, user)
+    creds = resp.json()
+    ddb = _ddb_client(endpoint, creds["access_key_id"], creds["secret_access_key"])
+    _put_allow_policy(mgmt, account_id, user, "dynamodb:ListTables")
+    ddb.list_tables()  # populates user_policies + credential caches
+
+    before = _metrics_invalidations(mgmt, ["authz", "user_policies"])
+
+    resp = mgmt.invalidate_cache(
+        "user", {"account_id": account_id, "user_name": user}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["scope"] == "user"
+    # Composite scope reports each subcache it touched.
+    expected = {
+        "user_policies",
+        "user_group_policies",
+        "user_boundary",
+        "user_tags",
+        "principal_credentials",
+    }
+    assert expected.issubset(set(body["invalidated"]))
+
+    after = _metrics_invalidations(mgmt, ["authz", "user_policies"])
+    assert after > before, f"user_policies invalidations: {before} → {after}"
+
+
+def test_manual_invalidate_account_does_not_break_subsequent_traffic(
+    auth_env, mgmt, account_id, user
+):
+    """scope=account sweeps every cache for the account; the user must still
+    work (re-fetched from the catalog) on the next request."""
+    endpoint, _, _ = auth_env
+    resp = mgmt.create_access_key(account_id, user)
+    creds = resp.json()
+    ddb = _ddb_client(endpoint, creds["access_key_id"], creds["secret_access_key"])
+    _put_allow_policy(mgmt, account_id, user, "dynamodb:ListTables")
+    ddb.list_tables()  # warm
+
+    resp = mgmt.invalidate_cache("account", {"account_id": account_id})
+    assert resp.status_code == 200, resp.text
+
+    # Cache is cold but the IAM state is unchanged → request succeeds.
+    ddb.list_tables()
+
+
+def test_manual_invalidate_all_requires_confirmation(auth_env, mgmt):
+    """scope=all without confirm:true is rejected with 400."""
+    resp = mgmt.invalidate_cache("all", {})
+    assert resp.status_code == 400, resp.text
+    assert "confirm" in resp.text.lower()
+
+
+def test_manual_invalidate_all_with_confirmation(auth_env, mgmt):
+    """scope=all with confirm:true sweeps every cache and returns 200."""
+    resp = mgmt.invalidate_cache("all", {"confirm": True})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["scope"] == "all"
+    assert {"authz", "table_key_info", "credentials"} == set(body["invalidated"])
+
+
+def test_manual_invalidate_missing_selector_returns_400(auth_env, mgmt, account_id):
+    """scope=user without user_name is a 400, not a silent no-op."""
+    resp = mgmt.invalidate_cache("user", {"account_id": account_id})
+    assert resp.status_code == 400, resp.text
+    assert "user_name" in resp.text
+
+
+def test_manual_invalidate_requires_admin_auth(auth_env, mgmt, account_id, user):
+    """IAM users cannot invalidate cache; missing/wrong creds → 401."""
+    import requests
+    # IAM user with valid console password but not admin → 403
+    pw = uuid.uuid4().hex
+    iam_user = f"cache-iam-{uuid.uuid4().hex[:8]}"
+    mgmt.create_user(account_id, iam_user, password=pw)
+    try:
+        resp = mgmt.invalidate_cache(
+            "all",
+            {"confirm": True},
+            auth=(f"{account_id}/{iam_user}", pw),
+        )
+        assert resp.status_code == 403, resp.text
+    finally:
+        mgmt.delete_user(account_id, iam_user)
+
+    # No credentials at all → 401.
+    resp = requests.post(
+        f"{mgmt.base_url}/cache/invalidate",
+        json={"scope": "all", "selectors": {"confirm": True}},
+        timeout=mgmt.timeout, verify=mgmt.verify,
+    )
+    assert resp.status_code == 401, resp.text
+
+
 def test_delete_table_invalidates_table_key_info_cache(
     auth_env, mgmt, account_id, user
 ):

@@ -130,6 +130,12 @@ impl CachedTableKeyInfoStore {
             .await;
     }
 
+    /// Drop every cached entry. Used by the manual `cache invalidate all`
+    /// admin endpoint; not called from any normal write-through path.
+    pub fn invalidate_all(&self) {
+        self.cache.invalidate_all();
+    }
+
     /// Snapshot the cache's internal counters.
     #[must_use]
     pub fn metrics(&self) -> Arc<extenddb_cache::SwrMetrics> {

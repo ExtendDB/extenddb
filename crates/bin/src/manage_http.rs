@@ -13,7 +13,7 @@ use std::sync::Arc;
 use base64::Engine;
 
 use crate::config;
-use crate::manage_types::ManageCommand;
+use crate::manage_types::{CacheAction, CacheInvalidateScope, ManageCommand};
 
 /// Resolve the management API endpoint from CLI args or config file.
 ///
@@ -419,5 +419,79 @@ pub fn dispatch(
             c.req("GET", &format!("/management/accounts/{account_id}/roles/{role_name}/permissions-boundary"), None),
         M::DeleteRoleBoundary { account_id, role_name } =>
             c.req("DELETE", &format!("/management/accounts/{account_id}/roles/{role_name}/permissions-boundary"), None),
+        M::Cache { action } => dispatch_cache(&c, action),
     }
+}
+
+fn dispatch_cache(c: &Ctx<'_>, action: CacheAction) -> anyhow::Result<(u16, String)> {
+    let CacheAction::Invalidate { scope } = action;
+    // Build the body matching the management API's `InvalidateRequest`
+    // shape. The CLI exposes only the subset of selector fields that
+    // each scope actually uses, so unused fields stay omitted.
+    let body = match scope {
+        CacheInvalidateScope::All { yes } => {
+            if !yes {
+                anyhow::bail!(
+                    "cache invalidate all requires --yes. This drops every cached \
+                     entry on the local instance and will cause a reload storm."
+                );
+            }
+            serde_json::json!({ "scope": "all", "selectors": { "confirm": true } })
+        }
+        CacheInvalidateScope::Account { account_id } => serde_json::json!({
+            "scope": "account",
+            "selectors": { "account_id": account_id },
+        }),
+        CacheInvalidateScope::Credential { access_key_id } => serde_json::json!({
+            "scope": "credential",
+            "selectors": { "access_key_id": access_key_id },
+        }),
+        CacheInvalidateScope::User {
+            account_id,
+            user_name,
+        } => serde_json::json!({
+            "scope": "user",
+            "selectors": { "account_id": account_id, "user_name": user_name },
+        }),
+        CacheInvalidateScope::Role {
+            account_id,
+            role_name,
+        } => serde_json::json!({
+            "scope": "role",
+            "selectors": { "account_id": account_id, "role_name": role_name },
+        }),
+        CacheInvalidateScope::GroupMembers {
+            account_id,
+            user_names,
+        } => {
+            // Comma-separated → Vec<String>. Leading/trailing whitespace
+            // and empty entries are filtered so users can paste lists
+            // freely.
+            let names: Vec<String> = user_names
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+            if names.is_empty() {
+                anyhow::bail!("--user-names must contain at least one non-empty name");
+            }
+            serde_json::json!({
+                "scope": "group_members",
+                "selectors": { "account_id": account_id, "user_names": names },
+            })
+        }
+        CacheInvalidateScope::TableKeyInfo {
+            account_id,
+            table_name,
+        } => serde_json::json!({
+            "scope": "table_key_info",
+            "selectors": { "account_id": account_id, "table_name": table_name },
+        }),
+        CacheInvalidateScope::ResourceTags { arn } => serde_json::json!({
+            "scope": "resource_tags",
+            "selectors": { "arn": arn },
+        }),
+    };
+    c.req("POST", "/management/cache/invalidate", Some(&body))
 }
