@@ -619,6 +619,10 @@ impl extenddb_auth::AuthzCacheInvalidator for CachedAuthzStore {
         self.invalidate_account(account_id);
         Box::pin(std::future::ready(()))
     }
+
+    fn invalidate_all(&self) {
+        self.invalidate_all();
+    }
 }
 
 // ── Loader factories ───────────────────────────────────────────────────

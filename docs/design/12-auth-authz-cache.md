@@ -139,6 +139,8 @@ Both the management API and the web console expose this surface; the CLI (`exten
 
 Composite scopes (`user`, `role`) match what an operator most often actually wants when they reach for this tool ("forget everything about user X"). The narrow scopes are still exposed for surgical use. `all` is the broadest hammer and requires `--yes` from the CLI / a confirmation token from the console.
 
+`account` sweeps the authz and credential caches but not `table_key_info` (the `TableKeyInfo` cache is keyed by `(account, table)` and the registry's `invalidate_account` does not currently fan out across it). To clear cached table-key-info for an account, either call `scope: table_key_info` per table or use `scope: all`. This is a deliberate scoping choice — the table-key-info cache rarely diverges per account in practice, so the narrower `invalidate_account` semantics keep the most common path cheap.
+
 ### Response shape
 
 ```json

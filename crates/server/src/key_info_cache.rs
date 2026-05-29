@@ -170,6 +170,10 @@ impl extenddb_auth::TableKeyInfoCacheInvalidator for CachedTableKeyInfoStore {
     fn invalidate<'a>(&'a self, account_id: &'a str, table_name: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(self.invalidate(account_id, table_name))
     }
+
+    fn invalidate_all(&self) {
+        self.invalidate_all();
+    }
 }
 
 // No unit tests in this module: the SWR mechanics are covered by the

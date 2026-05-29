@@ -114,9 +114,7 @@ pub async fn start_server(
     let auth_cache_for_mgmt = state.auth_cache.clone();
     let auth_cache_for_console = state.auth_cache.clone();
     let authz_cache_for_mgmt = state.authz_cache.clone();
-    let authz_cache_for_console = state.authz_cache.clone();
     let table_key_info_cache_for_mgmt = state.table_key_info_cache.clone();
-    let table_key_info_cache_for_console = state.table_key_info_cache.clone();
     let version_info = state.version_info.clone();
     let docs_store = state.docs_store.clone();
     let listen_url = {
@@ -175,8 +173,6 @@ pub async fn start_server(
             catalog_store,
             docs_store: docs_store.clone(),
             auth_cache: auth_cache_for_console,
-            authz_cache: authz_cache_for_console,
-            table_key_info_cache: table_key_info_cache_for_console,
         });
         let console_router = console::router().with_state(console_state);
         app = app

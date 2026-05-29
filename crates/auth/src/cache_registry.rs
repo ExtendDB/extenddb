@@ -29,6 +29,10 @@ pub trait TableKeyInfoCacheInvalidator: Send + Sync {
         account_id: &'a str,
         table_name: &'a str,
     ) -> futures::future::BoxFuture<'a, ()>;
+
+    /// Drop every cached entry. Used by the manual `cache invalidate
+    /// all` admin endpoint.
+    fn invalidate_all(&self);
 }
 
 /// Invalidation hooks for the authorization cache.
@@ -111,6 +115,10 @@ pub trait AuthzCacheInvalidator: Send + Sync {
     /// resource tags). Used by `delete_account` to ensure cached state for
     /// the deleted account is dropped.
     fn invalidate_account<'a>(&'a self, account_id: &'a str) -> BoxFuture<'a, ()>;
+
+    /// Drop every cached entry across every authz subcache. Used by the
+    /// manual `cache invalidate all` admin endpoint.
+    fn invalidate_all(&self);
 }
 
 /// Holds shared handles to every auth/authz cache instance.
@@ -277,6 +285,24 @@ impl AuthCacheRegistry {
                     "credential cache invalidate_account failed; relying on TTL"
                 );
             }
+        }
+    }
+
+    /// Drop every cached entry across every cache (authz subcaches,
+    /// credentials, table-key-info). Used by the manual `cache
+    /// invalidate all` admin endpoint. No-op for any cache that is
+    /// disabled. Callers MUST gate this on explicit confirmation; it
+    /// causes a reload storm against the catalog as the next requests
+    /// re-populate from cold.
+    pub fn invalidate_all_caches(&self) {
+        if let Some(c) = &self.authz {
+            c.invalidate_all();
+        }
+        if let Some(c) = &self.table_key_info {
+            c.invalidate_all();
+        }
+        if let Some(c) = &self.credential {
+            c.invalidate_all();
         }
     }
 

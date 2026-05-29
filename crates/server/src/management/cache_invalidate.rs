@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 
 use super::ManagementState;
 use super::auth::authenticate_admin;
-use crate::{CachedAuthzStore, CachedTableKeyInfoStore};
 
 /// Request body for `POST /management/cache/invalidate`. The `scope`
 /// discriminator drives validation of `selectors`.
@@ -47,6 +46,26 @@ pub enum Scope {
     GroupMembers,
     TableKeyInfo,
     ResourceTags,
+}
+
+impl Scope {
+    /// Canonical snake_case name (matches the JSON wire format, the CLI
+    /// subcommand names, and the design doc table). Used in audit logs
+    /// and the console success page so operators see the same
+    /// identifier across every surface.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Account => "account",
+            Self::Credential => "credential",
+            Self::User => "user",
+            Self::Role => "role",
+            Self::GroupMembers => "group_members",
+            Self::TableKeyInfo => "table_key_info",
+            Self::ResourceTags => "resource_tags",
+        }
+    }
 }
 
 /// Scope-specific parameters. Each field is optional; the handler
@@ -101,15 +120,7 @@ pub async fn invalidate(
         Err(e) => return (StatusCode::BAD_REQUEST, e.body_text()).into_response(),
     };
 
-    match apply(
-        &state.auth_cache,
-        &state.authz_cache,
-        &state.table_key_info_cache,
-        body,
-        &admin_name,
-    )
-    .await
-    {
+    match apply(&state.auth_cache, body, &admin_name).await {
         Ok(resp) => (StatusCode::OK, axum::Json(resp)).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
     }
@@ -118,15 +129,14 @@ pub async fn invalidate(
 /// Apply an invalidation request. Shared between the management API
 /// and the console form handler so the two paths stay byte-identical.
 ///
-/// Takes the cache handles directly rather than `ManagementState` so the
-/// console (which doesn't share that struct) can reuse it.
+/// Takes only the registry; both `Scope::All` and the per-scope
+/// composites flow through registry methods, including
+/// `invalidate_all_caches` for the global flush.
 ///
 /// On success returns the response body to send (or render). On
 /// validation failure returns a human-readable error string.
 pub async fn apply(
     auth_cache: &extenddb_auth::AuthCacheRegistry,
-    authz_cache: &CachedAuthzStore,
-    table_key_info_cache: &CachedTableKeyInfoStore,
     body: InvalidateRequest,
     admin_name: &str,
 ) -> Result<InvalidateResponse, String> {
@@ -141,12 +151,7 @@ pub async fn apply(
                         .to_owned(),
                 );
             }
-            // Sweep every cache. Order is irrelevant; each is independent.
-            authz_cache.invalidate_all();
-            table_key_info_cache.invalidate_all();
-            if let Some(c) = &auth_cache.credential {
-                c.invalidate_all();
-            }
+            auth_cache.invalidate_all_caches();
             vec!["authz", "table_key_info", "credentials"]
         }
         Scope::Account => {
@@ -236,12 +241,14 @@ pub async fn apply(
         }
     };
 
-    // Forensic audit trail. Operators can correlate this with the
-    // matching jump in the `invalidations` counter on auth-cache-metrics.
+    // Forensic audit trail. Includes every selector that was set so a
+    // post-incident reader can identify the exact target — `?selectors`
+    // skips `None` fields. Operators correlate this with the matching
+    // jump in the `invalidations` counter on /auth-cache-metrics.
     tracing::info!(
         admin = admin_name,
-        ?scope,
-        account_id = s.account_id.as_deref().unwrap_or(""),
+        scope = scope.as_str(),
+        selectors = ?s,
         "auth_cache: admin-triggered invalidation"
     );
 

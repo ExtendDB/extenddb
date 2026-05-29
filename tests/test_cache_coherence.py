@@ -258,11 +258,12 @@ def test_create_table_visible_to_authorized_caller_immediately(
 # ---------------------------------------------------------------------------
 
 
-def _metrics_invalidations(mgmt, subcache_path: list[str]) -> int:
-    """Read the auth-cache-metrics endpoint and walk to a subcache's
-    `invalidations` counter.
+def _metrics_counter(mgmt, subcache_path: list[str], counter: str) -> int:
+    """Read the auth-cache-metrics endpoint and return one named counter
+    on a specific subcache.
 
     `subcache_path` example: `["authz", "user_policies"]` or `["credential"]`.
+    `counter` is the JSON field name (e.g. `invalidations`, `misses`, `hits`).
     """
     import requests
     url = f"{mgmt.base_url}/auth-cache-metrics"
@@ -272,20 +273,28 @@ def _metrics_invalidations(mgmt, subcache_path: list[str]) -> int:
     node = resp.json()
     for k in subcache_path:
         node = node[k]
-    return int(node["invalidations"])
+    return int(node[counter])
 
 
-def test_manual_invalidate_user_increments_counters(auth_env, mgmt, account_id, user):
-    """scope=user touches each per-user authz subcache."""
+def _metrics_invalidations(mgmt, subcache_path: list[str]) -> int:
+    return _metrics_counter(mgmt, subcache_path, "invalidations")
+
+
+def test_manual_invalidate_user_forces_refetch(auth_env, mgmt, account_id, user):
+    """scope=user actually drops the cached entry: the next request
+    misses the cache (forcing a re-fetch) instead of getting served
+    from the warm slot."""
     endpoint, _, _ = auth_env
-    # Prime the per-user policy cache.
+    # Prime the per-user policy cache so we have a warm hit-able entry.
     resp = mgmt.create_access_key(account_id, user)
     creds = resp.json()
     ddb = _ddb_client(endpoint, creds["access_key_id"], creds["secret_access_key"])
     _put_allow_policy(mgmt, account_id, user, "dynamodb:ListTables")
-    ddb.list_tables()  # populates user_policies + credential caches
+    ddb.list_tables()  # populates user_policies cache
+    ddb.list_tables()  # second call should be a hit (proves warm)
 
-    before = _metrics_invalidations(mgmt, ["authz", "user_policies"])
+    invalidations_before = _metrics_invalidations(mgmt, ["authz", "user_policies"])
+    misses_before = _metrics_counter(mgmt, ["authz", "user_policies"], "misses")
 
     resp = mgmt.invalidate_cache(
         "user", {"account_id": account_id, "user_name": user}
@@ -303,8 +312,20 @@ def test_manual_invalidate_user_increments_counters(auth_env, mgmt, account_id, 
     }
     assert expected.issubset(set(body["invalidated"]))
 
-    after = _metrics_invalidations(mgmt, ["authz", "user_policies"])
-    assert after > before, f"user_policies invalidations: {before} → {after}"
+    invalidations_after = _metrics_invalidations(mgmt, ["authz", "user_policies"])
+    assert invalidations_after > invalidations_before, (
+        f"user_policies invalidations: {invalidations_before} → {invalidations_after}"
+    )
+
+    # Real proof of behavior: the next request must miss the cache and
+    # re-load from the inner store. If invalidation were broken, the
+    # warm entry would still be served and `misses` wouldn't move.
+    ddb.list_tables()
+    misses_after = _metrics_counter(mgmt, ["authz", "user_policies"], "misses")
+    assert misses_after > misses_before, (
+        f"expected user_policies miss after invalidation; "
+        f"misses: {misses_before} → {misses_after}"
+    )
 
 
 def test_manual_invalidate_account_does_not_break_subsequent_traffic(

@@ -46,15 +46,11 @@ pub struct ConsoleState {
     pub docs_store: Option<docs_embed::DocsStore>,
     /// Auth/authz cache registry. Used by mutation handlers to issue
     /// write-through invalidations after IAM changes — the same hooks the
-    /// management API calls. Without this, console-driven mutations leave
-    /// stale entries in the cache for up to `auth.cache.ttl_seconds`.
+    /// management API calls. Also used by the `/console/cache` admin
+    /// break-glass page to drive manual invalidation. Without this,
+    /// console-driven mutations leave stale entries in the cache for up
+    /// to `auth.cache.ttl_seconds`.
     pub auth_cache: extenddb_auth::AuthCacheRegistry,
-    /// Concrete authorization cache handle. Required by the
-    /// `/console/cache` admin break-glass page so it can call the same
-    /// `apply` helper used by `POST /management/cache/invalidate`.
-    pub authz_cache: Arc<crate::CachedAuthzStore>,
-    /// Concrete TableKeyInfo cache handle. Same rationale as `authz_cache`.
-    pub table_key_info_cache: Arc<crate::CachedTableKeyInfoStore>,
 }
 
 /// Build the console router.

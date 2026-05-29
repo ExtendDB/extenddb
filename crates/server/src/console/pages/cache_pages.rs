@@ -54,8 +54,6 @@ pub async fn cache_page(State(state): State<Arc<ConsoleState>>, headers: HeaderM
 Drops cached entries on this instance. Complements the automatic write-through
 hooks; reach for this when off-instance changes have not yet expired or when a
 test needs a deterministic flush.
-See the <a href="/console/docs/12-auth-authz-cache">design doc</a> for scope
-semantics.
 </p>
 <form method="post" action="/console/cache/invalidate">
 <label for="scope">Scope</label>
@@ -70,35 +68,70 @@ semantics.
 <option value="all">all — flush every cache (requires confirmation)</option>
 </select>
 
-<label for="account_id">account_id <span style="color:#999;font-size:0.85rem">(account, user, role, group_members, table_key_info)</span></label>
+<div class="sel" data-scopes="account user role group_members table_key_info">
+<label for="account_id">account_id</label>
 <input id="account_id" name="account_id" type="text" autocomplete="off">
+</div>
 
-<label for="user_name">user_name <span style="color:#999;font-size:0.85rem">(user)</span></label>
+<div class="sel" data-scopes="user">
+<label for="user_name">user_name</label>
 <input id="user_name" name="user_name" type="text" autocomplete="off">
+</div>
 
-<label for="role_name">role_name <span style="color:#999;font-size:0.85rem">(role)</span></label>
+<div class="sel" data-scopes="role">
+<label for="role_name">role_name</label>
 <input id="role_name" name="role_name" type="text" autocomplete="off">
+</div>
 
-<label for="user_names">user_names <span style="color:#999;font-size:0.85rem">(group_members, comma-separated)</span></label>
+<div class="sel" data-scopes="group_members">
+<label for="user_names">user_names <span style="color:#999;font-size:0.85rem">(comma-separated)</span></label>
 <input id="user_names" name="user_names" type="text" autocomplete="off" placeholder="alice, bob, charlie">
+</div>
 
-<label for="access_key_id">access_key_id <span style="color:#999;font-size:0.85rem">(credential)</span></label>
+<div class="sel" data-scopes="credential">
+<label for="access_key_id">access_key_id</label>
 <input id="access_key_id" name="access_key_id" type="text" autocomplete="off">
+</div>
 
-<label for="table_name">table_name <span style="color:#999;font-size:0.85rem">(table_key_info)</span></label>
+<div class="sel" data-scopes="table_key_info">
+<label for="table_name">table_name</label>
 <input id="table_name" name="table_name" type="text" autocomplete="off">
+</div>
 
-<label for="arn">arn <span style="color:#999;font-size:0.85rem">(resource_tags)</span></label>
+<div class="sel" data-scopes="resource_tags">
+<label for="arn">arn</label>
 <input id="arn" name="arn" type="text" autocomplete="off">
+</div>
 
-<label for="confirm">Confirmation <span style="color:#999;font-size:0.85rem">(scope=all only — type "{ALL_CONFIRMATION_TOKEN}")</span></label>
+<div class="sel" data-scopes="all">
+<label for="confirm">Confirmation <span style="color:#999;font-size:0.85rem">(type "{ALL_CONFIRMATION_TOKEN}")</span></label>
 <input id="confirm" name="confirm" type="text" autocomplete="off">
+</div>
 
 <div style="margin-top:1rem">
 <button class="btn btn-primary" type="submit">Invalidate</button>
 <a href="/console" class="btn">Cancel</a>
 </div>
 </form>
+<script>
+// Progressive disclosure: hide selector fields that don't apply to the
+// chosen scope. Submitted values for hidden fields are ignored by the
+// server (the shared `apply` helper validates per-scope), so this is
+// purely UX. The page works without JS — every field is visible.
+(function() {{
+  var sel = document.getElementById('scope');
+  var rows = document.querySelectorAll('.sel');
+  function apply() {{
+    var s = sel.value;
+    rows.forEach(function(row) {{
+      var scopes = row.getAttribute('data-scopes').split(' ');
+      row.style.display = scopes.indexOf(s) >= 0 ? '' : 'none';
+    }});
+  }}
+  sel.addEventListener('change', apply);
+  apply();
+}})();
+</script>
 </div>"#
     );
 
@@ -205,33 +238,18 @@ pub async fn invalidate_cache(
 
     let request = InvalidateRequest { scope, selectors };
 
-    match apply_invalidation(
-        &state.auth_cache,
-        &state.authz_cache,
-        &state.table_key_info_cache,
-        request,
-        &admin_name,
-    )
-    .await
-    {
+    match apply_invalidation(&state.auth_cache, request, &admin_name).await {
         Ok(resp) => render_success(&session, &resp),
         Err(msg) => render_error(&session, &msg),
     }
 }
 
 fn parse_scope(s: &str) -> Result<Scope, String> {
-    // Console form sends snake_case values matching the API enum.
-    Ok(match s {
-        "all" => Scope::All,
-        "account" => Scope::Account,
-        "credential" => Scope::Credential,
-        "user" => Scope::User,
-        "role" => Scope::Role,
-        "group_members" => Scope::GroupMembers,
-        "table_key_info" => Scope::TableKeyInfo,
-        "resource_tags" => Scope::ResourceTags,
-        other => return Err(format!("unknown scope: {other}")),
-    })
+    // Drive parsing through Scope's snake_case Deserialize impl so the
+    // form, the API JSON, the CLI, and the design doc table all stay in
+    // sync from one source. Adding a scope variant Just Works.
+    serde_json::from_value(serde_json::Value::String(s.to_owned()))
+        .map_err(|_| format!("unknown scope: {s}"))
 }
 
 fn optional(s: &str) -> Option<String> {
@@ -262,12 +280,12 @@ fn render_success(
         r#"{crumbs}
 <h1>Cache invalidated</h1>
 <div class="card">
-<p>Scope: <code>{scope:?}</code></p>
+<p>Scope: <code>{scope}</code></p>
 <p>Subcaches touched:</p>
 <ul>{invalidated_html}</ul>
 <p style="margin-top:1rem"><a class="btn" href="/console/cache">Back</a></p>
 </div>"#,
-        scope = resp.scope,
+        scope = resp.scope.as_str(),
     );
     Html(html::layout_csrf(
         "Cache invalidated",
