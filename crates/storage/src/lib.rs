@@ -482,10 +482,10 @@ pub trait StreamEngine: Send + Sync {
 /// Background worker operations that require storage access.
 ///
 /// Covers control-plane transition processing and other periodic maintenance
-/// tasks that were previously methods on the concrete `PostgresEngine`.
+/// tasks that belong to backend engines.
 pub trait WorkerStore: Send + Sync {
     /// Process pending control-plane transitions (CREATING → ACTIVE,
-    /// DELETING → deleted). Returns a list of `(table_name, description)`
+    /// UPDATING → ACTIVE, DELETING → deleted). Returns a list of `(table_name, description)`
     /// for each transition that fired.
     fn process_control_plane_transitions(
         &self,

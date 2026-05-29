@@ -113,7 +113,7 @@ impl Default for TlsConfig {
 
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
-    /// Storage backend selector (e.g. "postgres").
+    /// Storage backend selector.
     pub _backend: String,
     /// Backend-specific configuration (trait object).
     config: Box<dyn extenddb_storage::config::StorageConfig>,
@@ -144,6 +144,89 @@ impl StorageConfig {
     }
 }
 
+/// Storage config view enriched with runtime limits from the top-level config.
+#[derive(Debug)]
+pub struct RuntimeStorageConfig<'a> {
+    base: &'a dyn extenddb_storage::config::StorageConfig,
+    limits: LimitsConfig,
+}
+
+impl<'a> RuntimeStorageConfig<'a> {
+    pub fn new(
+        base: &'a dyn extenddb_storage::config::StorageConfig,
+        limits: &LimitsConfig,
+    ) -> Self {
+        Self {
+            base,
+            limits: limits.clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OwnedRuntimeStorageConfig {
+    base: Box<dyn extenddb_storage::config::StorageConfig>,
+    limits: LimitsConfig,
+}
+
+impl extenddb_storage::config::StorageConfig for RuntimeStorageConfig<'_> {
+    fn connection_config(&self) -> &str {
+        self.base.connection_config()
+    }
+
+    fn max_connections(&self) -> u32 {
+        self.base.max_connections()
+    }
+
+    fn max_catalog_connections(&self) -> u32 {
+        self.base.max_catalog_connections()
+    }
+
+    fn runtime_limits(&self) -> Option<&LimitsConfig> {
+        Some(&self.limits)
+    }
+
+    fn native_backup_config(&self) -> Option<extenddb_storage::config::NativeBackupConfig> {
+        self.base.native_backup_config()
+    }
+
+    fn clone_box(&self) -> Box<dyn extenddb_storage::config::StorageConfig> {
+        Box::new(OwnedRuntimeStorageConfig {
+            base: self.base.clone_box(),
+            limits: self.limits.clone(),
+        })
+    }
+}
+
+impl extenddb_storage::config::StorageConfig for OwnedRuntimeStorageConfig {
+    fn connection_config(&self) -> &str {
+        self.base.connection_config()
+    }
+
+    fn max_connections(&self) -> u32 {
+        self.base.max_connections()
+    }
+
+    fn max_catalog_connections(&self) -> u32 {
+        self.base.max_catalog_connections()
+    }
+
+    fn runtime_limits(&self) -> Option<&LimitsConfig> {
+        Some(&self.limits)
+    }
+
+    fn native_backup_config(&self) -> Option<extenddb_storage::config::NativeBackupConfig> {
+        self.base.native_backup_config()
+    }
+
+    fn clone_box(&self) -> Box<dyn extenddb_storage::config::StorageConfig> {
+        Box::new(Self {
+            base: self.base.clone_box(),
+            limits: self.limits.clone(),
+        })
+    }
+}
+
 impl<'de> serde::Deserialize<'de> for StorageConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -158,10 +241,9 @@ impl<'de> serde::Deserialize<'de> for StorageConfig {
         let backend = value
             .get("backend")
             .and_then(|v| v.as_str())
-            .unwrap_or("postgres")
-            .to_string();
+            .map_or_else(default_backend, str::to_owned);
 
-        // Get the backend-specific table (e.g., [storage.postgres])
+        // Get the backend-specific table matching `backend`.
         let backend_table: &toml::Table = value
             .get(&backend)
             .and_then(|v| v.as_table())
@@ -182,9 +264,14 @@ impl<'de> serde::Deserialize<'de> for StorageConfig {
 
 impl Default for StorageConfig {
     fn default() -> Self {
+        let backend = default_backend();
+        let config =
+            extenddb_storage::config::default_storage_config(&backend).unwrap_or_else(|e| {
+                panic!("Default storage backend '{backend}' is not registered: {e}")
+            });
         Self {
-            _backend: default_backend(),
-            config: Box::new(extenddb_storage_postgres::PostgresStorageConfig::default()),
+            _backend: backend,
+            config,
         }
     }
 }
@@ -253,8 +340,10 @@ pub fn expand_tilde(path: &str) -> String {
     }
     path.to_owned()
 }
-fn default_backend() -> String {
-    "postgres".to_owned()
+pub(crate) fn default_backend() -> String {
+    extenddb_storage::config::default_backend_name()
+        .unwrap_or_else(|e| panic!("No default storage backend registered: {e}"))
+        .to_owned()
 }
 fn default_tls_enabled() -> bool {
     true
@@ -298,15 +387,10 @@ pub fn load(config_path: &str) -> anyhow::Result<AppConfig> {
 /// Redact password from a connection string for safe logging (REQ-LOG-002).
 ///
 /// Uses the backend-specific operations engine to handle different connection
-/// string formats (`PostgreSQL`).
+/// string formats.
 pub fn redact_password(backend: &str, conn: &str) -> String {
     extenddb_storage::operations::redact_connection_string(backend, conn)
         .unwrap_or_else(|_| conn.to_owned())
-}
-
-/// Return the current OS username, falling back to given default username: e.g. `"postgres"`.
-pub fn whoami(default: &str) -> String {
-    std::env::var("USER").unwrap_or_else(|_| default.to_owned())
 }
 
 /// Validate that a string is safe to use as a database identifier for DDL.

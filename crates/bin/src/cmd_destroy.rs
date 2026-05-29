@@ -6,6 +6,7 @@
 //! Reads config, enumerates tables, requires `--yes` to confirm, drops both databases.
 
 use clap::Args;
+use extenddb_storage::bootstrapper::BootstrapOptions;
 
 use crate::config;
 
@@ -16,13 +17,13 @@ pub struct DestroyArgs {
     #[arg(short, long, default_value = "extenddb.toml")]
     config: String,
 
-    /// PostgreSQL admin user (for DROP DATABASE)
-    #[arg(long, default_value_t = config::whoami("postgres"))]
-    pg_user: String,
+    /// Storage admin user (for DROP DATABASE)
+    #[arg(long = "storage-admin-user")]
+    storage_admin_user: Option<String>,
 
-    /// PostgreSQL admin password
-    #[arg(long)]
-    pg_pass: Option<String>,
+    /// Storage admin password
+    #[arg(long = "storage-admin-password")]
+    storage_admin_password: Option<String>,
 
     /// Confirm destruction (required, no interactive prompt)
     #[arg(long)]
@@ -40,16 +41,23 @@ pub async fn run(args: DestroyArgs) -> anyhow::Result<()> {
     let app_config = config::load(&args.config)?;
     let backend = &app_config.storage._backend;
 
-    // Collect CLI args for backend-specific parsing
-    let cli_args: Vec<String> = std::env::args().collect();
+    let bootstrap_options = BootstrapOptions {
+        admin_user: args.storage_admin_user.clone(),
+        admin_password: args.storage_admin_password.clone(),
+        ..BootstrapOptions::default()
+    };
 
     println!("=== extenddb destroy ===");
     println!("Config:           {}", args.config);
     println!();
 
     // Create bootstrap store for catalog queries and database teardown.
-    let bootstrap =
-        extenddb_storage::bootstrapper::create_bootstrapper(backend, &args.config, &cli_args).await;
+    let bootstrap = extenddb_storage::bootstrapper::create_bootstrapper(
+        backend,
+        &args.config,
+        bootstrap_options.clone(),
+    )
+    .await;
 
     let mut data_db = String::new();
 
@@ -92,8 +100,7 @@ pub async fn run(args: DestroyArgs) -> anyhow::Result<()> {
     }
 
     // For drop, we need a fresh bootstrap store connected as admin (not to the
-    // catalog DB we're about to drop). The existing bootstrap store's admin pool
-    // connects to the `postgres` database, so we can reuse it.
+    // catalog DB we're about to drop).
     if !data_db.is_empty() {
         // Defense-in-depth: validate even though this came from the catalog.
         config::validate_identifier(backend, &data_db, "data database name")?;
@@ -102,10 +109,13 @@ pub async fn run(args: DestroyArgs) -> anyhow::Result<()> {
     // Reconnect as admin for DDL operations (the catalog pool must be dropped
     // before we can DROP DATABASE).
     drop(bootstrap);
-    let bootstrap =
-        extenddb_storage::bootstrapper::create_bootstrapper(backend, &args.config, &cli_args)
-            .await
-            .map_err(|e| anyhow::anyhow!("Cannot connect as admin: {e:?}"))?;
+    let bootstrap = extenddb_storage::bootstrapper::create_bootstrapper(
+        backend,
+        &args.config,
+        bootstrap_options,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Cannot connect as admin: {e:?}"))?;
 
     bootstrap
         .drop_databases(&data_db)

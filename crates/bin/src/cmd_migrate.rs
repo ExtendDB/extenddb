@@ -6,6 +6,7 @@
 //! Reads current catalog version, runs pending migrations, and reports the result.
 
 use clap::Args;
+use extenddb_storage::bootstrapper::BootstrapOptions;
 
 use crate::config;
 
@@ -15,13 +16,13 @@ pub struct MigrateArgs {
     #[arg(short, long, default_value = "extenddb.toml")]
     config: String,
 
-    /// `PostgreSQL` admin user (for catalog migrations)
-    #[arg(long)]
-    pg_user: Option<String>,
+    /// Storage admin user (for catalog migrations)
+    #[arg(long = "storage-admin-user")]
+    storage_admin_user: Option<String>,
 
-    /// `PostgreSQL` admin password
-    #[arg(long)]
-    pg_pass: Option<String>,
+    /// Storage admin password
+    #[arg(long = "storage-admin-password")]
+    storage_admin_password: Option<String>,
 
     /// Confirm migration (required, no interactive prompt)
     #[arg(long)]
@@ -43,14 +44,18 @@ pub async fn run(args: MigrateArgs) -> anyhow::Result<()> {
     println!("Config:           {}", args.config);
     println!();
 
-    // Collect CLI args for backend-specific parsing
-    let cli_args: Vec<String> = std::env::args().collect();
-
     // Create bootstrapper via registry
-    let bootstrap =
-        extenddb_storage::bootstrapper::create_bootstrapper(backend, &args.config, &cli_args)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let bootstrap = extenddb_storage::bootstrapper::create_bootstrapper(
+        backend,
+        &args.config,
+        BootstrapOptions {
+            admin_user: args.storage_admin_user.clone(),
+            admin_password: args.storage_admin_password.clone(),
+            ..BootstrapOptions::default()
+        },
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
     // Show current version.
     println!("--- Checking current catalog version...");
@@ -62,9 +67,12 @@ pub async fn run(args: MigrateArgs) -> anyhow::Result<()> {
     println!("  Current version: {current_display}");
 
     let expected = bootstrap.expected_catalog_version();
-    if current.as_deref() == Some(expected.as_str()) {
+    let catalog_version_matches = current.as_deref() == Some(expected.as_str());
+    if catalog_version_matches && !args.yes {
         println!();
-        println!("Catalog is up to date (version {expected}). No migrations needed.");
+        println!(
+            "Catalog version is current ({expected}). Use --yes to check and apply backend schema migrations."
+        );
         return Ok(());
     }
 
@@ -77,6 +85,10 @@ pub async fn run(args: MigrateArgs) -> anyhow::Result<()> {
 
     bootstrap
         .run_catalog_migrations()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    bootstrap
+        .run_data_migrations()
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 

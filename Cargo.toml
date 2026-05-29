@@ -7,6 +7,7 @@ members = [
     "crates/engine",
     "crates/storage",
     "crates/storage-postgres",
+    "crates/storage-tidb",
     "crates/auth",
     "crates/server",
     "crates/bin",
@@ -24,6 +25,7 @@ extenddb-core = { path = "crates/core" }
 extenddb-engine = { path = "crates/engine" }
 extenddb-storage = { path = "crates/storage" }
 extenddb-storage-postgres = { path = "crates/storage-postgres" }
+extenddb-storage-tidb = { path = "crates/storage-tidb" }
 extenddb-auth = { path = "crates/auth" }
 extenddb-server = { path = "crates/server" }
 
@@ -51,7 +53,7 @@ hyper = { version = "1" }
 inventory = "0.3"
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "json", "time", "uuid", "bigdecimal"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "mysql", "json", "time", "uuid", "bigdecimal"] }
 
 # Crypto & checksums
 crc32fast = "1"
@@ -85,6 +87,8 @@ metrics-exporter-prometheus = "0.16"
 # Config
 clap = { version = "4", features = ["derive"] }
 config = "0.14"
+percent-encoding = "2"
+url = "2"
 
 # Security
 zeroize = { version = "1.8", features = ["derive"] }

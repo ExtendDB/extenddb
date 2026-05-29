@@ -59,6 +59,8 @@ pub(crate) async fn handle_describe_backup(
             )
         })?;
 
+    ensure_backup_arn_account(backup_arn, &ctx.account_id)?;
+
     let desc = ctx
         .storage
         .describe_backup(backup_arn)
@@ -100,6 +102,8 @@ pub(crate) async fn handle_delete_backup(
             )
         })?;
 
+    ensure_backup_arn_account(backup_arn, &ctx.account_id)?;
+
     let desc = ctx
         .storage
         .delete_backup(backup_arn)
@@ -134,6 +138,8 @@ pub(crate) async fn handle_restore_table_from_backup(
                     .to_owned(),
             )
         })?;
+
+    ensure_backup_arn_account(backup_arn, &ctx.account_id)?;
 
     let desc = ctx
         .storage
@@ -210,13 +216,24 @@ pub(crate) async fn handle_restore_table_to_point_in_time(
     _body: Value,
     _ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
-    // TODO(fidelity): Implement real PITR using PostgreSQL temporal/history
-    // table approach — item_history table capturing every mutation, DISTINCT ON
-    // query to reconstruct state at time T, 35-day retention via background
-    // pruning.
+    // TODO(fidelity): Implement real PITR through a storage-level history
+    // contract so each backend can reconstruct state at time T with the same
+    // DynamoDB-visible semantics.
     Err(DynamoDbError::ValidationException(
         "Point-in-time recovery restore is not yet supported".to_owned(),
     ))
+}
+
+fn ensure_backup_arn_account(backup_arn: &str, account_id: &str) -> Result<(), DynamoDbError> {
+    let arn_account = backup_arn.split(':').nth(4).ok_or_else(|| {
+        DynamoDbError::ValidationException(format!("Invalid backup ARN: {backup_arn}"))
+    })?;
+    if arn_account != account_id {
+        return Err(DynamoDbError::AccessDeniedException(
+            "Access denied for backup ARN".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Convert storage errors to DynamoDB errors.

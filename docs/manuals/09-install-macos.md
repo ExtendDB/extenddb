@@ -75,7 +75,7 @@ On macOS you must tell `init` which PostgreSQL user to connect as for
 the `CREATE ROLE` / `CREATE DATABASE` steps — your macOS username:
 
 ```bash
-./target/release/extenddb init --pg-user $(whoami)
+./target/release/extenddb init --storage-admin-user $(whoami)
 ```
 
 This prints the admin credentials **once**. Save them — they cannot be
@@ -175,7 +175,7 @@ No data is lost; only the catalog schema is updated.
 | Item               | Linux                          | macOS (Homebrew)                                    |
 |--------------------|--------------------------------|-----------------------------------------------------|
 | PG admin user      | `postgres` (or custom)         | Your macOS username (`$(whoami)`), no password       |
-| `extenddb init` flags  | defaults usually fine          | pass `--pg-user $(whoami)`                          |
+| `extenddb init` flags  | defaults usually fine          | pass `--storage-admin-user $(whoami)`                          |
 | Service manager    | `systemctl` / `pg_ctl`         | `brew services` or `pg_ctl`                         |
 | Syslog reader      | `journalctl -t extenddb`           | `log stream --predicate 'processImagePath ENDSWITH "extenddb"'` |
 
@@ -185,7 +185,7 @@ No data is lost; only the catalog schema is updated.
 |--------------------------------------------------------|---------------------------------------------------------------------|
 | `connection refused` on port 8000                      | Server not running. `./target/release/extenddb serve --config extenddb.toml`|
 | `Catalog version X.Y.Z (binary expects A.B.C)`        | `./target/release/extenddb migrate --config extenddb.toml`                  |
-| `role "extenddb" does not exist` during init               | Re-run with `--pg-user $(whoami)`                                   |
+| `role "extenddb" does not exist` during init               | Re-run with `--storage-admin-user $(whoami)`                                   |
 | DROP DATABASE hangs after hard kill                    | Check for lingering backends: `ps -eo pid,command \| grep postgres` |
 
 See `docs/troubleshooting.md` for the full troubleshooting guide.

@@ -78,12 +78,12 @@ def _fail_if_no_binary():
 
 
 def _pg_args():
-    """Return --pg-user and --pg-pass args for commands that connect as admin."""
+    """Return --storage-admin-user and --storage-admin-password args for commands that connect as admin."""
     args = []
     if PG_USER:
-        args.extend(["--pg-user", PG_USER])
+        args.extend(["--storage-admin-user", PG_USER])
     if PG_PASS:
-        args.extend(["--pg-pass", PG_PASS])
+        args.extend(["--storage-admin-password", PG_PASS])
     return args
 
 
@@ -106,8 +106,8 @@ def _patch_config_port(config_path, port):
 def _init_args(cli_env):
     """Return CLI args for extenddb init including all connection details."""
     args = list(_pg_args())
-    args.extend(["--pg-host", cli_env["pg_host"]])
-    args.extend(["--pg-port", cli_env["pg_port"]])
+    args.extend(["--storage-host", cli_env["pg_host"]])
+    args.extend(["--storage-port", cli_env["pg_port"]])
     args.extend(["--catalog-db", cli_env["db_name"]])
     if PG_USER:
         args.extend(["--extenddb-user", PG_USER])

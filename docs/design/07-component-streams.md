@@ -87,7 +87,7 @@ Store stream records in the same database as the data. This allows atomic writes
 
 DynamoDB retains stream records for 24 hours. Options:
 - **Background worker**: Periodically delete records older than the retention period
-- **TTL on the storage side**: PostgreSQL `pg_cron` or application-level scheduled task
+- **TTL on the storage side**: Backend-native TTL where available, or an application-level scheduled task
 
 **Recommended:** Application-level background task (same pattern as TTL cleanup), configurable retention period (default: 24 hours).
 

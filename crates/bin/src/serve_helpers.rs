@@ -60,7 +60,7 @@ pub fn verify_daemon_started(pid_file: &PathBuf, bind_addr: &str) -> anyhow::Res
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
 
-    // Give the daemon a moment to initialize (connect to Postgres, load TLS
+    // Give the daemon a moment to initialize (connect to storage, load TLS
     // certs, etc.). Check every 200ms for up to 3 seconds.
     let check_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     loop {

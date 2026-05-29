@@ -21,8 +21,8 @@ pub struct WorkerContext {
 /// Backend-specific runtime hooks for worker spawning and initialization.
 ///
 /// Backends implement this trait to spawn workers that are tightly coupled
-/// to their implementation details (e.g., PostgreSQL's control plane poller,
-/// pool metrics, GSI delay polling).
+/// to their implementation details (e.g., control plane pollers, pool metrics,
+/// backend-native retention workers).
 #[async_trait]
 pub trait ServerRuntimeHooks: Send + Sync {
     /// Spawn backend-specific workers.
@@ -34,7 +34,7 @@ pub trait ServerRuntimeHooks: Send + Sync {
 
     /// Get backend-specific info for logging (optional).
     ///
-    /// Example: "data_db=ddbo_data" for PostgreSQL
+    /// Example: "data_db=extenddb_data"
     fn backend_info(&self) -> Option<String> {
         None
     }

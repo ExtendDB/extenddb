@@ -8,7 +8,7 @@ adaptation when switching between ExtendDB and the real service.
 
 | Area | DynamoDB | ExtendDB |
 |------|----------|------|
-| Storage backend | Proprietary distributed storage | PostgreSQL |
+| Storage backend | Proprietary distributed storage | Pluggable SQL storage backend. PostgreSQL is the default; TiDB is available with the `tidb` feature. |
 | Global Tables | CreateGlobalTable, replication | Not implemented (returns UnknownOperationException) |
 | DAX (Accelerator) | In-memory caching layer | Not applicable |
 | PartiQL | ExecuteStatement, BatchExecuteStatement | Not implemented (returns UnknownOperationException) |
@@ -47,7 +47,7 @@ adaptation when switching between ExtendDB and the real service.
 | Area | DynamoDB | ExtendDB |
 |------|----------|------|
 | TTL attribute name | Any UTF-8 string (1–255 bytes) | Restricted to `[a-zA-Z0-9._-]+` (1–255 bytes). Names with spaces, quotes, or other special characters are rejected. This eliminates SQL injection risk in the TTL expression index. |
-| TTL deletion | Background process, items deleted within 48 hours of expiry | Background worker with indexed sweep, configurable target via `ttl_deletion_target_seconds` (default: 300s) |
+| TTL deletion | Background process, items deleted within 48 hours of expiry | Backend-specific. PostgreSQL uses an indexed sweep. TiDB uses native table TTL for non-streaming tables and keeps an indexed worker only where DynamoDB Streams REMOVE records must be emitted. |
 | TTL stream records | REMOVE events with `userIdentity: {type: "Service", principalId: "dynamodb.amazonaws.com"}` | Supported — TTL deletions generate REMOVE stream records with the same `userIdentity` |
 | TTL modification cooldown | Enforces a cooldown period between enable/disable changes ("Time to live has been modified multiple times within a fixed interval") | No cooldown — TTL can be enabled and disabled immediately. Intentional divergence for faster local development. |
 
@@ -61,7 +61,7 @@ adaptation when switching between ExtendDB and the real service.
 
 | Area | DynamoDB | ExtendDB |
 |------|----------|------|
-| GSI update propagation | Eventually consistent (milliseconds to seconds) | Per-GSI propagation delay. System default: `gsi_propagation_delay_ms` setting (default 10ms). Each GSI can override with its own `propagation_delay_ms` (stored in catalog). A value of 0 means synchronous (future sync GSI feature). |
+| GSI update propagation | Eventually consistent (milliseconds to seconds) | Backend-specific. PostgreSQL can simulate asynchronous propagation via `gsi_propagation_delay_ms`; TiDB uses native secondary indexes maintained from the base table write. |
 | Multi-part base table keys | Not supported | Preview extension (opt-in via `enable_multipart_keys` setting). Standard single/composite keys work identically. |
 
 ## Capacity and Throttling
@@ -89,13 +89,33 @@ ExtendDB exposes runtime settings that have no DynamoDB equivalent:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `control_plane_delay_seconds` | 5 | Simulated delay for table state transitions (CREATING → ACTIVE, DELETING → removed) |
-| `gsi_propagation_delay_ms` | 10 | System-wide default GSI propagation delay (milliseconds). Per-GSI overrides stored in catalog. 0 = synchronous. |
+| `control_plane_delay_seconds` | 5 | Simulated delay for table create/delete state transitions (CREATING → ACTIVE, DELETING → removed). UpdateTable GSI/stream transitions report UPDATING until the backend reconciler completes, while table data-plane reads and writes remain available. |
+| `gsi_propagation_delay_ms` | 10 | PostgreSQL backend default GSI propagation delay (milliseconds). TiDB ignores this setting because GSI writes are transactional. |
 | `throttling_enabled` | `true` | Enable provisioned capacity throttling (token bucket per table/partition) |
 | `enable_multipart_keys` | `false` | Enable multi-part base table key extension |
 | `log_level` | `info` | Runtime log level (trace, debug, info, warn, error) |
 | `sqlx_log_level` | `warn` | Separate log level for sqlx query traces |
 | `allow_credential_import` | `true` | Allow importing credentials via the management API |
+
+## TiDB Native Backup/Restore
+
+The TiDB backend uses TiDB BR for backup data instead of copying items into
+ExtendDB catalog tables. `CreateBackup` requires `[storage.tidb.backup]`
+configuration (`pd_endpoint` and `storage_uri`).
+
+BR restores physical TiDB tables to their recorded database/table identity.
+That means TiDB `RestoreTableFromBackup` is available only when the target TiDB
+cluster is empty or conflict-free for the backed physical table. ExtendDB does
+not emulate unsupported BR restore shapes by replaying item rows.
+
+Restored tables do not inherit TTL or stream settings. When BR restores a TiDB
+table that previously used native TTL, ExtendDB strips the restored physical TTL
+artifacts before publishing the target table as `ACTIVE`.
+
+`DeleteBackup` removes TiDB BR backup data only for `local://` or `file://`
+backup URIs. For remote object stores, TiDB BR leaves backup-data lifecycle to
+the operator or object-store lifecycle policy, so ExtendDB refuses metadata-only
+deletion instead of reporting a false delete.
 
 ## Web Console
 

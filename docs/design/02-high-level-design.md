@@ -296,7 +296,7 @@ sequenceDiagram
    - If condition: call core's evaluate_condition() against existing item INSIDE the transaction
    - If condition fails: ROLLBACK, return ConditionFailed { old_item }
    - Insert/upsert item
-   - If GSIs exist: update GSI tables (within same transaction)
+   - If GSIs exist: update backend-specific secondary-index state (PostgreSQL companion tables; TiDB native indexes)
    - If stream_record provided: INSERT stream record (within same transaction)
    - COMMIT
 9. Calculate consumed capacity (item size → WCU)
@@ -305,7 +305,7 @@ sequenceDiagram
 12. HTTP layer: add CRC32 header, compress, send response
 ```
 
-> **Key invariant:** Condition evaluation, data write, GSI updates, and stream record capture all happen within a single PostgreSQL transaction. This prevents TOCTOU races (another request modifying the item between condition check and write) and ensures atomicity of stream capture.
+> **Key invariant:** Condition evaluation, data write, secondary-index maintenance, and stream record capture are transactionally consistent. PostgreSQL performs companion-table updates in the same transaction; TiDB delegates secondary-index maintenance to native TiDB indexes on the base table. This prevents TOCTOU races (another request modifying the item between condition check and write) and ensures atomicity of stream capture.
 
 ### 5.1b Write Path (UpdateItem — Additional Detail)
 
@@ -321,7 +321,7 @@ UpdateItem is more complex than PutItem because the storage backend must also ap
    - Call core's apply_update(actions, &mut item, ctx) → modified item
    - Validate modified item (size limits, key attributes unchanged)
    - INSERT/UPDATE the modified item
-   - If GSIs exist: update GSI tables (within same transaction)
+   - If GSIs exist: update backend-specific secondary-index state (PostgreSQL companion tables; TiDB native indexes)
    - If stream_capture provided: construct full StreamRecord (with old_image/new_image based on stream_view_type), INSERT stream record (within same transaction)
    - COMMIT
 ```
@@ -360,26 +360,26 @@ extenddb handles concurrent requests through three cooperating layers:
 
 The server runs on a tokio multi-thread runtime. Each incoming HTTP request is handled by an independent async task — there is no shared in-memory state on the hot path. Tasks are scheduled cooperatively across OS threads by the tokio work-stealing scheduler.
 
-### 6.2 PostgreSQL Connection Pool (sqlx)
+### 6.2 Storage Connection Pool
 
-All database access goes through an sqlx `PgPool`. The pool size is configurable via `storage.postgres.pool_size` in `extenddb.toml` (default: 20). When all connections are in use, new requests queue at the pool level until a connection is returned or the acquire timeout expires. If the timeout expires, the request fails with an internal server error (HTTP 500).
+All database access goes through the configured backend's sqlx connection pool. The pool size is configurable via the active storage section in `extenddb.toml` (default: 20). When all connections are in use, new requests queue at the pool level until a connection is returned or the acquire timeout expires. If the timeout expires, the request fails with an internal server error (HTTP 500).
 
-Total connection footprint on the PostgreSQL server:
+Total connection footprint on the storage backend:
 - `pool_size` connections for DynamoDB data operations (shared by all background workers)
-- +2 for the management API (separate pool, `max_connections(2)`)
-- +1 for the log-level poller (separate pool, `max_connections(1)`)
+- +`catalog_pool_size` connections for management/authz/catalog operations
+- +worker-specific connections as needed by the backend
 
-So the total is `pool_size + 3`. The default PostgreSQL `max_connections` is 100, which comfortably supports the default pool_size of 20.
+Size backend connection limits for `pool_size + catalog_pool_size + worker overhead`.
 
 ### 6.3 Row-Level Locking
 
-Read-modify-write operations (UpdateItem, PutItem with conditions, DeleteItem with conditions, TransactWriteItems) use `SELECT ... FOR UPDATE` to acquire a row-level lock inside a PostgreSQL transaction. This ensures:
+Read-modify-write operations (UpdateItem, PutItem with conditions, DeleteItem with conditions, TransactWriteItems) use the backend's transaction and row/record locking semantics. PostgreSQL uses `SELECT ... FOR UPDATE`; TiDB uses transactional row locks through its MySQL-compatible SQL layer. This ensures:
 
 - **Atomicity:** The condition check and the write happen against the same snapshot.
-- **Serialization:** Concurrent updates to the same item are serialized by PostgreSQL's row lock, not by any in-memory mutex.
+- **Serialization:** Concurrent updates to the same item are serialized by backend row/record locks, not by any in-memory mutex.
 - **No TOCTOU races:** Another request cannot modify the item between the condition check and the write.
 
-There is no in-memory locking (no `Mutex`, `RwLock`, or similar) on the data path. All contention is managed by PostgreSQL.
+There is no in-memory locking (no `Mutex`, `RwLock`, or similar) on the data path. All contention is managed by the storage backend.
 
 ### 6.4 Implications
 

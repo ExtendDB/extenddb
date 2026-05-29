@@ -36,7 +36,7 @@ Last updated: 2026-05-04 (P112)
 | # | Item | Location | Priority | Origin |
 |---|------|----------|----------|--------|
 | C-1 | `--catalog-db` should be `Optional<String>` for `init` without full config | `bin/cmd_init.rs:113` | Low | P1 |
-| C-2 | Storage backend config field unused (always "postgres") | `bin/config.rs:55` | Low | P1 |
+| C-2 | ~~Storage backend config field unused (always "postgres")~~ | ~~`bin/config.rs:55`~~ | ~~Low~~ | P1 |
 | C-3 | ~~GSI error matching via English substring `"does not exist"`~~ — now uses SQLSTATE `42P01` | `storage-postgres/gsi_queue.rs` | ~~Medium~~ | P25 |
 | C-4 | BigDecimal parsed on every comparison in expression evaluator | `core/expression/evaluator.rs:112` | Low | P4 |
 | C-5 | Stream shard list not cached per table (extra SQL round-trip per write) | `storage-postgres/lib.rs:1844` | Low | P10 |
@@ -50,7 +50,7 @@ Last updated: 2026-05-04 (P112)
 
 | # | Item | Location | Priority | Origin |
 |---|------|----------|----------|--------|
-| S-1 | Multi-instance safety: no lease table prevents multiple extenddb instances sharing one PostgreSQL database | — | High | P25 review |
+| S-1 | Multi-instance safety: no lease table prevents multiple extenddb instances sharing one catalog database | — | High | P25 review |
 | S-2 | `--password` flag visible in process listings (`ps aux`) | `bin/cmd_manage.rs` | Low | P12b |
 | S-3 | Release tarballs not GPG-signed — blocked on key ownership, public key distribution, CI secrets management | `devtools/build-release` | Medium | P28 |
 

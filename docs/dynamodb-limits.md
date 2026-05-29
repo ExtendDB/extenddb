@@ -126,7 +126,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 
 | Limit | DynamoDB Value | Status | Notes |
 |-------|---------------|--------|-------|
-| Concurrent restores | 50 | N/A | ExtendDB does not support backup/restore |
+| Concurrent restores | 50 | Backend-specific | Backup/restore is implemented by the storage backend. PostgreSQL uses its backend implementation; TiDB delegates physical backup data to native BR. ExtendDB does not enforce DynamoDB's concurrent restore quota. |
 
 ## Global Tables
 

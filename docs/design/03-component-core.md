@@ -324,7 +324,7 @@ For `UpdateItem`, the storage backend must execute the following steps inside a 
 5. Call core::expression::apply_update(actions, &mut item, ctx) → modified item
 6. Validate modified item (size limits, key attributes unchanged)
 7. INSERT/UPDATE the modified item
-8. If GSIs exist: update GSI tables (within same transaction)
+8. If GSIs exist: update backend-specific secondary-index state
 9. If stream_capture provided: construct full StreamRecord (with old_image/new_image
    based on stream_view_type), INSERT stream record (within same transaction)
 10. COMMIT

@@ -8,7 +8,9 @@
 //! lazily as needed during the bootstrap sequence.
 
 use async_trait::async_trait;
-use extenddb_storage::bootstrapper::{AdminBootstrapResult, BootstrapConfig, Bootstrapper};
+use extenddb_storage::bootstrapper::{
+    AdminBootstrapResult, BootstrapConfig, BootstrapOptions, Bootstrapper,
+};
 use extenddb_storage::management_store::{OpError, OpResult};
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -476,23 +478,12 @@ fn generate_random_password() -> String {
 }
 
 impl PostgresBootstrapper {
-    /// Create a bootstrapper from config file and CLI args. Parses
-    /// Postgres-specific arguments and merges with config.
+    /// Create a bootstrapper from config file and typed CLI overrides.
     pub async fn from_config(
         config_path: &str,
-        cli_args: &[String],
+        options: BootstrapOptions,
     ) -> Result<Self, extenddb_storage::error::StorageError> {
         use extenddb_storage::error::StorageError;
-
-        // Extract Postgres-specific CLI args
-        let pg_host = extract_arg(cli_args, "--pg-host");
-        let pg_port = extract_arg(cli_args, "--pg-port").and_then(|s| s.parse().ok());
-        let pg_user = extract_arg(cli_args, "--pg-user");
-        let pg_pass = extract_arg(cli_args, "--pg-pass");
-        let data_db = extract_arg(cli_args, "--data-db");
-        let catalog_db = extract_arg(cli_args, "--catalog-db");
-        let extenddb_user = extract_arg(cli_args, "--extenddb-user");
-        let extenddb_pass = extract_arg(cli_args, "--extenddb-pass");
 
         // Load config file if it exists
         let (host, port, user, password, catalog_db_name) = if std::path::Path::new(config_path)
@@ -519,12 +510,16 @@ impl PostgresBootstrapper {
                 .map_err(|e| StorageError::Internal(format!("Invalid connection string: {e}")))?;
 
             // Check for conflicts between CLI args and config values
-            check_conflict(pg_host.as_ref(), &parts.host, "--pg-host")?;
-            check_conflict(pg_port.as_ref(), &parts.port, "--pg-port")?;
-            check_conflict(extenddb_user.as_ref(), &parts.user, "--extenddb-user")?;
-            check_conflict(extenddb_pass.as_ref(), &parts.password, "--extenddb-pass")?;
+            check_conflict(options.storage_host.as_ref(), &parts.host, "--storage-host")?;
+            check_conflict(options.storage_port.as_ref(), &parts.port, "--storage-port")?;
+            check_conflict(options.app_user.as_ref(), &parts.user, "--extenddb-user")?;
+            check_conflict(
+                options.app_password.as_ref(),
+                &parts.password,
+                "--extenddb-pass",
+            )?;
 
-            if let Some(ref cli_catalog) = catalog_db {
+            if let Some(ref cli_catalog) = options.catalog_db {
                 if cli_catalog != &parts.database {
                     return Err(StorageError::Internal(format!(
                         "--catalog-db '{}' conflicts with config file catalog database '{}'",
@@ -552,25 +547,26 @@ impl PostgresBootstrapper {
         };
 
         // CLI args override config (or use config values if no CLI arg provided)
-        let resolved_host = pg_host.unwrap_or(host);
-        let resolved_port = pg_port.unwrap_or(port);
-        let resolved_admin_user = pg_user
+        let resolved_host = options.storage_host.unwrap_or(host);
+        let resolved_port = options.storage_port.unwrap_or(port);
+        let resolved_admin_user = options
+            .admin_user
             .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "postgres".to_owned()));
-        let resolved_catalog_db = catalog_db.unwrap_or(catalog_db_name);
-        let final_data_db = data_db.unwrap_or_else(|| {
+        let resolved_catalog_db = options.catalog_db.unwrap_or(catalog_db_name);
+        let final_data_db = options.data_db.unwrap_or_else(|| {
             resolved_catalog_db
                 .strip_suffix("_catalog")
                 .unwrap_or(&resolved_catalog_db)
                 .to_owned()
         });
-        let resolved_app_user = extenddb_user.unwrap_or(user);
-        let resolved_app_password = extenddb_pass.unwrap_or(password);
+        let resolved_app_user = options.app_user.unwrap_or(user);
+        let resolved_app_password = options.app_password.unwrap_or(password);
 
         let config = BootstrapConfig {
             host: resolved_host,
             port: resolved_port,
             admin_user: resolved_admin_user,
-            admin_password: pg_pass,
+            admin_password: options.admin_password,
             app_user: resolved_app_user,
             app_password: resolved_app_password,
             catalog_db: resolved_catalog_db,
@@ -598,9 +594,4 @@ fn check_conflict<T: PartialEq + std::fmt::Display>(
         }
     }
     Ok(())
-}
-
-/// Extract a CLI argument value by flag name.
-fn extract_arg(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
 }

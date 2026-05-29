@@ -41,7 +41,7 @@ See `docs/local-postgres-setup.md` for full setup instructions.
 
 ### `migration failed: ...`
 
-**Cause:** The PostgreSQL database exists but the migration SQL failed (permissions, schema conflicts, etc.).
+**Cause:** The storage database exists but the migration SQL failed (permissions, schema conflicts, etc.).
 
 **Fix:** Check the PostgreSQL logs (`~/pgdata/server.log`). Ensure the `extenddb` user has CREATE TABLE permissions on the `extenddb` database.
 
@@ -59,7 +59,7 @@ See `docs/local-postgres-setup.md` for full setup instructions.
 
 ### `Database '<name>' already exists. Run 'extenddb destroy --config <config>' first, then re-run 'extenddb init'.`
 
-**Cause:** `extenddb init` detected that the catalog or data database already exists in PostgreSQL. To prevent accidental data loss, `extenddb init` refuses to proceed when either database is present.
+**Cause:** `extenddb init` detected that the catalog or data database already exists in the configured storage backend. To prevent accidental data loss, `extenddb init` refuses to proceed when either database is present.
 
 **Fix:** If you want to re-initialize from scratch, run `extenddb destroy --config extenddb.toml` first to drop both databases, then run `extenddb init` again. If you want to keep the existing data and just apply migrations, use `extenddb migrate` instead.
 
@@ -157,7 +157,7 @@ journalctl -t extenddb -f
 
 **Cause:** The background task that polls the `log_level` setting from the database could not connect. The server continues to run with the initial log level from the config file.
 
-**Fix:** Verify the `connection_string` in `extenddb.toml` is correct and PostgreSQL is reachable. The log level can still be set via the config file; runtime changes via `extenddb settings set log_level` will not take effect until the server is restarted.
+**Fix:** Verify the `connection_string` in `extenddb.toml` is correct and the configured storage backend is reachable. The log level can still be set via the config file; runtime changes via `extenddb settings set log_level` will not take effect until the server is restarted.
 
 ### `Invalid log_level '<value>' in settings: <error>`
 
@@ -278,13 +278,13 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 ### SDK timeout errors
 
-**Cause:** extenddb is running but slow to respond (e.g., PostgreSQL connection pool exhausted).
+**Cause:** extenddb is running but slow to respond (e.g., storage backend connection pool exhausted).
 
-**Fix:** Check `extenddb.toml` `[storage.postgres] pool_size` — increase if under heavy concurrent load. Check PostgreSQL logs for slow queries.
+**Fix:** Check `extenddb.toml` `pool_size` under the active storage section (`[storage.postgres]` or `[storage.tidb]`) and increase it if under heavy concurrent load. Check backend logs for slow queries.
 
-### Table stuck in CREATING or DELETING state
+### Table stuck in CREATING, UPDATING, or DELETING state
 
-**Cause:** The background transition poller processes status changes when notified by CreateTable/DeleteTable, or on a 60-second defensive sweep. If the server was stopped while a table was in a transitional state, the transition completes on the next server startup.
+**Cause:** The background transition poller processes status changes when notified by CreateTable, UpdateTable, or DeleteTable, or on a 60-second defensive sweep. If the server was stopped while a table was in a transitional state, the transition completes on the next server startup.
 
 **Fix:** If a table appears stuck:
 1. Check that extenddb is running (`extenddb status`).
@@ -299,15 +299,15 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 ### Failed to recover control plane transitions
 
-**Cause:** At startup, extenddb attempts to complete any in-flight control plane transitions (CREATING→ACTIVE, DELETING→removed) left over from a previous server instance. This error means the recovery query failed, likely due to a database connectivity issue.
+**Cause:** At startup, extenddb attempts to complete any in-flight control plane transitions (CREATING→ACTIVE, UPDATING→ACTIVE, DELETING→removed) left over from a previous server instance. This error means the recovery query failed, likely due to a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and that the catalog database is accessible. Tables may be stuck in CREATING or DELETING state until the issue is resolved. Once the database is reachable, restart extenddb to retry recovery.
+**Fix:** Check database connectivity and that the catalog database is accessible. Tables may be stuck in CREATING, UPDATING, or DELETING state until the issue is resolved. Once the database is reachable, restart extenddb to retry recovery.
 
 ### Control plane transition poll failed
 
-**Cause:** The background poller that processes CREATING→ACTIVE and DELETING→removed transitions encountered a database error. Tables in transitional states will remain stuck until the poller succeeds.
+**Cause:** The background poller that processes CREATING→ACTIVE, UPDATING→ACTIVE, and DELETING→removed transitions encountered a database error. Tables in transitional states will remain stuck until the poller succeeds.
 
-**Fix:** Check PostgreSQL connectivity. The poller retries on the next wake (triggered by new CreateTable/DeleteTable requests or the 60-second defensive sweep). If the database is healthy and the error persists, check PostgreSQL logs for details.
+**Fix:** Check database connectivity. The poller retries on the next wake (triggered by new control-plane requests or the 60-second defensive sweep). If the database is healthy and the error persists, check backend database logs for details.
 
 ## Management API
 
@@ -315,7 +315,7 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Cause:** The management API could not query the `admin_users` table to verify credentials. The database may be unreachable or the catalog schema may be corrupted.
 
-**Fix:** Check PostgreSQL connectivity and that the `admin_users` table exists in the catalog database. Run `extenddb verify --config extenddb.toml` to check catalog health.
+**Fix:** Check storage backend connectivity and that the `admin_users` table exists in the catalog database. Run `extenddb verify --config extenddb.toml` to check catalog health.
 
 ### `Management API: bcrypt hash failed: <error>`
 
@@ -327,121 +327,121 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Cause:** The `INSERT INTO admin_users` query failed for a reason other than a unique constraint violation (which returns 409 Conflict). Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: list admins failed: <error>`
 
 **Cause:** The `SELECT FROM admin_users` query failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: delete admin failed: <error>`
 
 **Cause:** The `DELETE FROM admin_users` query failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: change password failed: <error>`
 
 **Cause:** The `UPDATE admin_users` query failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: create account failed: <error>`
 
 **Cause:** The `INSERT INTO accounts` query failed for a reason other than a unique constraint violation (which returns 409 Conflict). Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: list accounts failed: <error>`
 
 **Cause:** The `SELECT FROM accounts` query failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: check tables failed: <error>`
 
 **Cause:** During account deletion, the query to check whether the account owns tables failed. The delete was not attempted.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: delete account failed: <error>`
 
 **Cause:** The `DELETE FROM accounts` query failed. Likely a database connectivity issue or an unexpected FK constraint violation.
 
-**Fix:** Check PostgreSQL connectivity and logs. If the error mentions a foreign key violation, ensure all IAM entities for the account have been cleaned up (this should happen automatically via CASCADE).
+**Fix:** Check storage backend connectivity and logs. If the error mentions a foreign key violation, ensure all IAM entities for the account have been cleaned up (this should happen automatically via CASCADE).
 
 ### `Management API: begin transaction failed: <error>`
 
 **Cause:** The management API could not start a database transaction. Likely a database connectivity or pool exhaustion issue.
 
-**Fix:** Check PostgreSQL connectivity. If the management pool (2 connections) is exhausted, wait and retry.
+**Fix:** Check storage backend connectivity. If the management pool (2 connections) is exhausted, wait and retry.
 
 ### `Management API: commit delete account failed: <error>`
 
 **Cause:** The account deletion succeeded but the transaction commit failed. The deletion was rolled back. Likely a database connectivity issue.
 
-**Fix:** Retry the operation. Check PostgreSQL connectivity and logs.
+**Fix:** Retry the operation. Check storage backend connectivity and logs.
 
 ### `Management API: DB error during IAM user auth: <error>`
 
 **Cause:** The management API could not query the `iam_users` table to verify IAM user credentials. The database may be unreachable or the catalog schema may be corrupted.
 
-**Fix:** Check PostgreSQL connectivity and that the `iam_users` table exists in the catalog database. Run `extenddb verify --config extenddb.toml` to check catalog health.
+**Fix:** Check storage backend connectivity and that the `iam_users` table exists in the catalog database. Run `extenddb verify --config extenddb.toml` to check catalog health.
 
 ### `Management API: create IAM user failed: <error>`
 
 **Cause:** The `INSERT INTO iam_users` query failed for a reason other than a unique constraint or FK violation. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: seed self-service policy failed: <error>`
 
 **Cause:** After creating an IAM user, the default self-service policy could not be inserted. The user was created successfully but may lack the default policy.
 
-**Fix:** Manually attach a self-service policy using `extenddb manage put-user-policy`. Check PostgreSQL connectivity.
+**Fix:** Manually attach a self-service policy using `extenddb manage put-user-policy`. Check storage backend connectivity.
 
 ### `Management API: list IAM users failed: <error>`
 
 **Cause:** The `SELECT FROM iam_users` query failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: delete IAM user failed: <error>`
 
 **Cause:** The `DELETE FROM iam_users` query failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: tag IAM user failed: <error>`
 
 **Cause:** The `INSERT INTO iam_user_tags` query failed for a reason other than a FK violation. Likely a database connectivity issue. The tag transaction is rolled back — no partial tags are applied.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: commit tag transaction failed: <error>`
 
 **Cause:** All tag upserts succeeded but the transaction commit failed. Tags were rolled back. Likely a database connectivity issue.
 
-**Fix:** Retry the operation. Check PostgreSQL connectivity and logs.
+**Fix:** Retry the operation. Check storage backend connectivity and logs.
 
 ### `Management API: untag IAM user failed: <error>`
 
 **Cause:** The `DELETE FROM iam_user_tags` query failed. The untag transaction is rolled back — no partial deletes are applied. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: commit untag transaction failed: <error>`
 
 **Cause:** All tag deletions succeeded but the transaction commit failed. Deletions were rolled back. Likely a database connectivity issue.
 
-**Fix:** Retry the operation. Check PostgreSQL connectivity and logs.
+**Fix:** Retry the operation. Check storage backend connectivity and logs.
 
 ### `Management API: list IAM user tags failed: <error>`
 
 **Cause:** The `SELECT FROM iam_user_tags` query failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: encryption key not found in settings`
 
@@ -453,7 +453,7 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Cause:** The query to retrieve the encryption key from the `settings` table failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: encrypt secret key failed: <error>`
 
@@ -465,31 +465,31 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Cause:** The `INSERT INTO access_keys` query failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: list access keys failed: <error>`
 
 **Cause:** The `SELECT FROM access_keys` query failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: delete access key failed: <error>`
 
 **Cause:** The `DELETE FROM access_keys` query failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: change IAM user password failed: <error>`
 
 **Cause:** The `UPDATE iam_users` query to change the password failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: check allow_credential_import failed: <error>`
 
 **Cause:** The query to check the `allow_credential_import` runtime setting failed during an access key import. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs. Retry the import operation.
+**Fix:** Check storage backend connectivity and logs. Retry the import operation.
 
 ### `Management API: encrypt imported secret failed: <error>`
 
@@ -501,73 +501,73 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Cause:** The `INSERT INTO access_keys` query failed during an access key import for a reason other than a FK or unique constraint violation. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: create IAM group failed: <error>`
 
 **Cause:** The `INSERT INTO iam_groups` query failed for a reason other than a unique constraint or FK violation. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: list IAM groups failed: <error>`
 
 **Cause:** The `SELECT FROM iam_groups` query failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: delete IAM group failed: <error>`
 
 **Cause:** The `DELETE FROM iam_groups` query failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: add group member failed: <error>`
 
 **Cause:** The `INSERT INTO iam_group_members` query failed for a reason other than a unique constraint or FK violation. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: remove group member failed: <error>`
 
 **Cause:** The `DELETE FROM iam_group_members` query failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: put user policy failed: <error>`
 
 **Cause:** The `INSERT INTO iam_policies` query failed for a user policy for a reason other than a FK violation. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: put group policy failed: <error>`
 
 **Cause:** The `INSERT INTO iam_policies` query failed for a group policy for a reason other than a FK violation. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: list user policies failed: <error>`
 
 **Cause:** The `SELECT FROM iam_policies` query failed for user policies. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: list group policies failed: <error>`
 
 **Cause:** The `SELECT FROM iam_policies` query failed for group policies. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: delete user policy failed: <error>`
 
 **Cause:** The `DELETE FROM iam_policies` query failed for a user policy. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: delete group policy failed: <error>`
 
 **Cause:** The `DELETE FROM iam_policies` query failed for a group policy. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ## IAM Role Management
 
@@ -575,55 +575,55 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Cause:** The `INSERT INTO iam_roles` query failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: list IAM roles failed: <error>`
 
 **Cause:** The `SELECT` query for listing IAM roles failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: delete IAM role failed: <error>`
 
 **Cause:** The `DELETE FROM iam_roles` query failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: tag IAM role failed: <error>`
 
 **Cause:** The `INSERT INTO iam_role_tags` query failed during a tag operation. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: untag IAM role failed: <error>`
 
 **Cause:** The `DELETE FROM iam_role_tags` query failed during an untag operation. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: list IAM role tags failed: <error>`
 
 **Cause:** The `SELECT` query for listing IAM role tags failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: put role policy failed: <error>`
 
 **Cause:** The `INSERT INTO iam_policies` query failed for a role policy. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: list role policies failed: <error>`
 
 **Cause:** The `SELECT` query for listing role policies failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: delete role policy failed: <error>`
 
 **Cause:** The `DELETE FROM iam_policies` query failed for a role policy. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ## AssumeRole
 
@@ -631,7 +631,7 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Cause:** The `SELECT` query to load the role and its trust policy failed during an AssumeRole operation. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: encrypt session secret failed: <error>`
 
@@ -643,7 +643,7 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Cause:** The `INSERT INTO iam_sessions` query failed when storing the temporary session. Likely a database connectivity issue or a unique constraint violation on the generated access key ID (extremely unlikely).
 
-**Fix:** Check PostgreSQL connectivity and logs. Retry the assume-role operation.
+**Fix:** Check storage backend connectivity and logs. Retry the assume-role operation.
 
 ## Permissions Boundaries
 
@@ -651,37 +651,37 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Cause:** The `INSERT INTO iam_permissions_boundaries` query failed for a user boundary. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: get user permissions boundary failed: <error>`
 
 **Cause:** The `SELECT` query for a user permissions boundary failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: delete user permissions boundary failed: <error>`
 
 **Cause:** The `DELETE FROM iam_permissions_boundaries` query failed for a user boundary. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: set role permissions boundary failed: <error>`
 
 **Cause:** The `INSERT INTO iam_permissions_boundaries` query failed for a role boundary. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: get role permissions boundary failed: <error>`
 
 **Cause:** The `SELECT` query for a role permissions boundary failed. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ### `Management API: delete role permissions boundary failed: <error>`
 
 **Cause:** The `DELETE FROM iam_permissions_boundaries` query failed for a role boundary. Likely a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and logs.
+**Fix:** Check storage backend connectivity and logs.
 
 ## DynamoDB Streams
 
@@ -689,25 +689,25 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Cause:** After a successful write (PutItem, DeleteItem, UpdateItem), extenddb tried to capture a stream record but could not determine which shard to assign it to. The data write succeeded — only the stream record is missing.
 
-**Fix:** Check PostgreSQL connectivity. Verify the table's stream shards exist in the `stream_shards` table. If the table was created before streams were enabled, the shards may not have been initialized.
+**Fix:** Check storage backend connectivity. Verify the table's stream shards exist in the `stream_shards` table. If the table was created before streams were enabled, the shards may not have been initialized.
 
 ### `Stream capture: failed to write record for <table>: <error>`
 
 **Cause:** A stream record was constructed but could not be persisted to the `stream_records` table. The data write succeeded — only the stream record is missing.
 
-**Fix:** Check PostgreSQL connectivity and disk space. If the error mentions a unique constraint violation, two writes to the same shard may have occurred in the same microsecond — retry the operation.
+**Fix:** Check storage backend connectivity and disk space. If the error mentions a unique constraint violation, two writes to the same shard may have occurred in the same microsecond — retry the operation.
 
 ### `Stream capture: failed to get sequence number: <error>`
 
 **Cause:** extenddb could not generate a sequence number for a stream record. The data write succeeded — only the stream record is missing.
 
-**Fix:** Check PostgreSQL connectivity.
+**Fix:** Check storage backend connectivity.
 
 ### `Stream cleanup worker: <error>`
 
 **Cause:** The background worker that deletes stream records older than 24 hours encountered a database error. Expired records will accumulate until the worker succeeds.
 
-**Fix:** Check PostgreSQL connectivity. The worker retries every hour automatically.
+**Fix:** Check storage backend connectivity. The worker retries every hour automatically.
 
 ## Management Console Errors
 
@@ -761,27 +761,31 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Fix:** Use the full ARN format: `arn:aws:dynamodb:<region>:<account>:table/<name>`. You can get the ARN from `DescribeTable`.
 
-## GSI Async Update Behavior
+## PostgreSQL GSI Async Update Behavior
 
 ### GSI query returns stale data after a write
 
-**Cause:** GSI updates are applied asynchronously with a configurable propagation delay (default 10ms). This matches real DynamoDB's eventually consistent GSI behavior. Each GSI can have its own `propagation_delay_ms` setting; the system-wide default is controlled by the `gsi_propagation_delay_ms` runtime setting.
+**Cause:** On the PostgreSQL backend, GSI updates can be applied asynchronously with a configurable propagation delay (default 10ms). TiDB does not use this path; TiDB maintains native secondary indexes from the base table row.
 
-**Fix:** This is expected behavior. For tests that query GSIs after writes, poll/retry the GSI query until the expected data appears. To make all GSIs synchronous for testing, set `extenddb settings set gsi_propagation_delay_ms 0`. For production-like testing, keep the default async delay.
+**Fix:** For PostgreSQL tests that query GSIs immediately after writes, poll/retry the GSI query or set `extenddb settings set gsi_propagation_delay_ms 0`. No setting is needed for TiDB.
 
 ## Connection Pool Exhaustion
 
 ### HTTP 500 on all requests under heavy load
 
-**Cause:** The PostgreSQL connection pool is exhausted. All connections are in use and new requests cannot acquire a connection within the timeout. extenddb currently returns HTTP 500 (Internal Server Error) instead of the more appropriate 503 (Service Unavailable).
+**Cause:** The storage backend connection pool is exhausted. All connections are in use and new requests cannot acquire a connection within the timeout. extenddb currently returns HTTP 500 (Internal Server Error) instead of the more appropriate 503 (Service Unavailable).
 
 **Fix:** Increase the pool size in `extenddb.toml`:
 ```toml
 [storage.postgres]
 pool_size = 50  # default is 20
+
+# or, for TiDB:
+[storage.tidb]
+pool_size = 50
 ```
 
-If the problem persists, check for long-running queries or connection leaks with `SELECT * FROM pg_stat_activity WHERE datname = 'extenddb_data';`.
+If the problem persists, check for long-running queries or connection leaks with the backend's session-inspection tools, such as PostgreSQL `pg_stat_activity` or TiDB's statement/cluster diagnostics.
 
 **Known limitation:** The HTTP status code should be 503 with a `Retry-After` header. This is tracked as technical debt.
 

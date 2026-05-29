@@ -139,7 +139,7 @@ echo "  $PDF_DIR/"
 echo
 echo "Next steps:"
 echo "  1. Ensure PostgreSQL is running: pg_isready"
-echo "  2. Initialize: extenddb init --catalog-db extenddb_catalog --pg-user postgres"
+echo "  2. Initialize: extenddb init --catalog-db extenddb_catalog --storage-admin-user postgres"
 echo "  3. Verify:     extenddb verify --config extenddb.toml"
 echo "  4. Start:      extenddb serve --config extenddb.toml"
 echo

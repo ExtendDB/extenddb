@@ -6,8 +6,8 @@ This guide walks you through initializing a extenddb deployment, starting the se
 
 ### Platform-specific installation guides
 
-- [macOS (Homebrew)](manuals/09-install-macos.md) — covers Homebrew PostgreSQL, macOS syslog, and `--pg-user $(whoami)`
-- [Linux (Ubuntu/Debian, Amazon Linux, Fedora/RHEL)](manuals/08-install-linux.md) — covers system PostgreSQL, `journalctl`, and `--pg-user postgres`
+- [macOS (Homebrew)](manuals/09-install-macos.md) — covers Homebrew PostgreSQL, macOS syslog, and `--storage-admin-user $(whoami)`
+- [Linux (Ubuntu/Debian, Amazon Linux, Fedora/RHEL)](manuals/08-install-linux.md) — covers system PostgreSQL, `journalctl`, and `--storage-admin-user postgres`
 
 ### Installer scripts
 
@@ -29,7 +29,7 @@ software on your behalf. After the script completes, continue from
 
 ## Prerequisites
 
-- PostgreSQL 14+ running locally (see `docs/local-postgres-setup.md`)
+- A supported storage backend. The default build uses PostgreSQL 14+ locally (see `docs/local-postgres-setup.md`); TiDB is available when building with the `tidb` feature.
 - Rust toolchain (1.85+)
 - AWS CLI v2 (for testing)
 - Python 3.10+ with virtual environment (see [Python Environment Setup](../README.md#python-environment-setup) in the README)
@@ -51,7 +51,7 @@ Run `extenddb init` to create the catalog and data databases:
 ```
 
 This will:
-- Create a `extenddb` PostgreSQL user (if it doesn't exist)
+- Create an `extenddb` storage user (if it doesn't exist)
 - Create the `extenddb_catalog` database (catalog metadata)
 - Create the `extenddb` database (user item data)
 - Run schema migrations
@@ -79,16 +79,16 @@ To use a custom data database name:
 
 ### Remote PostgreSQL / Aurora
 
-For remote PostgreSQL or Aurora, supply the admin password with `--pg-pass`:
+For remote PostgreSQL or Aurora, supply the admin password with `--storage-admin-password`:
 
 ```bash
 # Pass the password inline:
 ./target/release/extenddb init \
-  --pg-host my-aurora-cluster.cluster-xxxx.us-east-1.rds.amazonaws.com \
-  --pg-user postgres --pg-pass <admin-password>
+  --storage-host my-aurora-cluster.cluster-xxxx.us-east-1.rds.amazonaws.com \
+  --storage-admin-user postgres --storage-admin-password <admin-password>
 ```
 
-When `--pg-pass` is omitted entirely, `extenddb init` connects without a password, relying on
+When `--storage-admin-password` is omitted entirely, `extenddb init` connects without a password, relying on
 PostgreSQL peer/ident authentication (works only on localhost via Unix socket).
 
 ### Custom bind address
@@ -240,14 +240,14 @@ Controls whether `extenddb manage import-access-key` is allowed (default: `true`
 
 ### GSI Propagation Delay
 
-GSI updates are applied asynchronously with a configurable delay, simulating real DynamoDB's eventually consistent GSI behavior. The system-wide default is 10ms. Each GSI can override this with a per-index `propagation_delay_ms` stored in the catalog.
+The PostgreSQL backend can apply GSI updates asynchronously with a configurable delay, simulating real DynamoDB's eventually consistent GSI behavior. The TiDB backend uses TiDB transactions and native secondary indexes maintained from the base table write.
 
 ```bash
-# Set system-wide default to 0 for synchronous GSI updates (fast tests)
+# PostgreSQL only: set system-wide default to 0 for synchronous GSI updates
 ./target/release/extenddb settings --config extenddb.toml set \
     gsi_propagation_delay_ms 0
 
-# Set to 50ms for more realistic eventual consistency
+# PostgreSQL only: set to 50ms for more realistic eventual consistency
 ./target/release/extenddb settings --config extenddb.toml set \
     gsi_propagation_delay_ms 50
 ```
@@ -1178,10 +1178,8 @@ extenddb supports running external test suites (e.g., Java/JUnit, Python/pytest)
 # Start extenddb first
 ./target/release/extenddb serve --config extenddb.toml
 
-# Set GSI propagation delay to 0 for external tests.
-# External suites expect synchronous GSI behavior (matching real DynamoDB's
-# typical sub-millisecond propagation). The async GSI path is tested
-# separately by the extenddb-specific test_gsi_async.py suite.
+# PostgreSQL only: external suites expect immediate GSI visibility.
+# TiDB GSI writes are already transactional, so this setting is not needed there.
 ./target/release/extenddb settings --config extenddb.toml set gsi_propagation_delay_ms 0
 
 # Run all registered suites

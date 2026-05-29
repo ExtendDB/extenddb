@@ -34,6 +34,57 @@ async fn make_table(name: &str) {
     wait_for_active(c, name).await;
 }
 
+async fn make_range_table(name: &str, sk_type: ScalarAttributeType) {
+    let c = client();
+    c.create_table()
+        .table_name(name)
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("sk")
+                .key_type(KeyType::Range)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("sk")
+                .attribute_type(sk_type)
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+    wait_for_active(c, name).await;
+}
+
+fn sort_value(
+    sk_type: &ScalarAttributeType,
+    index: i64,
+) -> aws_sdk_dynamodb::types::AttributeValue {
+    match sk_type {
+        ScalarAttributeType::S => s(&format!("sort_{index}")),
+        ScalarAttributeType::N => n(index),
+        ScalarAttributeType::B => b(&format!("sort_{index}")),
+        other => panic!("unexpected sort key type: {other:?}"),
+    }
+}
+
 /// Create a backup, retrying on `ContinuousBackupsUnavailableException`
 /// (real DynamoDB needs time for continuous backups to initialize).
 async fn create_backup_with_retry(
@@ -214,6 +265,62 @@ async fn restore_table_from_backup() {
 }
 
 #[tokio::test]
+async fn restore_table_from_backup_with_sort_keys() {
+    let c = client();
+    let cases = [
+        ScalarAttributeType::S,
+        ScalarAttributeType::N,
+        ScalarAttributeType::B,
+    ];
+
+    for sk_type in cases {
+        let table = format!("RestoreRange_{sk_type:?}_{}", ts());
+        make_range_table(&table, sk_type.clone()).await;
+
+        for i in 0..3 {
+            c.put_item()
+                .table_name(&table)
+                .item("pk", s("partition"))
+                .item("sk", sort_value(&sk_type, i))
+                .item("data", s(&format!("val_{i}")))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let create = create_backup_with_retry(c, &table, "restore-range-backup").await;
+        let arn = create.backup_details().unwrap().backup_arn().to_string();
+
+        let restored = format!("RestoredRange_{sk_type:?}_{}", ts());
+        c.restore_table_from_backup()
+            .target_table_name(&restored)
+            .backup_arn(&arn)
+            .send()
+            .await
+            .unwrap();
+
+        wait_for_active(c, &restored).await;
+        let scan = c.scan().table_name(&restored).send().await.unwrap();
+        assert_eq!(scan.count(), 3);
+
+        let resp = c
+            .get_item()
+            .table_name(&restored)
+            .key("pk", s("partition"))
+            .key("sk", sort_value(&sk_type, 1))
+            .consistent_read(true)
+            .send()
+            .await
+            .unwrap();
+        let item = resp.item().expect("restored range-key item exists");
+        assert_eq!(item.get("data"), Some(&s("val_1")));
+
+        c.delete_table().table_name(&restored).send().await.ok();
+        c.delete_table().table_name(&table).send().await.ok();
+    }
+}
+
+#[tokio::test]
 async fn describe_continuous_backups() {
     let c = client();
     let table = format!("ContBackup_{}", ts());
@@ -282,7 +389,10 @@ async fn restore_table_to_point_in_time() {
         .use_latest_restorable_time(true)
         .send()
         .await;
-    assert!(err.is_err(), "RestoreTableToPointInTime should return an error (not yet supported)");
+    assert!(
+        err.is_err(),
+        "RestoreTableToPointInTime should return an error (not yet supported)"
+    );
 
     c.delete_table().table_name(&table).send().await.ok();
 }
