@@ -90,6 +90,7 @@ Available when the binary is built with the `tidb` feature.
 | `connection_string` | `mysql://extenddb:extenddb-local-dev@localhost:4000/extenddb_catalog` | Catalog database connection string |
 | `pool_size` | `20` | Maximum connections for strong and default-read data pools (minimum: 10) |
 | `catalog_pool_size` | (= `pool_size`) | Maximum connections for catalog metadata, control-plane, management, and authz pools (minimum: 10) |
+| `resource_group` | unset | Optional TiDB Resource Control group. When set, ExtendDB binds every runtime TiDB pool session with `SET RESOURCE GROUP`. |
 
 TiDB capacity governance is configured in TiDB, not in ExtendDB. A typical
 deployment creates a TiDB resource group and binds the ExtendDB SQL user to it:
@@ -99,7 +100,13 @@ CREATE RESOURCE GROUP IF NOT EXISTS extenddb_api RU_PER_SEC = 500 BURSTABLE;
 ALTER USER 'extenddb'@'%' RESOURCE GROUP extenddb_api;
 ```
 
-Existing SQL sessions keep their previous resource group until they reconnect.
+Set `storage.tidb.resource_group = "extenddb_api"` when the server should bind
+each pooled runtime session itself. This is useful when the same SQL user is
+shared by multiple applications or when you want config review to show the exact
+ExtendDB serving group. TiDB resource control must be enabled. If TiDB strict
+resource-control mode is enabled, the SQL user needs permission to execute
+`SET RESOURCE GROUP`. Existing SQL sessions keep their previous resource group
+until they reconnect, so restart ExtendDB after changing the setting.
 
 #### [storage.tidb.backup]
 

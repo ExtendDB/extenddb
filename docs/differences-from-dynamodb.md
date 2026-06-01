@@ -69,7 +69,7 @@ adaptation when switching between ExtendDB and the real service.
 
 | Area | DynamoDB | ExtendDB |
 |------|----------|------|
-| Provisioned throughput | Token bucket per table/partition | PostgreSQL can use frontend token buckets for local fidelity tests. TiDB uses TiDB Resource Control/resource groups instead of process-local buckets. |
+| Provisioned throughput | Token bucket per table/partition | PostgreSQL can use frontend token buckets for local fidelity tests. TiDB uses TiDB Resource Control/resource groups instead of process-local buckets; `storage.tidb.resource_group` can bind runtime sessions to the selected group. |
 | On-demand capacity | Automatic scaling | PostgreSQL token buckets use fixed initial burst capacity when enabled. TiDB delegates cluster capacity and scheduling to TiDB. |
 | Throttling | Always on; throttles requests that exceed provisioned/burst capacity. No setting to disable | PostgreSQL frontend throttling is configurable via `throttling_enabled` and disabled by default. TiDB ignores frontend throttling and should use TiDB-native resource control. |
 

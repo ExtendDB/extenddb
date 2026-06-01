@@ -65,6 +65,15 @@ pub trait StorageConfig: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// Optional storage-native resource group used for capacity governance.
+    ///
+    /// Backends that support session-level cluster scheduling can expose an
+    /// operator-selected resource group here. The server passes it back to the
+    /// backend factory; backends without such a concept keep the default `None`.
+    fn native_capacity_resource_group(&self) -> Option<&str> {
+        None
+    }
+
     /// Clone this config into a boxed trait object.
     fn clone_box(&self) -> Box<dyn StorageConfig>;
 }

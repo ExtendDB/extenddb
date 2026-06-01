@@ -259,6 +259,9 @@ The PostgreSQL backend can apply GSI updates asynchronously with a configurable 
 PostgreSQL deployments can enable ExtendDB's frontend token buckets for provisioned throughput experiments. The buckets are process-local, so they are disabled by default and are not used by TiDB deployments.
 
 TiDB deployments should use TiDB Resource Control and resource groups for distributed capacity governance. That keeps flow control and scheduling inside TiDB, where all ExtendDB frontends share one cluster-owned quota.
+Create the resource group in TiDB, then either bind the ExtendDB SQL user with
+`ALTER USER ... RESOURCE GROUP` or set `storage.tidb.resource_group` so ExtendDB
+executes `SET RESOURCE GROUP` on every runtime pool session.
 
 ```bash
 # PostgreSQL only: disable frontend throttling

@@ -254,9 +254,11 @@ pub(crate) async fn metrics_flush_worker(
             // insert_metrics logs per-row failures internally and always returns Ok.
             let _ = store.insert_metrics(&rows).await;
         }
-        // Prune old DB rows.
+        // Prune old DB rows when retention is not owned by the backend.
         let mut errored = false;
-        if let Err(e) = store.prune_metrics(RETENTION).await {
+        if !store.metrics_retention_owned_by_backend()
+            && let Err(e) = store.prune_metrics(RETENTION).await
+        {
             tracing::warn!("Failed to prune old metrics from DB: {e:?}");
             metrics.record_worker_error(QuerySource::MetricsFlush);
             errored = true;

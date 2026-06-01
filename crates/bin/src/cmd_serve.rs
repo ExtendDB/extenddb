@@ -443,8 +443,11 @@ async fn serve_inner(
         metrics.clone(),
         catalog_store.clone(),
     ));
-    // Spawn background task to clean up old login attempt records.
-    tokio::spawn(workers::login_attempt_cleanup_worker(catalog_store.clone()));
+    // Spawn background task to clean up old login attempt records only when
+    // the backend does not own retention natively.
+    if !catalog_store.login_attempt_retention_owned_by_backend() {
+        tokio::spawn(workers::login_attempt_cleanup_worker(catalog_store.clone()));
+    }
     // Phase 11a: Spawn background task to warn about approximate consumed capacity.
     tokio::spawn(workers::capacity_warning_worker());
 

@@ -118,7 +118,8 @@ use extenddb_storage::error::StorageError;
 use sqlx::MySqlPool;
 
 use crate::tidb_util::{
-    is_table_not_found_tidb_sqlx_error, tidb_default_read_pool_options, tidb_pool_options,
+    is_table_not_found_tidb_sqlx_error, tidb_default_read_pool_options_with_resource_group,
+    tidb_pool_options, tidb_pool_options_with_resource_group,
 };
 
 /// Expected catalog version — compiled into the binary.
@@ -144,6 +145,8 @@ pub struct TidbConfig {
     /// Runtime limits that TiDB must enforce after storage-side mutations.
     pub limits: LimitsConfig,
     pub native_backup: extenddb_storage::config::NativeBackupConfig,
+    /// Optional TiDB Resource Control group for all runtime SQL sessions.
+    pub resource_group: Option<String>,
 }
 
 /// `TiDB` storage backend.
@@ -184,7 +187,12 @@ impl TidbEngine {
         let data_min_conns = data_pool_size.min(2);
         let catalog_connection_string =
             crate::config::sqlx_connection_string(&config.connection_string);
-        let pool = tidb_pool_options(catalog_pool_size, catalog_min_conns)
+        let catalog_pool_options = tidb_pool_options_with_resource_group(
+            catalog_pool_size,
+            catalog_min_conns,
+            config.resource_group.as_deref(),
+        )?;
+        let pool = catalog_pool_options
             .connect(&catalog_connection_string)
             .await
             .map_err(|e| StorageError::Connection(e.to_string()))?;
@@ -211,7 +219,12 @@ impl TidbEngine {
                 )));
             }
         };
-        let data_pool = tidb_pool_options(data_pool_size, data_min_conns)
+        let data_pool_options = tidb_pool_options_with_resource_group(
+            data_pool_size,
+            data_min_conns,
+            config.resource_group.as_deref(),
+        )?;
+        let data_pool = data_pool_options
             .connect(&data_connection_string)
             .await
             .map_err(|e| {
@@ -224,7 +237,12 @@ impl TidbEngine {
             &data_connection_string,
         )
         .await?;
-        let data_default_read_pool = tidb_default_read_pool_options(data_pool_size, data_min_conns)
+        let data_default_read_pool_options = tidb_default_read_pool_options_with_resource_group(
+            data_pool_size,
+            data_min_conns,
+            config.resource_group.as_deref(),
+        )?;
+        let data_default_read_pool = data_default_read_pool_options
             .connect(&data_connection_string)
             .await
             .map_err(|e| {
@@ -440,6 +458,7 @@ struct TidbRuntimeHooks {
     catalog_store_pool: MySqlPool,
     control_plane_notify: Arc<tokio::sync::Notify>,
     data_db_name: String,
+    resource_group: Option<String>,
 }
 
 const BACKEND_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
@@ -530,7 +549,15 @@ impl ServerRuntimeHooks for TidbRuntimeHooks {
     }
 
     fn backend_info(&self) -> Option<String> {
-        Some(format!("data_db={}", self.data_db_name))
+        Some(match &self.resource_group {
+            Some(resource_group) => {
+                format!(
+                    "data_db={}, resource_group={resource_group}",
+                    self.data_db_name
+                )
+            }
+            None => format!("data_db={}", self.data_db_name),
+        })
     }
 }
 
@@ -544,6 +571,7 @@ inventory::submit! {
             let max_catalog_connections = config.max_catalog_connections();
             let limits = config.runtime_limits().cloned().unwrap_or_default();
             let native_backup = config.native_backup_config().unwrap_or_default();
+            let resource_group = config.native_capacity_resource_group().map(str::to_owned);
             let region = region.to_string();
             Box::pin(async move {
                 let pool_size = normalized_pool_size("storage.tidb.pool_size", max_connections);
@@ -559,14 +587,20 @@ inventory::submit! {
                     catalog_pool_size,
                     limits,
                     native_backup,
+                    resource_group: resource_group.clone(),
                 };
 
                 // Create TidbEngine
                 let engine = TidbEngine::new(&tidb_config, &region)
                     .await
-                    .map_err(|e| BackendError::ConnectionFailed {
-                        backend: "tidb".to_string(),
-                        details: e.to_string(),
+                    .map_err(|error| match error {
+                        StorageError::Configuration(details) => {
+                            BackendError::InitializationFailed(details)
+                        }
+                        error => BackendError::ConnectionFailed {
+                            backend: "tidb".to_string(),
+                            details: error.to_string(),
+                        },
                     })?;
 
                 // Check catalog version
@@ -608,7 +642,13 @@ inventory::submit! {
 
                 // Create catalog store on the same independently sized catalog
                 // pool budget used by the engine's metadata/control-plane pool.
-                let catalog_pool = tidb_pool_options(catalog_pool_size, catalog_pool_size.min(2))
+                let catalog_pool_options = tidb_pool_options_with_resource_group(
+                    catalog_pool_size,
+                    catalog_pool_size.min(2),
+                    resource_group.as_deref(),
+                )
+                .map_err(|e| BackendError::InitializationFailed(e.to_string()))?;
+                let catalog_pool = catalog_pool_options
                     .connect(&crate::config::sqlx_connection_string(&connection_string))
                     .await
                     .map_err(|e| BackendError::ConnectionFailed {
@@ -640,6 +680,7 @@ inventory::submit! {
                     catalog_store_pool: catalog_pool.clone(),
                     control_plane_notify,
                     data_db_name,
+                    resource_group,
                 }) as Arc<dyn ServerRuntimeHooks>;
 
                 Ok(ServerComponents {

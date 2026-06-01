@@ -10,7 +10,40 @@ use extenddb_storage::error::StorageError;
 
 const MAX_TIDB_OPERATION_RETRIES: usize = 3;
 const TIDB_CONNECTION_MAX_LIFETIME: Duration = Duration::from_secs(1800);
+const TIDB_RESOURCE_GROUP_NAME_MAX_CHARS: usize = 32;
 pub(crate) const TIDB_REPLICA_READ_CLOSEST_ADAPTIVE: &str = "closest-adaptive";
+
+#[derive(Clone, Default)]
+struct TidbSessionInit {
+    resource_group: Option<String>,
+    replica_read: Option<&'static str>,
+}
+
+impl TidbSessionInit {
+    fn new(
+        resource_group: Option<&str>,
+        replica_read: Option<&'static str>,
+    ) -> Result<Self, StorageError> {
+        Ok(Self {
+            resource_group: resource_group
+                .map(quote_tidb_resource_group_name)
+                .transpose()?,
+            replica_read,
+        })
+    }
+
+    fn init_statements(&self) -> Vec<String> {
+        let mut statements = Vec::with_capacity(3);
+        if let Some(resource_group) = &self.resource_group {
+            statements.push(format!("SET RESOURCE GROUP {resource_group}"));
+        }
+        statements.push("SET SESSION tidb_txn_mode = 'pessimistic'".to_owned());
+        if let Some(replica_read) = self.replica_read {
+            statements.push(format!("SET SESSION tidb_replica_read = '{replica_read}'"));
+        }
+        statements
+    }
+}
 
 /// Build a TiDB pool configuration with the session behavior ExtendDB relies on.
 ///
@@ -22,48 +55,76 @@ pub(crate) fn tidb_pool_options(
     max_connections: u32,
     min_connections: u32,
 ) -> sqlx::mysql::MySqlPoolOptions {
-    tidb_pool_options_with_replica_read(max_connections, min_connections, None)
+    tidb_pool_options_with_session(max_connections, min_connections, TidbSessionInit::default())
 }
 
-/// Build a TiDB pool configuration for read-only data-plane traffic.
+/// Build a TiDB pool configuration bound to a Resource Control group.
+pub(crate) fn tidb_pool_options_with_resource_group(
+    max_connections: u32,
+    min_connections: u32,
+    resource_group: Option<&str>,
+) -> Result<sqlx::mysql::MySqlPoolOptions, StorageError> {
+    Ok(tidb_pool_options_with_session(
+        max_connections,
+        min_connections,
+        TidbSessionInit::new(resource_group, None)?,
+    ))
+}
+
+/// Build a read-only TiDB pool configuration.
 ///
 /// `tidb_replica_read = 'closest-adaptive'` lets TiDB route larger read-only
 /// statements to local replicas while keeping strong consistency through
 /// follower read. Point reads stay on leaders when TiDB estimates that follower
-/// read would add latency.
-pub(crate) fn tidb_default_read_pool_options(
+/// read would add latency. When `resource_group` is set, every pooled session is
+/// also bound to TiDB Resource Control before request traffic starts.
+pub(crate) fn tidb_default_read_pool_options_with_resource_group(
     max_connections: u32,
     min_connections: u32,
-) -> sqlx::mysql::MySqlPoolOptions {
-    tidb_pool_options_with_replica_read(
+    resource_group: Option<&str>,
+) -> Result<sqlx::mysql::MySqlPoolOptions, StorageError> {
+    Ok(tidb_pool_options_with_session(
         max_connections,
         min_connections,
-        Some(TIDB_REPLICA_READ_CLOSEST_ADAPTIVE),
-    )
+        TidbSessionInit::new(resource_group, Some(TIDB_REPLICA_READ_CLOSEST_ADAPTIVE))?,
+    ))
 }
 
-fn tidb_pool_options_with_replica_read(
+fn tidb_pool_options_with_session(
     max_connections: u32,
     min_connections: u32,
-    replica_read: Option<&'static str>,
+    session_init: TidbSessionInit,
 ) -> sqlx::mysql::MySqlPoolOptions {
+    let init_statements = session_init.init_statements();
     sqlx::mysql::MySqlPoolOptions::new()
         .max_connections(max_connections)
         .min_connections(min_connections)
         .test_before_acquire(false)
         .max_lifetime(TIDB_CONNECTION_MAX_LIFETIME)
         .after_connect(move |conn, _meta| {
+            let init_statements = init_statements.clone();
             Box::pin(async move {
-                sqlx::query("SET SESSION tidb_txn_mode = 'pessimistic'")
-                    .execute(&mut *conn)
-                    .await?;
-                if let Some(replica_read) = replica_read {
-                    let sql = format!("SET SESSION tidb_replica_read = '{replica_read}'");
+                for sql in init_statements {
                     sqlx::query(&sql).execute(&mut *conn).await?;
                 }
                 Ok(())
             })
         })
+}
+
+fn quote_tidb_resource_group_name(value: &str) -> Result<String, StorageError> {
+    if value.is_empty()
+        || value.chars().count() > TIDB_RESOURCE_GROUP_NAME_MAX_CHARS
+        || value.contains('`')
+        || value.chars().any(char::is_control)
+    {
+        return Err(StorageError::Configuration(format!(
+            "storage.tidb.resource_group must be a TiDB resource group identifier \
+             between 1 and {TIDB_RESOURCE_GROUP_NAME_MAX_CHARS} characters with no backticks or control characters",
+        )));
+    }
+
+    Ok(format!("`{value}`"))
 }
 
 /// Retry idempotent TiDB online DDL statements on transient schema/lock errors.
@@ -311,8 +372,9 @@ mod tests {
     use sqlx::error::DatabaseError;
 
     use super::{
-        is_retryable_tidb_storage_error, is_table_exists_tidb_error_text,
-        is_table_not_found_tidb_sqlx_error, is_table_not_found_tidb_storage_error,
+        TIDB_REPLICA_READ_CLOSEST_ADAPTIVE, TidbSessionInit, is_retryable_tidb_storage_error,
+        is_table_exists_tidb_error_text, is_table_not_found_tidb_sqlx_error,
+        is_table_not_found_tidb_storage_error, quote_tidb_resource_group_name,
         retry_tidb_idempotent_operation,
     };
 
@@ -462,5 +524,35 @@ mod tests {
 
         assert!(matches!(result, Err(StorageError::ConditionFailed(None))));
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn session_init_binds_resource_group_before_other_session_settings() {
+        let init = TidbSessionInit::new(
+            Some("extenddb-api"),
+            Some(TIDB_REPLICA_READ_CLOSEST_ADAPTIVE),
+        )
+        .expect("resource group should validate");
+
+        assert_eq!(
+            init.init_statements(),
+            vec![
+                "SET RESOURCE GROUP `extenddb-api`",
+                "SET SESSION tidb_txn_mode = 'pessimistic'",
+                "SET SESSION tidb_replica_read = 'closest-adaptive'",
+            ]
+        );
+    }
+
+    #[test]
+    fn resource_group_identifier_rejects_sql_breakout() {
+        for value in [
+            "",
+            "bad`name",
+            "bad\nname",
+            "abcdefghijklmnopqrstuvwxyz1234567",
+        ] {
+            assert!(quote_tidb_resource_group_name(value).is_err(), "{value}");
+        }
     }
 }

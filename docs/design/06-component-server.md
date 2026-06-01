@@ -575,6 +575,9 @@ setting is enabled, the handler deducts tokens and returns
 `ProvisionedThroughputExceededException` on exhaustion. When the backend declares
 native capacity control, the same consumed-capacity metrics are recorded but
 admission is left to the storage cluster.
+For TiDB, an optional `storage.tidb.resource_group` static setting is passed
+back to the storage factory so pooled SQL sessions bind to TiDB Resource Control
+with `SET RESOURCE GROUP`.
 
 ---
 

@@ -112,7 +112,9 @@ BR PITR remains a cluster recovery path, while TiDB historical reads are
 read-only for a live target table.
 TiDB capacity control is also storage-native: operators should use TiDB
 Resource Control/resource groups instead of ExtendDB's process-local token
-buckets, so a multi-frontend deployment has one cluster-owned quota.
+buckets, so a multi-frontend deployment has one cluster-owned quota. When
+`storage.tidb.resource_group` is configured, every TiDB runtime pool binds its
+sessions with `SET RESOURCE GROUP` before serving traffic.
 
 ### auth
 

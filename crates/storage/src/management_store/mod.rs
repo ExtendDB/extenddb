@@ -83,6 +83,11 @@ pub trait MetricsStore: Send + Sync {
 
     /// Delete metrics rows older than the retention period.
     fn prune_metrics(&self, retention: std::time::Duration) -> BoxFuture<'_, OpResult<()>>;
+
+    /// Whether metrics retention is handled by the backend itself.
+    fn metrics_retention_owned_by_backend(&self) -> bool {
+        false
+    }
 }
 
 // ── Rate limit store ───────────────────────────────────────────────────
@@ -108,6 +113,11 @@ pub trait RateLimitStore: Send + Sync {
 
     /// Delete login attempt records older than `max_age_seconds`.
     fn cleanup_old_attempts(&self, max_age_seconds: i64) -> BoxFuture<'_, ()>;
+
+    /// Whether login-attempt retention is handled by the backend itself.
+    fn login_attempt_retention_owned_by_backend(&self) -> bool {
+        false
+    }
 }
 
 // ── Admin store ────────────────────────────────────────────────────────

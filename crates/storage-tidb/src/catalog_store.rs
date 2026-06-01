@@ -317,6 +317,10 @@ impl extenddb_storage::management_store::MetricsStore for TidbCatalogStore {
             Ok(())
         })
     }
+
+    fn metrics_retention_owned_by_backend(&self) -> bool {
+        true
+    }
 }
 
 /// Internal row type for `sqlx::FromRow` derivation.
@@ -405,6 +409,10 @@ impl extenddb_storage::management_store::RateLimitStore for TidbCatalogStore {
         Box::pin(async move {
             // TiDB native TTL owns fixed 24-hour login-attempt retention.
         })
+    }
+
+    fn login_attempt_retention_owned_by_backend(&self) -> bool {
+        true
     }
 }
 

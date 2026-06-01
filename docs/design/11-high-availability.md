@@ -352,7 +352,9 @@ TiDB uses backend-native primitives instead of ExtendDB ownership layers:
 - On-demand backup and restore use TiDB BR metadata instead of row-copy backup payloads.
 - Table-level PITR restore is not emulated; TiDB-native PITR remains a cluster recovery path.
 - Capacity governance uses TiDB Resource Control/resource groups rather than
-  per-frontend token buckets, so quotas and scheduling are cluster-owned.
+  per-frontend token buckets, so quotas and scheduling are cluster-owned. If
+  `storage.tidb.resource_group` is configured, every runtime pool session binds
+  to that TiDB resource group.
 
 ### Deferred: PostgreSQL Replica Topology
 

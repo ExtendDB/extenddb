@@ -18,6 +18,9 @@ pub struct TidbStorageConfig {
     /// Defaults to `pool_size` if not set.
     #[serde(default)]
     pub catalog_pool_size: Option<u32>,
+    /// Optional TiDB Resource Control group bound to every runtime SQL session.
+    #[serde(default)]
+    pub resource_group: Option<String>,
     #[serde(default)]
     pub backup: TidbBackupConfig,
 }
@@ -52,6 +55,7 @@ impl Default for TidbStorageConfig {
             connection_string: default_connection_string(),
             pool_size: default_pool_size(),
             catalog_pool_size: None,
+            resource_group: None,
             backup: TidbBackupConfig::default(),
         }
     }
@@ -217,6 +221,10 @@ impl extenddb_storage::config::StorageConfig for TidbStorageConfig {
         true
     }
 
+    fn native_capacity_resource_group(&self) -> Option<&str> {
+        self.resource_group.as_deref()
+    }
+
     fn clone_box(&self) -> Box<dyn extenddb_storage::config::StorageConfig> {
         Box::new(self.clone())
     }
@@ -265,5 +273,21 @@ mod tests {
     #[test]
     fn tidb_uses_backend_native_capacity_control() {
         assert!(TidbStorageConfig::default().uses_backend_native_capacity_control());
+    }
+
+    #[test]
+    fn tidb_exposes_configured_native_resource_group() {
+        let config: TidbStorageConfig = toml::from_str(
+            r#"
+connection_string = "mysql://extenddb:extenddb-local-dev@localhost:4000/extenddb_catalog"
+resource_group = "extenddb_api"
+"#,
+        )
+        .expect("tidb config should parse");
+
+        assert_eq!(
+            config.native_capacity_resource_group(),
+            Some("extenddb_api")
+        );
     }
 }

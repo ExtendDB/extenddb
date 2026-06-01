@@ -143,6 +143,11 @@ impl StorageConfig {
     pub fn as_trait(&self) -> &dyn extenddb_storage::config::StorageConfig {
         &*self.config
     }
+
+    /// Optional backend-native resource group used for capacity governance.
+    pub fn native_capacity_resource_group(&self) -> Option<&str> {
+        self.config.native_capacity_resource_group()
+    }
 }
 
 /// Storage config view enriched with runtime limits from the top-level config.
@@ -195,6 +200,10 @@ impl extenddb_storage::config::StorageConfig for RuntimeStorageConfig<'_> {
         self.base.uses_backend_native_capacity_control()
     }
 
+    fn native_capacity_resource_group(&self) -> Option<&str> {
+        self.base.native_capacity_resource_group()
+    }
+
     fn clone_box(&self) -> Box<dyn extenddb_storage::config::StorageConfig> {
         Box::new(OwnedRuntimeStorageConfig {
             base: self.base.clone_box(),
@@ -226,6 +235,10 @@ impl extenddb_storage::config::StorageConfig for OwnedRuntimeStorageConfig {
 
     fn uses_backend_native_capacity_control(&self) -> bool {
         self.base.uses_backend_native_capacity_control()
+    }
+
+    fn native_capacity_resource_group(&self) -> Option<&str> {
+        self.base.native_capacity_resource_group()
     }
 
     fn clone_box(&self) -> Box<dyn extenddb_storage::config::StorageConfig> {
@@ -501,6 +514,13 @@ pub fn build_config_entries(cfg: &AppConfig) -> Vec<(String, String)> {
             },
         ),
     ];
+
+    if let Some(resource_group) = cfg.storage.native_capacity_resource_group() {
+        entries.push((
+            format!("storage.{backend}.resource_group"),
+            resource_group.to_owned(),
+        ));
+    }
 
     // Commonly adjusted limits (full list in [limits] section of extenddb.sample.toml).
     let lim = &cfg.limits;

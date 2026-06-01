@@ -68,6 +68,10 @@
                                 # one engine metadata/control-plane pool and
                                 # one management/authz/IAM/console pool.
                                 # Defaults to pool_size if not set.
+# resource_group = "extenddb_api"
+                                # Optional TiDB Resource Control group. When set,
+                                # every runtime TiDB pool session executes
+                                # SET RESOURCE GROUP before serving traffic.
 #
 # TiDB native backup/restore uses BR. SQL BACKUP/RESTORE is experimental in
 # TiDB, so ExtendDB shells out to BR when these fields are configured.
@@ -172,6 +176,7 @@
 # connection_string = "mysql://extenddb:<password>@tidb.example.com:4000/extenddb_catalog"
 # pool_size = 50               # creates strong and default-read data pools
 # catalog_pool_size = 50       # creates engine catalog and auth/catalog pools
+# resource_group = "extenddb_api"
 #
 # [auth]
 # provider = "builtin"
