@@ -1,0 +1,15 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "extenddb-storage-cassandra"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Cassandra storage backend for ExtendDB. Advertised in `extenddb init --backend` help text; previously unimplemented."
+
+[dependencies]
+extenddb-storage = { workspace = true }
+async-trait = { workspace = true }
+inventory = { workspace = true }
+tracing = { workspace = true }
