@@ -406,6 +406,7 @@ async fn serve_inner(
         throttle: throttle.clone(),
         config_entries,
         docs_store,
+        runtime_hooks: runtime_hooks.clone(),
     };
 
     // D-22: Spawn background task to poll log_level from settings table.
@@ -432,7 +433,7 @@ async fn serve_inner(
     tokio::spawn(workers::capacity_warning_worker());
 
     // Spawn backend-specific workers via runtime hooks
-    if let Some(hooks) = runtime_hooks {
+    if let Some(hooks) = &runtime_hooks {
         let worker_ctx = extenddb_storage::WorkerContext {
             metrics: metrics.clone(),
             catalog_store: catalog_store.clone(),

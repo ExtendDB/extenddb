@@ -49,6 +49,9 @@ curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/health
 # {"status":"healthy"}
 ```
 
+The endpoint returns `503` with `{"status":"unhealthy"}` if the selected
+storage backend cannot serve through one of the pools owned by this frontend.
+
 ## Configuration Reference
 
 ### extenddb.toml — Static Configuration
@@ -477,6 +480,10 @@ Prometheus-compatible metrics endpoint.
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/health
 # {"status":"healthy"}
 ```
+
+For TiDB, this probes the engine catalog, catalog-store/auth, strong-data, and
+default-read data pools. For PostgreSQL, it probes the catalog metadata,
+catalog-store/auth, and data pools.
 
 ## Troubleshooting
 

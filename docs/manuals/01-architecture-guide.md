@@ -123,7 +123,7 @@ HTTP/HTTPS server built on axum + tower. Responsibilities:
 - DynamoDB wire protocol endpoint (`POST /`)
 - Management REST API (`/management/*`)
 - Web console (`/console/*`) with CSRF protection and security headers
-- Health check (`/health`) and Prometheus metrics (`/metrics`)
+- Backend-aware health check (`/health`) and Prometheus metrics (`/metrics`)
 - TLS via rustls (self-signed or CA-signed certificates)
 - Request ID generation, CRC32 checksums, content-type headers
 - Graceful shutdown on SIGTERM/SIGINT
@@ -276,7 +276,7 @@ extenddb is a single-binary server that connects to a configured storage backend
 - **Containerized**: Docker/Kubernetes with the storage backend as a sidecar or external service
 - **Air-gapped**: No internet connectivity required; all functionality is self-contained
 
-The storage backend provides durability, replication, and physical backup capabilities. Use backend-native HA tools: PostgreSQL streaming replication/managed services for PostgreSQL, and TiDB's PD/TiKV topology plus BR for TiDB.
+The storage backend provides durability, replication, and physical backup capabilities. Use backend-native HA tools: PostgreSQL streaming replication/managed services for PostgreSQL, and TiDB's PD/TiKV topology plus BR for TiDB. `/health` is readiness-oriented and checks the selected backend's live pools before reporting healthy.
 
 ---
 

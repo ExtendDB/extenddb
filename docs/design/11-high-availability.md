@@ -192,17 +192,17 @@ pool_size = 20
 catalog_pool_size = 20
 ```
 
-For TiDB, topology is owned by TiDB itself: SQL nodes, PD, TiKV region leaders, follower reads, online DDL, TTL, and BR are native TiDB capabilities. ExtendDB keeps independently sized catalog, strong data, and default-read pools, but it does not configure per-replica endpoints or implement storage leadership.
+For TiDB, topology is owned by TiDB itself: SQL nodes, PD, TiKV region leaders, follower reads, online DDL, TTL, and BR are native TiDB capabilities. ExtendDB keeps independently sized engine-catalog, catalog-store/auth, strong-data, and default-read pools, but it does not configure per-replica endpoints or implement storage leadership.
 
 For PostgreSQL, the current configuration is a single connection string. Any future PostgreSQL topology configuration must be explicit in config and implemented in `storage-postgres`; docs must not imply hidden default-read routing.
 
 ### D6: Health Checks and Connection Failover
 
-Each frontend checks the pools that its configured backend actually owns. TiDB health is cluster-oriented: the SQL endpoint must accept catalog and data sessions, and the backend relies on TiDB/PD/TiKV for leader movement, follower availability, online DDL progress, TTL jobs, and BR status. PostgreSQL health currently checks the configured primary pool only.
+Each frontend checks the pools that its configured backend actually owns. TiDB health is cluster-oriented: the SQL endpoint must accept catalog, catalog-store/auth, strong-data, and default-read data sessions, and the backend relies on TiDB/PD/TiKV for leader movement, follower availability, online DDL progress, TTL jobs, and BR status. PostgreSQL health checks its catalog metadata, catalog-store/auth, and data pools.
 
 ### D7: Connection Pool Sizing
 
-With N frontends, connection count is N times the pools created by the selected backend. TiDB creates one catalog metadata/control-plane pool, one catalog store/authz pool, one strong data pool, and one default-read data pool, and reports metrics across all four pools. Operators should size TiDB SQL nodes for roughly `N * (2 * catalog_pool_size + 2 * pool_size)` ExtendDB sessions before considering other clients. PostgreSQL currently creates its primary pool from the configured `pool_size`.
+With N frontends, connection count is N times the pools created by the selected backend. TiDB creates one catalog metadata/control-plane pool, one catalog store/authz pool, one strong data pool, and one default-read data pool, and reports metrics across all four pools. Operators should size TiDB SQL nodes for roughly `N * (2 * catalog_pool_size + 2 * pool_size)` ExtendDB sessions before considering other clients. PostgreSQL creates engine catalog and data pools from `pool_size` plus a catalog-store/auth pool from `catalog_pool_size`.
 
 The design does not mandate a specific connection pooler. Operators should follow backend-specific best practices as frontend count grows.
 

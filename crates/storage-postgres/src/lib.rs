@@ -108,6 +108,7 @@ inventory::submit! {
 }
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use extenddb_core::version::CatalogVersion;
 use extenddb_storage::error::StorageError;
@@ -336,7 +337,7 @@ impl PostgresEngine {
 // ============================================================================
 
 use extenddb_auth::BuiltinAuthProvider;
-use extenddb_storage::hooks::{ServerRuntimeHooks, WorkerContext};
+use extenddb_storage::hooks::{BackendHealthError, ServerRuntimeHooks, WorkerContext};
 use extenddb_storage::server_components::{
     BackendError, ServerComponents, ServerComponentsRegistration,
 };
@@ -344,9 +345,60 @@ use extenddb_storage::server_components::{
 /// Backend-specific runtime hooks for PostgreSQL.
 struct PostgresRuntimeHooks {
     engine: Arc<PostgresEngine>,
+    catalog_store_pool: PgPool,
     control_plane_notify: Arc<tokio::sync::Notify>,
     gsi_default_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     data_db_name: String,
+}
+
+const BACKEND_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn check_postgres_catalog_pool(
+    name: &'static str,
+    pool: &PgPool,
+) -> Result<(), BackendHealthError> {
+    let query = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'catalog_version' LIMIT 1",
+    )
+    .fetch_optional(pool);
+
+    match tokio::time::timeout(BACKEND_HEALTH_TIMEOUT, query).await {
+        Ok(Ok(Some(_))) => Ok(()),
+        Ok(Ok(None)) => Err(BackendHealthError::new(format!(
+            "{name}: catalog_version missing"
+        ))),
+        Ok(Err(error)) => Err(BackendHealthError::new(format!("{name}: {error}"))),
+        Err(_) => Err(BackendHealthError::new(format!("{name}: timed out"))),
+    }
+}
+
+async fn check_postgres_data_pool(
+    name: &'static str,
+    pool: &PgPool,
+) -> Result<(), BackendHealthError> {
+    let query =
+        sqlx::query_scalar::<_, i32>("SELECT 1 FROM stream_records WHERE shard_id = '' LIMIT 1")
+            .fetch_optional(pool);
+
+    match tokio::time::timeout(BACKEND_HEALTH_TIMEOUT, query).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(BackendHealthError::new(format!("{name}: {error}"))),
+        Err(_) => Err(BackendHealthError::new(format!("{name}: timed out"))),
+    }
+}
+
+fn health_result(
+    results: impl IntoIterator<Item = Result<(), BackendHealthError>>,
+) -> Result<(), BackendHealthError> {
+    let failures: Vec<String> = results
+        .into_iter()
+        .filter_map(|result| result.err().map(|error| error.to_string()))
+        .collect();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(BackendHealthError::new(failures.join("; ")))
+    }
 }
 
 #[async_trait::async_trait]
@@ -400,6 +452,17 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
         tokio::spawn(
             async move { workers::poll_gsi_delay(catalog_store_for_gsi, gsi_delay).await },
         );
+    }
+
+    async fn health_check(&self) -> Result<(), BackendHealthError> {
+        let catalog_metadata =
+            check_postgres_catalog_pool("postgres.catalog_metadata_pool", &self.engine.pool);
+        let data = check_postgres_data_pool("postgres.data_pool", self.engine.data_pool());
+        let catalog_store =
+            check_postgres_catalog_pool("postgres.catalog_store_pool", &self.catalog_store_pool);
+
+        let results = tokio::join!(catalog_metadata, data, catalog_store);
+        health_result([results.0, results.1, results.2])
     }
 
     fn backend_info(&self) -> Option<String> {
@@ -512,12 +575,13 @@ inventory::submit! {
                 let auth_provider = Arc::new(BuiltinAuthProvider::new(cred_store));
 
                 // Create runtime hooks
-                let runtime_hooks = Box::new(PostgresRuntimeHooks {
+                let runtime_hooks = Arc::new(PostgresRuntimeHooks {
                     engine: engine.clone(),
+                    catalog_store_pool: catalog_pool.clone(),
                     control_plane_notify,
                     gsi_default_delay_ms,
                     data_db_name,
-                });
+                }) as Arc<dyn ServerRuntimeHooks>;
 
                 Ok(ServerComponents {
                     engine,

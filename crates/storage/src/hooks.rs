@@ -18,6 +18,32 @@ pub struct WorkerContext {
     pub config_log_level: String,
 }
 
+/// Backend readiness failure returned by [`ServerRuntimeHooks::health_check`].
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BackendHealthError {
+    message: String,
+}
+
+impl BackendHealthError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for BackendHealthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BackendHealthError {}
+
 /// Backend-specific runtime hooks for worker spawning and initialization.
 ///
 /// Backends implement this trait to spawn workers that are tightly coupled
@@ -31,6 +57,14 @@ pub trait ServerRuntimeHooks: Send + Sync {
     /// starts. Backends can spawn workers that need access to backend-specific
     /// state (connection pools, notify handles, etc.).
     async fn spawn_workers(&self, ctx: &WorkerContext);
+
+    /// Check the backend resources owned by this frontend.
+    ///
+    /// HTTP `/health` calls this so load balancers observe the selected
+    /// backend's real readiness instead of only the web process state.
+    async fn health_check(&self) -> Result<(), BackendHealthError> {
+        Ok(())
+    }
 
     /// Get backend-specific info for logging (optional).
     ///

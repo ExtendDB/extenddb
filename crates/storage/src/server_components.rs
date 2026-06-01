@@ -31,8 +31,8 @@ pub struct ServerComponents {
     /// Auth provider (wraps credential store internally)
     pub auth_provider: Arc<dyn AuthProvider>,
 
-    /// Optional backend-specific runtime hooks for worker spawning
-    pub runtime_hooks: Option<Box<dyn ServerRuntimeHooks>>,
+    /// Optional backend-specific runtime hooks for worker spawning and health checks
+    pub runtime_hooks: Option<Arc<dyn ServerRuntimeHooks>>,
 }
 
 /// Errors that can occur during backend initialization.

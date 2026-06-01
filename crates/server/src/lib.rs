@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::DefaultBodyLimit;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::{get, post};
@@ -65,6 +65,8 @@ pub struct AppState {
     pub config_entries: Vec<(String, String)>,
     /// Runtime documentation store. `None` if `docs_dir` is not configured.
     pub docs_store: Option<console::docs_embed::DocsStore>,
+    /// Backend runtime hooks for readiness checks.
+    pub runtime_hooks: Option<Arc<dyn extenddb_storage::ServerRuntimeHooks>>,
 }
 
 /// TLS configuration passed from the binary crate.
@@ -230,7 +232,20 @@ pub async fn start_server(
 }
 
 /// GET /health — REQ-OBS-006
-async fn health_check() -> impl IntoResponse {
+async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(hooks) = &state.runtime_hooks
+        && let Err(error) = hooks.health_check().await
+    {
+        tracing::warn!(%error, "backend health check failed");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({
+                "status": "unhealthy",
+                "error": "backend health check failed"
+            })),
+        );
+    }
+
     (StatusCode::OK, axum::Json(json!({"status": "healthy"})))
 }
 

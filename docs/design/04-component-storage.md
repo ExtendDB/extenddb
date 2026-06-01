@@ -572,11 +572,11 @@ The PostgreSQL backend uses two categories of tables:
 ### 5.2 Connection Pooling
 
 Backends own their native pool layout behind the storage traits. PostgreSQL
-keeps the existing catalog and data pools. TiDB keeps separate catalog,
-strong-data, and default-read data pools, but the catalog and data databases
-must be in the same TiDB cluster. TiDB backup metadata, BR `--backupts`,
-snapshot reads, online DDL, and native TTL all rely on one PD-owned global TSO
-timeline. The strong-data pool uses leader reads for writes and
+keeps catalog metadata, catalog-store/auth, and data pools. TiDB keeps separate
+engine-catalog, catalog-store/auth, strong-data, and default-read data pools,
+but the catalog and data databases must be in the same TiDB cluster. TiDB backup
+metadata, BR `--backupts`, snapshot reads, online DDL, and native TTL all rely
+on one PD-owned global TSO timeline. The strong-data pool uses leader reads for writes and
 `ConsistentRead=true`; the default-read pool sets
 `tidb_replica_read = 'closest-adaptive'` for DynamoDB reads that did not request
 `ConsistentRead=true`.
@@ -1175,6 +1175,8 @@ internals):
   session retention, startup repair re-enables native TTL jobs if TiDB tooling
   left `TTL_ENABLE = 'OFF'`, and TiDB `information_schema` table statistics are
   read on demand instead of refreshed by a frontend worker.
+- Runtime hooks also expose backend readiness to `/health`, so TiDB checks every
+  pool opened by the frontend instead of reporting web-process liveness only.
 - Other backends may spawn different workers or none at all
 
 Example PostgreSQL implementation:
