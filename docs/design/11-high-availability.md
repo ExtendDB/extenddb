@@ -189,9 +189,10 @@ backend = "tidb"
 [storage.tidb]
 connection_string = "mysql://root@127.0.0.1:4000/extenddb_catalog"
 pool_size = 20
+catalog_pool_size = 20
 ```
 
-For TiDB, topology is owned by TiDB itself: SQL nodes, PD, TiKV region leaders, follower reads, online DDL, TTL, and BR are native TiDB capabilities. ExtendDB keeps separate catalog, strong data, and default-read pools, but it does not configure per-replica endpoints or implement storage leadership.
+For TiDB, topology is owned by TiDB itself: SQL nodes, PD, TiKV region leaders, follower reads, online DDL, TTL, and BR are native TiDB capabilities. ExtendDB keeps independently sized catalog, strong data, and default-read pools, but it does not configure per-replica endpoints or implement storage leadership.
 
 For PostgreSQL, the current configuration is a single connection string. Any future PostgreSQL topology configuration must be explicit in config and implemented in `storage-postgres`; docs must not imply hidden default-read routing.
 
@@ -201,7 +202,7 @@ Each frontend checks the pools that its configured backend actually owns. TiDB h
 
 ### D7: Connection Pool Sizing
 
-With N frontends, connection count is N times the pools created by the selected backend. TiDB currently creates catalog, strong data, and default-read data pools from the configured `pool_size`, so operators should size TiDB SQL nodes for roughly `N * pool_size * 3` ExtendDB sessions before considering other clients. PostgreSQL currently creates its primary pool from the configured `pool_size`.
+With N frontends, connection count is N times the pools created by the selected backend. TiDB creates one catalog metadata/control-plane pool, one catalog store/authz pool, one strong data pool, and one default-read data pool. Operators should size TiDB SQL nodes for roughly `N * (2 * catalog_pool_size + 2 * pool_size)` ExtendDB sessions before considering other clients. PostgreSQL currently creates its primary pool from the configured `pool_size`.
 
 The design does not mandate a specific connection pooler. Operators should follow backend-specific best practices as frontend count grows.
 

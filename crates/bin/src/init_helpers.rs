@@ -124,7 +124,7 @@ backend = "{backend}"
 [storage.{backend}]
 connection_string = "{catalog_url}"
 # pool_size = 20                 # Max connections for data operations (default 20, min 10)
-# catalog_pool_size =            # Max connections for management/catalog ops (defaults to pool_size, min 10)
+# catalog_pool_size =            # Max connections for catalog/control/auth ops (defaults to pool_size, min 10)
 
 [auth]
 # provider = "builtin"           # SigV4 with local credential store (mandatory)

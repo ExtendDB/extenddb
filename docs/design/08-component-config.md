@@ -117,9 +117,10 @@ statement_timeout_secs = 30
 connection_string = "mysql://extenddb:extenddb-local-dev@localhost:4000/extenddb_catalog"
 pool_size = 20
 catalog_pool_size = 20
-# TiDB default reads use a separate default-read pool configured with native
-# closest-adaptive follower read; ConsistentRead=true and writes use the strong
-# data pool.
+# pool_size sizes the strong and default-read data pools. catalog_pool_size
+# separately sizes catalog metadata, control-plane, authz, IAM, and console pools.
+# TiDB default reads use native closest-adaptive follower read; ConsistentRead=true
+# and writes use the strong data pool.
 
 [storage.tidb.backup]
 pd_endpoint = "127.0.0.1:2379"

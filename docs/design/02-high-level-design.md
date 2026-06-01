@@ -372,12 +372,9 @@ The server runs on a tokio multi-thread runtime. Each incoming HTTP request is h
 
 All database access goes through the configured backend's sqlx connection pool. The pool size is configurable via the active storage section in `extenddb.toml` (default: 20). When all connections are in use, new requests queue at the pool level until a connection is returned or the acquire timeout expires. If the timeout expires, the request fails with an internal server error (HTTP 500).
 
-Total connection footprint on the storage backend:
-- `pool_size` connections for DynamoDB data operations (shared by all background workers)
-- +`catalog_pool_size` connections for management/authz/catalog operations
-- +worker-specific connections as needed by the backend
-
-Size backend connection limits for `pool_size + catalog_pool_size + worker overhead`.
+Total connection footprint is backend-specific:
+- PostgreSQL creates a primary data pool plus a catalog/authz pool; size backend limits for `pool_size + catalog_pool_size + worker overhead`.
+- TiDB creates independently sized strong data, default-read data, engine catalog/control-plane, and catalog-store/authz pools; size TiDB SQL nodes for roughly `2 * pool_size + 2 * catalog_pool_size` sessions per extenddb frontend, plus backend worker overhead.
 
 ### 6.3 Row-Level Locking
 

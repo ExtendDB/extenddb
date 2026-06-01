@@ -60,11 +60,14 @@
 # Connection string points to the CATALOG database. TiDB listens on port 4000 by default.
 # The `tidb://` scheme is accepted in config and converted to `mysql://` for sqlx.
 # connection_string = "mysql://extenddb:extenddb-local-dev@localhost:4000/extenddb_catalog"
-# pool_size = 20
-# catalog_pool_size = 20
-# ConsistentRead=false data reads use a separate TiDB default-read pool configured
-# with native closest-adaptive follower read. ConsistentRead=true and writes use
-# the strong data pool.
+# pool_size = 20               # Max connections for each TiDB data pool:
+                                # one strong pool for writes/ConsistentRead=true
+                                # and one default-read pool using native
+                                # closest-adaptive follower read.
+# catalog_pool_size = 20       # Max connections for each TiDB catalog pool:
+                                # one engine metadata/control-plane pool and
+                                # one management/authz/IAM/console pool.
+                                # Defaults to pool_size if not set.
 #
 # TiDB native backup/restore uses BR. SQL BACKUP/RESTORE is experimental in
 # TiDB, so ExtendDB shells out to BR when these fields are configured.
@@ -166,8 +169,8 @@
 #
 # [storage.tidb]
 # connection_string = "mysql://extenddb:<password>@tidb.example.com:4000/extenddb_catalog"
-# pool_size = 50
-# catalog_pool_size = 50
+# pool_size = 50               # creates strong and default-read data pools
+# catalog_pool_size = 50       # creates engine catalog and auth/catalog pools
 #
 # [auth]
 # provider = "builtin"

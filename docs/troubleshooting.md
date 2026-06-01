@@ -280,7 +280,7 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Cause:** extenddb is running but slow to respond (e.g., storage backend connection pool exhausted).
 
-**Fix:** Check `extenddb.toml` `pool_size` under the active storage section (`[storage.postgres]` or `[storage.tidb]`) and increase it if under heavy concurrent load. Check backend logs for slow queries.
+**Fix:** Check the active storage section in `extenddb.toml`. Increase `pool_size` for data-plane saturation; increase `catalog_pool_size` if auth, IAM, catalog, or control-plane calls are queuing. For TiDB, remember each frontend opens strong data, default-read data, engine catalog, and catalog-store/auth pools. Check backend logs for slow queries.
 
 ### Table stuck in CREATING, UPDATING, or DELETING state
 

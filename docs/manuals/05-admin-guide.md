@@ -84,8 +84,8 @@ Available when the binary is built with the `tidb` feature.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `connection_string` | `mysql://extenddb:extenddb-local-dev@localhost:4000/extenddb_catalog` | Catalog database connection string |
-| `pool_size` | `20` | Maximum concurrent database connections (minimum: 10) |
-| `catalog_pool_size` | (= `pool_size`) | Maximum connections for management/authz pool (minimum: 10) |
+| `pool_size` | `20` | Maximum connections for strong and default-read data pools (minimum: 10) |
+| `catalog_pool_size` | (= `pool_size`) | Maximum connections for catalog metadata, control-plane, management, and authz pools (minimum: 10) |
 
 #### [storage.tidb.backup]
 

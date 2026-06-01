@@ -133,7 +133,10 @@ const MIN_POOL_SIZE: u32 = 10;
 /// `TiDB` storage backend configuration.
 pub struct TidbConfig {
     pub connection_string: String,
+    /// Maximum connections for strong and default-read data-plane pools.
     pub pool_size: u32,
+    /// Maximum connections for catalog metadata and control-plane work.
+    pub catalog_pool_size: u32,
     /// Runtime limits that TiDB must enforce after storage-side mutations.
     pub limits: LimitsConfig,
     pub native_backup: extenddb_storage::config::NativeBackupConfig,
@@ -168,24 +171,14 @@ impl TidbEngine {
     pub async fn new(config: &TidbConfig, region: &str) -> Result<Self, StorageError> {
         validate_tidb_limits(&config.limits)?;
 
-        // Enforce a minimum of 10 connections per pool. Smaller values starve
-        // the auth/authz query fanout under concurrent load. If the configured
-        // value is below the floor, log a warning and clamp.
-        let pool_size = if config.pool_size < MIN_POOL_SIZE {
-            tracing::warn!(
-                "storage.tidb.pool_size = {} is below the minimum of {}; clamping to {}",
-                config.pool_size,
-                MIN_POOL_SIZE,
-                MIN_POOL_SIZE
-            );
-            MIN_POOL_SIZE
-        } else {
-            config.pool_size
-        };
+        let data_pool_size = normalized_pool_size("storage.tidb.pool_size", config.pool_size);
+        let catalog_pool_size =
+            normalized_pool_size("storage.tidb.catalog_pool_size", config.catalog_pool_size);
 
         // Keep a couple of warm connections to avoid first-request latency.
-        let min_conns = pool_size.min(2);
-        let pool = tidb_pool_options(pool_size, min_conns)
+        let catalog_min_conns = catalog_pool_size.min(2);
+        let data_min_conns = data_pool_size.min(2);
+        let pool = tidb_pool_options(catalog_pool_size, catalog_min_conns)
             .connect(&crate::config::sqlx_connection_string(
                 &config.connection_string,
             ))
@@ -206,13 +199,13 @@ impl TidbEngine {
             }
             _ => crate::config::sqlx_connection_string(&config.connection_string),
         };
-        let data_pool = tidb_pool_options(pool_size, min_conns)
+        let data_pool = tidb_pool_options(data_pool_size, data_min_conns)
             .connect(&data_connection_string)
             .await
             .map_err(|e| {
                 StorageError::Connection(format!("data database connection failed: {e}"))
             })?;
-        let data_default_read_pool = tidb_default_read_pool_options(pool_size, min_conns)
+        let data_default_read_pool = tidb_default_read_pool_options(data_pool_size, data_min_conns)
             .connect(&data_connection_string)
             .await
             .map_err(|e| {
@@ -329,6 +322,24 @@ impl TidbEngine {
     }
 }
 
+fn effective_pool_size(configured: u32) -> u32 {
+    configured.max(MIN_POOL_SIZE)
+}
+
+fn normalized_pool_size(config_key: &'static str, configured: u32) -> u32 {
+    let effective = effective_pool_size(configured);
+    if effective != configured {
+        tracing::warn!(
+            config_key,
+            configured,
+            minimum = MIN_POOL_SIZE,
+            effective,
+            "clamping TiDB connection pool size to minimum"
+        );
+    }
+    effective
+}
+
 fn validate_tidb_limits(limits: &LimitsConfig) -> Result<(), StorageError> {
     if limits.max_partition_key_size_bytes > data::DYNAMODB_HASH_KEY_COLUMN_BYTES {
         return Err(StorageError::Configuration(format!(
@@ -352,7 +363,15 @@ mod tests {
     use extenddb_core::limits::LimitsConfig;
     use extenddb_storage::error::StorageError;
 
-    use super::validate_tidb_limits;
+    use super::{MIN_POOL_SIZE, effective_pool_size, validate_tidb_limits};
+
+    #[test]
+    fn tidb_pool_sizes_are_clamped_to_the_backend_minimum() {
+        assert_eq!(effective_pool_size(0), MIN_POOL_SIZE);
+        assert_eq!(effective_pool_size(MIN_POOL_SIZE - 1), MIN_POOL_SIZE);
+        assert_eq!(effective_pool_size(MIN_POOL_SIZE), MIN_POOL_SIZE);
+        assert_eq!(effective_pool_size(MIN_POOL_SIZE + 1), MIN_POOL_SIZE + 1);
+    }
 
     #[test]
     fn tidb_limits_accept_dynamodb_key_defaults() {
@@ -443,10 +462,17 @@ inventory::submit! {
             let native_backup = config.native_backup_config().unwrap_or_default();
             let region = region.to_string();
             Box::pin(async move {
+                let pool_size = normalized_pool_size("storage.tidb.pool_size", max_connections);
+                let catalog_pool_size = normalized_pool_size(
+                    "storage.tidb.catalog_pool_size",
+                    max_catalog_connections,
+                );
+
                 // Build TidbConfig from extracted values
                 let tidb_config = TidbConfig {
                     connection_string: connection_string.clone(),
-                    pool_size: max_connections,
+                    pool_size,
+                    catalog_pool_size,
                     limits,
                     native_backup,
                 };
@@ -496,20 +522,8 @@ inventory::submit! {
                 // Wrap engine in Arc
                 let engine = Arc::new(engine);
 
-                // Create catalog store. Honors storage.tidb.catalog_pool_size,
-                // defaulting to pool_size when unset. Clamped to the same minimum
-                // as the engine pool.
-                let catalog_pool_size = if max_catalog_connections < MIN_POOL_SIZE {
-                    tracing::warn!(
-                        "storage.tidb.catalog_pool_size = {} is below the minimum of {}; clamping to {}",
-                        max_catalog_connections,
-                        MIN_POOL_SIZE,
-                        MIN_POOL_SIZE
-                    );
-                    MIN_POOL_SIZE
-                } else {
-                    max_catalog_connections
-                };
+                // Create catalog store on the same independently sized catalog
+                // pool budget used by the engine's metadata/control-plane pool.
                 let catalog_pool = tidb_pool_options(catalog_pool_size, catalog_pool_size.min(2))
                     .connect(&crate::config::sqlx_connection_string(&connection_string))
                     .await

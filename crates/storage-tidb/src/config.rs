@@ -14,7 +14,7 @@ pub struct TidbStorageConfig {
     pub connection_string: String,
     #[serde(default = "default_pool_size")]
     pub pool_size: u32,
-    /// Maximum connections for the management/catalog pool (authz, IAM, console).
+    /// Maximum connections for catalog metadata, control-plane, authz, IAM, and console work.
     /// Defaults to `pool_size` if not set.
     #[serde(default)]
     pub catalog_pool_size: Option<u32>,

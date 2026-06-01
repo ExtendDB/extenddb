@@ -86,6 +86,8 @@ backend = "tidb"
 
 [storage.tidb]
 connection_string = "mysql://extenddb:<password>@tidb.example.com:4000/extenddb_catalog"
+pool_size = 20
+catalog_pool_size = 20
 
 [storage.tidb.backup]
 pd_endpoint = "pd.example.com:2379"
@@ -170,7 +172,7 @@ Requirements in the air-gapped environment:
 ### Storage Backend
 
 - [ ] Use a dedicated backend user for extenddb with minimal privileges
-- [ ] Size backend connection limits for `pool_size + catalog_pool_size + workers`
+- [ ] Size backend connection limits for the active backend's pools: PostgreSQL uses `pool_size + catalog_pool_size + workers`; TiDB uses strong data, default-read data, engine catalog, and catalog-store/auth pools
 - [ ] Enable backend transport encryption
 - [ ] Set up automated backups with backend-native tools (PostgreSQL pg_dump/WAL or TiDB BR)
 - [ ] Monitor backend disk usage, connection count, replication health, and query performance
@@ -227,7 +229,7 @@ Multiple extenddb instances can connect to the same catalog. However:
 - extenddb does not cache database state in-process — every request reads directly from the storage backend
 - This means multiple instances see consistent data without cache invalidation
 - The storage backend's connection pool and transaction model handle concurrent access
-- Ensure `pool_size × instance_count + worker overhead` fits the backend's connection limits
+- Ensure each instance's backend-specific pool footprint fits the backend's connection limits
 
 ## Performance Tuning
 
@@ -238,6 +240,11 @@ The default `pool_size = 20` is suitable for moderate workloads. For high-concur
 ```toml
 [storage.postgres]
 pool_size = 50  # Increase for higher concurrency
+catalog_pool_size = 50
+
+[storage.tidb]
+pool_size = 50          # strong data pool + default-read data pool
+catalog_pool_size = 50  # engine catalog pool + auth/catalog-store pool
 ```
 
 Ensure the backend's connection limit accommodates the total pool size plus overhead.
