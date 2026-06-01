@@ -32,6 +32,7 @@ extenddb/
 │   ├── engine/           # DynamoDB operation handlers (PutItem, Query, etc.)
 │   ├── storage/          # Storage trait definitions (TableEngine trait)
 │   ├── storage-postgres/ # PostgreSQL implementation of TableEngine
+│   ├── storage-tidb/     # TiDB implementation of TableEngine
 │   ├── auth/             # SigV4 verification, IAM policy engine
 │   ├── server/           # HTTP server, management API, web console
 │   └── bin/              # CLI, config, daemon lifecycle (extenddb binary)
@@ -51,7 +52,8 @@ extenddb/
 
 The `TableEngine` trait in `crates/storage/src/lib.rs` defines the storage interface. All storage backends implement this trait:
 
-- **Current:** `storage-postgres` (PostgreSQL)
+- **Default:** `storage-postgres` (PostgreSQL)
+- **Optional:** `storage-tidb` (TiDB, enabled with the `tidb` feature)
 
 The storage traits use object-safe `BoxFuture` return types instead of `#[async_trait]`, allowing runtime backend selection through `Arc<dyn StorageEngine>`.
 
@@ -66,12 +68,14 @@ extenddb (bin)
        │    ├─> extenddb-core (pure sync, no async)
        │    └─> extenddb-storage (trait definitions)
        ├─> extenddb-auth
-       └─> extenddb-storage-postgres
+       ├─> extenddb-storage-postgres (default feature)
+       └─> extenddb-storage-tidb (tidb feature)
 ```
 
 - **extenddb-core:** Pure synchronous Rust. No async, no I/O. Types, validation, expression parsing.
 - **extenddb-storage:** Trait definitions only. No implementation.
 - **extenddb-storage-postgres:** Concrete PostgreSQL implementation.
+- **extenddb-storage-tidb:** Concrete TiDB implementation using native online DDL, native secondary indexes, TTL, follower reads, snapshot reads, and BR.
 - **extenddb-engine:** Operation handlers that call storage traits.
 - **extenddb-server:** HTTP server, management API, web console.
 - **extenddb-auth:** SigV4 signature verification, IAM policy evaluation.
@@ -82,7 +86,7 @@ extenddb (bin)
 ### Prerequisites
 
 - Rust 1.85+ (`rustup update`)
-- PostgreSQL 14+ running locally (see `docs/local-postgres-setup.md`)
+- PostgreSQL 14+ for the default backend (see `docs/local-postgres-setup.md`) or TiDB for the `tidb` feature backend
 - Python 3.10+ for tests (`python3 -m venv ~/venvs/extenddb-venv && source ~/venvs/extenddb-venv/bin/activate && pip install -r requirements.txt`)
 
 ### Build
@@ -113,7 +117,7 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 This creates:
-- PostgreSQL databases (`extenddb_catalog`, `extenddb_account_<id>`)
+- Backend catalog and account databases (`extenddb_catalog`, `extenddb_account_<id>`)
 - Admin user credentials (printed to stdout — save the password!)
 - Self-signed TLS certificate at `~/.extenddb/tls/cert.pem`
 - Config file `extenddb.toml`
@@ -325,7 +329,7 @@ UpdateTimeToLive, DescribeTimeToLive, TagResource, UntagResource, ListTagsOfReso
 1. Add types to `crates/core/src/types.rs` (input/output structs)
 2. Add handler to `crates/engine/src/` (e.g., `put_item.rs`)
 3. Add storage trait method to `crates/storage/src/lib.rs` if needed
-4. Implement in `crates/storage-postgres/src/`
+4. Implement in each enabled backend crate (`crates/storage-postgres/src/`, `crates/storage-tidb/src/`) or document why the operation is backend-specific
 5. Wire up HTTP route in `crates/server/src/`
 6. Add integration test in `tests/`
 
@@ -373,7 +377,7 @@ python3 docs/build-docs.py
 - **Async:** tokio; storage traits use explicit `BoxFuture` return types for object safety, while selected auth/bootstrap traits use `#[async_trait]`
 - **Error handling:** `thiserror` for library errors, `anyhow` for application errors
 - **Serialization:** `serde` + `serde_json`
-- **Database:** `sqlx` with compile-time query checking (PostgreSQL)
+- **Database:** `sqlx` for PostgreSQL and TiDB/MySQL protocol access
 - **HTTP:** `axum` + `tower` + `hyper`
 - **Logging:** `tracing` + `tracing-subscriber`
 - **Metrics:** `metrics` + `metrics-exporter-prometheus`
@@ -448,9 +452,16 @@ Activate when the user asks about installing, configuring, running, or debugging
 1. **TLS is mandatory** — server refuses to start without it. Use `AWS_CA_BUNDLE` for self-signed certs.
 2. **Auth is mandatory** — all requests must be SigV4-signed. Use `extenddb manage` or web console to create credentials.
 3. **Account isolation** — all operations are scoped to `account_id`. Different accounts can have tables with the same name.
-4. **PostgreSQL must be running** — `extenddb init` and `extenddb serve` require a running PostgreSQL instance.
+4. **The selected storage backend must be running** — default builds require PostgreSQL; TiDB builds require a reachable TiDB endpoint.
 5. **Python venv** — activate the venv before running tests: `source ~/venvs/extenddb-venv/bin/activate`
 6. **Test credentials** — run `devtools/provision-test-credentials` before pytest to create test users and keys.
+
+### TiDB Backend Guidelines
+
+- Prefer TiDB-native capabilities over local coordination code: online DDL for schema transitions, timestamp snapshot reads for point-in-time reads, native TTL for item expiration, native secondary indexes for GSIs/LSIs, follower reads for eventually consistent reads, and BR for backup/restore.
+- Do not add table locks, per-node schema workers, polling TTL workers, or custom backup formats to TiDB unless a live TiDB limitation has been verified and documented.
+- TiDB secondary indexes are global. Do not model local-index propagation or companion index tables in `storage-tidb`.
+- Validate unsupported DynamoDB-compatible key shapes before catalog commit. TiDB clustered and secondary indexes have native key-length constraints, so errors should surface as storage validation instead of late DDL failures.
 
 ## Getting Help
 
