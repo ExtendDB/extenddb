@@ -202,7 +202,10 @@ treats sequence numbers as opaque decimal strings and computes
 TSO-plus-ordinal values are wider than native host integers.
 TiDB does not foreground-delete stream history during `DeleteTable`; table ids
 are immutable, the catalog deletion makes the stream unreachable, and native
-TTL owns retention for the shared `stream_records` table.
+TTL owns retention for the shared `stream_records` table. TiDB data migrations
+pre-split both the clustered stream key and the commit-sequence secondary index
+by shard-id range, so a fresh shared stream table does not start as one Region
+for all frontend writers.
 
 **WorkerStore** (background worker operations):
 - `process_control_plane_transitions` — handles table state transitions
@@ -333,6 +336,12 @@ Database initialization, migration, verification, and destruction:
 
 Used by CLI commands (`extenddb init`, `extenddb migrate`, `extenddb verify`,
 `extenddb destroy`).
+
+The TiDB bootstrapper versions both catalog migrations and data-database
+migrations. Shared data tables such as `stream_records` and
+`idempotency_tokens` keep their native TTL repair paths, while one-time physical
+layout work such as TiDB Region splitting is recorded in `data_schema_history`
+instead of being replayed on every frontend startup.
 
 ### OperationsEngine
 
@@ -1203,8 +1212,9 @@ internals):
   online DDL owns schema jobs, TiDB native TTL handles all item TTL plus
   stream-record, idempotency-token, metrics, login-attempt, and assume-role
   session retention, startup repair re-enables native TTL jobs if TiDB tooling
-  left `TTL_ENABLE = 'OFF'`, and TiDB `information_schema` table statistics are
-  read on demand instead of refreshed by a frontend worker.
+  left `TTL_ENABLE = 'OFF'`, one-time data migrations pre-split shared write
+  tables with TiDB Region split/scatter, and TiDB `information_schema` table
+  statistics are read on demand instead of refreshed by a frontend worker.
 - Runtime hooks also expose backend readiness to `/health`, so TiDB checks every
   pool opened by the frontend instead of reporting web-process liveness only.
 - Other backends may spawn different workers or none at all

@@ -94,6 +94,15 @@ pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
 
 const DATA_SCHEMA_MIGRATION: &str =
     include_str!("../../storage-tidb/data_migrations/001_data_schema.sql");
+const DATA_PRESPLIT_SHARED_TABLES_MIGRATION: &str =
+    include_str!("../../storage-tidb/data_migrations/002_presplit_shared_data_tables.sql");
+pub(crate) const DATA_MIGRATIONS: &[(&str, &str)] = &[
+    ("001_data_schema.sql", DATA_SCHEMA_MIGRATION),
+    (
+        "002_presplit_shared_data_tables.sql",
+        DATA_PRESPLIT_SHARED_TABLES_MIGRATION,
+    ),
+];
 #[cfg(test)]
 const TIDB_BINARY_COLLATION_TABLE_OPTION: &str = "DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin";
 const DATA_NATIVE_TTL_LOOKUP_INDEX_DROPS: &[(&str, &str)] = &[
@@ -143,6 +152,7 @@ fn should_apply_consolidated_catalog_schema(catalog_table_count: i64) -> bool {
 /// Run data database migrations.
 pub(crate) async fn run_data_migrations(pool: &MySqlPool) -> OpResult<()> {
     println!("--- Initializing data database schema...");
+    ensure_data_schema_history(pool).await?;
     let initialized: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.tables \
          WHERE table_name = 'stream_records' AND table_schema = DATABASE())",
@@ -153,9 +163,20 @@ pub(crate) async fn run_data_migrations(pool: &MySqlPool) -> OpResult<()> {
 
     if initialized {
         println!("    Data schema already initialized.");
+        record_data_migration(pool, DATA_MIGRATIONS[0].0).await?;
     } else {
         run_sql_script(pool, DATA_SCHEMA_MIGRATION, "data migration").await?;
+        record_data_migration(pool, DATA_MIGRATIONS[0].0).await?;
         println!("    Data schema initialized.");
+    }
+    for (filename, sql) in DATA_MIGRATIONS.iter().skip(1) {
+        if is_data_migration_applied(pool, filename).await? {
+            println!("    {filename} — already applied, skipping.");
+            continue;
+        }
+        println!("    Applying {filename}...");
+        run_sql_script(pool, sql, filename).await?;
+        record_data_migration(pool, filename).await?;
     }
     drop_legacy_stream_shards(pool).await?;
     ensure_stream_commit_sequence(pool).await?;
@@ -164,6 +185,38 @@ pub(crate) async fn run_data_migrations(pool: &MySqlPool) -> OpResult<()> {
     validate_dynamodb_hash_key_column_layout(pool).await?;
     drop_native_ttl_lookup_indexes(pool).await?;
     ensure_data_table_ttl(pool).await?;
+    Ok(())
+}
+
+async fn ensure_data_schema_history(pool: &MySqlPool) -> OpResult<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS data_schema_history (\
+             filename VARCHAR(255) PRIMARY KEY CLUSTERED,\
+             applied_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)\
+         ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| OpError::Internal(format!("Create TiDB data schema history: {e}")))?;
+    Ok(())
+}
+
+async fn is_data_migration_applied(pool: &MySqlPool, filename: &str) -> OpResult<bool> {
+    let applied: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM data_schema_history WHERE filename = ?)")
+            .bind(filename)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| OpError::Internal(format!("Check TiDB data migration: {e}")))?;
+    Ok(applied)
+}
+
+async fn record_data_migration(pool: &MySqlPool, filename: &str) -> OpResult<()> {
+    sqlx::query("INSERT IGNORE INTO data_schema_history (filename) VALUES (?)")
+        .bind(filename)
+        .execute(pool)
+        .await
+        .map_err(|e| OpError::Internal(format!("Record TiDB data migration: {e}")))?;
     Ok(())
 }
 
@@ -430,9 +483,10 @@ async fn record_all_catalog_migrations(pool: &MySqlPool) -> OpResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CATALOG_MIGRATIONS, DATA_NATIVE_TTL_LOOKUP_INDEX_DROPS, DATA_SCHEMA_MIGRATION,
-        TIDB_BINARY_COLLATION_TABLE_OPTION, dynamodb_hash_key_column_needs_rebuild,
-        incompatible_dynamodb_hash_key_column_error, should_apply_consolidated_catalog_schema,
+        CATALOG_MIGRATIONS, DATA_MIGRATIONS, DATA_NATIVE_TTL_LOOKUP_INDEX_DROPS,
+        DATA_SCHEMA_MIGRATION, TIDB_BINARY_COLLATION_TABLE_OPTION,
+        dynamodb_hash_key_column_needs_rebuild, incompatible_dynamodb_hash_key_column_error,
+        should_apply_consolidated_catalog_schema,
     };
     use crate::CATALOG_VERSION;
 
@@ -638,6 +692,23 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn data_migrations_presplit_shared_write_tables_once() {
+        assert_eq!(DATA_MIGRATIONS[0].0, "001_data_schema.sql");
+        let (filename, sql) = DATA_MIGRATIONS
+            .iter()
+            .find(|(filename, _)| *filename == "002_presplit_shared_data_tables.sql")
+            .expect("shared data split migration");
+
+        assert_eq!(*filename, "002_presplit_shared_data_tables.sql");
+        assert!(sql.contains("SPLIT TABLE stream_records"));
+        assert!(
+            sql.contains("SPLIT TABLE stream_records INDEX idx_stream_records_commit_sequence")
+        );
+        assert!(sql.contains("SPLIT TABLE idempotency_tokens"));
+        assert!(sql.contains("REGIONS 16"));
     }
 
     #[test]

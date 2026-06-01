@@ -458,7 +458,7 @@ Activate when the user asks about installing, configuring, running, or debugging
 
 ### TiDB Backend Guidelines
 
-- Prefer TiDB-native capabilities over local coordination code: online DDL for schema transitions, timestamp snapshot reads for point-in-time reads, native TTL for item expiration, native secondary indexes for GSIs/LSIs, follower reads for eventually consistent reads, Resource Control/resource groups for distributed capacity governance, native row-id sharding/pre-split Regions for append-heavy internal tables, and BR for backup/restore.
+- Prefer TiDB-native capabilities over local coordination code: online DDL for schema transitions, timestamp snapshot reads for point-in-time reads, native TTL for item expiration, native secondary indexes for GSIs/LSIs, follower reads for eventually consistent reads, Resource Control/resource groups for distributed capacity governance, native row-id sharding/pre-split Regions for append-heavy internal and shared data tables, and BR for backup/restore.
 - Do not add table locks, per-node schema workers, polling TTL workers, process-local capacity limiters, or custom backup formats to TiDB unless a live TiDB limitation has been verified and documented.
 - TiDB secondary indexes are global. Do not model local-index propagation or companion index tables in `storage-tidb`.
 - Validate unsupported DynamoDB-compatible key shapes before catalog commit. TiDB clustered and secondary indexes have native key-length constraints, so errors should surface as storage validation instead of late DDL failures.
