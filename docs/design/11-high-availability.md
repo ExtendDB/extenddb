@@ -349,7 +349,8 @@ TiDB uses backend-native primitives instead of ExtendDB ownership layers:
 - GSI and LSI are represented with generated columns plus native TiDB secondary indexes.
 - Schema changes rely on TiDB online DDL and idempotent catalog publication.
 - TTL uses TiDB native table TTL.
-- Backup and restore use TiDB BR metadata instead of row-copy backup payloads.
+- On-demand backup and restore use TiDB BR metadata instead of row-copy backup payloads.
+- Table-level PITR restore is not emulated; TiDB-native PITR remains a cluster recovery path.
 
 ### Deferred: PostgreSQL Replica Topology
 

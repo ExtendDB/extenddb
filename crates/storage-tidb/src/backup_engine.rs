@@ -40,7 +40,7 @@ fn epoch_millis() -> u128 {
 /// Convert a TiDB timestamp to epoch seconds as `f64`.
 #[allow(clippy::cast_precision_loss)]
 fn timestamp_to_epoch(ts: time::OffsetDateTime) -> f64 {
-    ts.unix_timestamp() as f64
+    ts.unix_timestamp() as f64 + f64::from(ts.nanosecond()) / 1_000_000_000.0
 }
 
 #[derive(sqlx::FromRow)]
@@ -99,8 +99,15 @@ struct RestoreCatalogInsert<'a> {
     table_name: &'a str,
     table_id: &'a str,
     table_arn: &'a str,
-    backup: &'a BackupRestoreRow,
+    metadata: RestoreCatalogMetadata<'a>,
     indexes: &'a [BackupIndexSnapshotRow],
+}
+
+struct RestoreCatalogMetadata<'a> {
+    key_schema: &'a serde_json::Value,
+    attribute_definitions: &'a serde_json::Value,
+    billing_mode: &'a str,
+    provisioned_throughput: &'a Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -538,10 +545,10 @@ impl TidbEngine {
         )
         .bind(insert.account_id)
         .bind(insert.table_name)
-        .bind(&insert.backup.key_schema)
-        .bind(&insert.backup.attribute_definitions)
-        .bind(&insert.backup.billing_mode)
-        .bind(&insert.backup.provisioned_throughput)
+        .bind(insert.metadata.key_schema)
+        .bind(insert.metadata.attribute_definitions)
+        .bind(insert.metadata.billing_mode)
+        .bind(insert.metadata.provisioned_throughput)
         .bind(insert.table_arn)
         .bind(insert.table_id)
         .execute(&mut *tx)
@@ -950,7 +957,12 @@ impl BackupEngine for TidbEngine {
                     table_name: &target_table_name,
                     table_id: &target_table_id,
                     table_arn: &target_table_arn,
-                    backup: &backup_row,
+                    metadata: RestoreCatalogMetadata {
+                        key_schema: &backup_row.key_schema,
+                        attribute_definitions: &backup_row.attribute_definitions,
+                        billing_mode: &backup_row.billing_mode,
+                        provisioned_throughput: &backup_row.provisioned_throughput,
+                    },
                     indexes: &backup_index_rows,
                 })
                 .await?;
@@ -1056,7 +1068,9 @@ impl BackupEngine for TidbEngine {
             if pitr_enabled {
                 return Err(StorageError::Validation(
                     "TiDB table-level point-in-time recovery is not supported; \
-                     TiDB BR PITR restores into an empty or conflict-free target cluster"
+                     TiDB BR PITR restores into an empty or conflict-free target cluster, \
+                     and TiDB historical reads cannot be copied into a live target table \
+                     as one native online DDL/data operation"
                         .to_owned(),
                 ));
             }
@@ -1084,11 +1098,14 @@ impl BackupEngine for TidbEngine {
         _account_id: &str,
         _source_table_name: &str,
         _target_table_name: &str,
+        _restore_time_epoch: Option<f64>,
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
         Box::pin(async move {
             Err(StorageError::Validation(
-                "TiDB BR PITR restores to an empty/conflict-free cluster; \
-                 table-level PITR into a live ExtendDB table is not supported"
+                "TiDB cannot perform DynamoDB table-level point-in-time restore as a native \
+                 same-cluster online operation: BR PITR restores into an empty or conflict-free \
+                 target cluster, FLASHBACK TABLE restores dropped or truncated tables, and \
+                 TiDB historical reads are read-only for this live-target restore shape"
                     .to_owned(),
             ))
         })

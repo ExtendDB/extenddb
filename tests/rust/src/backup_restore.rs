@@ -343,7 +343,8 @@ async fn enable_point_in_time_recovery() {
     let table = format!("PITREnable_{}", ts());
     make_table(&table).await;
 
-    c.update_continuous_backups()
+    let update = c
+        .update_continuous_backups()
         .table_name(&table)
         .point_in_time_recovery_specification(
             PointInTimeRecoverySpecification::builder()
@@ -352,8 +353,18 @@ async fn enable_point_in_time_recovery() {
                 .unwrap(),
         )
         .send()
-        .await
-        .unwrap();
+        .await;
+
+    if !is_real_dynamodb() {
+        assert!(
+            update.is_err(),
+            "ExtendDB should not report PITR enabled until a backend implements real PITR"
+        );
+        c.delete_table().table_name(&table).send().await.ok();
+        return;
+    }
+
+    update.unwrap();
 
     let resp = c
         .describe_continuous_backups()

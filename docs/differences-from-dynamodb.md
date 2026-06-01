@@ -117,6 +117,16 @@ backend publishes the target table catalog only after BR restore, physical table
 rename, and restored-table normalization complete; an interrupted restore does
 not leave a durable `CREATING` table entry.
 
+TiDB table-level `RestoreTableToPointInTime` is not exposed. TiDB has native
+historical reads, but they are read-only for this live-target restore shape:
+the target table is current and therefore invisible under a historical session
+snapshot, while `INSERT ... SELECT ... AS OF TIMESTAMP` mixes a current write
+target with a stale-read source. ExtendDB does not add a frontend row-replay
+implementation because that would duplicate TiDB's data plane and change the
+operational profile. Use native BR for table backups, or TiDB cluster-level PITR
+into an empty or conflict-free recovery cluster when full-cluster recovery is
+required.
+
 Restored tables do not inherit TTL or stream settings. When BR restores a TiDB
 table that previously used native TTL, ExtendDB strips the restored physical TTL
 artifacts before publishing the target table as `ACTIVE`.

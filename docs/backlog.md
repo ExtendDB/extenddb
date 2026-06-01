@@ -26,7 +26,7 @@ Refreshed: v0.0.118 (P115)
 
 ## Feature Backlog (no phase assigned)
 
-- ⬜ **Real PITR implementation** — PostgreSQL temporal/history table approach: `item_history` table capturing every mutation, `DISTINCT ON` query to reconstruct state at time T, 35-day retention via background pruning. Deferred until `RestoreTableToPointInTime` unsupported error is in place. (P113 human session design direction)
+- ⬜ **Real PITR implementation** — PostgreSQL would need a temporal/history-table design. TiDB should not use frontend row replay; only expose DynamoDB table-level PITR if TiDB provides a native set-based online restore into a new table. The engine now delegates `RestoreTableToPointInTime` to storage, and backends return explicit unsupported errors when they cannot implement it faithfully.
 - ⬜ **Ion parser** — `InputFormat::Ion` falls through to DynamoDB JSON reader. Full Ion support needed for import/export.
 - ⬜ **Key-vs-item size gap** — batch/transact delete/update WCU uses key size, not old item size. Minor fidelity gap.
 - ⬜ **PostgreSQL single-frontend-per-catalog enforcement** — the PostgreSQL backend still needs an HA-safe worker coordination design before shared-catalog multi-frontend deployment. TiDB is not blocked by this item because the TiDB backend uses idempotent catalog reconciliation and TiDB-native online DDL scheduling.

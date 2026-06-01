@@ -99,6 +99,11 @@ catalog rows.
 `RestoreTableFromBackup` likewise publishes the target table only after BR
 restore, physical table rename, and restored-table normalization complete; failed
 or interrupted restores do not expose a durable `CREATING` table.
+Table-level `RestoreTableToPointInTime` is not exposed for TiDB because the
+native TiDB choices do not match DynamoDB's live new-table restore shape: BR PITR
+restores into an empty or conflict-free target cluster, `FLASHBACK TABLE` covers
+dropped or truncated tables, and historical reads cannot populate a current
+target table as one native online operation.
 `DeleteBackup` removes ExtendDB's catalog reference to the BR backup. Snapshot
 files remain under the configured backup storage URI and should be retained,
 archived, or deleted by the operator, TiDB Operator clean policy, or object-store
@@ -553,7 +558,7 @@ psql -f catalog_backup.sql extenddb_catalog
 psql -f data_backup.sql extenddb_catalog_data
 ```
 
-For TiDB, configure `[storage.tidb.backup]` and use DynamoDB-compatible backup APIs backed by native TiDB BR, or operate BR directly at the cluster level for full-cluster recovery. Table-level restore publishes catalog metadata only after TiDB finishes the physical restore path.
+For TiDB, configure `[storage.tidb.backup]` and use DynamoDB-compatible backup APIs backed by native TiDB BR, or operate BR directly at the cluster level for full-cluster recovery. Table-level restore from an on-demand backup publishes catalog metadata only after TiDB finishes the physical restore path. Point-in-time table restore is intentionally not emulated with frontend row replay; use TiDB cluster-level PITR into a recovery cluster for that recovery model.
 
 ---
 

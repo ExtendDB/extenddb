@@ -643,11 +643,15 @@ pub trait BackupEngine: Send + Sync {
     ) -> BoxFuture<'_, Result<extenddb_core::types::ContinuousBackupsDescription, StorageError>>;
 
     /// Restore a table to a point in time.
+    ///
+    /// `restore_time_epoch` is seconds since the Unix epoch. `None` means the
+    /// caller requested the backend's latest restorable timestamp.
     fn restore_table_to_point_in_time(
         &self,
         account_id: &str,
         source_table_name: &str,
         target_table_name: &str,
+        restore_time_epoch: Option<f64>,
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>>;
 }
 

@@ -107,6 +107,9 @@ TiDB implementation of the storage traits using the sqlx MySQL driver. It uses T
 TiDB backups use BR as the physical backup data plane. ExtendDB stores backup
 metadata in the catalog and delegates snapshot data to BR storage; it does not
 copy items into catalog backup tables for TiDB.
+TiDB table-level point-in-time restore is not emulated by ExtendDB frontends:
+BR PITR remains a cluster recovery path, while TiDB historical reads are
+read-only for a live target table.
 
 ### auth
 

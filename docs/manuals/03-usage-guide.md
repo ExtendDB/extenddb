@@ -527,7 +527,7 @@ extenddb reproduces DynamoDB error responses exactly. Common errors:
 | PartiQL | ✗ (not planned) |
 | DAX | ✗ (not applicable) |
 | Global Tables | ✗ (future) |
-| Backups / PITR | ✗ (future) |
+| Backups / PITR | Backups supported by backend; table-level PITR restore is backend-specific and may be unsupported |
 | Import/Export (local filesystem) | ✓ (FileSource instead of S3) |
 
 ---

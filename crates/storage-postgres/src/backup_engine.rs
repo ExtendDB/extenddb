@@ -583,6 +583,12 @@ impl BackupEngine for PostgresEngine {
                 )));
             }
 
+            if pitr_enabled {
+                return Err(StorageError::Validation(
+                    "PostgreSQL point-in-time recovery is not supported by this backend".to_owned(),
+                ));
+            }
+
             sqlx::query(
                 "INSERT INTO continuous_backups (account_id, table_name, pitr_enabled) \
              VALUES ($1, $2, $3) \
@@ -600,27 +606,17 @@ impl BackupEngine for PostgresEngine {
         })
     }
 
-    // TODO(cleanup): This method is unreachable — the engine handler returns
-    // ValidationException("not yet supported") before calling storage. Remove
-    // when real PITR is implemented or during the next storage trait cleanup.
     fn restore_table_to_point_in_time(
         &self,
-        account_id: &str,
-        source_table_name: &str,
-        target_table_name: &str,
+        _account_id: &str,
+        _source_table_name: &str,
+        _target_table_name: &str,
+        _restore_time_epoch: Option<f64>,
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
-        let account_id = account_id.to_string();
-        let source_table_name = source_table_name.to_string();
-        let target_table_name = target_table_name.to_string();
         Box::pin(async move {
-            let backup = self
-                .create_backup(&account_id, &source_table_name, "__pitr_restore__")
-                .await?;
-            let desc = self
-                .restore_table_from_backup(&account_id, &target_table_name, &backup.backup_arn)
-                .await?;
-            let _ = self.delete_backup(&backup.backup_arn).await;
-            Ok(desc)
+            Err(StorageError::Validation(
+                "PostgreSQL point-in-time restore is not supported by this backend".to_owned(),
+            ))
         })
     }
 }

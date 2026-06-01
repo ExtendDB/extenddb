@@ -206,29 +206,165 @@ pub(crate) async fn handle_update_continuous_backups(
     serialize_output(&json!({ "ContinuousBackupsDescription": desc }))
 }
 
-/// Handle `RestoreTableToPointInTime`.
-///
-/// Point-in-time recovery is not yet implemented. The previous implementation
-/// faked a restore by snapshotting the current table state (ignoring
-/// `RestoreDateTime`), which violates tenet 1 (fidelity over features).
-/// Until real PITR is implemented, return an error.
 pub(crate) async fn handle_restore_table_to_point_in_time(
-    _body: Value,
-    _ctx: &OperationContext,
+    body: Value,
+    ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
-    // TODO(fidelity): Implement real PITR through a storage-level history
-    // contract so each backend can reconstruct state at time T with the same
-    // DynamoDB-visible semantics.
-    Err(DynamoDbError::ValidationException(
-        "Point-in-time recovery restore is not yet supported".to_owned(),
-    ))
+    let target_table_name = required_string(
+        &body,
+        "TargetTableName",
+        "targetTableName",
+        "Member must not be null",
+    )?;
+    let source_table_name = resolve_source_table_name(&body, &ctx.account_id)?;
+    let use_latest = body
+        .get("UseLatestRestorableTime")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let restore_time = optional_timestamp(&body, "RestoreDateTime", "restoreDateTime")?;
+
+    if use_latest && restore_time.is_some() {
+        return Err(DynamoDbError::ValidationException(
+            "RestoreDateTime and UseLatestRestorableTime cannot both be specified".to_owned(),
+        ));
+    }
+    if !use_latest && restore_time.is_none() {
+        return Err(DynamoDbError::ValidationException(
+            "Either RestoreDateTime or UseLatestRestorableTime must be specified".to_owned(),
+        ));
+    }
+
+    let desc = ctx
+        .storage
+        .restore_table_to_point_in_time(
+            &ctx.account_id,
+            &source_table_name,
+            target_table_name,
+            restore_time,
+        )
+        .await
+        .map_err(storage_err_to_dynamo)?;
+
+    serialize_output(&json!({ "TableDescription": desc }))
+}
+
+fn required_string<'a>(
+    body: &'a Value,
+    field: &str,
+    wire_name: &str,
+    constraint: &str,
+) -> Result<&'a str, DynamoDbError> {
+    body.get(field).and_then(|v| v.as_str()).ok_or_else(|| {
+        DynamoDbError::ValidationException(format!(
+            "1 validation error detected: Value null at '{wire_name}' \
+             failed to satisfy constraint: {constraint}"
+        ))
+    })
+}
+
+fn optional_timestamp(
+    body: &Value,
+    field: &str,
+    wire_name: &str,
+) -> Result<Option<f64>, DynamoDbError> {
+    let Some(value) = body.get(field) else {
+        return Ok(None);
+    };
+    let Some(timestamp) = value.as_f64() else {
+        return Err(DynamoDbError::ValidationException(format!(
+            "1 validation error detected: Value at '{wire_name}' failed to satisfy constraint: \
+             Member must be a timestamp"
+        )));
+    };
+    if !timestamp.is_finite() || timestamp < 0.0 {
+        return Err(DynamoDbError::ValidationException(format!(
+            "1 validation error detected: Value at '{wire_name}' failed to satisfy constraint: \
+             Member must be a valid timestamp"
+        )));
+    }
+    Ok(Some(timestamp))
+}
+
+fn resolve_source_table_name(body: &Value, account_id: &str) -> Result<String, DynamoDbError> {
+    let source_name = body.get("SourceTableName").and_then(|v| v.as_str());
+    let source_arn = body.get("SourceTableArn").and_then(|v| v.as_str());
+
+    match (source_name, source_arn) {
+        (Some(name), None) => Ok(name.to_owned()),
+        (None, Some(arn)) => table_name_from_arn(arn, account_id),
+        (Some(name), Some(arn)) => {
+            let arn_name = table_name_from_arn(arn, account_id)?;
+            if arn_name != name {
+                return Err(DynamoDbError::ValidationException(
+                    "SourceTableName and SourceTableArn refer to different tables".to_owned(),
+                ));
+            }
+            Ok(name.to_owned())
+        }
+        (None, None) => Err(DynamoDbError::ValidationException(
+            "Either SourceTableName or SourceTableArn must be specified".to_owned(),
+        )),
+    }
+}
+
+fn table_name_from_arn(arn: &str, account_id: &str) -> Result<String, DynamoDbError> {
+    let parsed = parse_dynamodb_arn(arn, "source table")?;
+    if parsed.account_id != account_id {
+        return Err(DynamoDbError::AccessDeniedException(
+            "Access denied for source table ARN".to_owned(),
+        ));
+    }
+    parsed
+        .resource
+        .strip_prefix("table/")
+        .filter(|name| !name.is_empty() && !name.contains('/'))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            DynamoDbError::ValidationException(format!("Invalid source table ARN: {arn}"))
+        })
+}
+
+struct DynamoDbArn<'a> {
+    account_id: &'a str,
+    resource: &'a str,
+}
+
+fn parse_dynamodb_arn<'a>(arn: &'a str, kind: &str) -> Result<DynamoDbArn<'a>, DynamoDbError> {
+    let mut parts = arn.splitn(6, ':');
+    match (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) {
+        (
+            Some("arn"),
+            Some(partition),
+            Some("dynamodb"),
+            Some(region),
+            Some(account),
+            Some(resource),
+        ) if !partition.is_empty()
+            && !region.is_empty()
+            && !account.is_empty()
+            && !resource.is_empty() =>
+        {
+            Ok(DynamoDbArn {
+                account_id: account,
+                resource,
+            })
+        }
+        _ => Err(DynamoDbError::ValidationException(format!(
+            "Invalid {kind} ARN: {arn}"
+        ))),
+    }
 }
 
 fn ensure_backup_arn_account(backup_arn: &str, account_id: &str) -> Result<(), DynamoDbError> {
-    let arn_account = backup_arn.split(':').nth(4).ok_or_else(|| {
-        DynamoDbError::ValidationException(format!("Invalid backup ARN: {backup_arn}"))
-    })?;
-    if arn_account != account_id {
+    let parsed = parse_dynamodb_arn(backup_arn, "backup")?;
+    if parsed.account_id != account_id {
         return Err(DynamoDbError::AccessDeniedException(
             "Access denied for backup ARN".to_owned(),
         ));
@@ -257,5 +393,63 @@ fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> DynamoDbEr
             tracing::error!(internal_error = %other, "backup storage error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{optional_timestamp, resolve_source_table_name};
+    use extenddb_core::error::DynamoDbError;
+    use serde_json::json;
+
+    #[test]
+    fn source_table_name_accepts_matching_name_and_arn() {
+        let body = json!({
+            "SourceTableName": "orders",
+            "SourceTableArn": "arn:aws:dynamodb:us-east-1:123456789012:table/orders"
+        });
+
+        assert_eq!(
+            resolve_source_table_name(&body, "123456789012").expect("source table"),
+            "orders"
+        );
+    }
+
+    #[test]
+    fn source_table_name_rejects_cross_account_arn() {
+        let body = json!({
+            "SourceTableArn": "arn:aws:dynamodb:us-east-1:999999999999:table/orders"
+        });
+
+        let err = resolve_source_table_name(&body, "123456789012").unwrap_err();
+        assert!(matches!(err, DynamoDbError::AccessDeniedException(_)));
+    }
+
+    #[test]
+    fn source_table_name_rejects_non_dynamodb_arn() {
+        let body = json!({
+            "SourceTableArn": "arn:aws:s3:us-east-1:123456789012:table/orders"
+        });
+
+        let err = resolve_source_table_name(&body, "123456789012").unwrap_err();
+        assert!(matches!(err, DynamoDbError::ValidationException(_)));
+    }
+
+    #[test]
+    fn source_table_name_rejects_subresource_arn() {
+        let body = json!({
+            "SourceTableArn": "arn:aws:dynamodb:us-east-1:123456789012:table/orders/index/by_status"
+        });
+
+        let err = resolve_source_table_name(&body, "123456789012").unwrap_err();
+        assert!(matches!(err, DynamoDbError::ValidationException(_)));
+    }
+
+    #[test]
+    fn optional_timestamp_rejects_invalid_values() {
+        let body = json!({ "RestoreDateTime": "not-a-timestamp" });
+
+        let err = optional_timestamp(&body, "RestoreDateTime", "restoreDateTime").unwrap_err();
+        assert!(matches!(err, DynamoDbError::ValidationException(_)));
     }
 }

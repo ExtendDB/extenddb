@@ -317,8 +317,10 @@ Defined in `crates/storage/src/lib.rs`. Backup and restore operations:
 
 | Method | Purpose |
 |--------|---------|
-| `export_table` | Export table data to external storage |
-| `import_table` | Import table data from external storage |
+| `create_backup` / `restore_table_from_backup` | Backend-native on-demand backup and restore |
+| `describe_backup` / `list_backups` / `delete_backup` | Backup metadata and lifecycle |
+| `describe_continuous_backups` / `update_continuous_backups` | Backend PITR capability reporting and toggles |
+| `restore_table_to_point_in_time` | Restore to a new table at a requested timestamp, or return an explicit unsupported error when the backend cannot do so faithfully |
 
 ### Bootstrapper
 

@@ -222,6 +222,14 @@ table metadata. TiDB `DeleteBackup` removes only ExtendDB catalog metadata;
 the BR snapshot directory is lifecycle-managed by the configured backup storage
 or TiDB Operator rather than by an ExtendDB frontend.
 
+`RestoreTableToPointInTime` is a storage-owned operation, not an engine stub.
+Backends that cannot provide it faithfully return an explicit validation error.
+TiDB intentionally does not implement DynamoDB table-level PITR restore with a
+frontend item replay path: TiDB BR PITR is a cluster recovery primitive, TiDB
+`FLASHBACK TABLE` is for dropped/truncated tables, and TiDB historical reads are
+read-only for the live target-table shape. A future TiDB implementation should
+be added only if TiDB exposes a native set-based online restore into a new table.
+
 ```rust
 pub trait WorkerStore: Send + Sync {
     fn process_control_plane_transitions(
@@ -575,7 +583,7 @@ Backends own their native pool layout behind the storage traits. PostgreSQL
 keeps catalog metadata, catalog-store/auth, and data pools. TiDB keeps separate
 engine-catalog, catalog-store/auth, strong-data, and default-read data pools,
 but the catalog and data databases must be in the same TiDB cluster. TiDB backup
-metadata, BR `--backupts`, snapshot reads, online DDL, and native TTL all rely
+metadata, BR `--backupts`, read-only snapshot reads, online DDL, and native TTL all rely
 on one PD-owned global TSO timeline. TiDB startup validates the invariant by
 comparing the catalog and data pools' native
 `information_schema.cluster_info` topology fingerprints. If a TiDB edition does
