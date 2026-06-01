@@ -563,6 +563,9 @@ The PostgreSQL backend uses two categories of tables:
 
 - **GSI consistency**: GSI write consistency is backend-specific. TiDB relies
   on native secondary indexes, which are maintained by TiDB from the base row.
+  When a DynamoDB request supplies `IndexName`, TiDB read SQL forces the
+  matching native secondary index because the client has already selected the
+  access path.
   PostgreSQL can simulate asynchronous GSI propagation for compatibility
   testing. LSI updates are always synchronous. See §6 for details.
 
@@ -698,6 +701,9 @@ updates are always synchronous.
   DDL used for later changes. For each later reconciliation pass, generated key
   columns for all pending indexes on a table are added in one online
   `ALTER TABLE` DDL job before the native index DDL.
+- Explicit TiDB index reads use `FORCE INDEX` for the generated native index.
+  DynamoDB `IndexName` is not an optimizer suggestion; it is the requested read
+  path, so stale TiDB statistics must not turn an index query into a table scan.
 - The engine layer enforces DynamoDB projection semantics above the physical
   path: default index reads return projected attributes, GSI reads cannot ask
   for non-projected attributes, and LSI reads may fetch non-projected

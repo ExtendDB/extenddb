@@ -303,6 +303,9 @@ Backend write paths still must keep index state atomic with base-table writes:
 
 - No special GSI routing exists in storage. The engine rejects unsupported strong-GSI requests before storage sees them.
 - TiDB does not need a separate GSI consistency class. Its secondary indexes are native global TiDB indexes.
+- TiDB query and scan SQL for an explicit `IndexName` forces the matching native
+  secondary index. DynamoDB already made index choice part of the request, so
+  ExtendDB should not let stale TiDB statistics choose a different access path.
 - A backend that cannot keep index state atomic with base-row writes must reject the corresponding index feature at table-creation or index-update time.
 
 ### 8.3 StorageTopology (Extension of Storage Lifecycle)

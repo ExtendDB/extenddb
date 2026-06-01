@@ -11,8 +11,8 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{sk_column, sk_column_n, sk_info};
 
 use super::index::{
-    native_index_hash_column, native_index_key_tuple_columns, native_index_non_null_predicates,
-    native_index_sort_columns,
+    native_index_hash_column, native_index_key_tuple_columns, native_index_name,
+    native_index_non_null_predicates, native_index_sort_columns,
 };
 use super::query::{
     build_key, build_sk_sql, execute_query_sql, execute_scan_sql, resolve_expr_to_av,
@@ -110,6 +110,17 @@ fn native_index_scan_cursor_columns(
     CursorColumns::same(columns)
 }
 
+fn table_ref_for_read(table_id: &str, index: Option<&IndexInfo>) -> String {
+    let table = data_table_name(table_id);
+    match index {
+        Some(idx) => {
+            let index_name = native_index_name(&idx.index_id);
+            format!("{table} FORCE INDEX (`{index_name}`)")
+        }
+        None => table,
+    }
+}
+
 impl TidbEngine {
     /// Implementation of `DataEngine::query`.
     #[allow(clippy::too_many_arguments)]
@@ -130,7 +141,7 @@ impl TidbEngine {
             idx.key_schema.as_slice()
         });
         let attr_defs = key_info.attribute_definitions.as_slice();
-        let ddb_table = data_table_name(&key_info.table_id);
+        let ddb_table = table_ref_for_read(&key_info.table_id, index);
         let pk_column = index.map_or_else(
             || "pk".to_owned(),
             |idx| native_index_hash_column(&idx.index_id),
@@ -318,7 +329,7 @@ impl TidbEngine {
             idx.key_schema.as_slice()
         });
         let attr_defs = key_info.attribute_definitions.as_slice();
-        let ddb_table = data_table_name(&key_info.table_id);
+        let ddb_table = table_ref_for_read(&key_info.table_id, index);
 
         let mut sql = format!("SELECT item_data FROM {ddb_table}");
         let mut conditions: Vec<String> = Vec::new();
@@ -408,12 +419,13 @@ impl TidbEngine {
 #[cfg(test)]
 mod tests {
     use extenddb_core::types::{
-        AttributeDefinition, KeySchemaElement, KeyType, ScalarAttributeType,
+        AttributeDefinition, IndexInfo, IndexType, KeySchemaElement, KeyType, Projection,
+        ProjectionType, ScalarAttributeType,
     };
 
     use super::{
         native_index_query_cursor_columns, native_index_scan_cursor_columns, push_order_by,
-        tuple_comparison,
+        table_ref_for_read, tuple_comparison,
     };
 
     #[test]
@@ -508,6 +520,29 @@ mod tests {
         push_order_by(&mut sql, &columns.order, true);
 
         assert!(sql.ends_with(" ORDER BY edbidx_idx1_sk_s ASC, pk ASC, sk_n ASC"));
+    }
+
+    #[test]
+    fn secondary_index_reads_force_the_requested_native_index() {
+        let index = IndexInfo {
+            index_name: "by_customer".to_owned(),
+            index_id: "idx-1".to_owned(),
+            index_type: IndexType::Gsi,
+            key_schema: vec![KeySchemaElement {
+                attribute_name: "gpk".to_owned(),
+                key_type: KeyType::Hash,
+            }],
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
+        };
+
+        assert_eq!(
+            table_ref_for_read("tableid", Some(&index)),
+            "`_ddb_tableid` FORCE INDEX (`idx_idx1`)"
+        );
+        assert_eq!(table_ref_for_read("tableid", None), "`_ddb_tableid`");
     }
 
     #[test]
