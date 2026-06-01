@@ -405,13 +405,13 @@ fn validate_gsi_count(
     input: &CreateTableInput,
     limits: &LimitsConfig,
 ) -> Result<(), DynamoDbError> {
-    if let Some(gsis) = &input.global_secondary_indexes {
-        if gsis.len() > limits.max_gsis_per_table {
-            return Err(DynamoDbError::ValidationException(format!(
-                "One or more parameter values were invalid: GlobalSecondaryIndexes count exceeds limit of {}",
-                limits.max_gsis_per_table
-            )));
-        }
+    if let Some(gsis) = &input.global_secondary_indexes
+        && gsis.len() > limits.max_gsis_per_table
+    {
+        return Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: GlobalSecondaryIndexes count exceeds limit of {}",
+            limits.max_gsis_per_table
+        )));
     }
     Ok(())
 }
@@ -420,13 +420,13 @@ fn validate_lsi_count(
     input: &CreateTableInput,
     limits: &LimitsConfig,
 ) -> Result<(), DynamoDbError> {
-    if let Some(lsis) = &input.local_secondary_indexes {
-        if lsis.len() > limits.max_lsis_per_table {
-            return Err(DynamoDbError::ValidationException(format!(
-                "One or more parameter values were invalid: LocalSecondaryIndexes count exceeds limit of {}",
-                limits.max_lsis_per_table
-            )));
-        }
+    if let Some(lsis) = &input.local_secondary_indexes
+        && lsis.len() > limits.max_lsis_per_table
+    {
+        return Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: LocalSecondaryIndexes count exceeds limit of {}",
+            limits.max_lsis_per_table
+        )));
     }
     Ok(())
 }

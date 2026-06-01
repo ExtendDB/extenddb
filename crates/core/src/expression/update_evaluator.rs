@@ -135,10 +135,10 @@ fn evaluate_set_function(
                 ));
             }
             // If the path exists, return its value; otherwise return the default
-            if let Expr::Path(elements) = &args[0] {
-                if let Some(existing) = resolve_path_to_value(elements, item, maps)? {
-                    return Ok(existing.clone());
-                }
+            if let Expr::Path(elements) = &args[0]
+                && let Some(existing) = resolve_path_to_value(elements, item, maps)?
+            {
+                return Ok(existing.clone());
             }
             evaluate_set_value(&args[1], item, maps)
         }

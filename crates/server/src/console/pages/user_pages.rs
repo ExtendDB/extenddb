@@ -111,21 +111,21 @@ pub async fn create_user(
 
     let pw = form.password.as_deref().filter(|p| !p.is_empty());
 
-    if let Some(p) = pw {
-        if p.len() > 72 {
-            let nav = html::nav_bar(&identity_label(&session.identity));
-            let content = format!(
-                "<h1>Create User</h1>{}",
-                html::alert_error("password must not exceed 72 bytes (bcrypt limit)")
-            );
-            return Html(html::layout_csrf(
-                "New User",
-                &nav,
-                &content,
-                &session.csrf_token,
-            ))
-            .into_response();
-        }
+    if let Some(p) = pw
+        && p.len() > 72
+    {
+        let nav = html::nav_bar(&identity_label(&session.identity));
+        let content = format!(
+            "<h1>Create User</h1>{}",
+            html::alert_error("password must not exceed 72 bytes (bcrypt limit)")
+        );
+        return Html(html::layout_csrf(
+            "New User",
+            &nav,
+            &content,
+            &session.csrf_token,
+        ))
+        .into_response();
     }
 
     let password_hash = match pw {

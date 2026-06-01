@@ -279,11 +279,10 @@ pub fn dispatch(
             let r = c.req("POST", "/management/accounts", Some(&body))?;
             if (200..300).contains(&r.0) {
                 // Read server-generated account_id from response body.
-                if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&r.1) {
-                    if let Some(id) = resp.get("account_id").and_then(|v| v.as_str()) {
+                if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&r.1)
+                    && let Some(id) = resp.get("account_id").and_then(|v| v.as_str()) {
                         eprintln!("Account ID: {id}");
                     }
-                }
             }
             Ok(r)
         }

@@ -110,10 +110,10 @@ fn extract_session_token(headers: &HeaderMap) -> Option<String> {
     let cookie_header = headers.get("cookie")?.to_str().ok()?;
     for part in cookie_header.split(';') {
         let part = part.trim();
-        if let Some(value) = part.strip_prefix("extenddb_session=") {
-            if !value.is_empty() {
-                return Some(value.to_owned());
-            }
+        if let Some(value) = part.strip_prefix("extenddb_session=")
+            && !value.is_empty()
+        {
+            return Some(value.to_owned());
         }
     }
     None

@@ -307,12 +307,11 @@ fn default_run_dir() -> String {
 /// Expand a leading `~` in a path to `$HOME`. Returns the input unchanged
 /// if `$HOME` is unset or the path does not start with `~`.
 pub fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix('~') {
-        if rest.is_empty() || rest.starts_with('/') {
-            if let Ok(home) = std::env::var("HOME") {
-                return format!("{home}{rest}");
-            }
-        }
+    if let Some(rest) = path.strip_prefix('~')
+        && (rest.is_empty() || rest.starts_with('/'))
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return format!("{home}{rest}");
     }
     path.to_owned()
 }

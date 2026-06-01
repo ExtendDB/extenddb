@@ -277,12 +277,11 @@ async fn graceful_shutdown(pid_file: Option<PathBuf>) {
 
 /// Remove the PID file if it exists. Best-effort — log but don't fail.
 fn cleanup_pid_file(pid_file: Option<&std::path::Path>) {
-    if let Some(path) = pid_file {
-        if let Err(e) = std::fs::remove_file(path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!("Failed to remove PID file {}: {e}", path.display());
-            }
-        }
+    if let Some(path) = pid_file
+        && let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!("Failed to remove PID file {}: {e}", path.display());
     }
 }
 

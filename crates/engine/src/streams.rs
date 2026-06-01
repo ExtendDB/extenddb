@@ -198,20 +198,20 @@ pub async fn handle_get_records(
     let seq = if parts.len() >= 3 { parts[2] } else { "" };
 
     // Check iterator expiration (15 minutes).
-    if parts.len() >= 4 {
-        if let Ok(created_at) = parts[3].parse::<u64>() {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if now.saturating_sub(created_at) > SHARD_ITERATOR_EXPIRY_SECS {
-                return Err(DynamoDbError::ExpiredIteratorException(
-                    "The shard iterator has expired and can no longer be \
+    if parts.len() >= 4
+        && let Ok(created_at) = parts[3].parse::<u64>()
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now.saturating_sub(created_at) > SHARD_ITERATOR_EXPIRY_SECS {
+            return Err(DynamoDbError::ExpiredIteratorException(
+                "The shard iterator has expired and can no longer be \
                      used to retrieve stream records. A new shard iterator \
                      must be obtained by calling GetShardIterator."
-                        .to_owned(),
-                ));
-            }
+                    .to_owned(),
+            ));
         }
     }
 

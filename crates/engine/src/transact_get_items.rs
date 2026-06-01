@@ -140,10 +140,10 @@ pub async fn handle_transact_get_items(
                 let mut extra_names = std::collections::HashSet::new();
                 for path in &projection {
                     for el in path {
-                        if let extenddb_core::expression::PathElement::Attribute(name) = el {
-                            if let Some(ref_name) = name.strip_prefix('#') {
-                                extra_names.insert(ref_name.to_owned());
-                            }
+                        if let extenddb_core::expression::PathElement::Attribute(name) = el
+                            && let Some(ref_name) = name.strip_prefix('#')
+                        {
+                            extra_names.insert(ref_name.to_owned());
                         }
                     }
                 }

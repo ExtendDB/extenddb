@@ -39,12 +39,11 @@ pub(crate) async fn handle_request(
 
     // HTTP/2 uses :authority instead of Host. Ensure the Host header is
     // populated so SigV4 verification can find it in the canonical request.
-    if !headers.contains_key("host") {
-        if let Some(authority) = uri.authority() {
-            if let Ok(val) = authority.as_str().parse() {
-                headers.insert("host", val);
-            }
-        }
+    if !headers.contains_key("host")
+        && let Some(authority) = uri.authority()
+        && let Ok(val) = authority.as_str().parse()
+    {
+        headers.insert("host", val);
     }
     let request_id = uuid::Uuid::new_v4().to_string();
 
@@ -147,59 +146,58 @@ pub(crate) async fn handle_request(
     let throttle_start = std::time::Instant::now();
     let (is_read_op, is_write_op) = classify_data_operation(&operation);
     let partition_value = extract_partition_value(&input, &operation);
-    if let Some(ref tn) = table_name {
-        if is_read_op || is_write_op {
-            if !state.throttle.is_registered(&ctx.account_id, tn) {
-                if let Ok(desc) = ctx
-                    .storage
-                    .describe_table(
-                        &ctx.account_id,
-                        extenddb_core::types::DescribeTableInput {
-                            table_name: tn.clone(),
-                        },
-                    )
-                    .await
-                {
-                    let throughput = table_description_to_throughput(&desc);
-                    state
-                        .throttle
-                        .register_table(&ctx.account_id, tn, throughput);
-                }
-            }
+    if let Some(ref tn) = table_name
+        && (is_read_op || is_write_op)
+    {
+        if !state.throttle.is_registered(&ctx.account_id, tn)
+            && let Ok(desc) = ctx
+                .storage
+                .describe_table(
+                    &ctx.account_id,
+                    extenddb_core::types::DescribeTableInput {
+                        table_name: tn.clone(),
+                    },
+                )
+                .await
+        {
+            let throughput = table_description_to_throughput(&desc);
+            state
+                .throttle
+                .register_table(&ctx.account_id, tn, throughput);
+        }
 
-            let result = state.throttle.check_capacity_with_partition(
-                &ctx.account_id,
-                tn,
-                is_read_op,
-                is_write_op,
-                partition_value.as_deref(),
+        let result = state.throttle.check_capacity_with_partition(
+            &ctx.account_id,
+            tn,
+            is_read_op,
+            is_write_op,
+            partition_value.as_deref(),
+        );
+        if result != extenddb_core::throttle::ThrottleResult::Allowed {
+            let metric = if result == extenddb_core::throttle::ThrottleResult::ThrottledRead {
+                extenddb_core::metrics::MetricName::ReadThrottleEvents
+            } else {
+                extenddb_core::metrics::MetricName::WriteThrottleEvents
+            };
+            state
+                .metrics
+                .record(metric, 1.0, Some(tn), None, Some(&operation));
+            state.metrics.record(
+                extenddb_core::metrics::MetricName::ThrottledRequests,
+                1.0,
+                Some(tn),
+                None,
+                Some(&operation),
             );
-            if result != extenddb_core::throttle::ThrottleResult::Allowed {
-                let metric = if result == extenddb_core::throttle::ThrottleResult::ThrottledRead {
-                    extenddb_core::metrics::MetricName::ReadThrottleEvents
-                } else {
-                    extenddb_core::metrics::MetricName::WriteThrottleEvents
-                };
-                state
-                    .metrics
-                    .record(metric, 1.0, Some(tn), None, Some(&operation));
-                state.metrics.record(
-                    extenddb_core::metrics::MetricName::ThrottledRequests,
-                    1.0,
-                    Some(tn),
-                    None,
-                    Some(&operation),
-                );
-                return error_response(
-                    &DynamoDbError::ProvisionedThroughputExceededException(
-                        "The level of configured provisioned throughput for the table \
+            return error_response(
+                &DynamoDbError::ProvisionedThroughputExceededException(
+                    "The level of configured provisioned throughput for the table \
                          was exceeded. Consider increasing your provisioning level \
                          with the UpdateTable API."
-                            .to_owned(),
-                    ),
-                    &request_id,
-                );
-            }
+                        .to_owned(),
+                ),
+                &request_id,
+            );
         }
     }
     #[allow(clippy::cast_precision_loss)]

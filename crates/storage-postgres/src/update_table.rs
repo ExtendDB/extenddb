@@ -44,52 +44,48 @@ impl PostgresEngine {
         // throughput values is rejected by DynamoDB. This check runs under the
         // FOR UPDATE lock to eliminate the TOCTOU race that existed when the
         // check was in the engine layer.
-        if matches!(input.billing_mode, Some(BillingMode::Provisioned)) {
-            if let Some(ref pt) = input.provisioned_throughput {
-                let current_row: Option<(Option<String>, Option<serde_json::Value>)> =
-                    sqlx::query_as(
-                        "SELECT billing_mode, provisioned_throughput FROM tables \
+        if matches!(input.billing_mode, Some(BillingMode::Provisioned))
+            && let Some(ref pt) = input.provisioned_throughput
+        {
+            let current_row: Option<(Option<String>, Option<serde_json::Value>)> = sqlx::query_as(
+                "SELECT billing_mode, provisioned_throughput FROM tables \
                      WHERE account_id = $1 AND table_name = $2",
-                    )
-                    .bind(account_id)
-                    .bind(&input.table_name)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+            )
+            .bind(account_id)
+            .bind(&input.table_name)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-                if let Some((current_bm, current_pt_opt)) = current_row {
-                    let current_pt =
-                        current_pt_opt.unwrap_or(serde_json::Value::Object(Default::default()));
-                    let is_provisioned =
-                        current_bm.as_deref() == Some("PROVISIONED") || current_bm.is_none();
-                    let current_rcu = current_pt
-                        .get("ReadCapacityUnits")
-                        .or_else(|| current_pt.get("read_capacity_units"))
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    let current_wcu = current_pt
-                        .get("WriteCapacityUnits")
-                        .or_else(|| current_pt.get("write_capacity_units"))
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
+            if let Some((current_bm, current_pt_opt)) = current_row {
+                let current_pt =
+                    current_pt_opt.unwrap_or(serde_json::Value::Object(Default::default()));
+                let is_provisioned =
+                    current_bm.as_deref() == Some("PROVISIONED") || current_bm.is_none();
+                let current_rcu = current_pt
+                    .get("ReadCapacityUnits")
+                    .or_else(|| current_pt.get("read_capacity_units"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let current_wcu = current_pt
+                    .get("WriteCapacityUnits")
+                    .or_else(|| current_pt.get("write_capacity_units"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
 
-                    if is_provisioned
-                        && current_rcu == pt.read_capacity_units
-                        && current_wcu == pt.write_capacity_units
-                    {
-                        return Err(StorageError::NoOpUpdate(format!(
-                            "The provisioned throughput for the table will not change. \
+                if is_provisioned
+                    && current_rcu == pt.read_capacity_units
+                    && current_wcu == pt.write_capacity_units
+                {
+                    return Err(StorageError::NoOpUpdate(format!(
+                        "The provisioned throughput for the table will not change. \
                              The requested value equals the current value. \
                              Current ReadCapacityUnits provisioned for the table: {}. \
                              Requested ReadCapacityUnits: {}. \
                              Current WriteCapacityUnits provisioned for the table: {}. \
                              Requested WriteCapacityUnits: {}.",
-                            current_rcu,
-                            pt.read_capacity_units,
-                            current_wcu,
-                            pt.write_capacity_units
-                        )));
-                    }
+                        current_rcu, pt.read_capacity_units, current_wcu, pt.write_capacity_units
+                    )));
                 }
             }
         }

@@ -81,13 +81,13 @@ fn discover_docs_dir() -> Option<String> {
     let candidates: Vec<std::path::PathBuf> = {
         let mut v = Vec::new();
         // Relative to the binary.
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                v.push(dir.join("docs/rendered"));
-                // Also check one level up (binary in target/release/).
-                if let Some(parent) = dir.parent() {
-                    v.push(parent.join("docs/rendered"));
-                }
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            v.push(dir.join("docs/rendered"));
+            // Also check one level up (binary in target/release/).
+            if let Some(parent) = dir.parent() {
+                v.push(parent.join("docs/rendered"));
             }
         }
         // Relative to cwd.

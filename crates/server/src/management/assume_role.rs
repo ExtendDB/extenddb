@@ -119,14 +119,14 @@ pub async fn assume_role(
     }
 
     // Validate session policy if provided.
-    if let Some(ref sp) = request.session_policy {
-        if sp.get("Version").is_none() || sp.get("Statement").is_none() {
-            return (
-                StatusCode::BAD_REQUEST,
-                "Session policy must contain Version and Statement",
-            )
-                .into_response();
-        }
+    if let Some(ref sp) = request.session_policy
+        && (sp.get("Version").is_none() || sp.get("Statement").is_none())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Session policy must contain Version and Statement",
+        )
+            .into_response();
     }
 
     // Load the role and its trust policy.

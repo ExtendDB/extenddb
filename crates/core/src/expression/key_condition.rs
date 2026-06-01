@@ -449,31 +449,18 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
     }
 
     // begins_with(path, :val)
-    if let Token::Ident(name) = &tokens[*pos] {
-        if name.eq_ignore_ascii_case("begins_with")
-            && *pos + 1 < tokens.len()
-            && tokens[*pos + 1] == Token::LParen
-        {
-            *pos += 1; // skip function name
-            parser_common::expect_token(
-                tokens,
-                pos,
-                &Token::LParen,
-                "(",
-                "KeyConditionExpression",
-            )?;
-            let path = parse_key_operand_path(tokens, pos)?;
-            parser_common::expect_token(tokens, pos, &Token::Comma, ",", "KeyConditionExpression")?;
-            let prefix = parse_key_value(tokens, pos)?;
-            parser_common::expect_token(
-                tokens,
-                pos,
-                &Token::RParen,
-                ")",
-                "KeyConditionExpression",
-            )?;
-            return Ok(RawClause::BeginsWith(path, prefix));
-        }
+    if let Token::Ident(name) = &tokens[*pos]
+        && name.eq_ignore_ascii_case("begins_with")
+        && *pos + 1 < tokens.len()
+        && tokens[*pos + 1] == Token::LParen
+    {
+        *pos += 1; // skip function name
+        parser_common::expect_token(tokens, pos, &Token::LParen, "(", "KeyConditionExpression")?;
+        let path = parse_key_operand_path(tokens, pos)?;
+        parser_common::expect_token(tokens, pos, &Token::Comma, ",", "KeyConditionExpression")?;
+        let prefix = parse_key_value(tokens, pos)?;
+        parser_common::expect_token(tokens, pos, &Token::RParen, ")", "KeyConditionExpression")?;
+        return Ok(RawClause::BeginsWith(path, prefix));
     }
 
     // path op :value | :value op path | path BETWEEN :lo AND :hi

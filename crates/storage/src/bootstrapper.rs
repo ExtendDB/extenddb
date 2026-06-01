@@ -241,13 +241,13 @@ pub mod helpers {
         config_val: &T,
         flag: &str,
     ) -> Result<(), crate::error::StorageError> {
-        if let Some(v) = cli_val {
-            if v != config_val {
-                return Err(crate::error::StorageError::Internal(format!(
-                    "{} value '{}' conflicts with config file value '{}'",
-                    flag, v, config_val
-                )));
-            }
+        if let Some(v) = cli_val
+            && v != config_val
+        {
+            return Err(crate::error::StorageError::Internal(format!(
+                "{} value '{}' conflicts with config file value '{}'",
+                flag, v, config_val
+            )));
         }
         Ok(())
     }

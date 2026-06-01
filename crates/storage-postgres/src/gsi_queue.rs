@@ -201,42 +201,42 @@ async fn apply_gsi_update(pool: &PgPool, update: &GsiUpdate) -> Result<(), Stora
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
     // Delete old index row if the old item had index keys.
-    if let Some(ref old) = update.old_item {
-        if item_has_index_keys(old, &update.index_key_schema) {
-            delete_index_row_multi(
-                &mut tx,
-                &idx_table,
-                old,
-                &update.base_key_schema,
-                &update.attr_defs,
-                &base_sks,
-            )
-            .await?;
-        }
+    if let Some(ref old) = update.old_item
+        && item_has_index_keys(old, &update.index_key_schema)
+    {
+        delete_index_row_multi(
+            &mut tx,
+            &idx_table,
+            old,
+            &update.base_key_schema,
+            &update.attr_defs,
+            &base_sks,
+        )
+        .await?;
     }
 
     // Insert new index row if the new item has index keys.
-    if let Some(ref new) = update.new_item {
-        if item_has_index_keys(new, &update.index_key_schema) {
-            let projected = project_item_for_index(
-                new,
-                &update.index_key_schema,
-                &update.base_key_schema,
-                &update.index_projection,
-            );
-            insert_index_row_multi(
-                &mut tx,
-                &idx_table,
-                new,
-                &projected,
-                &update.index_key_schema,
-                &update.base_key_schema,
-                &update.attr_defs,
-                &idx_sks,
-                &base_sks,
-            )
-            .await?;
-        }
+    if let Some(ref new) = update.new_item
+        && item_has_index_keys(new, &update.index_key_schema)
+    {
+        let projected = project_item_for_index(
+            new,
+            &update.index_key_schema,
+            &update.base_key_schema,
+            &update.index_projection,
+        );
+        insert_index_row_multi(
+            &mut tx,
+            &idx_table,
+            new,
+            &projected,
+            &update.index_key_schema,
+            &update.base_key_schema,
+            &update.attr_defs,
+            &idx_sks,
+            &base_sks,
+        )
+        .await?;
     }
 
     tx.commit()

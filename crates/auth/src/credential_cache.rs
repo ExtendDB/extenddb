@@ -179,21 +179,19 @@ impl CredentialStore for CachedCredentialStore {
         // the cache cannot extend a session past its issued lifetime.
         // Mirror the storage-layer error so the cache is transparent to the
         // auth provider.
-        if let Some(ref cred) = result {
-            if cred.is_session {
-                if let Some(expires_at) = cred.expires_at {
-                    if expires_at < time::OffsetDateTime::now_utc() {
-                        // Drop the stale entry so the next lookup goes
-                        // straight to the storage layer (which will raise
-                        // ExpiredTokenException itself, or return the
-                        // post-rotation credential if one exists).
-                        self.cache.invalidate(&access_key_id.to_owned()).await;
-                        return Err(DynamoDbError::ExpiredTokenException(
-                            "The security token included in the request is expired".to_owned(),
-                        ));
-                    }
-                }
-            }
+        if let Some(ref cred) = result
+            && cred.is_session
+            && let Some(expires_at) = cred.expires_at
+            && expires_at < time::OffsetDateTime::now_utc()
+        {
+            // Drop the stale entry so the next lookup goes
+            // straight to the storage layer (which will raise
+            // ExpiredTokenException itself, or return the
+            // post-rotation credential if one exists).
+            self.cache.invalidate(&access_key_id.to_owned()).await;
+            return Err(DynamoDbError::ExpiredTokenException(
+                "The security token included in the request is expired".to_owned(),
+            ));
         }
         Ok(result)
     }

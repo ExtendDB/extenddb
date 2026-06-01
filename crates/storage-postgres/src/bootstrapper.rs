@@ -509,13 +509,13 @@ impl PostgresBootstrapper {
             check_conflict(extenddb_user.as_ref(), &parts.user, "--extenddb-user")?;
             check_conflict(extenddb_pass.as_ref(), &parts.password, "--extenddb-pass")?;
 
-            if let Some(ref cli_catalog) = catalog_db {
-                if cli_catalog != &parts.database {
-                    return Err(StorageError::Internal(format!(
-                        "--catalog-db '{}' conflicts with config file catalog database '{}'",
-                        cli_catalog, parts.database
-                    )));
-                }
+            if let Some(ref cli_catalog) = catalog_db
+                && cli_catalog != &parts.database
+            {
+                return Err(StorageError::Internal(format!(
+                    "--catalog-db '{}' conflicts with config file catalog database '{}'",
+                    cli_catalog, parts.database
+                )));
             }
 
             (

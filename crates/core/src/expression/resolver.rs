@@ -94,10 +94,10 @@ impl ExpressionMaps {
     /// existing behavior.
     pub fn pre_parse_numerics(&mut self) {
         for (key, value) in &self.values {
-            if let AttributeValue::N(n) = value {
-                if let Ok(d) = n.parse::<bigdecimal::BigDecimal>() {
-                    self.parsed_numerics.insert(key.clone(), d);
-                }
+            if let AttributeValue::N(n) = value
+                && let Ok(d) = n.parse::<bigdecimal::BigDecimal>()
+            {
+                self.parsed_numerics.insert(key.clone(), d);
             }
         }
     }
@@ -347,10 +347,10 @@ fn collect_action_refs(
 
 fn collect_path_refs(elements: &[PathElement], names: &mut std::collections::HashSet<String>) {
     for el in elements {
-        if let PathElement::Attribute(name) = el {
-            if let Some(ref_name) = name.strip_prefix('#') {
-                names.insert(ref_name.to_owned());
-            }
+        if let PathElement::Attribute(name) = el
+            && let Some(ref_name) = name.strip_prefix('#')
+        {
+            names.insert(ref_name.to_owned());
         }
     }
 }
@@ -415,27 +415,25 @@ pub fn validate_begins_with_operands(
 ) -> Result<(), DynamoDbError> {
     match expr {
         Expr::Function { name, args } if name == "begins_with" => {
-            if args.len() == 2 {
-                if let Expr::Placeholder(ref placeholder) = args[1] {
-                    if let Some(val) = maps.values.get(placeholder) {
-                        if !matches!(val, AttributeValue::S(_) | AttributeValue::B(_)) {
-                            let type_code = match val {
-                                AttributeValue::N(_) => "N",
-                                AttributeValue::Bool(_) => "BOOL",
-                                AttributeValue::Null => "NULL",
-                                AttributeValue::L(_) => "L",
-                                AttributeValue::M(_) => "M",
-                                AttributeValue::SS(_) => "SS",
-                                AttributeValue::NS(_) => "NS",
-                                AttributeValue::BS(_) => "BS",
-                                _ => "UNKNOWN",
-                            };
-                            return Err(DynamoDbError::ValidationException(format!(
-                                "Incorrect operand type for operator or function; operator or function: begins_with, operand type: {type_code}"
-                            )));
-                        }
-                    }
-                }
+            if args.len() == 2
+                && let Expr::Placeholder(ref placeholder) = args[1]
+                && let Some(val) = maps.values.get(placeholder)
+                && !matches!(val, AttributeValue::S(_) | AttributeValue::B(_))
+            {
+                let type_code = match val {
+                    AttributeValue::N(_) => "N",
+                    AttributeValue::Bool(_) => "BOOL",
+                    AttributeValue::Null => "NULL",
+                    AttributeValue::L(_) => "L",
+                    AttributeValue::M(_) => "M",
+                    AttributeValue::SS(_) => "SS",
+                    AttributeValue::NS(_) => "NS",
+                    AttributeValue::BS(_) => "BS",
+                    _ => "UNKNOWN",
+                };
+                return Err(DynamoDbError::ValidationException(format!(
+                    "Incorrect operand type for operator or function; operator or function: begins_with, operand type: {type_code}"
+                )));
             }
             Ok(())
         }

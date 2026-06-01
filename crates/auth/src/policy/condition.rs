@@ -281,17 +281,18 @@ fn compare_dates(a: &str, b: &str, cmp: impl FnOnce(i128, i128) -> bool) -> bool
 /// Also accepts epoch seconds as a plain number.
 fn parse_epoch_millis(s: &str) -> Option<i128> {
     // Try epoch seconds first (plain number)
-    if let Ok(n) = s.parse::<f64>() {
-        if !s.contains('T') && !s.contains('-') {
-            // Reject NaN/Infinity — they are not valid epoch timestamps.
-            if !n.is_finite() {
-                return None;
-            }
-            // f64 → i128 via `as` is saturating (Rust ≥1.45). Epoch millis
-            // for any realistic date fits in i128 with no precision loss.
-            #[allow(clippy::cast_possible_truncation)]
-            return Some((n * 1000.0) as i128);
+    if let Ok(n) = s.parse::<f64>()
+        && !s.contains('T')
+        && !s.contains('-')
+    {
+        // Reject NaN/Infinity — they are not valid epoch timestamps.
+        if !n.is_finite() {
+            return None;
         }
+        // f64 → i128 via `as` is saturating (Rust ≥1.45). Epoch millis
+        // for any realistic date fits in i128 with no precision loss.
+        #[allow(clippy::cast_possible_truncation)]
+        return Some((n * 1000.0) as i128);
     }
 
     // Try ISO 8601 with time crate

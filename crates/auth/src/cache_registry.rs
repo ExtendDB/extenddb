@@ -277,14 +277,14 @@ impl AuthCacheRegistry {
         // Best-effort credential fanout; failures are logged-but-not-fatal
         // because the credential cache's negative TTL bounds the worst-case
         // exposure window if invalidation fails.
-        if let Some(c) = &self.credential {
-            if let Err(e) = c.invalidate_account(account_id) {
-                tracing::warn!(
-                    account_id = account_id,
-                    error = ?e,
-                    "credential cache invalidate_account failed; relying on TTL"
-                );
-            }
+        if let Some(c) = &self.credential
+            && let Err(e) = c.invalidate_account(account_id)
+        {
+            tracing::warn!(
+                account_id = account_id,
+                error = ?e,
+                "credential cache invalidate_account failed; relying on TTL"
+            );
         }
     }
 
@@ -310,15 +310,15 @@ impl AuthCacheRegistry {
     /// `account_id`. Called when a user or role is deleted. No-op when
     /// caches are disabled.
     pub async fn invalidate_principal_credentials(&self, account_id: &str, principal_name: &str) {
-        if let Some(c) = &self.credential {
-            if let Err(e) = c.invalidate_principal(account_id, principal_name) {
-                tracing::warn!(
-                    account_id = account_id,
-                    principal = principal_name,
-                    error = ?e,
-                    "credential cache invalidate_principal failed; relying on TTL"
-                );
-            }
+        if let Some(c) = &self.credential
+            && let Err(e) = c.invalidate_principal(account_id, principal_name)
+        {
+            tracing::warn!(
+                account_id = account_id,
+                principal = principal_name,
+                error = ?e,
+                "credential cache invalidate_principal failed; relying on TTL"
+            );
         }
     }
 }

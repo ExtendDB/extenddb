@@ -53,12 +53,13 @@ pub async fn handle_update_table(
     }
 
     // Validate: enabling streams requires a view type.
-    if let Some(spec) = &input.stream_specification {
-        if spec.stream_enabled && spec.stream_view_type.is_none() {
-            return Err(DynamoDbError::ValidationException(
-                "StreamViewType must be specified when StreamEnabled is true".to_owned(),
-            ));
-        }
+    if let Some(spec) = &input.stream_specification
+        && spec.stream_enabled
+        && spec.stream_view_type.is_none()
+    {
+        return Err(DynamoDbError::ValidationException(
+            "StreamViewType must be specified when StreamEnabled is true".to_owned(),
+        ));
     }
 
     // Switching to PROVISIONED requires explicit throughput values.
@@ -80,12 +81,12 @@ pub async fn handle_update_table(
     }
 
     // Validate throughput values (must be > 0).
-    if let Some(ref tp) = input.provisioned_throughput {
-        if tp.read_capacity_units < 1 || tp.write_capacity_units < 1 {
-            return Err(DynamoDbError::ValidationException(
+    if let Some(ref tp) = input.provisioned_throughput
+        && (tp.read_capacity_units < 1 || tp.write_capacity_units < 1)
+    {
+        return Err(DynamoDbError::ValidationException(
                 "One or more parameter values were invalid: ReadCapacityUnits and WriteCapacityUnits must each be at least 1".to_owned(),
             ));
-        }
     }
 
     // Validate GSI updates: each entry must have exactly one of Create, Update, or Delete.

@@ -58,14 +58,13 @@ pub async fn handle_scan(
     };
 
     // ConsistentRead is not supported on GSI scans (tenet 1: fidelity).
-    if input.consistent_read == Some(true) {
-        if let Some(ref idx) = index_info {
-            if idx.index_type == IndexType::Gsi {
-                return Err(DynamoDbError::ValidationException(
-                    "Consistent reads are not supported on global secondary indexes".to_owned(),
-                ));
-            }
-        }
+    if input.consistent_read == Some(true)
+        && let Some(ref idx) = index_info
+        && idx.index_type == IndexType::Gsi
+    {
+        return Err(DynamoDbError::ValidationException(
+            "Consistent reads are not supported on global secondary indexes".to_owned(),
+        ));
     }
 
     // Validate Segment/TotalSegments — DynamoDB returns different messages per direction
@@ -104,12 +103,12 @@ pub async fn handle_scan(
     }
 
     // Validate Limit >= 1
-    if let Some(limit) = input.limit {
-        if limit < 1 {
-            return Err(DynamoDbError::ValidationException(format!(
-                "1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
-            )));
-        }
+    if let Some(limit) = input.limit
+        && limit < 1
+    {
+        return Err(DynamoDbError::ValidationException(format!(
+            "1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
+        )));
     }
 
     // For index scans, build a key_info that reflects the index's key schema.
@@ -210,10 +209,10 @@ pub async fn handle_scan(
         if let Some(ref proj) = projection {
             for path in proj {
                 for el in path {
-                    if let extenddb_core::expression::PathElement::Attribute(name) = el {
-                        if let Some(ref_name) = name.strip_prefix('#') {
-                            extra_names.insert(ref_name.to_owned());
-                        }
+                    if let extenddb_core::expression::PathElement::Attribute(name) = el
+                        && let Some(ref_name) = name.strip_prefix('#')
+                    {
+                        extra_names.insert(ref_name.to_owned());
                     }
                 }
             }
@@ -229,19 +228,19 @@ pub async fn handle_scan(
     }
 
     // Validate Select vs ProjectionExpression and index requirements
-    if let Some(Select::AllProjectedAttributes) = input.select {
-        if index_info.is_none() {
-            return Err(DynamoDbError::ValidationException(
-                "ALL_PROJECTED_ATTRIBUTES can be used only when scanning an index".to_owned(),
-            ));
-        }
+    if let Some(Select::AllProjectedAttributes) = input.select
+        && index_info.is_none()
+    {
+        return Err(DynamoDbError::ValidationException(
+            "ALL_PROJECTED_ATTRIBUTES can be used only when scanning an index".to_owned(),
+        ));
     }
-    if let Some(Select::Count) = input.select {
-        if effective_projection_str.is_some() {
-            return Err(DynamoDbError::ValidationException(
-                "Cannot specify the ProjectionExpression when Select is COUNT".to_owned(),
-            ));
-        }
+    if let Some(Select::Count) = input.select
+        && effective_projection_str.is_some()
+    {
+        return Err(DynamoDbError::ValidationException(
+            "Cannot specify the ProjectionExpression when Select is COUNT".to_owned(),
+        ));
     }
 
     let index_proj = if matches!(input.select, Some(Select::AllProjectedAttributes)) {

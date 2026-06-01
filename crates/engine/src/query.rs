@@ -62,23 +62,22 @@ pub async fn handle_query(
     };
 
     // ConsistentRead is not supported on GSI queries (tenet 1: fidelity).
-    if input.consistent_read == Some(true) {
-        if let Some(ref idx) = index_info {
-            if idx.index_type == IndexType::Gsi {
-                return Err(DynamoDbError::ValidationException(
-                    "Consistent reads are not supported on global secondary indexes".to_owned(),
-                ));
-            }
-        }
+    if input.consistent_read == Some(true)
+        && let Some(ref idx) = index_info
+        && idx.index_type == IndexType::Gsi
+    {
+        return Err(DynamoDbError::ValidationException(
+            "Consistent reads are not supported on global secondary indexes".to_owned(),
+        ));
     }
 
     // Validate Limit >= 1 (REQ-QUERY-001)
-    if let Some(limit) = input.limit {
-        if limit < 1 {
-            return Err(DynamoDbError::ValidationException(
+    if let Some(limit) = input.limit
+        && limit < 1
+    {
+        return Err(DynamoDbError::ValidationException(
                 "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1".to_owned(),
             ));
-        }
     }
 
     // For index queries, build a key_info that reflects the index's key schema
@@ -284,10 +283,10 @@ pub async fn handle_query(
         if let Some(ref proj) = projection {
             for path in proj {
                 for el in path {
-                    if let PathElement::Attribute(name) = el {
-                        if let Some(ref_name) = name.strip_prefix('#') {
-                            kc_names.insert(ref_name.to_owned());
-                        }
+                    if let PathElement::Attribute(name) = el
+                        && let Some(ref_name) = name.strip_prefix('#')
+                    {
+                        kc_names.insert(ref_name.to_owned());
                     }
                 }
             }
@@ -303,26 +302,26 @@ pub async fn handle_query(
     }
 
     // Validate Select vs ProjectionExpression and index requirements
-    if let Some(Select::SpecificAttributes) = input.select {
-        if effective_projection_str.is_none() {
-            return Err(DynamoDbError::ValidationException(
+    if let Some(Select::SpecificAttributes) = input.select
+        && effective_projection_str.is_none()
+    {
+        return Err(DynamoDbError::ValidationException(
                 "1 validation error detected: Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES".to_owned(),
             ));
-        }
     }
-    if let Some(Select::AllProjectedAttributes) = input.select {
-        if index_info.is_none() {
-            return Err(DynamoDbError::ValidationException(
-                "ALL_PROJECTED_ATTRIBUTES can be used only when querying an index".to_owned(),
-            ));
-        }
+    if let Some(Select::AllProjectedAttributes) = input.select
+        && index_info.is_none()
+    {
+        return Err(DynamoDbError::ValidationException(
+            "ALL_PROJECTED_ATTRIBUTES can be used only when querying an index".to_owned(),
+        ));
     }
-    if let Some(Select::Count) = input.select {
-        if effective_projection_str.is_some() {
-            return Err(DynamoDbError::ValidationException(
-                "Cannot specify the ProjectionExpression when Select is COUNT".to_owned(),
-            ));
-        }
+    if let Some(Select::Count) = input.select
+        && effective_projection_str.is_some()
+    {
+        return Err(DynamoDbError::ValidationException(
+            "Cannot specify the ProjectionExpression when Select is COUNT".to_owned(),
+        ));
     }
 
     // When Select=ALL_PROJECTED_ATTRIBUTES, capture the index info for post-read filtering.
@@ -465,17 +464,17 @@ fn validate_name_refs_in_expr(
     match expr {
         Expr::Path(elements) => {
             for el in elements {
-                if let PathElement::Attribute(name) = el {
-                    if let Some(ref_name) = name.strip_prefix('#') {
-                        let key_with_hash = format!("#{ref_name}");
-                        let defined = names.as_ref().is_some_and(|m| {
-                            m.contains_key(ref_name) || m.contains_key(key_with_hash.as_str())
-                        });
-                        if !defined {
-                            return Err(DynamoDbError::ValidationException(format!(
-                                "Invalid {expr_type}: An expression attribute name used in the document path is not defined; attribute name: #{ref_name}"
-                            )));
-                        }
+                if let PathElement::Attribute(name) = el
+                    && let Some(ref_name) = name.strip_prefix('#')
+                {
+                    let key_with_hash = format!("#{ref_name}");
+                    let defined = names.as_ref().is_some_and(|m| {
+                        m.contains_key(ref_name) || m.contains_key(key_with_hash.as_str())
+                    });
+                    if !defined {
+                        return Err(DynamoDbError::ValidationException(format!(
+                            "Invalid {expr_type}: An expression attribute name used in the document path is not defined; attribute name: #{ref_name}"
+                        )));
                     }
                 }
             }

@@ -26,12 +26,12 @@ impl OperationsEngine for PostgresOperationsEngine {
 
     fn redact_connection_string(&self, s: &str) -> String {
         // Redact password from postgresql://user:password@host:port/database
-        if let Some(at) = s.find('@') {
-            if let Some(colon) = s[..at].rfind(':') {
-                let scheme_end = s.find("://").map_or(0, |i| i + 3);
-                if colon >= scheme_end {
-                    return format!("{}:***@{}", &s[..colon], &s[at + 1..]);
-                }
+        if let Some(at) = s.find('@')
+            && let Some(colon) = s[..at].rfind(':')
+        {
+            let scheme_end = s.find("://").map_or(0, |i| i + 3);
+            if colon >= scheme_end {
+                return format!("{}:***@{}", &s[..colon], &s[at + 1..]);
             }
         }
         s.to_owned()

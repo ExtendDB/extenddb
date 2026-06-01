@@ -177,16 +177,15 @@ pub(crate) fn validate_enum_fields(
     };
     let mut errors: Vec<String> = Vec::new();
     for &(json_name, api_name, valid) in fields {
-        if let Some(val) = obj.get(json_name) {
-            if let Some(s) = val.as_str() {
-                if !valid.contains(&s) {
-                    errors.push(format!(
-                        "Value '{s}' at '{api_name}' failed to satisfy constraint: \
+        if let Some(val) = obj.get(json_name)
+            && let Some(s) = val.as_str()
+            && !valid.contains(&s)
+        {
+            errors.push(format!(
+                "Value '{s}' at '{api_name}' failed to satisfy constraint: \
                          Member must satisfy enum value set: [{}]",
-                        valid.join(", ")
-                    ));
-                }
-            }
+                valid.join(", ")
+            ));
         }
     }
     if errors.is_empty() {
@@ -284,10 +283,11 @@ impl OperationContext {
         &self,
         table_name: &str,
     ) -> Result<extenddb_core::types::TableKeyInfo, extenddb_storage::error::StorageError> {
-        if let Some(ref ki) = self.pre_fetched_key_info {
-            if ki.table_name == table_name && *ki.account_id == *self.account_id {
-                return Ok(ki.clone());
-            }
+        if let Some(ref ki) = self.pre_fetched_key_info
+            && ki.table_name == table_name
+            && *ki.account_id == *self.account_id
+        {
+            return Ok(ki.clone());
         }
         if let Some(ref lookup) = self.table_key_info_lookup {
             return lookup.lookup(&self.account_id, table_name).await;

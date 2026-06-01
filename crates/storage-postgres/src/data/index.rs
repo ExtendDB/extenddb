@@ -145,31 +145,31 @@ pub(crate) async fn sync_indexes(
         let base_sks = all_sort_key_info(base_key_schema, attr_defs);
 
         // Delete old index row if the old item had index keys
-        if let Some(old) = old_item {
-            if item_has_index_keys(old, &idx.key_schema) {
-                delete_index_row_multi(tx, &idx_table, old, base_key_schema, attr_defs, &base_sks)
-                    .await?;
-            }
+        if let Some(old) = old_item
+            && item_has_index_keys(old, &idx.key_schema)
+        {
+            delete_index_row_multi(tx, &idx_table, old, base_key_schema, attr_defs, &base_sks)
+                .await?;
         }
 
         // Insert new index row if the new item has index keys
-        if let Some(new) = new_item {
-            if item_has_index_keys(new, &idx.key_schema) {
-                let projected =
-                    project_item_for_index(new, &idx.key_schema, base_key_schema, &idx.projection);
-                insert_index_row_multi(
-                    tx,
-                    &idx_table,
-                    new,
-                    &projected,
-                    &idx.key_schema,
-                    base_key_schema,
-                    attr_defs,
-                    &idx_sks,
-                    &base_sks,
-                )
-                .await?;
-            }
+        if let Some(new) = new_item
+            && item_has_index_keys(new, &idx.key_schema)
+        {
+            let projected =
+                project_item_for_index(new, &idx.key_schema, base_key_schema, &idx.projection);
+            insert_index_row_multi(
+                tx,
+                &idx_table,
+                new,
+                &projected,
+                &idx.key_schema,
+                base_key_schema,
+                attr_defs,
+                &idx_sks,
+                &base_sks,
+            )
+            .await?;
         }
     }
     Ok(())
