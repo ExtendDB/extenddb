@@ -296,13 +296,14 @@ Historical metrics persistence and query:
 
 Metrics are flushed periodically from the in-memory collector to persistent
 storage. TiDB persists immutable rows in `metrics_samples` with a native
-`AUTO_RANDOM` clustered primary key and native TTL, then aggregates at query
-time. The old aggregate `metrics` table is migrated away instead of kept in
-the runtime read path. This avoids cross-frontend contention on a shared
-per-minute `ON DUPLICATE` metrics row. TiDB metrics flushes use one multi-row
-append-only insert per bounded batch rather than one insert per metric row,
-keeping frontend latency low while following TiDB's guidance to keep write
-transactions split into modest batches.
+`AUTO_RANDOM` clustered primary key, pre-split Regions, and native TTL, then
+aggregates at query time. The old aggregate `metrics` table is migrated away
+instead of kept in the runtime read path. This avoids cross-frontend
+contention on a shared per-minute `ON DUPLICATE` metrics row and avoids a
+single initial write Region for a new TiDB catalog. TiDB metrics flushes use
+one multi-row append-only insert per bounded batch rather than one insert per
+metric row, keeping frontend latency low while following TiDB's guidance to
+keep write transactions split into modest batches.
 
 ### RateLimitStore
 
@@ -312,8 +313,9 @@ Login rate limiting and account lockout:
 
 Tracks failed login attempts by principal and source IP to mitigate clients
 sending excessive traffic. TiDB stores these as append-only rows with native
-TTL retention and `SHARD_ROW_ID_BITS` on the implicit row id, so concurrent
-frontends do not concentrate failed-login inserts on one TiKV Region.
+TTL retention, `SHARD_ROW_ID_BITS` on the implicit row id, and pre-split
+Regions, so concurrent frontends do not concentrate failed-login inserts on
+one TiKV Region.
 
 ### AuthorizationStore
 

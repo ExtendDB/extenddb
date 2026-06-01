@@ -86,6 +86,10 @@ pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
         "020_raw_data_hash_key_columns.sql",
         include_str!("../../storage-tidb/migrations/020_raw_data_hash_key_columns.sql"),
     ),
+    (
+        "021_presplit_append_tables.sql",
+        include_str!("../../storage-tidb/migrations/021_presplit_append_tables.sql"),
+    ),
 ];
 
 const DATA_SCHEMA_MIGRATION: &str =
@@ -522,8 +526,22 @@ mod tests {
     }
 
     #[test]
-    fn latest_catalog_migration_records_data_key_layout_change() {
+    fn latest_catalog_migration_presplits_append_tables() {
         let (filename, sql) = CATALOG_MIGRATIONS.last().expect("latest migration");
+
+        assert_eq!(*filename, "021_presplit_append_tables.sql");
+        assert!(sql.contains("SPLIT TABLE metrics_samples"));
+        assert!(sql.contains("SPLIT TABLE login_attempts"));
+        assert!(sql.contains("REGIONS 16"));
+        assert!(sql.contains("0.0.21"));
+    }
+
+    #[test]
+    fn catalog_migration_records_data_key_layout_change() {
+        let (filename, sql) = CATALOG_MIGRATIONS
+            .iter()
+            .find(|(filename, _)| *filename == "020_raw_data_hash_key_columns.sql")
+            .expect("data key migration");
 
         assert_eq!(*filename, "020_raw_data_hash_key_columns.sql");
         assert!(sql.contains("0.0.20"));
@@ -570,6 +588,7 @@ mod tests {
         assert!(!sql.contains("CREATE INDEX idx_metrics_bucket ON metrics"));
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS metrics_samples"));
         assert!(sql.contains("sample_id BIGINT NOT NULL AUTO_RANDOM"));
+        assert!(sql.contains("PRE_SPLIT_REGIONS = 4"));
         assert!(sql.contains(&format!(
             "INSERT IGNORE INTO settings (`key`, value) VALUES ('catalog_version', '{}')",
             CATALOG_VERSION
@@ -598,6 +617,7 @@ mod tests {
             .and_then(|section| section.split("-- Backup metadata.").next())
             .expect("login attempts schema section");
         assert!(login_attempts_schema.contains("SHARD_ROW_ID_BITS = 4"));
+        assert!(login_attempts_schema.contains("PRE_SPLIT_REGIONS = 4"));
         assert!(login_attempts_schema.contains("TTL = `attempted_at` + INTERVAL 24 HOUR"));
     }
 

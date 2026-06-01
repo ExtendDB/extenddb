@@ -1,6 +1,6 @@
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
--- Consolidated catalog schema for extenddb (catalog version 0.0.20).
+-- Consolidated catalog schema for extenddb (catalog version 0.0.21).
 -- This is the complete schema applied on fresh installs.
 
 -- Accounts — multi-account support (REQ-AUTH-005).
@@ -188,8 +188,9 @@ CREATE TABLE IF NOT EXISTS iam_permissions_boundaries (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 -- Append-only metrics samples. TiDB frontends write one immutable row per
--- flushed in-memory aggregate with a native AUTO_RANDOM clustered key, so
--- multiple nodes do not contend on a shared `ON DUPLICATE KEY UPDATE` row.
+-- flushed in-memory aggregate with a native AUTO_RANDOM clustered key. Fresh
+-- installs pre-split the row keyspace so multi-node flush bursts are scattered
+-- from the first write instead of waiting for automatic Region growth.
 -- Query paths aggregate by bucket/metric.
 CREATE TABLE IF NOT EXISTS metrics_samples (
     sample_id BIGINT NOT NULL AUTO_RANDOM,
@@ -204,14 +205,15 @@ CREATE TABLE IF NOT EXISTS metrics_samples (
     max DOUBLE NOT NULL DEFAULT -1.79e308,
     PRIMARY KEY (sample_id) CLUSTERED
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+  PRE_SPLIT_REGIONS = 4
   TTL = `bucket` + INTERVAL 24 HOUR TTL_JOB_INTERVAL = '1h';
 
 CREATE INDEX idx_metrics_samples_bucket
     ON metrics_samples (bucket, metric, table_name, index_name, operation);
 
 -- Login attempt tracking. This append-only, TTL-owned table intentionally uses
--- TiDB sharded implicit row IDs so concurrent frontend inserts do not hotspot
--- one Region.
+-- TiDB sharded implicit row IDs with pre-split Regions so concurrent frontend
+-- inserts do not hotspot one Region.
 CREATE TABLE IF NOT EXISTS login_attempts (
     principal     VARCHAR(512) NOT NULL,
     attempted_at  TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -219,6 +221,7 @@ CREATE TABLE IF NOT EXISTS login_attempts (
     source_ip     VARCHAR(255)
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
   SHARD_ROW_ID_BITS = 4
+  PRE_SPLIT_REGIONS = 4
   TTL = `attempted_at` + INTERVAL 24 HOUR TTL_JOB_INTERVAL = '1h';
 
 CREATE INDEX idx_login_attempts_principal_time
@@ -280,4 +283,4 @@ CREATE TABLE IF NOT EXISTS continuous_backups (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 -- Seed settings.
-INSERT IGNORE INTO settings (`key`, value) VALUES ('catalog_version', '0.0.20');
+INSERT IGNORE INTO settings (`key`, value) VALUES ('catalog_version', '0.0.21');
