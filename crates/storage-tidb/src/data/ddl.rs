@@ -13,6 +13,7 @@ use extenddb_storage::util::{sk_column, sk_column_n};
 use super::index::{
     NativeSecondaryIndex, create_native_secondary_indexes, drop_native_secondary_indexes,
     native_index_create_table_definitions, native_index_generated_column_definitions,
+    native_index_name,
 };
 use super::{
     DYNAMODB_HASH_KEY_COLUMN_TYPE, DYNAMODB_SORT_KEY_COLUMN_TYPE, all_sort_key_info,
@@ -44,6 +45,14 @@ type TableReadInfoRow = (
     Option<serde_json::Value>,
     Option<serde_json::Value>,
 );
+
+const DATA_TABLE_SPLIT_REGIONS: u16 = 16;
+const VARBINARY_SPLIT_LOWER: &str = "X''";
+const VARBINARY_SPLIT_UPPER: &str = "X'ff'";
+const DECIMAL_SPLIT_LOWER: &str =
+    "-99999999999999999999999999999999999.999999999999999999999999999999";
+const DECIMAL_SPLIT_UPPER: &str =
+    "99999999999999999999999999999999999.999999999999999999999999999999";
 
 fn table_accepts_data_plane(status: &str) -> bool {
     matches!(status, "ACTIVE" | "UPDATING")
@@ -101,6 +110,84 @@ fn data_table_ddl(
     ))
 }
 
+fn split_bound_for_sort_key(
+    scalar_type: extenddb_core::types::ScalarAttributeType,
+    lower: bool,
+) -> &'static str {
+    match scalar_type {
+        extenddb_core::types::ScalarAttributeType::S
+        | extenddb_core::types::ScalarAttributeType::B => {
+            if lower {
+                VARBINARY_SPLIT_LOWER
+            } else {
+                VARBINARY_SPLIT_UPPER
+            }
+        }
+        extenddb_core::types::ScalarAttributeType::N => {
+            if lower {
+                DECIMAL_SPLIT_LOWER
+            } else {
+                DECIMAL_SPLIT_UPPER
+            }
+        }
+    }
+}
+
+fn data_table_region_split_sql(
+    table: &str,
+    key_schema: &[KeySchemaElement],
+    attr_defs: &[AttributeDefinition],
+) -> Result<String, StorageError> {
+    validate_native_key_schema_shape("table", key_schema)?;
+    let sk_infos = all_sort_key_info(key_schema, attr_defs);
+
+    let mut lower = vec![VARBINARY_SPLIT_LOWER];
+    let mut upper = vec![VARBINARY_SPLIT_UPPER];
+    for &(_, scalar_type) in &sk_infos {
+        lower.push(split_bound_for_sort_key(scalar_type, true));
+        upper.push(split_bound_for_sort_key(scalar_type, false));
+    }
+
+    Ok(format!(
+        "SPLIT TABLE {table} BETWEEN ({}) AND ({}) REGIONS {DATA_TABLE_SPLIT_REGIONS}",
+        lower.join(", "),
+        upper.join(", ")
+    ))
+}
+
+fn native_index_region_split_sql(table: &str, index_id: &str) -> String {
+    format!(
+        "SPLIT TABLE {table} INDEX `{}` BETWEEN ({VARBINARY_SPLIT_LOWER}) AND ({VARBINARY_SPLIT_UPPER}) REGIONS {DATA_TABLE_SPLIT_REGIONS}",
+        native_index_name(index_id)
+    )
+}
+
+async fn split_native_secondary_index_regions(
+    pool: &sqlx::MySqlPool,
+    table_id: &str,
+    indexes: &[NativeSecondaryIndex<'_>],
+) -> Result<(), StorageError> {
+    let table = data_table_name(table_id);
+    for index in indexes {
+        let sql = native_index_region_split_sql(&table, index.index_id);
+        execute_tidb_idempotent_ddl(pool, "split_native_secondary_index_regions", &sql).await?;
+    }
+    Ok(())
+}
+
+async fn split_data_table_regions(
+    pool: &sqlx::MySqlPool,
+    table_id: &str,
+    key_schema: &[KeySchemaElement],
+    attr_defs: &[AttributeDefinition],
+    indexes: &[NativeSecondaryIndex<'_>],
+) -> Result<(), StorageError> {
+    let table = data_table_name(table_id);
+    let table_split = data_table_region_split_sql(&table, key_schema, attr_defs)?;
+    execute_tidb_idempotent_ddl(pool, "split_data_table_regions", &table_split).await?;
+    split_native_secondary_index_regions(pool, table_id, indexes).await
+}
+
 impl TidbEngine {
     /// Create the per-DynamoDB-table data table in `TiDB`.
     ///
@@ -139,6 +226,7 @@ impl TidbEngine {
         if !created {
             create_native_secondary_indexes(pool, table_id, &indexes, attr_defs).await?;
         }
+        split_data_table_regions(pool, table_id, key_schema, attr_defs, &indexes).await?;
 
         Ok(())
     }
@@ -175,7 +263,8 @@ impl TidbEngine {
                 key_schema,
             })
             .collect::<Vec<_>>();
-        create_native_secondary_indexes(pool, table_id, &indexes, attr_defs).await
+        create_native_secondary_indexes(pool, table_id, &indexes, attr_defs).await?;
+        split_native_secondary_index_regions(pool, table_id, &indexes).await
     }
 
     /// Drop multiple native TiDB secondary indexes and remove their generated
@@ -443,7 +532,10 @@ mod tests {
         AttributeDefinition, KeySchemaElement, KeyType, ScalarAttributeType,
     };
 
-    use super::{data_table_ddl, table_accepts_data_plane};
+    use super::{
+        data_table_ddl, data_table_region_split_sql, native_index_region_split_sql,
+        table_accepts_data_plane,
+    };
     use crate::data::index::NativeSecondaryIndex;
 
     fn attr(name: &str, ty: ScalarAttributeType) -> AttributeDefinition {
@@ -536,6 +628,47 @@ mod tests {
         assert!(ddl.contains("INDEX `idx_idx1` (edbidx_idx1_pk, edbidx_idx1_sk_b)"));
         assert!(!ddl.contains("IF NOT EXISTS"));
         assert!(!ddl.contains("ALTER TABLE"));
+    }
+
+    #[test]
+    fn hash_only_tables_are_split_by_native_clustered_key_range() {
+        let split = data_table_region_split_sql(
+            "`_ddb_tableid`",
+            &[key("pk", KeyType::Hash)],
+            &[attr("pk", ScalarAttributeType::S)],
+        )
+        .expect("split sql");
+
+        assert_eq!(
+            split,
+            "SPLIT TABLE `_ddb_tableid` BETWEEN (X'') AND (X'ff') REGIONS 16"
+        );
+    }
+
+    #[test]
+    fn range_key_tables_are_split_by_full_clustered_key_shape() {
+        let split = data_table_region_split_sql(
+            "`_ddb_tableid`",
+            &[key("pk", KeyType::Hash), key("sk", KeyType::Range)],
+            &[
+                attr("pk", ScalarAttributeType::S),
+                attr("sk", ScalarAttributeType::N),
+            ],
+        )
+        .expect("split sql");
+
+        assert_eq!(
+            split,
+            "SPLIT TABLE `_ddb_tableid` BETWEEN (X'', -99999999999999999999999999999999999.999999999999999999999999999999) AND (X'ff', 99999999999999999999999999999999999.999999999999999999999999999999) REGIONS 16"
+        );
+    }
+
+    #[test]
+    fn native_secondary_indexes_are_split_by_generated_hash_key_prefix() {
+        assert_eq!(
+            native_index_region_split_sql("`_ddb_tableid`", "idx-1"),
+            "SPLIT TABLE `_ddb_tableid` INDEX `idx_idx1` BETWEEN (X'') AND (X'ff') REGIONS 16"
+        );
     }
 
     #[test]

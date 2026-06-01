@@ -530,7 +530,10 @@ The PostgreSQL backend uses two categories of tables:
   3072-byte native index limit. TiDB rejects configured key-size limits wider
   than that native shape, rejects multi-RANGE key schemas before catalog commit,
   and rejects multi-HASH values whose encoded tuple cannot fit in the raw
-  2048-byte hash-key slot.
+  2048-byte hash-key slot. During `CreateTable` reconciliation, TiDB pre-splits
+  the clustered data table across the native binary key range before publishing
+  the catalog row `ACTIVE`, so a newly created DynamoDB table does not start all
+  writes on one Region.
 
 - **Sort key storage**: Sort key values use typed columns (`sk_s TEXT`,
   `sk_n NUMERIC`, `sk_b BYTEA`) to ensure correct ordering. Only one `sk_*`
@@ -574,7 +577,9 @@ The PostgreSQL backend uses two categories of tables:
   later `UpdateTable` index changes, TiDB batches all generated-column
   additions currently pending for a table into one online `ALTER TABLE`, then
   submits the pending native index creations as one TiDB multi-schema
-  `ALTER TABLE` DDL job.
+  `ALTER TABLE` DDL job. After TiDB creates or repairs a native secondary
+  index, ExtendDB asks TiDB to split that index by the generated hash-key prefix
+  range, using TiDB Region split/scatter instead of companion index shards.
   TiDB has no separate local-index physical path; GSI versus LSI remains
   DynamoDB API metadata.
 
@@ -734,9 +739,12 @@ updates are always synchronous.
   indexes, leveraging TiDB's globally consistent transaction model. Initial
   secondary indexes are created with the base table; create replay repairs an
   already-existing physical table through the same TiDB online `IF NOT EXISTS`
-  DDL used for later changes. For each later reconciliation pass, generated key
-  columns for all pending indexes on a table are added in one online
-  `ALTER TABLE` DDL job before the native index DDL.
+  DDL used for later changes, then splits both the clustered table keyspace and
+  the native index keyspace before activation. For each later reconciliation
+  pass, generated key columns for all pending indexes on a table are added in
+  one online `ALTER TABLE` DDL job before the native index DDL; after TiDB
+  finishes the index DDL, the reconciler splits the new native index Region
+  range as a TiDB-owned placement operation.
 - Explicit TiDB index reads use `FORCE INDEX` for the generated native index.
   DynamoDB `IndexName` is not an optimizer suggestion; it is the requested read
   path, so stale TiDB statistics must not turn an index query into a table scan.
