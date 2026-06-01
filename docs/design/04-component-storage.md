@@ -850,9 +850,12 @@ When `UpdateTable` adds a new GSI to a table with existing data:
    indexes and their generated key columns in one multi-schema online
    `ALTER TABLE`, because those objects already exist when the drop starts.
    Concurrent reconcilers replay the same `IF [NOT] EXISTS` DDL and let TiDB
-   converge the schema. After physical DDL returns, TiDB publishes all still
-   pending index rows for that batch with one conditional catalog statement,
-   rather than probing or publishing each index separately.
+   converge the schema. The entire per-table replay plan is retried on TiDB
+   transient write conflicts, schema-version races, lock waits, and deadlocks,
+   so the retry boundary is the durable catalog intent rather than a single
+   partially completed SQL statement. After physical DDL returns, TiDB
+   publishes all still pending index rows for that batch with one conditional
+   catalog statement, rather than probing or publishing each index separately.
 5. PostgreSQL creates and backfills its companion index table
 6. On completion, the reconciler marks the index `ACTIVE` and returns the table to `ACTIVE`
 7. Queries against a `CREATING` index return `ResourceNotFoundException` (matching DynamoDB behavior)

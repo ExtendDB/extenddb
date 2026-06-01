@@ -10,7 +10,7 @@ use extenddb_storage::WorkerStore;
 use extenddb_storage::error::StorageError;
 
 use crate::TidbEngine;
-use crate::tidb_util::is_table_not_found_tidb_storage_error;
+use crate::tidb_util::{is_table_not_found_tidb_storage_error, retry_tidb_idempotent_operation};
 
 type CreatingTableRow = (
     String,
@@ -55,6 +55,7 @@ struct PendingIndexPlan {
     key_schema: Vec<KeySchemaElement>,
 }
 
+#[derive(Clone)]
 struct DeleteReconcilePlan {
     table_name: String,
     table_arn: String,
@@ -69,6 +70,7 @@ struct ControlPlaneTransitionRow {
     table_arn: String,
 }
 
+#[derive(Clone)]
 enum ControlPlaneReconcilePlan {
     Create { table_id: String },
     Update { table_id: String },
@@ -616,7 +618,13 @@ impl TidbEngine {
             .collect::<Result<Vec<_>, _>>()?;
 
         let results = stream::iter(plans)
-            .map(|plan| async move { self.reconcile_control_plane_plan(plan).await })
+            .map(|plan| async move {
+                retry_tidb_idempotent_operation("reconcile_control_plane_plan", || {
+                    let plan = plan.clone();
+                    async move { self.reconcile_control_plane_plan(plan).await }
+                })
+                .await
+            })
             .buffer_unordered(CONTROL_PLANE_TRANSITION_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
@@ -637,6 +645,8 @@ mod tests {
         ControlPlaneReconcilePlan, ControlPlaneTransitionRow, delete_pending_indexes_sql,
         mark_creating_indexes_active_sql,
     };
+    use crate::tidb_util::retry_tidb_idempotent_operation;
+    use extenddb_storage::error::StorageError;
 
     fn row(status: &str) -> ControlPlaneTransitionRow {
         ControlPlaneTransitionRow {
@@ -689,5 +699,37 @@ mod tests {
         assert!(sql.contains("index_status = 'DELETING'"));
         assert!(sql.contains("index_id IN (?, ?, ?)"));
         assert!(sql.contains("tables.table_status = 'UPDATING'"));
+    }
+
+    #[tokio::test]
+    async fn control_plane_reconcile_retry_replays_the_whole_plan() {
+        let plan = ControlPlaneReconcilePlan::from_row(row("CREATING")).expect("create plan");
+        let mut attempts = 0;
+
+        let result = retry_tidb_idempotent_operation("test_control_plane_retry", || {
+            let plan = plan.clone();
+            attempts += 1;
+            let attempt = attempts;
+            async move {
+                match plan {
+                    ControlPlaneReconcilePlan::Create { table_id } => {
+                        assert_eq!(table_id, "table-1");
+                    }
+                    _ => panic!("expected create plan"),
+                }
+
+                if attempt == 1 {
+                    Err(StorageError::Internal(
+                        "ERROR 9007 (HY000): Write conflict".to_owned(),
+                    ))
+                } else {
+                    Ok(attempt)
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(result.expect("retry succeeds"), 2);
+        assert_eq!(attempts, 2);
     }
 }
