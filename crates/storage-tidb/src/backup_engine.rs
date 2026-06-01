@@ -9,24 +9,23 @@
 //! backend returns an explicit validation error.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
 
 use extenddb_core::types::{
-    BackupDescription, BackupDetails, BackupSummary, BillingMode, ContinuousBackupsDescription,
-    CreateTableInput, GsiInput, KeySchemaElement, LsiInput, PointInTimeRecoveryDescription,
-    ProvisionedThroughput, SourceTableDetails, TableDescription,
+    BackupDescription, BackupDetails, BackupSummary, ContinuousBackupsDescription,
+    KeySchemaElement, PointInTimeRecoveryDescription, SourceTableDetails, TableDescription,
 };
 use extenddb_storage::BackupEngine;
 use extenddb_storage::config::NativeBackupConfig;
 use extenddb_storage::error::StorageError;
+use extenddb_storage::util::table_arn;
 use futures::future::BoxFuture;
 use tokio::process::Command;
 
 use crate::TidbEngine;
-use crate::create_table::CreateTableActivation;
 use crate::data::physical_data_table_name;
 use crate::metadata_engine::drop_ttl_artifacts;
-use crate::throughput::provisioned_throughput_from_description;
+use crate::table_helpers::TableStats;
+use crate::tidb_util::{current_tidb_tso, execute_tidb_idempotent_ddl, is_unique_violation};
 
 const TIDB_BACKUP_BACKEND: &str = "tidb-br";
 
@@ -51,8 +50,6 @@ struct BackupSourceRow {
     key_schema: serde_json::Value,
     attribute_definitions: serde_json::Value,
     billing_mode: String,
-    table_size_bytes: i64,
-    item_count: i64,
     provisioned_throughput: Option<serde_json::Value>,
     stream_specification: Option<serde_json::Value>,
     deletion_protection_enabled: bool,
@@ -64,7 +61,6 @@ struct BackupRestoreRow {
     attribute_definitions: serde_json::Value,
     billing_mode: String,
     provisioned_throughput: Option<serde_json::Value>,
-    item_count: i64,
     backup_backend: String,
     storage_uri: Option<String>,
     physical_table_name: Option<String>,
@@ -84,6 +80,7 @@ struct BackupMetadataSnapshot {
     source: BackupSourceRow,
     indexes: Vec<BackupIndexSnapshotRow>,
     tags: Vec<(String, String)>,
+    stats: TableStats,
     native_snapshot_tso: i64,
 }
 
@@ -95,6 +92,15 @@ struct BackupInsert<'a> {
     snapshot: &'a BackupMetadataSnapshot,
     storage_uri: &'a str,
     physical_table: &'a str,
+}
+
+struct RestoreCatalogInsert<'a> {
+    account_id: &'a str,
+    table_name: &'a str,
+    table_id: &'a str,
+    table_arn: &'a str,
+    backup: &'a BackupRestoreRow,
+    indexes: &'a [BackupIndexSnapshotRow],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,21 +280,6 @@ fn backup_storage_uri(base: &str, account_id: &str, table_id: &str, millis: u128
     )
 }
 
-fn uri_is_under_base(base: &str, uri: &str) -> bool {
-    let base = base.trim_end_matches('/');
-    uri == base
-        || uri
-            .strip_prefix(base)
-            .is_some_and(|rest| rest.starts_with('/'))
-}
-
-fn local_backup_path(uri: &str) -> Option<PathBuf> {
-    uri.strip_prefix("local://")
-        .or_else(|| uri.strip_prefix("file://"))
-        .filter(|path| path.starts_with('/'))
-        .map(PathBuf::from)
-}
-
 fn validate_br_name(value: &str, label: &str) -> Result<(), StorageError> {
     if value.is_empty() {
         return Err(StorageError::Internal(format!("empty TiDB {label} name")));
@@ -321,44 +312,11 @@ fn qualified_table(database: &str, table: &str) -> Result<String, StorageError> 
     ))
 }
 
-fn parse_billing_mode(value: &str) -> Result<BillingMode, StorageError> {
-    match value {
-        "PAY_PER_REQUEST" => Ok(BillingMode::PayPerRequest),
-        "PROVISIONED" => Ok(BillingMode::Provisioned),
-        other => Err(StorageError::Internal(format!(
-            "Invalid backup billing mode: {other}"
-        ))),
-    }
-}
-
 fn parse_json<T: serde::de::DeserializeOwned>(
     value: serde_json::Value,
     label: &str,
 ) -> Result<T, StorageError> {
     serde_json::from_value(value).map_err(|e| StorageError::Internal(format!("Parse {label}: {e}")))
-}
-
-fn parse_optional_json<T: serde::de::DeserializeOwned>(
-    value: Option<serde_json::Value>,
-    label: &str,
-) -> Result<Option<T>, StorageError> {
-    match value {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(value) => parse_json(value, label).map(Some),
-    }
-}
-
-fn parse_optional_index_provisioned_throughput(
-    value: Option<serde_json::Value>,
-    label: &str,
-) -> Result<Option<ProvisionedThroughput>, StorageError> {
-    let Some(description) = parse_optional_json::<
-        extenddb_core::types::ProvisionedThroughputDescription,
-    >(value, label)?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(provisioned_throughput_from_description(&description)))
 }
 
 fn backup_arn_account_id(backup_arn: &str) -> Result<String, StorageError> {
@@ -371,10 +329,7 @@ fn backup_arn_account_id(backup_arn: &str) -> Result<String, StorageError> {
 
 impl TidbEngine {
     async fn current_tso(&self) -> Result<i64, StorageError> {
-        sqlx::query_scalar("SELECT TIDB_CURRENT_TSO()")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))
+        current_tidb_tso(&self.pool).await
     }
 
     async fn data_database_name(&self) -> Result<String, StorageError> {
@@ -406,7 +361,9 @@ impl TidbEngine {
             return;
         };
         let sql = format!("DROP TABLE IF EXISTS {table}");
-        if let Err(err) = sqlx::query(&sql).execute(&self.data_pool).await {
+        if let Err(err) =
+            execute_tidb_idempotent_ddl(&self.data_pool, "drop_failed_br_restore_table", &sql).await
+        {
             tracing::error!("failed to drop failed BR restore table '{table}': {err}");
         }
     }
@@ -431,8 +388,7 @@ impl TidbEngine {
     ) -> Result<BackupMetadataSnapshot, StorageError> {
         let source: BackupSourceRow = sqlx::query_as(
             "SELECT table_id, table_arn, key_schema, attribute_definitions, billing_mode, \
-             table_size_bytes, item_count, provisioned_throughput, stream_specification, \
-             deletion_protection_enabled \
+             provisioned_throughput, stream_specification, deletion_protection_enabled \
              FROM tables AS OF TIMESTAMP TIDB_PARSE_TSO(?) \
              WHERE account_id = ? AND table_name = ? AND table_status = 'ACTIVE'",
         )
@@ -443,6 +399,8 @@ impl TidbEngine {
         .await
         .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?
         .ok_or_else(|| StorageError::TableNotFound(format!("Table not found: {table_name}")))?;
+
+        let stats = self.current_table_stats(&source.table_id).await?;
 
         let indexes: Vec<BackupIndexSnapshotRow> = sqlx::query_as(
             "SELECT index_id, index_name, index_type, key_schema, projection, provisioned_throughput \
@@ -470,6 +428,7 @@ impl TidbEngine {
             source,
             indexes,
             tags,
+            stats,
             native_snapshot_tso,
         })
     }
@@ -492,15 +451,15 @@ impl TidbEngine {
              backup_size_bytes, item_count, key_schema, attribute_definitions, billing_mode, \
              provisioned_throughput, stream_specification, deletion_protection_enabled, \
               backup_backend, storage_uri, physical_table_name, native_snapshot_tso) \
-             VALUES (?, ?, ?, ?, ?, 'CREATING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, 'AVAILABLE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(insert.backup_arn)
         .bind(insert.backup_name)
         .bind(&insert.snapshot.source.table_id)
         .bind(insert.table_name)
         .bind(insert.account_id)
-        .bind(insert.snapshot.source.table_size_bytes)
-        .bind(insert.snapshot.source.item_count)
+        .bind(insert.snapshot.stats.table_size_bytes)
+        .bind(insert.snapshot.stats.item_count)
         .bind(&key_schema_json)
         .bind(&attr_defs_json)
         .bind(&insert.snapshot.source.billing_mode)
@@ -559,113 +518,66 @@ impl TidbEngine {
         Ok(created_at)
     }
 
-    async fn cleanup_failed_backup(&self, backup_arn: &str) {
-        for sql in [
-            "DELETE FROM backup_indexes WHERE backup_arn = ?",
-            "DELETE FROM backup_tags WHERE backup_arn = ?",
-            "DELETE FROM backups WHERE backup_arn = ? AND backup_status = 'CREATING'",
-        ] {
-            if let Err(err) = sqlx::query(sql).bind(backup_arn).execute(&self.pool).await {
-                tracing::error!("failed to clean up incomplete backup '{backup_arn}': {err}");
-            }
-        }
-    }
+    async fn publish_restored_table_catalog(
+        &self,
+        insert: RestoreCatalogInsert<'_>,
+    ) -> Result<(), StorageError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
 
-    async fn delete_native_backup_storage(&self, storage_uri: &str) -> Result<(), StorageError> {
-        let base = self.native_backup.storage_uri.as_deref().ok_or_else(|| {
-            StorageError::Validation(
-                "TiDB DeleteBackup requires storage.tidb.backup.storage_uri".to_owned(),
-            )
-        })?;
-        if !uri_is_under_base(base, storage_uri) {
-            return Err(StorageError::Validation(format!(
-                "TiDB backup storage URI is outside configured backup root: {storage_uri}"
-            )));
-        }
-
-        let Some(path) = local_backup_path(storage_uri) else {
-            return Err(StorageError::Validation(
-                "TiDB BR does not manage remote backup deletion; DeleteBackup is supported only \
-                 for local:// or file:// backup storage without an object-store deleter"
-                    .to_owned(),
-            ));
-        };
-
-        match tokio::fs::remove_dir_all(&path).await {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(StorageError::Internal(format!(
-                "Delete TiDB backup storage '{}': {err}",
-                path.display()
-            ))),
-        }
-    }
-
-    async fn publish_backup(&self, backup_arn: &str) -> Result<(), StorageError> {
-        let result = sqlx::query(
-            "UPDATE backups SET backup_status = 'AVAILABLE' \
-             WHERE backup_arn = ? AND backup_status = 'CREATING'",
+        sqlx::query(
+            "INSERT INTO tables \
+             (account_id, table_name, key_schema, attribute_definitions, billing_mode, \
+              provisioned_throughput, stream_specification, table_status, table_arn, \
+              table_id, deletion_protection_enabled, status_transition_at, \
+              stream_label, ttl_attribute, ttl_status) \
+             VALUES (?, ?, ?, ?, ?, ?, NULL, 'ACTIVE', ?, ?, FALSE, NULL, NULL, NULL, 'DISABLED')",
         )
-        .bind(backup_arn)
-        .execute(&self.pool)
+        .bind(insert.account_id)
+        .bind(insert.table_name)
+        .bind(&insert.backup.key_schema)
+        .bind(&insert.backup.attribute_definitions)
+        .bind(&insert.backup.billing_mode)
+        .bind(&insert.backup.provisioned_throughput)
+        .bind(insert.table_arn)
+        .bind(insert.table_id)
+        .execute(&mut *tx)
         .await
-        .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
+        .map_err(|e| {
+            if is_unique_violation(&e) {
+                StorageError::TableAlreadyExists(insert.table_name.to_owned())
+            } else {
+                StorageError::Internal(format!("Database error: {e}"))
+            }
+        })?;
 
-        if result.rows_affected() != 1 {
-            return Err(StorageError::Internal(format!(
-                "backup was modified before publish: {backup_arn}"
-            )));
+        for index in insert.indexes {
+            sqlx::query(
+                "INSERT INTO indexes \
+                 (table_id, index_name, index_id, index_type, key_schema, projection, \
+                  index_status, provisioned_throughput) \
+                 VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?)",
+            )
+            .bind(insert.table_id)
+            .bind(&index.index_name)
+            .bind(&index.index_id)
+            .bind(&index.index_type)
+            .bind(&index.key_schema)
+            .bind(&index.projection)
+            .bind(&index.provisioned_throughput)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
         }
+
+        tx.commit()
+            .await
+            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
+
         Ok(())
-    }
-
-    async fn cleanup_failed_restore_table(&self, desc: &TableDescription) {
-        if let Err(err) = sqlx::query("DELETE FROM tags WHERE resource_arn = ?")
-            .bind(&desc.table_arn)
-            .execute(&self.pool)
-            .await
-        {
-            tracing::error!(
-                "failed to delete tags while cleaning failed restore for '{}': {err}",
-                desc.table_name
-            );
-        }
-
-        if let Err(err) = sqlx::query("DELETE FROM indexes WHERE table_id = ?")
-            .bind(&desc.table_id)
-            .execute(&self.pool)
-            .await
-        {
-            tracing::error!(
-                "failed to delete indexes while cleaning failed restore for '{}': {err}",
-                desc.table_name
-            );
-        }
-
-        if let Err(err) = sqlx::query("DELETE FROM tables WHERE table_id = ?")
-            .bind(&desc.table_id)
-            .execute(&self.pool)
-            .await
-        {
-            tracing::error!(
-                "failed to delete catalog row while cleaning failed restore for '{}': {err}",
-                desc.table_name
-            );
-        }
-
-        if let Err(err) = sqlx::query("DELETE FROM stream_shards WHERE table_id = ?")
-            .bind(&desc.table_id)
-            .execute(&self.data_pool)
-            .await
-        {
-            tracing::error!(
-                "failed to delete stream shards while cleaning failed restore '{}': {err}",
-                desc.table_name
-            );
-        }
-
-        let physical = physical_data_table_name(&desc.table_id);
-        self.drop_physical_table_if_exists(&physical).await;
     }
 }
 
@@ -698,7 +610,16 @@ impl BackupEngine for TidbEngine {
                 &metadata.source.table_id,
                 ts,
             );
-            let created_at = self
+            self.native_backup
+                .run(BrAction::BackupTable {
+                    database: &database,
+                    table: &physical_table,
+                    storage_uri: &storage_uri,
+                    backup_tso: metadata.native_snapshot_tso,
+                })
+                .await?;
+
+            let created_at = match self
                 .insert_backup_metadata(BackupInsert {
                     backup_arn: &backup_arn,
                     backup_name: &backup_name,
@@ -708,32 +629,24 @@ impl BackupEngine for TidbEngine {
                     storage_uri: &storage_uri,
                     physical_table: &physical_table,
                 })
-                .await?;
-
-            let backup_result = self
-                .native_backup
-                .run(BrAction::BackupTable {
-                    database: &database,
-                    table: &physical_table,
-                    storage_uri: &storage_uri,
-                    backup_tso: metadata.native_snapshot_tso,
-                })
-                .await;
-            if let Err(err) = backup_result {
-                self.cleanup_failed_backup(&backup_arn).await;
-                return Err(err);
-            }
-            if let Err(err) = self.publish_backup(&backup_arn).await {
-                self.cleanup_failed_backup(&backup_arn).await;
-                return Err(err);
-            }
+                .await
+            {
+                Ok(created_at) => created_at,
+                Err(err) => {
+                    tracing::warn!(
+                        "TiDB BR backup completed but catalog publish failed for '{backup_arn}'; \
+                         backup data remains at '{storage_uri}' for external lifecycle cleanup"
+                    );
+                    return Err(err);
+                }
+            };
 
             Ok(BackupDetails {
                 backup_arn,
                 backup_name,
                 backup_status: "AVAILABLE".to_owned(),
                 backup_type: "USER".to_owned(),
-                backup_size_bytes: metadata.source.table_size_bytes,
+                backup_size_bytes: metadata.stats.table_size_bytes,
                 backup_creation_date_time: timestamp_to_epoch(created_at),
             })
         })
@@ -885,38 +798,22 @@ impl BackupEngine for TidbEngine {
         Box::pin(async move {
             let account_id = account_id?;
             let desc = self.describe_backup(&backup_arn).await?;
-            let native_storage_uri: Option<(Option<String>,)> = sqlx::query_as(
-                "SELECT storage_uri FROM backups \
-                 WHERE backup_arn = ? AND account_id = ? AND backup_backend = ?",
-            )
-            .bind(&backup_arn)
-            .bind(&account_id)
-            .bind(TIDB_BACKUP_BACKEND)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
 
-            match native_storage_uri {
-                Some((Some(storage_uri),)) => {
-                    self.delete_native_backup_storage(&storage_uri).await?;
-                }
-                Some((None,)) => {
-                    return Err(StorageError::Internal(format!(
-                        "Backup missing TiDB BR storage URI: {backup_arn}"
-                    )));
-                }
-                None => {}
-            }
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
 
             sqlx::query("DELETE FROM backup_indexes WHERE backup_arn = ?")
                 .bind(&backup_arn)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
 
             sqlx::query("DELETE FROM backup_tags WHERE backup_arn = ?")
                 .bind(&backup_arn)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
 
@@ -926,9 +823,13 @@ impl BackupEngine for TidbEngine {
             )
             .bind(&backup_arn)
             .bind(&account_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
+
+            tx.commit()
+                .await
+                .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
 
             Ok(BackupDescription {
                 backup_details: BackupDetails {
@@ -952,7 +853,7 @@ impl BackupEngine for TidbEngine {
         Box::pin(async move {
             let backup_row: BackupRestoreRow = sqlx::query_as(
                 "SELECT key_schema, attribute_definitions, billing_mode, \
-                 provisioned_throughput, item_count, backup_backend, storage_uri, physical_table_name \
+                 provisioned_throughput, backup_backend, storage_uri, physical_table_name \
                  FROM backups \
                  WHERE backup_arn = ? AND account_id = ? AND backup_status = 'AVAILABLE'",
             )
@@ -969,14 +870,15 @@ impl BackupEngine for TidbEngine {
                 ));
             }
 
-            let storage_uri = backup_row.storage_uri.ok_or_else(|| {
+            let storage_uri = backup_row.storage_uri.as_deref().ok_or_else(|| {
                 StorageError::Internal(format!("Backup missing TiDB BR storage URI: {backup_arn}"))
             })?;
-            let source_physical_table = backup_row.physical_table_name.ok_or_else(|| {
-                StorageError::Internal(format!(
-                    "Backup missing TiDB physical table name: {backup_arn}"
-                ))
-            })?;
+            let source_physical_table =
+                backup_row.physical_table_name.as_deref().ok_or_else(|| {
+                    StorageError::Internal(format!(
+                        "Backup missing TiDB physical table name: {backup_arn}"
+                    ))
+                })?;
 
             let backup_index_rows: Vec<BackupIndexSnapshotRow> = sqlx::query_as(
                 "SELECT index_id, index_name, index_type, key_schema, projection, provisioned_throughput \
@@ -987,9 +889,32 @@ impl BackupEngine for TidbEngine {
             .await
             .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
 
+            for index in &backup_index_rows {
+                match index.index_type.as_str() {
+                    "GSI" | "LSI" => {}
+                    other => {
+                        return Err(StorageError::Internal(format!(
+                            "Invalid backup index type: {other}"
+                        )));
+                    }
+                }
+            }
+
+            let target_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM tables WHERE account_id = ? AND table_name = ?)",
+            )
+            .bind(&account_id)
+            .bind(&target_table_name)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
+            if target_exists {
+                return Err(StorageError::TableAlreadyExists(target_table_name.clone()));
+            }
+
             let database = self.data_database_name().await?;
             if self
-                .physical_table_exists(&database, &source_physical_table)
+                .physical_table_exists(&database, source_physical_table)
                 .await?
             {
                 return Err(StorageError::Validation(format!(
@@ -999,117 +924,51 @@ impl BackupEngine for TidbEngine {
                 )));
             }
 
-            let key_schema: Vec<KeySchemaElement> =
-                parse_json(backup_row.key_schema, "backup key schema")?;
-            let attr_defs = parse_json(backup_row.attribute_definitions, "backup attr defs")?;
-            let mut gsis = Vec::new();
-            let mut lsis = Vec::new();
-            for index in &backup_index_rows {
-                let index_key_schema =
-                    parse_json(index.key_schema.clone(), "backup index key schema")?;
-                let projection = parse_json(index.projection.clone(), "backup index projection")?;
-                match index.index_type.as_str() {
-                    "GSI" => gsis.push(GsiInput {
-                        index_name: index.index_name.clone(),
-                        key_schema: index_key_schema,
-                        projection,
-                        provisioned_throughput: parse_optional_index_provisioned_throughput(
-                            index.provisioned_throughput.clone(),
-                            "backup index provisioned throughput",
-                        )?,
-                    }),
-                    "LSI" => lsis.push(LsiInput {
-                        index_name: index.index_name.clone(),
-                        key_schema: index_key_schema,
-                        projection,
-                    }),
-                    other => {
-                        return Err(StorageError::Internal(format!(
-                            "Invalid backup index type: {other}"
-                        )));
-                    }
-                }
-            }
-
-            let create_input = CreateTableInput {
-                table_name: target_table_name.to_owned(),
-                key_schema,
-                attribute_definitions: attr_defs,
-                billing_mode: Some(parse_billing_mode(&backup_row.billing_mode)?),
-                provisioned_throughput: parse_optional_json::<ProvisionedThroughput>(
-                    backup_row.provisioned_throughput,
-                    "backup provisioned throughput",
-                )?,
-                global_secondary_indexes: (!gsis.is_empty()).then_some(gsis),
-                local_secondary_indexes: (!lsis.is_empty()).then_some(lsis),
-                stream_specification: None,
-                tags: None,
-                deletion_protection_enabled: Some(false),
-                sse_specification: None,
-                table_class: None,
-            };
-
-            let desc = self
-                .create_table_impl_with_activation(
-                    &account_id,
-                    create_input,
-                    CreateTableActivation::Deferred,
-                )
-                .await?;
+            let target_table_id = uuid::Uuid::new_v4().to_string();
+            let target_physical_table = physical_data_table_name(&target_table_id);
+            let target_table_arn = table_arn(&self.region, &account_id, &target_table_name);
 
             let restore_result = async {
-                for index in &backup_index_rows {
-                    sqlx::query(
-                        "UPDATE indexes SET index_id = ? \
-                         WHERE table_id = ? AND index_name = ?",
-                    )
-                    .bind(&index.index_id)
-                    .bind(&desc.table_id)
-                    .bind(&index.index_name)
-                    .execute(&self.pool)
-                    .await
-                    .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-                }
-
                 self.native_backup
                     .run(BrAction::RestoreTable {
                         database: &database,
-                        table: &source_physical_table,
-                        storage_uri: &storage_uri,
+                        table: source_physical_table,
+                        storage_uri,
                     })
                     .await?;
 
-                let target_physical_table = physical_data_table_name(&desc.table_id);
-                self.rename_physical_table(&source_physical_table, &target_physical_table)
+                self.rename_physical_table(source_physical_table, &target_physical_table)
                     .await?;
 
                 // DynamoDB restores table data, not TTL settings. BR restores the
                 // source table's physical shape, so normalize restored TiDB TTL
                 // artifacts before the catalog row becomes ACTIVE.
-                drop_ttl_artifacts(&self.data_pool, &desc.table_id).await?;
+                drop_ttl_artifacts(&self.data_pool, &target_table_id).await?;
 
-                sqlx::query(
-                    "UPDATE tables SET item_count = ?, table_status = 'ACTIVE', \
-                     status_transition_at = NULL WHERE table_id = ?",
-                )
-                .bind(backup_row.item_count)
-                .bind(&desc.table_id)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
+                self.publish_restored_table_catalog(RestoreCatalogInsert {
+                    account_id: &account_id,
+                    table_name: &target_table_name,
+                    table_id: &target_table_id,
+                    table_arn: &target_table_arn,
+                    backup: &backup_row,
+                    indexes: &backup_index_rows,
+                })
+                .await?;
 
                 Ok::<(), StorageError>(())
             }
             .await;
 
             if let Err(err) = restore_result {
-                self.drop_physical_table_if_exists(&source_physical_table)
+                self.drop_physical_table_if_exists(source_physical_table)
                     .await;
-                self.cleanup_failed_restore_table(&desc).await;
+                self.drop_physical_table_if_exists(&target_physical_table)
+                    .await;
                 return Err(err);
             }
 
-            Ok(desc)
+            self.build_table_description(&account_id, &target_table_name)
+                .await
         })
     }
 
@@ -1238,9 +1097,7 @@ impl BackupEngine for TidbEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BrAction, TidbNativeBackupConfig, backup_storage_uri, local_backup_path, uri_is_under_base,
-    };
+    use super::{BrAction, TidbNativeBackupConfig, backup_storage_uri};
     use extenddb_storage::config::NativeBackupConfig;
 
     #[test]
@@ -1325,27 +1182,5 @@ mod tests {
             backup_storage_uri("s3://bucket/root/", "acct", "table-id", 42),
             "s3://bucket/root/snapshots/acct/table-id/42"
         );
-    }
-
-    #[test]
-    fn delete_uri_must_stay_under_configured_backup_root() {
-        assert!(uri_is_under_base(
-            "local:///var/lib/extenddb/backups/",
-            "local:///var/lib/extenddb/backups/snapshots/a/t/1"
-        ));
-        assert!(!uri_is_under_base(
-            "local:///var/lib/extenddb/backups",
-            "local:///var/lib/extenddb/backups-other/snapshots/a/t/1"
-        ));
-    }
-
-    #[test]
-    fn local_backup_path_accepts_only_absolute_local_uris() {
-        assert_eq!(
-            local_backup_path("local:///tmp/extenddb-backups/a").as_deref(),
-            Some(std::path::Path::new("/tmp/extenddb-backups/a"))
-        );
-        assert!(local_backup_path("s3://bucket/backup").is_none());
-        assert!(local_backup_path("local://relative/path").is_none());
     }
 }

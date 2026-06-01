@@ -187,6 +187,37 @@ pub fn redact_connection_string(conn: &str) -> String {
     format!("{}:***@{}", &conn[..colon], &conn[at + 1..])
 }
 
+// ── StorageConfig trait implementation ────────────────────────────────
+
+impl extenddb_storage::config::StorageConfig for TidbStorageConfig {
+    fn connection_config(&self) -> &str {
+        &self.connection_string
+    }
+
+    fn max_connections(&self) -> u32 {
+        self.pool_size
+    }
+
+    fn max_catalog_connections(&self) -> u32 {
+        self.catalog_pool_size.unwrap_or(self.pool_size)
+    }
+
+    fn native_backup_config(&self) -> Option<extenddb_storage::config::NativeBackupConfig> {
+        Some(extenddb_storage::config::NativeBackupConfig {
+            binary: self.backup.binary.clone(),
+            component: self.backup.component.clone(),
+            coordinator_endpoint: self.backup.pd_endpoint.clone(),
+            storage_uri: self.backup.storage_uri.clone(),
+            log_storage_uri: self.backup.log_storage_uri.clone(),
+            send_credentials_to_storage_nodes: self.backup.send_credentials_to_tikv,
+        })
+    }
+
+    fn clone_box(&self) -> Box<dyn extenddb_storage::config::StorageConfig> {
+        Box::new(self.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{connection_url, parse_connection_string, redact_connection_string};
@@ -222,36 +253,5 @@ mod tests {
     fn redaction_uses_the_last_userinfo_separator() {
         let redacted = redact_connection_string("mysql://extenddb:p@ss@localhost:4000/db");
         assert_eq!(redacted, "mysql://extenddb:***@localhost:4000/db");
-    }
-}
-
-// ── StorageConfig trait implementation ────────────────────────────────
-
-impl extenddb_storage::config::StorageConfig for TidbStorageConfig {
-    fn connection_config(&self) -> &str {
-        &self.connection_string
-    }
-
-    fn max_connections(&self) -> u32 {
-        self.pool_size
-    }
-
-    fn max_catalog_connections(&self) -> u32 {
-        self.catalog_pool_size.unwrap_or(self.pool_size)
-    }
-
-    fn native_backup_config(&self) -> Option<extenddb_storage::config::NativeBackupConfig> {
-        Some(extenddb_storage::config::NativeBackupConfig {
-            binary: self.backup.binary.clone(),
-            component: self.backup.component.clone(),
-            coordinator_endpoint: self.backup.pd_endpoint.clone(),
-            storage_uri: self.backup.storage_uri.clone(),
-            log_storage_uri: self.backup.log_storage_uri.clone(),
-            send_credentials_to_storage_nodes: self.backup.send_credentials_to_tikv,
-        })
-    }
-
-    fn clone_box(&self) -> Box<dyn extenddb_storage::config::StorageConfig> {
-        Box::new(self.clone())
     }
 }

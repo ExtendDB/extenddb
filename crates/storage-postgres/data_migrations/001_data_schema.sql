@@ -3,7 +3,7 @@
 -- Data database schema for extenddb.
 -- These tables live in the data database (separate from the catalog) so that
 -- stream records and idempotency tokens can be written atomically with item
--- data within a single PostgreSQL transaction (P54 Bug 1).
+-- data within a single PostgreSQL transaction.
 
 BEGIN;
 

@@ -57,7 +57,7 @@ impl PostgresEngine {
 
         // DELETING → remove row (with tags and data table cleanup).
         //
-        // P57 Bug 1 fix: Collect index names BEFORE deleting the table row.
+        // Collect index names before deleting the table row.
         // The `indexes` table has `ON DELETE CASCADE` referencing `tables`,
         // so `DELETE FROM tables` immediately removes all index rows. The old
         // code did DELETE first then SELECT on indexes — always got zero rows,
@@ -117,7 +117,7 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // P54 Bug 1: Drop data tables on the data pool after catalog commit.
+        // Drop data tables on the data pool after catalog commit.
         for (table_id, index_ids) in &drop_info {
             let mut data_tx = self
                 .data_pool

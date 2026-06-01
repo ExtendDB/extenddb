@@ -212,7 +212,7 @@ journalctl -t extenddb | grep sqlx
 
 ### Control Plane Delay
 
-By default, control plane operations (CreateTable, DeleteTable) emulate real DynamoDB's async behavior — tables transition through CREATING → ACTIVE and DELETING → removed states over a configurable delay (default: 5 seconds). Adjust with:
+By default, control plane operations (CreateTable, DeleteTable) emulate real DynamoDB's async behavior — tables transition through CREATING → ACTIVE and DELETING → removed states asynchronously. The PostgreSQL backend can add a configurable simulated delay (default: 5 seconds). Adjust with:
 
 ```bash
 # Set to 0 for instant transitions (useful for fast test cycles)
@@ -223,6 +223,8 @@ By default, control plane operations (CreateTable, DeleteTable) emulate real Dyn
 ./target/release/extenddb settings --config extenddb.toml set \
     control_plane_delay_seconds 10
 ```
+
+The TiDB backend ignores `control_plane_delay_seconds`. It records the catalog intent immediately and lets TiDB native online DDL schedule physical table and index changes.
 
 ### Credential Import
 
@@ -268,7 +270,7 @@ extenddb enforces provisioned throughput limits using a token bucket per table a
 
 ### TTL Deletion Target
 
-Controls the target maximum time (in seconds) between an item's TTL expiry and its actual deletion. The TTL sweeper uses an indexed scan and runs every 60 seconds. Default: 300 seconds.
+Controls the PostgreSQL target maximum time (in seconds) between an item's TTL expiry and its actual deletion. PostgreSQL uses an indexed sweeper. TiDB ignores this setting and uses TiDB's native table TTL scheduler.
 
 ```bash
 # Set to 60 seconds for faster TTL cleanup
@@ -652,7 +654,9 @@ while True:
 
 See `samples/stream_consumer.py` for a complete working example with concurrent writer and poller threads.
 
-Stream records are retained for 24 hours. A background worker cleans up expired records every hour.
+Stream records are retained for 24 hours. TiDB delegates retention to native
+table TTL; backends without native TTL clean up expired records with a
+background worker.
 
 ### Health check
 
@@ -1290,10 +1294,10 @@ See `docs/troubleshooting.md` for common errors and fixes.
 
 A complete Python sample application is included at `samples/sample_app.py`. It demonstrates the full extenddb lifecycle:
 
-1. **Create tables** — simple PK, PK+SK with GSI, and multi-part GSI keys (tournament pattern)
+1. **Create tables** — simple PK, PK+SK with GSI, and DynamoDB-style composite GSI keys (tournament pattern)
 2. **Poll for ACTIVE** — wait for all tables to reach ACTIVE status
 3. **Load data** — PutItem and BatchWriteItem
-4. **Query** — Query on base tables and GSIs (including multi-part GSI keys), Scan
+4. **Query** — Query on base tables and GSIs (including composite GSI keys), Scan
 5. **Update** — UpdateItem with update expressions and conditions
 6. **Batch read** — BatchGetItem across multiple keys
 7. **Transactions** — TransactWriteItems and TransactGetItems across tables

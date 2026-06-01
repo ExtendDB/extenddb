@@ -5,7 +5,7 @@
 
 use extenddb_core::types::{
     AttributeDefinition, IndexInfo, IndexType, KeySchemaElement, Projection, StreamSpecification,
-    TableKeyInfo,
+    TableKeyInfo, TableReadInfo,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{sk_column, sk_column_n};
@@ -21,6 +21,20 @@ type TableInfoRow = (
     String,
     Option<serde_json::Value>,
     Option<bool>,
+);
+
+type TableReadInfoRow = (
+    serde_json::Value,
+    serde_json::Value,
+    String,
+    String,
+    Option<serde_json::Value>,
+    Option<bool>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<serde_json::Value>,
+    Option<serde_json::Value>,
 );
 
 impl PostgresEngine {
@@ -249,7 +263,7 @@ impl PostgresEngine {
     /// Fetch key schema and attribute definitions for a table from the catalog.
     ///
     /// Uses a single query that combines the table row with an LSI existence
-    /// subquery, eliminating one catalog roundtrip per call (P118 optimization #1).
+    /// subquery, eliminating one catalog roundtrip per call.
     ///
     /// # Errors
     ///
@@ -302,11 +316,113 @@ impl PostgresEngine {
         })
     }
 
+    pub(crate) async fn fetch_table_read_info(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        index_name: Option<&str>,
+    ) -> Result<TableReadInfo, StorageError> {
+        let Some(index_name) = index_name else {
+            return Ok(TableReadInfo {
+                table: self.fetch_table_key_info(account_id, table_name).await?,
+                index: None,
+            });
+        };
+
+        let row: Option<TableReadInfoRow> = sqlx::query_as(
+            "SELECT t.key_schema, t.attribute_definitions, t.table_status, t.table_id, \
+                    t.stream_specification, \
+                    EXISTS(SELECT 1 FROM indexes WHERE table_id = t.table_id AND index_type = 'LSI') AS has_lsi, \
+                    i.index_name, i.index_type, i.index_id, i.key_schema, i.projection \
+             FROM tables t \
+             LEFT JOIN indexes i \
+               ON i.table_id = t.table_id \
+              AND i.index_name = $1 \
+             WHERE t.account_id = $2 AND t.table_name = $3",
+        )
+        .bind(index_name)
+        .bind(account_id)
+        .bind(table_name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        let (
+            ks_json,
+            ad_json,
+            status,
+            table_id,
+            stream_spec_json,
+            has_lsi,
+            idx_name,
+            idx_type,
+            idx_id,
+            idx_ks_json,
+            idx_projection_json,
+        ) = row.ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
+
+        if status != "ACTIVE" {
+            return Err(StorageError::TableNotActive(table_name.to_owned()));
+        }
+
+        let key_schema: Vec<KeySchemaElement> =
+            serde_json::from_value(ks_json).map_err(|e| StorageError::Internal(e.to_string()))?;
+        let attribute_definitions: Vec<AttributeDefinition> =
+            serde_json::from_value(ad_json).map_err(|e| StorageError::Internal(e.to_string()))?;
+        let stream_specification: Option<StreamSpecification> = stream_spec_json
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        let idx_name =
+            idx_name.ok_or_else(|| StorageError::IndexNotFound(index_name.to_owned()))?;
+        let idx_type =
+            idx_type.ok_or_else(|| StorageError::IndexNotFound(index_name.to_owned()))?;
+        let idx_id = idx_id.ok_or_else(|| StorageError::IndexNotFound(index_name.to_owned()))?;
+        let idx_ks_json =
+            idx_ks_json.ok_or_else(|| StorageError::IndexNotFound(index_name.to_owned()))?;
+        let idx_projection_json = idx_projection_json
+            .ok_or_else(|| StorageError::IndexNotFound(index_name.to_owned()))?;
+
+        let index_type = match idx_type.as_str() {
+            "GSI" => IndexType::Gsi,
+            "LSI" => IndexType::Lsi,
+            other => {
+                return Err(StorageError::Internal(format!(
+                    "unknown index type in database: {other}"
+                )));
+            }
+        };
+
+        let index_key_schema: Vec<KeySchemaElement> = serde_json::from_value(idx_ks_json)
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let projection: Projection = serde_json::from_value(idx_projection_json)
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        Ok(TableReadInfo {
+            table: TableKeyInfo {
+                table_name: table_name.to_owned(),
+                account_id: account_id.to_owned(),
+                table_id,
+                key_schema,
+                attribute_definitions,
+                has_lsi: has_lsi.unwrap_or(false),
+                stream_specification,
+            },
+            index: Some(IndexInfo {
+                index_name: idx_name,
+                index_id: idx_id,
+                index_type,
+                key_schema: index_key_schema,
+                projection,
+            }),
+        })
+    }
+
     /// Fetch metadata for a secondary index from the catalog.
     ///
     /// This variant looks up `table_id` from the tables catalog. Prefer
-    /// `fetch_index_info_by_table_id` when `TableKeyInfo` is already available
-    /// (P118 optimization #4).
+    /// `fetch_index_info_by_table_id` when `TableKeyInfo` is already available.
     pub(crate) async fn fetch_index_info(
         &self,
         account_id: &str,
@@ -337,7 +453,7 @@ impl PostgresEngine {
     /// Fetch metadata for a secondary index using a known `table_id`.
     ///
     /// Saves one catalog roundtrip vs `fetch_index_info` when the caller
-    /// already has `TableKeyInfo` (P118 optimization #4).
+    /// already has `TableKeyInfo`.
     pub(crate) async fn fetch_index_info_by_table_id(
         &self,
         table_id: &str,

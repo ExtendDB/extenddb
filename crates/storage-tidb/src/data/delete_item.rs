@@ -7,11 +7,13 @@ use extenddb_core::expression::{Expr, ExpressionMaps};
 use extenddb_core::types::{Item, TableKeyInfo};
 use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{SortKeyValue, parse_sk, pk_to_text, sk_column, sk_info};
+use extenddb_storage::util::{SortKeyValue, parse_sk, sk_column, sk_info};
 
 use super::query::check_condition;
-use super::tx_helpers::write_stream_record_in_tx;
-use super::{data_table_name, json_to_item};
+use super::tx_helpers::{
+    StreamSequenceAllocator, finalize_stream_records_best_effort, write_stream_record_in_tx,
+};
+use super::{data_table_name, json_to_item, physical_pk_bytes};
 use crate::TidbEngine;
 
 impl TidbEngine {
@@ -26,12 +28,7 @@ impl TidbEngine {
         stream: Option<&StreamCapture>,
     ) -> Result<Option<Item>, StorageError> {
         let ddb_table = data_table_name(&key_info.table_id);
-
-        let pk_name = &key_info.key_schema[0].attribute_name;
-        let pk_value = key
-            .get(pk_name)
-            .ok_or_else(|| StorageError::Internal("missing partition key".to_owned()))?;
-        let pk_text = pk_to_text(pk_value)?;
+        let pk = physical_pk_bytes(key, &key_info.key_schema)?;
 
         let needs_tx = condition.is_some() || return_old || stream.is_some();
 
@@ -57,7 +54,7 @@ impl TidbEngine {
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
                 let old: Option<(serde_json::Value,)> =
-                    bind_sk_fetch_optional!(&select_sql, pk_text.as_ref(), &sk, &mut *tx)?;
+                    bind_sk_fetch_optional!(&select_sql, pk.as_slice(), &sk, &mut *tx)?;
 
                 if let Some((ref old_json,)) = old {
                     let old_item: Item = json_to_item(old_json.clone())?;
@@ -86,21 +83,21 @@ impl TidbEngine {
                 match &sk {
                     SortKeyValue::S(s) => {
                         sqlx::query(&delete_sql)
-                            .bind(pk_text.as_ref())
+                            .bind(pk.as_slice())
                             .bind(s.as_bytes().to_vec())
                             .execute(&mut *tx)
                             .await
                     }
                     SortKeyValue::N(n) => {
                         sqlx::query(&delete_sql)
-                            .bind(pk_text.as_ref())
+                            .bind(pk.as_slice())
                             .bind(n)
                             .execute(&mut *tx)
                             .await
                     }
                     SortKeyValue::B(b) => {
                         sqlx::query(&delete_sql)
-                            .bind(pk_text.as_ref())
+                            .bind(pk.as_slice())
                             .bind(b)
                             .execute(&mut *tx)
                             .await
@@ -109,6 +106,7 @@ impl TidbEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
                 // Write stream record atomically within the transaction.
+                let mut sequence_allocator = StreamSequenceAllocator::default();
                 if let Some(capture) = stream {
                     let old_for_stream = old
                         .as_ref()
@@ -116,6 +114,7 @@ impl TidbEngine {
                         .transpose()?;
                     write_stream_record_in_tx(
                         &mut tx,
+                        &mut sequence_allocator,
                         key_info,
                         capture,
                         old_for_stream.as_ref(),
@@ -126,6 +125,12 @@ impl TidbEngine {
                 tx.commit()
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
+                finalize_stream_records_best_effort(
+                    &self.data_pool,
+                    "delete_item",
+                    sequence_allocator.pending_records(),
+                )
+                .await;
 
                 if return_old {
                     old.map(|(v,)| json_to_item(v)).transpose()
@@ -137,21 +142,21 @@ impl TidbEngine {
                 match &sk {
                     SortKeyValue::S(s) => {
                         sqlx::query(&delete_sql)
-                            .bind(pk_text.as_ref())
+                            .bind(pk.as_slice())
                             .bind(s.as_bytes().to_vec())
                             .execute(&self.data_pool)
                             .await
                     }
                     SortKeyValue::N(n) => {
                         sqlx::query(&delete_sql)
-                            .bind(pk_text.as_ref())
+                            .bind(pk.as_slice())
                             .bind(n)
                             .execute(&self.data_pool)
                             .await
                     }
                     SortKeyValue::B(b) => {
                         sqlx::query(&delete_sql)
-                            .bind(pk_text.as_ref())
+                            .bind(pk.as_slice())
                             .bind(b)
                             .execute(&self.data_pool)
                             .await
@@ -174,7 +179,7 @@ impl TidbEngine {
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
                 let old: Option<(serde_json::Value,)> = sqlx::query_as(&select_sql)
-                    .bind(pk_text.as_ref())
+                    .bind(pk.as_slice())
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -201,12 +206,13 @@ impl TidbEngine {
                 }
 
                 sqlx::query(&delete_sql)
-                    .bind(pk_text.as_ref())
+                    .bind(pk.as_slice())
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
                 // Write stream record atomically within the transaction.
+                let mut sequence_allocator = StreamSequenceAllocator::default();
                 if let Some(capture) = stream {
                     let old_for_stream = old
                         .as_ref()
@@ -214,6 +220,7 @@ impl TidbEngine {
                         .transpose()?;
                     write_stream_record_in_tx(
                         &mut tx,
+                        &mut sequence_allocator,
                         key_info,
                         capture,
                         old_for_stream.as_ref(),
@@ -224,6 +231,12 @@ impl TidbEngine {
                 tx.commit()
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
+                finalize_stream_records_best_effort(
+                    &self.data_pool,
+                    "delete_item",
+                    sequence_allocator.pending_records(),
+                )
+                .await;
 
                 if return_old {
                     old.map(|(v,)| json_to_item(v)).transpose()
@@ -233,7 +246,7 @@ impl TidbEngine {
             } else {
                 let delete_sql = format!("DELETE FROM {ddb_table} WHERE pk = ?");
                 sqlx::query(&delete_sql)
-                    .bind(pk_text.as_ref())
+                    .bind(pk.as_slice())
                     .execute(&self.data_pool)
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;

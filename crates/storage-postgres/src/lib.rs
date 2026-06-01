@@ -139,24 +139,24 @@ pub struct PostgresConfig {
 ///
 /// The engine no longer stores a single `account_id`. Instead, `account_id`
 /// is passed per-request through the storage trait methods, enabling
-/// multi-account isolation (Phase 12f).
+/// multi-account isolation.
 ///
 /// Uses two connection pools: `pool` for catalog metadata (tables, indexes,
 /// settings, accounts, IAM) and `data_pool` for per-DynamoDB-table data
 /// (`_ddb_*` tables, GSI tables). This separation allows the catalog and
-/// data to live in different PostgreSQL databases (Bug 1, P54).
+/// data to live in different PostgreSQL databases.
 pub struct PostgresEngine {
     pub(crate) pool: PgPool,
     /// Connection pool for the data database where `_ddb_*` tables live.
     pub(crate) data_pool: PgPool,
     pub(crate) region: String,
     pub(crate) max_item_size_bytes: usize,
-    /// F-3: Wakes the control plane poller when a table enters CREATING or
+    /// Wakes the control plane poller when a table enters CREATING or
     /// DELETING state, so transitions are processed without polling delay.
     pub(crate) control_plane_notify: Arc<tokio::sync::Notify>,
-    /// D-4: Async GSI update queue. `None` until `start_gsi_workers()` is called.
+    /// Async GSI update queue. `None` until `start_gsi_workers()` is called.
     pub(crate) gsi_queue: Option<Arc<gsi_queue::GsiQueue>>,
-    /// P119: Cached GSI default propagation delay (milliseconds). Updated by
+    /// Cached GSI default propagation delay (milliseconds). Updated by
     /// background poller every 30s. Avoids per-request DB query on write path.
     pub gsi_default_delay_ms: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -178,7 +178,7 @@ impl PostgresEngine {
             config.pool_size
         };
 
-        // P79/P6: Set min_connections to avoid cold-start latency on first requests.
+        // Keep warm connections to avoid cold-start latency on first requests.
         let min_conns = pool_size.min(2);
         let pool = PgPoolOptions::new()
             .max_connections(pool_size)
@@ -189,7 +189,7 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Connection(e.to_string()))?;
 
-        // P54 Bug 1: Read data database connection string from catalog settings.
+        // Read data database connection string from catalog settings.
         // Falls back to the catalog pool if no separate data database is configured.
         let data_pool = match sqlx::query_as::<_, (String,)>(
             "SELECT value FROM settings WHERE key = 'data_database_connection_string'",

@@ -111,16 +111,7 @@ pub async fn handle_get_shard_iterator(
                     "SequenceNumber is required for AT_SEQUENCE_NUMBER iterator type".to_owned(),
                 )
             })?;
-            let n = raw.parse::<u64>().map_err(|_| {
-                DynamoDbError::ValidationException("Invalid SequenceNumber".to_owned())
-            })?;
-            // n == 0: sequence 0 is the first possible record, so "at 0"
-            // means "read from the beginning" — same as TRIM_HORIZON.
-            if n > 0 {
-                format!("{:021}", n - 1)
-            } else {
-                String::new()
-            }
+            previous_decimal_sequence(&raw)?
         }
         ShardIteratorType::AfterSequenceNumber => {
             input.sequence_number.clone().ok_or_else(|| {
@@ -253,6 +244,29 @@ pub async fn handle_get_records(
     serialize_output(&output)
 }
 
+fn previous_decimal_sequence(raw: &str) -> Result<String, DynamoDbError> {
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(DynamoDbError::ValidationException(
+            "Invalid SequenceNumber".to_owned(),
+        ));
+    }
+
+    let Some(last_non_zero) = raw.as_bytes().iter().rposition(|b| *b != b'0') else {
+        // Sequence zero is the first possible position, so "at 0" means
+        // "read from the beginning", the same as TRIM_HORIZON.
+        return Ok(String::new());
+    };
+
+    let mut previous = raw.as_bytes().to_vec();
+    previous[last_non_zero] -= 1;
+    for digit in previous.iter_mut().skip(last_non_zero + 1) {
+        *digit = b'9';
+    }
+
+    String::from_utf8(previous)
+        .map_err(|_| DynamoDbError::ValidationException("Invalid SequenceNumber".to_owned()))
+}
+
 fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
     match e {
         StorageError::Validation(msg) => DynamoDbError::ValidationException(msg),
@@ -261,5 +275,34 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
             tracing::error!(internal_error = %other, "storage internal error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::previous_decimal_sequence;
+
+    #[test]
+    fn sequence_predecessor_preserves_width_for_tidb_tso_ordinals() {
+        assert_eq!(
+            previous_decimal_sequence("000000000000000000042000000").expect("previous"),
+            "000000000000000000041999999"
+        );
+        assert_eq!(
+            previous_decimal_sequence("000000000000000000042000001").expect("previous"),
+            "000000000000000000042000000"
+        );
+    }
+
+    #[test]
+    fn sequence_predecessor_handles_zero_as_trim_horizon() {
+        assert_eq!(previous_decimal_sequence("0").expect("zero"), "");
+        assert_eq!(previous_decimal_sequence("000000").expect("zero"), "");
+    }
+
+    #[test]
+    fn sequence_predecessor_rejects_non_decimal_input() {
+        assert!(previous_decimal_sequence("").is_err());
+        assert!(previous_decimal_sequence("123abc").is_err());
     }
 }

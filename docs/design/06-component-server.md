@@ -33,15 +33,28 @@ crates/server/src/
 
 ## 3. Server Startup
 
-### 3.1 Why `AppState` is generic over the storage backend
+### 3.1 Runtime Storage Backend Selection
 
-`AppState<S>` carries a generic `S: StorageEngine` while `AuthProvider` is erased behind `Arc<dyn>`. This asymmetry is intentional:
+`AppState` stores the selected backend as `Arc<dyn StorageEngine>`, matching
+auth's `Arc<dyn AuthProvider>` shape:
 
-- **Storage uses static dispatch (generic `S`).** The storage engine is on the hot path — every request makes 1-3 storage calls. RPITIT on the storage traits avoids a `Box<dyn Future>` heap allocation per call. In absolute terms this saves ~50ns per call against a PostgreSQL round-trip of 0.5-5ms, so it's not measurable today. But this is a database compatibility layer where we control the full stack — there's no reason to leave performance on the table, and the ergonomic cost is small (the generic appears on ~6 function signatures, all in `server` and `engine`; it never leaks into `core`, `auth`, or middleware).
-- **Auth uses dynamic dispatch (`Arc<dyn>`).** Auth is called once per request, involves HMAC-SHA256 crypto that dwarfs any vtable cost, and benefits from runtime pluggability (swap providers via config without recompilation).
-- **The generic does NOT propagate into middleware.** `RequestIdLayer`, `LoggingLayer`, `MetricsLayer`, `RequestSizeLayer`, `CompressionLayer` — none of these touch storage. Only the main request handler and `OperationContext` carry the generic.
-- **Testing:** Test code needs a concrete `S` type. Use a `MockStorage` struct that implements all storage sub-traits. This is more verbose than `Arc<dyn>` mocks but straightforward with hand-written mocks or `mockall`.
-- **If this decision is revisited:** The simplest migration path is to add `#[async_trait]` to the storage traits and replace `Arc<S>` with `Arc<dyn StorageEngine>`. This removes all generics from the server/engine crates at the cost of one heap allocation per storage call. The change is mechanical and confined to trait definitions + `AppState`.
+- **Storage uses object-safe dynamic dispatch.** The server and engine do not
+  carry backend generics; the binary chooses PostgreSQL, TiDB, or another
+  registered backend at startup and hands the server one trait object.
+- **Storage traits use explicit `BoxFuture` signatures.** This keeps the
+  traits object-safe without `#[async_trait]`. Data-plane methods bind the
+  returned future lifetime to borrowed request metadata, so implementations can
+  await native backend calls without cloning keys, expression maps, resolved
+  index info, or transaction batches.
+- **Auth also uses dynamic dispatch (`Arc<dyn>`).** Auth is called once per
+  request, involves HMAC-SHA256 crypto that dwarfs any vtable cost, and
+  benefits from runtime pluggability.
+- **Middleware remains backend-agnostic.** `RequestIdLayer`, `LoggingLayer`,
+  `MetricsLayer`, `RequestSizeLayer`, and compression do not touch storage.
+  Only the main request handler and `OperationContext` receive the storage
+  trait object.
+- **Testing:** Tests can provide a mock `Arc<dyn StorageEngine>` or a real
+  backend registration without threading generic parameters through handlers.
 
 ```rust
 use axum::Router;
@@ -57,12 +70,10 @@ pub struct ServerConfig {
     pub rate_limit_rps: Option<f64>,
 }
 
-pub struct AppState<S: StorageEngine> {
-    pub storage: Arc<S>,
+pub struct AppState {
+    pub storage: Arc<dyn StorageEngine>,
     pub auth: Arc<dyn AuthProvider>,
-    pub credential_cache: Arc<CachedCredentialStore>,
     pub limits: Arc<LimitsConfig>,
-    pub capacity_tracker: Arc<ThroughputTracker>,
     pub metrics: Arc<MetricsCollector>,
 }
 
@@ -72,17 +83,14 @@ pub struct AppState<S: StorageEngine> {
 /// bind-before-fork pattern: the socket is bound in the sync context
 /// before daemonizing, so port conflicts are reported to stderr before
 /// the parent process exits.
-pub async fn start_server<S: StorageEngine + 'static>(
+pub async fn start_server(
     listener: tokio::net::TcpListener,
-    state: AppState<S>,
+    state: AppState,
 ) -> Result<(), anyhow::Error> {
     let shared_state = Arc::new(state);
 
-    // The turbofish on `post` is required to monomorphize the handler
-    // with the correct storage type. Without it, Rust cannot infer `S`
-    // from `Router::new()` alone.
     let app = Router::new()
-        .route("/", post(handle_dynamodb_request::<S>))
+        .route("/", post(handle_dynamodb_request))
         .route("/health", get(health::health_check))
         .route("/metrics", get(health::metrics_endpoint))
         .layer(
@@ -123,11 +131,10 @@ async fn shutdown_signal() {
 DynamoDB uses a single endpoint (`POST /`) with the operation name in the `X-Amz-Target` header.
 
 ```rust
-/// The `S: StorageEngine + 'static` bound is required by axum's `State` extractor
-/// (state must be `Clone + Send + Sync + 'static`). `Arc<AppState<S>>` satisfies
-/// all of these when `S: StorageEngine + 'static`.
-async fn handle_dynamodb_request<S: StorageEngine + 'static>(
-    State(state): State<Arc<AppState<S>>>,
+/// Axum's `State` extractor receives shared server state. The storage backend
+/// inside the state is already erased behind `Arc<dyn StorageEngine>`.
+async fn handle_dynamodb_request(
+    State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
@@ -442,14 +449,15 @@ Management routes are registered alongside the DynamoDB and health routes:
 
 ```rust
 let app = Router::new()
-    .route("/", post(handle_dynamodb_request::<S>))
+    .route("/", post(handle_dynamodb_request))
     .route("/health", get(health::health_check))
     .route("/metrics", get(health::metrics_endpoint))
-    .route("/management/:action", post(handle_management_request::<S>))
+    .nest("/management", management::router().with_state(management_state))
     .with_state(shared_state);
 ```
 
-The management handler has access to `AppState` which contains both the storage engine (for write operations) and the `CachedCredentialStore` (for cache invalidation after writes).
+Management handlers receive `ManagementState`, which contains the catalog store
+needed for admin, account, IAM, role, and settings operations.
 
 ## 9. TLS Configuration
 
@@ -463,16 +471,16 @@ pub struct TlsConfig {
 
 /// TLS variant of start_server. Uses `axum_server::bind_rustls` instead of
 /// `axum::serve` because axum's built-in serve doesn't support TLS directly.
-pub async fn start_tls_server<S: StorageEngine + 'static>(
+pub async fn start_tls_server(
     config: ServerConfig,
-    state: AppState<S>,
+    state: AppState,
 ) -> Result<(), anyhow::Error> {
     let tls = config.tls.as_ref().expect("TLS config required");
     let rustls_config = RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path).await?;
 
     let shared_state = Arc::new(state);
     let app = Router::new()
-        .route("/", post(handle_dynamodb_request::<S>))
+        .route("/", post(handle_dynamodb_request))
         .route("/health", get(health::health_check))
         .route("/metrics", get(health::metrics_endpoint))
         .with_state(shared_state);

@@ -759,19 +759,33 @@ pub fn validate_key_sizes(
 ) -> Result<(), DynamoDbError> {
     for ks in key_schema {
         if let Some(value) = item.get(&ks.attribute_name) {
-            validate_no_empty_key_value(&ks.attribute_name, value)?;
-            let size = key_value_byte_size(value);
-            let (max_size, key_label) = match ks.key_type {
-                KeyType::Hash => (limits.max_partition_key_size_bytes, "partition key"),
-                KeyType::Range => (limits.max_sort_key_size_bytes, "sort key"),
-            };
-            if size > max_size {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "One or more parameter values are not valid. \
-                     The {key_label} size must be between 1 and {max_size} bytes"
-                )));
-            }
+            validate_key_value_size(&ks.attribute_name, value, ks.key_type, limits)?;
         }
+    }
+    Ok(())
+}
+
+/// Validate one key attribute's non-empty and byte-size constraints.
+///
+/// Storage backends use this for post-mutation secondary-index keys whose
+/// values live in the item body rather than the request key map.
+pub fn validate_key_value_size(
+    attr_name: &str,
+    value: &AttributeValue,
+    key_type: KeyType,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    validate_no_empty_key_value(attr_name, value)?;
+    let size = key_value_byte_size(value);
+    let (max_size, key_label) = match key_type {
+        KeyType::Hash => (limits.max_partition_key_size_bytes, "partition key"),
+        KeyType::Range => (limits.max_sort_key_size_bytes, "sort key"),
+    };
+    if size > max_size {
+        return Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values are not valid. \
+             The {key_label} size must be between 1 and {max_size} bytes"
+        )));
     }
     Ok(())
 }

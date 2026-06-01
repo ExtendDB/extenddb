@@ -3,16 +3,16 @@
 -- Use TiDB BR as the TiDB backend's backup data plane.
 
 ALTER TABLE backups
-    ADD COLUMN IF NOT EXISTS backup_backend VARCHAR(32) NOT NULL DEFAULT 'legacy-logical';
+    ADD COLUMN IF NOT EXISTS backup_backend VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT 'legacy-logical';
 
 ALTER TABLE backups
-    ADD COLUMN IF NOT EXISTS storage_uri TEXT;
+    ADD COLUMN IF NOT EXISTS storage_uri TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
 
 ALTER TABLE backups
-    ADD COLUMN IF NOT EXISTS physical_table_name VARCHAR(255);
+    ADD COLUMN IF NOT EXISTS physical_table_name VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
 
 ALTER TABLE backups
-    ADD COLUMN IF NOT EXISTS native_snapshot_tso VARCHAR(64);
+    ADD COLUMN IF NOT EXISTS native_snapshot_tso VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
 
 -- Old TiDB logical backups depended on catalog-row copies. They cannot be
 -- restored after moving TiDB to native BR semantics, so hide them from list

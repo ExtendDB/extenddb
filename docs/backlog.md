@@ -29,7 +29,7 @@ Refreshed: v0.0.118 (P115)
 - ⬜ **Real PITR implementation** — PostgreSQL temporal/history table approach: `item_history` table capturing every mutation, `DISTINCT ON` query to reconstruct state at time T, 35-day retention via background pruning. Deferred until `RestoreTableToPointInTime` unsupported error is in place. (P113 human session design direction)
 - ⬜ **Ion parser** — `InputFormat::Ion` falls through to DynamoDB JSON reader. Full Ion support needed for import/export.
 - ⬜ **Key-vs-item size gap** — batch/transact delete/update WCU uses key size, not old item size. Minor fidelity gap.
-- ⬜ **Single-frontend-per-catalog enforcement** — no advisory lock or multi-instance coordination. Per steering, caching is prohibited until this is resolved.
+- ⬜ **PostgreSQL single-frontend-per-catalog enforcement** — the PostgreSQL backend still needs an HA-safe worker coordination design before shared-catalog multi-frontend deployment. TiDB is not blocked by this item because the TiDB backend uses idempotent catalog reconciliation and TiDB-native online DDL scheduling.
 - ⬜ **C/C++ test suite** — human has not confirmed whether this is desired. Rust + Python + Java suites are complete.
 
 ## Standing Items (need human decision)
@@ -42,7 +42,7 @@ Refreshed: v0.0.118 (P115)
 - ✅ Indexed TTL sweep — partial B-tree expression index created on TTL enable, sweeper uses index-ordered scan
 - ✅ Configurable deletion target — `ttl_deletion_target_seconds` runtime setting (default 300)
 - ✅ Staleness metric — `TtlDeletionStaleness` records deletion lag (sum/count/min/max)
-- ✅ File split — extracted `ttl_worker.rs` from `workers.rs` (both under 500 lines)
+- ✅ PostgreSQL file split — extracted `ttl_worker.rs` from `workers.rs` (both under 500 lines)
 - ✅ SQL injection fix — `validate_ttl_attribute_name()` at engine layer for DDL safety
 - ✅ Migration 011 consolidated into 001_schema.sql, catalog version 0.0.2
 - ✅ Clippy improvement: 272 (down from 273 baseline)

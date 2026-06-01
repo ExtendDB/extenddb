@@ -52,7 +52,7 @@ pub async fn handle_get_item(
 
     let item = ctx
         .storage
-        .get_item(&key_info, &input.key)
+        .get_item(&key_info, &input.key, input.consistent_read == Some(true))
         .await
         .map_err(storage_err_to_dynamo)?;
 

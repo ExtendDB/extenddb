@@ -6,4 +6,6 @@ ALTER TABLE iam_sessions
     TTL = `expires_at` + INTERVAL 24 HOUR
     TTL_JOB_INTERVAL = '1h';
 
+ALTER TABLE iam_sessions TTL_ENABLE = 'ON';
+
 UPDATE settings SET value = '0.0.10' WHERE `key` = 'catalog_version';

@@ -82,6 +82,10 @@ pub(crate) fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) ->
             tracing::error!(internal_error = %msg, "storage connection error");
             DynamoDbError::ServiceUnavailable("Service is temporarily unavailable".to_owned())
         }
+        StorageError::Configuration(msg) => {
+            tracing::error!(configuration_error = %msg, "storage configuration error");
+            DynamoDbError::InternalServerError("Internal server error".to_owned())
+        }
         StorageError::CatalogVersionMismatch { expected, found } => {
             tracing::error!("Catalog version mismatch: expected {expected}, found {found}");
             DynamoDbError::InternalServerError("Internal server error".to_owned())

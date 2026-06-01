@@ -4,7 +4,7 @@ Regenerated: v0.0.113 (P112)
 
 ## TODO(fidelity)
 
-- `crates/core/src/types/item.rs:168` — Route ConsistentRead to read replica when replica support is added.
+- `crates/storage-postgres/src/config.rs` — Add an optional PostgreSQL default-read topology if PostgreSQL deployments need a separate physical read path.
 - `crates/engine/src/batch_write_item.rs:168` — DynamoDB charges WCU based on old item size for deletes.
 - `crates/engine/src/transact_write_helpers.rs:95` — DynamoDB charges WCU based on old item size for deletes.
 - `crates/storage-postgres/src/table_helpers.rs:142` — Two queries not in a transaction under concurrent access.

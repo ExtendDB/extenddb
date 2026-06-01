@@ -173,8 +173,8 @@ pub struct GetItemInput {
     pub table_name: String,
     #[serde(rename = "Key")]
     pub key: Item,
-    // TODO(fidelity): Route ConsistentRead to read replica when replica support is added.
-    // Single-node mode is strictly consistent, so ignoring this field is correct for now.
+    /// Passed through to the storage backend so each implementation can choose
+    /// its native strong or default-read path.
     #[serde(rename = "ConsistentRead")]
     pub consistent_read: Option<bool>,
     #[serde(rename = "ProjectionExpression")]

@@ -254,7 +254,7 @@ impl PostgresEngine {
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
                     created_index_ids.push(index_id);
 
-                    // Create the index data table on the data pool (P54 Bug 1).
+                    // Create the index data table on the data pool.
                     // Catalog metadata is committed first; data DDL follows.
                 }
 
@@ -303,7 +303,7 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // P54 Bug 1: Execute data DDL on the data pool after catalog commit.
+        // Execute data DDL on the data pool after catalog commit.
         if let Some(updates) = &input.global_secondary_index_updates {
             let base_key_schema: Vec<KeySchemaElement> = serde_json::from_value(ks_json.clone())
                 .map_err(|e| StorageError::Internal(e.to_string()))?;

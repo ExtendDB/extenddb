@@ -50,7 +50,6 @@ Environment variables use double-underscore (`__`) as a nesting separator, prefi
 | `server.bind_addr` | `EXTENDDB__SERVER__BIND_ADDR` |
 | `storage.postgres.connection_string` | `EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING` |
 | `storage.tidb.connection_string` | `EXTENDDB__STORAGE__TIDB__CONNECTION_STRING` |
-| `storage.postgres.read_replica_url` | `EXTENDDB__STORAGE__POSTGRES__READ_REPLICA_URL` |
 | `auth.provider` | `EXTENDDB__AUTH__PROVIDER` |
 | `auth.encryption_key` | `EXTENDDB__AUTH__ENCRYPTION_KEY` |
 | `auth.aws_iam.region` | `EXTENDDB__AUTH__AWS_IAM__REGION` |
@@ -111,10 +110,6 @@ backend = "postgres"     # "postgres" | "tidb"
 [storage.postgres]
 connection_string = "postgresql://localhost:5432/extenddb"  # Set credentials via env var in production
 pool_size = 20
-read_replica_url = ""    # Optional: PostgreSQL streaming replica for eventually consistent reads.
-                         # When set, ConsistentRead=false reads route here. When empty, all reads
-                         # use the primary (strongly consistent). Recommended for migration testing.
-read_replica_pool_size = 20  # Pool size for the read replica (defaults to pool_size if unset)
 connection_timeout_secs = 5
 statement_timeout_secs = 30
 
@@ -122,6 +117,9 @@ statement_timeout_secs = 30
 connection_string = "mysql://extenddb:extenddb-local-dev@localhost:4000/extenddb_catalog"
 pool_size = 20
 catalog_pool_size = 20
+# TiDB default reads use a separate default-read pool configured with native
+# closest-adaptive follower read; ConsistentRead=true and writes use the strong
+# data pool.
 
 [storage.tidb.backup]
 pd_endpoint = "127.0.0.1:2379"
@@ -312,12 +310,16 @@ pub fn record_capacity(table: &str, rcu: f64, wcu: f64) {
 
 ## 7. Background Workers
 
-Two background tasks run as tokio tasks alongside the HTTP server:
+Storage backends install runtime workers through backend-specific hooks alongside the HTTP server. Workers must use native
+storage capabilities where available:
 
-### 7.1 TTL Cleanup Worker
+- PostgreSQL runs an application TTL cleanup worker because PostgreSQL has no table-native TTL.
+- TiDB uses native table TTL for item expiration and must not run a parallel application TTL worker.
+
+### 7.1 PostgreSQL TTL Cleanup Worker
 
 ```rust
-async fn ttl_worker<S: StorageEngine>(storage: Arc<S>, config: TtlConfig) {
+async fn ttl_worker(storage: Arc<dyn StorageEngine>, config: TtlConfig) {
     let mut interval = tokio::time::interval(Duration::from_secs(config.scan_interval_secs));
     loop {
         interval.tick().await;
@@ -330,7 +332,7 @@ async fn ttl_worker<S: StorageEngine>(storage: Arc<S>, config: TtlConfig) {
 ### 7.2 Stream Record Cleanup Worker
 
 ```rust
-async fn stream_cleanup_worker<S: StorageEngine>(storage: Arc<S>, config: StreamsConfig) {
+async fn stream_cleanup_worker(storage: Arc<dyn StorageEngine>, config: StreamsConfig) {
     let mut interval = tokio::time::interval(Duration::from_secs(config.cleanup_interval_secs));
     loop {
         interval.tick().await;
@@ -402,15 +404,20 @@ async fn main() -> anyhow::Result<()> {
         storage: storage.clone(),
         auth,
         limits: Arc::new(config.limits.clone()),
-        capacity_tracker: Arc::new(ThroughputTracker::new(&config.limits)),
+        region: Arc::from(config.server.region.as_str()),
+        catalog_store: Some(catalog_store.clone()),
         metrics,
+        throttle: throttle.clone(),
+        // ...
     };
 
-    // Start background workers
-    if config.ttl.enabled {
-        tokio::spawn(ttl_worker(storage.clone(), config.ttl.clone()));
+    // Start backend runtime hooks. PostgreSQL may install TTL, stream-cleanup,
+    // and statistics refresh workers. TiDB relies on native table TTL and
+    // information_schema statistics, so it installs only TiDB-specific
+    // control-plane and pool-metrics workers.
+    if let Some(hooks) = runtime_hooks {
+        hooks.spawn_workers(&worker_ctx).await;
     }
-    tokio::spawn(stream_cleanup_worker(storage.clone(), config.streams.clone()));
 
     // Start HTTP server
     start_server(config.server, state).await

@@ -44,7 +44,7 @@ sudo systemctl enable postgresql
 
 **Amazon Linux 2 (PGDG):**
 
-> **Note:** These instructions target Amazon Linux 2 (EL-7 compatible). For Amazon Linux 2023, use `sudo dnf install -y postgresql15-server postgresql15` directly — no PGDG workaround needed.
+> **Note:** These instructions target Amazon Linux 2 (EL-7 compatible). For Amazon Linux 2023, use `sudo dnf install -y postgresql15-server postgresql15` directly.
 
 ```bash
 sudo rpm -ivh --nodeps \

@@ -14,7 +14,7 @@ Last updated: 2026-05-04 (P112)
 | # | Item | Location | Priority | Origin |
 |---|------|----------|----------|--------|
 | F-1 | `AttributesToGet` (legacy API) not supported | `core/types/batch.rs:27` | Low | P6 |
-| F-2 | `ConsistentRead=false` not routed to read replica | `core/types/item.rs:166` | Low | P5 |
+| F-2 | PostgreSQL has no optional default-read topology for `ConsistentRead=false`; TiDB default reads now use native follower-read routing | `storage-postgres` | Low | P5 |
 | F-3 | Import/export: full Ion parser not implemented (JSON subset only) | `engine/import_export.rs:339` | Medium | P24 |
 | F-4 | Import/export: full Ion writer not implemented (JSON subset only) | `engine/import_export.rs:433` | Medium | P24 |
 | F-5 | `PutItem` returns `None` for `Item` field instead of omitting it | `server/lib.rs:235` | Low | P2 |
@@ -27,7 +27,7 @@ Last updated: 2026-05-04 (P112)
 | F-12 | ~~Tagging operations don't validate resource existence (real DynamoDB returns `ResourceNotFoundException`)~~ | ~~`engine/tagging.rs`~~ | ~~Medium~~ | P26 |
 | F-13 | HTTP 500 returned for pool exhaustion instead of 503 | `server/lib.rs` | Medium | P25 |
 | F-14 | POSIX syslog single-identity limitation prevents separate `extenddb-sqlx` syslog identity | `bin/cmd_serve.rs` | Low | P25 |
-| F-15 | ~~TTL worker bypasses stream capture — expired item deletions don't generate REMOVE stream records~~ | `bin/cmd_serve.rs:ttl_cleanup_worker` | ~~High~~ | P26 |
+| F-15 | ~~PostgreSQL TTL worker bypasses stream capture — expired item deletions don't generate REMOVE stream records~~ | `storage-postgres/src/ttl_worker.rs` | ~~High~~ | P26 |
 | F-16 | `transact_write_items.rs` passes `None` for `old_item` in stream capture — `OldImage` always `None` for transaction-originated stream records | `engine/transact_write_items.rs` | Medium | P27 |
 | F-17 | `validate_attribute_name_sizes` only checks top-level attribute names — nested map keys not validated | `core/validation/mod.rs` | Low | P30 |
 
@@ -50,7 +50,7 @@ Last updated: 2026-05-04 (P112)
 
 | # | Item | Location | Priority | Origin |
 |---|------|----------|----------|--------|
-| S-1 | Multi-instance safety: no lease table prevents multiple extenddb instances sharing one catalog database | — | High | P25 review |
+| S-1 | PostgreSQL multi-instance safety: worker coordination is still needed before multiple PostgreSQL-backed frontends share one catalog. TiDB is excluded because TiDB native online DDL plus idempotent catalog reconciliation owns distributed schema transitions. | `storage-postgres` | High | P25 review |
 | S-2 | `--password` flag visible in process listings (`ps aux`) | `bin/cmd_manage.rs` | Low | P12b |
 | S-3 | Release tarballs not GPG-signed — blocked on key ownership, public key distribution, CI secrets management | `devtools/build-release` | Medium | P28 |
 
@@ -130,7 +130,7 @@ Resolved (split in P94–P96):
 
 ## Resolved in P27
 
-- ~~F-15: TTL worker bypasses stream capture~~ (fixed: TTL deletions now route through engine stream capture with `userIdentity: {type: "Service", principalId: "dynamodb.amazonaws.com"}`)
+- ~~F-15: PostgreSQL TTL worker bypasses stream capture~~ (fixed: worker-driven TTL deletions now route through engine stream capture with `userIdentity: {type: "Service", principalId: "dynamodb.amazonaws.com"}`; TiDB uses native table TTL instead of a worker)
 - ~~T-2: No code coverage tooling~~ (fixed: `cargo-llvm-cov` for Rust, `pytest-cov` for Python; `devtools/run-coverage` script added)
 
 ## Resolved in P26

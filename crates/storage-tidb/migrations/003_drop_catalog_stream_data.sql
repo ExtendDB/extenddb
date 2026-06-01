@@ -7,3 +7,4 @@
 DROP TABLE IF EXISTS stream_records;
 DROP TABLE IF EXISTS stream_shards;
 DROP TABLE IF EXISTS stream_sequence;
+DROP TABLE IF EXISTS idempotency_tokens;

@@ -4,17 +4,81 @@
 //! Transaction helper functions: item fetch/upsert/delete within a transaction,
 //! stream record writing, and idempotency token checking.
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use extenddb_core::types::{
     AttributeValue, Item, StreamEventName, StreamRecord, StreamRecordData, StreamViewType,
     TableKeyInfo, item_size_bytes,
 };
 use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{SortKeyValue, parse_sk, pk_to_text, sk_column, sk_info};
+use extenddb_storage::util::{SortKeyValue, parse_sk, sk_column, sk_info};
 
-use super::{data_table_name, json_to_item};
+use super::{data_table_name, json_to_item, physical_pk_bytes};
+use crate::stream_engine::stream_shard_id_for_partition_key;
+use crate::tidb_util::{current_tidb_transaction_tso, current_tidb_tso};
+
+const STREAM_SEQUENCE_TSO_WIDTH: usize = 21;
+const STREAM_SEQUENCE_ORDINAL_WIDTH: usize = 6;
+const STREAM_SEQUENCE_MAX_ORDINAL: u32 = 999_999;
+const STREAM_COMMIT_SEQUENCE_SQL: &str = "CONCAT(\
+    LPAD(CAST(JSON_UNQUOTE(JSON_EXTRACT(\
+        TIDB_MVCC_INFO(TIDB_ENCODE_RECORD_KEY(DATABASE(), 'stream_records', shard_id, sequence_number)), \
+        '$[0].mvcc.info.writes[0].commit_ts'\
+    )) AS CHAR), 21, '0'), \
+    RIGHT(sequence_number, 6)\
+)";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PendingStreamRecord {
+    pub shard_id: String,
+    pub storage_sequence_number: String,
+}
+
+#[derive(Default)]
+pub(super) struct StreamSequenceAllocator {
+    transaction_tso: Option<u64>,
+    next_ordinal: u32,
+    pending_records: Vec<PendingStreamRecord>,
+}
+
+impl StreamSequenceAllocator {
+    async fn next_in_tx(
+        &mut self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    ) -> Result<String, StorageError> {
+        let transaction_tso = match self.transaction_tso {
+            Some(tso) => tso,
+            None => {
+                let tso = current_transaction_tso(tx).await?;
+                self.transaction_tso = Some(tso);
+                tso
+            }
+        };
+
+        let ordinal = self.next_ordinal;
+        if ordinal > STREAM_SEQUENCE_MAX_ORDINAL {
+            return Err(StorageError::Internal(
+                "too many TiDB stream records in one transaction".to_owned(),
+            ));
+        }
+        self.next_ordinal = self
+            .next_ordinal
+            .checked_add(1)
+            .ok_or_else(|| StorageError::Internal("stream sequence ordinal overflow".to_owned()))?;
+
+        Ok(format_tso_sequence_number(transaction_tso, ordinal))
+    }
+
+    fn push_pending(&mut self, shard_id: String, storage_sequence_number: String) {
+        self.pending_records.push(PendingStreamRecord {
+            shard_id,
+            storage_sequence_number,
+        });
+    }
+
+    pub(super) fn pending_records(&self) -> &[PendingStreamRecord] {
+        &self.pending_records
+    }
+}
 
 /// Fetch a single item within an existing transaction.
 pub(super) async fn fetch_item_in_tx(
@@ -23,11 +87,7 @@ pub(super) async fn fetch_item_in_tx(
     key: &Item,
 ) -> Result<Option<Item>, StorageError> {
     let ddb_table = data_table_name(&key_info.table_id);
-    let pk_name = &key_info.key_schema[0].attribute_name;
-    let pk_value = key
-        .get(pk_name)
-        .ok_or_else(|| StorageError::Internal("missing partition key".to_owned()))?;
-    let pk_text = pk_to_text(pk_value)?;
+    let pk = physical_pk_bytes(key, &key_info.key_schema)?;
 
     let json_opt = if let Some((sk_name, sk_type)) =
         sk_info(&key_info.key_schema, &key_info.attribute_definitions)
@@ -39,12 +99,12 @@ pub(super) async fn fetch_item_in_tx(
         let sk_col = sk_column(sk_type);
         let sql = format!("SELECT item_data FROM {ddb_table} WHERE pk = ? AND {sk_col} = ?");
         let row: Option<(serde_json::Value,)> =
-            bind_sk_fetch_optional!(&sql, pk_text.as_ref(), &sk, &mut **tx)?;
+            bind_sk_fetch_optional!(&sql, pk.as_slice(), &sk, &mut **tx)?;
         row.map(|(v,)| v)
     } else {
         let sql = format!("SELECT item_data FROM {ddb_table} WHERE pk = ?");
         let row: Option<(serde_json::Value,)> = sqlx::query_as(&sql)
-            .bind(pk_text.as_ref())
+            .bind(pk.as_slice())
             .fetch_optional(&mut **tx)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -61,11 +121,7 @@ pub(super) async fn fetch_item_for_update(
     key: &Item,
 ) -> Result<Option<Item>, StorageError> {
     let ddb_table = data_table_name(&key_info.table_id);
-    let pk_name = &key_info.key_schema[0].attribute_name;
-    let pk_value = key
-        .get(pk_name)
-        .ok_or_else(|| StorageError::Internal("missing partition key".to_owned()))?;
-    let pk_text = pk_to_text(pk_value)?;
+    let pk = physical_pk_bytes(key, &key_info.key_schema)?;
 
     let json_opt = if let Some((sk_name, sk_type)) =
         sk_info(&key_info.key_schema, &key_info.attribute_definitions)
@@ -78,12 +134,12 @@ pub(super) async fn fetch_item_for_update(
         let sql =
             format!("SELECT item_data FROM {ddb_table} WHERE pk = ? AND {sk_col} = ? FOR UPDATE");
         let row: Option<(serde_json::Value,)> =
-            bind_sk_fetch_optional!(&sql, pk_text.as_ref(), &sk, &mut **tx)?;
+            bind_sk_fetch_optional!(&sql, pk.as_slice(), &sk, &mut **tx)?;
         row.map(|(v,)| v)
     } else {
         let sql = format!("SELECT item_data FROM {ddb_table} WHERE pk = ? FOR UPDATE");
         let row: Option<(serde_json::Value,)> = sqlx::query_as(&sql)
-            .bind(pk_text.as_ref())
+            .bind(pk.as_slice())
             .fetch_optional(&mut **tx)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -100,11 +156,7 @@ pub(super) async fn upsert_item_in_tx(
     item: &Item,
 ) -> Result<(), StorageError> {
     let ddb_table = data_table_name(&key_info.table_id);
-    let pk_name = &key_info.key_schema[0].attribute_name;
-    let pk_value = item
-        .get(pk_name)
-        .ok_or_else(|| StorageError::Internal("missing partition key".to_owned()))?;
-    let pk_text = pk_to_text(pk_value)?;
+    let pk = physical_pk_bytes(item, &key_info.key_schema)?;
     let item_json =
         serde_json::to_value(item).map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -119,14 +171,14 @@ pub(super) async fn upsert_item_in_tx(
             "INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES (?, ?, ?) \
              ON DUPLICATE KEY UPDATE item_data = VALUES(item_data)"
         );
-        bind_sk_execute!(&sql, pk_text.as_ref(), &sk, &item_json, &mut **tx)?;
+        bind_sk_execute!(&sql, pk.as_slice(), &sk, &item_json, &mut **tx)?;
     } else {
         let sql = format!(
             "INSERT INTO {ddb_table} (pk, item_data) VALUES (?, ?) \
              ON DUPLICATE KEY UPDATE item_data = VALUES(item_data)"
         );
         sqlx::query(&sql)
-            .bind(pk_text.as_ref())
+            .bind(pk.as_slice())
             .bind(&item_json)
             .execute(&mut **tx)
             .await
@@ -142,11 +194,7 @@ pub(super) async fn delete_item_in_tx(
     key: &Item,
 ) -> Result<(), StorageError> {
     let ddb_table = data_table_name(&key_info.table_id);
-    let pk_name = &key_info.key_schema[0].attribute_name;
-    let pk_value = key
-        .get(pk_name)
-        .ok_or_else(|| StorageError::Internal("missing partition key".to_owned()))?;
-    let pk_text = pk_to_text(pk_value)?;
+    let pk = physical_pk_bytes(key, &key_info.key_schema)?;
 
     if let Some((sk_name, sk_type)) = sk_info(&key_info.key_schema, &key_info.attribute_definitions)
     {
@@ -159,21 +207,21 @@ pub(super) async fn delete_item_in_tx(
         match &sk {
             SortKeyValue::S(s) => {
                 sqlx::query(&sql)
-                    .bind(pk_text.as_ref())
+                    .bind(pk.as_slice())
                     .bind(s.as_bytes().to_vec())
                     .execute(&mut **tx)
                     .await
             }
             SortKeyValue::N(n) => {
                 sqlx::query(&sql)
-                    .bind(pk_text.as_ref())
+                    .bind(pk.as_slice())
                     .bind(n)
                     .execute(&mut **tx)
                     .await
             }
             SortKeyValue::B(b) => {
                 sqlx::query(&sql)
-                    .bind(pk_text.as_ref())
+                    .bind(pk.as_slice())
                     .bind(b)
                     .execute(&mut **tx)
                     .await
@@ -183,7 +231,7 @@ pub(super) async fn delete_item_in_tx(
     } else {
         let sql = format!("DELETE FROM {ddb_table} WHERE pk = ?");
         sqlx::query(&sql)
-            .bind(pk_text.as_ref())
+            .bind(pk.as_slice())
             .execute(&mut **tx)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -206,6 +254,7 @@ pub(super) async fn delete_item_in_tx(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn write_stream_record_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    sequence_allocator: &mut StreamSequenceAllocator,
     key_info: &TableKeyInfo,
     capture: &StreamCapture,
     old_item: Option<&Item>,
@@ -250,41 +299,13 @@ pub(super) async fn write_stream_record_in_tx(
     let size = source_item.map_or(0, |i| i64::try_from(item_size_bytes(i)).unwrap_or(i64::MAX));
 
     // Assign shard within the transaction.
-    let pk_name = &key_info.key_schema[0].attribute_name;
-    let pk_str = source
-        .get(pk_name)
-        .map(|v| match v {
-            AttributeValue::S(s) => s.clone(),
-            AttributeValue::N(n) => n.clone(),
-            AttributeValue::B(b) => BASE64.encode(b),
-            _ => String::new(),
-        })
-        .unwrap_or_default();
+    let pk = physical_pk_bytes(source, &key_info.key_schema)?;
+    let shard_id = stream_shard_id_for_partition_key(&key_info.table_id, &pk);
 
-    let shards: Vec<(String,)> = sqlx::query_as(
-        "SELECT shard_id FROM stream_shards \
-         WHERE table_id = ? \
-         ORDER BY shard_id",
-    )
-    .bind(&key_info.table_id)
-    .fetch_all(&mut **tx)
-    .await
-    .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-    if shards.is_empty() {
-        return Err(StorageError::Internal(format!(
-            "stream is enabled but no shards exist for table {}",
-            key_info.table_name
-        )));
-    }
-
-    let hash = crc32fast::hash(pk_str.as_bytes());
-    #[allow(clippy::cast_possible_truncation)]
-    let idx = (hash as usize) % shards.len();
-    let shard_id = &shards[idx].0;
-
-    // Generate monotonic sequence number within the transaction (CB-21).
-    let seq = next_shard_sequence_in_tx(tx, shard_id).await?;
+    // Use transaction TSO only as the clustered storage key while the row is
+    // committed atomically with the item write. After commit, TiDB MVCC
+    // commit_ts becomes the user-visible stream sequence base.
+    let seq = sequence_allocator.next_in_tx(tx).await?;
 
     let record = StreamRecord {
         event_id: uuid::Uuid::new_v4().to_string(),
@@ -318,7 +339,7 @@ pub(super) async fn write_stream_record_in_tx(
          VALUES (?, ?, ?, ?, ?)",
     )
     .bind(&record.dynamodb.sequence_number)
-    .bind(shard_id)
+    .bind(&shard_id)
     .bind(&key_info.table_id)
     .bind(format!("{:?}", record.event_name))
     .bind(&record_json)
@@ -326,49 +347,182 @@ pub(super) async fn write_stream_record_in_tx(
     .await
     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+    sequence_allocator.push_pending(shard_id, record.dynamodb.sequence_number);
+
     Ok(())
 }
 
-pub(crate) async fn next_shard_sequence_in_tx(
+async fn current_transaction_tso(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    shard_id: &str,
-) -> Result<String, StorageError> {
-    let result = sqlx::query(
-        "UPDATE stream_shards \
-         SET next_sequence_number = LAST_INSERT_ID(next_sequence_number + 1) \
-         WHERE shard_id = ?",
-    )
-    .bind(shard_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(|e| StorageError::Internal(e.to_string()))?;
+) -> Result<u64, StorageError> {
+    let tso = current_tidb_transaction_tso(tx).await?;
+    u64::try_from(tso)
+        .map_err(|_| StorageError::Internal(format!("TiDB returned negative TSO: {tso}")))
+}
 
-    if result.rows_affected() != 1 {
-        return Err(StorageError::Internal(format!(
-            "stream shard not found: {shard_id}"
-        )));
+pub(crate) async fn next_stream_sequence(
+    pool: &sqlx::MySqlPool,
+    _shard_id: &str,
+) -> Result<String, StorageError> {
+    let tso = current_tidb_tso(pool).await?;
+    let tso = u64::try_from(tso)
+        .map_err(|_| StorageError::Internal(format!("TiDB returned negative TSO: {tso}")))?;
+    Ok(format_tso_sequence_number(tso, 0))
+}
+
+pub(crate) fn format_tso_sequence_number(tso: u64, ordinal: u32) -> String {
+    format!("{tso:0STREAM_SEQUENCE_TSO_WIDTH$}{ordinal:0STREAM_SEQUENCE_ORDINAL_WIDTH$}")
+}
+
+pub(crate) async fn finalize_stream_records(
+    pool: &sqlx::MySqlPool,
+    records: &[PendingStreamRecord],
+) -> Result<u64, StorageError> {
+    if records.is_empty() {
+        return Ok(0);
     }
 
-    let seq_val: i64 = sqlx::query_scalar("SELECT LAST_INSERT_ID()")
-        .fetch_one(&mut **tx)
+    let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "UPDATE stream_records \
+         SET commit_sequence_number = ",
+    );
+    query.push(STREAM_COMMIT_SEQUENCE_SQL);
+    query.push(", record_data = JSON_SET(record_data, '$.dynamodb.SequenceNumber', ");
+    query.push(STREAM_COMMIT_SEQUENCE_SQL);
+    query.push(") WHERE commit_sequence_number IS NULL AND ");
+    query.push(STREAM_COMMIT_SEQUENCE_SQL);
+    query.push(" IS NOT NULL AND (");
+    for (idx, record) in records.iter().enumerate() {
+        if idx > 0 {
+            query.push(" OR ");
+        }
+        query.push("(shard_id = ");
+        query.push_bind(&record.shard_id);
+        query.push(" AND sequence_number = ");
+        query.push_bind(&record.storage_sequence_number);
+        query.push(")");
+    }
+    query.push(")");
+
+    let result = query
+        .build()
+        .execute(pool)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-    Ok(format!("{seq_val:021}"))
+    Ok(result.rows_affected())
+}
+
+pub(crate) async fn finalize_stream_records_best_effort(
+    pool: &sqlx::MySqlPool,
+    operation: &'static str,
+    records: &[PendingStreamRecord],
+) {
+    if records.is_empty() {
+        return;
+    }
+
+    match finalize_stream_records(pool, records).await {
+        Ok(finalized) if finalized == records.len() as u64 => {}
+        Ok(finalized) => {
+            tracing::warn!(
+                operation,
+                finalized,
+                expected = records.len(),
+                "TiDB stream commit-sequence finalization left pending records for repair"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                operation,
+                %error,
+                "TiDB stream commit-sequence finalization failed; stream reads will repair"
+            );
+        }
+    }
+}
+
+pub(crate) async fn finalize_pending_stream_records_for_shard(
+    pool: &sqlx::MySqlPool,
+    shard_id: &str,
+    limit: i64,
+) -> Result<u64, StorageError> {
+    let mut total_finalized = 0_u64;
+    loop {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT shard_id, sequence_number \
+             FROM stream_records \
+             WHERE shard_id = ? AND commit_sequence_number IS NULL \
+             ORDER BY sequence_number LIMIT ?",
+        )
+        .bind(shard_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        if rows.is_empty() {
+            return Ok(total_finalized);
+        }
+
+        let row_count = rows.len();
+        let pending = rows
+            .into_iter()
+            .map(|(shard_id, storage_sequence_number)| PendingStreamRecord {
+                shard_id,
+                storage_sequence_number,
+            })
+            .collect::<Vec<_>>();
+
+        let finalized = finalize_stream_records(pool, &pending).await?;
+        if finalized == 0 {
+            let remaining: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM stream_records \
+                 WHERE shard_id = ? AND commit_sequence_number IS NULL",
+            )
+            .bind(shard_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if remaining > 0 {
+                return Err(StorageError::Internal(format!(
+                    "unable to finalize {remaining} TiDB stream records from MVCC commit metadata"
+                )));
+            }
+            return Ok(total_finalized);
+        }
+
+        total_finalized += finalized;
+        if row_count < usize::try_from(limit).unwrap_or(usize::MAX) {
+            return Ok(total_finalized);
+        }
+    }
 }
 
 /// Check an idempotency token within an existing transaction.
 ///
-/// Returns `Ok(())` for new tokens (inserted), `Err(IdempotentReplay)` for
-/// matching replays, `Err(IdempotentMismatch)` for fingerprint conflicts.
+/// Returns `Ok(())` for newly claimed tokens, `Err(IdempotentReplay)` for
+/// matching in-window replays, and `Err(IdempotentMismatch)` for fingerprint
+/// conflicts. TiDB native TTL owns bulk retention; this path only atomically
+/// recycles a same-token row if the 10-minute DynamoDB idempotency window has
+/// already elapsed but the background TTL job has not removed it yet.
 pub(super) async fn check_idempotency_token_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     token: &str,
     fingerprint: &str,
 ) -> Result<(), StorageError> {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT fingerprint FROM idempotency_tokens \
-         WHERE token = ? AND created_at > DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 600 SECOND) \
+    let claim_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(idempotency_token_claim_sql())
+        .bind(token)
+        .bind(fingerprint)
+        .bind(&claim_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT fingerprint, claim_id FROM idempotency_tokens \
+         WHERE token = ? \
          FOR UPDATE",
     )
     .bind(token)
@@ -377,26 +531,53 @@ pub(super) async fn check_idempotency_token_in_tx(
     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
     match row {
-        Some((stored,)) if stored == fingerprint => return Err(StorageError::IdempotentReplay),
-        Some(_) => return Err(StorageError::IdempotentMismatch),
-        None => {}
+        Some((_, stored_claim_id)) if stored_claim_id == claim_id => Ok(()),
+        Some((stored, _)) if stored == fingerprint => Err(StorageError::IdempotentReplay),
+        Some((_, _)) => Err(StorageError::IdempotentMismatch),
+        None => Err(StorageError::Internal(
+            "idempotency token disappeared during transaction".to_owned(),
+        )),
+    }
+}
+
+fn idempotency_token_claim_sql() -> &'static str {
+    "INSERT INTO idempotency_tokens (token, fingerprint, claim_id) VALUES (?, ?, ?) \
+     ON DUPLICATE KEY UPDATE \
+        fingerprint = IF(created_at <= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 600 SECOND), VALUES(fingerprint), fingerprint), \
+        claim_id = IF(created_at <= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 600 SECOND), VALUES(claim_id), claim_id), \
+        created_at = IF(created_at <= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 600 SECOND), CURRENT_TIMESTAMP(6), created_at)"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_tso_sequence_number, idempotency_token_claim_sql};
+
+    #[test]
+    fn tidb_tso_sequence_numbers_sort_lexicographically() {
+        let first = format_tso_sequence_number(42, 0);
+        let second = format_tso_sequence_number(43, 0);
+
+        assert_eq!(first, "000000000000000000042000000");
+        assert!(first < second);
+        assert_eq!(second.len(), 27);
     }
 
-    sqlx::query(
-        "DELETE FROM idempotency_tokens \
-         WHERE token = ? AND created_at <= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 600 SECOND)",
-    )
-    .bind(token)
-    .execute(&mut **tx)
-    .await
-    .map_err(|e| StorageError::Internal(e.to_string()))?;
+    #[test]
+    fn tidb_tso_sequence_ordinals_order_records_inside_one_transaction() {
+        let first = format_tso_sequence_number(42, 0);
+        let second = format_tso_sequence_number(42, 1);
 
-    sqlx::query("INSERT INTO idempotency_tokens (token, fingerprint) VALUES (?, ?)")
-        .bind(token)
-        .bind(fingerprint)
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        assert_eq!(second, "000000000000000000042000001");
+        assert!(first < second);
+    }
 
-    Ok(())
+    #[test]
+    fn idempotency_token_claim_uses_single_native_upsert_without_cleanup_delete() {
+        let sql = idempotency_token_claim_sql();
+
+        assert!(sql.starts_with("INSERT INTO idempotency_tokens"));
+        assert!(sql.contains("ON DUPLICATE KEY UPDATE"));
+        assert!(sql.contains("claim_id"));
+        assert!(!sql.contains("DELETE FROM idempotency_tokens"));
+    }
 }

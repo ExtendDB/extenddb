@@ -6,8 +6,12 @@ ALTER TABLE metrics
     TTL = `bucket` + INTERVAL 24 HOUR
     TTL_JOB_INTERVAL = '1h';
 
+ALTER TABLE metrics TTL_ENABLE = 'ON';
+
 ALTER TABLE login_attempts
     TTL = `attempted_at` + INTERVAL 24 HOUR
     TTL_JOB_INTERVAL = '1h';
+
+ALTER TABLE login_attempts TTL_ENABLE = 'ON';
 
 UPDATE settings SET value = '0.0.9' WHERE `key` = 'catalog_version';

@@ -269,7 +269,6 @@ impl PostgresEngine {
             None => (0, 0),
         };
 
-        // Fix #12: Unknown table_status is an error, not a silent fallback
         let table_status = match row.table_status.as_str() {
             "ACTIVE" => TableStatus::Active,
             "CREATING" => TableStatus::Creating,

@@ -224,11 +224,11 @@ sequenceDiagram
 
 ### 4.3 Trait-Based Pluggability
 
-**Decision:** Define `StorageEngine` sub-traits as async traits using RPITIT (Return Position Impl Trait In Trait, stable since Rust 1.75), selected at startup via enum dispatch. Define `AuthProvider` and `CredentialStore` using `#[async_trait]` for object-safe dynamic dispatch.
+**Decision:** Define `StorageEngine` sub-traits with explicit `BoxFuture` return types for object-safe dynamic dispatch. Define `AuthProvider` and `CredentialStore` using `#[async_trait]` for object-safe dynamic dispatch.
 
 **Rationale:**
-- **Storage (RPITIT + enum dispatch):** RPITIT avoids the `Box<dyn Future>` heap allocation per call that `async_trait` introduces — at high throughput on the data path this matters. Since RPITIT traits are not object-safe, the backend is selected at startup via an enum dispatch wrapper in the `bin` crate (e.g., `enum Storage { Postgres(PostgresEngine) }`) rather than `Arc<dyn StorageEngine>`. The enum dispatch approach has zero overhead (static dispatch) and the match arms are generated once at startup.
-- **Auth (`#[async_trait]` + `Arc<dyn>`):** Both `AuthProvider` and `CredentialStore` use `#[async_trait]` for object safety. Auth is called once per request and involves crypto operations (SigV4 HMAC-SHA256, policy evaluation) that dwarf the cost of a single `Box<dyn Future>` allocation. Using `#[async_trait]` makes `AuthProvider` object-safe, allowing `Arc<dyn AuthProvider>` in the server crate without enum wrappers. `CredentialStore` uses `#[async_trait]` for the same reason — it allows `Arc<dyn CredentialStore>` inside `BuiltinAuthProvider`, avoiding a generic parameter that would propagate up through the auth provider. Note: `CredentialStore` (in the `auth` crate) is a separate trait from `CredentialEngine` (in the `storage` crate, which uses RPITIT). The `bin` crate bridges them with a thin adapter.
+- **Storage (`BoxFuture` + `Arc<dyn>`):** Storage backends are selected at runtime through `Arc<dyn StorageEngine>`. The explicit `BoxFuture` signatures keep the traits object-safe without relying on `#[async_trait]`, and data-plane methods tie the future lifetime to borrowed request metadata so implementations do not clone keys, expression maps, resolved index info, or transaction batches just to cross an async boundary.
+- **Auth (`#[async_trait]` + `Arc<dyn>`):** Both `AuthProvider` and `CredentialStore` use `#[async_trait]` for object safety. Auth is called once per request and involves crypto operations (SigV4 HMAC-SHA256, policy evaluation) that dwarf the cost of a single boxed future allocation. Using `#[async_trait]` makes `AuthProvider` object-safe, allowing `Arc<dyn AuthProvider>` in the server crate without enum wrappers. `CredentialStore` uses `#[async_trait]` for the same reason: it allows `Arc<dyn CredentialStore>` inside `BuiltinAuthProvider`, avoiding a generic parameter that would propagate up through the auth provider.
 - Avoids monomorphization bloat from generic parameters threaded through the entire codebase
 - Clean testing — mock implementations for unit tests, real backends for integration tests
 
@@ -265,18 +265,26 @@ sequenceDiagram
 - sqlx provides native async PostgreSQL support
 - The storage trait being async allows backends that use network I/O (e.g., a future DynamoDB-backed backend for testing, or a distributed storage backend)
 
-### 4.7 Read Consistency via Optional Read Replica
+### 4.7 Read Consistency Routing
 
-**Decision:** All reads are strongly consistent by default. Eventually consistent reads (`ConsistentRead=false`) are supported by routing to an optional PostgreSQL streaming replica.
+**Decision:** The engine passes DynamoDB `ConsistentRead` into storage read
+methods. Backends can use their native strong/default-read routing without
+inventing delay queues or app-side consistency machinery.
 
 **Rationale:**
-- DynamoDB's eventual consistency is a consequence of reading from storage replicas that haven't received the latest write yet — it's not artificial delays or queues
-- Strongly consistent is strictly stronger than eventually consistent — any application that works against eventually consistent DynamoDB also works against a strongly consistent backend
-- For migration testing (relational → DynamoDB), teams need to surface bugs where application code assumes strong consistency on default reads. A real read replica provides genuine staleness without synthetic delays
-- The read replica is opt-in via `storage.postgres.read_replica_url`. When unset, all reads hit the primary — simple, correct, and matching what DynamoDB Local and other emulators do
-- Writes always go to the primary. `ConsistentRead=true` always reads from the primary. Only `ConsistentRead=false` reads route to the replica
-- Capacity calculations always reflect the consistency mode (0.5 RCU for eventually consistent, 1.0 RCU for strongly consistent) regardless of whether a replica is configured
-- This requires zero changes to the storage trait, engine, or server — it's entirely contained in the PostgreSQL backend's pool selection logic
+- DynamoDB's eventual consistency is a read-path choice, not an artificial
+  background delay.
+- Strongly consistent reads remain the authoritative path. Writes and
+  `ConsistentRead=true` reads stay on the backend's strong data path.
+- Backends without a native replica/follower-read path may serve all reads
+  strongly; that is stricter than DynamoDB and compatible with clients.
+- TiDB uses a dedicated default-read pool with native `closest-adaptive` follower
+  read for default reads. TiDB follower read remains strongly consistent, but it
+  lets TiDB reduce leader and cross-AZ read pressure for larger read-only
+  statements.
+- Capacity calculations always reflect the requested consistency mode
+  (0.5 RCU for eventually consistent, 1.0 RCU for strongly consistent)
+  regardless of the backend's physical routing choice.
 
 ## 5. Data Flow
 
@@ -439,7 +447,7 @@ There is no in-memory locking (no `Mutex`, `RwLock`, or similar) on the data pat
 | Time | time | Timestamp handling (native sqlx support; chrono 0.4.31+ also fixed its localtime_r unsafety, but time has a leaner API) |
 | Decimal | bigdecimal | Arbitrary-precision decimal arithmetic for DynamoDB's 38-digit number type |
 | Caching | moka | Async-compatible cache with TTL, max-size eviction, and automatic cleanup |
-| Async trait | async_trait | Object-safe async traits for `AuthProvider` and `CredentialStore` (storage sub-traits use RPITIT instead) |
+| Async trait | async_trait | Object-safe async traits for `AuthProvider` and `CredentialStore` (storage sub-traits use explicit `BoxFuture` signatures instead) |
 
 ---
 

@@ -102,7 +102,7 @@ PostgreSQL implementation of all storage traits using `sqlx`. Features:
 
 ### storage-tidb
 
-TiDB implementation of the storage traits using the sqlx MySQL driver. It mirrors the PostgreSQL backend structure while using TiDB-compatible SQL, MySQL-style connection strings, `ON DUPLICATE KEY UPDATE` upserts, and TiDB/MySQL error classification. It is selected with `storage.backend = "tidb"` when the binary is built with the `tidb` feature.
+TiDB implementation of the storage traits using the sqlx MySQL driver. It uses TiDB-compatible SQL, MySQL-style connection strings, `ON DUPLICATE KEY UPDATE` upserts, and TiDB/MySQL error classification. TiDB write pools set the session transaction mode to pessimistic so conditional writes and `SELECT FOR UPDATE` use TiDB's distributed row-locking behavior even on clusters upgraded from older defaults. TiDB default-read pools use native `closest-adaptive` follower read for DynamoDB reads that did not request `ConsistentRead=true`; strong reads and writes use the strong data pool. It is selected with `storage.backend = "tidb"` when the binary is built with the `tidb` feature.
 
 TiDB backups use BR as the physical backup data plane. ExtendDB stores backup
 metadata in the catalog and delegates snapshot data to BR storage; it does not
@@ -135,7 +135,7 @@ Thin binary that wires everything together:
 - CLI parsing (clap): `serve`, `init`, `destroy`, `verify`, `migrate`, `status`, `settings`, `manage`, `version`
 - Configuration loading (TOML + env vars)
 - Daemon lifecycle (bind socket → fork → syslog → serve)
-- Background tasks (log level polling, throttling polling, stream record cleanup, TTL expiry, metrics persistence)
+- Background tasks (log level polling, throttling polling, stream record cleanup, backend-specific TTL expiry, metrics persistence)
 
 ## Request Lifecycle
 
@@ -160,7 +160,7 @@ extenddb always runs as a daemon. There is no foreground mode.
 5. Connect to the configured storage backend (catalog + data databases)
 6. Verify catalog version matches binary expectation
 7. Start axum server on the pre-bound socket
-8. Spawn background tasks (log level polling, throttling polling, stream cleanup, TTL expiry, metrics persistence)
+8. Spawn background tasks (log level polling, throttling polling, backend-specific retention, metrics persistence)
 9. On SIGTERM/SIGINT: drain connections (5s timeout), exit
 
 ## Catalog Model
@@ -170,7 +170,7 @@ extenddb uses a catalog/data storage architecture:
 - **Catalog database** (e.g., `extenddb_catalog`): Stores table metadata, account/user/group/role/policy definitions, access keys, settings, stream metadata, and metrics. Shared across all accounts.
 - **Data database** (e.g., `extenddb_catalog_data`): Stores user items, backend-specific secondary-index state, and stream records. PostgreSQL uses companion data/index tables. TiDB stores item rows once and uses generated columns plus native secondary indexes.
 
-The catalog version (currently 0.0.2) is stored in the `catalog_metadata` table and checked at startup. Version mismatches prevent the server from starting — run `extenddb migrate` to upgrade.
+The backend-specific catalog version is stored in the `settings` table as `catalog_version` and checked at startup. Version mismatches prevent the server from starting until migrations are run. TiDB also records the data database connection string in the catalog, and both TiDB databases must remain in the same TiDB cluster so native timestamps, online DDL, TTL, and BR operate on one global timeline.
 
 ## Pluggable Architecture
 
@@ -252,7 +252,7 @@ The documentation browser at `/console/docs` is accessible without login. All ot
 Two configuration surfaces:
 
 - **`extenddb.toml`**: Static configuration requiring a restart (bind address, port, database connection, auth provider, TLS, log format)
-- **Settings table**: Runtime configuration via `extenddb settings set` (log level, control plane delay, credential import toggle). A background poller picks up changes every 30 seconds.
+- **Settings table**: Runtime configuration via `extenddb settings set` (log level, backend-specific control plane delay, credential import toggle). A background poller picks up changes every 30 seconds.
 
 Configuration precedence: CLI flags > environment variables > config file > defaults.
 
@@ -262,7 +262,9 @@ extenddb implements DynamoDB Streams for change data capture. Stream records are
 
 Supported operations: `ListStreams`, `DescribeStream`, `GetShardIterator`, `GetRecords`.
 
-Stream records are retained for 24 hours. A background worker cleans up expired records hourly.
+Stream records are retained for 24 hours. Backends with native TTL, such as
+TiDB, delegate retention to the database; backends without native TTL clean up
+expired records with a background worker.
 
 ## Deployment Models
 

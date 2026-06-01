@@ -429,8 +429,12 @@ pub struct UpdateTableOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TimeToLiveStatus {
+    /// TTL is being enabled.
+    Enabling,
     /// TTL is enabled.
     Enabled,
+    /// TTL is being disabled.
+    Disabling,
     /// TTL is disabled.
     Disabled,
 }

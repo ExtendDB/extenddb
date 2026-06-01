@@ -227,6 +227,7 @@ pub async fn handle_export_table(
                 None,
                 None,
                 None,
+                true,
             )
             .await
             .map_err(storage_err_to_dynamo)?;

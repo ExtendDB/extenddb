@@ -108,7 +108,7 @@ aws dynamodb create-table \
     }]'
 ```
 
-Tables transition through `CREATING` → `ACTIVE` status. The transition delay is configurable via the `control_plane_delay_seconds` runtime setting (default: 5 seconds). Poll with DescribeTable until `TableStatus` is `ACTIVE` before performing operations on the table.
+Tables transition through `CREATING` → `ACTIVE` status. PostgreSQL can use the `control_plane_delay_seconds` runtime setting to simulate a delay. TiDB reconciles immediately and lets TiDB native online DDL schedule physical table and index changes. Poll with DescribeTable until `TableStatus` is `ACTIVE` before performing operations on the table.
 
 ### DeleteTable
 
@@ -233,7 +233,7 @@ aws dynamodb query \
     --return-consumed-capacity INDEXES
 ```
 
-Supports: `IndexName` (for GSI/LSI queries), `ScanIndexForward`, `Limit`, `ExclusiveStartKey`, `Select`, `ProjectionExpression`, `FilterExpression`, `ConsistentRead`, and `ReturnConsumedCapacity`.
+Supports: `IndexName` (for GSI/LSI queries), `ScanIndexForward`, `Limit`, `ExclusiveStartKey`, `Select`, `ProjectionExpression`, `FilterExpression`, `ConsistentRead`, and `ReturnConsumedCapacity`. Index reads follow DynamoDB projection rules: default index reads return projected attributes, GSI reads cannot request attributes that are not projected into that GSI, and LSI reads may fetch non-projected attributes from the base table.
 
 ### Scan
 
@@ -431,6 +431,11 @@ aws dynamodb update-time-to-live \
     --table-name Orders \
     --time-to-live-specification Enabled=true,AttributeName=ExpiresAt
 ```
+
+`DescribeTimeToLive` may report `ENABLING` or `DISABLING` while backend-native
+TTL artifacts are being reconciled. TiDB records the TTL intent durably and uses
+its native online DDL/TTL scheduler; ExtendDB does not run a frontend TTL item
+sweeper for TiDB.
 
 ## Expression Syntax Reference
 

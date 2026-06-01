@@ -20,7 +20,9 @@ use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
-use crate::index_helpers::combined_lek_key_schema;
+use crate::index_helpers::{
+    combined_lek_key_schema, index_projection_for_read, validate_gsi_projection_request,
+};
 use crate::legacy_filter::{desugar_filter, desugar_key_conditions};
 use crate::read_helpers::apply_post_read;
 use crate::serialize_output;
@@ -42,24 +44,12 @@ pub async fn handle_query(
 ) -> Result<DispatchResult, DynamoDbError> {
     let input: QueryInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
-    // P118: Fetch key_info first so we can use table_id for index lookup.
-    let key_info = ctx
-        .table_key_info(&input.table_name)
+    let read_info = ctx
+        .table_read_info(&input.table_name, input.index_name.as_deref())
         .await
         .map_err(storage_err_to_dynamo)?;
-
-    // GSI/LSI: resolve index metadata if querying a secondary index.
-    // Uses table_id from pre-fetched key_info to skip redundant table lookup (P118 #4).
-    let index_info = if let Some(ref idx_name) = input.index_name {
-        Some(
-            ctx.storage
-                .index_info_by_table_id(&key_info.table_id, idx_name)
-                .await
-                .map_err(storage_err_to_dynamo)?,
-        )
-    } else {
-        None
-    };
+    let key_info = read_info.table;
+    let index_info = read_info.index;
 
     // ConsistentRead is not supported on GSI queries (tenet 1: fidelity).
     if input.consistent_read == Some(true) {
@@ -324,13 +314,23 @@ pub async fn handle_query(
             ));
         }
     }
+    if effective_projection_str.is_some()
+        && matches!(
+            input.select,
+            Some(Select::AllAttributes | Select::AllProjectedAttributes)
+        )
+    {
+        return Err(DynamoDbError::ValidationException(
+            "Cannot specify the ProjectionExpression when Select is not SPECIFIC_ATTRIBUTES"
+                .to_owned(),
+        ));
+    }
 
-    // When Select=ALL_PROJECTED_ATTRIBUTES, capture the index info for post-read filtering.
-    let index_proj = if matches!(input.select, Some(Select::AllProjectedAttributes)) {
-        index_info.as_ref()
-    } else {
-        None
-    };
+    let index_proj = index_projection_for_read(
+        index_info.as_ref(),
+        input.select.as_ref(),
+        projection.is_some(),
+    );
 
     // Build the combined expression maps used for storage query and post-read evaluation.
     // Merges the base request maps with any legacy desugared maps and projection name maps.
@@ -360,6 +360,14 @@ pub async fn handle_query(
         )?;
     }
 
+    validate_gsi_projection_request(
+        index_info.as_ref(),
+        input.select.as_ref(),
+        &projection,
+        &combined_maps,
+        &key_info.key_schema,
+    )?;
+
     // Validate ExclusiveStartKey matches the key schema
     if let Some(ref start_key) = input.exclusive_start_key {
         let required = combined_lek_key_schema(&key_info.key_schema, index_info.as_ref());
@@ -376,13 +384,14 @@ pub async fn handle_query(
     let (raw_items, storage_last_key) = ctx
         .storage
         .query(
-            &query_key_info,
+            &key_info,
             &key_condition,
             &combined_maps,
             input.scan_index_forward,
             input.limit,
             input.exclusive_start_key.as_ref(),
-            input.index_name.as_deref(),
+            index_info.as_ref(),
+            input.consistent_read == Some(true),
         )
         .await
         .map_err(storage_err_to_dynamo)?;

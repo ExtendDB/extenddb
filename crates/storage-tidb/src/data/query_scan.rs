@@ -5,12 +5,10 @@
 
 use extenddb_core::expression::{ExpressionMaps, KeyCondition};
 use extenddb_core::types::{
-    AttributeDefinition, Item, KeySchemaElement, ScalarAttributeType, TableKeyInfo,
+    AttributeDefinition, IndexInfo, Item, KeySchemaElement, ScalarAttributeType, TableKeyInfo,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{
-    encode_netstring_composite, pk_to_text, sk_column, sk_column_n, sk_info,
-};
+use extenddb_storage::util::{sk_column, sk_column_n, sk_info};
 
 use super::index::{
     native_index_hash_column, native_index_key_tuple_columns, native_index_non_null_predicates,
@@ -19,7 +17,7 @@ use super::index::{
 use super::query::{
     build_key, build_sk_sql, execute_query_sql, execute_scan_sql, resolve_expr_to_av,
 };
-use super::{all_sort_key_info, data_table_name, json_to_item};
+use super::{all_sort_key_info, data_table_name, json_to_item, physical_pk_bytes_from_values};
 use crate::TidbEngine;
 
 fn sort_key_columns(
@@ -72,6 +70,46 @@ fn push_order_by(sql: &mut String, columns: &[String], forward: bool) {
     );
 }
 
+struct CursorColumns {
+    seek: Vec<String>,
+    order: Vec<String>,
+}
+
+impl CursorColumns {
+    fn same(columns: Vec<String>) -> Self {
+        Self {
+            seek: columns.clone(),
+            order: columns,
+        }
+    }
+}
+
+fn native_index_query_cursor_columns(
+    sort_columns: &[String],
+    base_key_schema: &[KeySchemaElement],
+    base_attr_defs: &[AttributeDefinition],
+) -> CursorColumns {
+    // TiDB secondary-index entries are ordered by the native index key followed
+    // by the clustered primary-key handle. Make the handle columns explicit in
+    // ORDER BY so LastEvaluatedKey pagination remains deterministic when many
+    // items share the same index key. The index hash column is already fixed by
+    // the equality predicate for Query, so only range columns plus the handle
+    // participate in the ordered cursor.
+    let mut columns = sort_columns.to_vec();
+    columns.extend(key_tuple_columns(base_key_schema, base_attr_defs));
+    CursorColumns::same(columns)
+}
+
+fn native_index_scan_cursor_columns(
+    index_columns: Vec<String>,
+    base_key_schema: &[KeySchemaElement],
+    base_attr_defs: &[AttributeDefinition],
+) -> CursorColumns {
+    let mut columns = index_columns;
+    columns.extend(key_tuple_columns(base_key_schema, base_attr_defs));
+    CursorColumns::same(columns)
+}
+
 impl TidbEngine {
     /// Implementation of `DataEngine::query`.
     #[allow(clippy::too_many_arguments)]
@@ -83,74 +121,47 @@ impl TidbEngine {
         forward: bool,
         limit: Option<i64>,
         exclusive_start_key: Option<&Item>,
-        index_name: Option<&str>,
+        index: Option<&IndexInfo>,
+        consistent_read: bool,
     ) -> Result<(Vec<Item>, Option<Item>), StorageError> {
         use std::fmt::Write;
 
-        let index_info = if let Some(idx_name) = index_name {
-            Some(
-                self.fetch_index_info_by_table_id(&key_info.table_id, idx_name)
-                    .await?,
-            )
-        } else {
-            None
-        };
-
-        let base_table_key = if index_info.is_some() {
-            Some(
-                self.fetch_base_key_schema_by_table_id(&key_info.table_id)
-                    .await?,
-            )
-        } else {
-            None
-        };
-
+        let read_key_schema = index.map_or(key_info.key_schema.as_slice(), |idx| {
+            idx.key_schema.as_slice()
+        });
+        let attr_defs = key_info.attribute_definitions.as_slice();
         let ddb_table = data_table_name(&key_info.table_id);
-        let pk_column = index_info.as_ref().map_or_else(
+        let pk_column = index.map_or_else(
             || "pk".to_owned(),
             |idx| native_index_hash_column(&idx.index_id),
         );
-        let sort_columns = index_info.as_ref().map_or_else(
-            || sort_key_columns(&key_info.key_schema, &key_info.attribute_definitions),
-            |idx| {
-                native_index_sort_columns(
-                    &idx.index_id,
-                    &key_info.key_schema,
-                    &key_info.attribute_definitions,
-                )
-            },
+        let sort_columns = index.map_or_else(
+            || sort_key_columns(read_key_schema, attr_defs),
+            |idx| native_index_sort_columns(&idx.index_id, read_key_schema, attr_defs),
         );
 
-        // Resolve partition key value(s) — for multi-part keys, encode
-        // all HASH attribute values into a single composite PK text using
-        // netstring encoding (matching the write path in composite_pk_to_text).
-        let pk_text = if key_condition.extra_pk_conditions.is_empty() {
-            let pk_expr_val = resolve_expr_to_av(&key_condition.pk_value, maps)?;
-            pk_to_text(&pk_expr_val)?.into_owned()
-        } else {
-            let mut parts = Vec::with_capacity(1 + key_condition.extra_pk_conditions.len());
-            let first_val = resolve_expr_to_av(&key_condition.pk_value, maps)?;
-            parts.push(pk_to_text(&first_val)?.into_owned());
-            for (_, value) in &key_condition.extra_pk_conditions {
-                let val = resolve_expr_to_av(value, maps)?;
-                parts.push(pk_to_text(&val)?.into_owned());
-            }
-            encode_netstring_composite(&parts)
-        };
+        let first_pk_value = resolve_expr_to_av(&key_condition.pk_value, maps)?;
+        let mut pk_values = Vec::with_capacity(1 + key_condition.extra_pk_conditions.len());
+        pk_values.push(&first_pk_value);
+        let extra_pk_values = key_condition
+            .extra_pk_conditions
+            .iter()
+            .map(|(_, value)| resolve_expr_to_av(value, maps))
+            .collect::<Result<Vec<_>, _>>()?;
+        pk_values.extend(extra_pk_values.iter());
+        let pk = physical_pk_bytes_from_values(&pk_values)?;
 
-        let sk_info_val = sk_info(&key_info.key_schema, &key_info.attribute_definitions);
-        let all_sks = all_sort_key_info(&key_info.key_schema, &key_info.attribute_definitions);
+        let sk_info_val = sk_info(read_key_schema, attr_defs);
+        let all_sks = all_sort_key_info(read_key_schema, attr_defs);
 
         // Build SQL query
         let mut sql = format!("SELECT item_data FROM {ddb_table} WHERE {pk_column} = ?");
         let mut param_idx: u32 = 2;
 
-        if let Some(idx) = &index_info {
-            for predicate in native_index_non_null_predicates(
-                &idx.index_id,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            ) {
+        if let Some(idx) = index {
+            for predicate in
+                native_index_non_null_predicates(&idx.index_id, read_key_schema, attr_defs)
+            {
                 sql.push_str(" AND ");
                 sql.push_str(&predicate);
             }
@@ -160,10 +171,14 @@ impl TidbEngine {
         let sk_sql_info = if let (Some(sk_cond), Some((_, sk_type))) =
             (&key_condition.sk_condition, sk_info_val)
         {
-            let sk_col = index_info
-                .as_ref()
-                .and_then(|_| sort_columns.first().cloned())
-                .unwrap_or_else(|| sk_column(sk_type).to_owned());
+            let sk_col = if index.is_some() {
+                sort_columns
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| sk_column(sk_type).to_owned())
+            } else {
+                sk_column(sk_type).to_owned()
+            };
             Some(build_sk_sql(
                 sk_cond,
                 &sk_col,
@@ -207,10 +222,14 @@ impl TidbEngine {
                 // Skip index 0 — that's the primary SK handled above
                 if pos > 0 {
                     let (_, sk_type) = all_sks[pos];
-                    let col = index_info
-                        .as_ref()
-                        .and_then(|_| sort_columns.get(pos).cloned())
-                        .unwrap_or_else(|| sk_column_n(pos, sk_type));
+                    let col = if index.is_some() {
+                        sort_columns
+                            .get(pos)
+                            .cloned()
+                            .unwrap_or_else(|| sk_column_n(pos, sk_type))
+                    } else {
+                        sk_column_n(pos, sk_type)
+                    };
                     let _ = write!(sql, " AND {col} = ?");
                     param_idx += 1;
                     extra_sk_col_indices.push((pos, sk_type));
@@ -218,23 +237,25 @@ impl TidbEngine {
             }
         }
 
-        let cursor_columns = if let Some((base_key_schema, base_attr_defs)) = &base_table_key {
-            let mut columns = sort_columns.clone();
-            columns.extend(key_tuple_columns(base_key_schema, base_attr_defs));
-            columns
+        let cursor_columns = if index.is_some() {
+            native_index_query_cursor_columns(
+                &sort_columns,
+                &key_info.key_schema,
+                &key_info.attribute_definitions,
+            )
         } else {
-            sort_columns.clone()
+            CursorColumns::same(sort_columns.clone())
         };
 
         if exclusive_start_key.is_some() {
-            if cursor_columns.is_empty() {
+            if cursor_columns.seek.is_empty() {
                 return Ok((Vec::new(), None));
             }
             let op = if forward { ">" } else { "<" };
-            let _ = write!(sql, " AND {}", tuple_comparison(&cursor_columns, op));
+            let _ = write!(sql, " AND {}", tuple_comparison(&cursor_columns.seek, op));
         }
 
-        push_order_by(&mut sql, &cursor_columns, forward);
+        push_order_by(&mut sql, &cursor_columns.order, forward);
 
         // LIMIT — fetch one extra to detect pagination
         let fetch_limit = limit.map_or(1_000_001, |l| l + 1);
@@ -243,18 +264,21 @@ impl TidbEngine {
         // Execute with dynamic bindings
         let rows = execute_query_sql(
             &sql,
-            &pk_text,
+            &pk,
             key_condition,
             maps,
-            &key_info.key_schema,
-            &key_info.attribute_definitions,
+            read_key_schema,
+            attr_defs,
             sk_info_val,
             &extra_sk_col_indices,
             exclusive_start_key,
-            base_table_key
-                .as_ref()
-                .map(|(key_schema, attr_defs)| (key_schema.as_slice(), attr_defs.as_slice())),
-            &self.data_pool,
+            index.map(|_| {
+                (
+                    key_info.key_schema.as_slice(),
+                    key_info.attribute_definitions.as_slice(),
+                )
+            }),
+            self.data_read_pool(consistent_read),
         )
         .await?;
 
@@ -268,9 +292,7 @@ impl TidbEngine {
             .collect::<Result<Vec<_>, _>>()?;
 
         let last_key = if has_more {
-            items
-                .last()
-                .map(|item| build_key(item, &key_info.key_schema))
+            items.last().map(|item| build_key(item, read_key_schema))
         } else {
             None
         };
@@ -279,6 +301,7 @@ impl TidbEngine {
     }
 
     /// Implementation of `DataEngine::scan`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn scan_impl(
         &self,
         key_info: &TableKeyInfo,
@@ -286,71 +309,55 @@ impl TidbEngine {
         exclusive_start_key: Option<&Item>,
         segment: Option<i64>,
         total_segments: Option<i64>,
-        index_name: Option<&str>,
+        index: Option<&IndexInfo>,
+        consistent_read: bool,
     ) -> Result<(Vec<Item>, Option<Item>), StorageError> {
         use std::fmt::Write;
 
-        let index_info = if let Some(idx_name) = index_name {
-            Some(
-                self.fetch_index_info_by_table_id(&key_info.table_id, idx_name)
-                    .await?,
-            )
-        } else {
-            None
-        };
-
-        let base_table_key = if index_info.is_some() {
-            Some(
-                self.fetch_base_key_schema_by_table_id(&key_info.table_id)
-                    .await?,
-            )
-        } else {
-            None
-        };
-
+        let read_key_schema = index.map_or(key_info.key_schema.as_slice(), |idx| {
+            idx.key_schema.as_slice()
+        });
+        let attr_defs = key_info.attribute_definitions.as_slice();
         let ddb_table = data_table_name(&key_info.table_id);
 
         let mut sql = format!("SELECT item_data FROM {ddb_table}");
         let mut conditions: Vec<String> = Vec::new();
-        if let Some(idx) = &index_info {
+        if let Some(idx) = index {
             conditions.extend(native_index_non_null_predicates(
                 &idx.index_id,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
+                read_key_schema,
+                attr_defs,
             ));
         }
         // Parallel scan: hash-based segment assignment.
         if let (Some(seg), Some(total)) = (segment, total_segments) {
-            let segment_column = index_info.as_ref().map_or_else(
+            let segment_column = index.map_or_else(
                 || "pk".to_owned(),
                 |idx| native_index_hash_column(&idx.index_id),
             );
             conditions.push(format!("CRC32({segment_column}) % {total} = {seg}"));
         }
 
-        let order_columns = if let Some((base_key_schema, base_attr_defs)) = &base_table_key {
-            let idx = index_info
-                .as_ref()
-                .ok_or_else(|| StorageError::Internal("missing index metadata".to_owned()))?;
-            let mut columns = native_index_key_tuple_columns(
-                &idx.index_id,
+        let cursor_columns = if let Some(idx) = index {
+            let index_columns =
+                native_index_key_tuple_columns(&idx.index_id, read_key_schema, attr_defs);
+            native_index_scan_cursor_columns(
+                index_columns,
                 &key_info.key_schema,
                 &key_info.attribute_definitions,
-            );
-            columns.extend(key_tuple_columns(base_key_schema, base_attr_defs));
-            columns
+            )
         } else {
-            key_tuple_columns(&key_info.key_schema, &key_info.attribute_definitions)
+            CursorColumns::same(key_tuple_columns(read_key_schema, attr_defs))
         };
 
         if let Some(start_key) = exclusive_start_key {
-            let pk_name = &key_info.key_schema[0].attribute_name;
+            let pk_name = &read_key_schema[0].attribute_name;
             if !start_key.contains_key(pk_name) {
                 return Err(StorageError::Validation(
                     "The provided starting key is invalid: The provided key element does not match the schema".to_owned(),
                 ));
             }
-            conditions.push(tuple_comparison(&order_columns, ">"));
+            conditions.push(tuple_comparison(&cursor_columns.seek, ">"));
         }
 
         if !conditions.is_empty() {
@@ -358,7 +365,7 @@ impl TidbEngine {
             sql.push_str(&conditions.join(" AND "));
         }
 
-        let _ = write!(sql, " ORDER BY {}", order_columns.join(", "));
+        let _ = write!(sql, " ORDER BY {}", cursor_columns.order.join(", "));
 
         let fetch_limit = limit.map_or(1_000_001, |l| l + 1);
         let _ = write!(sql, " LIMIT {fetch_limit}");
@@ -367,12 +374,15 @@ impl TidbEngine {
         let rows = execute_scan_sql(
             &sql,
             exclusive_start_key,
-            &key_info.key_schema,
-            &key_info.attribute_definitions,
-            base_table_key
-                .as_ref()
-                .map(|(key_schema, attr_defs)| (key_schema.as_slice(), attr_defs.as_slice())),
-            &self.data_pool,
+            read_key_schema,
+            attr_defs,
+            index.map(|_| {
+                (
+                    key_info.key_schema.as_slice(),
+                    key_info.attribute_definitions.as_slice(),
+                )
+            }),
+            self.data_read_pool(consistent_read),
         )
         .await?;
 
@@ -386,9 +396,7 @@ impl TidbEngine {
             .collect::<Result<Vec<_>, _>>()?;
 
         let last_key = if has_more {
-            items
-                .last()
-                .map(|item| build_key(item, &key_info.key_schema))
+            items.last().map(|item| build_key(item, read_key_schema))
         } else {
             None
         };
@@ -399,7 +407,14 @@ impl TidbEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::tuple_comparison;
+    use extenddb_core::types::{
+        AttributeDefinition, KeySchemaElement, KeyType, ScalarAttributeType,
+    };
+
+    use super::{
+        native_index_query_cursor_columns, native_index_scan_cursor_columns, push_order_by,
+        tuple_comparison,
+    };
 
     #[test]
     fn tuple_comparison_uses_all_cursor_columns() {
@@ -418,5 +433,143 @@ mod tests {
     fn tuple_comparison_keeps_single_column_syntax_simple() {
         let cols = vec!["base_pk".to_owned()];
         assert_eq!(tuple_comparison(&cols, "<"), "base_pk < ?");
+    }
+
+    #[test]
+    fn native_index_query_orders_by_index_sort_columns_then_clustered_handle() {
+        let base_key = vec![
+            KeySchemaElement {
+                attribute_name: "pk".to_owned(),
+                key_type: KeyType::Hash,
+            },
+            KeySchemaElement {
+                attribute_name: "sk".to_owned(),
+                key_type: KeyType::Range,
+            },
+        ];
+        let base_attrs = vec![
+            AttributeDefinition {
+                attribute_name: "pk".to_owned(),
+                attribute_type: ScalarAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "sk".to_owned(),
+                attribute_type: ScalarAttributeType::N,
+            },
+        ];
+        let sort_columns = vec!["edbidx_idx1_sk_s".to_owned()];
+
+        let columns = native_index_query_cursor_columns(&sort_columns, &base_key, &base_attrs);
+
+        assert_eq!(
+            columns.seek,
+            vec![
+                "edbidx_idx1_sk_s".to_owned(),
+                "pk".to_owned(),
+                "sk_n".to_owned()
+            ]
+        );
+        assert_eq!(
+            columns.order,
+            vec![
+                "edbidx_idx1_sk_s".to_owned(),
+                "pk".to_owned(),
+                "sk_n".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn native_index_query_sql_order_by_includes_clustered_handle() {
+        let base_key = vec![
+            KeySchemaElement {
+                attribute_name: "pk".to_owned(),
+                key_type: KeyType::Hash,
+            },
+            KeySchemaElement {
+                attribute_name: "sk".to_owned(),
+                key_type: KeyType::Range,
+            },
+        ];
+        let base_attrs = vec![
+            AttributeDefinition {
+                attribute_name: "pk".to_owned(),
+                attribute_type: ScalarAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "sk".to_owned(),
+                attribute_type: ScalarAttributeType::N,
+            },
+        ];
+        let sort_columns = vec!["edbidx_idx1_sk_s".to_owned()];
+        let columns = native_index_query_cursor_columns(&sort_columns, &base_key, &base_attrs);
+        let mut sql = "SELECT item_data FROM `_ddb_table` WHERE edbidx_idx1_pk = ?".to_owned();
+
+        push_order_by(&mut sql, &columns.order, true);
+
+        assert!(sql.ends_with(" ORDER BY edbidx_idx1_sk_s ASC, pk ASC, sk_n ASC"));
+    }
+
+    #[test]
+    fn native_hash_only_index_query_orders_by_clustered_handle() {
+        let base_key = vec![KeySchemaElement {
+            attribute_name: "pk".to_owned(),
+            key_type: KeyType::Hash,
+        }];
+        let base_attrs = vec![AttributeDefinition {
+            attribute_name: "pk".to_owned(),
+            attribute_type: ScalarAttributeType::S,
+        }];
+        let columns = native_index_query_cursor_columns(&[], &base_key, &base_attrs);
+
+        assert_eq!(columns.seek, vec!["pk".to_owned()]);
+        assert_eq!(columns.order, vec!["pk".to_owned()]);
+    }
+
+    #[test]
+    fn native_index_scan_orders_by_index_columns_then_clustered_handle() {
+        let base_key = vec![
+            KeySchemaElement {
+                attribute_name: "pk".to_owned(),
+                key_type: KeyType::Hash,
+            },
+            KeySchemaElement {
+                attribute_name: "sk".to_owned(),
+                key_type: KeyType::Range,
+            },
+        ];
+        let base_attrs = vec![
+            AttributeDefinition {
+                attribute_name: "pk".to_owned(),
+                attribute_type: ScalarAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "sk".to_owned(),
+                attribute_type: ScalarAttributeType::N,
+            },
+        ];
+        let index_columns = vec!["edbidx_idx1_pk".to_owned(), "edbidx_idx1_sk_s".to_owned()];
+
+        let columns =
+            native_index_scan_cursor_columns(index_columns.clone(), &base_key, &base_attrs);
+
+        assert_eq!(
+            columns.seek,
+            vec![
+                "edbidx_idx1_pk".to_owned(),
+                "edbidx_idx1_sk_s".to_owned(),
+                "pk".to_owned(),
+                "sk_n".to_owned()
+            ]
+        );
+        assert_eq!(
+            columns.order,
+            vec![
+                "edbidx_idx1_pk".to_owned(),
+                "edbidx_idx1_sk_s".to_owned(),
+                "pk".to_owned(),
+                "sk_n".to_owned()
+            ]
+        );
     }
 }

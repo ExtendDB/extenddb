@@ -7,13 +7,16 @@ use extenddb_core::expression::{Expr, ExpressionMaps};
 use extenddb_core::types::{Item, TableKeyInfo};
 use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{composite_pk_to_text, parse_sk, pk_to_text, sk_column, sk_info};
+use extenddb_storage::util::{parse_sk, sk_column, sk_info};
 
-use super::index::{fetch_write_index_key_schemas, validate_item_index_key_types};
+use super::index::validate_item_secondary_index_key_constraints;
 use super::query::check_condition;
-use super::tx_helpers::write_stream_record_in_tx;
-use super::{data_table_name, json_to_item};
+use super::tx_helpers::{
+    StreamSequenceAllocator, finalize_stream_records_best_effort, write_stream_record_in_tx,
+};
+use super::{data_table_name, json_to_item, physical_pk_bytes};
 use crate::TidbEngine;
+use crate::tidb_util::is_unique_violation;
 
 impl TidbEngine {
     /// Implementation of `DataEngine::put_item`.
@@ -28,13 +31,20 @@ impl TidbEngine {
     ) -> Result<Option<Item>, StorageError> {
         let ddb_table = data_table_name(&key_info.table_id);
 
-        let pk_text = composite_pk_to_text(&item, &key_info.key_schema)?;
+        let pk = physical_pk_bytes(&item, &key_info.key_schema)?;
 
         let item_json =
             serde_json::to_value(&item).map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let index_keys = fetch_write_index_key_schemas(&key_info.table_id, &self.pool).await?;
-        validate_item_index_key_types(&item, &index_keys, &key_info.attribute_definitions)?;
+        validate_item_secondary_index_key_constraints(
+            &key_info.table_id,
+            &item,
+            &key_info.key_schema,
+            &key_info.attribute_definitions,
+            &self.limits,
+            &self.pool,
+        )
+        .await?;
 
         // When there's a condition, return_old, or stream capture, we need a transaction.
         let needs_tx = condition.is_some() || return_old || stream.is_some();
@@ -60,7 +70,7 @@ impl TidbEngine {
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
                 let old: Option<(serde_json::Value,)> =
-                    bind_sk_fetch_optional!(&select_sql, pk_text.as_str(), &sk, &mut *tx)?;
+                    bind_sk_fetch_optional!(&select_sql, pk.as_slice(), &sk, &mut *tx)?;
 
                 if let Some((ref old_json,)) = old {
                     let old_item: Item = json_to_item(old_json.clone())?;
@@ -75,13 +85,7 @@ impl TidbEngine {
                     let update_sql = format!(
                         "UPDATE {ddb_table} SET item_data = ? WHERE pk = ? AND {sk_col} = ?"
                     );
-                    bind_sk_update_execute!(
-                        &update_sql,
-                        &item_json,
-                        pk_text.as_str(),
-                        &sk,
-                        &mut *tx
-                    )?;
+                    bind_sk_update_execute!(&update_sql, &item_json, pk.as_slice(), &sk, &mut *tx)?;
                 } else {
                     // No existing item — condition checks against empty item
                     let empty = std::collections::BTreeMap::new();
@@ -92,24 +96,28 @@ impl TidbEngine {
                         }
                         Err(e) => return Err(e),
                     }
-                    // Condition passed against empty — atomic insert, fail if someone beat us.
+                    // Condition passed against empty. In pessimistic mode,
+                    // the preceding point SELECT FOR UPDATE locks this
+                    // primary key even when absent. A duplicate here is still
+                    // handled as the authoritative race outcome.
                     let insert_sql = format!(
-                        "INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES (?, ?, ?) \
-                         ON DUPLICATE KEY UPDATE pk = pk"
+                        "INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES (?, ?, ?)"
                     );
-                    let result =
-                        bind_sk_execute!(&insert_sql, pk_text.as_str(), &sk, &item_json, &mut *tx)?;
-                    if result.rows_affected() == 0 {
-                        // Another transaction inserted between our SELECT and INSERT.
-                        // Fetch the winner to return with ConditionFailed.
-                        let winner: Option<(serde_json::Value,)> =
-                            bind_sk_fetch_optional!(&select_sql, pk_text.as_str(), &sk, &mut *tx)?;
-                        let winner_item = winner.map(|(v,)| json_to_item(v)).transpose()?;
-                        return Err(StorageError::ConditionFailed(winner_item));
+                    let insert_result =
+                        bind_sk_execute_raw!(&insert_sql, pk.as_slice(), &sk, &item_json, &mut *tx);
+                    if let Err(err) = insert_result {
+                        if is_unique_violation(&err) {
+                            let winner: Option<(serde_json::Value,)> =
+                                bind_sk_fetch_optional!(&select_sql, pk.as_slice(), &sk, &mut *tx)?;
+                            let winner_item = winner.map(|(v,)| json_to_item(v)).transpose()?;
+                            return Err(StorageError::ConditionFailed(winner_item));
+                        }
+                        return Err(StorageError::Internal(err.to_string()));
                     }
                 }
 
                 // Write stream record atomically within the transaction.
+                let mut sequence_allocator = StreamSequenceAllocator::default();
                 if let Some(capture) = stream {
                     let old_for_stream = old
                         .as_ref()
@@ -117,6 +125,7 @@ impl TidbEngine {
                         .transpose()?;
                     write_stream_record_in_tx(
                         &mut tx,
+                        &mut sequence_allocator,
                         key_info,
                         capture,
                         old_for_stream.as_ref(),
@@ -127,6 +136,12 @@ impl TidbEngine {
                 tx.commit()
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
+                finalize_stream_records_best_effort(
+                    &self.data_pool,
+                    "put_item",
+                    sequence_allocator.pending_records(),
+                )
+                .await;
 
                 if return_old {
                     old.map(|(v,)| json_to_item(v)).transpose()
@@ -138,13 +153,7 @@ impl TidbEngine {
                     "INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES (?, ?, ?) \
                      ON DUPLICATE KEY UPDATE item_data = VALUES(item_data)"
                 );
-                bind_sk_execute!(
-                    &upsert_sql,
-                    pk_text.as_str(),
-                    &sk,
-                    &item_json,
-                    &self.data_pool
-                )?;
+                bind_sk_execute!(&upsert_sql, pk.as_slice(), &sk, &item_json, &self.data_pool)?;
                 Ok(None)
             }
         } else {
@@ -160,7 +169,7 @@ impl TidbEngine {
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
                 let old: Option<(serde_json::Value,)> = sqlx::query_as(&select_sql)
-                    .bind(pk_text.as_str())
+                    .bind(pk.as_slice())
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -178,7 +187,7 @@ impl TidbEngine {
                     let update_sql = format!("UPDATE {ddb_table} SET item_data = ? WHERE pk = ?");
                     sqlx::query(&update_sql)
                         .bind(&item_json)
-                        .bind(pk_text.as_str())
+                        .bind(pk.as_slice())
                         .execute(&mut *tx)
                         .await
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -191,30 +200,33 @@ impl TidbEngine {
                         }
                         Err(e) => return Err(e),
                     }
-                    // Condition passed against empty — atomic insert, fail if someone beat us.
-                    let insert_sql = format!(
-                        "INSERT INTO {ddb_table} (pk, item_data) VALUES (?, ?) \
-                         ON DUPLICATE KEY UPDATE pk = pk"
-                    );
-                    let result = sqlx::query(&insert_sql)
-                        .bind(pk_text.as_str())
+                    // Condition passed against empty. The preceding point
+                    // SELECT FOR UPDATE locks the primary key in TiDB
+                    // pessimistic mode; duplicate-key remains the final race
+                    // signal if another writer already committed.
+                    let insert_sql =
+                        format!("INSERT INTO {ddb_table} (pk, item_data) VALUES (?, ?)");
+                    let insert_result = sqlx::query(&insert_sql)
+                        .bind(pk.as_slice())
                         .bind(&item_json)
                         .execute(&mut *tx)
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    if result.rows_affected() == 0 {
-                        // Another transaction inserted between our SELECT and INSERT.
-                        let winner: Option<(serde_json::Value,)> = sqlx::query_as(&select_sql)
-                            .bind(pk_text.as_str())
-                            .fetch_optional(&mut *tx)
-                            .await
-                            .map_err(|e| StorageError::Internal(e.to_string()))?;
-                        let winner_item = winner.map(|(v,)| json_to_item(v)).transpose()?;
-                        return Err(StorageError::ConditionFailed(winner_item));
+                        .await;
+                    if let Err(err) = insert_result {
+                        if is_unique_violation(&err) {
+                            let winner: Option<(serde_json::Value,)> = sqlx::query_as(&select_sql)
+                                .bind(pk.as_slice())
+                                .fetch_optional(&mut *tx)
+                                .await
+                                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                            let winner_item = winner.map(|(v,)| json_to_item(v)).transpose()?;
+                            return Err(StorageError::ConditionFailed(winner_item));
+                        }
+                        return Err(StorageError::Internal(err.to_string()));
                     }
                 }
 
                 // Write stream record atomically within the transaction.
+                let mut sequence_allocator = StreamSequenceAllocator::default();
                 if let Some(capture) = stream {
                     let old_for_stream = old
                         .as_ref()
@@ -222,6 +234,7 @@ impl TidbEngine {
                         .transpose()?;
                     write_stream_record_in_tx(
                         &mut tx,
+                        &mut sequence_allocator,
                         key_info,
                         capture,
                         old_for_stream.as_ref(),
@@ -232,6 +245,12 @@ impl TidbEngine {
                 tx.commit()
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
+                finalize_stream_records_best_effort(
+                    &self.data_pool,
+                    "put_item",
+                    sequence_allocator.pending_records(),
+                )
+                .await;
 
                 if return_old {
                     old.map(|(v,)| json_to_item(v)).transpose()
@@ -244,7 +263,7 @@ impl TidbEngine {
                      ON DUPLICATE KEY UPDATE item_data = VALUES(item_data)"
                 );
                 sqlx::query(&upsert_sql)
-                    .bind(pk_text.as_str())
+                    .bind(pk.as_slice())
                     .bind(&item_json)
                     .execute(&self.data_pool)
                     .await
@@ -259,14 +278,11 @@ impl TidbEngine {
         &self,
         key_info: &TableKeyInfo,
         key: &Item,
+        consistent_read: bool,
     ) -> Result<Option<Item>, StorageError> {
         let ddb_table = data_table_name(&key_info.table_id);
-
-        let pk_name = &key_info.key_schema[0].attribute_name;
-        let pk_value = key
-            .get(pk_name)
-            .ok_or_else(|| StorageError::Internal("missing partition key".to_owned()))?;
-        let pk_text = pk_to_text(pk_value)?;
+        let pk = physical_pk_bytes(key, &key_info.key_schema)?;
+        let pool = self.data_read_pool(consistent_read);
 
         let json_opt = if let Some((sk_name, sk_type)) =
             sk_info(&key_info.key_schema, &key_info.attribute_definitions)
@@ -278,13 +294,13 @@ impl TidbEngine {
             let sk_col = sk_column(sk_type);
             let sql = format!("SELECT item_data FROM {ddb_table} WHERE pk = ? AND {sk_col} = ?");
             let row: Option<(serde_json::Value,)> =
-                bind_sk_fetch_optional!(&sql, pk_text.as_ref(), &sk, &self.data_pool)?;
+                bind_sk_fetch_optional!(&sql, pk.as_slice(), &sk, pool)?;
             row.map(|(v,)| v)
         } else {
             let sql = format!("SELECT item_data FROM {ddb_table} WHERE pk = ?");
             let row: Option<(serde_json::Value,)> = sqlx::query_as(&sql)
-                .bind(pk_text.as_ref())
-                .fetch_optional(&self.data_pool)
+                .bind(pk.as_slice())
+                .fetch_optional(pool)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             row.map(|(v,)| v)

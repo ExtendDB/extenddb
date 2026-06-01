@@ -9,11 +9,14 @@
 //! This decouples callers from direct `sqlx::MySqlPool` usage, enabling
 //! alternative storage backends.
 
-use std::sync::Arc;
-
 use extenddb_storage::management_store::{MetricsRow, OpError, OpResult};
 use futures::future::BoxFuture;
-use sqlx::MySqlPool;
+use sqlx::{MySql, MySqlPool, QueryBuilder};
+use std::sync::Arc;
+
+use crate::tidb_util::tidb_pool_options;
+
+const METRICS_INSERT_BATCH_ROWS: usize = 200;
 
 /// TiDB-backed catalog store for settings, metrics, and rate limiting.
 ///
@@ -21,8 +24,8 @@ use sqlx::MySqlPool;
 /// and shared (via `Arc`) across management API handlers and background workers.
 pub struct TidbCatalogStore {
     pool: MySqlPool,
-    /// P119: Cached encryption key (immutable after bootstrap). Avoids
-    /// per-request DB query on access key and assume-role operations.
+    /// Cached encryption key (immutable after bootstrap). Avoids per-request
+    /// DB query on access key and assume-role operations.
     encryption_key: Option<Arc<str>>,
 }
 
@@ -35,7 +38,7 @@ impl TidbCatalogStore {
         }
     }
 
-    /// Create a new catalog store with a pre-loaded encryption key (P119).
+    /// Create a new catalog store with a pre-loaded encryption key.
     pub fn with_encryption_key(pool: MySqlPool, encryption_key: String) -> Self {
         Self {
             pool,
@@ -52,6 +55,50 @@ impl TidbCatalogStore {
     pub fn encryption_key(&self) -> Option<&Arc<str>> {
         self.encryption_key.as_ref()
     }
+}
+
+fn metrics_query_sql(has_table_filter: bool, has_metric_filter: bool) -> String {
+    let mut sql = String::from(
+        "SELECT bucket, metric, table_name, index_name, operation, \
+         SUM(sum) AS sum, CAST(SUM(count) AS SIGNED) AS count, \
+         MIN(min) AS min, MAX(max) AS max \
+         FROM metrics_samples \
+         WHERE bucket >= ? AND bucket <= ?",
+    );
+
+    if has_table_filter {
+        sql.push_str(" AND table_name = ?");
+    }
+    if has_metric_filter {
+        sql.push_str(" AND metric = ?");
+    }
+    sql.push_str(" GROUP BY bucket, metric, table_name, index_name, operation ORDER BY bucket");
+
+    sql
+}
+
+fn metrics_insert_query(rows: &[MetricsRow]) -> QueryBuilder<'_, MySql> {
+    let mut query = QueryBuilder::<MySql>::new(
+        "INSERT INTO metrics_samples \
+         (bucket, metric, table_name, index_name, operation, sum, count, min, max) ",
+    );
+    query.push_values(rows, |mut values, row| {
+        values
+            .push_bind(row.bucket)
+            .push_bind(&row.metric)
+            .push_bind(row.table_name.as_deref().unwrap_or(""))
+            .push_bind(row.index_name.as_deref().unwrap_or(""))
+            .push_bind(row.operation.as_deref().unwrap_or(""))
+            .push_bind(row.sum)
+            .push_bind(row.count)
+            .push_bind(row.min)
+            .push_bind(row.max);
+    });
+    query
+}
+
+fn metrics_insert_chunks(rows: &[MetricsRow]) -> std::slice::Chunks<'_, MetricsRow> {
+    rows.chunks(METRICS_INSERT_BATCH_ROWS)
 }
 
 // ── SettingsStore ──────────────────────────────────────────────────────
@@ -170,15 +217,9 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for TidbCatalogStore {
             match (conn_row, name_row) {
                 (Some((conn,)), Some((name,))) => {
                     // Test connection
-                    sqlx::mysql::MySqlPoolOptions::new()
-                        .max_connections(1)
-                        .connect(&conn)
-                        .await
-                        .map_err(|e| {
-                            extenddb_storage::diagnostics::DiagError::ConnectionFailed(
-                                e.to_string(),
-                            )
-                        })?;
+                    tidb_pool_options(1, 0).connect(&conn).await.map_err(|e| {
+                        extenddb_storage::diagnostics::DiagError::ConnectionFailed(e.to_string())
+                    })?;
                     Ok(name)
                 }
                 _ => Err(extenddb_storage::diagnostics::DiagError::QueryFailed(
@@ -195,29 +236,17 @@ impl extenddb_storage::management_store::MetricsStore for TidbCatalogStore {
     fn insert_metrics(&self, rows: &[MetricsRow]) -> BoxFuture<'_, OpResult<()>> {
         let rows = rows.to_vec();
         Box::pin(async move {
-            for row in &rows {
-                let result = sqlx::query(
-                    "INSERT INTO metrics \
-                     (bucket, metric, table_name, index_name, operation, sum, count, min, max) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-                     ON DUPLICATE KEY UPDATE sum = metrics.sum + VALUES(sum), \
-                                   count = metrics.count + VALUES(count), \
-                                   min = LEAST(metrics.min, VALUES(min)), \
-                                   max = GREATEST(metrics.max, VALUES(max))",
-                )
-                .bind(row.bucket)
-                .bind(&row.metric)
-                .bind(row.table_name.as_deref().unwrap_or(""))
-                .bind(row.index_name.as_deref().unwrap_or(""))
-                .bind(row.operation.as_deref().unwrap_or(""))
-                .bind(row.sum)
-                .bind(row.count)
-                .bind(row.min)
-                .bind(row.max)
-                .execute(&self.pool)
-                .await;
+            if rows.is_empty() {
+                return Ok(());
+            }
+
+            for chunk in metrics_insert_chunks(&rows) {
+                let result = metrics_insert_query(chunk)
+                    .build()
+                    .execute(&self.pool)
+                    .await;
                 if let Err(e) = result {
-                    tracing::warn!("Failed to upsert metrics row: {e}");
+                    tracing::warn!("Failed to insert metrics sample batch: {e}");
                 }
             }
             Ok(())
@@ -234,20 +263,8 @@ impl extenddb_storage::management_store::MetricsStore for TidbCatalogStore {
         let table_name = table_name.map(|s| s.to_owned());
         let metric = metric.map(|s| s.to_owned());
         Box::pin(async move {
-            let mut sql = String::from(
-                "SELECT bucket, metric, table_name, index_name, operation, \
-                 sum, count, min, max \
-                 FROM metrics WHERE bucket >= ? AND bucket <= ?",
-            );
-
             let table_filter = table_name.as_deref().filter(|s| !s.is_empty());
-            if table_filter.is_some() {
-                sql.push_str(" AND table_name = ?");
-            }
-            if metric.is_some() {
-                sql.push_str(" AND metric = ?");
-            }
-            sql.push_str(" ORDER BY bucket");
+            let sql = metrics_query_sql(table_filter.is_some(), metric.is_some());
 
             // Build the query with dynamic binds.
             let mut query = sqlx::query_as::<_, DbMetricsRow>(&sql)
@@ -395,5 +412,71 @@ impl extenddb_storage::management_store::RateLimitStore for TidbCatalogStore {
 impl extenddb_storage::CatalogStore for TidbCatalogStore {
     fn cached_encryption_key(&self) -> Option<String> {
         self.encryption_key.as_ref().map(|arc| arc.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use time::OffsetDateTime;
+
+    use super::{
+        METRICS_INSERT_BATCH_ROWS, metrics_insert_chunks, metrics_insert_query, metrics_query_sql,
+    };
+
+    #[test]
+    fn metrics_query_aggregates_append_only_samples_only() {
+        let sql = metrics_query_sql(true, true);
+
+        assert!(sql.contains("FROM metrics_samples"));
+        assert!(sql.contains("SUM(sum) AS sum"));
+        assert!(sql.contains("CAST(SUM(count) AS SIGNED) AS count"));
+        assert!(sql.contains("GROUP BY bucket, metric, table_name, index_name, operation"));
+        assert!(!sql.contains("UNION ALL"));
+        assert!(!sql.contains("FROM metrics "));
+        assert!(!sql.contains("ON DUPLICATE"));
+        assert!(!sql.contains("writer_id"));
+        assert!(!sql.contains("INSERT"));
+    }
+
+    #[test]
+    fn metrics_insert_uses_one_append_only_multi_row_statement() {
+        let rows = vec![sample_metric_row("put_item"), sample_metric_row("query")];
+        let query = metrics_insert_query(&rows);
+        let sql = query.sql();
+
+        assert!(sql.starts_with("INSERT INTO metrics_samples"));
+        assert_eq!(sql.matches("VALUES").count(), 1);
+        assert_eq!(sql.matches("(?, ?, ?, ?, ?, ?, ?, ?, ?)").count(), 2);
+        assert!(!sql.contains("ON DUPLICATE"));
+        assert!(!sql.contains("UPDATE metrics"));
+    }
+
+    #[test]
+    fn metrics_insert_batches_are_bounded_for_tidb_transactions() {
+        let rows = (0..=METRICS_INSERT_BATCH_ROWS)
+            .map(|i| sample_metric_row(&format!("op_{i}")))
+            .collect::<Vec<_>>();
+
+        let chunk_sizes = metrics_insert_chunks(&rows)
+            .map(<[extenddb_storage::management_store::MetricsRow]>::len)
+            .collect::<Vec<_>>();
+
+        assert_eq!(chunk_sizes.len(), 2);
+        assert_eq!(chunk_sizes[0], METRICS_INSERT_BATCH_ROWS);
+        assert_eq!(chunk_sizes[1], 1);
+    }
+
+    fn sample_metric_row(operation: &str) -> extenddb_storage::management_store::MetricsRow {
+        extenddb_storage::management_store::MetricsRow {
+            bucket: OffsetDateTime::UNIX_EPOCH,
+            metric: "latency".to_owned(),
+            table_name: Some("table".to_owned()),
+            index_name: None,
+            operation: Some(operation.to_owned()),
+            sum: 10.0,
+            count: 2,
+            min: 1.0,
+            max: 9.0,
+        }
     }
 }

@@ -11,6 +11,7 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn};
 
 use crate::TidbEngine;
+use crate::data::physical_data_table_name;
 use crate::throughput::zero_provisioned_throughput_description;
 
 /// Row type for table metadata queries.
@@ -24,12 +25,17 @@ pub(crate) struct TableRow {
     pub stream_specification: Option<serde_json::Value>,
     pub table_status: String,
     pub creation_epoch: Option<f64>,
-    pub table_size_bytes: i64,
-    pub item_count: i64,
     pub table_arn: String,
     pub table_id: String,
     pub deletion_protection_enabled: bool,
     pub stream_label: Option<String>,
+}
+
+/// Native TiDB table statistics used for DynamoDB table descriptions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TableStats {
+    pub table_size_bytes: i64,
+    pub item_count: i64,
 }
 
 /// Row type for index metadata queries.
@@ -44,6 +50,28 @@ pub(crate) struct IndexRow {
 }
 
 impl TidbEngine {
+    pub(crate) async fn current_table_stats(
+        &self,
+        table_id: &str,
+    ) -> Result<TableStats, StorageError> {
+        let physical_table = physical_data_table_name(table_id);
+        let (item_count, table_size_bytes): (i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(TABLE_ROWS, 0), COALESCE(DATA_LENGTH, 0) \
+             FROM information_schema.tables \
+             WHERE table_schema = DATABASE() AND table_name = ?",
+        )
+        .bind(&physical_table)
+        .fetch_optional(&self.data_pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?
+        .unwrap_or((0, 0));
+
+        Ok(TableStats {
+            table_size_bytes,
+            item_count,
+        })
+    }
+
     pub(crate) async fn build_table_description(
         &self,
         account_id: &str,
@@ -59,8 +87,7 @@ impl TidbEngine {
             r"SELECT table_name, key_schema, attribute_definitions, billing_mode,
                       provisioned_throughput, stream_specification, table_status,
                       CAST(UNIX_TIMESTAMP(creation_date_time) AS DOUBLE) as creation_epoch,
-                      table_size_bytes, item_count, table_arn, table_id,
-                      deletion_protection_enabled, stream_label
+                      table_arn, table_id, deletion_protection_enabled, stream_label
                FROM tables WHERE account_id = ? AND table_name = ?",
         )
         .bind(account_id)
@@ -85,7 +112,9 @@ impl TidbEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        self.build_table_description_from_row(account_id, row, index_rows)
+        let stats = self.current_table_stats(&row.table_id).await?;
+
+        self.build_table_description_from_row(account_id, row, index_rows, stats)
     }
 
     pub(crate) fn build_table_description_from_row(
@@ -93,6 +122,7 @@ impl TidbEngine {
         account_id: &str,
         row: TableRow,
         index_rows: Vec<IndexRow>,
+        stats: TableStats,
     ) -> Result<TableDescription, StorageError> {
         let mut gsis: Vec<GsiDescription> = Vec::new();
         let mut lsis: Vec<LsiDescription> = Vec::new();
@@ -205,8 +235,8 @@ impl TidbEngine {
             attribute_definitions: attr_defs,
             table_status,
             creation_date_time: creation_epoch,
-            table_size_bytes: row.table_size_bytes,
-            item_count: row.item_count,
+            table_size_bytes: stats.table_size_bytes,
+            item_count: stats.item_count,
             table_arn: row.table_arn,
             table_id: row.table_id,
             provisioned_throughput: ProvisionedThroughputDescription {

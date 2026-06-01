@@ -12,14 +12,9 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn, table_arn};
 
 use crate::TidbEngine;
+use crate::data::validate_native_key_schema_shape;
 use crate::throughput::provisioned_throughput_description;
 use crate::tidb_util::is_unique_violation;
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub(crate) enum CreateTableActivation {
-    Standard,
-    Deferred,
-}
 
 enum SecondaryIndexCreateRef<'a> {
     Global(&'a GsiInput),
@@ -72,18 +67,24 @@ impl TidbEngine {
         account_id: &str,
         input: CreateTableInput,
     ) -> Result<TableDescription, StorageError> {
-        self.create_table_impl_with_activation(account_id, input, CreateTableActivation::Standard)
-            .await
-    }
-
-    /// Core implementation of `create_table`.
-    pub(crate) async fn create_table_impl_with_activation(
-        &self,
-        account_id: &str,
-        input: CreateTableInput,
-        activation: CreateTableActivation,
-    ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
+        validate_native_key_schema_shape("table key schema", &input.key_schema)?;
+        if let Some(indexes) = &input.global_secondary_indexes {
+            for index in indexes {
+                validate_native_key_schema_shape(
+                    &format!("global secondary index {}", index.index_name),
+                    &index.key_schema,
+                )?;
+            }
+        }
+        if let Some(indexes) = &input.local_secondary_indexes {
+            for index in indexes {
+                validate_native_key_schema_shape(
+                    &format!("local secondary index {}", index.index_name),
+                    &index.key_schema,
+                )?;
+            }
+        }
         let table_id = uuid::Uuid::new_v4().to_string();
         let table_arn = table_arn(&self.region, account_id, &input.table_name);
         let billing_mode = input.billing_mode.unwrap_or(BillingMode::Provisioned);
@@ -115,15 +116,9 @@ impl TidbEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // Insert catalog metadata as CREATING first. TiDB data DDL is owned by
-        // the control-plane reconciler, so a crash after this commit leaves a
-        // durable, retryable transition instead of a half-finished table.
-        let delay_secs: f64 = sqlx::query_scalar(
-            "SELECT COALESCE((SELECT CAST(value AS DOUBLE) FROM settings WHERE `key` = 'control_plane_delay_seconds'), 0.25)",
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        // Insert catalog metadata as CREATING first. TiDB owns distributed
+        // online DDL scheduling; the reconciler only replays the desired state
+        // immediately and idempotently from the committed catalog row.
         let now = time::OffsetDateTime::now_utc();
         let creation_epoch =
             now.unix_timestamp() as f64 + f64::from(now.nanosecond()) / 1_000_000_000.0;
@@ -140,8 +135,7 @@ impl TidbEngine {
                 creation_date_time, table_arn, table_id, deletion_protection_enabled,
                 status_transition_at, stream_label)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6), ?, ?, ?,
-                       CASE WHEN ? THEN DATE_ADD(CURRENT_TIMESTAMP(6), INTERVAL ? SECOND) ELSE NULL END,
-                       ?)",
+                       CURRENT_TIMESTAMP(6), ?)",
         )
         .bind(account_id)
         .bind(&input.table_name)
@@ -154,8 +148,6 @@ impl TidbEngine {
         .bind(&table_arn)
         .bind(&table_id)
         .bind(deletion_protection)
-        .bind(activation == CreateTableActivation::Standard)
-        .bind(delay_secs.max(0.0))
         .bind(&stream_label)
         .execute(&mut *tx)
         .await
@@ -233,9 +225,7 @@ impl TidbEngine {
         // transition without waiting for the idle timeout.
         // If the server crashes between commit and notify, the startup recovery
         // and defensive sweep recover the transition.
-        if activation == CreateTableActivation::Standard {
-            self.control_plane_notify.notify_one();
-        }
+        self.control_plane_notify.notify_one();
 
         // Build response from in-scope data — avoids post-commit read race
         // (another request could delete the table between commit and read).

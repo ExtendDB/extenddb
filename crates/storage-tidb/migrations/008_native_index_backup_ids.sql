@@ -3,7 +3,7 @@
 -- Preserve native TiDB generated-column/index identifiers in backup metadata.
 
 ALTER TABLE backup_indexes
-    ADD COLUMN IF NOT EXISTS index_id VARCHAR(64) NOT NULL DEFAULT '';
+    ADD COLUMN IF NOT EXISTS index_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '';
 
 UPDATE backup_indexes bi
 JOIN backups b ON b.backup_arn = bi.backup_arn

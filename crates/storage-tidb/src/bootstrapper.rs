@@ -13,11 +13,12 @@ use extenddb_storage::bootstrapper::{
 };
 use extenddb_storage::management_store::{OpError, OpResult};
 use sqlx::MySqlPool;
-use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
+use sqlx::mysql::MySqlConnectOptions;
 use tokio::sync::OnceCell;
 
 use crate::CATALOG_VERSION;
 use crate::migrations;
+use crate::tidb_util::tidb_pool_options;
 
 /// Utilities for bootstrapping a TiDB backend store.
 ///
@@ -62,8 +63,7 @@ impl TidbBootstrapper {
                 } else {
                     opts
                 };
-                MySqlPoolOptions::new()
-                    .max_connections(1)
+                tidb_pool_options(1, 0)
                     .connect_with(opts)
                     .await
                     .map_err(|e| OpError::Internal(format!("Cannot connect as admin: {e}")))
@@ -94,8 +94,7 @@ impl TidbBootstrapper {
 
     /// Open a one-shot pool to the given database as the application user.
     async fn app_pool(&self, database: &str) -> OpResult<MySqlPool> {
-        MySqlPoolOptions::new()
-            .max_connections(1)
+        tidb_pool_options(1, 0)
             .connect_with(self.app_connect_opts(database))
             .await
             .map_err(|e| OpError::Internal(format!("Cannot connect to {database}: {e}")))
@@ -439,7 +438,10 @@ async fn create_database(pool: &MySqlPool, name: &str, owner: &str) -> OpResult<
     }
 
     // CREATE DATABASE doesn't support parameterized names.
-    let sql = format!("CREATE DATABASE {}", quote_identifier(name)?);
+    let sql = format!(
+        "CREATE DATABASE {} DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+        quote_identifier(name)?
+    );
     sqlx::query(&sql)
         .execute(pool)
         .await

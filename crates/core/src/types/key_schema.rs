@@ -86,6 +86,18 @@ pub struct TableKeyInfo {
     pub stream_specification: Option<super::StreamSpecification>,
 }
 
+/// Resolved metadata for a table read path.
+///
+/// `table` always describes the base DynamoDB table. `index`, when present,
+/// describes the secondary index selected by Query or Scan. Keeping both parts
+/// together lets storage backends execute reads without re-fetching catalog
+/// metadata or reconstructing the base-table key after index routing.
+#[derive(Debug, Clone)]
+pub struct TableReadInfo {
+    pub table: TableKeyInfo,
+    pub index: Option<IndexInfo>,
+}
+
 /// Extract all HASH key elements from a key schema (preserving order).
 pub fn hash_key_elements(key_schema: &[KeySchemaElement]) -> Vec<&KeySchemaElement> {
     key_schema

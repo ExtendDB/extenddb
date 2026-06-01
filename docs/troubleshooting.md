@@ -288,12 +288,12 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Fix:** If a table appears stuck:
 1. Check that extenddb is running (`extenddb status`).
-2. Wait for the configured `control_plane_delay_seconds` (default: 5) — the poller is woken immediately when a table enters a transitional state.
+2. Wait for the backend transition worker. PostgreSQL may use the configured `control_plane_delay_seconds` delay; TiDB makes transitions immediately eligible but large native online DDL jobs can still take time inside TiDB. TiDB tables can continue serving data-plane writes while `UPDATING`.
 3. If the server was restarted, transitions are recovered automatically at startup.
 
 ### CreateTable returns CREATING instead of ACTIVE
 
-**Cause:** extenddb emulates real DynamoDB's async control plane behavior. Tables start in CREATING state and transition to ACTIVE after a configurable delay (default: 5 seconds).
+**Cause:** extenddb emulates real DynamoDB's async control plane behavior. Tables start in CREATING state and transition to ACTIVE after the backend has reconciled physical storage artifacts. PostgreSQL can add a configured simulated delay. TiDB uses native online DDL and does not add an ExtendDB delay.
 
 **Fix:** This is expected behavior matching real DynamoDB. Poll with DescribeTable until `TableStatus` is `ACTIVE` before performing operations on the table. All test code should use a `wait_for_active()` helper after CreateTable.
 
@@ -689,13 +689,13 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Cause:** After a successful write (PutItem, DeleteItem, UpdateItem), extenddb tried to capture a stream record but could not determine which shard to assign it to. The data write succeeded — only the stream record is missing.
 
-**Fix:** Check storage backend connectivity. Verify the table's stream shards exist in the `stream_shards` table. If the table was created before streams were enabled, the shards may not have been initialized.
+**Fix:** Check storage backend connectivity. TiDB derives stream shards from table metadata; there is no shard table to repair.
 
 ### `Stream capture: failed to write record for <table>: <error>`
 
 **Cause:** A stream record was constructed but could not be persisted to the `stream_records` table. The data write succeeded — only the stream record is missing.
 
-**Fix:** Check storage backend connectivity and disk space. If the error mentions a unique constraint violation, two writes to the same shard may have occurred in the same microsecond — retry the operation.
+**Fix:** Check storage backend connectivity and disk space. TiDB uses MVCC commit timestamps plus a per-transaction ordinal for stream sequence numbers, so duplicate stream sequence errors indicate a storage failure rather than same-millisecond application writes or multiple writes in one transaction.
 
 ### `Stream capture: failed to get sequence number: <error>`
 

@@ -380,7 +380,7 @@ The console provides a GUI for managing accounts, users, groups, roles, policies
 Adjust behavior without restarting:
 
 ```bash
-# Reduce table transition delay for faster test cycles
+# Reduce PostgreSQL table transition delay for faster test cycles
 ./target/release/extenddb settings --config extenddb.toml set \
     control_plane_delay_seconds 2
 

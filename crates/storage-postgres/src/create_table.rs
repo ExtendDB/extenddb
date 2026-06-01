@@ -13,7 +13,7 @@ use extenddb_storage::util::{index_arn, stream_arn, table_arn};
 use crate::PostgresEngine;
 
 impl PostgresEngine {
-    /// Core implementation of `create_table` (Fix #4: wrapped in a transaction).
+    /// Core implementation of `create_table`.
     pub(crate) async fn create_table_impl(
         &self,
         account_id: &str,
@@ -31,7 +31,6 @@ impl PostgresEngine {
             BillingMode::Provisioned => "PROVISIONED",
             BillingMode::PayPerRequest => "PAY_PER_REQUEST",
         };
-        // Fix #7: Use serde_json::to_value directly instead of redundant closures
         let pt_json = input
             .provisioned_throughput
             .as_ref()
@@ -188,7 +187,7 @@ impl PostgresEngine {
         }
 
         // Create the per-DynamoDB-table data table for item storage.
-        // P54 Bug 1: Data tables live in the data database, not the catalog.
+        // Data tables live in the data database, not the catalog.
         // Commit catalog metadata first, then create data tables on data_pool.
         // If data DDL fails, the catalog entry is cleaned up (see below).
 
@@ -215,7 +214,7 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // P54 Bug 1: Create data tables on the data pool after catalog commit.
+        // Create data tables on the data pool after catalog commit.
         let data_ddl_result = async {
             let mut data_tx = self
                 .data_pool
@@ -281,7 +280,7 @@ impl PostgresEngine {
             return Err(e);
         }
 
-        // F-3: Wake the control plane poller so it processes the CREATING →
+        // Wake the control plane poller so it processes the CREATING →
         // ACTIVE transition without waiting for the idle timeout.
         // If the server crashes between commit and notify, the 60s defensive
         // sweep recovers the transition.

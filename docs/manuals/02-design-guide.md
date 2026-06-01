@@ -11,7 +11,7 @@ extenddb uses a catalog/data database topology per deployment:
 - **Catalog database** (e.g., `extenddb_catalog`): All metadata — table definitions, indexes, accounts, IAM entities, settings, stream metadata, and schema history.
 - **Data database** (e.g., `extenddb_catalog_data`): User item data plus backend-specific secondary-index state. PostgreSQL stores base and secondary-index data in physical companion tables. TiDB stores item rows once and uses generated columns plus native secondary indexes.
 
-The data database connection string is stored in the catalog's `settings` table under the key `data_database_url`. This allows the catalog and data databases to live on different backend instances or clusters.
+The data database connection string is stored in the catalog's `settings` table under the key `data_database_connection_string`. PostgreSQL deployments may place the catalog and data databases on different PostgreSQL instances. TiDB deployments must keep both databases in the same TiDB cluster so snapshot timestamps, online DDL, native TTL, and BR backup/restore all refer to one global timeline.
 
 ### Catalog Tables
 
@@ -21,7 +21,7 @@ The data database connection string is stored in the catalog's `settings` table 
 | `tables` | DynamoDB table metadata. Composite PK: `(account_id, table_name)`. Stores key schema, attribute definitions, billing mode, stream spec, status, ARN, and TTL config. |
 | `indexes` | GSI/LSI metadata. FK on `table_id` (UUID) with CASCADE delete. |
 | `tags` | Resource tags. PK: `(resource_arn, tag_key)`. |
-| `settings` | Key-value store for catalog version, data DB URL, and runtime settings. |
+| `settings` | Key-value store for catalog version, data DB connection string, and runtime settings. |
 | `schema_history` | Migration tracking. Records which SQL files have been applied. |
 | `admin_users` | Admin credentials (bcrypt-hashed passwords). |
 | `iam_users` | IAM users scoped to accounts. Optional console password. |
@@ -36,8 +36,7 @@ The data database connection string is stored in the catalog's `settings` table 
 | `iam_role_tags` | Tags on IAM roles. |
 | `permissions_boundaries` | Permissions boundaries for users and roles. |
 | `encryption_keys` | AES-256-GCM key used to encrypt access key secrets. |
-| `stream_shards` | Stream shard metadata (parent shard, sequence range). |
-| `stream_records` | Stream change records with 24-hour retention. |
+| `stream_records` | Stream change records with 24-hour native TTL retention. TiDB derives fixed shard IDs from table metadata instead of storing shard rows. |
 
 ### Data Tables
 
@@ -48,7 +47,7 @@ Each DynamoDB table `T` in account `A` maps to a backend-owned physical table in
 - `item` column: Full item as JSONB
 - Primary key: `(pk)` or `(pk, sk)`
 
-PostgreSQL GSI tables are named `gsi_{table_id}_{index_name}` with the GSI key columns and a copy of projected attributes. TiDB represents every DynamoDB secondary index definition as generated key columns plus a native secondary index on the base data table; GSI versus LSI is API metadata, not a separate TiDB physical path.
+PostgreSQL GSI tables are named `gsi_{table_id}_{index_name}` with the GSI key columns and a copy of projected attributes. TiDB represents every DynamoDB secondary index definition as generated key columns plus a native secondary index on the base data table; GSI versus LSI is API metadata, not a separate TiDB physical path. The native index contains the DynamoDB index key columns only because TiDB already carries the clustered row handle in secondary-index entries. Initial indexes are included in the physical TiDB `CREATE TABLE`; replay repairs an already-existing physical table with TiDB online `IF NOT EXISTS` DDL before activation, and later GSI changes use TiDB online DDL.
 
 ### Schema Conventions
 
@@ -132,13 +131,13 @@ Credential lookups (access key → encrypted secret) read directly from the data
 
 ### Record Capture
 
-Stream records are captured atomically with data writes. The engine constructs a `StreamCapture` struct with metadata (stream ARN, view type, shard ID, sequence number, keys). The storage backend persists the stream record in the same backend transaction as the data write.
+Stream records are captured atomically with data writes. The engine constructs a `StreamCapture` struct with stream ARN, view type, and region metadata. The storage backend assigns the shard and sequence number and persists the stream record in the same backend transaction as the data write.
 
 For UpdateItem, the `new_image` is not known until after `apply_update` runs inside the transaction, so the storage backend constructs the full `StreamRecord` after the update.
 
 ### Shard Model
 
-Each stream has a fixed set of shards (currently 4 shards per stream). Shard IDs are deterministic (`shardId-<table>-000000000000` through `shardId-<table>-000000000003`). Sequence numbers are monotonically increasing integers.
+Each stream has a fixed set of shards (currently 4 shards per stream). Shard IDs are deterministic (`shardId-<table>-000000000000` through `shardId-<table>-000000000003`). Sequence numbers are monotonically increasing, sortable strings within a shard; TiDB derives them from native MVCC commit timestamps with a per-transaction ordinal suffix.
 
 ### Iterator Types
 
@@ -151,7 +150,8 @@ Iterators expire after 15 minutes of inactivity.
 
 ### Retention
 
-Stream records are retained for 24 hours. A background task runs hourly to delete expired records.
+Stream records are retained for 24 hours. TiDB uses native table TTL for
+retention; backends without native TTL use a background cleanup task.
 
 ## Architecture Decision Records
 

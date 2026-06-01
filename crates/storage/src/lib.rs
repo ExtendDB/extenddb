@@ -4,8 +4,8 @@
 //! Storage trait definitions for extenddb.
 //!
 //! Defines `TableEngine`, `DataEngine`, `MetadataEngine`, `StreamEngine`,
-//! and `WorkerStore` traits using RPITIT for async methods. Account-scoped
-//! methods receive `account_id` from the authenticated identity.
+//! and `WorkerStore` traits using object-safe `BoxFuture` return types.
+//! Account-scoped methods receive `account_id` from the authenticated identity.
 
 pub mod authorization_store;
 pub mod bootstrapper;
@@ -39,8 +39,8 @@ use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, UpdateAction
 use extenddb_core::types::{
     CreateTableInput, DeleteTableInput, DescribeStreamInput, DescribeTableInput, IndexInfo, Item,
     ListTablesInput, ListTablesOutput, StreamDescription, StreamRecord, StreamSummary,
-    StreamViewType, TableDescription, TableKeyInfo, Tag, TimeToLiveDescription, UpdateTableInput,
-    UserIdentity,
+    StreamViewType, TableDescription, TableKeyInfo, TableReadInfo, Tag, TimeToLiveDescription,
+    UpdateTableInput, UserIdentity,
 };
 
 use error::StorageError;
@@ -108,7 +108,8 @@ pub trait TableEngine: Send + Sync {
         input: UpdateTableInput,
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>>;
 
-    /// Fetch key schema and attribute definitions for an ACTIVE table.
+    /// Fetch key schema and attribute definitions for a table that can serve
+    /// data-plane requests.
     ///
     /// Lighter than `describe_table` — returns only the metadata needed
     /// by data operations for validation and key extraction.
@@ -117,6 +118,35 @@ pub trait TableEngine: Send + Sync {
         account_id: &str,
         table_name: &str,
     ) -> BoxFuture<'_, Result<TableKeyInfo, StorageError>>;
+
+    /// Fetch base-table metadata plus optional secondary-index metadata for
+    /// a read path in one logical operation.
+    ///
+    /// Backends should override this when they can fetch the table row and
+    /// index row with a single catalog query. The default preserves the older
+    /// two-step contract for backends that do not need the optimization.
+    fn table_read_info(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        index_name: Option<&str>,
+    ) -> BoxFuture<'_, Result<TableReadInfo, StorageError>> {
+        let account_id = account_id.to_owned();
+        let table_name = table_name.to_owned();
+        let index_name = index_name.map(ToOwned::to_owned);
+        Box::pin(async move {
+            let table = self.table_key_info(&account_id, &table_name).await?;
+            let index = if let Some(index_name) = index_name {
+                Some(
+                    self.index_info_by_table_id(&table.table_id, &index_name)
+                        .await?,
+                )
+            } else {
+                None
+            };
+            Ok(TableReadInfo { table, index })
+        })
+    }
 
     /// Fetch metadata for a secondary index on an ACTIVE table.
     ///
@@ -136,7 +166,7 @@ pub trait TableEngine: Send + Sync {
     /// Fetch metadata for a secondary index using a known `table_id`.
     ///
     /// Saves one catalog roundtrip vs `index_info` when the caller already
-    /// has `TableKeyInfo` (P118 optimization #4). Backends that don't override
+    /// has `TableKeyInfo`. Backends that don't override
     /// this will fall back to the standard `index_info` path.
     fn index_info_by_table_id(
         &self,
@@ -148,11 +178,16 @@ pub trait TableEngine: Send + Sync {
 /// Item-level data operations.
 ///
 /// All methods receive a `TableKeyInfo` from the engine layer, which has
-/// already validated the table exists and is ACTIVE. Storage backends do
-/// not re-fetch catalog metadata for data operations.
+/// already validated the table exists and can serve data-plane requests.
+/// Storage backends do not re-fetch catalog metadata for data operations.
 ///
 /// `account_id` is carried inside `TableKeyInfo` for data operations,
 /// so these methods do not need a separate `account_id` parameter.
+///
+/// Data-plane methods tie the returned future lifetime to both `&self` and the
+/// borrowed request metadata. Implementations can await the backend operation
+/// directly instead of cloning keys, expression maps, or transaction batches
+/// just to satisfy async lifetime requirements.
 pub trait DataEngine: Send + Sync {
     /// Write an item to a table, replacing any existing item with the same key.
     ///
@@ -164,24 +199,28 @@ pub trait DataEngine: Send + Sync {
     /// transaction as the data write, guaranteeing atomicity.
     ///
     /// Returns the previous item if `return_old` is true and an item existed.
-    fn put_item(
-        &self,
-        key_info: &TableKeyInfo,
+    fn put_item<'a>(
+        &'a self,
+        key_info: &'a TableKeyInfo,
         item: Item,
         return_old: bool,
-        condition: Option<&Expr>,
-        maps: &ExpressionMaps,
-        stream: Option<&StreamCapture>,
-    ) -> BoxFuture<'_, Result<Option<Item>, StorageError>>;
+        condition: Option<&'a Expr>,
+        maps: &'a ExpressionMaps,
+        stream: Option<&'a StreamCapture>,
+    ) -> BoxFuture<'a, Result<Option<Item>, StorageError>>;
 
     /// Read a single item by primary key.
     ///
     /// Returns `None` if the item does not exist (not an error).
-    fn get_item(
-        &self,
-        key_info: &TableKeyInfo,
-        key: &Item,
-    ) -> BoxFuture<'_, Result<Option<Item>, StorageError>>;
+    /// `consistent_read` is the DynamoDB request flag: `true` asks the backend
+    /// for the latest strongly consistent path; `false` lets the backend use a
+    /// native eventually-consistent or replica-read path when it has one.
+    fn get_item<'a>(
+        &'a self,
+        key_info: &'a TableKeyInfo,
+        key: &'a Item,
+        consistent_read: bool,
+    ) -> BoxFuture<'a, Result<Option<Item>, StorageError>>;
 
     /// Delete a single item by primary key.
     ///
@@ -193,15 +232,15 @@ pub trait DataEngine: Send + Sync {
     /// transaction as the data write, guaranteeing atomicity.
     ///
     /// Returns the deleted item if `return_old` is true and an item existed.
-    fn delete_item(
-        &self,
-        key_info: &TableKeyInfo,
-        key: &Item,
+    fn delete_item<'a>(
+        &'a self,
+        key_info: &'a TableKeyInfo,
+        key: &'a Item,
         return_old: bool,
-        condition: Option<&Expr>,
-        maps: &ExpressionMaps,
-        stream: Option<&StreamCapture>,
-    ) -> BoxFuture<'_, Result<Option<Item>, StorageError>>;
+        condition: Option<&'a Expr>,
+        maps: &'a ExpressionMaps,
+        stream: Option<&'a StreamCapture>,
+    ) -> BoxFuture<'a, Result<Option<Item>, StorageError>>;
 
     /// Update an item by primary key using update actions.
     ///
@@ -217,17 +256,17 @@ pub trait DataEngine: Send + Sync {
     /// Returns the item (old or new) based on `ReturnValues` semantics.
     /// The caller specifies which snapshots to capture via `return_old` and `return_new`.
     #[allow(clippy::too_many_arguments)]
-    fn update_item(
-        &self,
-        key_info: &TableKeyInfo,
-        key: &Item,
-        actions: &[UpdateAction],
+    fn update_item<'a>(
+        &'a self,
+        key_info: &'a TableKeyInfo,
+        key: &'a Item,
+        actions: &'a [UpdateAction],
         return_old: bool,
         return_new: bool,
-        condition: Option<&Expr>,
-        maps: &ExpressionMaps,
-        stream: Option<&StreamCapture>,
-    ) -> BoxFuture<'_, ItemPairResult>;
+        condition: Option<&'a Expr>,
+        maps: &'a ExpressionMaps,
+        stream: Option<&'a StreamCapture>,
+    ) -> BoxFuture<'a, ItemPairResult>;
 
     /// Query items by partition key with optional sort key condition.
     ///
@@ -235,40 +274,42 @@ pub trait DataEngine: Send + Sync {
     /// `forward` controls sort order (`true` = ascending, `false` = descending).
     /// `limit` caps the number of items read (before filtering).
     /// `exclusive_start_key` enables pagination.
-    /// `index_name` routes the query to a secondary index table.
+    /// `index` routes the query to a resolved secondary index read path.
     ///
     /// Returns `(items, last_evaluated_key)`. If `last_evaluated_key` is `Some`,
     /// there are more items to read.
     #[allow(clippy::too_many_arguments)]
-    fn query(
-        &self,
-        key_info: &TableKeyInfo,
-        key_condition: &KeyCondition,
-        maps: &ExpressionMaps,
+    fn query<'a>(
+        &'a self,
+        key_info: &'a TableKeyInfo,
+        key_condition: &'a KeyCondition,
+        maps: &'a ExpressionMaps,
         forward: bool,
         limit: Option<i64>,
-        exclusive_start_key: Option<&Item>,
-        index_name: Option<&str>,
-    ) -> BoxFuture<'_, QueryResult>;
+        exclusive_start_key: Option<&'a Item>,
+        index: Option<&'a IndexInfo>,
+        consistent_read: bool,
+    ) -> BoxFuture<'a, QueryResult>;
 
     /// Scan all items in a table or index.
     ///
     /// Returns items in storage order. `limit` caps the number of items read
     /// (before filtering). `exclusive_start_key` enables pagination.
     /// `segment` and `total_segments` enable parallel scan.
-    /// `index_name` routes the scan to a secondary index table.
+    /// `index` routes the scan to a resolved secondary index read path.
     ///
     /// Returns `(items, last_evaluated_key)`.
     #[allow(clippy::too_many_arguments)]
-    fn scan(
-        &self,
-        key_info: &TableKeyInfo,
+    fn scan<'a>(
+        &'a self,
+        key_info: &'a TableKeyInfo,
         limit: Option<i64>,
-        exclusive_start_key: Option<&Item>,
+        exclusive_start_key: Option<&'a Item>,
         segment: Option<i64>,
         total_segments: Option<i64>,
-        index_name: Option<&str>,
-    ) -> BoxFuture<'_, QueryResult>;
+        index: Option<&'a IndexInfo>,
+        consistent_read: bool,
+    ) -> BoxFuture<'a, QueryResult>;
 
     /// Execute multiple get operations in a single consistent snapshot.
     ///
@@ -278,10 +319,10 @@ pub trait DataEngine: Send + Sync {
     /// # Errors
     ///
     /// Returns [`StorageError::Internal`] on transaction or query failure.
-    fn transact_get_items(
-        &self,
-        ops: &[TransactGetOp<'_>],
-    ) -> BoxFuture<'_, Result<Vec<Option<Item>>, StorageError>>;
+    fn transact_get_items<'a>(
+        &'a self,
+        ops: &'a [TransactGetOp<'a>],
+    ) -> BoxFuture<'a, Result<Vec<Option<Item>>, StorageError>>;
 
     /// Execute multiple write operations atomically in a single transaction.
     ///
@@ -302,11 +343,11 @@ pub trait DataEngine: Send + Sync {
     /// Returns [`StorageError::IdempotentReplay`] if the token matches a previous request.
     /// Returns [`StorageError::IdempotentMismatch`] if the token exists with different ops.
     #[allow(clippy::too_many_arguments)]
-    fn transact_write_items(
-        &self,
-        ops: &[TransactWriteOp<'_>],
-        token: Option<(&str, &str)>,
-    ) -> BoxFuture<'_, Result<(), StorageError>>;
+    fn transact_write_items<'a>(
+        &'a self,
+        ops: &'a [TransactWriteOp<'a>],
+        token: Option<(&'a str, &'a str)>,
+    ) -> BoxFuture<'a, Result<(), StorageError>>;
 
     /// Delete idempotency tokens older than the given age in seconds.
     fn cleanup_expired_idempotency_tokens(
@@ -336,6 +377,44 @@ pub trait MetadataEngine: Send + Sync {
         enabled: bool,
     ) -> BoxFuture<'_, Result<(), StorageError>>;
 
+    /// Apply a complete TTL state change, including any backend-specific
+    /// physical TTL artifacts.
+    ///
+    /// The default implementation preserves the historical indexed-worker
+    /// workflow used by storage backends that keep TTL lookup artifacts outside
+    /// `update_ttl`: drop artifacts before disabling, and best-effort-create
+    /// artifacts after enabling. Backends with native TTL DDL should override
+    /// this method so the backend owns the full catalog/DDL transition.
+    fn apply_ttl_update(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        attribute_name: &str,
+        enabled: bool,
+    ) -> BoxFuture<'_, Result<(), StorageError>> {
+        let account_id = account_id.to_owned();
+        let table_name = table_name.to_owned();
+        let attribute_name = attribute_name.to_owned();
+        Box::pin(async move {
+            if !enabled {
+                self.drop_ttl_index(&account_id, &table_name).await?;
+            }
+
+            self.update_ttl(&account_id, &table_name, &attribute_name, enabled)
+                .await?;
+
+            if enabled
+                && let Err(err) = self
+                    .create_ttl_index(&account_id, &table_name, &attribute_name)
+                    .await
+            {
+                tracing::warn!("TTL index creation deferred for {table_name}: {err}");
+            }
+
+            Ok(())
+        })
+    }
+
     /// Add or overwrite tags on a resource.
     fn tag_resource(&self, arn: &str, tags: &[Tag]) -> BoxFuture<'_, Result<(), StorageError>>;
 
@@ -358,13 +437,20 @@ pub trait MetadataEngine: Send + Sync {
     /// List all tables with TTL enabled across all accounts: `(account_id, table_name, ttl_attribute)`.
     fn all_tables_with_ttl(&self) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>>;
 
-    /// List all tables with TTL enabled AND index ready: `(account_id, table_name, ttl_attribute)`.
+    /// List all tables with TTL enabled AND index ready for an indexed-worker
+    /// TTL sweeper: `(account_id, table_name, ttl_attribute)`.
+    ///
+    /// Backends that delegate expiration to native database TTL should return
+    /// an empty list so the generic sweeper cannot duplicate native deletion.
     fn all_tables_with_ttl_index_ready(
         &self,
     ) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>>;
 
-    /// Create the TTL expression index concurrently for a table.
-    /// Sets `ttl_index_ready = TRUE` on success.
+    /// Create the TTL artifact for a table.
+    ///
+    /// Indexed-worker backends usually create an expression index and set
+    /// `ttl_index_ready = TRUE`. Native TTL backends may apply database-native
+    /// TTL DDL and publish their own explicit TTL state.
     fn create_ttl_index(
         &self,
         account_id: &str,
@@ -372,8 +458,11 @@ pub trait MetadataEngine: Send + Sync {
         ttl_attribute: &str,
     ) -> BoxFuture<'_, Result<(), StorageError>>;
 
-    /// Drop the TTL expression index for a table.
-    /// Sets `ttl_index_ready = FALSE`.
+    /// Drop the TTL artifact for a table.
+    ///
+    /// Indexed-worker backends usually drop an expression index and set
+    /// `ttl_index_ready = FALSE`. Native TTL backends may remove database-native
+    /// TTL DDL and publish their own explicit TTL state.
     fn drop_ttl_index(
         &self,
         account_id: &str,
@@ -381,6 +470,9 @@ pub trait MetadataEngine: Send + Sync {
     ) -> BoxFuture<'_, Result<(), StorageError>>;
 
     /// Find expired items using the TTL index (ordered scan with LIMIT).
+    ///
+    /// Indexed-worker backends return candidate items for application-level
+    /// deletion. Native TTL backends should return an empty list.
     fn find_expired_items_indexed(
         &self,
         account_id: &str,
@@ -390,6 +482,9 @@ pub trait MetadataEngine: Send + Sync {
     ) -> BoxFuture<'_, Result<Vec<Item>, StorageError>>;
 
     /// Recompute and store `table_size_bytes` and `item_count` for a table.
+    ///
+    /// Backends that can answer table statistics from native metadata may
+    /// compute them on demand instead of running a periodic refresh worker.
     fn refresh_table_size(
         &self,
         account_id: &str,
@@ -455,7 +550,10 @@ pub trait StreamEngine: Send + Sync {
         partition_key: &str,
     ) -> BoxFuture<'_, Result<String, StorageError>>;
 
-    /// Generate the next sequence number for a shard.
+    /// Generate the next sortable sequence number for a shard.
+    ///
+    /// Sequence numbers must be monotonically increasing within a shard, but do
+    /// not need to be contiguous.
     fn next_sequence_number(&self, shard_id: &str) -> BoxFuture<'_, Result<String, StorageError>>;
 
     /// Validate that a shard exists for the given stream ARN.
@@ -545,9 +643,6 @@ pub trait BackupEngine: Send + Sync {
     ) -> BoxFuture<'_, Result<extenddb_core::types::ContinuousBackupsDescription, StorageError>>;
 
     /// Restore a table to a point in time.
-    // TODO(cleanup): This method is unreachable — the engine handler returns
-    // ValidationException("not yet supported") before calling storage. Remove
-    // when real PITR is implemented or during the next storage trait cleanup.
     fn restore_table_to_point_in_time(
         &self,
         account_id: &str,
@@ -603,15 +698,190 @@ pub trait CatalogStore:
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
 
     /// Verify that CatalogStore is dyn-compatible (object-safe).
     ///
-    /// This test ensures all catalog traits use BoxFuture instead of RPITIT,
-    /// allowing us to use `Arc<dyn CatalogStore>` in the factory pattern.
+    /// This test ensures all catalog traits remain object-safe, allowing us to
+    /// use `Arc<dyn CatalogStore>` in the factory pattern.
     #[test]
     fn catalog_store_is_dyn_compatible() {
         // This function just needs to compile - it's never called
         fn _assert_dyn(_: Arc<dyn CatalogStore>) {}
+    }
+
+    #[test]
+    fn data_engine_is_dyn_compatible_with_borrowed_futures() {
+        // This function just needs to compile - it's never called.
+        fn _assert_dyn(_: Arc<dyn DataEngine>) {}
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeMetadataEngine {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        fail_create: bool,
+    }
+
+    impl FakeMetadataEngine {
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().expect("calls lock poisoned").clone()
+        }
+
+        fn record(&self, call: &'static str) {
+            self.calls.lock().expect("calls lock poisoned").push(call);
+        }
+    }
+
+    impl MetadataEngine for FakeMetadataEngine {
+        fn describe_ttl(
+            &self,
+            _account_id: &str,
+            _table_name: &str,
+        ) -> BoxFuture<'_, Result<TimeToLiveDescription, StorageError>> {
+            Box::pin(async move {
+                Ok(TimeToLiveDescription {
+                    time_to_live_status: extenddb_core::types::TimeToLiveStatus::Disabled,
+                    attribute_name: None,
+                })
+            })
+        }
+
+        fn update_ttl(
+            &self,
+            _account_id: &str,
+            _table_name: &str,
+            _attribute_name: &str,
+            enabled: bool,
+        ) -> BoxFuture<'_, Result<(), StorageError>> {
+            let this = self.clone();
+            Box::pin(async move {
+                this.record(if enabled {
+                    "update_enable"
+                } else {
+                    "update_disable"
+                });
+                Ok(())
+            })
+        }
+
+        fn tag_resource(
+            &self,
+            _arn: &str,
+            _tags: &[Tag],
+        ) -> BoxFuture<'_, Result<(), StorageError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn untag_resource(
+            &self,
+            _arn: &str,
+            _tag_keys: &[String],
+        ) -> BoxFuture<'_, Result<(), StorageError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn list_tags(&self, _arn: &str) -> BoxFuture<'_, Result<Vec<Tag>, StorageError>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn tables_with_ttl(
+            &self,
+            _account_id: &str,
+        ) -> BoxFuture<'_, Result<Vec<(String, String)>, StorageError>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn all_tables_with_ttl(&self) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn all_tables_with_ttl_index_ready(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn create_ttl_index(
+            &self,
+            _account_id: &str,
+            _table_name: &str,
+            _ttl_attribute: &str,
+        ) -> BoxFuture<'_, Result<(), StorageError>> {
+            let this = self.clone();
+            Box::pin(async move {
+                this.record("create");
+                if this.fail_create {
+                    Err(StorageError::Internal("create failed".to_owned()))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn drop_ttl_index(
+            &self,
+            _account_id: &str,
+            _table_name: &str,
+        ) -> BoxFuture<'_, Result<(), StorageError>> {
+            let this = self.clone();
+            Box::pin(async move {
+                this.record("drop");
+                Ok(())
+            })
+        }
+
+        fn find_expired_items_indexed(
+            &self,
+            _account_id: &str,
+            _table_name: &str,
+            _ttl_attribute: &str,
+            _limit: usize,
+        ) -> BoxFuture<'_, Result<Vec<Item>, StorageError>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn refresh_table_size(
+            &self,
+            _account_id: &str,
+            _table_name: &str,
+        ) -> BoxFuture<'_, Result<(), StorageError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn list_active_table_names(
+            &self,
+            _account_id: &str,
+        ) -> BoxFuture<'_, Result<Vec<String>, StorageError>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn all_active_tables(&self) -> BoxFuture<'_, Result<Vec<(String, String)>, StorageError>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+    }
+
+    #[test]
+    fn default_ttl_update_disables_by_dropping_then_updating() {
+        let engine = FakeMetadataEngine::default();
+
+        futures::executor::block_on(engine.apply_ttl_update("acct", "table", "ttl", false))
+            .expect("disable should succeed");
+
+        assert_eq!(engine.calls(), vec!["drop", "update_disable"]);
+    }
+
+    #[test]
+    fn default_ttl_update_enable_defers_create_failures() {
+        let engine = FakeMetadataEngine {
+            fail_create: true,
+            ..FakeMetadataEngine::default()
+        };
+
+        futures::executor::block_on(engine.apply_ttl_update("acct", "table", "ttl", true))
+            .expect("create failure should be deferred");
+
+        assert_eq!(engine.calls(), vec!["update_enable", "create"]);
     }
 }

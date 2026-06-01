@@ -18,7 +18,6 @@ This directory contains the authoritative design documents for ExtendDB (extendd
 | 10 | [Licenses](10-dependency-licenses.md) | Licensing summary for third-party dependencies |
 | 11 | [Scaling](11-high-availability.md) | DRAFT document on scaling ExtendDB |
 
-
 ## How to Use These Docs
 
 - **Before implementing a feature:** read the relevant component doc and the requirements doc for the operation.

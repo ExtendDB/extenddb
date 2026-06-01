@@ -14,13 +14,13 @@ CREATE TABLE IF NOT EXISTS backup_indexes (
     projection JSON NOT NULL,
     provisioned_throughput JSON,
     PRIMARY KEY (backup_arn, index_name) CLUSTERED
-);
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 CREATE TABLE IF NOT EXISTS backup_tags (
     backup_arn VARCHAR(512) NOT NULL REFERENCES backups(backup_arn) ON DELETE CASCADE,
     tag_key VARCHAR(255) NOT NULL,
     tag_value TEXT NOT NULL,
     PRIMARY KEY (backup_arn, tag_key) CLUSTERED
-);
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 UPDATE settings SET value = '0.0.3' WHERE `key` = 'catalog_version';

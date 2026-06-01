@@ -46,9 +46,9 @@ impl PostgresEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // P54 Bug 1: Stream shards live in the data database for atomic
-        // writes with stream records and item data. Use a transaction so
-        // all shards are created atomically.
+        // Stream shards live in the data database for atomic writes with stream
+        // records and item data. Use a transaction so all shards are created
+        // atomically.
         let mut data_tx = data_pool
             .begin()
             .await

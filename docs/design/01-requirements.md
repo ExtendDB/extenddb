@@ -164,7 +164,7 @@ These are the core CRUD operations. All must be fully implemented.
 - REQ-DATA-012: TransactGetItems must be atomic — consistent snapshot of up to 100 items
 - REQ-DATA-013: All data operations must support legacy `Expected` and `ConditionalOperator` parameters (converted internally to expressions)
 - REQ-DATA-014: All write operations must trigger stream event capture when streams are enabled on the table
-- REQ-DATA-015: `ConsistentRead` parameter must be accepted on GetItem, Query, Scan, and BatchGetItem. When a read replica is configured, `ConsistentRead=false` reads must route to the replica; `ConsistentRead=true` reads must route to the primary. When no replica is configured, all reads are strongly consistent. Capacity calculations must reflect the consistency mode regardless of replica configuration (0.5 RCU for eventually consistent, 1.0 RCU for strongly consistent).
+- REQ-DATA-015: `ConsistentRead` parameter must be accepted on GetItem, Query, Scan, and BatchGetItem and passed to storage read methods. Each backend maps `ConsistentRead=false` and `ConsistentRead=true` to its native default and strong read paths. Capacity calculations must reflect the requested consistency mode (0.5 RCU for eventually consistent, 1.0 RCU for strongly consistent).
 
 ### 3.2 Control Plane Operations (In Scope)
 
@@ -439,6 +439,7 @@ The catalog database stores extenddb metadata: table definitions, indexes, tags,
 - REQ-STOR-003: The trait must support transactions with serializable isolation for TransactWriteItems/TransactGetItems
 - REQ-STOR-004: The trait must not leak backend-specific types — all inputs and outputs use core DynamoDB types
 - REQ-STOR-005: Adding a new backend must not require changes to any existing crate
+- REQ-STOR-006: Read methods must receive the DynamoDB `ConsistentRead` flag so each backend can map strong and default reads to its native consistency paths without leaking topology into the engine layer
 
 ### 8.2 PostgreSQL Backend (First Implementation)
 
@@ -449,15 +450,17 @@ The catalog database stores extenddb metadata: table definitions, indexes, tags,
 - REQ-PG-005: Use parameterized queries for all read operations to prevent SQL injection
 - REQ-PG-006: Schema migrations managed via embedded migration files
 - REQ-PG-007: Support PostgreSQL 14+
-- REQ-PG-008: Support optional read replica connection for eventually consistent reads. When `read_replica_url` is configured, `ConsistentRead=false` reads (GetItem, Query, Scan, BatchGetItem) route to the replica pool. All writes and `ConsistentRead=true` reads always use the primary pool.
+- REQ-PG-008: Honor the storage trait read-consistency contract. The current PostgreSQL backend uses its configured primary data pool for both strong and default reads until a PostgreSQL topology configuration is implemented.
 
 ### 8.3 TiDB Backend
 
 - REQ-TIDB-001: Use TiDB's MySQL-compatible SQL endpoint through the sqlx MySQL driver
 - REQ-TIDB-002: Use TiDB transactions for global consistency across base rows, secondary indexes, streams, and catalog updates
 - REQ-TIDB-003: Represent DynamoDB secondary indexes with generated columns and native TiDB secondary indexes; GSI versus LSI is API metadata, not separate physical index classes
-- REQ-TIDB-004: Use TiDB native TTL for non-streaming tables and retain an indexed worker path only when DynamoDB Streams REMOVE records must be emitted
+- REQ-TIDB-004: Use TiDB native TTL for all user tables; do not run a parallel ExtendDB TTL worker for TiDB tables
 - REQ-TIDB-005: Use TiDB BR for native physical backup/restore instead of catalog row-copy backup data
+- REQ-TIDB-006: Route default data-plane reads through a TiDB session configured for native follower-read locality (`tidb_replica_read = 'closest-adaptive'`); route writes and `ConsistentRead=true` reads through the strong data pool
+- REQ-TIDB-007: Run `TransactGetItems` inside a TiDB transaction so multi-item transactional reads use one native snapshot instead of application-level locking
 
 ## 9. Expression Engine Requirements
 

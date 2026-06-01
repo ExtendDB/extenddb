@@ -240,14 +240,14 @@ impl DispatchResult {
 }
 
 /// Context passed to every operation handler.
-/// Fix #9: region and `account_id` use Arc<str> to avoid per-request cloning.
+/// Region and `account_id` use `Arc<str>` to avoid per-request cloning.
 ///
-/// # Catalog Query Discipline (P118)
+/// # Catalog Query Discipline
 ///
 /// For single-table item operations (`GetItem`, `PutItem`, `DeleteItem`,
-/// `UpdateItem`, `Query`, `Scan`), the auth layer pre-fetches `TableKeyInfo`
-/// and stores it in `pre_fetched_key_info`. Engine handlers MUST use this
-/// pre-fetched value instead of calling `storage.table_key_info()` directly.
+/// `UpdateItem`, `Query`, `Scan`), the auth layer pre-fetches `TableReadInfo`
+/// and stores it in `pre_fetched_read_info`. Engine handlers MUST use this
+/// pre-fetched value instead of calling storage metadata APIs directly.
 /// New per-request catalog roundtrips require justification in the discussion
 /// file and principal reviewer approval.
 pub struct OperationContext {
@@ -261,27 +261,51 @@ pub struct OperationContext {
     /// Allowed directories for export file operations. Empty means exports
     /// are disabled (secure default).
     pub export_paths: Arc<[Arc<PathBuf>]>,
-    /// Pre-fetched `TableKeyInfo` from the auth layer (P118 optimization #2).
+    /// Pre-fetched `TableReadInfo` from the auth layer.
     /// Populated for single-table item-level operations; `None` for table-level
     /// and batch/transact operations.
-    pub pre_fetched_key_info: Option<extenddb_core::types::TableKeyInfo>,
+    pub pre_fetched_read_info: Option<extenddb_core::types::TableReadInfo>,
 }
 
 impl OperationContext {
     /// Return pre-fetched `TableKeyInfo` if available and matching the requested
     /// table, otherwise fetch from storage. This is the single entry point for
-    /// obtaining `TableKeyInfo` in engine handlers (P118 Catalog Query Discipline).
+    /// obtaining `TableKeyInfo` in engine handlers.
     pub(crate) async fn table_key_info(
         &self,
         table_name: &str,
     ) -> Result<extenddb_core::types::TableKeyInfo, extenddb_storage::error::StorageError> {
-        if let Some(ref ki) = self.pre_fetched_key_info {
-            if ki.table_name == table_name && *ki.account_id == *self.account_id {
-                return Ok(ki.clone());
+        if let Some(ref read_info) = self.pre_fetched_read_info {
+            let table = &read_info.table;
+            if table.table_name == table_name && *table.account_id == *self.account_id {
+                return Ok(table.clone());
             }
         }
         self.storage
             .table_key_info(&self.account_id, table_name)
+            .await
+    }
+
+    /// Return pre-fetched table-plus-index read metadata if available and
+    /// matching the requested table/index, otherwise fetch the resolved read
+    /// path from storage.
+    pub(crate) async fn table_read_info(
+        &self,
+        table_name: &str,
+        index_name: Option<&str>,
+    ) -> Result<extenddb_core::types::TableReadInfo, extenddb_storage::error::StorageError> {
+        if let Some(ref read_info) = self.pre_fetched_read_info {
+            let table = &read_info.table;
+            let fetched_index_name = read_info.index.as_ref().map(|idx| idx.index_name.as_str());
+            if table.table_name == table_name
+                && *table.account_id == *self.account_id
+                && fetched_index_name == index_name
+            {
+                return Ok(read_info.clone());
+            }
+        }
+        self.storage
+            .table_read_info(&self.account_id, table_name, index_name)
             .await
     }
 }

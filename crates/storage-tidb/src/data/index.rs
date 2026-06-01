@@ -5,19 +5,38 @@
 //!
 //! `TiDB` owns secondary-index maintenance. ExtendDB stores every item once in
 //! the base `_ddb_*` table, exposes DynamoDB index keys as generated columns,
-//! and creates a native TiDB secondary index over those generated columns plus
-//! the base table key for stable pagination.
+//! and creates a native TiDB secondary index over those generated columns.
+//! TiDB secondary-index entries already carry the clustered row handle, so the
+//! base table key must not be duplicated into the index definition: doing so
+//! would waste write bandwidth and can exceed TiDB's 3072-byte index key limit
+//! for legal DynamoDB key sizes.
+//!
+//! Generated columns are intentional here. TiDB documents them as the
+//! production path for indexing JSON-derived values; generic expression indexes
+//! would make DynamoDB's casts, binary decoding, and composite-key expressions
+//! depend on the expression-index experimental function surface.
 
+use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, Item, KeySchemaElement, KeyType, ScalarAttributeType,
 };
+use extenddb_core::validation::validate_key_value_size;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::sk_column_n;
 
-use super::{all_sort_key_info, data_table_name};
+use super::{
+    DYNAMODB_HASH_KEY_COLUMN_TYPE, DYNAMODB_SORT_KEY_COLUMN_TYPE, all_sort_key_info,
+    data_table_name, physical_pk_bytes_from_values,
+};
+use crate::tidb_util::execute_tidb_idempotent_ddl;
 
 pub(crate) struct WriteIndexKeys {
     key_schema: Vec<KeySchemaElement>,
+}
+
+pub(crate) struct NativeSecondaryIndex<'a> {
+    pub index_id: &'a str,
+    pub key_schema: &'a [KeySchemaElement],
 }
 
 struct GeneratedColumn {
@@ -53,12 +72,60 @@ pub(crate) async fn fetch_write_index_key_schemas(
         .collect()
 }
 
-pub(crate) fn validate_item_index_key_types(
+pub(crate) fn has_potential_secondary_index_keys(
+    key_schema: &[KeySchemaElement],
+    attr_defs: &[AttributeDefinition],
+) -> bool {
+    attr_defs.iter().any(|attr| {
+        !key_schema
+            .iter()
+            .any(|key| key.attribute_name == attr.attribute_name)
+    })
+}
+
+pub(crate) fn item_has_potential_secondary_index_key(
+    item: &Item,
+    key_schema: &[KeySchemaElement],
+    attr_defs: &[AttributeDefinition],
+) -> bool {
+    attr_defs.iter().any(|attr| {
+        item.contains_key(&attr.attribute_name)
+            && !key_schema
+                .iter()
+                .any(|key| key.attribute_name == attr.attribute_name)
+    })
+}
+
+pub(crate) async fn validate_item_secondary_index_key_constraints(
+    table_id: &str,
+    item: &Item,
+    key_schema: &[KeySchemaElement],
+    attr_defs: &[AttributeDefinition],
+    limits: &LimitsConfig,
+    pool: &sqlx::MySqlPool,
+) -> Result<(), StorageError> {
+    if !item_has_potential_secondary_index_key(item, key_schema, attr_defs) {
+        return Ok(());
+    }
+
+    let index_keys = fetch_write_index_key_schemas(table_id, pool).await?;
+    validate_item_index_key_constraints(item, &index_keys, attr_defs, limits)
+}
+
+pub(crate) fn validate_item_index_key_constraints(
     item: &Item,
     indexes: &[WriteIndexKeys],
     attr_defs: &[AttributeDefinition],
+    limits: &LimitsConfig,
 ) -> Result<(), StorageError> {
     for index in indexes {
+        let hash_key_count = index
+            .key_schema
+            .iter()
+            .filter(|key| key.key_type == KeyType::Hash)
+            .count();
+        let mut hash_values = Vec::with_capacity(hash_key_count);
+
         for key in &index.key_schema {
             let Some(value) = item.get(&key.attribute_name) else {
                 continue;
@@ -80,76 +147,182 @@ pub(crate) fn validate_item_index_key_types(
                     scalar_type_name(expected)
                 )));
             }
+            validate_key_value_size(&key.attribute_name, value, key.key_type, limits)
+                .map_err(|e| StorageError::Validation(e.to_string()))?;
+
+            if key.key_type == KeyType::Hash {
+                hash_values.push(value);
+            }
+        }
+
+        if hash_values.len() == hash_key_count && hash_key_count > 1 {
+            let encoded = physical_pk_bytes_from_values(&hash_values)?;
+            if encoded.len() > limits.max_partition_key_size_bytes {
+                return Err(StorageError::Validation(format!(
+                    "One or more parameter values are not valid. \
+                     The partition key size must be between 1 and {} bytes",
+                    limits.max_partition_key_size_bytes
+                )));
+            }
         }
     }
     Ok(())
 }
 
-pub(crate) async fn create_native_secondary_index(
+pub(crate) async fn create_native_secondary_indexes(
     pool: &sqlx::MySqlPool,
     table_id: &str,
-    index_id: &str,
-    index_key_schema: &[KeySchemaElement],
+    indexes: &[NativeSecondaryIndex<'_>],
     attr_defs: &[AttributeDefinition],
-    base_key_schema: &[KeySchemaElement],
-    base_attr_defs: &[AttributeDefinition],
 ) -> Result<(), StorageError> {
-    let table = data_table_name(table_id);
-    for column in generated_columns(index_id, index_key_schema, attr_defs)? {
-        let ddl = format!(
-            "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS `{}` {} AS ({}) VIRTUAL",
-            column.name, column.ddl_type, column.expression
-        );
-        sqlx::query(&ddl)
-            .execute(pool)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+    if indexes.is_empty() {
+        return Ok(());
     }
 
-    let index_name = native_index_name(index_id);
-    let index_columns = native_index_physical_columns(
-        index_id,
-        index_key_schema,
-        attr_defs,
-        base_key_schema,
-        base_attr_defs,
-    );
-    let ddl = format!(
-        "CREATE INDEX IF NOT EXISTS `{index_name}` ON {table} ({})",
-        index_columns.join(", ")
-    );
-    sqlx::query(&ddl)
-        .execute(pool)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+    let table = data_table_name(table_id);
+    let columns = indexes
+        .iter()
+        .map(|index| generated_columns(index.index_id, index.key_schema, attr_defs))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let ddl = add_generated_columns_ddl(&table, &columns);
+    execute_tidb_idempotent_ddl(pool, "create_native_secondary_index_add_columns", &ddl).await?;
+
+    // Keep this as a second online DDL job. TiDB validates multi-change ALTER
+    // statements against the starting schema, so ADD INDEX cannot safely refer
+    // to generated columns added earlier in the same ALTER statement.
+    let ddl = add_native_indexes_ddl(&table, indexes, attr_defs);
+    execute_tidb_idempotent_ddl(pool, "create_native_secondary_indexes_add_indexes", &ddl).await?;
 
     Ok(())
 }
 
-pub(crate) async fn drop_native_secondary_index(
+fn add_generated_columns_ddl(table: &str, columns: &[GeneratedColumn]) -> String {
+    let specs = columns
+        .iter()
+        .map(|column| {
+            format!(
+                "ADD COLUMN IF NOT EXISTS {}",
+                generated_column_definition(column)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("ALTER TABLE {table} {specs}")
+}
+
+fn generated_column_definition(column: &GeneratedColumn) -> String {
+    format!(
+        "`{}` {} AS ({}) VIRTUAL",
+        column.name, column.ddl_type, column.expression
+    )
+}
+
+pub(crate) fn native_index_generated_column_definitions(
+    indexes: &[NativeSecondaryIndex<'_>],
+    attr_defs: &[AttributeDefinition],
+) -> Result<Vec<String>, StorageError> {
+    let columns = indexes
+        .iter()
+        .map(|index| generated_columns(index.index_id, index.key_schema, attr_defs))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+    Ok(columns
+        .iter()
+        .map(generated_column_definition)
+        .collect::<Vec<_>>())
+}
+
+fn add_native_indexes_ddl(
+    table: &str,
+    indexes: &[NativeSecondaryIndex<'_>],
+    attr_defs: &[AttributeDefinition],
+) -> String {
+    let specs = indexes
+        .iter()
+        .map(|index| {
+            let (index_name, index_columns) = native_index_name_and_columns(index, attr_defs);
+            format!(
+                "ADD INDEX IF NOT EXISTS `{index_name}` ({})",
+                index_columns.join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("ALTER TABLE {table} {specs}")
+}
+
+pub(crate) fn native_index_create_table_definitions(
+    indexes: &[NativeSecondaryIndex<'_>],
+    attr_defs: &[AttributeDefinition],
+) -> Vec<String> {
+    indexes
+        .iter()
+        .map(|index| native_index_definition(index, attr_defs))
+        .collect()
+}
+
+fn native_index_definition(
+    index: &NativeSecondaryIndex<'_>,
+    attr_defs: &[AttributeDefinition],
+) -> String {
+    let (index_name, index_columns) = native_index_name_and_columns(index, attr_defs);
+    format!("INDEX `{index_name}` ({})", index_columns.join(", "))
+}
+
+fn native_index_name_and_columns(
+    index: &NativeSecondaryIndex<'_>,
+    attr_defs: &[AttributeDefinition],
+) -> (String, Vec<String>) {
+    (
+        native_index_name(index.index_id),
+        native_index_key_tuple_columns(index.index_id, index.key_schema, attr_defs),
+    )
+}
+
+pub(crate) async fn drop_native_secondary_indexes(
     pool: &sqlx::MySqlPool,
     table_id: &str,
-    index_id: &str,
-    index_key_schema: &[KeySchemaElement],
+    indexes: &[NativeSecondaryIndex<'_>],
     attr_defs: &[AttributeDefinition],
 ) -> Result<(), StorageError> {
-    let table = data_table_name(table_id);
-    let index_name = native_index_name(index_id);
-    let drop_index = format!("DROP INDEX IF EXISTS `{index_name}` ON {table}");
-    sqlx::query(&drop_index)
-        .execute(pool)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-    for column in native_index_key_tuple_columns(index_id, index_key_schema, attr_defs) {
-        let ddl = format!("ALTER TABLE {table} DROP COLUMN IF EXISTS `{column}`");
-        sqlx::query(&ddl)
-            .execute(pool)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+    if indexes.is_empty() {
+        return Ok(());
     }
 
+    let table = data_table_name(table_id);
+    let ddl = drop_native_indexes_and_columns_ddl(&table, indexes, attr_defs);
+    execute_tidb_idempotent_ddl(pool, "drop_native_secondary_index_artifacts", &ddl).await?;
+
     Ok(())
+}
+
+fn drop_native_indexes_and_columns_ddl(
+    table: &str,
+    indexes: &[NativeSecondaryIndex<'_>],
+    attr_defs: &[AttributeDefinition],
+) -> String {
+    let mut specs = indexes
+        .iter()
+        .map(|index| {
+            let index_name = native_index_name(index.index_id);
+            format!("DROP INDEX IF EXISTS `{index_name}`")
+        })
+        .collect::<Vec<_>>();
+    specs.extend(
+        indexes
+            .iter()
+            .flat_map(|index| {
+                native_index_key_tuple_columns(index.index_id, index.key_schema, attr_defs)
+            })
+            .map(|column| format!("DROP COLUMN IF EXISTS `{column}`")),
+    );
+    format!("ALTER TABLE {table} {}", specs.join(", "))
 }
 
 pub(crate) fn native_index_hash_column(index_id: &str) -> String {
@@ -195,24 +368,6 @@ pub(crate) fn native_index_non_null_predicates(
         .collect()
 }
 
-fn native_index_physical_columns(
-    index_id: &str,
-    index_key_schema: &[KeySchemaElement],
-    attr_defs: &[AttributeDefinition],
-    base_key_schema: &[KeySchemaElement],
-    base_attr_defs: &[AttributeDefinition],
-) -> Vec<String> {
-    let mut columns = native_index_key_tuple_columns(index_id, index_key_schema, attr_defs);
-    columns.push("pk".to_owned());
-    columns.extend(
-        all_sort_key_info(base_key_schema, base_attr_defs)
-            .into_iter()
-            .enumerate()
-            .map(|(i, (_, sk_type))| sk_column_n(i, sk_type)),
-    );
-    columns
-}
-
 fn generated_columns(
     index_id: &str,
     key_schema: &[KeySchemaElement],
@@ -220,7 +375,7 @@ fn generated_columns(
 ) -> Result<Vec<GeneratedColumn>, StorageError> {
     let mut columns = vec![GeneratedColumn {
         name: native_index_hash_column(index_id),
-        ddl_type: "VARBINARY(2048)",
+        ddl_type: DYNAMODB_HASH_KEY_COLUMN_TYPE,
         expression: hash_key_expression(key_schema, attr_defs)?,
     }];
 
@@ -251,12 +406,12 @@ fn hash_key_expression(
         .filter(|ks| ks.key_type == KeyType::Hash)
         .map(|ks| {
             let attr_type = attribute_type(&ks.attribute_name, attr_defs)?;
-            Ok(key_scalar_expression(&ks.attribute_name, attr_type))
+            Ok(key_binary_expression(&ks.attribute_name, attr_type))
         })
         .collect::<Result<Vec<_>, StorageError>>()?;
 
     if hash_parts.len() == 1 {
-        return Ok(format!("CAST({} AS BINARY)", hash_parts[0]));
+        return Ok(hash_parts[0].clone());
     }
 
     let mut concat_parts = Vec::with_capacity(hash_parts.len() * 4);
@@ -267,6 +422,14 @@ fn hash_key_expression(
         concat_parts.push("','".to_owned());
     }
     Ok(format!("CONCAT({})", concat_parts.join(", ")))
+}
+
+fn key_binary_expression(attr_name: &str, attr_type: ScalarAttributeType) -> String {
+    let scalar = key_scalar_expression(attr_name, attr_type);
+    match attr_type {
+        ScalarAttributeType::S | ScalarAttributeType::N => format!("CAST({scalar} AS BINARY)"),
+        ScalarAttributeType::B => format!("FROM_BASE64({scalar})"),
+    }
 }
 
 fn sort_key_expression(attr_name: &str, attr_type: ScalarAttributeType) -> String {
@@ -287,7 +450,7 @@ fn key_scalar_expression(attr_name: &str, attr_type: ScalarAttributeType) -> Str
 
 fn generated_sort_column_type(attr_type: ScalarAttributeType) -> &'static str {
     match attr_type {
-        ScalarAttributeType::S | ScalarAttributeType::B => "VARBINARY(1024)",
+        ScalarAttributeType::S | ScalarAttributeType::B => DYNAMODB_SORT_KEY_COLUMN_TYPE,
         ScalarAttributeType::N => "DECIMAL(65, 30)",
     }
 }
@@ -358,11 +521,19 @@ fn sql_string_literal(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use extenddb_core::limits::LimitsConfig;
     use extenddb_core::types::{
-        AttributeDefinition, KeySchemaElement, KeyType, ScalarAttributeType,
+        AttributeDefinition, AttributeValue, KeySchemaElement, KeyType, ScalarAttributeType,
     };
 
-    use super::{hash_key_expression, native_index_hash_column, native_index_key_tuple_columns};
+    use super::{
+        NativeSecondaryIndex, add_generated_columns_ddl, add_native_indexes_ddl,
+        drop_native_indexes_and_columns_ddl, generated_columns, has_potential_secondary_index_keys,
+        hash_key_expression, item_has_potential_secondary_index_key, native_index_hash_column,
+        native_index_key_tuple_columns, validate_item_index_key_constraints,
+    };
 
     #[test]
     fn native_index_columns_are_stable_and_identifier_safe() {
@@ -427,8 +598,350 @@ mod tests {
 
         let expr = hash_key_expression(&ks, &attrs).expect("hash expression");
         assert!(expr.starts_with("CONCAT("));
-        assert!(expr.contains("OCTET_LENGTH(JSON_UNQUOTE(JSON_EXTRACT"));
+        assert!(expr.contains("OCTET_LENGTH(CAST(JSON_UNQUOTE(JSON_EXTRACT"));
+        assert!(expr.contains("OCTET_LENGTH(FROM_BASE64(JSON_UNQUOTE(JSON_EXTRACT"));
         assert!(expr.contains("$.\"a\".\"S\""));
         assert!(expr.contains("$.\"b\".\"B\""));
+    }
+
+    #[test]
+    fn binary_hash_expression_uses_raw_bytes_not_base64_text() {
+        let ks = vec![KeySchemaElement {
+            attribute_name: "gpk".to_owned(),
+            key_type: KeyType::Hash,
+        }];
+        let attrs = vec![AttributeDefinition {
+            attribute_name: "gpk".to_owned(),
+            attribute_type: ScalarAttributeType::B,
+        }];
+
+        let expr = hash_key_expression(&ks, &attrs).expect("hash expression");
+
+        assert!(expr.starts_with("FROM_BASE64(JSON_UNQUOTE(JSON_EXTRACT"));
+        assert!(!expr.contains("CAST("));
+    }
+
+    #[test]
+    fn generated_index_columns_are_added_in_one_online_ddl() {
+        let ks = vec![
+            KeySchemaElement {
+                attribute_name: "gpk".to_owned(),
+                key_type: KeyType::Hash,
+            },
+            KeySchemaElement {
+                attribute_name: "gsk".to_owned(),
+                key_type: KeyType::Range,
+            },
+        ];
+        let attrs = vec![
+            AttributeDefinition {
+                attribute_name: "gpk".to_owned(),
+                attribute_type: ScalarAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "gsk".to_owned(),
+                attribute_type: ScalarAttributeType::N,
+            },
+        ];
+
+        let columns = generated_columns("idx-1", &ks, &attrs).expect("generated columns");
+        let ddl = add_generated_columns_ddl("`_ddb_table`", &columns);
+
+        assert_eq!(ddl.matches("ADD COLUMN IF NOT EXISTS").count(), 2);
+        assert!(ddl.starts_with("ALTER TABLE `_ddb_table` ADD COLUMN IF NOT EXISTS"));
+        assert!(ddl.contains(", ADD COLUMN IF NOT EXISTS"));
+        assert!(ddl.contains("`edbidx_idx1_pk` VARBINARY(2048) AS"));
+        assert!(ddl.contains("`edbidx_idx1_sk_n` DECIMAL(65, 30) AS"));
+    }
+
+    #[test]
+    fn multiple_indexes_share_one_generated_column_online_ddl() {
+        let ks = vec![KeySchemaElement {
+            attribute_name: "gpk".to_owned(),
+            key_type: KeyType::Hash,
+        }];
+        let attrs = vec![AttributeDefinition {
+            attribute_name: "gpk".to_owned(),
+            attribute_type: ScalarAttributeType::S,
+        }];
+
+        let mut columns = generated_columns("idx-1", &ks, &attrs).expect("first index columns");
+        columns.extend(generated_columns("idx-2", &ks, &attrs).expect("second index columns"));
+        let ddl = add_generated_columns_ddl("`_ddb_table`", &columns);
+
+        assert_eq!(ddl.matches("ALTER TABLE").count(), 1);
+        assert_eq!(ddl.matches("ADD COLUMN IF NOT EXISTS").count(), 2);
+        assert!(ddl.contains("`edbidx_idx1_pk` VARBINARY(2048) AS"));
+        assert!(ddl.contains("`edbidx_idx2_pk` VARBINARY(2048) AS"));
+    }
+
+    #[test]
+    fn multiple_native_indexes_are_created_in_one_online_ddl() {
+        let index_ks = vec![KeySchemaElement {
+            attribute_name: "gpk".to_owned(),
+            key_type: KeyType::Hash,
+        }];
+        let attrs = vec![
+            AttributeDefinition {
+                attribute_name: "pk".to_owned(),
+                attribute_type: ScalarAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "sk".to_owned(),
+                attribute_type: ScalarAttributeType::N,
+            },
+            AttributeDefinition {
+                attribute_name: "gpk".to_owned(),
+                attribute_type: ScalarAttributeType::S,
+            },
+        ];
+        let indexes = vec![
+            NativeSecondaryIndex {
+                index_id: "idx-1",
+                key_schema: &index_ks,
+            },
+            NativeSecondaryIndex {
+                index_id: "idx-2",
+                key_schema: &index_ks,
+            },
+        ];
+
+        let ddl = add_native_indexes_ddl("`_ddb_table`", &indexes, &attrs);
+
+        assert_eq!(ddl.matches("ALTER TABLE").count(), 1);
+        assert_eq!(ddl.matches("ADD INDEX IF NOT EXISTS").count(), 2);
+        assert!(ddl.starts_with("ALTER TABLE `_ddb_table` ADD INDEX IF NOT EXISTS"));
+        assert!(ddl.contains("`idx_idx1` (edbidx_idx1_pk)"));
+        assert!(ddl.contains(", ADD INDEX IF NOT EXISTS `idx_idx2`"));
+    }
+
+    #[test]
+    fn multiple_native_indexes_are_dropped_in_one_online_ddl() {
+        let ks = vec![KeySchemaElement {
+            attribute_name: "gpk".to_owned(),
+            key_type: KeyType::Hash,
+        }];
+        let attrs = vec![AttributeDefinition {
+            attribute_name: "gpk".to_owned(),
+            attribute_type: ScalarAttributeType::S,
+        }];
+        let indexes = vec![
+            NativeSecondaryIndex {
+                index_id: "idx-1",
+                key_schema: &ks,
+            },
+            NativeSecondaryIndex {
+                index_id: "idx-2",
+                key_schema: &ks,
+            },
+        ];
+
+        let ddl = drop_native_indexes_and_columns_ddl("`_ddb_table`", &indexes, &attrs);
+
+        assert_eq!(ddl.matches("ALTER TABLE").count(), 1);
+        assert_eq!(ddl.matches("DROP INDEX IF EXISTS").count(), 2);
+        assert_eq!(ddl.matches("DROP COLUMN IF EXISTS").count(), 2);
+        assert!(ddl.starts_with("ALTER TABLE `_ddb_table` DROP INDEX IF EXISTS"));
+        assert!(ddl.contains("`idx_idx1`"));
+        assert!(ddl.contains(", DROP INDEX IF EXISTS `idx_idx2`"));
+        assert!(ddl.contains(", DROP COLUMN IF EXISTS `edbidx_idx1_pk`"));
+        assert!(ddl.contains(", DROP COLUMN IF EXISTS `edbidx_idx2_pk`"));
+    }
+
+    #[test]
+    fn secondary_index_validation_guard_uses_existing_table_metadata() {
+        let table_keys = vec![KeySchemaElement {
+            attribute_name: "pk".to_owned(),
+            key_type: KeyType::Hash,
+        }];
+        let attr_defs = vec![
+            AttributeDefinition {
+                attribute_name: "pk".to_owned(),
+                attribute_type: ScalarAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "gpk".to_owned(),
+                attribute_type: ScalarAttributeType::S,
+            },
+        ];
+
+        assert!(has_potential_secondary_index_keys(&table_keys, &attr_defs));
+        assert!(!item_has_potential_secondary_index_key(
+            &BTreeMap::from([("pk".to_owned(), AttributeValue::S("a".to_owned()))]),
+            &table_keys,
+            &attr_defs,
+        ));
+        assert!(item_has_potential_secondary_index_key(
+            &BTreeMap::from([
+                ("pk".to_owned(), AttributeValue::S("a".to_owned())),
+                ("gpk".to_owned(), AttributeValue::N("1".to_owned())),
+            ]),
+            &table_keys,
+            &attr_defs,
+        ));
+    }
+
+    #[test]
+    fn secondary_index_validation_guard_skips_tables_without_index_key_defs() {
+        let table_keys = vec![KeySchemaElement {
+            attribute_name: "pk".to_owned(),
+            key_type: KeyType::Hash,
+        }];
+        let attr_defs = vec![AttributeDefinition {
+            attribute_name: "pk".to_owned(),
+            attribute_type: ScalarAttributeType::S,
+        }];
+
+        assert!(!has_potential_secondary_index_keys(&table_keys, &attr_defs));
+        assert!(!item_has_potential_secondary_index_key(
+            &BTreeMap::from([
+                ("pk".to_owned(), AttributeValue::S("a".to_owned())),
+                ("payload".to_owned(), AttributeValue::S("x".to_owned())),
+            ]),
+            &table_keys,
+            &attr_defs,
+        ));
+    }
+
+    #[test]
+    fn secondary_index_validation_rejects_empty_binary_key_values() {
+        let indexes = vec![super::WriteIndexKeys {
+            key_schema: vec![KeySchemaElement {
+                attribute_name: "gpk".to_owned(),
+                key_type: KeyType::Hash,
+            }],
+        }];
+        let attr_defs = vec![AttributeDefinition {
+            attribute_name: "gpk".to_owned(),
+            attribute_type: ScalarAttributeType::B,
+        }];
+        let item = BTreeMap::from([("gpk".to_owned(), AttributeValue::B(Vec::new()))]);
+
+        let err = validate_item_index_key_constraints(
+            &item,
+            &indexes,
+            &attr_defs,
+            &LimitsConfig::default(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("key attribute cannot contain an empty binary value")
+        );
+    }
+
+    #[test]
+    fn secondary_index_validation_rejects_oversized_hash_key_values() {
+        let indexes = vec![super::WriteIndexKeys {
+            key_schema: vec![KeySchemaElement {
+                attribute_name: "gpk".to_owned(),
+                key_type: KeyType::Hash,
+            }],
+        }];
+        let attr_defs = vec![AttributeDefinition {
+            attribute_name: "gpk".to_owned(),
+            attribute_type: ScalarAttributeType::S,
+        }];
+        let item = BTreeMap::from([("gpk".to_owned(), AttributeValue::S("x".repeat(2049)))]);
+
+        let err = validate_item_index_key_constraints(
+            &item,
+            &indexes,
+            &attr_defs,
+            &LimitsConfig::default(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("partition key size must be between 1 and 2048 bytes")
+        );
+    }
+
+    #[test]
+    fn secondary_index_validation_rejects_oversized_sort_key_values() {
+        let indexes = vec![super::WriteIndexKeys {
+            key_schema: vec![
+                KeySchemaElement {
+                    attribute_name: "gpk".to_owned(),
+                    key_type: KeyType::Hash,
+                },
+                KeySchemaElement {
+                    attribute_name: "gsk".to_owned(),
+                    key_type: KeyType::Range,
+                },
+            ],
+        }];
+        let attr_defs = vec![
+            AttributeDefinition {
+                attribute_name: "gpk".to_owned(),
+                attribute_type: ScalarAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "gsk".to_owned(),
+                attribute_type: ScalarAttributeType::S,
+            },
+        ];
+        let item = BTreeMap::from([
+            ("gpk".to_owned(), AttributeValue::S("ok".to_owned())),
+            ("gsk".to_owned(), AttributeValue::S("x".repeat(1025))),
+        ]);
+
+        let err = validate_item_index_key_constraints(
+            &item,
+            &indexes,
+            &attr_defs,
+            &LimitsConfig::default(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("sort key size must be between 1 and 1024 bytes")
+        );
+    }
+
+    #[test]
+    fn secondary_index_validation_rejects_oversized_multipart_hash_tuple() {
+        let indexes = vec![super::WriteIndexKeys {
+            key_schema: vec![
+                KeySchemaElement {
+                    attribute_name: "gpk1".to_owned(),
+                    key_type: KeyType::Hash,
+                },
+                KeySchemaElement {
+                    attribute_name: "gpk2".to_owned(),
+                    key_type: KeyType::Hash,
+                },
+            ],
+        }];
+        let attr_defs = vec![
+            AttributeDefinition {
+                attribute_name: "gpk1".to_owned(),
+                attribute_type: ScalarAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "gpk2".to_owned(),
+                attribute_type: ScalarAttributeType::S,
+            },
+        ];
+        let item = BTreeMap::from([
+            ("gpk1".to_owned(), AttributeValue::S("x".repeat(1020))),
+            ("gpk2".to_owned(), AttributeValue::S("y".repeat(1020))),
+        ]);
+
+        let err = validate_item_index_key_constraints(
+            &item,
+            &indexes,
+            &attr_defs,
+            &LimitsConfig::default(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("partition key size must be between 1 and 2048 bytes")
+        );
     }
 }

@@ -438,6 +438,10 @@ aws dynamodb transact-get-items --transact-items '[
 Open a **second terminal** and run the streams consumer script. This will
 print change events as they arrive — including the TTL deletion event.
 
+TiDB note: the TiDB backend delegates TTL deletion to native TiDB table TTL.
+The expired ticket is still deleted, but TiDB does not synthesize ExtendDB
+Streams REMOVE records for native TTL deletions.
+
 ```bash
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
 export AWS_ENDPOINT_URL_DYNAMODB=https://127.0.0.1:8000
@@ -500,8 +504,9 @@ aws dynamodb get-item \
 ```
 
 **Now wait approximately 2 minutes.** While waiting, proceed to step 13 to
-check metrics. When the TTL fires, the streams consumer will print a REMOVE
-event with `userIdentity.type: Service` — proving the deletion was automatic.
+check metrics. On backends with an ExtendDB TTL worker, when the TTL fires, the
+streams consumer will print a REMOVE event with `userIdentity.type: Service` —
+proving the deletion was automatic.
 
 ---
 
@@ -537,7 +542,8 @@ aws dynamodb get-item \
 # Should return empty (no Item)
 ```
 
-Check the streams consumer terminal — you should see:
+On backends with an ExtendDB TTL worker, check the streams consumer terminal —
+you should see:
 
 ```
 REMOVE: {'event_id': {'S': 'EVT-002'}, 'ticket_id': {'S': 'TKT-002'}}
@@ -545,7 +551,8 @@ REMOVE: {'event_id': {'S': 'EVT-002'}, 'ticket_id': {'S': 'TKT-002'}}
 ```
 
 This confirms TTL-based deletion generates a streams event with the service
-principal, exactly matching real DynamoDB behavior.
+principal on worker-driven TTL backends. TiDB-native TTL deletes the item inside
+TiDB and does not currently emit this ExtendDB Streams record.
 
 ---
 

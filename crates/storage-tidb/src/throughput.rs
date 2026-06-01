@@ -15,15 +15,6 @@ pub(crate) fn provisioned_throughput_description(
     }
 }
 
-pub(crate) fn provisioned_throughput_from_description(
-    description: &ProvisionedThroughputDescription,
-) -> ProvisionedThroughput {
-    ProvisionedThroughput {
-        read_capacity_units: description.read_capacity_units,
-        write_capacity_units: description.write_capacity_units,
-    }
-}
-
 pub(crate) fn zero_provisioned_throughput_description() -> ProvisionedThroughputDescription {
     ProvisionedThroughputDescription {
         read_capacity_units: 0,

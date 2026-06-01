@@ -10,14 +10,17 @@ use serde_json::Value;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{ExpressionMaps, parse_projection, tokenize_with_limit};
 use extenddb_core::types::{
-    IndexType, ScanInput, ScanOutput, Select, TableKeyInfo, extract_key, item_size_bytes,
+    IndexType, ScanInput, ScanOutput, Select, extract_key, item_size_bytes,
 };
 
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
-use crate::index_helpers::{combined_lek_key_schema, validate_scan_exclusive_start_key};
+use crate::index_helpers::{
+    combined_lek_key_schema, index_projection_for_read, validate_gsi_projection_request,
+    validate_scan_exclusive_start_key,
+};
 use crate::legacy_filter::desugar_filter;
 use crate::read_helpers::apply_post_read;
 use crate::serialize_output;
@@ -38,24 +41,12 @@ pub async fn handle_scan(
 ) -> Result<DispatchResult, DynamoDbError> {
     let input: ScanInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
-    // P118: Fetch key_info first so we can use table_id for index lookup.
-    let key_info = ctx
-        .table_key_info(&input.table_name)
+    let read_info = ctx
+        .table_read_info(&input.table_name, input.index_name.as_deref())
         .await
         .map_err(storage_err_to_dynamo)?;
-
-    // GSI/LSI: resolve index metadata if scanning a secondary index.
-    // Uses table_id from pre-fetched key_info to skip redundant table lookup (P118 #4).
-    let index_info = if let Some(ref idx_name) = input.index_name {
-        Some(
-            ctx.storage
-                .index_info_by_table_id(&key_info.table_id, idx_name)
-                .await
-                .map_err(storage_err_to_dynamo)?,
-        )
-    } else {
-        None
-    };
+    let key_info = read_info.table;
+    let index_info = read_info.index;
 
     // ConsistentRead is not supported on GSI scans (tenet 1: fidelity).
     if input.consistent_read == Some(true) {
@@ -111,21 +102,6 @@ pub async fn handle_scan(
             )));
         }
     }
-
-    // For index scans, build a key_info that reflects the index's key schema.
-    let scan_key_info = if let Some(ref idx) = index_info {
-        TableKeyInfo {
-            table_name: key_info.table_name.clone(),
-            account_id: key_info.account_id.clone(),
-            table_id: key_info.table_id.clone(),
-            key_schema: idx.key_schema.clone(),
-            attribute_definitions: key_info.attribute_definitions.clone(),
-            has_lsi: key_info.has_lsi,
-            stream_specification: None, // Scans don't capture stream records
-        }
-    } else {
-        key_info.clone()
-    };
 
     // --- Legacy vs expression mutual exclusivity checks ---
     let has_fe = input.filter_expression.is_some();
@@ -229,6 +205,13 @@ pub async fn handle_scan(
     }
 
     // Validate Select vs ProjectionExpression and index requirements
+    if let Some(Select::SpecificAttributes) = input.select {
+        if effective_projection_str.is_none() {
+            return Err(DynamoDbError::ValidationException(
+                "1 validation error detected: Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES".to_owned(),
+            ));
+        }
+    }
     if let Some(Select::AllProjectedAttributes) = input.select {
         if index_info.is_none() {
             return Err(DynamoDbError::ValidationException(
@@ -243,12 +226,23 @@ pub async fn handle_scan(
             ));
         }
     }
+    if effective_projection_str.is_some()
+        && matches!(
+            input.select,
+            Some(Select::AllAttributes | Select::AllProjectedAttributes)
+        )
+    {
+        return Err(DynamoDbError::ValidationException(
+            "Cannot specify the ProjectionExpression when Select is not SPECIFIC_ATTRIBUTES"
+                .to_owned(),
+        ));
+    }
 
-    let index_proj = if matches!(input.select, Some(Select::AllProjectedAttributes)) {
-        index_info.as_ref()
-    } else {
-        None
-    };
+    let index_proj = index_projection_for_read(
+        index_info.as_ref(),
+        input.select.as_ref(),
+        projection.is_some(),
+    );
 
     // Build the combined expression maps for post-read evaluation.
     let combined_maps = {
@@ -279,16 +273,25 @@ pub async fn handle_scan(
         )?;
     }
 
+    validate_gsi_projection_request(
+        index_info.as_ref(),
+        input.select.as_ref(),
+        &projection,
+        &combined_maps,
+        &key_info.key_schema,
+    )?;
+
     // Scan storage
     let (raw_items, storage_last_key) = ctx
         .storage
         .scan(
-            &scan_key_info,
+            &key_info,
             input.limit,
             input.exclusive_start_key.as_ref(),
             input.segment,
             input.total_segments,
-            input.index_name.as_deref(),
+            index_info.as_ref(),
+            input.consistent_read == Some(true),
         )
         .await
         .map_err(storage_err_to_dynamo)?;

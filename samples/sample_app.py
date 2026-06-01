@@ -7,7 +7,7 @@
 Exercises the complete extenddb lifecycle against a running server with
 auth_mode = builtin. Demonstrates:
 
-  1. Table creation (simple PK, PK+SK, multi-part GSI keys)
+  1. Table creation (simple PK, PK+SK, composite GSI keys)
   2. Polling for control plane completion (DescribeTable)
   3. Loading data (PutItem, BatchWriteItem)
   4. Querying data (Query on base table and GSIs, Scan)
@@ -137,19 +137,17 @@ def create_tables(client) -> None:
         BillingMode="PAY_PER_REQUEST",
     )
 
-    # Table 3: Multi-part GSI keys (tournament pattern from AWS docs)
+    # Table 3: Composite GSI keys (DynamoDB multi-attribute key pattern)
     # https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.DesignPattern.MultiAttributeKeys.html
-    print(f"Creating {TOURNAMENT_TABLE} (multi-part GSI keys)...")
+    print(f"Creating {TOURNAMENT_TABLE} (composite GSI keys)...")
     client.create_table(
         TableName=TOURNAMENT_TABLE,
         AttributeDefinitions=[
             {"AttributeName": "matchId", "AttributeType": "S"},
-            {"AttributeName": "tournamentId", "AttributeType": "S"},
-            {"AttributeName": "region", "AttributeType": "S"},
-            {"AttributeName": "round", "AttributeType": "N"},
-            {"AttributeName": "bracket", "AttributeType": "S"},
+            {"AttributeName": "tournamentRegion", "AttributeType": "S"},
+            {"AttributeName": "roundBracketMatch", "AttributeType": "S"},
             {"AttributeName": "player1Id", "AttributeType": "S"},
-            {"AttributeName": "matchDate", "AttributeType": "S"},
+            {"AttributeName": "playerMatchSort", "AttributeType": "S"},
         ],
         KeySchema=[
             {"AttributeName": "matchId", "KeyType": "HASH"},
@@ -158,11 +156,8 @@ def create_tables(client) -> None:
             {
                 "IndexName": "TournamentRegionIndex",
                 "KeySchema": [
-                    {"AttributeName": "tournamentId", "KeyType": "HASH"},
-                    {"AttributeName": "region", "KeyType": "HASH"},
-                    {"AttributeName": "round", "KeyType": "RANGE"},
-                    {"AttributeName": "bracket", "KeyType": "RANGE"},
-                    {"AttributeName": "matchId", "KeyType": "RANGE"},
+                    {"AttributeName": "tournamentRegion", "KeyType": "HASH"},
+                    {"AttributeName": "roundBracketMatch", "KeyType": "RANGE"},
                 ],
                 "Projection": {"ProjectionType": "ALL"},
             },
@@ -170,8 +165,7 @@ def create_tables(client) -> None:
                 "IndexName": "PlayerMatchHistoryIndex",
                 "KeySchema": [
                     {"AttributeName": "player1Id", "KeyType": "HASH"},
-                    {"AttributeName": "matchDate", "KeyType": "RANGE"},
-                    {"AttributeName": "round", "KeyType": "RANGE"},
+                    {"AttributeName": "playerMatchSort", "KeyType": "RANGE"},
                 ],
                 "Projection": {"ProjectionType": "ALL"},
             },
@@ -252,6 +246,9 @@ def load_data(client) -> None:
             "PutRequest": {
                 "Item": {
                     "matchId": {"S": m["matchId"]},
+                    "tournamentRegion": {"S": f"{m['tournamentId']}#{m['region']}"},
+                    "roundBracketMatch": {"S": f"{m['round']:04d}#{m['bracket']}#{m['matchId']}"},
+                    "playerMatchSort": {"S": f"{m['matchDate']}#{m['round']:04d}#{m['matchId']}"},
                     "tournamentId": {"S": m["tournamentId"]},
                     "region": {"S": m["region"]},
                     "round": {"N": str(m["round"])},
@@ -300,22 +297,20 @@ def query_data(client) -> None:
     for item in resp["Items"]:
         print(f"    {item['orderDate']['S']} — {item['orderId']['S']}")
 
-    # Query multi-part GSI — tournament matches in NA region, Spring tournament
+    # Query composite GSI — tournament matches in NA region, Spring tournament
     resp = client.query(
         TableName=TOURNAMENT_TABLE,
         IndexName="TournamentRegionIndex",
-        KeyConditionExpression="tournamentId = :tid AND #r = :region",
-        ExpressionAttributeNames={"#r": "region"},
+        KeyConditionExpression="tournamentRegion = :tr",
         ExpressionAttributeValues={
-            ":tid": {"S": "T2026-Spring"},
-            ":region": {"S": "NA"},
+            ":tr": {"S": "T2026-Spring#NA"},
         },
     )
-    print(f"\n  Spring tournament NA matches (via multi-part GSI): {resp['Count']} items")
+    print(f"\n  Spring tournament NA matches (via composite GSI): {resp['Count']} items")
     for item in resp["Items"]:
         print(f"    Match {item['matchId']['S']}: round {item['round']['N']}, bracket {item['bracket']['S']}, score {item['score']['S']}")
 
-    # Query multi-part GSI — player match history
+    # Query composite GSI — player match history
     resp = client.query(
         TableName=TOURNAMENT_TABLE,
         IndexName="PlayerMatchHistoryIndex",

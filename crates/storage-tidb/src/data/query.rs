@@ -12,9 +12,9 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::SortKeyValue;
-use extenddb_storage::util::{composite_pk_to_text, parse_sk};
+use extenddb_storage::util::parse_sk;
 
-use super::all_sort_key_info;
+use super::{all_sort_key_info, physical_pk_bytes};
 
 type JsonRowsQuery<'q> =
     sqlx::query::QueryAs<'q, sqlx::MySql, (serde_json::Value,), sqlx::mysql::MySqlArguments>;
@@ -138,7 +138,7 @@ pub(crate) fn build_sk_sql(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_query_sql(
     sql: &str,
-    pk_text: &str,
+    pk: &[u8],
     key_condition: &KeyCondition,
     maps: &ExpressionMaps,
     key_schema: &[KeySchemaElement],
@@ -150,7 +150,7 @@ pub(crate) async fn execute_query_sql(
     pool: &sqlx::MySqlPool,
 ) -> Result<Vec<serde_json::Value>, StorageError> {
     let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sql);
-    query = query.bind(pk_text.to_owned());
+    query = query.bind(pk.to_vec());
 
     // Bind sort key condition values
     if let (Some(sk_cond), Some((_, sk_type))) = (&key_condition.sk_condition, sk_info) {
@@ -228,7 +228,7 @@ pub(crate) fn bind_key_tuple<'q>(
     key_schema: &[KeySchemaElement],
     attr_defs: &[AttributeDefinition],
 ) -> Result<JsonRowsQuery<'q>, StorageError> {
-    let mut query = query.bind(composite_pk_to_text(key, key_schema)?);
+    let mut query = query.bind(physical_pk_bytes(key, key_schema)?);
     query = bind_sort_key_tuple(query, key, key_schema, attr_defs)?;
     Ok(query)
 }

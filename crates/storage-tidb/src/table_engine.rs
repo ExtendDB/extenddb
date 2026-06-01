@@ -7,7 +7,7 @@ use futures::future::BoxFuture;
 
 use extenddb_core::types::{
     CreateTableInput, DeleteTableInput, DescribeTableInput, IndexInfo, ListTablesInput,
-    ListTablesOutput, TableDescription, TableKeyInfo,
+    ListTablesOutput, TableDescription, TableKeyInfo, TableReadInfo,
 };
 use extenddb_storage::TableEngine;
 use extenddb_storage::error::StorageError;
@@ -58,7 +58,7 @@ impl TableEngine for TidbEngine {
 
             let rows: Vec<(String,)> = if let Some(ref start) = input.exclusive_start_table_name {
                 sqlx::query_as(
-                    "SELECT table_name FROM tables WHERE account_id = ? AND table_name > ? ORDER BY table_name COLLATE utf8mb4_bin LIMIT ?",
+                    "SELECT table_name FROM tables WHERE account_id = ? AND table_name > ? ORDER BY table_name LIMIT ?",
                 )
                 .bind(&account_id)
                 .bind(start)
@@ -68,7 +68,7 @@ impl TableEngine for TidbEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?
             } else {
                 sqlx::query_as(
-                    "SELECT table_name FROM tables WHERE account_id = ? ORDER BY table_name COLLATE utf8mb4_bin LIMIT ?",
+                    "SELECT table_name FROM tables WHERE account_id = ? ORDER BY table_name LIMIT ?",
                 )
                 .bind(&account_id)
                 .bind(limit + 1)
@@ -103,6 +103,21 @@ impl TableEngine for TidbEngine {
         let account_id = account_id.to_string();
         let table_name = table_name.to_string();
         Box::pin(async move { self.fetch_table_key_info(&account_id, &table_name).await })
+    }
+
+    fn table_read_info(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        index_name: Option<&str>,
+    ) -> BoxFuture<'_, Result<TableReadInfo, StorageError>> {
+        let account_id = account_id.to_string();
+        let table_name = table_name.to_string();
+        let index_name = index_name.map(ToOwned::to_owned);
+        Box::pin(async move {
+            self.fetch_table_read_info(&account_id, &table_name, index_name.as_deref())
+                .await
+        })
     }
 
     fn index_info(

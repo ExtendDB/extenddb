@@ -4,7 +4,7 @@
 //! `query` and `scan` implementations for the `PostgreSQL` backend.
 
 use extenddb_core::expression::{ExpressionMaps, KeyCondition};
-use extenddb_core::types::{Item, ScalarAttributeType, TableKeyInfo};
+use extenddb_core::types::{IndexInfo, Item, ScalarAttributeType, TableKeyInfo};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
     encode_netstring_composite, pk_to_text, sk_column, sk_column_n, sk_info,
@@ -27,15 +27,16 @@ impl PostgresEngine {
         forward: bool,
         limit: Option<i64>,
         exclusive_start_key: Option<&Item>,
-        index_name: Option<&str>,
+        index: Option<&IndexInfo>,
     ) -> Result<(Vec<Item>, Option<Item>), StorageError> {
         use std::fmt::Write;
 
-        let ddb_table = if let Some(idx_name) = index_name {
-            let idx_info = self
-                .fetch_index_info_by_table_id(&key_info.table_id, idx_name)
-                .await?;
-            index_table_name(&idx_info.index_id)
+        let read_key_schema = index.map_or(key_info.key_schema.as_slice(), |idx| {
+            idx.key_schema.as_slice()
+        });
+        let attr_defs = key_info.attribute_definitions.as_slice();
+        let ddb_table = if let Some(idx) = index {
+            index_table_name(&idx.index_id)
         } else {
             data_table_name(&key_info.table_id)
         };
@@ -57,8 +58,8 @@ impl PostgresEngine {
             encode_netstring_composite(&parts)
         };
 
-        let sk_info_val = sk_info(&key_info.key_schema, &key_info.attribute_definitions);
-        let all_sks = all_sort_key_info(&key_info.key_schema, &key_info.attribute_definitions);
+        let sk_info_val = sk_info(read_key_schema, attr_defs);
+        let all_sks = all_sort_key_info(read_key_schema, attr_defs);
 
         // Build SQL query
         let mut sql = format!("SELECT item_data FROM {ddb_table} WHERE pk = $1");
@@ -171,9 +172,7 @@ impl PostgresEngine {
             .collect::<Result<Vec<_>, _>>()?;
 
         let last_key = if has_more {
-            items
-                .last()
-                .map(|item| build_key(item, &key_info.key_schema))
+            items.last().map(|item| build_key(item, read_key_schema))
         } else {
             None
         };
@@ -189,19 +188,20 @@ impl PostgresEngine {
         exclusive_start_key: Option<&Item>,
         segment: Option<i64>,
         total_segments: Option<i64>,
-        index_name: Option<&str>,
+        index: Option<&IndexInfo>,
     ) -> Result<(Vec<Item>, Option<Item>), StorageError> {
         use std::fmt::Write;
 
-        let ddb_table = if let Some(idx_name) = index_name {
-            let idx_info = self
-                .fetch_index_info_by_table_id(&key_info.table_id, idx_name)
-                .await?;
-            index_table_name(&idx_info.index_id)
+        let read_key_schema = index.map_or(key_info.key_schema.as_slice(), |idx| {
+            idx.key_schema.as_slice()
+        });
+        let attr_defs = key_info.attribute_definitions.as_slice();
+        let ddb_table = if let Some(idx) = index {
+            index_table_name(&idx.index_id)
         } else {
             data_table_name(&key_info.table_id)
         };
-        let sk_info_val = sk_info(&key_info.key_schema, &key_info.attribute_definitions);
+        let sk_info_val = sk_info(read_key_schema, attr_defs);
 
         let mut sql = format!("SELECT item_data FROM {ddb_table}");
         let mut conditions: Vec<String> = Vec::new();
@@ -218,7 +218,7 @@ impl PostgresEngine {
 
         // Pagination via exclusive start key
         if let Some(start_key) = exclusive_start_key {
-            let pk_name = &key_info.key_schema[0].attribute_name;
+            let pk_name = &read_key_schema[0].attribute_name;
             if !start_key.contains_key(pk_name) {
                 return Err(StorageError::Validation(
                     "The provided starting key is invalid: The provided key element does not match the schema".to_owned(),
@@ -268,8 +268,8 @@ impl PostgresEngine {
         let rows = execute_scan_sql(
             &sql,
             exclusive_start_key,
-            &key_info.key_schema,
-            &key_info.attribute_definitions,
+            read_key_schema,
+            attr_defs,
             &self.data_pool,
         )
         .await?;
@@ -284,9 +284,7 @@ impl PostgresEngine {
             .collect::<Result<Vec<_>, _>>()?;
 
         let last_key = if has_more {
-            items
-                .last()
-                .map(|item| build_key(item, &key_info.key_schema))
+            items.last().map(|item| build_key(item, read_key_schema))
         } else {
             None
         };

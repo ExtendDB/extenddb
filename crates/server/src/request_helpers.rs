@@ -46,11 +46,18 @@ pub(crate) fn extract_table_name(input: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn extract_index_name(input: &Value) -> Option<String> {
+    input
+        .get("IndexName")
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned)
+}
+
 /// Evaluate IAM policies for an authenticated identity.
 ///
-/// Returns the pre-fetched `TableKeyInfo` for single-table item-level operations
-/// (P118 optimization #2). The caller passes this into `OperationContext` to
-/// avoid a redundant catalog roundtrip in the engine layer.
+/// Returns the pre-fetched `TableReadInfo` for single-table item-level operations.
+/// The caller passes this into `OperationContext` to avoid a redundant catalog
+/// roundtrip in the engine layer.
 pub(crate) async fn authorize_request(
     state: &AppState,
     store: &dyn extenddb_storage::authorization_store::AuthorizationStore,
@@ -58,17 +65,34 @@ pub(crate) async fn authorize_request(
     input: &Value,
     operation: &str,
     account_id: &str,
-) -> Result<Option<extenddb_core::types::TableKeyInfo>, DynamoDbError> {
+) -> Result<Option<extenddb_core::types::TableReadInfo>, DynamoDbError> {
     let table_name = extract_table_name(input);
+    let index_name = extract_index_name(input);
     let resource_arn = build_resource_arn(&state.region, account_id, table_name.as_deref());
 
-    // P118: Fetch table_key_info for item-level operations. The result is both
-    // used for LeadingKeys extraction here AND returned to the caller to avoid
-    // a redundant fetch in the engine layer.
-    let key_info = match operation {
-        "GetItem" | "PutItem" | "DeleteItem" | "UpdateItem" | "Query" | "Scan" => {
+    // Fetch read metadata for item-level operations. The result is both used
+    // for LeadingKeys extraction here and returned to the caller to avoid a
+    // redundant fetch in the engine layer. Query/Scan include IndexName when
+    // present so index metadata is resolved once per request.
+    let read_info = match operation {
+        "GetItem" | "PutItem" | "DeleteItem" | "UpdateItem" => {
             if let Some(ref tn) = table_name {
-                state.storage.table_key_info(account_id, tn).await.ok()
+                state
+                    .storage
+                    .table_read_info(account_id, tn, None)
+                    .await
+                    .ok()
+            } else {
+                None
+            }
+        }
+        "Query" | "Scan" => {
+            if let Some(ref tn) = table_name {
+                state
+                    .storage
+                    .table_read_info(account_id, tn, index_name.as_deref())
+                    .await
+                    .ok()
             } else {
                 None
             }
@@ -76,9 +100,9 @@ pub(crate) async fn authorize_request(
         _ => None,
     };
 
-    let pk_attr = key_info
+    let pk_attr = read_info
         .as_ref()
-        .map(|ki| ki.key_schema[0].attribute_name.clone());
+        .map(|info| info.table.key_schema[0].attribute_name.clone());
 
     let params = extenddb_auth::policy::context::RequestParams {
         leading_keys: extract_leading_keys(input, operation, pk_attr.as_deref()),
@@ -107,7 +131,7 @@ pub(crate) async fn authorize_request(
     )
     .await?;
 
-    Ok(key_info)
+    Ok(read_info)
 }
 
 /// Extract partition key values from the request body for `dynamodb:LeadingKeys`.

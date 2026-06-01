@@ -13,7 +13,7 @@ use extenddb_storage::error::StorageError;
 /// SQL table name for a Virtual `DynamoDB` table.
 ///
 /// Uses `_ddb_` prefix to avoid collisions with catalog metadata tables.
-/// Includes `account_id` for multi-account isolation (Phase 12a).
+/// Includes `account_id` for multi-account isolation.
 /// Table names are validated at the engine layer (alphanumeric + `_.-`),
 /// so this is safe for identifier construction.
 pub(crate) fn data_table_name(table_id: &str) -> String {

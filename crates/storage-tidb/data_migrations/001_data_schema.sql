@@ -3,44 +3,31 @@
 -- Data database schema for extenddb.
 -- These tables live in the data database (separate from the catalog) so that
 -- stream records and idempotency tokens can be written atomically with item
--- data within a single TiDB transaction (P54 Bug 1).
+-- data within a single TiDB transaction.
 
--- Stream shards — fixed shards per table, assigned by partition key hash.
--- No FK to catalog tables (cross-database FKs are not possible).
--- Application-level integrity ensures table_id validity.
-CREATE TABLE IF NOT EXISTS stream_shards (
-    shard_id VARCHAR(128) PRIMARY KEY CLUSTERED,
-    table_id VARCHAR(64) NOT NULL,
-    parent_shard_id VARCHAR(128),
-    starting_sequence_number VARCHAR(64) NOT NULL,
-    ending_sequence_number VARCHAR(64),
-    next_sequence_number BIGINT NOT NULL DEFAULT 0,
-    created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
-);
-
-CREATE INDEX IF NOT EXISTS idx_stream_shards_table
-    ON stream_shards (table_id);
-
--- Stream records — change data capture records.
+-- Stream records — change data capture records. TiDB derives fixed stream
+-- shards from table_id. Rows are inserted atomically with item writes under a
+-- transaction-local storage sequence, then finalized to the user-visible
+-- sequence_number from TiDB MVCC commit_ts plus the in-transaction ordinal.
+-- This keeps stream order tied to TiDB commit order without a shard counter.
 CREATE TABLE IF NOT EXISTS stream_records (
-    shard_id VARCHAR(128) NOT NULL REFERENCES stream_shards(shard_id) ON DELETE CASCADE,
+    shard_id VARCHAR(128) NOT NULL,
     sequence_number VARCHAR(64) NOT NULL,
+    commit_sequence_number VARCHAR(64),
     table_id VARCHAR(64) NOT NULL,
     event_name VARCHAR(32) NOT NULL,
     record_data JSON NOT NULL,
     created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (shard_id, sequence_number) CLUSTERED
-) TTL = `created_at` + INTERVAL 24 HOUR TTL_JOB_INTERVAL = '1h';
-
-CREATE INDEX IF NOT EXISTS idx_stream_records_created
-    ON stream_records (created_at);
+    PRIMARY KEY (shard_id, sequence_number) CLUSTERED,
+    INDEX idx_stream_records_commit_sequence (shard_id, commit_sequence_number)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+  TTL = `created_at` + INTERVAL 24 HOUR TTL_JOB_INTERVAL = '1h';
 
 -- Idempotency token storage for TransactWriteItems.
 CREATE TABLE IF NOT EXISTS idempotency_tokens (
     token       VARCHAR(255) PRIMARY KEY CLUSTERED,
     fingerprint TEXT NOT NULL,
+    claim_id    VARCHAR(36) NOT NULL,
     created_at  TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
-) TTL = `created_at` + INTERVAL 600 SECOND TTL_JOB_INTERVAL = '10m';
-
-CREATE INDEX IF NOT EXISTS idx_idempotency_tokens_created
-    ON idempotency_tokens (created_at);
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+  TTL = `created_at` + INTERVAL 600 SECOND TTL_JOB_INTERVAL = '10m';

@@ -38,7 +38,7 @@ pub use item::{
 };
 pub use key_schema::{
     AttributeDefinition, IndexInfo, IndexType, KeySchemaElement, KeyType, ScalarAttributeType,
-    TableKeyInfo, hash_key_elements, is_multipart_key_schema, range_key_elements,
+    TableKeyInfo, TableReadInfo, hash_key_elements, is_multipart_key_schema, range_key_elements,
 };
 pub use query::{Condition, QueryInput, QueryOutput, ScanInput, ScanOutput, Select};
 pub use stream::{

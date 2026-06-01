@@ -16,7 +16,7 @@ impl TidbCatalogStore {
         account_id: &str,
         user_name: &str,
     ) -> OpResult<AccessKeyCreated> {
-        // P119: Use cached encryption key if available, fall back to DB query.
+        // Use cached encryption key if available, fall back to DB query.
         let enc_key: String = if let Some(cached) = self.encryption_key() {
             cached.to_string()
         } else {
@@ -115,7 +115,7 @@ impl TidbCatalogStore {
         access_key_id: &str,
         secret_access_key: &str,
     ) -> OpResult<()> {
-        // P119: Use cached encryption key if available, fall back to DB query.
+        // Use cached encryption key if available, fall back to DB query.
         let enc_key: String = if let Some(cached) = self.encryption_key() {
             cached.to_string()
         } else {

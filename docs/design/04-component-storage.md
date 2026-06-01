@@ -88,7 +88,7 @@ on the traits they need.
 
 ### 2.3 BoxFuture Pattern
 
-All storage traits use `BoxFuture<'_, Result<T, StorageError>>` return types:
+Storage traits use explicit `BoxFuture` return types:
 
 ```rust
 use futures::future::BoxFuture;
@@ -96,12 +96,27 @@ use futures::future::BoxFuture;
 pub trait TableEngine: Send + Sync {
     fn create_table(&self, account_id: &str, input: CreateTableInput)
         -> BoxFuture<'_, Result<TableDescription, StorageError>>;
+
+    fn table_read_info(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        index_name: Option<&str>,
+    ) -> BoxFuture<'_, Result<TableReadInfo, StorageError>>;
+}
+
+pub trait DataEngine: Send + Sync {
+    fn get_item<'a>(
+        &'a self,
+        key_info: &'a TableKeyInfo,
+        key: &'a Item,
+    ) -> BoxFuture<'a, Result<Option<Item>, StorageError>>;
 }
 ```
 
 This pattern provides:
 - **Object safety**: Traits can be used as `Arc<dyn Trait>`
-- **Explicit lifetimes**: `BoxFuture<'_>` borrows from `&self`
+- **Explicit lifetimes**: control-plane futures can borrow from `&self`; data-plane futures can borrow request metadata until awaited
 - **No macro overhead**: No `#[async_trait]` macro expansion
 
 The `CredentialStore` trait in the `auth` crate uses `#[async_trait]` instead
@@ -113,6 +128,9 @@ The `CredentialStore` trait in the `auth` crate uses `#[async_trait]` instead
 - `create_table`, `delete_table`, `describe_table`, `list_tables`, `update_table`
 - `table_key_info` — returns lightweight metadata (key schema, attribute definitions)
   for data operations, avoiding the overhead of a full `describe_table` call
+- `table_read_info` — returns base table metadata plus optional resolved GSI/LSI
+  metadata for Query and Scan so storage backends do not re-fetch catalog rows
+  after the engine has selected an index
 - `index_info` — returns GSI/LSI metadata for query operations
 
 All table operations are scoped by `account_id` for multi-account isolation.
@@ -124,21 +142,67 @@ All table operations are scoped by `account_id` for multi-account isolation.
 - `cleanup_expired_idempotency_tokens`
 
 Data operations receive `TableKeyInfo` from the engine layer, which has already
-validated the table exists and is ACTIVE. Condition expressions are evaluated
-inside the storage transaction to prevent TOCTOU races. Stream records are
-written atomically with data writes when `stream` is `Some`.
+validated the table exists and can serve the data plane. Query and Scan also
+receive resolved `IndexInfo` when they target a secondary index; the storage
+backend must not re-fetch index metadata from an index name string. Condition
+expressions are evaluated inside the storage transaction to prevent TOCTOU
+races. Read methods receive the DynamoDB `ConsistentRead` flag so a backend can
+route strong reads and eventually consistent reads through different native
+paths. Stream records are written atomically with data writes when `stream` is
+`Some`.
+
+For TiDB, every storage connection uses pessimistic transaction mode. Conditional
+writes first perform a primary-key `SELECT ... FOR UPDATE`; TiDB locks the
+point key even when the row is absent, so a subsequent create path can use a
+plain `INSERT` and rely on the native unique-key result as the final race
+signal. The implementation must not infer correctness from MySQL affected-row
+counts on no-op upserts.
+Unconditional transactional Put/Delete operations should not pay for a pre-read
+when no stream record needs the old image; TiDB can execute the write directly
+inside the transaction and let native primary-key/index maintenance do the
+coordination. `TransactGetItems` starts a normal TiDB transaction and performs
+plain reads inside that transaction, getting one native snapshot without
+application-level locks.
 
 **MetadataEngine** (TTL, tags, table statistics):
-- `describe_ttl`, `update_ttl`
+- `describe_ttl`, `update_ttl`, `apply_ttl_update`
 - `tag_resource`, `untag_resource`, `list_tags`
-- `refresh_table_size` — updates cached table size and item count
-- `create_ttl_index`, `find_expired_items_indexed` — TTL cleanup support
+- `refresh_table_size` — updates cached table size and item count for backends
+  that maintain a catalog cache. Native-stat backends can answer from their
+  database metadata at describe/backup time instead.
+- `create_ttl_index`, `find_expired_items_indexed` — backend-specific TTL
+  artifact support for indexed-worker backends. `apply_ttl_update` lets the
+  storage backend own the whole TTL transition; PostgreSQL uses the default
+  indexed-worker workflow, while TiDB records native TTL intent and lets the
+  control-plane reconciler submit TiDB online TTL DDL. TiDB batches legacy
+  artifact cleanup with multi-schema `ALTER TABLE` and does not run or expose
+  an item sweeper. TiDB persists explicit TTL intent (`DISABLED`, `ENABLING`,
+  `ENABLED`, `DISABLING`) so the live reconciler and startup repair can finish
+  the correct native DDL path after a frontend crash instead of inferring
+  intent from artifact booleans. Legacy readiness booleans are migrated into
+  that explicit status and then dropped. Repair also reads physical table TTL state and
+  re-enables `TTL_ENABLE` when TiDB recovery tools such as BR or Flashback have
+  disabled TTL jobs.
 
 **StreamEngine** (DynamoDB Streams):
 - `write_stream_record` — writes stream record atomically with data write
 - `get_stream_records` — retrieves stream records for a shard
 - `describe_stream`, `list_streams`
 - `cleanup_expired_stream_records` — removes records older than 24 hours
+
+TiDB uses a fixed deterministic stream shard layout, so streamed writes compute
+the shard id from the encoded partition-key tuple. Stream rows are inserted
+atomically with item writes under a transaction-local storage sequence, then
+finalized to the user-visible sequence number using TiDB's native MVCC
+`commit_ts` (`TIDB_MVCC_INFO` over `TIDB_ENCODE_RECORD_KEY`) plus the
+in-transaction ordinal. This avoids a shard counter row while preserving
+commit-order stream iteration across multiple TiDB nodes. Stream iterator code
+treats sequence numbers as opaque decimal strings and computes
+`AT_SEQUENCE_NUMBER` predecessors with string arithmetic, because TiDB
+TSO-plus-ordinal values are wider than native host integers.
+TiDB does not foreground-delete stream history during `DeleteTable`; table ids
+are immutable, the catalog deletion makes the stream unreachable, and native
+TTL owns retention for the shared `stream_records` table.
 
 **WorkerStore** (background worker operations):
 - `process_control_plane_transitions` — handles table state transitions
@@ -151,7 +215,12 @@ written atomically with data writes when `stream` is `Some`.
 Backend implementations own the physical backup data plane. PostgreSQL keeps
 its existing implementation. TiDB uses native BR for snapshot data and keeps
 only ExtendDB metadata in the catalog; unsupported BR restore shapes are
-reported explicitly rather than emulated by item replay.
+reported explicitly rather than emulated by item replay. For TiDB restore,
+physical BR restore and online DDL normalization complete before the target
+catalog row is published, so failed restores do not create durable transitional
+table metadata. TiDB `DeleteBackup` removes only ExtendDB catalog metadata;
+the BR snapshot directory is lifecycle-managed by the configured backup storage
+or TiDB Operator rather than by an ExtendDB frontend.
 
 ```rust
 pub trait WorkerStore: Send + Sync {
@@ -198,7 +267,7 @@ IAM-type entities.
 Runtime settings storage (key-value store):
 - `get_setting`, `set_setting`, `list_settings`, `cached_encryption_key`
 
-Settings include `control_plane_delay_seconds`, `log_level`, and the
+Settings include backend-specific control-plane timing, `log_level`, and the
 encryption key for access key secrets.
 
 ### MetricsStore
@@ -207,7 +276,14 @@ Historical metrics persistence and query:
 - `insert_metrics`, `query_metrics`, `prune_metrics`
 
 Metrics are flushed periodically from the in-memory collector to persistent
-storage.
+storage. TiDB persists immutable rows in `metrics_samples` with a native
+`AUTO_RANDOM` clustered primary key and native TTL, then aggregates at query
+time. The old aggregate `metrics` table is migrated away instead of kept in
+the runtime read path. This avoids cross-frontend contention on a shared
+per-minute `ON DUPLICATE` metrics row. TiDB metrics flushes use one multi-row
+append-only insert per bounded batch rather than one insert per metric row,
+keeping frontend latency low while following TiDB's guidance to keep write
+transactions split into modest batches.
 
 ### RateLimitStore
 
@@ -216,7 +292,9 @@ Login rate limiting and account lockout:
   `cleanup_old_attempts`
 
 Tracks failed login attempts by principal and source IP to mitigate clients
-sending excessive traffic.
+sending excessive traffic. TiDB stores these as append-only rows with native
+TTL retention and `SHARD_ROW_ID_BITS` on the implicit row id, so concurrent
+frontends do not concentrate failed-login inserts on one TiKV Region.
 
 ### AuthorizationStore
 
@@ -289,6 +367,13 @@ Storage backends must preserve the exact type and value of each attribute.
 - `table_id: String`
 - `key_schema: Vec<KeySchemaElement>`
 - `attribute_definitions: Vec<AttributeDefinition>`
+- `has_lsi: bool`
+- `stream_specification: Option<StreamSpecification>`
+
+**TableReadInfo**: Resolved read-path metadata:
+- `table: TableKeyInfo` — the base table identity and key metadata
+- `index: Option<IndexInfo>` — the selected secondary index metadata for
+  Query/Scan, if the request uses an index
 
 ### Expression Types
 
@@ -325,13 +410,17 @@ Storage backends must preserve the exact type and value of each attribute.
 - `region: Arc<str>`
 
 Storage backends write stream records atomically with data writes when `stream` is `Some`.
+For TiDB, stream shard assignment uses the same physical HASH-key tuple encoder
+as the base table and derives the fixed shard id directly; visible stream
+sequence numbers are finalized from TiDB MVCC commit timestamps, so writers do
+not serialize through a per-shard counter row.
 
 ### Error Types
 
 **StorageError**: Errors returned by storage trait methods:
 - `TableNotFound(String)` — table does not exist
 - `TableAlreadyExists(String)` — table already exists
-- `TableNotActive(String)` — table is CREATING, DELETING, or UPDATING
+- `TableNotActive(String)` — table cannot serve the requested operation (for example CREATING or DELETING; TiDB data-plane operations continue during UPDATING)
 - `ConditionFailed { old_item: Option<Item> }` — condition expression evaluated to false
 - `TransactionCanceled(Vec<CancellationReason>)` — transaction failed with per-item reasons
 - `IdempotentReplay` — idempotency token matched previous request
@@ -363,12 +452,18 @@ The PostgreSQL backend uses two categories of tables:
 
 **Data tables** (created dynamically per DynamoDB table):
 - `_ddb_<table_id>` — base table (table_id is a UUID)
-- `_ddb_<index_id>` — GSI/LSI projection tables (index_id is a UUID)
+- PostgreSQL companion index tables — backend-owned GSI/LSI projection tables
+- TiDB generated columns and native secondary indexes on `_ddb_<table_id>` —
+  no separate physical table per secondary index
 
 **Schema files:**
 - Catalog schema: `crates/storage-postgres/migrations/001_schema.sql`
-- Data table DDL generation: `crates/storage-postgres/src/data/ddl.rs`
-- Table name helpers: `crates/storage-postgres/src/data/mod.rs`
+- Data table DDL generation:
+  `crates/storage-postgres/src/data/ddl.rs` and
+  `crates/storage-tidb/src/data/ddl.rs`
+- Table name helpers:
+  `crates/storage-postgres/src/data/mod.rs` and
+  `crates/storage-tidb/src/data/mod.rs`
 
 **Design notes:**
 
@@ -379,13 +474,18 @@ The PostgreSQL backend uses two categories of tables:
   Unicode, spaces, SQL keywords). The `_ddb_` prefix prevents collisions with
   catalog tables.
 
-- **Partition key storage**: Partition key values are always stored as TEXT.
-  String keys store directly, number keys store their string representation,
-  binary keys store base64. Partition keys only need equality comparison, so
-  text storage is correct. **Important:** Binary partition keys must use
-  canonical base64 encoding (standard alphabet with padding, via
-  `base64::engine::general_purpose::STANDARD`) to ensure equality comparison
-  is reliable. A validation step on ingest must normalize the encoding.
+- **Partition key storage**: PostgreSQL stores partition key values as text:
+  string keys directly, number keys as their string representation, and binary
+  keys as canonical base64. TiDB stores the physical partition-key slot as raw
+  `VARBINARY(2048)`: strings and numbers use their UTF-8 bytes, and binary keys
+  use their decoded bytes. All TiDB point reads, writes, locks, stream shard
+  assignment, and transaction helpers must use that same physical key helper so
+  multipart keys cannot split across different SQL predicates. The raw
+  2048-byte hash-key slot plus the 1024-byte sort-key slot fits TiDB's default
+  3072-byte native index limit. TiDB rejects configured key-size limits wider
+  than that native shape, rejects multi-RANGE key schemas before catalog commit,
+  and rejects multi-HASH values whose encoded tuple cannot fit in the raw
+  2048-byte hash-key slot.
 
 - **Sort key storage**: Sort key values use typed columns (`sk_s TEXT`,
   `sk_n NUMERIC`, `sk_b BYTEA`) to ensure correct ordering. Only one `sk_*`
@@ -405,9 +505,46 @@ The PostgreSQL backend uses two categories of tables:
   companion tables with base table primary key columns (`base_pk`, `base_sk_*`)
   as actual SQL columns. TiDB stores each item once in the base table, exposes
   index keys as generated columns over `item_data`, and creates native TiDB
-  secondary indexes over those generated columns plus the base key tie-breaker.
+  secondary indexes over those generated columns. TiDB secondary indexes
+  already carry the clustered row handle, so ExtendDB does not duplicate the
+  full base table key into the index definition; that keeps legal DynamoDB key
+  sizes within TiDB's 3072-byte index key limit and avoids unnecessary write
+  amplification. Native secondary-index hash columns use the same raw
+  2048-byte physical width as the base `pk` column; paired with 1024-byte
+  sort-key columns, the native index tuple fits TiDB's default key limit. TiDB
+  validates secondary-index key values before writes reach generated columns,
+  so empty, oversized, or type-mismatched index keys return DynamoDB-shaped
+  validation errors instead of leaking database constraint errors.
+  Startup data migrations reject older incompatible `_ddb_*` key layouts
+  instead of attempting unsupported TiDB primary-key/generated-column rewrites.
+  The generated columns are deliberate: TiDB documents generated columns as the
+  production path for indexing JSON-derived values, while generic expression
+  indexes would make DynamoDB's casts, binary decoding, and composite-key
+  expressions depend on the expression-index experimental function surface.
+  On `CreateTable`, TiDB includes initial generated columns and native
+  secondary indexes directly in the physical `CREATE TABLE` DDL. If replay
+  finds the physical table already exists, the reconciler treats that as TiDB's
+  native distributed race signal and converges any missing generated columns
+  and indexes with `IF NOT EXISTS` online DDL before publishing `ACTIVE`. For
+  later `UpdateTable` index changes, TiDB batches all generated-column
+  additions currently pending for a table into one online `ALTER TABLE`, then
+  submits the pending native index creations as one TiDB multi-schema
+  `ALTER TABLE` DDL job.
   TiDB has no separate local-index physical path; GSI versus LSI remains
   DynamoDB API metadata.
+
+- **Table statistics**: TiDB does not cache table size or item count in the
+  ExtendDB table catalog. `DescribeTable` and backup metadata read TiDB's
+  native `information_schema.tables` statistics when needed, keeping catalog
+  rows as control-plane metadata rather than a stale data-plane counter cache.
+
+- **String-key collation**: TiDB catalog and data metadata tables are created
+  with `DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`, and metrics labels use
+  `ascii_bin`. Migrations convert existing TiDB metadata columns to those
+  binary collations instead of only changing future table defaults.
+  DynamoDB-visible names, ARNs, stream shard ids, and idempotency tokens
+  therefore remain case-sensitive and byte-ordered without per-query collation
+  overrides or dependence on the cluster/database default.
 
 - **GSI consistency**: GSI write consistency is backend-specific. TiDB relies
   on native secondary indexes, which are maintained by TiDB from the base row.
@@ -416,68 +553,31 @@ The PostgreSQL backend uses two categories of tables:
 
 ### 5.2 Connection Pooling
 
-```rust
-use sqlx::postgres::PgPoolOptions;
-
-pub struct PostgresEngine {
-    /// Primary connection pool — used for all writes and consistent reads.
-    pool: PgPool,
-    /// Optional read replica pool — used for eventually consistent reads
-    /// (ConsistentRead=false). When None, all reads use the primary pool.
-    read_pool: Option<PgPool>,
-}
-
-impl PostgresEngine {
-    pub async fn new(config: &PostgresConfig) -> Result<Self, StorageError> {
-        let pool = PgPoolOptions::new()
-            .max_connections(config.pool_size)
-            .connect(&config.connection_string)
-            .await
-            .map_err(|e| StorageError::Connection(e.to_string()))?;
-
-        let read_pool = match &config.read_replica_url {
-            Some(url) => {
-                let rp = PgPoolOptions::new()
-                    .max_connections(config.read_replica_pool_size.unwrap_or(config.pool_size))
-                    .connect(url)
-                    .await
-                    .map_err(|e| StorageError::Connection(format!("read replica: {e}")))?;
-                Some(rp)
-            }
-            None => None,
-        };
-
-        Ok(Self { pool, read_pool })
-    }
-
-    /// Returns the appropriate connection pool for a read operation.
-    /// Uses the read replica for eventually consistent reads (when available),
-    /// falls back to the primary pool otherwise.
-    fn read_pool(&self, consistent_read: bool) -> &PgPool {
-        if consistent_read {
-            &self.pool
-        } else {
-            self.read_pool.as_ref().unwrap_or(&self.pool)
-        }
-    }
-}
-```
+Backends own their native pool layout behind the storage traits. PostgreSQL
+keeps the existing catalog and data pools. TiDB keeps separate catalog,
+strong-data, and default-read data pools, but the catalog and data databases
+must be in the same TiDB cluster. TiDB backup metadata, BR `--backupts`,
+snapshot reads, online DDL, and native TTL all rely on one PD-owned global TSO
+timeline. The strong-data pool uses leader reads for writes and
+`ConsistentRead=true`; the default-read pool sets
+`tidb_replica_read = 'closest-adaptive'` for DynamoDB reads that did not request
+`ConsistentRead=true`.
 
 ### 5.3 Read Consistency Model
 
-DynamoDB supports two read consistency modes: strongly consistent and eventually consistent (the default). The
-PostgreSQL backend models this via an optional read replica.
+DynamoDB supports two read consistency modes: strongly consistent and eventually
+consistent (the default). The engine passes the request flag to `get_item`,
+`query`, and `scan`; `BatchGetItem` passes each table's per-request flag.
 
-**Single-node mode (no read replica configured):** All reads are strongly consistent regardless of the `consistent_read`
-flag. This is strictly stronger than the DynamoDB spec and compatible with all applications. The `consistent_read`
-parameter is accepted and correctly reflected in capacity calculations (eventually consistent reads consume 0.5 RCU vs
-1.0 RCU for strongly consistent).
+**PostgreSQL:** all reads currently use the configured primary data pool. This
+is stronger than the DynamoDB default and preserves existing behavior while the
+trait carries the consistency signal for backends that can use it.
 
-**Read replica mode (`read_replica_url` configured):** Eventually consistent reads (`consistent_read=false`) are routed
-to a PostgreSQL streaming replica that is naturally a few milliseconds behind the primary. Strongly consistent reads
-(`consistent_read=true`) always read from the primary. This mirrors how DynamoDB achieves eventual consistency
-— via storage node replicas — and surfaces the exact class of bugs that applications may encounter in production
-DynamoDB (e.g., read-after-write without `ConsistentRead=true` returning stale data).
+**TiDB:** `ConsistentRead=true` uses the strong data pool. Default reads use a
+dedicated default-read pool with TiDB's `closest-adaptive` follower-read mode.
+TiDB follower read is still strongly consistent, but it lets TiDB offload larger
+read-only statements to local replicas and reduce leader/AZ pressure while
+remaining valid for DynamoDB's weaker default read contract.
 
 **Which operations are affected:**
 - `GetItem`: uses `consistent_read` field (default `false` in DynamoDB)
@@ -486,9 +586,6 @@ DynamoDB (e.g., read-after-write without `ConsistentRead=true` returning stale d
 - `BatchGetItem`: uses per-table `consistent_read` field
 - `TransactGetItems`: always strongly consistent (DynamoDB spec — serializable isolation)
 - All write operations: always use the primary pool
-
-The `read_pool()` helper method on `PostgresEngine` encapsulates this routing. All read implementations call
-`self.read_pool(input.consistent_read)` instead of `&self.pool` directly.
 
 ### 5.4 Query Translation
 
@@ -568,7 +665,7 @@ Migrations are embedded in the binary at compile time via `include_str!` and app
 Migration files are numbered sequentially:
 ```
 migrations/
-└── 001_initial_schema.sql
+└── 001_schema.sql
 ```
 
 ## 6. GSI Consistency Model
@@ -580,7 +677,25 @@ updates are always synchronous.
 
 **Implementation:**
 - TiDB stores each item once and uses generated columns plus native secondary
-  indexes, leveraging TiDB's globally consistent transaction model.
+  indexes, leveraging TiDB's globally consistent transaction model. Initial
+  secondary indexes are created with the base table; create replay repairs an
+  already-existing physical table through the same TiDB online `IF NOT EXISTS`
+  DDL used for later changes. For each later reconciliation pass, generated key
+  columns for all pending indexes on a table are added in one online
+  `ALTER TABLE` DDL job before the native index DDL.
+- The engine layer enforces DynamoDB projection semantics above the physical
+  path: default index reads return projected attributes, GSI reads cannot ask
+  for non-projected attributes, and LSI reads may fetch non-projected
+  attributes from the base table. This keeps TiDB's single-row native-index
+  layout from leaking full `item_data` through a KEYS_ONLY or INCLUDE GSI.
+- TiDB write operations use the table's already-fetched `AttributeDefinitions`
+  as a cheap guard before secondary-index key validation. Writes that cannot
+  contain a candidate secondary-index key do not re-read the catalog; TiDB
+  generated columns and native indexes maintain physical index state from the
+  base row.
+- TiDB storage pools set `tidb_txn_mode = 'pessimistic'` at connection time so
+  row-level `SELECT ... FOR UPDATE` semantics do not depend on whether the
+  cluster was freshly created or upgraded from an older optimistic default.
 - PostgreSQL supports `gsi_propagation_delay_ms` for asynchronous compatibility
   testing.
 - LSIs are always synchronous (delay is ignored) to match DynamoDB behavior
@@ -599,65 +714,88 @@ simpler transactional path as the default and only path.
 
 ### 6.1 Table Status Enforcement
 
-All data plane operations (PutItem, GetItem, Query, etc.) must check `table_status` before proceeding. If the table is
-not `ACTIVE`, return `StorageError::TableNotActive` (mapped to `ResourceInUseException`). Control plane operations that
-modify the table (`UpdateTable`, `DeleteTable`) must:
+All data plane operations (PutItem, GetItem, Query, etc.) must check
+`table_status` before proceeding. `CREATING` and `DELETING` tables cannot serve
+data-plane traffic. Backends with online schema changes may continue to serve
+data during `UPDATING`; TiDB does this because native online DDL maintains
+writes while TiDB's DDL owner schedules generated-column, index, and TTL jobs.
 
-1. Atomically move the catalog row out of `ACTIVE` (`UPDATING` or `DELETING`) before publishing any data-side work
-2. Persist the pending work in catalog metadata (`indexes.index_status`, stream specification, or table deletion state)
-3. Let the backend control-plane reconciler create, backfill, drop, or repair data artifacts, then set the table back to
-   `ACTIVE` or remove the row
+Control-plane operations that modify table artifacts must:
 
-This prevents concurrent DDL operations on the same table and makes crash recovery a normal retry path rather than a
-cleanup special case.
+1. Persist the durable intent in catalog metadata (`tables.table_status`,
+   `indexes.index_status`, stream specification, TTL metadata, or table deletion
+   state)
+2. Let the backend reconciler or native database feature create, backfill,
+   drop, or repair data artifacts from that durable intent
+3. Publish completion by marking the artifact `ACTIVE`, returning the table to
+   `ACTIVE`, or removing the catalog row
+
+TiDB does not use `UPDATING` as an ExtendDB-level DDL mutex. Multiple frontend
+nodes may append compatible GSI/TTL/delete intent while a table is already
+`UPDATING`; the catalog row lock is held only for the short metadata mutation,
+and TiDB's distributed online DDL queue owns the physical ordering.
 
 ### 6.1.1 Async Control Plane Transitions (Phase 1c)
 
 Real DynamoDB control plane operations are not instantaneous — `CreateTable` returns `CREATING` status and the table
-transitions to `ACTIVE` asynchronously. extenddb emulates this behavior.
+transitions to `ACTIVE` asynchronously. extenddb emulates this behavior while letting each backend use its native
+coordination model.
 
 **Implementation:**
 
 - A `status_transition_at TIMESTAMPTZ` column on the `tables` table records when a pending transition should fire.
 When `NULL`, no transition is pending.
-- `CreateTable` inserts with `table_status = 'CREATING'` and sets `status_transition_at` to
-`NOW() + control_plane_delay_seconds`. The delay is read from the settings table via a subquery in the same INSERT
-(no extra round-trip).
-- `DeleteTable` sets `table_status = 'DELETING'` with a scheduled transition time. The row, its indexes, and tags are
-removed when the transition fires.
+- `CreateTable` inserts with `table_status = 'CREATING'` and sets `status_transition_at` according to backend policy.
+PostgreSQL can set `NOW() + control_plane_delay_seconds` to emulate a fixed delay. TiDB sets immediate eligibility and
+delegates physical schema scheduling to TiDB native online DDL.
+- `DeleteTable` sets `table_status = 'DELETING'` with a transition time. The row, its indexes, and tags are removed
+when the transition fires. TiDB uses immediate eligibility and idempotent `DROP TABLE IF EXISTS`.
 - A background poller processes pending transitions. `CREATING → ACTIVE`
   creates any missing data artifacts before activation. `UPDATING → ACTIVE`
-  reconciles pending GSI and stream work. `DELETING → removed` drops data
-  artifacts before deleting catalog metadata.
+  reconciles pending GSI work and TiDB native TTL enable/disable intent. TiDB
+  stream enablement only publishes stream metadata because shard IDs are derived
+  from the fixed layout and sequence numbers come from TiDB MVCC commit
+  timestamps plus an in-transaction ordinal; it does not need data-side shard
+  rows or an async table-status transition.
+  `DELETING → removed` drops data artifacts before
+  deleting catalog metadata.
 - On startup, `process_control_plane_transitions()` recovers any in-flight
   operations from a previous server instance.
-- A partial index (`idx_tables_pending_transition ON tables
-  (status_transition_at) WHERE status_transition_at IS NOT NULL`) keeps the
-  poller query efficient regardless of table count.
+- A backend-appropriate work index over pending table status and transition
+  time keeps the poller query efficient regardless of table count.
 
 **Design decisions and future direction (from Phase 1c human review):**
 
-- The single-column approach works because each table has exactly one pending status transition at a time. Index-level
-transitions are represented by `indexes.index_status` while the parent table is `UPDATING`.
-- The poller interval will be increased to 10 seconds at idle, with control
-  plane operations poking the poller to wake up immediately and backoff
-  appropriately (Phase 2).
-- The default delay will be randomized to `[5, 20]` seconds for more realistic
-  DynamoDB emulation (Phase 2).
-- Startup recovery will reset stuck `CREATING` tables to
-  `NOW() + random[5, 20]` instead of instant activation (Phase 2).
-- `control_plane_delay_seconds` is a runtime setting (0–300 range), managed
-  via `extenddb settings set`. It is not a `.toml` config key.
+- The single-column approach works for base table lifecycle. Index-level
+  transitions are represented by `indexes.index_status` while the parent table
+  is `UPDATING`; TiDB may accept more catalog intent during that state and
+  converges through native online DDL plus set-based conditional catalog
+  publication for the pending index batch.
+- Control-plane operations wake the poller immediately. TiDB keeps the idle
+  sweep only as crash-recovery insurance; it is not a DDL ownership mechanism.
+- Backends that simulate delay may randomize it to `[5, 20]` seconds for more realistic DynamoDB emulation. TiDB must not add an ExtendDB delay because TiDB already owns distributed online DDL scheduling.
+- Startup recovery replays durable TiDB catalog intent directly. Backends that
+  intentionally simulate DynamoDB delay may choose to reschedule future
+  transition timestamps instead.
+- `control_plane_delay_seconds` is a backend-specific runtime setting (0–300 range), managed via
+  `extenddb settings set`. It is not a `.toml` config key. TiDB ignores it because TiDB's own DDL owner already
+  coordinates distributed online schema changes.
+- TiDB does not elect an ExtendDB DDL owner. Multiple frontend nodes may replay
+  the same catalog intent concurrently; idempotent `IF EXISTS` / `IF NOT EXISTS`
+  DDL and conditional catalog publication converge on the TiDB-owned schema
+  state.
 
 **Crash recovery and in-flight operation tracking:**
 
 The `status_transition_at` column on the `tables` table serves as the
 in-flight operation tracker. When the extenddb server shuts down (cleanly or
 via crash) while tables have pending transitions, the state is durable in
-PostgreSQL. On the next startup, `process_control_plane_transitions()` scans
-for rows where `status_transition_at IS NOT NULL AND
-status_transition_at <= NOW()` and completes them immediately. Rows where
-`status_transition_at` is in the future are left for the background poller.
+the backend catalog. On the next startup, `process_control_plane_transitions()` scans
+for due transitions and completes them from durable catalog intent. TiDB writes
+immediate transition timestamps, so startup recovery submits any remaining
+online DDL without waiting for an ExtendDB timer. Rows where
+`status_transition_at` is in the future are left for the background poller on
+backends that intentionally emulate a delay.
 
 This column-on-tables approach is sufficient while control plane operations are scoped to one table
 (`CREATING → ACTIVE`, `UPDATING → ACTIVE`, `DELETING → removed`). A separate `control_plane_operations` table becomes
@@ -673,11 +811,27 @@ full crash recovery.
 
 When `UpdateTable` adds a new GSI to a table with existing data:
 
-1. Set the parent table to `UPDATING` and insert the new index with `index_status = 'CREATING'`
-2. Commit the catalog transaction so the pending operation is durable
+1. Merge the new GSI key `AttributeDefinitions` into the table catalog, set the parent table to `UPDATING`, and insert the new index with `index_status = 'CREATING'`
+2. Commit the catalog transaction so the pending operation is durable; another frontend may append another compatible
+   update while the table remains `UPDATING`
 3. The control-plane reconciler performs the backend-native physical work
-4. TiDB adds generated columns and a native secondary index; TiDB's online DDL backfills and maintains the index from the
-   base table, so ExtendDB does not run a separate item-replay backfill
+4. TiDB adds generated key columns for all currently pending indexes on the
+   table in one online `ALTER TABLE`, then submits all pending native secondary
+   indexes in one TiDB multi-schema `ALTER TABLE`; the split is intentional
+   because TiDB validates a multi-change `ALTER TABLE` against the starting
+   schema, so an `ADD INDEX` must not depend on a generated column introduced
+   earlier in the same statement. TiDB's online DDL backfills and maintains the
+   indexes from the base table, so ExtendDB does not run a separate item-replay
+   backfill. Initial `CreateTable` indexes avoid this follow-up path because
+   they are part of the physical `CREATE TABLE`; if replay observes that the
+   table already exists, it repairs missing index artifacts with the same
+   online `IF NOT EXISTS` DDL before activation. GSI deletes drop the native
+   indexes and their generated key columns in one multi-schema online
+   `ALTER TABLE`, because those objects already exist when the drop starts.
+   Concurrent reconcilers replay the same `IF [NOT] EXISTS` DDL and let TiDB
+   converge the schema. After physical DDL returns, TiDB publishes all still
+   pending index rows for that batch with one conditional catalog statement,
+   rather than probing or publishing each index separately.
 5. PostgreSQL creates and backfills its companion index table
 6. On completion, the reconciler marks the index `ACTIVE` and returns the table to `ACTIVE`
 7. Queries against a `CREATING` index return `ResourceNotFoundException` (matching DynamoDB behavior)
@@ -719,8 +873,10 @@ WHERE (pk = $gsi_pk AND sk_s > $gsi_sk)
 
 For GSI queries, the pagination key includes both the GSI key attributes and the base table primary key (needed to
 uniquely identify the position, since GSI keys are not unique). Backends must preserve this tie-breaker. PostgreSQL
-stores `base_pk` and `base_sk_*` as actual columns in companion GSI tables; TiDB includes the generated base-key columns
-in its native secondary indexes.
+stores `base_pk` and `base_sk_*` as actual columns in companion GSI tables. TiDB keeps the seek predicate's base-key
+tie-breaker but orders only by the native secondary-index key columns; TiDB's secondary-index entry already carries the
+clustered row handle, so this preserves duplicate-key pagination while allowing TiDB to serve `ORDER BY` and `LIMIT` from
+the ordered index scan instead of a root sort.
 
 ## 8. Parallel Scan Segment Assignment
 
@@ -749,8 +905,6 @@ arithmetic assigns each partition key to exactly one segment, ensuring:
 > hash function in the `core` crate (e.g., CRC32 of the partition key bytes)
 > that all backends use, and pass the pre-computed segment filter to the
 > storage backend.
-> crate (e.g., CRC32 of the partition key bytes) that all backends use, and pass the pre-computed segment filter to the
-> storage backend.
 
 ## 9. Idempotency Token Storage
 
@@ -758,23 +912,44 @@ arithmetic assigns each partition key to exactly one segment, ensuring:
 
 ```sql
 CREATE TABLE _dynamodb_idempotency_tokens (
-    client_request_token TEXT PRIMARY KEY,
-    response JSONB NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    client_request_token <string> PRIMARY KEY,
+    response <json> NOT NULL,
+    created_at <timestamp> NOT NULL DEFAULT <current_timestamp>
 );
-CREATE INDEX ON _dynamodb_idempotency_tokens(created_at);
 ```
 
 **Flow:**
-1. Before executing a transaction, check if the token exists
-2. If found: return the stored response (idempotent replay)
-3. If not found: execute the transaction, store the token + response
-   atomically in the same backend transaction
-4. Background cleanup: delete tokens older than 10 minutes (matching
-   DynamoDB's idempotency window)
+1. At the start of the backend transaction, claim the token with an atomic
+   insert into a unique-key token table.
+2. If the insert succeeds, execute the transaction and commit the token claim
+   atomically with the item writes.
+3. If the database reports a native unique-key conflict, lock/read the existing
+   token row. Matching fingerprints are idempotent replays; different
+   fingerprints are `IdempotentParameterMismatchException`.
+4. Backend-native retention removes tokens older than 10 minutes (matching
+   DynamoDB's idempotency window). TiDB uses native table TTL, so it does not
+   add a frontend cleanup index on `created_at`.
 
-If a request arrives with the same token but different parameters, return
-`IdempotentParameterMismatchException`.
+Storage backends must not implement this as a preflight `SELECT` followed by
+`INSERT`: under multiple frontend writers, both transactions can observe a
+missing row. The unique key is the distributed race detector.
+
+TiDB uses the token as the retry boundary for retryable write-conflict,
+deadlock, lock-timeout, and schema-change errors. When a token is present,
+the TiDB backend can retry the whole `TransactWriteItems` operation: if the
+previous attempt committed, the retry observes the token as an idempotent
+replay; if it rolled back, TiDB re-executes the transaction. Without a client
+request token, TiDB does not broaden automatic write retries because a commit
+outcome could be ambiguous for non-idempotent updates.
+TiDB stores this token table in the data database, not the catalog database,
+so the token claim, item writes, and stream records share one TiDB transaction.
+TiDB does not add a `created_at` lookup index or run a foreground cleanup
+delete for token cleanup: the write path uses one primary-key
+`INSERT ... ON DUPLICATE KEY UPDATE` claim with a per-attempt `claim_id`, and
+native TTL owns retention inside TiDB. If a same-token row has passed the
+10-minute DynamoDB idempotency window but TiDB's TTL job has not deleted it
+yet, the upsert atomically recycles the row; otherwise the unchanged `claim_id`
+distinguishes replay from mismatch.
 
 ## 10. Backend Plugin Architecture
 
@@ -903,9 +1078,9 @@ let components = create_server_components(
 
 // Pass trait objects to server
 let app_state = AppState {
-    engine: components.engine,
-    catalog_store: components.catalog_store,
-    auth_provider: components.auth_provider,
+    storage: components.engine.clone(),
+    auth: components.auth_provider,
+    catalog_store: Some(components.catalog_store.clone()),
     metrics: Arc::new(MetricsCollector::new()),
     // ...
 };
@@ -918,7 +1093,7 @@ if let Some(hooks) = components.runtime_hooks {
     let ctx = WorkerContext {
         metrics: app_state.metrics.clone(),
         catalog_store: components.catalog_store.clone(),
-        reload_handle: app_state.reload_handle.clone(),
+        reload_handle: reload_handle.clone(),
         config_log_level: config.logging.level.clone(),
     };
     hooks.spawn_workers(&ctx).await;
@@ -973,10 +1148,12 @@ internals):
 - PostgreSQL spawns its control-plane poller, pool metrics, GSI delay poller,
   TTL cleanup, stream cleanup, idempotency token cleanup, and table size refresh
   workers
-- TiDB spawns its control-plane poller, table size refresh, stream-emitting
-  item TTL cleanup, and pool metrics workers; TiDB native TTL handles
-  non-streaming item TTL plus stream-record, idempotency-token, metrics,
-  login-attempt, and assume-role session retention
+- TiDB spawns only its control-plane poller and pool metrics workers; TiDB
+  online DDL owns schema jobs, TiDB native TTL handles all item TTL plus
+  stream-record, idempotency-token, metrics, login-attempt, and assume-role
+  session retention, startup repair re-enables native TTL jobs if TiDB tooling
+  left `TTL_ENABLE = 'OFF'`, and TiDB `information_schema` table statistics are
+  read on demand instead of refreshed by a frontend worker.
 - Other backends may spawn different workers or none at all
 
 Example PostgreSQL implementation:
@@ -1009,7 +1186,7 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
 
 ### 10.6 BoxFuture Pattern for Object Safety
 
-All storage traits use `BoxFuture<'_, Result<T, StorageError>>` return types instead of RPITIT (`impl Future`):
+All storage traits use explicit `BoxFuture` return types for object safety:
 
 ```rust
 use futures::future::BoxFuture;
@@ -1025,7 +1202,7 @@ pub trait TableEngine: Send + Sync {
 
 **Why BoxFuture:**
 - **Object safety**: Enables `Arc<dyn StorageEngine>` usage
-- **Explicit lifetimes**: `BoxFuture<'_>` borrows from `&self`
+- **Explicit lifetimes**: control-plane futures can borrow from `&self`; data-plane futures can borrow request metadata until awaited
 - **No macro overhead**: No `#[async_trait]` macro expansion
 
 **Implementation pattern:**
@@ -1037,13 +1214,27 @@ impl TableEngine for PostgresEngine {
         account_id: &str,
         input: CreateTableInput,
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
-        // Clone borrowed params before async move
+        // Owned request payloads can be moved into the future.
         let account_id = account_id.to_string();
-        let input = input.clone();
-        
+
         Box::pin(async move {
-            self.create_table_impl(&account_id, &input).await
+            self.create_table_impl(&account_id, input).await
         })
+    }
+}
+```
+
+Hot data-plane methods should return their implementation future directly so
+borrowed metadata stays borrowed instead of cloned:
+
+```rust
+impl DataEngine for MyBackend {
+    fn get_item<'a>(
+        &'a self,
+        key_info: &'a TableKeyInfo,
+        key: &'a Item,
+    ) -> BoxFuture<'a, Result<Option<Item>, StorageError>> {
+        Box::pin(self.get_item_impl(key_info, key))
     }
 }
 ```

@@ -19,7 +19,7 @@ extenddb always runs as a daemon. On startup it:
 5. Connects to the configured storage backend (catalog + data databases)
 6. Verifies catalog version matches the binary
 7. Starts the HTTP server
-8. Spawns background tasks (log level polling, stream cleanup, TTL expiry)
+8. Spawns background tasks (log level polling, backend-specific retention and metrics tasks)
 
 ### Checking Status
 
@@ -90,10 +90,16 @@ Available when the binary is built with the `tidb` feature.
 #### [storage.tidb.backup]
 
 TiDB backup and restore uses native BR, not a logical row-copy table. Configure these fields before using `CreateBackup` with the TiDB backend.
-`DeleteBackup` removes backup data directly only for `local://` or `file://`
-storage URIs. For S3, GCS, Azure Blob, and S3-compatible stores, configure
-object-store lifecycle management; ExtendDB will not mark remote BR backups
-deleted without a storage deleter.
+`CreateBackup` returns after BR completes and publishes the backup as
+`AVAILABLE`; incomplete native backup attempts are not exposed as durable
+catalog rows.
+`RestoreTableFromBackup` likewise publishes the target table only after BR
+restore, physical table rename, and restored-table normalization complete; failed
+or interrupted restores do not expose a durable `CREATING` table.
+`DeleteBackup` removes ExtendDB's catalog reference to the BR backup. Snapshot
+files remain under the configured backup storage URI and should be retained,
+archived, or deleted by the operator, TiDB Operator clean policy, or object-store
+lifecycle rules. ExtendDB does not run a frontend-side file deleter for BR data.
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -153,7 +159,7 @@ Managed via `extenddb settings set`. Changes take effect within 30 seconds witho
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `log_level` | `info` | Log level: trace, debug, info, warn, error |
-| `control_plane_delay_seconds` | `5` | Delay for table status transitions (0 = instant) |
+| `control_plane_delay_seconds` | `5` | PostgreSQL delay for table status transitions (0 = instant); TiDB ignores this setting and uses native online DDL reconciliation |
 | `allow_credential_import` | `true` | Whether `import-access-key` is allowed |
 
 ```bash
@@ -540,7 +546,7 @@ psql -f catalog_backup.sql extenddb_catalog
 psql -f data_backup.sql extenddb_catalog_data
 ```
 
-For TiDB, configure `[storage.tidb.backup]` and use DynamoDB-compatible backup APIs backed by native TiDB BR, or operate BR directly at the cluster level for full-cluster recovery.
+For TiDB, configure `[storage.tidb.backup]` and use DynamoDB-compatible backup APIs backed by native TiDB BR, or operate BR directly at the cluster level for full-cluster recovery. Table-level restore publishes catalog metadata only after TiDB finishes the physical restore path.
 
 ---
 

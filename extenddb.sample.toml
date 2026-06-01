@@ -62,6 +62,9 @@
 # connection_string = "mysql://extenddb:extenddb-local-dev@localhost:4000/extenddb_catalog"
 # pool_size = 20
 # catalog_pool_size = 20
+# ConsistentRead=false data reads use a separate TiDB default-read pool configured
+# with native closest-adaptive follower read. ConsistentRead=true and writes use
+# the strong data pool.
 #
 # TiDB native backup/restore uses BR. SQL BACKUP/RESTORE is experimental in
 # TiDB, so ExtendDB shells out to BR when these fields are configured.

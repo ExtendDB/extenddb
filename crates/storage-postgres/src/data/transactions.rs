@@ -86,7 +86,7 @@ impl PostgresEngine {
             }
         }
 
-        // D-4: Read system default delay from cache (P119).
+        // Read system default delay from cache.
         let sys_delay = self
             .gsi_default_delay_ms
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -97,13 +97,13 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // Check idempotency token within the transaction (BLOCKER #2 fix).
+        // Check idempotency token within the transaction.
         if let Some((tok, fp)) = token {
             check_idempotency_token_in_tx(&mut tx, tok, fp).await?;
         }
 
         let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());
-        // M-3: Collect old/new items from each op for async GSI enqueue after commit.
+        // Collect old/new items from each op for async GSI enqueue after commit.
         let mut op_items: Vec<(Option<Item>, Option<Item>)> = Vec::with_capacity(ops.len());
         let mut any_failed = false;
 
@@ -139,7 +139,7 @@ impl PostgresEngine {
             return Err(StorageError::TransactionCanceled(reasons));
         }
 
-        // Write stream records atomically within the transaction (BLOCKER #1 fix).
+        // Write stream records atomically within the transaction.
         for (op, (old_item, new_item)) in ops.iter().zip(op_items.iter()) {
             let capture = match op {
                 TransactWriteOp::Put { stream, .. }
@@ -168,8 +168,8 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // D-4: Enqueue async GSI updates after commit using the old/new items
-        // collected during transaction execution (M-3 fix).
+        // Enqueue async GSI updates after commit using the old/new items
+        // collected during transaction execution.
         if let Some(ref q) = self.gsi_queue {
             for (op, (old_item, new_item)) in ops.iter().zip(op_items.iter()) {
                 let indexes = &table_indexes[transact_op_table_name(op)];
@@ -220,7 +220,7 @@ impl PostgresEngine {
         max_age_seconds: i64,
     ) -> Result<u64, StorageError> {
         // Cast i64→integer for PG 15 compat; safe for realistic values (<68 years).
-        // P54 Bug 1: idempotency_tokens lives in the data database.
+        // idempotency_tokens lives in the data database.
         let result = sqlx::query(
             "DELETE FROM idempotency_tokens WHERE created_at < NOW() - make_interval(secs => $1::integer)",
         )
@@ -258,7 +258,7 @@ fn transact_op_table_id<'a>(op: &'a TransactWriteOp<'_>) -> &'a str {
 /// Separates user-driven cancellations (condition failures, validation errors)
 /// from infrastructure errors (PG connection failures, serialization errors).
 /// This prevents internal error details from leaking into client-visible
-/// cancellation reasons (BLOCKER #3 fix).
+/// cancellation reasons.
 enum TxnOpError {
     /// User-driven failure — becomes a per-item cancellation reason.
     Cancel(CancellationReason),

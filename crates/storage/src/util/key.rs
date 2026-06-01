@@ -84,6 +84,18 @@ pub fn pk_to_text(value: &AttributeValue) -> Result<Cow<'_, str>, StorageError> 
     }
 }
 
+/// Extract the partition key as raw bytes for backends with binary key columns.
+pub fn pk_to_bytes(value: &AttributeValue) -> Result<Cow<'_, [u8]>, StorageError> {
+    match value {
+        AttributeValue::S(s) => Ok(Cow::Borrowed(s.as_bytes())),
+        AttributeValue::N(n) => Ok(Cow::Borrowed(n.as_bytes())),
+        AttributeValue::B(b) => Ok(Cow::Borrowed(b.as_slice())),
+        _ => Err(StorageError::Internal(
+            "partition key must be S, N, or B".to_owned(),
+        )),
+    }
+}
+
 /// Determine which sort key column to use based on the attribute type.
 pub fn sk_column(attr_type: ScalarAttributeType) -> &'static str {
     match attr_type {
@@ -169,6 +181,16 @@ mod tests {
         assert_ne!(
             encode_netstring_composite(&a),
             encode_netstring_composite(&b)
+        );
+    }
+
+    #[test]
+    fn pk_to_bytes_keeps_binary_partition_keys_raw() {
+        let value = AttributeValue::B(vec![0, 1, 2, 253, 254, 255]);
+
+        assert_eq!(
+            pk_to_bytes(&value).expect("bytes").as_ref(),
+            &[0, 1, 2, 253, 254, 255]
         );
     }
 }

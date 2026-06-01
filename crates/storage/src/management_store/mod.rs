@@ -11,8 +11,8 @@
 //!
 //! # Design decisions
 //!
-//! - **RPITIT** (return-position `impl Trait` in traits) for async methods,
-//!   matching the existing storage traits.
+//! - **Object-safe `BoxFuture` return types** for async methods, matching the
+//!   existing storage traits and allowing shared `Arc<dyn CatalogStore>` use.
 //! - **`OpError` / `OpResult`** live in the `types` submodule so both the
 //!   storage implementation and the server crate can use them without circular
 //!   dependencies.
@@ -58,8 +58,8 @@ pub trait SettingsStore: Send + Sync {
     /// List all settings as `(key, value)` pairs, ordered by key.
     fn list_settings(&self) -> BoxFuture<'_, OpResult<Vec<(String, String)>>>;
 
-    /// P119: Get the cached encryption key if available. Returns `None` by
-    /// default; backends that cache the key at startup override this.
+    /// Get the cached encryption key if available. Returns `None` by default;
+    /// backends that cache the key at startup override this.
     fn cached_encryption_key(&self) -> Option<String> {
         None
     }

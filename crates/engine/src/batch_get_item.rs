@@ -146,15 +146,15 @@ pub async fn handle_batch_get_item(
                 ));
             }
             validate_batch_key_only(key, &key_info.key_schema, &key_info.attribute_definitions)?;
+            let strongly_consistent = ka.consistent_read == Some(true);
 
             if let Some(item) = ctx
                 .storage
-                .get_item(&key_info, key)
+                .get_item(&key_info, key, strongly_consistent)
                 .await
                 .map_err(storage_err_to_dynamo)?
             {
                 let size = item_size_bytes(&item);
-                let strongly_consistent = ka.consistent_read == Some(true);
                 let item_rcu = capacity_helpers::read_capacity_units(size, strongly_consistent);
                 total_rcu += item_rcu;
                 *per_table_rcu.entry(table_name.clone()).or_default() += item_rcu;
@@ -176,7 +176,7 @@ pub async fn handle_batch_get_item(
         per_table_rcu.iter().map(|(t, cu)| (t.as_str(), *cu)),
     );
 
-    // Per-item RCU already accumulated above (M-1: DynamoDB rounds per item, then sums).
+    // Per-item RCU already accumulated above; DynamoDB rounds per item, then sums.
     let rcu = total_rcu;
 
     let output = BatchGetItemOutput {

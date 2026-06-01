@@ -27,7 +27,6 @@ mod table_engine;
 mod table_helpers;
 mod throughput;
 mod tidb_util;
-mod ttl_worker;
 mod update_table;
 mod worker_store;
 mod workers;
@@ -82,7 +81,8 @@ inventory::submit! {
         factory: |connection_string| {
             let connection_string = config::sqlx_connection_string(connection_string);
             Box::pin(async move {
-                let pool = sqlx::MySqlPool::connect(&connection_string)
+                let pool = tidb_pool_options(MIN_POOL_SIZE, 0)
+                    .connect(&connection_string)
                     .await
                     .map_err(|e| extenddb_storage::settings_store::SettingsStoreError::ConnectionFailed(e.to_string()))?;
                 Ok(Box::new(TidbCatalogStore::new(pool)) as Box<dyn extenddb_storage::management_store::SettingsStore>)
@@ -98,7 +98,8 @@ inventory::submit! {
         factory: |connection_string| {
             let connection_string = config::sqlx_connection_string(connection_string);
             Box::pin(async move {
-                let pool = sqlx::MySqlPool::connect(&connection_string)
+                let pool = tidb_pool_options(MIN_POOL_SIZE, 0)
+                    .connect(&connection_string)
                     .await
                     .map_err(|e| extenddb_storage::diagnostics_store::DiagnosticsStoreError::ConnectionFailed(e.to_string()))?;
                 Ok(Box::new(TidbCatalogStore::new(pool)) as Box<dyn extenddb_storage::diagnostics::DiagnosticsStore>)
@@ -109,16 +110,18 @@ inventory::submit! {
 
 use std::sync::Arc;
 
+use extenddb_core::limits::LimitsConfig;
 use extenddb_core::version::CatalogVersion;
 use extenddb_storage::error::StorageError;
 use sqlx::MySqlPool;
-use sqlx::mysql::MySqlPoolOptions;
 
-/// Expected catalog version — compiled into the binary (REQ-CAT-006, D-9).
+use crate::tidb_util::{tidb_default_read_pool_options, tidb_pool_options};
+
+/// Expected catalog version — compiled into the binary.
 ///
 /// The tuple is the single source of truth. Use `CATALOG_VERSION.to_string()`
 /// wherever a string representation is needed.
-pub const CATALOG_VERSION: CatalogVersion = CatalogVersion::new(0, 0, 10);
+pub const CATALOG_VERSION: CatalogVersion = CatalogVersion::new(0, 0, 20);
 
 /// Minimum number of connections allowed per pool.
 ///
@@ -131,8 +134,8 @@ const MIN_POOL_SIZE: u32 = 10;
 pub struct TidbConfig {
     pub connection_string: String,
     pub pool_size: u32,
-    /// Maximum item size in bytes for post-update validation.
-    pub max_item_size_bytes: usize,
+    /// Runtime limits that TiDB must enforce after storage-side mutations.
+    pub limits: LimitsConfig,
     pub native_backup: extenddb_storage::config::NativeBackupConfig,
 }
 
@@ -140,18 +143,21 @@ pub struct TidbConfig {
 ///
 /// The engine no longer stores a single `account_id`. Instead, `account_id`
 /// is passed per-request through the storage trait methods, enabling
-/// multi-account isolation (Phase 12f).
+/// multi-account isolation.
 ///
-/// Uses two connection pools: `pool` for catalog metadata (tables, indexes,
-/// settings, accounts, IAM) and `data_pool` for per-DynamoDB-table data
-/// (`_ddb_*` tables and native generated-column secondary indexes). This separation allows the catalog and
-/// data to live in different TiDB databases (Bug 1, P54).
+/// Uses separate connection pools for catalog metadata, strong data-plane
+/// work, and default-read data-plane work. The default-read pool enables TiDB
+/// follower read (`closest-adaptive`) without contaminating write transactions
+/// or `ConsistentRead=true` operations.
 pub struct TidbEngine {
     pub(crate) pool: MySqlPool,
     /// Connection pool for the data database where `_ddb_*` tables live.
     pub(crate) data_pool: MySqlPool,
+    /// Read-only data pool for DynamoDB reads that did not request
+    /// `ConsistentRead=true`.
+    pub(crate) data_default_read_pool: MySqlPool,
     pub(crate) region: String,
-    pub(crate) max_item_size_bytes: usize,
+    pub(crate) limits: LimitsConfig,
     pub(crate) native_backup: backup_engine::TidbNativeBackupConfig,
     /// Wakes the control plane poller when a table enters CREATING, UPDATING,
     /// or DELETING state, so transitions are processed without polling delay.
@@ -160,6 +166,8 @@ pub struct TidbEngine {
 
 impl TidbEngine {
     pub async fn new(config: &TidbConfig, region: &str) -> Result<Self, StorageError> {
+        validate_tidb_limits(&config.limits)?;
+
         // Enforce a minimum of 10 connections per pool. Smaller values starve
         // the auth/authz query fanout under concurrent load. If the configured
         // value is below the floor, log a warning and clamp.
@@ -175,45 +183,48 @@ impl TidbEngine {
             config.pool_size
         };
 
-        // P79/P6: Set min_connections to avoid cold-start latency on first requests.
+        // Keep a couple of warm connections to avoid first-request latency.
         let min_conns = pool_size.min(2);
-        let pool = MySqlPoolOptions::new()
-            .max_connections(pool_size)
-            .min_connections(min_conns)
-            .test_before_acquire(false)
-            .max_lifetime(std::time::Duration::from_secs(1800))
+        let pool = tidb_pool_options(pool_size, min_conns)
             .connect(&crate::config::sqlx_connection_string(
                 &config.connection_string,
             ))
             .await
             .map_err(|e| StorageError::Connection(e.to_string()))?;
 
-        // P54 Bug 1: Read data database connection string from catalog settings.
-        // Falls back to the catalog pool if no separate data database is configured.
-        let data_pool = match sqlx::query_as::<_, (String,)>(
+        // Read the data database connection string from catalog settings.
+        // Fall back to the catalog database when no separate data database is
+        // configured.
+        let data_connection_string = match sqlx::query_as::<_, (String,)>(
             "SELECT value FROM settings WHERE `key` = 'data_database_connection_string'",
         )
         .fetch_optional(&pool)
         .await
         {
-            Ok(Some((data_conn,))) if !data_conn.is_empty() => MySqlPoolOptions::new()
-                .max_connections(pool_size)
-                .min_connections(min_conns)
-                .test_before_acquire(false)
-                .max_lifetime(std::time::Duration::from_secs(1800))
-                .connect(&crate::config::sqlx_connection_string(&data_conn))
-                .await
-                .map_err(|e| {
-                    StorageError::Connection(format!("data database connection failed: {e}"))
-                })?,
-            _ => pool.clone(),
+            Ok(Some((data_conn,))) if !data_conn.is_empty() => {
+                crate::config::sqlx_connection_string(&data_conn)
+            }
+            _ => crate::config::sqlx_connection_string(&config.connection_string),
         };
+        let data_pool = tidb_pool_options(pool_size, min_conns)
+            .connect(&data_connection_string)
+            .await
+            .map_err(|e| {
+                StorageError::Connection(format!("data database connection failed: {e}"))
+            })?;
+        let data_default_read_pool = tidb_default_read_pool_options(pool_size, min_conns)
+            .connect(&data_connection_string)
+            .await
+            .map_err(|e| {
+                StorageError::Connection(format!("default-read data connection failed: {e}"))
+            })?;
 
         Ok(Self {
             pool,
             data_pool,
+            data_default_read_pool,
             region: region.to_owned(),
-            max_item_size_bytes: config.max_item_size_bytes,
+            limits: config.limits.clone(),
             native_backup: backup_engine::TidbNativeBackupConfig::from_storage_config(
                 config.native_backup.clone(),
             ),
@@ -241,7 +252,7 @@ impl TidbEngine {
         Ok(())
     }
 
-    /// Validate catalog version matches the compiled-in expectation (REQ-CAT-007, D-10).
+    /// Validate catalog version matches the compiled-in expectation.
     ///
     /// Reads the version string from the `settings` table and parses it
     /// strictly into a `CatalogVersion`. Rejects malformed strings.
@@ -303,10 +314,75 @@ impl TidbEngine {
         Ok(row.map_or_else(|| "(not configured)".to_owned(), |(name,)| name))
     }
 
-    /// Returns a reference to the data pool for use by background workers
-    /// that operate on `_ddb_*` tables (e.g., TTL cleanup, table size refresh).
+    /// Returns a reference to the data pool for backend runtime workers.
     pub fn data_pool(&self) -> &MySqlPool {
         &self.data_pool
+    }
+
+    /// Select the native TiDB read pool for a DynamoDB read request.
+    pub(crate) fn data_read_pool(&self, consistent_read: bool) -> &MySqlPool {
+        if consistent_read {
+            &self.data_pool
+        } else {
+            &self.data_default_read_pool
+        }
+    }
+}
+
+fn validate_tidb_limits(limits: &LimitsConfig) -> Result<(), StorageError> {
+    if limits.max_partition_key_size_bytes > data::DYNAMODB_HASH_KEY_COLUMN_BYTES {
+        return Err(StorageError::Configuration(format!(
+            "TiDB backend supports partition keys up to {} bytes because native clustered and secondary indexes must fit TiDB's 3072-byte key limit; configured limit is {}",
+            data::DYNAMODB_HASH_KEY_COLUMN_BYTES,
+            limits.max_partition_key_size_bytes
+        )));
+    }
+    if limits.max_sort_key_size_bytes > data::DYNAMODB_SORT_KEY_COLUMN_BYTES {
+        return Err(StorageError::Configuration(format!(
+            "TiDB backend supports sort keys up to {} bytes because native clustered and secondary indexes must fit TiDB's 3072-byte key limit; configured limit is {}",
+            data::DYNAMODB_SORT_KEY_COLUMN_BYTES,
+            limits.max_sort_key_size_bytes
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use extenddb_core::limits::LimitsConfig;
+    use extenddb_storage::error::StorageError;
+
+    use super::validate_tidb_limits;
+
+    #[test]
+    fn tidb_limits_accept_dynamodb_key_defaults() {
+        validate_tidb_limits(&LimitsConfig::default()).expect("default limits");
+    }
+
+    #[test]
+    fn tidb_limits_reject_partition_keys_wider_than_native_index_shape() {
+        let limits = LimitsConfig {
+            max_partition_key_size_bytes: 2049,
+            ..LimitsConfig::default()
+        };
+
+        let err = validate_tidb_limits(&limits).unwrap_err();
+
+        assert!(matches!(err, StorageError::Configuration(_)));
+        assert!(err.to_string().contains("partition keys up to 2048 bytes"));
+    }
+
+    #[test]
+    fn tidb_limits_reject_sort_keys_wider_than_native_index_shape() {
+        let limits = LimitsConfig {
+            max_sort_key_size_bytes: 1025,
+            ..LimitsConfig::default()
+        };
+
+        let err = validate_tidb_limits(&limits).unwrap_err();
+
+        assert!(matches!(err, StorageError::Configuration(_)));
+        assert!(err.to_string().contains("sort keys up to 1024 bytes"));
     }
 }
 
@@ -335,28 +411,18 @@ impl ServerRuntimeHooks for TidbRuntimeHooks {
         // 1. Control plane transitions poller
         let storage_for_poller = self.engine.clone();
         let cp_notify = self.control_plane_notify.clone();
-        let catalog_store = ctx.catalog_store.clone();
         tokio::spawn(async move {
-            workers::poll_control_plane_transitions(storage_for_poller, cp_notify, catalog_store)
-                .await
+            workers::poll_control_plane_transitions(storage_for_poller, cp_notify).await
         });
 
-        // 2. Table size refresh worker
-        let storage_for_size = self.engine.clone();
-        tokio::spawn(async move { workers::table_size_refresh_worker(storage_for_size).await });
-
-        // 3. TTL cleanup worker for stream-enabled user tables. TiDB native TTL
-        // handles internal retention tables and user tables without Streams.
-        let storage_for_ttl = self.engine.clone();
-        let metrics = ctx.metrics.clone();
-        tokio::spawn(async move { ttl_worker::ttl_cleanup_worker(storage_for_ttl, metrics).await });
-
-        // 4. Pool metrics worker - needs both catalog and data pools
+        // 2. Pool metrics worker - needs both catalog and data pools
         let catalog_pool = self.engine.pool.clone();
         let data_pool = self.engine.data_pool().clone();
+        let data_default_read_pool = self.engine.data_default_read_pool.clone();
         let metrics = ctx.metrics.clone();
         tokio::spawn(async move {
-            workers::pool_metrics_worker(catalog_pool, data_pool, metrics).await
+            workers::pool_metrics_worker(catalog_pool, data_pool, data_default_read_pool, metrics)
+                .await
         });
     }
 
@@ -373,12 +439,7 @@ inventory::submit! {
             let connection_string = config.connection_config().to_string();
             let max_connections = config.max_connections();
             let max_catalog_connections = config.max_catalog_connections();
-            let max_item_size_bytes = config
-                .runtime_limits()
-                .map_or_else(
-                    || extenddb_core::limits::LimitsConfig::default().max_item_size_bytes,
-                    |limits| limits.max_item_size_bytes,
-                );
+            let limits = config.runtime_limits().cloned().unwrap_or_default();
             let native_backup = config.native_backup_config().unwrap_or_default();
             let region = region.to_string();
             Box::pin(async move {
@@ -386,7 +447,7 @@ inventory::submit! {
                 let tidb_config = TidbConfig {
                     connection_string: connection_string.clone(),
                     pool_size: max_connections,
-                    max_item_size_bytes,
+                    limits,
                     native_backup,
                 };
 
@@ -404,6 +465,12 @@ inventory::submit! {
                         BackendError::CatalogVersionMismatch { expected, found }
                     }
                     _ => BackendError::InitializationFailed(e.to_string()),
+                })?;
+
+                engine.repair_native_ttl().await.map_err(|e| {
+                    BackendError::InitializationFailed(format!(
+                        "Failed to repair TiDB native TTL artifacts: {e}"
+                    ))
                 })?;
 
                 // Recover control plane transitions (ignore errors)
@@ -443,11 +510,7 @@ inventory::submit! {
                 } else {
                     max_catalog_connections
                 };
-                let catalog_pool = MySqlPoolOptions::new()
-                    .max_connections(catalog_pool_size)
-                    .min_connections(catalog_pool_size.min(2))
-                    .test_before_acquire(false)
-                    .max_lifetime(std::time::Duration::from_secs(1800))
+                let catalog_pool = tidb_pool_options(catalog_pool_size, catalog_pool_size.min(2))
                     .connect(&crate::config::sqlx_connection_string(&connection_string))
                     .await
                     .map_err(|e| BackendError::ConnectionFailed {

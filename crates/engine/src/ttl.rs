@@ -44,8 +44,8 @@ pub async fn handle_describe_time_to_live(
 
 /// Handle `UpdateTimeToLive` — enable or disable TTL on a table attribute.
 ///
-/// When enabling, kicks off backend-specific TTL lookup setup. When disabling,
-/// removes backend lookup/TTL artifacts before marking TTL disabled.
+/// The storage backend owns the full TTL mutation, including any
+/// backend-specific lookup index or native TTL DDL.
 ///
 /// # Errors
 ///
@@ -71,27 +71,30 @@ pub async fn handle_update_time_to_live(
         .await
         .map_err(storage_to_dynamo)?;
 
-    let already_enabled = current.time_to_live_status == TimeToLiveStatus::Enabled;
-    if input.time_to_live_specification.enabled && already_enabled {
-        return Err(DynamoDbError::ValidationException(
-            "TimeToLive is already enabled".to_owned(),
-        ));
-    }
-    if !input.time_to_live_specification.enabled && !already_enabled {
-        return Err(DynamoDbError::ValidationException(
-            "TimeToLive is already disabled".to_owned(),
-        ));
-    }
-
-    if !input.time_to_live_specification.enabled {
-        ctx.storage
-            .drop_ttl_index(&ctx.account_id, &input.table_name)
-            .await
-            .map_err(storage_to_dynamo)?;
+    match (
+        input.time_to_live_specification.enabled,
+        current.time_to_live_status,
+    ) {
+        (true, TimeToLiveStatus::Enabled) => {
+            return Err(DynamoDbError::ValidationException(
+                "TimeToLive is already enabled".to_owned(),
+            ));
+        }
+        (false, TimeToLiveStatus::Disabled) => {
+            return Err(DynamoDbError::ValidationException(
+                "TimeToLive is already disabled".to_owned(),
+            ));
+        }
+        (_, TimeToLiveStatus::Enabling | TimeToLiveStatus::Disabling) => {
+            return Err(DynamoDbError::ValidationException(
+                "TimeToLive is currently being modified".to_owned(),
+            ));
+        }
+        _ => {}
     }
 
     ctx.storage
-        .update_ttl(
+        .apply_ttl_update(
             &ctx.account_id,
             &input.table_name,
             &input.time_to_live_specification.attribute_name,
@@ -99,21 +102,6 @@ pub async fn handle_update_time_to_live(
         )
         .await
         .map_err(storage_to_dynamo)?;
-
-    if input.time_to_live_specification.enabled {
-        // Kick off backend-specific TTL lookup creation. If it fails, the TTL
-        // sweeper will retry on its next cycle.
-        let account_id = ctx.account_id.clone();
-        let table_name = input.table_name.clone();
-        let attr = input.time_to_live_specification.attribute_name.clone();
-        if let Err(e) = ctx
-            .storage
-            .create_ttl_index(&account_id, &table_name, &attr)
-            .await
-        {
-            tracing::warn!("TTL index creation deferred for {table_name}: {e}");
-        }
-    }
 
     let output = UpdateTimeToLiveOutput {
         time_to_live_specification: TimeToLiveSpecificationOutput {
@@ -158,6 +146,7 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
         StorageError::TableNotActive(name) => {
             DynamoDbError::ResourceInUseException(format!("Table {name} is not in ACTIVE state"))
         }
+        StorageError::Validation(message) => DynamoDbError::ValidationException(message),
         other => {
             tracing::error!(internal_error = %other, "storage internal error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
