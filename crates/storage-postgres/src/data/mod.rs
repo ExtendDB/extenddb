@@ -17,12 +17,22 @@ use extenddb_storage::error::StorageError;
 /// Table names are validated at the engine layer (alphanumeric + `_.-`),
 /// so this is safe for identifier construction.
 pub(crate) fn data_table_name(table_id: &str) -> String {
-    format!("\"_ddb_{table_id}\"")
+    format!("\"{}\"", physical_data_table_name(table_id))
 }
 
 /// SQL table name for a GSI/LSI data table.
 pub(crate) fn index_table_name(index_id: &str) -> String {
-    format!("\"_ddb_{index_id}\"")
+    format!("\"{}\"", physical_index_table_name(index_id))
+}
+
+/// Raw PostgreSQL table name for a Virtual `DynamoDB` table.
+pub(crate) fn physical_data_table_name(table_id: &str) -> String {
+    format!("_ddb_{table_id}")
+}
+
+/// Raw PostgreSQL table name for a GSI/LSI data table.
+pub(crate) fn physical_index_table_name(index_id: &str) -> String {
+    format!("_ddb_{index_id}")
 }
 
 /// Look up all RANGE key attribute definitions from the key schema (preserving order).

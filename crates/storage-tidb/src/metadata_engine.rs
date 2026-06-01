@@ -86,11 +86,14 @@ async fn show_create_table(
     Ok(create_table)
 }
 
-fn create_table_has_native_ttl(create_table: &str) -> bool {
-    create_table.contains(" TTL =") || create_table.contains("/*T![TTL] TTL =")
+pub(crate) fn create_table_has_native_ttl(create_table: &str) -> bool {
+    create_table.contains(" TTL =")
+        || create_table.contains(" TTL=")
+        || create_table.contains("/*T![TTL] TTL =")
+        || create_table.contains("/*T![TTL] TTL=")
 }
 
-fn create_table_has_disabled_ttl(create_table: &str) -> bool {
+pub(crate) fn create_table_has_disabled_ttl(create_table: &str) -> bool {
     create_table.contains("TTL_ENABLE = 'OFF'") || create_table.contains("TTL_ENABLE='OFF'")
 }
 
@@ -972,6 +975,11 @@ mod tests {
 
         assert!(create_table_has_native_ttl(create));
         assert!(create_table_has_disabled_ttl(create));
+
+        let real_tidb_comment = "/*T![ttl] TTL=`_edb_ttl_expires_at` + INTERVAL 0 SECOND */ \
+             /*T![ttl] TTL_ENABLE='ON' */"
+            .to_ascii_uppercase();
+        assert!(create_table_has_native_ttl(&real_tidb_comment));
     }
 
     #[test]

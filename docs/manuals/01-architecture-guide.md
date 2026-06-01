@@ -136,6 +136,7 @@ Thin binary that wires everything together:
 - Configuration loading (TOML + env vars)
 - Daemon lifecycle (bind socket → fork → syslog → serve)
 - Background tasks (log level polling, throttling polling, stream record cleanup, backend-specific TTL expiry, metrics persistence)
+- Backend diagnostics (`catalog-check`) through the selected storage backend's operations engine
 
 ## Request Lifecycle
 

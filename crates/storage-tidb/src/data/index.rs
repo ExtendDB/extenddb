@@ -495,7 +495,7 @@ fn native_index_prefix(index_id: &str) -> String {
     format!("edbidx_{suffix}")
 }
 
-fn native_index_name(index_id: &str) -> String {
+pub(crate) fn native_index_name(index_id: &str) -> String {
     let suffix: String = index_id
         .chars()
         .filter(char::is_ascii_alphanumeric)

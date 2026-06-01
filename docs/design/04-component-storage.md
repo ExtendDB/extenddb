@@ -313,6 +313,21 @@ Database initialization, migration, verification, and destruction:
 Used by CLI commands (`extenddb init`, `extenddb migrate`, `extenddb verify`,
 `extenddb destroy`).
 
+### OperationsEngine
+
+Backend CLI diagnostics and formatting helpers:
+- connection-string parsing and redaction
+- DDL identifier validation
+- expected catalog version reporting
+- backend-owned `catalog-check` integrity checks
+
+`extenddb catalog-check` is intentionally backend-owned. PostgreSQL checks
+physical `_ddb_<table_id>` data tables and companion index tables. TiDB checks
+physical `_ddb_<table_id>` data tables plus native generated-column secondary
+index artifacts, native TTL state, and stuck online-DDL catalog transitions.
+The binary only loads config, refuses to run while the server PID is alive, and
+prints the backend report.
+
 ## 4. Core Types Used by Storage Traits
 
 Storage trait methods use types defined in `extenddb_core::types`. These types represent data concepts in a

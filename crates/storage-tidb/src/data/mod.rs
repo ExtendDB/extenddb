@@ -260,6 +260,7 @@ mod transactions;
 mod tx_helpers;
 mod update_item;
 
+pub(crate) use index::{native_index_key_tuple_columns, native_index_name};
 pub(crate) use tx_helpers::{finalize_pending_stream_records_for_shard, next_stream_sequence};
 
 #[cfg(test)]

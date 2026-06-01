@@ -332,6 +332,26 @@ Defined in `crates/storage/src/bootstrapper.rs`. Database lifecycle:
 | `verify` | Check catalog version and migration status |
 | `catalog_version` | Return the current catalog version |
 
+### OperationsEngine
+
+Defined in `crates/storage/src/operations.rs`. Backend CLI operations and
+diagnostics:
+
+| Method | Purpose |
+|--------|---------|
+| `parse_connection_string` | Parse backend connection strings for CLI display |
+| `redact_connection_string` | Hide credentials in CLI output |
+| `validate_identifier` | Validate backend DDL identifiers |
+| `catalog_version` | Return the compiled backend catalog version |
+| `catalog_check` | Run backend-owned catalog/data integrity checks |
+
+`catalog_check` must live in the backend, not in the binary crate. PostgreSQL
+has physical data and companion index tables. TiDB has one physical data table
+per DynamoDB table and uses native generated columns, native secondary indexes,
+native TTL, and online DDL transitions. A new backend should report its own
+physical invariants and only implement `--fix` actions that are safe without a
+running server.
+
 ### CredentialStore
 
 Defined in `crates/auth/src/lib.rs`. Used by SigV4 verification:
