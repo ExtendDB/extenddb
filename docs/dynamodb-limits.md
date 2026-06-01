@@ -15,12 +15,12 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 
 | Limit | DynamoDB Value | Status | Notes |
 |-------|---------------|--------|-------|
-| Per-table RCU (provisioned) | 40,000 | Enforced | `LimitsConfig::per_table_max_rcu`, configurable |
-| Per-table WCU (provisioned) | 40,000 | Enforced | `LimitsConfig::per_table_max_wcu`, configurable |
-| Per-table read request units (on-demand) | 40,000 | N/A | ExtendDB does not throttle on-demand reads |
-| Per-table write request units (on-demand) | 40,000 | N/A | ExtendDB does not throttle on-demand writes |
-| Per-account RCU (provisioned) | 80,000 | Enforced | `LimitsConfig::per_account_max_rcu`, configurable |
-| Per-account WCU (provisioned) | 80,000 | Enforced | `LimitsConfig::per_account_max_wcu`, configurable |
+| Per-table RCU (provisioned) | 40,000 | Backend-specific | PostgreSQL frontend token buckets can enforce this in single-frontend tests. TiDB should use native Resource Control/resource groups. |
+| Per-table WCU (provisioned) | 40,000 | Backend-specific | PostgreSQL frontend token buckets can enforce this in single-frontend tests. TiDB should use native Resource Control/resource groups. |
+| Per-table read request units (on-demand) | 40,000 | Backend-specific | PostgreSQL frontend token buckets use local on-demand ceilings when enabled. TiDB delegates capacity to native Resource Control. |
+| Per-table write request units (on-demand) | 40,000 | Backend-specific | PostgreSQL frontend token buckets use local on-demand ceilings when enabled. TiDB delegates capacity to native Resource Control. |
+| Per-account RCU (provisioned) | 80,000 | Backend-specific | PostgreSQL frontend token buckets can enforce this per process. TiDB should use native Resource Control/resource groups for distributed enforcement. |
+| Per-account WCU (provisioned) | 80,000 | Backend-specific | PostgreSQL frontend token buckets can enforce this per process. TiDB should use native Resource Control/resource groups for distributed enforcement. |
 | Minimum throughput per table/GSI | 1 RCU / 1 WCU | Enforced | `validate_provisioned_throughput` rejects < 1 |
 | Provisioned capacity decrease limit | 27 per day (4 + 1/hour) | Not enforced | No decrease tracking implemented |
 | Reserved capacity per account | 1,000,000 units | N/A | ExtendDB has no reserved capacity concept |

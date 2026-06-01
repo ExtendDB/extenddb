@@ -1,14 +1,16 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Token bucket rate limiter for `DynamoDB` provisioned throughput enforcement.
+//! Process-local token bucket rate limiter for optional `DynamoDB`
+//! provisioned-throughput emulation.
 //!
 //! Each bucket refills at a steady rate (the provisioned capacity units per
 //! second) and allows bursting up to 300 seconds of accumulated capacity,
 //! matching real `DynamoDB` behavior.
 //!
 //! Buckets are purely in-memory operational state — not cached database state.
-//! This is compliant with the no-caching rule (see P51 discussion).
+//! Backends that expose native distributed capacity control, such as TiDB,
+//! disable this frontend limiter so quotas are enforced by the storage cluster.
 
 use std::collections::HashMap;
 use std::sync::RwLock;

@@ -65,6 +65,7 @@ These settings require a server restart to take effect.
 | `bind_addr` | `127.0.0.1` | Network interface to bind |
 | `port` | `8000` | HTTP port |
 | `region` | `us-east-1` | AWS region for ARN generation |
+| `throttling_enabled` | unset / `false` | PostgreSQL frontend token buckets for local capacity fidelity. Ignored by TiDB; use TiDB Resource Control/resource groups for distributed capacity governance. |
 
 #### [storage]
 
@@ -89,6 +90,16 @@ Available when the binary is built with the `tidb` feature.
 | `connection_string` | `mysql://extenddb:extenddb-local-dev@localhost:4000/extenddb_catalog` | Catalog database connection string |
 | `pool_size` | `20` | Maximum connections for strong and default-read data pools (minimum: 10) |
 | `catalog_pool_size` | (= `pool_size`) | Maximum connections for catalog metadata, control-plane, management, and authz pools (minimum: 10) |
+
+TiDB capacity governance is configured in TiDB, not in ExtendDB. A typical
+deployment creates a TiDB resource group and binds the ExtendDB SQL user to it:
+
+```sql
+CREATE RESOURCE GROUP IF NOT EXISTS extenddb_api RU_PER_SEC = 500 BURSTABLE;
+ALTER USER 'extenddb'@'%' RESOURCE GROUP extenddb_api;
+```
+
+Existing SQL sessions keep their previous resource group until they reconnect.
 
 #### [storage.tidb.backup]
 

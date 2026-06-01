@@ -432,7 +432,7 @@ Transactional write: ceil(item_size / 1024) * 2 WCU
 
 ### 7.3 Throughput Enforcement
 
-Throughput enforcement (token bucket per partition and per table) is a runtime stateful concern, not pure business logic. It lives in the `server` crate's `middleware/capacity.rs`, not in `core`. See the server component design (06-component-server.md §10) for the `ThroughputTracker` and `TokenBucket` types.
+Throughput enforcement is a runtime concern, not pure business logic. PostgreSQL can use server-side token buckets for single-frontend fidelity tests, while TiDB uses native Resource Control/resource groups for distributed enforcement. See the server component design for the backend-aware request path.
 
 `core::capacity` only contains the pure math: `calculator.rs` (item size → RCU/WCU).
 

@@ -110,6 +110,9 @@ copy items into catalog backup tables for TiDB.
 TiDB table-level point-in-time restore is not emulated by ExtendDB frontends:
 BR PITR remains a cluster recovery path, while TiDB historical reads are
 read-only for a live target table.
+TiDB capacity control is also storage-native: operators should use TiDB
+Resource Control/resource groups instead of ExtendDB's process-local token
+buckets, so a multi-frontend deployment has one cluster-owned quota.
 
 ### auth
 

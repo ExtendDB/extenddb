@@ -256,14 +256,16 @@ The PostgreSQL backend can apply GSI updates asynchronously with a configurable 
 
 ### Throttling
 
-extenddb enforces provisioned throughput limits using a token bucket per table and partition, matching DynamoDB's burst and refill behavior. Throttling is enabled by default.
+PostgreSQL deployments can enable ExtendDB's frontend token buckets for provisioned throughput experiments. The buckets are process-local, so they are disabled by default and are not used by TiDB deployments.
+
+TiDB deployments should use TiDB Resource Control and resource groups for distributed capacity governance. That keeps flow control and scheduling inside TiDB, where all ExtendDB frontends share one cluster-owned quota.
 
 ```bash
-# Disable throttling (useful for bulk loading)
+# PostgreSQL only: disable frontend throttling
 ./target/release/extenddb settings --config extenddb.toml set \
     throttling_enabled false
 
-# Re-enable throttling
+# PostgreSQL only: enable frontend throttling for local fidelity tests
 ./target/release/extenddb settings --config extenddb.toml set \
     throttling_enabled true
 ```

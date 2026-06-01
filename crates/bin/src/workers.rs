@@ -92,23 +92,35 @@ pub(crate) async fn poll_log_level(
     }
 }
 
-/// Poll the `throttling_enabled` runtime setting and update the
-/// `ThrottleManager` when it changes. This allows enabling/disabling
-/// throttling at runtime via `extenddb settings set throttling_enabled true`.
+/// Poll the `throttling_enabled` runtime setting and update the frontend
+/// `ThrottleManager` when it changes. Backends with native distributed
+/// capacity control keep the frontend limiter disabled even if the setting is
+/// true.
+pub(crate) fn effective_frontend_throttling(
+    requested_enabled: bool,
+    backend_native_capacity_control: bool,
+) -> bool {
+    requested_enabled && !backend_native_capacity_control
+}
+
 pub(crate) async fn poll_throttling_enabled(
     store: Arc<dyn SettingsStore>,
     throttle: Arc<ThrottleManager>,
     config_enabled: bool,
+    initial_requested_enabled: bool,
+    initial_effective_enabled: bool,
+    backend_native_capacity_control: bool,
 ) {
     use std::time::Duration;
 
     const POLL_INTERVAL: Duration = Duration::from_secs(30);
-    let mut current = config_enabled;
+    let mut current_effective = initial_effective_enabled;
+    let mut current_requested = initial_requested_enabled;
 
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
 
-        let new_enabled = match store.get_setting("throttling_enabled").await {
+        let requested_enabled = match store.get_setting("throttling_enabled").await {
             Ok(Some(v)) => v == "true",
             Ok(None) => config_enabled,
             Err(_) => {
@@ -116,15 +128,31 @@ pub(crate) async fn poll_throttling_enabled(
                 continue;
             }
         };
+        let new_effective_enabled =
+            effective_frontend_throttling(requested_enabled, backend_native_capacity_control);
 
-        if new_enabled != current {
+        if backend_native_capacity_control
+            && requested_enabled
+            && current_requested != requested_enabled
+        {
+            tracing::warn!(
+                "Ignoring throttling_enabled=true because the selected storage backend uses native distributed capacity control"
+            );
+        }
+
+        if new_effective_enabled != current_effective {
             tracing::warn!(
                 "Throttling {} (from settings table)",
-                if new_enabled { "enabled" } else { "disabled" }
+                if new_effective_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
             );
-            throttle.set_enabled(new_enabled);
-            current = new_enabled;
+            throttle.set_enabled(new_effective_enabled);
+            current_effective = new_effective_enabled;
         }
+        current_requested = requested_enabled;
     }
 }
 
@@ -252,5 +280,21 @@ pub(crate) async fn login_attempt_cleanup_worker(store: Arc<dyn RateLimitStore>)
     loop {
         tokio::time::sleep(CLEANUP_INTERVAL).await;
         store.cleanup_old_attempts(MAX_AGE_SECONDS).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_frontend_throttling;
+
+    #[test]
+    fn native_capacity_control_disables_frontend_throttling() {
+        assert!(!effective_frontend_throttling(true, true));
+    }
+
+    #[test]
+    fn process_local_capacity_control_honors_requested_setting() {
+        assert!(effective_frontend_throttling(true, false));
+        assert!(!effective_frontend_throttling(false, false));
     }
 }

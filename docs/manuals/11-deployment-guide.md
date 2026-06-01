@@ -175,6 +175,7 @@ Requirements in the air-gapped environment:
 - [ ] Size backend connection limits for the active backend's pools: PostgreSQL uses `pool_size + catalog_pool_size + workers`; TiDB uses strong data, default-read data, engine catalog, and catalog-store/auth pools
 - [ ] Enable backend transport encryption
 - [ ] Set up automated backups with backend-native tools (PostgreSQL pg_dump/WAL or TiDB BR)
+- [ ] For TiDB, use TiDB Resource Control/resource groups for distributed capacity governance instead of `throttling_enabled`
 - [ ] Monitor backend disk usage, connection count, replication health, and query performance
 
 ### Monitoring
@@ -230,6 +231,7 @@ Multiple extenddb instances can connect to the same catalog. However:
 - This means multiple instances see consistent data without cache invalidation
 - The storage backend's connection pool and transaction model handle concurrent access
 - Ensure each instance's backend-specific pool footprint fits the backend's connection limits
+- TiDB capacity control is cluster-native. Process-local token buckets are disabled for TiDB because each frontend would otherwise admit its own burst.
 
 ## Performance Tuning
 

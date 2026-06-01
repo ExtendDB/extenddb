@@ -177,6 +177,12 @@ extenddb calculates consumed capacity matching real DynamoDB:
 
 Item size includes attribute names and values, matching DynamoDB's size calculation rules.
 
+Capacity enforcement is backend-aware. PostgreSQL can use ExtendDB's
+process-local token buckets for local fidelity tests. TiDB disables those
+frontend buckets and relies on TiDB Resource Control/resource groups for
+distributed flow control and scheduling, so multiple ExtendDB frontends share
+one storage-owned quota instead of each admitting its own local burst.
+
 ## Caching Design
 
 extenddb caches a small set of operational settings in memory to avoid per-request database queries on hot paths. Catalog state (table metadata, auth policies, tags, GSI definitions) is never cached.
@@ -187,7 +193,7 @@ extenddb caches a small set of operational settings in memory to avoid per-reque
 |---------|-----------|---------|---------------|
 | `encryption_key` | `Arc<str>` loaded at startup | Never (immutable after `extenddb init`) | Decryption key for access key secrets; generated once, never changes |
 | `log_level` / `log_destination` | Tracing filter reload | Background poller every 30s | Observability tuning; stale value only delays log level changes |
-| `throttling_enabled` | `AtomicBool` | Background poller every 30s | Capacity management toggle; briefly-stale is safe |
+| `throttling_enabled` | `AtomicBool` | Background poller every 30s | PostgreSQL frontend capacity toggle; ignored by TiDB because capacity control is storage-native |
 
 All cached values are operational tuning knobs where a briefly-stale value does not affect correctness.
 

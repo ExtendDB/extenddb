@@ -22,7 +22,7 @@ crates/server/src/
 │   ├── request_id.rs     # Assign x-amzn-RequestId
 │   ├── logging.rs        # Request/response logging
 │   ├── auth.rs           # Authentication + authorization layer
-│   ├── capacity.rs       # Capacity tracking + throughput enforcement (ThroughputTracker, TokenBucket)
+│   ├── throttle_helpers.rs # Backend-aware frontend capacity tracking
 │   ├── rate_limit.rs     # Global and per-table rate limiting
 │   ├── metrics.rs        # Per-operation metrics collection
 │   ├── request_size.rs   # Request body size limit enforcement
@@ -537,7 +537,12 @@ impl RateLimiter {
 
 ## 11. Throughput Tracking
 
-Throughput tracking enforces DynamoDB's per-partition and per-table capacity limits (REQ-CAP-004, REQ-CAP-005). This is a runtime stateful component — it lives in the server crate, not in `core` (which only contains the pure-math RCU/WCU calculator).
+Throughput tracking is backend-aware. The server records consumed capacity for
+all backends. PostgreSQL deployments can additionally use process-local token
+buckets for DynamoDB-like throttling in a single-frontend test environment.
+TiDB deployments disable those frontend buckets and use TiDB Resource
+Control/resource groups, because capacity enforcement must be cluster-owned when
+multiple ExtendDB frontends share one TiDB backend.
 
 ```rust
 use std::sync::Mutex;
@@ -564,7 +569,12 @@ struct TokenBucketState {
 }
 ```
 
-The handler calls `core::capacity::calculator` to compute consumed RCU/WCU, then calls `ThroughputTracker::consume()` to deduct tokens. If insufficient tokens, returns `ProvisionedThroughputExceededException`.
+The handler computes consumed RCU/WCU from the operation result. When the
+selected backend allows frontend throttling and the `throttling_enabled` runtime
+setting is enabled, the handler deducts tokens and returns
+`ProvisionedThroughputExceededException` on exhaustion. When the backend declares
+native capacity control, the same consumed-capacity metrics are recorded but
+admission is left to the storage cluster.
 
 ---
 

@@ -369,13 +369,26 @@ async fn serve_inner(
         limits
     });
 
+    let backend_native_capacity_control = app_config
+        .storage
+        .as_trait()
+        .uses_backend_native_capacity_control();
     let config_throttling = app_config.server.throttling_enabled.unwrap_or(false);
-    let initial_throttling = catalog_store
+    let requested_throttling = catalog_store
         .get_setting("throttling_enabled")
         .await
         .ok()
         .flatten()
         .map_or(config_throttling, |v| v == "true");
+    if backend_native_capacity_control && requested_throttling {
+        tracing::warn!(
+            "Ignoring throttling_enabled=true because backend '{backend}' uses native distributed capacity control"
+        );
+    }
+    let initial_throttling = workers::effective_frontend_throttling(
+        requested_throttling,
+        backend_native_capacity_control,
+    );
 
     let throttle = Arc::new(extenddb_core::throttle::ThrottleManager::new(
         limits.per_account_max_rcu,
@@ -420,6 +433,9 @@ async fn serve_inner(
         catalog_store.clone(),
         throttle,
         config_throttling,
+        requested_throttling,
+        initial_throttling,
+        backend_native_capacity_control,
     ));
     // Spawn background tasks for metrics pruning and flushing.
     tokio::spawn(workers::metrics_prune_worker(metrics.clone()));

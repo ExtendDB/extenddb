@@ -110,7 +110,7 @@ bind_addr = "{bind_addr}"
 # port = 8000                    # HTTP port
 # region = "us-east-1"           # AWS region for ARN generation
 # run_dir = "{run_dir}"          # Directory for PID file
-# throttling_enabled = false     # Enable provisioned throughput throttling
+# throttling_enabled = false     # PostgreSQL frontend throttling only; TiDB uses native Resource Control
 
 [server.tls]
 # TLS is mandatory. The server refuses to start with enabled = false.

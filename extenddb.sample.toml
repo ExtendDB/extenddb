@@ -96,7 +96,8 @@
 # When enabled, tables with provisioned capacity are rate-limited to their
 # configured RCU/WCU. On-demand tables use default ceilings (12,000 RCU /
 # 4,000 WCU). Account-level aggregate limits also apply.
-# Disabled by default — enable for production-like behavior.
+# Disabled by default. TiDB builds ignore this process-local limiter and should
+# use TiDB Resource Control/resource groups for distributed capacity governance.
 # throttling_enabled = false
 
 [server.tls]

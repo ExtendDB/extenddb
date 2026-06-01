@@ -213,6 +213,10 @@ impl extenddb_storage::config::StorageConfig for TidbStorageConfig {
         })
     }
 
+    fn uses_backend_native_capacity_control(&self) -> bool {
+        true
+    }
+
     fn clone_box(&self) -> Box<dyn extenddb_storage::config::StorageConfig> {
         Box::new(self.clone())
     }
@@ -220,7 +224,10 @@ impl extenddb_storage::config::StorageConfig for TidbStorageConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{connection_url, parse_connection_string, redact_connection_string};
+    use super::{
+        TidbStorageConfig, connection_url, parse_connection_string, redact_connection_string,
+    };
+    use extenddb_storage::config::StorageConfig;
 
     #[test]
     fn parses_percent_encoded_credentials() {
@@ -253,5 +260,10 @@ mod tests {
     fn redaction_uses_the_last_userinfo_separator() {
         let redacted = redact_connection_string("mysql://extenddb:p@ss@localhost:4000/db");
         assert_eq!(redacted, "mysql://extenddb:***@localhost:4000/db");
+    }
+
+    #[test]
+    fn tidb_uses_backend_native_capacity_control() {
+        assert!(TidbStorageConfig::default().uses_backend_native_capacity_control());
     }
 }

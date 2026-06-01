@@ -64,8 +64,9 @@ pub struct ServerConfig {
     /// TLS configuration. When enabled, the server serves HTTPS.
     #[serde(default)]
     pub tls: TlsConfig,
-    /// Enable provisioned throughput throttling via token buckets.
-    /// When `None` or `false`, all requests are allowed regardless of capacity.
+    /// Enable frontend provisioned-throughput throttling via token buckets.
+    /// Backends with native distributed capacity control, such as TiDB, ignore
+    /// this process-local limiter.
     pub throttling_enabled: Option<bool>,
 }
 
@@ -190,6 +191,10 @@ impl extenddb_storage::config::StorageConfig for RuntimeStorageConfig<'_> {
         self.base.native_backup_config()
     }
 
+    fn uses_backend_native_capacity_control(&self) -> bool {
+        self.base.uses_backend_native_capacity_control()
+    }
+
     fn clone_box(&self) -> Box<dyn extenddb_storage::config::StorageConfig> {
         Box::new(OwnedRuntimeStorageConfig {
             base: self.base.clone_box(),
@@ -217,6 +222,10 @@ impl extenddb_storage::config::StorageConfig for OwnedRuntimeStorageConfig {
 
     fn native_backup_config(&self) -> Option<extenddb_storage::config::NativeBackupConfig> {
         self.base.native_backup_config()
+    }
+
+    fn uses_backend_native_capacity_control(&self) -> bool {
+        self.base.uses_backend_native_capacity_control()
     }
 
     fn clone_box(&self) -> Box<dyn extenddb_storage::config::StorageConfig> {

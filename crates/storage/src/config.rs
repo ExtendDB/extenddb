@@ -54,6 +54,17 @@ pub trait StorageConfig: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Whether this backend should use its own cluster-native capacity control
+    /// instead of the frontend process-local token bucket.
+    ///
+    /// A backend returns `true` when capacity should be enforced by the storage
+    /// cluster so multiple ExtendDB frontends observe one shared quota and
+    /// scheduler. The server still records consumed-capacity metrics, but it
+    /// does not reject requests from its in-memory token buckets.
+    fn uses_backend_native_capacity_control(&self) -> bool {
+        false
+    }
+
     /// Clone this config into a boxed trait object.
     fn clone_box(&self) -> Box<dyn StorageConfig>;
 }

@@ -174,9 +174,11 @@ The management web console (`/console/*`) implements:
 
 ## Provisioned Throughput Throttling
 
-extenddb includes a token bucket rate limiter for provisioned throughput enforcement. When `server.throttling_enabled = true` in `extenddb.toml`, read and write requests are throttled against the table's provisioned RCU/WCU limits. Requests that exceed the limit receive `ProvisionedThroughputExceededException` (HTTP 400), matching real DynamoDB behavior.
+extenddb includes a token bucket rate limiter for PostgreSQL-backed provisioned throughput experiments. When `server.throttling_enabled = true` in `extenddb.toml`, read and write requests are throttled against the table's provisioned RCU/WCU limits. Requests that exceed the limit receive `ProvisionedThroughputExceededException` (HTTP 400), matching real DynamoDB behavior.
 
 Token buckets are purely in-memory operational state — not cached database state. They are recreated on server restart.
+
+TiDB-backed deployments do not use these process-local token buckets. A multi-frontend TiDB deployment needs one cluster-owned quota and scheduler, so capacity governance belongs in TiDB Resource Control/resource groups.
 
 ## Input Validation
 

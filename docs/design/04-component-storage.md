@@ -230,6 +230,13 @@ frontend item replay path: TiDB BR PITR is a cluster recovery primitive, TiDB
 read-only for the live target-table shape. A future TiDB implementation should
 be added only if TiDB exposes a native set-based online restore into a new table.
 
+Backends also declare whether capacity control is frontend-local or storage
+native. PostgreSQL can use ExtendDB's process-local token buckets when operators
+want DynamoDB-like throttling in a single-frontend test environment. TiDB marks
+capacity control as backend-native so the server does not enforce local token
+buckets; TiDB Resource Control/resource groups own distributed flow control and
+scheduling across all frontends.
+
 ```rust
 pub trait WorkerStore: Send + Sync {
     fn process_control_plane_transitions(

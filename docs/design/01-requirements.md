@@ -396,12 +396,12 @@ All limits must be enforced by default with DynamoDB-compatible values. All limi
 - REQ-CAP-001: Support both `PROVISIONED` and `PAY_PER_REQUEST` billing modes
 - REQ-CAP-002: Calculate Read Capacity Units: 1 RCU = one strongly consistent read up to 4 KB; 0.5 RCU for eventually consistent; 2 RCU for transactional
 - REQ-CAP-003: Calculate Write Capacity Units: 1 WCU = one write up to 1 KB; 2 WCU for transactional
-- REQ-CAP-004: Enforce per-partition throughput limits (default: 3,000 RCU/s, 1,000 WCU/s) using token bucket / leaky bucket
-- REQ-CAP-005: Enforce per-table provisioned throughput limits for PROVISIONED billing mode
+- REQ-CAP-004: Calculate per-partition throughput usage (default DynamoDB reference: 3,000 RCU/s, 1,000 WCU/s) and enforce it through the selected backend's capacity-control model
+- REQ-CAP-005: Enforce per-table provisioned throughput limits for PROVISIONED billing mode when the selected backend exposes a distributed capacity-control mechanism; PostgreSQL's frontend token bucket is single-frontend only, while TiDB uses native Resource Control/resource groups
 - REQ-CAP-006: Return `ConsumedCapacity` in responses when `ReturnConsumedCapacity` is TOTAL or INDEXES
 - REQ-CAP-007: Return per-table and per-index capacity breakdown when `ReturnConsumedCapacity` is INDEXES
 - REQ-CAP-008: Return `ProvisionedThroughputExceededException` when throughput limits are exceeded
-- REQ-CAP-009: Throughput tracking must be per-instance (stateless — no cross-instance coordination required)
+- REQ-CAP-009: Capacity enforcement must not require cross-frontend coordination in ExtendDB; distributed backends such as TiDB must use backend-native capacity control
 
 ## 7. Catalog & Data Separation Requirements
 

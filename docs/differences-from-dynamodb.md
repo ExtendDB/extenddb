@@ -69,9 +69,9 @@ adaptation when switching between ExtendDB and the real service.
 
 | Area | DynamoDB | ExtendDB |
 |------|----------|------|
-| Provisioned throughput | Token bucket per table/partition | Token bucket per table/partition, matching DynamoDB's burst and refill behavior |
-| On-demand capacity | Automatic scaling | Fixed initial burst capacity (4000 WCU / 12000 RCU), no auto-scaling |
-| Throttling | Always on; throttles requests that exceed provisioned/burst capacity. No setting to disable | Configurable via `throttling_enabled` runtime setting (default: `true`) |
+| Provisioned throughput | Token bucket per table/partition | PostgreSQL can use frontend token buckets for local fidelity tests. TiDB uses TiDB Resource Control/resource groups instead of process-local buckets. |
+| On-demand capacity | Automatic scaling | PostgreSQL token buckets use fixed initial burst capacity when enabled. TiDB delegates cluster capacity and scheduling to TiDB. |
+| Throttling | Always on; throttles requests that exceed provisioned/burst capacity. No setting to disable | PostgreSQL frontend throttling is configurable via `throttling_enabled` and disabled by default. TiDB ignores frontend throttling and should use TiDB-native resource control. |
 
 ## Operations Not Implemented
 
@@ -92,7 +92,7 @@ ExtendDB exposes runtime settings that have no DynamoDB equivalent:
 |---------|---------|-------------|
 | `control_plane_delay_seconds` | 5 | PostgreSQL simulated delay for table create/delete transitions. TiDB ignores this setting and lets TiDB native online DDL schedule table/index changes. UpdateTable GSI/stream transitions report UPDATING until the backend reconciler completes, while table data-plane reads and writes remain available. |
 | `gsi_propagation_delay_ms` | 10 | PostgreSQL backend default GSI propagation delay (milliseconds). TiDB ignores this setting because GSI writes are transactional. |
-| `throttling_enabled` | `true` | Enable provisioned capacity throttling (token bucket per table/partition) |
+| `throttling_enabled` | `false` | PostgreSQL-only frontend token bucket. TiDB ignores it because per-frontend buckets are not distributed; use TiDB Resource Control/resource groups for TiDB. |
 | `enable_multipart_keys` | `false` | Enable multi-part base table key extension |
 | `log_level` | `info` | Runtime log level (trace, debug, info, warn, error) |
 | `sqlx_log_level` | `warn` | Separate log level for sqlx query traces |
