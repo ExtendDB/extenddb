@@ -13,6 +13,7 @@ mod authorization_store;
 mod backup_engine;
 mod bootstrapper;
 mod catalog_store;
+mod cluster_topology;
 pub mod config;
 mod create_table;
 mod credential_store;
@@ -116,7 +117,9 @@ use extenddb_core::version::CatalogVersion;
 use extenddb_storage::error::StorageError;
 use sqlx::MySqlPool;
 
-use crate::tidb_util::{tidb_default_read_pool_options, tidb_pool_options};
+use crate::tidb_util::{
+    is_table_not_found_tidb_sqlx_error, tidb_default_read_pool_options, tidb_pool_options,
+};
 
 /// Expected catalog version — compiled into the binary.
 ///
@@ -179,10 +182,10 @@ impl TidbEngine {
         // Keep a couple of warm connections to avoid first-request latency.
         let catalog_min_conns = catalog_pool_size.min(2);
         let data_min_conns = data_pool_size.min(2);
+        let catalog_connection_string =
+            crate::config::sqlx_connection_string(&config.connection_string);
         let pool = tidb_pool_options(catalog_pool_size, catalog_min_conns)
-            .connect(&crate::config::sqlx_connection_string(
-                &config.connection_string,
-            ))
+            .connect(&catalog_connection_string)
             .await
             .map_err(|e| StorageError::Connection(e.to_string()))?;
 
@@ -198,7 +201,15 @@ impl TidbEngine {
             Ok(Some((data_conn,))) if !data_conn.is_empty() => {
                 crate::config::sqlx_connection_string(&data_conn)
             }
-            _ => crate::config::sqlx_connection_string(&config.connection_string),
+            Ok(_) => catalog_connection_string.clone(),
+            Err(error) if is_table_not_found_tidb_sqlx_error(&error) => {
+                catalog_connection_string.clone()
+            }
+            Err(error) => {
+                return Err(StorageError::Connection(format!(
+                    "read data database connection from catalog settings: {error}"
+                )));
+            }
         };
         let data_pool = tidb_pool_options(data_pool_size, data_min_conns)
             .connect(&data_connection_string)
@@ -206,6 +217,13 @@ impl TidbEngine {
             .map_err(|e| {
                 StorageError::Connection(format!("data database connection failed: {e}"))
             })?;
+        cluster_topology::validate_catalog_data_same_cluster(
+            &pool,
+            &catalog_connection_string,
+            &data_pool,
+            &data_connection_string,
+        )
+        .await?;
         let data_default_read_pool = tidb_default_read_pool_options(data_pool_size, data_min_conns)
             .connect(&data_connection_string)
             .await

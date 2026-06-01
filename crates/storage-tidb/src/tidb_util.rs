@@ -225,6 +225,15 @@ fn is_table_exists_tidb_sqlx_error(error: &sqlx::Error) -> bool {
         || is_table_exists_tidb_error_text(db_error.message())
 }
 
+pub(crate) fn is_table_not_found_tidb_sqlx_error(error: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(db_error) = error else {
+        return false;
+    };
+
+    db_error.code().is_some_and(|code| code.as_ref() == "42S02")
+        || is_table_not_found_tidb_error_text(db_error.message())
+}
+
 pub(crate) fn is_table_not_found_tidb_storage_error(error: &StorageError) -> bool {
     match error {
         StorageError::Internal(message) => is_table_not_found_tidb_error_text(message),
@@ -299,11 +308,53 @@ pub(crate) fn is_fk_violation(e: &sqlx::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use extenddb_storage::error::StorageError;
+    use sqlx::error::DatabaseError;
 
     use super::{
         is_retryable_tidb_storage_error, is_table_exists_tidb_error_text,
-        is_table_not_found_tidb_storage_error, retry_tidb_idempotent_operation,
+        is_table_not_found_tidb_sqlx_error, is_table_not_found_tidb_storage_error,
+        retry_tidb_idempotent_operation,
     };
+
+    #[derive(Debug)]
+    struct StubDbError {
+        code: Option<&'static str>,
+        message: &'static str,
+    }
+
+    impl std::fmt::Display for StubDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.message)
+        }
+    }
+
+    impl std::error::Error for StubDbError {}
+
+    impl DatabaseError for StubDbError {
+        fn message(&self) -> &str {
+            self.message
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            self.code.map(std::borrow::Cow::Borrowed)
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+    }
 
     #[test]
     fn retry_classifier_accepts_tidb_online_ddl_conflicts() {
@@ -366,6 +417,16 @@ mod tests {
         assert!(!is_table_not_found_tidb_storage_error(
             &StorageError::Internal("Unknown column 'pk' in 'field list'".to_owned())
         ));
+    }
+
+    #[test]
+    fn table_not_found_sqlx_classifier_accepts_tidb_error_code() {
+        let error = sqlx::Error::Database(Box::new(StubDbError {
+            code: Some("42S02"),
+            message: "Table 'extenddb_catalog.settings' doesn't exist",
+        }));
+
+        assert!(is_table_not_found_tidb_sqlx_error(&error));
     }
 
     #[tokio::test]

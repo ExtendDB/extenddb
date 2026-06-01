@@ -576,8 +576,14 @@ keeps catalog metadata, catalog-store/auth, and data pools. TiDB keeps separate
 engine-catalog, catalog-store/auth, strong-data, and default-read data pools,
 but the catalog and data databases must be in the same TiDB cluster. TiDB backup
 metadata, BR `--backupts`, snapshot reads, online DDL, and native TTL all rely
-on one PD-owned global TSO timeline. The strong-data pool uses leader reads for writes and
-`ConsistentRead=true`; the default-read pool sets
+on one PD-owned global TSO timeline. TiDB startup validates the invariant by
+comparing the catalog and data pools' native
+`information_schema.cluster_info` topology fingerprints. If a TiDB edition does
+not expose that topology table, the backend accepts only the same SQL endpoint
+and user for both databases; different SQL endpoints or users must expose
+native topology metadata so ExtendDB can prove they share one cluster. The
+strong-data pool uses leader reads for writes and `ConsistentRead=true`; the
+default-read pool sets
 `tidb_replica_read = 'closest-adaptive'` for DynamoDB reads that did not request
 `ConsistentRead=true`.
 

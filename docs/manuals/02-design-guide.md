@@ -11,7 +11,7 @@ extenddb uses a catalog/data database topology per deployment:
 - **Catalog database** (e.g., `extenddb_catalog`): All metadata — table definitions, indexes, accounts, IAM entities, settings, stream metadata, and schema history.
 - **Data database** (e.g., `extenddb_catalog_data`): User item data plus backend-specific secondary-index state. PostgreSQL stores base and secondary-index data in physical companion tables. TiDB stores item rows once and uses generated columns plus native secondary indexes.
 
-The data database connection string is stored in the catalog's `settings` table under the key `data_database_connection_string`. PostgreSQL deployments may place the catalog and data databases on different PostgreSQL instances. TiDB deployments must keep both databases in the same TiDB cluster so snapshot timestamps, online DDL, native TTL, and BR backup/restore all refer to one global timeline.
+The data database connection string is stored in the catalog's `settings` table under the key `data_database_connection_string`. PostgreSQL deployments may place the catalog and data databases on different PostgreSQL instances. TiDB deployments must keep both databases in the same TiDB cluster so snapshot timestamps, online DDL, native TTL, and BR backup/restore all refer to one global timeline. At startup, the TiDB backend compares `information_schema.cluster_info` from the catalog and data pools when TiDB exposes that native topology table. On TiDB editions that hide cluster topology metadata, ExtendDB accepts the split only when both databases use the same SQL endpoint and user; separate endpoints or users require visible TiDB topology metadata so the backend can prove they belong to one cluster.
 
 ### Catalog Tables
 

@@ -192,7 +192,7 @@ pool_size = 20
 catalog_pool_size = 20
 ```
 
-For TiDB, topology is owned by TiDB itself: SQL nodes, PD, TiKV region leaders, follower reads, online DDL, TTL, and BR are native TiDB capabilities. ExtendDB keeps independently sized engine-catalog, catalog-store/auth, strong-data, and default-read pools, but it does not configure per-replica endpoints or implement storage leadership.
+For TiDB, topology is owned by TiDB itself: SQL nodes, PD, TiKV region leaders, follower reads, online DDL, TTL, and BR are native TiDB capabilities. ExtendDB keeps independently sized engine-catalog, catalog-store/auth, strong-data, and default-read pools, but it does not configure per-replica endpoints or implement storage leadership. The catalog and data pools must resolve to the same TiDB cluster; startup compares TiDB's native `information_schema.cluster_info` topology view when available, and falls back to requiring one shared SQL endpoint and user only on TiDB editions that hide cluster topology metadata.
 
 For PostgreSQL, the current configuration is a single connection string. Any future PostgreSQL topology configuration must be explicit in config and implemented in `storage-postgres`; docs must not imply hidden default-read routing.
 

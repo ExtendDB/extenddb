@@ -171,7 +171,7 @@ extenddb uses a catalog/data storage architecture:
 - **Catalog database** (e.g., `extenddb_catalog`): Stores table metadata, account/user/group/role/policy definitions, access keys, settings, stream metadata, and metrics. Shared across all accounts.
 - **Data database** (e.g., `extenddb_catalog_data`): Stores user items, backend-specific secondary-index state, and stream records. PostgreSQL uses companion data/index tables. TiDB stores item rows once and uses generated columns plus native secondary indexes.
 
-The backend-specific catalog version is stored in the `settings` table as `catalog_version` and checked at startup. Version mismatches prevent the server from starting until migrations are run. TiDB also records the data database connection string in the catalog, and both TiDB databases must remain in the same TiDB cluster so native timestamps, online DDL, TTL, and BR operate on one global timeline.
+The backend-specific catalog version is stored in the `settings` table as `catalog_version` and checked at startup. Version mismatches prevent the server from starting until migrations are run. TiDB also records the data database connection string in the catalog, and both TiDB databases must remain in the same TiDB cluster so native timestamps, online DDL, TTL, and BR operate on one global timeline. Startup validates this with TiDB's native `information_schema.cluster_info` topology view when available; if a TiDB edition hides that view, catalog and data must use the same SQL endpoint and user.
 
 ## Pluggable Architecture
 
