@@ -11,6 +11,27 @@ use futures::future::BoxFuture;
 use crate::PostgresEngine;
 use crate::data;
 
+fn sql_string_literal(value: &str) -> Result<String, StorageError> {
+    if value.contains('\0') {
+        return Err(StorageError::Validation(
+            "TimeToLiveSpecification.AttributeName contains an unsupported null character"
+                .to_owned(),
+        ));
+    }
+
+    for suffix in 0..1024 {
+        let delimiter = format!("$edb_ttl_{suffix}$");
+        if !value.contains(&delimiter) {
+            return Ok(format!("{delimiter}{value}{delimiter}"));
+        }
+    }
+
+    Err(StorageError::Validation(
+        "TimeToLiveSpecification.AttributeName contains unsupported SQL delimiter sequences"
+            .to_owned(),
+    ))
+}
+
 impl MetadataEngine for PostgresEngine {
     fn describe_ttl(
         &self,
@@ -289,11 +310,12 @@ impl MetadataEngine for PostgresEngine {
             let data_table = data::data_table_name(&table_id);
             let bare_table = data_table.trim_matches('"');
             let index_name = format!("idx_ttl_{bare_table}");
+            let ttl_attribute = sql_string_literal(&ttl_attribute)?;
 
             let sql = format!(
                 "CREATE INDEX CONCURRENTLY IF NOT EXISTS \"{index_name}\" \
-                 ON {data_table} (((item_data->'{ttl_attribute}'->>'N')::BIGINT)) \
-                 WHERE (item_data->'{ttl_attribute}'->>'N') IS NOT NULL"
+                 ON {data_table} (((item_data->{ttl_attribute}->>'N')::BIGINT)) \
+                 WHERE (item_data->{ttl_attribute}->>'N') IS NOT NULL"
             );
             sqlx::query(&sql)
                 .execute(&self.data_pool)
@@ -417,5 +439,26 @@ impl MetadataEngine for PostgresEngine {
 
             Ok(rows)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sql_string_literal;
+
+    #[test]
+    fn ttl_attribute_literal_escapes_postgres_quotes() {
+        assert_eq!(
+            sql_string_literal("it's ttl").expect("literal"),
+            "$edb_ttl_0$it's ttl$edb_ttl_0$"
+        );
+        assert_eq!(
+            sql_string_literal("过期\"ttl").expect("literal"),
+            "$edb_ttl_0$过期\"ttl$edb_ttl_0$"
+        );
+        assert_eq!(
+            sql_string_literal("$edb_ttl_0$").expect("literal"),
+            "$edb_ttl_1$$edb_ttl_0$$edb_ttl_1$"
+        );
     }
 }

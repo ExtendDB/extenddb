@@ -114,25 +114,20 @@ pub async fn handle_update_time_to_live(
 
 /// Validate a TTL attribute name.
 ///
-/// Real `DynamoDB` allows any UTF-8 (1–255 bytes). However, the TTL attribute
-/// name is interpolated into backend DDL (TTL lookup/native TTL setup) where
-/// parameterized queries are not possible. We use a strict allowlist:
-/// `^[a-zA-Z0-9._-]+$` (1–255 bytes). This eliminates the entire class of
-/// SQL injection risk. See `docs/differences-from-dynamodb.md`.
-///
-/// Defense-in-depth per `docs/adr/sql-injection-defense.md`.
+/// DynamoDB's `TimeToLiveSpecification.AttributeName` has no character-pattern
+/// restriction; it is a UTF-8 string with a 1-255 byte bound. Backends that need
+/// the name in DDL must escape it there instead of narrowing the API here.
 fn validate_ttl_attribute_name(name: &str) -> Result<(), DynamoDbError> {
     if name.is_empty() || name.len() > 255 {
         return Err(DynamoDbError::ValidationException(
-            "TimeToLiveSpecification.AttributeName must be between 1 and 255 characters".to_owned(),
+            "TimeToLiveSpecification.AttributeName must be between 1 and 255 UTF-8 bytes"
+                .to_owned(),
         ));
     }
-    if !name
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
-    {
+    if name.contains('\0') {
         return Err(DynamoDbError::ValidationException(
-            "TimeToLiveSpecification.AttributeName contains invalid characters".to_owned(),
+            "TimeToLiveSpecification.AttributeName contains an unsupported null character"
+                .to_owned(),
         ));
     }
     Ok(())
@@ -165,6 +160,12 @@ mod tests {
         assert!(validate_ttl_attribute_name("my.ttl-attr").is_ok());
         assert!(validate_ttl_attribute_name("a").is_ok());
         assert!(validate_ttl_attribute_name("A0_.-z9").is_ok());
+        assert!(validate_ttl_attribute_name("expires at").is_ok());
+        assert!(validate_ttl_attribute_name("it's").is_ok());
+        assert!(validate_ttl_attribute_name("a\"b").is_ok());
+        assert!(validate_ttl_attribute_name("a\\b").is_ok());
+        assert!(validate_ttl_attribute_name("a/b#c:d").is_ok());
+        assert!(validate_ttl_attribute_name("过期时间").is_ok());
     }
 
     #[test]
@@ -179,21 +180,24 @@ mod tests {
     }
 
     #[test]
+    fn multibyte_name_length_is_measured_in_utf8_bytes() {
+        let max = "界".repeat(85);
+        assert_eq!(max.len(), 255);
+        assert!(validate_ttl_attribute_name(&max).is_ok());
+
+        let too_long = "界".repeat(86);
+        assert_eq!(too_long.len(), 258);
+        assert!(validate_ttl_attribute_name(&too_long).is_err());
+    }
+
+    #[test]
     fn max_length_accepted() {
         let max = "a".repeat(255);
         assert!(validate_ttl_attribute_name(&max).is_ok());
     }
 
     #[test]
-    fn special_chars_rejected() {
-        assert!(validate_ttl_attribute_name("it's").is_err());
-        assert!(validate_ttl_attribute_name("a\"b").is_err());
-        assert!(validate_ttl_attribute_name("a\\b").is_err());
+    fn null_byte_rejected() {
         assert!(validate_ttl_attribute_name("a\0b").is_err());
-        assert!(validate_ttl_attribute_name("a b").is_err());
-        assert!(validate_ttl_attribute_name("a/b").is_err());
-        assert!(validate_ttl_attribute_name("a#b").is_err());
-        assert!(validate_ttl_attribute_name("a:b").is_err());
-        assert!(validate_ttl_attribute_name("café").is_err());
     }
 }

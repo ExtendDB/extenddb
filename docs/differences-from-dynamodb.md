@@ -46,7 +46,7 @@ adaptation when switching between ExtendDB and the real service.
 
 | Area | DynamoDB | ExtendDB |
 |------|----------|------|
-| TTL attribute name | Any UTF-8 string (1–255 bytes) | Restricted to `[a-zA-Z0-9._-]+` (1–255 bytes). Names with spaces, quotes, or other special characters are rejected. This keeps backend-native TTL generated-column DDL safe. |
+| TTL attribute name | Any UTF-8 string (1–255 bytes) | Same 1–255 UTF-8 byte bound for ordinary names, including spaces, quotes, punctuation, and non-ASCII names. ExtendDB rejects the null character because backend SQL metadata cannot represent it reliably. |
 | TTL deletion | Background process, items deleted within 48 hours of expiry | Backend-specific. PostgreSQL uses an indexed sweep. TiDB uses native table TTL for all user tables. |
 | TTL transition states | `ENABLING`, `ENABLED`, `DISABLING`, `DISABLED` | Same API states. TiDB stores these states explicitly in the catalog so distributed startup repair can complete native TTL enable/disable DDL after a crash. |
 | TTL stream records | REMOVE events with `userIdentity: {type: "Service", principalId: "dynamodb.amazonaws.com"}` | PostgreSQL emits TTL REMOVE stream records. TiDB delegates deletion to native TTL, so ExtendDB does not synthesize TTL service REMOVE records for TiDB streams. |

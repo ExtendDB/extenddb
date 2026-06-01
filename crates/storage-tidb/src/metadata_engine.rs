@@ -31,10 +31,9 @@ struct FixedNativeTtl<'a> {
 }
 
 fn ttl_json_path(ttl_attribute: &str) -> String {
-    format!(
-        "$.\"{}\".N",
-        ttl_attribute.replace('\\', "\\\\").replace('"', "\\\"")
-    )
+    let quoted_attr = serde_json::to_string(ttl_attribute)
+        .expect("serializing a Rust string into a JSON string cannot fail");
+    format!("$.{quoted_attr}.N")
 }
 
 fn sql_string_literal(value: &str) -> String {
@@ -921,7 +920,8 @@ mod tests {
     use super::{
         create_table_has_disabled_ttl, create_table_has_native_ttl, drop_columns_sql,
         drop_indexes_sql, fixed_native_ttl_attribute_sql, native_ttl_attribute_sql,
-        native_ttl_enable_sql, table_accepts_native_schema_change, ttl_status_from_catalog,
+        native_ttl_enable_sql, table_accepts_native_schema_change, ttl_json_path,
+        ttl_status_from_catalog,
     };
     use extenddb_core::types::TimeToLiveStatus;
 
@@ -935,6 +935,17 @@ mod tests {
             native_ttl_enable_sql("`_ddb_table`"),
             "ALTER TABLE `_ddb_table` TTL_ENABLE = 'ON'"
         );
+    }
+
+    #[test]
+    fn ttl_json_path_uses_json_quoted_attribute_names() {
+        assert_eq!(ttl_json_path("ttl"), "$.\"ttl\".N");
+        assert_eq!(ttl_json_path("expires at"), "$.\"expires at\".N");
+        assert_eq!(
+            ttl_json_path("it's\"ttl\\name"),
+            "$.\"it's\\\"ttl\\\\name\".N"
+        );
+        assert_eq!(ttl_json_path("过期时间"), "$.\"过期时间\".N");
     }
 
     #[test]
