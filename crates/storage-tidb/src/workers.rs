@@ -87,40 +87,46 @@ fn transition_poll_delay(next_due_micros: Option<i64>, max_poll: Duration) -> Du
     }
 }
 
-pub(crate) async fn pool_metrics_worker(
-    catalog_pool: MySqlPool,
-    data_pool: MySqlPool,
-    data_default_read_pool: MySqlPool,
-    metrics: Arc<MetricsCollector>,
-) {
+pub(crate) async fn pool_metrics_worker(pools: Vec<MySqlPool>, metrics: Arc<MetricsCollector>) {
     const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
     loop {
         tokio::time::sleep(SAMPLE_INTERVAL).await;
 
-        let catalog_size = catalog_pool.size() as usize;
-        let catalog_idle = catalog_pool.num_idle();
-        let data_size = data_pool.size() as usize;
-        let data_idle = data_pool.num_idle();
-        let read_size = data_default_read_pool.size() as usize;
-        let read_idle = data_default_read_pool.num_idle();
-
-        // Combined pool stats (catalog + data)
-        let total_active = (catalog_size.saturating_sub(catalog_idle))
-            + (data_size.saturating_sub(data_idle))
-            + (read_size.saturating_sub(read_idle));
-        let total_idle = catalog_idle + data_idle + read_idle;
+        let snapshots = pools
+            .iter()
+            .map(|pool| PoolSnapshot {
+                size: pool.size() as usize,
+                idle: pool.num_idle(),
+            })
+            .collect::<Vec<_>>();
+        let (total_active, total_idle) = pool_metric_totals(&snapshots);
 
         #[allow(clippy::cast_possible_truncation)]
         metrics.record_pool_state(total_active as u32, total_idle as u32);
     }
 }
 
+#[derive(Clone, Copy)]
+struct PoolSnapshot {
+    size: usize,
+    idle: usize,
+}
+
+fn pool_metric_totals(pools: &[PoolSnapshot]) -> (usize, usize) {
+    pools.iter().fold((0, 0), |(active, idle), pool| {
+        (
+            active + pool.size.saturating_sub(pool.idle),
+            idle + pool.idle,
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use super::transition_poll_delay;
+    use super::{PoolSnapshot, pool_metric_totals, transition_poll_delay};
 
     #[test]
     fn transition_poll_delay_tracks_near_due_transitions() {
@@ -134,5 +140,17 @@ mod tests {
         );
         assert_eq!(transition_poll_delay(Some(2_000_000), max_poll), max_poll);
         assert_eq!(transition_poll_delay(None, max_poll), max_poll);
+    }
+
+    #[test]
+    fn pool_metric_totals_include_every_tidb_pool() {
+        let pools = [
+            PoolSnapshot { size: 10, idle: 7 },
+            PoolSnapshot { size: 10, idle: 8 },
+            PoolSnapshot { size: 10, idle: 10 },
+            PoolSnapshot { size: 10, idle: 6 },
+        ];
+
+        assert_eq!(pool_metric_totals(&pools), (9, 31));
     }
 }

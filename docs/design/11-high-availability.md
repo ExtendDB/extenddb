@@ -202,7 +202,7 @@ Each frontend checks the pools that its configured backend actually owns. TiDB h
 
 ### D7: Connection Pool Sizing
 
-With N frontends, connection count is N times the pools created by the selected backend. TiDB creates one catalog metadata/control-plane pool, one catalog store/authz pool, one strong data pool, and one default-read data pool. Operators should size TiDB SQL nodes for roughly `N * (2 * catalog_pool_size + 2 * pool_size)` ExtendDB sessions before considering other clients. PostgreSQL currently creates its primary pool from the configured `pool_size`.
+With N frontends, connection count is N times the pools created by the selected backend. TiDB creates one catalog metadata/control-plane pool, one catalog store/authz pool, one strong data pool, and one default-read data pool, and reports metrics across all four pools. Operators should size TiDB SQL nodes for roughly `N * (2 * catalog_pool_size + 2 * pool_size)` ExtendDB sessions before considering other clients. PostgreSQL currently creates its primary pool from the configured `pool_size`.
 
 The design does not mandate a specific connection pooler. Operators should follow backend-specific best practices as frontend count grows.
 

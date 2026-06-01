@@ -418,6 +418,7 @@ use extenddb_storage::server_components::{
 /// Backend-specific runtime hooks for TiDB.
 struct TidbRuntimeHooks {
     engine: Arc<TidbEngine>,
+    catalog_store_pool: MySqlPool,
     control_plane_notify: Arc<tokio::sync::Notify>,
     data_db_name: String,
 }
@@ -434,15 +435,15 @@ impl ServerRuntimeHooks for TidbRuntimeHooks {
             workers::poll_control_plane_transitions(storage_for_poller, cp_notify).await
         });
 
-        // 2. Pool metrics worker - needs both catalog and data pools
-        let catalog_pool = self.engine.pool.clone();
-        let data_pool = self.engine.data_pool().clone();
-        let data_default_read_pool = self.engine.data_default_read_pool.clone();
+        // 2. Pool metrics worker - samples every TiDB pool opened by this frontend.
+        let pools = vec![
+            self.engine.pool.clone(),
+            self.engine.data_pool().clone(),
+            self.engine.data_default_read_pool.clone(),
+            self.catalog_store_pool.clone(),
+        ];
         let metrics = ctx.metrics.clone();
-        tokio::spawn(async move {
-            workers::pool_metrics_worker(catalog_pool, data_pool, data_default_read_pool, metrics)
-                .await
-        });
+        tokio::spawn(async move { workers::pool_metrics_worker(pools, metrics).await });
     }
 
     fn backend_info(&self) -> Option<String> {
@@ -553,6 +554,7 @@ inventory::submit! {
                 // Create runtime hooks
                 let runtime_hooks = Box::new(TidbRuntimeHooks {
                     engine: engine.clone(),
+                    catalog_store_pool: catalog_pool.clone(),
                     control_plane_notify,
                     data_db_name,
                 });
