@@ -289,7 +289,8 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 **Fix:** If a table appears stuck:
 1. Check that extenddb is running (`extenddb status`).
 2. Wait for the backend transition worker. PostgreSQL may use the configured `control_plane_delay_seconds` delay; TiDB makes transitions immediately eligible but large native online DDL jobs can still take time inside TiDB. TiDB tables can continue serving data-plane writes while `UPDATING`.
-3. If the server was restarted, transitions are recovered automatically at startup.
+3. For TiDB, run `extenddb catalog-check` to distinguish a real stale catalog transition from a native online DDL job that is still running or queued. TiDB reports native DDL state through `information_schema.ddl_jobs`; paused, failed, or missing native DDL progress is an operator issue, while running or queued jobs should be allowed to finish.
+4. If the server was restarted, transitions are recovered automatically at startup.
 
 ### CreateTable returns CREATING instead of ACTIVE
 

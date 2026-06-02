@@ -390,6 +390,11 @@ The best design is to remove the worker-specific coordination problem:
   generated-column additions per table, and TiDB online DDL performs distributed
   backfill before maintaining each index transactionally with the base table.
 - TiDB TTL uses table-level native TTL. ExtendDB does not run a per-table TTL deletion worker for TiDB user data; the catalog stores explicit TTL transition state so any frontend can complete an interrupted enable or disable using TiDB online DDL, and startup repair re-enables native TTL jobs if TiDB recovery tooling left `TTL_ENABLE = 'OFF'`.
+- TiDB diagnostics also stay schema-job-aware. `catalog-check` does not treat
+  an old `CREATING`, `UPDATING`, or `DELETING` row as stuck while TiDB reports a
+  progressing native DDL job for the physical `_ddb_*` table in
+  `information_schema.ddl_jobs`; paused, failed, or missing TiDB DDL progress is
+  surfaced as the problem.
 
 For a backend that still needs an application worker, use backend-native
 advisory/session locks or an equivalent lease. **Lock granularity should be

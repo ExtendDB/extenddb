@@ -434,7 +434,11 @@ Backend CLI diagnostics and formatting helpers:
 `extenddb catalog-check` is intentionally backend-owned. PostgreSQL checks
 physical `_ddb_<table_id>` data tables and companion index tables. TiDB checks
 physical `_ddb_<table_id>` data tables plus native generated-column secondary
-index artifacts, native TTL state, and stuck online-DDL catalog transitions.
+index artifacts, native TTL state, and catalog transitions against TiDB's
+native `information_schema.ddl_jobs` queue. A long `CREATING`, `UPDATING`, or
+`DELETING` transition is not reported as stuck while TiDB still shows a
+progressing online DDL job for the physical `_ddb_*` table; paused, failed, or
+missing native DDL progress is reported with the TiDB job state.
 The binary only loads config, refuses to run while the server PID is alive, and
 prints the backend report.
 

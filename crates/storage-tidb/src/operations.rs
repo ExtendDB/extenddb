@@ -31,12 +31,22 @@ type NativeIndexArtifactRow = (
     serde_json::Value,
 );
 
+type CatalogTransitionRow = (String, String, String);
+
 struct RequiredCatalogLookupIndex {
     table: &'static str,
     index: &'static str,
     columns: &'static str,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct TidbDdlJob {
+    table_name: String,
+    job_type: String,
+    state: String,
+}
+
+const STALE_TRANSITION_MINUTES: i64 = 10;
 const REQUIRED_CATALOG_LOOKUP_INDEXES: &[RequiredCatalogLookupIndex] =
     &[RequiredCatalogLookupIndex {
         table: "iam_group_members",
@@ -63,6 +73,62 @@ fn parse_json<T: serde::de::DeserializeOwned>(
 ) -> Result<T, StorageError> {
     serde_json::from_value(value)
         .map_err(|e| StorageError::Internal(format!("invalid {label}: {e}")))
+}
+
+fn stale_catalog_transitions_sql() -> &'static str {
+    "SELECT table_name, table_status, table_id FROM tables \
+     WHERE table_status IN ('CREATING', 'UPDATING', 'DELETING') \
+       AND TIMESTAMPDIFF(MINUTE, status_transition_at, CURRENT_TIMESTAMP(6)) >= ?"
+}
+
+fn ddl_jobs_for_tables_sql(count: usize) -> String {
+    let placeholders = std::iter::repeat_n("?", count)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT TABLE_NAME, JOB_TYPE, STATE FROM information_schema.ddl_jobs \
+         WHERE DB_NAME = DATABASE() AND TABLE_NAME IN ({placeholders})"
+    )
+}
+
+fn ddl_state_is_progressing(state: &str) -> bool {
+    matches!(
+        state.to_ascii_lowercase().as_str(),
+        "none" | "queueing" | "running" | "done"
+    )
+}
+
+fn stale_catalog_transition_issues(
+    transitions: &[CatalogTransitionRow],
+    ddl_jobs: &[TidbDdlJob],
+) -> Vec<CatalogCheckIssue> {
+    let mut jobs_by_physical_table: HashMap<&str, Vec<&TidbDdlJob>> = HashMap::new();
+    for job in ddl_jobs {
+        jobs_by_physical_table
+            .entry(&job.table_name)
+            .or_default()
+            .push(job);
+    }
+
+    transitions
+        .iter()
+        .filter_map(|(table_name, table_status, table_id)| {
+            let physical_table = physical_data_table_name(table_id);
+            let jobs = jobs_by_physical_table
+                .get(physical_table.as_str())
+                .map_or(&[][..], Vec::as_slice);
+
+            if jobs.iter().any(|job| ddl_state_is_progressing(&job.state)) {
+                return None;
+            }
+
+            let detail = jobs.first().map_or_else(
+                || format!("{table_status}; no active TiDB DDL job found for {physical_table}"),
+                |job| format!("{table_status}; TiDB DDL {}: {}", job.state, job.job_type),
+            );
+            Some(catalog_check_issue(table_name).with_detail(detail))
+        })
+        .collect()
 }
 
 async fn tidb_catalog_check(
@@ -184,28 +250,56 @@ async fn tidb_catalog_check(
             .collect(),
     ));
 
-    let stuck: Vec<(String, String)> = sqlx::query_as(
-        "SELECT table_name, table_status FROM tables \
-         WHERE table_status IN ('CREATING', 'UPDATING', 'DELETING') \
-         AND status_transition_at < CURRENT_TIMESTAMP(6) - INTERVAL 10 MINUTE",
-    )
-    .fetch_all(&catalog_pool)
-    .await
-    .map_err(|e| StorageError::Internal(e.to_string()))?;
-    sections.push(CatalogCheckSection::new(
-        "Checking for stuck transitions",
-        "No stuck transitions.",
-        stuck
-            .into_iter()
-            .map(|(name, status)| catalog_check_issue(name).with_detail(status))
-            .collect(),
-    ));
-
+    sections.push(check_tidb_catalog_transitions(&catalog_pool, &data_pool).await?);
     sections.push(check_tidb_catalog_lookup_indexes(&catalog_pool).await?);
     sections.push(check_tidb_native_index_artifacts(&catalog_pool, &data_pool, &actual).await?);
     sections.push(check_tidb_native_ttl_artifacts(&catalog_pool, &data_pool, &actual).await?);
 
     Ok(CatalogCheckReport { sections })
+}
+
+async fn check_tidb_catalog_transitions(
+    catalog_pool: &sqlx::MySqlPool,
+    data_pool: &sqlx::MySqlPool,
+) -> Result<CatalogCheckSection, StorageError> {
+    let stale_transitions: Vec<CatalogTransitionRow> =
+        sqlx::query_as(stale_catalog_transitions_sql())
+            .bind(STALE_TRANSITION_MINUTES)
+            .fetch_all(catalog_pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+    let physical_tables = stale_transitions
+        .iter()
+        .map(|(_, _, table_id)| physical_data_table_name(table_id))
+        .collect::<Vec<_>>();
+
+    let ddl_jobs = if physical_tables.is_empty() {
+        Vec::new()
+    } else {
+        let sql = ddl_jobs_for_tables_sql(physical_tables.len());
+        let mut query = sqlx::query_as::<_, (String, String, String)>(&sql);
+        for physical_table in &physical_tables {
+            query = query.bind(physical_table);
+        }
+        query
+            .fetch_all(data_pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .into_iter()
+            .map(|(table_name, job_type, state)| TidbDdlJob {
+                table_name,
+                job_type,
+                state,
+            })
+            .collect()
+    };
+
+    Ok(CatalogCheckSection::new(
+        "Checking TiDB catalog transitions against native online DDL",
+        "All long-running catalog transitions have active TiDB DDL progress or have completed.",
+        stale_catalog_transition_issues(&stale_transitions, &ddl_jobs),
+    ))
 }
 
 async fn check_tidb_catalog_lookup_indexes(
@@ -445,7 +539,10 @@ impl OperationsEngine for TidbOperationsEngine {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{catalog_lookup_index_issues, quote_tidb_identifier};
+    use super::{
+        TidbDdlJob, catalog_lookup_index_issues, ddl_jobs_for_tables_sql, quote_tidb_identifier,
+        stale_catalog_transition_issues, stale_catalog_transitions_sql,
+    };
 
     #[test]
     fn catalog_check_quotes_tidb_physical_table_names_for_cleanup() {
@@ -482,6 +579,77 @@ mod tests {
         assert_eq!(
             issues[0].detail.as_deref(),
             Some("missing native TiDB catalog lookup index")
+        );
+    }
+
+    #[test]
+    fn catalog_transition_check_reads_tidb_native_ddl_jobs() {
+        let stale_sql = stale_catalog_transitions_sql();
+        assert!(stale_sql.contains("TIMESTAMPDIFF(MINUTE"));
+        assert!(!stale_sql.contains("INTERVAL 10 MINUTE"));
+
+        let jobs_sql = ddl_jobs_for_tables_sql(2);
+        assert!(jobs_sql.contains("information_schema.ddl_jobs"));
+        assert!(jobs_sql.contains("DB_NAME = DATABASE()"));
+        assert!(jobs_sql.contains("TABLE_NAME IN (?, ?)"));
+    }
+
+    #[test]
+    fn catalog_transition_with_progressing_tidb_ddl_is_not_stuck() {
+        let transitions = vec![(
+            "orders".to_owned(),
+            "UPDATING".to_owned(),
+            "tableid".to_owned(),
+        )];
+        let ddl_jobs = vec![TidbDdlJob {
+            table_name: "_ddb_tableid".to_owned(),
+            job_type: "add index".to_owned(),
+            state: "running".to_owned(),
+        }];
+
+        let issues = stale_catalog_transition_issues(&transitions, &ddl_jobs);
+
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn catalog_transition_reports_missing_tidb_ddl_progress() {
+        let transitions = vec![(
+            "orders".to_owned(),
+            "UPDATING".to_owned(),
+            "tableid".to_owned(),
+        )];
+
+        let issues = stale_catalog_transition_issues(&transitions, &[]);
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].name, "orders");
+        assert_eq!(
+            issues[0].detail.as_deref(),
+            Some("UPDATING; no active TiDB DDL job found for _ddb_tableid")
+        );
+    }
+
+    #[test]
+    fn catalog_transition_reports_paused_tidb_ddl_job() {
+        let transitions = vec![(
+            "orders".to_owned(),
+            "UPDATING".to_owned(),
+            "tableid".to_owned(),
+        )];
+        let ddl_jobs = vec![TidbDdlJob {
+            table_name: "_ddb_tableid".to_owned(),
+            job_type: "add index".to_owned(),
+            state: "paused".to_owned(),
+        }];
+
+        let issues = stale_catalog_transition_issues(&transitions, &ddl_jobs);
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].name, "orders");
+        assert_eq!(
+            issues[0].detail.as_deref(),
+            Some("UPDATING; TiDB DDL paused: add index")
         );
     }
 }
