@@ -24,6 +24,15 @@ use crate::data::finalize_pending_stream_records_for_shard;
 pub(crate) const SHARDS_PER_STREAM: u32 = 16;
 const LEGACY_TABLE_PREFIX_SHARDS_PER_STREAM: u32 = 4;
 
+pub(crate) struct StreamGenerationCatalog<'a> {
+    pub account_id: &'a str,
+    pub table_name: &'a str,
+    pub table_id: &'a str,
+    pub stream_label: &'a str,
+    pub key_schema: &'a serde_json::Value,
+    pub stream_specification: &'a serde_json::Value,
+}
+
 pub(crate) fn stream_shard_id(table_id: &str, stream_label: &str, shard_index: u32) -> String {
     format!("shardId-{shard_index:012}-{stream_label}-{table_id}")
 }
@@ -71,6 +80,65 @@ impl TidbEngine {
         time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_else(|_| time::OffsetDateTime::now_utc().unix_timestamp().to_string())
+    }
+
+    pub(crate) async fn upsert_enabled_stream_generation_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        generation: StreamGenerationCatalog<'_>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO stream_generations \
+             (account_id, table_name, table_id, stream_label, key_schema, \
+              stream_specification, stream_status, disabled_at, expires_at) \
+             VALUES (?, ?, ?, ?, ?, ?, 'ENABLED', NULL, NULL) \
+             ON DUPLICATE KEY UPDATE \
+              table_id = VALUES(table_id), \
+              key_schema = VALUES(key_schema), \
+              stream_specification = VALUES(stream_specification), \
+              stream_status = 'ENABLED', \
+              disabled_at = NULL, \
+              expires_at = NULL",
+        )
+        .bind(generation.account_id)
+        .bind(generation.table_name)
+        .bind(generation.table_id)
+        .bind(generation.stream_label)
+        .bind(generation.key_schema)
+        .bind(generation.stream_specification)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    pub(crate) async fn disable_stream_generation_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        generation: StreamGenerationCatalog<'_>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO stream_generations \
+             (account_id, table_name, table_id, stream_label, key_schema, \
+              stream_specification, stream_status, disabled_at, expires_at) \
+             VALUES (?, ?, ?, ?, ?, ?, 'DISABLED', CURRENT_TIMESTAMP(6), \
+                     CURRENT_TIMESTAMP(6) + INTERVAL 24 HOUR) \
+             ON DUPLICATE KEY UPDATE \
+              table_id = VALUES(table_id), \
+              key_schema = VALUES(key_schema), \
+              stream_specification = VALUES(stream_specification), \
+              stream_status = 'DISABLED', \
+              disabled_at = COALESCE(disabled_at, CURRENT_TIMESTAMP(6)), \
+              expires_at = COALESCE(expires_at, CURRENT_TIMESTAMP(6) + INTERVAL 24 HOUR)",
+        )
+        .bind(generation.account_id)
+        .bind(generation.table_name)
+        .bind(generation.table_id)
+        .bind(generation.stream_label)
+        .bind(generation.key_schema)
+        .bind(generation.stream_specification)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        Ok(())
     }
 
     pub(crate) fn fixed_stream_shards(table_id: &str, stream_label: &str) -> Vec<Shard> {
@@ -188,10 +256,12 @@ impl StreamEngine for TidbEngine {
         Box::pin(async move {
             let (table_name, stream_label) = parse_stream_arn(&stream_arn)?;
 
-            let row: Option<(serde_json::Value, serde_json::Value, Option<serde_json::Value>, String, String)> =
+            let row: Option<(serde_json::Value, serde_json::Value, String, String)> =
                 sqlx::query_as(
-                    "SELECT key_schema, attribute_definitions, stream_specification, table_status, table_id \
-                     FROM tables WHERE account_id = ? AND table_name = ? AND stream_label = ?",
+                    "SELECT key_schema, stream_specification, stream_status, table_id \
+                     FROM stream_generations \
+                     WHERE account_id = ? AND table_name = ? AND stream_label = ? \
+                       AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP(6))",
                 )
                 .bind(&account_id)
                 .bind(&table_name)
@@ -200,7 +270,7 @@ impl StreamEngine for TidbEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            let (ks_json, _ad_json, stream_spec_json, table_status, table_id) =
+            let (ks_json, stream_spec_json, generation_status, table_id) =
                 row.ok_or_else(|| {
                     StorageError::TableNotFound(format!(
                         "Requested resource not found: Stream: {arn} not found.",
@@ -211,18 +281,9 @@ impl StreamEngine for TidbEngine {
             let key_schema = serde_json::from_value(ks_json)
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            let stream_specification: Option<StreamSpecification> = stream_spec_json
-                .map(serde_json::from_value)
-                .transpose()
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let stream_specification = stream_specification
-                .filter(|spec| spec.stream_enabled)
-                .ok_or_else(|| {
-                    StorageError::TableNotFound(format!(
-                        "Requested resource not found: Stream: {arn} not found.",
-                        arn = stream_arn
-                    ))
-                })?;
+            let stream_specification: StreamSpecification =
+                serde_json::from_value(stream_spec_json)
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
             let stream_view_type = stream_specification
                 .stream_view_type
                 .unwrap_or(StreamViewType::KeysOnly);
@@ -249,10 +310,15 @@ impl StreamEngine for TidbEngine {
 
             let shards: Vec<Shard> = shard_rows.into_iter().take(limit_usize).collect();
 
-            let stream_status = if table_status == "DELETING" {
-                StreamStatus::Disabling
-            } else {
-                StreamStatus::Enabled
+            let stream_status = match generation_status.as_str() {
+                "ENABLED" => StreamStatus::Enabled,
+                "DISABLED" => StreamStatus::Disabled,
+                "DISABLING" => StreamStatus::Disabling,
+                other => {
+                    return Err(StorageError::Internal(format!(
+                        "unknown TiDB stream generation status: {other}"
+                    )));
+                }
             };
 
             Ok(StreamDescription {
@@ -279,63 +345,65 @@ impl StreamEngine for TidbEngine {
         let table_name = table_name.map(|s| s.to_string());
         let exclusive_start_stream_arn = exclusive_start_stream_arn.map(|s| s.to_string());
         Box::pin(async move {
-            let rows: Vec<(String, String, String)> = match (
-                table_name.as_deref(),
-                exclusive_start_stream_arn.as_deref(),
-            ) {
-                (Some(tn), Some(start_arn)) => {
-                    let (_, start_label) = parse_stream_arn(start_arn)?;
-                    sqlx::query_as(
-                        "SELECT table_name, table_arn, stream_label FROM tables \
-                         WHERE account_id = ? AND stream_label IS NOT NULL AND table_name = ? AND stream_label > ? \
+            let rows: Vec<(String, String)> =
+                match (table_name.as_deref(), exclusive_start_stream_arn.as_deref()) {
+                    (Some(tn), Some(start_arn)) => {
+                        let (_, start_label) = parse_stream_arn(start_arn)?;
+                        sqlx::query_as(
+                            "SELECT table_name, stream_label FROM stream_generations \
+                         WHERE account_id = ? AND table_name = ? AND stream_label > ? \
+                           AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP(6)) \
+                         ORDER BY stream_label LIMIT ?",
+                        )
+                        .bind(&account_id)
+                        .bind(tn)
+                        .bind(&start_label)
+                        .bind(limit + 1)
+                        .fetch_all(&self.pool)
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))?
+                    }
+                    (Some(tn), None) => sqlx::query_as(
+                        "SELECT table_name, stream_label FROM stream_generations \
+                         WHERE account_id = ? AND table_name = ? \
+                           AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP(6)) \
                          ORDER BY stream_label LIMIT ?",
                     )
                     .bind(&account_id)
                     .bind(tn)
-                    .bind(&start_label)
                     .bind(limit + 1)
                     .fetch_all(&self.pool)
                     .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?
-                }
-                (Some(tn), None) => sqlx::query_as(
-                    "SELECT table_name, table_arn, stream_label FROM tables \
-                         WHERE account_id = ? AND stream_label IS NOT NULL AND table_name = ? \
-                         ORDER BY stream_label LIMIT ?",
-                )
-                .bind(&account_id)
-                .bind(tn)
-                .bind(limit + 1)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?,
-                (None, Some(start_arn)) => {
-                    let (start_table, start_label) = parse_stream_arn(start_arn)?;
-                    sqlx::query_as(
-                        "SELECT table_name, table_arn, stream_label FROM tables \
-                         WHERE account_id = ? AND stream_label IS NOT NULL \
+                    .map_err(|e| StorageError::Internal(e.to_string()))?,
+                    (None, Some(start_arn)) => {
+                        let (start_table, start_label) = parse_stream_arn(start_arn)?;
+                        sqlx::query_as(
+                            "SELECT table_name, stream_label FROM stream_generations \
+                         WHERE account_id = ? \
+                           AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP(6)) \
                            AND (table_name, stream_label) > (?, ?) \
+                         ORDER BY table_name, stream_label LIMIT ?",
+                        )
+                        .bind(&account_id)
+                        .bind(&start_table)
+                        .bind(&start_label)
+                        .bind(limit + 1)
+                        .fetch_all(&self.pool)
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))?
+                    }
+                    (None, None) => sqlx::query_as(
+                        "SELECT table_name, stream_label FROM stream_generations \
+                         WHERE account_id = ? \
+                           AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP(6)) \
                          ORDER BY table_name, stream_label LIMIT ?",
                     )
                     .bind(&account_id)
-                    .bind(&start_table)
-                    .bind(&start_label)
                     .bind(limit + 1)
                     .fetch_all(&self.pool)
                     .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?
-                }
-                (None, None) => sqlx::query_as(
-                    "SELECT table_name, table_arn, stream_label FROM tables \
-                         WHERE account_id = ? AND stream_label IS NOT NULL \
-                         ORDER BY table_name, stream_label LIMIT ?",
-                )
-                .bind(&account_id)
-                .bind(limit + 1)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?,
-            };
+                    .map_err(|e| StorageError::Internal(e.to_string()))?,
+                };
 
             #[allow(clippy::cast_sign_loss)]
             let limit_usize = limit as usize;
@@ -343,7 +411,7 @@ impl StreamEngine for TidbEngine {
             let summaries: Vec<StreamSummary> = rows
                 .iter()
                 .take(limit_usize)
-                .map(|(tn, _table_arn, label)| StreamSummary {
+                .map(|(tn, label)| StreamSummary {
                     stream_arn: stream_arn(&self.region, &account_id, tn, label),
                     stream_label: label.clone(),
                     table_name: tn.clone(),
@@ -412,8 +480,9 @@ impl StreamEngine for TidbEngine {
             let (table_name, stream_label) = parse_stream_arn(&stream_arn)?;
 
             let table_id: Option<String> = sqlx::query_scalar(
-                "SELECT table_id FROM tables \
-                 WHERE account_id = ? AND table_name = ? AND stream_label = ?",
+                "SELECT table_id FROM stream_generations \
+                 WHERE account_id = ? AND table_name = ? AND stream_label = ? \
+                   AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP(6))",
             )
             .bind(&account_id)
             .bind(&table_name)

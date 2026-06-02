@@ -7,6 +7,7 @@ use extenddb_core::types::{DeleteTableInput, TableDescription, TableStatus};
 use extenddb_storage::error::StorageError;
 
 use crate::TidbEngine;
+use crate::stream_engine::StreamGenerationCatalog;
 use crate::table_helpers::{IndexRow, TableRow};
 
 impl TidbEngine {
@@ -57,6 +58,27 @@ impl TidbEngine {
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let stats = self.current_table_stats(&row.table_id).await?;
+
+        if let Some(stream_label) = row.stream_label.as_deref() {
+            let stream_specification = row.stream_specification.as_ref().ok_or_else(|| {
+                StorageError::Internal(format!(
+                    "stream label exists without stream specification for table {}",
+                    input.table_name
+                ))
+            })?;
+            Self::disable_stream_generation_in_tx(
+                &mut tx,
+                StreamGenerationCatalog {
+                    account_id,
+                    table_name: &input.table_name,
+                    table_id: &row.table_id,
+                    stream_label,
+                    key_schema: &row.key_schema,
+                    stream_specification,
+                },
+            )
+            .await?;
+        }
 
         // Set DELETING status with immediate cleanup eligibility. The control-plane
         // reconciler drops TiDB data artifacts first, then removes catalog

@@ -99,7 +99,7 @@ Expected:
 ```
 === extenddb verify ===
 ...
-  OK: Catalog version 0.0.26
+  OK: Catalog version 0.0.27
 ...
 === HEALTHY: All checks passed ===
 ```

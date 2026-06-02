@@ -5,7 +5,7 @@
 ## Current Status
 
 ExtendDB 0.1.0 defaults to the TiDB backend and currently expects TiDB catalog
-version 0.0.26. Existing TiDB catalogs are upgraded in place by
+version 0.0.27. Existing TiDB catalogs are upgraded in place by
 `extenddb migrate`.
 
 ## How Catalog Upgrades Work
@@ -19,6 +19,7 @@ applied in filename order:
 001_schema.sql                         ← complete initial schema
 ...
 026_simplify_control_plane_queue_index.sql
+027_stream_generations.sql
 ```
 
 TiDB data-plane migrations live separately in
@@ -47,7 +48,7 @@ A single row in the `settings` table stores the catalog version:
 
 ```sql
 SELECT value FROM settings WHERE key = 'catalog_version';
--- '0.0.26'
+-- '0.0.27'
 ```
 
 The binary embeds an expected catalog version (`CATALOG_VERSION` constant in `crates/storage-tidb/src/lib.rs`). At startup, the server compares the database value against the binary's expectation. If they don't match, the server refuses to start and directs the operator to run `extenddb migrate`.
@@ -191,7 +192,13 @@ If an upgrade fails:
 
 ## Version History
 
-### TiDB Catalog 0.0.26 (Current)
+### TiDB Catalog 0.0.27 (Current)
+
+Adds `stream_generations`, a TiDB-native-TTL catalog table that keeps disabled
+or deleted DynamoDB stream generations readable for the 24-hour Streams
+retention window.
+
+### TiDB Catalog 0.0.26
 
 Simplifies the TiDB control-plane transition queue index while preserving
 idempotent replay through TiDB-native online DDL scheduling.

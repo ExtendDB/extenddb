@@ -36,7 +36,8 @@ The data database connection string is stored in the catalog's `settings` table 
 | `iam_role_tags` | Tags on IAM roles. |
 | `permissions_boundaries` | Permissions boundaries for users and roles. |
 | `encryption_keys` | AES-256-GCM key used to encrypt access key secrets. |
-| `stream_records` | Stream change records with 24-hour native TTL retention. TiDB derives fixed shard IDs from table metadata instead of storing shard rows. |
+| `stream_generations` | Stream generation metadata. Disabled/deleted generations use TiDB native TTL for DynamoDB Streams' 24-hour readability window. |
+| `stream_records` | Stream change records with 24-hour native TTL retention. TiDB derives fixed shard IDs from stream-generation metadata instead of storing shard rows. |
 
 ### Data Tables
 
@@ -156,10 +157,13 @@ For UpdateItem, the `new_image` is not known until after `apply_update` runs ins
 
 ### Shard Model
 
-Each stream has a fixed set of shards. TiDB uses 16 deterministic shards per
-stream and puts the shard bucket before the table id in the shard key
-(`shardId-000000000000-<table>` through `shardId-000000000015-<table>`) so
-the shared stream commit-sequence index can be pre-split by bucket prefix.
+Each stream generation has a fixed set of shards. TiDB uses 16 deterministic
+shards per generation and puts the shard bucket before the stream label and
+table id in the shard key
+(`shardId-000000000000-<stream-label>-<table-id>` through
+`shardId-000000000015-<stream-label>-<table-id>`) so the shared stream
+commit-sequence index can be pre-split by bucket prefix while disable/re-enable
+cycles never mix records across stream generations.
 TiDB schemas store stream rows under an `AUTO_RANDOM` clustered
 `record_id`, so highly concurrent stream inserts are scattered by TiDB instead
 of appending inside one shard key range. Sequence numbers are monotonically
@@ -177,8 +181,9 @@ Iterators expire after 15 minutes of inactivity.
 
 ### Retention
 
-Stream records are retained for 24 hours. TiDB uses native table TTL for
-retention; backends without native TTL use a background cleanup task.
+Stream records and disabled/deleted stream generation metadata are retained for
+24 hours. TiDB uses native table TTL for retention; backends without native TTL
+use a background cleanup task.
 
 ## Architecture Decision Records
 

@@ -1,6 +1,6 @@
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
--- Consolidated catalog schema for extenddb (catalog version 0.0.26).
+-- Consolidated catalog schema for extenddb (catalog version 0.0.27).
 -- This is the complete schema applied on fresh installs.
 
 -- Accounts — multi-account support (REQ-AUTH-005).
@@ -34,6 +34,25 @@ CREATE TABLE IF NOT EXISTS tables (
 
 CREATE INDEX idx_tables_control_plane_work
     ON tables (table_status, status_transition_at);
+
+-- DynamoDB stream generations. This intentionally stands apart from the live
+-- tables row so disabled or deleted table streams remain readable for the
+-- DynamoDB Streams 24-hour retention window. TiDB native TTL owns expiry.
+CREATE TABLE IF NOT EXISTS stream_generations (
+    account_id VARCHAR(32) NOT NULL,
+    table_name VARCHAR(255) NOT NULL,
+    table_id VARCHAR(64) NOT NULL,
+    stream_label VARCHAR(64) NOT NULL,
+    key_schema JSON NOT NULL,
+    stream_specification JSON NOT NULL,
+    stream_status VARCHAR(32) NOT NULL DEFAULT 'ENABLED',
+    created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    disabled_at TIMESTAMP(6),
+    expires_at TIMESTAMP(6),
+    PRIMARY KEY (account_id, table_name, stream_label) CLUSTERED,
+    INDEX idx_stream_generations_table_id (table_id, stream_label)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+  TTL = `expires_at` + INTERVAL 0 SECOND TTL_JOB_INTERVAL = '1h';
 
 -- Index metadata.
 CREATE TABLE IF NOT EXISTS indexes (
@@ -276,4 +295,4 @@ CREATE TABLE IF NOT EXISTS backup_tags (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 -- Seed settings.
-INSERT IGNORE INTO settings (`key`, value) VALUES ('catalog_version', '0.0.26');
+INSERT IGNORE INTO settings (`key`, value) VALUES ('catalog_version', '0.0.27');

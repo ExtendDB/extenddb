@@ -228,8 +228,9 @@ Key design decisions:
   directly on a monotonically increasing shard sequence concentrates one hot
   table's stream writes into one key range.
 - TiDB should not foreground-delete stream history during `DeleteTable`; native
-  TTL owns shared `stream_records` retention and immutable table IDs prevent
-  reuse conflicts.
+  TTL owns shared `stream_records` retention, while TiDB catalog TTL owns
+  disabled/deleted `stream_generations` metadata so Streams consumers can keep
+  reading for DynamoDB's 24-hour retention window.
 
 ### WorkerStore
 

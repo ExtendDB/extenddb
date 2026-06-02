@@ -11,11 +11,13 @@ use extenddb_storage::error::StorageError;
 
 use crate::TidbEngine;
 use crate::data::validate_native_key_schema_shape;
+use crate::stream_engine::StreamGenerationCatalog;
 use crate::throughput::provisioned_throughput_description;
 
 type UpdateTableCatalogRow = (
     String,
     String,
+    serde_json::Value,
     serde_json::Value,
     String,
     Option<serde_json::Value>,
@@ -124,7 +126,7 @@ impl TidbEngine {
         // Lock only the short-lived catalog row while appending new intent.
         // TiDB owns the long-running distributed online DDL jobs.
         let row: Option<UpdateTableCatalogRow> = sqlx::query_as(
-            "SELECT table_status, table_id, attribute_definitions, billing_mode, \
+            "SELECT table_status, table_id, key_schema, attribute_definitions, billing_mode, \
                     provisioned_throughput, stream_specification, stream_label \
              FROM tables \
              WHERE account_id = ? AND table_name = ? FOR UPDATE",
@@ -138,6 +140,7 @@ impl TidbEngine {
         let (
             status,
             table_id,
+            current_key_schema_json,
             current_attr_defs_json,
             current_billing_mode,
             current_pt_json,
@@ -362,12 +365,70 @@ impl TidbEngine {
         if let Some(spec) = &input.stream_specification {
             let spec_json =
                 serde_json::to_value(spec).map_err(|e| StorageError::Internal(e.to_string()))?;
+            let current_stream_enabled =
+                stream_enabled_from_catalog(current_stream_spec_json.as_ref())?;
             let next_stream_label = next_stream_label_for_update(
                 current_stream_spec_json.as_ref(),
                 current_stream_label.as_deref(),
                 spec.stream_enabled,
                 Self::new_stream_label(),
             )?;
+            match (
+                spec.stream_enabled,
+                current_stream_enabled,
+                &current_stream_label,
+            ) {
+                (true, true, Some(label)) => {
+                    Self::upsert_enabled_stream_generation_in_tx(
+                        &mut tx,
+                        StreamGenerationCatalog {
+                            account_id,
+                            table_name: &input.table_name,
+                            table_id: &table_id,
+                            stream_label: label,
+                            key_schema: &current_key_schema_json,
+                            stream_specification: &spec_json,
+                        },
+                    )
+                    .await?;
+                }
+                (true, _, _) => {
+                    let label = next_stream_label.as_deref().ok_or_else(|| {
+                        StorageError::Internal(
+                            "stream enable did not allocate a stream label".to_owned(),
+                        )
+                    })?;
+                    Self::upsert_enabled_stream_generation_in_tx(
+                        &mut tx,
+                        StreamGenerationCatalog {
+                            account_id,
+                            table_name: &input.table_name,
+                            table_id: &table_id,
+                            stream_label: label,
+                            key_schema: &current_key_schema_json,
+                            stream_specification: &spec_json,
+                        },
+                    )
+                    .await?;
+                }
+                (false, _, Some(label)) => {
+                    let generation_spec_json =
+                        current_stream_spec_json.as_ref().unwrap_or(&spec_json);
+                    Self::disable_stream_generation_in_tx(
+                        &mut tx,
+                        StreamGenerationCatalog {
+                            account_id,
+                            table_name: &input.table_name,
+                            table_id: &table_id,
+                            stream_label: label,
+                            key_schema: &current_key_schema_json,
+                            stream_specification: generation_spec_json,
+                        },
+                    )
+                    .await?;
+                }
+                (false, _, None) => {}
+            }
             sqlx::query(
                 "UPDATE tables SET stream_specification = ?, stream_label = ? \
                  WHERE account_id = ? AND table_name = ?",

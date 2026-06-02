@@ -14,6 +14,7 @@ use sqlx::{MySql, QueryBuilder};
 
 use crate::TidbEngine;
 use crate::data::validate_native_key_schema_shape;
+use crate::stream_engine::StreamGenerationCatalog;
 use crate::throughput::provisioned_throughput_description;
 use crate::tidb_util::is_unique_violation;
 
@@ -273,6 +274,21 @@ impl TidbEngine {
         // TiDB has one physical secondary-index mechanism. The GSI/LSI split is
         // DynamoDB API metadata, not a separate storage path.
         insert_secondary_index_catalog_rows(&mut tx, &table_id, &index_rows).await?;
+
+        if let (Some(label), Some(spec_json)) = (&stream_label, &stream_json) {
+            Self::upsert_enabled_stream_generation_in_tx(
+                &mut tx,
+                StreamGenerationCatalog {
+                    account_id,
+                    table_name: &input.table_name,
+                    table_id: &table_id,
+                    stream_label: label,
+                    key_schema: &key_schema_json,
+                    stream_specification: spec_json,
+                },
+            )
+            .await?;
+        }
 
         if let Some(tags) = &input.tags {
             insert_table_tags(&mut tx, &table_arn, tags).await?;

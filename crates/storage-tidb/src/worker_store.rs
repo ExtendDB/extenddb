@@ -156,10 +156,11 @@ impl WorkerStore for TidbEngine {
 
 impl TidbEngine {
     async fn drop_table_data_artifacts(&self, table_id: &str) -> Result<(), StorageError> {
-        // `stream_records` is a shared TiDB TTL table keyed by immutable table
-        // ids. Deleting a table must not issue a large foreground delete over
-        // stream history; native TTL owns retention and the removed catalog row
-        // makes the stream inaccessible to new requests.
+        // `stream_records` is a shared TiDB TTL table keyed by stream
+        // generation shard ids. Deleting a table must not issue a large
+        // foreground delete over stream history; native TTL owns retention, and
+        // stream_generations keeps disabled/deleted streams readable for the
+        // DynamoDB Streams retention window.
         Self::drop_data_table(&self.data_pool, table_id).await?;
         Ok(())
     }
@@ -189,6 +190,29 @@ impl TidbEngine {
              WHERE table_id = ? AND table_status IN ('CREATING', 'UPDATING', 'ACTIVE')",
         )
         .bind(&label)
+        .bind(table_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        sqlx::query(
+            "INSERT INTO stream_generations \
+             (account_id, table_name, table_id, stream_label, key_schema, \
+              stream_specification, stream_status, disabled_at, expires_at) \
+             SELECT account_id, table_name, table_id, stream_label, key_schema, \
+                    stream_specification, 'ENABLED', NULL, NULL \
+             FROM tables \
+             WHERE table_id = ? \
+               AND stream_label IS NOT NULL \
+               AND JSON_UNQUOTE(JSON_EXTRACT(stream_specification, '$.StreamEnabled')) = 'true' \
+             ON DUPLICATE KEY UPDATE \
+              table_id = VALUES(table_id), \
+              key_schema = VALUES(key_schema), \
+              stream_specification = VALUES(stream_specification), \
+              stream_status = 'ENABLED', \
+              disabled_at = NULL, \
+              expires_at = NULL",
+        )
         .bind(table_id)
         .execute(&self.pool)
         .await
