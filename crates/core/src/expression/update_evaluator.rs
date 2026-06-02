@@ -27,10 +27,13 @@ pub fn apply_update(
     item: &mut BTreeMap<String, AttributeValue>,
     maps: &ExpressionMaps,
 ) -> Result<(), DynamoDbError> {
-    // DynamoDB applies actions in order: SET, REMOVE, ADD, DELETE
+    // DynamoDB evaluates all SET RHS values against the pre-update snapshot,
+    // then applies the results. This means `SET a = :v, b = a` assigns `b`
+    // the *original* value of `a`, not the value just written by the first clause.
+    let snapshot = item.clone();
     for action in actions {
         if let UpdateAction::Set { path, value } = action {
-            let resolved_value = evaluate_set_value(value, item, maps)?;
+            let resolved_value = evaluate_set_value(value, &snapshot, maps)?;
             set_path(item, path, resolved_value, maps)?;
         }
     }
