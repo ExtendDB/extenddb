@@ -5,7 +5,7 @@
 
 use extenddb_core::types::{
     BillingMode, BillingModeSummary, GsiDescription, LsiDescription,
-    ProvisionedThroughputDescription, TableDescription, TableStatus,
+    ProvisionedThroughputDescription, StreamSpecification, TableDescription, TableStatus,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn};
@@ -220,11 +220,16 @@ impl TidbEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         let attr_defs = serde_json::from_value(row.attribute_definitions)
             .map_err(|e| StorageError::Internal(e.to_string()))?;
-        let stream_spec = row
+        let stream_spec: Option<StreamSpecification> = row
             .stream_specification
             .map(serde_json::from_value)
             .transpose()
             .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let active_stream_label = if stream_spec.as_ref().is_some_and(|spec| spec.stream_enabled) {
+            row.stream_label.clone()
+        } else {
+            None
+        };
 
         let (rcu, wcu) = match &row.provisioned_throughput {
             Some(v) => {
@@ -259,8 +264,7 @@ impl TidbEngine {
             None
         };
 
-        let latest_stream_arn = row
-            .stream_label
+        let latest_stream_arn = active_stream_label
             .as_ref()
             .map(|label| stream_arn(&self.region, account_id, &row.table_name, label));
 
@@ -286,7 +290,7 @@ impl TidbEngine {
             local_secondary_indexes: if lsis.is_empty() { None } else { Some(lsis) },
             stream_specification: stream_spec,
             latest_stream_arn,
-            latest_stream_label: row.stream_label,
+            latest_stream_label: active_stream_label,
             deletion_protection_enabled: row.deletion_protection_enabled,
             sse_description: None,
             table_class_summary: None,

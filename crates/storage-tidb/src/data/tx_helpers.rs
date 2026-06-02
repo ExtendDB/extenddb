@@ -380,7 +380,13 @@ pub(super) async fn write_stream_record_for_event_in_tx(
 
     // Assign shard within the transaction.
     let pk = physical_pk_bytes(source, &key_info.key_schema)?;
-    let shard_id = stream_shard_id_for_partition_key(&key_info.table_id, &pk);
+    let stream_label = key_info.stream_label.as_deref().ok_or_else(|| {
+        StorageError::Internal(format!(
+            "stream label missing for stream-enabled table {}",
+            key_info.table_name
+        ))
+    })?;
+    let shard_id = stream_shard_id_for_partition_key(&key_info.table_id, stream_label, &pk);
 
     // Use transaction TSO only as the clustered storage key while the row is
     // committed atomically with the item write. After commit, TiDB MVCC

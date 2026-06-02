@@ -14,13 +14,14 @@ use super::{all_sort_key_info, data_table_name, index_table_name};
 use crate::PostgresEngine;
 
 /// Row shape returned by the table-info query:
-/// (key_schema, attr_defs, status, table_id, stream_spec, has_lsi).
+/// (key_schema, attr_defs, status, table_id, stream_spec, stream_label, has_lsi).
 type TableInfoRow = (
     serde_json::Value,
     serde_json::Value,
     String,
     String,
     Option<serde_json::Value>,
+    Option<String>,
     Option<bool>,
 );
 
@@ -30,6 +31,7 @@ type TableWriteInfoRow = (
     String,
     String,
     Option<serde_json::Value>,
+    Option<String>,
     Option<bool>,
     serde_json::Value,
 );
@@ -40,6 +42,7 @@ type TableReadInfoRow = (
     String,
     String,
     Option<serde_json::Value>,
+    Option<String>,
     Option<bool>,
     Option<String>,
     Option<String>,
@@ -288,7 +291,7 @@ impl PostgresEngine {
     ) -> Result<TableKeyInfo, StorageError> {
         let row: Option<TableInfoRow> = sqlx::query_as(
             "SELECT key_schema, attribute_definitions, table_status, table_id, \
-             stream_specification, \
+             stream_specification, stream_label, \
              EXISTS(SELECT 1 FROM indexes WHERE table_id = tables.table_id AND index_type = 'LSI') AS has_lsi \
              FROM tables \
              WHERE account_id = $1 AND table_name = $2",
@@ -299,7 +302,7 @@ impl PostgresEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let (ks_json, ad_json, status, table_id, stream_spec_json, has_lsi) =
+        let (ks_json, ad_json, status, table_id, stream_spec_json, stream_label, has_lsi) =
             row.ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
 
         if status != "ACTIVE" {
@@ -325,6 +328,7 @@ impl PostgresEngine {
             secondary_index_key_schemas: Vec::new(),
             has_lsi: has_lsi.unwrap_or(false),
             stream_specification,
+            stream_label,
         })
     }
 
@@ -335,7 +339,7 @@ impl PostgresEngine {
     ) -> Result<TableKeyInfo, StorageError> {
         let row: Option<TableWriteInfoRow> = sqlx::query_as(
             "SELECT key_schema, attribute_definitions, table_status, table_id, \
-             stream_specification, \
+             stream_specification, stream_label, \
              EXISTS(SELECT 1 FROM indexes WHERE table_id = tables.table_id AND index_type = 'LSI') AS has_lsi, \
              COALESCE(( \
                  SELECT jsonb_agg(key_schema) FROM indexes \
@@ -356,6 +360,7 @@ impl PostgresEngine {
             status,
             table_id,
             stream_spec_json,
+            stream_label,
             has_lsi,
             secondary_index_key_schemas_json,
         ) = row.ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
@@ -385,6 +390,7 @@ impl PostgresEngine {
             secondary_index_key_schemas,
             has_lsi: has_lsi.unwrap_or(false),
             stream_specification,
+            stream_label,
         })
     }
 
@@ -403,7 +409,7 @@ impl PostgresEngine {
 
         let row: Option<TableReadInfoRow> = sqlx::query_as(
             "SELECT t.key_schema, t.attribute_definitions, t.table_status, t.table_id, \
-                    t.stream_specification, \
+                    t.stream_specification, t.stream_label, \
                     EXISTS(SELECT 1 FROM indexes WHERE table_id = t.table_id AND index_type = 'LSI') AS has_lsi, \
                     i.index_name, i.index_type, i.index_id, i.key_schema, i.projection \
              FROM tables t \
@@ -425,6 +431,7 @@ impl PostgresEngine {
             status,
             table_id,
             stream_spec_json,
+            stream_label,
             has_lsi,
             idx_name,
             idx_type,
@@ -481,6 +488,7 @@ impl PostgresEngine {
                 secondary_index_key_schemas: Vec::new(),
                 has_lsi: has_lsi.unwrap_or(false),
                 stream_specification,
+                stream_label,
             },
             index: Some(IndexInfo {
                 index_name: idx_name,

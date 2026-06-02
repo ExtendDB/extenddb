@@ -467,6 +467,7 @@ mod tests {
             }]],
             has_lsi: false,
             stream_specification: None,
+            stream_label: None,
         }
     }
 

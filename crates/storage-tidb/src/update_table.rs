@@ -4,8 +4,8 @@
 //! `update_table` implementation for `TidbEngine`.
 
 use extenddb_core::types::{
-    AttributeDefinition, BillingMode, KeySchemaElement, ProvisionedThroughput, TableDescription,
-    UpdateTableInput,
+    AttributeDefinition, BillingMode, KeySchemaElement, ProvisionedThroughput, StreamSpecification,
+    TableDescription, UpdateTableInput,
 };
 use extenddb_storage::error::StorageError;
 
@@ -19,6 +19,8 @@ type UpdateTableCatalogRow = (
     serde_json::Value,
     String,
     Option<serde_json::Value>,
+    Option<serde_json::Value>,
+    Option<String>,
 );
 
 fn table_accepts_update_table(status: &str) -> bool {
@@ -73,6 +75,38 @@ fn validate_index_key_definitions(
     Ok(())
 }
 
+fn stream_enabled_from_catalog(
+    stream_specification: Option<&serde_json::Value>,
+) -> Result<bool, StorageError> {
+    stream_specification
+        .map(|value| {
+            serde_json::from_value::<StreamSpecification>(value.clone())
+                .map(|spec| spec.stream_enabled)
+        })
+        .transpose()
+        .map_err(|e| StorageError::Internal(e.to_string()))
+        .map(|enabled| enabled.unwrap_or(false))
+}
+
+fn next_stream_label_for_update(
+    current_stream_specification: Option<&serde_json::Value>,
+    current_stream_label: Option<&str>,
+    requested_stream_enabled: bool,
+    generated_stream_label: String,
+) -> Result<Option<String>, StorageError> {
+    if !requested_stream_enabled {
+        return Ok(None);
+    }
+
+    if stream_enabled_from_catalog(current_stream_specification)? {
+        return Ok(current_stream_label
+            .map(str::to_owned)
+            .or(Some(generated_stream_label)));
+    }
+
+    Ok(Some(generated_stream_label))
+}
+
 impl TidbEngine {
     /// Core implementation of `update_table` (REQ-CTRL-003).
     pub(crate) async fn update_table_impl(
@@ -91,7 +125,7 @@ impl TidbEngine {
         // TiDB owns the long-running distributed online DDL jobs.
         let row: Option<UpdateTableCatalogRow> = sqlx::query_as(
             "SELECT table_status, table_id, attribute_definitions, billing_mode, \
-                    provisioned_throughput \
+                    provisioned_throughput, stream_specification, stream_label \
              FROM tables \
              WHERE account_id = ? AND table_name = ? FOR UPDATE",
         )
@@ -101,8 +135,15 @@ impl TidbEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let (status, table_id, current_attr_defs_json, current_billing_mode, current_pt_json) =
-            row.ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
+        let (
+            status,
+            table_id,
+            current_attr_defs_json,
+            current_billing_mode,
+            current_pt_json,
+            current_stream_spec_json,
+            current_stream_label,
+        ) = row.ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
         if !table_accepts_update_table(&status) {
             return Err(StorageError::TableNotActive(input.table_name.clone()));
         }
@@ -321,15 +362,18 @@ impl TidbEngine {
         if let Some(spec) = &input.stream_specification {
             let spec_json =
                 serde_json::to_value(spec).map_err(|e| StorageError::Internal(e.to_string()))?;
-            let new_label = spec.stream_enabled.then(Self::new_stream_label);
+            let next_stream_label = next_stream_label_for_update(
+                current_stream_spec_json.as_ref(),
+                current_stream_label.as_deref(),
+                spec.stream_enabled,
+                Self::new_stream_label(),
+            )?;
             sqlx::query(
-                "UPDATE tables SET stream_specification = ?, \
-                 stream_label = CASE WHEN ? THEN COALESCE(stream_label, ?) ELSE stream_label END \
+                "UPDATE tables SET stream_specification = ?, stream_label = ? \
                  WHERE account_id = ? AND table_name = ?",
             )
             .bind(&spec_json)
-            .bind(spec.stream_enabled)
-            .bind(&new_label)
+            .bind(&next_stream_label)
             .bind(account_id)
             .bind(&input.table_name)
             .execute(&mut *tx)
@@ -359,7 +403,8 @@ mod tests {
     };
 
     use super::{
-        merge_attribute_definitions, table_accepts_update_table, validate_index_key_definitions,
+        merge_attribute_definitions, next_stream_label_for_update, table_accepts_update_table,
+        validate_index_key_definitions,
     };
 
     fn attr(name: &str, attribute_type: ScalarAttributeType) -> AttributeDefinition {
@@ -430,5 +475,56 @@ mod tests {
             ],
         )
         .expect("existing attribute definition is enough");
+    }
+
+    #[test]
+    fn update_table_stream_reenable_starts_new_generation() {
+        let disabled = serde_json::json!({"StreamEnabled": false});
+
+        let label = next_stream_label_for_update(
+            Some(&disabled),
+            Some("2026-01-01T00:00:00Z"),
+            true,
+            "2026-01-02T00:00:00Z".to_owned(),
+        )
+        .expect("stream label");
+
+        assert_eq!(label.as_deref(), Some("2026-01-02T00:00:00Z"));
+    }
+
+    #[test]
+    fn update_table_stream_update_keeps_active_generation() {
+        let enabled = serde_json::json!({
+            "StreamEnabled": true,
+            "StreamViewType": "NEW_AND_OLD_IMAGES"
+        });
+
+        let label = next_stream_label_for_update(
+            Some(&enabled),
+            Some("2026-01-01T00:00:00Z"),
+            true,
+            "2026-01-02T00:00:00Z".to_owned(),
+        )
+        .expect("stream label");
+
+        assert_eq!(label.as_deref(), Some("2026-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn update_table_stream_disable_removes_active_generation() {
+        let enabled = serde_json::json!({
+            "StreamEnabled": true,
+            "StreamViewType": "KEYS_ONLY"
+        });
+
+        let label = next_stream_label_for_update(
+            Some(&enabled),
+            Some("2026-01-01T00:00:00Z"),
+            false,
+            "2026-01-02T00:00:00Z".to_owned(),
+        )
+        .expect("stream label");
+
+        assert_eq!(label, None);
     }
 }

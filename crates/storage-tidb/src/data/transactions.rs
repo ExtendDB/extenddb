@@ -928,6 +928,7 @@ mod tests {
             }]],
             has_lsi: false,
             stream_specification: None,
+            stream_label: Some("stream-a".to_owned()),
         }
     }
 

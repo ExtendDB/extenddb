@@ -26,13 +26,14 @@ use crate::table_attributes::deny_table_region_merges;
 use crate::tidb_util::{execute_tidb_create_table_ddl, execute_tidb_idempotent_ddl};
 
 /// Row shape returned by the table-info query:
-/// (key_schema, attr_defs, status, table_id, stream_spec, has_lsi).
+/// (key_schema, attr_defs, status, table_id, stream_spec, stream_label, has_lsi).
 type TableInfoRow = (
     serde_json::Value,
     serde_json::Value,
     String,
     String,
     Option<serde_json::Value>,
+    Option<String>,
     Option<bool>,
 );
 
@@ -42,6 +43,7 @@ type TableWriteInfoRow = (
     String,
     String,
     Option<serde_json::Value>,
+    Option<String>,
     Option<bool>,
     serde_json::Value,
 );
@@ -52,6 +54,7 @@ type TableReadInfoRow = (
     String,
     String,
     Option<serde_json::Value>,
+    Option<String>,
     Option<bool>,
     Option<String>,
     Option<String>,
@@ -312,7 +315,7 @@ impl TidbEngine {
     ) -> Result<TableKeyInfo, StorageError> {
         let row: Option<TableInfoRow> = sqlx::query_as(
             "SELECT key_schema, attribute_definitions, table_status, table_id, \
-             stream_specification, \
+             stream_specification, stream_label, \
              EXISTS(SELECT 1 FROM indexes WHERE table_id = tables.table_id AND index_type = 'LSI') AS has_lsi \
              FROM tables \
              WHERE account_id = ? AND table_name = ?",
@@ -323,7 +326,7 @@ impl TidbEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let (ks_json, ad_json, status, table_id, stream_spec_json, has_lsi) =
+        let (ks_json, ad_json, status, table_id, stream_spec_json, stream_label, has_lsi) =
             row.ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
 
         if !table_accepts_data_plane(&status) {
@@ -349,6 +352,7 @@ impl TidbEngine {
             secondary_index_key_schemas: Vec::new(),
             has_lsi: has_lsi.unwrap_or(false),
             stream_specification,
+            stream_label,
         })
     }
 
@@ -359,7 +363,7 @@ impl TidbEngine {
     ) -> Result<TableKeyInfo, StorageError> {
         let row: Option<TableWriteInfoRow> = sqlx::query_as(
             "SELECT key_schema, attribute_definitions, table_status, table_id, \
-             stream_specification, \
+             stream_specification, stream_label, \
              EXISTS(SELECT 1 FROM indexes WHERE table_id = tables.table_id AND index_type = 'LSI') AS has_lsi, \
              COALESCE(( \
                  SELECT JSON_ARRAYAGG(key_schema) FROM indexes \
@@ -380,6 +384,7 @@ impl TidbEngine {
             status,
             table_id,
             stream_spec_json,
+            stream_label,
             has_lsi,
             secondary_index_key_schemas_json,
         ) = row.ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
@@ -409,6 +414,7 @@ impl TidbEngine {
             secondary_index_key_schemas,
             has_lsi: has_lsi.unwrap_or(false),
             stream_specification,
+            stream_label,
         })
     }
 
@@ -427,7 +433,7 @@ impl TidbEngine {
 
         let row: Option<TableReadInfoRow> = sqlx::query_as(
             "SELECT t.key_schema, t.attribute_definitions, t.table_status, t.table_id, \
-                    t.stream_specification, \
+                    t.stream_specification, t.stream_label, \
                     EXISTS(SELECT 1 FROM indexes WHERE table_id = t.table_id AND index_type = 'LSI') AS has_lsi, \
                     i.index_name, i.index_type, i.index_id, i.key_schema, i.projection \
              FROM tables t \
@@ -450,6 +456,7 @@ impl TidbEngine {
             status,
             table_id,
             stream_spec_json,
+            stream_label,
             has_lsi,
             idx_name,
             idx_type,
@@ -506,6 +513,7 @@ impl TidbEngine {
                 secondary_index_key_schemas: Vec::new(),
                 has_lsi: has_lsi.unwrap_or(false),
                 stream_specification,
+                stream_label,
             },
             index: Some(IndexInfo {
                 index_name: idx_name,

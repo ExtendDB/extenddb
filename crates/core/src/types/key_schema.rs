@@ -90,6 +90,11 @@ pub struct TableKeyInfo {
     /// Stream specification for the table, if streams are configured.
     /// Cached here to avoid an extra `describe_table` call per write operation.
     pub stream_specification: Option<super::StreamSpecification>,
+    /// Active stream generation label, when streams are enabled.
+    ///
+    /// TiDB uses this as part of the physical stream shard identity so disabling
+    /// and re-enabling a table stream cannot mix records across generations.
+    pub stream_label: Option<String>,
 }
 
 /// Resolved metadata for a table read path.

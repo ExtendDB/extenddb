@@ -4,8 +4,8 @@
 //! `StreamEngine` trait implementation for `TidbEngine`.
 
 use extenddb_core::types::{
-    SequenceNumberRange, Shard, StreamDescription, StreamRecord, StreamStatus, StreamSummary,
-    StreamViewType,
+    SequenceNumberRange, Shard, StreamDescription, StreamRecord, StreamSpecification, StreamStatus,
+    StreamSummary, StreamViewType,
 };
 use extenddb_storage::StreamEngine;
 use extenddb_storage::error::StorageError;
@@ -24,7 +24,11 @@ use crate::data::finalize_pending_stream_records_for_shard;
 pub(crate) const SHARDS_PER_STREAM: u32 = 16;
 const LEGACY_TABLE_PREFIX_SHARDS_PER_STREAM: u32 = 4;
 
-pub(crate) fn stream_shard_id(table_id: &str, shard_index: u32) -> String {
+pub(crate) fn stream_shard_id(table_id: &str, stream_label: &str, shard_index: u32) -> String {
+    format!("shardId-{shard_index:012}-{stream_label}-{table_id}")
+}
+
+fn legacy_bucket_prefix_stream_shard_id(table_id: &str, shard_index: u32) -> String {
     format!("shardId-{shard_index:012}-{table_id}")
 }
 
@@ -36,8 +40,12 @@ pub(crate) fn stream_shard_index(partition_key: &[u8]) -> u32 {
     crc32fast::hash(partition_key) % SHARDS_PER_STREAM
 }
 
-pub(crate) fn stream_shard_id_for_partition_key(table_id: &str, partition_key: &[u8]) -> String {
-    stream_shard_id(table_id, stream_shard_index(partition_key))
+pub(crate) fn stream_shard_id_for_partition_key(
+    table_id: &str,
+    stream_label: &str,
+    partition_key: &[u8],
+) -> String {
+    stream_shard_id(table_id, stream_label, stream_shard_index(partition_key))
 }
 
 async fn latest_committed_sequence_number(
@@ -65,10 +73,10 @@ impl TidbEngine {
             .unwrap_or_else(|_| time::OffsetDateTime::now_utc().unix_timestamp().to_string())
     }
 
-    pub(crate) fn fixed_stream_shards(table_id: &str) -> Vec<Shard> {
+    pub(crate) fn fixed_stream_shards(table_id: &str, stream_label: &str) -> Vec<Shard> {
         (0..SHARDS_PER_STREAM)
             .map(|index| Shard {
-                shard_id: stream_shard_id(table_id, index),
+                shard_id: stream_shard_id(table_id, stream_label, index),
                 parent_shard_id: None,
                 sequence_number_range: SequenceNumberRange {
                     starting_sequence_number: format!("{:027}", 0),
@@ -203,15 +211,24 @@ impl StreamEngine for TidbEngine {
             let key_schema = serde_json::from_value(ks_json)
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            let stream_view_type = stream_spec_json
-                .and_then(|v| {
-                    v.get("StreamViewType")
-                        .and_then(|sv| serde_json::from_value::<StreamViewType>(sv.clone()).ok())
-                })
+            let stream_specification: Option<StreamSpecification> = stream_spec_json
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let stream_specification = stream_specification
+                .filter(|spec| spec.stream_enabled)
+                .ok_or_else(|| {
+                    StorageError::TableNotFound(format!(
+                        "Requested resource not found: Stream: {arn} not found.",
+                        arn = stream_arn
+                    ))
+                })?;
+            let stream_view_type = stream_specification
+                .stream_view_type
                 .unwrap_or(StreamViewType::KeysOnly);
 
             let limit = limit.unwrap_or(100);
-            let all_shards = Self::fixed_stream_shards(&table_id);
+            let all_shards = Self::fixed_stream_shards(&table_id, &stream_label);
             let shard_rows = all_shards
                 .into_iter()
                 .filter(|shard| {
@@ -353,17 +370,25 @@ impl StreamEngine for TidbEngine {
         let table_name = table_name.to_string();
         let partition_key = partition_key.to_string();
         Box::pin(async move {
-            let table_id: String = sqlx::query_scalar(
-                "SELECT table_id FROM tables WHERE account_id = ? AND table_name = ?",
+            let row: Option<(String, Option<String>)> = sqlx::query_as(
+                "SELECT table_id, stream_label FROM tables WHERE account_id = ? AND table_name = ?",
             )
             .bind(&account_id)
             .bind(&table_name)
-            .fetch_one(&self.pool)
+            .fetch_optional(&self.pool)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let (table_id, stream_label) =
+                row.ok_or_else(|| StorageError::TableNotFound(table_name.clone()))?;
+            let stream_label = stream_label.ok_or_else(|| {
+                StorageError::Internal(format!(
+                    "stream label missing for stream-enabled table {table_name}"
+                ))
+            })?;
 
             Ok(stream_shard_id_for_partition_key(
                 &table_id,
+                &stream_label,
                 partition_key.as_bytes(),
             ))
         })
@@ -404,7 +429,10 @@ impl StreamEngine for TidbEngine {
             };
 
             let shard_belongs_to_stream = (0..SHARDS_PER_STREAM)
-                .any(|index| stream_shard_id(&table_id, index) == shard_id)
+                .any(|index| stream_shard_id(&table_id, &stream_label, index) == shard_id)
+                || (0..SHARDS_PER_STREAM).any(|index| {
+                    legacy_bucket_prefix_stream_shard_id(&table_id, index) == shard_id
+                })
                 || (0..LEGACY_TABLE_PREFIX_SHARDS_PER_STREAM)
                     .any(|index| legacy_table_prefix_stream_shard_id(&table_id, index) == shard_id);
 
@@ -437,17 +465,30 @@ impl StreamEngine for TidbEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        SHARDS_PER_STREAM, legacy_table_prefix_stream_shard_id, stream_shard_id,
-        stream_shard_id_for_partition_key, stream_shard_index,
+        SHARDS_PER_STREAM, legacy_bucket_prefix_stream_shard_id,
+        legacy_table_prefix_stream_shard_id, stream_shard_id, stream_shard_id_for_partition_key,
+        stream_shard_index,
     };
 
     #[test]
     fn stream_shard_ids_put_bucket_before_table_id_for_tidb_region_splits() {
         assert_eq!(
-            stream_shard_id("table-1", 3),
-            "shardId-000000000003-table-1"
+            stream_shard_id("table-1", "stream-a", 3),
+            "shardId-000000000003-stream-a-table-1"
         );
         assert_eq!(SHARDS_PER_STREAM, 16);
+    }
+
+    #[test]
+    fn stream_shard_ids_include_generation_label() {
+        let first_generation = stream_shard_id("table-1", "stream-a", 3);
+        let second_generation = stream_shard_id("table-1", "stream-b", 3);
+
+        assert_ne!(first_generation, second_generation);
+        assert_eq!(
+            legacy_bucket_prefix_stream_shard_id("table-1", 3),
+            "shardId-000000000003-table-1"
+        );
     }
 
     #[test]
@@ -460,8 +501,8 @@ mod tests {
 
     #[test]
     fn stream_shard_assignment_is_deterministic_and_in_range() {
-        let first = stream_shard_id_for_partition_key("table-1", b"customer-a");
-        let second = stream_shard_id_for_partition_key("table-1", b"customer-a");
+        let first = stream_shard_id_for_partition_key("table-1", "stream-a", b"customer-a");
+        let second = stream_shard_id_for_partition_key("table-1", "stream-a", b"customer-a");
 
         assert_eq!(first, second);
         assert!(stream_shard_index(b"customer-a") < SHARDS_PER_STREAM);

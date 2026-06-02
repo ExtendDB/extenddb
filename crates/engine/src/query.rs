@@ -82,6 +82,7 @@ pub async fn handle_query(
             secondary_index_key_schemas: key_info.secondary_index_key_schemas.clone(),
             has_lsi: key_info.has_lsi,
             stream_specification: None, // Queries don't capture stream records
+            stream_label: None,
         }
     } else {
         key_info.clone()
