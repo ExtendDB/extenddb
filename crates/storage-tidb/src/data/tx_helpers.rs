@@ -452,6 +452,24 @@ pub(crate) fn format_tso_sequence_number(tso: u64, ordinal: u32) -> String {
     format!("{tso:0STREAM_SEQUENCE_TSO_WIDTH$}{ordinal:0STREAM_SEQUENCE_ORDINAL_WIDTH$}")
 }
 
+fn push_stream_record_pk_tuple_predicate<'a>(
+    query: &mut sqlx::QueryBuilder<'a, sqlx::MySql>,
+    records: &'a [PendingStreamRecord],
+) {
+    query.push("(shard_id, sequence_number) IN (");
+    for (idx, record) in records.iter().enumerate() {
+        if idx > 0 {
+            query.push(", ");
+        }
+        query.push("(");
+        query.push_bind(&record.shard_id);
+        query.push(", ");
+        query.push_bind(&record.storage_sequence_number);
+        query.push(")");
+    }
+    query.push(")");
+}
+
 pub(crate) async fn finalize_stream_records(
     pool: &sqlx::MySqlPool,
     records: &[PendingStreamRecord],
@@ -469,18 +487,8 @@ pub(crate) async fn finalize_stream_records(
     query.push(STREAM_COMMIT_SEQUENCE_SQL);
     query.push(") WHERE commit_sequence_number IS NULL AND ");
     query.push(STREAM_COMMIT_SEQUENCE_SQL);
-    query.push(" IS NOT NULL AND (");
-    for (idx, record) in records.iter().enumerate() {
-        if idx > 0 {
-            query.push(" OR ");
-        }
-        query.push("(shard_id = ");
-        query.push_bind(&record.shard_id);
-        query.push(" AND sequence_number = ");
-        query.push_bind(&record.storage_sequence_number);
-        query.push(")");
-    }
-    query.push(")");
+    query.push(" IS NOT NULL AND ");
+    push_stream_record_pk_tuple_predicate(&mut query, records);
 
     let result = query
         .build()
@@ -634,7 +642,8 @@ mod tests {
     use extenddb_storage::StreamCapture;
 
     use super::{
-        format_tso_sequence_number, idempotency_token_claim_sql, stream_capture_needs_old_item,
+        PendingStreamRecord, format_tso_sequence_number, idempotency_token_claim_sql,
+        push_stream_record_pk_tuple_predicate, stream_capture_needs_old_item,
         stream_event_from_upsert_rows_affected,
     };
 
@@ -705,5 +714,26 @@ mod tests {
             stream_event_from_upsert_rows_affected(0),
             StreamEventName::Modify
         );
+    }
+
+    #[test]
+    fn stream_finalization_uses_native_primary_key_tuple_predicate() {
+        let records = [
+            PendingStreamRecord {
+                shard_id: "shard-a".to_owned(),
+                storage_sequence_number: "0001".to_owned(),
+            },
+            PendingStreamRecord {
+                shard_id: "shard-b".to_owned(),
+                storage_sequence_number: "0002".to_owned(),
+            },
+        ];
+        let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new("");
+
+        push_stream_record_pk_tuple_predicate(&mut query, &records);
+
+        let sql = sqlx::Execute::sql(&query.build()).to_owned();
+        assert_eq!(sql, "(shard_id, sequence_number) IN ((?, ?), (?, ?))");
+        assert!(!sql.contains(" OR "));
     }
 }
