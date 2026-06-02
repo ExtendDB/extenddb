@@ -211,6 +211,7 @@ impl TidbNativeBackupConfig {
                     table.into(),
                     "--storage".into(),
                     storage_uri.into(),
+                    "--load-stats=true".into(),
                 ]);
                 if let Some(send) = self.send_credentials_to_tikv {
                     args.push(format!("--send-credentials-to-tikv={send}").into());
@@ -1204,6 +1205,7 @@ mod tests {
                 "_ddb_source",
                 "--storage",
                 "local:///backup/snapshots/a/t/1",
+                "--load-stats=true",
                 "--send-credentials-to-tikv=false",
             ]
         );

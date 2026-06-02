@@ -264,12 +264,13 @@ its existing implementation. TiDB uses native BR for snapshot data and keeps
 only ExtendDB metadata in the catalog; unsupported BR restore shapes are
 reported explicitly rather than emulated by item replay. TiDB BR table backups
 request native statistics preservation (`--ignore-stats=false`) so restored
-tables can load TiDB's optimizer statistics from the backup artifact instead of
-waiting for a fresh `ANALYZE TABLE` cycle. For TiDB restore, physical BR restore
-and online DDL normalization complete before the target catalog row is
-published, so failed restores do not create durable transitional table
-metadata. TiDB `DeleteBackup` removes only ExtendDB catalog metadata; the BR
-snapshot directory is lifecycle-managed by the configured backup storage or
+tables can load TiDB's optimizer statistics from the backup artifact. TiDB BR
+restores pass `--load-stats=true` explicitly, keeping the hot-table query plan
+warm instead of waiting for a fresh `ANALYZE TABLE` cycle. For TiDB restore,
+physical BR restore and online DDL normalization complete before the target
+catalog row is published, so failed restores do not create durable transitional
+table metadata. TiDB `DeleteBackup` removes only ExtendDB catalog metadata; the
+BR snapshot directory is lifecycle-managed by the configured backup storage or
 TiDB Operator rather than by an ExtendDB frontend.
 
 `RestoreTableToPointInTime` is a storage-owned operation, not an engine stub.

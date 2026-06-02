@@ -115,8 +115,8 @@ TiDB backup and restore uses native BR, not a logical row-copy table. Configure 
 `AVAILABLE`; incomplete native backup attempts are not exposed as durable
 catalog rows. ExtendDB passes `--ignore-stats=false` to BR table backups, so
 TiDB includes table, column, and index statistics in the native backup metadata
-and restored tables do not have to wait for a new analyze cycle before planning
-hot Query and Scan paths.
+and passes `--load-stats=true` to BR restores so restored tables do not have to
+wait for a new analyze cycle before planning hot Query and Scan paths.
 `RestoreTableFromBackup` likewise publishes the target table only after BR
 restore, physical table rename, and restored-table normalization complete; failed
 or interrupted restores do not expose a durable `CREATING` table.
