@@ -343,14 +343,6 @@ impl StreamEngine for TidbEngine {
         })
     }
 
-    fn cleanup_expired_stream_records(
-        &self,
-        _retention_hours: i64,
-    ) -> BoxFuture<'_, Result<u64, StorageError>> {
-        // TiDB native TTL owns stream retention; no duplicate manual delete path.
-        Box::pin(async move { Ok(0) })
-    }
-
     fn assign_shard(
         &self,
         account_id: &str,

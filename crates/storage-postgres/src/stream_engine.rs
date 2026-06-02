@@ -369,23 +369,6 @@ impl StreamEngine for PostgresEngine {
         })
     }
 
-    fn cleanup_expired_stream_records(
-        &self,
-        retention_hours: i64,
-    ) -> BoxFuture<'_, Result<u64, StorageError>> {
-        Box::pin(async move {
-            let result = sqlx::query(
-                "DELETE FROM stream_records \
-                 WHERE created_at < NOW() - make_interval(hours => $1::integer)",
-            )
-            .bind(retention_hours)
-            .execute(&self.data_pool)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-            Ok(result.rows_affected())
-        })
-    }
-
     fn assign_shard(
         &self,
         account_id: &str,
@@ -500,5 +483,22 @@ impl StreamEngine for PostgresEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
             Ok(row.map(|(s,)| s))
         })
+    }
+}
+
+impl PostgresEngine {
+    pub(crate) async fn cleanup_expired_stream_records_impl(
+        &self,
+        retention_hours: i64,
+    ) -> Result<u64, StorageError> {
+        let result = sqlx::query(
+            "DELETE FROM stream_records \
+             WHERE created_at < NOW() - make_interval(hours => $1::integer)",
+        )
+        .bind(retention_hours)
+        .execute(&self.data_pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        Ok(result.rows_affected())
     }
 }

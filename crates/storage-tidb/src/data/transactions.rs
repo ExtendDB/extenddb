@@ -250,17 +250,6 @@ impl TidbEngine {
 
         Ok(())
     }
-
-    /// Implementation of `DataEngine::cleanup_expired_idempotency_tokens`.
-    pub(crate) async fn cleanup_expired_idempotency_tokens_impl(
-        &self,
-        _max_age_seconds: i64,
-    ) -> Result<u64, StorageError> {
-        // TiDB native TTL owns background retention for this table. The
-        // transaction write path still handles same-token expiry so client
-        // idempotency semantics do not depend on TTL job timing.
-        Ok(0)
-    }
 }
 
 fn transact_get_groups<'a>(

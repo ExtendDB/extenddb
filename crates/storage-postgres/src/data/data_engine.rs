@@ -131,14 +131,4 @@ impl DataEngine for PostgresEngine {
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(self.transact_write_items_impl(ops, idempotency))
     }
-
-    fn cleanup_expired_idempotency_tokens(
-        &self,
-        max_age_seconds: i64,
-    ) -> BoxFuture<'_, Result<u64, StorageError>> {
-        Box::pin(async move {
-            self.cleanup_expired_idempotency_tokens_impl(max_age_seconds)
-                .await
-        })
-    }
 }

@@ -511,12 +511,6 @@ pub trait DataEngine: Send + Sync {
         ops: &'a [TransactWriteOp<'a>],
         idempotency: Option<IdempotencyClaim<'a>>,
     ) -> BoxFuture<'a, Result<(), StorageError>>;
-
-    /// Delete idempotency tokens older than the given age in seconds.
-    fn cleanup_expired_idempotency_tokens(
-        &self,
-        max_age_seconds: i64,
-    ) -> BoxFuture<'_, Result<u64, StorageError>>;
 }
 
 /// TTL, tag, and table-size management operations.
@@ -697,12 +691,6 @@ pub trait StreamEngine: Send + Sync {
         limit: i64,
         exclusive_start_stream_arn: Option<&str>,
     ) -> BoxFuture<'_, StreamListResult>;
-
-    /// Delete stream records older than the retention period.
-    fn cleanup_expired_stream_records(
-        &self,
-        retention_hours: i64,
-    ) -> BoxFuture<'_, Result<u64, StorageError>>;
 
     /// Assign a shard for a given partition key (hash-based).
     fn assign_shard(

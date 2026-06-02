@@ -215,7 +215,7 @@ impl PostgresEngine {
         Ok(())
     }
 
-    /// Implementation of `DataEngine::cleanup_expired_idempotency_tokens`.
+    /// Delete expired transaction idempotency tokens for PostgreSQL's retention worker.
     pub(crate) async fn cleanup_expired_idempotency_tokens_impl(
         &self,
         max_age_seconds: i64,

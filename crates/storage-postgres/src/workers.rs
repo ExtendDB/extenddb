@@ -8,8 +8,8 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use extenddb_core::metrics::MetricsCollector;
+use extenddb_storage::MetadataEngine;
 use extenddb_storage::management_store::SettingsStore;
-use extenddb_storage::{DataEngine, MetadataEngine, StreamEngine};
 use sqlx::PgPool;
 
 use crate::PostgresEngine;
@@ -102,7 +102,10 @@ pub(crate) async fn stream_record_cleanup_worker(
         tokio::time::sleep(CLEANUP_INTERVAL).await;
         let cycle_start = std::time::Instant::now();
 
-        match StreamEngine::cleanup_expired_stream_records(&*storage, RETENTION_HOURS).await {
+        match storage
+            .cleanup_expired_stream_records_impl(RETENTION_HOURS)
+            .await
+        {
             Ok(0) => {
                 #[allow(clippy::cast_precision_loss)]
                 let cycle_us = cycle_start.elapsed().as_micros() as f64;
@@ -135,7 +138,10 @@ pub(crate) async fn idempotency_token_cleanup_worker(
         tokio::time::sleep(CLEANUP_INTERVAL).await;
         let cycle_start = std::time::Instant::now();
 
-        match DataEngine::cleanup_expired_idempotency_tokens(&*storage, MAX_AGE_SECONDS).await {
+        match storage
+            .cleanup_expired_idempotency_tokens_impl(MAX_AGE_SECONDS)
+            .await
+        {
             Ok(0) => {
                 #[allow(clippy::cast_precision_loss)]
                 let cycle_us = cycle_start.elapsed().as_micros() as f64;

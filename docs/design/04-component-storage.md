@@ -145,7 +145,6 @@ All table operations are scoped by `account_id` for multi-account isolation.
 - `batch_get_items`, `batch_write_items`
 - `export_table_items`, `refresh_table_statistics`
 - `transact_get_items`, `transact_write_items`
-- `cleanup_expired_idempotency_tokens`
 
 Data operations receive `TableKeyInfo` from the engine layer, which has already
 validated the table exists and can serve the data plane. Handlers that only need
@@ -188,6 +187,9 @@ all stream records in that same transaction. Old-image stream views fetch the
 prior row with native point `SELECT ... FOR UPDATE` inside the batch
 transaction; key-only and new-image views skip that read and rely on native DML
 outcomes.
+Transaction idempotency-token retention is backend-specific rather than part
+of `DataEngine`: Postgres runs a concrete cleanup worker, while TiDB uses
+native table TTL and handles same-token expiry in the token-claim upsert path.
 Bulk import writes validated rows through `batch_write_items`, then calls
 `refresh_table_statistics` before reporting completion. Imports fetch
 `table_write_info`, so secondary-index key validation uses the same write
@@ -222,7 +224,8 @@ from real table and index statistics instead of pseudo statistics.
 - `write_stream_record` — writes stream record atomically with data write
 - `get_stream_records` — retrieves stream records for a shard
 - `describe_stream`, `list_streams`
-- `cleanup_expired_stream_records` — removes records older than 24 hours
+- `assign_shard`, `next_sequence_number`, `validate_shard`,
+  `latest_sequence_number`
 
 TiDB uses a fixed deterministic stream shard layout, so streamed writes compute
 the shard id from the encoded partition-key tuple. The shard bucket is the
@@ -236,6 +239,8 @@ counter row while preserving commit-order stream iteration across multiple TiDB
 nodes. Stream iterator code treats sequence numbers as opaque decimal strings
 and computes `AT_SEQUENCE_NUMBER` predecessors with string arithmetic, because
 TiDB TSO-plus-ordinal values are wider than native host integers.
+Stream-record retention is backend-specific rather than part of the shared
+stream trait. Postgres runs a concrete cleanup worker for its stream table.
 TiDB does not foreground-delete stream history during `DeleteTable`; table ids
 are immutable, the catalog deletion makes the stream unreachable, and native
 TTL owns retention for the shared `stream_records` table. TiDB data migrations

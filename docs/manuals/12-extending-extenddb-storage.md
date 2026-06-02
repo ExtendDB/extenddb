@@ -90,10 +90,13 @@ Item CRUD, query, scan, and transaction operations:
 | `scan` | Full table/index scan with pagination, parallel scan segments, and the `ConsistentRead` flag |
 | `transact_get_items` | Multi-item consistent read (serializable isolation) |
 | `transact_write_items` | Multi-item atomic write with conditions and idempotency tokens |
-| `cleanup_expired_idempotency_tokens` | Garbage-collect old idempotency tokens |
 
 Key design decisions:
 - **Condition expressions** are evaluated inside the storage transaction. The engine parses and compiles expressions; the storage layer receives an AST (`Expr`) and evaluates it against the existing item within the same transaction that performs the write. This is critical for correctness — condition checks and writes must be atomic.
+- **Idempotency token retention** is backend-specific. Application-worker
+  backends can run concrete cleanup workers, while native-retention backends
+  such as TiDB should use database TTL and keep cleanup hooks out of
+  `DataEngine`.
 - **DataEngine futures borrow request metadata.** Backend implementations
   should return the implementation future directly and should not clone keys,
   expression maps, resolved index info, or transaction batches just to enter
@@ -188,7 +191,6 @@ DynamoDB Streams support:
 | `get_stream_records` | Read records from a shard after a sequence number |
 | `describe_stream` | Describe a stream (shards, status, view type) |
 | `list_streams` | List streams, optionally filtered by table |
-| `cleanup_expired_stream_records` | Delete records older than retention period |
 | `assign_shard` | Hash-assign a partition key to a shard |
 | `next_sequence_number` | Generate the next sortable sequence number for a shard |
 | `validate_shard` | Verify a shard exists for a given stream ARN |
@@ -198,7 +200,9 @@ Key design decisions:
 - Stream records are written atomically with data writes (same transaction).
 - Shards are hash-assigned based on partition key.
 - Sequence numbers must be monotonically increasing within a shard.
-- The retention period is configurable (default 24 hours).
+- Stream-record retention is backend-specific: Postgres uses a concrete
+  backend cleanup worker, while TiDB uses native table TTL for the shared
+  stream table.
 - TiDB backends should derive user-visible stream sequence numbers from native
   MVCC commit timestamps, not transaction start timestamps. Insert the stream
   record atomically with the item write, then finalize the visible sequence
