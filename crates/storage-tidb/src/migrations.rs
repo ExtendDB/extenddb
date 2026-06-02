@@ -107,11 +107,17 @@ const DATA_SCHEMA_MIGRATION: &str =
     include_str!("../../storage-tidb/data_migrations/001_data_schema.sql");
 const DATA_PRESPLIT_SHARED_TABLES_MIGRATION: &str =
     include_str!("../../storage-tidb/data_migrations/002_presplit_shared_data_tables.sql");
+const DATA_STREAM_RECORD_BUCKET_SPLITS_MIGRATION: &str =
+    include_str!("../../storage-tidb/data_migrations/004_stream_record_bucket_splits.sql");
 pub(crate) const DATA_MIGRATIONS: &[(&str, &str)] = &[
     ("001_data_schema.sql", DATA_SCHEMA_MIGRATION),
     (
         "002_presplit_shared_data_tables.sql",
         DATA_PRESPLIT_SHARED_TABLES_MIGRATION,
+    ),
+    (
+        "004_stream_record_bucket_splits.sql",
+        DATA_STREAM_RECORD_BUCKET_SPLITS_MIGRATION,
     ),
 ];
 #[cfg(test)]
@@ -773,8 +779,26 @@ mod tests {
         assert!(
             sql.contains("SPLIT TABLE stream_records INDEX idx_stream_records_commit_sequence")
         );
+        assert!(sql.contains("SPLIT TABLE stream_records BY"));
+        assert!(sql.contains("'shardId-000000000001-'"));
+        assert!(sql.contains("'shardId-000000000015-'"));
         assert!(sql.contains("SPLIT TABLE idempotency_tokens"));
-        assert!(sql.contains("REGIONS 16"));
+    }
+
+    #[test]
+    fn data_migrations_split_stream_records_by_bucket_prefix() {
+        let (filename, sql) = DATA_MIGRATIONS
+            .iter()
+            .find(|(filename, _)| *filename == "004_stream_record_bucket_splits.sql")
+            .expect("stream bucket split migration");
+
+        assert_eq!(*filename, "004_stream_record_bucket_splits.sql");
+        assert!(sql.contains("SPLIT TABLE stream_records BY"));
+        assert!(
+            sql.contains("SPLIT TABLE stream_records INDEX idx_stream_records_commit_sequence BY")
+        );
+        assert!(sql.contains("'shardId-000000000001-'"));
+        assert!(sql.contains("'shardId-000000000015-'"));
     }
 
     #[test]

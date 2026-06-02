@@ -201,6 +201,10 @@ Key design decisions:
   record atomically with the item write, then finalize the visible sequence
   from TiDB `commit_ts` plus an in-transaction ordinal so `LATEST` and
   `GetRecords` follow commit order without a per-shard counter row.
+- TiDB stream shard ids should put the deterministic shard bucket before the
+  table id and pre-split `stream_records` plus its commit-sequence index at the
+  bucket prefixes; putting table id first concentrates one hot table's stream
+  writes into one key range.
 - TiDB should not foreground-delete stream history during `DeleteTable`; native
   TTL owns shared `stream_records` retention and immutable table IDs prevent
   reuse conflicts.

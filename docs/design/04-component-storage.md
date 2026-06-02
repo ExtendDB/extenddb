@@ -217,21 +217,23 @@ from real table and index statistics instead of pseudo statistics.
 - `cleanup_expired_stream_records` — removes records older than 24 hours
 
 TiDB uses a fixed deterministic stream shard layout, so streamed writes compute
-the shard id from the encoded partition-key tuple. Stream rows are inserted
-atomically with item writes under a transaction-local storage sequence, then
-finalized to the user-visible sequence number using TiDB's native MVCC
-`commit_ts` (`TIDB_MVCC_INFO` over `TIDB_ENCODE_RECORD_KEY`) plus the
-in-transaction ordinal. This avoids a shard counter row while preserving
-commit-order stream iteration across multiple TiDB nodes. Stream iterator code
-treats sequence numbers as opaque decimal strings and computes
-`AT_SEQUENCE_NUMBER` predecessors with string arithmetic, because TiDB
-TSO-plus-ordinal values are wider than native host integers.
+the shard id from the encoded partition-key tuple. The shard bucket is the
+first varying component in the TiDB shard key (`shardId-<bucket>-<table_id>`),
+so the shared `stream_records` table and its commit-sequence index can be
+pre-split by bucket prefix. Stream rows are inserted atomically with item writes
+under a transaction-local storage sequence, then finalized to the user-visible
+sequence number using TiDB's native MVCC `commit_ts` (`TIDB_MVCC_INFO` over
+`TIDB_ENCODE_RECORD_KEY`) plus the in-transaction ordinal. This avoids a shard
+counter row while preserving commit-order stream iteration across multiple TiDB
+nodes. Stream iterator code treats sequence numbers as opaque decimal strings
+and computes `AT_SEQUENCE_NUMBER` predecessors with string arithmetic, because
+TiDB TSO-plus-ordinal values are wider than native host integers.
 TiDB does not foreground-delete stream history during `DeleteTable`; table ids
 are immutable, the catalog deletion makes the stream unreachable, and native
 TTL owns retention for the shared `stream_records` table. TiDB data migrations
 pre-split both the clustered stream key and the commit-sequence secondary index
-by shard-id range, so a fresh shared stream table does not start as one Region
-for all frontend writers.
+at the 16 shard-bucket prefixes, so a hot stream table does not start all shard
+writes in one Region.
 
 **WorkerStore** (background worker operations):
 - `process_control_plane_transitions` — handles table state transitions

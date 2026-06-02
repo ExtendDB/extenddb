@@ -16,9 +16,19 @@ use crate::TidbEngine;
 use crate::data::finalize_pending_stream_records_for_shard;
 
 /// Number of fixed shards per stream (hash-based assignment).
-pub(crate) const SHARDS_PER_STREAM: u32 = 4;
+///
+/// Keep this aligned with the TiDB stream_records Region split points. The
+/// bucket is the first varying component in `shard_id` so one hot table can
+/// spread stream writes across TiDB Regions instead of concentrating under the
+/// table_id prefix.
+pub(crate) const SHARDS_PER_STREAM: u32 = 16;
+const LEGACY_TABLE_PREFIX_SHARDS_PER_STREAM: u32 = 4;
 
 pub(crate) fn stream_shard_id(table_id: &str, shard_index: u32) -> String {
+    format!("shardId-{shard_index:012}-{table_id}")
+}
+
+fn legacy_table_prefix_stream_shard_id(table_id: &str, shard_index: u32) -> String {
     format!("shardId-{table_id}-{shard_index:012}")
 }
 
@@ -401,8 +411,10 @@ impl StreamEngine for TidbEngine {
                 )));
             };
 
-            let shard_belongs_to_stream =
-                (0..SHARDS_PER_STREAM).any(|index| stream_shard_id(&table_id, index) == shard_id);
+            let shard_belongs_to_stream = (0..SHARDS_PER_STREAM)
+                .any(|index| stream_shard_id(&table_id, index) == shard_id)
+                || (0..LEGACY_TABLE_PREFIX_SHARDS_PER_STREAM)
+                    .any(|index| legacy_table_prefix_stream_shard_id(&table_id, index) == shard_id);
 
             if !shard_belongs_to_stream {
                 return Err(StorageError::TableNotFound(format!(
@@ -433,13 +445,23 @@ impl StreamEngine for TidbEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        SHARDS_PER_STREAM, stream_shard_id, stream_shard_id_for_partition_key, stream_shard_index,
+        SHARDS_PER_STREAM, legacy_table_prefix_stream_shard_id, stream_shard_id,
+        stream_shard_id_for_partition_key, stream_shard_index,
     };
 
     #[test]
-    fn stream_shard_ids_match_the_fixed_layout() {
+    fn stream_shard_ids_put_bucket_before_table_id_for_tidb_region_splits() {
         assert_eq!(
             stream_shard_id("table-1", 3),
+            "shardId-000000000003-table-1"
+        );
+        assert_eq!(SHARDS_PER_STREAM, 16);
+    }
+
+    #[test]
+    fn legacy_table_prefix_stream_shard_ids_remain_validatable() {
+        assert_eq!(
+            legacy_table_prefix_stream_shard_id("table-1", 3),
             "shardId-table-1-000000000003"
         );
     }

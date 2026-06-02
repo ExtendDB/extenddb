@@ -137,7 +137,12 @@ For UpdateItem, the `new_image` is not known until after `apply_update` runs ins
 
 ### Shard Model
 
-Each stream has a fixed set of shards (currently 4 shards per stream). Shard IDs are deterministic (`shardId-<table>-000000000000` through `shardId-<table>-000000000003`). Sequence numbers are monotonically increasing, sortable strings within a shard; TiDB derives them from native MVCC commit timestamps with a per-transaction ordinal suffix.
+Each stream has a fixed set of shards. TiDB uses 16 deterministic shards per
+stream and puts the shard bucket before the table id in the shard key
+(`shardId-000000000000-<table>` through `shardId-000000000015-<table>`) so
+the shared stream table can be pre-split by bucket prefix. Sequence numbers are
+monotonically increasing, sortable strings within a shard; TiDB derives them
+from native MVCC commit timestamps with a per-transaction ordinal suffix.
 
 ### Iterator Types
 
