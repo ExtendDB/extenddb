@@ -341,3 +341,26 @@ fn set_intermediate_map_path_missing_fails() {
     let result = apply("SET a.b.c = :v", &mut item, HashMap::new(), values);
     assert!(result.is_err());
 }
+
+#[test]
+fn set_snapshot_semantics_second_clause_reads_old_value() {
+    let mut item = BTreeMap::new();
+    item.insert("pk".into(), AttributeValue::S("key1".into()));
+    item.insert("a".into(), AttributeValue::S("OLD".into()));
+    let mut values = HashMap::new();
+    values.insert("v".into(), AttributeValue::S("NEW".into()));
+    apply("SET a = :v, b = a", &mut item, HashMap::new(), values).unwrap();
+    assert_eq!(item.get("a"), Some(&AttributeValue::S("NEW".into())));
+    assert_eq!(item.get("b"), Some(&AttributeValue::S("OLD".into())));
+}
+
+#[test]
+fn set_parenthesised_arithmetic() {
+    let mut item = BTreeMap::new();
+    item.insert("pk".into(), AttributeValue::S("key1".into()));
+    item.insert("c".into(), AttributeValue::N("10".into()));
+    let mut values = HashMap::new();
+    values.insert("v".into(), AttributeValue::N("3".into()));
+    apply("SET c = (c - :v)", &mut item, HashMap::new(), values).unwrap();
+    assert_eq!(item.get("c"), Some(&AttributeValue::N("7".into())));
+}
