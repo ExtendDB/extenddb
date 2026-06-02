@@ -955,7 +955,10 @@ the ordered index scan instead of a root sort.
 
 ## 8. Parallel Scan Segment Assignment
 
-`Segment` and `TotalSegments` map to PostgreSQL via hash-based partitioning of the primary key:
+`Segment` and `TotalSegments` are backend-owned. Each backend must ensure every item in a table or index belongs to
+exactly one segment and that segment cursors remain deterministic.
+
+PostgreSQL maps segments via hash-based partitioning of the primary key:
 
 ```sql
 -- Scan segment 2 of 4 total segments:
@@ -974,12 +977,23 @@ arithmetic assigns each partition key to exactly one segment, ensuring:
 - Segments can be scanned in parallel by independent workers
 - The assignment is deterministic (same item always in same segment)
 
-> **Portability note:** `hashtext()` is PostgreSQL-specific. Segment
-> assignment is not guaranteed to be consistent across different storage
-> backends. If cross-backend consistency is needed in the future, define a
-> hash function in the `core` crate (e.g., CRC32 of the partition key bytes)
-> that all backends use, and pass the pre-computed segment filter to the
-> storage backend.
+TiDB maps segments to native range predicates over the clustered base-table key (`pk`) or the selected native
+secondary-index partition-key column. For example, segment 1 of 4 scans a bounded TiDB key range:
+
+```sql
+SELECT item_data FROM `_ddb_Users`
+WHERE pk >= X'4000000000000000' AND pk < X'8000000000000000'
+ORDER BY pk, sk_s
+LIMIT ?
+```
+
+This avoids row-by-row `CRC32(...) % TotalSegments` predicates that would force every worker to scan the full table or
+index. TiDB serves each segment as a native clustered/index range scan; the assignment remains disjoint and complete,
+but the exact segment mapping is intentionally backend-specific.
+
+> **Portability note:** Segment assignment is not guaranteed to be consistent across different storage backends. Clients
+> should treat `Segment`/`TotalSegments` as an execution partitioning hint for one scan operation, not as a portable
+> durable partitioning scheme.
 
 ## 9. Idempotency Token Storage
 

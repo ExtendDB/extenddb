@@ -19,6 +19,7 @@ use super::index::{
 };
 use super::query::{
     build_key, build_sk_sql, execute_query_sql, execute_scan_sql, resolve_expr_to_av,
+    scan_segment_range,
 };
 use super::{all_sort_key_info, data_table_name, json_to_item, physical_pk_bytes_from_values};
 use crate::TidbEngine;
@@ -365,13 +366,22 @@ impl TidbEngine {
                 attr_defs,
             ));
         }
-        // Parallel scan: hash-based segment assignment.
-        if let (Some(seg), Some(total)) = (segment, total_segments) {
+        let segment_range = if let (Some(seg), Some(total)) = (segment, total_segments) {
+            Some(scan_segment_range(seg, total)?)
+        } else {
+            None
+        };
+
+        // Parallel scan: native range segments over the base clustered key or
+        // the selected native secondary-index partition-key column. This keeps
+        // each segment disjoint while allowing TiDB to seek a key range instead
+        // of evaluating a row-by-row hash/modulo predicate.
+        if let Some(range) = &segment_range {
             let segment_column = index.map_or_else(
                 || "pk".to_owned(),
                 |idx| native_index_hash_column(&idx.index_id),
             );
-            conditions.push(format!("CRC32({segment_column}) % {total} = {seg}"));
+            conditions.extend(range.predicates(&segment_column));
         }
 
         let cursor_columns = if let Some(idx) = index {
@@ -409,6 +419,7 @@ impl TidbEngine {
         // Execute
         let rows = execute_scan_sql(
             &sql,
+            segment_range.as_ref(),
             exclusive_start_key,
             read_key_schema,
             attr_defs,

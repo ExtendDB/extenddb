@@ -19,6 +19,64 @@ use super::{all_sort_key_info, physical_pk_bytes};
 pub(crate) type JsonRowsQuery<'q> =
     sqlx::query::QueryAs<'q, sqlx::MySql, (serde_json::Value,), sqlx::mysql::MySqlArguments>;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ScanSegmentRange {
+    pub(super) lower: Option<Vec<u8>>,
+    pub(super) upper: Option<Vec<u8>>,
+}
+
+impl ScanSegmentRange {
+    pub(super) fn predicates(&self, column: &str) -> Vec<String> {
+        let mut predicates = Vec::with_capacity(2);
+        if self.lower.is_some() {
+            predicates.push(format!("{column} >= ?"));
+        }
+        if self.upper.is_some() {
+            predicates.push(format!("{column} < ?"));
+        }
+        predicates
+    }
+}
+
+pub(super) fn scan_segment_range(
+    segment: i64,
+    total_segments: i64,
+) -> Result<ScanSegmentRange, StorageError> {
+    if total_segments < 1 || segment < 0 || segment >= total_segments {
+        return Err(StorageError::Validation(
+            "invalid parallel scan segment".to_owned(),
+        ));
+    }
+
+    let segment = u128::try_from(segment)
+        .map_err(|_| StorageError::Validation("invalid parallel scan segment".to_owned()))?;
+    let total = u128::try_from(total_segments)
+        .map_err(|_| StorageError::Validation("invalid parallel scan segment".to_owned()))?;
+    let keyspace = 1_u128 << 64;
+
+    let lower = if segment == 0 {
+        None
+    } else {
+        let value = segment * keyspace / total;
+        Some(scan_segment_bound_bytes(value)?)
+    };
+    let upper = if segment + 1 == total {
+        None
+    } else {
+        let value = (segment + 1) * keyspace / total;
+        Some(scan_segment_bound_bytes(value)?)
+    };
+
+    Ok(ScanSegmentRange { lower, upper })
+}
+
+fn scan_segment_bound_bytes(value: u128) -> Result<Vec<u8>, StorageError> {
+    let value = u64::try_from(value).map_err(|_| {
+        StorageError::Internal(format!("parallel scan segment bound out of range: {value}"))
+    })?;
+    Ok(value.to_be_bytes().to_vec())
+}
+
 /// Evaluate a condition expression against an item inside a transaction.
 ///
 /// Returns `Ok(())` if the condition passes or is `None`.
@@ -252,6 +310,7 @@ fn bind_sort_key_tuple<'q>(
 /// Execute a scan SQL statement with dynamic parameter binding.
 pub(crate) async fn execute_scan_sql(
     sql: &str,
+    segment_range: Option<&ScanSegmentRange>,
     exclusive_start_key: Option<&Item>,
     key_schema: &[KeySchemaElement],
     attr_defs: &[AttributeDefinition],
@@ -259,6 +318,15 @@ pub(crate) async fn execute_scan_sql(
     pool: &sqlx::MySqlPool,
 ) -> Result<Vec<serde_json::Value>, StorageError> {
     let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sql);
+
+    if let Some(range) = segment_range {
+        if let Some(lower) = &range.lower {
+            query = query.bind(lower);
+        }
+        if let Some(upper) = &range.upper {
+            query = query.bind(upper);
+        }
+    }
 
     if let Some(start_key) = exclusive_start_key {
         query = bind_key_tuple(query, start_key, key_schema, attr_defs)?;
@@ -287,7 +355,7 @@ mod tests {
     use extenddb_core::expression::{Expr, SortKeyCondition};
     use extenddb_core::types::{AttributeValue, ScalarAttributeType};
 
-    use super::{build_sk_sql, next_prefix_bytes};
+    use super::{ScanSegmentRange, build_sk_sql, next_prefix_bytes, scan_segment_range};
 
     #[test]
     fn prefix_upper_bound_uses_half_open_byte_range() {
@@ -317,5 +385,52 @@ mod tests {
 
         assert_eq!(sql.fragment, " AND sk_s >= ? AND sk_s < ?");
         assert_eq!(param_idx, 4);
+    }
+
+    #[test]
+    fn scan_segment_range_partitions_native_keyspace() {
+        let first = scan_segment_range(0, 4).expect("first segment");
+        let second = scan_segment_range(1, 4).expect("second segment");
+        let last = scan_segment_range(3, 4).expect("last segment");
+
+        assert_eq!(first.lower, None);
+        assert_eq!(first.upper, Some(vec![0x40, 0, 0, 0, 0, 0, 0, 0]));
+        assert_eq!(second.lower, Some(vec![0x40, 0, 0, 0, 0, 0, 0, 0]));
+        assert_eq!(second.upper, Some(vec![0x80, 0, 0, 0, 0, 0, 0, 0]));
+        assert_eq!(last.lower, Some(vec![0xc0, 0, 0, 0, 0, 0, 0, 0]));
+        assert_eq!(last.upper, None);
+    }
+
+    #[test]
+    fn scan_segment_predicates_are_native_range_seeks() {
+        let range = ScanSegmentRange {
+            lower: Some(vec![1]),
+            upper: Some(vec![2]),
+        };
+
+        let predicates = range.predicates("edbidx_idx1_pk");
+
+        assert_eq!(
+            predicates,
+            vec!["edbidx_idx1_pk >= ?", "edbidx_idx1_pk < ?"]
+        );
+        assert!(!predicates.join(" ").contains("CRC32"));
+        assert!(!predicates.join(" ").contains('%'));
+    }
+
+    #[test]
+    fn scan_segment_single_total_needs_no_range_predicates() {
+        let range = scan_segment_range(0, 1).expect("single segment");
+
+        assert_eq!(range.lower, None);
+        assert_eq!(range.upper, None);
+        assert!(range.predicates("pk").is_empty());
+    }
+
+    #[test]
+    fn scan_segment_range_rejects_invalid_segments() {
+        assert!(scan_segment_range(0, 0).is_err());
+        assert!(scan_segment_range(-1, 4).is_err());
+        assert!(scan_segment_range(4, 4).is_err());
     }
 }
