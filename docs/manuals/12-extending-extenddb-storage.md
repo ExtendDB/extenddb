@@ -280,7 +280,10 @@ aggregate `metrics` table after the samples table is available; runtime code
 does not query both paths. Flushes should batch the drained metrics rows into
 bounded multi-row inserts so the append-only design does not pay one frontend
 catalog round trip per metric row while still avoiding oversized TiDB write
-transactions.
+transactions. When a migration creates append-heavy TiDB tables with
+`PRE_SPLIT_REGIONS`, run the schema script in a session with
+`tidb_scatter_region = 'global'` and wait for split/scatter completion so the
+first frontend write burst starts on distributed Regions.
 
 For fixed-retention data tables, such as TiDB stream records and transaction
 idempotency tokens, prefer native TTL over frontend cleanup indexes. Keep only
@@ -299,7 +302,8 @@ shape.
 For append-only TiDB catalog tables without a clustered primary key, such as
 failed-login attempts, use TiDB `SHARD_ROW_ID_BITS` to scatter implicit row IDs
 instead of adding a frontend-generated identifier. This keeps the write path a
-single insert while avoiding one-Region hotspots under multiple frontend nodes.
+single insert while avoiding one-Region hotspots under multiple frontend nodes;
+pair it with migration-session scatter for fresh pre-split tables.
 
 ### RateLimitStore
 

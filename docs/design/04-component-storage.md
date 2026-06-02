@@ -350,7 +350,10 @@ storage. TiDB persists immutable rows in `metrics_samples` with a native
 aggregates at query time. The old aggregate `metrics` table is migrated away
 instead of kept in the runtime read path. This avoids cross-frontend
 contention on a shared per-minute `ON DUPLICATE` metrics row and avoids a
-single initial write Region for a new TiDB catalog. TiDB metrics flushes use
+single initial write Region for a new TiDB catalog. TiDB migration sessions
+set `tidb_scatter_region = 'global'` and wait for split/scatter completion so
+fresh `PRE_SPLIT_REGIONS` tables are distributed by TiDB before write bursts
+start. TiDB metrics flushes use
 one multi-row append-only insert per bounded batch rather than one insert per
 metric row, keeping frontend latency low while following TiDB's guidance to
 keep write transactions split into modest batches.
@@ -366,8 +369,9 @@ Login rate limiting and account lockout:
 Tracks failed login attempts by principal and source IP to mitigate clients
 sending excessive traffic. TiDB stores these as append-only rows with native
 TTL retention, `SHARD_ROW_ID_BITS` on the implicit row id, and pre-split
-Regions, so concurrent frontends do not concentrate failed-login inserts on one
-TiKV Region. Login-attempt retention is backend-specific rather than part of
+Regions scattered by the migration session, so concurrent frontends do not
+concentrate failed-login inserts on one TiKV Region. Login-attempt retention is
+backend-specific rather than part of
 `RateLimitStore`: Postgres runs a concrete cleanup worker, while TiDB uses
 native TTL on `login_attempts`.
 

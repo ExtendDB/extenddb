@@ -4,7 +4,7 @@
 //! TiDB schema migration helpers for catalog and data databases.
 
 use extenddb_storage::management_store::{OpError, OpResult};
-use sqlx::MySqlPool;
+use sqlx::{MySqlConnection, MySqlPool};
 
 use crate::data::{
     DYNAMODB_HASH_KEY_COLUMN_BYTES, DYNAMODB_HASH_KEY_COLUMN_TYPE,
@@ -137,6 +137,10 @@ const DATA_NATIVE_TTL_LOOKUP_INDEX_DROPS: &[(&str, &str)] = &[
         "idempotency_tokens",
         "ALTER TABLE idempotency_tokens DROP INDEX IF EXISTS idx_idempotency_tokens_created",
     ),
+];
+const MIGRATION_SESSION_INIT_STATEMENTS: &[&str] = &[
+    "SET SESSION tidb_scatter_region = 'global'",
+    "SET SESSION tidb_wait_split_region_finish = ON",
 ];
 
 /// Run catalog migrations, skipping already-applied ones.
@@ -447,6 +451,7 @@ async fn run_sql_script(pool: &MySqlPool, sql: &str, label: &str) -> OpResult<()
         .acquire()
         .await
         .map_err(|e| OpError::Internal(format!("Acquire migration connection: {e}")))?;
+    configure_migration_session(&mut conn, label).await?;
     let restores_foreign_key_checks = sql.contains("FOREIGN_KEY_CHECKS");
     for statement in sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
         if let Err(err) = sqlx::query(statement).execute(&mut *conn).await {
@@ -459,6 +464,18 @@ async fn run_sql_script(pool: &MySqlPool, sql: &str, label: &str) -> OpResult<()
                 "Migration {label} failed: {err}"
             )));
         }
+    }
+    Ok(())
+}
+
+async fn configure_migration_session(conn: &mut MySqlConnection, label: &str) -> OpResult<()> {
+    for statement in MIGRATION_SESSION_INIT_STATEMENTS {
+        sqlx::query(statement)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                OpError::Internal(format!("Configure TiDB migration session for {label}: {e}"))
+            })?;
     }
     Ok(())
 }
@@ -524,9 +541,9 @@ async fn record_all_catalog_migrations(pool: &MySqlPool) -> OpResult<()> {
 mod tests {
     use super::{
         CATALOG_MIGRATIONS, DATA_MIGRATIONS, DATA_NATIVE_TTL_LOOKUP_INDEX_DROPS,
-        DATA_SCHEMA_MIGRATION, TIDB_BINARY_COLLATION_TABLE_OPTION,
-        dynamodb_hash_key_column_needs_rebuild, incompatible_dynamodb_hash_key_column_error,
-        should_apply_consolidated_catalog_schema,
+        DATA_SCHEMA_MIGRATION, MIGRATION_SESSION_INIT_STATEMENTS,
+        TIDB_BINARY_COLLATION_TABLE_OPTION, dynamodb_hash_key_column_needs_rebuild,
+        incompatible_dynamodb_hash_key_column_error, should_apply_consolidated_catalog_schema,
     };
     use crate::{CATALOG_VERSION, data::USER_TABLE_FULL_KEYSPACE_SPLITS_MIGRATION};
 
@@ -631,6 +648,17 @@ mod tests {
         assert!(sql.contains("SPLIT TABLE login_attempts"));
         assert!(sql.contains("REGIONS 16"));
         assert!(sql.contains("0.0.21"));
+    }
+
+    #[test]
+    fn migration_sessions_scatter_presplit_regions() {
+        assert_eq!(
+            MIGRATION_SESSION_INIT_STATEMENTS,
+            [
+                "SET SESSION tidb_scatter_region = 'global'",
+                "SET SESSION tidb_wait_split_region_finish = ON",
+            ]
+        );
     }
 
     #[test]
