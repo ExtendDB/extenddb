@@ -156,9 +156,9 @@ pub(super) async fn upsert_item_in_tx(
 /// Put an item without materializing the old row and return the stream event.
 ///
 /// This is valid only when callers do not need conditions, old return values,
-/// or old stream images. TiDB's native point DML owns the concurrency: update
-/// existing rows first, insert only on miss, and retry if another writer creates
-/// the key between those statements.
+/// or old stream images. TiDB's native unique-key check owns the concurrency:
+/// insert succeeds for new rows, and duplicate-key is the authoritative signal
+/// that the operation is a DynamoDB `MODIFY` without materializing the old item.
 pub(super) async fn put_item_without_old_item_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     key_info: &TableKeyInfo,
@@ -185,50 +185,39 @@ pub(super) async fn put_prepared_item_without_old_item_in_tx(
             .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?;
         let sk = parse_sk(sk_value, sk_type)?;
         let sk_col = sk_column(sk_type);
-        let update_sql =
-            format!("UPDATE {ddb_table} SET item_data = ? WHERE pk = ? AND {sk_col} = ?");
         let insert_sql =
             format!("INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES (?, ?, ?)");
-
-        loop {
-            let update_result =
+        let insert_result = bind_sk_execute_raw!(&insert_sql, pk, &sk, item_json, &mut **tx);
+        match insert_result {
+            Ok(_) => Ok(StreamEventName::Insert),
+            Err(err) if is_unique_violation(&err) => {
+                let update_sql =
+                    format!("UPDATE {ddb_table} SET item_data = ? WHERE pk = ? AND {sk_col} = ?");
                 bind_sk_update_execute!(&update_sql, item_json, pk, &sk, &mut **tx)?;
-            if update_result.rows_affected() > 0 {
-                return Ok(StreamEventName::Modify);
+                Ok(StreamEventName::Modify)
             }
-
-            let insert_result = bind_sk_execute_raw!(&insert_sql, pk, &sk, item_json, &mut **tx);
-            match insert_result {
-                Ok(_) => return Ok(StreamEventName::Insert),
-                Err(err) if is_unique_violation(&err) => {}
-                Err(err) => return Err(StorageError::Internal(err.to_string())),
-            }
+            Err(err) => Err(StorageError::Internal(err.to_string())),
         }
     } else {
-        let update_sql = format!("UPDATE {ddb_table} SET item_data = ? WHERE pk = ?");
         let insert_sql = format!("INSERT INTO {ddb_table} (pk, item_data) VALUES (?, ?)");
-
-        loop {
-            let update_result = sqlx::query(&update_sql)
-                .bind(item_json)
-                .bind(pk)
-                .execute(&mut **tx)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            if update_result.rows_affected() > 0 {
-                return Ok(StreamEventName::Modify);
+        let insert_result = sqlx::query(&insert_sql)
+            .bind(pk)
+            .bind(item_json)
+            .execute(&mut **tx)
+            .await;
+        match insert_result {
+            Ok(_) => Ok(StreamEventName::Insert),
+            Err(err) if is_unique_violation(&err) => {
+                let update_sql = format!("UPDATE {ddb_table} SET item_data = ? WHERE pk = ?");
+                sqlx::query(&update_sql)
+                    .bind(item_json)
+                    .bind(pk)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                Ok(StreamEventName::Modify)
             }
-
-            let insert_result = sqlx::query(&insert_sql)
-                .bind(pk)
-                .bind(item_json)
-                .execute(&mut **tx)
-                .await;
-            match insert_result {
-                Ok(_) => return Ok(StreamEventName::Insert),
-                Err(err) if is_unique_violation(&err) => {}
-                Err(err) => return Err(StorageError::Internal(err.to_string())),
-            }
+            Err(err) => Err(StorageError::Internal(err.to_string())),
         }
     }
 }

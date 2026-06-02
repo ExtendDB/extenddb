@@ -3,12 +3,17 @@
 
 //! Native `BatchWriteItem` support for the `TiDB` backend.
 
-use extenddb_core::types::{Item, ScalarAttributeType, TableKeyInfo};
+use extenddb_core::types::{Item, ScalarAttributeType, StreamEventName, TableKeyInfo};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{SortKeyValue, parse_sk, sk_column, sk_info};
 use extenddb_storage::{BatchWriteOp, StreamCapture};
 
 use super::index::validate_item_index_key_constraints;
+use super::tx_helpers::{
+    StreamSequenceAllocator, delete_item_without_old_item_in_tx,
+    finalize_stream_records_best_effort, put_item_without_old_item_in_tx,
+    stream_capture_needs_old_item, write_stream_record_for_event_in_tx,
+};
 use super::{data_table_name, physical_pk_bytes, repeat_tuple_placeholders};
 use crate::TidbEngine;
 
@@ -37,7 +42,12 @@ impl TidbEngine {
             return Ok(());
         }
 
-        if stream.is_some() {
+        if let Some(capture) = stream {
+            if batch_stream_capture_can_use_native_tx(capture) {
+                return self
+                    .batch_write_items_with_stream_native(key_info, ops, capture)
+                    .await;
+            }
             return self
                 .batch_write_items_with_stream_loop(key_info, ops, stream)
                 .await;
@@ -68,6 +78,69 @@ impl TidbEngine {
                 .await?;
         }
 
+        Ok(())
+    }
+
+    async fn batch_write_items_with_stream_native(
+        &self,
+        key_info: &TableKeyInfo,
+        ops: &[BatchWriteOp<'_>],
+        capture: &StreamCapture,
+    ) -> Result<(), StorageError> {
+        self.validate_batch_write_secondary_index_keys(key_info, ops)?;
+
+        let mut tx = self
+            .data_pool
+            .begin()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let mut sequence_allocator = StreamSequenceAllocator::default();
+
+        for op in ops {
+            match op {
+                BatchWriteOp::Put(item) => {
+                    let event = put_item_without_old_item_in_tx(&mut tx, key_info, item).await?;
+                    write_stream_record_for_event_in_tx(
+                        &mut tx,
+                        &mut sequence_allocator,
+                        key_info,
+                        capture,
+                        event,
+                        item,
+                        None,
+                        Some(item),
+                    )
+                    .await?;
+                }
+                BatchWriteOp::Delete(key) => {
+                    let removed =
+                        delete_item_without_old_item_in_tx(&mut tx, key_info, key).await?;
+                    if removed {
+                        write_stream_record_for_event_in_tx(
+                            &mut tx,
+                            &mut sequence_allocator,
+                            key_info,
+                            capture,
+                            StreamEventName::Remove,
+                            key,
+                            None,
+                            None,
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        finalize_stream_records_best_effort(
+            &self.data_pool,
+            "batch_write_items",
+            sequence_allocator.pending_records(),
+        )
+        .await;
         Ok(())
     }
 
@@ -110,6 +183,10 @@ impl TidbEngine {
         }
         Ok(())
     }
+}
+
+fn batch_stream_capture_can_use_native_tx(capture: &StreamCapture) -> bool {
+    !stream_capture_needs_old_item(capture)
 }
 
 pub(super) fn prepare_batch_put(
@@ -236,7 +313,20 @@ fn batch_delete_sql(table: &str, sk_col: Option<&str>, row_count: usize) -> Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{batch_delete_sql, batch_put_sql};
+    use std::sync::Arc;
+
+    use extenddb_core::types::StreamViewType;
+    use extenddb_storage::StreamCapture;
+
+    use super::{batch_delete_sql, batch_put_sql, batch_stream_capture_can_use_native_tx};
+
+    fn capture(view_type: StreamViewType) -> StreamCapture {
+        StreamCapture {
+            view_type,
+            user_identity: None,
+            region: Arc::from("us-east-1"),
+        }
+    }
 
     #[test]
     fn batch_write_put_sql_uses_one_native_multi_row_upsert() {
@@ -262,5 +352,21 @@ mod tests {
             batch_delete_sql("`_ddb_table`", Some("sk_b"), 2),
             "DELETE FROM `_ddb_table` WHERE (pk, sk_b) IN ((?, ?), (?, ?))"
         );
+    }
+
+    #[test]
+    fn stream_batch_native_tx_path_only_uses_views_without_old_images() {
+        assert!(batch_stream_capture_can_use_native_tx(&capture(
+            StreamViewType::KeysOnly
+        )));
+        assert!(batch_stream_capture_can_use_native_tx(&capture(
+            StreamViewType::NewImage
+        )));
+        assert!(!batch_stream_capture_can_use_native_tx(&capture(
+            StreamViewType::OldImage
+        )));
+        assert!(!batch_stream_capture_can_use_native_tx(&capture(
+            StreamViewType::NewAndOldImages
+        )));
     }
 }
