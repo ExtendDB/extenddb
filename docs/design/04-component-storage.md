@@ -521,11 +521,12 @@ not serialize through a per-shard counter row.
 
 The `engine` crate maps `StorageError` to wire protocol error responses.
 
-## 5. PostgreSQL Backend Implementation
+## 5. Backend Physical Layout
 
 ### 5.1 Schema Design
 
-The PostgreSQL backend uses two categories of tables:
+Each backend owns its physical schema behind the shared storage traits. The
+schema has two broad categories:
 
 **Catalog tables** (metadata, created by migrations):
 - `tables` — DynamoDB table metadata (key schema, status, ARN, table_id)
@@ -558,12 +559,11 @@ The PostgreSQL backend uses two categories of tables:
 
 **Design notes:**
 
-- **Table naming**: Physical PostgreSQL tables use UUIDs instead of
-  user-provided names. `table_id` and `index_id` are generated with
-  `uuid::Uuid::new_v4()` and stored in the catalog. This avoids SQL injection
-  risks and allows DynamoDB table names to use any characters (including
-  Unicode, spaces, SQL keywords). The `_ddb_` prefix prevents collisions with
-  catalog tables.
+- **Table naming**: Physical data tables use UUID `table_id` values instead of
+  user-provided names. `table_id` and `index_id` are generated during catalog
+  writes and stored in the catalog. This avoids SQL injection risks and allows
+  DynamoDB table names to use any characters (including Unicode, spaces, SQL
+  keywords). The `_ddb_` prefix prevents collisions with catalog tables.
 
 - **Partition key storage**: PostgreSQL stores partition key values as text:
   string keys directly, number keys as their string representation, and binary
@@ -581,18 +581,20 @@ The PostgreSQL backend uses two categories of tables:
   the catalog row `ACTIVE`, so a newly created DynamoDB table does not start all
   writes on one Region.
 
-- **Sort key storage**: Sort key values use typed columns (`sk_s TEXT`,
-  `sk_n NUMERIC`, `sk_b BYTEA`) to ensure correct ordering. Only one `sk_*`
-  column is populated per table, determined by the sort key's
-  `AttributeDefinition` type. The `CREATE TABLE` DDL and `PRIMARY KEY`
-  constraint are generated dynamically based on the key schema.
-  - `NUMERIC` ensures `2 < 10 < 100` (not lexicographic `"10" < "2"`)
-  - `BYTEA` ensures correct binary comparison order
-  - `TEXT` ensures correct UTF-8 string ordering
+- **Sort key storage**: Sort key values use typed columns to ensure correct
+  ordering. PostgreSQL uses `sk_s TEXT`, `sk_n NUMERIC`, and `sk_b BYTEA`. TiDB
+  uses `sk_s VARBINARY(1024)`, `sk_n DECIMAL(65, 30)`, and
+  `sk_b VARBINARY(1024)`. Only the column matching the table's sort-key
+  `AttributeDefinition` type participates in the physical primary key. The
+  `CREATE TABLE` DDL and `PRIMARY KEY` constraint are generated dynamically
+  based on the key schema.
+  - `NUMERIC`/`DECIMAL` ensures `2 < 10 < 100` (not lexicographic `"10" < "2"`)
+  - `BYTEA`/`VARBINARY` ensures correct binary comparison order
+  - `TEXT`/UTF-8 bytes ensures correct string ordering
 
-- **Item storage**: `item_data` JSONB contains the complete item including key
+- **Item storage**: `item_data` contains the complete item including key
   attributes, matching the DynamoDB model where key attributes are part of the
-  item.
+  item. PostgreSQL stores this as `JSONB`; TiDB stores it as native `JSON`.
 
 - **Secondary indexes**: Backend implementations use the database-native shape
   that preserves DynamoDB key ordering and pagination. PostgreSQL stores GSI

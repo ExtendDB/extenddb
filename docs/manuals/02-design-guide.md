@@ -40,14 +40,27 @@ The data database connection string is stored in the catalog's `settings` table 
 
 ### Data Tables
 
-Each DynamoDB table `T` in account `A` maps to a backend-owned physical table in the data database. The logical shape is:
+Each DynamoDB table `T` in account `A` maps to backend-owned physical storage in
+the data database. The logical shape is a partition-key slot, an optional
+sort-key slot, the complete item document, and a backend-native primary key over
+the key slots. Physical column types are backend-specific:
 
-- `pk` column: Partition key value (stored as JSONB)
-- `sk` column: Sort key value (JSONB, nullable for hash-only tables)
-- `item` column: Full item as JSONB
-- Primary key: `(pk)` or `(pk, sk)`
+- PostgreSQL stores key slots in PostgreSQL-typed columns and the complete item
+  in `item_data JSONB`.
+- TiDB stores the hash-key slot as raw `VARBINARY(2048)`, sort-key slots as
+  typed `VARBINARY(1024)` or `DECIMAL(65, 30)` columns, and the complete item in
+  `item_data JSON`.
 
-PostgreSQL GSI tables are named `gsi_{table_id}_{index_name}` with the GSI key columns and a copy of projected attributes. TiDB represents every DynamoDB secondary index definition as generated key columns plus a native secondary index on the base data table; GSI versus LSI is API metadata, not a separate TiDB physical path. The native index contains the DynamoDB index key columns only because TiDB already carries the clustered row handle in secondary-index entries. Initial indexes are included in the physical TiDB `CREATE TABLE`; replay repairs an already-existing physical table with TiDB online `IF NOT EXISTS` DDL before activation, and later GSI changes use TiDB online DDL.
+PostgreSQL companion index tables are named `_ddb_<index_id>` and store the
+index key columns plus projected attributes. TiDB represents every DynamoDB
+secondary index definition as generated key columns plus a native secondary
+index on the base data table; GSI versus LSI is API metadata, not a separate
+TiDB physical path. The native index contains the DynamoDB index key columns
+only because TiDB already carries the clustered row handle in secondary-index
+entries. Initial indexes are included in the physical TiDB `CREATE TABLE`;
+replay repairs an already-existing physical table with TiDB online
+`IF NOT EXISTS` DDL before activation, and later GSI changes use TiDB online
+DDL.
 
 ### Schema Conventions
 

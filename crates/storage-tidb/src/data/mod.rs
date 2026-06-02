@@ -3,7 +3,7 @@
 
 //! Per-DynamoDB-table DDL and item CRUD for the `TiDB` backend.
 //!
-//! Each Virtual `DynamoDB` table maps to a `TiDB` table named `_ddb_<TableName>`.
+//! Each Virtual `DynamoDB` table maps to a `TiDB` table named `_ddb_<table_id>`.
 //! Partition keys are stored as bytes. Sort keys use typed columns (`sk_s`, `sk_n`, `sk_b`)
 //! for correct ordering. The full item is stored as JSON in `item_data`.
 

@@ -3,7 +3,7 @@
 
 //! Per-DynamoDB-table DDL and item CRUD for the `PostgreSQL` backend.
 //!
-//! Each Virtual `DynamoDB` table maps to a `PostgreSQL` table named `_ddb_<TableName>`.
+//! Each Virtual `DynamoDB` table maps to a `PostgreSQL` table named `_ddb_<table_id>`.
 //! Partition keys are stored as TEXT. Sort keys use typed columns (`sk_s`, `sk_n`, `sk_b`)
 //! for correct ordering. The full item is stored as JSONB in `item_data`.
 
