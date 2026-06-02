@@ -5,7 +5,7 @@
 
 use extenddb_core::types::{
     BillingMode, BillingModeSummary, CreateTableInput, GsiDescription, LsiDescription,
-    ProvisionedThroughputDescription, TableDescription, TableStatus,
+    ProvisionedThroughputDescription, SseDescription, SseType, TableDescription, TableStatus,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn, table_arn};
@@ -45,6 +45,13 @@ impl PostgresEngine {
             .transpose()
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         let deletion_protection = input.deletion_protection_enabled.unwrap_or(false);
+        let sse_spec_json = input.sse_specification.as_ref().cloned();
+        let on_demand_json = input
+            .on_demand_throughput
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let mut tx = self
             .pool
@@ -68,7 +75,7 @@ impl PostgresEngine {
                (account_id, table_name, key_schema, attribute_definitions, billing_mode,
                 provisioned_throughput, stream_specification, table_status,
                 creation_date_time, table_arn, table_id, deletion_protection_enabled,
-                status_transition_at)
+                status_transition_at, table_class, sse_specification, on_demand_throughput)
                VALUES ($1, $2, $3, $4, $5, $6, $7,
                 CASE WHEN (SELECT secs FROM delay) = 0
                      THEN 'ACTIVE' ELSE 'CREATING' END,
@@ -76,7 +83,8 @@ impl PostgresEngine {
                 CASE WHEN (SELECT secs FROM delay) = 0
                      THEN NULL
                      ELSE NOW() + make_interval(secs => (SELECT secs FROM delay))
-                END)
+                END,
+                $11, $12, $13)
                RETURNING EXTRACT(EPOCH FROM creation_date_time)::FLOAT8, table_status",
         )
         .bind(account_id)
@@ -89,6 +97,9 @@ impl PostgresEngine {
         .bind(&table_arn)
         .bind(&table_id)
         .bind(deletion_protection)
+        .bind(&input.table_class)
+        .bind(&sse_spec_json)
+        .bind(&on_demand_json)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| match &e {
@@ -386,8 +397,29 @@ impl PostgresEngine {
             latest_stream_arn,
             latest_stream_label: stream_label,
             deletion_protection_enabled: input.deletion_protection_enabled.unwrap_or(false),
-            sse_description: None,
-            table_class_summary: None,
+            sse_description: input.sse_specification.as_ref().and_then(|spec| {
+                let enabled = spec
+                    .get("Enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if enabled {
+                    Some(SseDescription {
+                        status: "ENABLED".to_string(),
+                        sse_type: Some(SseType::KMS),
+                        kms_master_key_arn: Some(format!(
+                            "arn:aws:kms:us-east-1:{}:key/default",
+                            account_id
+                        )),
+                    })
+                } else {
+                    None
+                }
+            }),
+            table_class_summary: input
+                .table_class
+                .as_ref()
+                .map(|tc| serde_json::json!({ "TableClass": tc })),
+            on_demand_throughput: input.on_demand_throughput,
         })
     }
 }
