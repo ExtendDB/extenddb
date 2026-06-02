@@ -225,23 +225,25 @@ from real table and index statistics instead of pseudo statistics.
 TiDB uses a fixed deterministic stream shard layout, so streamed writes compute
 the shard id from the encoded partition-key tuple. The shard bucket is the
 first varying component in the TiDB shard key (`shardId-<bucket>-<table_id>`),
-so the shared `stream_records` table and its commit-sequence index can be
-pre-split by bucket prefix. Stream rows are inserted atomically with item writes
-under a transaction-local storage sequence, then finalized to the user-visible
-sequence number using TiDB's native MVCC `commit_ts` (`TIDB_MVCC_INFO` over
-`TIDB_ENCODE_RECORD_KEY`) plus the in-transaction ordinal. This avoids a shard
-counter row while preserving commit-order stream iteration across multiple TiDB
-nodes. Stream iterator code treats sequence numbers as opaque decimal strings
-and computes `AT_SEQUENCE_NUMBER` predecessors with string arithmetic, because
-TiDB TSO-plus-ordinal values are wider than native host integers.
+so the commit-sequence secondary index can be pre-split by bucket prefix. Fresh
+TiDB schemas store stream rows under an `AUTO_RANDOM` clustered `record_id`;
+the visible shard/sequence tuple remains unique and indexed, but clustered
+writes use TiDB's native random handle instead of appending to one shard range.
+Stream rows are inserted atomically with item writes under a transaction-local
+storage sequence, then finalized to the user-visible sequence number using
+TiDB's native MVCC `commit_ts` (`TIDB_MVCC_INFO` over `TIDB_ENCODE_RECORD_KEY`)
+plus the in-transaction ordinal. This avoids a shard counter row while
+preserving commit-order stream iteration across multiple TiDB nodes. Stream
+iterator code treats sequence numbers as opaque decimal strings and computes
+`AT_SEQUENCE_NUMBER` predecessors with string arithmetic, because TiDB
+TSO-plus-ordinal values are wider than native host integers.
 Stream-record retention is backend-specific rather than part of the shared
 stream trait. Postgres runs a concrete cleanup worker for its stream table.
 TiDB does not foreground-delete stream history during `DeleteTable`; table ids
 are immutable, the catalog deletion makes the stream unreachable, and native
 TTL owns retention for the shared `stream_records` table. TiDB data migrations
-pre-split both the clustered stream key and the commit-sequence secondary index
-at the 16 shard-bucket prefixes, so a hot stream table does not start all shard
-writes in one Region.
+pre-split the commit-sequence secondary index at the 16 shard-bucket prefixes,
+while `AUTO_RANDOM` scatters clustered stream writes.
 
 **WorkerStore** (background worker operations):
 - `process_control_plane_transitions` — handles table state transitions

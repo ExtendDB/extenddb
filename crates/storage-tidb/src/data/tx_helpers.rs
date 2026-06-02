@@ -19,16 +19,30 @@ use crate::tidb_util::{current_tidb_transaction_tso, current_tidb_tso};
 const STREAM_SEQUENCE_TSO_WIDTH: usize = 21;
 const STREAM_SEQUENCE_ORDINAL_WIDTH: usize = 6;
 const STREAM_SEQUENCE_MAX_ORDINAL: u32 = 999_999;
-const STREAM_COMMIT_SEQUENCE_SQL: &str = "CONCAT(\
+const STREAM_COMMIT_SEQUENCE_COMMON_HANDLE_SQL: &str = "CONCAT(\
     LPAD(CAST(JSON_UNQUOTE(JSON_EXTRACT(\
         TIDB_MVCC_INFO(TIDB_ENCODE_RECORD_KEY(DATABASE(), 'stream_records', shard_id, sequence_number)), \
         '$[0].mvcc.info.writes[0].commit_ts'\
     )) AS CHAR), 21, '0'), \
     RIGHT(sequence_number, 6)\
 )";
+const STREAM_COMMIT_SEQUENCE_AUTO_RANDOM_SQL: &str = "CONCAT(\
+    LPAD(CAST(JSON_UNQUOTE(JSON_EXTRACT(\
+        TIDB_MVCC_INFO(TIDB_ENCODE_RECORD_KEY(DATABASE(), 'stream_records', record_id)), \
+        '$[0].mvcc.info.writes[0].commit_ts'\
+    )) AS CHAR), 21, '0'), \
+    RIGHT(sequence_number, 6)\
+)";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StreamRecordHandleMode {
+    AutoRandomRecordId,
+    CommonHandle,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PendingStreamRecord {
+    pub record_id: Option<i64>,
     pub shard_id: String,
     pub storage_sequence_number: String,
 }
@@ -68,8 +82,14 @@ impl StreamSequenceAllocator {
         Ok(format_tso_sequence_number(transaction_tso, ordinal))
     }
 
-    fn push_pending(&mut self, shard_id: String, storage_sequence_number: String) {
+    fn push_pending(
+        &mut self,
+        record_id: Option<i64>,
+        shard_id: String,
+        storage_sequence_number: String,
+    ) {
         self.pending_records.push(PendingStreamRecord {
+            record_id,
             shard_id,
             storage_sequence_number,
         });
@@ -78,6 +98,26 @@ impl StreamSequenceAllocator {
     pub(super) fn pending_records(&self) -> &[PendingStreamRecord] {
         &self.pending_records
     }
+}
+
+pub(crate) async fn detect_stream_record_handle_mode(
+    pool: &sqlx::MySqlPool,
+) -> Result<StreamRecordHandleMode, StorageError> {
+    let has_record_id: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns \
+         WHERE table_schema = DATABASE() \
+           AND table_name = 'stream_records' \
+           AND column_name = 'record_id')",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| StorageError::Internal(format!("Inspect TiDB stream record handle: {e}")))?;
+
+    Ok(if has_record_id {
+        StreamRecordHandleMode::AutoRandomRecordId
+    } else {
+        StreamRecordHandleMode::CommonHandle
+    })
 }
 
 /// Fetch a single item with `FOR UPDATE` lock within a transaction.
@@ -302,6 +342,7 @@ pub(super) async fn delete_item_without_old_item_in_tx(
 pub(super) async fn write_stream_record_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     sequence_allocator: &mut StreamSequenceAllocator,
+    handle_mode: StreamRecordHandleMode,
     key_info: &TableKeyInfo,
     capture: &StreamCapture,
     old_item: Option<&Item>,
@@ -325,6 +366,7 @@ pub(super) async fn write_stream_record_in_tx(
     write_stream_record_for_event_in_tx(
         tx,
         sequence_allocator,
+        handle_mode,
         key_info,
         capture,
         event,
@@ -346,6 +388,7 @@ pub(super) fn stream_capture_needs_old_item(capture: &StreamCapture) -> bool {
 pub(super) async fn write_stream_record_for_event_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     sequence_allocator: &mut StreamSequenceAllocator,
+    handle_mode: StreamRecordHandleMode,
     key_info: &TableKeyInfo,
     capture: &StreamCapture,
     event: StreamEventName,
@@ -412,7 +455,7 @@ pub(super) async fn write_stream_record_for_event_in_tx(
     let record_json =
         serde_json::to_value(&record).map_err(|e| StorageError::Internal(e.to_string()))?;
 
-    sqlx::query(
+    let result = sqlx::query(
         "INSERT INTO stream_records (sequence_number, shard_id, table_id, event_name, record_data) \
          VALUES (?, ?, ?, ?, ?)",
     )
@@ -425,7 +468,20 @@ pub(super) async fn write_stream_record_for_event_in_tx(
     .await
     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-    sequence_allocator.push_pending(shard_id, record.dynamodb.sequence_number);
+    let record_id = match handle_mode {
+        StreamRecordHandleMode::AutoRandomRecordId => {
+            let record_id = result.last_insert_id();
+            let record_id = i64::try_from(record_id).map_err(|_| {
+                StorageError::Internal(format!(
+                    "TiDB AUTO_RANDOM stream record id exceeds signed range: {record_id}"
+                ))
+            })?;
+            Some(record_id)
+        }
+        StreamRecordHandleMode::CommonHandle => None,
+    };
+
+    sequence_allocator.push_pending(record_id, shard_id, record.dynamodb.sequence_number);
 
     Ok(())
 }
@@ -470,25 +526,61 @@ fn push_stream_record_pk_tuple_predicate<'a>(
     query.push(")");
 }
 
+fn push_stream_record_id_predicate<'a>(
+    query: &mut sqlx::QueryBuilder<'a, sqlx::MySql>,
+    records: &'a [PendingStreamRecord],
+) -> Result<(), StorageError> {
+    query.push("record_id IN (");
+    for (idx, record) in records.iter().enumerate() {
+        if idx > 0 {
+            query.push(", ");
+        }
+        let record_id = record.record_id.ok_or_else(|| {
+            StorageError::Internal(
+                "TiDB AUTO_RANDOM stream finalization is missing record_id".to_owned(),
+            )
+        })?;
+        query.push_bind(record_id);
+    }
+    query.push(")");
+    Ok(())
+}
+
+fn stream_commit_sequence_sql(handle_mode: StreamRecordHandleMode) -> &'static str {
+    match handle_mode {
+        StreamRecordHandleMode::AutoRandomRecordId => STREAM_COMMIT_SEQUENCE_AUTO_RANDOM_SQL,
+        StreamRecordHandleMode::CommonHandle => STREAM_COMMIT_SEQUENCE_COMMON_HANDLE_SQL,
+    }
+}
+
 pub(crate) async fn finalize_stream_records(
     pool: &sqlx::MySqlPool,
+    handle_mode: StreamRecordHandleMode,
     records: &[PendingStreamRecord],
 ) -> Result<u64, StorageError> {
     if records.is_empty() {
         return Ok(0);
     }
 
+    let commit_sequence_sql = stream_commit_sequence_sql(handle_mode);
     let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
         "UPDATE stream_records \
          SET commit_sequence_number = ",
     );
-    query.push(STREAM_COMMIT_SEQUENCE_SQL);
+    query.push(commit_sequence_sql);
     query.push(", record_data = JSON_SET(record_data, '$.dynamodb.SequenceNumber', ");
-    query.push(STREAM_COMMIT_SEQUENCE_SQL);
+    query.push(commit_sequence_sql);
     query.push(") WHERE commit_sequence_number IS NULL AND ");
-    query.push(STREAM_COMMIT_SEQUENCE_SQL);
+    query.push(commit_sequence_sql);
     query.push(" IS NOT NULL AND ");
-    push_stream_record_pk_tuple_predicate(&mut query, records);
+    match handle_mode {
+        StreamRecordHandleMode::AutoRandomRecordId => {
+            push_stream_record_id_predicate(&mut query, records)?;
+        }
+        StreamRecordHandleMode::CommonHandle => {
+            push_stream_record_pk_tuple_predicate(&mut query, records);
+        }
+    }
 
     let result = query
         .build()
@@ -501,6 +593,7 @@ pub(crate) async fn finalize_stream_records(
 
 pub(crate) async fn finalize_stream_records_best_effort(
     pool: &sqlx::MySqlPool,
+    handle_mode: StreamRecordHandleMode,
     operation: &'static str,
     records: &[PendingStreamRecord],
 ) {
@@ -508,7 +601,7 @@ pub(crate) async fn finalize_stream_records_best_effort(
         return;
     }
 
-    match finalize_stream_records(pool, records).await {
+    match finalize_stream_records(pool, handle_mode, records).await {
         Ok(finalized) if finalized == records.len() as u64 => {}
         Ok(finalized) => {
             tracing::warn!(
@@ -530,37 +623,66 @@ pub(crate) async fn finalize_stream_records_best_effort(
 
 pub(crate) async fn finalize_pending_stream_records_for_shard(
     pool: &sqlx::MySqlPool,
+    handle_mode: StreamRecordHandleMode,
     shard_id: &str,
     limit: i64,
 ) -> Result<u64, StorageError> {
     let mut total_finalized = 0_u64;
     loop {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT shard_id, sequence_number \
-             FROM stream_records \
-             WHERE shard_id = ? AND commit_sequence_number IS NULL \
-             ORDER BY sequence_number LIMIT ?",
-        )
-        .bind(shard_id)
-        .bind(limit)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let pending = match handle_mode {
+            StreamRecordHandleMode::AutoRandomRecordId => {
+                let rows: Vec<(i64, String, String)> = sqlx::query_as(
+                    "SELECT record_id, shard_id, sequence_number \
+                     FROM stream_records \
+                     WHERE shard_id = ? AND commit_sequence_number IS NULL \
+                     ORDER BY sequence_number LIMIT ?",
+                )
+                .bind(shard_id)
+                .bind(limit)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        if rows.is_empty() {
+                rows.into_iter()
+                    .map(
+                        |(record_id, shard_id, storage_sequence_number)| PendingStreamRecord {
+                            record_id: Some(record_id),
+                            shard_id,
+                            storage_sequence_number,
+                        },
+                    )
+                    .collect::<Vec<_>>()
+            }
+            StreamRecordHandleMode::CommonHandle => {
+                let rows: Vec<(String, String)> = sqlx::query_as(
+                    "SELECT shard_id, sequence_number \
+                     FROM stream_records \
+                     WHERE shard_id = ? AND commit_sequence_number IS NULL \
+                     ORDER BY sequence_number LIMIT ?",
+                )
+                .bind(shard_id)
+                .bind(limit)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+                rows.into_iter()
+                    .map(|(shard_id, storage_sequence_number)| PendingStreamRecord {
+                        record_id: None,
+                        shard_id,
+                        storage_sequence_number,
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        if pending.is_empty() {
             return Ok(total_finalized);
         }
 
-        let row_count = rows.len();
-        let pending = rows
-            .into_iter()
-            .map(|(shard_id, storage_sequence_number)| PendingStreamRecord {
-                shard_id,
-                storage_sequence_number,
-            })
-            .collect::<Vec<_>>();
+        let row_count = pending.len();
 
-        let finalized = finalize_stream_records(pool, &pending).await?;
+        let finalized = finalize_stream_records(pool, handle_mode, &pending).await?;
         if finalized == 0 {
             let remaining: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM stream_records \
@@ -642,9 +764,10 @@ mod tests {
     use extenddb_storage::StreamCapture;
 
     use super::{
-        PendingStreamRecord, format_tso_sequence_number, idempotency_token_claim_sql,
+        PendingStreamRecord, StreamRecordHandleMode, format_tso_sequence_number,
+        idempotency_token_claim_sql, push_stream_record_id_predicate,
         push_stream_record_pk_tuple_predicate, stream_capture_needs_old_item,
-        stream_event_from_upsert_rows_affected,
+        stream_commit_sequence_sql, stream_event_from_upsert_rows_affected,
     };
 
     #[test]
@@ -720,10 +843,12 @@ mod tests {
     fn stream_finalization_uses_native_primary_key_tuple_predicate() {
         let records = [
             PendingStreamRecord {
+                record_id: None,
                 shard_id: "shard-a".to_owned(),
                 storage_sequence_number: "0001".to_owned(),
             },
             PendingStreamRecord {
+                record_id: None,
                 shard_id: "shard-b".to_owned(),
                 storage_sequence_number: "0002".to_owned(),
             },
@@ -735,5 +860,36 @@ mod tests {
         let sql = sqlx::Execute::sql(&query.build()).to_owned();
         assert_eq!(sql, "(shard_id, sequence_number) IN ((?, ?), (?, ?))");
         assert!(!sql.contains(" OR "));
+    }
+
+    #[test]
+    fn stream_finalization_uses_autorandom_record_id_predicate() {
+        let records = [
+            PendingStreamRecord {
+                record_id: Some(101),
+                shard_id: "shard-a".to_owned(),
+                storage_sequence_number: "0001".to_owned(),
+            },
+            PendingStreamRecord {
+                record_id: Some(202),
+                shard_id: "shard-b".to_owned(),
+                storage_sequence_number: "0002".to_owned(),
+            },
+        ];
+        let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new("");
+
+        push_stream_record_id_predicate(&mut query, &records).expect("record ids");
+
+        let sql = sqlx::Execute::sql(&query.build()).to_owned();
+        assert_eq!(sql, "record_id IN (?, ?)");
+        assert!(!sql.contains("shard_id ="));
+    }
+
+    #[test]
+    fn autorandom_stream_sequence_uses_record_handle_mvcc_key() {
+        let sql = stream_commit_sequence_sql(StreamRecordHandleMode::AutoRandomRecordId);
+
+        assert!(sql.contains("TIDB_ENCODE_RECORD_KEY(DATABASE(), 'stream_records', record_id)"));
+        assert!(!sql.contains("shard_id, sequence_number"));
     }
 }

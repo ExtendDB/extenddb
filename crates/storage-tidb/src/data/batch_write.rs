@@ -102,6 +102,7 @@ impl TidbEngine {
                         write_stream_record_in_tx(
                             &mut tx,
                             &mut sequence_allocator,
+                            self.stream_record_handle,
                             key_info,
                             capture,
                             old_item.as_ref(),
@@ -114,6 +115,7 @@ impl TidbEngine {
                         write_stream_record_for_event_in_tx(
                             &mut tx,
                             &mut sequence_allocator,
+                            self.stream_record_handle,
                             key_info,
                             capture,
                             event,
@@ -133,6 +135,7 @@ impl TidbEngine {
                             write_stream_record_in_tx(
                                 &mut tx,
                                 &mut sequence_allocator,
+                                self.stream_record_handle,
                                 key_info,
                                 capture,
                                 Some(&old_item),
@@ -147,6 +150,7 @@ impl TidbEngine {
                             write_stream_record_for_event_in_tx(
                                 &mut tx,
                                 &mut sequence_allocator,
+                                self.stream_record_handle,
                                 key_info,
                                 capture,
                                 StreamEventName::Remove,
@@ -166,6 +170,7 @@ impl TidbEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         finalize_stream_records_best_effort(
             &self.data_pool,
+            self.stream_record_handle,
             "batch_write_items",
             sequence_allocator.pending_records(),
         )

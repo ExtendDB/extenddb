@@ -169,6 +169,7 @@ pub struct TidbEngine {
     pub(crate) region: String,
     pub(crate) limits: LimitsConfig,
     pub(crate) native_backup: backup_engine::TidbNativeBackupConfig,
+    pub(crate) stream_record_handle: data::StreamRecordHandleMode,
     /// Wakes the control plane poller when a table enters CREATING, UPDATING,
     /// or DELETING state, so transitions are processed without polling delay.
     pub(crate) control_plane_notify: Arc<tokio::sync::Notify>,
@@ -248,6 +249,7 @@ impl TidbEngine {
             .map_err(|e| {
                 StorageError::Connection(format!("default-read data connection failed: {e}"))
             })?;
+        let stream_record_handle = data::detect_stream_record_handle_mode(&data_pool).await?;
 
         Ok(Self {
             pool,
@@ -258,6 +260,7 @@ impl TidbEngine {
             native_backup: backup_engine::TidbNativeBackupConfig::from_storage_config(
                 config.native_backup.clone(),
             ),
+            stream_record_handle,
             control_plane_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }

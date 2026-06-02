@@ -133,6 +133,7 @@ impl StreamEngine for TidbEngine {
         Box::pin(async move {
             finalize_pending_stream_records_for_shard(
                 &self.data_pool,
+                self.stream_record_handle,
                 &shard_id,
                 STREAM_FINALIZE_READ_REPAIR_BATCH_SIZE,
             )
@@ -425,6 +426,7 @@ impl StreamEngine for TidbEngine {
         Box::pin(async move {
             finalize_pending_stream_records_for_shard(
                 &self.data_pool,
+                self.stream_record_handle,
                 &shard_id,
                 STREAM_FINALIZE_READ_REPAIR_BATCH_SIZE,
             )

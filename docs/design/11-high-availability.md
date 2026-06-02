@@ -539,7 +539,7 @@ Useful metrics for HA monitoring:
 | Feature | Impact | Notes |
 |---------|--------|-------|
 | DynamoDB API operations | Consistency-aware storage routing | All operations continue to work. |
-| Streams | None | Stream records are written to primary in the same transaction as data. |
+| Streams | TiDB-native scattered writes | Stream records are written in the same transaction as data. Fresh TiDB schemas use an `AUTO_RANDOM` clustered `stream_records.record_id` for write distribution, while the `(shard_id, commit_sequence_number)` index preserves ordered shard reads. |
 | TTL | Backend-native where available | TiDB uses native table TTL and has no ExtendDB TTL deletion worker. Backends without native TTL need exactly-one worker coordination. |
 | Auth/IAM | None | Auth data is in the catalog, read on every request (No Caching Rule). |
 | Management console | None | Console reads from catalog like any other request. |

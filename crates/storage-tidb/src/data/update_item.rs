@@ -203,6 +203,7 @@ impl TidbEngine {
             write_stream_record_in_tx(
                 &mut tx,
                 &mut sequence_allocator,
+                self.stream_record_handle,
                 key_info,
                 capture,
                 pre_mutation_item.as_ref(),
@@ -215,6 +216,7 @@ impl TidbEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         finalize_stream_records_best_effort(
             &self.data_pool,
+            self.stream_record_handle,
             "update_item",
             sequence_allocator.pending_records(),
         )
