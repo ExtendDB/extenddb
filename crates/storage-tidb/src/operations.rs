@@ -37,18 +37,12 @@ struct RequiredCatalogLookupIndex {
     columns: &'static str,
 }
 
-const REQUIRED_CATALOG_LOOKUP_INDEXES: &[RequiredCatalogLookupIndex] = &[
-    RequiredCatalogLookupIndex {
+const REQUIRED_CATALOG_LOOKUP_INDEXES: &[RequiredCatalogLookupIndex] =
+    &[RequiredCatalogLookupIndex {
         table: "iam_group_members",
         index: "idx_iam_group_members_user",
         columns: "account_id,user_name,group_name",
-    },
-    RequiredCatalogLookupIndex {
-        table: "iam_sessions",
-        index: "idx_iam_sessions_role_session",
-        columns: "account_id,role_name,session_name,expires_at",
-    },
-];
+    }];
 
 fn catalog_check_issue(name: impl Into<String>) -> CatalogCheckIssue {
     CatalogCheckIssue::new(name)
@@ -222,7 +216,7 @@ async fn check_tidb_catalog_lookup_indexes(
                     GROUP_CONCAT(column_name ORDER BY seq_in_index SEPARATOR ',') AS columns \
              FROM information_schema.statistics \
              WHERE table_schema = DATABASE() \
-               AND table_name IN ('iam_group_members', 'iam_sessions') \
+               AND table_name = 'iam_group_members' \
              GROUP BY table_name, index_name",
     )
     .fetch_all(catalog_pool)
@@ -471,8 +465,20 @@ mod tests {
 
         let issues = catalog_lookup_index_issues(&actual);
 
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn catalog_check_reports_missing_group_membership_lookup_index() {
+        let actual = HashMap::new();
+
+        let issues = catalog_lookup_index_issues(&actual);
+
         assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].name, "iam_sessions.idx_iam_sessions_role_session");
+        assert_eq!(
+            issues[0].name,
+            "iam_group_members.idx_iam_group_members_user"
+        );
         assert_eq!(
             issues[0].detail.as_deref(),
             Some("missing native TiDB catalog lookup index")

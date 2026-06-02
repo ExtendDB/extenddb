@@ -101,6 +101,10 @@ pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
         "023_drop_continuous_backups.sql",
         include_str!("../../storage-tidb/migrations/023_drop_continuous_backups.sql"),
     ),
+    (
+        "024_drop_redundant_session_role_index.sql",
+        include_str!("../../storage-tidb/migrations/024_drop_redundant_session_role_index.sql"),
+    ),
 ];
 
 const DATA_SCHEMA_MIGRATION: &str =
@@ -671,18 +675,29 @@ mod tests {
         assert_eq!(*filename, "022_auth_lookup_indexes.sql");
         assert!(sql.contains("CREATE INDEX IF NOT EXISTS idx_iam_group_members_user"));
         assert!(sql.contains("ON iam_group_members (account_id, user_name, group_name)"));
-        assert!(sql.contains("CREATE INDEX IF NOT EXISTS idx_iam_sessions_role_session"));
-        assert!(sql.contains("ON iam_sessions (account_id, role_name, session_name, expires_at)"));
+        assert!(!sql.contains("idx_iam_sessions_role_session"));
         assert!(sql.contains("0.0.22"));
     }
 
     #[test]
-    fn latest_catalog_migration_drops_unsupported_pitr_state() {
-        let (filename, sql) = CATALOG_MIGRATIONS.last().expect("latest migration");
+    fn catalog_migration_drops_unsupported_pitr_state() {
+        let (filename, sql) = CATALOG_MIGRATIONS
+            .iter()
+            .find(|(filename, _)| *filename == "023_drop_continuous_backups.sql")
+            .expect("continuous backups migration");
 
         assert_eq!(*filename, "023_drop_continuous_backups.sql");
         assert!(sql.contains("DROP TABLE IF EXISTS continuous_backups"));
         assert!(sql.contains("0.0.23"));
+    }
+
+    #[test]
+    fn latest_catalog_migration_drops_redundant_session_role_index() {
+        let (filename, sql) = CATALOG_MIGRATIONS.last().expect("latest migration");
+
+        assert_eq!(*filename, "024_drop_redundant_session_role_index.sql");
+        assert!(sql.contains("DROP INDEX IF EXISTS idx_iam_sessions_role_session ON iam_sessions"));
+        assert!(sql.contains("0.0.24"));
     }
 
     #[test]
@@ -777,8 +792,8 @@ mod tests {
         assert_eq!(*filename, "001_schema.sql");
         assert!(sql.contains("CREATE INDEX idx_iam_group_members_user"));
         assert!(sql.contains("ON iam_group_members (account_id, user_name, group_name)"));
-        assert!(sql.contains("CREATE INDEX idx_iam_sessions_role_session"));
-        assert!(sql.contains("ON iam_sessions (account_id, role_name, session_name, expires_at)"));
+        assert!(!sql.contains("idx_iam_sessions_role_session"));
+        assert!(sql.contains("access_key_id VARCHAR(128) NOT NULL UNIQUE"));
     }
 
     #[test]

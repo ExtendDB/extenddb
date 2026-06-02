@@ -1,6 +1,6 @@
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
--- Consolidated catalog schema for extenddb (catalog version 0.0.23).
+-- Consolidated catalog schema for extenddb (catalog version 0.0.24).
 -- This is the complete schema applied on fresh installs.
 
 -- Accounts — multi-account support (REQ-AUTH-005).
@@ -170,9 +170,6 @@ CREATE TABLE IF NOT EXISTS iam_sessions (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
   TTL = `expires_at` + INTERVAL 24 HOUR TTL_JOB_INTERVAL = '1h';
 
-CREATE INDEX idx_iam_sessions_role_session
-    ON iam_sessions (account_id, role_name, session_name, expires_at);
-
 -- IAM policies.
 CREATE TABLE IF NOT EXISTS iam_policies (
     account_id VARCHAR(32) NOT NULL REFERENCES accounts(account_id) ON DELETE CASCADE,
@@ -279,4 +276,4 @@ CREATE TABLE IF NOT EXISTS backup_tags (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 -- Seed settings.
-INSERT IGNORE INTO settings (`key`, value) VALUES ('catalog_version', '0.0.23');
+INSERT IGNORE INTO settings (`key`, value) VALUES ('catalog_version', '0.0.24');

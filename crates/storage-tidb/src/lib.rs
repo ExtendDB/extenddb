@@ -126,7 +126,7 @@ use crate::tidb_util::{
 ///
 /// The tuple is the single source of truth. Use `CATALOG_VERSION.to_string()`
 /// wherever a string representation is needed.
-pub const CATALOG_VERSION: CatalogVersion = CatalogVersion::new(0, 0, 23);
+pub const CATALOG_VERSION: CatalogVersion = CatalogVersion::new(0, 0, 24);
 
 /// Minimum number of connections allowed per pool.
 ///

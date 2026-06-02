@@ -392,11 +392,11 @@ default aggregate methods.
 TiDB overrides the aggregate methods with one set-oriented `UNION ALL` catalog
 query per user or role authorization check. User group membership is indexed by
 `(account_id, user_name, group_name)` for policy joins. Role session metadata is
-selected by the authenticated temporary access key, while the
-`(account_id, role_name, session_name, expires_at)` index remains useful for
-session-name scoped diagnostics and cleanup. Those indexes keep SigV4
-authorization on native TiDB range/point lookups instead of scanning all
-memberships or sessions for an account.
+selected by the authenticated temporary access key using the native unique
+`access_key_id` index declared by `iam_sessions`, and expired-session retention
+is TiDB native TTL. This keeps SigV4 authorization on native TiDB range/point
+lookups instead of scanning memberships or sessions for an account, without
+maintaining a redundant session cleanup index.
 
 ### Bootstrapper
 
