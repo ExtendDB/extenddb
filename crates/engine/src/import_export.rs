@@ -18,16 +18,21 @@ use crate::create_table::storage_err_to_dynamo;
 use crate::import_export_io::{read_items, validate_path, validate_path_parent};
 use crate::serialize_output;
 use extenddb_core::error::DynamoDbError;
+use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
     CreateTableInput, ExportFormat, ImportStatus, ImportTableDescription, ImportTableInput,
-    ImportTableOutput, Item, TableCreationParameters,
+    ImportTableOutput, Item, TableCreationParameters, TableKeyInfo, extract_key, item_size_bytes,
 };
 use extenddb_core::validation::{
     validate_attribute_name_sizes, validate_item_keys, validate_item_size, validate_key_sizes,
 };
+use extenddb_storage::BatchWriteOp;
 use extenddb_storage::error::StorageError;
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+const IMPORT_WRITE_BATCH_MAX_ITEMS: usize = 1_000;
+const IMPORT_WRITE_BATCH_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 struct ExportLineSink<'a> {
     file: &'a mut tokio::fs::File,
@@ -125,38 +130,25 @@ pub async fn handle_import_table(
     let mut imported_count: i64 = 0;
     let mut error_count: i64 = 0;
     let processed_count = i64::try_from(items.len()).unwrap_or(i64::MAX);
+    let mut write_batch = ImportWriteBatch::new();
 
     for item in items {
-        if let Err(e) =
-            validate_item_keys(&item, &key_info.key_schema, &key_info.attribute_definitions)
-        {
-            tracing::warn!(error = %e, "import: skipping item with invalid keys");
-            error_count += 1;
-            continue;
-        }
-        if let Err(e) = validate_item_size(&item, ctx.limits.max_item_size_bytes) {
-            tracing::warn!(error = %e, "import: skipping oversized item");
-            error_count += 1;
-            continue;
-        }
-        if let Err(e) = validate_attribute_name_sizes(&item, &ctx.limits) {
-            tracing::warn!(error = %e, "import: skipping item with oversized attribute name");
-            error_count += 1;
-            continue;
-        }
-        if let Err(e) = validate_key_sizes(&item, &key_info.key_schema, &ctx.limits) {
-            tracing::warn!(error = %e, "import: skipping item with oversized key");
-            error_count += 1;
-            continue;
-        }
+        let item_size = match validate_import_item(&item, &key_info, &ctx.limits) {
+            Ok(size) => size,
+            Err(e) => {
+                tracing::warn!(reason = e.reason, error = %e, "import: skipping item");
+                error_count += 1;
+                continue;
+            }
+        };
+        let key = extract_key(&item, &key_info.key_schema);
 
-        let maps = extenddb_core::expression::ExpressionMaps::default();
-        ctx.storage
-            .put_item(&key_info, item, false, None, &maps, None)
-            .await
-            .map_err(storage_err_to_dynamo)?;
-        imported_count += 1;
+        if write_batch.should_flush_before(&key, item_size) {
+            imported_count += write_batch.flush(ctx, &key_info).await?;
+        }
+        write_batch.push(key, item, item_size);
     }
+    imported_count += write_batch.flush(ctx, &key_info).await?;
 
     let end_time = epoch_seconds();
     let import_arn = format!("{}:import/{}", table_arn, uuid::Uuid::new_v4());
@@ -181,6 +173,95 @@ pub async fn handle_import_table(
     serialize_output(&ImportTableOutput {
         import_table_description: description,
     })
+}
+
+struct ImportWriteBatch {
+    items: Vec<Item>,
+    keys: Vec<Item>,
+    size_bytes: usize,
+}
+
+impl ImportWriteBatch {
+    fn new() -> Self {
+        Self {
+            items: Vec::new(),
+            keys: Vec::new(),
+            size_bytes: 0,
+        }
+    }
+
+    fn should_flush_before(&self, key: &Item, item_size: usize) -> bool {
+        !self.items.is_empty()
+            && (self.items.len() >= IMPORT_WRITE_BATCH_MAX_ITEMS
+                || self.size_bytes.saturating_add(item_size) > IMPORT_WRITE_BATCH_MAX_BYTES
+                || self.keys.contains(key))
+    }
+
+    fn push(&mut self, key: Item, item: Item, item_size: usize) {
+        self.keys.push(key);
+        self.items.push(item);
+        self.size_bytes = self.size_bytes.saturating_add(item_size);
+    }
+
+    async fn flush(
+        &mut self,
+        ctx: &OperationContext,
+        key_info: &TableKeyInfo,
+    ) -> Result<i64, DynamoDbError> {
+        if self.items.is_empty() {
+            return Ok(0);
+        }
+
+        let ops = self.items.iter().map(BatchWriteOp::Put).collect::<Vec<_>>();
+        ctx.storage
+            .batch_write_items(key_info, &ops, None)
+            .await
+            .map_err(storage_err_to_dynamo)?;
+
+        let written = i64::try_from(self.items.len()).unwrap_or(i64::MAX);
+        self.items.clear();
+        self.keys.clear();
+        self.size_bytes = 0;
+        Ok(written)
+    }
+}
+
+fn validate_import_item(
+    item: &Item,
+    key_info: &TableKeyInfo,
+    limits: &LimitsConfig,
+) -> Result<usize, ImportItemValidationError> {
+    validate_item_keys(item, &key_info.key_schema, &key_info.attribute_definitions)
+        .map_err(|e| import_item_validation_error("invalid_keys", e))?;
+    validate_item_size(item, limits.max_item_size_bytes)
+        .map_err(|e| import_item_validation_error("oversized_item", e))?;
+    validate_attribute_name_sizes(item, limits)
+        .map_err(|e| import_item_validation_error("oversized_attribute_name", e))?;
+    validate_key_sizes(item, &key_info.key_schema, limits)
+        .map_err(|e| import_item_validation_error("oversized_key", e))?;
+    Ok(item_size_bytes(item))
+}
+
+#[derive(Debug)]
+struct ImportItemValidationError {
+    reason: &'static str,
+    message: String,
+}
+
+impl std::fmt::Display for ImportItemValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+fn import_item_validation_error(
+    reason: &'static str,
+    error: impl std::fmt::Display,
+) -> ImportItemValidationError {
+    ImportItemValidationError {
+        reason,
+        message: error.to_string(),
+    }
 }
 
 /// Handle an `ExportTableToPointInTime` request.
@@ -326,4 +407,56 @@ fn epoch_seconds() -> f64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use extenddb_core::types::{AttributeValue, KeySchemaElement, KeyType};
+
+    fn hash_key() -> KeySchemaElement {
+        KeySchemaElement {
+            attribute_name: "pk".to_owned(),
+            key_type: KeyType::Hash,
+        }
+    }
+
+    fn item(pk: &str) -> Item {
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S(pk.to_owned()));
+        item
+    }
+
+    fn key(pk: &str) -> Item {
+        extract_key(&item(pk), &[hash_key()])
+    }
+
+    #[test]
+    fn import_batch_flushes_before_duplicate_key() {
+        let mut batch = ImportWriteBatch::new();
+        batch.push(key("a"), item("a"), 10);
+
+        assert!(batch.should_flush_before(&key("a"), 10));
+        assert!(!batch.should_flush_before(&key("b"), 10));
+    }
+
+    #[test]
+    fn import_batch_flushes_at_item_limit() {
+        let mut batch = ImportWriteBatch::new();
+        for i in 0..IMPORT_WRITE_BATCH_MAX_ITEMS {
+            let pk = i.to_string();
+            batch.push(key(&pk), item(&pk), 1);
+        }
+
+        assert!(batch.should_flush_before(&key("next"), 1));
+    }
+
+    #[test]
+    fn import_batch_flushes_before_byte_limit_overflow() {
+        let mut batch = ImportWriteBatch::new();
+        batch.push(key("a"), item("a"), IMPORT_WRITE_BATCH_MAX_BYTES - 1);
+
+        assert!(!batch.should_flush_before(&key("b"), 1));
+        assert!(batch.should_flush_before(&key("b"), 2));
+    }
 }
