@@ -275,6 +275,37 @@ pub(super) async fn write_stream_record_in_tx(
         (None, None) => return Ok(()),
     };
 
+    write_stream_record_for_event_in_tx(
+        tx,
+        sequence_allocator,
+        key_info,
+        capture,
+        event,
+        source,
+        old_item,
+        new_item,
+    )
+    .await
+}
+
+pub(super) fn stream_capture_needs_old_item(capture: &StreamCapture) -> bool {
+    matches!(
+        capture.view_type,
+        StreamViewType::OldImage | StreamViewType::NewAndOldImages
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn write_stream_record_for_event_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    sequence_allocator: &mut StreamSequenceAllocator,
+    key_info: &TableKeyInfo,
+    capture: &StreamCapture,
+    event: StreamEventName,
+    source: &Item,
+    old_item: Option<&Item>,
+    new_item: Option<&Item>,
+) -> Result<(), StorageError> {
     // Extract key attributes.
     let keys: std::collections::BTreeMap<String, AttributeValue> = key_info
         .key_schema
@@ -296,7 +327,7 @@ pub(super) async fn write_stream_record_in_tx(
         _ => None,
     };
 
-    let size = source_item.map_or(0, |i| i64::try_from(item_size_bytes(i)).unwrap_or(i64::MAX));
+    let size = i64::try_from(item_size_bytes(source)).unwrap_or(i64::MAX);
 
     // Assign shard within the transaction.
     let pk = physical_pk_bytes(source, &key_info.key_schema)?;
@@ -550,7 +581,14 @@ fn idempotency_token_claim_sql() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_tso_sequence_number, idempotency_token_claim_sql};
+    use std::sync::Arc;
+
+    use extenddb_core::types::StreamViewType;
+    use extenddb_storage::StreamCapture;
+
+    use super::{
+        format_tso_sequence_number, idempotency_token_claim_sql, stream_capture_needs_old_item,
+    };
 
     #[test]
     fn tidb_tso_sequence_numbers_sort_lexicographically() {
@@ -579,5 +617,29 @@ mod tests {
         assert!(sql.contains("ON DUPLICATE KEY UPDATE"));
         assert!(sql.contains("claim_id"));
         assert!(!sql.contains("DELETE FROM idempotency_tokens"));
+    }
+
+    #[test]
+    fn stream_capture_needs_old_item_only_for_old_image_views() {
+        fn capture(view_type: StreamViewType) -> StreamCapture {
+            StreamCapture {
+                view_type,
+                user_identity: None,
+                region: Arc::from("us-east-1"),
+            }
+        }
+
+        assert!(!stream_capture_needs_old_item(&capture(
+            StreamViewType::KeysOnly
+        )));
+        assert!(!stream_capture_needs_old_item(&capture(
+            StreamViewType::NewImage
+        )));
+        assert!(stream_capture_needs_old_item(&capture(
+            StreamViewType::OldImage
+        )));
+        assert!(stream_capture_needs_old_item(&capture(
+            StreamViewType::NewAndOldImages
+        )));
     }
 }

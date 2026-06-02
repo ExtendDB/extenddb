@@ -4,7 +4,7 @@
 //! `put_item` and `get_item` implementations for the `TiDB` backend.
 
 use extenddb_core::expression::{Expr, ExpressionMaps};
-use extenddb_core::types::{Item, TableKeyInfo};
+use extenddb_core::types::{Item, StreamEventName, TableKeyInfo};
 use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{parse_sk, sk_column, sk_info};
@@ -12,7 +12,8 @@ use extenddb_storage::util::{parse_sk, sk_column, sk_info};
 use super::index::validate_item_secondary_index_key_constraints;
 use super::query::check_condition;
 use super::tx_helpers::{
-    StreamSequenceAllocator, finalize_stream_records_best_effort, write_stream_record_in_tx,
+    StreamSequenceAllocator, finalize_stream_records_best_effort, stream_capture_needs_old_item,
+    write_stream_record_for_event_in_tx, write_stream_record_in_tx,
 };
 use super::{data_table_name, json_to_item, physical_pk_bytes};
 use crate::TidbEngine;
@@ -57,6 +58,57 @@ impl TidbEngine {
                 .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?;
             let sk = parse_sk(sk_value, sk_type)?;
             let sk_col = sk_column(sk_type);
+
+            if let Some(capture) =
+                put_stream_capture_without_old_item(return_old, condition, stream)
+            {
+                let update_sql =
+                    format!("UPDATE {ddb_table} SET item_data = ? WHERE pk = ? AND {sk_col} = ?");
+                let insert_sql =
+                    format!("INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES (?, ?, ?)");
+
+                let mut tx = self
+                    .data_pool
+                    .begin()
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+                // Another writer can create the key after our update misses.
+                // Retry as native point DML until this transaction owns the write.
+                // sqlx-mysql enables CLIENT_FOUND_ROWS, so an unchanged
+                // existing item still reports a matched row here.
+                let event = loop {
+                    let update_result = bind_sk_update_execute!(
+                        &update_sql,
+                        &item_json,
+                        pk.as_slice(),
+                        &sk,
+                        &mut *tx
+                    )?;
+                    if update_result.rows_affected() > 0 {
+                        break StreamEventName::Modify;
+                    }
+
+                    let insert_result =
+                        bind_sk_execute_raw!(&insert_sql, pk.as_slice(), &sk, &item_json, &mut *tx);
+                    match insert_result {
+                        Ok(_) => break StreamEventName::Insert,
+                        Err(err) if is_unique_violation(&err) => {}
+                        Err(err) => return Err(StorageError::Internal(err.to_string())),
+                    }
+                };
+
+                commit_put_stream_without_old_item(
+                    &self.data_pool,
+                    tx,
+                    key_info,
+                    capture,
+                    event,
+                    &item,
+                )
+                .await?;
+                return Ok(None);
+            }
 
             if needs_tx {
                 let select_sql = format!(
@@ -158,6 +210,57 @@ impl TidbEngine {
             }
         } else {
             // No sort key — PK-only table
+            if let Some(capture) =
+                put_stream_capture_without_old_item(return_old, condition, stream)
+            {
+                let update_sql = format!("UPDATE {ddb_table} SET item_data = ? WHERE pk = ?");
+                let insert_sql = format!("INSERT INTO {ddb_table} (pk, item_data) VALUES (?, ?)");
+
+                let mut tx = self
+                    .data_pool
+                    .begin()
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+                // Another writer can create the key after our update misses.
+                // Retry as native point DML until this transaction owns the write.
+                // sqlx-mysql enables CLIENT_FOUND_ROWS, so an unchanged
+                // existing item still reports a matched row here.
+                let event = loop {
+                    let update_result = sqlx::query(&update_sql)
+                        .bind(&item_json)
+                        .bind(pk.as_slice())
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    if update_result.rows_affected() > 0 {
+                        break StreamEventName::Modify;
+                    }
+
+                    let insert_result = sqlx::query(&insert_sql)
+                        .bind(pk.as_slice())
+                        .bind(&item_json)
+                        .execute(&mut *tx)
+                        .await;
+                    match insert_result {
+                        Ok(_) => break StreamEventName::Insert,
+                        Err(err) if is_unique_violation(&err) => {}
+                        Err(err) => return Err(StorageError::Internal(err.to_string())),
+                    }
+                };
+
+                commit_put_stream_without_old_item(
+                    &self.data_pool,
+                    tx,
+                    key_info,
+                    capture,
+                    event,
+                    &item,
+                )
+                .await?;
+                return Ok(None);
+            }
+
             if needs_tx {
                 let select_sql =
                     format!("SELECT item_data FROM {ddb_table} WHERE pk = ? FOR UPDATE");
@@ -307,5 +410,101 @@ impl TidbEngine {
         };
 
         json_opt.map(json_to_item).transpose()
+    }
+}
+
+fn put_stream_capture_without_old_item<'a>(
+    return_old: bool,
+    condition: Option<&Expr>,
+    stream: Option<&'a StreamCapture>,
+) -> Option<&'a StreamCapture> {
+    match stream {
+        Some(capture)
+            if !return_old && condition.is_none() && !stream_capture_needs_old_item(capture) =>
+        {
+            Some(capture)
+        }
+        _ => None,
+    }
+}
+
+async fn commit_put_stream_without_old_item(
+    pool: &sqlx::MySqlPool,
+    mut tx: sqlx::Transaction<'_, sqlx::MySql>,
+    key_info: &TableKeyInfo,
+    capture: &StreamCapture,
+    event: StreamEventName,
+    item: &Item,
+) -> Result<(), StorageError> {
+    let mut sequence_allocator = StreamSequenceAllocator::default();
+    write_stream_record_for_event_in_tx(
+        &mut tx,
+        &mut sequence_allocator,
+        key_info,
+        capture,
+        event,
+        item,
+        None,
+        Some(item),
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+    finalize_stream_records_best_effort(pool, "put_item", sequence_allocator.pending_records())
+        .await;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use extenddb_core::expression::Expr;
+    use extenddb_core::types::StreamViewType;
+    use extenddb_storage::StreamCapture;
+
+    use super::put_stream_capture_without_old_item;
+
+    fn capture(view_type: StreamViewType) -> StreamCapture {
+        StreamCapture {
+            view_type,
+            user_identity: None,
+            region: Arc::from("us-east-1"),
+        }
+    }
+
+    fn condition() -> Expr {
+        Expr::Function {
+            name: "attribute_exists".to_owned(),
+            args: vec![Expr::Path(vec![
+                extenddb_core::expression::PathElement::Attribute("pk".to_owned()),
+            ])],
+        }
+    }
+
+    #[test]
+    fn stream_put_can_skip_old_item_for_key_or_new_image_views() {
+        let keys_only = capture(StreamViewType::KeysOnly);
+        let new_image = capture(StreamViewType::NewImage);
+
+        assert!(put_stream_capture_without_old_item(false, None, Some(&keys_only)).is_some());
+        assert!(put_stream_capture_without_old_item(false, None, Some(&new_image)).is_some());
+    }
+
+    #[test]
+    fn stream_put_keeps_old_item_read_when_result_needs_old_state() {
+        let condition = condition();
+        let keys_only = capture(StreamViewType::KeysOnly);
+        let old_image = capture(StreamViewType::OldImage);
+        let both_images = capture(StreamViewType::NewAndOldImages);
+
+        assert!(
+            put_stream_capture_without_old_item(false, Some(&condition), Some(&keys_only))
+                .is_none()
+        );
+        assert!(put_stream_capture_without_old_item(true, None, Some(&keys_only)).is_none());
+        assert!(put_stream_capture_without_old_item(false, None, Some(&old_image)).is_none());
+        assert!(put_stream_capture_without_old_item(false, None, Some(&both_images)).is_none());
     }
 }
