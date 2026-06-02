@@ -57,9 +57,11 @@ pub struct AppState {
     /// Allowed directories for export file operations. Empty means exports
     /// are disabled (secure default).
     pub export_paths: Arc<[Arc<std::path::PathBuf>]>,
-    /// Frontend token bucket manager for backends that do not use native
-    /// distributed capacity control.
-    pub throttle: Arc<ThrottleManager>,
+    /// Frontend token bucket manager for backends that emulate capacity in the
+    /// HTTP layer. Backends with native distributed capacity control, such as
+    /// TiDB Resource Control, leave this unset so the hot request path does not
+    /// perform process-local admission bookkeeping.
+    pub throttle: Option<Arc<ThrottleManager>>,
     /// Static configuration entries from the `.toml` file for the console
     /// settings page. Each entry is `(key, display_value)` — sensitive values
     /// are pre-redacted by the caller.

@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use clap::Args;
 use daemonize::Daemonize;
+use extenddb_core::limits::LimitsConfig;
+use extenddb_core::throttle::ThrottleManager;
 use extenddb_server::AppState;
 use syslog_tracing::{Facility, Options, Syslog};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, reload, util::SubscriberInitExt};
@@ -27,6 +29,22 @@ pub struct ServeArgs {
     /// Override server port
     #[arg(short, long)]
     port: Option<u16>,
+}
+
+fn frontend_throttle_manager(
+    limits: &LimitsConfig,
+    enabled: bool,
+    backend_native_capacity_control: bool,
+) -> Option<Arc<ThrottleManager>> {
+    if backend_native_capacity_control {
+        None
+    } else {
+        Some(Arc::new(ThrottleManager::new(
+            limits.per_account_max_rcu,
+            limits.per_account_max_wcu,
+            enabled,
+        )))
+    }
 }
 
 /// Bind the listening socket, daemonize, then start the tokio runtime.
@@ -394,11 +412,8 @@ async fn serve_inner(
         backend_native_capacity_control,
     );
 
-    let throttle = Arc::new(extenddb_core::throttle::ThrottleManager::new(
-        limits.per_account_max_rcu,
-        limits.per_account_max_wcu,
-        initial_throttling,
-    ));
+    let throttle =
+        frontend_throttle_manager(&limits, initial_throttling, backend_native_capacity_control);
 
     let state = AppState {
         storage,
@@ -433,15 +448,19 @@ async fn serve_inner(
         reload_handle.clone(),
         app_config.logging.level.clone(),
     ));
-    // Poll throttling_enabled runtime setting.
-    tokio::spawn(workers::poll_throttling_enabled(
-        catalog_store.clone(),
-        throttle,
-        config_throttling,
-        requested_throttling,
-        initial_throttling,
-        backend_native_capacity_control,
-    ));
+    // Poll throttling_enabled only when the selected backend uses frontend
+    // token buckets. TiDB uses native Resource Control and should not keep a
+    // process-local admission worker alive.
+    if let Some(throttle) = throttle {
+        tokio::spawn(workers::poll_throttling_enabled(
+            catalog_store.clone(),
+            throttle,
+            config_throttling,
+            requested_throttling,
+            initial_throttling,
+            backend_native_capacity_control,
+        ));
+    }
     // Spawn background tasks for metrics pruning and flushing.
     tokio::spawn(workers::metrics_prune_worker(metrics.clone()));
     tokio::spawn(workers::metrics_flush_worker(
@@ -487,4 +506,22 @@ async fn serve_inner(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::frontend_throttle_manager;
+    use extenddb_core::limits::LimitsConfig;
+
+    #[test]
+    fn native_capacity_backends_do_not_allocate_frontend_throttle_manager() {
+        let limits = LimitsConfig::default();
+        assert!(frontend_throttle_manager(&limits, true, true).is_none());
+    }
+
+    #[test]
+    fn frontend_capacity_backends_keep_token_bucket_manager() {
+        let limits = LimitsConfig::default();
+        assert!(frontend_throttle_manager(&limits, false, false).is_some());
+    }
 }

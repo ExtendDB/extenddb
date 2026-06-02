@@ -155,63 +155,67 @@ pub(crate) async fn handle_request(
 
     // --- Throttle segment ---
     let throttle_start = std::time::Instant::now();
-    let (is_read_op, is_write_op) = classify_data_operation(&operation);
-    let partition_value = extract_partition_value(&input, &operation);
-    if let Some(ref tn) = table_name {
-        if is_read_op || is_write_op {
-            if !state.throttle.is_registered(&ctx.account_id, tn) {
-                if let Ok(desc) = ctx
-                    .storage
-                    .describe_table(
-                        &ctx.account_id,
-                        extenddb_core::types::DescribeTableInput {
-                            table_name: tn.clone(),
-                        },
-                    )
-                    .await
-                {
-                    let throughput = table_description_to_throughput(&desc);
+    let partition_value = if let Some(throttle) = &state.throttle {
+        let (is_read_op, is_write_op) = classify_data_operation(&operation);
+        let partition_value = extract_partition_value(&input, &operation);
+        if let Some(ref tn) = table_name {
+            if is_read_op || is_write_op {
+                if !throttle.is_registered(&ctx.account_id, tn) {
+                    if let Ok(desc) = ctx
+                        .storage
+                        .describe_table(
+                            &ctx.account_id,
+                            extenddb_core::types::DescribeTableInput {
+                                table_name: tn.clone(),
+                            },
+                        )
+                        .await
+                    {
+                        let throughput = table_description_to_throughput(&desc);
+                        throttle.register_table(&ctx.account_id, tn, throughput);
+                    }
+                }
+
+                let result = throttle.check_capacity_with_partition(
+                    &ctx.account_id,
+                    tn,
+                    is_read_op,
+                    is_write_op,
+                    partition_value.as_deref(),
+                );
+                if result != extenddb_core::throttle::ThrottleResult::Allowed {
+                    let metric = if result == extenddb_core::throttle::ThrottleResult::ThrottledRead
+                    {
+                        extenddb_core::metrics::MetricName::ReadThrottleEvents
+                    } else {
+                        extenddb_core::metrics::MetricName::WriteThrottleEvents
+                    };
                     state
-                        .throttle
-                        .register_table(&ctx.account_id, tn, throughput);
+                        .metrics
+                        .record(metric, 1.0, Some(tn), None, Some(&operation));
+                    state.metrics.record(
+                        extenddb_core::metrics::MetricName::ThrottledRequests,
+                        1.0,
+                        Some(tn),
+                        None,
+                        Some(&operation),
+                    );
+                    return error_response(
+                        &DynamoDbError::ProvisionedThroughputExceededException(
+                            "The level of configured provisioned throughput for the table \
+                             was exceeded. Consider increasing your provisioning level \
+                             with the UpdateTable API."
+                                .to_owned(),
+                        ),
+                        &request_id,
+                    );
                 }
             }
-
-            let result = state.throttle.check_capacity_with_partition(
-                &ctx.account_id,
-                tn,
-                is_read_op,
-                is_write_op,
-                partition_value.as_deref(),
-            );
-            if result != extenddb_core::throttle::ThrottleResult::Allowed {
-                let metric = if result == extenddb_core::throttle::ThrottleResult::ThrottledRead {
-                    extenddb_core::metrics::MetricName::ReadThrottleEvents
-                } else {
-                    extenddb_core::metrics::MetricName::WriteThrottleEvents
-                };
-                state
-                    .metrics
-                    .record(metric, 1.0, Some(tn), None, Some(&operation));
-                state.metrics.record(
-                    extenddb_core::metrics::MetricName::ThrottledRequests,
-                    1.0,
-                    Some(tn),
-                    None,
-                    Some(&operation),
-                );
-                return error_response(
-                    &DynamoDbError::ProvisionedThroughputExceededException(
-                        "The level of configured provisioned throughput for the table \
-                         was exceeded. Consider increasing your provisioning level \
-                         with the UpdateTable API."
-                            .to_owned(),
-                    ),
-                    &request_id,
-                );
-            }
         }
-    }
+        partition_value
+    } else {
+        None
+    };
     #[allow(clippy::cast_precision_loss)]
     let throttle_us = throttle_start.elapsed().as_micros() as f64;
 
@@ -250,13 +254,15 @@ pub(crate) async fn handle_request(
     let response_start = std::time::Instant::now();
     let response = match dispatch_result {
         Ok(result) => {
-            update_throttle_buckets(
-                &state.throttle,
-                &operation,
-                &ctx.account_id,
-                table_name.as_deref(),
-                &result.body,
-            );
+            if let Some(throttle) = &state.throttle {
+                update_throttle_buckets(
+                    throttle,
+                    &operation,
+                    &ctx.account_id,
+                    table_name.as_deref(),
+                    &result.body,
+                );
+            }
 
             let m = &result.metrics;
             if let Some(ref tn) = table_name {
@@ -288,13 +294,15 @@ pub(crate) async fn handle_request(
                         .metrics
                         .record_returned_bytes(tn, &operation, m.returned_bytes);
                 }
-                state.throttle.consume_with_partition(
-                    &ctx.account_id,
-                    tn,
-                    m.read_capacity_units,
-                    m.write_capacity_units,
-                    partition_value.as_deref(),
-                );
+                if let Some(throttle) = &state.throttle {
+                    throttle.consume_with_partition(
+                        &ctx.account_id,
+                        tn,
+                        m.read_capacity_units,
+                        m.write_capacity_units,
+                        partition_value.as_deref(),
+                    );
+                }
             }
 
             success_response(&result.body, &request_id)

@@ -275,8 +275,9 @@ Backends also declare whether capacity control is frontend-local or storage
 native. PostgreSQL can use ExtendDB's process-local token buckets when operators
 want DynamoDB-like throttling in a single-frontend test environment. TiDB marks
 capacity control as backend-native so the server does not enforce local token
-buckets; TiDB Resource Control/resource groups own distributed flow control and
-scheduling across all frontends. The TiDB adapter exposes the optional
+buckets or run frontend throttle bookkeeping on the request hot path; TiDB
+Resource Control/resource groups own distributed flow control and scheduling
+across all frontends. The TiDB adapter exposes the optional
 `storage.tidb.resource_group` value through storage config and binds catalog,
 strong data, default-read data, and catalog-store runtime sessions with
 `SET RESOURCE GROUP`. Catalog stores also declare when retention is owned by
