@@ -6,7 +6,7 @@
 
 ## 1. Architecture Overview
 
-extenddb (ExtendDB) is a standalone async Rust application structured as a Cargo workspace. It receives DynamoDB wire protocol requests over HTTP, authenticates and authorizes them via a pluggable auth provider, executes the operation logic in a backend-agnostic core, and delegates persistence to a pluggable storage engine.
+extenddb (ExtendDB) is a standalone async Rust application structured as a Cargo workspace. It receives DynamoDB wire protocol requests over HTTP, authenticates and authorizes them via SigV4 and the built-in IAM engine, executes operation logic in a backend-agnostic core, and delegates persistence to a pluggable storage engine. TiDB is the default product backend; PostgreSQL is an explicit alternate backend.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -37,9 +37,9 @@ extenddb (ExtendDB) is a standalone async Rust application structured as a Cargo
 ┌──────────────────────────┐         ┌────────────────────────────────┐
 │     AuthProvider trait   │         │     StorageEngine trait        │
 │  ┌────────────────────┐  │         │  ┌────────────────────────┐    │
-│  │ Built-in SigV4     │  │         │  │ PostgreSQL (sqlx)      │    │
-│  │ AWS IAM (future)   │  │         │  │ SQLite (future)        │    │
-│  │ Azure AD (future)  │  │         │  │ MySQL (future)         │    │
+│  │ Built-in SigV4     │  │         │  │ TiDB (sqlx MySQL)      │    │
+│  │ Local IAM engine   │  │         │  │ PostgreSQL alternate   │    │
+│  │ Session policies   │  │         │  │ Future backend crates  │    │
 │  └────────────────────┘  │         │  └────────────────────────┘    │
 └──────────────────────────┘         └────────────────────────────────┘
 ```
@@ -49,7 +49,7 @@ extenddb (ExtendDB) is a standalone async Rust application structured as a Cargo
 ```
 extenddb/
 ├── Cargo.toml                    # Workspace root
-├── config.example.toml           # Example configuration file
+├── extenddb.sample.toml          # Example configuration file
 ├── docs/                         # Design documentation (this folder)
 │
 ├── crates/
@@ -97,17 +97,15 @@ extenddb/
 │   │       ├── types.rs          # Storage-specific types (QueryParams, ScanParams, etc.)
 │   │       └── error.rs          # StorageError type
 │   │
-│   ├── storage-postgres/         # PostgreSQL backend implementation
-│   │   ├── Cargo.toml
-│   │   ├── migrations/           # SQL migration files
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── engine.rs         # StorageEngine impl for PostgreSQL
-│   │       ├── schema.rs         # Table/index DDL generation
-│   │       ├── item.rs           # Item CRUD operations
-│   │       ├── query.rs          # Query/Scan SQL generation
-│   │       ├── transaction.rs    # Transaction support
-│   │       └── migration.rs      # Schema migration runner
+│   ├── storage-tidb/             # Default TiDB backend implementation
+│   │   ├── migrations/           # Catalog SQL migrations
+│   │   ├── data_migrations/      # Data database SQL migrations
+│   │   └── src/                  # TiDB engines, native DDL, TTL, BR, workers
+│   │
+│   ├── storage-postgres/         # Explicit PostgreSQL alternate backend implementation
+│   │   ├── migrations/           # Catalog SQL migrations
+│   │   ├── data_migrations/      # Data database SQL migrations
+│   │   └── src/                  # PostgreSQL engines and workers
 │   │
 │   ├── auth/                     # AuthProvider trait + built-in SigV4 + policy engine
 │   │   ├── Cargo.toml
@@ -141,6 +139,7 @@ extenddb/
 ```mermaid
 graph TD
     BIN[bin] --> SERVER[server]
+    BIN --> STORAGE_TIDB[storage-tidb]
     BIN --> STORAGE_PG[storage-postgres]
     BIN --> AUTH[auth]
     BIN --> ENGINE[engine]
@@ -156,6 +155,8 @@ graph TD
 
     AUTH --> CORE
 
+    STORAGE_TIDB --> STORAGE
+    STORAGE_TIDB --> CORE
     STORAGE_PG --> STORAGE
     STORAGE_PG --> CORE
 
@@ -200,15 +201,15 @@ sequenceDiagram
 
 ### 4.1 Cargo Workspace with Crate Boundaries
 
-**Decision:** Structure as a Cargo workspace with 7 crates.
+**Decision:** Structure as a Cargo workspace with focused crates and explicit backend crates.
 
 **Rationale:**
-- Compile-time enforcement of dependency boundaries — the storage trait crate physically cannot depend on PostgreSQL
+- Compile-time enforcement of dependency boundaries — the storage trait crate physically cannot depend on TiDB or PostgreSQL
 - `core` is pure sync Rust with no async runtime — types, expressions, validation, capacity, errors
 - `engine` contains async operation handlers that depend on `core` + `storage`, keeping the async boundary explicit
-- Independent testing — `cargo test -p dynamodb-core` needs no database and no async runtime
-- Faster incremental builds — changing the Postgres backend doesn't recompile the expression parser
-- Clean extension points — adding a SQLite backend is a new crate, zero changes to existing code
+- Independent testing — `cargo test -p extenddb-core` needs no database and no async runtime
+- Faster incremental builds — changing a backend doesn't recompile the expression parser
+- Clean extension points — adding another backend is a new crate, with no storage-trait dependency leak into core
 - Lean dependency trees — core has no async runtime, no database drivers, no HTTP framework
 
 ### 4.2 axum + tower for HTTP
@@ -262,7 +263,7 @@ sequenceDiagram
 **Rationale:**
 - The original pg_dynamodb extension was forced into blocking mode by PostgreSQL SPI constraints. As a standalone process, we have no such limitation
 - Async I/O is essential for handling thousands of concurrent connections efficiently
-- sqlx provides native async PostgreSQL support
+- sqlx provides async SQL drivers for the TiDB MySQL-compatible endpoint and for the PostgreSQL alternate backend
 - The storage trait being async allows backends that use network I/O (e.g., a future DynamoDB-backed backend for testing, or a distributed storage backend)
 
 ### 4.7 Read Consistency Routing
@@ -304,7 +305,7 @@ inventing delay queues or app-side consistency machinery.
    - If condition: call core's evaluate_condition() against existing item INSIDE the transaction
    - If condition fails: ROLLBACK, return ConditionFailed { old_item }
    - Insert/upsert item
-   - If GSIs exist: update backend-specific secondary-index state (PostgreSQL companion tables; TiDB native indexes)
+   - If GSIs exist: update backend-specific secondary-index state. TiDB uses native generated-column secondary indexes maintained by the base-table write; PostgreSQL uses companion state.
    - If stream_record provided: INSERT stream record (within same transaction)
    - COMMIT
 9. Calculate consumed capacity (item size → WCU)
@@ -329,7 +330,7 @@ UpdateItem is more complex than PutItem because the storage backend must also ap
    - Call core's apply_update(actions, &mut item, ctx) → modified item
    - Validate modified item (size limits, key attributes unchanged)
    - INSERT/UPDATE the modified item
-   - If GSIs exist: update backend-specific secondary-index state (PostgreSQL companion tables; TiDB native indexes)
+   - If GSIs exist: update backend-specific secondary-index state. TiDB uses native generated-column secondary indexes maintained by the base-table write; PostgreSQL uses companion state.
    - If stream_capture provided: construct full StreamRecord (with old_image/new_image based on stream_view_type), INSERT stream record (within same transaction)
    - COMMIT
 ```
@@ -388,8 +389,8 @@ There is no in-memory locking (no `Mutex`, `RwLock`, or similar) on the data pat
 
 ### 6.4 Implications
 
-- **Throughput scales with pool_size.** More connections allow more concurrent transactions. The limit is PostgreSQL's `max_connections` and available CPU/IO.
-- **Contention on the same item serializes at the database.** 50 threads incrementing the same counter will queue on the row lock — each update succeeds, but throughput for that single item is bounded by PostgreSQL's single-row transaction rate.
+- **Throughput scales with backend pool capacity.** More connections allow more concurrent transactions. The limit is the selected backend's SQL session capacity, CPU, and IO.
+- **Contention on the same item serializes at the database.** 50 threads incrementing the same counter will queue on the backend row/record lock — each update succeeds, but throughput for that single item is bounded by the backend's single-key transaction rate.
 - **Different items have no contention.** Parallel inserts to different keys proceed fully concurrently up to the pool size.
 
 ## 7. High-Level Design Choices — Deferred Components
@@ -430,7 +431,8 @@ There is no in-memory locking (no `Mutex`, `RwLock`, or similar) on the data pat
 | HTTP framework | axum + tower | Composable middleware, hyper-based |
 | HTTP TLS server | axum_server | Adds rustls bind support on top of axum (used only when TLS is enabled) |
 | TLS | rustls | No OpenSSL dependency, pure Rust |
-| PostgreSQL driver | sqlx | Async, compile-time query checking, migrations |
+| TiDB driver | sqlx MySQL | Async access to TiDB's MySQL-compatible SQL endpoint |
+| PostgreSQL driver | sqlx | Async access to the explicit alternate backend |
 | Serialization | serde + serde_json | Standard, zero-copy where possible |
 | Crypto (SigV4) | hmac + sha2 + constant_time_eq | Pure Rust, audited |
 | Crypto (encryption) | aes-gcm | AES-256-GCM for credential encryption |

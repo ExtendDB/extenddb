@@ -781,15 +781,20 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Fix:** Increase the pool size in `extenddb.toml`:
 ```toml
-[storage.postgres]
-pool_size = 50  # default is 20
-
-# or, for TiDB:
 [storage.tidb]
+pool_size = 50
+catalog_pool_size = 50
+
+# PostgreSQL alternate backend:
+[storage.postgres]
 pool_size = 50
 ```
 
-If the problem persists, check for long-running queries or connection leaks with the backend's session-inspection tools, such as PostgreSQL `pg_stat_activity` or TiDB's statement/cluster diagnostics.
+For TiDB, remember that each frontend opens strong-data, default-read-data,
+engine-catalog, and catalog-store/auth pools. Check TiDB session usage, slow
+queries, DDL jobs, and Resource Control throttling with TiDB's cluster
+diagnostics. For the PostgreSQL alternate backend, use PostgreSQL session
+inspection such as `pg_stat_activity`.
 
 **Known limitation:** The HTTP status code should be 503 with a `Retry-After` header. This is tracked as technical debt.
 

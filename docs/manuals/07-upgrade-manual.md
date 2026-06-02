@@ -72,22 +72,21 @@ Add a new SQL file with the next sequence number:
 crates/storage-tidb/migrations/027_your_feature.sql
 ```
 
-The file should be a single transaction:
+TiDB DDL auto-commits and cannot be rolled back as part of an explicit SQL
+transaction, so migration files must be written as idempotent online DDL plus
+small, repeatable catalog DML. Do not wrap TiDB migration files in `BEGIN` /
+`COMMIT`:
 
 ```sql
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
 -- Migration 027: Brief description of what this adds/changes.
 
-BEGIN;
-
--- Your DDL here.
+-- Your online DDL here.
 ALTER TABLE tables ADD COLUMN IF NOT EXISTS new_column TEXT;
 
--- Bump the catalog version.
+-- Bump the catalog version after the DDL statements are in place.
 UPDATE settings SET value = '0.0.27' WHERE key = 'catalog_version';
-
-COMMIT;
 ```
 
 ### 2. Register it in the migration runner
@@ -131,7 +130,7 @@ The consolidated schema file is what fresh installs get. Add your new column/tab
 
 **Backward compatibility.** Prefer additive changes (new columns with defaults, new tables) over destructive ones (dropping columns, renaming tables). A running server on the old binary should survive the schema change until it's restarted with the new binary.
 
-**TiDB online DDL.** Prefer TiDB online DDL and idempotent `IF EXISTS` / `IF NOT EXISTS` statements. Do not add frontend locks or per-node migration ownership; TiDB owns distributed DDL scheduling.
+**TiDB online DDL.** Prefer TiDB online DDL and idempotent `IF EXISTS` / `IF NOT EXISTS` statements. DDL statements auto-commit in TiDB, so migration correctness comes from idempotency and post-migration verification, not from a frontend transaction wrapper. Do not add frontend locks or per-node migration ownership; TiDB owns distributed DDL scheduling.
 
 **No data migrations in DDL files.** If a schema change requires backfilling data, do it in Rust code triggered by `extenddb migrate`, not in raw SQL. This gives you error handling, progress reporting, and the ability to batch large updates.
 

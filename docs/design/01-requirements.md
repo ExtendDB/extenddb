@@ -6,13 +6,14 @@
 
 ## 1. Overview
 
-extenddb (ExtendDB) is a standalone, stateless Rust application that provides a 100% DynamoDB-compatible API backed by pluggable storage engines. Any AWS SDK client (Java, Python, Go, Node.js, Rust, .NET, etc.) connects directly with zero code changes. The system runs as its own process, completely independent of any specific database, and supports pluggable authentication providers and pluggable storage backends.
+extenddb (ExtendDB) is a standalone, stateless Rust application that provides a DynamoDB-compatible API backed by pluggable storage engines. Any AWS SDK client (Java, Python, Go, Node.js, Rust, .NET, etc.) connects directly with zero code changes. The standard product path uses TiDB as the default backend so ExtendDB can rely on TiDB-native transactions, online DDL, secondary indexes, TTL, follower reads, Resource Control, and BR.
 
 ### 1.1 Goals
 
 - **Full DynamoDB API compatibility** — byte-for-byte compatible wire protocol, error responses, and SDK behavior
-- **Pluggable storage** — clean trait-based abstraction allowing any database as a backend (PostgreSQL first)
-- **Pluggable authentication** — support local SigV4, AWS IAM, Azure AD, and custom providers
+- **TiDB-first storage** — use TiDB native capabilities instead of frontend coordination whenever TiDB provides the distributed primitive
+- **Pluggable storage** — clean trait-based abstraction with TiDB as the default backend and PostgreSQL as an explicit alternate backend
+- **Built-in authentication** — local SigV4 and IAM-style authorization, with provider traits available for future auth integrations
 - **Standalone & stateless** — single async Rust binary, no embedded database, horizontally scalable
 - **Production-ready** — TLS, observability, graceful shutdown, configurable limits, VM and Kubernetes deployment
 
@@ -21,7 +22,7 @@ extenddb (ExtendDB) is a standalone, stateless Rust application that provides a 
 | Feature | Reason |
 |---------|--------|
 | PartiQL (ExecuteStatement, BatchExecuteStatement, ExecuteTransaction) | Deferred — focus on JSON wire protocol first |
-| Backup/Restore (CreateBackup, DeleteBackup, DescribeBackup, ListBackups, RestoreTableFromBackup, DescribeContinuousBackups, UpdateContinuousBackups, RestoreTableToPointInTime) | Excluded — backup is a storage-layer concern, not an API concern |
+| Non-native frontend backup formats for TiDB | Excluded — TiDB backups and table restore use native BR/cluster recovery paths |
 | Auto-scaling APIs (DescribeTableReplicaAutoScaling, UpdateTableReplicaAutoScaling) | Excluded — auto-scaling is an infrastructure concern |
 | Contributor Insights (DescribeContributorInsights, ListContributorInsights, UpdateContributorInsights) | Excluded — analytics feature, not core API |
 | Kinesis Streaming Destination (DescribeKinesisStreamingDestination, EnableKinesisStreamingDestination, DisableKinesisStreamingDestination, UpdateKinesisStreamingDestination) | Excluded — AWS-specific integration |
@@ -242,38 +243,30 @@ These are the core CRUD operations. All must be fully implemented.
 
 ## 4. Authentication & Authorization Requirements
 
-### 4.1 Pluggable Authentication
+### 4.1 Authentication Provider Boundary
 
-- REQ-AUTH-001: Authentication must be pluggable via a provider trait
+- REQ-AUTH-001: Authentication must flow through a provider trait, with the built-in provider as the supported production provider
 - REQ-AUTH-002: The built-in provider must implement full AWS SigV4 signature validation
 - REQ-AUTH-003: SigV4 validation must include: canonical request construction, signing key derivation (HMAC-SHA256 chain: secret → date → region → service → signing), constant-time signature comparison
 - REQ-AUTH-004: Support configurable clock skew tolerance (default: ±300 seconds)
 - REQ-AUTH-005: Credential storage must encrypt secret keys at rest (AES-256-GCM)
 - REQ-AUTH-006: Credential lookup must be cached with configurable TTL
-- REQ-AUTH-007: Future providers must be addable without modifying core code:
-  - **Azure AD**: Validate OAuth2/OIDC bearer token, map Azure AD identity to local identity
-  - **Custom**: User-provided authentication via shared library or gRPC sidecar
+- REQ-AUTH-007: Future providers must be addable without modifying core request handling code
 
 ### 4.1.1 Auth Modes
 
-extenddb supports three authentication modes, selectable by configuration. The mode determines how credentials are validated and how authorization decisions are made.
+extenddb supports the built-in authentication mode. The server refuses to start
+without authentication.
 
 **Mode 1: No auth** (removed — `auth.provider = "none"` is no longer accepted)
 Previously accepted any request regardless of the Authorization header. This mode has been removed. The server refuses to start with `provider = "none"`.
 
-**Mode 2: Local credential store** (`auth.provider = "builtin"`)
+**Supported mode: Local credential store** (`auth.provider = "builtin"`)
 extenddb maintains its own credential store and policy documents. SigV4 signatures are validated against locally stored secret keys. Authorization is evaluated against locally stored IAM-style policies. Credentials and policies are managed via the management API or seed configuration. This is the default for production in disconnected or semi-connected environments.
 
-**Mode 3: AWS IAM** (`auth.provider = "aws_iam"`)
-When extenddb has network connectivity to AWS (e.g., running on EC2), it delegates authentication and authorization to real AWS IAM. This mode has three sub-capabilities:
-
-- REQ-AUTH-008: **STS authentication via pre-signed GetCallerIdentity token.** The client generates a pre-signed STS `GetCallerIdentity` URL (signed for the `sts` service) and sends it as an `X-Extenddb-Auth-Token` header alongside the normal DynamoDB request. extenddb calls STS using this pre-signed URL to validate the credential and resolve the caller's IAM ARN, account ID, and user ID. Cache validated identities with configurable TTL to avoid per-request STS calls. This is the same pattern used by EKS (`aws-iam-authenticator`) and Vault's AWS auth method.
-- REQ-AUTH-009: **IAM policy retrieval.** Fetch the caller's attached policies, group policies, and permissions boundaries from IAM using `iam:GetUserPolicy`, `iam:ListAttachedUserPolicies`, `iam:GetPolicy`, `iam:GetPolicyVersion`, `iam:ListGroupsForUser`, `iam:GetRolePolicy`, `iam:ListAttachedRolePolicies`, and `iam:GetUserPermissionsBoundary` / `iam:GetRolePermissionsBoundary`. Retrieved policies are evaluated by the same local policy engine used in Mode 2. Cache retrieved policies with configurable TTL.
-- REQ-AUTH-010: **Near-seamless SDK experience with thin client wrapper.** A lightweight extenddb client wrapper generates the pre-signed STS token and attaches it as `X-Extenddb-Auth-Token` before each request. The wrapper uses the same AWS credentials and SDK configuration as normal DynamoDB calls. Switching between extenddb and real DynamoDB requires changing `endpoint_url` and adding/removing the wrapper. The wrapper is provided for Python (boto3 plugin), Rust, and Java.
-- REQ-AUTH-011: **Graceful degradation.** If STS or IAM is unreachable (network partition, transient failure), extenddb must return a clear error (`ServiceUnavailable` with a message indicating the auth backend is unreachable) rather than silently allowing or denying requests. Cached identities and policies remain valid for their TTL during outages.
-- REQ-AUTH-012: **IAM permissions required.** The EC2 instance (or IAM principal) running extenddb must have permissions to call `sts:GetCallerIdentity` (always allowed, no policy needed) and the `iam:Get*`/`iam:List*` actions above. The required IAM policy for the extenddb host is documented in the deployment guide.
-
-> **Design note:** Mode 3 enables a powerful workflow: develop locally with Mode 2 (local credentials + policies), then deploy to EC2 with Mode 3 (real IAM) using the same application code and SDK configuration (only `endpoint_url` changes, plus adding the extenddb client wrapper). The same policy documents work in both modes because the policy engine is shared. The pre-signed token approach is a proven pattern used by EKS and Vault — it works because the token is signed for the `sts` service by the client's own credentials, avoiding the SigV4 service-binding problem.
+**Future mode: External identity provider**
+An AWS IAM, OIDC, or custom provider can be added behind the provider trait in a
+future release, but the current supported runtime mode is `builtin`.
 
 ### 4.2 Identity Model
 
@@ -407,12 +400,12 @@ All limits must be enforced by default with DynamoDB-compatible values. All limi
 
 ### 7.1 Catalog Database
 
-The catalog database stores extenddb metadata: table definitions, indexes, tags, and the data database connection info. The data database stores user item data. This follows the PostgreSQL/MySQL pattern of system catalog vs. user databases.
+The catalog database stores extenddb metadata: table definitions, indexes, tags, and the data database connection info. The data database stores user item data. TiDB deployments keep both databases in the same TiDB cluster so native TSO snapshots, online DDL, TTL, and BR operate on one global timeline.
 
 - REQ-CAT-001: extenddb metadata (table definitions, indexes, tags) must reside in a catalog database, separate from user item data
 - REQ-CAT-002: User item data must reside in a data database whose connection info is recorded in the catalog
 - REQ-CAT-003: The `extenddb.toml` connection string points to the catalog database; the catalog stores the data database location
-- REQ-CAT-004: The catalog database name is user-chosen via the connection string — never hardcoded. Multiple independent catalogs can coexist on one PostgreSQL instance
+- REQ-CAT-004: The catalog database name is user-chosen via the connection string — never hardcoded. Multiple independent catalogs can coexist on one TiDB cluster
 
 ### 7.2 Catalog Versioning
 
@@ -441,27 +434,31 @@ The catalog database stores extenddb metadata: table definitions, indexes, tags,
 - REQ-STOR-005: Adding a new backend must not require changes to any existing crate
 - REQ-STOR-006: Read methods must receive the DynamoDB `ConsistentRead` flag so each backend can map strong and default reads to its native consistency paths without leaking topology into the engine layer
 
-### 8.2 PostgreSQL Backend (First Implementation)
-
-- REQ-PG-001: Use async PostgreSQL driver (sqlx with tokio runtime)
-- REQ-PG-002: Connection pooling with configurable pool size
-- REQ-PG-003: Each DynamoDB table maps to a PostgreSQL table with typed key columns and `item_data JSONB`
-- REQ-PG-004: GSIs map to separate PostgreSQL tables with automatic backfill on write
-- REQ-PG-005: Use parameterized queries for all read operations to prevent SQL injection
-- REQ-PG-006: Schema migrations managed via embedded migration files
-- REQ-PG-007: Support PostgreSQL 14+
-- REQ-PG-008: Honor the storage trait read-consistency contract. The current PostgreSQL backend uses its configured primary data pool for both strong and default reads until a PostgreSQL topology configuration is implemented.
-
-### 8.3 TiDB Backend
+### 8.2 TiDB Backend (Default Implementation)
 
 - REQ-TIDB-001: Use TiDB's MySQL-compatible SQL endpoint through the sqlx MySQL driver
 - REQ-TIDB-002: Use TiDB transactions for global consistency across base rows, secondary indexes, streams, and catalog updates
 - REQ-TIDB-003: Represent DynamoDB secondary indexes with generated columns and native TiDB secondary indexes; GSI versus LSI is API metadata, not separate physical index classes
-- REQ-TIDB-004: Use TiDB native TTL for all user tables; do not run a parallel ExtendDB TTL worker for TiDB tables
-- REQ-TIDB-005: Use TiDB BR for native physical backup/restore instead of catalog row-copy backup data
-- REQ-TIDB-006: Route default data-plane reads through a TiDB session configured for native follower-read locality (`tidb_replica_read = 'closest-adaptive'`); route writes and `ConsistentRead=true` reads through the strong data pool
-- REQ-TIDB-007: Run `TransactGetItems` inside a TiDB transaction so multi-item transactional reads use one native snapshot instead of application-level locking
-- REQ-TIDB-008: Run `ExportTableToPointInTime` through TiDB native `AS OF TIMESTAMP` snapshot reads; do not emulate point-in-time export with engine-level paginated scans
+- REQ-TIDB-004: Treat TiDB secondary indexes as global for DynamoDB index reads; do not implement local-index fallback or routing logic
+- REQ-TIDB-005: Use TiDB native online DDL and idempotent catalog reconciliation for table create, delete, update, and TTL transitions; do not add frontend DDL leases or ownership locks
+- REQ-TIDB-006: Use TiDB native TTL for all user tables and fixed-retention internal tables; do not run a parallel ExtendDB TTL worker for TiDB tables
+- REQ-TIDB-007: Use TiDB BR for native physical backup/restore instead of catalog row-copy backup data
+- REQ-TIDB-008: Route default data-plane reads through a TiDB session configured for native follower-read locality (`tidb_replica_read = 'closest-adaptive'`); route writes and `ConsistentRead=true` reads through the strong data pool
+- REQ-TIDB-009: Run `TransactGetItems` inside a TiDB transaction so multi-item transactional reads use one native snapshot instead of application-level locking
+- REQ-TIDB-010: Run `ExportTableToPointInTime` through TiDB native `AS OF TIMESTAMP` snapshot reads; do not emulate point-in-time export with engine-level paginated scans
+- REQ-TIDB-011: Use TiDB Resource Control/resource groups for distributed capacity governance; do not use per-frontend token buckets for TiDB
+- REQ-TIDB-012: Keep catalog and data databases in the same TiDB cluster and validate that topology at startup
+
+### 8.3 PostgreSQL Backend (Explicit Alternate)
+
+- REQ-PG-001: Use async PostgreSQL driver (sqlx with tokio runtime)
+- REQ-PG-002: Connection pooling with configurable pool size
+- REQ-PG-003: Each DynamoDB table maps to PostgreSQL data structures owned by the PostgreSQL backend
+- REQ-PG-004: PostgreSQL-specific GSI and TTL machinery must remain isolated in `storage-postgres`
+- REQ-PG-005: Use parameterized queries for all read operations to prevent SQL injection
+- REQ-PG-006: Schema migrations managed via embedded migration files
+- REQ-PG-007: Support PostgreSQL 14+ only for explicitly selected PostgreSQL deployments
+- REQ-PG-008: Honor the storage trait read-consistency contract. The current PostgreSQL backend uses its configured primary data pool for both strong and default reads until a PostgreSQL topology configuration is implemented.
 
 ## 9. Expression Engine Requirements
 

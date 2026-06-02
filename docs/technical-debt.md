@@ -66,13 +66,13 @@ Last updated: 2026-05-04 (P112)
 
 | # | Item | Location | Priority | Origin |
 |---|------|----------|----------|--------|
-| A-1 | Catalog/data database separation not implemented (REQ-CAT-001/002) | `storage-postgres/src/lib.rs` | High | P40 |
+| A-1 | PostgreSQL catalog/data database separation not implemented (REQ-CAT-001/002) | `storage-postgres/src/lib.rs` | High | P40 |
 
 ### A-1: Catalog/Data Database Separation
 
-**Design requirement:** Two databases — catalog (`extenddb`) for metadata, data (`extenddb_data`) for user items (REQ-CAT-001, REQ-CAT-002).
+**Design requirement:** Two databases — catalog for metadata, data for user items (REQ-CAT-001, REQ-CAT-002). TiDB implements this with catalog and data databases in the same TiDB cluster so native TSO snapshots, online DDL, TTL, and BR share one timeline.
 
-**Current state:** `extenddb init` correctly creates both databases and stores the data connection string in the settings table. However, the runtime (`PostgresEngine`) only opens one connection pool to the catalog database. All `_ddb_*` item tables are created in the catalog database. The `extenddb_data` database exists but sits empty. The settings table has `data_database_connection_string` and `data_database_name` but the code never reads them at runtime.
+**Current state:** TiDB uses the separated catalog/data topology and validates that both databases are in the same TiDB cluster at startup. This remaining debt is PostgreSQL-specific: the PostgreSQL runtime (`PostgresEngine`) only opens one connection pool to the catalog database, so `_ddb_*` item tables are created in the catalog database.
 
 **What needs to change:**
 1. Open a second connection pool for the data database at startup

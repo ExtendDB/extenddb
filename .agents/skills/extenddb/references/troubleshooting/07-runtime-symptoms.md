@@ -13,15 +13,20 @@ This file holds verbatim Cause and Fix entries for runtime performance and event
 HTTP 500 on all requests under heavy load
 ```
 
-**Cause:** The PostgreSQL connection pool is exhausted. All connections are in use and new requests cannot acquire a connection within the timeout. extenddb currently returns HTTP 500 (Internal Server Error) instead of the more appropriate 503 (Service Unavailable).
+**Cause:** The active storage backend connection pool is exhausted. All connections are in use and new requests cannot acquire a connection within the timeout. extenddb currently returns HTTP 500 (Internal Server Error) instead of the more appropriate 503 (Service Unavailable).
 
 **Fix:** Increase the pool size in `extenddb.toml`:
 ```toml
+[storage.tidb]
+pool_size = 50
+catalog_pool_size = 50
+
+# PostgreSQL alternate backend:
 [storage.postgres]
-pool_size = 50  # default is 20
+pool_size = 50
 ```
 
-If the problem persists, check for long-running queries or connection leaks with `SELECT * FROM pg_stat_activity WHERE datname = 'extenddb_data';`.
+For TiDB, each frontend opens strong-data, default-read-data, engine-catalog, and catalog-store/auth pools. If the problem persists, inspect TiDB sessions, slow queries, DDL jobs, and Resource Control throttling with TiDB's cluster diagnostics. PostgreSQL alternate deployments should inspect `pg_stat_activity`.
 
 **Known limitation:** The HTTP status code should be 503 with a `Retry-After` header. This is tracked as technical debt.
 
@@ -40,7 +45,7 @@ Stream capture: failed to assign shard for <table>: <error>
 
 **Cause:** After a successful write (PutItem, DeleteItem, UpdateItem), extenddb tried to capture a stream record but could not determine which shard to assign it to. The data write succeeded — only the stream record is missing.
 
-**Fix:** Check PostgreSQL connectivity. Verify the table's stream shards exist in the `stream_shards` table. If the table was created before streams were enabled, the shards may not have been initialized.
+**Fix:** Check storage backend connectivity and stream metadata. TiDB stores stream records in the shared data database table and uses native TTL for retention. PostgreSQL alternate deployments should also verify the table's stream shard metadata.
 
 **Source:** `docs/troubleshooting.md`, section "DynamoDB Streams", last synced 2026-05-12.
 
@@ -53,7 +58,7 @@ Stream capture: failed to write record for <table>: <error>
 
 **Cause:** A stream record was constructed but could not be persisted to the `stream_records` table. The data write succeeded — only the stream record is missing.
 
-**Fix:** Check PostgreSQL connectivity and disk space. If the error mentions a unique constraint violation, two writes to the same shard may have occurred in the same microsecond — retry the operation.
+**Fix:** Check storage backend connectivity and disk space. For TiDB, inspect the data database `stream_records` table and TiDB slow/query diagnostics. PostgreSQL alternate deployments should also check for backend-specific unique constraint errors.
 
 **Source:** `docs/troubleshooting.md`, section "DynamoDB Streams", last synced 2026-05-12.
 

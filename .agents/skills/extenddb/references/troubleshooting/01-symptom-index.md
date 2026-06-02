@@ -138,8 +138,8 @@ The cause and fix summaries below are paraphrased for quick scanning. The catego
 ### Connection pool exhausted
 
 **Error text:** `HTTP 500 on all requests under heavy load`
-**Cause summary:** The PostgreSQL connection pool is exhausted and new requests cannot acquire a connection within the timeout.
-**Fix summary:** Raise `pool_size` under `[storage.postgres]` in `extenddb.toml` and investigate long-running queries in `pg_stat_activity`.
+**Cause summary:** The active storage backend connection pool is exhausted and new requests cannot acquire a connection within the timeout.
+**Fix summary:** For TiDB, raise `[storage.tidb] pool_size` and `catalog_pool_size`, then inspect TiDB sessions, slow queries, DDL jobs, and Resource Control. PostgreSQL alternate deployments should raise `[storage.postgres] pool_size` and inspect `pg_stat_activity`.
 **Full entry:** `references/07-runtime-symptoms.md#connection-pool-exhausted`
 
 ## 4. Unknown-symptom fallback

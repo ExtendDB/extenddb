@@ -3,7 +3,7 @@
 **Version:** 1.0
 **Date:** 2026-04-03
 **Status:** Draft
-**Crate:** `dynamodb-core`
+**Crate:** `extenddb-core`
 
 ## 1. Purpose
 

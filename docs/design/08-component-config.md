@@ -13,7 +13,7 @@ This document covers the configuration system, configurable limits, logging, met
 Precedence (highest to lowest):
 1. **CLI flags** — `--config`, `--port`, `--version`, `--validate-config`
 2. **Environment variables** — `EXTENDDB__SERVER__PORT=8000`
-3. **Config file** — TOML format, path specified via `--config` or default `config.toml`
+3. **Config file** — TOML format, path specified via `--config` or generated as `extenddb.toml`
 4. **Defaults** — hardcoded in Rust structs via `Default` trait
 
 ### 2.1 CLI (clap)
@@ -48,13 +48,11 @@ Environment variables use double-underscore (`__`) as a nesting separator, prefi
 |-----------|---------------------|
 | `server.port` | `EXTENDDB__SERVER__PORT` |
 | `server.bind_addr` | `EXTENDDB__SERVER__BIND_ADDR` |
-| `storage.postgres.connection_string` | `EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING` |
+| `storage.backend` | `EXTENDDB__STORAGE__BACKEND` |
 | `storage.tidb.connection_string` | `EXTENDDB__STORAGE__TIDB__CONNECTION_STRING` |
+| `storage.tidb.resource_group` | `EXTENDDB__STORAGE__TIDB__RESOURCE_GROUP` |
 | `auth.provider` | `EXTENDDB__AUTH__PROVIDER` |
 | `auth.encryption_key` | `EXTENDDB__AUTH__ENCRYPTION_KEY` |
-| `auth.aws_iam.region` | `EXTENDDB__AUTH__AWS_IAM__REGION` |
-| `auth.aws_iam.identity_cache_ttl_seconds` | `EXTENDDB__AUTH__AWS_IAM__IDENTITY_CACHE_TTL_SECONDS` |
-| `auth.aws_iam.policy_cache_ttl_seconds` | `EXTENDDB__AUTH__AWS_IAM__POLICY_CACHE_TTL_SECONDS` |
 | `limits.max_item_size_bytes` | `EXTENDDB__LIMITS__MAX_ITEM_SIZE_BYTES` |
 
 ### 2.3 Loading
@@ -130,7 +128,7 @@ connection_timeout_secs = 5
 statement_timeout_secs = 30
 
 [auth]
-provider = "builtin"     # "none" | "builtin" | "aws_iam" | future: "azure_ad"
+provider = "builtin"     # builtin SigV4 + local IAM; auth is mandatory
 region = "us-east-1"     # Region for SigV4 validation
 # encryption_key: Set via EXTENDDB__AUTH__ENCRYPTION_KEY env var (never in config files)
 credential_cache_ttl_secs = 300
@@ -317,20 +315,7 @@ storage capabilities where available:
 - PostgreSQL runs an application TTL cleanup worker because PostgreSQL has no table-native TTL.
 - TiDB uses native table TTL for item expiration and must not run a parallel application TTL worker.
 
-### 7.1 PostgreSQL TTL Cleanup Worker
-
-```rust
-async fn ttl_worker(storage: Arc<dyn StorageEngine>, config: TtlConfig) {
-    let mut interval = tokio::time::interval(Duration::from_secs(config.scan_interval_secs));
-    loop {
-        interval.tick().await;
-        // List all tables with TTL enabled
-        // For each table: call storage.cleanup_expired_items()
-    }
-}
-```
-
-### 7.2 Stream Record Cleanup Worker
+### 7.1 Stream Record Cleanup Worker
 
 ```rust
 async fn stream_cleanup_worker(storage: Arc<dyn StorageEngine>, config: StreamsConfig) {
@@ -365,59 +350,31 @@ async fn main() -> anyhow::Result<()> {
 
     init_logging(&config.logging);
 
-    // Initialize storage backend
-    let storage = match config.storage.backend.as_str() {
-        "postgres" => {
-            let pg = PostgresEngine::new(&config.storage.postgres).await?;
-            pg.run_migrations().await?;
-            Arc::new(pg)
-        }
-        other => anyhow::bail!("Unknown storage backend: {other}"),
-    };
+    // Initialize selected storage backend. `serve` validates catalog version
+    // but never runs migrations; `init` and `migrate` are explicit lifecycle
+    // commands.
+    let backend = storage_registry::select(&config.storage.backend)?;
+    let storage = backend.connect(&config).await?;
+    storage.check_catalog_version().await?;
 
     // Initialize auth provider
     let credential_store = StorageCredentialAdapter::new(storage.clone());
-    let auth: Arc<dyn AuthProvider> = match config.auth.provider.as_str() {
-        "none" => Arc::new(NoopAuthProvider),
-        "builtin" => Arc::new(BuiltinAuthProvider::new(
-            credential_store,
-            config.auth.clone(),
-        )),
-        "aws_iam" => {
-            let mut builder = aws_config::defaults(BehaviorVersion::latest());
-            if let Some(region) = &config.auth.aws_iam.region {
-                builder = builder.region(Region::new(region.clone()));
-            }
-            let aws_config = builder.load().await;
-            Arc::new(AwsIamProvider::new(
-                &aws_config,
-                config.auth.aws_iam.clone(),
-            ))
-        }
-        other => anyhow::bail!("Unknown auth provider: {other}"),
-    };
+    anyhow::ensure!(config.auth.provider == "builtin", "auth.provider must be builtin");
+    let auth: Arc<dyn AuthProvider> = Arc::new(BuiltinAuthProvider::new(
+        credential_store,
+        config.auth.clone(),
+    ));
 
     // Initialize metrics
     let metrics = init_metrics(&config.metrics);
 
-    // Build app state
-    let state = AppState {
-        storage: storage.clone(),
-        auth,
-        limits: Arc::new(config.limits.clone()),
-        region: Arc::from(config.server.region.as_str()),
-        catalog_store: Some(catalog_store.clone()),
-        metrics,
-        throttle: throttle.clone(),
-        // ...
-    };
-
-    // Start backend runtime hooks. PostgreSQL may install TTL, stream-cleanup,
-    // and statistics refresh workers. TiDB relies on native table TTL and
-    // information_schema statistics, so it installs only TiDB-specific
+    // Build app state and start backend runtime hooks. PostgreSQL may install
+    // application TTL and statistics workers. TiDB relies on native table TTL
+    // and information_schema statistics, so it installs only TiDB-specific
     // control-plane and pool-metrics workers.
-    if let Some(hooks) = runtime_hooks {
-        hooks.spawn_workers(&worker_ctx).await;
+    let state = AppState::new(storage.clone(), auth, metrics, config.clone());
+    if let Some(hooks) = storage.runtime_hooks() {
+        hooks.spawn_workers(&WorkerContext::from_config(&config)).await;
     }
 
     // Start HTTP server
@@ -437,12 +394,14 @@ cp config.toml /etc/extenddb/config.toml
 # systemd service
 [Unit]
 Description=extenddb
-After=network.target postgresql.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-Type=simple
-ExecStart=/usr/local/bin/extenddb --config /etc/extenddb/config.toml
-Restart=always
+Type=forking
+ExecStart=/usr/local/bin/extenddb serve --config /etc/extenddb/config.toml
+ExecStop=/usr/local/bin/extenddb stop --config /etc/extenddb/config.toml
+Restart=on-failure
 RestartSec=5
 Environment=EXTENDDB__AUTH__ENCRYPTION_KEY=<secret>
 
@@ -504,19 +463,19 @@ spec:
 
 ```dockerfile
 # Static musl build for minimal container image (REQ-DEPLOY-006: < 50 MB)
-FROM rust:1.77-alpine AS builder
+FROM rust:1.85-alpine AS builder
 RUN apk add --no-cache musl-dev
 RUN rustup target add x86_64-unknown-linux-musl
 WORKDIR /app
 COPY . .
-RUN cargo build -j12 --release --target x86_64-unknown-linux-musl -p extenddb-bin
+RUN cargo build -j12 --release --target x86_64-unknown-linux-musl -p extenddb
 
 FROM scratch
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/extenddb /extenddb
-COPY config.example.toml /etc/extenddb/config.toml
+COPY extenddb.sample.toml /etc/extenddb/config.toml
 EXPOSE 8000
 ENTRYPOINT ["/extenddb"]
-CMD ["--config", "/etc/extenddb/config.toml"]
+CMD ["serve", "--config", "/etc/extenddb/config.toml"]
 ```
 
 ## 10. SDK Client Configuration

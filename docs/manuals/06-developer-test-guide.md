@@ -12,7 +12,8 @@ extenddb/
 │   ├── core/                  Pure sync Rust: types, expressions, validation, errors
 │   ├── engine/                Async operation handlers
 │   ├── storage/               Storage trait definitions
-│   ├── storage-postgres/      PostgreSQL backend
+│   ├── storage-tidb/          Default TiDB backend
+│   ├── storage-postgres/      Explicit PostgreSQL alternate backend
 │   ├── auth/                  Authentication and authorization
 │   ├── server/                HTTP server, management API, web console
 │   └── bin/                   CLI entry point
@@ -55,7 +56,9 @@ Both debug and release builds must pass before any phase exit.
 - `core` is pure sync Rust — no async runtime, no database drivers, no HTTP framework
 - `storage` defines traits and backend-agnostic utilities (ARN, key parsing)
 - `engine` contains async operation handlers that call storage traits
-- `storage-postgres` implements storage traits for PostgreSQL
+- `storage-tidb` implements the default TiDB backend with native online DDL,
+  secondary indexes, TTL, follower reads, Resource Control, and BR
+- `storage-postgres` implements the explicit PostgreSQL alternate backend
 - `auth` handles authentication and authorization
 - `server` handles HTTP concerns
 - `bin` wires everything together
@@ -96,7 +99,8 @@ Every source file must carry:
 2. Register it in the `dispatch` function in `crates/engine/src/lib.rs`
 3. Add any new types to `crates/core/src/types/`
 4. Add storage trait methods to `crates/storage/src/lib.rs` if needed
-5. Implement the storage methods in `crates/storage-postgres/src/`
+5. Implement the storage methods in every enabled backend crate. For the
+   default product path, implement and verify `crates/storage-tidb/src/`.
 6. Add Python integration tests in `tests/`
 7. Update the Usage Guide (`docs/manuals/03-usage-guide.md`)
 
@@ -159,7 +163,7 @@ The `run-tests` script automatically:
 - Configures backend-specific test settings for immediate control-plane visibility
 - Enables throttling for production-like behavior
 - Configures import/export paths for file operation tests
-- Extracts and exports `EXTENDDB_TEST_PG_CONNECTION_STRING` for CLI lifecycle tests
+- Extracts and exports backend-specific lifecycle-test connection settings when the selected backend needs them
 
 **Test artifacts** are written to `discussions/` with the code repo's HEAD commit hash:
 - `test-rust-<hash>.txt` — Rust unit test output
@@ -178,7 +182,7 @@ The `run-tests` script automatically:
 | Pytest (standard) | 180 + 118 skipped | DynamoDB API tests via boto3 |
 | Comprehensive (Python) | 296 | Clean-room gap analysis tests |
 | External (Java) | 346 | Third-party functional test suite |
-| CLI lifecycle | 9 | Binary lifecycle tests (separate, requires `EXTENDDB_TEST_PG_CONNECTION_STRING`) |
+| CLI lifecycle | 9 | Binary lifecycle tests for the selected backend |
 
 ### Python Integration Tests
 
@@ -204,7 +208,7 @@ The `--parallel` flag enables pytest-xdist with `--dist loadfile`, which
 distributes entire test files across workers. This keeps module/class-scoped
 fixtures on a single worker while running independent files concurrently. The
 default worker count (1/3 of CPU cores, minimum 2) leaves headroom for the
-extenddb server and its Postgres backend.
+extenddb server and the active storage backend.
 
 ### Comprehensive Tests
 
