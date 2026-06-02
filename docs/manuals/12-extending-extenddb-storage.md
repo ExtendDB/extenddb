@@ -189,8 +189,10 @@ Key design decisions:
   periodic frontend refresh worker is only needed when the backend has no
   cheap native table-stat view. TiDB follows this native path: its table
   catalog does not store cached size/count columns, and descriptions read
-  size estimates from `information_schema.table_storage_stats` and row-count
-  estimates from `SHOW STATS_META` on demand.
+  DynamoDB-facing logical size estimates from
+  `information_schema.tables.DATA_LENGTH` and row-count estimates from
+  `SHOW STATS_META` on demand. TiDB `table_storage_stats` is a physical TiKV
+  Region-allocation view, not a DynamoDB `TableSizeBytes` source.
 
 ### StreamEngine
 

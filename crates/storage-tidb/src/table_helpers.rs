@@ -32,7 +32,7 @@ pub(crate) struct TableRow {
     pub stream_label: Option<String>,
 }
 
-/// Native TiDB table statistics used for DynamoDB table descriptions.
+/// TiDB table statistics used for DynamoDB table descriptions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TableStats {
     pub table_size_bytes: i64,
@@ -50,24 +50,10 @@ pub(crate) struct IndexRow {
     pub provisioned_throughput: Option<serde_json::Value>,
 }
 
-fn current_table_storage_size_sql() -> &'static str {
-    "SELECT CAST(COALESCE(SUM(s.TABLE_SIZE), 0) AS SIGNED) * 1048576 \
-     FROM information_schema.table_storage_stats s \
-     LEFT JOIN information_schema.partitions p \
-       ON p.table_schema = s.table_schema \
-      AND p.table_name = s.table_name \
-      AND p.tidb_partition_id = s.table_id \
-     WHERE s.table_schema = DATABASE() \
-       AND s.table_name = ? \
-       AND ( \
-           p.partition_name IS NOT NULL \
-           OR NOT EXISTS ( \
-               SELECT 1 FROM information_schema.partitions pp \
-               WHERE pp.table_schema = s.table_schema \
-                 AND pp.table_name = s.table_name \
-                 AND pp.partition_name IS NOT NULL \
-           ) \
-       )"
+fn current_table_logical_size_sql() -> &'static str {
+    "SELECT CAST(COALESCE(MAX(DATA_LENGTH), 0) AS SIGNED) \
+     FROM information_schema.tables \
+     WHERE table_schema = DATABASE() AND table_name = ?"
 }
 
 fn current_table_item_count_sql() -> &'static str {
@@ -90,7 +76,7 @@ impl TidbEngine {
         table_id: &str,
     ) -> Result<TableStats, StorageError> {
         let physical_table = physical_data_table_name(table_id);
-        let table_size_bytes = sqlx::query_scalar(current_table_storage_size_sql())
+        let table_size_bytes = sqlx::query_scalar(current_table_logical_size_sql())
             .bind(&physical_table)
             .fetch_one(&self.data_pool)
             .await
@@ -311,22 +297,20 @@ impl TidbEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        current_table_item_count_sql, current_table_storage_size_sql,
+        current_table_item_count_sql, current_table_logical_size_sql,
         item_count_from_stats_meta_rows,
     };
 
     #[test]
-    fn table_description_stats_use_tidb_storage_engine_metadata() {
-        let size_sql = current_table_storage_size_sql();
+    fn table_description_stats_use_dynamodb_logical_size_and_tidb_row_count() {
+        let size_sql = current_table_logical_size_sql();
 
-        assert!(size_sql.contains("information_schema.table_storage_stats"));
-        assert!(size_sql.contains("SUM(s.TABLE_SIZE)"));
-        assert!(size_sql.contains("* 1048576"));
-        assert!(size_sql.contains("information_schema.partitions"));
-        assert!(size_sql.contains("p.partition_name IS NOT NULL"));
-        assert!(!size_sql.contains("information_schema.tables"));
+        assert!(size_sql.contains("information_schema.tables"));
+        assert!(size_sql.contains("DATA_LENGTH"));
+        assert!(size_sql.contains("COALESCE(MAX(DATA_LENGTH), 0)"));
+        assert!(!size_sql.contains("information_schema.table_storage_stats"));
+        assert!(!size_sql.contains("TABLE_SIZE"));
         assert!(!size_sql.contains("TABLE_ROWS"));
-        assert!(!size_sql.contains("DATA_LENGTH"));
 
         let count_sql = current_table_item_count_sql();
         assert_eq!(
