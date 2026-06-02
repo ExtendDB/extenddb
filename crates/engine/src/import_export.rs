@@ -6,9 +6,12 @@
 //! extenddb imports from and exports to the local filesystem instead of S3.
 //! Both operations are synchronous — they complete before returning.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::time::SystemTime;
 
 use serde_json::Value;
+use tokio::io::AsyncWriteExt;
 
 use crate::OperationContext;
 use crate::create_table::storage_err_to_dynamo;
@@ -22,6 +25,30 @@ use extenddb_core::types::{
 use extenddb_core::validation::{
     validate_attribute_name_sizes, validate_item_keys, validate_item_size, validate_key_sizes,
 };
+use extenddb_storage::error::StorageError;
+
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+struct ExportLineSink<'a> {
+    file: &'a mut tokio::fs::File,
+}
+
+impl extenddb_storage::ItemExportSink for ExportLineSink<'_> {
+    fn write_item<'a>(&'a mut self, item: &'a Item) -> BoxFuture<'a, Result<(), StorageError>> {
+        Box::pin(async move {
+            let wrapper = serde_json::json!({"Item": item});
+            let mut line = serde_json::to_string(&wrapper).map_err(|e| {
+                tracing::error!(internal_error = %e, "failed to serialize export item");
+                StorageError::Internal("Serialize export item".to_owned())
+            })?;
+            line.push('\n');
+            self.file
+                .write_all(line.as_bytes())
+                .await
+                .map_err(|_| StorageError::Validation("Cannot write export file".to_owned()))
+        })
+    }
+}
 
 /// Handle an `ImportTable` request.
 ///
@@ -176,6 +203,13 @@ pub async fn handle_export_table(
 
     let input: extenddb_core::types::ExportTableToPointInTimeInput =
         serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    if let Some(export_time) = input.export_time
+        && (!export_time.is_finite() || export_time < 0.0)
+    {
+        return Err(DynamoDbError::ValidationException(
+            "ExportTime must be a non-negative finite epoch timestamp".to_owned(),
+        ));
+    }
 
     let start_time = epoch_seconds();
     let export_format = input.export_format.unwrap_or(ExportFormat::DynamoDbJson);
@@ -185,17 +219,6 @@ pub async fn handle_export_table(
     let key_info = ctx
         .storage
         .table_key_info(&ctx.account_id, &table_name)
-        .await
-        .map_err(storage_err_to_dynamo)?;
-
-    let table_desc = ctx
-        .storage
-        .describe_table(
-            &ctx.account_id,
-            extenddb_core::types::DescribeTableInput {
-                table_name: table_name.clone(),
-            },
-        )
         .await
         .map_err(storage_err_to_dynamo)?;
 
@@ -214,51 +237,17 @@ pub async fn handle_export_table(
         .await
         .map_err(|_| DynamoDbError::ValidationException("Cannot create export file".to_owned()))?;
 
-    let mut item_count: i64 = 0;
-    let max_export_items = ctx.limits.max_export_item_count;
-    let mut exclusive_start_key: Option<Item> = None;
-    loop {
-        let (items, last_key) = ctx
-            .storage
-            .scan(
-                &key_info,
-                Some(1000),
-                exclusive_start_key.as_ref(),
-                None,
-                None,
-                None,
-                true,
-            )
-            .await
-            .map_err(storage_err_to_dynamo)?;
-
-        item_count += i64::from(u16::try_from(items.len()).unwrap_or(u16::MAX));
-
-        if u64::try_from(item_count).unwrap_or(u64::MAX) > max_export_items {
-            return Err(DynamoDbError::ValidationException(format!(
-                "Export item count exceeds maximum ({max_export_items})"
-            )));
-        }
-
-        for item in &items {
-            let wrapper = serde_json::json!({"Item": item});
-            let mut line = serde_json::to_string(&wrapper).map_err(|e| {
-                tracing::error!(internal_error = %e, "failed to serialize export item");
-                DynamoDbError::InternalServerError("Internal server error".to_owned())
-            })?;
-            line.push('\n');
-            tokio::io::AsyncWriteExt::write_all(&mut file, line.as_bytes())
-                .await
-                .map_err(|_| {
-                    DynamoDbError::ValidationException("Cannot write export file".to_owned())
-                })?;
-        }
-
-        if last_key.is_none() {
-            break;
-        }
-        exclusive_start_key = last_key;
-    }
+    let mut sink = ExportLineSink { file: &mut file };
+    let summary = ctx
+        .storage
+        .export_table_items(
+            &key_info,
+            input.export_time,
+            ctx.limits.max_export_item_count,
+            &mut sink,
+        )
+        .await
+        .map_err(storage_err_to_dynamo)?;
 
     let end_time = epoch_seconds();
     let export_arn = format!("{}:export/{}", input.table_arn, uuid::Uuid::new_v4());
@@ -267,9 +256,9 @@ pub async fn handle_export_table(
         export_arn,
         export_status: extenddb_core::types::ExportStatus::Completed,
         table_arn: input.table_arn,
-        table_id: Some(table_desc.table_id),
+        table_id: Some(key_info.table_id),
         export_format,
-        item_count,
+        item_count: summary.item_count,
         billed_size_bytes: 0,
         start_time: Some(start_time),
         end_time: Some(end_time),

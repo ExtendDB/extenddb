@@ -233,6 +233,13 @@ frontend item replay path: TiDB BR PITR is a cluster recovery primitive, TiDB
 read-only for the live target-table shape. A future TiDB implementation should
 be added only if TiDB exposes a native set-based online restore into a new table.
 
+`ExportTableToPointInTime` is also storage-owned. The engine validates the local
+destination path and serializes exported items, but storage chooses the snapshot
+primitive and streams rows to the engine sink. TiDB uses native `AS OF TIMESTAMP`
+for both explicit `ExportTime` and latest-snapshot exports; PostgreSQL provides
+a current one-statement snapshot and returns an explicit validation error for
+historical `ExportTime`.
+
 Backends also declare whether capacity control is frontend-local or storage
 native. PostgreSQL can use ExtendDB's process-local token buckets when operators
 want DynamoDB-like throttling in a single-frontend test environment. TiDB marks

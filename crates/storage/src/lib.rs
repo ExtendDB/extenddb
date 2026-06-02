@@ -57,6 +57,19 @@ pub type StreamRecordsResult = Result<(Vec<StreamRecord>, Option<String>), Stora
 /// Stream list result: summaries plus an optional next exclusive start ARN.
 pub type StreamListResult = Result<(Vec<StreamSummary>, Option<String>), StorageError>;
 
+/// Summary returned after a storage-owned table export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportTableItemsSummary {
+    /// Number of items written to the export sink.
+    pub item_count: i64,
+}
+
+/// Sink used by storage backends to stream exported items without materializing
+/// the full table in memory.
+pub trait ItemExportSink: Send {
+    fn write_item<'a>(&'a mut self, item: &'a Item) -> BoxFuture<'a, Result<(), StorageError>>;
+}
+
 /// One unconditional write in a `BatchWriteItem` request.
 ///
 /// `BatchWriteItem` has no conditions or return values, so storage backends can
@@ -381,6 +394,20 @@ pub trait DataEngine: Send + Sync {
         index: Option<&'a IndexInfo>,
         consistent_read: bool,
     ) -> BoxFuture<'a, QueryResult>;
+
+    /// Export base-table items from one backend-owned snapshot.
+    ///
+    /// `export_time_epoch` is seconds since the Unix epoch. Backends that have a
+    /// native historical-read facility should honor it. Backends without one
+    /// must return a validation error instead of emulating point-in-time export
+    /// by replaying current rows.
+    fn export_table_items<'a>(
+        &'a self,
+        key_info: &'a TableKeyInfo,
+        export_time_epoch: Option<f64>,
+        max_items: u64,
+        sink: &'a mut dyn ItemExportSink,
+    ) -> BoxFuture<'a, Result<ExportTableItemsSummary, StorageError>>;
 
     /// Execute multiple get operations in a single consistent snapshot.
     ///

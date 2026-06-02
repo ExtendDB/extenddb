@@ -11,6 +11,8 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
     encode_netstring_composite, pk_to_text, sk_column, sk_column_n, sk_info,
 };
+use extenddb_storage::{ExportTableItemsSummary, ItemExportSink};
+use futures::TryStreamExt;
 
 use super::query::{
     build_key, build_sk_sql, execute_query_sql, execute_scan_sql, resolve_expr_to_av,
@@ -24,6 +26,35 @@ fn last_evaluated_key(
     index: Option<&IndexInfo>,
 ) -> Item {
     build_key(item, &combined_lek_key_schema(base_key_schema, index))
+}
+
+fn export_order_columns(
+    key_schema: &[KeySchemaElement],
+    attr_defs: &[extenddb_core::types::AttributeDefinition],
+) -> Vec<String> {
+    let mut columns = vec!["pk".to_owned()];
+    columns.extend(
+        all_sort_key_info(key_schema, attr_defs)
+            .into_iter()
+            .enumerate()
+            .map(|(i, (_, sk_type))| {
+                let column = sk_column_n(i, sk_type);
+                if sk_type == ScalarAttributeType::S {
+                    format!("{column} COLLATE \"C\"")
+                } else {
+                    column
+                }
+            }),
+    );
+    columns
+}
+
+fn postgres_export_sql(table_id: &str, order_columns: &[String]) -> String {
+    let table = data_table_name(table_id);
+    format!(
+        "SELECT item_data FROM {table} ORDER BY {}",
+        order_columns.join(", ")
+    )
 }
 
 impl PostgresEngine {
@@ -305,16 +336,55 @@ impl PostgresEngine {
 
         Ok((items, last_key))
     }
+
+    pub(crate) async fn export_table_items_impl(
+        &self,
+        key_info: &TableKeyInfo,
+        export_time_epoch: Option<f64>,
+        max_items: u64,
+        sink: &mut dyn ItemExportSink,
+    ) -> Result<ExportTableItemsSummary, StorageError> {
+        if export_time_epoch.is_some() {
+            return Err(StorageError::Validation(
+                "PostgreSQL backend does not support ExportTime point-in-time export".to_owned(),
+            ));
+        }
+
+        let sql = postgres_export_sql(
+            &key_info.table_id,
+            &export_order_columns(&key_info.key_schema, &key_info.attribute_definitions),
+        );
+        let mut rows = sqlx::query_as::<_, (serde_json::Value,)>(&sql).fetch(&self.data_pool);
+        let mut item_count = 0_u64;
+        while let Some((row,)) = rows
+            .try_next()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?
+        {
+            item_count = item_count.saturating_add(1);
+            if item_count > max_items {
+                return Err(StorageError::Validation(format!(
+                    "Export item count exceeds maximum ({max_items})"
+                )));
+            }
+            let item = json_to_item(row)?;
+            sink.write_item(&item).await?;
+        }
+
+        Ok(ExportTableItemsSummary {
+            item_count: i64::try_from(item_count).unwrap_or(i64::MAX),
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use extenddb_core::types::{
         AttributeValue, IndexInfo, IndexType, Item, KeySchemaElement, KeyType, Projection,
-        ProjectionType,
+        ProjectionType, ScalarAttributeType,
     };
 
-    use super::last_evaluated_key;
+    use super::{export_order_columns, last_evaluated_key, postgres_export_sql};
 
     #[test]
     fn index_last_evaluated_key_includes_base_and_index_keys() {
@@ -366,5 +436,36 @@ mod tests {
         assert!(key.contains_key("gpk"));
         assert!(key.contains_key("gsk"));
         assert!(!key.contains_key("payload"));
+    }
+
+    #[test]
+    fn export_sql_orders_by_full_base_key_with_binary_string_collation() {
+        let key_schema = vec![
+            KeySchemaElement {
+                attribute_name: "pk".to_owned(),
+                key_type: KeyType::Hash,
+            },
+            KeySchemaElement {
+                attribute_name: "sk".to_owned(),
+                key_type: KeyType::Range,
+            },
+        ];
+        let attr_defs = vec![
+            extenddb_core::types::AttributeDefinition {
+                attribute_name: "pk".to_owned(),
+                attribute_type: ScalarAttributeType::S,
+            },
+            extenddb_core::types::AttributeDefinition {
+                attribute_name: "sk".to_owned(),
+                attribute_type: ScalarAttributeType::S,
+            },
+        ];
+
+        let sql = postgres_export_sql("tableid", &export_order_columns(&key_schema, &attr_defs));
+
+        assert_eq!(
+            sql,
+            "SELECT item_data FROM \"_ddb_tableid\" ORDER BY pk, sk_s COLLATE \"C\""
+        );
     }
 }

@@ -350,6 +350,7 @@ TiDB uses backend-native primitives instead of ExtendDB ownership layers:
 - Schema changes rely on TiDB online DDL and idempotent catalog publication.
 - TTL uses TiDB native table TTL.
 - On-demand backup and restore use TiDB BR metadata instead of row-copy backup payloads.
+- `ExportTableToPointInTime` uses TiDB native `AS OF TIMESTAMP` snapshot reads.
 - Table-level PITR restore is not emulated; TiDB-native PITR remains a cluster recovery path.
 - Capacity governance uses TiDB Resource Control/resource groups rather than
   per-frontend token buckets, so quotas and scheduling are cluster-owned. If

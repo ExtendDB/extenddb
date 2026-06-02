@@ -33,7 +33,7 @@ adaptation when switching between ExtendDB and the real service.
 | Import formats | CSV, DYNAMODB_JSON, ION | CSV, DYNAMODB_JSON, ION |
 | Export formats | DYNAMODB_JSON, ION | DYNAMODB_JSON, ION |
 | Import execution | Asynchronous (background job) | Synchronous (completes before returning) |
-| Export execution | Point-in-time snapshot | Current snapshot, synchronous |
+| Export execution | Point-in-time snapshot | Synchronous storage-owned snapshot. TiDB honors `ExportTime` with native `AS OF TIMESTAMP`; PostgreSQL exports the current snapshot and rejects `ExportTime` |
 
 ## Control Plane
 

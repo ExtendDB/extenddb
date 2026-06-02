@@ -242,6 +242,36 @@ pub(crate) async fn current_tidb_tso(pool: &sqlx::MySqlPool) -> Result<i64, Stor
     Ok(tso)
 }
 
+pub(crate) fn tidb_as_of_tso_clause(tso: i64) -> Result<String, StorageError> {
+    if tso <= 0 {
+        return Err(StorageError::Internal(format!(
+            "invalid TiDB snapshot TSO: {tso}"
+        )));
+    }
+    Ok(format!("AS OF TIMESTAMP TIDB_PARSE_TSO({tso})"))
+}
+
+pub(crate) fn tidb_as_of_epoch_clause(epoch_seconds: f64) -> Result<String, StorageError> {
+    if !epoch_seconds.is_finite() || epoch_seconds < 0.0 {
+        return Err(StorageError::Validation(
+            "ExportTime must be a non-negative finite epoch timestamp".to_owned(),
+        ));
+    }
+    Ok(format!("AS OF TIMESTAMP FROM_UNIXTIME({epoch_seconds:.6})"))
+}
+
+pub(crate) fn map_tidb_snapshot_read_sqlx_error(error: sqlx::Error) -> StorageError {
+    if let sqlx::Error::Database(db_error) = &error {
+        let message = db_error.message();
+        if is_tidb_snapshot_read_error_text(message) {
+            return StorageError::Validation(format!(
+                "ExportTime is outside TiDB's historical read window: {message}"
+            ));
+        }
+    }
+    StorageError::Internal(error.to_string())
+}
+
 pub(crate) async fn current_tidb_transaction_tso(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
 ) -> Result<i64, StorageError> {
@@ -324,6 +354,14 @@ fn is_table_not_found_tidb_error_text(message: &str) -> bool {
         || (message.contains("Table") && message.contains("does not exist"))
 }
 
+fn is_tidb_snapshot_read_error_text(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("invalid as of timestamp")
+        || lower.contains("cannot set read timestamp to a future time")
+        || lower.contains("gc safe point")
+        || lower.contains("gc safepoint")
+}
+
 const RETRYABLE_TIDB_ERROR_CODES: &[&str] = &[
     "8028", // Schema changed during the transaction.
     "9004", // Resolve lock timeout.
@@ -374,8 +412,9 @@ mod tests {
     use super::{
         TIDB_REPLICA_READ_CLOSEST_ADAPTIVE, TidbSessionInit, is_retryable_tidb_storage_error,
         is_table_exists_tidb_error_text, is_table_not_found_tidb_sqlx_error,
-        is_table_not_found_tidb_storage_error, quote_tidb_resource_group_name,
-        retry_tidb_idempotent_operation,
+        is_table_not_found_tidb_storage_error, is_tidb_snapshot_read_error_text,
+        quote_tidb_resource_group_name, retry_tidb_idempotent_operation, tidb_as_of_epoch_clause,
+        tidb_as_of_tso_clause,
     };
 
     #[derive(Debug)]
@@ -542,6 +581,59 @@ mod tests {
                 "SET SESSION tidb_replica_read = 'closest-adaptive'",
             ]
         );
+    }
+
+    #[test]
+    fn as_of_tso_clause_uses_numeric_literal() {
+        assert_eq!(
+            tidb_as_of_tso_clause(466_712_376_294_768_640).unwrap(),
+            "AS OF TIMESTAMP TIDB_PARSE_TSO(466712376294768640)"
+        );
+    }
+
+    #[test]
+    fn as_of_tso_clause_rejects_invalid_tso() {
+        assert!(matches!(
+            tidb_as_of_tso_clause(0),
+            Err(StorageError::Internal(_))
+        ));
+    }
+
+    #[test]
+    fn as_of_epoch_clause_uses_fixed_numeric_literal() {
+        assert_eq!(
+            tidb_as_of_epoch_clause(1_717_171_717.1234567).unwrap(),
+            "AS OF TIMESTAMP FROM_UNIXTIME(1717171717.123457)"
+        );
+    }
+
+    #[test]
+    fn as_of_epoch_clause_rejects_non_finite_values() {
+        for value in [f64::NAN, f64::INFINITY, -1.0] {
+            assert!(matches!(
+                tidb_as_of_epoch_clause(value),
+                Err(StorageError::Validation(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn snapshot_read_error_classifier_accepts_tidb_as_of_failures() {
+        for message in [
+            "invalid as of timestamp: as of timestamp cannot be NULL",
+            "cannot set read timestamp to a future time, readTS: 2, currentTS: 1",
+            "snapshot is older than GC safe point",
+            "snapshot is older than GC safepoint",
+        ] {
+            assert!(is_tidb_snapshot_read_error_text(message), "{message}");
+        }
+    }
+
+    #[test]
+    fn snapshot_read_error_classifier_rejects_unrelated_errors() {
+        assert!(!is_tidb_snapshot_read_error_text(
+            "Table 'extenddb._ddb_missing' doesn't exist"
+        ));
     }
 
     #[test]

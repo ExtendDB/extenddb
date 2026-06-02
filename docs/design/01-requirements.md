@@ -461,6 +461,7 @@ The catalog database stores extenddb metadata: table definitions, indexes, tags,
 - REQ-TIDB-005: Use TiDB BR for native physical backup/restore instead of catalog row-copy backup data
 - REQ-TIDB-006: Route default data-plane reads through a TiDB session configured for native follower-read locality (`tidb_replica_read = 'closest-adaptive'`); route writes and `ConsistentRead=true` reads through the strong data pool
 - REQ-TIDB-007: Run `TransactGetItems` inside a TiDB transaction so multi-item transactional reads use one native snapshot instead of application-level locking
+- REQ-TIDB-008: Run `ExportTableToPointInTime` through TiDB native `AS OF TIMESTAMP` snapshot reads; do not emulate point-in-time export with engine-level paginated scans
 
 ## 9. Expression Engine Requirements
 

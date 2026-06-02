@@ -25,7 +25,9 @@ use crate::TidbEngine;
 use crate::data::physical_data_table_name;
 use crate::metadata_engine::drop_ttl_artifacts;
 use crate::table_helpers::TableStats;
-use crate::tidb_util::{current_tidb_tso, execute_tidb_idempotent_ddl, is_unique_violation};
+use crate::tidb_util::{
+    current_tidb_tso, execute_tidb_idempotent_ddl, is_unique_violation, tidb_as_of_tso_clause,
+};
 
 const TIDB_BACKUP_BACKEND: &str = "tidb-br";
 
@@ -393,43 +395,44 @@ impl TidbEngine {
         table_name: &str,
         native_snapshot_tso: i64,
     ) -> Result<BackupMetadataSnapshot, StorageError> {
-        let source: BackupSourceRow = sqlx::query_as(
+        let as_of = tidb_as_of_tso_clause(native_snapshot_tso)?;
+        let source_sql = format!(
             "SELECT table_id, table_arn, key_schema, attribute_definitions, billing_mode, \
              provisioned_throughput, stream_specification, deletion_protection_enabled \
-             FROM tables AS OF TIMESTAMP TIDB_PARSE_TSO(?) \
-             WHERE account_id = ? AND table_name = ? AND table_status = 'ACTIVE'",
-        )
-        .bind(native_snapshot_tso)
-        .bind(account_id)
-        .bind(table_name)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?
-        .ok_or_else(|| StorageError::TableNotFound(format!("Table not found: {table_name}")))?;
+             FROM tables {as_of} \
+             WHERE account_id = ? AND table_name = ? AND table_status = 'ACTIVE'"
+        );
+        let source: BackupSourceRow = sqlx::query_as(&source_sql)
+            .bind(account_id)
+            .bind(table_name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?
+            .ok_or_else(|| StorageError::TableNotFound(format!("Table not found: {table_name}")))?;
 
         let stats = self.current_table_stats(&source.table_id).await?;
 
-        let indexes: Vec<BackupIndexSnapshotRow> = sqlx::query_as(
+        let indexes_sql = format!(
             "SELECT index_id, index_name, index_type, key_schema, projection, provisioned_throughput \
-             FROM indexes AS OF TIMESTAMP TIDB_PARSE_TSO(?) \
-             WHERE table_id = ? ORDER BY index_type, index_name",
-        )
-        .bind(native_snapshot_tso)
-        .bind(&source.table_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
+             FROM indexes {as_of} \
+             WHERE table_id = ? ORDER BY index_type, index_name"
+        );
+        let indexes: Vec<BackupIndexSnapshotRow> = sqlx::query_as(&indexes_sql)
+            .bind(&source.table_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
 
-        let tags = sqlx::query_as(
+        let tags_sql = format!(
             "SELECT tag_key, tag_value FROM tags \
-             AS OF TIMESTAMP TIDB_PARSE_TSO(?) \
-             WHERE resource_arn = ? ORDER BY tag_key",
-        )
-        .bind(native_snapshot_tso)
-        .bind(&source.table_arn)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
+             {as_of} \
+             WHERE resource_arn = ? ORDER BY tag_key"
+        );
+        let tags = sqlx::query_as(&tags_sql)
+            .bind(&source.table_arn)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
 
         Ok(BackupMetadataSnapshot {
             source,

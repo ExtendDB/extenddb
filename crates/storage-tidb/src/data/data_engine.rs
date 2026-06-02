@@ -7,7 +7,10 @@
 use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, UpdateAction};
 use extenddb_core::types::{IndexInfo, Item, TableKeyInfo};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{BatchWriteOp, DataEngine, StreamCapture, TransactGetOp, TransactWriteOp};
+use extenddb_storage::{
+    BatchWriteOp, DataEngine, ExportTableItemsSummary, ItemExportSink, StreamCapture,
+    TransactGetOp, TransactWriteOp,
+};
 use futures::future::BoxFuture;
 
 use crate::TidbEngine;
@@ -122,6 +125,16 @@ impl DataEngine for TidbEngine {
             index,
             consistent_read,
         ))
+    }
+
+    fn export_table_items<'a>(
+        &'a self,
+        key_info: &'a TableKeyInfo,
+        export_time_epoch: Option<f64>,
+        max_items: u64,
+        sink: &'a mut dyn ItemExportSink,
+    ) -> BoxFuture<'a, Result<ExportTableItemsSummary, StorageError>> {
+        Box::pin(self.export_table_items_impl(key_info, export_time_epoch, max_items, sink))
     }
 
     fn transact_get_items<'a>(

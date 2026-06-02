@@ -10,6 +10,8 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{sk_column, sk_column_n, sk_info};
+use extenddb_storage::{ExportTableItemsSummary, ItemExportSink};
+use futures::TryStreamExt;
 
 use super::index::{
     native_index_hash_column, native_index_key_tuple_columns, native_index_name,
@@ -20,6 +22,10 @@ use super::query::{
 };
 use super::{all_sort_key_info, data_table_name, json_to_item, physical_pk_bytes_from_values};
 use crate::TidbEngine;
+use crate::tidb_util::{
+    current_tidb_tso, map_tidb_snapshot_read_sqlx_error, tidb_as_of_epoch_clause,
+    tidb_as_of_tso_clause,
+};
 
 fn sort_key_columns(
     key_schema: &[KeySchemaElement],
@@ -128,6 +134,14 @@ fn last_evaluated_key(
     index: Option<&IndexInfo>,
 ) -> Item {
     build_key(item, &combined_lek_key_schema(base_key_schema, index))
+}
+
+fn tidb_export_sql(table_id: &str, snapshot_clause: &str, order_columns: &[String]) -> String {
+    let table = data_table_name(table_id);
+    format!(
+        "SELECT item_data FROM {table} {snapshot_clause} ORDER BY {}",
+        order_columns.join(", ")
+    )
 }
 
 impl TidbEngine {
@@ -427,6 +441,46 @@ impl TidbEngine {
 
         Ok((items, last_key))
     }
+
+    pub(crate) async fn export_table_items_impl(
+        &self,
+        key_info: &TableKeyInfo,
+        export_time_epoch: Option<f64>,
+        max_items: u64,
+        sink: &mut dyn ItemExportSink,
+    ) -> Result<ExportTableItemsSummary, StorageError> {
+        let snapshot_clause = if let Some(export_time) = export_time_epoch {
+            tidb_as_of_epoch_clause(export_time)?
+        } else {
+            tidb_as_of_tso_clause(current_tidb_tso(&self.data_pool).await?)?
+        };
+        let sql = tidb_export_sql(
+            &key_info.table_id,
+            &snapshot_clause,
+            &key_tuple_columns(&key_info.key_schema, &key_info.attribute_definitions),
+        );
+        let mut rows =
+            sqlx::query_as::<_, (serde_json::Value,)>(&sql).fetch(self.data_read_pool(false));
+        let mut item_count = 0_u64;
+        while let Some((row,)) = rows
+            .try_next()
+            .await
+            .map_err(map_tidb_snapshot_read_sqlx_error)?
+        {
+            item_count = item_count.saturating_add(1);
+            if item_count > max_items {
+                return Err(StorageError::Validation(format!(
+                    "Export item count exceeds maximum ({max_items})"
+                )));
+            }
+            let item = json_to_item(row)?;
+            sink.write_item(&item).await?;
+        }
+
+        Ok(ExportTableItemsSummary {
+            item_count: i64::try_from(item_count).unwrap_or(i64::MAX),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -438,8 +492,9 @@ mod tests {
 
     use super::{
         last_evaluated_key, native_index_query_cursor_columns, native_index_scan_cursor_columns,
-        push_order_by, table_ref_for_read, tuple_comparison,
+        push_order_by, table_ref_for_read, tidb_export_sql, tuple_comparison,
     };
+    use crate::tidb_util::{tidb_as_of_epoch_clause, tidb_as_of_tso_clause};
 
     #[test]
     fn tuple_comparison_uses_all_cursor_columns() {
@@ -556,6 +611,34 @@ mod tests {
             "`_ddb_tableid` FORCE INDEX (`idx_idx1`)"
         );
         assert_eq!(table_ref_for_read("tableid", None), "`_ddb_tableid`");
+    }
+
+    #[test]
+    fn export_sql_uses_tidb_current_tso_snapshot_when_export_time_is_absent() {
+        let sql = tidb_export_sql(
+            "tableid",
+            &tidb_as_of_tso_clause(466_712_376_294_768_640).unwrap(),
+            &["pk".to_owned(), "sk_s".to_owned()],
+        );
+
+        assert_eq!(
+            sql,
+            "SELECT item_data FROM `_ddb_tableid` AS OF TIMESTAMP TIDB_PARSE_TSO(466712376294768640) ORDER BY pk, sk_s"
+        );
+    }
+
+    #[test]
+    fn export_sql_uses_tidb_epoch_snapshot_when_export_time_is_present() {
+        let sql = tidb_export_sql(
+            "tableid",
+            &tidb_as_of_epoch_clause(1_717_171_717.123456).unwrap(),
+            &["pk".to_owned()],
+        );
+
+        assert_eq!(
+            sql,
+            "SELECT item_data FROM `_ddb_tableid` AS OF TIMESTAMP FROM_UNIXTIME(1717171717.123456) ORDER BY pk"
+        );
     }
 
     #[test]

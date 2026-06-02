@@ -189,7 +189,7 @@ pub struct ImportTableOutput {
 /// Accepts both the extenddb-specific `FilePath` field and the standard `DynamoDB`
 /// fields (`S3Bucket`, `S3Prefix`, `ClientToken`, etc.). When `S3Prefix` is
 /// provided, it is used as the local filesystem path. `S3Bucket`,
-/// `S3BucketOwner`, `ExportTime`, and `ClientToken` are accepted but ignored.
+/// `S3BucketOwner`, and `ClientToken` are accepted but ignored.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExportTableToPointInTimeInput {
     /// ARN of the table to export.
@@ -207,9 +207,9 @@ pub struct ExportTableToPointInTimeInput {
     /// Standard `DynamoDB` field — accepted but ignored.
     #[serde(rename = "S3BucketOwner")]
     _s3_bucket_owner: Option<String>,
-    /// Standard `DynamoDB` field — accepted but ignored.
+    /// Optional point-in-time export timestamp, in epoch seconds.
     #[serde(rename = "ExportTime")]
-    _export_time: Option<f64>,
+    pub export_time: Option<f64>,
     /// Standard `DynamoDB` field — accepted but ignored.
     #[serde(rename = "ClientToken")]
     _client_token: Option<String>,
