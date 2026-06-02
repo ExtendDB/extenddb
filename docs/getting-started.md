@@ -143,7 +143,7 @@ You should see all checks pass:
 --- Checking catalog connection...
   OK: Connected to catalog.
 --- Checking catalog version...
-  OK: Catalog version 0.0.2
+  OK: Catalog version 0.0.3
 --- Checking data database...
   OK: Connected to data database 'extenddb_catalog_data'.
 --- Enumerating tables...
@@ -159,7 +159,7 @@ extenddb runs as a daemon (background process) and logs to syslog. On startup it
 
 ```bash
 ./target/release/extenddb serve --config extenddb.toml
-# extenddb 0.0.2 (catalog 0.0.2) listening on 127.0.0.1:8000
+# extenddb 0.1.0 (catalog 0.0.3) listening on 127.0.0.1:8000
 ```
 
 Check status (includes the daemon PID):
@@ -1243,8 +1243,8 @@ Each runner requires its tools to be installed. The runner checks prerequisites 
 
 ```bash
 ./target/release/extenddb version
-# extenddb 0.0.2
-# catalog 0.0.2
+# extenddb 0.1.0
+# catalog 0.0.3
 # commit abc1234
 # built 2026-04-17T12:00:00Z
 ```

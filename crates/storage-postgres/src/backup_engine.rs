@@ -522,38 +522,12 @@ impl BackupEngine for PostgresEngine {
                 )));
             }
 
-            let pitr_row: Option<(bool,)> = sqlx::query_as(
-                "SELECT pitr_enabled FROM continuous_backups \
-             WHERE account_id = $1 AND table_name = $2",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-
-            let pitr_enabled = pitr_row.is_some_and(|r| r.0);
-
-            #[allow(clippy::cast_precision_loss)]
-            let now_epoch = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as f64;
-
             Ok(ContinuousBackupsDescription {
                 continuous_backups_status: "ENABLED".to_owned(),
                 point_in_time_recovery_description: Some(PointInTimeRecoveryDescription {
-                    point_in_time_recovery_status: if pitr_enabled {
-                        "ENABLED".to_owned()
-                    } else {
-                        "DISABLED".to_owned()
-                    },
-                    earliest_restorable_date_time: if pitr_enabled {
-                        Some(now_epoch - 35.0 * 24.0 * 3600.0)
-                    } else {
-                        None
-                    },
-                    latest_restorable_date_time: if pitr_enabled { Some(now_epoch) } else { None },
+                    point_in_time_recovery_status: "DISABLED".to_owned(),
+                    earliest_restorable_date_time: None,
+                    latest_restorable_date_time: None,
                 }),
             })
         })
@@ -588,18 +562,6 @@ impl BackupEngine for PostgresEngine {
                     "PostgreSQL point-in-time recovery is not supported by this backend".to_owned(),
                 ));
             }
-
-            sqlx::query(
-                "INSERT INTO continuous_backups (account_id, table_name, pitr_enabled) \
-             VALUES ($1, $2, $3) \
-             ON CONFLICT (account_id, table_name) DO UPDATE SET pitr_enabled = $3",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .bind(pitr_enabled)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
 
             self.describe_continuous_backups(&account_id, &table_name)
                 .await

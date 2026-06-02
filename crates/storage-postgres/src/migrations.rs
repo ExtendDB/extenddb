@@ -7,10 +7,16 @@ use extenddb_storage::management_store::{OpError, OpResult};
 use sqlx::PgPool;
 
 /// Embedded catalog migration files, applied in order.
-pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[(
-    "001_schema.sql",
-    include_str!("../../storage-postgres/migrations/001_schema.sql"),
-)];
+pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "001_schema.sql",
+        include_str!("../../storage-postgres/migrations/001_schema.sql"),
+    ),
+    (
+        "002_drop_continuous_backups.sql",
+        include_str!("../../storage-postgres/migrations/002_drop_continuous_backups.sql"),
+    ),
+];
 
 /// Run catalog migrations, skipping already-applied ones.
 pub(crate) async fn run_catalog_migrations(pool: &PgPool) -> OpResult<()> {
@@ -96,4 +102,41 @@ async fn record_migration(pool: &PgPool, filename: &str) -> OpResult<()> {
     .await
     .map_err(|e| OpError::Internal(format!("Record migration: {e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CATALOG_MIGRATIONS;
+    use crate::CATALOG_VERSION;
+
+    #[test]
+    fn latest_catalog_migration_drops_unsupported_pitr_state() {
+        let (filename, sql) = CATALOG_MIGRATIONS.last().expect("latest migration");
+
+        assert_eq!(*filename, "002_drop_continuous_backups.sql");
+        assert!(sql.contains("DROP TABLE IF EXISTS continuous_backups"));
+        assert!(sql.contains("0.0.3"));
+    }
+
+    #[test]
+    fn compiled_catalog_version_matches_latest_migration() {
+        let (_filename, sql) = CATALOG_MIGRATIONS.last().expect("latest migration");
+
+        assert!(sql.contains(&format!(
+            "UPDATE settings SET value = '{}' WHERE key = 'catalog_version'",
+            CATALOG_VERSION
+        )));
+    }
+
+    #[test]
+    fn fresh_catalog_schema_omits_unsupported_pitr_state() {
+        let (filename, sql) = CATALOG_MIGRATIONS.first().expect("fresh catalog migration");
+
+        assert_eq!(*filename, "001_schema.sql");
+        assert!(!sql.contains("CREATE TABLE IF NOT EXISTS continuous_backups"));
+        assert!(sql.contains(&format!(
+            "INSERT INTO settings (key, value) VALUES ('catalog_version', '{}')",
+            CATALOG_VERSION
+        )));
+    }
 }

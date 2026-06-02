@@ -258,6 +258,9 @@ frontend item replay path: TiDB BR PITR is a cluster recovery primitive, TiDB
 `FLASHBACK TABLE` is for dropped/truncated tables, and TiDB historical reads are
 read-only for the live target-table shape. A future TiDB implementation should
 be added only if TiDB exposes a native set-based online restore into a new table.
+Unsupported PITR state is not persisted in the catalog: `DescribeContinuousBackups`
+returns DynamoDB's continuous-backup wrapper with PITR disabled after resolving
+the table row, and `UpdateContinuousBackups(true)` fails explicitly.
 
 `ExportTableToPointInTime` is also storage-owned. The engine validates the local
 destination path and serializes exported items, but storage chooses the snapshot

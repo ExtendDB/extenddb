@@ -97,6 +97,10 @@ pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
         "022_auth_lookup_indexes.sql",
         include_str!("../../storage-tidb/migrations/022_auth_lookup_indexes.sql"),
     ),
+    (
+        "023_drop_continuous_backups.sql",
+        include_str!("../../storage-tidb/migrations/023_drop_continuous_backups.sql"),
+    ),
 ];
 
 const DATA_SCHEMA_MIGRATION: &str =
@@ -618,8 +622,11 @@ mod tests {
     }
 
     #[test]
-    fn latest_catalog_migration_adds_auth_lookup_indexes() {
-        let (filename, sql) = CATALOG_MIGRATIONS.last().expect("latest migration");
+    fn catalog_migration_adds_auth_lookup_indexes() {
+        let (filename, sql) = CATALOG_MIGRATIONS
+            .iter()
+            .find(|(filename, _)| *filename == "022_auth_lookup_indexes.sql")
+            .expect("auth lookup migration");
 
         assert_eq!(*filename, "022_auth_lookup_indexes.sql");
         assert!(sql.contains("CREATE INDEX IF NOT EXISTS idx_iam_group_members_user"));
@@ -627,6 +634,15 @@ mod tests {
         assert!(sql.contains("CREATE INDEX IF NOT EXISTS idx_iam_sessions_role_session"));
         assert!(sql.contains("ON iam_sessions (account_id, role_name, session_name, expires_at)"));
         assert!(sql.contains("0.0.22"));
+    }
+
+    #[test]
+    fn latest_catalog_migration_drops_unsupported_pitr_state() {
+        let (filename, sql) = CATALOG_MIGRATIONS.last().expect("latest migration");
+
+        assert_eq!(*filename, "023_drop_continuous_backups.sql");
+        assert!(sql.contains("DROP TABLE IF EXISTS continuous_backups"));
+        assert!(sql.contains("0.0.23"));
     }
 
     #[test]

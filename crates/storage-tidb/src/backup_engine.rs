@@ -1010,35 +1010,12 @@ impl BackupEngine for TidbEngine {
                 )));
             }
 
-            let pitr_row: Option<(
-                bool,
-                Option<time::OffsetDateTime>,
-                Option<time::OffsetDateTime>,
-            )> = sqlx::query_as(
-                "SELECT pitr_enabled, earliest_restorable, latest_restorable \
-                     FROM continuous_backups WHERE account_id = ? AND table_name = ?",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-
-            let (pitr_enabled, earliest, latest) = pitr_row
-                .map_or((false, None, None), |(enabled, earliest, latest)| {
-                    (enabled, earliest, latest)
-                });
-
             Ok(ContinuousBackupsDescription {
                 continuous_backups_status: "ENABLED".to_owned(),
                 point_in_time_recovery_description: Some(PointInTimeRecoveryDescription {
-                    point_in_time_recovery_status: if pitr_enabled {
-                        "ENABLED".to_owned()
-                    } else {
-                        "DISABLED".to_owned()
-                    },
-                    earliest_restorable_date_time: earliest.map(timestamp_to_epoch),
-                    latest_restorable_date_time: latest.map(timestamp_to_epoch),
+                    point_in_time_recovery_status: "DISABLED".to_owned(),
+                    earliest_restorable_date_time: None,
+                    latest_restorable_date_time: None,
                 }),
             })
         })
@@ -1077,19 +1054,6 @@ impl BackupEngine for TidbEngine {
                         .to_owned(),
                 ));
             }
-
-            sqlx::query(
-                "INSERT INTO continuous_backups \
-                 (account_id, table_name, pitr_enabled, earliest_restorable, latest_restorable) \
-                 VALUES (?, ?, ?, NULL, NULL) \
-                 ON DUPLICATE KEY UPDATE pitr_enabled = VALUES(pitr_enabled)",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .bind(pitr_enabled)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
 
             self.describe_continuous_backups(&account_id, &table_name)
                 .await

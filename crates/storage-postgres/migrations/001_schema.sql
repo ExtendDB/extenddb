@@ -1,6 +1,6 @@
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
--- Consolidated catalog schema for extenddb (catalog version 0.0.2).
+-- Consolidated catalog schema for extenddb (catalog version 0.0.3).
 -- This is the complete schema applied on fresh installs.
 
 BEGIN;
@@ -287,16 +287,6 @@ CREATE TABLE IF NOT EXISTS backup_items (
 
 CREATE INDEX idx_backup_items_arn ON backup_items (backup_arn);
 
--- Continuous backups / PITR status.
-CREATE TABLE IF NOT EXISTS continuous_backups (
-    account_id TEXT NOT NULL,
-    table_name TEXT NOT NULL,
-    pitr_enabled BOOLEAN NOT NULL DEFAULT false,
-    earliest_restorable TIMESTAMPTZ,
-    latest_restorable TIMESTAMPTZ,
-    PRIMARY KEY (account_id, table_name)
-);
-
 -- Stream sequence (monotonic, starts at current epoch microseconds).
 CREATE SEQUENCE IF NOT EXISTS stream_seq START 1;
 SELECT setval('stream_seq', GREATEST(
@@ -305,7 +295,7 @@ SELECT setval('stream_seq', GREATEST(
 ));
 
 -- Seed settings.
-INSERT INTO settings (key, value) VALUES ('catalog_version', '0.0.2')
+INSERT INTO settings (key, value) VALUES ('catalog_version', '0.0.3')
 ON CONFLICT (key) DO NOTHING;
 INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0.25')
 ON CONFLICT (key) DO NOTHING;

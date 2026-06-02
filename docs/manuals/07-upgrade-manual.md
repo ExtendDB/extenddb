@@ -4,9 +4,8 @@
 
 ## Current Status
 
-ExtendDB 0.0.2 is the initial release. There is no upgrade path from a previous version — all deployments are fresh installs via `extenddb init`.
-
-Future releases will include migrations that upgrade the catalog schema in place. The migration infrastructure is built and ready; this document describes how it works and how developers should think about adding new migrations.
+ExtendDB 0.1.0 currently expects PostgreSQL catalog version 0.0.3. Existing
+0.0.2 catalogs are upgraded in place by `extenddb migrate`.
 
 ## How Catalog Upgrades Work
 
@@ -15,8 +14,8 @@ Future releases will include migrations that upgrade the catalog schema in place
 Migrations are SQL files in `crates/storage-postgres/migrations/`, applied in filename order:
 
 ```
-001_schema.sql      ← current: the complete initial schema
-002_<next>.sql      ← future: first incremental migration
+001_schema.sql                  ← complete initial schema
+002_drop_continuous_backups.sql ← removes unsupported PITR state
 ```
 
 The `schema_history` table tracks which files have been applied. When `extenddb migrate` runs, it:
@@ -34,7 +33,7 @@ A single row in the `settings` table stores the catalog version:
 
 ```sql
 SELECT value FROM settings WHERE key = 'catalog_version';
--- '0.0.2'
+-- '0.0.3'
 ```
 
 The binary embeds an expected catalog version (`CATALOG_VERSION` constant in `crates/storage-postgres/src/lib.rs`). At startup, the server compares the database value against the binary's expectation. If they don't match, the server refuses to start and directs the operator to run `extenddb migrate`.
@@ -56,7 +55,7 @@ When you need to change the catalog schema, here's the process:
 Add a new SQL file with the next sequence number:
 
 ```
-crates/storage-postgres/migrations/002_your_feature.sql
+crates/storage-postgres/migrations/003_your_feature.sql
 ```
 
 The file should be a single transaction:
@@ -64,7 +63,7 @@ The file should be a single transaction:
 ```sql
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
--- Migration 002: Brief description of what this adds/changes.
+-- Migration 003: Brief description of what this adds/changes.
 
 BEGIN;
 
@@ -88,8 +87,12 @@ pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../../storage-postgres/migrations/001_schema.sql"),
     ),
     (
-        "002_your_feature.sql",
-        include_str!("../../storage-postgres/migrations/002_your_feature.sql"),
+        "002_drop_continuous_backups.sql",
+        include_str!("../../storage-postgres/migrations/002_drop_continuous_backups.sql"),
+    ),
+    (
+        "003_your_feature.sql",
+        include_str!("../../storage-postgres/migrations/003_your_feature.sql"),
     ),
 ];
 ```
@@ -181,9 +184,16 @@ psql -d extenddb_catalog -f catalog_backup_YYYYMMDD.sql
 
 ## Version History
 
-### Catalog 0.0.2 (Current — Initial Release)
+### Catalog 0.0.3 (Current)
 
-Complete schema: accounts, tables, indexes, tags, streams, IAM (users, groups, roles, policies, access keys, sessions, permissions boundaries), idempotency tokens, metrics, login attempts, backups, continuous backups, TTL support, settings.
+Removes the unsupported `continuous_backups` catalog table. Backends now report
+disabled PITR state directly after resolving the table catalog row; enabling
+PITR still returns an explicit unsupported error until a backend can provide the
+DynamoDB table-level restore shape faithfully.
+
+### Catalog 0.0.2 (Initial Release)
+
+Complete schema: accounts, tables, indexes, tags, streams, IAM (users, groups, roles, policies, access keys, sessions, permissions boundaries), idempotency tokens, metrics, login attempts, backups, TTL support, settings.
 
 No prior versions exist. All deployments are fresh installs.
 

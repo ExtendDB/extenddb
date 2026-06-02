@@ -531,7 +531,7 @@ Check that the configured storage backend is running and the connection string i
 **Catalog version mismatch:**
 
 ```
-Error: catalog version mismatch: found 1.0.0, expected 0.0.2
+Error: catalog version mismatch: found 1.0.0, expected 0.0.3
 ```
 
 Run `extenddb migrate --config extenddb.toml` to upgrade the catalog schema.

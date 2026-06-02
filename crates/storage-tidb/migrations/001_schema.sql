@@ -1,6 +1,6 @@
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
--- Consolidated catalog schema for extenddb (catalog version 0.0.22).
+-- Consolidated catalog schema for extenddb (catalog version 0.0.23).
 -- This is the complete schema applied on fresh installs.
 
 -- Accounts — multi-account support (REQ-AUTH-005).
@@ -278,15 +278,5 @@ CREATE TABLE IF NOT EXISTS backup_tags (
     PRIMARY KEY (backup_arn, tag_key) CLUSTERED
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- Continuous backups / PITR status.
-CREATE TABLE IF NOT EXISTS continuous_backups (
-    account_id VARCHAR(32) NOT NULL,
-    table_name VARCHAR(255) NOT NULL,
-    pitr_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-    earliest_restorable TIMESTAMP(6),
-    latest_restorable TIMESTAMP(6),
-    PRIMARY KEY (account_id, table_name) CLUSTERED
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
-
 -- Seed settings.
-INSERT IGNORE INTO settings (`key`, value) VALUES ('catalog_version', '0.0.22');
+INSERT IGNORE INTO settings (`key`, value) VALUES ('catalog_version', '0.0.23');
