@@ -510,3 +510,17 @@ def test_transact_get_indexes_capacity_has_rcu_field(dynamodb_client, hash_table
     assert table_cap.get("ReadCapacityUnits") == 2.0
     # WriteCapacityUnits should not be present for reads
     assert table_cap.get("WriteCapacityUnits") is None
+
+
+def test_transact_write_charges_2x_wcu(dynamodb_client, hash_table):
+    """TransactWriteItems charges 2 WCU per item (transaction cost)."""
+    resp = dynamodb_client.transact_write_items(
+        ReturnConsumedCapacity="TOTAL",
+        TransactItems=[
+            {"Put": {"TableName": hash_table, "Item": {"pk": {"S": "tw-cap-1"}}}},
+            {"Put": {"TableName": hash_table, "Item": {"pk": {"S": "tw-cap-2"}}}},
+        ],
+    )
+    # 2 items × 1 WCU each × 2 (transaction) = 4.0
+    total = sum(c["CapacityUnits"] for c in resp["ConsumedCapacity"])
+    assert total == 4.0

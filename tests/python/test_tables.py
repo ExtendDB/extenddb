@@ -96,7 +96,7 @@ class TestCreateTable:
                 BillingMode="PAY_PER_REQUEST",
             )
         err = exc_info.value.response["Error"]
-        assert err["Code"] == "SerializationException"
+        assert err["Code"] == "ValidationException"
 
     def test_create_missing_attribute_definition(self, dynamodb_client):
         """KeySchema references an attribute not in AttributeDefinitions."""

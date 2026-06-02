@@ -77,18 +77,24 @@ class TestTagging:
         resp = dynamodb_client.list_tags_of_resource(ResourceArn=arn)
         assert resp["Tags"] == []
 
-    def test_tag_nonexistent_resource(self, dynamodb_client):
+    def test_tag_nonexistent_resource(self, table_factory, dynamodb_client):
         """Tagging a nonexistent resource fails."""
-        fake_arn = "arn:aws:dynamodb:us-east-1:000000000000:table/nonexistent-xyz"
+        # Use a real table's ARN to extract the correct account/region prefix,
+        # then reference a table that doesn't exist.
+        name = table_factory()
+        real_arn = self._get_table_arn(dynamodb_client, name)
+        fake_arn = real_arn.rsplit("/", 1)[0] + "/nonexistent-xyz-99"
         with pytest.raises(ClientError) as exc:
             dynamodb_client.tag_resource(
                 ResourceArn=fake_arn, Tags=[{"Key": "k", "Value": "v"}]
             )
         assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
-    def test_list_tags_nonexistent_resource(self, dynamodb_client):
+    def test_list_tags_nonexistent_resource(self, table_factory, dynamodb_client):
         """ListTagsOfResource on a nonexistent resource fails."""
-        fake_arn = "arn:aws:dynamodb:us-east-1:000000000000:table/nonexistent-xyz"
+        name = table_factory()
+        real_arn = self._get_table_arn(dynamodb_client, name)
+        fake_arn = real_arn.rsplit("/", 1)[0] + "/nonexistent-xyz-99"
         with pytest.raises(ClientError) as exc:
             dynamodb_client.list_tags_of_resource(ResourceArn=fake_arn)
         assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
