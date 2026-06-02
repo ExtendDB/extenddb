@@ -12,7 +12,8 @@ use extenddb_storage::util::{parse_sk, sk_column, sk_info};
 use super::index::validate_item_secondary_index_key_constraints;
 use super::query::check_condition;
 use super::tx_helpers::{
-    StreamSequenceAllocator, finalize_stream_records_best_effort, stream_capture_needs_old_item,
+    StreamSequenceAllocator, finalize_stream_records_best_effort,
+    put_prepared_item_without_old_item_in_tx, stream_capture_needs_old_item,
     write_stream_record_for_event_in_tx, write_stream_record_in_tx,
 };
 use super::{data_table_name, json_to_item, physical_pk_bytes};
@@ -62,41 +63,15 @@ impl TidbEngine {
             if let Some(capture) =
                 put_stream_capture_without_old_item(return_old, condition, stream)
             {
-                let update_sql =
-                    format!("UPDATE {ddb_table} SET item_data = ? WHERE pk = ? AND {sk_col} = ?");
-                let insert_sql =
-                    format!("INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES (?, ?, ?)");
-
                 let mut tx = self
                     .data_pool
                     .begin()
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-                // Another writer can create the key after our update misses.
-                // Retry as native point DML until this transaction owns the write.
-                // sqlx-mysql enables CLIENT_FOUND_ROWS, so an unchanged
-                // existing item still reports a matched row here.
-                let event = loop {
-                    let update_result = bind_sk_update_execute!(
-                        &update_sql,
-                        &item_json,
-                        pk.as_slice(),
-                        &sk,
-                        &mut *tx
-                    )?;
-                    if update_result.rows_affected() > 0 {
-                        break StreamEventName::Modify;
-                    }
-
-                    let insert_result =
-                        bind_sk_execute_raw!(&insert_sql, pk.as_slice(), &sk, &item_json, &mut *tx);
-                    match insert_result {
-                        Ok(_) => break StreamEventName::Insert,
-                        Err(err) if is_unique_violation(&err) => {}
-                        Err(err) => return Err(StorageError::Internal(err.to_string())),
-                    }
-                };
+                let event = put_prepared_item_without_old_item_in_tx(
+                    &mut tx, key_info, &item, &pk, &item_json,
+                )
+                .await?;
 
                 commit_put_stream_without_old_item(
                     &self.data_pool,
@@ -213,41 +188,15 @@ impl TidbEngine {
             if let Some(capture) =
                 put_stream_capture_without_old_item(return_old, condition, stream)
             {
-                let update_sql = format!("UPDATE {ddb_table} SET item_data = ? WHERE pk = ?");
-                let insert_sql = format!("INSERT INTO {ddb_table} (pk, item_data) VALUES (?, ?)");
-
                 let mut tx = self
                     .data_pool
                     .begin()
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-                // Another writer can create the key after our update misses.
-                // Retry as native point DML until this transaction owns the write.
-                // sqlx-mysql enables CLIENT_FOUND_ROWS, so an unchanged
-                // existing item still reports a matched row here.
-                let event = loop {
-                    let update_result = sqlx::query(&update_sql)
-                        .bind(&item_json)
-                        .bind(pk.as_slice())
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    if update_result.rows_affected() > 0 {
-                        break StreamEventName::Modify;
-                    }
-
-                    let insert_result = sqlx::query(&insert_sql)
-                        .bind(pk.as_slice())
-                        .bind(&item_json)
-                        .execute(&mut *tx)
-                        .await;
-                    match insert_result {
-                        Ok(_) => break StreamEventName::Insert,
-                        Err(err) if is_unique_violation(&err) => {}
-                        Err(err) => return Err(StorageError::Internal(err.to_string())),
-                    }
-                };
+                let event = put_prepared_item_without_old_item_in_tx(
+                    &mut tx, key_info, &item, &pk, &item_json,
+                )
+                .await?;
 
                 commit_put_stream_without_old_item(
                     &self.data_pool,

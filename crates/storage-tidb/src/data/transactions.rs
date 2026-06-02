@@ -8,9 +8,10 @@ use std::collections::HashMap;
 use extenddb_core::expression::{self, ExpressionMaps};
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
-    AttributeValue, CancellationReason, Item, ReturnValuesOnConditionCheckFailure,
+    AttributeValue, CancellationReason, Item, ReturnValuesOnConditionCheckFailure, StreamEventName,
 };
 use extenddb_core::validation;
+use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{TransactGetOp, TransactWriteOp};
 
@@ -21,7 +22,8 @@ use super::index::{
 use super::tx_helpers::{
     StreamSequenceAllocator, check_idempotency_token_in_tx, delete_item_in_tx,
     fetch_item_for_update, fetch_item_in_tx, finalize_stream_records_best_effort,
-    upsert_item_in_tx, write_stream_record_in_tx,
+    put_item_without_old_item_in_tx, stream_capture_needs_old_item, upsert_item_in_tx,
+    write_stream_record_for_event_in_tx, write_stream_record_in_tx,
 };
 use crate::TidbEngine;
 use crate::tidb_util::retry_tidb_idempotent_operation;
@@ -129,20 +131,19 @@ impl TidbEngine {
         }
 
         let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());
-        // Collect old/new items from each op for stream records.
-        let mut op_items: Vec<(Option<Item>, Option<Item>)> = Vec::with_capacity(ops.len());
+        let mut op_outcomes = Vec::with_capacity(ops.len());
         let mut any_failed = false;
 
         for op in ops {
             let indexes = &table_indexes[transact_op_table_id(op)];
             let reason = execute_transact_write_op(&mut tx, op, indexes, &self.limits).await;
             match reason {
-                Ok(items) => {
-                    op_items.push(items);
+                Ok(outcome) => {
+                    op_outcomes.push(outcome);
                     reasons.push(CancellationReason::none());
                 }
                 Err(TxnOpError::Cancel(r)) => {
-                    op_items.push((None, None));
+                    op_outcomes.push(TxnWriteOutcome::NoStream);
                     any_failed = true;
                     reasons.push(r);
                 }
@@ -160,28 +161,46 @@ impl TidbEngine {
 
         // Write stream records atomically within the transaction.
         let mut sequence_allocator = StreamSequenceAllocator::default();
-        for (op, (old_item, new_item)) in ops.iter().zip(op_items.iter()) {
-            let capture = match op {
-                TransactWriteOp::Put { stream, .. }
-                | TransactWriteOp::Delete { stream, .. }
-                | TransactWriteOp::Update { stream, .. } => stream.as_ref(),
-                TransactWriteOp::ConditionCheck { .. } => None,
+        for (op, outcome) in ops.iter().zip(op_outcomes.iter()) {
+            let Some(capture) = transact_op_stream_capture(op) else {
+                continue;
             };
-            if let Some(capture) = capture {
-                write_stream_record_in_tx(
-                    &mut tx,
-                    &mut sequence_allocator,
-                    match op {
-                        TransactWriteOp::Put { key_info, .. }
-                        | TransactWriteOp::Delete { key_info, .. }
-                        | TransactWriteOp::Update { key_info, .. }
-                        | TransactWriteOp::ConditionCheck { key_info, .. } => key_info,
-                    },
-                    capture,
-                    old_item.as_ref(),
-                    new_item.as_ref(),
-                )
-                .await?;
+            let key_info = transact_op_key_info(op);
+            match outcome {
+                TxnWriteOutcome::NoStream => {}
+                TxnWriteOutcome::StreamFromItems { old_item, new_item } => {
+                    write_stream_record_in_tx(
+                        &mut tx,
+                        &mut sequence_allocator,
+                        key_info,
+                        capture,
+                        old_item.as_ref(),
+                        new_item.as_ref(),
+                    )
+                    .await?;
+                }
+                TxnWriteOutcome::StreamFromEvent {
+                    event,
+                    old_item,
+                    new_item,
+                } => {
+                    let source_item = new_item.as_ref().or(old_item.as_ref()).ok_or_else(|| {
+                        StorageError::Internal(
+                            "transaction stream event has no source item".to_owned(),
+                        )
+                    })?;
+                    write_stream_record_for_event_in_tx(
+                        &mut tx,
+                        &mut sequence_allocator,
+                        key_info,
+                        capture,
+                        *event,
+                        source_item,
+                        old_item.as_ref(),
+                        new_item.as_ref(),
+                    )
+                    .await?;
+                }
             }
         }
 
@@ -212,11 +231,24 @@ impl TidbEngine {
 
 /// Extract the table_id from a transactional write operation.
 fn transact_op_table_id<'a>(op: &'a TransactWriteOp<'_>) -> &'a str {
+    &transact_op_key_info(op).table_id
+}
+
+fn transact_op_key_info<'a>(op: &'a TransactWriteOp<'_>) -> &'a extenddb_core::types::TableKeyInfo {
     match op {
         TransactWriteOp::Put { key_info, .. }
         | TransactWriteOp::Delete { key_info, .. }
         | TransactWriteOp::Update { key_info, .. }
-        | TransactWriteOp::ConditionCheck { key_info, .. } => &key_info.table_id,
+        | TransactWriteOp::ConditionCheck { key_info, .. } => key_info,
+    }
+}
+
+fn transact_op_stream_capture<'a>(op: &'a TransactWriteOp<'_>) -> Option<&'a StreamCapture> {
+    match op {
+        TransactWriteOp::Put { stream, .. }
+        | TransactWriteOp::Delete { stream, .. }
+        | TransactWriteOp::Update { stream, .. } => stream.as_ref(),
+        TransactWriteOp::ConditionCheck { .. } => None,
     }
 }
 
@@ -235,9 +267,16 @@ fn transact_op_needs_secondary_index_validation(op: &TransactWriteOp<'_>) -> boo
     }
 }
 
-fn transact_write_needs_existing_item(
+fn transact_put_needs_existing_item(
     condition: Option<&extenddb_core::expression::Expr>,
-    stream: &Option<extenddb_storage::StreamCapture>,
+    stream: &Option<StreamCapture>,
+) -> bool {
+    condition.is_some() || stream.as_ref().is_some_and(stream_capture_needs_old_item)
+}
+
+fn transact_delete_needs_existing_item(
+    condition: Option<&extenddb_core::expression::Expr>,
+    stream: &Option<StreamCapture>,
 ) -> bool {
     condition.is_some() || stream.is_some()
 }
@@ -255,6 +294,19 @@ enum TxnOpError {
     Storage(StorageError),
 }
 
+enum TxnWriteOutcome {
+    NoStream,
+    StreamFromItems {
+        old_item: Option<Item>,
+        new_item: Option<Item>,
+    },
+    StreamFromEvent {
+        event: StreamEventName,
+        old_item: Option<Item>,
+        new_item: Option<Item>,
+    },
+}
+
 impl From<CancellationReason> for TxnOpError {
     fn from(r: CancellationReason) -> Self {
         Self::Cancel(r)
@@ -262,13 +314,13 @@ impl From<CancellationReason> for TxnOpError {
 }
 
 /// Execute a single transactional write operation, including native index-key validation.
-/// Returns `(old_item, new_item)` on success for stream capture.
+/// Returns stream capture material on success.
 async fn execute_transact_write_op(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     op: &TransactWriteOp<'_>,
     indexes: &[WriteIndexKeys],
     limits: &LimitsConfig,
-) -> Result<(Option<Item>, Option<Item>), TxnOpError> {
+) -> Result<TxnWriteOutcome, TxnOpError> {
     match op {
         TransactWriteOp::Put {
             key_info,
@@ -294,7 +346,30 @@ async fn execute_transact_write_op(
                 &key_info.attribute_definitions,
                 limits,
             )?;
-            let existing = if transact_write_needs_existing_item(*condition, stream) {
+            if !transact_put_needs_existing_item(*condition, stream) {
+                let event = if stream.is_some() {
+                    Some(
+                        put_item_without_old_item_in_tx(tx, key_info, item)
+                            .await
+                            .map_err(TxnOpError::Storage)?,
+                    )
+                } else {
+                    upsert_item_in_tx(tx, key_info, item)
+                        .await
+                        .map_err(TxnOpError::Storage)?;
+                    None
+                };
+                return Ok(match event {
+                    Some(event) => TxnWriteOutcome::StreamFromEvent {
+                        event,
+                        old_item: None,
+                        new_item: Some((*item).clone()),
+                    },
+                    None => TxnWriteOutcome::NoStream,
+                });
+            }
+
+            let existing = {
                 let existing = fetch_item_for_update(tx, key_info, item)
                     .await
                     .map_err(TxnOpError::Storage)?;
@@ -307,13 +382,18 @@ async fn execute_transact_write_op(
                     existing.as_ref(),
                 )?;
                 existing
-            } else {
-                None
             };
             upsert_item_in_tx(tx, key_info, item)
                 .await
                 .map_err(TxnOpError::Storage)?;
-            Ok((existing, Some((*item).clone())))
+            Ok(if stream.is_some() {
+                TxnWriteOutcome::StreamFromItems {
+                    old_item: existing,
+                    new_item: Some((*item).clone()),
+                }
+            } else {
+                TxnWriteOutcome::NoStream
+            })
         }
         TransactWriteOp::Delete {
             key_info,
@@ -330,7 +410,7 @@ async fn execute_transact_write_op(
                 &key_info.attribute_definitions,
             )
             .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
-            let existing = if transact_write_needs_existing_item(*condition, stream) {
+            let existing = if transact_delete_needs_existing_item(*condition, stream) {
                 let existing = fetch_item_for_update(tx, key_info, key)
                     .await
                     .map_err(TxnOpError::Storage)?;
@@ -349,7 +429,14 @@ async fn execute_transact_write_op(
             delete_item_in_tx(tx, key_info, key)
                 .await
                 .map_err(TxnOpError::Storage)?;
-            Ok((existing, None))
+            Ok(if stream.is_some() {
+                TxnWriteOutcome::StreamFromItems {
+                    old_item: existing,
+                    new_item: None,
+                }
+            } else {
+                TxnWriteOutcome::NoStream
+            })
         }
         TransactWriteOp::Update {
             key_info,
@@ -358,6 +445,7 @@ async fn execute_transact_write_op(
             condition,
             maps,
             return_values_on_ccf,
+            stream,
             ..
         } => {
             validation::validate_key_only(
@@ -399,7 +487,14 @@ async fn execute_transact_write_op(
             upsert_item_in_tx(tx, key_info, &item)
                 .await
                 .map_err(TxnOpError::Storage)?;
-            Ok((existing, Some(item)))
+            Ok(if stream.is_some() {
+                TxnWriteOutcome::StreamFromItems {
+                    old_item: existing,
+                    new_item: Some(item),
+                }
+            } else {
+                TxnWriteOutcome::NoStream
+            })
         }
         TransactWriteOp::ConditionCheck {
             key_info,
@@ -426,7 +521,7 @@ async fn execute_transact_write_op(
                 *return_values_on_ccf,
                 existing.as_ref(),
             )?;
-            Ok((None, None))
+            Ok(TxnWriteOutcome::NoStream)
         }
     }
 }
@@ -482,7 +577,7 @@ mod tests {
     use extenddb_core::types::StreamViewType;
     use extenddb_storage::StreamCapture;
 
-    use super::transact_write_needs_existing_item;
+    use super::{transact_delete_needs_existing_item, transact_put_needs_existing_item};
 
     fn condition() -> Expr {
         Expr::Function {
@@ -503,14 +598,41 @@ mod tests {
 
     #[test]
     fn unconditional_transaction_write_without_stream_skips_existing_item_read() {
-        assert!(!transact_write_needs_existing_item(None, &None));
+        assert!(!transact_put_needs_existing_item(None, &None));
+        assert!(!transact_delete_needs_existing_item(None, &None));
     }
 
     #[test]
-    fn transaction_write_with_condition_or_stream_needs_existing_item_read() {
+    fn transaction_put_reads_existing_item_for_conditions_or_old_image_streams() {
         let condition = condition();
-        assert!(transact_write_needs_existing_item(Some(&condition), &None));
-        assert!(transact_write_needs_existing_item(
+        assert!(transact_put_needs_existing_item(Some(&condition), &None));
+        assert!(!transact_put_needs_existing_item(
+            None,
+            &Some(stream_capture())
+        ));
+        assert!(transact_put_needs_existing_item(
+            None,
+            &Some(StreamCapture {
+                view_type: StreamViewType::OldImage,
+                user_identity: None,
+                region: Arc::from("us-east-1"),
+            })
+        ));
+        assert!(transact_put_needs_existing_item(
+            None,
+            &Some(StreamCapture {
+                view_type: StreamViewType::NewAndOldImages,
+                user_identity: None,
+                region: Arc::from("us-east-1"),
+            })
+        ));
+    }
+
+    #[test]
+    fn transaction_delete_still_reads_existing_item_for_any_stream() {
+        let condition = condition();
+        assert!(transact_delete_needs_existing_item(Some(&condition), &None));
+        assert!(transact_delete_needs_existing_item(
             None,
             &Some(stream_capture())
         ));

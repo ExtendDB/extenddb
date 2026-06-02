@@ -14,7 +14,7 @@ use extenddb_storage::util::{SortKeyValue, parse_sk, sk_column, sk_info};
 
 use super::{data_table_name, json_to_item, physical_pk_bytes};
 use crate::stream_engine::stream_shard_id_for_partition_key;
-use crate::tidb_util::{current_tidb_transaction_tso, current_tidb_tso};
+use crate::tidb_util::{current_tidb_transaction_tso, current_tidb_tso, is_unique_violation};
 
 const STREAM_SEQUENCE_TSO_WIDTH: usize = 21;
 const STREAM_SEQUENCE_ORDINAL_WIDTH: usize = 6;
@@ -185,6 +185,86 @@ pub(super) async fn upsert_item_in_tx(
             .map_err(|e| StorageError::Internal(e.to_string()))?;
     }
     Ok(())
+}
+
+/// Put an item without materializing the old row and return the stream event.
+///
+/// This is valid only when callers do not need conditions, old return values,
+/// or old stream images. TiDB's native point DML owns the concurrency: update
+/// existing rows first, insert only on miss, and retry if another writer creates
+/// the key between those statements.
+pub(super) async fn put_item_without_old_item_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    key_info: &TableKeyInfo,
+    item: &Item,
+) -> Result<StreamEventName, StorageError> {
+    let pk = physical_pk_bytes(item, &key_info.key_schema)?;
+    let item_json =
+        serde_json::to_value(item).map_err(|e| StorageError::Internal(e.to_string()))?;
+    put_prepared_item_without_old_item_in_tx(tx, key_info, item, &pk, &item_json).await
+}
+
+pub(super) async fn put_prepared_item_without_old_item_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    key_info: &TableKeyInfo,
+    item: &Item,
+    pk: &[u8],
+    item_json: &serde_json::Value,
+) -> Result<StreamEventName, StorageError> {
+    let ddb_table = data_table_name(&key_info.table_id);
+    if let Some((sk_name, sk_type)) = sk_info(&key_info.key_schema, &key_info.attribute_definitions)
+    {
+        let sk_value = item
+            .get(sk_name)
+            .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?;
+        let sk = parse_sk(sk_value, sk_type)?;
+        let sk_col = sk_column(sk_type);
+        let update_sql =
+            format!("UPDATE {ddb_table} SET item_data = ? WHERE pk = ? AND {sk_col} = ?");
+        let insert_sql =
+            format!("INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES (?, ?, ?)");
+
+        loop {
+            let update_result =
+                bind_sk_update_execute!(&update_sql, item_json, pk, &sk, &mut **tx)?;
+            if update_result.rows_affected() > 0 {
+                return Ok(StreamEventName::Modify);
+            }
+
+            let insert_result = bind_sk_execute_raw!(&insert_sql, pk, &sk, item_json, &mut **tx);
+            match insert_result {
+                Ok(_) => return Ok(StreamEventName::Insert),
+                Err(err) if is_unique_violation(&err) => {}
+                Err(err) => return Err(StorageError::Internal(err.to_string())),
+            }
+        }
+    } else {
+        let update_sql = format!("UPDATE {ddb_table} SET item_data = ? WHERE pk = ?");
+        let insert_sql = format!("INSERT INTO {ddb_table} (pk, item_data) VALUES (?, ?)");
+
+        loop {
+            let update_result = sqlx::query(&update_sql)
+                .bind(item_json)
+                .bind(pk)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if update_result.rows_affected() > 0 {
+                return Ok(StreamEventName::Modify);
+            }
+
+            let insert_result = sqlx::query(&insert_sql)
+                .bind(pk)
+                .bind(item_json)
+                .execute(&mut **tx)
+                .await;
+            match insert_result {
+                Ok(_) => return Ok(StreamEventName::Insert),
+                Err(err) if is_unique_violation(&err) => {}
+                Err(err) => return Err(StorageError::Internal(err.to_string())),
+            }
+        }
+    }
 }
 
 /// Delete an item by key within a transaction.
