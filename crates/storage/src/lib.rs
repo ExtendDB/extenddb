@@ -196,7 +196,9 @@ pub trait DataEngine: Send + Sync {
     /// condition evaluates to false.
     ///
     /// When `stream` is `Some`, the stream record is inserted in the same
-    /// transaction as the data write, guaranteeing atomicity.
+    /// transaction as the data write, guaranteeing atomicity. The backend
+    /// decides which item images the stream view needs; callers should not set
+    /// `return_old` only for stream capture.
     ///
     /// Returns the previous item if `return_old` is true and an item existed.
     fn put_item<'a>(
@@ -229,7 +231,9 @@ pub trait DataEngine: Send + Sync {
     /// condition evaluates to false.
     ///
     /// When `stream` is `Some`, the stream record is inserted in the same
-    /// transaction as the data write, guaranteeing atomicity.
+    /// transaction as the data write, guaranteeing atomicity. The backend
+    /// decides which item images the stream view needs; callers should not set
+    /// `return_old` only for stream capture.
     ///
     /// Returns the deleted item if `return_old` is true and an item existed.
     fn delete_item<'a>(
@@ -251,7 +255,9 @@ pub trait DataEngine: Send + Sync {
     /// (or empty item for new) inside a transaction.
     ///
     /// When `stream` is `Some`, the stream record is inserted in the same
-    /// transaction as the data write, guaranteeing atomicity.
+    /// transaction as the data write, guaranteeing atomicity. The backend
+    /// decides which item images the stream view needs; callers should not set
+    /// `return_old` only for stream capture.
     ///
     /// Returns the item (old or new) based on `ReturnValues` semantics.
     /// The caller specifies which snapshots to capture via `return_old` and `return_new`.

@@ -74,19 +74,24 @@ impl TidbEngine {
         } else {
             key.clone()
         };
+        let item_existed = old_json.is_some();
 
         // Save pre-mutation item for stream capture.
-        let pre_mutation_item = if stream.is_some() && old_json.is_some() {
+        let pre_mutation_item = if stream.is_some() && item_existed {
             Some(item.clone())
         } else {
             None
         };
 
-        let old_item = if return_old { Some(item.clone()) } else { None };
+        let old_item = if return_old && item_existed {
+            Some(item.clone())
+        } else {
+            None
+        };
 
         // Evaluate condition against the existing item (empty if non-existent).
         // DynamoDB treats a non-existent item as having no attributes at all.
-        let condition_item = if old_json.is_some() {
+        let condition_item = if item_existed {
             &item
         } else {
             &std::collections::BTreeMap::new()
@@ -94,7 +99,7 @@ impl TidbEngine {
         match check_condition(condition, condition_item, maps) {
             Ok(()) => {}
             Err(StorageError::ConditionFailed(_)) => {
-                if old_json.is_some() {
+                if item_existed {
                     return Err(StorageError::ConditionFailed(Some(item)));
                 }
                 return Err(StorageError::ConditionFailed(None));
@@ -138,7 +143,7 @@ impl TidbEngine {
                 .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?;
             let sk = parse_sk(sk_value, sk_type)?;
             let sk_col = sk_column(sk_type);
-            if old_json.is_some() {
+            if item_existed {
                 // Row existed — update in place.
                 let update_sql =
                     format!("UPDATE {ddb_table} SET item_data = ? WHERE pk = ? AND {sk_col} = ?");
@@ -164,7 +169,7 @@ impl TidbEngine {
                     return Err(StorageError::Internal(err.to_string()));
                 }
             }
-        } else if old_json.is_some() {
+        } else if item_existed {
             let update_sql = format!("UPDATE {ddb_table} SET item_data = ? WHERE pk = ?");
             sqlx::query(&update_sql)
                 .bind(&item_json)

@@ -888,6 +888,22 @@ class TestUpdateItemWCU:
         # New item is ~1.5KB → rounds up to 2 WCU
         assert cap["WriteCapacityUnits"] >= 2.0
 
+    def test_update_item_wcu_reflects_old_item_size(self, dynamodb_client, wcu_table):
+        """UpdateItem WCU is based on the larger of old/new item (old item here)."""
+        dynamodb_client.put_item(
+            TableName=wcu_table,
+            Item={"pk": {"S": "wcu-shrink"}, "big": {"S": "x" * 1500}},
+        )
+        resp = dynamodb_client.update_item(
+            TableName=wcu_table,
+            Key={"pk": {"S": "wcu-shrink"}},
+            UpdateExpression="SET big = :data",
+            ExpressionAttributeValues={":data": {"S": "x"}},
+            ReturnConsumedCapacity="TOTAL",
+        )
+        cap = resp["ConsumedCapacity"]
+        assert cap["WriteCapacityUnits"] >= 2.0
+
 
 # ---------------------------------------------------------------------------
 # Number sizing uses DynamoDB formula (a787349)

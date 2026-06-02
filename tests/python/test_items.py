@@ -458,6 +458,18 @@ class TestUpdateItem:
         )
         assert resp["Attributes"]["v"]["N"] == "1"
 
+    def test_update_return_all_old_on_new_item(self, table_factory, dynamodb_client):
+        """UpdateItem with ReturnValues=ALL_OLD returns no Attributes for a new item."""
+        name = table_factory()
+        resp = dynamodb_client.update_item(
+            TableName=name,
+            Key={"pk": {"S": "key1"}},
+            UpdateExpression="SET v = :new",
+            ExpressionAttributeValues={":new": {"N": "10"}},
+            ReturnValues="ALL_OLD",
+        )
+        assert "Attributes" not in resp
+
     def test_update_return_updated_new(self, table_factory, dynamodb_client):
         """UpdateItem with ReturnValues=UPDATED_NEW."""
         name = table_factory()

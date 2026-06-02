@@ -85,19 +85,24 @@ impl PostgresEngine {
         } else {
             key.clone()
         };
+        let item_existed = old_json.is_some();
 
         // Save pre-mutation item for index sync and stream capture.
-        let pre_mutation_item = if (!indexes.is_empty() || stream.is_some()) && old_json.is_some() {
+        let pre_mutation_item = if (!indexes.is_empty() || stream.is_some()) && item_existed {
             Some(item.clone())
         } else {
             None
         };
 
-        let old_item = if return_old { Some(item.clone()) } else { None };
+        let old_item = if return_old && item_existed {
+            Some(item.clone())
+        } else {
+            None
+        };
 
         // Evaluate condition against the existing item (empty if non-existent).
         // DynamoDB treats a non-existent item as having no attributes at all.
-        let condition_item = if old_json.is_some() {
+        let condition_item = if item_existed {
             &item
         } else {
             &std::collections::BTreeMap::new()
@@ -105,7 +110,7 @@ impl PostgresEngine {
         match check_condition(condition, condition_item, maps) {
             Ok(()) => {}
             Err(StorageError::ConditionFailed(_)) => {
-                if old_json.is_some() {
+                if item_existed {
                     return Err(StorageError::ConditionFailed(Some(item)));
                 }
                 return Err(StorageError::ConditionFailed(None));
@@ -139,7 +144,7 @@ impl PostgresEngine {
                 .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?;
             let sk = parse_sk(sk_value, sk_type)?;
             let sk_col = sk_column(sk_type);
-            if old_json.is_some() {
+            if item_existed {
                 // Row existed — update in place.
                 let update_sql = format!(
                     "UPDATE {ddb_table} SET item_data = $3 WHERE pk = $1 AND {sk_col} = $2"
@@ -165,7 +170,7 @@ impl PostgresEngine {
                     return Err(StorageError::ConditionFailed(winner_item));
                 }
             }
-        } else if old_json.is_some() {
+        } else if item_existed {
             let update_sql = format!("UPDATE {ddb_table} SET item_data = $2 WHERE pk = $1");
             sqlx::query(&update_sql)
                 .bind(pk_text.as_ref())

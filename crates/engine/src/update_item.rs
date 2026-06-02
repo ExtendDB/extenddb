@@ -148,18 +148,12 @@ pub async fn handle_update_item(
     // Validate that no update action targets a key attribute (REQ-DATA-003)
     validate_no_key_updates(&actions, &key_info, &maps)?;
 
-    let return_old = matches!(
-        input.return_values,
-        ReturnValues::AllOld | ReturnValues::UpdatedOld
-    );
-
     let view_type = stream_capture::stream_view_type(&key_info);
     let stream = view_type.map(|vt| extenddb_storage::StreamCapture {
         view_type: vt,
         user_identity: None,
         region: ctx.region.clone(),
     });
-    let need_old_for_stream = stream.is_some();
 
     let (old_item, new_item) = ctx
         .storage
@@ -167,7 +161,7 @@ pub async fn handle_update_item(
             &key_info,
             &input.key,
             &actions,
-            return_old || need_old_for_stream,
+            true, // UpdateItem already reads old; return it for exact WCU.
             true, // always fetch new item for WCU calculation
             condition.as_ref(),
             &maps,

@@ -152,7 +152,7 @@ pub async fn handle_put_item(
         key_info.has_lsi,
     );
 
-    // Check if streams are enabled (need old item for stream record).
+    // Check if streams are enabled.
     let view_type = stream_capture::stream_view_type(&key_info);
 
     let stream = view_type.map(|vt| extenddb_storage::StreamCapture {
@@ -160,16 +160,13 @@ pub async fn handle_put_item(
         user_identity: None,
         region: ctx.region.clone(),
     });
-    // When streams are enabled, always request old item so the storage layer
-    // can determine Insert vs Modify and build old images.
-    let need_old_for_stream = stream.is_some();
 
     let old_item = ctx
         .storage
         .put_item(
             &key_info,
             input.item,
-            return_old || need_old_for_stream,
+            return_old,
             condition.as_ref(),
             &maps,
             stream.as_ref(),

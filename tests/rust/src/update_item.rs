@@ -303,3 +303,28 @@ async fn update_item_return_values_all_old() {
         "Old item should not have 'extra'"
     );
 }
+
+#[tokio::test]
+async fn update_item_return_values_all_old_on_new_item() {
+    let c = client();
+    let t = tables().await;
+    let table = &t.simple_key_string;
+    let item = create_item(table);
+    let key = get_key(table, &item);
+
+    let resp = c
+        .update_item()
+        .table_name(table)
+        .set_key(Some(key))
+        .update_expression("SET extra = :v")
+        .expression_attribute_values(":v", s("new"))
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::AllOld)
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        resp.attributes().is_none(),
+        "ALL_OLD should not return key attributes for a newly created item"
+    );
+}

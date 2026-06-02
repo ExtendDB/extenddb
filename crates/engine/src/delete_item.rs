@@ -83,14 +83,13 @@ pub async fn handle_delete_item(
         user_identity: None,
         region: ctx.region.clone(),
     });
-    let need_old_for_stream = stream.is_some();
 
     let old_item = ctx
         .storage
         .delete_item(
             &key_info,
             &input.key,
-            return_old || need_old_for_stream,
+            return_old,
             condition.as_ref(),
             &maps,
             stream.as_ref(),

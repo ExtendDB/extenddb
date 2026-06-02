@@ -140,16 +140,14 @@ pub async fn handle_batch_write_item(
                     user_identity: None,
                     region: ctx.region.clone(),
                 });
-                let need_old_for_stream = stream.is_some();
                 let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&put.item));
                 total_wcu += item_wcu;
                 *per_table_wcu.entry(table_name.clone()).or_default() += item_wcu;
-                let _old_item = ctx
-                    .storage
+                ctx.storage
                     .put_item(
                         &key_info,
                         put.item.clone(),
-                        need_old_for_stream,
+                        false,
                         None,
                         &empty_maps,
                         stream.as_ref(),
@@ -176,18 +174,16 @@ pub async fn handle_batch_write_item(
                     user_identity: None,
                     region: ctx.region.clone(),
                 });
-                let need_old_for_stream = stream.is_some();
                 // TODO(fidelity): DynamoDB charges WCU based on old item size for deletes,
                 // but old item size is not available here. Using key size as lower bound.
                 let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&del.key));
                 total_wcu += item_wcu;
                 *per_table_wcu.entry(table_name.clone()).or_default() += item_wcu;
-                let _old_item = ctx
-                    .storage
+                ctx.storage
                     .delete_item(
                         &key_info,
                         &del.key,
-                        need_old_for_stream,
+                        false,
                         None,
                         &empty_maps,
                         stream.as_ref(),
