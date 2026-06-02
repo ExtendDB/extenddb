@@ -49,7 +49,9 @@ the key slots. Physical column types are backend-specific:
   in `item_data JSONB`.
 - TiDB stores the hash-key slot as raw `VARBINARY(2048)`, sort-key slots as
   typed `VARBINARY(1024)` or `DECIMAL(65, 30)` columns, and the complete item in
-  `item_data JSON`.
+  `item_data JSON`. Fresh TiDB data tables are `PARTITION BY KEY(pk)` so TiDB
+  distributes rows by the DynamoDB HASH key while preserving the raw key bytes
+  used for point reads, Query, transaction locks, and stream shard assignment.
 
 PostgreSQL companion index tables are named `_ddb_<index_id>` and store the
 index key columns plus projected attributes. TiDB represents every DynamoDB
@@ -57,10 +59,12 @@ secondary index definition as generated key columns plus a native secondary
 index on the base data table; GSI versus LSI is API metadata, not a separate
 TiDB physical path. The native index contains the DynamoDB index key columns
 only because TiDB already carries the clustered row handle in secondary-index
-entries. Initial indexes are included in the physical TiDB `CREATE TABLE`;
-replay repairs an already-existing physical table with TiDB online
-`IF NOT EXISTS` DDL before activation, and later GSI changes use TiDB online
-DDL.
+entries. On fresh partitioned TiDB tables those native secondary indexes are
+declared `GLOBAL`, so an `IndexName` read uses one global TiDB index range
+instead of probing every partition. Initial indexes are included in the
+physical TiDB `CREATE TABLE`; replay repairs an already-existing physical
+table with TiDB online `IF NOT EXISTS` DDL before activation, and later GSI
+changes use TiDB online DDL.
 
 ### Schema Conventions
 

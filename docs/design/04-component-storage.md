@@ -606,9 +606,14 @@ schema has two broad categories:
   3072-byte native index limit. TiDB rejects configured key-size limits wider
   than that native shape, rejects multi-RANGE key schemas before catalog commit,
   and rejects multi-HASH values whose encoded tuple cannot fit in the raw
-  2048-byte hash-key slot. During `CreateTable` reconciliation, TiDB pre-splits
-  the clustered data table across the native binary key range before publishing
-  the catalog row `ACTIVE`, so a newly created DynamoDB table does not start all
+  2048-byte hash-key slot. The TiDB backend requires TiDB v8.5.4 or newer
+  because this native layout depends on non-unique `GLOBAL` secondary indexes.
+  Fresh TiDB data tables are native
+  `PARTITION BY KEY(pk)` tables, so TiDB hashes the DynamoDB partition-key slot
+  into physical partitions instead of relying on a custom hash prefix or raw
+  key locality. During `CreateTable` reconciliation, TiDB also pre-splits the
+  clustered data table across the native binary key range before publishing the
+  catalog row `ACTIVE`, so a newly created DynamoDB table does not start all
   writes on one Region.
 
 - **Sort key storage**: Sort key values use typed columns to ensure correct
@@ -658,8 +663,12 @@ schema has two broad categories:
   `ALTER TABLE` DDL job. After TiDB creates or repairs a native secondary
   index, ExtendDB asks TiDB to split that index by the generated hash-key prefix
   range, using TiDB Region split/scatter instead of companion index shards.
-  TiDB has no separate local-index physical path; GSI versus LSI remains
-  DynamoDB API metadata.
+  Fresh partitioned TiDB data tables declare native secondary indexes as
+  `GLOBAL`, so a DynamoDB `IndexName` read uses one global TiDB index range
+  instead of probing every physical partition. Older unpartitioned physical
+  tables keep plain native indexes during online repair because TiDB rejects
+  `GLOBAL` on non-partitioned tables. TiDB has no separate local-index physical
+  path for ExtendDB; GSI versus LSI remains DynamoDB API metadata.
 
 - **Table statistics**: TiDB does not cache table size or item count in the
   ExtendDB table catalog. `DescribeTable` and backup metadata read TiDB's
@@ -815,14 +824,17 @@ updates are always synchronous.
 **Implementation:**
 - TiDB stores each item once and uses generated columns plus native secondary
   indexes, leveraging TiDB's globally consistent transaction model. Initial
-  secondary indexes are created with the base table; create replay repairs an
-  already-existing physical table through the same TiDB online `IF NOT EXISTS`
-  DDL used for later changes, then splits both the clustered table keyspace and
-  the native index keyspace before activation. For each later reconciliation
-  pass, generated key columns for all pending indexes on a table are added in
-  one online `ALTER TABLE` DDL job before the native index DDL; after TiDB
-  finishes the index DDL, the reconciler splits the new native index Region
-  range as a TiDB-owned placement operation.
+  secondary indexes are created with the base table as TiDB `GLOBAL` indexes
+  over generated key columns; the base table itself is `PARTITION BY KEY(pk)`
+  so TiDB distributes data by the DynamoDB HASH key without changing the
+  DynamoDB-visible key encoding. Create replay repairs an already-existing
+  physical table through the same TiDB online `IF NOT EXISTS` DDL used for
+  later changes, then splits both the clustered table keyspace and the native
+  index keyspace before activation. For each later reconciliation pass,
+  generated key columns for all pending indexes on a table are added in one
+  online `ALTER TABLE` DDL job before the native index DDL; after TiDB finishes
+  the index DDL, the reconciler splits the new native index Region range as a
+  TiDB-owned placement operation.
 - Explicit TiDB index reads use `FORCE INDEX` for the generated native index.
   DynamoDB `IndexName` is not an optimizer suggestion; it is the requested read
   path, so stale TiDB statistics must not turn an index query into a table scan.

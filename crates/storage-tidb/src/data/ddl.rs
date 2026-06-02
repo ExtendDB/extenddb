@@ -16,7 +16,7 @@ use super::index::{
     native_index_name,
 };
 use super::{
-    DATA_TABLE_SPLIT_REGIONS, DECIMAL_SPLIT_LOWER, DECIMAL_SPLIT_UPPER,
+    DATA_TABLE_PARTITIONS, DATA_TABLE_SPLIT_REGIONS, DECIMAL_SPLIT_LOWER, DECIMAL_SPLIT_UPPER,
     DYNAMODB_HASH_KEY_COLUMN_BYTES, DYNAMODB_HASH_KEY_COLUMN_TYPE, DYNAMODB_SORT_KEY_COLUMN_BYTES,
     DYNAMODB_SORT_KEY_COLUMN_TYPE, VARBINARY_SPLIT_LOWER, all_sort_key_info, data_table_name,
     validate_native_key_schema_shape, varbinary_split_upper,
@@ -107,11 +107,14 @@ fn data_table_ddl(
         indexes, attr_defs,
     )?);
     definitions.push(format!("PRIMARY KEY ({}) CLUSTERED", pk_cols.join(", ")));
-    definitions.extend(native_index_create_table_definitions(indexes, attr_defs));
+    definitions.extend(native_index_create_table_definitions(
+        indexes, attr_defs, true,
+    ));
 
     Ok(format!(
-        "CREATE TABLE {ddb_table} (\n    {}\n) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
-        definitions.join(",\n    ")
+        "CREATE TABLE {ddb_table} (\n    {}\n) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin\n\
+         PARTITION BY KEY(pk) PARTITIONS {DATA_TABLE_PARTITIONS}",
+        definitions.join(",\n    "),
     ))
 }
 
@@ -634,7 +637,8 @@ mod tests {
 
         assert!(ddl.contains("PRIMARY KEY (pk) CLUSTERED"));
         assert!(ddl.contains("pk VARBINARY(2048) NOT NULL"));
-        assert!(ddl.ends_with("DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"));
+        assert!(ddl.contains("DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"));
+        assert!(ddl.ends_with("PARTITION BY KEY(pk) PARTITIONS 16"));
     }
 
     #[test]
@@ -695,9 +699,10 @@ mod tests {
         assert!(ddl.starts_with("CREATE TABLE `_ddb_tableid`"));
         assert!(ddl.contains("`edbidx_idx1_pk` VARBINARY(2048) AS"));
         assert!(ddl.contains("`edbidx_idx1_sk_b` VARBINARY(1024) AS"));
-        assert!(ddl.contains("INDEX `idx_idx1` (edbidx_idx1_pk, edbidx_idx1_sk_b)"));
+        assert!(ddl.contains("INDEX `idx_idx1` (edbidx_idx1_pk, edbidx_idx1_sk_b) GLOBAL"));
         assert!(!ddl.contains("IF NOT EXISTS"));
         assert!(!ddl.contains("ALTER TABLE"));
+        assert!(ddl.contains("PARTITION BY KEY(pk) PARTITIONS 16"));
     }
 
     #[test]

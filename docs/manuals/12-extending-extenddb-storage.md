@@ -141,7 +141,17 @@ Key design decisions:
   shape, and TiDB table/index creation rejects multi-RANGE key schemas instead
   of letting an impossible online DDL job fail later. Multi-HASH extension
   values are accepted only when their encoded tuple fits the raw 2048-byte
-  hash slot.
+  hash slot. TiDB v8.5.4 or newer is required because this layout depends on
+  non-unique `GLOBAL` secondary indexes. Fresh TiDB data tables should use
+  `PARTITION BY KEY(pk)` so TiDB distributes the raw DynamoDB HASH-key slot
+  natively, without adding an application hash prefix that would reduce the
+  legal key size or complicate point lookups.
+- **Partitioned TiDB data tables need global native indexes.** When the base
+  table is key-partitioned, generated-column secondary indexes should be
+  declared `GLOBAL` so GSI and LSI reads use one TiDB index range instead of a
+  partition-local fan-out. Online repair of older unpartitioned TiDB tables
+  must omit `GLOBAL`, because TiDB only accepts global indexes on partitioned
+  tables.
 - **Stream shard assignment** should not add a metadata read to every write
   when the backend has a fixed shard layout. The TiDB backend derives the shard
   id directly from the encoded partition-key tuple and uses TiDB's native TSO

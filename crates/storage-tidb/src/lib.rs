@@ -13,6 +13,7 @@ mod authorization_store;
 mod backup_engine;
 mod bootstrapper;
 mod catalog_store;
+mod cluster_capabilities;
 mod cluster_topology;
 pub mod config;
 mod create_table;
@@ -238,6 +239,7 @@ impl TidbEngine {
             &data_connection_string,
         )
         .await?;
+        cluster_capabilities::validate_tidb_capabilities(&data_pool).await?;
         let data_default_read_pool_options = tidb_default_read_pool_options_with_resource_group(
             data_pool_size,
             data_min_conns,
