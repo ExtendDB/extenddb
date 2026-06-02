@@ -13,7 +13,7 @@ use extenddb_core::validation;
 use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{SortKeyValue, parse_sk, sk_column, sk_info};
-use extenddb_storage::{TransactGetOp, TransactWriteOp};
+use extenddb_storage::{IdempotencyClaim, TransactGetOp, TransactWriteOp};
 
 use super::batch_write::{
     PreparedDelete, PreparedPut, execute_batch_deletes, execute_batch_puts, prepare_batch_delete,
@@ -123,11 +123,11 @@ impl TidbEngine {
     pub(crate) async fn transact_write_items_impl(
         &self,
         ops: &[TransactWriteOp<'_>],
-        token: Option<(&str, &str)>,
+        idempotency: Option<IdempotencyClaim<'_>>,
     ) -> Result<(), StorageError> {
-        if token.is_some() {
+        if idempotency.is_some() {
             match retry_tidb_idempotent_operation("transact_write_items", || async {
-                self.transact_write_items_once(ops, token).await
+                self.transact_write_items_once(ops, idempotency).await
             })
             .await
             {
@@ -135,14 +135,14 @@ impl TidbEngine {
                 result => result,
             }
         } else {
-            self.transact_write_items_once(ops, token).await
+            self.transact_write_items_once(ops, idempotency).await
         }
     }
 
     async fn transact_write_items_once(
         &self,
         ops: &[TransactWriteOp<'_>],
-        token: Option<(&str, &str)>,
+        idempotency: Option<IdempotencyClaim<'_>>,
     ) -> Result<(), StorageError> {
         let mut tx = self
             .data_pool
@@ -151,8 +151,9 @@ impl TidbEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         // Check idempotency token within the transaction.
-        if let Some((tok, fp)) = token {
-            check_idempotency_token_in_tx(&mut tx, tok, fp).await?;
+        if let Some(claim) = idempotency {
+            let storage_key = claim.storage_key();
+            check_idempotency_token_in_tx(&mut tx, &storage_key, claim.fingerprint).await?;
         }
 
         let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());

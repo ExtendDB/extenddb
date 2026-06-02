@@ -337,7 +337,7 @@ pub(super) async fn write_stream_record_in_tx(
 /// matching replays, `Err(IdempotentMismatch)` for fingerprint conflicts.
 pub(super) async fn check_idempotency_token_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    token: &str,
+    storage_key: &str,
     fingerprint: &str,
 ) -> Result<(), StorageError> {
     let row: Option<(String, bool)> = sqlx::query_as(
@@ -358,7 +358,7 @@ pub(super) async fn check_idempotency_token_in_tx(
             AND NOT EXISTS (SELECT 1 FROM ins)
           LIMIT 1",
     )
-    .bind(token)
+    .bind(storage_key)
     .bind(fingerprint)
     .fetch_optional(&mut **tx)
     .await

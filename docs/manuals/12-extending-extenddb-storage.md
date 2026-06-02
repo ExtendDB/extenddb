@@ -141,7 +141,7 @@ Key design decisions:
   plus an in-transaction ordinal as the sequence source instead of a per-shard
   counter row.
 - **Stream capture** is passed as `Option<&StreamCapture>`. When present, the stream record must be written in the same transaction as the data write.
-- **Idempotency tokens** for `TransactWriteItems` must be claimed atomically with the writes by inserting into a unique-key token table. Do not pre-select then insert; use the database's native duplicate-key result to distinguish a new token from a replay. Backends may use the token as a safe retry boundary for retryable transaction conflicts; without a token, avoid automatic retries that could duplicate non-idempotent updates after an ambiguous commit.
+- **Idempotency tokens** for `TransactWriteItems` must be claimed atomically with the writes by inserting an account-scoped claim into a unique-key token table. Do not pre-select then insert; use the database's native duplicate-key result to distinguish a new token from a replay. Backends may use the account-scoped claim as a safe retry boundary for retryable transaction conflicts; without a token, avoid automatic retries that could duplicate non-idempotent updates after an ambiguous commit.
 - **Items** are `BTreeMap<String, AttributeValue>`. A new backend must handle the full `AttributeValue` type (S, N, B, SS, NS, BS, L, M, BOOL, NULL).
 - **Query** must support forward/reverse sort order, exclusive start key pagination, and routing to secondary index storage.
 - **Parallel scan** uses `segment` and `total_segments` to partition the keyspace.
@@ -288,9 +288,12 @@ For fixed-retention data tables, such as TiDB stream records and transaction
 idempotency tokens, prefer native TTL over frontend cleanup indexes. Keep only
 indexes needed by read/write paths; TTL does not require an application-facing
 `created_at` lookup index. For same-token idempotency-window expiry, use one
-native primary-key upsert claim that atomically recycles an expired row and a
+native primary-key upsert claim on a backend-owned `(account_id,
+ClientRequestToken)` storage key that atomically recycles an expired row and a
 per-attempt `claim_id` to distinguish a newly claimed token from an in-window
-replay; do not put a cleanup delete on the transaction write path.
+replay; do not put a cleanup delete on the transaction write path. TiDB should
+use a hash-prefixed clustered key for this shared table so token claims from
+busy accounts do not concentrate in one key range.
 
 For append-only TiDB catalog tables without a clustered primary key, such as
 failed-login attempts, use TiDB `SHARD_ROW_ID_BITS` to scatter implicit row IDs

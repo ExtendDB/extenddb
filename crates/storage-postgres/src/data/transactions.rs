@@ -12,7 +12,7 @@ use extenddb_core::types::{
 use extenddb_core::validation;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::pk_to_text;
-use extenddb_storage::{TransactGetOp, TransactWriteOp};
+use extenddb_storage::{IdempotencyClaim, TransactGetOp, TransactWriteOp};
 
 use super::index::{
     IndexMeta, enqueue_async_indexes, fetch_indexes_for_table, pk_hash, sync_indexes,
@@ -73,7 +73,7 @@ impl PostgresEngine {
     pub(crate) async fn transact_write_items_impl(
         &self,
         ops: &[TransactWriteOp<'_>],
-        token: Option<(&str, &str)>,
+        idempotency: Option<IdempotencyClaim<'_>>,
     ) -> Result<(), StorageError> {
         // Pre-fetch indexes for each unique table involved in the transaction.
         let mut table_indexes: HashMap<String, Vec<IndexMeta>> = HashMap::new();
@@ -98,8 +98,9 @@ impl PostgresEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         // Check idempotency token within the transaction.
-        if let Some((tok, fp)) = token {
-            check_idempotency_token_in_tx(&mut tx, tok, fp).await?;
+        if let Some(claim) = idempotency {
+            let storage_key = claim.storage_key();
+            check_idempotency_token_in_tx(&mut tx, &storage_key, claim.fingerprint).await?;
         }
 
         let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());

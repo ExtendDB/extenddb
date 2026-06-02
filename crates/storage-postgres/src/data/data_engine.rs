@@ -8,8 +8,8 @@ use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, UpdateAction
 use extenddb_core::types::{IndexInfo, Item, TableKeyInfo};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{
-    DataEngine, ExportTableItemsSummary, ItemExportSink, StreamCapture, TransactGetOp,
-    TransactWriteOp,
+    DataEngine, ExportTableItemsSummary, IdempotencyClaim, ItemExportSink, StreamCapture,
+    TransactGetOp, TransactWriteOp,
 };
 use futures::future::BoxFuture;
 
@@ -127,9 +127,9 @@ impl DataEngine for PostgresEngine {
     fn transact_write_items<'a>(
         &'a self,
         ops: &'a [TransactWriteOp<'a>],
-        token: Option<(&'a str, &'a str)>,
+        idempotency: Option<IdempotencyClaim<'a>>,
     ) -> BoxFuture<'a, Result<(), StorageError>> {
-        Box::pin(self.transact_write_items_impl(ops, token))
+        Box::pin(self.transact_write_items_impl(ops, idempotency))
     }
 
     fn cleanup_expired_idempotency_tokens(

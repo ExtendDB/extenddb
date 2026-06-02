@@ -57,6 +57,41 @@ pub type StreamRecordsResult = Result<(Vec<StreamRecord>, Option<String>), Stora
 /// Stream list result: summaries plus an optional next exclusive start ARN.
 pub type StreamListResult = Result<(Vec<StreamSummary>, Option<String>), StorageError>;
 
+/// Account-scoped idempotency claim for `TransactWriteItems`.
+///
+/// The client request token is only unique within one authenticated account.
+/// Shared data-plane token tables must therefore claim an account-scoped
+/// storage key, not the raw client token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdempotencyClaim<'a> {
+    /// Authenticated account issuing the transaction.
+    pub account_id: &'a str,
+    /// Raw DynamoDB `ClientRequestToken`.
+    pub token: &'a str,
+    /// Fingerprint of the transaction payload under the client token.
+    pub fingerprint: &'a str,
+}
+
+impl IdempotencyClaim<'_> {
+    /// Return the collision-free, hash-prefixed key stored in shared token tables.
+    ///
+    /// The CRC32 prefix is a placement prefix only; uniqueness comes from the
+    /// netstring-encoded `(account_id, token)` payload. This keeps TiDB's
+    /// clustered primary key distributed without making correctness depend on
+    /// the hash.
+    pub fn storage_key(&self) -> String {
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(self.account_id.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(self.token.as_bytes());
+        let hash = hasher.finalize();
+        format!(
+            "{hash:08x}:{}",
+            util::encode_netstring_composite(&[self.account_id, self.token])
+        )
+    }
+}
+
 /// Summary returned after a storage-owned table export.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExportTableItemsSummary {
@@ -460,8 +495,9 @@ pub trait DataEngine: Send + Sync {
     /// When `stream` is `Some`, stream records for each write operation are
     /// inserted in the same transaction as the data writes.
     ///
-    /// When `token` is `Some`, the idempotency token is checked and stored
-    /// in the same transaction as the writes, guaranteeing atomicity.
+    /// When `idempotency` is `Some`, the account-scoped idempotency claim is
+    /// checked and stored in the same transaction as the writes, guaranteeing
+    /// atomicity.
     ///
     /// # Errors
     ///
@@ -473,7 +509,7 @@ pub trait DataEngine: Send + Sync {
     fn transact_write_items<'a>(
         &'a self,
         ops: &'a [TransactWriteOp<'a>],
-        token: Option<(&'a str, &'a str)>,
+        idempotency: Option<IdempotencyClaim<'a>>,
     ) -> BoxFuture<'a, Result<(), StorageError>>;
 
     /// Delete idempotency tokens older than the given age in seconds.
@@ -847,6 +883,53 @@ mod tests {
     fn data_engine_is_dyn_compatible_with_borrowed_futures() {
         // This function just needs to compile - it's never called.
         fn _assert_dyn(_: Arc<dyn DataEngine>) {}
+    }
+
+    #[test]
+    fn idempotency_claim_storage_key_is_account_scoped() {
+        let first = IdempotencyClaim {
+            account_id: "111111111111",
+            token: "same-token",
+            fingerprint: "fp",
+        }
+        .storage_key();
+        let second = IdempotencyClaim {
+            account_id: "222222222222",
+            token: "same-token",
+            fingerprint: "fp",
+        }
+        .storage_key();
+
+        assert_ne!(first, second);
+        assert!(first.ends_with("12:111111111111,10:same-token,"));
+        assert!(second.ends_with("12:222222222222,10:same-token,"));
+    }
+
+    #[test]
+    fn idempotency_claim_storage_key_uses_hash_prefix_for_distribution_only() {
+        let key = IdempotencyClaim {
+            account_id: "acct",
+            token: "token",
+            fingerprint: "fp",
+        }
+        .storage_key();
+
+        let (prefix, encoded) = key.split_once(':').expect("hash-prefixed key");
+        assert_eq!(prefix.len(), 8);
+        assert!(prefix.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(encoded, "4:acct,5:token,");
+    }
+
+    #[test]
+    fn idempotency_claim_storage_key_fits_tidb_token_column() {
+        let key = IdempotencyClaim {
+            account_id: "a1234567890123456789012345678901",
+            token: "b12345678901234567890123456789012345",
+            fingerprint: "fp",
+        }
+        .storage_key();
+
+        assert!(key.len() <= 255);
     }
 
     #[derive(Clone, Default)]

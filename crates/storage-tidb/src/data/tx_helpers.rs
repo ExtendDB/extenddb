@@ -601,12 +601,12 @@ pub(crate) async fn finalize_pending_stream_records_for_shard(
 /// already elapsed but the background TTL job has not removed it yet.
 pub(super) async fn check_idempotency_token_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    token: &str,
+    storage_key: &str,
     fingerprint: &str,
 ) -> Result<(), StorageError> {
     let claim_id = uuid::Uuid::new_v4().to_string();
     sqlx::query(idempotency_token_claim_sql())
-        .bind(token)
+        .bind(storage_key)
         .bind(fingerprint)
         .bind(&claim_id)
         .execute(&mut **tx)
@@ -618,7 +618,7 @@ pub(super) async fn check_idempotency_token_in_tx(
          WHERE token = ? \
          FOR UPDATE",
     )
-    .bind(token)
+    .bind(storage_key)
     .fetch_optional(&mut **tx)
     .await
     .map_err(|e| StorageError::Internal(e.to_string()))?;

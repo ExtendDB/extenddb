@@ -140,9 +140,10 @@ pub fn sk_info<'a>(
 ///
 /// Format: `<len>:<value>,<len>:<value>,...` — e.g., `"abc"` + `"de"` → `"3:abc,2:de,"`.
 /// This encoding is unambiguous for arbitrary byte content and contains no null bytes.
-pub fn encode_netstring_composite(parts: &[String]) -> String {
+pub fn encode_netstring_composite<S: AsRef<str>>(parts: &[S]) -> String {
     let mut out = String::new();
     for p in parts {
+        let p = p.as_ref();
         out.push_str(&p.len().to_string());
         out.push(':');
         out.push_str(p);

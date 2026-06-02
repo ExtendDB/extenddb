@@ -27,6 +27,7 @@ use extenddb_core::types::{
 use extenddb_core::validation::{
     validate_attribute_name_sizes, validate_item_size, validate_key_sizes,
 };
+use extenddb_storage::IdempotencyClaim;
 
 /// Maximum number of items in a single `TransactWriteItems` request.
 const MAX_TRANSACT_WRITE_ITEMS: usize = 100;
@@ -142,12 +143,16 @@ pub async fn handle_transact_write_items(
         validate_client_request_token(token)?;
     }
 
-    let token_pair = input
+    let idempotency = input
         .client_request_token
         .as_deref()
-        .map(|t| (t, fingerprint.as_str()));
+        .map(|t| IdempotencyClaim {
+            account_id: &ctx.account_id,
+            token: t,
+            fingerprint: fingerprint.as_str(),
+        });
 
-    match ctx.storage.transact_write_items(&ops, token_pair).await {
+    match ctx.storage.transact_write_items(&ops, idempotency).await {
         Ok(()) => {}
         Err(extenddb_storage::error::StorageError::IdempotentReplay) => {
             let output = TransactWriteItemsOutput {

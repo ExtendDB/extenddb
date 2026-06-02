@@ -1036,12 +1036,14 @@ but the exact segment mapping is intentionally backend-specific.
 
 ## 9. Idempotency Token Storage
 
-`TransactWriteItems` supports `ClientRequestToken` for idempotency. Tokens are stored in a dedicated table:
+`TransactWriteItems` supports `ClientRequestToken` for idempotency. The raw client token is scoped by the authenticated
+account before it is stored, because two accounts can legally use the same client token. Tokens are stored in a dedicated
+table:
 
 ```sql
 CREATE TABLE _dynamodb_idempotency_tokens (
-    client_request_token <string> PRIMARY KEY,
-    response <json> NOT NULL,
+    token <string> PRIMARY KEY,
+    fingerprint <string> NOT NULL,
     created_at <timestamp> NOT NULL DEFAULT <current_timestamp>
 );
 ```
@@ -1061,6 +1063,10 @@ CREATE TABLE _dynamodb_idempotency_tokens (
 Storage backends must not implement this as a preflight `SELECT` followed by
 `INSERT`: under multiple frontend writers, both transactions can observe a
 missing row. The unique key is the distributed race detector.
+
+The physical primary key is a backend-owned storage key derived from `(account_id, ClientRequestToken)`, not the raw
+client token. TiDB prefixes that collision-free encoded value with a stable hash placement prefix so the clustered
+primary key distributes naturally across Regions while uniqueness still comes from the encoded account/token payload.
 
 TiDB uses the token as the retry boundary for retryable write-conflict,
 deadlock, lock-timeout, and schema-change errors. When a token is present,
