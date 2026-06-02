@@ -4,28 +4,42 @@
 
 ## Current Status
 
-ExtendDB 0.1.0 currently expects PostgreSQL catalog version 0.0.3. Existing
-0.0.2 catalogs are upgraded in place by `extenddb migrate`.
+ExtendDB 0.1.0 defaults to the TiDB backend and currently expects TiDB catalog
+version 0.0.26. Existing TiDB catalogs are upgraded in place by
+`extenddb migrate`.
 
 ## How Catalog Upgrades Work
 
 ### The Migration System
 
-Migrations are SQL files in `crates/storage-postgres/migrations/`, applied in filename order:
+TiDB catalog migrations are SQL files in `crates/storage-tidb/migrations/`,
+applied in filename order:
 
 ```
-001_schema.sql                  ← complete initial schema
-002_drop_continuous_backups.sql ← removes unsupported PITR state
+001_schema.sql                         ← complete initial schema
+...
+026_simplify_control_plane_queue_index.sql
 ```
 
-The `schema_history` table tracks which files have been applied. When `extenddb migrate` runs, it:
+TiDB data-plane migrations live separately in
+`crates/storage-tidb/data_migrations/` because the catalog database and data
+database are separate TiDB databases on the same cluster timeline:
+
+```
+001_data_schema.sql
+002_presplit_shared_data_tables.sql
+004_stream_record_bucket_splits.sql
+005_idempotency_token_native_layout.sql
+```
+
+The `schema_history` table tracks which catalog files have been applied. When `extenddb migrate` runs, it:
 
 1. Reads all migration files embedded in the binary (via `include_str!`)
 2. Checks `schema_history` for each filename
 3. Applies any unapplied migrations in order
 4. Records each applied filename in `schema_history`
 
-Running `extenddb migrate` on an up-to-date catalog is a no-op.
+Running `extenddb migrate` on an up-to-date catalog/data database is a no-op.
 
 ### The Catalog Version
 
@@ -33,10 +47,10 @@ A single row in the `settings` table stores the catalog version:
 
 ```sql
 SELECT value FROM settings WHERE key = 'catalog_version';
--- '0.0.3'
+-- '0.0.26'
 ```
 
-The binary embeds an expected catalog version (`CATALOG_VERSION` constant in `crates/storage-postgres/src/lib.rs`). At startup, the server compares the database value against the binary's expectation. If they don't match, the server refuses to start and directs the operator to run `extenddb migrate`.
+The binary embeds an expected catalog version (`CATALOG_VERSION` constant in `crates/storage-tidb/src/lib.rs`). At startup, the server compares the database value against the binary's expectation. If they don't match, the server refuses to start and directs the operator to run `extenddb migrate`.
 
 ### Version Semantics
 
@@ -55,7 +69,7 @@ When you need to change the catalog schema, here's the process:
 Add a new SQL file with the next sequence number:
 
 ```
-crates/storage-postgres/migrations/003_your_feature.sql
+crates/storage-tidb/migrations/027_your_feature.sql
 ```
 
 The file should be a single transaction:
@@ -63,7 +77,7 @@ The file should be a single transaction:
 ```sql
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
--- Migration 003: Brief description of what this adds/changes.
+-- Migration 027: Brief description of what this adds/changes.
 
 BEGIN;
 
@@ -71,38 +85,38 @@ BEGIN;
 ALTER TABLE tables ADD COLUMN IF NOT EXISTS new_column TEXT;
 
 -- Bump the catalog version.
-UPDATE settings SET value = '0.1.0' WHERE key = 'catalog_version';
+UPDATE settings SET value = '0.0.27' WHERE key = 'catalog_version';
 
 COMMIT;
 ```
 
 ### 2. Register it in the migration runner
 
-Add the file to `CATALOG_MIGRATIONS` in `crates/storage-postgres/src/migrations.rs`:
+Add the file to `CATALOG_MIGRATIONS` in `crates/storage-tidb/src/migrations.rs`:
 
 ```rust
 pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
     (
         "001_schema.sql",
-        include_str!("../../storage-postgres/migrations/001_schema.sql"),
+        include_str!("../../storage-tidb/migrations/001_schema.sql"),
     ),
     (
-        "002_drop_continuous_backups.sql",
-        include_str!("../../storage-postgres/migrations/002_drop_continuous_backups.sql"),
+        "026_simplify_control_plane_queue_index.sql",
+        include_str!("../../storage-tidb/migrations/026_simplify_control_plane_queue_index.sql"),
     ),
     (
-        "003_your_feature.sql",
-        include_str!("../../storage-postgres/migrations/003_your_feature.sql"),
+        "027_your_feature.sql",
+        include_str!("../../storage-tidb/migrations/027_your_feature.sql"),
     ),
 ];
 ```
 
 ### 3. Bump the catalog version constant
 
-In `crates/storage-postgres/src/lib.rs`:
+In `crates/storage-tidb/src/lib.rs`:
 
 ```rust
-pub const CATALOG_VERSION: CatalogVersion = CatalogVersion::new(0, 1, 0);
+pub const CATALOG_VERSION: CatalogVersion = CatalogVersion::new(0, 0, 27);
 ```
 
 This must match the version written by your migration's `UPDATE settings` statement.
@@ -117,7 +131,7 @@ The consolidated schema file is what fresh installs get. Add your new column/tab
 
 **Backward compatibility.** Prefer additive changes (new columns with defaults, new tables) over destructive ones (dropping columns, renaming tables). A running server on the old binary should survive the schema change until it's restarted with the new binary.
 
-**Transaction boundaries.** Wrap each migration in `BEGIN`/`COMMIT`. If any statement fails, the entire migration rolls back and the catalog stays at the previous version.
+**TiDB online DDL.** Prefer TiDB online DDL and idempotent `IF EXISTS` / `IF NOT EXISTS` statements. Do not add frontend locks or per-node migration ownership; TiDB owns distributed DDL scheduling.
 
 **No data migrations in DDL files.** If a schema change requires backfilling data, do it in Rust code triggered by `extenddb migrate`, not in raw SQL. This gives you error handling, progress reporting, and the ability to batch large updates.
 
@@ -135,18 +149,17 @@ For future releases that include catalog changes:
 extenddb stop --config extenddb.toml
 ```
 
-2. **Back up databases**
+2. **Back up TiDB**
 
-```bash
-pg_dump extenddb_catalog > catalog_backup_$(date +%Y%m%d).sql
-pg_dump extenddb > data_backup_$(date +%Y%m%d).sql
-```
+Use the configured `[storage.tidb.backup]` BR path, or run TiDB BR directly for
+cluster-level backup. Do not use frontend row-copy backup as a substitute for
+TiDB's physical backup path.
 
 3. **Build the new version**
 
 ```bash
 git pull
-cargo build --release
+cargo build -j12 --release
 ```
 
 4. **Run migrations**
@@ -172,30 +185,24 @@ extenddb serve --config extenddb.toml
 If an upgrade fails:
 
 1. Stop the server
-2. Restore from backup:
-
-```bash
-psql -c "DROP DATABASE extenddb_catalog;"
-psql -c "CREATE DATABASE extenddb_catalog OWNER extenddb;"
-psql -d extenddb_catalog -f catalog_backup_YYYYMMDD.sql
-```
+2. Restore with TiDB BR to a safe recovery cluster or restore the affected
+   databases through the configured native BR path.
 
 3. Rebuild the previous version and start it
 
 ## Version History
 
-### Catalog 0.0.3 (Current)
+### TiDB Catalog 0.0.26 (Current)
 
-Removes the unsupported `continuous_backups` catalog table. Backends now report
-disabled PITR state directly after resolving the table catalog row; enabling
-PITR still returns an explicit unsupported error until a backend can provide the
-DynamoDB table-level restore shape faithfully.
+Simplifies the TiDB control-plane transition queue index while preserving
+idempotent replay through TiDB-native online DDL scheduling.
 
-### Catalog 0.0.2 (Initial Release)
+### Earlier TiDB Catalog Versions
 
-Complete schema: accounts, tables, indexes, tags, streams, IAM (users, groups, roles, policies, access keys, sessions, permissions boundaries), idempotency tokens, metrics, login attempts, backups, TTL support, settings.
-
-No prior versions exist. All deployments are fresh installs.
+Earlier TiDB catalog versions introduced native BR metadata, native TTL state,
+binary-collated catalog defaults, append-table pre-splitting, authentication
+lookup indexes, raw data hash-key columns, and removal of legacy frontend
+control-plane leases and metrics tables.
 
 ---
 

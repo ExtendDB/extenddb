@@ -92,7 +92,7 @@ extenddb (bin)
 ### Build
 
 ```bash
-cargo build --release
+cargo build -j12 --release
 ```
 
 Binary: `target/release/extenddb`
@@ -166,7 +166,7 @@ Tests live in `tests/` and use pytest. They run against either ExtendDB or Amazo
 
 ```bash
 # 1. Build and initialize (first time)
-cargo build --release
+cargo build -j12 --release
 ./target/release/extenddb init --config extenddb.toml
 # Save the admin password!
 

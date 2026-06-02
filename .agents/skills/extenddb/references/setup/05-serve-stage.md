@@ -75,4 +75,4 @@ Common causes, with pointers to the troubleshooting skill for detail:
 - Port 8000 already in use. Consult ``references/troubleshooting/01-symptom-index.md``, symptom "Address already in use."
 - TLS certificate missing or unreadable. Consult ``references/troubleshooting/01-symptom-index.md``, symptom "Failed to load TLS certificates."
 - Config file permissions too open. Consult ``references/troubleshooting/01-symptom-index.md``, symptom "Config file permissions too open."
-- Postgres unreachable. Consult ``references/postgres/01-readiness-checks.md``.
+- TiDB unreachable. Consult ``references/tidb/01-readiness-checks.md``.

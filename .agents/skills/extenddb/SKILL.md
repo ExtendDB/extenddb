@@ -15,7 +15,8 @@ Determine what the user needs and load the appropriate reference domain:
 | User intent | Domain | Entry point |
 |---|---|---|
 | Install, build, init, serve, first IAM user | **setup** | Start at state detection below |
-| PostgreSQL not ready, pg_isready fails | **postgres** | `references/postgres/01-readiness-checks.md` |
+| TiDB not ready, MySQL client cannot connect to port 4000 | **tidb** | `references/tidb/01-readiness-checks.md` |
+| Explicit PostgreSQL backend issue | **postgres** | `references/postgres/01-readiness-checks.md` |
 | Configure AWS CLI or SDK, first CRUD round trip | **first-request** | `references/first-request/01-aws-cli-config.md` |
 | Run sample_app.py or stream_consumer.py | **samples** | `references/samples/01-venv-setup.md` |
 | Error message, stack trace, unexpected behavior | **troubleshooting** | `references/troubleshooting/01-symptom-index.md` |
@@ -37,7 +38,7 @@ Run `uname -s` and branch on the output.
 Run `bash scripts/detect-state.sh`. The script prints one of five resume-point words on stdout.
 
 - `dependencies`: binary absent. Load `references/setup/02-dependency-checks.md` then `references/setup/03-build-stage.md`.
-- `postgres`: binary built but `extenddb.toml` absent. Verify Postgres readiness (see postgres domain), then load `references/setup/04-init-stage.md`.
+- `tidb`: binary built but `extenddb.toml` absent. Verify TiDB readiness (see TiDB domain), then load `references/setup/04-init-stage.md`.
 - `init`: `extenddb.toml` exists but TLS cert absent. Partial-init state. Load `references/setup/04-init-stage.md` with destroy-first warning.
 - `iam`: server running. Load `references/setup/06-iam-first-user.md`.
 - `running-server-stopped`: config and TLS present but server not running. Offer start (`references/setup/05-serve-stage.md`) or reinit (`references/setup/04-init-stage.md`).
@@ -46,15 +47,23 @@ Run `bash scripts/detect-state.sh`. The script prints one of five resume-point w
 
 1. Dependencies: `references/setup/02-dependency-checks.md`
 2. Build: `references/setup/03-build-stage.md`
-3. PostgreSQL readiness: route to postgres domain on failure
+3. TiDB readiness: route to TiDB domain on failure
 4. `extenddb init`: `references/setup/04-init-stage.md`
 5. `extenddb serve`: `references/setup/05-serve-stage.md`
 6. First IAM user: `references/setup/06-iam-first-user.md`
 7. First CRUD: route to first-request domain
 
+## TiDB domain
+
+Load when the default TiDB backend cannot be reached or the MySQL/TiDB client is missing.
+
+- `references/tidb/01-readiness-checks.md`: mysql client, TiDB SQL endpoint, local TiUP playground, remote TiDB connection flags
+
+Return to the setup domain (init stage) when TiDB is confirmed ready.
+
 ## Postgres domain
 
-Load when `pg_isready -q` exits nonzero or the user reports a Postgres connectivity issue.
+Load only when the user explicitly selects the PostgreSQL backend or reports a Postgres connectivity issue.
 
 - `references/postgres/01-readiness-checks.md`: pg_isready, pg_ctl status, socket vs TCP checks
 - `references/postgres/02-from-scratch.md`: full install from PGDG or Homebrew (only when no Postgres exists)
@@ -116,7 +125,7 @@ Ask the user to paste relevant lines back and retry the lookup.
 
 ## Non-destructive operation reminder
 
-This skill presents commands but does not execute state-changing operations (`extenddb init`, `extenddb serve`, `extenddb destroy`, `cargo build`, `chmod`, `kill`). The user reviews each command before invoking it. Read-only checks (`pg_isready -q`, `extenddb status`, `which cargo`, `test -f`, `bash scripts/detect-state.sh`) are the only commands this skill runs directly.
+This skill presents commands but does not execute state-changing operations (`extenddb init`, `extenddb serve`, `extenddb destroy`, `cargo build`, `chmod`, `kill`). The user reviews each command before invoking it. Read-only checks (`mysql -h 127.0.0.1 -P 4000 -uroot -e "SELECT VERSION();"`, `extenddb status`, `which cargo`, `test -f`, `bash scripts/detect-state.sh`) are the only commands this skill runs directly.
 
 ## Reference file index
 
@@ -125,11 +134,13 @@ This skill presents commands but does not execute state-changing operations (`ex
 | **Setup** | |
 | `references/setup/01-environment-state.md` | Detection algorithm, state-to-stage mapping |
 | `references/setup/02-dependency-checks.md` | Per-dependency checks, minimum versions, install hints |
-| `references/setup/03-build-stage.md` | Binary presence check, `cargo build --release`, install scripts |
+| `references/setup/03-build-stage.md` | Binary presence check, `cargo build -j12 --release`, install scripts |
 | `references/setup/04-init-stage.md` | `extenddb init`, six artifacts, re-init rules, `extenddb verify` |
 | `references/setup/05-serve-stage.md` | `extenddb serve`, status confirmation, log commands |
 | `references/setup/06-iam-first-user.md` | create-user, put-user-policy, create-access-key |
 | `references/setup/07-platform-commands.md` | Linux and macOS command table |
+| **TiDB** | |
+| `references/tidb/01-readiness-checks.md` | mysql client, TiDB SQL endpoint, TiUP playground |
 | **Postgres** | |
 | `references/postgres/01-readiness-checks.md` | pg_isready, pg_ctl status, socket/TCP |
 | `references/postgres/02-from-scratch.md` | PGDG and Homebrew install paths |

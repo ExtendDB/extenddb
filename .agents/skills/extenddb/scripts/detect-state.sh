@@ -16,7 +16,7 @@
 # any file, and it does not kill any process.
 #
 # Output contract:
-#   stdout: exactly one of: dependencies | postgres | init | iam |
+#   stdout: exactly one of: dependencies | tidb | init | iam |
 #           running-server-stopped
 #   stderr: a human-readable one-line summary of what was detected
 #   exit 0: a state was detected successfully
@@ -58,8 +58,8 @@ fi
 
 # Step 2: Has `extenddb init` been run (produces extenddb.toml)?
 if ! test -f "${EXTENDDB_TOML}"; then
-    echo "detected state: extenddb binary present, ${EXTENDDB_TOML} absent; resume at postgres stage" 1>&2
-    echo "postgres"
+    echo "detected state: extenddb binary present, ${EXTENDDB_TOML} absent; resume at tidb stage" 1>&2
+    echo "tidb"
     exit 0
 fi
 

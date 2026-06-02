@@ -19,31 +19,34 @@ cp extenddb.sample.toml extenddb.toml
 
 ### `error connecting to server: Connection refused`
 
-**Cause:** PostgreSQL is not running or not listening on the configured host/port.
+**Cause:** TiDB is not running, not reachable, or the configured `storage.tidb.connection_string` points at the wrong SQL endpoint.
 
 **Fix:**
 ```bash
-pg_ctl -D ~/pgdata status          # check if running
-pg_ctl -D ~/pgdata -l ~/pgdata/server.log start  # start it
+mysql -h 127.0.0.1 -P 4000 -uroot -e "SELECT VERSION();"
 ```
+
+For local development, start TiDB with `tiup playground v8.5.4 --db 1 --pd 1 --kv 3 --without-monitor`, or pass the remote TiDB SQL endpoint to `extenddb init` with `--storage-host` and `--storage-port`.
 
 ### `password authentication failed for user "extenddb"`
 
-**Cause:** The PostgreSQL `extenddb` user doesn't exist or the password doesn't match.
+**Cause:** The TiDB `extenddb` SQL user doesn't exist, the password doesn't match, or the config points at a TiDB cluster that was not initialized by this deployment.
 
 **Fix:**
 ```bash
-psql -U $(id -nu) -d postgres -c "CREATE USER extenddb WITH PASSWORD 'extenddb-local-dev';"
-psql -U $(id -nu) -d postgres -c "CREATE DATABASE extenddb OWNER extenddb;"
+./target/release/extenddb init \
+  --storage-host <tidb-host> \
+  --storage-port 4000 \
+  --storage-admin-user <tidb-admin-user>
 ```
 
-See `docs/local-postgres-setup.md` for full setup instructions.
+Use `--storage-admin-password <password>` for remote TiDB clusters that require an admin password.
 
 ### `migration failed: ...`
 
 **Cause:** The storage database exists but the migration SQL failed (permissions, schema conflicts, etc.).
 
-**Fix:** Check the PostgreSQL logs (`~/pgdata/server.log`). Ensure the `extenddb` user has CREATE TABLE permissions on the `extenddb` database.
+**Fix:** Check TiDB DDL/job state and SQL connectivity. Ensure the `extenddb` SQL user can create tables, indexes, generated columns, TTL metadata, and run the TiDB-specific migrations in the catalog and data databases.
 
 ### `Catalog version mismatch: expected X, found Y. Run 'extenddb migrate' to update.`
 

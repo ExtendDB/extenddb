@@ -34,7 +34,7 @@ extenddb/
 cargo build
 
 # Release build
-cargo build --release
+cargo build -j12 --release
 
 # Check without building
 cargo check

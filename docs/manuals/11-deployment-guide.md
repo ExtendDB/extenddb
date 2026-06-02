@@ -108,7 +108,7 @@ Example Dockerfile:
 FROM rust:1.85 AS builder
 WORKDIR /src
 COPY . .
-RUN cargo build --release
+RUN cargo build -j12 --release
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates tini && rm -rf /var/lib/apt/lists/*

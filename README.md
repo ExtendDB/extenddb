@@ -29,7 +29,7 @@ A DynamoDB-compatible API adapter, ExtendDB speaks the DynamoDB wire protocol â€
 
 ```bash
 # Build
-cargo build --release
+cargo build -j12 --release
 
 # Initialize against TiDB (creates databases, admin credentials, TLS cert, config file)
 ./target/release/extenddb init

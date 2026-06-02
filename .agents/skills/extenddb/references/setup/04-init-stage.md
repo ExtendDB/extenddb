@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`extenddb init` bootstraps a fresh deployment in a single command. It creates the Postgres user and two databases, generates the AES-256-GCM encryption key, provisions the admin user, emits a self-signed TLS certificate, and writes `extenddb.toml` to the repository root. The admin username, admin password, and account ID are printed to stdout exactly once. None of the three values can be retrieved later, so credential capture is part of this stage, not an afterthought.
+`extenddb init` bootstraps a fresh deployment in a single command. With the default TiDB backend, it creates the TiDB application SQL user and two databases, generates the AES-256-GCM encryption key, provisions the admin user, emits a self-signed TLS certificate, and writes `extenddb.toml` to the repository root. The admin username, admin password, and account ID are printed to stdout exactly once. None of the three values can be retrieved later, so credential capture is part of this stage, not an afterthought.
 
 ## Prerequisite check
 
@@ -14,9 +14,9 @@ First, check whether a config file is already present at the repo root.
 test -f extenddb.toml && echo "extenddb.toml already exists" || echo "extenddb.toml absent"
 ```
 
-`extenddb.toml` on its own does not block `extenddb init`. If `extenddb.toml` exists, `init` loads defaults from it and continues. The real blocker is whether the `extenddb_catalog` and `extenddb` data databases exist in PostgreSQL.
+`extenddb.toml` on its own does not block `extenddb init`. If `extenddb.toml` exists, `init` loads defaults from it and continues. The real blocker is whether the `extenddb_catalog` and `extenddb` data databases exist in TiDB.
 
-Second, check whether a prior deployment is present in PostgreSQL.
+Second, check whether a prior deployment is present in TiDB.
 
 ```bash
 ./target/release/extenddb status --config extenddb.toml
@@ -28,7 +28,7 @@ If `extenddb status` reports a deployment, `extenddb init` will abort with:
 Database '<name>' already exists. Run 'extenddb destroy --config <config>' first, then re-run 'extenddb init'.
 ```
 
-This abort is driven by the PostgreSQL databases, not by `extenddb.toml`. The docs are explicit: "`extenddb init` will abort if either the catalog or data database already exists" (`docs/getting-started.md`), and "`extenddb init` detected that the catalog or data database already exists in PostgreSQL" (`docs/troubleshooting.md`).
+This abort is driven by the TiDB databases, not by `extenddb.toml`. The docs are explicit: "`extenddb init` will abort if either the catalog or data database already exists" (`docs/getting-started.md`).
 
 To clear the blocker, drop both databases:
 
@@ -74,15 +74,15 @@ Once the prerequisite check confirms no prior deployment, present the standard c
 ./target/release/extenddb init
 ```
 
-The default flags work for a local PostgreSQL instance running on the same host with peer or ident authentication. Remote Postgres and Aurora variants are below.
+The default flags work for a local TiDB SQL endpoint on `localhost:4000` using the `root` admin user with no password, which matches local TiUP playground defaults. Remote TiDB variants are below.
 
 ## The six artifacts init creates
 
 | Artifact | Where |
 |---|---|
-| `extenddb` PostgreSQL user | Postgres server |
-| `extenddb_catalog` database | Postgres server |
-| `extenddb` data database | Postgres server |
+| `extenddb` TiDB SQL user | TiDB cluster |
+| `extenddb_catalog` database | TiDB cluster |
+| `extenddb` data database | TiDB cluster |
 | AES-256-GCM encryption key | `~/.extenddb/keys/master.key` (confirm exact path from init output) |
 | Admin user with one-time password | Printed to stdout once |
 | Self-signed TLS certificate | `~/.extenddb/tls/cert.pem` and `~/.extenddb/tls/key.pem` |
@@ -93,19 +93,19 @@ Init also writes `extenddb.toml` at the repository root.
 
 > IMPORTANT. The admin username, admin password, and account ID are printed to stdout exactly once during `extenddb init`. The admin password cannot be retrieved later. Copy all three values to a password manager or secure note before continuing.
 
-## Remote PostgreSQL or Aurora variant
+## Remote TiDB variant
 
-If the user's Postgres is not local, supply connection flags explicitly.
+If the user's TiDB SQL endpoint is not local, supply connection flags explicitly.
 
 ```bash
 ./target/release/extenddb init \
-    --pg-host <hostname> \
-    --pg-port 5432 \
-    --pg-user <postgres-superuser> \
-    --pg-pass <password>
+    --storage-host <hostname> \
+    --storage-port 4000 \
+    --storage-admin-user <tidb-admin-user> \
+    --storage-admin-password <password>
 ```
 
-> The `--pg-pass` flag is visible in `ps` output on shared hosts. In shared environments, prefer the `PGPASSWORD` environment variable or a `.pgpass` file. See ``references/postgres/03-connection-strings.md`` for the full set of connection patterns.
+> The `--storage-admin-password` flag is visible in `ps` output on shared hosts. In shared environments, prefer running init from a trusted shell/session.
 
 ## Custom catalog database name
 
@@ -113,7 +113,7 @@ If the user's Postgres is not local, supply connection flags explicitly.
 ./target/release/extenddb init --catalog-db my_catalog
 ```
 
-The default `extenddb_catalog` works for most users. Override only when a naming convention or multi-tenant Postgres arrangement requires it.
+The default `extenddb_catalog` works for most users. Override only when a naming convention or multi-tenant TiDB arrangement requires it.
 
 ## Post-init verification
 

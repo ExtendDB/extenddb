@@ -509,7 +509,7 @@ RUN apk add --no-cache musl-dev
 RUN rustup target add x86_64-unknown-linux-musl
 WORKDIR /app
 COPY . .
-RUN cargo build --release --target x86_64-unknown-linux-musl -p extenddb-bin
+RUN cargo build -j12 --release --target x86_64-unknown-linux-musl -p extenddb-bin
 
 FROM scratch
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/extenddb /extenddb

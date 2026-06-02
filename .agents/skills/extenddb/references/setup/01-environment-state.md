@@ -14,7 +14,7 @@ The script runs four checks in order and falls through on the first one that fai
    - succeeds -> continue
 
 2. test -f ${REPO_ROOT}/extenddb.toml
-   - fails    -> "postgres"
+   - fails    -> "tidb"
    - succeeds -> continue
 
 3. test -f ${HOME}/.extenddb/tls/cert.pem
@@ -31,7 +31,7 @@ The script runs four checks in order and falls through on the first one that fai
 | Binary | `extenddb.toml` | Cert | `extenddb status` | Resume point | Requirement |
 |---|---|---|---|---|---|
 | absent | n/a | n/a | n/a | `dependencies` | 3 |
-| present | absent | n/a | n/a | `postgres` | 5 |
+| present | absent | n/a | n/a | `tidb` | 5 |
 | present | present | absent | n/a | `init` (warn about partial state) | 6 |
 | present | present | present | running | `iam` | 8 |
 | present | present | present | stopped | `running-server-stopped` (choice: start or reinit) | 7 or 6 |
@@ -48,15 +48,15 @@ The script prints the resume point on stdout and a human-readable summary on std
 
 ### `dependencies`
 
-The extenddb binary is absent at `${REPO_ROOT}/target/release/extenddb`. The user has not completed the build stage, and upstream stages (dependency check, Postgres readiness, init, serve) have not started either. Load `references/setup/02-dependency-checks.md` next to walk the user through Rust, Postgres, and Python 3 verification, and load `references/setup/03-build-stage.md` after that for the `cargo build --release` command.
+The extenddb binary is absent at `${REPO_ROOT}/target/release/extenddb`. The user has not completed the build stage, and upstream stages (dependency check, TiDB readiness, init, serve) have not started either. Load `references/setup/02-dependency-checks.md` next to walk the user through Rust, TiDB, and Python 3 verification, and load `references/setup/03-build-stage.md` after that for the `cargo build -j12 --release` command.
 
-### `postgres`
+### `tidb`
 
-The binary is present, but `${REPO_ROOT}/extenddb.toml` is absent. The user has built extenddb but has not yet run `extenddb init`. Load `references/setup/02-dependency-checks.md` to verify `pg_isready` reports ready, then hand off to `references/postgres/01-readiness-checks.md` if Postgres is not ready. Once Postgres is confirmed ready, load `references/setup/04-init-stage.md` for the init walkthrough.
+The binary is present, but `${REPO_ROOT}/extenddb.toml` is absent. The user has built extenddb but has not yet run `extenddb init`. Load `references/setup/02-dependency-checks.md` to verify a MySQL-compatible client is present and TiDB is reachable, then hand off to `references/tidb/01-readiness-checks.md` if TiDB is not ready. Once TiDB is confirmed ready, load `references/setup/04-init-stage.md` for the init walkthrough.
 
 ### `init`
 
-The binary and `extenddb.toml` are present, but `${HOME}/.extenddb/tls/cert.pem` is absent. This is a partial-init state: `extenddb init` completed far enough to create the `extenddb_catalog` and `extenddb` data databases in PostgreSQL (and almost certainly the admin user and encryption key) but did not emit the self-signed TLS cert. Warn the user that re-running `extenddb init` will abort with a "`Database '<name>' already exists`" error because the databases are still there. `extenddb destroy --config extenddb.toml --yes` drops both databases; run it first, then re-run `extenddb init`. Load `references/setup/04-init-stage.md` for the destroy-and-reinit sequence and the one-time credential capture warning.
+The binary and `extenddb.toml` are present, but `${HOME}/.extenddb/tls/cert.pem` is absent. This is a partial-init state: `extenddb init` completed far enough to create the `extenddb_catalog` and `extenddb` data databases in TiDB (and almost certainly the admin user and encryption key) but did not emit the self-signed TLS cert. Warn the user that re-running `extenddb init` will abort with a "`Database '<name>' already exists`" error because the databases are still there. `extenddb destroy --config extenddb.toml --yes` drops both databases; run it first, then re-run `extenddb init`. Load `references/setup/04-init-stage.md` for the destroy-and-reinit sequence and the one-time credential capture warning.
 
 Alternative path: if the user saved the admin credentials from the prior init run, they may be able to regenerate only the TLS cert pair with `openssl` (per `docs/getting-started.md`) and avoid destroying the databases. `references/setup/04-init-stage.md` covers both paths.
 
@@ -70,4 +70,4 @@ The binary, `extenddb.toml`, and TLS cert are all present, but `extenddb status`
 
 ## Override by the user
 
-The user can override the detection by naming a stage explicitly, for example, "skip detection, start at init." File presence is a weak signal, and a user may know their environment better than the detector. The valid stage names the user can name are `dependencies`, `build`, `postgres`, `init`, `serve`, `iam`, and `first-request`. When the user overrides, load the reference file for the named stage and skip the detection output.
+The user can override the detection by naming a stage explicitly, for example, "skip detection, start at init." File presence is a weak signal, and a user may know their environment better than the detector. The valid stage names the user can name are `dependencies`, `build`, `tidb`, `init`, `serve`, `iam`, and `first-request`. When the user overrides, load the reference file for the named stage and skip the detection output.

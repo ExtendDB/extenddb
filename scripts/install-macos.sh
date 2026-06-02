@@ -4,7 +4,7 @@
 # Install script for extenddb on macOS.
 #
 # What this script does:
-#   1. Checks dependencies (Rust toolchain, PostgreSQL, Python 3).
+#   1. Checks dependencies (Rust toolchain, TiDB/MySQL client, Python 3).
 #   2. Creates a Python venv and installs doc-build requirements.
 #   3. Builds extenddb in release mode.
 #   4. Builds PDF documentation.
@@ -55,21 +55,22 @@ else
     MISSING=1
 fi
 
-# PostgreSQL (Homebrew)
-if command -v psql &>/dev/null; then
-    PG_VER="$(psql --version | awk '{print $3}')"
-    info "PostgreSQL client: $PG_VER"
+# TiDB/MySQL client (Homebrew)
+if command -v mysql &>/dev/null; then
+    MYSQL_VER="$(mysql --version)"
+    info "TiDB/MySQL client: $MYSQL_VER"
 else
-    fail "PostgreSQL not found. Install via: brew install postgresql@17"
+    fail "TiDB/MySQL client not found. Install via: brew install mysql-client"
     MISSING=1
 fi
 
-# pg_isready — verify server is reachable
-if command -v pg_isready &>/dev/null; then
-    if pg_isready -q 2>/dev/null; then
-        info "PostgreSQL server: accepting connections"
+# TiDB SQL endpoint readiness. This is a warning, not a build blocker, because
+# users may initialize against a remote TiDB endpoint after the install step.
+if command -v mysql &>/dev/null; then
+    if mysql -h 127.0.0.1 -P 4000 -uroot -e "SELECT VERSION();" >/dev/null 2>&1; then
+        info "TiDB SQL endpoint: accepting connections on 127.0.0.1:4000"
     else
-        warn "PostgreSQL server not accepting connections. Start it: brew services start postgresql@17"
+        warn "TiDB SQL endpoint not reachable on 127.0.0.1:4000. Start TiDB before running extenddb init, for example: tiup playground v8.5.4 --db 1 --pd 1 --kv 3 --without-monitor"
     fi
 fi
 
@@ -110,7 +111,7 @@ echo
 
 echo -e "${BOLD}Building extenddb (release mode)...${RESET}"
 
-cargo build --release --manifest-path "$PROJECT_ROOT/Cargo.toml"
+cargo build -j12 --release --manifest-path "$PROJECT_ROOT/Cargo.toml"
 info "Built target/release/extenddb"
 echo
 
@@ -138,8 +139,8 @@ echo "PDF documentation:"
 echo "  $PDF_DIR/"
 echo
 echo "Next steps:"
-echo "  1. Ensure PostgreSQL is running: pg_isready"
-echo "  2. Initialize: extenddb init --catalog-db extenddb_catalog --storage-admin-user $(whoami)"
+echo "  1. Ensure TiDB is reachable: mysql -h 127.0.0.1 -P 4000 -uroot -e 'SELECT VERSION();'"
+echo "  2. Initialize: extenddb init"
 echo "  3. Verify:     extenddb verify --config extenddb.toml"
 echo "  4. Start:      extenddb serve --config extenddb.toml"
 echo

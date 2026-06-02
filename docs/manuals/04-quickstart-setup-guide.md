@@ -17,7 +17,7 @@ This section gets you from zero to a working extenddb instance as fast as possib
 ```bash
 # 1. Clone and build
 git clone <repo-url> extenddb && cd extenddb
-cargo build --release
+cargo build -j12 --release
 
 # 2. Initialize (creates databases, admin user, TLS cert, config file)
 ./target/release/extenddb init
@@ -104,7 +104,7 @@ defaults.
 cargo build
 
 # Release build (slower compilation, optimized runtime)
-cargo build --release
+cargo build -j12 --release
 ```
 
 The binary is at `target/release/extenddb` (or `target/debug/extenddb`).
@@ -155,7 +155,7 @@ Expected output:
 --- Checking catalog connection...
   OK: Connected to catalog.
 --- Checking catalog version...
-  OK: Catalog version 0.0.3
+  OK: Catalog version 0.0.26
 --- Checking data database...
   OK: Connected to data database 'extenddb_catalog_data'.
 --- Enumerating tables...

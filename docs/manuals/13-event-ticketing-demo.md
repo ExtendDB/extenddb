@@ -38,7 +38,7 @@ brew install awscli
 
 ```bash
 cd /path/to/ExtendDB
-cargo build --release --workspace
+cargo build -j12 --release --workspace
 ```
 
 ---

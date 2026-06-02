@@ -600,7 +600,9 @@ schema has two broad categories:
   no separate physical table per secondary index
 
 **Schema files:**
-- Catalog schema: `crates/storage-postgres/migrations/001_schema.sql`
+- TiDB catalog schema: `crates/storage-tidb/migrations/001_schema.sql`
+- TiDB data schema: `crates/storage-tidb/data_migrations/001_data_schema.sql`
+- PostgreSQL catalog schema: `crates/storage-postgres/migrations/001_schema.sql`
 - Data table DDL generation:
   `crates/storage-postgres/src/data/ddl.rs` and
   `crates/storage-tidb/src/data/ddl.rs`
@@ -1592,7 +1594,7 @@ Run the full test suite:
 
 ```bash
 # Build with new backend
-cargo build --release
+cargo build -j12 --release
 
 # Initialize with SQLite backend
 ./target/release/extenddb init --config extenddb.toml

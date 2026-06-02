@@ -27,55 +27,51 @@ If you prefer to run each step yourself, follow the sections below.
 ## Prerequisites
 
 - Rust 1.85+ (`rustup update`)
-- PostgreSQL 14+ via Homebrew (`brew install postgresql@17`)
+- TiDB 8.5.4+ and a MySQL-compatible client via Homebrew (`brew install mysql-client`)
 - Python 3.10+ (for test suites)
 - AWS CLI v2 (for testing)
 
-## 1. Start PostgreSQL
+## 1. Install a TiDB client and start TiDB
 
-Using `brew services` (recommended — survives reboots):
+Install a MySQL-compatible client:
 
 ```bash
-brew services start postgresql@17
+brew install mysql-client
 ```
 
-Or manually:
+Start a local TiDB playground in a separate terminal, or use an existing TiDB
+cluster:
 
 ```bash
-pg_ctl -D /opt/homebrew/var/postgresql@17 \
-       -l /opt/homebrew/var/postgresql@17/server.log start
+tiup playground v8.5.4 --db 1 --pd 1 --kv 3 --without-monitor
 ```
 
 Verify it's accepting connections:
 
 ```bash
-pg_isready
-# /tmp:5432 - accepting connections
+mysql -h 127.0.0.1 -P 4000 -uroot -e "SELECT VERSION();"
 ```
-
-On Homebrew macOS the superuser is your macOS username (`$(whoami)`), not
-`postgres`, and uses trust auth over the local socket.
 
 ## 2. Build extenddb
 
 ```bash
-cargo build --release
+cargo build -j12 --release
 ```
 
 Binary lands at `target/release/extenddb`.
 
 ## 3. Initialize the deployment
 
-`extenddb init` creates the PostgreSQL `extenddb` role, the catalog and data
+`extenddb init` creates the TiDB `extenddb` SQL user, the catalog and data
 databases, applies schema migrations, generates an encryption key,
 creates a default account + admin user, and writes `extenddb.toml` for you.
 Do **not** hand-write `extenddb.toml` before running `init`.
 
-On macOS you must tell `init` which PostgreSQL user to connect as for
-the `CREATE ROLE` / `CREATE DATABASE` steps — your macOS username:
+For local TiUP playground, the default TiDB admin user is `root` with no
+password, so no storage flags are needed:
 
 ```bash
-./target/release/extenddb init --storage-admin-user $(whoami)
+./target/release/extenddb init
 ```
 
 This prints the admin credentials **once**. Save them — they cannot be
@@ -96,7 +92,7 @@ Expected:
 ```
 === extenddb verify ===
 ...
-  OK: Catalog version 0.0.3
+  OK: Catalog version 0.0.26
 ...
 === HEALTHY: All checks passed ===
 ```
@@ -154,7 +150,7 @@ catalog, `extenddb serve` refuses to start and `extenddb verify` reports a
 version mismatch. Apply migrations:
 
 ```bash
-cargo build --release
+cargo build -j12 --release
 ./target/release/extenddb migrate --config extenddb.toml
 ```
 
@@ -166,7 +162,7 @@ No data is lost; only the catalog schema is updated.
 # Stop the server
 ./target/release/extenddb stop --config extenddb.toml
 
-# Drop both databases and the extenddb role
+# Drop both databases and the extenddb SQL user
 ./target/release/extenddb destroy --config extenddb.toml --yes
 ```
 
@@ -174,9 +170,9 @@ No data is lost; only the catalog schema is updated.
 
 | Item               | Linux                          | macOS (Homebrew)                                    |
 |--------------------|--------------------------------|-----------------------------------------------------|
-| PG admin user      | `postgres` (or custom)         | Your macOS username (`$(whoami)`), no password       |
-| `extenddb init` flags  | defaults usually fine          | pass `--storage-admin-user $(whoami)`                          |
-| Service manager    | `systemctl` / `pg_ctl`         | `brew services` or `pg_ctl`                         |
+| TiDB admin user    | `root` for local TiUP playground | `root` for local TiUP playground                 |
+| `extenddb init` flags  | no storage flags for local playground | no storage flags for local playground        |
+| Local TiDB process | `tiup playground ...`          | `tiup playground ...`                               |
 | Syslog reader      | `journalctl -t extenddb`           | `log stream --predicate 'processImagePath ENDSWITH "extenddb"'` |
 
 ## Troubleshooting
@@ -185,8 +181,9 @@ No data is lost; only the catalog schema is updated.
 |--------------------------------------------------------|---------------------------------------------------------------------|
 | `connection refused` on port 8000                      | Server not running. `./target/release/extenddb serve --config extenddb.toml`|
 | `Catalog version X.Y.Z (binary expects A.B.C)`        | `./target/release/extenddb migrate --config extenddb.toml`                  |
-| `role "extenddb" does not exist` during init               | Re-run with `--storage-admin-user $(whoami)`                                   |
-| DROP DATABASE hangs after hard kill                    | Check for lingering backends: `ps -eo pid,command \| grep postgres` |
+| `Cannot connect as admin` during init                  | Confirm TiDB is reachable: `mysql -h 127.0.0.1 -P 4000 -uroot -e "SELECT VERSION();"` |
+| TiDB version is too old                                | Upgrade TiDB to 8.5.4+ so native non-unique `GLOBAL` indexes are available |
+| DROP DATABASE hangs after hard kill                    | Check for lingering sessions with TiDB statement/processlist diagnostics |
 
 See `docs/troubleshooting.md` for the full troubleshooting guide.
 

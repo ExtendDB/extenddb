@@ -45,7 +45,7 @@ tiup playground v8.5.4 --db 1 --pd 1 --kv 3 --without-monitor
 ## 1. Build extenddb
 
 ```bash
-cargo build --release
+cargo build -j12 --release
 ```
 
 The binary is at `target/release/extenddb`.
@@ -154,7 +154,7 @@ You should see all checks pass:
 --- Checking catalog connection...
   OK: Connected to catalog.
 --- Checking catalog version...
-  OK: Catalog version 0.0.3
+  OK: Catalog version 0.0.26
 --- Checking data database...
   OK: Connected to data database 'extenddb_catalog_data'.
 --- Enumerating tables...
