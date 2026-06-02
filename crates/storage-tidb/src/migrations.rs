@@ -126,23 +126,6 @@ const DATA_STREAM_RECORD_BUCKET_SPLITS_MIGRATION: &str =
     include_str!("../../storage-tidb/data_migrations/004_stream_record_bucket_splits.sql");
 const DATA_IDEMPOTENCY_TOKEN_NATIVE_LAYOUT_MARKER_MIGRATION: &str =
     include_str!("../../storage-tidb/data_migrations/005_idempotency_token_native_layout.sql");
-const IDEMPOTENCY_TOKEN_NATIVE_LAYOUT_MIGRATION: &str = "006_idempotency_token_native_layout.sql";
-const IDEMPOTENCY_TOKEN_NATIVE_TABLE_DDL: &str = r"
-CREATE TABLE IF NOT EXISTS idempotency_tokens_native (
-    token_id    BIGINT NOT NULL AUTO_RANDOM(4),
-    token       VARCHAR(255) NOT NULL,
-    token_hash  BIGINT UNSIGNED AS (CRC32(token)) STORED,
-    fingerprint TEXT NOT NULL,
-    claim_id    VARCHAR(36) NOT NULL,
-    created_at  TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (token_id) CLUSTERED,
-    UNIQUE KEY uk_idempotency_tokens_token ((TIDB_SHARD(token_hash)), token_hash, token)
-) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
-  PRE_SPLIT_REGIONS = 4
-  TTL = `created_at` + INTERVAL 600 SECOND TTL_JOB_INTERVAL = '10m';
-
-ALTER TABLE idempotency_tokens_native ATTRIBUTES 'merge_option=deny';
-";
 pub(crate) const DATA_MIGRATIONS: &[(&str, &str)] = &[
     ("001_data_schema.sql", DATA_SCHEMA_MIGRATION),
     (
@@ -243,10 +226,9 @@ pub(crate) async fn run_data_migrations(pool: &MySqlPool) -> OpResult<()> {
     }
     drop_legacy_stream_shards(pool).await?;
     ensure_stream_commit_sequence(pool).await?;
-    ensure_idempotency_token_claims(pool).await?;
-    ensure_idempotency_token_native_layout(pool).await?;
-    ensure_data_table_binary_defaults(pool).await?;
     validate_stream_records_auto_random_handle(pool).await?;
+    validate_idempotency_token_native_layout(pool).await?;
+    ensure_data_table_binary_defaults(pool).await?;
     validate_dynamodb_hash_key_column_layout(pool).await?;
     ensure_shared_data_table_region_merge_option(pool).await?;
     ensure_user_data_table_region_merge_option(pool).await?;
@@ -355,120 +337,31 @@ async fn ensure_stream_commit_sequence(pool: &MySqlPool) -> OpResult<()> {
     Ok(())
 }
 
-async fn ensure_idempotency_token_claims(pool: &MySqlPool) -> OpResult<()> {
+async fn validate_idempotency_token_native_layout(pool: &MySqlPool) -> OpResult<()> {
     if !table_exists(pool, "idempotency_tokens").await? {
+        return Err(incompatible_idempotency_token_layout_error(
+            "missing idempotency_tokens table".to_owned(),
+        ));
+    }
+    if idempotency_token_layout_is_native(pool).await? {
         return Ok(());
     }
 
-    sqlx::query(
-        "ALTER TABLE idempotency_tokens \
-         ADD COLUMN IF NOT EXISTS claim_id VARCHAR(36) NOT NULL DEFAULT '' \
-         AFTER fingerprint",
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| OpError::Internal(format!("Configure TiDB idempotency token claims: {e}")))?;
-
-    Ok(())
+    Err(incompatible_idempotency_token_layout_error(
+        idempotency_token_layout_summary(pool).await?,
+    ))
 }
 
-async fn ensure_idempotency_token_native_layout(pool: &MySqlPool) -> OpResult<()> {
-    if !table_exists(pool, "idempotency_tokens").await? {
-        return Ok(());
-    }
-    if idempotency_token_layout_is_native(pool, "idempotency_tokens").await? {
-        cleanup_idempotency_token_rebuild_tables(pool).await?;
-        record_data_migration(pool, IDEMPOTENCY_TOKEN_NATIVE_LAYOUT_MIGRATION).await?;
-        return Ok(());
-    }
-
-    run_sql_script(
-        pool,
-        IDEMPOTENCY_TOKEN_NATIVE_TABLE_DDL,
-        IDEMPOTENCY_TOKEN_NATIVE_LAYOUT_MIGRATION,
-    )
-    .await?;
-
-    sqlx::query(idempotency_token_native_copy_sql())
-        .execute(pool)
-        .await
-        .map_err(|e| OpError::Internal(format!("Copy TiDB idempotency tokens: {e}")))?;
-
-    if idempotency_token_layout_is_native(pool, "idempotency_tokens").await? {
-        cleanup_idempotency_token_rebuild_tables(pool).await?;
-        record_data_migration(pool, IDEMPOTENCY_TOKEN_NATIVE_LAYOUT_MIGRATION).await?;
-        return Ok(());
-    }
-
-    let rename = sqlx::query(
-        "RENAME TABLE \
-         idempotency_tokens TO idempotency_tokens_legacy, \
-         idempotency_tokens_native TO idempotency_tokens",
-    )
-    .execute(pool)
-    .await;
-
-    if let Err(error) = rename {
-        if idempotency_token_layout_is_native(pool, "idempotency_tokens").await? {
-            cleanup_idempotency_token_rebuild_tables(pool).await?;
-            record_data_migration(pool, IDEMPOTENCY_TOKEN_NATIVE_LAYOUT_MIGRATION).await?;
-            return Ok(());
-        }
-        return Err(OpError::Internal(format!(
-            "Rebuild TiDB idempotency token layout: {error}"
-        )));
-    }
-
-    cleanup_idempotency_token_rebuild_tables(pool).await?;
-    sqlx::query("ALTER TABLE idempotency_tokens ATTRIBUTES 'merge_option=deny'")
-        .execute(pool)
-        .await
-        .map_err(|e| {
-            OpError::Internal(format!(
-                "Configure TiDB idempotency token Region merge option: {e}"
-            ))
-        })?;
-    record_data_migration(pool, IDEMPOTENCY_TOKEN_NATIVE_LAYOUT_MIGRATION).await?;
-    Ok(())
-}
-
-fn idempotency_token_native_copy_sql() -> &'static str {
-    "INSERT IGNORE INTO idempotency_tokens_native \
-         (token, fingerprint, claim_id, created_at) \
-     SELECT \
-         CASE \
-             WHEN token REGEXP '^[0-9a-fA-F]{8}:' THEN SUBSTRING(token, 10) \
-             ELSE token \
-         END AS token, \
-         fingerprint, \
-         claim_id, \
-         created_at \
-     FROM idempotency_tokens"
-}
-
-async fn cleanup_idempotency_token_rebuild_tables(pool: &MySqlPool) -> OpResult<()> {
-    for table in ["idempotency_tokens_native", "idempotency_tokens_legacy"] {
-        let sql = format!("DROP TABLE IF EXISTS {table}");
-        sqlx::query(&sql).execute(pool).await.map_err(|e| {
-            OpError::Internal(format!(
-                "Clean up TiDB idempotency token rebuild table: {e}"
-            ))
-        })?;
-    }
-    Ok(())
-}
-
-async fn idempotency_token_layout_is_native(pool: &MySqlPool, table_name: &str) -> OpResult<bool> {
+async fn idempotency_token_layout_is_native(pool: &MySqlPool) -> OpResult<bool> {
     let token_id: Option<(String, String, String, Option<String>)> = sqlx::query_as(
         "SELECT c.COLUMN_TYPE, c.IS_NULLABLE, c.COLUMN_KEY, t.TIDB_ROW_ID_SHARDING_INFO \
          FROM information_schema.columns c \
          JOIN information_schema.tables t \
            ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME \
          WHERE c.TABLE_SCHEMA = DATABASE() \
-           AND c.TABLE_NAME = ? \
+           AND c.TABLE_NAME = 'idempotency_tokens' \
            AND c.COLUMN_NAME = 'token_id'",
     )
-    .bind(table_name)
     .fetch_optional(pool)
     .await
     .map_err(|e| OpError::Internal(format!("Inspect TiDB idempotency token handle: {e}")))?;
@@ -490,10 +383,9 @@ async fn idempotency_token_layout_is_native(pool: &MySqlPool, table_name: &str) 
         "SELECT COLUMN_TYPE, EXTRA, GENERATION_EXPRESSION \
          FROM information_schema.columns \
          WHERE TABLE_SCHEMA = DATABASE() \
-           AND TABLE_NAME = ? \
+           AND TABLE_NAME = 'idempotency_tokens' \
            AND COLUMN_NAME = 'token_hash'",
     )
-    .bind(table_name)
     .fetch_optional(pool)
     .await
     .map_err(|e| OpError::Internal(format!("Inspect TiDB idempotency token hash: {e}")))?;
@@ -510,22 +402,36 @@ async fn idempotency_token_layout_is_native(pool: &MySqlPool, table_name: &str) 
         return Ok(false);
     }
 
-    idempotency_token_unique_index_is_native(pool, table_name).await
+    let claim_id: Option<(String, String)> = sqlx::query_as(
+        "SELECT COLUMN_TYPE, IS_NULLABLE \
+         FROM information_schema.columns \
+         WHERE TABLE_SCHEMA = DATABASE() \
+           AND TABLE_NAME = 'idempotency_tokens' \
+           AND COLUMN_NAME = 'claim_id'",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| OpError::Internal(format!("Inspect TiDB idempotency token claim: {e}")))?;
+
+    let Some((column_type, is_nullable)) = claim_id else {
+        return Ok(false);
+    };
+    if !column_type.eq_ignore_ascii_case("varchar(36)") || !is_nullable.eq_ignore_ascii_case("NO") {
+        return Ok(false);
+    }
+
+    idempotency_token_unique_index_is_native(pool).await
 }
 
-async fn idempotency_token_unique_index_is_native(
-    pool: &MySqlPool,
-    table_name: &str,
-) -> OpResult<bool> {
+async fn idempotency_token_unique_index_is_native(pool: &MySqlPool) -> OpResult<bool> {
     let rows: Vec<(i64, Option<String>, Option<String>, i64)> = sqlx::query_as(
         "SELECT SEQ_IN_INDEX, COLUMN_NAME, EXPRESSION, NON_UNIQUE \
          FROM information_schema.statistics \
          WHERE TABLE_SCHEMA = DATABASE() \
-           AND TABLE_NAME = ? \
+           AND TABLE_NAME = 'idempotency_tokens' \
            AND INDEX_NAME = 'uk_idempotency_tokens_token' \
          ORDER BY SEQ_IN_INDEX",
     )
-    .bind(table_name)
     .fetch_all(pool)
     .await
     .map_err(|e| OpError::Internal(format!("Inspect TiDB idempotency token index: {e}")))?;
@@ -547,6 +453,68 @@ async fn idempotency_token_unique_index_is_native(
         && rows[1].1.as_deref() == Some("token_hash")
         && rows[2].0 == 3
         && rows[2].1.as_deref() == Some("token"))
+}
+
+#[derive(sqlx::FromRow)]
+struct IdempotencyTokenLayoutColumn {
+    column_name: String,
+    column_type: String,
+    is_nullable: String,
+    column_key: String,
+    generation_expression: Option<String>,
+    row_id_sharding_info: Option<String>,
+}
+
+async fn idempotency_token_layout_summary(pool: &MySqlPool) -> OpResult<String> {
+    let columns: Vec<IdempotencyTokenLayoutColumn> = sqlx::query_as(
+        "SELECT c.COLUMN_NAME AS column_name, \
+                    c.COLUMN_TYPE AS column_type, \
+                    c.IS_NULLABLE AS is_nullable, \
+                    c.COLUMN_KEY AS column_key, \
+                    c.GENERATION_EXPRESSION AS generation_expression, \
+                    t.TIDB_ROW_ID_SHARDING_INFO AS row_id_sharding_info \
+             FROM information_schema.columns c \
+             JOIN information_schema.tables t \
+               ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME \
+             WHERE c.TABLE_SCHEMA = DATABASE() \
+               AND c.TABLE_NAME = 'idempotency_tokens' \
+               AND c.COLUMN_NAME IN ('token_id', 'token_hash', 'claim_id') \
+             ORDER BY c.COLUMN_NAME",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| OpError::Internal(format!("Inspect TiDB idempotency token layout: {e}")))?;
+
+    if columns.is_empty() {
+        return Ok("missing token_id, token_hash, and claim_id columns".to_owned());
+    }
+
+    let details = columns
+        .into_iter()
+        .map(|column| {
+            format!(
+                "{}: type={}, nullable={}, key={}, generated={}, row_id_sharding_info={}",
+                column.column_name,
+                column.column_type,
+                column.is_nullable,
+                column.column_key,
+                column.generation_expression.unwrap_or_default(),
+                column.row_id_sharding_info.unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    Ok(details)
+}
+
+fn incompatible_idempotency_token_layout_error(observed: String) -> OpError {
+    OpError::Internal(format!(
+        "TiDB idempotency_tokens must use native AUTO_RANDOM clustered token_id primary key, \
+         generated token_hash = CRC32(token), NOT NULL claim_id, and a \
+         TIDB_SHARD unique token index; {observed}. Recreate the TiDB data database \
+         with the current ExtendDB TiDB schema before serving distributed transaction writes."
+    ))
 }
 
 async fn ensure_data_table_binary_defaults(pool: &MySqlPool) -> OpResult<()> {
@@ -853,10 +821,9 @@ mod tests {
     use super::{
         CATALOG_MIGRATIONS, CATALOG_REGION_MERGE_DENY_TABLES, DATA_MIGRATIONS,
         DATA_NATIVE_TTL_LOOKUP_INDEX_DROPS, DATA_REGION_MERGE_DENY_TABLES, DATA_SCHEMA_MIGRATION,
-        IDEMPOTENCY_TOKEN_NATIVE_LAYOUT_MIGRATION, IDEMPOTENCY_TOKEN_NATIVE_TABLE_DDL,
         MIGRATION_SESSION_INIT_STATEMENTS, TIDB_BINARY_COLLATION_TABLE_OPTION,
-        dynamodb_hash_key_column_needs_rebuild, idempotency_token_native_copy_sql,
-        incompatible_dynamodb_hash_key_column_error, incompatible_stream_record_layout_error,
+        dynamodb_hash_key_column_needs_rebuild, incompatible_dynamodb_hash_key_column_error,
+        incompatible_idempotency_token_layout_error, incompatible_stream_record_layout_error,
         should_apply_consolidated_catalog_schema,
     };
     use crate::{CATALOG_VERSION, data::USER_TABLE_FULL_KEYSPACE_SPLITS_MIGRATION};
@@ -1244,19 +1211,21 @@ mod tests {
     }
 
     #[test]
-    fn idempotency_token_native_rebuild_is_a_dynamic_data_migration() {
-        assert_eq!(
-            IDEMPOTENCY_TOKEN_NATIVE_LAYOUT_MIGRATION,
-            "006_idempotency_token_native_layout.sql"
-        );
+    fn idempotency_token_native_layout_is_validated_not_rebuilt() {
         assert!(
             DATA_MIGRATIONS
                 .iter()
-                .all(|(filename, _)| *filename != IDEMPOTENCY_TOKEN_NATIVE_LAYOUT_MIGRATION)
+                .all(|(filename, _)| *filename != "006_idempotency_token_native_layout.sql")
         );
-        assert!(IDEMPOTENCY_TOKEN_NATIVE_TABLE_DDL.contains("AUTO_RANDOM(4)"));
-        assert!(IDEMPOTENCY_TOKEN_NATIVE_TABLE_DDL.contains("TIDB_SHARD(token_hash)"));
-        assert!(IDEMPOTENCY_TOKEN_NATIVE_TABLE_DDL.contains("PRE_SPLIT_REGIONS = 4"));
+
+        let OpError::Internal(error) = incompatible_idempotency_token_layout_error(
+            "token_id: type=varchar(255), nullable=NO, key=PRI".to_owned(),
+        ) else {
+            panic!("expected internal migration error");
+        };
+        assert!(error.contains("AUTO_RANDOM clustered token_id primary key"));
+        assert!(error.contains("TIDB_SHARD unique token index"));
+        assert!(error.contains("Recreate the TiDB data database"));
     }
 
     #[test]
@@ -1315,15 +1284,6 @@ mod tests {
         ));
         assert!(DATA_SCHEMA_MIGRATION.contains("PRIMARY KEY (token_id) CLUSTERED"));
         assert!(DATA_SCHEMA_MIGRATION.contains("PRE_SPLIT_REGIONS = 4"));
-    }
-
-    #[test]
-    fn idempotency_token_native_rebuild_strips_legacy_hash_prefix() {
-        let sql = idempotency_token_native_copy_sql();
-
-        assert!(sql.contains("INSERT IGNORE INTO idempotency_tokens_native"));
-        assert!(sql.contains("token REGEXP '^[0-9a-fA-F]{8}:'"));
-        assert!(sql.contains("SUBSTRING(token, 10)"));
     }
 
     #[test]

@@ -1146,7 +1146,8 @@ layout: `idempotency_tokens` uses an `AUTO_RANDOM` clustered `token_id`, a
 generated `token_hash = CRC32(token)` column, and a unique
 `(TIDB_SHARD(token_hash), token_hash, token)` token index. Fresh schemas use
 `PRE_SPLIT_REGIONS` and `merge_option=deny` for the scattered row handle, and
-startup repair rebuilds older clustered-token tables into this native shape.
+startup validation rejects older clustered-token tables instead of rebuilding
+the table behind concurrent distributed writers.
 The write path claims with one `INSERT ... ON DUPLICATE KEY UPDATE`; the
 follow-up lock/read includes `TIDB_SHARD(token_hash)`, `token_hash`, and
 `token`, so TiDB serves it as a unique-index point lookup instead of scanning
