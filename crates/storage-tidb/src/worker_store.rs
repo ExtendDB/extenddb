@@ -30,6 +30,12 @@ type PendingIndexRow = (String, String, String, serde_json::Value);
 
 const CONTROL_PLANE_TRANSITION_CONCURRENCY: usize = 16;
 const CONTROL_PLANE_TRANSITION_SCAN_LIMIT: i64 = 256;
+const CONTROL_PLANE_TRANSITION_CANDIDATES_SQL: &str = r"SELECT table_status, table_name, table_id, table_arn
+               FROM tables
+              WHERE table_status IN ('CREATING', 'UPDATING', 'DELETING')
+                AND status_transition_at <= CURRENT_TIMESTAMP(6)
+              ORDER BY status_transition_at, table_name
+              LIMIT ?";
 
 struct CreateReconcilePlan {
     table_name: String,
@@ -594,23 +600,12 @@ impl TidbEngine {
     pub async fn process_control_plane_transitions(
         &self,
     ) -> Result<Vec<(String, &'static str)>, StorageError> {
-        let candidates: Vec<ControlPlaneTransitionRow> = sqlx::query_as(
-            r"SELECT table_status, table_name, table_id, table_arn
-               FROM tables
-              WHERE (table_status = 'CREATING'
-                     AND status_transition_at <= CURRENT_TIMESTAMP(6))
-                 OR (table_status = 'UPDATING'
-                     AND (status_transition_at IS NULL
-                          OR status_transition_at <= CURRENT_TIMESTAMP(6)))
-                 OR (table_status = 'DELETING'
-                     AND status_transition_at <= CURRENT_TIMESTAMP(6))
-              ORDER BY status_transition_at, table_name
-              LIMIT ?",
-        )
-        .bind(CONTROL_PLANE_TRANSITION_SCAN_LIMIT)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let candidates: Vec<ControlPlaneTransitionRow> =
+            sqlx::query_as(CONTROL_PLANE_TRANSITION_CANDIDATES_SQL)
+                .bind(CONTROL_PLANE_TRANSITION_SCAN_LIMIT)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let plans = candidates
             .into_iter()
@@ -642,8 +637,8 @@ impl TidbEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlPlaneReconcilePlan, ControlPlaneTransitionRow, delete_pending_indexes_sql,
-        mark_creating_indexes_active_sql,
+        CONTROL_PLANE_TRANSITION_CANDIDATES_SQL, ControlPlaneReconcilePlan,
+        ControlPlaneTransitionRow, delete_pending_indexes_sql, mark_creating_indexes_active_sql,
     };
     use crate::tidb_util::retry_tidb_idempotent_operation;
     use extenddb_storage::error::StorageError;
@@ -699,6 +694,16 @@ mod tests {
         assert!(sql.contains("index_status = 'DELETING'"));
         assert!(sql.contains("index_id IN (?, ?, ?)"));
         assert!(sql.contains("tables.table_status = 'UPDATING'"));
+    }
+
+    #[test]
+    fn control_plane_transition_scan_uses_status_due_time_queue() {
+        let sql = CONTROL_PLANE_TRANSITION_CANDIDATES_SQL;
+
+        assert!(sql.contains("table_status IN ('CREATING', 'UPDATING', 'DELETING')"));
+        assert!(sql.contains("status_transition_at <= CURRENT_TIMESTAMP(6)"));
+        assert!(!sql.contains("status_transition_at IS NULL"));
+        assert!(!sql.contains(" OR "));
     }
 
     #[tokio::test]

@@ -885,7 +885,7 @@ coordination model.
 **Implementation:**
 
 - A `status_transition_at TIMESTAMPTZ` column on the `tables` table records when a pending transition should fire.
-When `NULL`, no transition is pending.
+Pending table states always carry a timestamp; when `NULL`, no transition is pending.
 - `CreateTable` inserts with `table_status = 'CREATING'` and sets `status_transition_at` according to backend policy.
 PostgreSQL can set `NOW() + control_plane_delay_seconds` to emulate a fixed delay. TiDB sets immediate eligibility and
 delegates physical schema scheduling to TiDB native online DDL.

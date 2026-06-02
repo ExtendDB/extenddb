@@ -1,6 +1,6 @@
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
--- Consolidated catalog schema for extenddb (catalog version 0.0.25).
+-- Consolidated catalog schema for extenddb (catalog version 0.0.26).
 -- This is the complete schema applied on fresh installs.
 
 -- Accounts — multi-account support (REQ-AUTH-005).
@@ -31,9 +31,6 @@ CREATE TABLE IF NOT EXISTS tables (
     PRIMARY KEY (account_id, table_name) CLUSTERED,
     CONSTRAINT tables_table_id_unique UNIQUE (table_id)
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
-
-CREATE INDEX idx_tables_pending_transition
-    ON tables (status_transition_at);
 
 CREATE INDEX idx_tables_control_plane_work
     ON tables (table_status, status_transition_at);
@@ -275,4 +272,4 @@ CREATE TABLE IF NOT EXISTS backup_tags (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 -- Seed settings.
-INSERT IGNORE INTO settings (`key`, value) VALUES ('catalog_version', '0.0.25');
+INSERT IGNORE INTO settings (`key`, value) VALUES ('catalog_version', '0.0.26');

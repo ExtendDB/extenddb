@@ -109,6 +109,10 @@ pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
         "025_drop_redundant_login_success_column.sql",
         include_str!("../../storage-tidb/migrations/025_drop_redundant_login_success_column.sql"),
     ),
+    (
+        "026_simplify_control_plane_queue_index.sql",
+        include_str!("../../storage-tidb/migrations/026_simplify_control_plane_queue_index.sql"),
+    ),
 ];
 
 const DATA_SCHEMA_MIGRATION: &str =
@@ -708,12 +712,25 @@ mod tests {
     }
 
     #[test]
-    fn latest_catalog_migration_drops_redundant_login_success_column() {
-        let (filename, sql) = CATALOG_MIGRATIONS.last().expect("latest migration");
+    fn catalog_migration_drops_redundant_login_success_column() {
+        let (filename, sql) = CATALOG_MIGRATIONS
+            .iter()
+            .find(|(filename, _)| *filename == "025_drop_redundant_login_success_column.sql")
+            .expect("redundant login success column migration");
 
         assert_eq!(*filename, "025_drop_redundant_login_success_column.sql");
         assert!(sql.contains("ALTER TABLE login_attempts DROP COLUMN IF EXISTS success"));
         assert!(sql.contains("0.0.25"));
+    }
+
+    #[test]
+    fn latest_catalog_migration_simplifies_control_plane_queue_index() {
+        let (filename, sql) = CATALOG_MIGRATIONS.last().expect("latest migration");
+
+        assert_eq!(*filename, "026_simplify_control_plane_queue_index.sql");
+        assert!(sql.contains("status_transition_at = CURRENT_TIMESTAMP(6)"));
+        assert!(sql.contains("DROP INDEX IF EXISTS idx_tables_pending_transition ON tables"));
+        assert!(sql.contains("0.0.26"));
     }
 
     #[test]
@@ -773,6 +790,8 @@ mod tests {
             "INSERT IGNORE INTO settings (`key`, value) VALUES ('catalog_version', '{}')",
             CATALOG_VERSION
         )));
+        assert!(!sql.contains("idx_tables_pending_transition"));
+        assert!(sql.contains("idx_tables_control_plane_work"));
     }
 
     #[test]
