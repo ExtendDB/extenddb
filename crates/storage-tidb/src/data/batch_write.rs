@@ -99,11 +99,9 @@ impl TidbEngine {
         ops: &[BatchWriteOp<'_>],
     ) -> Result<(), StorageError> {
         if !ops.iter().any(|op| match op {
-            BatchWriteOp::Put(item) => item_has_potential_secondary_index_key(
-                item,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            ),
+            BatchWriteOp::Put(item) => {
+                item_has_potential_secondary_index_key(item, &key_info.secondary_index_key_schemas)
+            }
             BatchWriteOp::Delete(_) => false,
         }) {
             return Ok(());

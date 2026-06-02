@@ -765,6 +765,155 @@ pub fn validate_key_sizes(
     Ok(())
 }
 
+/// Return true when an item contains an attribute used by a secondary-index
+/// key schema.
+#[must_use]
+pub fn item_has_potential_secondary_index_key(
+    item: &Item,
+    secondary_index_key_schemas: &[Vec<KeySchemaElement>],
+) -> bool {
+    secondary_index_key_schemas
+        .iter()
+        .flatten()
+        .any(|key| item.contains_key(&key.attribute_name))
+}
+
+/// Validate secondary-index key type and size constraints for an item.
+///
+/// This uses the write metadata carried by `TableKeyInfo`: backends that own
+/// native secondary indexes can validate request-visible DynamoDB key
+/// constraints without re-reading catalog rows.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` if a present secondary-index
+/// key value has the wrong scalar type, is empty, or exceeds key-size limits.
+pub fn validate_item_secondary_index_key_constraints(
+    item: &Item,
+    secondary_index_key_schemas: &[Vec<KeySchemaElement>],
+    attr_defs: &[AttributeDefinition],
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    validate_item_index_key_constraints(item, secondary_index_key_schemas, attr_defs, limits)
+}
+
+/// Validate index-key constraints for all secondary indexes whose key
+/// attributes are present in an item.
+///
+/// Missing secondary-index attributes are allowed; the item simply does not
+/// appear in that sparse index. Present key attributes must have the declared
+/// scalar type and satisfy DynamoDB key-size constraints. Multi-part HASH keys
+/// also validate the encoded partition tuple size used by ExtendDB's multipart
+/// key extension.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError` for validation failures or inconsistent catalog
+/// metadata.
+pub fn validate_item_index_key_constraints(
+    item: &Item,
+    indexes: &[Vec<KeySchemaElement>],
+    attr_defs: &[AttributeDefinition],
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    for key_schema in indexes {
+        let hash_key_count = key_schema
+            .iter()
+            .filter(|key| key.key_type == KeyType::Hash)
+            .count();
+        let mut hash_values = Vec::with_capacity(hash_key_count);
+
+        for key in key_schema {
+            let Some(value) = item.get(&key.attribute_name) else {
+                continue;
+            };
+            let expected = index_key_attribute_type(&key.attribute_name, attr_defs)?;
+            validate_index_key_attribute_type(&key.attribute_name, value, expected)?;
+            validate_key_value_size(&key.attribute_name, value, key.key_type, limits)?;
+
+            if key.key_type == KeyType::Hash {
+                hash_values.push(value);
+            }
+        }
+
+        if hash_values.len() == hash_key_count && hash_key_count > 1 {
+            let encoded_len = multipart_hash_tuple_len(&hash_values);
+            if encoded_len > limits.max_partition_key_size_bytes {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "One or more parameter values are not valid. \
+                     The partition key size must be between 1 and {} bytes",
+                    limits.max_partition_key_size_bytes
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn index_key_attribute_type(
+    attr_name: &str,
+    attr_defs: &[AttributeDefinition],
+) -> Result<ScalarAttributeType, DynamoDbError> {
+    attr_defs
+        .iter()
+        .find(|ad| ad.attribute_name == attr_name)
+        .map(|ad| ad.attribute_type)
+        .ok_or_else(|| {
+            DynamoDbError::InternalServerError(format!(
+                "missing attribute definition for index key {attr_name}"
+            ))
+        })
+}
+
+fn validate_index_key_attribute_type(
+    attr_name: &str,
+    value: &AttributeValue,
+    expected: ScalarAttributeType,
+) -> Result<(), DynamoDbError> {
+    let matches = matches!(
+        (expected, value),
+        (ScalarAttributeType::S, AttributeValue::S(_))
+            | (ScalarAttributeType::N, AttributeValue::N(_))
+            | (ScalarAttributeType::B, AttributeValue::B(_))
+    );
+    if matches {
+        return Ok(());
+    }
+
+    Err(DynamoDbError::ValidationException(format!(
+        "One or more parameter values were invalid: Type mismatch for key attribute {attr_name}: expected: {}",
+        scalar_type_name(expected)
+    )))
+}
+
+fn scalar_type_name(attr_type: ScalarAttributeType) -> &'static str {
+    match attr_type {
+        ScalarAttributeType::S => "S",
+        ScalarAttributeType::N => "N",
+        ScalarAttributeType::B => "B",
+    }
+}
+
+fn multipart_hash_tuple_len(values: &[&AttributeValue]) -> usize {
+    if values.len() == 1 {
+        return key_value_raw_bytes(values[0]).map_or(0, <[u8]>::len);
+    }
+
+    values
+        .iter()
+        .filter_map(|value| key_value_raw_bytes(value))
+        .map(|bytes| bytes.len().to_string().len() + 1 + bytes.len() + 1)
+        .sum()
+}
+
+fn key_value_raw_bytes(value: &AttributeValue) -> Option<&[u8]> {
+    match value {
+        AttributeValue::S(s) | AttributeValue::N(s) => Some(s.as_bytes()),
+        AttributeValue::B(b) => Some(b.as_slice()),
+        _ => None,
+    }
+}
+
 /// Validate one key attribute's non-empty and byte-size constraints.
 ///
 /// Storage backends use this for post-mutation secondary-index keys whose
@@ -1159,6 +1308,110 @@ mod tests {
         let mut item = Item::new();
         item.insert("pk".to_owned(), AttributeValue::B(vec![0x00]));
         assert!(validate_key_sizes(&item, &[make_ks("pk", KeyType::Hash)], &limits).is_ok());
+    }
+
+    #[test]
+    fn secondary_index_validation_skips_items_without_index_attributes() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S("base".to_owned()));
+
+        assert!(!item_has_potential_secondary_index_key(
+            &item,
+            &[vec![make_ks("gpk", KeyType::Hash)]],
+        ));
+        assert!(
+            validate_item_secondary_index_key_constraints(
+                &item,
+                &[vec![make_ks("gpk", KeyType::Hash)]],
+                &[
+                    make_ad("pk", ScalarAttributeType::S),
+                    make_ad("gpk", ScalarAttributeType::S),
+                ],
+                &limits,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn secondary_index_validation_rejects_type_mismatch() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S("base".to_owned()));
+        item.insert("gpk".to_owned(), AttributeValue::N("1".to_owned()));
+
+        let err = validate_item_secondary_index_key_constraints(
+            &item,
+            &[vec![make_ks("gpk", KeyType::Hash)]],
+            &[
+                make_ad("pk", ScalarAttributeType::S),
+                make_ad("gpk", ScalarAttributeType::S),
+            ],
+            &limits,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Type mismatch for key attribute gpk: expected: S"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn secondary_index_validation_rejects_missing_index_attribute_definition() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S("base".to_owned()));
+        item.insert("gpk".to_owned(), AttributeValue::S("index-key".to_owned()));
+
+        let err = validate_item_secondary_index_key_constraints(
+            &item,
+            &[vec![make_ks("gpk", KeyType::Hash)]],
+            &[make_ad("pk", ScalarAttributeType::S)],
+            &limits,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("missing attribute definition for index key gpk"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn secondary_index_validation_rejects_oversized_multipart_hash_tuple() {
+        let limits = LimitsConfig {
+            max_partition_key_size_bytes: 10,
+            ..Default::default()
+        };
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S("base".to_owned()));
+        item.insert("gpk1".to_owned(), AttributeValue::S("aaaa".to_owned()));
+        item.insert("gpk2".to_owned(), AttributeValue::S("bbbb".to_owned()));
+
+        let err = validate_item_secondary_index_key_constraints(
+            &item,
+            &[vec![
+                make_ks("gpk1", KeyType::Hash),
+                make_ks("gpk2", KeyType::Hash),
+            ]],
+            &[
+                make_ad("pk", ScalarAttributeType::S),
+                make_ad("gpk1", ScalarAttributeType::S),
+                make_ad("gpk2", ScalarAttributeType::S),
+            ],
+            &limits,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("partition key size must be between 1 and 10 bytes"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

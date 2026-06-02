@@ -24,7 +24,8 @@ use extenddb_core::types::{
     ImportTableOutput, Item, TableCreationParameters, TableKeyInfo, extract_key, item_size_bytes,
 };
 use extenddb_core::validation::{
-    validate_attribute_name_sizes, validate_item_keys, validate_item_size, validate_key_sizes,
+    validate_attribute_name_sizes, validate_item_keys,
+    validate_item_secondary_index_key_constraints, validate_item_size, validate_key_sizes,
 };
 use extenddb_storage::BatchWriteOp;
 use extenddb_storage::error::StorageError;
@@ -95,7 +96,7 @@ pub async fn handle_import_table(
 
     let key_info = ctx
         .storage
-        .table_key_info(&ctx.account_id, &tcp.table_name)
+        .table_write_info(&ctx.account_id, &tcp.table_name)
         .await
         .map_err(storage_err_to_dynamo)?;
 
@@ -243,6 +244,13 @@ fn validate_import_item(
         .map_err(|e| import_item_validation_error("oversized_attribute_name", e))?;
     validate_key_sizes(item, &key_info.key_schema, limits)
         .map_err(|e| import_item_validation_error("oversized_key", e))?;
+    validate_item_secondary_index_key_constraints(
+        item,
+        &key_info.secondary_index_key_schemas,
+        &key_info.attribute_definitions,
+        limits,
+    )
+    .map_err(|e| import_item_validation_error("invalid_index_keys", e))?;
     Ok(item_size_bytes(item))
 }
 
@@ -416,7 +424,9 @@ fn epoch_seconds() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use extenddb_core::types::{AttributeValue, KeySchemaElement, KeyType};
+    use extenddb_core::types::{
+        AttributeDefinition, AttributeValue, KeySchemaElement, KeyType, ScalarAttributeType,
+    };
 
     fn hash_key() -> KeySchemaElement {
         KeySchemaElement {
@@ -433,6 +443,31 @@ mod tests {
 
     fn key(pk: &str) -> Item {
         extract_key(&item(pk), &[hash_key()])
+    }
+
+    fn import_key_info_with_gsi() -> TableKeyInfo {
+        TableKeyInfo {
+            table_name: "ImportTable".to_owned(),
+            account_id: "123456789012".to_owned(),
+            table_id: "importtable".to_owned(),
+            key_schema: vec![hash_key()],
+            attribute_definitions: vec![
+                AttributeDefinition {
+                    attribute_name: "pk".to_owned(),
+                    attribute_type: ScalarAttributeType::S,
+                },
+                AttributeDefinition {
+                    attribute_name: "gpk".to_owned(),
+                    attribute_type: ScalarAttributeType::S,
+                },
+            ],
+            secondary_index_key_schemas: vec![vec![KeySchemaElement {
+                attribute_name: "gpk".to_owned(),
+                key_type: KeyType::Hash,
+            }]],
+            has_lsi: false,
+            stream_specification: None,
+        }
     }
 
     #[test]
@@ -462,5 +497,22 @@ mod tests {
 
         assert!(!batch.should_flush_before(&key("b"), 1));
         assert!(batch.should_flush_before(&key("b"), 2));
+    }
+
+    #[test]
+    fn import_validation_rejects_invalid_secondary_index_key_before_batch_write() {
+        let mut item = item("base");
+        item.insert("gpk".to_owned(), AttributeValue::N("1".to_owned()));
+
+        let err =
+            validate_import_item(&item, &import_key_info_with_gsi(), &LimitsConfig::default())
+                .unwrap_err();
+
+        assert_eq!(err.reason, "invalid_index_keys");
+        assert!(
+            err.to_string()
+                .contains("Type mismatch for key attribute gpk: expected: S"),
+            "unexpected error: {err}"
+        );
     }
 }

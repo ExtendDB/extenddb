@@ -18,15 +18,14 @@
 
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
-    AttributeDefinition, AttributeValue, Item, KeySchemaElement, KeyType, ScalarAttributeType,
+    AttributeDefinition, Item, KeySchemaElement, KeyType, ScalarAttributeType,
 };
-use extenddb_core::validation::validate_key_value_size;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::sk_column_n;
 
 use super::{
     DYNAMODB_HASH_KEY_COLUMN_TYPE, DYNAMODB_SORT_KEY_COLUMN_TYPE, all_sort_key_info,
-    data_table_name, physical_pk_bytes_from_values,
+    data_table_name,
 };
 use crate::tidb_util::execute_tidb_idempotent_ddl;
 
@@ -43,29 +42,27 @@ struct GeneratedColumn {
 
 pub(crate) fn item_has_potential_secondary_index_key(
     item: &Item,
-    key_schema: &[KeySchemaElement],
-    attr_defs: &[AttributeDefinition],
+    secondary_index_key_schemas: &[Vec<KeySchemaElement>],
 ) -> bool {
-    attr_defs.iter().any(|attr| {
-        item.contains_key(&attr.attribute_name)
-            && !key_schema
-                .iter()
-                .any(|key| key.attribute_name == attr.attribute_name)
-    })
+    extenddb_core::validation::item_has_potential_secondary_index_key(
+        item,
+        secondary_index_key_schemas,
+    )
 }
 
 pub(crate) fn validate_item_secondary_index_key_constraints(
     item: &Item,
-    key_schema: &[KeySchemaElement],
     secondary_index_key_schemas: &[Vec<KeySchemaElement>],
     attr_defs: &[AttributeDefinition],
     limits: &LimitsConfig,
 ) -> Result<(), StorageError> {
-    if !item_has_potential_secondary_index_key(item, key_schema, attr_defs) {
-        return Ok(());
-    }
-
-    validate_item_index_key_constraints(item, secondary_index_key_schemas, attr_defs, limits)
+    extenddb_core::validation::validate_item_secondary_index_key_constraints(
+        item,
+        secondary_index_key_schemas,
+        attr_defs,
+        limits,
+    )
+    .map_err(dynamodb_validation_to_storage_error)
 }
 
 pub(crate) fn validate_item_index_key_constraints(
@@ -74,54 +71,19 @@ pub(crate) fn validate_item_index_key_constraints(
     attr_defs: &[AttributeDefinition],
     limits: &LimitsConfig,
 ) -> Result<(), StorageError> {
-    for key_schema in indexes {
-        let hash_key_count = key_schema
-            .iter()
-            .filter(|key| key.key_type == KeyType::Hash)
-            .count();
-        let mut hash_values = Vec::with_capacity(hash_key_count);
+    extenddb_core::validation::validate_item_index_key_constraints(item, indexes, attr_defs, limits)
+        .map_err(dynamodb_validation_to_storage_error)
+}
 
-        for key in key_schema {
-            let Some(value) = item.get(&key.attribute_name) else {
-                continue;
-            };
-            let expected = attr_defs
-                .iter()
-                .find(|ad| ad.attribute_name == key.attribute_name)
-                .map(|ad| ad.attribute_type)
-                .ok_or_else(|| {
-                    StorageError::Internal(format!(
-                        "missing attribute definition for index key {}",
-                        key.attribute_name
-                    ))
-                })?;
-            if !attribute_value_matches_type(value, expected) {
-                return Err(StorageError::Validation(format!(
-                    "One or more parameter values were invalid: Type mismatch for key attribute {}: expected: {}",
-                    key.attribute_name,
-                    scalar_type_name(expected)
-                )));
-            }
-            validate_key_value_size(&key.attribute_name, value, key.key_type, limits)
-                .map_err(|e| StorageError::Validation(e.to_string()))?;
-
-            if key.key_type == KeyType::Hash {
-                hash_values.push(value);
-            }
+fn dynamodb_validation_to_storage_error(
+    error: extenddb_core::error::DynamoDbError,
+) -> StorageError {
+    match error {
+        extenddb_core::error::DynamoDbError::ValidationException(message) => {
+            StorageError::Validation(message)
         }
-
-        if hash_values.len() == hash_key_count && hash_key_count > 1 {
-            let encoded = physical_pk_bytes_from_values(&hash_values)?;
-            if encoded.len() > limits.max_partition_key_size_bytes {
-                return Err(StorageError::Validation(format!(
-                    "One or more parameter values are not valid. \
-                     The partition key size must be between 1 and {} bytes",
-                    limits.max_partition_key_size_bytes
-                )));
-            }
-        }
+        other => StorageError::Internal(other.to_string()),
     }
-    Ok(())
 }
 
 pub(crate) async fn create_native_secondary_indexes(
@@ -425,15 +387,6 @@ fn attribute_type(
         })
 }
 
-fn attribute_value_matches_type(value: &AttributeValue, attr_type: ScalarAttributeType) -> bool {
-    matches!(
-        (attr_type, value),
-        (ScalarAttributeType::S, AttributeValue::S(_))
-            | (ScalarAttributeType::N, AttributeValue::N(_))
-            | (ScalarAttributeType::B, AttributeValue::B(_))
-    )
-}
-
 fn scalar_type_name(attr_type: ScalarAttributeType) -> &'static str {
     match attr_type {
         ScalarAttributeType::S => "S",
@@ -704,55 +657,33 @@ mod tests {
     }
 
     #[test]
-    fn secondary_index_validation_guard_uses_existing_table_metadata() {
-        let table_keys = vec![KeySchemaElement {
-            attribute_name: "pk".to_owned(),
+    fn secondary_index_validation_guard_uses_index_schema_metadata() {
+        let indexes = vec![vec![KeySchemaElement {
+            attribute_name: "gpk".to_owned(),
             key_type: KeyType::Hash,
-        }];
-        let attr_defs = vec![
-            AttributeDefinition {
-                attribute_name: "pk".to_owned(),
-                attribute_type: ScalarAttributeType::S,
-            },
-            AttributeDefinition {
-                attribute_name: "gpk".to_owned(),
-                attribute_type: ScalarAttributeType::S,
-            },
-        ];
+        }]];
 
         assert!(!item_has_potential_secondary_index_key(
             &BTreeMap::from([("pk".to_owned(), AttributeValue::S("a".to_owned()))]),
-            &table_keys,
-            &attr_defs,
+            &indexes,
         ));
         assert!(item_has_potential_secondary_index_key(
             &BTreeMap::from([
                 ("pk".to_owned(), AttributeValue::S("a".to_owned())),
                 ("gpk".to_owned(), AttributeValue::N("1".to_owned())),
             ]),
-            &table_keys,
-            &attr_defs,
+            &indexes,
         ));
     }
 
     #[test]
-    fn secondary_index_validation_guard_skips_tables_without_index_key_defs() {
-        let table_keys = vec![KeySchemaElement {
-            attribute_name: "pk".to_owned(),
-            key_type: KeyType::Hash,
-        }];
-        let attr_defs = vec![AttributeDefinition {
-            attribute_name: "pk".to_owned(),
-            attribute_type: ScalarAttributeType::S,
-        }];
-
+    fn secondary_index_validation_guard_skips_tables_without_secondary_index_schemas() {
         assert!(!item_has_potential_secondary_index_key(
             &BTreeMap::from([
                 ("pk".to_owned(), AttributeValue::S("a".to_owned())),
                 ("payload".to_owned(), AttributeValue::S("x".to_owned())),
             ]),
-            &table_keys,
-            &attr_defs,
+            &[],
         ));
     }
 

@@ -40,7 +40,6 @@ impl TidbEngine {
 
         validate_item_secondary_index_key_constraints(
             &item,
-            &key_info.key_schema,
             &key_info.secondary_index_key_schemas,
             &key_info.attribute_definitions,
             &self.limits,

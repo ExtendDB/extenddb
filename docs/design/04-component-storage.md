@@ -183,10 +183,12 @@ coordination. `TransactGetItems` starts a normal TiDB transaction and performs
 plain reads inside that transaction, getting one native snapshot without
 application-level locks.
 Bulk import writes validated rows through `batch_write_items`, then calls
-`refresh_table_statistics` before reporting completion. TiDB implements this as
-native multi-row DML followed by `ANALYZE TABLE`, so imported tables immediately
-plan Query and Scan paths from real table and index statistics instead of
-pseudo statistics.
+`refresh_table_statistics` before reporting completion. Imports fetch
+`table_write_info`, so secondary-index key validation uses the same write
+metadata as Put, Update, BatchWrite, and TransactWrite before rows reach native
+storage. TiDB implements the valid row batches as native multi-row DML followed
+by `ANALYZE TABLE`, so imported tables immediately plan Query and Scan paths
+from real table and index statistics instead of pseudo statistics.
 
 **MetadataEngine** (TTL, tags, table statistics):
 - `describe_ttl`, `update_ttl`, `apply_ttl_update`
