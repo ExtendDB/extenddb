@@ -34,6 +34,15 @@ impl DataEngine for TidbEngine {
         Box::pin(self.get_item_impl(key_info, key, consistent_read))
     }
 
+    fn batch_get_items<'a>(
+        &'a self,
+        key_info: &'a TableKeyInfo,
+        keys: &'a [Item],
+        consistent_read: bool,
+    ) -> BoxFuture<'a, Result<Vec<Item>, StorageError>> {
+        Box::pin(self.batch_get_items_impl(key_info, keys, consistent_read))
+    }
+
     fn delete_item<'a>(
         &'a self,
         key_info: &'a TableKeyInfo,

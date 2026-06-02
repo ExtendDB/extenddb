@@ -224,6 +224,29 @@ pub trait DataEngine: Send + Sync {
         consistent_read: bool,
     ) -> BoxFuture<'a, Result<Option<Item>, StorageError>>;
 
+    /// Read multiple items from one table by primary key.
+    ///
+    /// The returned items need not preserve request order; DynamoDB
+    /// `BatchGetItem` responses are unordered. Backends that can express the
+    /// keys as a native batch point lookup should override this. The default
+    /// preserves the single-item behavior for simpler backends.
+    fn batch_get_items<'a>(
+        &'a self,
+        key_info: &'a TableKeyInfo,
+        keys: &'a [Item],
+        consistent_read: bool,
+    ) -> BoxFuture<'a, Result<Vec<Item>, StorageError>> {
+        Box::pin(async move {
+            let mut items = Vec::new();
+            for key in keys {
+                if let Some(item) = self.get_item(key_info, key, consistent_read).await? {
+                    items.push(item);
+                }
+            }
+            Ok(items)
+        })
+    }
+
     /// Delete a single item by primary key.
     ///
     /// If `condition` is `Some`, evaluates the condition against the existing item

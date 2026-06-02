@@ -25,8 +25,8 @@ const MAX_BATCH_GET_KEYS: usize = 100;
 /// Handle a `BatchGetItem` request.
 ///
 /// Reads items from one or more tables by primary key. Each table's keys are
-/// fetched individually via `get_item`. `DynamoDB` limits: max 100 keys total,
-/// max 16 MB response size.
+/// fetched through the storage backend's batch read path. `DynamoDB` limits:
+/// max 100 keys total, max 16 MB response size.
 ///
 /// # Errors
 ///
@@ -146,27 +146,28 @@ pub async fn handle_batch_get_item(
                 ));
             }
             validate_batch_key_only(key, &key_info.key_schema, &key_info.attribute_definitions)?;
-            let strongly_consistent = ka.consistent_read == Some(true);
+        }
 
-            if let Some(item) = ctx
-                .storage
-                .get_item(&key_info, key, strongly_consistent)
-                .await
-                .map_err(storage_err_to_dynamo)?
-            {
-                let size = item_size_bytes(&item);
-                let item_rcu = capacity_helpers::read_capacity_units(size, strongly_consistent);
-                total_rcu += item_rcu;
-                *per_table_rcu.entry(table_name.clone()).or_default() += item_rcu;
-                total_pre_proj_bytes += size;
-                returned_count += 1;
-                let item = if let Some(ref paths) = projection {
-                    apply_projection(&item, paths, &maps)?
-                } else {
-                    item
-                };
-                table_items.push(item);
-            }
+        let strongly_consistent = ka.consistent_read == Some(true);
+        let items = ctx
+            .storage
+            .batch_get_items(&key_info, &ka.keys, strongly_consistent)
+            .await
+            .map_err(storage_err_to_dynamo)?;
+
+        for item in items {
+            let size = item_size_bytes(&item);
+            let item_rcu = capacity_helpers::read_capacity_units(size, strongly_consistent);
+            total_rcu += item_rcu;
+            *per_table_rcu.entry(table_name.clone()).or_default() += item_rcu;
+            total_pre_proj_bytes += size;
+            returned_count += 1;
+            let item = if let Some(ref paths) = projection {
+                apply_projection(&item, paths, &maps)?
+            } else {
+                item
+            };
+            table_items.push(item);
         }
         responses.insert(table_name.clone(), table_items);
     }

@@ -16,7 +16,7 @@ use extenddb_storage::util::parse_sk;
 
 use super::{all_sort_key_info, physical_pk_bytes};
 
-type JsonRowsQuery<'q> =
+pub(crate) type JsonRowsQuery<'q> =
     sqlx::query::QueryAs<'q, sqlx::MySql, (serde_json::Value,), sqlx::mysql::MySqlArguments>;
 
 /// Evaluate a condition expression against an item inside a transaction.

@@ -10,7 +10,7 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{parse_sk, sk_column, sk_info};
 
 use super::index::validate_item_secondary_index_key_constraints;
-use super::query::check_condition;
+use super::query::{bind_sk_value, check_condition};
 use super::tx_helpers::{
     StreamSequenceAllocator, finalize_stream_records_best_effort,
     put_prepared_item_without_old_item_in_tx, stream_capture_needs_old_item,
@@ -325,6 +325,52 @@ impl TidbEngine {
         }
     }
 
+    /// Implementation of `DataEngine::batch_get_items`.
+    pub(crate) async fn batch_get_items_impl(
+        &self,
+        key_info: &TableKeyInfo,
+        keys: &[Item],
+        consistent_read: bool,
+    ) -> Result<Vec<Item>, StorageError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ddb_table = data_table_name(&key_info.table_id);
+        let pool = self.data_read_pool(consistent_read);
+        let rows: Vec<(serde_json::Value,)> = if let Some((sk_name, sk_type)) =
+            sk_info(&key_info.key_schema, &key_info.attribute_definitions)
+        {
+            let sk_col = sk_column(sk_type);
+            let sql = batch_get_pk_sk_sql(&ddb_table, sk_col, keys.len());
+            let mut query = sqlx::query_as::<_, (serde_json::Value,)>(&sql);
+            for key in keys {
+                query = query.bind(physical_pk_bytes(key, &key_info.key_schema)?);
+                let sk_value = key.get(sk_name).ok_or_else(|| {
+                    StorageError::Internal(format!("missing sort key attribute {sk_name}"))
+                })?;
+                let sk = parse_sk(sk_value, sk_type)?;
+                query = bind_sk_value(query, &sk);
+            }
+            query
+                .fetch_all(pool)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?
+        } else {
+            let sql = batch_get_pk_sql(&ddb_table, keys.len());
+            let mut query = sqlx::query_as::<_, (serde_json::Value,)>(&sql);
+            for key in keys {
+                query = query.bind(physical_pk_bytes(key, &key_info.key_schema)?);
+            }
+            query
+                .fetch_all(pool)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?
+        };
+
+        rows.into_iter().map(|(json,)| json_to_item(json)).collect()
+    }
+
     /// Implementation of `DataEngine::get_item`.
     pub(crate) async fn get_item_impl(
         &self,
@@ -360,6 +406,36 @@ impl TidbEngine {
 
         json_opt.map(json_to_item).transpose()
     }
+}
+
+fn repeat_tuple_placeholders(count: usize, width: usize) -> String {
+    let tuple = if width == 1 {
+        "?".to_owned()
+    } else {
+        format!(
+            "({})",
+            std::iter::repeat_n("?", width)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    std::iter::repeat_n(tuple, count)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn batch_get_pk_sql(table: &str, key_count: usize) -> String {
+    format!(
+        "SELECT item_data FROM {table} WHERE pk IN ({})",
+        repeat_tuple_placeholders(key_count, 1)
+    )
+}
+
+fn batch_get_pk_sk_sql(table: &str, sk_col: &str, key_count: usize) -> String {
+    format!(
+        "SELECT item_data FROM {table} WHERE (pk, {sk_col}) IN ({})",
+        repeat_tuple_placeholders(key_count, 2)
+    )
 }
 
 fn put_stream_capture_without_old_item<'a>(
@@ -413,7 +489,10 @@ mod tests {
     use extenddb_core::types::StreamViewType;
     use extenddb_storage::StreamCapture;
 
-    use super::put_stream_capture_without_old_item;
+    use super::{
+        batch_get_pk_sk_sql, batch_get_pk_sql, put_stream_capture_without_old_item,
+        repeat_tuple_placeholders,
+    };
 
     fn capture(view_type: StreamViewType) -> StreamCapture {
         StreamCapture {
@@ -455,5 +534,23 @@ mod tests {
         assert!(put_stream_capture_without_old_item(true, None, Some(&keys_only)).is_none());
         assert!(put_stream_capture_without_old_item(false, None, Some(&old_image)).is_none());
         assert!(put_stream_capture_without_old_item(false, None, Some(&both_images)).is_none());
+    }
+
+    #[test]
+    fn batch_get_placeholders_use_native_primary_key_in_shape() {
+        assert_eq!(repeat_tuple_placeholders(3, 1), "?, ?, ?");
+        assert_eq!(repeat_tuple_placeholders(2, 2), "(?, ?), (?, ?)");
+    }
+
+    #[test]
+    fn batch_get_sql_uses_primary_key_in_predicates() {
+        assert_eq!(
+            batch_get_pk_sql("`_ddb_table`", 3),
+            "SELECT item_data FROM `_ddb_table` WHERE pk IN (?, ?, ?)"
+        );
+        assert_eq!(
+            batch_get_pk_sk_sql("`_ddb_table`", "sk_n", 2),
+            "SELECT item_data FROM `_ddb_table` WHERE (pk, sk_n) IN ((?, ?), (?, ?))"
+        );
     }
 }
