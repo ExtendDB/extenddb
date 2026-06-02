@@ -19,7 +19,7 @@ use super::{
     DATA_TABLE_PARTITIONS, DATA_TABLE_SPLIT_REGIONS, DECIMAL_SPLIT_LOWER, DECIMAL_SPLIT_UPPER,
     DYNAMODB_HASH_KEY_COLUMN_BYTES, DYNAMODB_HASH_KEY_COLUMN_TYPE, DYNAMODB_SORT_KEY_COLUMN_BYTES,
     DYNAMODB_SORT_KEY_COLUMN_TYPE, VARBINARY_SPLIT_LOWER, all_sort_key_info, data_table_name,
-    validate_native_key_schema_shape, varbinary_split_upper,
+    deny_data_table_region_merges, validate_native_key_schema_shape, varbinary_split_upper,
 };
 use crate::TidbEngine;
 use crate::tidb_util::{execute_tidb_create_table_ddl, execute_tidb_idempotent_ddl};
@@ -235,6 +235,7 @@ impl TidbEngine {
         if !created {
             create_native_secondary_indexes(pool, table_id, &indexes, attr_defs).await?;
         }
+        deny_data_table_region_merges(pool, table_id).await?;
         split_data_table_regions(pool, table_id, key_schema, attr_defs, &indexes).await?;
 
         Ok(())

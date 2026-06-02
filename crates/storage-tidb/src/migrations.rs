@@ -8,7 +8,8 @@ use sqlx::{MySqlConnection, MySqlPool};
 
 use crate::data::{
     DYNAMODB_HASH_KEY_COLUMN_BYTES, DYNAMODB_HASH_KEY_COLUMN_TYPE,
-    USER_TABLE_FULL_KEYSPACE_SPLITS_MIGRATION, user_data_table_region_split_sqls,
+    USER_TABLE_FULL_KEYSPACE_SPLITS_MIGRATION, user_data_table_region_merge_option_sqls,
+    user_data_table_region_split_sqls,
 };
 
 /// Embedded catalog migration files, applied in order.
@@ -240,6 +241,7 @@ pub(crate) async fn run_data_migrations(pool: &MySqlPool) -> OpResult<()> {
     ensure_idempotency_token_claims(pool).await?;
     ensure_data_table_binary_defaults(pool).await?;
     validate_dynamodb_hash_key_column_layout(pool).await?;
+    ensure_user_data_table_region_merge_option(pool).await?;
     repair_user_data_table_region_splits(pool).await?;
     repair_common_handle_stream_record_splits(pool).await?;
     drop_native_ttl_lookup_indexes(pool).await?;
@@ -446,6 +448,17 @@ async fn repair_user_data_table_region_splits(pool: &MySqlPool) -> OpResult<()> 
     }
 
     record_data_migration(pool, USER_TABLE_FULL_KEYSPACE_SPLITS_MIGRATION).await?;
+    Ok(())
+}
+
+async fn ensure_user_data_table_region_merge_option(pool: &MySqlPool) -> OpResult<()> {
+    for statement in user_data_table_region_merge_option_sqls(pool).await? {
+        sqlx::query(&statement).execute(pool).await.map_err(|e| {
+            OpError::Internal(format!(
+                "Configure TiDB user data table Region merge option: {e}"
+            ))
+        })?;
+    }
     Ok(())
 }
 

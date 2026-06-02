@@ -145,7 +145,11 @@ Key design decisions:
   non-unique `GLOBAL` secondary indexes. Fresh TiDB data tables should use
   `PARTITION BY KEY(pk)` so TiDB distributes the raw DynamoDB HASH-key slot
   natively, without adding an application hash prefix that would reduce the
-  legal key size or complicate point lookups.
+  legal key size or complicate point lookups. If the backend pre-splits fresh
+  user data tables or indexes, set TiDB's native table attribute
+  `merge_option=deny` before the split so PD does not merge empty split Regions
+  before traffic arrives. Re-apply that attribute during startup repair because
+  TiDB BR and TiCDC can skip table-attribute DDL.
 - **Partitioned TiDB data tables need global native indexes.** When the base
   table is key-partitioned, generated-column secondary indexes should be
   declared `GLOBAL` so GSI and LSI reads use one TiDB index range instead of a

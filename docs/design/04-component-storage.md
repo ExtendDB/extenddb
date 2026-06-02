@@ -611,10 +611,13 @@ schema has two broad categories:
   Fresh TiDB data tables are native
   `PARTITION BY KEY(pk)` tables, so TiDB hashes the DynamoDB partition-key slot
   into physical partitions instead of relying on a custom hash prefix or raw
-  key locality. During `CreateTable` reconciliation, TiDB also pre-splits the
-  clustered data table across the native binary key range before publishing the
-  catalog row `ACTIVE`, so a newly created DynamoDB table does not start all
-  writes on one Region.
+  key locality. During `CreateTable` reconciliation, TiDB sets the native table
+  attribute `merge_option=deny` and pre-splits the clustered data table across
+  the native binary key range before publishing the catalog row `ACTIVE`, so a
+  newly created DynamoDB table does not start all writes on one Region and PD
+  does not later merge the empty split Regions before traffic arrives. Startup
+  repair re-applies that table attribute because TiDB BR and TiCDC can skip
+  table-attribute DDL.
 
 - **Sort key storage**: Sort key values use typed columns to ensure correct
   ordering. PostgreSQL uses `sk_s TEXT`, `sk_n NUMERIC`, and `sk_b BYTEA`. TiDB
@@ -662,7 +665,9 @@ schema has two broad categories:
   submits the pending native index creations as one TiDB multi-schema
   `ALTER TABLE` DDL job. After TiDB creates or repairs a native secondary
   index, ExtendDB asks TiDB to split that index by the generated hash-key prefix
-  range, using TiDB Region split/scatter instead of companion index shards.
+  range, using TiDB Region split/scatter instead of companion index shards; the
+  table-level `merge_option=deny` attribute also preserves those empty index
+  Regions until writes populate them.
   Fresh partitioned TiDB data tables declare native secondary indexes as
   `GLOBAL`, so a DynamoDB `IndexName` read uses one global TiDB index range
   instead of probing every physical partition. Older unpartitioned physical
