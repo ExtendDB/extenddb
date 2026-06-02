@@ -5,6 +5,10 @@
 -- Split their row keyspace explicitly during upgrade so multi-node frontends
 -- do not start from a single hot Region.
 
+ALTER TABLE metrics_samples ATTRIBUTES 'merge_option=deny';
+
+ALTER TABLE login_attempts ATTRIBUTES 'merge_option=deny';
+
 SPLIT TABLE metrics_samples
     BETWEEN (-9223372036854775808) AND (9223372036854775807)
     REGIONS 16;

@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS stream_records (
   PRE_SPLIT_REGIONS = 4
   TTL = `created_at` + INTERVAL 24 HOUR TTL_JOB_INTERVAL = '1h';
 
+ALTER TABLE stream_records ATTRIBUTES 'merge_option=deny';
+
 -- Idempotency token storage for TransactWriteItems.
 CREATE TABLE IF NOT EXISTS idempotency_tokens (
     token       VARCHAR(255) PRIMARY KEY CLUSTERED,

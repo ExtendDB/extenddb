@@ -355,7 +355,9 @@ contention on a shared per-minute `ON DUPLICATE` metrics row and avoids a
 single initial write Region for a new TiDB catalog. TiDB migration sessions
 set `tidb_scatter_region = 'global'` and wait for split/scatter completion so
 fresh `PRE_SPLIT_REGIONS` tables are distributed by TiDB before write bursts
-start. TiDB metrics flushes use
+start. TiDB sets the native `merge_option=deny` table attribute on
+`metrics_samples` and repairs it at startup so PD does not merge those empty
+split Regions before production traffic reaches them. TiDB metrics flushes use
 one multi-row append-only insert per bounded batch rather than one insert per
 metric row, keeping frontend latency low while following TiDB's guidance to
 keep write transactions split into modest batches.
@@ -372,7 +374,9 @@ Tracks failed login attempts by principal and source IP to mitigate clients
 sending excessive traffic. TiDB stores only failure rows, with native TTL
 retention, `SHARD_ROW_ID_BITS` on the implicit row id, and pre-split Regions
 scattered by the migration session, so concurrent frontends do not concentrate
-failed-login inserts on one TiKV Region. The hot count queries are direct
+failed-login inserts on one TiKV Region. TiDB also sets and repairs
+`merge_option=deny` on `login_attempts` so those split Regions are not merged
+away while the table is still warming up. The hot count queries are direct
 native range scans on `(principal, attempted_at)` and `(source_ip,
 attempted_at)` without an extra boolean filter. Login-attempt retention is
 backend-specific rather than part of
@@ -412,9 +416,12 @@ Used by CLI commands (`extenddb init`, `extenddb migrate`, `extenddb verify`,
 
 The TiDB bootstrapper versions both catalog migrations and data-database
 migrations. Shared data tables such as `stream_records` and
-`idempotency_tokens` keep their native TTL repair paths, while one-time physical
+`idempotency_tokens` keep their native TTL repair paths. One-time physical
 layout work such as TiDB Region splitting is recorded in `data_schema_history`
-instead of being replayed on every frontend startup.
+instead of being replayed on every frontend startup, while TiDB table
+attributes such as `merge_option=deny` are repaired at startup for shared
+catalog tables, shared data tables, and user `_ddb_*` tables because TiDB BR
+and TiCDC can omit table-attribute DDL.
 
 ### OperationsEngine
 
@@ -1338,10 +1345,12 @@ internals):
   online DDL owns schema jobs, TiDB native TTL handles all item TTL plus
   stream-record, idempotency-token, metrics, login-attempt, and assume-role
   session retention, startup repair re-enables native TTL jobs if TiDB tooling
-  left `TTL_ENABLE = 'OFF'`, one-time data migrations pre-split shared write
-  tables with TiDB Region split/scatter using boundaries derived from their
-  native key layout, and TiDB `information_schema` table statistics are read on
-  demand instead of refreshed by a frontend worker.
+  left `TTL_ENABLE = 'OFF'`, startup repair re-applies `merge_option=deny` for
+  pre-split catalog, shared data, and user data tables if TiDB tooling omitted
+  table attributes, one-time data migrations pre-split shared write tables with
+  TiDB Region split/scatter using boundaries derived from their native key
+  layout, and TiDB `information_schema` table statistics are read on demand
+  instead of refreshed by a frontend worker.
 - Runtime hooks also expose backend readiness to `/health`, so TiDB checks every
   pool opened by the frontend instead of reporting web-process liveness only.
 - Other backends may spawn different workers or none at all

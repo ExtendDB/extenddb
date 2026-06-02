@@ -8,8 +8,10 @@ use sqlx::{MySqlConnection, MySqlPool};
 
 use crate::data::{
     DYNAMODB_HASH_KEY_COLUMN_BYTES, DYNAMODB_HASH_KEY_COLUMN_TYPE,
-    USER_TABLE_FULL_KEYSPACE_SPLITS_MIGRATION, user_data_table_region_merge_option_sqls,
-    user_data_table_region_split_sqls,
+    USER_TABLE_FULL_KEYSPACE_SPLITS_MIGRATION, user_data_table_region_split_sqls,
+};
+use crate::table_attributes::{
+    fixed_table_region_merge_option_sqls, user_data_table_region_merge_option_sqls,
 };
 
 /// Embedded catalog migration files, applied in order.
@@ -151,6 +153,8 @@ const DATA_NATIVE_TTL_LOOKUP_INDEX_DROPS: &[(&str, &str)] = &[
         "ALTER TABLE idempotency_tokens DROP INDEX IF EXISTS idx_idempotency_tokens_created",
     ),
 ];
+const CATALOG_REGION_MERGE_DENY_TABLES: &[&str] = &["metrics_samples", "login_attempts"];
+const DATA_REGION_MERGE_DENY_TABLES: &[&str] = &["stream_records", "idempotency_tokens"];
 const STREAM_COMMON_HANDLE_SPLITS_MIGRATION: &str = "006_common_handle_stream_record_splits.sql";
 const COMMON_HANDLE_STREAM_RECORD_SPLIT_SQL: &str = "\
 SPLIT TABLE stream_records BY
@@ -186,6 +190,7 @@ pub(crate) async fn run_catalog_migrations(pool: &MySqlPool) -> OpResult<()> {
         println!("    Applying consolidated {filename}...");
         run_sql_script(pool, sql, filename).await?;
         record_all_catalog_migrations(pool).await?;
+        ensure_catalog_table_region_merge_option(pool).await?;
         println!("    Fresh catalog initialized from consolidated schema.");
         return Ok(());
     }
@@ -199,6 +204,7 @@ pub(crate) async fn run_catalog_migrations(pool: &MySqlPool) -> OpResult<()> {
         run_sql_script(pool, sql, filename).await?;
         record_migration(pool, filename).await?;
     }
+    ensure_catalog_table_region_merge_option(pool).await?;
     println!("    Migrations applied.");
     Ok(())
 }
@@ -241,6 +247,7 @@ pub(crate) async fn run_data_migrations(pool: &MySqlPool) -> OpResult<()> {
     ensure_idempotency_token_claims(pool).await?;
     ensure_data_table_binary_defaults(pool).await?;
     validate_dynamodb_hash_key_column_layout(pool).await?;
+    ensure_shared_data_table_region_merge_option(pool).await?;
     ensure_user_data_table_region_merge_option(pool).await?;
     repair_user_data_table_region_splits(pool).await?;
     repair_common_handle_stream_record_splits(pool).await?;
@@ -390,10 +397,10 @@ async fn validate_dynamodb_hash_key_column_layout(pool: &MySqlPool) -> OpResult<
         r"SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, GENERATION_EXPRESSION
           FROM information_schema.columns
           WHERE TABLE_SCHEMA = DATABASE()
-            AND TABLE_NAME LIKE '\\_ddb\\_%' ESCAPE '\\'
+            AND TABLE_NAME LIKE '!_ddb!_%' ESCAPE '!'
             AND (
                 COLUMN_NAME = 'pk'
-                OR (COLUMN_NAME LIKE 'edbidx\\_%\\_pk' ESCAPE '\\' AND EXTRA LIKE '%GENERATED%')
+                OR (COLUMN_NAME LIKE 'edbidx!_%!_pk' ESCAPE '!' AND EXTRA LIKE '%GENERATED%')
             )",
     )
     .fetch_all(pool)
@@ -448,6 +455,29 @@ async fn repair_user_data_table_region_splits(pool: &MySqlPool) -> OpResult<()> 
     }
 
     record_data_migration(pool, USER_TABLE_FULL_KEYSPACE_SPLITS_MIGRATION).await?;
+    Ok(())
+}
+
+async fn ensure_catalog_table_region_merge_option(pool: &MySqlPool) -> OpResult<()> {
+    ensure_fixed_table_region_merge_option(pool, CATALOG_REGION_MERGE_DENY_TABLES, "catalog").await
+}
+
+async fn ensure_shared_data_table_region_merge_option(pool: &MySqlPool) -> OpResult<()> {
+    ensure_fixed_table_region_merge_option(pool, DATA_REGION_MERGE_DENY_TABLES, "data").await
+}
+
+async fn ensure_fixed_table_region_merge_option(
+    pool: &MySqlPool,
+    table_names: &[&str],
+    label: &str,
+) -> OpResult<()> {
+    for statement in fixed_table_region_merge_option_sqls(pool, table_names).await? {
+        sqlx::query(&statement).execute(pool).await.map_err(|e| {
+            OpError::Internal(format!(
+                "Configure TiDB {label} table Region merge option: {e}"
+            ))
+        })?;
+    }
     Ok(())
 }
 
@@ -616,11 +646,12 @@ async fn record_all_catalog_migrations(pool: &MySqlPool) -> OpResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CATALOG_MIGRATIONS, COMMON_HANDLE_STREAM_RECORD_SPLIT_SQL, DATA_MIGRATIONS,
-        DATA_NATIVE_TTL_LOOKUP_INDEX_DROPS, DATA_SCHEMA_MIGRATION,
-        MIGRATION_SESSION_INIT_STATEMENTS, STREAM_COMMON_HANDLE_SPLITS_MIGRATION,
-        TIDB_BINARY_COLLATION_TABLE_OPTION, dynamodb_hash_key_column_needs_rebuild,
-        incompatible_dynamodb_hash_key_column_error, should_apply_consolidated_catalog_schema,
+        CATALOG_MIGRATIONS, CATALOG_REGION_MERGE_DENY_TABLES,
+        COMMON_HANDLE_STREAM_RECORD_SPLIT_SQL, DATA_MIGRATIONS, DATA_NATIVE_TTL_LOOKUP_INDEX_DROPS,
+        DATA_REGION_MERGE_DENY_TABLES, DATA_SCHEMA_MIGRATION, MIGRATION_SESSION_INIT_STATEMENTS,
+        STREAM_COMMON_HANDLE_SPLITS_MIGRATION, TIDB_BINARY_COLLATION_TABLE_OPTION,
+        dynamodb_hash_key_column_needs_rebuild, incompatible_dynamodb_hash_key_column_error,
+        should_apply_consolidated_catalog_schema,
     };
     use crate::{CATALOG_VERSION, data::USER_TABLE_FULL_KEYSPACE_SPLITS_MIGRATION};
 
@@ -721,6 +752,8 @@ mod tests {
             .expect("presplit append tables migration");
 
         assert_eq!(*filename, "021_presplit_append_tables.sql");
+        assert!(sql.contains("ALTER TABLE metrics_samples ATTRIBUTES 'merge_option=deny'"));
+        assert!(sql.contains("ALTER TABLE login_attempts ATTRIBUTES 'merge_option=deny'"));
         assert!(sql.contains("SPLIT TABLE metrics_samples"));
         assert!(sql.contains("SPLIT TABLE login_attempts"));
         assert!(sql.contains("REGIONS 16"));
@@ -851,6 +884,7 @@ mod tests {
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS metrics_samples"));
         assert!(sql.contains("sample_id BIGINT NOT NULL AUTO_RANDOM"));
         assert!(sql.contains("PRE_SPLIT_REGIONS = 4"));
+        assert!(sql.contains("ALTER TABLE metrics_samples ATTRIBUTES 'merge_option=deny'"));
         assert!(sql.contains(&format!(
             "INSERT IGNORE INTO settings (`key`, value) VALUES ('catalog_version', '{}')",
             CATALOG_VERSION
@@ -884,6 +918,10 @@ mod tests {
         assert!(login_attempts_schema.contains("SHARD_ROW_ID_BITS = 4"));
         assert!(login_attempts_schema.contains("PRE_SPLIT_REGIONS = 4"));
         assert!(login_attempts_schema.contains("TTL = `attempted_at` + INTERVAL 24 HOUR"));
+        assert!(
+            login_attempts_schema
+                .contains("ALTER TABLE login_attempts ATTRIBUTES 'merge_option=deny'")
+        );
     }
 
     #[test]
@@ -909,6 +947,10 @@ mod tests {
             )
         );
         assert!(DATA_SCHEMA_MIGRATION.contains("PRE_SPLIT_REGIONS = 4"));
+        assert!(
+            DATA_SCHEMA_MIGRATION
+                .contains("ALTER TABLE stream_records ATTRIBUTES 'merge_option=deny'")
+        );
         assert!(DATA_SCHEMA_MIGRATION.contains("shard_id VARCHAR(128) NOT NULL"));
         assert!(DATA_SCHEMA_MIGRATION.contains("TiDB MVCC commit_ts"));
         assert!(DATA_SCHEMA_MIGRATION.contains("commit_sequence_number VARCHAR(64)"));
@@ -933,6 +975,8 @@ mod tests {
             .expect("shared data split migration");
 
         assert_eq!(*filename, "002_presplit_shared_data_tables.sql");
+        assert!(sql.contains("ALTER TABLE stream_records ATTRIBUTES 'merge_option=deny'"));
+        assert!(sql.contains("ALTER TABLE idempotency_tokens ATTRIBUTES 'merge_option=deny'"));
         assert!(sql.contains("SPLIT TABLE stream_records"));
         assert!(
             sql.contains("SPLIT TABLE stream_records INDEX idx_stream_records_commit_sequence")
@@ -955,6 +999,7 @@ mod tests {
             .expect("stream bucket split migration");
 
         assert_eq!(*filename, "004_stream_record_bucket_splits.sql");
+        assert!(sql.contains("ALTER TABLE stream_records ATTRIBUTES 'merge_option=deny'"));
         assert!(!sql.contains("SPLIT TABLE stream_records BY"));
         assert!(
             sql.contains("SPLIT TABLE stream_records INDEX idx_stream_records_commit_sequence BY")
@@ -971,6 +1016,7 @@ mod tests {
             .expect("idempotency token hash-prefix split migration");
 
         assert_eq!(*filename, "005_idempotency_token_hash_prefix_splits.sql");
+        assert!(sql.contains("ALTER TABLE idempotency_tokens ATTRIBUTES 'merge_option=deny'"));
         assert!(sql.contains("SPLIT TABLE idempotency_tokens BY"));
         assert!(sql.contains("('10000000:')"));
         assert!(sql.contains("('80000000:')"));
@@ -1006,6 +1052,18 @@ mod tests {
         assert!(COMMON_HANDLE_STREAM_RECORD_SPLIT_SQL.contains("'shardId-000000000001-'"));
         assert!(COMMON_HANDLE_STREAM_RECORD_SPLIT_SQL.contains("'shardId-000000000015-'"));
         assert!(!COMMON_HANDLE_STREAM_RECORD_SPLIT_SQL.contains("INDEX"));
+    }
+
+    #[test]
+    fn shared_tidb_append_tables_deny_region_merges_on_startup_repair() {
+        assert_eq!(
+            CATALOG_REGION_MERGE_DENY_TABLES,
+            ["metrics_samples", "login_attempts"]
+        );
+        assert_eq!(
+            DATA_REGION_MERGE_DENY_TABLES,
+            ["stream_records", "idempotency_tokens"]
+        );
     }
 
     #[test]

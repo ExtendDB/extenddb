@@ -5,6 +5,8 @@
 -- by ':'. These split points produce 16 primary-key ranges by first hex digit
 -- while correctness still comes from the encoded account/token payload.
 
+ALTER TABLE idempotency_tokens ATTRIBUTES 'merge_option=deny';
+
 SPLIT TABLE idempotency_tokens BY
     ('10000000:'),
     ('20000000:'),

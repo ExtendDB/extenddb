@@ -31,10 +31,10 @@ pub(crate) async fn user_data_table_region_split_sqls(pool: &MySqlPool) -> OpRes
            AND c.TABLE_NAME = s.TABLE_NAME
            AND c.COLUMN_NAME = s.COLUMN_NAME
           WHERE s.TABLE_SCHEMA = DATABASE()
-            AND s.TABLE_NAME LIKE '\\_ddb\\_%' ESCAPE '\\'
+            AND s.TABLE_NAME LIKE '!_ddb!_%' ESCAPE '!'
             AND (
                 s.INDEX_NAME = 'PRIMARY'
-                OR s.INDEX_NAME LIKE 'idx\\_%' ESCAPE '\\'
+                OR s.INDEX_NAME LIKE 'idx!_%' ESCAPE '!'
             )
           ORDER BY s.TABLE_NAME, s.INDEX_NAME, s.SEQ_IN_INDEX",
     )

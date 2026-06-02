@@ -208,6 +208,8 @@ CREATE TABLE IF NOT EXISTS metrics_samples (
   PRE_SPLIT_REGIONS = 4
   TTL = `bucket` + INTERVAL 24 HOUR TTL_JOB_INTERVAL = '1h';
 
+ALTER TABLE metrics_samples ATTRIBUTES 'merge_option=deny';
+
 CREATE INDEX idx_metrics_samples_bucket
     ON metrics_samples (bucket, metric, table_name, index_name, operation);
 
@@ -222,6 +224,8 @@ CREATE TABLE IF NOT EXISTS login_attempts (
   SHARD_ROW_ID_BITS = 4
   PRE_SPLIT_REGIONS = 4
   TTL = `attempted_at` + INTERVAL 24 HOUR TTL_JOB_INTERVAL = '1h';
+
+ALTER TABLE login_attempts ATTRIBUTES 'merge_option=deny';
 
 CREATE INDEX idx_login_attempts_principal_time
     ON login_attempts (principal, attempted_at DESC);

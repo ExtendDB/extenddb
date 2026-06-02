@@ -286,16 +286,12 @@ mod query;
 mod query_scan;
 mod region_split;
 mod statistics;
-mod table_attributes;
 mod transactions;
 mod tx_helpers;
 mod update_item;
 
 pub(crate) use region_split::{
     USER_TABLE_FULL_KEYSPACE_SPLITS_MIGRATION, user_data_table_region_split_sqls,
-};
-pub(crate) use table_attributes::{
-    deny_data_table_region_merges, user_data_table_region_merge_option_sqls,
 };
 
 pub(crate) use index::{native_index_key_tuple_columns, native_index_name};

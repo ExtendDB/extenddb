@@ -25,6 +25,7 @@ mod metadata_engine;
 mod migrations;
 mod operations;
 mod stream_engine;
+mod table_attributes;
 mod table_engine;
 mod table_helpers;
 mod throughput;

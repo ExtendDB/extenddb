@@ -113,9 +113,9 @@ async fn tidb_catalog_check(
 
     let actual_tables: Vec<(String,)> = sqlx::query_as(
         "SELECT table_name FROM information_schema.tables \
-         WHERE table_schema = DATABASE() AND table_name LIKE ? ESCAPE '\\\\'",
+         WHERE table_schema = DATABASE() AND table_name LIKE ? ESCAPE '!'",
     )
-    .bind(r"\_ddb\_%")
+    .bind("!_ddb!_%")
     .fetch_all(&data_pool)
     .await
     .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -276,9 +276,9 @@ async fn check_tidb_native_index_artifacts(
 
     let actual_columns: HashSet<(String, String)> = sqlx::query_as::<_, (String, String)>(
         "SELECT table_name, column_name FROM information_schema.columns \
-         WHERE table_schema = DATABASE() AND table_name LIKE ? ESCAPE '\\\\'",
+         WHERE table_schema = DATABASE() AND table_name LIKE ? ESCAPE '!'",
     )
-    .bind(r"\_ddb\_%")
+    .bind("!_ddb!_%")
     .fetch_all(data_pool)
     .await
     .map_err(|e| StorageError::Internal(e.to_string()))?
@@ -287,9 +287,9 @@ async fn check_tidb_native_index_artifacts(
 
     let actual_indexes: HashSet<(String, String)> = sqlx::query_as::<_, (String, String)>(
         "SELECT table_name, index_name FROM information_schema.statistics \
-         WHERE table_schema = DATABASE() AND table_name LIKE ? ESCAPE '\\\\'",
+         WHERE table_schema = DATABASE() AND table_name LIKE ? ESCAPE '!'",
     )
-    .bind(r"\_ddb\_%")
+    .bind("!_ddb!_%")
     .fetch_all(data_pool)
     .await
     .map_err(|e| StorageError::Internal(e.to_string()))?

@@ -6,6 +6,8 @@
 -- Fresh schemas use an AUTO_RANDOM clustered stream handle, so clustered
 -- stream writes are scattered by TiDB rather than split by shard prefix.
 
+ALTER TABLE stream_records ATTRIBUTES 'merge_option=deny';
+
 SPLIT TABLE stream_records INDEX idx_stream_records_commit_sequence BY
     ('shardId-000000000001-', ''),
     ('shardId-000000000002-', ''),
