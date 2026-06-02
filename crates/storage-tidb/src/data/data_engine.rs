@@ -137,6 +137,13 @@ impl DataEngine for TidbEngine {
         Box::pin(self.export_table_items_impl(key_info, export_time_epoch, max_items, sink))
     }
 
+    fn refresh_table_statistics<'a>(
+        &'a self,
+        key_info: &'a TableKeyInfo,
+    ) -> BoxFuture<'a, Result<(), StorageError>> {
+        Box::pin(self.refresh_table_statistics_impl(key_info))
+    }
+
     fn transact_get_items<'a>(
         &'a self,
         ops: &'a [TransactGetOp<'a>],

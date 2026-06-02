@@ -149,6 +149,10 @@ pub async fn handle_import_table(
         write_batch.push(key, item, item_size);
     }
     imported_count += write_batch.flush(ctx, &key_info).await?;
+    ctx.storage
+        .refresh_table_statistics(&key_info)
+        .await
+        .map_err(storage_err_to_dynamo)?;
 
     let end_time = epoch_seconds();
     let import_arn = format!("{}:import/{}", table_arn, uuid::Uuid::new_v4());

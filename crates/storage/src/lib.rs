@@ -409,6 +409,19 @@ pub trait DataEngine: Send + Sync {
         sink: &'a mut dyn ItemExportSink,
     ) -> BoxFuture<'a, Result<ExportTableItemsSummary, StorageError>>;
 
+    /// Refresh backend-native optimizer statistics after a bulk load.
+    ///
+    /// Backends with native statistics collection should override this so
+    /// newly imported tables are immediately planned from real row/index
+    /// metadata. Backends without optimizer statistics can keep the no-op
+    /// default.
+    fn refresh_table_statistics<'a>(
+        &'a self,
+        _key_info: &'a TableKeyInfo,
+    ) -> BoxFuture<'a, Result<(), StorageError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
     /// Execute multiple get operations in a single consistent snapshot.
     ///
     /// Returns one `Option<Item>` per request, in the same order as `ops`.

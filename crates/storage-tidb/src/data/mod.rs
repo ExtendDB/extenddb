@@ -284,6 +284,7 @@ mod put_item;
 mod query;
 mod query_scan;
 mod region_split;
+mod statistics;
 mod transactions;
 mod tx_helpers;
 mod update_item;

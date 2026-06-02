@@ -138,6 +138,8 @@ All table operations are scoped by `account_id` for multi-account isolation.
 **DataEngine** (item CRUD, query, scan, transactions):
 - `put_item`, `get_item`, `delete_item`, `update_item`
 - `query`, `scan`
+- `batch_get_items`, `batch_write_items`
+- `export_table_items`, `refresh_table_statistics`
 - `transact_get_items`, `transact_write_items`
 - `cleanup_expired_idempotency_tokens`
 
@@ -163,6 +165,11 @@ inside the transaction and let native primary-key/index maintenance do the
 coordination. `TransactGetItems` starts a normal TiDB transaction and performs
 plain reads inside that transaction, getting one native snapshot without
 application-level locks.
+Bulk import writes validated rows through `batch_write_items`, then calls
+`refresh_table_statistics` before reporting completion. TiDB implements this as
+native multi-row DML followed by `ANALYZE TABLE`, so imported tables immediately
+plan Query and Scan paths from real table and index statistics instead of
+pseudo statistics.
 
 **MetadataEngine** (TTL, tags, table statistics):
 - `describe_ttl`, `update_ttl`, `apply_ttl_update`
