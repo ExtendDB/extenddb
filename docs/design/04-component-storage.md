@@ -30,7 +30,7 @@ ExtendDB defines **13 traits** across three categories:
 **DynamoDB Data Path** (defined in `storage/src/lib.rs`):
 - `TableEngine` — table lifecycle operations
 - `DataEngine` — item CRUD, query, scan, batch, transactions
-- `MetadataEngine` — TTL, tags, table statistics
+- `MetadataEngine` — TTL and tags
 - `StreamEngine` — DynamoDB Streams record storage and retrieval
 - `WorkerStore` — background worker operations (control plane transitions)
 - `BackupEngine` — backup and restore operations
@@ -1091,6 +1091,10 @@ missing row. The unique key is the distributed race detector.
 The physical primary key is a backend-owned storage key derived from `(account_id, ClientRequestToken)`, not the raw
 client token. TiDB prefixes that collision-free encoded value with a stable hash placement prefix so the clustered
 primary key distributes naturally across Regions while uniqueness still comes from the encoded account/token payload.
+The TiDB data migrations split this shared clustered primary key at the exact
+hash-prefix boundaries (`10000000:`, `20000000:`, ..., `f0000000:`), matching
+the storage-key format instead of relying on a broad lexicographic string
+range.
 
 TiDB uses the token as the retry boundary for retryable write-conflict,
 deadlock, lock-timeout, and schema-change errors. When a token is present,
@@ -1302,16 +1306,17 @@ pub struct WorkerContext {
 
 **Backend-specific workers** (spawned via `RuntimeHooks`, access backend
 internals):
-- PostgreSQL spawns its control-plane poller, pool metrics, GSI delay poller,
-  TTL cleanup, stream cleanup, idempotency token cleanup, metrics DB prune,
-  login-attempt cleanup, and table size refresh workers
+- PostgreSQL spawns its concrete backend workers for control-plane transitions,
+  pool metrics, asynchronous index status, fixed-retention cleanup, metrics DB
+  prune, login-attempt cleanup, and table size refresh
 - TiDB spawns only its control-plane poller and pool metrics workers; TiDB
   online DDL owns schema jobs, TiDB native TTL handles all item TTL plus
   stream-record, idempotency-token, metrics, login-attempt, and assume-role
   session retention, startup repair re-enables native TTL jobs if TiDB tooling
   left `TTL_ENABLE = 'OFF'`, one-time data migrations pre-split shared write
-  tables with TiDB Region split/scatter, and TiDB `information_schema` table
-  statistics are read on demand instead of refreshed by a frontend worker.
+  tables with TiDB Region split/scatter using boundaries derived from their
+  native key layout, and TiDB `information_schema` table statistics are read on
+  demand instead of refreshed by a frontend worker.
 - Runtime hooks also expose backend readiness to `/health`, so TiDB checks every
   pool opened by the frontend instead of reporting web-process liveness only.
 - Other backends may spawn different workers or none at all

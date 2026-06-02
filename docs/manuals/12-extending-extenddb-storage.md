@@ -32,9 +32,9 @@ A new backend must implement **13 storage traits** plus the `CredentialStore` tr
 **DynamoDB data path** (defined in `crates/storage/src/lib.rs`):
 1. `TableEngine` — table lifecycle
 2. `DataEngine` — item CRUD, query, scan, transactions
-3. `MetadataEngine` — TTL, tags, table statistics
+3. `MetadataEngine` — TTL and tags
 4. `StreamEngine` — DynamoDB Streams
-5. `WorkerStore` — background worker operations (control-plane transitions, TTL cleanup)
+5. `WorkerStore` — background worker operations (control-plane transitions and backend-specific runtime work)
 
 **Management and operational** (defined in `crates/storage/src/`):
 6. `ManagementStore` — IAM CRUD (users, groups, roles, policies, access keys, accounts)
@@ -291,7 +291,10 @@ ClientRequestToken)` storage key that atomically recycles an expired row and a
 per-attempt `claim_id` to distinguish a newly claimed token from an in-window
 replay; do not put a cleanup delete on the transaction write path. TiDB should
 use a hash-prefixed clustered key for this shared table so token claims from
-busy accounts do not concentrate in one key range.
+busy accounts do not concentrate in one key range. Split that clustered key at
+the hash-prefix boundaries produced by the storage-key encoder instead of using
+an approximate string range; the split layout should follow the native key
+shape.
 
 For append-only TiDB catalog tables without a clustered primary key, such as
 failed-login attempts, use TiDB `SHARD_ROW_ID_BITS` to scatter implicit row IDs
@@ -529,7 +532,7 @@ The PostgreSQL implementation makes backend-specific choices. These are implemen
 |-------|------------|---------------------------|---------------------|---------|
 | `TableEngine` | `storage/src/lib.rs` | `PostgresEngine` | `TidbEngine` | Table lifecycle |
 | `DataEngine` | `storage/src/lib.rs` | `PostgresEngine` | `TidbEngine` | Item CRUD, query, scan, transactions |
-| `MetadataEngine` | `storage/src/lib.rs` | `PostgresEngine` | `TidbEngine` | TTL, tags, table statistics |
+| `MetadataEngine` | `storage/src/lib.rs` | `PostgresEngine` | `TidbEngine` | TTL and tags |
 | `StreamEngine` | `storage/src/lib.rs` | `PostgresEngine` | `TidbEngine` | DynamoDB Streams |
 | `WorkerStore` | `storage/src/lib.rs` | `PostgresEngine` | `TidbEngine` | Background workers |
 | `BackupEngine` | `storage/src/lib.rs` | `PostgresEngine` | `TidbEngine` | Backup and restore |

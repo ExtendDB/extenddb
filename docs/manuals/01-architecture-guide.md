@@ -97,7 +97,7 @@ PostgreSQL implementation of all storage traits using `sqlx`. Features:
 - Items stored as JSONB with indexed key columns
 - GSI/LSI metadata in the catalog; physical index layout is backend-specific
 - Transactions use `SELECT FOR UPDATE` + single-transaction commits
-- Stream records stored in a dedicated table with background cleanup
+- Stream records stored in a dedicated table; retention is backend-owned
 - All queries parameterized (no dynamic SQL construction)
 
 ### storage-tidb
@@ -143,7 +143,7 @@ Thin binary that wires everything together:
 - CLI parsing (clap): `serve`, `init`, `destroy`, `verify`, `migrate`, `status`, `settings`, `manage`, `version`
 - Configuration loading (TOML + env vars)
 - Daemon lifecycle (bind socket → fork → syslog → serve)
-- Background tasks (log level polling, throttling polling, stream record cleanup, backend-specific TTL expiry, metrics persistence)
+- Background tasks (log level polling, throttling polling, backend-specific runtime hooks, metrics persistence)
 - Backend diagnostics (`catalog-check`) through the selected storage backend's operations engine
 
 ## Request Lifecycle

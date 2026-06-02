@@ -109,6 +109,8 @@ const DATA_PRESPLIT_SHARED_TABLES_MIGRATION: &str =
     include_str!("../../storage-tidb/data_migrations/002_presplit_shared_data_tables.sql");
 const DATA_STREAM_RECORD_BUCKET_SPLITS_MIGRATION: &str =
     include_str!("../../storage-tidb/data_migrations/004_stream_record_bucket_splits.sql");
+const DATA_IDEMPOTENCY_TOKEN_HASH_PREFIX_SPLITS_MIGRATION: &str =
+    include_str!("../../storage-tidb/data_migrations/005_idempotency_token_hash_prefix_splits.sql");
 pub(crate) const DATA_MIGRATIONS: &[(&str, &str)] = &[
     ("001_data_schema.sql", DATA_SCHEMA_MIGRATION),
     (
@@ -118,6 +120,10 @@ pub(crate) const DATA_MIGRATIONS: &[(&str, &str)] = &[
     (
         "004_stream_record_bucket_splits.sql",
         DATA_STREAM_RECORD_BUCKET_SPLITS_MIGRATION,
+    ),
+    (
+        "005_idempotency_token_hash_prefix_splits.sql",
+        DATA_IDEMPOTENCY_TOKEN_HASH_PREFIX_SPLITS_MIGRATION,
     ),
 ];
 #[cfg(test)]
@@ -799,6 +805,21 @@ mod tests {
         );
         assert!(sql.contains("'shardId-000000000001-'"));
         assert!(sql.contains("'shardId-000000000015-'"));
+    }
+
+    #[test]
+    fn data_migrations_split_idempotency_tokens_by_hash_prefix() {
+        let (filename, sql) = DATA_MIGRATIONS
+            .iter()
+            .find(|(filename, _)| *filename == "005_idempotency_token_hash_prefix_splits.sql")
+            .expect("idempotency token hash-prefix split migration");
+
+        assert_eq!(*filename, "005_idempotency_token_hash_prefix_splits.sql");
+        assert!(sql.contains("SPLIT TABLE idempotency_tokens BY"));
+        assert!(sql.contains("('10000000:')"));
+        assert!(sql.contains("('80000000:')"));
+        assert!(sql.contains("('f0000000:')"));
+        assert!(!sql.contains("BETWEEN ('') AND ('~')"));
     }
 
     #[test]
