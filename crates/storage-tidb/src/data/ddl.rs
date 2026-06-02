@@ -24,7 +24,8 @@ use super::{
 use crate::TidbEngine;
 use crate::tidb_util::{execute_tidb_create_table_ddl, execute_tidb_idempotent_ddl};
 
-/// Row shape returned by the table-info query: (key_schema, attr_defs, status, table_id, stream_spec, has_lsi).
+/// Row shape returned by the table-info query:
+/// (key_schema, attr_defs, status, table_id, stream_spec, has_lsi, secondary index key schemas).
 type TableInfoRow = (
     serde_json::Value,
     serde_json::Value,
@@ -32,6 +33,7 @@ type TableInfoRow = (
     String,
     Option<serde_json::Value>,
     Option<bool>,
+    serde_json::Value,
 );
 
 type TableReadInfoRow = (
@@ -46,6 +48,7 @@ type TableReadInfoRow = (
     Option<String>,
     Option<serde_json::Value>,
     Option<serde_json::Value>,
+    serde_json::Value,
 );
 
 fn table_accepts_data_plane(status: &str) -> bool {
@@ -299,7 +302,11 @@ impl TidbEngine {
         let row: Option<TableInfoRow> = sqlx::query_as(
             "SELECT key_schema, attribute_definitions, table_status, table_id, \
              stream_specification, \
-             EXISTS(SELECT 1 FROM indexes WHERE table_id = tables.table_id AND index_type = 'LSI') AS has_lsi \
+             EXISTS(SELECT 1 FROM indexes WHERE table_id = tables.table_id AND index_type = 'LSI') AS has_lsi, \
+             COALESCE(( \
+                 SELECT JSON_ARRAYAGG(key_schema) FROM indexes \
+                 WHERE table_id = tables.table_id AND index_status IN ('ACTIVE', 'CREATING') \
+             ), JSON_ARRAY()) AS secondary_index_key_schemas \
              FROM tables \
              WHERE account_id = ? AND table_name = ?",
         )
@@ -309,8 +316,15 @@ impl TidbEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let (ks_json, ad_json, status, table_id, stream_spec_json, has_lsi) =
-            row.ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
+        let (
+            ks_json,
+            ad_json,
+            status,
+            table_id,
+            stream_spec_json,
+            has_lsi,
+            secondary_index_key_schemas_json,
+        ) = row.ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
 
         if !table_accepts_data_plane(&status) {
             return Err(StorageError::TableNotActive(table_name.to_owned()));
@@ -325,6 +339,9 @@ impl TidbEngine {
             .map(serde_json::from_value)
             .transpose()
             .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let secondary_index_key_schemas: Vec<Vec<KeySchemaElement>> =
+            serde_json::from_value(secondary_index_key_schemas_json)
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         Ok(TableKeyInfo {
             table_name: table_name.to_owned(),
@@ -332,6 +349,7 @@ impl TidbEngine {
             table_id,
             key_schema,
             attribute_definitions,
+            secondary_index_key_schemas,
             has_lsi: has_lsi.unwrap_or(false),
             stream_specification,
         })
@@ -354,7 +372,11 @@ impl TidbEngine {
             "SELECT t.key_schema, t.attribute_definitions, t.table_status, t.table_id, \
                     t.stream_specification, \
                     EXISTS(SELECT 1 FROM indexes WHERE table_id = t.table_id AND index_type = 'LSI') AS has_lsi, \
-                    i.index_name, i.index_type, i.index_id, i.key_schema, i.projection \
+                    i.index_name, i.index_type, i.index_id, i.key_schema, i.projection, \
+                    COALESCE(( \
+                        SELECT JSON_ARRAYAGG(key_schema) FROM indexes \
+                        WHERE table_id = t.table_id AND index_status IN ('ACTIVE', 'CREATING') \
+                    ), JSON_ARRAY()) AS secondary_index_key_schemas \
              FROM tables t \
              LEFT JOIN indexes i \
                ON i.table_id = t.table_id \
@@ -381,6 +403,7 @@ impl TidbEngine {
             idx_id,
             idx_ks_json,
             idx_projection_json,
+            secondary_index_key_schemas_json,
         ) = row.ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
 
         if !table_accepts_data_plane(&status) {
@@ -395,6 +418,9 @@ impl TidbEngine {
             .map(serde_json::from_value)
             .transpose()
             .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let secondary_index_key_schemas: Vec<Vec<KeySchemaElement>> =
+            serde_json::from_value(secondary_index_key_schemas_json)
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let idx_name =
             idx_name.ok_or_else(|| StorageError::IndexNotFound(index_name.to_owned()))?;
@@ -428,6 +454,7 @@ impl TidbEngine {
                 table_id,
                 key_schema,
                 attribute_definitions,
+                secondary_index_key_schemas,
                 has_lsi: has_lsi.unwrap_or(false),
                 stream_specification,
             },

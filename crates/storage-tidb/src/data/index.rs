@@ -30,10 +30,6 @@ use super::{
 };
 use crate::tidb_util::execute_tidb_idempotent_ddl;
 
-pub(crate) struct WriteIndexKeys {
-    key_schema: Vec<KeySchemaElement>,
-}
-
 pub(crate) struct NativeSecondaryIndex<'a> {
     pub index_id: &'a str,
     pub key_schema: &'a [KeySchemaElement],
@@ -43,44 +39,6 @@ struct GeneratedColumn {
     name: String,
     ddl_type: &'static str,
     expression: String,
-}
-
-/// Fetch secondary-index key schemas that must be validated on writes.
-///
-/// CREATING indexes are included because TiDB's online ADD INDEX backfill will
-/// observe existing base rows. Letting malformed index-key attributes into the
-/// base table during that window would create permanently sparse index entries.
-pub(crate) async fn fetch_write_index_key_schemas(
-    table_id: &str,
-    pool: &sqlx::MySqlPool,
-) -> Result<Vec<WriteIndexKeys>, StorageError> {
-    let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
-        "SELECT key_schema FROM indexes \
-         WHERE table_id = ? AND index_status IN ('ACTIVE', 'CREATING')",
-    )
-    .bind(table_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-    rows.into_iter()
-        .map(|(ks_json,)| {
-            let key_schema = serde_json::from_value(ks_json)
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            Ok(WriteIndexKeys { key_schema })
-        })
-        .collect()
-}
-
-pub(crate) fn has_potential_secondary_index_keys(
-    key_schema: &[KeySchemaElement],
-    attr_defs: &[AttributeDefinition],
-) -> bool {
-    attr_defs.iter().any(|attr| {
-        !key_schema
-            .iter()
-            .any(|key| key.attribute_name == attr.attribute_name)
-    })
 }
 
 pub(crate) fn item_has_potential_secondary_index_key(
@@ -96,37 +54,34 @@ pub(crate) fn item_has_potential_secondary_index_key(
     })
 }
 
-pub(crate) async fn validate_item_secondary_index_key_constraints(
-    table_id: &str,
+pub(crate) fn validate_item_secondary_index_key_constraints(
     item: &Item,
     key_schema: &[KeySchemaElement],
+    secondary_index_key_schemas: &[Vec<KeySchemaElement>],
     attr_defs: &[AttributeDefinition],
     limits: &LimitsConfig,
-    pool: &sqlx::MySqlPool,
 ) -> Result<(), StorageError> {
     if !item_has_potential_secondary_index_key(item, key_schema, attr_defs) {
         return Ok(());
     }
 
-    let index_keys = fetch_write_index_key_schemas(table_id, pool).await?;
-    validate_item_index_key_constraints(item, &index_keys, attr_defs, limits)
+    validate_item_index_key_constraints(item, secondary_index_key_schemas, attr_defs, limits)
 }
 
 pub(crate) fn validate_item_index_key_constraints(
     item: &Item,
-    indexes: &[WriteIndexKeys],
+    indexes: &[Vec<KeySchemaElement>],
     attr_defs: &[AttributeDefinition],
     limits: &LimitsConfig,
 ) -> Result<(), StorageError> {
-    for index in indexes {
-        let hash_key_count = index
-            .key_schema
+    for key_schema in indexes {
+        let hash_key_count = key_schema
             .iter()
             .filter(|key| key.key_type == KeyType::Hash)
             .count();
         let mut hash_values = Vec::with_capacity(hash_key_count);
 
-        for key in &index.key_schema {
+        for key in key_schema {
             let Some(value) = item.get(&key.attribute_name) else {
                 continue;
             };
@@ -530,8 +485,8 @@ mod tests {
 
     use super::{
         NativeSecondaryIndex, add_generated_columns_ddl, add_native_indexes_ddl,
-        drop_native_indexes_and_columns_ddl, generated_columns, has_potential_secondary_index_keys,
-        hash_key_expression, item_has_potential_secondary_index_key, native_index_hash_column,
+        drop_native_indexes_and_columns_ddl, generated_columns, hash_key_expression,
+        item_has_potential_secondary_index_key, native_index_hash_column,
         native_index_key_tuple_columns, validate_item_index_key_constraints,
     };
 
@@ -765,7 +720,6 @@ mod tests {
             },
         ];
 
-        assert!(has_potential_secondary_index_keys(&table_keys, &attr_defs));
         assert!(!item_has_potential_secondary_index_key(
             &BTreeMap::from([("pk".to_owned(), AttributeValue::S("a".to_owned()))]),
             &table_keys,
@@ -792,7 +746,6 @@ mod tests {
             attribute_type: ScalarAttributeType::S,
         }];
 
-        assert!(!has_potential_secondary_index_keys(&table_keys, &attr_defs));
         assert!(!item_has_potential_secondary_index_key(
             &BTreeMap::from([
                 ("pk".to_owned(), AttributeValue::S("a".to_owned())),
@@ -805,12 +758,10 @@ mod tests {
 
     #[test]
     fn secondary_index_validation_rejects_empty_binary_key_values() {
-        let indexes = vec![super::WriteIndexKeys {
-            key_schema: vec![KeySchemaElement {
-                attribute_name: "gpk".to_owned(),
-                key_type: KeyType::Hash,
-            }],
-        }];
+        let indexes = vec![vec![KeySchemaElement {
+            attribute_name: "gpk".to_owned(),
+            key_type: KeyType::Hash,
+        }]];
         let attr_defs = vec![AttributeDefinition {
             attribute_name: "gpk".to_owned(),
             attribute_type: ScalarAttributeType::B,
@@ -833,12 +784,10 @@ mod tests {
 
     #[test]
     fn secondary_index_validation_rejects_oversized_hash_key_values() {
-        let indexes = vec![super::WriteIndexKeys {
-            key_schema: vec![KeySchemaElement {
-                attribute_name: "gpk".to_owned(),
-                key_type: KeyType::Hash,
-            }],
-        }];
+        let indexes = vec![vec![KeySchemaElement {
+            attribute_name: "gpk".to_owned(),
+            key_type: KeyType::Hash,
+        }]];
         let attr_defs = vec![AttributeDefinition {
             attribute_name: "gpk".to_owned(),
             attribute_type: ScalarAttributeType::S,
@@ -861,18 +810,16 @@ mod tests {
 
     #[test]
     fn secondary_index_validation_rejects_oversized_sort_key_values() {
-        let indexes = vec![super::WriteIndexKeys {
-            key_schema: vec![
-                KeySchemaElement {
-                    attribute_name: "gpk".to_owned(),
-                    key_type: KeyType::Hash,
-                },
-                KeySchemaElement {
-                    attribute_name: "gsk".to_owned(),
-                    key_type: KeyType::Range,
-                },
-            ],
-        }];
+        let indexes = vec![vec![
+            KeySchemaElement {
+                attribute_name: "gpk".to_owned(),
+                key_type: KeyType::Hash,
+            },
+            KeySchemaElement {
+                attribute_name: "gsk".to_owned(),
+                key_type: KeyType::Range,
+            },
+        ]];
         let attr_defs = vec![
             AttributeDefinition {
                 attribute_name: "gpk".to_owned(),
@@ -904,18 +851,16 @@ mod tests {
 
     #[test]
     fn secondary_index_validation_rejects_oversized_multipart_hash_tuple() {
-        let indexes = vec![super::WriteIndexKeys {
-            key_schema: vec![
-                KeySchemaElement {
-                    attribute_name: "gpk1".to_owned(),
-                    key_type: KeyType::Hash,
-                },
-                KeySchemaElement {
-                    attribute_name: "gpk2".to_owned(),
-                    key_type: KeyType::Hash,
-                },
-            ],
-        }];
+        let indexes = vec![vec![
+            KeySchemaElement {
+                attribute_name: "gpk1".to_owned(),
+                key_type: KeyType::Hash,
+            },
+            KeySchemaElement {
+                attribute_name: "gpk2".to_owned(),
+                key_type: KeyType::Hash,
+            },
+        ]];
         let attr_defs = vec![
             AttributeDefinition {
                 attribute_name: "gpk1".to_owned(),

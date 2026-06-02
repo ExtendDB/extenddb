@@ -126,8 +126,10 @@ The `CredentialStore` trait in the `auth` crate uses `#[async_trait]` instead
 
 **TableEngine** (table lifecycle):
 - `create_table`, `delete_table`, `describe_table`, `list_tables`, `update_table`
-- `table_key_info` — returns lightweight metadata (key schema, attribute definitions)
-  for data operations, avoiding the overhead of a full `describe_table` call
+- `table_key_info` — returns lightweight metadata (key schema, attribute definitions,
+  and write-validation secondary index key schemas) for data operations,
+  avoiding the overhead of a full `describe_table` call and extra write-path
+  catalog lookups
 - `table_read_info` — returns base table metadata plus optional resolved GSI/LSI
   metadata for Query and Scan so storage backends do not re-fetch catalog rows
   after the engine has selected an index
@@ -152,6 +154,12 @@ races. Read methods receive the DynamoDB `ConsistentRead` flag so a backend can
 route strong reads and eventually consistent reads through different native
 paths. Stream records are written atomically with data writes when `stream` is
 `Some`.
+
+For TiDB, `TableKeyInfo` also carries ACTIVE and CREATING secondary index key
+schemas. Item writes validate DynamoDB index-key type and size constraints from
+that metadata, while TiDB native generated columns and secondary indexes own
+physical maintenance and backfill. This removes a per-write catalog lookup
+without weakening validation for online index builds.
 
 For TiDB, every storage connection uses pessimistic transaction mode. Conditional
 writes first perform a primary-key `SELECT ... FOR UPDATE`; TiDB locks the
@@ -431,6 +439,7 @@ Storage backends must preserve the exact type and value of each attribute.
 - `table_id: String`
 - `key_schema: Vec<KeySchemaElement>`
 - `attribute_definitions: Vec<AttributeDefinition>`
+- `secondary_index_key_schemas: Vec<Vec<KeySchemaElement>>`
 - `has_lsi: bool`
 - `stream_specification: Option<StreamSpecification>`
 

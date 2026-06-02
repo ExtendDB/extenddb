@@ -39,14 +39,12 @@ impl TidbEngine {
             serde_json::to_value(&item).map_err(|e| StorageError::Internal(e.to_string()))?;
 
         validate_item_secondary_index_key_constraints(
-            &key_info.table_id,
             &item,
             &key_info.key_schema,
+            &key_info.secondary_index_key_schemas,
             &key_info.attribute_definitions,
             &self.limits,
-            &self.pool,
-        )
-        .await?;
+        )?;
 
         // When there's a condition, return_old, or stream capture, we need a transaction.
         let needs_tx = condition.is_some() || return_old || stream.is_some();

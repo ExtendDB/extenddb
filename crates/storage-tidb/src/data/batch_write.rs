@@ -8,10 +8,7 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{SortKeyValue, parse_sk, sk_column, sk_info};
 use extenddb_storage::{BatchWriteOp, StreamCapture};
 
-use super::index::{
-    fetch_write_index_key_schemas, item_has_potential_secondary_index_key,
-    validate_item_index_key_constraints,
-};
+use super::index::{item_has_potential_secondary_index_key, validate_item_index_key_constraints};
 use super::{data_table_name, physical_pk_bytes, repeat_tuple_placeholders};
 use crate::TidbEngine;
 
@@ -46,8 +43,7 @@ impl TidbEngine {
                 .await;
         }
 
-        self.validate_batch_write_secondary_index_keys(key_info, ops)
-            .await?;
+        self.validate_batch_write_secondary_index_keys(key_info, ops)?;
 
         let ddb_table = data_table_name(&key_info.table_id);
         let sk = sk_info(&key_info.key_schema, &key_info.attribute_definitions);
@@ -97,7 +93,7 @@ impl TidbEngine {
         Ok(())
     }
 
-    async fn validate_batch_write_secondary_index_keys(
+    fn validate_batch_write_secondary_index_keys(
         &self,
         key_info: &TableKeyInfo,
         ops: &[BatchWriteOp<'_>],
@@ -113,12 +109,11 @@ impl TidbEngine {
             return Ok(());
         }
 
-        let index_keys = fetch_write_index_key_schemas(&key_info.table_id, &self.pool).await?;
         for op in ops {
             if let BatchWriteOp::Put(item) = op {
                 validate_item_index_key_constraints(
                     item,
-                    &index_keys,
+                    &key_info.secondary_index_key_schemas,
                     &key_info.attribute_definitions,
                     &self.limits,
                 )?;

@@ -112,14 +112,12 @@ impl TidbEngine {
             .map_err(|e| StorageError::Validation(e.to_string()))?;
 
         validate_item_secondary_index_key_constraints(
-            &key_info.table_id,
             &item,
             &key_info.key_schema,
+            &key_info.secondary_index_key_schemas,
             &key_info.attribute_definitions,
             &self.limits,
-            &self.pool,
-        )
-        .await?;
+        )?;
 
         // Validate post-update item size (400 KB limit)
         validation::validate_item_size(&item, self.limits.max_item_size_bytes)

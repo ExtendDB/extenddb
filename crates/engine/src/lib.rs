@@ -247,7 +247,9 @@ impl DispatchResult {
 /// For single-table item operations (`GetItem`, `PutItem`, `DeleteItem`,
 /// `UpdateItem`, `Query`, `Scan`), the auth layer pre-fetches `TableReadInfo`
 /// and stores it in `pre_fetched_read_info`. Engine handlers MUST use this
-/// pre-fetched value instead of calling storage metadata APIs directly.
+/// pre-fetched value instead of calling storage metadata APIs directly. Write
+/// handlers rely on its `TableKeyInfo` secondary-index key schemas for
+/// DynamoDB validation before native storage writes.
 /// New per-request catalog roundtrips require justification in the discussion
 /// file and principal reviewer approval.
 pub struct OperationContext {

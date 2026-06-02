@@ -3,13 +3,11 @@
 
 //! Transactional read/write implementations for the `TiDB` backend.
 
-use std::collections::HashMap;
-
 use extenddb_core::expression::{self, ExpressionMaps};
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
-    AttributeValue, CancellationReason, Item, ReturnValuesOnConditionCheckFailure,
-    ScalarAttributeType, StreamEventName, TableKeyInfo,
+    AttributeValue, CancellationReason, Item, KeySchemaElement,
+    ReturnValuesOnConditionCheckFailure, ScalarAttributeType, StreamEventName, TableKeyInfo,
 };
 use extenddb_core::validation;
 use extenddb_storage::StreamCapture;
@@ -21,10 +19,7 @@ use super::batch_write::{
     PreparedDelete, PreparedPut, execute_batch_deletes, execute_batch_puts, prepare_batch_delete,
     prepare_batch_put,
 };
-use super::index::{
-    WriteIndexKeys, fetch_write_index_key_schemas, has_potential_secondary_index_keys,
-    item_has_potential_secondary_index_key, validate_item_index_key_constraints,
-};
+use super::index::validate_item_index_key_constraints;
 use super::tx_helpers::{
     StreamSequenceAllocator, check_idempotency_token_in_tx, delete_item_in_tx,
     delete_item_without_old_item_in_tx, fetch_item_for_update, finalize_stream_records_best_effort,
@@ -149,20 +144,6 @@ impl TidbEngine {
         ops: &[TransactWriteOp<'_>],
         token: Option<(&str, &str)>,
     ) -> Result<(), StorageError> {
-        // Pre-fetch secondary-index key schemas only for tables whose writes can
-        // touch secondary-index key attributes. TiDB generated columns/native
-        // indexes own maintenance; this fetch is only for DynamoDB validation
-        // messages before a write reaches TiDB.
-        let mut table_indexes: HashMap<String, Vec<WriteIndexKeys>> = HashMap::new();
-        for (table_id, needs_validation) in transact_write_table_index_validation_needs(ops) {
-            let indexes = if needs_validation {
-                fetch_write_index_key_schemas(&table_id, &self.pool).await?
-            } else {
-                Vec::new()
-            };
-            table_indexes.insert(table_id, indexes);
-        }
-
         let mut tx = self
             .data_pool
             .begin()
@@ -180,7 +161,7 @@ impl TidbEngine {
         let mut any_failed = false;
 
         for op in ops {
-            let indexes = &table_indexes[transact_op_table_id(op)];
+            let indexes = &transact_op_key_info(op).secondary_index_key_schemas;
             let reason = match stage_native_transact_write_op(
                 op,
                 indexes,
@@ -468,11 +449,6 @@ fn transact_get_pk_sk_sql(table: &str, sk_col: &str, key_count: usize) -> String
     )
 }
 
-/// Extract the table_id from a transactional write operation.
-fn transact_op_table_id<'a>(op: &'a TransactWriteOp<'_>) -> &'a str {
-    &transact_op_key_info(op).table_id
-}
-
 fn transact_op_key_info<'a>(op: &'a TransactWriteOp<'_>) -> &'a extenddb_core::types::TableKeyInfo {
     match op {
         TransactWriteOp::Put { key_info, .. }
@@ -489,35 +465,6 @@ fn transact_op_stream_capture<'a>(op: &'a TransactWriteOp<'_>) -> Option<&'a Str
         | TransactWriteOp::Update { stream, .. } => stream.as_ref(),
         TransactWriteOp::ConditionCheck { .. } => None,
     }
-}
-
-fn transact_op_needs_secondary_index_validation(op: &TransactWriteOp<'_>) -> bool {
-    match op {
-        TransactWriteOp::Put { key_info, item, .. } => item_has_potential_secondary_index_key(
-            item,
-            &key_info.key_schema,
-            &key_info.attribute_definitions,
-        ),
-        TransactWriteOp::Update { key_info, .. } => has_potential_secondary_index_keys(
-            &key_info.key_schema,
-            &key_info.attribute_definitions,
-        ),
-        TransactWriteOp::Delete { .. } | TransactWriteOp::ConditionCheck { .. } => false,
-    }
-}
-
-fn transact_write_table_index_validation_needs(
-    ops: &[TransactWriteOp<'_>],
-) -> HashMap<String, bool> {
-    let mut table_needs = HashMap::new();
-    for op in ops {
-        let needs_validation = transact_op_needs_secondary_index_validation(op);
-        table_needs
-            .entry(transact_op_table_id(op).to_owned())
-            .and_modify(|needs| *needs |= needs_validation)
-            .or_insert(needs_validation);
-    }
-    table_needs
 }
 
 fn transact_put_needs_existing_item(
@@ -600,7 +547,7 @@ async fn execute_native_txn_write_group(
 
 fn stage_native_transact_write_op<'a>(
     op: &TransactWriteOp<'a>,
-    indexes: &[WriteIndexKeys],
+    indexes: &[Vec<KeySchemaElement>],
     limits: &LimitsConfig,
     batch: &mut NativeTxnWriteBatch<'a>,
 ) -> Result<Option<TxnWriteOutcome>, TxnOpError> {
@@ -674,7 +621,7 @@ impl From<CancellationReason> for TxnOpError {
 async fn execute_transact_write_op(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     op: &TransactWriteOp<'_>,
-    indexes: &[WriteIndexKeys],
+    indexes: &[Vec<KeySchemaElement>],
     limits: &LimitsConfig,
 ) -> Result<TxnWriteOutcome, TxnOpError> {
     match op {
@@ -874,7 +821,7 @@ async fn execute_transact_write_op(
 fn validate_transact_put(
     key_info: &TableKeyInfo,
     item: &Item,
-    indexes: &[WriteIndexKeys],
+    indexes: &[Vec<KeySchemaElement>],
     limits: &LimitsConfig,
 ) -> Result<(), TxnOpError> {
     validation::validate_item_keys(item, &key_info.key_schema, &key_info.attribute_definitions)
@@ -889,7 +836,7 @@ fn validate_transact_key_only(key_info: &TableKeyInfo, key: &Item) -> Result<(),
 
 fn validate_txn_index_key_constraints(
     item: &Item,
-    indexes: &[WriteIndexKeys],
+    indexes: &[Vec<KeySchemaElement>],
     attr_defs: &[extenddb_core::types::AttributeDefinition],
     limits: &LimitsConfig,
 ) -> Result<(), TxnOpError> {
@@ -943,10 +890,10 @@ mod tests {
     use extenddb_storage::{StreamCapture, TransactWriteOp};
 
     use super::{
-        NativeTxnWriteBatch, TransactGetEntry, TransactGetGroup, TransactGetLookupKey,
+        NativeTxnWriteBatch, TransactGetEntry, TransactGetGroup, TransactGetLookupKey, TxnOpError,
         TxnWriteOutcome, assign_transact_get_group_results, stage_native_transact_write_op,
         transact_delete_needs_existing_item, transact_get_pk_sk_sql, transact_get_pk_sql,
-        transact_put_needs_existing_item, transact_write_table_index_validation_needs,
+        transact_put_needs_existing_item,
     };
 
     fn condition() -> Expr {
@@ -985,6 +932,10 @@ mod tests {
                     attribute_type: ScalarAttributeType::S,
                 },
             ],
+            secondary_index_key_schemas: vec![vec![KeySchemaElement {
+                attribute_name: "gpk".to_owned(),
+                key_type: KeyType::Hash,
+            }]],
             has_lsi: false,
             stream_specification: None,
         }
@@ -993,12 +944,6 @@ mod tests {
     fn item(value: &str) -> extenddb_core::types::Item {
         let mut item = extenddb_core::types::Item::new();
         item.insert("pk".to_owned(), AttributeValue::S(value.to_owned()));
-        item
-    }
-
-    fn item_with_index_key(value: &str) -> extenddb_core::types::Item {
-        let mut item = item(value);
-        item.insert("gpk".to_owned(), AttributeValue::S(value.to_owned()));
         item
     }
 
@@ -1113,33 +1058,39 @@ mod tests {
     }
 
     #[test]
-    fn transaction_index_validation_plan_uses_all_ops_for_a_table() {
+    fn transaction_put_validates_index_schemas_from_table_key_info() {
         let key_info = key_info();
         let maps = ExpressionMaps::default();
-        let delete_key = item("delete");
-        let put_item = item_with_index_key("put");
-        let ops = vec![
-            TransactWriteOp::Delete {
-                key_info: &key_info,
-                key: &delete_key,
-                condition: None,
-                maps: &maps,
-                return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
-                stream: None,
-            },
-            TransactWriteOp::Put {
-                key_info: &key_info,
-                item: &put_item,
-                condition: None,
-                maps: &maps,
-                return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
-                stream: None,
-            },
-        ];
+        let limits = LimitsConfig::default();
+        let mut batch = NativeTxnWriteBatch::default();
+        let mut put_item = item("put");
+        put_item.insert("gpk".to_owned(), AttributeValue::B(vec![1]));
+        let put_op = TransactWriteOp::Put {
+            key_info: &key_info,
+            item: &put_item,
+            condition: None,
+            maps: &maps,
+            return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+            stream: None,
+        };
 
-        let needs = transact_write_table_index_validation_needs(&ops);
+        let result = stage_native_transact_write_op(
+            &put_op,
+            &key_info.secondary_index_key_schemas,
+            &limits,
+            &mut batch,
+        );
 
-        assert_eq!(needs.get("tableid"), Some(&true));
+        let Err(TxnOpError::Cancel(reason)) = result else {
+            panic!("index key validation should cancel the transaction item");
+        };
+        assert_eq!(reason.code, "ValidationError");
+        assert!(
+            reason
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("Type mismatch for key attribute gpk"))
+        );
     }
 
     #[test]
