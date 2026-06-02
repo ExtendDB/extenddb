@@ -131,6 +131,22 @@ pub(crate) fn json_to_item(v: serde_json::Value) -> Result<Item, StorageError> {
     serde_json::from_value(v).map_err(|e| StorageError::Internal(e.to_string()))
 }
 
+pub(crate) fn repeat_tuple_placeholders(count: usize, width: usize) -> String {
+    let tuple = if width == 1 {
+        "?".to_owned()
+    } else {
+        format!(
+            "({})",
+            std::iter::repeat_n("?", width)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    std::iter::repeat_n(tuple, count)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Bind a `SortKeyValue` to a positional parameter in a sqlx query and execute it.
 ///
 /// Reduces the repeated match-on-variant-and-bind pattern across query helpers.
@@ -259,6 +275,7 @@ macro_rules! bind_sk_update_execute {
 }
 
 // Submodules declared after macros so they can use bind_sk_fetch_optional/bind_sk_execute.
+mod batch_write;
 mod data_engine;
 mod ddl;
 mod delete_item;

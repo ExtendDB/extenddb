@@ -16,7 +16,7 @@ use super::tx_helpers::{
     put_prepared_item_without_old_item_in_tx, stream_capture_needs_old_item,
     write_stream_record_for_event_in_tx, write_stream_record_in_tx,
 };
-use super::{data_table_name, json_to_item, physical_pk_bytes};
+use super::{data_table_name, json_to_item, physical_pk_bytes, repeat_tuple_placeholders};
 use crate::TidbEngine;
 use crate::tidb_util::is_unique_violation;
 
@@ -408,22 +408,6 @@ impl TidbEngine {
     }
 }
 
-fn repeat_tuple_placeholders(count: usize, width: usize) -> String {
-    let tuple = if width == 1 {
-        "?".to_owned()
-    } else {
-        format!(
-            "({})",
-            std::iter::repeat_n("?", width)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
-    std::iter::repeat_n(tuple, count)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 fn batch_get_pk_sql(table: &str, key_count: usize) -> String {
     format!(
         "SELECT item_data FROM {table} WHERE pk IN ({})",
@@ -489,10 +473,9 @@ mod tests {
     use extenddb_core::types::StreamViewType;
     use extenddb_storage::StreamCapture;
 
-    use super::{
-        batch_get_pk_sk_sql, batch_get_pk_sql, put_stream_capture_without_old_item,
-        repeat_tuple_placeholders,
-    };
+    use crate::data::repeat_tuple_placeholders;
+
+    use super::{batch_get_pk_sk_sql, batch_get_pk_sql, put_stream_capture_without_old_item};
 
     fn capture(view_type: StreamViewType) -> StreamCapture {
         StreamCapture {

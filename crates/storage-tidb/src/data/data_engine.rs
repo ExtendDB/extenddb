@@ -7,7 +7,7 @@
 use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, UpdateAction};
 use extenddb_core::types::{IndexInfo, Item, TableKeyInfo};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{DataEngine, StreamCapture, TransactGetOp, TransactWriteOp};
+use extenddb_storage::{BatchWriteOp, DataEngine, StreamCapture, TransactGetOp, TransactWriteOp};
 use futures::future::BoxFuture;
 
 use crate::TidbEngine;
@@ -41,6 +41,15 @@ impl DataEngine for TidbEngine {
         consistent_read: bool,
     ) -> BoxFuture<'a, Result<Vec<Item>, StorageError>> {
         Box::pin(self.batch_get_items_impl(key_info, keys, consistent_read))
+    }
+
+    fn batch_write_items<'a>(
+        &'a self,
+        key_info: &'a TableKeyInfo,
+        ops: &'a [BatchWriteOp<'a>],
+        stream: Option<&'a StreamCapture>,
+    ) -> BoxFuture<'a, Result<(), StorageError>> {
+        Box::pin(self.batch_write_items_impl(key_info, ops, stream))
     }
 
     fn delete_item<'a>(

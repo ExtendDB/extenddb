@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::ExpressionMaps;
 use extenddb_core::types::{
     BatchWriteItemInput, BatchWriteItemOutput, Item, KeySchemaElement, ReturnItemCollectionMetrics,
     WriteRequest, extract_key, item_size_bytes,
@@ -24,15 +23,16 @@ use crate::create_table::storage_err_to_dynamo;
 use crate::serialize_output;
 use crate::stream_capture;
 use crate::{DispatchMetrics, DispatchResult};
+use extenddb_storage::BatchWriteOp;
 
 /// Maximum number of write requests across all tables in a single `BatchWriteItem`.
 const MAX_BATCH_WRITE_ITEMS: usize = 25;
 
 /// Handle a `BatchWriteItem` request.
 ///
-/// Writes (put or delete) items across one or more tables. Each operation is
-/// executed individually — no cross-item conditions. `DynamoDB` limits: max 25
-/// items total, max 16 MB request size, max 400 KB per item.
+/// Writes (put or delete) items across one or more tables. Each table's writes
+/// are sent through the storage backend's batch write path. `DynamoDB` limits:
+/// max 25 items total, max 16 MB request size, max 400 KB per item.
 ///
 /// # Errors
 ///
@@ -98,7 +98,6 @@ pub async fn handle_batch_write_item(
         }
     }
 
-    let empty_maps = ExpressionMaps::default();
     let mut all_icm: HashMap<String, Vec<extenddb_core::types::ItemCollectionMetrics>> =
         HashMap::new();
     let mut total_wcu: f64 = 0.0;
@@ -115,6 +114,12 @@ pub async fn handle_batch_write_item(
         validate_no_duplicate_keys(reqs, &key_info.key_schema)?;
 
         let view_type = stream_capture::stream_view_type(&key_info);
+        let stream = view_type.map(|vt| extenddb_storage::StreamCapture {
+            view_type: vt,
+            user_identity: None,
+            region: ctx.region.clone(),
+        });
+        let mut ops = Vec::with_capacity(reqs.len());
 
         for wr in reqs {
             if let Some(put) = &wr.put_request {
@@ -135,25 +140,10 @@ pub async fn handle_batch_write_item(
                     &mut all_icm,
                 );
 
-                let stream = view_type.map(|vt| extenddb_storage::StreamCapture {
-                    view_type: vt,
-                    user_identity: None,
-                    region: ctx.region.clone(),
-                });
                 let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&put.item));
                 total_wcu += item_wcu;
                 *per_table_wcu.entry(table_name.clone()).or_default() += item_wcu;
-                ctx.storage
-                    .put_item(
-                        &key_info,
-                        put.item.clone(),
-                        false,
-                        None,
-                        &empty_maps,
-                        stream.as_ref(),
-                    )
-                    .await
-                    .map_err(storage_err_to_dynamo)?;
+                ops.push(BatchWriteOp::Put(&put.item));
             } else if let Some(del) = &wr.delete_request {
                 validate_batch_key_only(
                     &del.key,
@@ -169,29 +159,19 @@ pub async fn handle_batch_write_item(
                     &mut all_icm,
                 );
 
-                let stream = view_type.map(|vt| extenddb_storage::StreamCapture {
-                    view_type: vt,
-                    user_identity: None,
-                    region: ctx.region.clone(),
-                });
                 // TODO(fidelity): DynamoDB charges WCU based on old item size for deletes,
                 // but old item size is not available here. Using key size as lower bound.
                 let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&del.key));
                 total_wcu += item_wcu;
                 *per_table_wcu.entry(table_name.clone()).or_default() += item_wcu;
-                ctx.storage
-                    .delete_item(
-                        &key_info,
-                        &del.key,
-                        false,
-                        None,
-                        &empty_maps,
-                        stream.as_ref(),
-                    )
-                    .await
-                    .map_err(storage_err_to_dynamo)?;
+                ops.push(BatchWriteOp::Delete(&del.key));
             }
         }
+
+        ctx.storage
+            .batch_write_items(&key_info, &ops, stream.as_ref())
+            .await
+            .map_err(storage_err_to_dynamo)?;
     }
 
     let consumed_capacity = capacity_helpers::batch_write_capacity(

@@ -57,6 +57,15 @@ pub type StreamRecordsResult = Result<(Vec<StreamRecord>, Option<String>), Stora
 /// Stream list result: summaries plus an optional next exclusive start ARN.
 pub type StreamListResult = Result<(Vec<StreamSummary>, Option<String>), StorageError>;
 
+/// One unconditional write in a `BatchWriteItem` request.
+///
+/// `BatchWriteItem` has no conditions or return values, so storage backends can
+/// batch these by physical key while preserving the single-item fallback.
+pub enum BatchWriteOp<'a> {
+    Put(&'a Item),
+    Delete(&'a Item),
+}
+
 /// Parameters for capturing a stream record within a data write transaction.
 ///
 /// When present, the storage backend inserts the stream record in the same
@@ -244,6 +253,35 @@ pub trait DataEngine: Send + Sync {
                 }
             }
             Ok(items)
+        })
+    }
+
+    /// Write multiple unconditional items for one table.
+    ///
+    /// Backends that can express these writes as native multi-row DML should
+    /// override this. The default preserves the single-item behavior for
+    /// simpler backends and for feature paths that require per-item handling.
+    fn batch_write_items<'a>(
+        &'a self,
+        key_info: &'a TableKeyInfo,
+        ops: &'a [BatchWriteOp<'a>],
+        stream: Option<&'a StreamCapture>,
+    ) -> BoxFuture<'a, Result<(), StorageError>> {
+        Box::pin(async move {
+            let maps = ExpressionMaps::default();
+            for op in ops {
+                match op {
+                    BatchWriteOp::Put(item) => {
+                        self.put_item(key_info, (*item).clone(), false, None, &maps, stream)
+                            .await?;
+                    }
+                    BatchWriteOp::Delete(key) => {
+                        self.delete_item(key_info, key, false, None, &maps, stream)
+                            .await?;
+                    }
+                }
+            }
+            Ok(())
         })
     }
 
