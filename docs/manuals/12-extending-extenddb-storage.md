@@ -313,9 +313,13 @@ Defined in `crates/storage/src/management_store/mod.rs`. Login rate limiting:
 
 | Method | Purpose |
 |--------|---------|
-| `record_login_attempt` | Record a login attempt (success or failure) |
-| `recent_failed_attempts` | Count recent failed attempts for lockout decisions |
-| `cleanup_old_attempts` | Garbage-collect old login attempt records |
+| `record_failed_login` | Record a failed login attempt |
+| `count_principal_failures` | Count recent failed attempts for lockout decisions |
+| `count_ip_failures` | Count recent failed attempts from one source IP |
+
+Login-attempt retention is backend-specific. Backends without native retention
+can run concrete cleanup workers; TiDB should use native table TTL and keep
+cleanup hooks out of `RateLimitStore`.
 
 ### AuthorizationStore
 

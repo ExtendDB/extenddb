@@ -347,7 +347,7 @@ encryption key for access key secrets.
 ### MetricsStore
 
 Historical metrics persistence and query:
-- `insert_metrics`, `query_metrics`, `prune_metrics`
+- `insert_metrics`, `query_metrics`
 
 Metrics are flushed periodically from the in-memory collector to persistent
 storage. TiDB persists immutable rows in `metrics_samples` with a native
@@ -359,18 +359,22 @@ single initial write Region for a new TiDB catalog. TiDB metrics flushes use
 one multi-row append-only insert per bounded batch rather than one insert per
 metric row, keeping frontend latency low while following TiDB's guidance to
 keep write transactions split into modest batches.
+Persistent metrics retention is backend-specific rather than part of
+`MetricsStore`: Postgres runs a concrete backend prune worker, while TiDB uses
+native TTL on `metrics_samples`.
 
 ### RateLimitStore
 
 Login rate limiting and account lockout:
-- `count_principal_failures`, `count_ip_failures`, `record_failed_login`,
-  `cleanup_old_attempts`
+- `count_principal_failures`, `count_ip_failures`, `record_failed_login`
 
 Tracks failed login attempts by principal and source IP to mitigate clients
 sending excessive traffic. TiDB stores these as append-only rows with native
 TTL retention, `SHARD_ROW_ID_BITS` on the implicit row id, and pre-split
-Regions, so concurrent frontends do not concentrate failed-login inserts on
-one TiKV Region.
+Regions, so concurrent frontends do not concentrate failed-login inserts on one
+TiKV Region. Login-attempt retention is backend-specific rather than part of
+`RateLimitStore`: Postgres runs a concrete cleanup worker, while TiDB uses
+native TTL on `login_attempts`.
 
 ### AuthorizationStore
 
@@ -1300,13 +1304,12 @@ pub struct WorkerContext {
 3. `metrics_prune_worker` — uses in-memory `MetricsCollector`
 4. `metrics_flush_worker` — uses `MetricsStore::insert_metrics`
 5. `capacity_warning_worker` — uses in-memory metrics
-6. `login_attempt_cleanup_worker` — uses `RateLimitStore::cleanup_old_attempts`
 
 **Backend-specific workers** (spawned via `RuntimeHooks`, access backend
 internals):
 - PostgreSQL spawns its control-plane poller, pool metrics, GSI delay poller,
-  TTL cleanup, stream cleanup, idempotency token cleanup, and table size refresh
-  workers
+  TTL cleanup, stream cleanup, idempotency token cleanup, metrics DB prune,
+  login-attempt cleanup, and table size refresh workers
 - TiDB spawns only its control-plane poller and pool metrics workers; TiDB
   online DDL owns schema jobs, TiDB native TTL handles all item TTL plus
   stream-record, idempotency-token, metrics, login-attempt, and assume-role

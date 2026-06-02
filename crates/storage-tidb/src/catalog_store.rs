@@ -310,17 +310,6 @@ impl extenddb_storage::management_store::MetricsStore for TidbCatalogStore {
                 .collect())
         })
     }
-
-    fn prune_metrics(&self, _retention: std::time::Duration) -> BoxFuture<'_, OpResult<()>> {
-        Box::pin(async move {
-            // TiDB native TTL owns fixed 24-hour metrics retention.
-            Ok(())
-        })
-    }
-
-    fn metrics_retention_owned_by_backend(&self) -> bool {
-        true
-    }
 }
 
 /// Internal row type for `sqlx::FromRow` derivation.
@@ -403,16 +392,6 @@ impl extenddb_storage::management_store::RateLimitStore for TidbCatalogStore {
                 tracing::error!("Failed to record login attempt: {e}");
             }
         })
-    }
-
-    fn cleanup_old_attempts(&self, _max_age_seconds: i64) -> BoxFuture<'_, ()> {
-        Box::pin(async move {
-            // TiDB native TTL owns fixed 24-hour login-attempt retention.
-        })
-    }
-
-    fn login_attempt_retention_owned_by_backend(&self) -> bool {
-        true
     }
 }
 

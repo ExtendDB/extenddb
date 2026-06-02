@@ -161,6 +161,61 @@ pub(crate) async fn idempotency_token_cleanup_worker(
     }
 }
 
+pub(crate) async fn metrics_db_prune_worker(
+    storage: Arc<PostgresEngine>,
+    metrics: Arc<MetricsCollector>,
+) {
+    use extenddb_core::metrics::QuerySource;
+
+    const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+    const RETENTION_SECONDS: i64 = 86_400;
+
+    loop {
+        tokio::time::sleep(PRUNE_INTERVAL).await;
+        let cycle_start = std::time::Instant::now();
+
+        let cutoff = time::OffsetDateTime::now_utc() - time::Duration::seconds(RETENTION_SECONDS);
+        match sqlx::query("DELETE FROM metrics WHERE bucket < $1")
+            .bind(cutoff)
+            .execute(&storage.pool)
+            .await
+        {
+            Ok(_) => {
+                #[allow(clippy::cast_precision_loss)]
+                let cycle_us = cycle_start.elapsed().as_micros() as f64;
+                metrics.record_worker_success(QuerySource::MetricsPrune, cycle_us);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to prune old metrics from PostgreSQL: {e}");
+                metrics.record_worker_error(QuerySource::MetricsPrune);
+            }
+        }
+    }
+}
+
+pub(crate) async fn login_attempt_cleanup_worker(storage: Arc<PostgresEngine>) {
+    const CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
+    const MAX_AGE_SECONDS: i64 = 86_400;
+
+    loop {
+        tokio::time::sleep(CLEANUP_INTERVAL).await;
+        let result = sqlx::query(
+            "DELETE FROM login_attempts WHERE attempted_at < NOW() - make_interval(secs => $1)",
+        )
+        .bind(MAX_AGE_SECONDS)
+        .execute(&storage.pool)
+        .await;
+        match result {
+            Ok(r) => {
+                if r.rows_affected() > 0 {
+                    tracing::debug!("Cleaned up {} old login attempt records", r.rows_affected());
+                }
+            }
+            Err(e) => tracing::error!("Login attempt cleanup failed: {e}"),
+        }
+    }
+}
+
 pub(crate) async fn poll_gsi_delay<S: SettingsStore + ?Sized>(
     store: Arc<S>,
     gsi_delay: Arc<AtomicU64>,

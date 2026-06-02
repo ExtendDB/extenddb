@@ -299,23 +299,6 @@ impl extenddb_storage::management_store::MetricsStore for PostgresCatalogStore {
                 .collect())
         })
     }
-
-    fn prune_metrics(&self, retention: std::time::Duration) -> BoxFuture<'_, OpResult<()>> {
-        Box::pin(async move {
-            #[allow(clippy::cast_possible_wrap)] // retention seconds fit in i64
-            let cutoff = time::OffsetDateTime::now_utc()
-                - time::Duration::seconds(retention.as_secs() as i64);
-            sqlx::query("DELETE FROM metrics WHERE bucket < $1")
-                .bind(cutoff)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| {
-                    tracing::warn!("prune_metrics: {e}");
-                    OpError::Internal("Database error".to_owned())
-                })?;
-            Ok(())
-        })
-    }
 }
 
 /// Internal row type for `sqlx::FromRow` derivation.
@@ -396,28 +379,6 @@ impl extenddb_storage::management_store::RateLimitStore for PostgresCatalogStore
             .await;
             if let Err(e) = result {
                 tracing::error!("Failed to record login attempt: {e}");
-            }
-        })
-    }
-
-    fn cleanup_old_attempts(&self, max_age_seconds: i64) -> BoxFuture<'_, ()> {
-        Box::pin(async move {
-            let result = sqlx::query(
-                "DELETE FROM login_attempts WHERE attempted_at < NOW() - make_interval(secs => $1)",
-            )
-            .bind(max_age_seconds)
-            .execute(&self.pool)
-            .await;
-            match result {
-                Ok(r) => {
-                    if r.rows_affected() > 0 {
-                        tracing::debug!(
-                            "Cleaned up {} old login attempt records",
-                            r.rows_affected()
-                        );
-                    }
-                }
-                Err(e) => tracing::error!("Login attempt cleanup failed: {e}"),
             }
         })
     }

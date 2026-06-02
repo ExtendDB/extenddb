@@ -461,17 +461,15 @@ async fn serve_inner(
             backend_native_capacity_control,
         ));
     }
-    // Spawn background tasks for metrics pruning and flushing.
+    // Spawn background tasks for in-memory metrics pruning and flushing.
+    // Database retention is backend-specific: native-retention backends use
+    // database TTL, while other backends spawn concrete retention workers from
+    // their runtime hooks.
     tokio::spawn(workers::metrics_prune_worker(metrics.clone()));
     tokio::spawn(workers::metrics_flush_worker(
         metrics.clone(),
         catalog_store.clone(),
     ));
-    // Spawn background task to clean up old login attempt records only when
-    // the backend does not own retention natively.
-    if !catalog_store.login_attempt_retention_owned_by_backend() {
-        tokio::spawn(workers::login_attempt_cleanup_worker(catalog_store.clone()));
-    }
     // Phase 11a: Spawn background task to warn about approximate consumed capacity.
     tokio::spawn(workers::capacity_warning_worker());
 

@@ -433,12 +433,24 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             workers::idempotency_token_cleanup_worker(storage_for_token, metrics).await
         });
 
-        // 5. TTL cleanup worker
+        // 5. PostgreSQL catalog retention workers
+        let storage_for_metrics_prune = self.engine.clone();
+        let metrics = ctx.metrics.clone();
+        tokio::spawn(async move {
+            workers::metrics_db_prune_worker(storage_for_metrics_prune, metrics).await
+        });
+
+        let storage_for_login_cleanup = self.engine.clone();
+        tokio::spawn(async move {
+            workers::login_attempt_cleanup_worker(storage_for_login_cleanup).await
+        });
+
+        // 6. TTL cleanup worker
         let storage_for_ttl = self.engine.clone();
         let metrics = ctx.metrics.clone();
         tokio::spawn(async move { ttl_worker::ttl_cleanup_worker(storage_for_ttl, metrics).await });
 
-        // 6. Pool metrics worker - needs both catalog and data pools
+        // 7. Pool metrics worker - needs both catalog and data pools
         let catalog_pool = self.engine.pool.clone();
         let data_pool = self.engine.data_pool().clone();
         let metrics = ctx.metrics.clone();
@@ -446,7 +458,7 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             workers::pool_metrics_worker(catalog_pool, data_pool, metrics).await
         });
 
-        // 7. GSI delay poller
+        // 8. GSI delay poller
         let catalog_store_for_gsi = ctx.catalog_store.clone();
         let gsi_delay = self.gsi_default_delay_ms.clone();
         tokio::spawn(

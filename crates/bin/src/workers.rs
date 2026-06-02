@@ -6,7 +6,7 @@
 //! Each function runs as a `tokio::spawn`-ed task for the lifetime of the
 //! server process. Workers handle log-level polling, control-plane transitions,
 //! TTL cleanup, table size refresh, stream record expiry, idempotency token
-//! cleanup, capacity warning, and metrics pruning.
+//! cleanup, capacity warning, and in-memory metrics pruning.
 //!
 //! Workers are generic over storage traits so they are decoupled from concrete
 //! backend engine and catalog-store types.
@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use extenddb_core::throttle::ThrottleManager;
-use extenddb_storage::management_store::{MetricsStore, RateLimitStore, SettingsStore};
+use extenddb_storage::management_store::{MetricsStore, SettingsStore};
 use tracing_subscriber::{EnvFilter, reload};
 
 /// Poll the `log_level` and `sqlx_log_level` settings from the database
@@ -199,8 +199,9 @@ pub(crate) async fn metrics_prune_worker(metrics: Arc<extenddb_core::metrics::Me
 /// Periodically flush in-memory metrics to the database.
 ///
 /// Drains data points older than 60 seconds, aggregates them into 1-minute
-/// buckets, and upserts via the `MetricsStore` trait. Also prunes DB rows
-/// older than 24 hours.
+/// buckets, and upserts via the `MetricsStore` trait. Database retention is
+/// backend-specific: TiDB uses native TTL and Postgres runs a concrete backend
+/// pruning worker.
 pub(crate) async fn metrics_flush_worker(
     metrics: Arc<extenddb_core::metrics::MetricsCollector>,
     store: Arc<dyn MetricsStore>,
@@ -209,7 +210,6 @@ pub(crate) async fn metrics_flush_worker(
     use extenddb_storage::management_store::MetricsRow;
 
     const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-    const RETENTION: std::time::Duration = std::time::Duration::from_secs(86400);
     loop {
         tokio::time::sleep(FLUSH_INTERVAL).await;
         let cycle_start = std::time::Instant::now();
@@ -254,34 +254,9 @@ pub(crate) async fn metrics_flush_worker(
             // insert_metrics logs per-row failures internally and always returns Ok.
             let _ = store.insert_metrics(&rows).await;
         }
-        // Prune old DB rows when retention is not owned by the backend.
-        let mut errored = false;
-        if !store.metrics_retention_owned_by_backend()
-            && let Err(e) = store.prune_metrics(RETENTION).await
-        {
-            tracing::warn!("Failed to prune old metrics from DB: {e:?}");
-            metrics.record_worker_error(QuerySource::MetricsFlush);
-            errored = true;
-        }
-        if !errored {
-            #[allow(clippy::cast_precision_loss)]
-            let cycle_us = cycle_start.elapsed().as_micros() as f64;
-            metrics.record_worker_success(QuerySource::MetricsFlush, cycle_us);
-        }
-    }
-}
-
-/// Background worker that deletes old login attempt records.
-pub(crate) async fn login_attempt_cleanup_worker(store: Arc<dyn RateLimitStore>) {
-    use std::time::Duration;
-
-    const CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
-    // Keep records for 24 hours for audit purposes.
-    const MAX_AGE_SECONDS: i64 = 86400;
-
-    loop {
-        tokio::time::sleep(CLEANUP_INTERVAL).await;
-        store.cleanup_old_attempts(MAX_AGE_SECONDS).await;
+        #[allow(clippy::cast_precision_loss)]
+        let cycle_us = cycle_start.elapsed().as_micros() as f64;
+        metrics.record_worker_success(QuerySource::MetricsFlush, cycle_us);
     }
 }
 
