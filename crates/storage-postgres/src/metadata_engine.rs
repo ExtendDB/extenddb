@@ -11,6 +11,8 @@ use futures::future::BoxFuture;
 use crate::PostgresEngine;
 use crate::data;
 
+type TtlTableInfo = (String, String, String);
+
 fn sql_string_literal(value: &str) -> Result<String, StorageError> {
     if value.contains('\0') {
         return Err(StorageError::Validation(
@@ -111,6 +113,37 @@ impl MetadataEngine for PostgresEngine {
         })
     }
 
+    fn apply_ttl_update(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        attribute_name: &str,
+        enabled: bool,
+    ) -> BoxFuture<'_, Result<(), StorageError>> {
+        let account_id = account_id.to_owned();
+        let table_name = table_name.to_owned();
+        let attribute_name = attribute_name.to_owned();
+        Box::pin(async move {
+            if !enabled {
+                self.drop_ttl_expiration_artifacts(&account_id, &table_name)
+                    .await?;
+            }
+
+            MetadataEngine::update_ttl(self, &account_id, &table_name, &attribute_name, enabled)
+                .await?;
+
+            if enabled
+                && let Err(err) = self
+                    .ensure_ttl_expiration_artifacts(&account_id, &table_name, &attribute_name)
+                    .await
+            {
+                tracing::warn!("TTL expiration artifact creation deferred for {table_name}: {err}");
+            }
+
+            Ok(())
+        })
+    }
+
     fn tag_resource(&self, arn: &str, tags: &[Tag]) -> BoxFuture<'_, Result<(), StorageError>> {
         let arn = arn.to_string();
         let tags = tags.to_vec();
@@ -168,27 +201,10 @@ impl MetadataEngine for PostgresEngine {
                 .collect())
         })
     }
+}
 
-    fn tables_with_ttl(
-        &self,
-        account_id: &str,
-    ) -> BoxFuture<'_, Result<Vec<(String, String)>, StorageError>> {
-        let account_id = account_id.to_string();
-        Box::pin(async move {
-            let rows: Vec<(String, String)> = sqlx::query_as(
-                "SELECT table_name, ttl_attribute FROM tables \
-                 WHERE account_id = $1 AND ttl_attribute IS NOT NULL AND table_status = 'ACTIVE'",
-            )
-            .bind(&account_id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            Ok(rows)
-        })
-    }
-
-    fn refresh_table_size(
+impl PostgresEngine {
+    pub(crate) fn refresh_table_size(
         &self,
         account_id: &str,
         table_name: &str,
@@ -236,27 +252,9 @@ impl MetadataEngine for PostgresEngine {
         })
     }
 
-    fn list_active_table_names(
+    pub(crate) fn all_tables_with_ttl(
         &self,
-        account_id: &str,
-    ) -> BoxFuture<'_, Result<Vec<String>, StorageError>> {
-        let account_id = account_id.to_string();
-        Box::pin(async move {
-            let rows: Vec<(String,)> = sqlx::query_as(
-                "SELECT table_name FROM tables WHERE account_id = $1 AND table_status = 'ACTIVE' ORDER BY table_name",
-            )
-            .bind(&account_id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            Ok(rows.into_iter().map(|(n,)| n).collect())
-        })
-    }
-
-    fn all_tables_with_ttl(
-        &self,
-    ) -> BoxFuture<'_, Result<Vec<(String, String, String)>, StorageError>> {
+    ) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>> {
         Box::pin(async move {
             let rows: Vec<(String, String, String)> = sqlx::query_as(
                 "SELECT account_id, table_name, ttl_attribute FROM tables \
@@ -270,9 +268,9 @@ impl MetadataEngine for PostgresEngine {
         })
     }
 
-    fn ttl_sweeper_tables(
+    pub(crate) fn ttl_sweeper_tables(
         &self,
-    ) -> BoxFuture<'_, Result<Vec<(String, String, String)>, StorageError>> {
+    ) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>> {
         Box::pin(async move {
             let rows: Vec<(String, String, String)> = sqlx::query_as(
                 "SELECT account_id, table_name, ttl_attribute FROM tables \
@@ -286,7 +284,7 @@ impl MetadataEngine for PostgresEngine {
         })
     }
 
-    fn ensure_ttl_expiration_artifacts(
+    pub(crate) fn ensure_ttl_expiration_artifacts(
         &self,
         account_id: &str,
         table_name: &str,
@@ -336,7 +334,7 @@ impl MetadataEngine for PostgresEngine {
         })
     }
 
-    fn drop_ttl_expiration_artifacts(
+    pub(crate) fn drop_ttl_expiration_artifacts(
         &self,
         account_id: &str,
         table_name: &str,
@@ -378,7 +376,7 @@ impl MetadataEngine for PostgresEngine {
         })
     }
 
-    fn find_expired_items_for_sweeper(
+    pub(crate) fn find_expired_items_for_sweeper(
         &self,
         account_id: &str,
         table_name: &str,
@@ -427,7 +425,9 @@ impl MetadataEngine for PostgresEngine {
         })
     }
 
-    fn all_active_tables(&self) -> BoxFuture<'_, Result<Vec<(String, String)>, StorageError>> {
+    pub(crate) fn all_active_tables(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<(String, String)>, StorageError>> {
         Box::pin(async move {
             let rows: Vec<(String, String)> = sqlx::query_as(
                 "SELECT account_id, table_name FROM tables \

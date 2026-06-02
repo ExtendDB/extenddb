@@ -198,27 +198,22 @@ storage. TiDB implements the valid row batches as native multi-row DML followed
 by `ANALYZE TABLE`, so imported tables immediately plan Query and Scan paths
 from real table and index statistics instead of pseudo statistics.
 
-**MetadataEngine** (TTL, tags, table statistics):
+**MetadataEngine** (client-visible TTL and tags):
 - `describe_ttl`, `update_ttl`, `apply_ttl_update`
 - `tag_resource`, `untag_resource`, `list_tags`
-- `refresh_table_size` — updates cached table size and item count for backends
-  that maintain a catalog cache. Native-stat backends can answer from their
-  database metadata at describe/backup time instead.
-- `ttl_sweeper_tables`, `ensure_ttl_expiration_artifacts`,
-  `drop_ttl_expiration_artifacts`, `find_expired_items_for_sweeper` —
-  backend-specific TTL expiration support. `apply_ttl_update` lets the storage
-  backend own the whole TTL transition; PostgreSQL uses the default
-  application-sweeper workflow with an internal expression index, while TiDB
-  records native TTL intent and lets the control-plane reconciler submit TiDB
-  online TTL DDL. TiDB batches legacy artifact cleanup with multi-schema
-  `ALTER TABLE` and does not run or expose an item sweeper. TiDB persists
-  explicit TTL intent (`DISABLED`, `ENABLING`, `ENABLED`, `DISABLING`) so the
-  live reconciler and startup repair can finish
-  the correct native DDL path after a frontend crash instead of inferring
-  intent from artifact booleans. Legacy readiness booleans are migrated into
-  that explicit status and then dropped. Repair also reads physical table TTL state and
-  re-enables `TTL_ENABLE` when TiDB recovery tools such as BR or Flashback have
-  disabled TTL jobs.
+- `apply_ttl_update` lets each storage backend own the whole TTL transition.
+  Backends with application-level sweepers keep their sweeper tables,
+  expiration artifacts, and cached table-size refresh hooks in concrete runtime
+  code rather than in the shared metadata trait. TiDB records native TTL intent
+  and lets the control-plane reconciler submit TiDB online TTL DDL. TiDB batches
+  legacy artifact cleanup with multi-schema `ALTER TABLE` and has no
+  application item sweeper surface. TiDB persists explicit TTL intent
+  (`DISABLED`, `ENABLING`, `ENABLED`, `DISABLING`) so the live reconciler and
+  startup repair can finish the correct native DDL path after a frontend crash
+  instead of inferring intent from artifact booleans. Legacy readiness booleans
+  are migrated into that explicit status and then dropped. Repair also reads
+  physical table TTL state and re-enables `TTL_ENABLE` when TiDB recovery tools
+  such as BR or Flashback have disabled TTL jobs.
 
 **StreamEngine** (DynamoDB Streams):
 - `write_stream_record` — writes stream record atomically with data write

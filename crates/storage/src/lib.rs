@@ -50,8 +50,6 @@ use error::StorageError;
 pub type ItemPairResult = Result<(Option<Item>, Option<Item>), StorageError>;
 /// Result of a query or scan: items plus an optional last-evaluated-key for pagination.
 pub type QueryResult = Result<(Vec<Item>, Option<Item>), StorageError>;
-/// TTL table info: `(account_id, table_name, ttl_attribute)`.
-pub type TtlTableInfo = (String, String, String);
 /// Stream records result: records plus an optional next shard iterator.
 pub type StreamRecordsResult = Result<(Vec<StreamRecord>, Option<String>), StorageError>;
 /// Stream list result: summaries plus an optional next exclusive start ARN.
@@ -534,13 +532,9 @@ pub trait MetadataEngine: Send + Sync {
         enabled: bool,
     ) -> BoxFuture<'_, Result<(), StorageError>>;
 
-    /// Apply a complete TTL state change, including any backend-specific
-    /// physical TTL artifacts.
+    /// Apply a complete TTL state change.
     ///
-    /// The default implementation preserves the application-sweeper workflow
-    /// used by storage backends that keep TTL expiration artifacts outside
-    /// `update_ttl`: drop artifacts before disabling, and best-effort-create
-    /// artifacts after enabling. Backends with native TTL DDL should override
+    /// Backends with physical TTL artifacts or native TTL DDL should override
     /// this method so the backend owns the full catalog/DDL transition.
     fn apply_ttl_update(
         &self,
@@ -549,28 +543,7 @@ pub trait MetadataEngine: Send + Sync {
         attribute_name: &str,
         enabled: bool,
     ) -> BoxFuture<'_, Result<(), StorageError>> {
-        let account_id = account_id.to_owned();
-        let table_name = table_name.to_owned();
-        let attribute_name = attribute_name.to_owned();
-        Box::pin(async move {
-            if !enabled {
-                self.drop_ttl_expiration_artifacts(&account_id, &table_name)
-                    .await?;
-            }
-
-            self.update_ttl(&account_id, &table_name, &attribute_name, enabled)
-                .await?;
-
-            if enabled
-                && let Err(err) = self
-                    .ensure_ttl_expiration_artifacts(&account_id, &table_name, &attribute_name)
-                    .await
-            {
-                tracing::warn!("TTL expiration artifact creation deferred for {table_name}: {err}");
-            }
-
-            Ok(())
-        })
+        self.update_ttl(account_id, table_name, attribute_name, enabled)
     }
 
     /// Add or overwrite tags on a resource.
@@ -585,76 +558,6 @@ pub trait MetadataEngine: Send + Sync {
 
     /// List all tags for a resource.
     fn list_tags(&self, arn: &str) -> BoxFuture<'_, Result<Vec<Tag>, StorageError>>;
-
-    /// List all table names that have TTL enabled, with their TTL attribute.
-    fn tables_with_ttl(
-        &self,
-        account_id: &str,
-    ) -> BoxFuture<'_, Result<Vec<(String, String)>, StorageError>>;
-
-    /// List all tables with TTL enabled across all accounts: `(account_id, table_name, ttl_attribute)`.
-    fn all_tables_with_ttl(&self) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>>;
-
-    /// List all tables with TTL enabled and ready for an application-level TTL
-    /// sweeper: `(account_id, table_name, ttl_attribute)`.
-    ///
-    /// Backends that delegate expiration to native database TTL should return
-    /// an empty list so the generic sweeper cannot duplicate native deletion.
-    fn ttl_sweeper_tables(&self) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>>;
-
-    /// Ensure backend-specific TTL expiration artifacts for a table.
-    ///
-    /// Application-sweeper backends may create an internal lookup index and set
-    /// a backend readiness flag. Native TTL backends may apply database-native
-    /// TTL DDL and publish their own explicit TTL state.
-    fn ensure_ttl_expiration_artifacts(
-        &self,
-        account_id: &str,
-        table_name: &str,
-        ttl_attribute: &str,
-    ) -> BoxFuture<'_, Result<(), StorageError>>;
-
-    /// Drop backend-specific TTL expiration artifacts for a table.
-    ///
-    /// Application-sweeper backends may drop an internal lookup index and clear
-    /// a backend readiness flag. Native TTL backends may remove
-    /// database-native TTL DDL and publish their own explicit TTL state.
-    fn drop_ttl_expiration_artifacts(
-        &self,
-        account_id: &str,
-        table_name: &str,
-    ) -> BoxFuture<'_, Result<(), StorageError>>;
-
-    /// Find expired items for an application-level TTL sweeper.
-    ///
-    /// Application-sweeper backends return candidate items for application-level
-    /// deletion. Native TTL backends should return an empty list.
-    fn find_expired_items_for_sweeper(
-        &self,
-        account_id: &str,
-        table_name: &str,
-        ttl_attribute: &str,
-        limit: usize,
-    ) -> BoxFuture<'_, Result<Vec<Item>, StorageError>>;
-
-    /// Recompute and store `table_size_bytes` and `item_count` for a table.
-    ///
-    /// Backends that can answer table statistics from native metadata may
-    /// compute them on demand instead of running a periodic refresh worker.
-    fn refresh_table_size(
-        &self,
-        account_id: &str,
-        table_name: &str,
-    ) -> BoxFuture<'_, Result<(), StorageError>>;
-
-    /// List all active table names (for background workers).
-    fn list_active_table_names(
-        &self,
-        account_id: &str,
-    ) -> BoxFuture<'_, Result<Vec<String>, StorageError>>;
-
-    /// List all active tables across all accounts: `(account_id, table_name)`.
-    fn all_active_tables(&self) -> BoxFuture<'_, Result<Vec<(String, String)>, StorageError>>;
 }
 
 /// DynamoDB Streams record storage and retrieval.
@@ -852,8 +755,6 @@ pub trait CatalogStore:
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
 
     /// Verify that CatalogStore is dyn-compatible (object-safe).
@@ -919,168 +820,9 @@ mod tests {
         assert!(key.len() <= 255);
     }
 
-    #[derive(Clone, Default)]
-    struct FakeMetadataEngine {
-        calls: Arc<Mutex<Vec<&'static str>>>,
-        fail_create: bool,
-    }
-
-    impl FakeMetadataEngine {
-        fn calls(&self) -> Vec<&'static str> {
-            self.calls.lock().expect("calls lock poisoned").clone()
-        }
-
-        fn record(&self, call: &'static str) {
-            self.calls.lock().expect("calls lock poisoned").push(call);
-        }
-    }
-
-    impl MetadataEngine for FakeMetadataEngine {
-        fn describe_ttl(
-            &self,
-            _account_id: &str,
-            _table_name: &str,
-        ) -> BoxFuture<'_, Result<TimeToLiveDescription, StorageError>> {
-            Box::pin(async move {
-                Ok(TimeToLiveDescription {
-                    time_to_live_status: extenddb_core::types::TimeToLiveStatus::Disabled,
-                    attribute_name: None,
-                })
-            })
-        }
-
-        fn update_ttl(
-            &self,
-            _account_id: &str,
-            _table_name: &str,
-            _attribute_name: &str,
-            enabled: bool,
-        ) -> BoxFuture<'_, Result<(), StorageError>> {
-            let this = self.clone();
-            Box::pin(async move {
-                this.record(if enabled {
-                    "update_enable"
-                } else {
-                    "update_disable"
-                });
-                Ok(())
-            })
-        }
-
-        fn tag_resource(
-            &self,
-            _arn: &str,
-            _tags: &[Tag],
-        ) -> BoxFuture<'_, Result<(), StorageError>> {
-            Box::pin(async move { Ok(()) })
-        }
-
-        fn untag_resource(
-            &self,
-            _arn: &str,
-            _tag_keys: &[String],
-        ) -> BoxFuture<'_, Result<(), StorageError>> {
-            Box::pin(async move { Ok(()) })
-        }
-
-        fn list_tags(&self, _arn: &str) -> BoxFuture<'_, Result<Vec<Tag>, StorageError>> {
-            Box::pin(async move { Ok(Vec::new()) })
-        }
-
-        fn tables_with_ttl(
-            &self,
-            _account_id: &str,
-        ) -> BoxFuture<'_, Result<Vec<(String, String)>, StorageError>> {
-            Box::pin(async move { Ok(Vec::new()) })
-        }
-
-        fn all_tables_with_ttl(&self) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>> {
-            Box::pin(async move { Ok(Vec::new()) })
-        }
-
-        fn ttl_sweeper_tables(&self) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>> {
-            Box::pin(async move { Ok(Vec::new()) })
-        }
-
-        fn ensure_ttl_expiration_artifacts(
-            &self,
-            _account_id: &str,
-            _table_name: &str,
-            _ttl_attribute: &str,
-        ) -> BoxFuture<'_, Result<(), StorageError>> {
-            let this = self.clone();
-            Box::pin(async move {
-                this.record("create");
-                if this.fail_create {
-                    Err(StorageError::Internal("create failed".to_owned()))
-                } else {
-                    Ok(())
-                }
-            })
-        }
-
-        fn drop_ttl_expiration_artifacts(
-            &self,
-            _account_id: &str,
-            _table_name: &str,
-        ) -> BoxFuture<'_, Result<(), StorageError>> {
-            let this = self.clone();
-            Box::pin(async move {
-                this.record("drop");
-                Ok(())
-            })
-        }
-
-        fn find_expired_items_for_sweeper(
-            &self,
-            _account_id: &str,
-            _table_name: &str,
-            _ttl_attribute: &str,
-            _limit: usize,
-        ) -> BoxFuture<'_, Result<Vec<Item>, StorageError>> {
-            Box::pin(async move { Ok(Vec::new()) })
-        }
-
-        fn refresh_table_size(
-            &self,
-            _account_id: &str,
-            _table_name: &str,
-        ) -> BoxFuture<'_, Result<(), StorageError>> {
-            Box::pin(async move { Ok(()) })
-        }
-
-        fn list_active_table_names(
-            &self,
-            _account_id: &str,
-        ) -> BoxFuture<'_, Result<Vec<String>, StorageError>> {
-            Box::pin(async move { Ok(Vec::new()) })
-        }
-
-        fn all_active_tables(&self) -> BoxFuture<'_, Result<Vec<(String, String)>, StorageError>> {
-            Box::pin(async move { Ok(Vec::new()) })
-        }
-    }
-
     #[test]
-    fn default_ttl_update_disables_by_dropping_then_updating() {
-        let engine = FakeMetadataEngine::default();
-
-        futures::executor::block_on(engine.apply_ttl_update("acct", "table", "ttl", false))
-            .expect("disable should succeed");
-
-        assert_eq!(engine.calls(), vec!["drop", "update_disable"]);
-    }
-
-    #[test]
-    fn default_ttl_update_enable_defers_create_failures() {
-        let engine = FakeMetadataEngine {
-            fail_create: true,
-            ..FakeMetadataEngine::default()
-        };
-
-        futures::executor::block_on(engine.apply_ttl_update("acct", "table", "ttl", true))
-            .expect("create failure should be deferred");
-
-        assert_eq!(engine.calls(), vec!["update_enable", "create"]);
+    fn metadata_engine_is_dyn_compatible() {
+        // This function just needs to compile - it's never called.
+        fn _assert_dyn(_: Arc<dyn MetadataEngine>) {}
     }
 }

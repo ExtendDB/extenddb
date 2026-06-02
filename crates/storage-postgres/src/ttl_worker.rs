@@ -9,7 +9,7 @@ use std::time::Duration;
 use extenddb_core::metrics::MetricsCollector;
 use extenddb_core::types::UserIdentity;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{DataEngine, MetadataEngine, TableEngine};
+use extenddb_storage::{DataEngine, TableEngine};
 
 use crate::PostgresEngine;
 
@@ -31,10 +31,10 @@ pub(crate) async fn ttl_cleanup_worker(
 }
 
 async fn retry_pending_indexes(storage: &PostgresEngine) {
-    let Ok(pending) = MetadataEngine::all_tables_with_ttl(storage).await else {
+    let Ok(pending) = storage.all_tables_with_ttl().await else {
         return;
     };
-    let Ok(ready) = MetadataEngine::ttl_sweeper_tables(storage).await else {
+    let Ok(ready) = storage.ttl_sweeper_tables().await else {
         return;
     };
     let ready_set: std::collections::HashSet<(&str, &str)> = ready
@@ -43,10 +43,9 @@ async fn retry_pending_indexes(storage: &PostgresEngine) {
         .collect();
     for (account_id, table_name, ttl_attr) in &pending {
         if !ready_set.contains(&(account_id.as_str(), table_name.as_str())) {
-            if let Err(e) = MetadataEngine::ensure_ttl_expiration_artifacts(
-                storage, account_id, table_name, ttl_attr,
-            )
-            .await
+            if let Err(e) = storage
+                .ensure_ttl_expiration_artifacts(account_id, table_name, ttl_attr)
+                .await
             {
                 tracing::debug!("TTL worker: index creation retry failed for {table_name}: {e}");
             } else {
@@ -66,7 +65,7 @@ async fn sweep_expired_items(
         principal_id: "dynamodb.amazonaws.com".to_owned(),
     };
 
-    let tables = match MetadataEngine::ttl_sweeper_tables(storage).await {
+    let tables = match storage.ttl_sweeper_tables().await {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!("TTL worker: failed to list tables: {e}");
@@ -80,14 +79,9 @@ async fn sweep_expired_items(
         .as_secs();
 
     for (account_id, table_name, ttl_attribute) in &tables {
-        let items = match MetadataEngine::find_expired_items_for_sweeper(
-            storage,
-            account_id,
-            table_name,
-            ttl_attribute,
-            BATCH_SIZE,
-        )
-        .await
+        let items = match storage
+            .find_expired_items_for_sweeper(account_id, table_name, ttl_attribute, BATCH_SIZE)
+            .await
         {
             Ok(items) => items,
             Err(e) => {

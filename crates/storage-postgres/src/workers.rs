@@ -8,7 +8,6 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use extenddb_core::metrics::MetricsCollector;
-use extenddb_storage::MetadataEngine;
 use extenddb_storage::management_store::SettingsStore;
 use sqlx::PgPool;
 
@@ -71,7 +70,7 @@ pub(crate) async fn table_size_refresh_worker(storage: Arc<PostgresEngine>) {
     loop {
         tokio::time::sleep(REFRESH_INTERVAL).await;
 
-        let tables = match MetadataEngine::all_active_tables(&*storage).await {
+        let tables = match storage.all_active_tables().await {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("Size refresh worker: failed to list tables: {e}");
@@ -80,9 +79,7 @@ pub(crate) async fn table_size_refresh_worker(storage: Arc<PostgresEngine>) {
         };
 
         for (account_id, table_name) in &tables {
-            if let Err(e) =
-                MetadataEngine::refresh_table_size(&*storage, account_id, table_name).await
-            {
+            if let Err(e) = storage.refresh_table_size(account_id, table_name).await {
                 tracing::warn!("Size refresh worker: failed for {table_name}: {e}");
             }
         }
