@@ -791,3 +791,398 @@ class TestQueryLSI:
         )
         assert resp["Count"] == 1
         assert resp["Items"][0]["data"]["S"] == "hello"
+
+
+# ---------------------------------------------------------------------------
+# LSI pagination with duplicate index sort keys (issue #145)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="class")
+def lsi_pagination_table(dynamodb_client):
+    """Table with LSI and items sharing the same index sort key value."""
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "taskType", "AttributeType": "S"},
+        ],
+        key_schema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        LocalSecondaryIndexes=[
+            {
+                "IndexName": "TaskTypeLSI",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "taskType", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            },
+        ],
+    ) as name:
+        # Insert 5 items with same pk and same LSI sort key, different base SK
+        for i in range(1, 6):
+            dynamodb_client.put_item(
+                TableName=name,
+                Item={
+                    "pk": {"S": "user1"},
+                    "sk": {"S": f"task{i}"},
+                    "taskType": {"S": "EXPORT"},
+                    "data": {"S": f"payload-{i}"},
+                },
+            )
+        yield name
+
+
+class TestLSIPaginationDuplicateSortKeys:
+    """LSI pagination must work when multiple items share the same index sort key."""
+
+    def test_paginate_all_items_with_limit(self, dynamodb_client, lsi_pagination_table):
+        """Paginating through all items with Limit returns all 5 items across pages."""
+        all_items = []
+        exclusive_start_key = None
+
+        while True:
+            kwargs = {
+                "TableName": lsi_pagination_table,
+                "IndexName": "TaskTypeLSI",
+                "KeyConditionExpression": "pk = :pk",
+                "ExpressionAttributeValues": {":pk": {"S": "user1"}},
+                "Limit": 2,
+            }
+            if exclusive_start_key:
+                kwargs["ExclusiveStartKey"] = exclusive_start_key
+
+            resp = dynamodb_client.query(**kwargs)
+            all_items.extend(resp["Items"])
+
+            if "LastEvaluatedKey" not in resp:
+                break
+            exclusive_start_key = resp["LastEvaluatedKey"]
+
+        assert len(all_items) == 5
+        # Verify all items are present
+        sks = sorted(item["sk"]["S"] for item in all_items)
+        assert sks == ["task1", "task2", "task3", "task4", "task5"]
+
+    def test_paginate_reverse_order(self, dynamodb_client, lsi_pagination_table):
+        """ScanIndexForward=False with pagination returns all items in reverse."""
+        all_items = []
+        exclusive_start_key = None
+
+        while True:
+            kwargs = {
+                "TableName": lsi_pagination_table,
+                "IndexName": "TaskTypeLSI",
+                "KeyConditionExpression": "pk = :pk",
+                "ExpressionAttributeValues": {":pk": {"S": "user1"}},
+                "Limit": 2,
+                "ScanIndexForward": False,
+            }
+            if exclusive_start_key:
+                kwargs["ExclusiveStartKey"] = exclusive_start_key
+
+            resp = dynamodb_client.query(**kwargs)
+            all_items.extend(resp["Items"])
+
+            if "LastEvaluatedKey" not in resp:
+                break
+            exclusive_start_key = resp["LastEvaluatedKey"]
+
+        assert len(all_items) == 5
+        # Verify reverse order by base table sort key
+        sks = [item["sk"]["S"] for item in all_items]
+        assert sks == ["task5", "task4", "task3", "task2", "task1"]
+
+    def test_page_two_returns_items(self, dynamodb_client, lsi_pagination_table):
+        """Second page of LSI query with duplicate sort keys returns items (not 0)."""
+        # First page
+        resp1 = dynamodb_client.query(
+            TableName=lsi_pagination_table,
+            IndexName="TaskTypeLSI",
+            KeyConditionExpression="pk = :pk",
+            ExpressionAttributeValues={":pk": {"S": "user1"}},
+            Limit=2,
+        )
+        assert resp1["Count"] == 2
+        assert "LastEvaluatedKey" in resp1
+
+        # Second page — this is the core regression test for issue #145
+        resp2 = dynamodb_client.query(
+            TableName=lsi_pagination_table,
+            IndexName="TaskTypeLSI",
+            KeyConditionExpression="pk = :pk",
+            ExpressionAttributeValues={":pk": {"S": "user1"}},
+            Limit=2,
+            ExclusiveStartKey=resp1["LastEvaluatedKey"],
+        )
+        assert resp2["Count"] == 2, (
+            f"Page 2 should return 2 items but got {resp2['Count']}. "
+            "ExclusiveStartKey pagination with duplicate index sort keys is broken."
+        )
+
+    def test_last_evaluated_key_contains_all_keys(self, dynamodb_client, lsi_pagination_table):
+        """LastEvaluatedKey for LSI query contains pk, sk (base), and taskType (index)."""
+        resp = dynamodb_client.query(
+            TableName=lsi_pagination_table,
+            IndexName="TaskTypeLSI",
+            KeyConditionExpression="pk = :pk",
+            ExpressionAttributeValues={":pk": {"S": "user1"}},
+            Limit=2,
+        )
+        lek = resp["LastEvaluatedKey"]
+        assert "pk" in lek, "LastEvaluatedKey must contain partition key"
+        assert "sk" in lek, "LastEvaluatedKey must contain base table sort key"
+        assert "taskType" in lek, "LastEvaluatedKey must contain index sort key"
+
+
+# ---------------------------------------------------------------------------
+# Hash-only GSI pagination (related to issue #145)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="class")
+def gsi_hash_only_table(dynamodb_client):
+    """Table with a hash-only GSI for pagination tests."""
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[
+            {"AttributeName": "instanceId", "AttributeType": "S"},
+            {"AttributeName": "nodeStatus", "AttributeType": "S"},
+        ],
+        key_schema=[
+            {"AttributeName": "instanceId", "KeyType": "HASH"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "StatusGSI",
+                "KeySchema": [
+                    {"AttributeName": "nodeStatus", "KeyType": "HASH"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            },
+        ],
+    ) as name:
+        # Insert 10 items with same GSI hash key
+        for i in range(1, 11):
+            dynamodb_client.put_item(
+                TableName=name,
+                Item={
+                    "instanceId": {"S": f"node-{i}"},
+                    "nodeStatus": {"S": "ACTIVE"},
+                    "data": {"S": f"payload-{i}"},
+                },
+            )
+        yield name
+
+
+class TestHashOnlyGSIPagination:
+    """Hash-only GSI pagination must work with ExclusiveStartKey."""
+
+    def test_paginate_all_items_with_limit(self, dynamodb_client, gsi_hash_only_table):
+        """Paginating through all items on a hash-only GSI returns all 10 items."""
+        all_items = []
+        exclusive_start_key = None
+
+        while True:
+            kwargs = {
+                "TableName": gsi_hash_only_table,
+                "IndexName": "StatusGSI",
+                "KeyConditionExpression": "nodeStatus = :s",
+                "ExpressionAttributeValues": {":s": {"S": "ACTIVE"}},
+                "Limit": 3,
+            }
+            if exclusive_start_key:
+                kwargs["ExclusiveStartKey"] = exclusive_start_key
+
+            resp = dynamodb_client.query(**kwargs)
+            all_items.extend(resp["Items"])
+
+            if "LastEvaluatedKey" not in resp:
+                break
+            exclusive_start_key = resp["LastEvaluatedKey"]
+
+        assert len(all_items) == 10
+        ids = sorted(item["instanceId"]["S"] for item in all_items)
+        expected = sorted(f"node-{i}" for i in range(1, 11))
+        assert ids == expected
+
+    def test_page_two_returns_items(self, dynamodb_client, gsi_hash_only_table):
+        """Second page of hash-only GSI query returns items (not 0)."""
+        resp1 = dynamodb_client.query(
+            TableName=gsi_hash_only_table,
+            IndexName="StatusGSI",
+            KeyConditionExpression="nodeStatus = :s",
+            ExpressionAttributeValues={":s": {"S": "ACTIVE"}},
+            Limit=3,
+        )
+        assert resp1["Count"] == 3
+        assert "LastEvaluatedKey" in resp1
+
+        resp2 = dynamodb_client.query(
+            TableName=gsi_hash_only_table,
+            IndexName="StatusGSI",
+            KeyConditionExpression="nodeStatus = :s",
+            ExpressionAttributeValues={":s": {"S": "ACTIVE"}},
+            Limit=3,
+            ExclusiveStartKey=resp1["LastEvaluatedKey"],
+        )
+        assert resp2["Count"] == 3, (
+            f"Page 2 should return 3 items but got {resp2['Count']}. "
+            "Hash-only GSI pagination with ExclusiveStartKey is broken."
+        )
+
+    def test_no_duplicates_across_pages(self, dynamodb_client, gsi_hash_only_table):
+        """Pagination does not return duplicate items across pages."""
+        all_ids = []
+        exclusive_start_key = None
+
+        while True:
+            kwargs = {
+                "TableName": gsi_hash_only_table,
+                "IndexName": "StatusGSI",
+                "KeyConditionExpression": "nodeStatus = :s",
+                "ExpressionAttributeValues": {":s": {"S": "ACTIVE"}},
+                "Limit": 2,
+            }
+            if exclusive_start_key:
+                kwargs["ExclusiveStartKey"] = exclusive_start_key
+
+            resp = dynamodb_client.query(**kwargs)
+            all_ids.extend(item["instanceId"]["S"] for item in resp["Items"])
+
+            if "LastEvaluatedKey" not in resp:
+                break
+            exclusive_start_key = resp["LastEvaluatedKey"]
+
+        assert len(all_ids) == len(set(all_ids)), "Duplicate items found across pages"
+
+
+# ---------------------------------------------------------------------------
+# GSI pagination on hash-only base table (reviewer comment #4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="class")
+def gsi_on_hash_only_base_table(dynamodb_client):
+    """Table with hash-only PK (no range key) and a GSI with a sort key."""
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[
+            {"AttributeName": "itemId", "AttributeType": "S"},
+            {"AttributeName": "category", "AttributeType": "S"},
+            {"AttributeName": "priority", "AttributeType": "N"},
+        ],
+        key_schema=[
+            {"AttributeName": "itemId", "KeyType": "HASH"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "CategoryPriorityGSI",
+                "KeySchema": [
+                    {"AttributeName": "category", "KeyType": "HASH"},
+                    {"AttributeName": "priority", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            },
+        ],
+    ) as name:
+        # Insert items with duplicate GSI sort keys (same priority)
+        for i in range(1, 8):
+            dynamodb_client.put_item(
+                TableName=name,
+                Item={
+                    "itemId": {"S": f"item-{i}"},
+                    "category": {"S": "urgent"},
+                    "priority": {"N": "1"},
+                    "data": {"S": f"payload-{i}"},
+                },
+            )
+        yield name
+
+
+class TestGSIOnHashOnlyBaseTable:
+    """GSI pagination works when the base table has no range key."""
+
+    def test_paginate_duplicate_gsi_sort_keys(self, dynamodb_client, gsi_on_hash_only_base_table):
+        """All 7 items with same GSI sort key are returned through pagination."""
+        all_items = []
+        exclusive_start_key = None
+
+        while True:
+            kwargs = {
+                "TableName": gsi_on_hash_only_base_table,
+                "IndexName": "CategoryPriorityGSI",
+                "KeyConditionExpression": "category = :c",
+                "ExpressionAttributeValues": {":c": {"S": "urgent"}},
+                "Limit": 2,
+            }
+            if exclusive_start_key:
+                kwargs["ExclusiveStartKey"] = exclusive_start_key
+
+            resp = dynamodb_client.query(**kwargs)
+            all_items.extend(resp["Items"])
+
+            if "LastEvaluatedKey" not in resp:
+                break
+            exclusive_start_key = resp["LastEvaluatedKey"]
+
+        assert len(all_items) == 7
+        ids = sorted(item["itemId"]["S"] for item in all_items)
+        assert ids == sorted(f"item-{i}" for i in range(1, 8))
+
+    def test_scan_pagination_on_gsi(self, dynamodb_client, gsi_on_hash_only_base_table):
+        """Scan on GSI with Limit paginates correctly over hash-only base table."""
+        all_items = []
+        exclusive_start_key = None
+
+        while True:
+            kwargs = {
+                "TableName": gsi_on_hash_only_base_table,
+                "IndexName": "CategoryPriorityGSI",
+                "Limit": 3,
+            }
+            if exclusive_start_key:
+                kwargs["ExclusiveStartKey"] = exclusive_start_key
+
+            resp = dynamodb_client.scan(**kwargs)
+            all_items.extend(resp["Items"])
+
+            if "LastEvaluatedKey" not in resp:
+                break
+            exclusive_start_key = resp["LastEvaluatedKey"]
+
+        assert len(all_items) == 7
+        ids = sorted(item["itemId"]["S"] for item in all_items)
+        assert ids == sorted(f"item-{i}" for i in range(1, 8))
+
+    def test_repeated_pagination_consistent(self, dynamodb_client, gsi_on_hash_only_base_table):
+        """Multiple paginated queries produce consistent results (exercises cache path).
+
+        The first query populates the internal base_key_cache. Subsequent queries
+        hit the cache. Any cache corruption would cause pagination to break.
+        """
+        for run in range(5):
+            all_items = []
+            exclusive_start_key = None
+            while True:
+                kwargs = {
+                    "TableName": gsi_on_hash_only_base_table,
+                    "IndexName": "CategoryPriorityGSI",
+                    "KeyConditionExpression": "category = :c",
+                    "ExpressionAttributeValues": {":c": {"S": "urgent"}},
+                    "Limit": 3,
+                }
+                if exclusive_start_key:
+                    kwargs["ExclusiveStartKey"] = exclusive_start_key
+                resp = dynamodb_client.query(**kwargs)
+                all_items.extend(resp["Items"])
+                if "LastEvaluatedKey" not in resp:
+                    break
+                exclusive_start_key = resp["LastEvaluatedKey"]
+            assert len(all_items) == 7, (
+                f"Run {run+1}: expected 7 items but got {len(all_items)}"
+            )

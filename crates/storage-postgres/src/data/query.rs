@@ -14,6 +14,22 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::util::SortKeyValue;
 use extenddb_storage::util::{parse_sk, pk_to_text, sk_info};
 
+/// Extra pagination bind values for index queries.
+///
+/// Built in `query_scan.rs` in the same branch that generates the SQL placeholders,
+/// then consumed here for binding. This ensures the bind order cannot diverge from
+/// the SQL — the variant determines exactly which values are bound and in what order.
+pub(crate) enum PaginationBinds {
+    /// Base table query or index query with no extra pagination binds needed.
+    None,
+    /// Index query where base table has no SK — only base_pk as tie-breaker.
+    BasePkOnly { pk_text: String },
+    /// Index query where base table has a SK — base_sk as tie-breaker.
+    BaseSkOnly { sk: SortKeyValue },
+    /// Hash-only index where base table has a SK — both base_pk and base_sk.
+    BasePkAndSk { pk_text: String, sk: SortKeyValue },
+}
+
 /// Evaluate a condition expression against an item inside a transaction.
 ///
 /// Returns `Ok(())` if the condition passes or is `None`.
@@ -122,6 +138,14 @@ pub(crate) fn build_sk_sql(
 }
 
 /// Execute a query SQL statement with dynamic parameter binding.
+///
+/// # Parameter binding order:
+/// 1. pk_text (partition key)
+/// 2. SK condition params (from `build_sk_sql`)
+/// 3. Extra SK equality params (multi-range schemas)
+/// 4. ExclusiveStartKey index SK value (if paginating with sort key)
+/// 5. Pagination extra binds (from `PaginationBinds` enum — built in `query_scan.rs`
+///    in the same branch that generates the SQL, so order cannot diverge)
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_query_sql(
     sql: &str,
@@ -131,6 +155,7 @@ pub(crate) async fn execute_query_sql(
     sk_info: Option<(&str, ScalarAttributeType)>,
     extra_sk_col_indices: &[(usize, ScalarAttributeType)],
     exclusive_start_key: Option<&Item>,
+    pagination_binds: &PaginationBinds,
     pool: &sqlx::PgPool,
 ) -> Result<Vec<serde_json::Value>, StorageError> {
     let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sql);
@@ -150,12 +175,28 @@ pub(crate) async fn execute_query_sql(
         }
     }
 
-    // Bind exclusive start key SK value
+    // Bind exclusive start key SK value (index SK for the > / < comparison)
     if let (Some(start_key), Some((sk_name, sk_type))) = (exclusive_start_key, sk_info)
         && let Some(sk_val) = start_key.get(sk_name)
     {
         let sk = parse_sk(sk_val, sk_type)?;
         query = bind_sk_value(query, &sk);
+    }
+
+    // Bind pagination extra values — order is determined by the enum variant,
+    // which is constructed in the same code branch that generated the SQL placeholders.
+    match pagination_binds {
+        PaginationBinds::None => {}
+        PaginationBinds::BasePkOnly { pk_text } => {
+            query = query.bind(pk_text.clone());
+        }
+        PaginationBinds::BaseSkOnly { sk } => {
+            query = bind_sk_value(query, sk);
+        }
+        PaginationBinds::BasePkAndSk { pk_text, sk } => {
+            query = query.bind(pk_text.clone());
+            query = bind_sk_value(query, sk);
+        }
     }
 
     let rows: Vec<(serde_json::Value,)> = query
@@ -249,16 +290,23 @@ pub(crate) fn bind_sk_value<'q>(
 }
 
 /// Execute a scan SQL statement with dynamic parameter binding.
+///
+/// Bind order for index scans: pk, sk (if present), base_pk, base_sk (if present).
+/// Bind order for base table scans: pk, sk (if present).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_scan_sql(
     sql: &str,
     exclusive_start_key: Option<&Item>,
     key_schema: &[KeySchemaElement],
     attr_defs: &[AttributeDefinition],
+    base_sk_info: Option<&(String, ScalarAttributeType)>,
+    base_pk_attr_name: Option<&str>,
     pool: &sqlx::PgPool,
 ) -> Result<Vec<serde_json::Value>, StorageError> {
     let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sql);
 
     if let Some(start_key) = exclusive_start_key {
+        // Bind index/table PK
         let pk_name = &key_schema[0].attribute_name;
         let pk_val = start_key
             .get(pk_name)
@@ -266,11 +314,28 @@ pub(crate) async fn execute_scan_sql(
         let pk_text = pk_to_text(pk_val)?;
         query = query.bind(pk_text.into_owned());
 
+        // Bind index/table SK (if present)
         if let Some((sk_name, sk_type)) = sk_info(key_schema, attr_defs)
             && let Some(sk_val) = start_key.get(sk_name)
         {
             let sk = parse_sk(sk_val, sk_type)?;
             query = bind_sk_value(query, &sk);
+        }
+
+        // Bind base table PK for index scans
+        if let Some(base_pk_name) = base_pk_attr_name {
+            if let Some(base_pk_val) = start_key.get(base_pk_name) {
+                let base_pk_text = pk_to_text(base_pk_val)?;
+                query = query.bind(base_pk_text.into_owned());
+            }
+        }
+
+        // Bind base table SK for index scans (if base table has a sort key)
+        if let Some((base_sk_name, base_sk_type)) = base_sk_info {
+            if let Some(base_sk_val) = start_key.get(base_sk_name.as_str()) {
+                let sk = parse_sk(base_sk_val, *base_sk_type)?;
+                query = bind_sk_value(query, &sk);
+            }
         }
     }
 
