@@ -155,7 +155,10 @@ TTL, tags, and table statistics:
 | `describe_ttl` | Get TTL configuration for a table |
 | `update_ttl` | Enable/disable TTL on a table attribute |
 | `apply_ttl_update` | Apply the full TTL state transition, including backend-specific physical artifacts |
-| `find_expired_items_indexed` | Find items with expired TTL attribute for indexed-worker backends |
+| `ttl_sweeper_tables` | List tables that should be scanned by an application-level TTL sweeper |
+| `ensure_ttl_expiration_artifacts` | Create or repair backend-specific TTL expiration artifacts |
+| `drop_ttl_expiration_artifacts` | Remove backend-specific TTL expiration artifacts |
+| `find_expired_items_for_sweeper` | Find expired items for application-level TTL sweeper backends |
 | `tag_resource` | Add/overwrite tags on a resource ARN |
 | `untag_resource` | Remove tags by key |
 | `list_tags` | List all tags for a resource ARN |
@@ -166,7 +169,7 @@ TTL, tags, and table statistics:
 | `all_active_tables` | List active tables (all accounts) |
 
 Key design decisions:
-- TTL mutation is storage-owned through `apply_ttl_update`. Backends may use the default indexed-worker path, or override it for native database TTL. When a worker deletes expired items, it must call `DataEngine::delete_item` so index sync and stream capture remain correct. A backend that delegates deletion to native TTL, such as TiDB, should return no tables/items from indexed-worker TTL enumeration methods so application-level cleanup cannot duplicate native deletion. Native TTL backends should persist explicit transition state (`DISABLED`, `ENABLING`, `ENABLED`, `DISABLING`) and let the backend control-plane reconciler submit native online TTL DDL from that durable intent, so live nodes and startup repair can finish enable and disable paths without guessing from artifact booleans. Legacy readiness booleans should be migrated into explicit status and removed. If native tooling can disable TTL jobs during restore or flashback, the backend should verify physical TTL state on startup and re-enable the native table option.
+- TTL mutation is storage-owned through `apply_ttl_update`. Backends may use the default application-sweeper path, or override it for native database TTL. When a worker deletes expired items, it must call `DataEngine::delete_item` so index sync and stream capture remain correct. A backend that delegates deletion to native TTL, such as TiDB, should return no tables/items from TTL sweeper methods so application-level cleanup cannot duplicate native deletion. Native TTL backends should persist explicit transition state (`DISABLED`, `ENABLING`, `ENABLED`, `DISABLING`) and let the backend control-plane reconciler submit native online TTL DDL from that durable intent, so live nodes and startup repair can finish enable and disable paths without guessing from artifact booleans. Legacy readiness booleans should be migrated into explicit status and removed. If native tooling can disable TTL jobs during restore or flashback, the backend should verify physical TTL state on startup and re-enable the native table option.
 - Tags are stored by ARN string.
 - Native-stat backends should prefer reading table size and item count from
   backend metadata when building `DescribeTable` and backup metadata. A

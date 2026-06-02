@@ -809,17 +809,17 @@ impl MetadataEngine for TidbEngine {
         })
     }
 
-    fn all_tables_with_ttl_index_ready(
+    fn ttl_sweeper_tables(
         &self,
     ) -> BoxFuture<'_, Result<Vec<(String, String, String)>, StorageError>> {
         Box::pin(async move {
             // TiDB native TTL owns item expiration. Do not expose user tables
-            // to the generic indexed TTL sweeper.
+            // to the generic application-level TTL sweeper.
             Ok(Vec::new())
         })
     }
 
-    fn create_ttl_index(
+    fn ensure_ttl_expiration_artifacts(
         &self,
         account_id: &str,
         table_name: &str,
@@ -874,7 +874,7 @@ impl MetadataEngine for TidbEngine {
         })
     }
 
-    fn drop_ttl_index(
+    fn drop_ttl_expiration_artifacts(
         &self,
         account_id: &str,
         table_name: &str,
@@ -908,7 +908,7 @@ impl MetadataEngine for TidbEngine {
         })
     }
 
-    fn find_expired_items_indexed(
+    fn find_expired_items_for_sweeper(
         &self,
         _account_id: &str,
         _table_name: &str,

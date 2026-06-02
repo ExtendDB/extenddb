@@ -543,8 +543,8 @@ pub trait MetadataEngine: Send + Sync {
     /// Apply a complete TTL state change, including any backend-specific
     /// physical TTL artifacts.
     ///
-    /// The default implementation preserves the historical indexed-worker
-    /// workflow used by storage backends that keep TTL lookup artifacts outside
+    /// The default implementation preserves the application-sweeper workflow
+    /// used by storage backends that keep TTL expiration artifacts outside
     /// `update_ttl`: drop artifacts before disabling, and best-effort-create
     /// artifacts after enabling. Backends with native TTL DDL should override
     /// this method so the backend owns the full catalog/DDL transition.
@@ -560,7 +560,8 @@ pub trait MetadataEngine: Send + Sync {
         let attribute_name = attribute_name.to_owned();
         Box::pin(async move {
             if !enabled {
-                self.drop_ttl_index(&account_id, &table_name).await?;
+                self.drop_ttl_expiration_artifacts(&account_id, &table_name)
+                    .await?;
             }
 
             self.update_ttl(&account_id, &table_name, &attribute_name, enabled)
@@ -568,10 +569,10 @@ pub trait MetadataEngine: Send + Sync {
 
             if enabled
                 && let Err(err) = self
-                    .create_ttl_index(&account_id, &table_name, &attribute_name)
+                    .ensure_ttl_expiration_artifacts(&account_id, &table_name, &attribute_name)
                     .await
             {
-                tracing::warn!("TTL index creation deferred for {table_name}: {err}");
+                tracing::warn!("TTL expiration artifact creation deferred for {table_name}: {err}");
             }
 
             Ok(())
@@ -600,43 +601,41 @@ pub trait MetadataEngine: Send + Sync {
     /// List all tables with TTL enabled across all accounts: `(account_id, table_name, ttl_attribute)`.
     fn all_tables_with_ttl(&self) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>>;
 
-    /// List all tables with TTL enabled AND index ready for an indexed-worker
-    /// TTL sweeper: `(account_id, table_name, ttl_attribute)`.
+    /// List all tables with TTL enabled and ready for an application-level TTL
+    /// sweeper: `(account_id, table_name, ttl_attribute)`.
     ///
     /// Backends that delegate expiration to native database TTL should return
     /// an empty list so the generic sweeper cannot duplicate native deletion.
-    fn all_tables_with_ttl_index_ready(
-        &self,
-    ) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>>;
+    fn ttl_sweeper_tables(&self) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>>;
 
-    /// Create the TTL artifact for a table.
+    /// Ensure backend-specific TTL expiration artifacts for a table.
     ///
-    /// Indexed-worker backends usually create an expression index and set
-    /// `ttl_index_ready = TRUE`. Native TTL backends may apply database-native
+    /// Application-sweeper backends may create an internal lookup index and set
+    /// a backend readiness flag. Native TTL backends may apply database-native
     /// TTL DDL and publish their own explicit TTL state.
-    fn create_ttl_index(
+    fn ensure_ttl_expiration_artifacts(
         &self,
         account_id: &str,
         table_name: &str,
         ttl_attribute: &str,
     ) -> BoxFuture<'_, Result<(), StorageError>>;
 
-    /// Drop the TTL artifact for a table.
+    /// Drop backend-specific TTL expiration artifacts for a table.
     ///
-    /// Indexed-worker backends usually drop an expression index and set
-    /// `ttl_index_ready = FALSE`. Native TTL backends may remove database-native
-    /// TTL DDL and publish their own explicit TTL state.
-    fn drop_ttl_index(
+    /// Application-sweeper backends may drop an internal lookup index and clear
+    /// a backend readiness flag. Native TTL backends may remove
+    /// database-native TTL DDL and publish their own explicit TTL state.
+    fn drop_ttl_expiration_artifacts(
         &self,
         account_id: &str,
         table_name: &str,
     ) -> BoxFuture<'_, Result<(), StorageError>>;
 
-    /// Find expired items using the TTL index (ordered scan with LIMIT).
+    /// Find expired items for an application-level TTL sweeper.
     ///
-    /// Indexed-worker backends return candidate items for application-level
+    /// Application-sweeper backends return candidate items for application-level
     /// deletion. Native TTL backends should return an empty list.
-    fn find_expired_items_indexed(
+    fn find_expired_items_for_sweeper(
         &self,
         account_id: &str,
         table_name: &str,
@@ -1011,13 +1010,11 @@ mod tests {
             Box::pin(async move { Ok(Vec::new()) })
         }
 
-        fn all_tables_with_ttl_index_ready(
-            &self,
-        ) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>> {
+        fn ttl_sweeper_tables(&self) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>> {
             Box::pin(async move { Ok(Vec::new()) })
         }
 
-        fn create_ttl_index(
+        fn ensure_ttl_expiration_artifacts(
             &self,
             _account_id: &str,
             _table_name: &str,
@@ -1034,7 +1031,7 @@ mod tests {
             })
         }
 
-        fn drop_ttl_index(
+        fn drop_ttl_expiration_artifacts(
             &self,
             _account_id: &str,
             _table_name: &str,
@@ -1046,7 +1043,7 @@ mod tests {
             })
         }
 
-        fn find_expired_items_indexed(
+        fn find_expired_items_for_sweeper(
             &self,
             _account_id: &str,
             _table_name: &str,

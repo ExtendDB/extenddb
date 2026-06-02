@@ -270,7 +270,7 @@ impl MetadataEngine for PostgresEngine {
         })
     }
 
-    fn all_tables_with_ttl_index_ready(
+    fn ttl_sweeper_tables(
         &self,
     ) -> BoxFuture<'_, Result<Vec<(String, String, String)>, StorageError>> {
         Box::pin(async move {
@@ -286,7 +286,7 @@ impl MetadataEngine for PostgresEngine {
         })
     }
 
-    fn create_ttl_index(
+    fn ensure_ttl_expiration_artifacts(
         &self,
         account_id: &str,
         table_name: &str,
@@ -336,7 +336,7 @@ impl MetadataEngine for PostgresEngine {
         })
     }
 
-    fn drop_ttl_index(
+    fn drop_ttl_expiration_artifacts(
         &self,
         account_id: &str,
         table_name: &str,
@@ -378,7 +378,7 @@ impl MetadataEngine for PostgresEngine {
         })
     }
 
-    fn find_expired_items_indexed(
+    fn find_expired_items_for_sweeper(
         &self,
         account_id: &str,
         table_name: &str,

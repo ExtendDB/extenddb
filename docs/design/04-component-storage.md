@@ -202,14 +202,16 @@ from real table and index statistics instead of pseudo statistics.
 - `refresh_table_size` — updates cached table size and item count for backends
   that maintain a catalog cache. Native-stat backends can answer from their
   database metadata at describe/backup time instead.
-- `create_ttl_index`, `find_expired_items_indexed` — backend-specific TTL
-  artifact support for indexed-worker backends. `apply_ttl_update` lets the
-  storage backend own the whole TTL transition; PostgreSQL uses the default
-  indexed-worker workflow, while TiDB records native TTL intent and lets the
-  control-plane reconciler submit TiDB online TTL DDL. TiDB batches legacy
-  artifact cleanup with multi-schema `ALTER TABLE` and does not run or expose
-  an item sweeper. TiDB persists explicit TTL intent (`DISABLED`, `ENABLING`,
-  `ENABLED`, `DISABLING`) so the live reconciler and startup repair can finish
+- `ttl_sweeper_tables`, `ensure_ttl_expiration_artifacts`,
+  `drop_ttl_expiration_artifacts`, `find_expired_items_for_sweeper` —
+  backend-specific TTL expiration support. `apply_ttl_update` lets the storage
+  backend own the whole TTL transition; PostgreSQL uses the default
+  application-sweeper workflow with an internal expression index, while TiDB
+  records native TTL intent and lets the control-plane reconciler submit TiDB
+  online TTL DDL. TiDB batches legacy artifact cleanup with multi-schema
+  `ALTER TABLE` and does not run or expose an item sweeper. TiDB persists
+  explicit TTL intent (`DISABLED`, `ENABLING`, `ENABLED`, `DISABLING`) so the
+  live reconciler and startup repair can finish
   the correct native DDL path after a frontend crash instead of inferring
   intent from artifact booleans. Legacy readiness booleans are migrated into
   that explicit status and then dropped. Repair also reads physical table TTL state and
