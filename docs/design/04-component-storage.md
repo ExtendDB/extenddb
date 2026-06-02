@@ -342,6 +342,11 @@ Policy lookups for authorization decisions:
 
 Used by the authorization policy engine to retrieve policies for authorization
 evaluation.
+TiDB treats these as hot request-path catalog reads: user group membership is
+indexed by `(account_id, user_name, group_name)` for policy joins, and role
+session data is indexed by `(account_id, role_name, session_name, expires_at)`.
+Those indexes keep SigV4 authorization on native TiDB range/point lookups
+instead of scanning all memberships or sessions for an account.
 
 ### Bootstrapper
 

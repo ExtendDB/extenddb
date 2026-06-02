@@ -3,7 +3,7 @@
 
 //! TiDB implementation of `OperationsEngine`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use extenddb_core::types::{AttributeDefinition, KeySchemaElement};
 use extenddb_storage::error::StorageError;
@@ -30,6 +30,25 @@ type NativeIndexArtifactRow = (
     String,
     serde_json::Value,
 );
+
+struct RequiredCatalogLookupIndex {
+    table: &'static str,
+    index: &'static str,
+    columns: &'static str,
+}
+
+const REQUIRED_CATALOG_LOOKUP_INDEXES: &[RequiredCatalogLookupIndex] = &[
+    RequiredCatalogLookupIndex {
+        table: "iam_group_members",
+        index: "idx_iam_group_members_user",
+        columns: "account_id,user_name,group_name",
+    },
+    RequiredCatalogLookupIndex {
+        table: "iam_sessions",
+        index: "idx_iam_sessions_role_session",
+        columns: "account_id,role_name,session_name,expires_at",
+    },
+];
 
 fn catalog_check_issue(name: impl Into<String>) -> CatalogCheckIssue {
     CatalogCheckIssue::new(name)
@@ -188,10 +207,61 @@ async fn tidb_catalog_check(
             .collect(),
     ));
 
+    sections.push(check_tidb_catalog_lookup_indexes(&catalog_pool).await?);
     sections.push(check_tidb_native_index_artifacts(&catalog_pool, &data_pool, &actual).await?);
     sections.push(check_tidb_native_ttl_artifacts(&catalog_pool, &data_pool, &actual).await?);
 
     Ok(CatalogCheckReport { sections })
+}
+
+async fn check_tidb_catalog_lookup_indexes(
+    catalog_pool: &sqlx::MySqlPool,
+) -> Result<CatalogCheckSection, StorageError> {
+    let actual: HashMap<(String, String), String> = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT table_name, index_name, \
+                    GROUP_CONCAT(column_name ORDER BY seq_in_index SEPARATOR ',') AS columns \
+             FROM information_schema.statistics \
+             WHERE table_schema = DATABASE() \
+               AND table_name IN ('iam_group_members', 'iam_sessions') \
+             GROUP BY table_name, index_name",
+    )
+    .fetch_all(catalog_pool)
+    .await
+    .map_err(|e| StorageError::Internal(e.to_string()))?
+    .into_iter()
+    .map(|(table, index, columns)| ((table, index), columns))
+    .collect();
+
+    Ok(CatalogCheckSection::new(
+        "Checking TiDB catalog authorization lookup indexes",
+        "All hot authorization lookups have native TiDB indexes.",
+        catalog_lookup_index_issues(&actual),
+    ))
+}
+
+fn catalog_lookup_index_issues(
+    actual: &HashMap<(String, String), String>,
+) -> Vec<CatalogCheckIssue> {
+    REQUIRED_CATALOG_LOOKUP_INDEXES
+        .iter()
+        .filter_map(|required| {
+            let key = (required.table.to_owned(), required.index.to_owned());
+            match actual.get(&key) {
+                Some(columns) if columns == required.columns => None,
+                Some(columns) => Some(
+                    catalog_check_issue(format!("{}.{}", required.table, required.index))
+                        .with_detail(format!(
+                            "expected columns {}, found {columns}",
+                            required.columns
+                        )),
+                ),
+                None => Some(
+                    catalog_check_issue(format!("{}.{}", required.table, required.index))
+                        .with_detail("missing native TiDB catalog lookup index"),
+                ),
+            }
+        })
+        .collect()
 }
 
 async fn check_tidb_native_index_artifacts(
@@ -379,11 +449,33 @@ impl OperationsEngine for TidbOperationsEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::quote_tidb_identifier;
+    use std::collections::HashMap;
+
+    use super::{catalog_lookup_index_issues, quote_tidb_identifier};
 
     #[test]
     fn catalog_check_quotes_tidb_physical_table_names_for_cleanup() {
         assert_eq!(quote_tidb_identifier("_ddb_abc").unwrap(), "`_ddb_abc`");
         assert!(quote_tidb_identifier("_ddb_bad`name").is_err());
+    }
+
+    #[test]
+    fn catalog_check_requires_hot_authorization_lookup_indexes() {
+        let actual = HashMap::from([(
+            (
+                "iam_group_members".to_owned(),
+                "idx_iam_group_members_user".to_owned(),
+            ),
+            "account_id,user_name,group_name".to_owned(),
+        )]);
+
+        let issues = catalog_lookup_index_issues(&actual);
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].name, "iam_sessions.idx_iam_sessions_role_session");
+        assert_eq!(
+            issues[0].detail.as_deref(),
+            Some("missing native TiDB catalog lookup index")
+        );
     }
 }

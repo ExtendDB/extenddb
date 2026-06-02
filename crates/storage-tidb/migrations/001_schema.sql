@@ -1,6 +1,6 @@
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
--- Consolidated catalog schema for extenddb (catalog version 0.0.21).
+-- Consolidated catalog schema for extenddb (catalog version 0.0.22).
 -- This is the complete schema applied on fresh installs.
 
 -- Accounts — multi-account support (REQ-AUTH-005).
@@ -130,6 +130,9 @@ CREATE TABLE IF NOT EXISTS iam_group_members (
     FOREIGN KEY (account_id, user_name) REFERENCES iam_users(account_id, user_name) ON DELETE CASCADE
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
+CREATE INDEX idx_iam_group_members_user
+    ON iam_group_members (account_id, user_name, group_name);
+
 -- IAM roles.
 CREATE TABLE IF NOT EXISTS iam_roles (
     account_id VARCHAR(32) NOT NULL REFERENCES accounts(account_id) ON DELETE CASCADE,
@@ -166,6 +169,9 @@ CREATE TABLE IF NOT EXISTS iam_sessions (
     FOREIGN KEY (account_id, role_name) REFERENCES iam_roles(account_id, role_name) ON DELETE CASCADE
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
   TTL = `expires_at` + INTERVAL 24 HOUR TTL_JOB_INTERVAL = '1h';
+
+CREATE INDEX idx_iam_sessions_role_session
+    ON iam_sessions (account_id, role_name, session_name, expires_at);
 
 -- IAM policies.
 CREATE TABLE IF NOT EXISTS iam_policies (
@@ -283,4 +289,4 @@ CREATE TABLE IF NOT EXISTS continuous_backups (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 -- Seed settings.
-INSERT IGNORE INTO settings (`key`, value) VALUES ('catalog_version', '0.0.21');
+INSERT IGNORE INTO settings (`key`, value) VALUES ('catalog_version', '0.0.22');

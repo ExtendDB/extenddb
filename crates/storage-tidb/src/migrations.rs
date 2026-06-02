@@ -93,6 +93,10 @@ pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
         "021_presplit_append_tables.sql",
         include_str!("../../storage-tidb/migrations/021_presplit_append_tables.sql"),
     ),
+    (
+        "022_auth_lookup_indexes.sql",
+        include_str!("../../storage-tidb/migrations/022_auth_lookup_indexes.sql"),
+    ),
 ];
 
 const DATA_SCHEMA_MIGRATION: &str =
@@ -600,14 +604,29 @@ mod tests {
     }
 
     #[test]
-    fn latest_catalog_migration_presplits_append_tables() {
-        let (filename, sql) = CATALOG_MIGRATIONS.last().expect("latest migration");
+    fn catalog_migration_presplits_append_tables() {
+        let (filename, sql) = CATALOG_MIGRATIONS
+            .iter()
+            .find(|(filename, _)| *filename == "021_presplit_append_tables.sql")
+            .expect("presplit append tables migration");
 
         assert_eq!(*filename, "021_presplit_append_tables.sql");
         assert!(sql.contains("SPLIT TABLE metrics_samples"));
         assert!(sql.contains("SPLIT TABLE login_attempts"));
         assert!(sql.contains("REGIONS 16"));
         assert!(sql.contains("0.0.21"));
+    }
+
+    #[test]
+    fn latest_catalog_migration_adds_auth_lookup_indexes() {
+        let (filename, sql) = CATALOG_MIGRATIONS.last().expect("latest migration");
+
+        assert_eq!(*filename, "022_auth_lookup_indexes.sql");
+        assert!(sql.contains("CREATE INDEX IF NOT EXISTS idx_iam_group_members_user"));
+        assert!(sql.contains("ON iam_group_members (account_id, user_name, group_name)"));
+        assert!(sql.contains("CREATE INDEX IF NOT EXISTS idx_iam_sessions_role_session"));
+        assert!(sql.contains("ON iam_sessions (account_id, role_name, session_name, expires_at)"));
+        assert!(sql.contains("0.0.22"));
     }
 
     #[test]
@@ -693,6 +712,17 @@ mod tests {
         assert!(login_attempts_schema.contains("SHARD_ROW_ID_BITS = 4"));
         assert!(login_attempts_schema.contains("PRE_SPLIT_REGIONS = 4"));
         assert!(login_attempts_schema.contains("TTL = `attempted_at` + INTERVAL 24 HOUR"));
+    }
+
+    #[test]
+    fn fresh_catalog_schema_uses_auth_lookup_indexes() {
+        let (filename, sql) = CATALOG_MIGRATIONS.first().expect("fresh catalog migration");
+
+        assert_eq!(*filename, "001_schema.sql");
+        assert!(sql.contains("CREATE INDEX idx_iam_group_members_user"));
+        assert!(sql.contains("ON iam_group_members (account_id, user_name, group_name)"));
+        assert!(sql.contains("CREATE INDEX idx_iam_sessions_role_session"));
+        assert!(sql.contains("ON iam_sessions (account_id, role_name, session_name, expires_at)"));
     }
 
     #[test]
