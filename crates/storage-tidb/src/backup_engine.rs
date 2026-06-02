@@ -186,6 +186,7 @@ impl TidbNativeBackupConfig {
                     storage_uri.into(),
                     "--backupts".into(),
                     backup_tso.to_string().into(),
+                    "--ignore-stats=false".into(),
                 ]);
                 if let Some(send) = self.send_credentials_to_tikv {
                     args.push(format!("--send-credentials-to-tikv={send}").into());
@@ -1165,6 +1166,7 @@ mod tests {
                 "s3://bucket/extenddb/snapshots/a/t/1",
                 "--backupts",
                 "450456244814610433",
+                "--ignore-stats=false",
                 "--send-credentials-to-tikv=false",
             ]
         );
