@@ -8,11 +8,13 @@ use std::collections::HashMap;
 use extenddb_core::expression::{self, ExpressionMaps};
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
-    AttributeValue, CancellationReason, Item, ReturnValuesOnConditionCheckFailure, StreamEventName,
+    AttributeValue, CancellationReason, Item, ReturnValuesOnConditionCheckFailure,
+    ScalarAttributeType, StreamEventName, TableKeyInfo,
 };
 use extenddb_core::validation;
 use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
+use extenddb_storage::util::{SortKeyValue, parse_sk, sk_column, sk_info};
 use extenddb_storage::{TransactGetOp, TransactWriteOp};
 
 use super::index::{
@@ -21,13 +23,37 @@ use super::index::{
 };
 use super::tx_helpers::{
     StreamSequenceAllocator, check_idempotency_token_in_tx, delete_item_in_tx,
-    delete_item_without_old_item_in_tx, fetch_item_for_update, fetch_item_in_tx,
-    finalize_stream_records_best_effort, put_item_without_old_item_in_tx,
-    stream_capture_needs_old_item, upsert_item_in_tx, write_stream_record_for_event_in_tx,
-    write_stream_record_in_tx,
+    delete_item_without_old_item_in_tx, fetch_item_for_update, finalize_stream_records_best_effort,
+    put_item_without_old_item_in_tx, stream_capture_needs_old_item, upsert_item_in_tx,
+    write_stream_record_for_event_in_tx, write_stream_record_in_tx,
 };
+use super::{data_table_name, json_to_item, physical_pk_bytes, repeat_tuple_placeholders};
 use crate::TidbEngine;
 use crate::tidb_util::retry_tidb_idempotent_operation;
+
+type TxnGetRowsQuery<'q, O> = sqlx::query::QueryAs<'q, sqlx::MySql, O, sqlx::mysql::MySqlArguments>;
+
+#[derive(Clone, Debug, PartialEq)]
+struct TransactGetLookupKey {
+    pk: Vec<u8>,
+    sk: Option<TransactGetSortKey>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum TransactGetSortKey {
+    Bytes(Vec<u8>),
+    Number(bigdecimal::BigDecimal),
+}
+
+struct TransactGetEntry {
+    result_index: usize,
+    lookup_key: TransactGetLookupKey,
+}
+
+struct TransactGetGroup<'a> {
+    key_info: &'a TableKeyInfo,
+    entries: Vec<TransactGetEntry>,
+}
 
 impl TidbEngine {
     /// Implementation of `DataEngine::transact_get_items`.
@@ -35,6 +61,10 @@ impl TidbEngine {
         &self,
         ops: &[TransactGetOp<'_>],
     ) -> Result<Vec<Option<Item>>, StorageError> {
+        if ops.is_empty() {
+            return Ok(Vec::new());
+        }
+
         // Validate key types inside the transaction so mismatches produce
         // TransactionCanceledException with ValidationError cancellation
         // reasons, matching real DynamoDB behavior.
@@ -57,6 +87,8 @@ impl TidbEngine {
             return Err(StorageError::TransactionCanceled(reasons));
         }
 
+        let groups = transact_get_groups(ops)?;
+
         // Plain reads inside one TiDB transaction share a snapshot. TiDB treats
         // MySQL's READ ONLY transaction syntax as a disabled no-op feature, so
         // do not use START TRANSACTION READ ONLY here.
@@ -66,10 +98,9 @@ impl TidbEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let mut results = Vec::with_capacity(ops.len());
-        for op in ops {
-            let item = fetch_item_in_tx(&mut tx, op.key_info, op.key).await?;
-            results.push(item);
+        let mut results = vec![None; ops.len()];
+        for group in &groups {
+            fetch_transact_get_group(&mut tx, group, &mut results).await?;
         }
 
         tx.commit()
@@ -224,6 +255,193 @@ impl TidbEngine {
         // idempotency semantics do not depend on TTL job timing.
         Ok(0)
     }
+}
+
+fn transact_get_groups<'a>(
+    ops: &'a [TransactGetOp<'a>],
+) -> Result<Vec<TransactGetGroup<'a>>, StorageError> {
+    let mut groups: Vec<TransactGetGroup<'a>> = Vec::new();
+
+    for (result_index, op) in ops.iter().enumerate() {
+        let lookup_key = transact_get_lookup_key(op.key_info, op.key)?;
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.key_info.table_id == op.key_info.table_id)
+        {
+            group.entries.push(TransactGetEntry {
+                result_index,
+                lookup_key,
+            });
+        } else {
+            groups.push(TransactGetGroup {
+                key_info: op.key_info,
+                entries: vec![TransactGetEntry {
+                    result_index,
+                    lookup_key,
+                }],
+            });
+        }
+    }
+
+    Ok(groups)
+}
+
+fn transact_get_lookup_key(
+    key_info: &TableKeyInfo,
+    key: &Item,
+) -> Result<TransactGetLookupKey, StorageError> {
+    let pk = physical_pk_bytes(key, &key_info.key_schema)?;
+    let sk = if let Some((sk_name, sk_type)) =
+        sk_info(&key_info.key_schema, &key_info.attribute_definitions)
+    {
+        let sk_value = key.get(sk_name).ok_or_else(|| {
+            StorageError::Internal(format!("missing sort key attribute {sk_name}"))
+        })?;
+        let sk = parse_sk(sk_value, sk_type)?;
+        Some(transact_get_sort_key(sk))
+    } else {
+        None
+    };
+    Ok(TransactGetLookupKey { pk, sk })
+}
+
+fn transact_get_sort_key(sk: SortKeyValue) -> TransactGetSortKey {
+    match sk {
+        SortKeyValue::S(s) => TransactGetSortKey::Bytes(s.into_bytes()),
+        SortKeyValue::N(n) => TransactGetSortKey::Number(n),
+        SortKeyValue::B(b) => TransactGetSortKey::Bytes(b),
+    }
+}
+
+async fn fetch_transact_get_group(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    group: &TransactGetGroup<'_>,
+    results: &mut [Option<Item>],
+) -> Result<(), StorageError> {
+    let ddb_table = data_table_name(&group.key_info.table_id);
+    let fetched = if let Some((_, sk_type)) = sk_info(
+        &group.key_info.key_schema,
+        &group.key_info.attribute_definitions,
+    ) {
+        let sk_col = sk_column(sk_type);
+        let sql = transact_get_pk_sk_sql(&ddb_table, sk_col, group.entries.len());
+        match sk_type {
+            ScalarAttributeType::S | ScalarAttributeType::B => {
+                let mut query = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, serde_json::Value)>(&sql);
+                for entry in &group.entries {
+                    query = query.bind(entry.lookup_key.pk.clone());
+                    query = bind_transact_get_sort_key(
+                        query,
+                        entry.lookup_key.sk.as_ref().ok_or_else(|| {
+                            StorageError::Internal(
+                                "missing prepared transaction sort key".to_owned(),
+                            )
+                        })?,
+                    );
+                }
+                let rows = query
+                    .fetch_all(&mut **tx)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                rows.into_iter()
+                    .map(|(pk, sk, json)| {
+                        Ok((
+                            TransactGetLookupKey {
+                                pk,
+                                sk: Some(TransactGetSortKey::Bytes(sk)),
+                            },
+                            json_to_item(json)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, StorageError>>()?
+            }
+            ScalarAttributeType::N => {
+                let mut query =
+                    sqlx::query_as::<_, (Vec<u8>, bigdecimal::BigDecimal, serde_json::Value)>(&sql);
+                for entry in &group.entries {
+                    query = query.bind(entry.lookup_key.pk.clone());
+                    query = bind_transact_get_sort_key(
+                        query,
+                        entry.lookup_key.sk.as_ref().ok_or_else(|| {
+                            StorageError::Internal(
+                                "missing prepared transaction sort key".to_owned(),
+                            )
+                        })?,
+                    );
+                }
+                let rows = query
+                    .fetch_all(&mut **tx)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                rows.into_iter()
+                    .map(|(pk, sk, json)| {
+                        Ok((
+                            TransactGetLookupKey {
+                                pk,
+                                sk: Some(TransactGetSortKey::Number(sk)),
+                            },
+                            json_to_item(json)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, StorageError>>()?
+            }
+        }
+    } else {
+        let sql = transact_get_pk_sql(&ddb_table, group.entries.len());
+        let mut query = sqlx::query_as::<_, (Vec<u8>, serde_json::Value)>(&sql);
+        for entry in &group.entries {
+            query = query.bind(entry.lookup_key.pk.clone());
+        }
+        let rows = query
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(|(pk, json)| Ok((TransactGetLookupKey { pk, sk: None }, json_to_item(json)?)))
+            .collect::<Result<Vec<_>, StorageError>>()?
+    };
+
+    assign_transact_get_group_results(group, &fetched, results);
+    Ok(())
+}
+
+fn bind_transact_get_sort_key<'q, O>(
+    query: TxnGetRowsQuery<'q, O>,
+    sk: &TransactGetSortKey,
+) -> TxnGetRowsQuery<'q, O> {
+    match sk {
+        TransactGetSortKey::Bytes(bytes) => query.bind(bytes.clone()),
+        TransactGetSortKey::Number(number) => query.bind(number.clone()),
+    }
+}
+
+fn assign_transact_get_group_results(
+    group: &TransactGetGroup<'_>,
+    fetched: &[(TransactGetLookupKey, Item)],
+    results: &mut [Option<Item>],
+) {
+    for entry in &group.entries {
+        if let Some((_, item)) = fetched
+            .iter()
+            .find(|(lookup_key, _)| lookup_key == &entry.lookup_key)
+        {
+            results[entry.result_index] = Some(item.clone());
+        }
+    }
+}
+
+fn transact_get_pk_sql(table: &str, key_count: usize) -> String {
+    format!(
+        "SELECT pk, item_data FROM {table} WHERE pk IN ({})",
+        repeat_tuple_placeholders(key_count, 1)
+    )
+}
+
+fn transact_get_pk_sk_sql(table: &str, sk_col: &str, key_count: usize) -> String {
+    format!(
+        "SELECT pk, {sk_col}, item_data FROM {table} WHERE (pk, {sk_col}) IN ({})",
+        repeat_tuple_placeholders(key_count, 2)
+    )
 }
 
 /// Extract the table_id from a transactional write operation.
@@ -587,10 +805,14 @@ mod tests {
     use std::sync::Arc;
 
     use extenddb_core::expression::Expr;
-    use extenddb_core::types::StreamViewType;
+    use extenddb_core::types::{AttributeValue, StreamViewType, TableKeyInfo};
     use extenddb_storage::StreamCapture;
 
-    use super::{transact_delete_needs_existing_item, transact_put_needs_existing_item};
+    use super::{
+        TransactGetEntry, TransactGetGroup, TransactGetLookupKey,
+        assign_transact_get_group_results, transact_delete_needs_existing_item,
+        transact_get_pk_sk_sql, transact_get_pk_sql, transact_put_needs_existing_item,
+    };
 
     fn condition() -> Expr {
         Expr::Function {
@@ -607,6 +829,24 @@ mod tests {
             user_identity: None,
             region: Arc::from("us-east-1"),
         }
+    }
+
+    fn key_info() -> TableKeyInfo {
+        TableKeyInfo {
+            table_name: "table".to_owned(),
+            account_id: "acct".to_owned(),
+            table_id: "tableid".to_owned(),
+            key_schema: Vec::new(),
+            attribute_definitions: Vec::new(),
+            has_lsi: false,
+            stream_specification: None,
+        }
+    }
+
+    fn item(value: &str) -> extenddb_core::types::Item {
+        let mut item = extenddb_core::types::Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S(value.to_owned()));
+        item
     }
 
     #[test]
@@ -673,5 +913,49 @@ mod tests {
                 region: Arc::from("us-east-1"),
             })
         ));
+    }
+
+    #[test]
+    fn transaction_get_sql_uses_native_primary_key_batch_shape() {
+        assert_eq!(
+            transact_get_pk_sql("`_ddb_table`", 3),
+            "SELECT pk, item_data FROM `_ddb_table` WHERE pk IN (?, ?, ?)"
+        );
+        assert_eq!(
+            transact_get_pk_sk_sql("`_ddb_table`", "sk_n", 2),
+            "SELECT pk, sk_n, item_data FROM `_ddb_table` WHERE (pk, sk_n) IN ((?, ?), (?, ?))"
+        );
+    }
+
+    #[test]
+    fn transaction_get_assignment_restores_request_order() {
+        let key_info = key_info();
+        let first = TransactGetLookupKey {
+            pk: b"first".to_vec(),
+            sk: None,
+        };
+        let second = TransactGetLookupKey {
+            pk: b"second".to_vec(),
+            sk: None,
+        };
+        let group = TransactGetGroup {
+            key_info: &key_info,
+            entries: vec![
+                TransactGetEntry {
+                    result_index: 0,
+                    lookup_key: first.clone(),
+                },
+                TransactGetEntry {
+                    result_index: 1,
+                    lookup_key: second.clone(),
+                },
+            ],
+        };
+        let fetched = vec![(second, item("second")), (first, item("first"))];
+        let mut results = vec![None, None];
+
+        assign_transact_get_group_results(&group, &fetched, &mut results);
+
+        assert_eq!(results, vec![Some(item("first")), Some(item("second"))]);
     }
 }

@@ -80,40 +80,6 @@ impl StreamSequenceAllocator {
     }
 }
 
-/// Fetch a single item within an existing transaction.
-pub(super) async fn fetch_item_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    key_info: &TableKeyInfo,
-    key: &Item,
-) -> Result<Option<Item>, StorageError> {
-    let ddb_table = data_table_name(&key_info.table_id);
-    let pk = physical_pk_bytes(key, &key_info.key_schema)?;
-
-    let json_opt = if let Some((sk_name, sk_type)) =
-        sk_info(&key_info.key_schema, &key_info.attribute_definitions)
-    {
-        let sk_value = key
-            .get(sk_name)
-            .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?;
-        let sk = parse_sk(sk_value, sk_type)?;
-        let sk_col = sk_column(sk_type);
-        let sql = format!("SELECT item_data FROM {ddb_table} WHERE pk = ? AND {sk_col} = ?");
-        let row: Option<(serde_json::Value,)> =
-            bind_sk_fetch_optional!(&sql, pk.as_slice(), &sk, &mut **tx)?;
-        row.map(|(v,)| v)
-    } else {
-        let sql = format!("SELECT item_data FROM {ddb_table} WHERE pk = ?");
-        let row: Option<(serde_json::Value,)> = sqlx::query_as(&sql)
-            .bind(pk.as_slice())
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-        row.map(|(v,)| v)
-    };
-
-    json_opt.map(json_to_item).transpose()
-}
-
 /// Fetch a single item with `FOR UPDATE` lock within a transaction.
 pub(super) async fn fetch_item_for_update(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,

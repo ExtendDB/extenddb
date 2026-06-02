@@ -31,3 +31,4 @@ bcrypt = { workspace = true }
 aes-gcm = { workspace = true }
 async-trait = { workspace = true }
 zeroize = { workspace = true }
+bigdecimal = { workspace = true }
