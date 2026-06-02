@@ -80,10 +80,9 @@ pub struct TableKeyInfo {
     pub attribute_definitions: Vec<AttributeDefinition>,
     /// Key schemas for secondary indexes that writes must validate.
     ///
-    /// Backends populate ACTIVE indexes and any pending native index builds
-    /// that can observe newly written rows. This keeps write-path validation
-    /// on the table metadata fetched for the request instead of forcing a
-    /// second catalog lookup before every item write.
+    /// Write metadata populates ACTIVE indexes and any pending native index
+    /// builds that can observe newly written rows. Lightweight read metadata
+    /// can leave this empty.
     pub secondary_index_key_schemas: Vec<Vec<KeySchemaElement>>,
     /// Whether the table has at least one local secondary index.
     /// Used to decide whether `ItemCollectionMetrics` should be returned.

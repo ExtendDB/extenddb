@@ -67,6 +67,7 @@ Table lifecycle operations:
 | `list_tables` | Paginated list of table names for an account |
 | `update_table` | Modify billing mode, throughput, stream specification, deletion protection, and GSI create/delete |
 | `table_key_info` | Lightweight metadata fetch (key schema, attribute definitions) for data ops |
+| `table_write_info` | Write-path metadata fetch for Put/Update/BatchWrite/TransactWrite validation |
 | `table_read_info` | Base table metadata plus optional resolved secondary-index metadata for Query and Scan |
 | `index_info` | Fetch metadata for a specific secondary index |
 

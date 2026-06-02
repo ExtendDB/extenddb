@@ -60,7 +60,7 @@ pub async fn handle_update_item(
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
 
     let key_info = ctx
-        .table_key_info(&input.table_name)
+        .table_write_info(&input.table_name)
         .await
         .map_err(storage_err_to_dynamo)?;
 

@@ -126,10 +126,12 @@ The `CredentialStore` trait in the `auth` crate uses `#[async_trait]` instead
 
 **TableEngine** (table lifecycle):
 - `create_table`, `delete_table`, `describe_table`, `list_tables`, `update_table`
-- `table_key_info` — returns lightweight metadata (key schema, attribute definitions,
-  and write-validation secondary index key schemas) for data operations,
-  avoiding the overhead of a full `describe_table` call and extra write-path
-  catalog lookups
+- `table_key_info` — returns lightweight table metadata (key schema and
+  attribute definitions) for data operations, avoiding the overhead of a full
+  `describe_table` call
+- `table_write_info` — returns table metadata for item writes. Backends can
+  include validation-only metadata, such as TiDB ACTIVE and CREATING secondary
+  index key schemas, without adding that catalog cost to read paths
 - `table_read_info` — returns base table metadata plus optional resolved GSI/LSI
   metadata for Query and Scan so storage backends do not re-fetch catalog rows
   after the engine has selected an index
@@ -146,20 +148,22 @@ All table operations are scoped by `account_id` for multi-account isolation.
 - `cleanup_expired_idempotency_tokens`
 
 Data operations receive `TableKeyInfo` from the engine layer, which has already
-validated the table exists and can serve the data plane. Query and Scan also
-receive resolved `IndexInfo` when they target a secondary index; the storage
-backend must not re-fetch index metadata from an index name string. Condition
+validated the table exists and can serve the data plane. Handlers that only need
+table keys use `table_key_info`; handlers that can write secondary-index keys
+use `table_write_info`; Query and Scan use `table_read_info` and receive
+resolved `IndexInfo` when they target a secondary index. The storage backend
+must not re-fetch index metadata from an index name string. Condition
 expressions are evaluated inside the storage transaction to prevent TOCTOU
 races. Read methods receive the DynamoDB `ConsistentRead` flag so a backend can
 route strong reads and eventually consistent reads through different native
 paths. Stream records are written atomically with data writes when `stream` is
 `Some`.
 
-For TiDB, `TableKeyInfo` also carries ACTIVE and CREATING secondary index key
+For TiDB, `table_write_info` carries ACTIVE and CREATING secondary index key
 schemas. Item writes validate DynamoDB index-key type and size constraints from
 that metadata, while TiDB native generated columns and secondary indexes own
 physical maintenance and backfill. This removes a per-write catalog lookup
-without weakening validation for online index builds.
+without making read paths aggregate write-validation metadata.
 
 For TiDB, every storage connection uses pessimistic transaction mode. Conditional
 writes first perform a primary-key `SELECT ... FOR UPDATE`; TiDB locks the
@@ -439,7 +443,9 @@ Storage backends must preserve the exact type and value of each attribute.
 - `table_id: String`
 - `key_schema: Vec<KeySchemaElement>`
 - `attribute_definitions: Vec<AttributeDefinition>`
-- `secondary_index_key_schemas: Vec<Vec<KeySchemaElement>>`
+- `secondary_index_key_schemas: Vec<Vec<KeySchemaElement>>` — populated by
+  write metadata when a backend needs secondary-index key validation; empty on
+  lightweight read metadata
 - `has_lsi: bool`
 - `stream_specification: Option<StreamSpecification>`
 

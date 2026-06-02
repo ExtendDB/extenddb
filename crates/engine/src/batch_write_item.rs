@@ -104,11 +104,17 @@ pub async fn handle_batch_write_item(
     let mut per_table_wcu: HashMap<String, f64> = HashMap::new();
 
     for (table_name, reqs) in &input.request_items {
-        let key_info = ctx
-            .storage
-            .table_key_info(&ctx.account_id, table_name)
-            .await
-            .map_err(storage_err_to_dynamo)?;
+        let has_put = reqs.iter().any(|request| request.put_request.is_some());
+        let key_info = if has_put {
+            ctx.storage
+                .table_write_info(&ctx.account_id, table_name)
+                .await
+        } else {
+            ctx.storage
+                .table_key_info(&ctx.account_id, table_name)
+                .await
+        }
+        .map_err(storage_err_to_dynamo)?;
 
         // Validate: no duplicate keys within the same table (using key schema)
         validate_no_duplicate_keys(reqs, &key_info.key_schema)?;

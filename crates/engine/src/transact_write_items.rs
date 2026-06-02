@@ -89,9 +89,8 @@ pub async fn handle_transact_write_items(
         }
     }
 
-    // Resolve table key info, validate inputs, parse expressions, and check
-    // for duplicate targets — all in a single pass to avoid redundant
-    // `table_key_info` lookups.
+    // Resolve table metadata, validate inputs, parse expressions, and check
+    // for duplicate targets in one pass to avoid redundant catalog lookups.
     let mut prepared: Vec<PreparedOp> = Vec::with_capacity(input.transact_items.len());
     let mut seen_targets: HashSet<String> = HashSet::with_capacity(input.transact_items.len());
     for twi in &input.transact_items {
@@ -205,7 +204,7 @@ async fn prepare_write_op(
     if let Some(put) = &twi.put {
         let key_info = ctx
             .storage
-            .table_key_info(&ctx.account_id, &put.table_name)
+            .table_write_info(&ctx.account_id, &put.table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
         validate_item_size(&put.item, ctx.limits.max_item_size_bytes)?;
@@ -284,7 +283,7 @@ async fn prepare_write_op(
     if let Some(upd) = &twi.update {
         let key_info = ctx
             .storage
-            .table_key_info(&ctx.account_id, &upd.table_name)
+            .table_write_info(&ctx.account_id, &upd.table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
         let maps = build_expression_maps(

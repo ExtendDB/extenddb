@@ -245,11 +245,10 @@ impl DispatchResult {
 /// # Catalog Query Discipline
 ///
 /// For single-table item operations (`GetItem`, `PutItem`, `DeleteItem`,
-/// `UpdateItem`, `Query`, `Scan`), the auth layer pre-fetches `TableReadInfo`
-/// and stores it in `pre_fetched_read_info`. Engine handlers MUST use this
-/// pre-fetched value instead of calling storage metadata APIs directly. Write
-/// handlers rely on its `TableKeyInfo` secondary-index key schemas for
-/// DynamoDB validation before native storage writes.
+/// `UpdateItem`, `Query`, `Scan`), the auth layer pre-fetches table metadata
+/// and stores it in `pre_fetched_read_info` or `pre_fetched_write_info`.
+/// Engine handlers MUST use these pre-fetched values instead of calling
+/// storage metadata APIs directly.
 /// New per-request catalog roundtrips require justification in the discussion
 /// file and principal reviewer approval.
 pub struct OperationContext {
@@ -264,15 +263,20 @@ pub struct OperationContext {
     /// are disabled (secure default).
     pub export_paths: Arc<[Arc<PathBuf>]>,
     /// Pre-fetched `TableReadInfo` from the auth layer.
-    /// Populated for single-table item-level operations; `None` for table-level
-    /// and batch/transact operations.
+    /// Populated for single-table read operations; `None` for table-level,
+    /// write, batch, and transact operations.
     pub pre_fetched_read_info: Option<extenddb_core::types::TableReadInfo>,
+    /// Pre-fetched write metadata from the auth layer.
+    /// Populated for single-table writes that need DynamoDB write validation;
+    /// `None` for reads, table-level, batch, and transact operations.
+    pub pre_fetched_write_info: Option<extenddb_core::types::TableKeyInfo>,
 }
 
 impl OperationContext {
     /// Return pre-fetched `TableKeyInfo` if available and matching the requested
-    /// table, otherwise fetch from storage. This is the single entry point for
-    /// obtaining `TableKeyInfo` in engine handlers.
+    /// table, otherwise fetch lightweight table metadata from storage.
+    /// Write handlers that need secondary-index validation must use
+    /// [`OperationContext::table_write_info`].
     pub(crate) async fn table_key_info(
         &self,
         table_name: &str,
@@ -285,6 +289,22 @@ impl OperationContext {
         }
         self.storage
             .table_key_info(&self.account_id, table_name)
+            .await
+    }
+
+    /// Return pre-fetched write metadata if available and matching the table,
+    /// otherwise fetch the backend's write metadata.
+    pub(crate) async fn table_write_info(
+        &self,
+        table_name: &str,
+    ) -> Result<extenddb_core::types::TableKeyInfo, extenddb_storage::error::StorageError> {
+        if let Some(ref table) = self.pre_fetched_write_info {
+            if table.table_name == table_name && *table.account_id == *self.account_id {
+                return Ok(table.clone());
+            }
+        }
+        self.storage
+            .table_write_info(&self.account_id, table_name)
             .await
     }
 

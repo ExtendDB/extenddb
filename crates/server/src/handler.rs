@@ -108,6 +108,7 @@ pub(crate) async fn handle_request(
     // --- Authz segment ---
     let authz_start = std::time::Instant::now();
     let pre_fetched_read_info;
+    let pre_fetched_write_info;
     {
         let Some(catalog_store) = &state.catalog_store else {
             tracing::error!("Authorization required but catalog_store is not configured");
@@ -128,7 +129,10 @@ pub(crate) async fn handle_request(
         )
         .await
         {
-            Ok(info) => pre_fetched_read_info = info,
+            Ok(info) => {
+                pre_fetched_read_info = info.read_info;
+                pre_fetched_write_info = info.write_info;
+            }
             Err(e) => return error_response(&e, &request_id),
         }
     }
@@ -144,6 +148,7 @@ pub(crate) async fn handle_request(
         import_paths: state.import_paths.clone(),
         export_paths: state.export_paths.clone(),
         pre_fetched_read_info,
+        pre_fetched_write_info,
     };
 
     let table_name = extract_table_name(&input);

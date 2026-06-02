@@ -141,6 +141,22 @@ pub trait TableEngine: Send + Sync {
         table_name: &str,
     ) -> BoxFuture<'_, Result<TableKeyInfo, StorageError>>;
 
+    /// Fetch table metadata for item writes.
+    ///
+    /// Backends may include extra validation metadata needed before a write
+    /// reaches native storage. For example, TiDB includes ACTIVE and CREATING
+    /// secondary-index key schemas so DynamoDB index-key validation does not
+    /// require a second catalog lookup on the write path. Read handlers should
+    /// use [`TableEngine::table_key_info`] or [`TableEngine::table_read_info`]
+    /// instead.
+    fn table_write_info(
+        &self,
+        account_id: &str,
+        table_name: &str,
+    ) -> BoxFuture<'_, Result<TableKeyInfo, StorageError>> {
+        self.table_key_info(account_id, table_name)
+    }
+
     /// Fetch base-table metadata plus optional secondary-index metadata for
     /// a read path in one logical operation.
     ///

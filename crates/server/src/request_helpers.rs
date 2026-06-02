@@ -5,6 +5,7 @@
 
 use axum::http::HeaderMap;
 use extenddb_core::error::DynamoDbError;
+use extenddb_core::types::{TableKeyInfo, TableReadInfo};
 use serde_json::Value;
 
 use crate::AppState;
@@ -53,11 +54,18 @@ fn extract_index_name(input: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+pub(crate) struct AuthorizationPrefetch {
+    pub read_info: Option<TableReadInfo>,
+    pub write_info: Option<TableKeyInfo>,
+}
+
 /// Evaluate IAM policies for an authenticated identity.
 ///
-/// Returns the pre-fetched `TableReadInfo` for single-table item-level operations.
-/// The caller passes this into `OperationContext` to avoid a redundant catalog
-/// roundtrip in the engine layer.
+/// Returns pre-fetched table metadata for single-table item-level operations.
+/// The caller passes this into `OperationContext` to avoid redundant catalog
+/// roundtrips in the engine layer. Read operations fetch lightweight read
+/// metadata; write operations that can change secondary-index keys fetch
+/// explicit write metadata.
 pub(crate) async fn authorize_request(
     state: &AppState,
     store: &dyn extenddb_storage::authorization_store::AuthorizationStore,
@@ -65,44 +73,64 @@ pub(crate) async fn authorize_request(
     input: &Value,
     operation: &str,
     account_id: &str,
-) -> Result<Option<extenddb_core::types::TableReadInfo>, DynamoDbError> {
+) -> Result<AuthorizationPrefetch, DynamoDbError> {
     let table_name = extract_table_name(input);
     let index_name = extract_index_name(input);
     let resource_arn = build_resource_arn(&state.region, account_id, table_name.as_deref());
 
-    // Fetch read metadata for item-level operations. The result is both used
+    // Fetch table metadata for item-level operations. The result is both used
     // for LeadingKeys extraction here and returned to the caller to avoid a
     // redundant fetch in the engine layer. Query/Scan include IndexName when
-    // present so index metadata is resolved once per request.
-    let read_info = match operation {
-        "GetItem" | "PutItem" | "DeleteItem" | "UpdateItem" => {
-            if let Some(ref tn) = table_name {
-                state
-                    .storage
-                    .table_read_info(account_id, tn, None)
-                    .await
-                    .ok()
+    // present so index metadata is resolved once per request. Put/Update ask
+    // for write metadata because secondary-index key validation can matter.
+    let (read_info, write_info) = match operation {
+        "PutItem" | "UpdateItem" => {
+            let write_info = if let Some(ref tn) = table_name {
+                state.storage.table_write_info(account_id, tn).await.ok()
             } else {
                 None
+            };
+            (None, write_info)
+        }
+        "GetItem" | "DeleteItem" => {
+            if let Some(ref tn) = table_name {
+                (
+                    state
+                        .storage
+                        .table_read_info(account_id, tn, None)
+                        .await
+                        .ok(),
+                    None,
+                )
+            } else {
+                (None, None)
             }
         }
         "Query" | "Scan" => {
             if let Some(ref tn) = table_name {
-                state
-                    .storage
-                    .table_read_info(account_id, tn, index_name.as_deref())
-                    .await
-                    .ok()
+                (
+                    state
+                        .storage
+                        .table_read_info(account_id, tn, index_name.as_deref())
+                        .await
+                        .ok(),
+                    None,
+                )
             } else {
-                None
+                (None, None)
             }
         }
-        _ => None,
+        _ => (None, None),
     };
 
     let pk_attr = read_info
         .as_ref()
         .map(|info| info.table.key_schema[0].attribute_name.clone());
+    let pk_attr = pk_attr.or_else(|| {
+        write_info
+            .as_ref()
+            .map(|info| info.key_schema[0].attribute_name.clone())
+    });
 
     let params = extenddb_auth::policy::context::RequestParams {
         leading_keys: extract_leading_keys(input, operation, pk_attr.as_deref()),
@@ -131,7 +159,10 @@ pub(crate) async fn authorize_request(
     )
     .await?;
 
-    Ok(read_info)
+    Ok(AuthorizationPrefetch {
+        read_info,
+        write_info,
+    })
 }
 
 /// Extract partition key values from the request body for `dynamodb:LeadingKeys`.
