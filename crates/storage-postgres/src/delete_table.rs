@@ -29,7 +29,8 @@ impl PostgresEngine {
                       provisioned_throughput, stream_specification, table_status,
                       EXTRACT(EPOCH FROM creation_date_time)::FLOAT8 as creation_epoch,
                       table_size_bytes, item_count, table_arn, table_id,
-                      deletion_protection_enabled, stream_label
+                      deletion_protection_enabled, stream_label,
+                      table_class, sse_specification, on_demand_throughput
                FROM tables WHERE account_id = $1 AND table_name = $2 AND table_status IN ('ACTIVE', 'CREATING')
                FOR UPDATE",
         )

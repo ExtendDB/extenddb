@@ -201,6 +201,35 @@ impl PostgresEngine {
             }
         }
 
+        // Apply table class change.
+        if let Some(tc) = &input.table_class {
+            sqlx::query(
+                "UPDATE tables SET table_class = $1 WHERE account_id = $2 AND table_name = $3",
+            )
+            .bind(tc)
+            .bind(account_id)
+            .bind(&input.table_name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
+
+        // Apply on-demand throughput change.
+        if let Some(odt) = &input.on_demand_throughput {
+            let odt_json =
+                serde_json::to_value(odt).map_err(|e| StorageError::Internal(e.to_string()))?;
+            sqlx::query(
+                "UPDATE tables SET on_demand_throughput = $1 \
+                 WHERE account_id = $2 AND table_name = $3",
+            )
+            .bind(&odt_json)
+            .bind(account_id)
+            .bind(&input.table_name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
+
         // Apply GSI updates (create/delete).
         let mut created_index_ids: Vec<String> = Vec::new();
         let mut deleted_index_ids: Vec<String> = Vec::new();

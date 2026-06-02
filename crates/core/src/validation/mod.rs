@@ -961,6 +961,7 @@ mod tests {
             tags: None,
             deletion_protection_enabled: None,
             table_class: None,
+            on_demand_throughput: None,
         }
     }
 

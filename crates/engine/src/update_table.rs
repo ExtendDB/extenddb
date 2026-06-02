@@ -45,6 +45,8 @@ pub async fn handle_update_table(
         && input.provisioned_throughput.is_none()
         && input.deletion_protection_enabled.is_none()
         && input.stream_specification.is_none()
+        && input.table_class.is_none()
+        && input.on_demand_throughput.is_none()
         && !has_gsi_updates
     {
         return Err(DynamoDbError::ValidationException(
