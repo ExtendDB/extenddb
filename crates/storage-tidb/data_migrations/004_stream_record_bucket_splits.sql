@@ -3,7 +3,7 @@
 -- Stream shard IDs now put the deterministic shard bucket before table_id.
 -- Split the commit-sequence index at those bucket prefixes so one hot stream
 -- table distributes index reads across TiDB Regions.
--- Fresh schemas use an AUTO_RANDOM clustered stream handle, so clustered
+-- TiDB schemas use an AUTO_RANDOM clustered stream handle, so clustered
 -- stream writes are scattered by TiDB rather than split by shard prefix.
 
 ALTER TABLE stream_records ATTRIBUTES 'merge_option=deny';

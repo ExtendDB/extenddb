@@ -155,24 +155,6 @@ const DATA_NATIVE_TTL_LOOKUP_INDEX_DROPS: &[(&str, &str)] = &[
 ];
 const CATALOG_REGION_MERGE_DENY_TABLES: &[&str] = &["metrics_samples", "login_attempts"];
 const DATA_REGION_MERGE_DENY_TABLES: &[&str] = &["stream_records", "idempotency_tokens"];
-const STREAM_COMMON_HANDLE_SPLITS_MIGRATION: &str = "006_common_handle_stream_record_splits.sql";
-const COMMON_HANDLE_STREAM_RECORD_SPLIT_SQL: &str = "\
-SPLIT TABLE stream_records BY
-    ('shardId-000000000001-', ''),
-    ('shardId-000000000002-', ''),
-    ('shardId-000000000003-', ''),
-    ('shardId-000000000004-', ''),
-    ('shardId-000000000005-', ''),
-    ('shardId-000000000006-', ''),
-    ('shardId-000000000007-', ''),
-    ('shardId-000000000008-', ''),
-    ('shardId-000000000009-', ''),
-    ('shardId-000000000010-', ''),
-    ('shardId-000000000011-', ''),
-    ('shardId-000000000012-', ''),
-    ('shardId-000000000013-', ''),
-    ('shardId-000000000014-', ''),
-    ('shardId-000000000015-', '')";
 const MIGRATION_SESSION_INIT_STATEMENTS: &[&str] = &[
     "SET SESSION tidb_scatter_region = 'global'",
     "SET SESSION tidb_wait_split_region_finish = ON",
@@ -246,11 +228,11 @@ pub(crate) async fn run_data_migrations(pool: &MySqlPool) -> OpResult<()> {
     ensure_stream_commit_sequence(pool).await?;
     ensure_idempotency_token_claims(pool).await?;
     ensure_data_table_binary_defaults(pool).await?;
+    validate_stream_records_auto_random_handle(pool).await?;
     validate_dynamodb_hash_key_column_layout(pool).await?;
     ensure_shared_data_table_region_merge_option(pool).await?;
     ensure_user_data_table_region_merge_option(pool).await?;
     repair_user_data_table_region_splits(pool).await?;
-    repair_common_handle_stream_record_splits(pool).await?;
     drop_native_ttl_lookup_indexes(pool).await?;
     ensure_data_table_ttl(pool).await?;
     Ok(())
@@ -442,6 +424,64 @@ fn incompatible_dynamodb_hash_key_column_error(
     ))
 }
 
+async fn validate_stream_records_auto_random_handle(pool: &MySqlPool) -> OpResult<()> {
+    if !table_exists(pool, "stream_records").await? {
+        return Ok(());
+    }
+
+    let row: Option<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT c.COLUMN_TYPE, c.IS_NULLABLE, c.COLUMN_KEY, t.TIDB_ROW_ID_SHARDING_INFO \
+         FROM information_schema.columns c \
+         JOIN information_schema.tables t \
+           ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME \
+         WHERE c.TABLE_SCHEMA = DATABASE() \
+           AND c.TABLE_NAME = 'stream_records' \
+           AND c.COLUMN_NAME = 'record_id'",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| OpError::Internal(format!("Inspect TiDB stream record handle: {e}")))?;
+
+    let Some((column_type, is_nullable, column_key, row_id_sharding_info)) = row else {
+        return Err(incompatible_stream_record_layout_error(None));
+    };
+    let is_bigint = column_type.to_ascii_lowercase().starts_with("bigint");
+    let is_primary_key = column_key.eq_ignore_ascii_case("PRI");
+    let is_not_null = is_nullable.eq_ignore_ascii_case("NO");
+    let uses_auto_random = row_id_sharding_info
+        .as_deref()
+        .is_some_and(|info| info.contains("PK_AUTO_RANDOM_BITS="));
+
+    if is_bigint && is_primary_key && is_not_null && uses_auto_random {
+        return Ok(());
+    }
+
+    Err(incompatible_stream_record_layout_error(Some((
+        column_type,
+        is_nullable,
+        column_key,
+        row_id_sharding_info.unwrap_or_default(),
+    ))))
+}
+
+fn incompatible_stream_record_layout_error(
+    observed: Option<(String, String, String, String)>,
+) -> OpError {
+    let observed = observed.map_or_else(
+        || "missing record_id column".to_owned(),
+        |(column_type, is_nullable, column_key, row_id_sharding_info)| {
+            format!(
+                "record_id column_type={column_type}, nullable={is_nullable}, key={column_key}, row_id_sharding_info={row_id_sharding_info}"
+            )
+        },
+    );
+    OpError::Internal(format!(
+        "TiDB stream_records must use native AUTO_RANDOM clustered record_id primary key; \
+         {observed}. Recreate the TiDB data database with the current ExtendDB TiDB schema \
+         before serving stream writes."
+    ))
+}
+
 async fn repair_user_data_table_region_splits(pool: &MySqlPool) -> OpResult<()> {
     if is_data_migration_applied(pool, USER_TABLE_FULL_KEYSPACE_SPLITS_MIGRATION).await? {
         return Ok(());
@@ -489,38 +529,6 @@ async fn ensure_user_data_table_region_merge_option(pool: &MySqlPool) -> OpResul
             ))
         })?;
     }
-    Ok(())
-}
-
-async fn repair_common_handle_stream_record_splits(pool: &MySqlPool) -> OpResult<()> {
-    if is_data_migration_applied(pool, STREAM_COMMON_HANDLE_SPLITS_MIGRATION).await? {
-        return Ok(());
-    }
-    if !table_exists(pool, "stream_records").await? {
-        record_data_migration(pool, STREAM_COMMON_HANDLE_SPLITS_MIGRATION).await?;
-        return Ok(());
-    }
-
-    let has_auto_random_record_id: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM information_schema.columns \
-         WHERE table_schema = DATABASE() \
-           AND table_name = 'stream_records' \
-           AND column_name = 'record_id')",
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(|e| OpError::Internal(format!("Inspect TiDB stream record handle: {e}")))?;
-
-    if !has_auto_random_record_id {
-        sqlx::query(COMMON_HANDLE_STREAM_RECORD_SPLIT_SQL)
-            .execute(pool)
-            .await
-            .map_err(|e| {
-                OpError::Internal(format!("Split TiDB common-handle stream records: {e}"))
-            })?;
-    }
-
-    record_data_migration(pool, STREAM_COMMON_HANDLE_SPLITS_MIGRATION).await?;
     Ok(())
 }
 
@@ -645,13 +653,14 @@ async fn record_all_catalog_migrations(pool: &MySqlPool) -> OpResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use extenddb_storage::management_store::OpError;
+
     use super::{
-        CATALOG_MIGRATIONS, CATALOG_REGION_MERGE_DENY_TABLES,
-        COMMON_HANDLE_STREAM_RECORD_SPLIT_SQL, DATA_MIGRATIONS, DATA_NATIVE_TTL_LOOKUP_INDEX_DROPS,
-        DATA_REGION_MERGE_DENY_TABLES, DATA_SCHEMA_MIGRATION, MIGRATION_SESSION_INIT_STATEMENTS,
-        STREAM_COMMON_HANDLE_SPLITS_MIGRATION, TIDB_BINARY_COLLATION_TABLE_OPTION,
+        CATALOG_MIGRATIONS, CATALOG_REGION_MERGE_DENY_TABLES, DATA_MIGRATIONS,
+        DATA_NATIVE_TTL_LOOKUP_INDEX_DROPS, DATA_REGION_MERGE_DENY_TABLES, DATA_SCHEMA_MIGRATION,
+        MIGRATION_SESSION_INIT_STATEMENTS, TIDB_BINARY_COLLATION_TABLE_OPTION,
         dynamodb_hash_key_column_needs_rebuild, incompatible_dynamodb_hash_key_column_error,
-        should_apply_consolidated_catalog_schema,
+        incompatible_stream_record_layout_error, should_apply_consolidated_catalog_schema,
     };
     use crate::{CATALOG_VERSION, data::USER_TABLE_FULL_KEYSPACE_SPLITS_MIGRATION};
 
@@ -1038,20 +1047,13 @@ mod tests {
     }
 
     #[test]
-    fn common_handle_stream_split_repair_is_a_dynamic_data_migration() {
-        assert_eq!(
-            STREAM_COMMON_HANDLE_SPLITS_MIGRATION,
-            "006_common_handle_stream_record_splits.sql"
-        );
-        assert!(
-            DATA_MIGRATIONS
-                .iter()
-                .all(|(filename, _)| *filename != STREAM_COMMON_HANDLE_SPLITS_MIGRATION)
-        );
-        assert!(COMMON_HANDLE_STREAM_RECORD_SPLIT_SQL.contains("SPLIT TABLE stream_records BY"));
-        assert!(COMMON_HANDLE_STREAM_RECORD_SPLIT_SQL.contains("'shardId-000000000001-'"));
-        assert!(COMMON_HANDLE_STREAM_RECORD_SPLIT_SQL.contains("'shardId-000000000015-'"));
-        assert!(!COMMON_HANDLE_STREAM_RECORD_SPLIT_SQL.contains("INDEX"));
+    fn common_handle_stream_tables_are_rejected_instead_of_repaired() {
+        let OpError::Internal(error) = incompatible_stream_record_layout_error(None) else {
+            panic!("expected internal migration error");
+        };
+
+        assert!(error.contains("AUTO_RANDOM clustered record_id primary key"));
+        assert!(error.contains("Recreate the TiDB data database"));
     }
 
     #[test]

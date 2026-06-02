@@ -158,7 +158,7 @@ Each stream has a fixed set of shards. TiDB uses 16 deterministic shards per
 stream and puts the shard bucket before the table id in the shard key
 (`shardId-000000000000-<table>` through `shardId-000000000015-<table>`) so
 the shared stream commit-sequence index can be pre-split by bucket prefix.
-Fresh TiDB schemas store stream rows under an `AUTO_RANDOM` clustered
+TiDB schemas store stream rows under an `AUTO_RANDOM` clustered
 `record_id`, so highly concurrent stream inserts are scattered by TiDB instead
 of appending inside one shard key range. Sequence numbers are monotonically
 increasing, sortable strings within a shard; TiDB derives them from native MVCC

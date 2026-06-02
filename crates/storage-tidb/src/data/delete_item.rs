@@ -45,7 +45,6 @@ impl TidbEngine {
             commit_delete_stream_without_old_item(
                 &self.data_pool,
                 tx,
-                self.stream_record_handle,
                 key_info,
                 capture,
                 key,
@@ -138,7 +137,6 @@ impl TidbEngine {
                     write_stream_record_in_tx(
                         &mut tx,
                         &mut sequence_allocator,
-                        self.stream_record_handle,
                         key_info,
                         capture,
                         old_for_stream.as_ref(),
@@ -151,7 +149,6 @@ impl TidbEngine {
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
                 finalize_stream_records_best_effort(
                     &self.data_pool,
-                    self.stream_record_handle,
                     "delete_item",
                     sequence_allocator.pending_records(),
                 )
@@ -246,7 +243,6 @@ impl TidbEngine {
                     write_stream_record_in_tx(
                         &mut tx,
                         &mut sequence_allocator,
-                        self.stream_record_handle,
                         key_info,
                         capture,
                         old_for_stream.as_ref(),
@@ -259,7 +255,6 @@ impl TidbEngine {
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
                 finalize_stream_records_best_effort(
                     &self.data_pool,
-                    self.stream_record_handle,
                     "delete_item",
                     sequence_allocator.pending_records(),
                 )
@@ -301,7 +296,6 @@ fn delete_stream_capture_without_old_item<'a>(
 async fn commit_delete_stream_without_old_item(
     pool: &sqlx::MySqlPool,
     mut tx: sqlx::Transaction<'_, sqlx::MySql>,
-    handle_mode: super::StreamRecordHandleMode,
     key_info: &TableKeyInfo,
     capture: &StreamCapture,
     key: &Item,
@@ -312,7 +306,6 @@ async fn commit_delete_stream_without_old_item(
         write_stream_record_for_event_in_tx(
             &mut tx,
             &mut sequence_allocator,
-            handle_mode,
             key_info,
             capture,
             StreamEventName::Remove,
@@ -325,13 +318,8 @@ async fn commit_delete_stream_without_old_item(
     tx.commit()
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
-    finalize_stream_records_best_effort(
-        pool,
-        handle_mode,
-        "delete_item",
-        sequence_allocator.pending_records(),
-    )
-    .await;
+    finalize_stream_records_best_effort(pool, "delete_item", sequence_allocator.pending_records())
+        .await;
     Ok(())
 }
 

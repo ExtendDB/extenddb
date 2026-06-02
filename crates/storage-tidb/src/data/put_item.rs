@@ -73,7 +73,6 @@ impl TidbEngine {
                 commit_put_stream_without_old_item(
                     &self.data_pool,
                     tx,
-                    self.stream_record_handle,
                     key_info,
                     capture,
                     event,
@@ -151,7 +150,6 @@ impl TidbEngine {
                     write_stream_record_in_tx(
                         &mut tx,
                         &mut sequence_allocator,
-                        self.stream_record_handle,
                         key_info,
                         capture,
                         old_for_stream.as_ref(),
@@ -164,7 +162,6 @@ impl TidbEngine {
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
                 finalize_stream_records_best_effort(
                     &self.data_pool,
-                    self.stream_record_handle,
                     "put_item",
                     sequence_allocator.pending_records(),
                 )
@@ -201,7 +198,6 @@ impl TidbEngine {
                 commit_put_stream_without_old_item(
                     &self.data_pool,
                     tx,
-                    self.stream_record_handle,
                     key_info,
                     capture,
                     event,
@@ -288,7 +284,6 @@ impl TidbEngine {
                     write_stream_record_in_tx(
                         &mut tx,
                         &mut sequence_allocator,
-                        self.stream_record_handle,
                         key_info,
                         capture,
                         old_for_stream.as_ref(),
@@ -301,7 +296,6 @@ impl TidbEngine {
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
                 finalize_stream_records_best_effort(
                     &self.data_pool,
-                    self.stream_record_handle,
                     "put_item",
                     sequence_allocator.pending_records(),
                 )
@@ -443,7 +437,6 @@ fn put_stream_capture_without_old_item<'a>(
 async fn commit_put_stream_without_old_item(
     pool: &sqlx::MySqlPool,
     mut tx: sqlx::Transaction<'_, sqlx::MySql>,
-    handle_mode: super::StreamRecordHandleMode,
     key_info: &TableKeyInfo,
     capture: &StreamCapture,
     event: StreamEventName,
@@ -453,7 +446,6 @@ async fn commit_put_stream_without_old_item(
     write_stream_record_for_event_in_tx(
         &mut tx,
         &mut sequence_allocator,
-        handle_mode,
         key_info,
         capture,
         event,
@@ -465,13 +457,8 @@ async fn commit_put_stream_without_old_item(
     tx.commit()
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
-    finalize_stream_records_best_effort(
-        pool,
-        handle_mode,
-        "put_item",
-        sequence_allocator.pending_records(),
-    )
-    .await;
+    finalize_stream_records_best_effort(pool, "put_item", sequence_allocator.pending_records())
+        .await;
     Ok(())
 }
 
