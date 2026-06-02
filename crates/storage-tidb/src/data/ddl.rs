@@ -16,8 +16,9 @@ use super::index::{
     native_index_name,
 };
 use super::{
-    DYNAMODB_HASH_KEY_COLUMN_TYPE, DYNAMODB_SORT_KEY_COLUMN_TYPE, all_sort_key_info,
-    data_table_name, validate_native_key_schema_shape,
+    DYNAMODB_HASH_KEY_COLUMN_BYTES, DYNAMODB_HASH_KEY_COLUMN_TYPE, DYNAMODB_SORT_KEY_COLUMN_BYTES,
+    DYNAMODB_SORT_KEY_COLUMN_TYPE, all_sort_key_info, data_table_name,
+    validate_native_key_schema_shape,
 };
 use crate::TidbEngine;
 use crate::tidb_util::{execute_tidb_create_table_ddl, execute_tidb_idempotent_ddl};
@@ -48,7 +49,6 @@ type TableReadInfoRow = (
 
 const DATA_TABLE_SPLIT_REGIONS: u16 = 16;
 const VARBINARY_SPLIT_LOWER: &str = "X''";
-const VARBINARY_SPLIT_UPPER: &str = "X'ff'";
 const DECIMAL_SPLIT_LOWER: &str =
     "-99999999999999999999999999999999999.999999999999999999999999999999";
 const DECIMAL_SPLIT_UPPER: &str =
@@ -110,24 +110,28 @@ fn data_table_ddl(
     ))
 }
 
+fn varbinary_split_upper(bytes: usize) -> String {
+    format!("X'{}'", "ff".repeat(bytes))
+}
+
 fn split_bound_for_sort_key(
     scalar_type: extenddb_core::types::ScalarAttributeType,
     lower: bool,
-) -> &'static str {
+) -> String {
     match scalar_type {
         extenddb_core::types::ScalarAttributeType::S
         | extenddb_core::types::ScalarAttributeType::B => {
             if lower {
-                VARBINARY_SPLIT_LOWER
+                VARBINARY_SPLIT_LOWER.to_owned()
             } else {
-                VARBINARY_SPLIT_UPPER
+                varbinary_split_upper(DYNAMODB_SORT_KEY_COLUMN_BYTES)
             }
         }
         extenddb_core::types::ScalarAttributeType::N => {
             if lower {
-                DECIMAL_SPLIT_LOWER
+                DECIMAL_SPLIT_LOWER.to_owned()
             } else {
-                DECIMAL_SPLIT_UPPER
+                DECIMAL_SPLIT_UPPER.to_owned()
             }
         }
     }
@@ -141,8 +145,8 @@ fn data_table_region_split_sql(
     validate_native_key_schema_shape("table", key_schema)?;
     let sk_infos = all_sort_key_info(key_schema, attr_defs);
 
-    let mut lower = vec![VARBINARY_SPLIT_LOWER];
-    let mut upper = vec![VARBINARY_SPLIT_UPPER];
+    let mut lower = vec![VARBINARY_SPLIT_LOWER.to_owned()];
+    let mut upper = vec![varbinary_split_upper(DYNAMODB_HASH_KEY_COLUMN_BYTES)];
     for &(_, scalar_type) in &sk_infos {
         lower.push(split_bound_for_sort_key(scalar_type, true));
         upper.push(split_bound_for_sort_key(scalar_type, false));
@@ -156,8 +160,9 @@ fn data_table_region_split_sql(
 }
 
 fn native_index_region_split_sql(table: &str, index_id: &str) -> String {
+    let upper = varbinary_split_upper(DYNAMODB_HASH_KEY_COLUMN_BYTES);
     format!(
-        "SPLIT TABLE {table} INDEX `{}` BETWEEN ({VARBINARY_SPLIT_LOWER}) AND ({VARBINARY_SPLIT_UPPER}) REGIONS {DATA_TABLE_SPLIT_REGIONS}",
+        "SPLIT TABLE {table} INDEX `{}` BETWEEN ({VARBINARY_SPLIT_LOWER}) AND ({upper}) REGIONS {DATA_TABLE_SPLIT_REGIONS}",
         native_index_name(index_id)
     )
 }
@@ -534,9 +539,11 @@ mod tests {
 
     use super::{
         data_table_ddl, data_table_region_split_sql, native_index_region_split_sql,
-        table_accepts_data_plane,
+        table_accepts_data_plane, varbinary_split_upper,
     };
-    use crate::data::index::NativeSecondaryIndex;
+    use crate::data::{
+        DYNAMODB_HASH_KEY_COLUMN_BYTES, DYNAMODB_SORT_KEY_COLUMN_BYTES, index::NativeSecondaryIndex,
+    };
 
     fn attr(name: &str, ty: ScalarAttributeType) -> AttributeDefinition {
         AttributeDefinition {
@@ -641,7 +648,10 @@ mod tests {
 
         assert_eq!(
             split,
-            "SPLIT TABLE `_ddb_tableid` BETWEEN (X'') AND (X'ff') REGIONS 16"
+            format!(
+                "SPLIT TABLE `_ddb_tableid` BETWEEN (X'') AND ({}) REGIONS 16",
+                varbinary_split_upper(DYNAMODB_HASH_KEY_COLUMN_BYTES)
+            )
         );
     }
 
@@ -659,7 +669,10 @@ mod tests {
 
         assert_eq!(
             split,
-            "SPLIT TABLE `_ddb_tableid` BETWEEN (X'', -99999999999999999999999999999999999.999999999999999999999999999999) AND (X'ff', 99999999999999999999999999999999999.999999999999999999999999999999) REGIONS 16"
+            format!(
+                "SPLIT TABLE `_ddb_tableid` BETWEEN (X'', -99999999999999999999999999999999999.999999999999999999999999999999) AND ({}, 99999999999999999999999999999999999.999999999999999999999999999999) REGIONS 16",
+                varbinary_split_upper(DYNAMODB_HASH_KEY_COLUMN_BYTES)
+            )
         );
     }
 
@@ -667,8 +680,30 @@ mod tests {
     fn native_secondary_indexes_are_split_by_generated_hash_key_prefix() {
         assert_eq!(
             native_index_region_split_sql("`_ddb_tableid`", "idx-1"),
-            "SPLIT TABLE `_ddb_tableid` INDEX `idx_idx1` BETWEEN (X'') AND (X'ff') REGIONS 16"
+            format!(
+                "SPLIT TABLE `_ddb_tableid` INDEX `idx_idx1` BETWEEN (X'') AND ({}) REGIONS 16",
+                varbinary_split_upper(DYNAMODB_HASH_KEY_COLUMN_BYTES)
+            )
         );
+    }
+
+    #[test]
+    fn binary_sort_key_split_bound_matches_native_sort_key_width() {
+        let split = data_table_region_split_sql(
+            "`_ddb_tableid`",
+            &[key("pk", KeyType::Hash), key("sk", KeyType::Range)],
+            &[
+                attr("pk", ScalarAttributeType::S),
+                attr("sk", ScalarAttributeType::B),
+            ],
+        )
+        .expect("split sql");
+
+        assert!(split.contains(&format!(
+            "AND ({}, {})",
+            varbinary_split_upper(DYNAMODB_HASH_KEY_COLUMN_BYTES),
+            varbinary_split_upper(DYNAMODB_SORT_KEY_COLUMN_BYTES)
+        )));
     }
 
     #[test]
