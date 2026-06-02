@@ -303,7 +303,10 @@ For append-only TiDB catalog tables without a clustered primary key, such as
 failed-login attempts, use TiDB `SHARD_ROW_ID_BITS` to scatter implicit row IDs
 instead of adding a frontend-generated identifier. This keeps the write path a
 single insert while avoiding one-Region hotspots under multiple frontend nodes;
-pair it with migration-session scatter for fresh pre-split tables.
+pair it with migration-session scatter for fresh pre-split tables. Store only
+failure rows when the trait only records failures, so native `(principal,
+attempted_at)` and `(source_ip, attempted_at)` range scans do not carry an
+unused success flag.
 
 ### RateLimitStore
 

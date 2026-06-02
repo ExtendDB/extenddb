@@ -1,6 +1,6 @@
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
--- Consolidated catalog schema for extenddb (catalog version 0.0.24).
+-- Consolidated catalog schema for extenddb (catalog version 0.0.25).
 -- This is the complete schema applied on fresh installs.
 
 -- Accounts — multi-account support (REQ-AUTH-005).
@@ -216,11 +216,10 @@ CREATE INDEX idx_metrics_samples_bucket
 
 -- Login attempt tracking. This append-only, TTL-owned table intentionally uses
 -- TiDB sharded implicit row IDs with pre-split Regions so concurrent frontend
--- inserts do not hotspot one Region.
+-- failed-login inserts do not hotspot one Region.
 CREATE TABLE IF NOT EXISTS login_attempts (
     principal     VARCHAR(512) NOT NULL,
     attempted_at  TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    success       BOOLEAN NOT NULL,
     source_ip     VARCHAR(255)
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
   SHARD_ROW_ID_BITS = 4
@@ -276,4 +275,4 @@ CREATE TABLE IF NOT EXISTS backup_tags (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 -- Seed settings.
-INSERT IGNORE INTO settings (`key`, value) VALUES ('catalog_version', '0.0.24');
+INSERT IGNORE INTO settings (`key`, value) VALUES ('catalog_version', '0.0.25');

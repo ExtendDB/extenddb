@@ -105,6 +105,10 @@ pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
         "024_drop_redundant_session_role_index.sql",
         include_str!("../../storage-tidb/migrations/024_drop_redundant_session_role_index.sql"),
     ),
+    (
+        "025_drop_redundant_login_success_column.sql",
+        include_str!("../../storage-tidb/migrations/025_drop_redundant_login_success_column.sql"),
+    ),
 ];
 
 const DATA_SCHEMA_MIGRATION: &str =
@@ -692,12 +696,24 @@ mod tests {
     }
 
     #[test]
-    fn latest_catalog_migration_drops_redundant_session_role_index() {
-        let (filename, sql) = CATALOG_MIGRATIONS.last().expect("latest migration");
+    fn catalog_migration_drops_redundant_session_role_index() {
+        let (filename, sql) = CATALOG_MIGRATIONS
+            .iter()
+            .find(|(filename, _)| *filename == "024_drop_redundant_session_role_index.sql")
+            .expect("redundant session role index migration");
 
         assert_eq!(*filename, "024_drop_redundant_session_role_index.sql");
         assert!(sql.contains("DROP INDEX IF EXISTS idx_iam_sessions_role_session ON iam_sessions"));
         assert!(sql.contains("0.0.24"));
+    }
+
+    #[test]
+    fn latest_catalog_migration_drops_redundant_login_success_column() {
+        let (filename, sql) = CATALOG_MIGRATIONS.last().expect("latest migration");
+
+        assert_eq!(*filename, "025_drop_redundant_login_success_column.sql");
+        assert!(sql.contains("ALTER TABLE login_attempts DROP COLUMN IF EXISTS success"));
+        assert!(sql.contains("0.0.25"));
     }
 
     #[test]
@@ -780,6 +796,7 @@ mod tests {
             .nth(1)
             .and_then(|section| section.split("-- Backup metadata.").next())
             .expect("login attempts schema section");
+        assert!(!login_attempts_schema.contains("success"));
         assert!(login_attempts_schema.contains("SHARD_ROW_ID_BITS = 4"));
         assert!(login_attempts_schema.contains("PRE_SPLIT_REGIONS = 4"));
         assert!(login_attempts_schema.contains("TTL = `attempted_at` + INTERVAL 24 HOUR"));

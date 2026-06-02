@@ -17,6 +17,14 @@ use std::sync::Arc;
 use crate::tidb_util::tidb_pool_options;
 
 const METRICS_INSERT_BATCH_ROWS: usize = 200;
+const COUNT_PRINCIPAL_FAILURES_SQL: &str = "SELECT COUNT(*) FROM login_attempts \
+     WHERE principal = ? \
+     AND attempted_at > DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? SECOND)";
+const COUNT_IP_FAILURES_SQL: &str = "SELECT COUNT(*) FROM login_attempts \
+     WHERE source_ip = ? \
+     AND attempted_at > DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? SECOND)";
+const INSERT_FAILED_LOGIN_SQL: &str =
+    "INSERT INTO login_attempts (principal, source_ip) VALUES (?, ?)";
 
 /// TiDB-backed catalog store for settings, metrics, and rate limiting.
 ///
@@ -336,19 +344,15 @@ impl extenddb_storage::management_store::RateLimitStore for TidbCatalogStore {
     ) -> BoxFuture<'_, OpResult<i64>> {
         let principal = principal.to_owned();
         Box::pin(async move {
-            let row: (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM login_attempts \
-                 WHERE principal = ? AND success = false \
-                 AND attempted_at > DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? SECOND)",
-            )
-            .bind(&principal)
-            .bind(window_seconds)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| {
-                tracing::error!("count_principal_failures: {e}");
-                OpError::Internal("Database error".to_owned())
-            })?;
+            let row: (i64,) = sqlx::query_as(COUNT_PRINCIPAL_FAILURES_SQL)
+                .bind(&principal)
+                .bind(window_seconds)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| {
+                    tracing::error!("count_principal_failures: {e}");
+                    OpError::Internal("Database error".to_owned())
+                })?;
             Ok(row.0)
         })
     }
@@ -360,19 +364,15 @@ impl extenddb_storage::management_store::RateLimitStore for TidbCatalogStore {
     ) -> BoxFuture<'_, OpResult<i64>> {
         let source_ip = source_ip.to_owned();
         Box::pin(async move {
-            let row: (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM login_attempts \
-                 WHERE source_ip = ? AND success = false \
-                 AND attempted_at > DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? SECOND)",
-            )
-            .bind(&source_ip)
-            .bind(window_seconds)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| {
-                tracing::error!("count_ip_failures: {e}");
-                OpError::Internal("Database error".to_owned())
-            })?;
+            let row: (i64,) = sqlx::query_as(COUNT_IP_FAILURES_SQL)
+                .bind(&source_ip)
+                .bind(window_seconds)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| {
+                    tracing::error!("count_ip_failures: {e}");
+                    OpError::Internal("Database error".to_owned())
+                })?;
             Ok(row.0)
         })
     }
@@ -381,13 +381,11 @@ impl extenddb_storage::management_store::RateLimitStore for TidbCatalogStore {
         let principal = principal.to_owned();
         let source_ip = source_ip.map(|s| s.to_owned());
         Box::pin(async move {
-            let result = sqlx::query(
-                "INSERT INTO login_attempts (principal, success, source_ip) VALUES (?, false, ?)",
-            )
-            .bind(&principal)
-            .bind(source_ip.as_deref())
-            .execute(&self.pool)
-            .await;
+            let result = sqlx::query(INSERT_FAILED_LOGIN_SQL)
+                .bind(&principal)
+                .bind(source_ip.as_deref())
+                .execute(&self.pool)
+                .await;
             if let Err(e) = result {
                 tracing::error!("Failed to record login attempt: {e}");
             }
@@ -407,6 +405,7 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::{
+        COUNT_IP_FAILURES_SQL, COUNT_PRINCIPAL_FAILURES_SQL, INSERT_FAILED_LOGIN_SQL,
         METRICS_INSERT_BATCH_ROWS, metrics_insert_chunks, metrics_insert_query, metrics_query_sql,
     };
 
@@ -451,6 +450,22 @@ mod tests {
         assert_eq!(chunk_sizes.len(), 2);
         assert_eq!(chunk_sizes[0], METRICS_INSERT_BATCH_ROWS);
         assert_eq!(chunk_sizes[1], 1);
+    }
+
+    #[test]
+    fn rate_limit_queries_match_failure_only_schema() {
+        assert!(COUNT_PRINCIPAL_FAILURES_SQL.contains("WHERE principal = ?"));
+        assert!(COUNT_PRINCIPAL_FAILURES_SQL.contains("attempted_at > DATE_SUB"));
+        assert!(!COUNT_PRINCIPAL_FAILURES_SQL.contains("success"));
+
+        assert!(COUNT_IP_FAILURES_SQL.contains("WHERE source_ip = ?"));
+        assert!(COUNT_IP_FAILURES_SQL.contains("attempted_at > DATE_SUB"));
+        assert!(!COUNT_IP_FAILURES_SQL.contains("success"));
+
+        assert_eq!(
+            INSERT_FAILED_LOGIN_SQL,
+            "INSERT INTO login_attempts (principal, source_ip) VALUES (?, ?)"
+        );
     }
 
     fn sample_metric_row(operation: &str) -> extenddb_storage::management_store::MetricsRow {

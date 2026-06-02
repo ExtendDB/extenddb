@@ -367,10 +367,12 @@ Login rate limiting and account lockout:
 - `count_principal_failures`, `count_ip_failures`, `record_failed_login`
 
 Tracks failed login attempts by principal and source IP to mitigate clients
-sending excessive traffic. TiDB stores these as append-only rows with native
-TTL retention, `SHARD_ROW_ID_BITS` on the implicit row id, and pre-split
-Regions scattered by the migration session, so concurrent frontends do not
-concentrate failed-login inserts on one TiKV Region. Login-attempt retention is
+sending excessive traffic. TiDB stores only failure rows, with native TTL
+retention, `SHARD_ROW_ID_BITS` on the implicit row id, and pre-split Regions
+scattered by the migration session, so concurrent frontends do not concentrate
+failed-login inserts on one TiKV Region. The hot count queries are direct
+native range scans on `(principal, attempted_at)` and `(source_ip,
+attempted_at)` without an extra boolean filter. Login-attempt retention is
 backend-specific rather than part of
 `RateLimitStore`: Postgres runs a concrete cleanup worker, while TiDB uses
 native TTL on `login_attempts`.
