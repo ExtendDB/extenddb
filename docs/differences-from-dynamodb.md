@@ -39,7 +39,7 @@ adaptation when switching between ExtendDB and the real service.
 
 | Area | DynamoDB | ExtendDB |
 |------|----------|------|
-| Table creation delay | Returns `CREATING` immediately; transitions to `ACTIVE` typically within seconds. Same behavior for on-demand and provisioned | PostgreSQL can simulate a configurable delay with `control_plane_delay_seconds`; TiDB ignores that setting and reconciles immediately through native online DDL |
+| Table creation delay | Returns `CREATING` immediately; transitions to `ACTIVE` typically within seconds. Same behavior for on-demand and provisioned | PostgreSQL can simulate a configurable delay with `control_plane_delay_seconds`; TiDB does not expose that frontend simulation setting and reconciles through native online DDL |
 | DeletionProtectionEnabled | Enforced | Enforced (accepted and stored, DeleteTable rejects when enabled) |
 
 ## Time to Live (TTL)
@@ -63,7 +63,7 @@ adaptation when switching between ExtendDB and the real service.
 | Area | DynamoDB | ExtendDB |
 |------|----------|------|
 | GSI update propagation | Eventually consistent (milliseconds to seconds) | Backend-specific. PostgreSQL can simulate asynchronous propagation via `gsi_propagation_delay_ms`; TiDB uses native secondary indexes maintained from the base table write. |
-| Multi-part base table keys | Not supported | Preview extension (opt-in via `enable_multipart_keys` setting). Standard single/composite keys work identically. TiDB accepts multi-HASH shapes that fit its raw 2048-byte hash slot, and rejects multi-RANGE shapes because native TiDB indexes must stay within the 3072-byte key limit. |
+| Multi-part base table keys | Not supported | Preview extension. Standard single/composite keys work identically. TiDB accepts multi-HASH shapes that fit its raw 2048-byte hash slot, and rejects multi-RANGE shapes because native TiDB indexes must stay within the 3072-byte key limit. |
 
 ## Capacity and Throttling
 
@@ -71,7 +71,7 @@ adaptation when switching between ExtendDB and the real service.
 |------|----------|------|
 | Provisioned throughput | Token bucket per table/partition | PostgreSQL can use frontend token buckets for local fidelity tests. TiDB uses TiDB Resource Control/resource groups instead of process-local buckets; `storage.tidb.resource_group` can bind runtime sessions to the selected group. |
 | On-demand capacity | Automatic scaling | PostgreSQL token buckets use fixed initial burst capacity when enabled. TiDB delegates cluster capacity and scheduling to TiDB. |
-| Throttling | Always on; throttles requests that exceed provisioned/burst capacity. No setting to disable | PostgreSQL frontend throttling is configurable via `throttling_enabled` and disabled by default. TiDB ignores frontend throttling and should use TiDB-native resource control. |
+| Throttling | Always on; throttles requests that exceed provisioned/burst capacity. No setting to disable | PostgreSQL frontend throttling is configurable via `throttling_enabled` and disabled by default. TiDB does not expose frontend throttling; use TiDB-native Resource Control/resource groups. |
 
 ## Operations Not Implemented
 
@@ -90,10 +90,9 @@ ExtendDB exposes runtime settings that have no DynamoDB equivalent:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `control_plane_delay_seconds` | 5 | PostgreSQL simulated delay for table create/delete transitions. TiDB ignores this setting and lets TiDB native online DDL schedule table/index changes. UpdateTable GSI/stream transitions report UPDATING until the backend reconciler completes, while table data-plane reads and writes remain available. |
-| `gsi_propagation_delay_ms` | 10 | PostgreSQL backend default GSI propagation delay (milliseconds). TiDB ignores this setting because GSI writes are transactional. |
-| `throttling_enabled` | `false` | PostgreSQL-only frontend token bucket. TiDB ignores it because per-frontend buckets are not distributed; use TiDB Resource Control/resource groups for TiDB. |
-| `enable_multipart_keys` | `false` | Enable multi-part base table key extension |
+| `control_plane_delay_seconds` | 5 | PostgreSQL-only simulated delay for table create/delete transitions. TiDB rejects this setting because TiDB native online DDL owns schema scheduling. |
+| `gsi_propagation_delay_ms` | 10 | PostgreSQL-only backend default GSI propagation delay (milliseconds). TiDB rejects this setting because native secondary-index writes are transactional. |
+| `throttling_enabled` | `false` | PostgreSQL-only frontend token bucket. TiDB rejects this setting because per-frontend buckets are not distributed; use TiDB Resource Control/resource groups for TiDB. |
 | `log_level` | `info` | Runtime log level (trace, debug, info, warn, error) |
 | `sqlx_log_level` | `warn` | Separate log level for sqlx query traces |
 | `allow_credential_import` | `true` | Allow importing credentials via the management API |

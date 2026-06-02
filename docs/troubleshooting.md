@@ -767,7 +767,7 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Cause:** On the PostgreSQL backend, GSI updates can be applied asynchronously with a configurable propagation delay (default 10ms). TiDB does not use this path; TiDB maintains native secondary indexes from the base table row.
 
-**Fix:** For PostgreSQL tests that query GSIs immediately after writes, poll/retry the GSI query or set `extenddb settings set gsi_propagation_delay_ms 0`. No setting is needed for TiDB.
+**Fix:** For PostgreSQL tests that query GSIs immediately after writes, poll/retry the GSI query or set `extenddb settings set gsi_propagation_delay_ms 0`. TiDB rejects that setting because native secondary-index writes are transactional.
 
 ## Connection Pool Exhaustion
 

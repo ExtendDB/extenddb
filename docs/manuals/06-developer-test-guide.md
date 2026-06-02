@@ -155,7 +155,7 @@ The `run-tests` script automatically:
 - Performs health check on the target endpoint
 - Provisions test credentials via `devtools/provision-test-credentials`
 - Creates a Java truststore for external tests (self-signed TLS cert)
-- Sets `control_plane_delay_seconds` to 0.05 for backends that use a simulated control-plane delay; TiDB ignores this setting and relies on native online DDL
+- Sets `control_plane_delay_seconds` to 0.05 for backends that use a simulated control-plane delay; TiDB does not expose this setting and relies on native online DDL
 - Configures backend-specific test settings for immediate control-plane visibility
 - Enables throttling for production-like behavior
 - Configures import/export paths for file operation tests

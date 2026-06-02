@@ -39,6 +39,8 @@ pub struct ConsoleState {
     /// Static configuration entries from the `.toml` file, as `(key, value)` pairs.
     /// Populated at server startup. Values for sensitive keys are pre-redacted.
     pub config_entries: Vec<(String, String)>,
+    /// Backend capability context for runtime settings display.
+    pub setting_context: crate::management::ops_settings::RuntimeSettingContext,
     /// Catalog store implementing operational storage traits.
     pub catalog_store: Arc<dyn extenddb_storage::CatalogStore>,
     /// Runtime documentation store. `None` if `docs_dir` is not configured or

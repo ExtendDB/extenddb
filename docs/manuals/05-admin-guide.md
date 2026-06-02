@@ -65,7 +65,7 @@ These settings require a server restart to take effect.
 | `bind_addr` | `127.0.0.1` | Network interface to bind |
 | `port` | `8000` | HTTP port |
 | `region` | `us-east-1` | AWS region for ARN generation |
-| `throttling_enabled` | unset / `false` | PostgreSQL frontend token buckets for local capacity fidelity. Ignored by TiDB; use TiDB Resource Control/resource groups for distributed capacity governance. |
+| `throttling_enabled` | unset / `false` | PostgreSQL frontend token buckets for local capacity fidelity. TiDB rejects this runtime setting; use TiDB Resource Control/resource groups for distributed capacity governance. |
 
 #### [storage]
 
@@ -185,7 +185,7 @@ Managed via `extenddb settings set`. Changes take effect within 30 seconds witho
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `log_level` | `info` | Log level: trace, debug, info, warn, error |
-| `control_plane_delay_seconds` | `5` | PostgreSQL delay for table status transitions (0 = instant); TiDB ignores this setting and uses native online DDL reconciliation |
+| `control_plane_delay_seconds` | `5` | PostgreSQL delay for table status transitions (0 = instant). TiDB rejects this runtime setting and uses native online DDL reconciliation |
 | `allow_credential_import` | `true` | Whether `import-access-key` is allowed |
 
 ```bash

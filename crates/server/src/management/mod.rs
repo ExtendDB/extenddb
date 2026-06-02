@@ -36,6 +36,8 @@ pub use auth::CallerIdentity;
 pub struct ManagementState {
     /// Catalog store implementing operational storage traits.
     pub catalog_store: Arc<dyn extenddb_storage::CatalogStore>,
+    /// Backend capability context for runtime setting validation.
+    pub setting_context: ops_settings::RuntimeSettingContext,
 }
 
 /// Build the management API router.

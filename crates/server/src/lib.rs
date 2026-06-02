@@ -64,6 +64,8 @@ pub struct AppState {
     /// settings page. Each entry is `(key, display_value)` — sensitive values
     /// are pre-redacted by the caller.
     pub config_entries: Vec<(String, String)>,
+    /// Backend capability context for runtime setting validation/display.
+    pub setting_context: management::ops_settings::RuntimeSettingContext,
     /// Runtime documentation store. `None` if `docs_dir` is not configured.
     pub docs_store: Option<console::docs_embed::DocsStore>,
     /// Backend runtime hooks for readiness checks.
@@ -130,12 +132,13 @@ pub async fn start_server(
         .route("/metrics", get(metrics_endpoint::metrics_endpoint))
         // S-6: Explicit small body limit for non-DynamoDB endpoints.
         .layer(DefaultBodyLimit::max(1024))
-        .with_state(shared);
+        .with_state(shared.clone());
 
     // Mount management API and web console if catalog store is available.
     if let Some(catalog_store) = catalog_store {
         let mgmt_state = Arc::new(management::ManagementState {
             catalog_store: catalog_store.clone(),
+            setting_context: shared.setting_context,
         });
         let mgmt_router = management::router().with_state(mgmt_state);
         app = app.nest("/management", mgmt_router);
@@ -145,6 +148,7 @@ pub async fn start_server(
             version_info,
             listen_url,
             config_entries,
+            setting_context: shared.setting_context,
             catalog_store,
             docs_store: docs_store.clone(),
         });

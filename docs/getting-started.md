@@ -224,7 +224,9 @@ By default, control plane operations (CreateTable, DeleteTable) emulate real Dyn
     control_plane_delay_seconds 10
 ```
 
-The TiDB backend ignores `control_plane_delay_seconds`. It records the catalog intent immediately and lets TiDB native online DDL schedule physical table and index changes.
+TiDB deployments reject `control_plane_delay_seconds`. They record catalog
+intent immediately and let TiDB native online DDL schedule physical table and
+index changes.
 
 ### Credential Import
 
@@ -256,7 +258,9 @@ The PostgreSQL backend can apply GSI updates asynchronously with a configurable 
 
 ### Throttling
 
-PostgreSQL deployments can enable ExtendDB's frontend token buckets for provisioned throughput experiments. The buckets are process-local, so they are disabled by default and are not used by TiDB deployments.
+PostgreSQL deployments can enable ExtendDB's frontend token buckets for
+provisioned throughput experiments. The buckets are process-local, so TiDB
+deployments reject `throttling_enabled`.
 
 TiDB deployments should use TiDB Resource Control and resource groups for distributed capacity governance. That keeps flow control and scheduling inside TiDB, where all ExtendDB frontends share one cluster-owned quota.
 Create the resource group in TiDB, then either bind the ExtendDB SQL user with
@@ -271,20 +275,6 @@ executes `SET RESOURCE GROUP` on every runtime pool session.
 # PostgreSQL only: enable frontend throttling for local fidelity tests
 ./target/release/extenddb settings --config extenddb.toml set \
     throttling_enabled true
-```
-
-### TTL Deletion Target
-
-Controls the PostgreSQL target maximum time (in seconds) between an item's TTL expiry and its actual deletion. PostgreSQL uses an indexed sweeper. TiDB ignores this setting and uses TiDB's native table TTL scheduler.
-
-```bash
-# Set to 60 seconds for faster TTL cleanup
-./target/release/extenddb settings --config extenddb.toml set \
-    ttl_deletion_target_seconds 60
-
-# Set to 600 seconds for less aggressive cleanup
-./target/release/extenddb settings --config extenddb.toml set \
-    ttl_deletion_target_seconds 600
 ```
 
 Stop the server:

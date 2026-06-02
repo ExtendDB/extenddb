@@ -16,6 +16,7 @@ use axum::response::{Html, IntoResponse, Response};
 
 use crate::console::ConsoleState;
 use crate::console::html;
+use crate::management::ops_settings;
 
 use super::{identity_label, is_admin, require_session};
 
@@ -120,6 +121,9 @@ pub async fn settings_page(State(state): State<Arc<ConsoleState>>, headers: Head
         .collect();
 
     for &(key, default) in RUNTIME_DEFAULTS {
+        if !runtime_default_visible(state.setting_context, key) {
+            continue;
+        }
         let ek = html::escape(key);
         let (value, source) = if let Some(&db_val) = db_map.get(key) {
             (db_val.to_owned(), "database")
@@ -145,7 +149,10 @@ pub async fn settings_page(State(state): State<Arc<ConsoleState>>, headers: Head
 
     // Show any DB settings not in RUNTIME_DEFAULTS (unexpected keys).
     for (key, value) in &db_rows {
-        if RUNTIME_DEFAULTS.iter().any(|&(k, _)| k == key) {
+        if RUNTIME_DEFAULTS
+            .iter()
+            .any(|&(k, _)| k == key && runtime_default_visible(state.setting_context, key))
+        {
             continue;
         }
         let ek = html::escape(key);
@@ -180,4 +187,8 @@ pub async fn settings_page(State(state): State<Arc<ConsoleState>>, headers: Head
         &session.csrf_token,
     ))
     .into_response()
+}
+
+fn runtime_default_visible(context: ops_settings::RuntimeSettingContext, key: &str) -> bool {
+    ops_settings::READONLY_KEYS.contains(&key) || ops_settings::setting_is_supported(context, key)
 }

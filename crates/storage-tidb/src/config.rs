@@ -217,6 +217,14 @@ impl extenddb_storage::config::StorageConfig for TidbStorageConfig {
         })
     }
 
+    fn uses_backend_native_control_plane(&self) -> bool {
+        true
+    }
+
+    fn uses_backend_native_secondary_indexes(&self) -> bool {
+        true
+    }
+
     fn uses_backend_native_capacity_control(&self) -> bool {
         true
     }
@@ -271,8 +279,12 @@ mod tests {
     }
 
     #[test]
-    fn tidb_uses_backend_native_capacity_control() {
-        assert!(TidbStorageConfig::default().uses_backend_native_capacity_control());
+    fn tidb_uses_backend_native_capabilities() {
+        let config = TidbStorageConfig::default();
+
+        assert!(config.uses_backend_native_control_plane());
+        assert!(config.uses_backend_native_secondary_indexes());
+        assert!(config.uses_backend_native_capacity_control());
     }
 
     #[test]

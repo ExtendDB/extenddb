@@ -117,7 +117,14 @@ pub async fn set_setting(
         return r;
     }
 
-    match ops_settings::set_setting(&*state.catalog_store, &key, &body.value).await {
+    match ops_settings::set_setting(
+        &*state.catalog_store,
+        state.setting_context,
+        &key,
+        &body.value,
+    )
+    .await
+    {
         Ok(()) => {
             let display_value = if should_redact(&key) {
                 "••••••••".to_owned()

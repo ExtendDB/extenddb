@@ -196,6 +196,14 @@ impl extenddb_storage::config::StorageConfig for RuntimeStorageConfig<'_> {
         self.base.native_backup_config()
     }
 
+    fn uses_backend_native_control_plane(&self) -> bool {
+        self.base.uses_backend_native_control_plane()
+    }
+
+    fn uses_backend_native_secondary_indexes(&self) -> bool {
+        self.base.uses_backend_native_secondary_indexes()
+    }
+
     fn uses_backend_native_capacity_control(&self) -> bool {
         self.base.uses_backend_native_capacity_control()
     }
@@ -231,6 +239,14 @@ impl extenddb_storage::config::StorageConfig for OwnedRuntimeStorageConfig {
 
     fn native_backup_config(&self) -> Option<extenddb_storage::config::NativeBackupConfig> {
         self.base.native_backup_config()
+    }
+
+    fn uses_backend_native_control_plane(&self) -> bool {
+        self.base.uses_backend_native_control_plane()
+    }
+
+    fn uses_backend_native_secondary_indexes(&self) -> bool {
+        self.base.uses_backend_native_secondary_indexes()
     }
 
     fn uses_backend_native_capacity_control(&self) -> bool {

@@ -890,8 +890,8 @@ when the transition fires. TiDB uses immediate eligibility and idempotent `DROP 
 - Startup recovery replays durable TiDB catalog intent directly. Backends that
   intentionally simulate DynamoDB delay may choose to reschedule future
   transition timestamps instead.
-- `control_plane_delay_seconds` is a backend-specific runtime setting (0–300 range), managed via
-  `extenddb settings set`. It is not a `.toml` config key. TiDB ignores it because TiDB's own DDL owner already
+- `control_plane_delay_seconds` is a PostgreSQL runtime setting (0–300 range), managed via
+  `extenddb settings set`. It is not a `.toml` config key. TiDB rejects it because TiDB's own DDL owner already
   coordinates distributed online schema changes.
 - TiDB does not elect an ExtendDB DDL owner. Multiple frontend nodes may replay
   the same catalog intent concurrently; idempotent `IF EXISTS` / `IF NOT EXISTS`

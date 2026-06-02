@@ -54,6 +54,18 @@ pub trait StorageConfig: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Whether this backend owns table and index lifecycle through native
+    /// distributed online DDL instead of frontend-simulated control-plane delay.
+    fn uses_backend_native_control_plane(&self) -> bool {
+        false
+    }
+
+    /// Whether this backend maintains secondary indexes natively from base-row
+    /// writes instead of frontend-managed companion index propagation.
+    fn uses_backend_native_secondary_indexes(&self) -> bool {
+        false
+    }
+
     /// Whether this backend should use its own cluster-native capacity control
     /// instead of the frontend process-local token bucket.
     ///

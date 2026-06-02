@@ -344,6 +344,10 @@ async fn serve_inner(
     // D9: Build static config entries for the console settings page.
     // Must be called before `app_config.limits` is moved.
     let config_entries = config::build_config_entries(&app_config);
+    let setting_context =
+        extenddb_server::management::ops_settings::RuntimeSettingContext::from_storage_config(
+            app_config.storage.as_trait(),
+        );
 
     // AI-1: Load runtime documentation from docs_dir if configured.
     let docs_store = app_config.docs_dir.as_ref().and_then(|raw| {
@@ -418,6 +422,7 @@ async fn serve_inner(
         export_paths,
         throttle: throttle.clone(),
         config_entries,
+        setting_context,
         docs_store,
         runtime_hooks: runtime_hooks.clone(),
     };
