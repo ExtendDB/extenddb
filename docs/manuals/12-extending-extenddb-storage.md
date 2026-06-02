@@ -126,7 +126,11 @@ Key design decisions:
 - **Unconditional transactional Put/Delete operations** should not pre-read the
   item when there is no condition expression and no stream record needs the old
   image. TiDB can execute the write directly inside the transaction and let
-  native primary-key and index maintenance coordinate the mutation.
+  native primary-key and index maintenance coordinate the mutation. For PutItem
+  stream records that only need keys or the new image, TiDB uses
+  `INSERT ... ON DUPLICATE KEY UPDATE` and classifies `INSERT` versus `MODIFY`
+  from native affected-row counts instead of issuing a separate duplicate-key
+  update path.
 - **Physical key encoding** must be centralized. TiDB stores the full DynamoDB
   HASH-key tuple in one physical `pk` column, so get/update/delete,
   transactions, and stream shard assignment must all use the same physical key

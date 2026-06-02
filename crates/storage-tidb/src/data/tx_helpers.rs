@@ -14,7 +14,7 @@ use extenddb_storage::util::{SortKeyValue, parse_sk, sk_column, sk_info};
 
 use super::{data_table_name, json_to_item, physical_pk_bytes};
 use crate::stream_engine::stream_shard_id_for_partition_key;
-use crate::tidb_util::{current_tidb_transaction_tso, current_tidb_tso, is_unique_violation};
+use crate::tidb_util::{current_tidb_transaction_tso, current_tidb_tso};
 
 const STREAM_SEQUENCE_TSO_WIDTH: usize = 21;
 const STREAM_SEQUENCE_ORDINAL_WIDTH: usize = 6;
@@ -156,9 +156,9 @@ pub(super) async fn upsert_item_in_tx(
 /// Put an item without materializing the old row and return the stream event.
 ///
 /// This is valid only when callers do not need conditions, old return values,
-/// or old stream images. TiDB's native unique-key check owns the concurrency:
-/// insert succeeds for new rows, and duplicate-key is the authoritative signal
-/// that the operation is a DynamoDB `MODIFY` without materializing the old item.
+/// or old stream images. TiDB's native upsert owns the concurrency and affected
+/// rows classify whether the stream event is an `INSERT` or `MODIFY` without
+/// materializing the old item.
 pub(super) async fn put_item_without_old_item_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     key_info: &TableKeyInfo,
@@ -185,40 +185,36 @@ pub(super) async fn put_prepared_item_without_old_item_in_tx(
             .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?;
         let sk = parse_sk(sk_value, sk_type)?;
         let sk_col = sk_column(sk_type);
-        let insert_sql =
-            format!("INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES (?, ?, ?)");
-        let insert_result = bind_sk_execute_raw!(&insert_sql, pk, &sk, item_json, &mut **tx);
-        match insert_result {
-            Ok(_) => Ok(StreamEventName::Insert),
-            Err(err) if is_unique_violation(&err) => {
-                let update_sql =
-                    format!("UPDATE {ddb_table} SET item_data = ? WHERE pk = ? AND {sk_col} = ?");
-                bind_sk_update_execute!(&update_sql, item_json, pk, &sk, &mut **tx)?;
-                Ok(StreamEventName::Modify)
-            }
-            Err(err) => Err(StorageError::Internal(err.to_string())),
-        }
+        let upsert_sql = format!(
+            "INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES (?, ?, ?) \
+             ON DUPLICATE KEY UPDATE item_data = VALUES(item_data)"
+        );
+        let result = bind_sk_execute!(&upsert_sql, pk, &sk, item_json, &mut **tx)?;
+        Ok(stream_event_from_upsert_rows_affected(
+            result.rows_affected(),
+        ))
     } else {
-        let insert_sql = format!("INSERT INTO {ddb_table} (pk, item_data) VALUES (?, ?)");
-        let insert_result = sqlx::query(&insert_sql)
+        let upsert_sql = format!(
+            "INSERT INTO {ddb_table} (pk, item_data) VALUES (?, ?) \
+             ON DUPLICATE KEY UPDATE item_data = VALUES(item_data)"
+        );
+        let result = sqlx::query(&upsert_sql)
             .bind(pk)
             .bind(item_json)
             .execute(&mut **tx)
-            .await;
-        match insert_result {
-            Ok(_) => Ok(StreamEventName::Insert),
-            Err(err) if is_unique_violation(&err) => {
-                let update_sql = format!("UPDATE {ddb_table} SET item_data = ? WHERE pk = ?");
-                sqlx::query(&update_sql)
-                    .bind(item_json)
-                    .bind(pk)
-                    .execute(&mut **tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                Ok(StreamEventName::Modify)
-            }
-            Err(err) => Err(StorageError::Internal(err.to_string())),
-        }
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        Ok(stream_event_from_upsert_rows_affected(
+            result.rows_affected(),
+        ))
+    }
+}
+
+fn stream_event_from_upsert_rows_affected(rows_affected: u64) -> StreamEventName {
+    if rows_affected == 1 {
+        StreamEventName::Insert
+    } else {
+        StreamEventName::Modify
     }
 }
 
@@ -634,11 +630,12 @@ fn idempotency_token_claim_sql() -> &'static str {
 mod tests {
     use std::sync::Arc;
 
-    use extenddb_core::types::StreamViewType;
+    use extenddb_core::types::{StreamEventName, StreamViewType};
     use extenddb_storage::StreamCapture;
 
     use super::{
         format_tso_sequence_number, idempotency_token_claim_sql, stream_capture_needs_old_item,
+        stream_event_from_upsert_rows_affected,
     };
 
     #[test]
@@ -692,5 +689,21 @@ mod tests {
         assert!(stream_capture_needs_old_item(&capture(
             StreamViewType::NewAndOldImages
         )));
+    }
+
+    #[test]
+    fn upsert_affected_rows_classify_stream_event_without_old_item() {
+        assert_eq!(
+            stream_event_from_upsert_rows_affected(1),
+            StreamEventName::Insert
+        );
+        assert_eq!(
+            stream_event_from_upsert_rows_affected(2),
+            StreamEventName::Modify
+        );
+        assert_eq!(
+            stream_event_from_upsert_rows_affected(0),
+            StreamEventName::Modify
+        );
     }
 }
