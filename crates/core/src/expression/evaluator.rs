@@ -298,7 +298,16 @@ fn evaluate_function(
                         let parts: Vec<String> = p
                             .iter()
                             .map(|e| match e {
-                                PathElement::Attribute(a) => a.clone(),
+                                PathElement::Attribute(a) => {
+                                    if let Some(ref_name) = a.strip_prefix('#') {
+                                        maps.names
+                                            .get(ref_name)
+                                            .cloned()
+                                            .unwrap_or_else(|| a.clone())
+                                    } else {
+                                        a.clone()
+                                    }
+                                }
                                 PathElement::Index(i) => format!("[{i}]"),
                             })
                             .collect();

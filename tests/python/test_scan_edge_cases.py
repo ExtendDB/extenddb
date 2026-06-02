@@ -452,3 +452,29 @@ class TestScanEdgeCases:
             ExclusiveStartKey={"pk": {"S": "P"}, "sk": {"S": "S"}},
         )
         assert "Items" in resp
+
+
+    def test_scan_rejects_negative_segment(self, table_factory, dynamodb_client):
+        """Scan with negative Segment returns ValidationException."""
+        import os
+        import boto3
+        import botocore.config
+
+        name = table_factory()
+        # Create a client without parameter validation to bypass boto3 client-side checks
+        endpoint = os.environ.get("DYNAMODB_ENDPOINT")
+        kwargs = {
+            "service_name": "dynamodb",
+            "region_name": os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+            "config": botocore.config.Config(parameter_validation=False),
+        }
+        if endpoint:
+            kwargs["endpoint_url"] = endpoint
+            if endpoint.startswith("https://"):
+                kwargs["verify"] = False
+        raw_client = boto3.client(**kwargs)
+        with pytest.raises(ClientError) as exc:
+            raw_client.scan(TableName=name, Segment=-1, TotalSegments=4)
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert "greater than or equal to 0" in err["Message"]

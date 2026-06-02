@@ -325,7 +325,17 @@ fn filter_to_updated_attrs(item: &Item, actions: &[UpdateAction], maps: &Express
         };
         if let Some(leaf) = resolve_path_value(top_val, &path[1..], maps) {
             let wrapped = wrap_leaf_in_path(&path[1..], &leaf, maps);
-            result.insert(top_name, wrapped);
+            // Merge into existing top-level entry if multiple subpaths target
+            // the same attribute (e.g., SET a.b = :x, a.c = :y).
+            if let Some(existing) = result.get(&top_name) {
+                if let Some(merged) = merge_maps(existing, &wrapped) {
+                    result.insert(top_name, merged);
+                } else {
+                    result.insert(top_name, wrapped);
+                }
+            } else {
+                result.insert(top_name, wrapped);
+            }
         }
     }
     result
@@ -377,6 +387,28 @@ fn wrap_leaf_in_path(
             AttributeValue::M(map)
         }
         PathElement::Index(_) => AttributeValue::L(vec![inner]),
+    }
+}
+
+/// Recursively merge two Map AttributeValues. Returns None if either isn't a Map.
+fn merge_maps(a: &AttributeValue, b: &AttributeValue) -> Option<AttributeValue> {
+    match (a, b) {
+        (AttributeValue::M(ma), AttributeValue::M(mb)) => {
+            let mut merged = ma.clone();
+            for (k, v) in mb {
+                if let Some(existing) = merged.get(k) {
+                    if let Some(deep) = merge_maps(existing, v) {
+                        merged.insert(k.clone(), deep);
+                    } else {
+                        merged.insert(k.clone(), v.clone());
+                    }
+                } else {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
+            Some(AttributeValue::M(merged))
+        }
+        _ => None,
     }
 }
 
