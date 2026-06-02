@@ -6,11 +6,13 @@
 //! Extracted from `transact_write_items.rs` to keep both files under the
 //! 500-line limit.
 
+use std::collections::HashMap;
+
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{ExpressionMaps, PathElement, UpdateAction};
 use extenddb_core::types::{
     ReturnItemCollectionMetrics, ReturnValuesOnConditionCheckFailure, TableKeyInfo,
-    attribute_value_size, extract_key, item_size_bytes,
+    TransactWriteItem, attribute_value_size, extract_key, item_size_bytes,
 };
 use extenddb_storage::TransactWriteOp;
 use hmac::{Hmac, Mac};
@@ -18,6 +20,61 @@ use serde_json::Value;
 use sha2::Sha256;
 
 use crate::capacity_helpers;
+
+/// Metadata shape needed for one transaction table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TableMetadataKind {
+    Key,
+    Write,
+}
+
+impl TableMetadataKind {
+    fn merge(self, other: Self) -> Self {
+        if matches!(self, Self::Write) || matches!(other, Self::Write) {
+            Self::Write
+        } else {
+            Self::Key
+        }
+    }
+}
+
+pub(crate) fn transact_write_table_name(twi: &TransactWriteItem) -> Option<&str> {
+    if let Some(put) = &twi.put {
+        Some(&put.table_name)
+    } else if let Some(del) = &twi.delete {
+        Some(&del.table_name)
+    } else if let Some(upd) = &twi.update {
+        Some(&upd.table_name)
+    } else if let Some(cc) = &twi.condition_check {
+        Some(&cc.table_name)
+    } else {
+        None
+    }
+}
+
+fn transact_write_metadata_kind(twi: &TransactWriteItem) -> Option<(&str, TableMetadataKind)> {
+    if let Some(put) = &twi.put {
+        Some((&put.table_name, TableMetadataKind::Write))
+    } else if let Some(upd) = &twi.update {
+        Some((&upd.table_name, TableMetadataKind::Write))
+    } else {
+        transact_write_table_name(twi).map(|table_name| (table_name, TableMetadataKind::Key))
+    }
+}
+
+pub(crate) fn transact_write_metadata_plan(
+    items: &[TransactWriteItem],
+) -> HashMap<String, TableMetadataKind> {
+    let mut plan = HashMap::with_capacity(items.len());
+    for item in items {
+        if let Some((table_name, kind)) = transact_write_metadata_kind(item) {
+            plan.entry(table_name.to_owned())
+                .and_modify(|existing: &mut TableMetadataKind| *existing = existing.merge(kind))
+                .or_insert(kind);
+        }
+    }
+    plan
+}
 
 /// Pre-processed write operation with parsed expressions and resolved table info.
 pub(crate) enum PreparedOp {
@@ -307,6 +364,51 @@ pub(crate) fn validate_no_key_updates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transact_write_metadata_plan_uses_write_metadata_for_put_and_update_tables() {
+        let input: extenddb_core::types::TransactWriteItemsInput =
+            serde_json::from_value(serde_json::json!({
+                "TransactItems": [
+                    {
+                        "Delete": {
+                            "TableName": "orders",
+                            "Key": {"pk": {"S": "o1"}}
+                        }
+                    },
+                    {
+                        "Put": {
+                            "TableName": "orders",
+                            "Item": {"pk": {"S": "o2"}}
+                        }
+                    },
+                    {
+                        "ConditionCheck": {
+                            "TableName": "customers",
+                            "Key": {"pk": {"S": "c1"}},
+                            "ConditionExpression": "attribute_exists(pk)"
+                        }
+                    },
+                    {
+                        "Update": {
+                            "TableName": "items",
+                            "Key": {"pk": {"S": "i1"}},
+                            "UpdateExpression": "SET #v = :v",
+                            "ExpressionAttributeNames": {"#v": "v"},
+                            "ExpressionAttributeValues": {":v": {"S": "new"}}
+                        }
+                    }
+                ]
+            }))
+            .expect("valid transaction");
+
+        let plan = transact_write_metadata_plan(&input.transact_items);
+
+        assert_eq!(plan.get("orders"), Some(&TableMetadataKind::Write));
+        assert_eq!(plan.get("items"), Some(&TableMetadataKind::Write));
+        assert_eq!(plan.get("customers"), Some(&TableMetadataKind::Key));
+        assert_eq!(plan.len(), 3);
+    }
 
     #[test]
     fn validate_token_valid() {

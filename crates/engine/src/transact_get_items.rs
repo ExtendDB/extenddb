@@ -3,14 +3,14 @@
 
 //! `TransactGetItems` operation handler.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{apply_projection, parse_projection, tokenize_for};
 use extenddb_core::types::{
-    ItemResponse, TransactGetItemsInput, TransactGetItemsOutput, item_size_bytes,
+    ItemResponse, TableKeyInfo, TransactGetItemsInput, TransactGetItemsOutput, item_size_bytes,
 };
 use extenddb_storage::TransactGetOp;
 
@@ -69,13 +69,22 @@ pub async fn handle_transact_get_items(
         }
     }
 
+    let mut table_info_cache: HashMap<String, TableKeyInfo> =
+        HashMap::with_capacity(input.transact_items.len());
     let mut key_infos = Vec::with_capacity(input.transact_items.len());
     for tgi in &input.transact_items {
-        let key_info = ctx
-            .storage
-            .table_key_info(&ctx.account_id, &tgi.get.table_name)
-            .await
-            .map_err(storage_err_to_dynamo)?;
+        let table_name = &tgi.get.table_name;
+        let key_info = if let Some(key_info) = table_info_cache.get(table_name) {
+            key_info.clone()
+        } else {
+            let key_info = ctx
+                .storage
+                .table_key_info(&ctx.account_id, table_name)
+                .await
+                .map_err(storage_err_to_dynamo)?;
+            table_info_cache.insert(table_name.clone(), key_info.clone());
+            key_info
+        };
         // Key type validation is deferred to the storage layer so that
         // mismatches produce TransactionCanceledException with ValidationError
         // cancellation reasons, matching real DynamoDB behavior.

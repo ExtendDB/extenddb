@@ -158,6 +158,11 @@ races. Read methods receive the DynamoDB `ConsistentRead` flag so a backend can
 route strong reads and eventually consistent reads through different native
 paths. Stream records are written atomically with data writes when `stream` is
 `Some`.
+Batch and transaction handlers resolve table metadata once per table per
+request. If any transaction write against a table needs secondary-index
+validation, the handler uses `table_write_info` once for that table and reuses
+it for the other transaction members on the same table; key-only transaction
+tables keep the lighter `table_key_info` path.
 
 For TiDB, `table_write_info` carries ACTIVE and CREATING secondary index key
 schemas. Item writes validate DynamoDB index-key type and size constraints from

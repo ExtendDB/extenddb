@@ -14,13 +14,16 @@ use crate::expression_helpers::build_expression_maps;
 use crate::serialize_output;
 use crate::stream_capture;
 use crate::transact_write_helpers::{
-    PreparedOp, compute_fingerprint, parse_optional_condition, validate_client_request_token,
+    PreparedOp, TableMetadataKind, compute_fingerprint, parse_optional_condition,
+    transact_write_metadata_plan, transact_write_table_name, validate_client_request_token,
     validate_no_key_updates,
 };
 use crate::{DispatchMetrics, DispatchResult};
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::parse_update;
-use extenddb_core::types::{TransactWriteItem, TransactWriteItemsInput, TransactWriteItemsOutput};
+use extenddb_core::types::{
+    TableKeyInfo, TransactWriteItem, TransactWriteItemsInput, TransactWriteItemsOutput,
+};
 use extenddb_core::validation::{
     validate_attribute_name_sizes, validate_item_size, validate_key_sizes,
 };
@@ -91,10 +94,25 @@ pub async fn handle_transact_write_items(
 
     // Resolve table metadata, validate inputs, parse expressions, and check
     // for duplicate targets in one pass to avoid redundant catalog lookups.
+    let metadata_plan = transact_write_metadata_plan(&input.transact_items);
+    let mut table_info_cache: HashMap<String, TableKeyInfo> =
+        HashMap::with_capacity(metadata_plan.len());
     let mut prepared: Vec<PreparedOp> = Vec::with_capacity(input.transact_items.len());
     let mut seen_targets: HashSet<String> = HashSet::with_capacity(input.transact_items.len());
     for twi in &input.transact_items {
-        let op = prepare_write_op(twi, ctx).await?;
+        let table_name = transact_write_table_name(twi).ok_or_else(|| {
+            DynamoDbError::ValidationException(
+                "TransactWriteItem must contain exactly one operation".to_owned(),
+            )
+        })?;
+        let metadata_kind = metadata_plan
+            .get(table_name)
+            .copied()
+            .unwrap_or(TableMetadataKind::Key);
+        let key_info =
+            transact_write_table_info(ctx, &mut table_info_cache, table_name, metadata_kind)
+                .await?;
+        let op = prepare_write_op(twi, ctx, key_info)?;
         let target_key = op.canonical_target();
         if !seen_targets.insert(target_key) {
             return Err(DynamoDbError::ValidationException(
@@ -196,17 +214,40 @@ pub async fn handle_transact_write_items(
     })
 }
 
+async fn transact_write_table_info(
+    ctx: &OperationContext,
+    cache: &mut HashMap<String, TableKeyInfo>,
+    table_name: &str,
+    metadata_kind: TableMetadataKind,
+) -> Result<TableKeyInfo, DynamoDbError> {
+    if let Some(key_info) = cache.get(table_name) {
+        return Ok(key_info.clone());
+    }
+
+    let key_info = match metadata_kind {
+        TableMetadataKind::Key => {
+            ctx.storage
+                .table_key_info(&ctx.account_id, table_name)
+                .await
+        }
+        TableMetadataKind::Write => {
+            ctx.storage
+                .table_write_info(&ctx.account_id, table_name)
+                .await
+        }
+    }
+    .map_err(storage_err_to_dynamo)?;
+    cache.insert(table_name.to_owned(), key_info.clone());
+    Ok(key_info)
+}
+
 /// Parse and validate a single `TransactWriteItem`, returning a `PreparedOp`.
-async fn prepare_write_op(
+fn prepare_write_op(
     twi: &TransactWriteItem,
     ctx: &OperationContext,
+    key_info: TableKeyInfo,
 ) -> Result<PreparedOp, DynamoDbError> {
     if let Some(put) = &twi.put {
-        let key_info = ctx
-            .storage
-            .table_write_info(&ctx.account_id, &put.table_name)
-            .await
-            .map_err(storage_err_to_dynamo)?;
         validate_item_size(&put.item, ctx.limits.max_item_size_bytes)?;
         validate_attribute_name_sizes(&put.item, &ctx.limits)?;
         validate_key_sizes(&put.item, &key_info.key_schema, &ctx.limits)?;
@@ -243,11 +284,6 @@ async fn prepare_write_op(
     }
 
     if let Some(del) = &twi.delete {
-        let key_info = ctx
-            .storage
-            .table_key_info(&ctx.account_id, &del.table_name)
-            .await
-            .map_err(storage_err_to_dynamo)?;
         let maps = build_expression_maps(
             del.expression_attribute_names.as_ref(),
             del.expression_attribute_values.as_ref(),
@@ -281,11 +317,6 @@ async fn prepare_write_op(
     }
 
     if let Some(upd) = &twi.update {
-        let key_info = ctx
-            .storage
-            .table_write_info(&ctx.account_id, &upd.table_name)
-            .await
-            .map_err(storage_err_to_dynamo)?;
         let maps = build_expression_maps(
             upd.expression_attribute_names.as_ref(),
             upd.expression_attribute_values.as_ref(),
@@ -324,11 +355,6 @@ async fn prepare_write_op(
     }
 
     if let Some(cc) = &twi.condition_check {
-        let key_info = ctx
-            .storage
-            .table_key_info(&ctx.account_id, &cc.table_name)
-            .await
-            .map_err(storage_err_to_dynamo)?;
         let maps = build_expression_maps(
             cc.expression_attribute_names.as_ref(),
             cc.expression_attribute_values.as_ref(),
