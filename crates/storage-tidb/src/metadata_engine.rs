@@ -7,6 +7,7 @@ use extenddb_core::types::{Item, Tag, TimeToLiveDescription, TimeToLiveStatus};
 use extenddb_storage::MetadataEngine;
 use extenddb_storage::error::StorageError;
 use futures::future::BoxFuture;
+use sqlx::{MySql, QueryBuilder};
 
 use crate::TidbEngine;
 use crate::data;
@@ -220,6 +221,13 @@ fn drop_columns_sql(data_table: &str, column_names: &[&str]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("ALTER TABLE {data_table} {specs}")
+}
+
+fn tag_delete_sql(tag_key_count: usize) -> String {
+    let placeholders = std::iter::repeat_n("?", tag_key_count)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("DELETE FROM tags WHERE resource_arn = ? AND tag_key IN ({placeholders})")
 }
 
 impl TidbEngine {
@@ -657,18 +665,25 @@ impl MetadataEngine for TidbEngine {
         let arn = arn.to_string();
         let tags = tags.to_vec();
         Box::pin(async move {
-            for tag in &tags {
-                sqlx::query(
-                    "INSERT INTO tags (resource_arn, tag_key, tag_value) VALUES (?, ?, ?) \
-                     ON DUPLICATE KEY UPDATE tag_value = VALUES(tag_value)",
-                )
-                .bind(&arn)
-                .bind(&tag.key)
-                .bind(&tag.value)
+            if tags.is_empty() {
+                return Ok(());
+            }
+
+            let mut query =
+                QueryBuilder::<MySql>::new("INSERT INTO tags (resource_arn, tag_key, tag_value) ");
+            query.push_values(&tags, |mut values, tag| {
+                values
+                    .push_bind(&arn)
+                    .push_bind(&tag.key)
+                    .push_bind(&tag.value);
+            });
+            query.push(" ON DUPLICATE KEY UPDATE tag_value = VALUES(tag_value)");
+
+            query
+                .build()
                 .execute(&self.pool)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
-            }
             Ok(())
         })
     }
@@ -681,14 +696,19 @@ impl MetadataEngine for TidbEngine {
         let arn = arn.to_string();
         let tag_keys = tag_keys.to_vec();
         Box::pin(async move {
-            for key in &tag_keys {
-                sqlx::query("DELETE FROM tags WHERE resource_arn = ? AND tag_key = ?")
-                    .bind(&arn)
-                    .bind(key)
-                    .execute(&self.pool)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if tag_keys.is_empty() {
+                return Ok(());
             }
+
+            let sql = tag_delete_sql(tag_keys.len());
+            let mut query = sqlx::query(&sql).bind(&arn);
+            for key in &tag_keys {
+                query = query.bind(key);
+            }
+            query
+                .execute(&self.pool)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
             Ok(())
         })
     }
@@ -923,7 +943,7 @@ mod tests {
     use super::{
         create_table_has_disabled_ttl, create_table_has_native_ttl, drop_columns_sql,
         drop_indexes_sql, fixed_native_ttl_attribute_sql, native_ttl_attribute_sql,
-        native_ttl_enable_sql, table_accepts_native_schema_change, ttl_json_path,
+        native_ttl_enable_sql, table_accepts_native_schema_change, tag_delete_sql, ttl_json_path,
         ttl_status_from_catalog,
     };
     use extenddb_core::types::TimeToLiveStatus;
@@ -1020,6 +1040,14 @@ mod tests {
         assert_eq!(
             drop_columns_sql("`_ddb_table`", &["col_a", "col_b"]),
             "ALTER TABLE `_ddb_table` DROP COLUMN IF EXISTS `col_a`, DROP COLUMN IF EXISTS `col_b`"
+        );
+    }
+
+    #[test]
+    fn tag_delete_uses_one_set_based_catalog_delete() {
+        assert_eq!(
+            tag_delete_sql(3),
+            "DELETE FROM tags WHERE resource_arn = ? AND tag_key IN (?, ?, ?)"
         );
     }
 }

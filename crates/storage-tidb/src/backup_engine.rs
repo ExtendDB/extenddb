@@ -19,6 +19,7 @@ use extenddb_storage::config::NativeBackupConfig;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::table_arn;
 use futures::future::BoxFuture;
+use sqlx::{MySql, QueryBuilder};
 use tokio::process::Command;
 
 use crate::TidbEngine;
@@ -336,6 +337,96 @@ fn backup_arn_account_id(backup_arn: &str) -> Result<String, StorageError> {
         .ok_or_else(|| StorageError::Validation(format!("Invalid backup ARN: {backup_arn}")))
 }
 
+async fn insert_backup_index_rows(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    backup_arn: &str,
+    indexes: &[BackupIndexSnapshotRow],
+) -> Result<(), StorageError> {
+    if indexes.is_empty() {
+        return Ok(());
+    }
+
+    let mut query = QueryBuilder::<MySql>::new(
+        "INSERT INTO backup_indexes \
+         (backup_arn, index_id, index_name, index_type, key_schema, projection, \
+          provisioned_throughput) ",
+    );
+    query.push_values(indexes, |mut values, index| {
+        values
+            .push_bind(backup_arn)
+            .push_bind(&index.index_id)
+            .push_bind(&index.index_name)
+            .push_bind(&index.index_type)
+            .push_bind(&index.key_schema)
+            .push_bind(&index.projection)
+            .push_bind(&index.provisioned_throughput);
+    });
+
+    query
+        .build()
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
+    Ok(())
+}
+
+async fn insert_backup_tag_rows(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    backup_arn: &str,
+    tags: &[(String, String)],
+) -> Result<(), StorageError> {
+    if tags.is_empty() {
+        return Ok(());
+    }
+
+    let mut query =
+        QueryBuilder::<MySql>::new("INSERT INTO backup_tags (backup_arn, tag_key, tag_value) ");
+    query.push_values(tags, |mut values, (key, value)| {
+        values.push_bind(backup_arn).push_bind(key).push_bind(value);
+    });
+
+    query
+        .build()
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
+    Ok(())
+}
+
+async fn insert_restored_index_catalog_rows(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    table_id: &str,
+    indexes: &[BackupIndexSnapshotRow],
+) -> Result<(), StorageError> {
+    if indexes.is_empty() {
+        return Ok(());
+    }
+
+    let mut query = QueryBuilder::<MySql>::new(
+        "INSERT INTO indexes \
+         (table_id, index_name, index_id, index_type, key_schema, projection, \
+          index_status, provisioned_throughput) ",
+    );
+    query.push_values(indexes, |mut values, index| {
+        values
+            .push_bind(table_id)
+            .push_bind(&index.index_name)
+            .push_bind(&index.index_id)
+            .push_bind(&index.index_type)
+            .push_bind(&index.key_schema)
+            .push_bind(&index.projection)
+            .push_bind("ACTIVE")
+            .push_bind(&index.provisioned_throughput);
+    });
+
+    query
+        .build()
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
+    Ok(())
+}
+
 impl TidbEngine {
     async fn current_tso(&self) -> Result<i64, StorageError> {
         current_tidb_tso(&self.pool).await
@@ -484,35 +575,8 @@ impl TidbEngine {
         .await
         .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
 
-        for index in &insert.snapshot.indexes {
-            sqlx::query(
-                "INSERT INTO backup_indexes \
-                 (backup_arn, index_id, index_name, index_type, key_schema, projection, provisioned_throughput) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(insert.backup_arn)
-            .bind(&index.index_id)
-            .bind(&index.index_name)
-            .bind(&index.index_type)
-            .bind(&index.key_schema)
-            .bind(&index.projection)
-            .bind(&index.provisioned_throughput)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-        }
-
-        for (key, value) in &insert.snapshot.tags {
-            sqlx::query(
-                "INSERT INTO backup_tags (backup_arn, tag_key, tag_value) VALUES (?, ?, ?)",
-            )
-            .bind(insert.backup_arn)
-            .bind(key)
-            .bind(value)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-        }
+        insert_backup_index_rows(&mut tx, insert.backup_arn, &insert.snapshot.indexes).await?;
+        insert_backup_tag_rows(&mut tx, insert.backup_arn, &insert.snapshot.tags).await?;
 
         let created_at: time::OffsetDateTime =
             sqlx::query_scalar("SELECT created_at FROM backups WHERE backup_arn = ?")
@@ -564,24 +628,7 @@ impl TidbEngine {
             }
         })?;
 
-        for index in insert.indexes {
-            sqlx::query(
-                "INSERT INTO indexes \
-                 (table_id, index_name, index_id, index_type, key_schema, projection, \
-                  index_status, provisioned_throughput) \
-                 VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?)",
-            )
-            .bind(insert.table_id)
-            .bind(&index.index_name)
-            .bind(&index.index_id)
-            .bind(&index.index_type)
-            .bind(&index.key_schema)
-            .bind(&index.projection)
-            .bind(&index.provisioned_throughput)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-        }
+        insert_restored_index_catalog_rows(&mut tx, insert.table_id, insert.indexes).await?;
 
         tx.commit()
             .await

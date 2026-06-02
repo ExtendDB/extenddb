@@ -6,10 +6,11 @@
 use extenddb_core::types::{
     BillingMode, BillingModeSummary, CreateTableInput, GsiDescription, GsiInput, KeySchemaElement,
     LsiDescription, LsiInput, Projection, ProvisionedThroughputDescription, TableDescription,
-    TableStatus,
+    TableStatus, Tag,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn, table_arn};
+use sqlx::{MySql, QueryBuilder};
 
 use crate::TidbEngine;
 use crate::data::validate_native_key_schema_shape;
@@ -59,6 +60,115 @@ impl SecondaryIndexCreateRef<'_> {
             Self::Local(_) => None,
         }
     }
+}
+
+struct SecondaryIndexCatalogRow {
+    index_name: String,
+    index_id: String,
+    index_type: &'static str,
+    key_schema: serde_json::Value,
+    projection: serde_json::Value,
+    provisioned_throughput: Option<serde_json::Value>,
+}
+
+fn secondary_index_catalog_rows(
+    input: &CreateTableInput,
+) -> Result<Vec<SecondaryIndexCatalogRow>, StorageError> {
+    let global_indexes = input
+        .global_secondary_indexes
+        .iter()
+        .flatten()
+        .map(SecondaryIndexCreateRef::Global);
+    let local_indexes = input
+        .local_secondary_indexes
+        .iter()
+        .flatten()
+        .map(SecondaryIndexCreateRef::Local);
+
+    global_indexes
+        .chain(local_indexes)
+        .map(|index| {
+            let key_schema = serde_json::to_value(index.key_schema())
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let projection = serde_json::to_value(index.projection())
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let provisioned_throughput_description = index.provisioned_throughput_description();
+            let provisioned_throughput = provisioned_throughput_description
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+            Ok(SecondaryIndexCatalogRow {
+                index_name: index.index_name().to_owned(),
+                index_id: uuid::Uuid::new_v4().to_string(),
+                index_type: index.api_type(),
+                key_schema,
+                projection,
+                provisioned_throughput,
+            })
+        })
+        .collect()
+}
+
+async fn insert_secondary_index_catalog_rows(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    table_id: &str,
+    rows: &[SecondaryIndexCatalogRow],
+) -> Result<(), StorageError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut query = QueryBuilder::<MySql>::new(
+        "INSERT INTO indexes \
+         (table_id, index_name, index_id, index_type, key_schema, projection, \
+          index_status, provisioned_throughput) ",
+    );
+    query.push_values(rows, |mut values, row| {
+        values
+            .push_bind(table_id)
+            .push_bind(&row.index_name)
+            .push_bind(&row.index_id)
+            .push_bind(row.index_type)
+            .push_bind(&row.key_schema)
+            .push_bind(&row.projection)
+            .push_bind("ACTIVE")
+            .push_bind(&row.provisioned_throughput);
+    });
+
+    query
+        .build()
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+    Ok(())
+}
+
+async fn insert_table_tags(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    table_arn: &str,
+    tags: &[Tag],
+) -> Result<(), StorageError> {
+    if tags.is_empty() {
+        return Ok(());
+    }
+
+    let mut query =
+        QueryBuilder::<MySql>::new("INSERT INTO tags (resource_arn, tag_key, tag_value) ");
+    query.push_values(tags, |mut values, tag| {
+        values
+            .push_bind(table_arn)
+            .push_bind(&tag.key)
+            .push_bind(&tag.value);
+    });
+
+    query
+        .build()
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+    Ok(())
 }
 
 impl TidbEngine {
@@ -127,6 +237,7 @@ impl TidbEngine {
             .as_ref()
             .is_some_and(|s| s.stream_enabled)
             .then(Self::new_stream_label);
+        let index_rows = secondary_index_catalog_rows(&input)?;
 
         sqlx::query(
             r"INSERT INTO tables
@@ -161,58 +272,10 @@ impl TidbEngine {
 
         // TiDB has one physical secondary-index mechanism. The GSI/LSI split is
         // DynamoDB API metadata, not a separate storage path.
-        let global_indexes = input
-            .global_secondary_indexes
-            .iter()
-            .flatten()
-            .map(SecondaryIndexCreateRef::Global);
-        let local_indexes = input
-            .local_secondary_indexes
-            .iter()
-            .flatten()
-            .map(SecondaryIndexCreateRef::Local);
-        for index in global_indexes.chain(local_indexes) {
-            let key_schema_json = serde_json::to_value(index.key_schema())
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let projection_json = serde_json::to_value(index.projection())
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let provisioned_throughput = index.provisioned_throughput_description();
-            let provisioned_throughput_json = provisioned_throughput
-                .as_ref()
-                .map(serde_json::to_value)
-                .transpose()
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+        insert_secondary_index_catalog_rows(&mut tx, &table_id, &index_rows).await?;
 
-            let index_id = uuid::Uuid::new_v4().to_string();
-            sqlx::query(
-                r"INSERT INTO indexes
-                   (table_id, index_name, index_id, index_type, key_schema, projection,
-                    index_status, provisioned_throughput)
-                   VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?)",
-            )
-            .bind(&table_id)
-            .bind(index.index_name())
-            .bind(&index_id)
-            .bind(index.api_type())
-            .bind(&key_schema_json)
-            .bind(&projection_json)
-            .bind(&provisioned_throughput_json)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-        }
-
-        // Insert tags
         if let Some(tags) = &input.tags {
-            for tag in tags {
-                sqlx::query("INSERT INTO tags (resource_arn, tag_key, tag_value) VALUES (?, ?, ?)")
-                    .bind(&table_arn)
-                    .bind(&tag.key)
-                    .bind(&tag.value)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-            }
+            insert_table_tags(&mut tx, &table_arn, tags).await?;
         }
 
         tx.commit()
