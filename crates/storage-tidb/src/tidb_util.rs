@@ -12,6 +12,22 @@ const MAX_TIDB_OPERATION_RETRIES: usize = 3;
 const TIDB_CONNECTION_MAX_LIFETIME: Duration = Duration::from_secs(1800);
 const TIDB_RESOURCE_GROUP_NAME_MAX_CHARS: usize = 32;
 pub(crate) const TIDB_REPLICA_READ_CLOSEST_ADAPTIVE: &str = "closest-adaptive";
+const ACTIVE_TIDB_DDL_JOB_STATES: &[&str] = &[
+    "none",
+    "queueing",
+    "running",
+    "done",
+    "rollingback",
+    "cancelling",
+    "pausing",
+    "paused",
+];
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct TidbActiveDdlJob {
+    pub(crate) job_type: String,
+    pub(crate) state: String,
+}
 
 #[derive(Clone, Default)]
 struct TidbSessionInit {
@@ -227,6 +243,57 @@ where
     }
 }
 
+fn active_tidb_ddl_job_for_table_sql() -> String {
+    let states = ACTIVE_TIDB_DDL_JOB_STATES
+        .iter()
+        .map(|state| format!("'{state}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT JOB_TYPE, STATE \
+         FROM information_schema.ddl_jobs \
+         WHERE DB_NAME = DATABASE() \
+           AND TABLE_NAME = ? \
+           AND END_TIME IS NULL \
+           AND LOWER(STATE) IN ({states}) \
+         ORDER BY CREATE_TIME DESC, JOB_ID DESC \
+         LIMIT 1"
+    )
+}
+
+pub(crate) async fn active_tidb_ddl_job_for_table(
+    pool: &sqlx::MySqlPool,
+    physical_table_name: &str,
+) -> Result<Option<TidbActiveDdlJob>, StorageError> {
+    let sql = active_tidb_ddl_job_for_table_sql();
+    let row: Option<(String, String)> = sqlx::query_as(&sql)
+        .bind(physical_table_name)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| StorageError::Internal(format!("read TiDB DDL jobs: {e}")))?;
+
+    Ok(row.map(|(job_type, state)| TidbActiveDdlJob { job_type, state }))
+}
+
+pub(crate) async fn defer_if_table_has_active_ddl_job(
+    pool: &sqlx::MySqlPool,
+    operation: &'static str,
+    physical_table_name: &str,
+) -> Result<bool, StorageError> {
+    let Some(job) = active_tidb_ddl_job_for_table(pool, physical_table_name).await? else {
+        return Ok(false);
+    };
+
+    tracing::debug!(
+        operation,
+        physical_table_name,
+        job_type = job.job_type,
+        state = job.state,
+        "deferring TiDB control-plane reconciliation while native DDL job is active"
+    );
+    Ok(true)
+}
+
 pub(crate) async fn current_tidb_tso(pool: &sqlx::MySqlPool) -> Result<i64, StorageError> {
     let mut tx = pool
         .begin()
@@ -410,11 +477,11 @@ mod tests {
     use sqlx::error::DatabaseError;
 
     use super::{
-        TIDB_REPLICA_READ_CLOSEST_ADAPTIVE, TidbSessionInit, is_retryable_tidb_storage_error,
-        is_table_exists_tidb_error_text, is_table_not_found_tidb_sqlx_error,
-        is_table_not_found_tidb_storage_error, is_tidb_snapshot_read_error_text,
-        quote_tidb_resource_group_name, retry_tidb_idempotent_operation, tidb_as_of_epoch_clause,
-        tidb_as_of_tso_clause,
+        TIDB_REPLICA_READ_CLOSEST_ADAPTIVE, TidbSessionInit, active_tidb_ddl_job_for_table_sql,
+        is_retryable_tidb_storage_error, is_table_exists_tidb_error_text,
+        is_table_not_found_tidb_sqlx_error, is_table_not_found_tidb_storage_error,
+        is_tidb_snapshot_read_error_text, quote_tidb_resource_group_name,
+        retry_tidb_idempotent_operation, tidb_as_of_epoch_clause, tidb_as_of_tso_clause,
     };
 
     #[derive(Debug)]
@@ -563,6 +630,21 @@ mod tests {
 
         assert!(matches!(result, Err(StorageError::ConditionFailed(None))));
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn active_ddl_job_query_uses_tidb_native_job_queue() {
+        let sql = active_tidb_ddl_job_for_table_sql();
+
+        assert!(sql.contains("information_schema.ddl_jobs"));
+        assert!(sql.contains("DB_NAME = DATABASE()"));
+        assert!(sql.contains("TABLE_NAME = ?"));
+        assert!(sql.contains("END_TIME IS NULL"));
+        assert!(sql.contains("LOWER(STATE) IN"));
+        assert!(sql.contains("'queueing'"));
+        assert!(sql.contains("'running'"));
+        assert!(sql.contains("'done'"));
+        assert!(sql.contains("ORDER BY CREATE_TIME DESC, JOB_ID DESC"));
     }
 
     #[test]

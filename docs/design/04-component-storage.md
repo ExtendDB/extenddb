@@ -454,6 +454,9 @@ native `information_schema.ddl_jobs` queue. A long `CREATING`, `UPDATING`, or
 `DELETING` transition is not reported as stuck while TiDB still shows a
 progressing online DDL job for the physical `_ddb_*` table; paused, failed, or
 missing native DDL progress is reported with the TiDB job state.
+The TiDB reconciler uses the same native DDL-job view before submitting table
+DDL, so multiple frontend nodes defer while TiDB already has a queued or
+running job for that physical table instead of creating duplicate DDL pressure.
 The binary only loads config, refuses to run while the server PID is alive, and
 prints the backend report.
 
@@ -976,7 +979,8 @@ when the transition fires. TiDB uses immediate eligibility and idempotent `DROP 
   coordinates distributed online schema changes.
 - TiDB does not elect an ExtendDB DDL owner. Multiple frontend nodes may replay
   the same catalog intent concurrently; idempotent `IF EXISTS` / `IF NOT EXISTS`
-  DDL and conditional catalog publication converge on the TiDB-owned schema
+  DDL, native `information_schema.ddl_jobs` deferral for already-active table
+  jobs, and conditional catalog publication converge on the TiDB-owned schema
   state.
 
 **Crash recovery and in-flight operation tracking:**

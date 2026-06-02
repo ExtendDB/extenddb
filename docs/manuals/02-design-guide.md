@@ -67,7 +67,9 @@ unpartitioned data tables or local-index artifacts rather than preserving a
 slower compatibility path. Initial indexes are included in the physical TiDB
 `CREATE TABLE`; replay repairs an already-existing physical table with TiDB
 online `IF NOT EXISTS` DDL before activation, and later GSI changes use TiDB
-online DDL.
+online DDL. Reconciliation checks TiDB's native DDL job queue before submitting
+table DDL, so another frontend leaves a queued or running schema job with
+TiDB's DDL owner instead of duplicating it.
 
 ### Schema Conventions
 

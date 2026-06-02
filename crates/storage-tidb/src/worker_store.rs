@@ -10,7 +10,11 @@ use extenddb_storage::WorkerStore;
 use extenddb_storage::error::StorageError;
 
 use crate::TidbEngine;
-use crate::tidb_util::{is_table_not_found_tidb_storage_error, retry_tidb_idempotent_operation};
+use crate::data::physical_data_table_name;
+use crate::tidb_util::{
+    defer_if_table_has_active_ddl_job, is_table_not_found_tidb_storage_error,
+    retry_tidb_idempotent_operation,
+};
 
 type CreatingTableRow = (
     String,
@@ -165,6 +169,15 @@ impl TidbEngine {
         Ok(())
     }
 
+    async fn table_has_active_native_ddl_job(
+        &self,
+        table_id: &str,
+        operation: &'static str,
+    ) -> Result<bool, StorageError> {
+        let physical_table = physical_data_table_name(table_id);
+        defer_if_table_has_active_ddl_job(&self.data_pool, operation, &physical_table).await
+    }
+
     async fn drop_create_artifacts_if_table_was_deleted(
         &self,
         table_id: &str,
@@ -273,6 +286,13 @@ impl TidbEngine {
             indexes,
         };
 
+        if self
+            .table_has_active_native_ddl_job(table_id, "reconcile_table_create")
+            .await?
+        {
+            return Ok(None);
+        }
+
         let indexes = plan
             .indexes
             .iter()
@@ -371,6 +391,13 @@ impl TidbEngine {
             ttl_status,
             pending_indexes,
         };
+
+        if self
+            .table_has_active_native_ddl_job(table_id, "reconcile_table_update")
+            .await?
+        {
+            return Ok(None);
+        }
 
         if plan.stream_enabled {
             self.ensure_stream_label_for_table_id(table_id).await?;
@@ -574,6 +601,13 @@ impl TidbEngine {
                 .await
                 .map(|table_name| table_name.map(|name| (name, "UPDATING → active"))),
             ControlPlaneReconcilePlan::Delete(plan) => {
+                if self
+                    .table_has_active_native_ddl_job(&plan.table_id, "reconcile_table_delete")
+                    .await?
+                {
+                    return Ok(None);
+                }
+
                 self.drop_table_data_artifacts(&plan.table_id).await?;
 
                 let mut finalize = self
