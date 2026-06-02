@@ -157,7 +157,7 @@ pub async fn handle_transact_write_items(
     let wcu: f64 = prepared
         .iter()
         .map(|op| {
-            let item_wcu = capacity_helpers::write_capacity_units(op.write_bytes());
+            let item_wcu = capacity_helpers::write_capacity_units(op.write_bytes()) * 2.0; // transactions cost 2x
             *per_table_wcu.entry(op.table_name().to_owned()).or_default() += item_wcu;
             item_wcu
         })

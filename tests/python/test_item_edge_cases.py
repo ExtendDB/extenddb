@@ -282,22 +282,20 @@ class TestGetItemEdgeCases:
         assert set(resp["Item"]["ss"]["SS"]) == {"alpha", "beta", "gamma"}
 
     def test_batch_get_item_same_key_twice(self, table_factory, dynamodb_client):
-        """BatchGetItem with same key twice returns it once."""
+        """BatchGetItem with same key twice is rejected."""
         name = table_factory()
         dynamodb_client.put_item(
             TableName=name, Item={"pk": {"S": "k1"}, "v": {"S": "val"}}
         )
-        resp = dynamodb_client.batch_get_item(
-            RequestItems={
-                name: {
-                    "Keys": [{"pk": {"S": "k1"}}, {"pk": {"S": "k1"}}],
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.batch_get_item(
+                RequestItems={
+                    name: {
+                        "Keys": [{"pk": {"S": "k1"}}, {"pk": {"S": "k1"}}],
+                    }
                 }
-            }
-        )
-        # DynamoDB deduplicates or returns duplicates — verify at least one
-        items = resp["Responses"][name]
-        assert len(items) >= 1
-        assert items[0]["v"]["S"] == "val"
+            )
+        assert exc_info.value.response["Error"]["Code"] == "ValidationException"
 
 
 class TestDeleteItemEdgeCases:
@@ -417,7 +415,8 @@ class TestUpdateItemEdgeCases:
         dynamodb_client.update_item(
             TableName=name,
             Key={"pk": {"S": "k1"}},
-            UpdateExpression="SET items[1] = :v",
+            UpdateExpression="SET #i[1] = :v",
+            ExpressionAttributeNames={"#i": "items"},
             ExpressionAttributeValues={":v": {"S": "B"}},
         )
         resp = dynamodb_client.get_item(TableName=name, Key={"pk": {"S": "k1"}})
@@ -525,7 +524,8 @@ class TestUpdateItemEdgeCases:
         dynamodb_client.update_item(
             TableName=name,
             Key={"pk": {"S": "k1"}},
-            UpdateExpression="ADD counter :v",
+            UpdateExpression="ADD #c :v",
+            ExpressionAttributeNames={"#c": "counter"},
             ExpressionAttributeValues={":v": {"N": "1"}},
         )
         resp = dynamodb_client.get_item(TableName=name, Key={"pk": {"S": "k1"}})

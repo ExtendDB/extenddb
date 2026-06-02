@@ -88,9 +88,10 @@ pub async fn handle_scan(
                 ));
             }
             if seg < 0 {
-                return Err(DynamoDbError::ValidationException(
-                    "The parameter Segment should be greater than or equal to 0".to_owned(),
-                ));
+                return Err(DynamoDbError::ValidationException(format!(
+                    "1 validation error detected: Value '{}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0",
+                    seg
+                )));
             }
             if seg >= total {
                 return Err(DynamoDbError::ValidationException(format!(
