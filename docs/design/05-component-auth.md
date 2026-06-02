@@ -9,7 +9,7 @@
 
 The `auth` crate provides pluggable authentication and authorization. It defines the `AuthProvider` trait, implements the built-in SigV4 provider, and contains the IAM policy evaluation engine with support for identity-based policies, role-based access control, and tag-based access control (ABAC). The crate depends on `extenddb-core` (for types and errors) and `async_trait` (for object-safe async trait dispatch). It has no HTTP framework or storage dependencies.
 
-> **Note on `CredentialStore`:** The `auth` crate defines its own `CredentialStore` trait for credential, identity, and policy lookup. The `bin` crate provides a thin adapter (`StorageCredentialAdapter`) that implements `CredentialStore` by delegating to the storage engine's `CredentialEngine` trait. This keeps `auth` independent of the `storage` crate while allowing identity data to live in the same database.
+> **Note on `CredentialStore`:** The `auth` crate defines its own `CredentialStore` trait for authentication-only access-key lookup. The server crate adapts that trait to the selected storage backend. Authorization metadata comes from the storage `AuthorizationStore` aggregate methods so backends can fetch policies, boundaries, sessions, and tags in their native hot-path shape.
 
 ## 2. Module Structure
 
@@ -42,74 +42,24 @@ crates/auth/src/
 
 extenddb implements a local IAM identity model that mirrors AWS IAM structure for DynamoDB access control.
 
-### 3.1 Principal Types
+### 3.1 Authenticated Identity
 
 ```rust
-/// A resolved principal — any entity that can make requests.
-/// Named `ResolvedPrincipal` to distinguish from `PrincipalMatch` in policy
-/// statements, which represents ARN strings in Principal/NotPrincipal fields.
+/// The resolved identity after successful SigV4 authentication.
 #[derive(Debug, Clone)]
-pub enum ResolvedPrincipal {
-    User(UserIdentity),
-    AssumedRole(RoleSession),
-}
-
-#[derive(Debug, Clone)]
-pub struct UserIdentity {
-    pub user_name: String,
-    pub user_arn: String,           // arn:aws:iam::{account}:user/{name}
-    pub account_id: String,
-    pub tags: HashMap<String, String>,  // principal tags
-    pub groups: Vec<String>,        // group names this user belongs to
-}
-
-#[derive(Debug, Clone)]
-pub struct RoleSession {
-    pub role_name: String,
-    pub role_arn: String,           // arn:aws:iam::{account}:role/{name}
-    pub session_name: String,
-    pub account_id: String,
-    /// Effective tags: role tags merged with session tags (session tags win).
-    pub tags: HashMap<String, String>,
-    pub session_policy: Option<PolicyDocument>,
-    pub expires_at: time::OffsetDateTime,  // `time` crate — already in dependency tree via `axum`
-}
-```
-
-### 3.2 AuthIdentity (Authentication Result)
-
-```rust
-/// Authenticated identity returned by a provider.
-#[derive(Debug, Clone)]
-pub struct AuthIdentity {
-    /// The resolved principal (user or assumed-role session).
-    pub principal: ResolvedPrincipal,
-    /// Provider name (e.g., "builtin", "aws_iam", "azure_ad").
-    pub provider: &'static str,
-}
-
-impl AuthIdentity {
-    /// Returns the principal ARN for policy evaluation.
-    pub fn principal_arn(&self) -> &str {
-        match &self.principal {
-            ResolvedPrincipal::User(u) => &u.user_arn,
-            ResolvedPrincipal::AssumedRole(r) => &r.role_arn,
-        }
-    }
-
-    /// Returns principal tags for condition evaluation.
-    pub fn principal_tags(&self) -> &HashMap<String, String> {
-        match &self.principal {
-            ResolvedPrincipal::User(u) => &u.tags,
-            ResolvedPrincipal::AssumedRole(r) => &r.tags,
-        }
-    }
-
-    pub fn account_id(&self) -> &str {
-        match &self.principal {
-            ResolvedPrincipal::User(u) => &u.account_id,
-            ResolvedPrincipal::AssumedRole(r) => &r.account_id,
-        }
+pub enum AuthIdentity {
+    User {
+        account_id: String,
+        user_name: String,
+    },
+    RoleSession {
+        account_id: String,
+        role_name: String,
+        session_name: String,
+        /// The temporary access key is the unique session row selector.
+        /// Session names are not unique, so authorization must not fetch
+        /// session policy/tags by role name + session name alone.
+        access_key_id: String,
     }
 }
 ```
@@ -117,15 +67,8 @@ impl AuthIdentity {
 ## 4. AuthProvider Trait
 
 ```rust
+use axum::http::HeaderMap;
 use extenddb_core::error::DynamoDbError;
-
-/// Request context passed to the auth provider.
-pub struct AuthRequest<'a> {
-    pub headers: &'a HashMap<String, String>,
-    pub body: &'a [u8],
-    pub operation: &'a str,
-    pub resource_arn: &'a str,
-}
 
 /// Authorization decision.
 pub enum AuthzDecision {
@@ -134,7 +77,8 @@ pub enum AuthzDecision {
 }
 
 /// Request context for policy condition evaluation.
-/// Built by the server middleware before calling authorize().
+/// Built by the server authorization path after fetching authorization
+/// metadata from storage.
 ///
 /// Multi-value keys (`leading_keys`, `attributes`) use `Option<Vec<String>>`
 /// to distinguish "key not applicable to this operation" (`None`) from
@@ -185,23 +129,15 @@ pub struct RequestParams {
     pub enclosing_operation: Option<String>,
 }
 
-/// Pluggable authentication and authorization provider.
+/// Pluggable authentication provider.
 #[async_trait::async_trait]
 pub trait AuthProvider: Send + Sync {
     /// Authenticate a request. Returns the identity or an error.
-    async fn authenticate(&self, request: &AuthRequest<'_>) -> Result<AuthIdentity, DynamoDbError>;
-
-    /// Authorize an authenticated identity for an action on a resource.
-    async fn authorize(
+    async fn authenticate(
         &self,
-        identity: &AuthIdentity,
-        action: &str,
-        resource_arn: &str,
-        context: &RequestContext,
-    ) -> Result<AuthzDecision, DynamoDbError>;
-
-    /// Provider name for logging and configuration.
-    fn name(&self) -> &'static str;
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<AuthIdentity, DynamoDbError>;
 }
 ```
 
@@ -234,35 +170,31 @@ pub trait AuthProvider: Send + Sync {
 7. Constant-time compare client signature vs expected signature
    - If mismatch: return UnrecognizedClientException
 
-8. Resolve full identity based on principal_type:
-   a. If PrincipalType::User:
-      - principal_name is the user_name
-      - Load UserIdentity via get_user(principal_name): tags, groups
-      - Return AuthIdentity with ResolvedPrincipal::User
-   b. If PrincipalType::Session:
-      - principal_name is the session_token
-      - Load RoleSession via get_session(principal_name)
-      - Check session expiration: if expired, return ExpiredTokenException
-      - Return AuthIdentity with ResolvedPrincipal::AssumedRole
+8. Resolve identity from the stored credential:
+   a. If this is a long-lived user key:
+      - Return `AuthIdentity::User { account_id, user_name }`
+   b. If this is a temporary session key:
+      - Validate the request's session token against the stored session token
+      - Return `AuthIdentity::RoleSession { account_id, role_name, session_name, access_key_id }`
 
-   The join path for session credentials:
-   _dynamodb_credentials.principal_name = _dynamodb_sessions.session_token
-   This allows the auth flow to go from access_key_id → credential →
-   session_token → full RoleSession in two lookups.
+   Session expiration is enforced by the credential lookup path. Expired
+   sessions are not returned as usable credentials.
 ```
 
 ### 5.2 Authorization Flow
 
 ```
-1. Collect applicable policies for the principal:
-   a. If ResolvedPrincipal::User:
+1. Fetch request authorization metadata from `AuthorizationStore`:
+   a. If `AuthIdentity::User`:
       - User's directly attached policies
       - Policies from all groups the user belongs to
       - User's permissions boundary (if set)
-   b. If ResolvedPrincipal::AssumedRole:
+      - User tags and resource tags
+   b. If `AuthIdentity::RoleSession`:
       - Role's attached policies
       - Session policy (if passed during AssumeRole)
       - Role's permissions boundary (if set)
+      - Role tags, session tags, and resource tags
 
 2. Build effective policy set:
    - Identity policies = union of all collected policies
@@ -283,132 +215,38 @@ pub trait AuthProvider: Send + Sync {
 
 ### 5.3 Credential Store
 
+The auth crate owns SigV4 verification and credential authentication. It does
+not own policy, permissions-boundary, session-policy, or tag lookup. After
+authentication succeeds, the server authorization path asks
+`AuthorizationStore` for aggregate request metadata and passes parsed policy
+documents into the IAM evaluator.
+
 ```rust
-/// Abstraction for credential and identity storage.
+/// Authentication-only credential lookup.
 #[async_trait::async_trait]
 pub trait CredentialStore: Send + Sync {
-    /// Look up a credential by access key ID.
-    async fn get_credential(&self, access_key_id: &str) -> Result<Option<StoredCredential>, DynamoDbError>;
-
-    /// Resolve a user's full identity: tags, group memberships.
-    async fn get_user(&self, user_name: &str) -> Result<Option<UserRecord>, DynamoDbError>;
-
-    /// Resolve a role's definition: tags, trust policy, permissions boundary.
-    async fn get_role(&self, role_name: &str) -> Result<Option<RoleRecord>, DynamoDbError>;
-
-    /// Get all policies for a principal (user or role) including group policies.
-    async fn get_effective_policies(&self, principal: &ResolvedPrincipal) -> Result<Vec<PolicyDocument>, DynamoDbError>;
-
-    /// Get the permissions boundary for a principal (if set).
-    async fn get_permissions_boundary(&self, principal_arn: &str) -> Result<Option<PolicyDocument>, DynamoDbError>;
-
-    /// Resolve a session credential to its RoleSession.
-    async fn get_session(&self, session_token: &str) -> Result<Option<RoleSession>, DynamoDbError>;
+    async fn lookup_credential(
+        &self,
+        access_key_id: &str,
+    ) -> Result<Option<StoredCredential>, DynamoDbError>;
 }
 
 pub struct StoredCredential {
-    pub access_key_id: String,
-    pub secret_key_encrypted: Vec<u8>,
-    pub principal_type: PrincipalType,  // User or Session
+    pub secret_key: String,
+    pub account_id: String,
+    /// User name for long-lived keys, role name for session keys.
     pub principal_name: String,
+    /// Session name for temporary session credentials.
+    pub session_name: Option<String>,
+    pub is_session: bool,
+    pub session_token: Option<String>,
     pub is_active: bool,
 }
-
-pub enum PrincipalType { User, Session }
-
-pub struct UserRecord {
-    pub user_name: String,
-    pub user_arn: String,
-    pub account_id: String,
-    pub tags: HashMap<String, String>,
-    pub groups: Vec<String>,
-    pub permissions_boundary_arn: Option<String>,
-}
-
-pub struct RoleRecord {
-    pub role_name: String,
-    pub role_arn: String,
-    pub account_id: String,
-    pub tags: HashMap<String, String>,
-    pub trust_policy: PolicyDocument,
-    pub permissions_boundary_arn: Option<String>,
-}
-
-/// Cached wrapper around any CredentialStore.
-///
-/// ### CredentialStore ↔ CredentialEngine Mapping
-///
-/// The `StorageCredentialAdapter` (in `bin`) bridges these two traits:
-///
-/// | `CredentialStore` method       | Delegates to `CredentialEngine` method(s)                          |
-/// |-------------------------------|--------------------------------------------------------------------|
-/// | `get_credential(access_key_id)` | `get_credential(access_key_id)`                                  |
-/// | `get_user(user_name)`          | `get_user(user_name)` + `get_user_groups(user_name)` (merged)    |
-/// | `get_role(role_name)`          | `get_role(role_name)`                                             |
-/// | `get_effective_policies(principal)` | For User: `get_policies_for_principal(user_arn)` + for each group in `UserIdentity.groups`: construct group ARN as `arn:aws:iam::{UserIdentity.account_id}:group/{group_name}`, then `get_policies_for_principal(group_arn)`. For AssumedRole: `get_policies_for_principal(role_arn)` |
-/// | `get_permissions_boundary(arn)` | `get_permissions_boundary(arn)`                                  |
-/// | `get_session(session_token)`   | `get_session(session_token)`                                      |
-///
-/// Write-side `CredentialEngine` methods (`create_user`, `create_role`, `create_group`,
-/// `add_user_to_group`, `store_credential`, `store_policy`, `create_session`,
-/// `delete_user`, `delete_role`, `deactivate_credential`, `cleanup_expired_sessions`)
-/// are called by the management API handlers in the `server` crate
-/// (see `POST /management/*` routes in 06-component-server.md).
-pub struct CachedCredentialStore {
-    inner: Arc<dyn CredentialStore>,
-    credential_cache: moka::future::Cache<String, StoredCredential>,
-    user_cache: moka::future::Cache<String, UserRecord>,
-    role_cache: moka::future::Cache<String, RoleRecord>,
-    /// Caches individual per-ARN policy lookups, NOT composed effective policies.
-    /// `get_effective_policies` composes results at query time by looking up
-    /// each principal ARN (user + groups) separately. This ensures
-    /// `invalidate_policies(group_arn)` correctly evicts stale group policies
-    /// without requiring group→user propagation.
-    policy_cache: moka::future::Cache<String, Vec<PolicyDocument>>,
-    session_cache: moka::future::Cache<String, RoleSession>,
-    boundary_cache: moka::future::Cache<String, Option<PolicyDocument>>,
-}
-
-impl CachedCredentialStore {
-    /// Invalidate a cached credential. Called by management API after
-    /// store_credential or deactivate_credential.
-    pub fn invalidate_credential(&self, access_key_id: &str) {
-        self.credential_cache.invalidate(access_key_id);
-    }
-
-    /// Invalidate a cached user. Called by management API after
-    /// create_user, delete_user, set_user_tags, add_user_to_group,
-    /// or remove_user_from_group.
-    pub fn invalidate_user(&self, user_name: &str) {
-        self.user_cache.invalidate(user_name);
-    }
-
-    /// Invalidate a cached role. Called by management API after
-    /// create_role, delete_role, or set_role_tags.
-    pub fn invalidate_role(&self, role_name: &str) {
-        self.role_cache.invalidate(role_name);
-    }
-
-    /// Invalidate cached policies for a principal. Called by management API
-    /// after store_policy, detach_policy, or any group membership change
-    /// (which affects effective policies for users in that group).
-    pub fn invalidate_policies(&self, principal_arn: &str) {
-        self.policy_cache.invalidate(principal_arn);
-    }
-
-    /// Invalidate a cached session. Called by management API after
-    /// revoke_session.
-    pub fn invalidate_session(&self, session_token: &str) {
-        self.session_cache.invalidate(session_token);
-    }
-
-    /// Invalidate a cached permissions boundary. Called by management API
-    /// after set_permissions_boundary.
-    pub fn invalidate_boundary(&self, principal_arn: &str) {
-        self.boundary_cache.invalidate(principal_arn);
-    }
-}
 ```
+
+The server crate implements this trait on top of the selected storage backend.
+Expired sessions fail closed at lookup time: storage returns an authentication
+error instead of returning an expired temporary credential.
 
 ## 6. IAM Policy Evaluation
 
@@ -921,94 +759,41 @@ impl ConditionContext for AssumeRoleContext {
 
 > **Historical note (P63b):** The `NoopAuthProvider` and `AuthIdentity::Anonymous`
 > variant were removed in v0.0.67. Authentication is now mandatory — the server
-> refuses to start with `auth.provider = "none"`. The code below is preserved
-> for historical reference only.
-
-```rust
-/// [REMOVED] Accepted all requests without validating credentials.
-/// For environments where authentication is not under test.
-///
-/// Returns a synthetic identity with account_id "000000000000".
-/// This value is never used in policy evaluation because authorize()
-/// returns Allow unconditionally — no policy engine runs in Mode 1.
-/// If code constructs resource ARNs using this account_id, they will
-/// contain "000000000000" which won't match real account IDs in policies,
-/// but that's irrelevant since policies are never evaluated.
-pub struct NoopAuthProvider;
-
-impl AuthProvider for NoopAuthProvider {
-    async fn authenticate(&self, _request: &AuthRequest<'_>) -> Result<AuthIdentity, DynamoDbError> {
-        Ok(AuthIdentity {
-            principal: ResolvedPrincipal::User(UserIdentity {
-                user_name: "anonymous".into(),
-                user_arn: "arn:aws:iam::000000000000:user/anonymous".into(),
-                account_id: "000000000000".into(),
-                tags: HashMap::new(),
-                groups: vec![],
-            }),
-            provider: "none",
-        })
-    }
-
-    async fn authorize(&self, _identity: &AuthIdentity, _action: &str, _resource_arn: &str, _context: &RequestContext) -> Result<AuthzDecision, DynamoDbError> {
-        Ok(AuthzDecision::Allow)
-    }
-
-    fn name(&self) -> &'static str { "none" }
-}
-```
+> refuses to start with `auth.provider = "none"`.
 
 ### 8.2 Built-in SigV4 Provider (Mode 2)
 
-The default provider for local testing with managed identities and policies. Composes the SigV4 verification flow (§5.1), credential store (§5.3), and policy evaluation engine (§6.4) into a single `AuthProvider` implementation.
+The default provider for managed local identities. It composes the SigV4
+verification flow (§5.1) with the authentication-only credential store (§5.3).
+Policy evaluation happens after authentication in the server authorization path.
 
 ```rust
-/// SigV4 authentication with local credential store and IAM policy evaluation.
+/// SigV4 authentication with local credential store.
 /// This is the default auth mode — identities and policies are managed via the
 /// extenddb management API and stored in the pluggable storage backend.
 pub struct BuiltinAuthProvider {
-    credential_store: CachedCredentialStore,
-    encryption_key: [u8; 32],
+    credential_store: C,
 }
 
 impl AuthProvider for BuiltinAuthProvider {
     async fn authenticate(
         &self,
-        request: &AuthRequest<'_>,
+        headers: &HeaderMap,
+        body: &[u8],
     ) -> Result<AuthIdentity, DynamoDbError> {
         // 1. Parse Authorization header → access_key_id, signed_headers, signature
-        // 2. credential_store.get_credential(access_key_id)
-        // 3. Decrypt secret key with self.encryption_key
-        // 4. Derive signing key and verify signature (§5.1 steps 5–7)
-        // 5. Resolve identity:
-        //    - PrincipalType::User → credential_store.get_user(principal_name)
-        //    - PrincipalType::Session → credential_store.get_session(principal_name),
-        //      check expiration
-        // 6. Return AuthIdentity with ResolvedPrincipal
+        // 2. credential_store.lookup_credential(access_key_id)
+        // 3. Validate timestamp and session token
+        // 4. Derive signing key and verify signature (§5.1 steps 5-7)
+        // 5. Return AuthIdentity
     }
-
-    async fn authorize(
-        &self,
-        identity: &AuthIdentity,
-        action: &str,
-        resource_arn: &str,
-        context: &RequestContext,
-    ) -> Result<AuthzDecision, DynamoDbError> {
-        let policies = self.credential_store
-            .get_effective_policies(&identity.principal).await?;
-        let boundary = self.credential_store
-            .get_permissions_boundary(&identity.principal_arn()).await?;
-        let session_policy = match &identity.principal {
-            ResolvedPrincipal::AssumedRole(session) => session.session_policy.as_ref(),
-            _ => None,
-        };
-
-        evaluate_policies(&policies, boundary.as_ref(), session_policy, action, resource_arn, context)
-    }
-
-    fn name(&self) -> &'static str { "builtin" }
 }
 ```
+
+The built-in provider authenticates only. Server authorization then calls
+`AuthorizationStore::fetch_user_authorization` or
+`AuthorizationStore::fetch_role_authorization`, parses the returned policy
+documents, builds `RequestContext`, and runs `evaluate_policies`.
 
 ### 8.3 AWS IAM Provider (Mode 3)
 
@@ -1040,14 +825,12 @@ Client (with extenddb wrapper)
 │     ├─ Cache identity (TTL configurable)    │
 │     └─ Return AuthIdentity                  │
 │                                             │
-│  2. authorize()                             │
-│     ├─ Check policy cache (by principal ARN)│
-│     ├─ Cache miss: call IAM to fetch        │
-│     │   policies for the principal          │
-│     ├─ Evaluate fetched policies using      │
-│     │   the same local policy engine        │
-│     ├─ Cache policies (TTL configurable)    │
-│     └─ Return AuthzDecision                 │
+│  2. server authorization                    │
+│     ├─ Fetch authorization metadata through │
+│     │   the configured storage/backend path │
+│     ├─ Build RequestContext                 │
+│     ├─ Evaluate policies locally            │
+│     └─ Allow or return AccessDenied         │
 └─────────────────────────────────────────────┘
 ```
 
@@ -1383,8 +1166,12 @@ fn validate_presigned_url(url: &str) -> Result<(), DynamoDbError> {
 }
 
 impl AuthProvider for AwsIamProvider {
-    async fn authenticate(&self, request: &AuthRequest<'_>) -> Result<AuthIdentity, DynamoDbError> {
-        let token = request.headers.get("x-extenddb-auth-token")
+    async fn authenticate(
+        &self,
+        headers: &HeaderMap,
+        _body: &[u8],
+    ) -> Result<AuthIdentity, DynamoDbError> {
+        let token = headers.get("x-extenddb-auth-token")
             .ok_or_else(|| DynamoDbError::incomplete_signature(
                 "Missing X-Extenddb-Auth-Token header (required for aws_iam auth mode)"
             ))?;
@@ -1423,36 +1210,8 @@ impl AuthProvider for AwsIamProvider {
         Ok(self.build_auth_identity(&identity))
     }
 
-    async fn authorize(
-        &self,
-        identity: &AuthIdentity,
-        action: &str,
-        resource_arn: &str,
-        context: &RequestContext,
-    ) -> Result<AuthzDecision, DynamoDbError> {
-        let principal_arn = identity.principal_arn();
-
-        let policies = if let Some(cached) = self.policy_cache.get(principal_arn).await {
-            cached
-        } else {
-            let fetched = self.fetch_policies(identity)
-                .await
-                .map_err(|_| DynamoDbError::service_unavailable("Policy retrieval failed"))?;
-            self.policy_cache.insert(principal_arn.to_owned(), fetched.clone()).await;
-            fetched
-        };
-
-        evaluate_policies(
-            &policies.identity_policies,
-            policies.permissions_boundary.as_ref(),
-            None, // session policy — not retrievable in Mode 3
-            action,
-            resource_arn,
-            context,
-        )
-    }
-
-    fn name(&self) -> &'static str { "aws_iam" }
+    // Authorization is handled by the server/storage authorization path after
+    // authentication returns an AuthIdentity.
 }
 ```
 
@@ -1467,54 +1226,46 @@ pub struct AzureAdProvider {
 
 impl AuthProvider for AzureAdProvider {
     // Extract Bearer token, validate JWT, map to local Principal
-    async fn authenticate(&self, request: &AuthRequest<'_>) -> Result<AuthIdentity, DynamoDbError> { todo!() }
-
-    // Use local policy engine keyed by mapped principal
-    async fn authorize(&self, identity: &AuthIdentity, action: &str, resource_arn: &str, context: &RequestContext) -> Result<AuthzDecision, DynamoDbError> { todo!() }
-
-    fn name(&self) -> &'static str { "azure_ad" }
+    async fn authenticate(
+        &self,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<AuthIdentity, DynamoDbError> { todo!() }
 }
 ```
 
 ## 9. Integration with Middleware
 
-The auth provider is injected into the server's middleware pipeline as an `Arc<dyn AuthProvider>`. The middleware builds the `RequestContext` before calling `authorize()`:
+The auth provider is injected into the server path as an `Arc<dyn AuthProvider>`
+for SigV4 authentication. Authorization is a separate server operation that
+uses storage `AuthorizationStore` metadata and the auth crate's policy
+evaluator:
 
 ```rust
-pub struct AuthLayer {
-    provider: Arc<dyn AuthProvider>,
-}
+let identity = auth_provider.authenticate(&headers, body).await?;
 
-impl AuthLayer {
-    pub async fn authenticate_and_authorize(
-        &self,
-        headers: &HashMap<String, String>,
-        body: &[u8],
-        operation: &str,
-        table_name: Option<&str>,
-        resource_tags: &HashMap<String, String>,
-        request_params: &RequestParams,
-    ) -> Result<AuthIdentity, DynamoDbError> {
-        let resource_arn = build_resource_arn(table_name);
-        let request = AuthRequest { headers, body, operation, resource_arn: &resource_arn };
+let authorization = load_request_authorization_metadata(
+    &storage,
+    &identity,
+    &resource_arn,
+).await?;
 
-        let identity = self.provider.authenticate(&request).await?;
-
-        let context = RequestContext::build(
-            &identity,
-            operation,
-            resource_tags,
-            request_params,
-        );
-
-        let action = format!("dynamodb:{operation}");
-        let decision = self.provider.authorize(&identity, &action, &resource_arn, &context).await?;
-
-        match decision {
-            AuthzDecision::Allow => Ok(identity),
-            AuthzDecision::Deny { reason } => Err(DynamoDbError::access_denied(reason)),
-        }
-    }
+let context = RequestContext::build(
+    authorization.principal_tags,
+    authorization.resource_tags,
+    is_scan,
+    &request_params,
+);
+let decision = evaluate_policies(
+    &authorization.identity_policies,
+    authorization.boundary.as_ref(),
+    authorization.session_policy.as_ref(),
+    &action,
+    &resource_arn,
+    &context,
+);
+if !matches!(decision, AuthzDecision::Allow) {
+    return Err(DynamoDbError::access_denied("Not authorized"));
 }
 ```
 

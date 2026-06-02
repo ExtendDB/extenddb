@@ -120,7 +120,7 @@ Full SigV4 signature verification:
 3. Reconstruct the canonical request and string-to-sign
 4. Derive the signing key: `HMAC-SHA256(HMAC-SHA256(HMAC-SHA256(HMAC-SHA256("AWS4" + secret, date), region), service), "aws4_request")`
 5. Compare computed signature with the provided signature (constant-time comparison)
-6. Return `AuthIdentity::User` or `AuthIdentity::RoleSession` with account context
+6. Return `AuthIdentity::User` or `AuthIdentity::RoleSession` with account context; role sessions include the access key so authorization fetches the exact session row
 
 ### IAM Policy Evaluation
 

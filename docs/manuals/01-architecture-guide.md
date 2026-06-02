@@ -83,7 +83,7 @@ Trait definitions for the storage layer. Thirteen storage traits partition backe
 - **SettingsStore**: Runtime settings persistence
 - **MetricsStore**: Metrics collection and retrieval
 - **RateLimitStore**: Rate limiting state
-- **AuthorizationStore**: Policy evaluation cache
+- **AuthorizationStore**: Authorization policy, boundary, session, and tag metadata
 - **Bootstrapper**: Initial database setup
 
 Traits use `BoxFuture` for object safety. Backends register at compile time via the `inventory` crate and are selected at startup by name. The `RuntimeHooks` trait allows backends to spawn backend-specific workers.

@@ -368,16 +368,25 @@ one TiKV Region.
 ### AuthorizationStore
 
 Policy lookups for authorization decisions:
-- `get_user_policies`, `get_group_policies`, `get_role_policies`,
-  `get_permissions_boundary`
+- `fetch_user_authorization`, `fetch_role_authorization`
+- split lookup methods for policies, boundaries, sessions, and tags
 
 Used by the authorization policy engine to retrieve policies for authorization
 evaluation.
-TiDB treats these as hot request-path catalog reads: user group membership is
-indexed by `(account_id, user_name, group_name)` for policy joins, and role
-session data is indexed by `(account_id, role_name, session_name, expires_at)`.
-Those indexes keep SigV4 authorization on native TiDB range/point lookups
-instead of scanning all memberships or sessions for an account.
+The aggregate methods are the hot-path contract: a backend can fetch all policy,
+permissions boundary, principal tag, session, and resource tag metadata needed
+for one request in the most natural shape for that backend. The split lookup
+methods remain available for simpler backend implementations and are used by the
+default aggregate methods.
+
+TiDB overrides the aggregate methods with one set-oriented `UNION ALL` catalog
+query per user or role authorization check. User group membership is indexed by
+`(account_id, user_name, group_name)` for policy joins. Role session metadata is
+selected by the authenticated temporary access key, while the
+`(account_id, role_name, session_name, expires_at)` index remains useful for
+session-name scoped diagnostics and cleanup. Those indexes keep SigV4
+authorization on native TiDB range/point lookups instead of scanning all
+memberships or sessions for an account.
 
 ### Bootstrapper
 

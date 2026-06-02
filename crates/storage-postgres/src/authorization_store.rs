@@ -139,20 +139,24 @@ impl AuthorizationStore for PostgresCatalogStore {
         account_id: &str,
         role_name: &str,
         session_name: &str,
+        access_key_id: &str,
     ) -> BoxFuture<'_, OpResult<Option<SessionData>>> {
         let account_id = account_id.to_owned();
         let role_name = role_name.to_owned();
         let session_name = session_name.to_owned();
+        let access_key_id = access_key_id.to_owned();
         Box::pin(async move {
             let row: Option<(Option<serde_json::Value>, Option<serde_json::Value>)> =
                 sqlx::query_as(
                     "SELECT session_policy, session_tags FROM iam_sessions \
                      WHERE account_id = $1 AND role_name = $2 AND session_name = $3 \
+                     AND access_key_id = $4 \
                      AND expires_at > now()",
                 )
                 .bind(&account_id)
                 .bind(&role_name)
                 .bind(&session_name)
+                .bind(&access_key_id)
                 .fetch_optional(self.pool())
                 .await
                 .map_err(|e| {

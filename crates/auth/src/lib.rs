@@ -39,6 +39,7 @@ pub enum AuthIdentity {
         account_id: String,
         role_name: String,
         session_name: String,
+        access_key_id: String,
     },
 }
 
@@ -195,6 +196,7 @@ impl<C: CredentialStore + 'static> AuthProvider for BuiltinAuthProvider<C> {
                 account_id: credential.account_id.clone(),
                 role_name: credential.principal_name.clone(),
                 session_name: credential.session_name.clone().unwrap_or_default(),
+                access_key_id: parsed.access_key_id.clone(),
             })
         } else {
             Ok(AuthIdentity::User {

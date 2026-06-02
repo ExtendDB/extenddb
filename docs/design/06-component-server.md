@@ -150,23 +150,15 @@ async fn handle_dynamodb_request(
         Err(e) => return error_response(DynamoDbError::serialization_error(e.to_string())),
     };
 
-    // 3. Authenticate and authorize
-    let header_map = extract_headers(&headers);
-    let identity = match state.auth.authenticate(&AuthRequest {
-        headers: &header_map,
-        body: &body,
-        operation: &operation,
-        resource_arn: &extract_resource_arn(&input, &operation),
-    }).await {
+    // 3. Authenticate
+    let identity = match state.auth.authenticate(&headers, &body).await {
         Ok(id) => id,
         Err(e) => return error_response(e),
     };
 
-    // 4. Authorize
-    let resource_tags = fetch_resource_tags(&state.storage, &input, &operation).await;
-    let request_params = extract_request_params(&input, &operation);
-    let context = RequestContext::build(&identity, &operation, &resource_tags, &request_params);
-    if let Err(e) = check_authorization(&state.auth, &identity, &operation, &input, &context).await {
+    // 4. Authorize. AuthorizationStore fetches policy, boundary, session, and
+    // tag metadata as one backend-shaped request-path lookup.
+    if let Err(e) = check_authorization(&state.storage, &identity, &operation, &input).await {
         return error_response(e);
     }
 
