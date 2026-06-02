@@ -3,6 +3,7 @@
 
 //! `query` and `scan` implementations for the `TiDB` backend.
 
+use extenddb_core::expression::PathElement;
 use extenddb_core::expression::{ExpressionMaps, KeyCondition};
 use extenddb_core::types::{
     AttributeDefinition, IndexInfo, Item, KeySchemaElement, ScalarAttributeType, TableKeyInfo,
@@ -116,6 +117,29 @@ fn native_index_scan_cursor_columns(
     let mut columns = index_columns;
     columns.extend(key_tuple_columns(base_key_schema, base_attr_defs));
     CursorColumns::same(columns)
+}
+
+fn key_condition_attribute_name(
+    path: &[PathElement],
+    maps: &ExpressionMaps,
+) -> Result<String, StorageError> {
+    match path.first() {
+        Some(PathElement::Attribute(name)) => {
+            if let Some(ref_name) = name.strip_prefix('#') {
+                maps.names.get(ref_name).cloned().ok_or_else(|| {
+                    StorageError::Validation(format!(
+                        "An expression attribute name used in the document path \
+                         is not defined; attribute name: #{ref_name}"
+                    ))
+                })
+            } else {
+                Ok(name.clone())
+            }
+        }
+        _ => Err(StorageError::Validation(
+            "Invalid key condition path".to_owned(),
+        )),
+    }
 }
 
 fn table_ref_for_read(table_id: &str, index: Option<&IndexInfo>) -> String {
@@ -233,22 +257,7 @@ impl TidbEngine {
         // Each extra SK condition is an equality on an additional RANGE attribute.
         let mut extra_sk_col_indices: Vec<(usize, ScalarAttributeType)> = Vec::new();
         for (path, _value) in &key_condition.extra_sk_conditions {
-            let attr_name = match path.first() {
-                Some(extenddb_core::expression::PathElement::Attribute(name)) => {
-                    if let Some(ref_name) = name.strip_prefix('#') {
-                        match maps.names.get(ref_name) {
-                            Some(resolved) => resolved.clone(),
-                            None => {
-                                tracing::warn!(name_ref = %ref_name, "unresolved expression attribute name in extra SK condition, skipping");
-                                continue;
-                            }
-                        }
-                    } else {
-                        name.clone()
-                    }
-                }
-                _ => continue,
-            };
+            let attr_name = key_condition_attribute_name(path, maps)?;
             // Find which RANGE key index this attribute corresponds to
             if let Some(pos) = all_sks
                 .iter()
@@ -502,8 +511,9 @@ mod tests {
     };
 
     use super::{
-        last_evaluated_key, native_index_query_cursor_columns, native_index_scan_cursor_columns,
-        push_order_by, table_ref_for_read, tidb_export_sql, tuple_comparison,
+        key_condition_attribute_name, last_evaluated_key, native_index_query_cursor_columns,
+        native_index_scan_cursor_columns, push_order_by, table_ref_for_read, tidb_export_sql,
+        tuple_comparison,
     };
     use crate::tidb_util::{tidb_as_of_epoch_clause, tidb_as_of_tso_clause};
 
@@ -524,6 +534,24 @@ mod tests {
     fn tuple_comparison_keeps_single_column_syntax_simple() {
         let cols = vec!["base_pk".to_owned()];
         assert_eq!(tuple_comparison(&cols, "<"), "base_pk < ?");
+    }
+
+    #[test]
+    fn key_condition_attribute_name_rejects_unresolved_name_reference() {
+        let maps = extenddb_core::expression::ExpressionMaps::default();
+        let err = key_condition_attribute_name(
+            &[extenddb_core::expression::PathElement::Attribute(
+                "#missing".to_owned(),
+            )],
+            &maps,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("expression attribute name used in the document path is not defined"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

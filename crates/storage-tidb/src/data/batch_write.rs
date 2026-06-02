@@ -8,7 +8,7 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{SortKeyValue, parse_sk, sk_column, sk_info};
 use extenddb_storage::{BatchWriteOp, StreamCapture};
 
-use super::index::{item_has_potential_secondary_index_key, validate_item_index_key_constraints};
+use super::index::validate_item_index_key_constraints;
 use super::{data_table_name, physical_pk_bytes, repeat_tuple_placeholders};
 use crate::TidbEngine;
 
@@ -98,15 +98,6 @@ impl TidbEngine {
         key_info: &TableKeyInfo,
         ops: &[BatchWriteOp<'_>],
     ) -> Result<(), StorageError> {
-        if !ops.iter().any(|op| match op {
-            BatchWriteOp::Put(item) => {
-                item_has_potential_secondary_index_key(item, &key_info.secondary_index_key_schemas)
-            }
-            BatchWriteOp::Delete(_) => false,
-        }) {
-            return Ok(());
-        }
-
         for op in ops {
             if let BatchWriteOp::Put(item) = op {
                 validate_item_index_key_constraints(

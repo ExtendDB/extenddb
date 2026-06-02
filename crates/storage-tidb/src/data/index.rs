@@ -40,16 +40,6 @@ struct GeneratedColumn {
     expression: String,
 }
 
-pub(crate) fn item_has_potential_secondary_index_key(
-    item: &Item,
-    secondary_index_key_schemas: &[Vec<KeySchemaElement>],
-) -> bool {
-    extenddb_core::validation::item_has_potential_secondary_index_key(
-        item,
-        secondary_index_key_schemas,
-    )
-}
-
 pub(crate) fn validate_item_secondary_index_key_constraints(
     item: &Item,
     secondary_index_key_schemas: &[Vec<KeySchemaElement>],
@@ -439,8 +429,8 @@ mod tests {
     use super::{
         NativeSecondaryIndex, add_generated_columns_ddl, add_native_indexes_ddl,
         drop_native_indexes_and_columns_ddl, generated_columns, hash_key_expression,
-        item_has_potential_secondary_index_key, native_index_hash_column,
-        native_index_key_tuple_columns, validate_item_index_key_constraints,
+        native_index_hash_column, native_index_key_tuple_columns,
+        validate_item_index_key_constraints,
     };
 
     #[test]
@@ -654,37 +644,6 @@ mod tests {
         assert!(ddl.contains(", DROP INDEX IF EXISTS `idx_idx2`"));
         assert!(ddl.contains(", DROP COLUMN IF EXISTS `edbidx_idx1_pk`"));
         assert!(ddl.contains(", DROP COLUMN IF EXISTS `edbidx_idx2_pk`"));
-    }
-
-    #[test]
-    fn secondary_index_validation_guard_uses_index_schema_metadata() {
-        let indexes = vec![vec![KeySchemaElement {
-            attribute_name: "gpk".to_owned(),
-            key_type: KeyType::Hash,
-        }]];
-
-        assert!(!item_has_potential_secondary_index_key(
-            &BTreeMap::from([("pk".to_owned(), AttributeValue::S("a".to_owned()))]),
-            &indexes,
-        ));
-        assert!(item_has_potential_secondary_index_key(
-            &BTreeMap::from([
-                ("pk".to_owned(), AttributeValue::S("a".to_owned())),
-                ("gpk".to_owned(), AttributeValue::N("1".to_owned())),
-            ]),
-            &indexes,
-        ));
-    }
-
-    #[test]
-    fn secondary_index_validation_guard_skips_tables_without_secondary_index_schemas() {
-        assert!(!item_has_potential_secondary_index_key(
-            &BTreeMap::from([
-                ("pk".to_owned(), AttributeValue::S("a".to_owned())),
-                ("payload".to_owned(), AttributeValue::S("x".to_owned())),
-            ]),
-            &[],
-        ));
     }
 
     #[test]

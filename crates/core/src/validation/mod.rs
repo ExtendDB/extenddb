@@ -765,19 +765,6 @@ pub fn validate_key_sizes(
     Ok(())
 }
 
-/// Return true when an item contains an attribute used by a secondary-index
-/// key schema.
-#[must_use]
-pub fn item_has_potential_secondary_index_key(
-    item: &Item,
-    secondary_index_key_schemas: &[Vec<KeySchemaElement>],
-) -> bool {
-    secondary_index_key_schemas
-        .iter()
-        .flatten()
-        .any(|key| item.contains_key(&key.attribute_name))
-}
-
 /// Validate secondary-index key type and size constraints for an item.
 ///
 /// This uses the write metadata carried by `TableKeyInfo`: backends that own
@@ -1316,10 +1303,6 @@ mod tests {
         let mut item = Item::new();
         item.insert("pk".to_owned(), AttributeValue::S("base".to_owned()));
 
-        assert!(!item_has_potential_secondary_index_key(
-            &item,
-            &[vec![make_ks("gpk", KeyType::Hash)]],
-        ));
         assert!(
             validate_item_secondary_index_key_constraints(
                 &item,
