@@ -6,7 +6,10 @@
 use extenddb_storage::management_store::{OpError, OpResult};
 use sqlx::MySqlPool;
 
-use crate::data::{DYNAMODB_HASH_KEY_COLUMN_BYTES, DYNAMODB_HASH_KEY_COLUMN_TYPE};
+use crate::data::{
+    DYNAMODB_HASH_KEY_COLUMN_BYTES, DYNAMODB_HASH_KEY_COLUMN_TYPE,
+    USER_TABLE_FULL_KEYSPACE_SPLITS_MIGRATION, user_data_table_region_split_sqls,
+};
 
 /// Embedded catalog migration files, applied in order.
 pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
@@ -183,6 +186,7 @@ pub(crate) async fn run_data_migrations(pool: &MySqlPool) -> OpResult<()> {
     ensure_idempotency_token_claims(pool).await?;
     ensure_data_table_binary_defaults(pool).await?;
     validate_dynamodb_hash_key_column_layout(pool).await?;
+    repair_user_data_table_region_splits(pool).await?;
     drop_native_ttl_lookup_indexes(pool).await?;
     ensure_data_table_ttl(pool).await?;
     Ok(())
@@ -374,6 +378,22 @@ fn incompatible_dynamodb_hash_key_column_error(
     ))
 }
 
+async fn repair_user_data_table_region_splits(pool: &MySqlPool) -> OpResult<()> {
+    if is_data_migration_applied(pool, USER_TABLE_FULL_KEYSPACE_SPLITS_MIGRATION).await? {
+        return Ok(());
+    }
+
+    for split_sql in user_data_table_region_split_sqls(pool).await? {
+        sqlx::query(&split_sql)
+            .execute(pool)
+            .await
+            .map_err(|e| OpError::Internal(format!("Split TiDB user data table Regions: {e}")))?;
+    }
+
+    record_data_migration(pool, USER_TABLE_FULL_KEYSPACE_SPLITS_MIGRATION).await?;
+    Ok(())
+}
+
 async fn drop_native_ttl_lookup_indexes(pool: &MySqlPool) -> OpResult<()> {
     for (table, statement) in DATA_NATIVE_TTL_LOOKUP_INDEX_DROPS {
         if !table_exists(pool, table).await? {
@@ -488,7 +508,7 @@ mod tests {
         dynamodb_hash_key_column_needs_rebuild, incompatible_dynamodb_hash_key_column_error,
         should_apply_consolidated_catalog_schema,
     };
-    use crate::CATALOG_VERSION;
+    use crate::{CATALOG_VERSION, data::USER_TABLE_FULL_KEYSPACE_SPLITS_MIGRATION};
 
     #[test]
     fn catalog_migration_pins_binary_collation_defaults() {
@@ -709,6 +729,19 @@ mod tests {
         );
         assert!(sql.contains("SPLIT TABLE idempotency_tokens"));
         assert!(sql.contains("REGIONS 16"));
+    }
+
+    #[test]
+    fn user_table_split_repair_is_a_dynamic_data_migration() {
+        assert_eq!(
+            USER_TABLE_FULL_KEYSPACE_SPLITS_MIGRATION,
+            "003_full_user_table_split_bounds.sql"
+        );
+        assert!(
+            DATA_MIGRATIONS
+                .iter()
+                .all(|(filename, _)| *filename != USER_TABLE_FULL_KEYSPACE_SPLITS_MIGRATION)
+        );
     }
 
     #[test]

@@ -16,9 +16,10 @@ use super::index::{
     native_index_name,
 };
 use super::{
+    DATA_TABLE_SPLIT_REGIONS, DECIMAL_SPLIT_LOWER, DECIMAL_SPLIT_UPPER,
     DYNAMODB_HASH_KEY_COLUMN_BYTES, DYNAMODB_HASH_KEY_COLUMN_TYPE, DYNAMODB_SORT_KEY_COLUMN_BYTES,
-    DYNAMODB_SORT_KEY_COLUMN_TYPE, all_sort_key_info, data_table_name,
-    validate_native_key_schema_shape,
+    DYNAMODB_SORT_KEY_COLUMN_TYPE, VARBINARY_SPLIT_LOWER, all_sort_key_info, data_table_name,
+    validate_native_key_schema_shape, varbinary_split_upper,
 };
 use crate::TidbEngine;
 use crate::tidb_util::{execute_tidb_create_table_ddl, execute_tidb_idempotent_ddl};
@@ -46,13 +47,6 @@ type TableReadInfoRow = (
     Option<serde_json::Value>,
     Option<serde_json::Value>,
 );
-
-const DATA_TABLE_SPLIT_REGIONS: u16 = 16;
-const VARBINARY_SPLIT_LOWER: &str = "X''";
-const DECIMAL_SPLIT_LOWER: &str =
-    "-99999999999999999999999999999999999.999999999999999999999999999999";
-const DECIMAL_SPLIT_UPPER: &str =
-    "99999999999999999999999999999999999.999999999999999999999999999999";
 
 fn table_accepts_data_plane(status: &str) -> bool {
     matches!(status, "ACTIVE" | "UPDATING")
@@ -108,10 +102,6 @@ fn data_table_ddl(
         "CREATE TABLE {ddb_table} (\n    {}\n) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
         definitions.join(",\n    ")
     ))
-}
-
-fn varbinary_split_upper(bytes: usize) -> String {
-    format!("X'{}'", "ff".repeat(bytes))
 }
 
 fn split_bound_for_sort_key(

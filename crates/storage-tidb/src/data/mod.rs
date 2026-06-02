@@ -21,6 +21,16 @@ pub(crate) const DYNAMODB_HASH_KEY_COLUMN_BYTES: usize = 2048;
 pub(crate) const DYNAMODB_HASH_KEY_COLUMN_TYPE: &str = "VARBINARY(2048)";
 pub(crate) const DYNAMODB_SORT_KEY_COLUMN_BYTES: usize = 1024;
 pub(crate) const DYNAMODB_SORT_KEY_COLUMN_TYPE: &str = "VARBINARY(1024)";
+pub(crate) const DATA_TABLE_SPLIT_REGIONS: u16 = 16;
+pub(crate) const VARBINARY_SPLIT_LOWER: &str = "X''";
+pub(crate) const DECIMAL_SPLIT_LOWER: &str =
+    "-99999999999999999999999999999999999.999999999999999999999999999999";
+pub(crate) const DECIMAL_SPLIT_UPPER: &str =
+    "99999999999999999999999999999999999.999999999999999999999999999999";
+
+pub(crate) fn varbinary_split_upper(bytes: usize) -> String {
+    format!("X'{}'", "ff".repeat(bytes))
+}
 
 /// SQL table name for a Virtual `DynamoDB` table.
 ///
@@ -256,9 +266,14 @@ mod index;
 mod put_item;
 mod query;
 mod query_scan;
+mod region_split;
 mod transactions;
 mod tx_helpers;
 mod update_item;
+
+pub(crate) use region_split::{
+    USER_TABLE_FULL_KEYSPACE_SPLITS_MIGRATION, user_data_table_region_split_sqls,
+};
 
 pub(crate) use index::{native_index_key_tuple_columns, native_index_name};
 pub(crate) use tx_helpers::{finalize_pending_stream_records_for_shard, next_stream_sequence};
