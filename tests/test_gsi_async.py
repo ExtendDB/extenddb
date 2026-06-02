@@ -1,17 +1,14 @@
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for async GSI propagation delay (D-4, Phase 24).
+"""PostgreSQL-backed async GSI propagation delay tests (D-4, Phase 24).
 
-Verifies that GSI updates are applied asynchronously with a measurable
-delay, simulating real DynamoDB eventual consistency behavior.
+Verifies that the PostgreSQL backend can apply GSI updates asynchronously with
+a measurable delay, simulating real DynamoDB eventual consistency behavior.
 
-These tests are extenddb-specific — real DynamoDB does not expose GSI
-propagation delay as a configurable setting.
-
-Note: These tests require auth to be disabled (the default) for the
-DynamoDB data plane operations. The settings functions use the extenddb CLI
-directly and do not require HTTP auth.
+These tests are extenddb/PostgreSQL-specific. Real DynamoDB does not expose GSI
+propagation delay as a configurable setting, and TiDB uses native transactional
+secondary indexes instead of this frontend simulation.
 """
 
 from __future__ import annotations
@@ -23,11 +20,17 @@ import uuid
 
 import pytest
 
-from conftest import wait_for_active, wait_for_deleted
-# EXTENDDB_TEST_ENDPOINT is required — devtools/run-tests validates this.
-# Tests will use the default endpoint if the env var is missing.
+from conftest import extenddb_storage_backend, wait_for_active, wait_for_deleted
 
-ENDPOINT = os.environ.get("EXTENDDB_TEST_ENDPOINT", "http://localhost:8000").strip()
+STORAGE_BACKEND = extenddb_storage_backend()
+pytestmark = pytest.mark.skipif(
+    STORAGE_BACKEND != "postgres",
+    reason=(
+        "async GSI propagation settings belong to the PostgreSQL backend; "
+        f"active backend is {STORAGE_BACKEND}"
+    ),
+)
+
 EXTENDDB_CONFIG = os.environ.get("EXTENDDB_CONFIG", "extenddb.toml")
 def extenddb_settings_set(key: str, value: str) -> None:
     """Set a extenddb runtime setting via the CLI.

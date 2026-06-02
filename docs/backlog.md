@@ -40,7 +40,7 @@ Refreshed: v0.0.118 (P115)
 
 ### P115 — TTL Redesign (v0.0.118)
 - ✅ Indexed TTL sweep — partial B-tree expression index created on TTL enable, sweeper uses index-ordered scan
-- ✅ Configurable deletion target — `ttl_deletion_target_seconds` runtime setting (default 300)
+- ✅ Backend-owned TTL cleanup — PostgreSQL uses the indexed sweeper; TiDB uses native TTL instead of a frontend deletion target
 - ✅ Staleness metric — `TtlDeletionStaleness` records deletion lag (sum/count/min/max)
 - ✅ PostgreSQL file split — extracted `ttl_worker.rs` from `workers.rs` (both under 500 lines)
 - ✅ SQL injection fix — `validate_ttl_attribute_name()` at engine layer for DDL safety

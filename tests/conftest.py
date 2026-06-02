@@ -24,6 +24,50 @@ from botocore.config import Config
 
 # D4: Suppress InsecureRequestWarning for self-signed TLS certs from ``extenddb init``.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+def _storage_backend_from_config(config_path: str) -> str:
+    """Return the configured ExtendDB storage backend without requiring tomllib."""
+    section = ""
+    try:
+        with open(config_path, encoding="utf-8") as config:
+            for raw_line in config:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    section = line.removeprefix("[").removesuffix("]").strip()
+                    continue
+                if section == "storage" and line.startswith("backend"):
+                    key, separator, value = line.partition("=")
+                    if separator and key.strip() == "backend":
+                        return (
+                            value.split("#", maxsplit=1)[0]
+                            .strip()
+                            .strip("\"'")
+                            .lower()
+                        )
+    except OSError:
+        pass
+    return "postgres"
+
+
+def extenddb_storage_backend() -> str:
+    """Return the active test backend: real-dynamodb, postgres, or tidb."""
+    if not os.environ.get("EXTENDDB_TEST_ENDPOINT", "").strip():
+        return "real-dynamodb"
+
+    explicit = os.environ.get("EXTENDDB_STORAGE_BACKEND") or os.environ.get(
+        "EXTENDDB__STORAGE__BACKEND"
+    )
+    if explicit:
+        return explicit.strip().lower()
+
+    return _storage_backend_from_config(
+        os.environ.get("EXTENDDB_CONFIG", "extenddb.toml")
+    )
+
+
 @pytest.fixture(scope="session")
 def endpoint_url() -> str | None:
     """Return the endpoint URL if targeting extenddb, None for real DynamoDB."""

@@ -68,6 +68,47 @@ FILTER=""
 CONFIG_PATH=""
 PARALLEL=""
 
+config_for_target() {
+    if [[ -n "$CONFIG_PATH" ]]; then
+        echo "$CONFIG_PATH"
+    elif [[ -n "${EXTENDDB_CONFIG:-}" ]]; then
+        echo "$EXTENDDB_CONFIG"
+    else
+        echo "${TARGET}.toml"
+    fi
+}
+
+storage_backend_from_config() {
+    local config="$1"
+    local backend="${EXTENDDB_STORAGE_BACKEND:-${EXTENDDB__STORAGE__BACKEND:-}}"
+
+    if [[ -z "$backend" && -f "$config" ]]; then
+        backend=$(
+            awk '
+                /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+                /^[[:space:]]*\[/ {
+                    section = $0
+                    gsub(/^[[:space:]]*\[/, "", section)
+                    gsub(/\][[:space:]]*$/, "", section)
+                    next
+                }
+                section == "storage" && /^[[:space:]]*backend[[:space:]]*=/ {
+                    line = $0
+                    sub(/^[^=]*=[[:space:]]*/, "", line)
+                    sub(/[[:space:]]*#.*/, "", line)
+                    gsub(/"/, "", line)
+                    gsub(/[[:space:]]/, "", line)
+                    print tolower(line)
+                    exit
+                }
+            ' "$config"
+        )
+    fi
+
+    backend="$(printf '%s' "$backend" | tr '[:upper:]' '[:lower:]')"
+    echo "${backend:-postgres}"
+}
+
 usage() {
     cat <<'EOF'
 Usage: devtools/run-tests --extenddb|--real-dynamodb SUITES [OPTIONS]
@@ -205,6 +246,12 @@ if $NEEDS_INTEGRATION; then
     esac
 fi
 
+CONFIG_FOR_TARGET="$(config_for_target)"
+if [[ "$TARGET" != "real-dynamodb" ]]; then
+    export EXTENDDB_CONFIG="$CONFIG_FOR_TARGET"
+    export EXTENDDB_STORAGE_BACKEND="$(storage_backend_from_config "$CONFIG_FOR_TARGET")"
+fi
+
 # --- Echo target info (D3: always, before any tests) ---
 echo "=== Test target: $TARGET ==="
 echo "  commit:              $HASH"
@@ -214,6 +261,8 @@ if [[ "$TARGET" == "real-dynamodb" ]]; then
 else
     echo "  EXTENDDB_TEST_ENDPOINT = ${EXTENDDB_TEST_ENDPOINT:-}"
     echo "  AWS_ACCESS_KEY_ID  = ${AWS_ACCESS_KEY_ID:-(will be provisioned)}"
+    echo "  config             = $EXTENDDB_CONFIG"
+    echo "  storage backend    = $EXTENDDB_STORAGE_BACKEND"
 fi
 echo ""
 
@@ -297,17 +346,27 @@ if $NEEDS_INTEGRATION && [[ "$TARGET" != "real-dynamodb" ]]; then
     if [[ ! -x "$BINARY" ]]; then
         BINARY="target/debug/$TARGET"
     fi
-    CONFIG_FOR_SETTINGS="${CONFIG_PATH:-${TARGET}.toml}"
+    CONFIG_FOR_SETTINGS="$CONFIG_FOR_TARGET"
     if [[ -x "$BINARY" && -f "$CONFIG_FOR_SETTINGS" ]]; then
-        if "$BINARY" settings --config "$CONFIG_FOR_SETTINGS" set control_plane_delay_seconds 0.05 2>/dev/null; then
-            echo "  ✓ control_plane_delay_seconds set to 0.05"
-        fi
-        if "$BINARY" settings --config "$CONFIG_FOR_SETTINGS" set gsi_propagation_delay_ms 0 2>/dev/null; then
-            echo "  ✓ gsi_propagation_delay_ms set to 0"
-        fi
-        if "$BINARY" settings --config "$CONFIG_FOR_SETTINGS" set throttling_enabled true 2>/dev/null; then
-            echo "  ✓ throttling_enabled set to true"
-        fi
+        case "$EXTENDDB_STORAGE_BACKEND" in
+            postgres)
+                if "$BINARY" settings --config "$CONFIG_FOR_SETTINGS" set control_plane_delay_seconds 0.05 2>/dev/null; then
+                    echo "  ✓ control_plane_delay_seconds set to 0.05"
+                fi
+                if "$BINARY" settings --config "$CONFIG_FOR_SETTINGS" set gsi_propagation_delay_ms 0 2>/dev/null; then
+                    echo "  ✓ gsi_propagation_delay_ms set to 0"
+                fi
+                if "$BINARY" settings --config "$CONFIG_FOR_SETTINGS" set throttling_enabled true 2>/dev/null; then
+                    echo "  ✓ throttling_enabled set to true"
+                fi
+                ;;
+            tidb)
+                echo "  ✓ PostgreSQL runtime simulation settings skipped for TiDB native online DDL, indexes, and Resource Control"
+                ;;
+            *)
+                echo "  ⚠ runtime simulation settings skipped for unsupported storage backend: $EXTENDDB_STORAGE_BACKEND"
+                ;;
+        esac
     fi
 
     # Import/export paths
@@ -346,7 +405,7 @@ if $NEEDS_INTEGRATION && [[ "$TARGET" != "real-dynamodb" ]]; then
 
     # Export PG connection string for CLI lifecycle tests.
     # Extract from config, strip the database name to get the base URL.
-    if [[ -z "${EXTENDDB_TEST_PG_CONNECTION_STRING:-}" && -f "$CONFIG_FOR_SETTINGS" ]]; then
+    if [[ "$EXTENDDB_STORAGE_BACKEND" == "postgres" && -z "${EXTENDDB_TEST_PG_CONNECTION_STRING:-}" && -f "$CONFIG_FOR_SETTINGS" ]]; then
         FULL_CONN=$(grep 'connection_string' "$CONFIG_FOR_SETTINGS" | sed -n 's/.*connection_string[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
         if [[ -n "$FULL_CONN" ]]; then
             # Strip trailing /database_name to get base URL
@@ -505,7 +564,7 @@ if $RUN_COMPREHENSIVE; then
 fi
 
 # --- CLI lifecycle tests (run last — they start/stop their own servers) ---
-if $RUN_PYTEST && [[ "$TARGET" != "real-dynamodb" && -n "${EXTENDDB_TEST_PG_CONNECTION_STRING:-}" ]]; then
+if $RUN_PYTEST && [[ "$TARGET" != "real-dynamodb" && "$EXTENDDB_STORAGE_BACKEND" == "postgres" && -n "${EXTENDDB_TEST_PG_CONNECTION_STRING:-}" ]]; then
     CLI_OUTFILE="discussions/test-cli-${HASH}.txt"
     echo "=== CLI lifecycle tests → ${CLI_OUTFILE} ==="
     CLI_ARGS=(python3 -m pytest tests/test_cli_lifecycle.py -v)
@@ -533,7 +592,7 @@ if $RUN_CATALOG_CHECK; then
             echo "error: $TARGET binary not found. Build with: cargo build --release"
             exit 1
         fi
-        CHECK_CONFIG="${CONFIG_PATH:-${TARGET}.toml}"
+        CHECK_CONFIG="$CONFIG_FOR_TARGET"
         if [[ ! -f "$CHECK_CONFIG" ]]; then
             echo "error: config file not found: $CHECK_CONFIG"
             exit 1
