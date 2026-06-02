@@ -7,8 +7,10 @@ use extenddb_storage::management_store::{OpError, OpResult};
 use sqlx::{MySqlConnection, MySqlPool};
 
 use crate::data::{
-    DYNAMODB_HASH_KEY_COLUMN_BYTES, DYNAMODB_HASH_KEY_COLUMN_TYPE,
-    USER_TABLE_FULL_KEYSPACE_SPLITS_MIGRATION, user_data_table_region_split_sqls,
+    DATA_TABLE_METADATA_LIKE_CLAUSE, DATA_TABLE_PARTITIONS, DYNAMODB_HASH_KEY_COLUMN_BYTES,
+    DYNAMODB_HASH_KEY_COLUMN_TYPE, NATIVE_INDEX_GENERATED_PK_COLUMN_METADATA_LIKE_CLAUSE,
+    NATIVE_INDEX_METADATA_LIKE_CLAUSE, USER_TABLE_FULL_KEYSPACE_SPLITS_MIGRATION,
+    user_data_table_region_split_sqls,
 };
 use crate::table_attributes::{
     fixed_table_region_merge_option_sqls, user_data_table_region_merge_option_sqls,
@@ -229,7 +231,9 @@ pub(crate) async fn run_data_migrations(pool: &MySqlPool) -> OpResult<()> {
     validate_stream_records_auto_random_handle(pool).await?;
     validate_idempotency_token_native_layout(pool).await?;
     ensure_data_table_binary_defaults(pool).await?;
+    validate_dynamodb_data_table_partition_layout(pool).await?;
     validate_dynamodb_hash_key_column_layout(pool).await?;
+    validate_dynamodb_secondary_index_global_layout(pool).await?;
     ensure_shared_data_table_region_merge_option(pool).await?;
     ensure_user_data_table_region_merge_option(pool).await?;
     repair_user_data_table_region_splits(pool).await?;
@@ -538,19 +542,20 @@ async fn ensure_data_table_binary_defaults(pool: &MySqlPool) -> OpResult<()> {
 }
 
 async fn validate_dynamodb_hash_key_column_layout(pool: &MySqlPool) -> OpResult<()> {
-    let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+    let sql = format!(
         r"SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, GENERATION_EXPRESSION
           FROM information_schema.columns
           WHERE TABLE_SCHEMA = DATABASE()
-            AND TABLE_NAME LIKE '!_ddb!_%' ESCAPE '!'
+            AND TABLE_NAME {DATA_TABLE_METADATA_LIKE_CLAUSE}
             AND (
                 COLUMN_NAME = 'pk'
-                OR (COLUMN_NAME LIKE 'edbidx!_%!_pk' ESCAPE '!' AND EXTRA LIKE '%GENERATED%')
-            )",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| OpError::Internal(format!("Inspect TiDB data key columns: {e}")))?;
+                OR (COLUMN_NAME {NATIVE_INDEX_GENERATED_PK_COLUMN_METADATA_LIKE_CLAUSE} AND EXTRA LIKE '%GENERATED%')
+            )"
+    );
+    let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(&sql)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| OpError::Internal(format!("Inspect TiDB data key columns: {e}")))?;
 
     for (table_name, column_name, column_type, generation_expression) in rows {
         if !dynamodb_hash_key_column_needs_rebuild(&column_type) {
@@ -584,6 +589,120 @@ fn incompatible_dynamodb_hash_key_column_error(
         "TiDB data table {table_name}.{column_name} uses incompatible{generated} \
          hash-key column type {column_type}; recreate the table with raw \
          {DYNAMODB_HASH_KEY_COLUMN_TYPE} hash-key columns before using this backend version"
+    ))
+}
+
+#[derive(sqlx::FromRow)]
+struct DataTablePartitionLayout {
+    table_name: String,
+    partition_count: i64,
+    min_partition_method: Option<String>,
+    max_partition_method: Option<String>,
+}
+
+async fn validate_dynamodb_data_table_partition_layout(pool: &MySqlPool) -> OpResult<()> {
+    let sql = format!(
+        r"SELECT t.TABLE_NAME AS table_name,
+                 COUNT(p.PARTITION_NAME) AS partition_count,
+                 MIN(p.PARTITION_METHOD) AS min_partition_method,
+                 MAX(p.PARTITION_METHOD) AS max_partition_method
+          FROM information_schema.tables t
+          LEFT JOIN information_schema.partitions p
+            ON p.TABLE_SCHEMA = t.TABLE_SCHEMA
+           AND p.TABLE_NAME = t.TABLE_NAME
+           AND p.PARTITION_NAME IS NOT NULL
+          WHERE t.TABLE_SCHEMA = DATABASE()
+            AND t.TABLE_NAME {DATA_TABLE_METADATA_LIKE_CLAUSE}
+          GROUP BY t.TABLE_NAME"
+    );
+    let rows: Vec<DataTablePartitionLayout> = sqlx::query_as(&sql)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| OpError::Internal(format!("Inspect TiDB data table partition layout: {e}")))?;
+
+    for row in rows {
+        if dynamodb_data_table_partition_layout_is_native(
+            row.partition_count,
+            row.min_partition_method.as_deref(),
+            row.max_partition_method.as_deref(),
+        ) {
+            continue;
+        }
+        return Err(incompatible_dynamodb_data_table_partition_error(
+            &row.table_name,
+            row.partition_count,
+            row.min_partition_method.as_deref(),
+            row.max_partition_method.as_deref(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn dynamodb_data_table_partition_layout_is_native(
+    partition_count: i64,
+    min_partition_method: Option<&str>,
+    max_partition_method: Option<&str>,
+) -> bool {
+    partition_count == i64::from(DATA_TABLE_PARTITIONS)
+        && min_partition_method.is_some_and(|method| method.eq_ignore_ascii_case("KEY"))
+        && max_partition_method.is_some_and(|method| method.eq_ignore_ascii_case("KEY"))
+}
+
+fn incompatible_dynamodb_data_table_partition_error(
+    table_name: &str,
+    partition_count: i64,
+    min_partition_method: Option<&str>,
+    max_partition_method: Option<&str>,
+) -> OpError {
+    let min_partition_method = min_partition_method.unwrap_or("<none>");
+    let max_partition_method = max_partition_method.unwrap_or("<none>");
+    OpError::Internal(format!(
+        "TiDB data table {table_name} must use native PARTITION BY KEY(pk) \
+         PARTITIONS {DATA_TABLE_PARTITIONS}; observed partition_count={partition_count}, \
+         partition_method_range={min_partition_method}..{max_partition_method}. \
+         Recreate the table with the current ExtendDB TiDB schema before serving \
+         distributed reads or writes."
+    ))
+}
+
+async fn validate_dynamodb_secondary_index_global_layout(pool: &MySqlPool) -> OpResult<()> {
+    let sql = format!(
+        r"SELECT TABLE_NAME, KEY_NAME, MIN(IS_GLOBAL), MAX(IS_GLOBAL)
+          FROM information_schema.tidb_indexes
+          WHERE TABLE_SCHEMA = DATABASE()
+            AND TABLE_NAME {DATA_TABLE_METADATA_LIKE_CLAUSE}
+            AND KEY_NAME {NATIVE_INDEX_METADATA_LIKE_CLAUSE}
+          GROUP BY TABLE_NAME, KEY_NAME
+          HAVING MIN(IS_GLOBAL) <> 1 OR MAX(IS_GLOBAL) <> 1"
+    );
+    let rows: Vec<(String, String, i64, i64)> = sqlx::query_as(&sql)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| OpError::Internal(format!("Inspect TiDB data table global indexes: {e}")))?;
+
+    if let Some((table_name, index_name, min_is_global, max_is_global)) = rows.into_iter().next() {
+        return Err(incompatible_dynamodb_secondary_index_global_error(
+            &table_name,
+            &index_name,
+            min_is_global,
+            max_is_global,
+        ));
+    }
+
+    Ok(())
+}
+
+fn incompatible_dynamodb_secondary_index_global_error(
+    table_name: &str,
+    index_name: &str,
+    min_is_global: i64,
+    max_is_global: i64,
+) -> OpError {
+    OpError::Internal(format!(
+        "TiDB data table {table_name}.{index_name} uses a local secondary index \
+         layout (IS_GLOBAL range {min_is_global}..{max_is_global}); recreate it as \
+         a TiDB GLOBAL index before serving DynamoDB IndexName reads."
     ))
 }
 
@@ -822,7 +941,10 @@ mod tests {
         CATALOG_MIGRATIONS, CATALOG_REGION_MERGE_DENY_TABLES, DATA_MIGRATIONS,
         DATA_NATIVE_TTL_LOOKUP_INDEX_DROPS, DATA_REGION_MERGE_DENY_TABLES, DATA_SCHEMA_MIGRATION,
         MIGRATION_SESSION_INIT_STATEMENTS, TIDB_BINARY_COLLATION_TABLE_OPTION,
-        dynamodb_hash_key_column_needs_rebuild, incompatible_dynamodb_hash_key_column_error,
+        dynamodb_data_table_partition_layout_is_native, dynamodb_hash_key_column_needs_rebuild,
+        incompatible_dynamodb_data_table_partition_error,
+        incompatible_dynamodb_hash_key_column_error,
+        incompatible_dynamodb_secondary_index_global_error,
         incompatible_idempotency_token_layout_error, incompatible_stream_record_layout_error,
         should_apply_consolidated_catalog_schema,
     };
@@ -1236,6 +1358,44 @@ mod tests {
 
         assert!(error.contains("AUTO_RANDOM clustered record_id primary key"));
         assert!(error.contains("Recreate the TiDB data database"));
+    }
+
+    #[test]
+    fn data_table_partition_validation_rejects_unpartitioned_tables() {
+        assert!(dynamodb_data_table_partition_layout_is_native(
+            16,
+            Some("KEY"),
+            Some("KEY")
+        ));
+        assert!(!dynamodb_data_table_partition_layout_is_native(
+            0, None, None
+        ));
+        assert!(!dynamodb_data_table_partition_layout_is_native(
+            16,
+            Some("HASH"),
+            Some("HASH")
+        ));
+
+        let OpError::Internal(error) =
+            incompatible_dynamodb_data_table_partition_error("_ddb_tableid", 0, None, None)
+        else {
+            panic!("expected internal migration error");
+        };
+        assert!(error.contains("PARTITION BY KEY(pk)"));
+        assert!(error.contains("PARTITIONS 16"));
+        assert!(error.contains("Recreate the table"));
+    }
+
+    #[test]
+    fn data_table_secondary_index_validation_rejects_local_indexes() {
+        let OpError::Internal(error) =
+            incompatible_dynamodb_secondary_index_global_error("_ddb_tableid", "idx_idx1", 0, 0)
+        else {
+            panic!("expected internal migration error");
+        };
+        assert!(error.contains("local secondary index"));
+        assert!(error.contains("GLOBAL index"));
+        assert!(error.contains("DynamoDB IndexName reads"));
     }
 
     #[test]

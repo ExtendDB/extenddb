@@ -7,6 +7,7 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::management_store::{OpError, OpResult};
 use sqlx::MySqlPool;
 
+use crate::data::DATA_TABLE_METADATA_LIKE_CLAUSE;
 use crate::tidb_util::execute_tidb_idempotent_ddl;
 
 const REGION_MERGE_OPTION: &str = "merge_option=deny";
@@ -36,19 +37,20 @@ pub(crate) async fn fixed_table_region_merge_option_sqls(
 pub(crate) async fn user_data_table_region_merge_option_sqls(
     pool: &MySqlPool,
 ) -> OpResult<Vec<String>> {
-    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+    let sql = format!(
         r"SELECT t.TABLE_NAME, a.ATTRIBUTES
           FROM information_schema.tables t
           LEFT JOIN information_schema.attributes a
             ON a.id = CONCAT('schema/', t.TABLE_SCHEMA, '/', t.TABLE_NAME)
           WHERE t.TABLE_SCHEMA = DATABASE()
             AND t.TABLE_TYPE = 'BASE TABLE'
-            AND t.TABLE_NAME LIKE '!_ddb!_%' ESCAPE '!'
-          ORDER BY t.TABLE_NAME",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| OpError::Internal(format!("Inspect TiDB user data table attributes: {e}")))?;
+            AND t.TABLE_NAME {DATA_TABLE_METADATA_LIKE_CLAUSE}
+          ORDER BY t.TABLE_NAME"
+    );
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(&sql)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| OpError::Internal(format!("Inspect TiDB user data table attributes: {e}")))?;
 
     Ok(rows
         .into_iter()

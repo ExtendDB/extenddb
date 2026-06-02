@@ -689,12 +689,13 @@ schema has two broad categories:
   range, using TiDB Region split/scatter instead of companion index shards; the
   table-level `merge_option=deny` attribute also preserves those empty index
   Regions until writes populate them.
-  Fresh partitioned TiDB data tables declare native secondary indexes as
-  `GLOBAL`, so a DynamoDB `IndexName` read uses one global TiDB index range
-  instead of probing every physical partition. Older unpartitioned physical
-  tables keep plain native indexes during online repair because TiDB rejects
-  `GLOBAL` on non-partitioned tables. TiDB has no separate local-index physical
-  path for ExtendDB; GSI versus LSI remains DynamoDB API metadata.
+  TiDB data tables must use native `PARTITION BY KEY(pk)` and every DynamoDB
+  secondary index is declared as `GLOBAL`, so a DynamoDB `IndexName` read uses
+  one global TiDB index range instead of probing every physical partition.
+  Startup validation rejects older unpartitioned data tables or local-index
+  artifacts rather than preserving a slower physical path. TiDB has no separate
+  local-index physical path for ExtendDB; GSI versus LSI remains DynamoDB API
+  metadata.
 
 - **Table statistics**: TiDB does not cache table size or item count in the
   ExtendDB table catalog. `DescribeTable` and backup metadata read logical

@@ -108,9 +108,7 @@ fn data_table_ddl(
         indexes, attr_defs,
     )?);
     definitions.push(format!("PRIMARY KEY ({}) CLUSTERED", pk_cols.join(", ")));
-    definitions.extend(native_index_create_table_definitions(
-        indexes, attr_defs, true,
-    ));
+    definitions.extend(native_index_create_table_definitions(indexes, attr_defs));
 
     Ok(format!(
         "CREATE TABLE {ddb_table} (\n    {}\n) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin\n\

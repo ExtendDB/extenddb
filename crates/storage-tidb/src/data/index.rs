@@ -25,7 +25,7 @@ use extenddb_storage::util::sk_column_n;
 
 use super::{
     DYNAMODB_HASH_KEY_COLUMN_TYPE, DYNAMODB_SORT_KEY_COLUMN_TYPE, all_sort_key_info,
-    data_table_name, physical_data_table_name,
+    data_table_name,
 };
 use crate::tidb_util::execute_tidb_idempotent_ddl;
 
@@ -87,8 +87,6 @@ pub(crate) async fn create_native_secondary_indexes(
     }
 
     let table = data_table_name(table_id);
-    let use_global_indexes =
-        data_table_is_partitioned(pool, &physical_data_table_name(table_id)).await?;
     let columns = indexes
         .iter()
         .map(|index| generated_columns(index.index_id, index.key_schema, attr_defs))
@@ -102,27 +100,10 @@ pub(crate) async fn create_native_secondary_indexes(
     // Keep this as a second online DDL job. TiDB validates multi-change ALTER
     // statements against the starting schema, so ADD INDEX cannot safely refer
     // to generated columns added earlier in the same ALTER statement.
-    let ddl = add_native_indexes_ddl(&table, indexes, attr_defs, use_global_indexes);
+    let ddl = add_native_indexes_ddl(&table, indexes, attr_defs);
     execute_tidb_idempotent_ddl(pool, "create_native_secondary_indexes_add_indexes", &ddl).await?;
 
     Ok(())
-}
-
-async fn data_table_is_partitioned(
-    pool: &sqlx::MySqlPool,
-    physical_table_name: &str,
-) -> Result<bool, StorageError> {
-    let partition_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM information_schema.partitions \
-         WHERE table_schema = DATABASE() \
-           AND table_name = ? \
-           AND partition_name IS NOT NULL",
-    )
-    .bind(physical_table_name)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| StorageError::Internal(e.to_string()))?;
-    Ok(partition_count > 0)
 }
 
 fn add_generated_columns_ddl(table: &str, columns: &[GeneratedColumn]) -> String {
@@ -168,15 +149,13 @@ fn add_native_indexes_ddl(
     table: &str,
     indexes: &[NativeSecondaryIndex<'_>],
     attr_defs: &[AttributeDefinition],
-    use_global_indexes: bool,
 ) -> String {
     let specs = indexes
         .iter()
         .map(|index| {
             let (index_name, index_columns) = native_index_name_and_columns(index, attr_defs);
-            let global = if use_global_indexes { " GLOBAL" } else { "" };
             format!(
-                "ADD INDEX IF NOT EXISTS `{index_name}` ({}){global}",
+                "ADD INDEX IF NOT EXISTS `{index_name}` ({}) GLOBAL",
                 index_columns.join(", "),
             )
         })
@@ -188,25 +167,19 @@ fn add_native_indexes_ddl(
 pub(crate) fn native_index_create_table_definitions(
     indexes: &[NativeSecondaryIndex<'_>],
     attr_defs: &[AttributeDefinition],
-    use_global_indexes: bool,
 ) -> Vec<String> {
     indexes
         .iter()
-        .map(|index| native_index_definition(index, attr_defs, use_global_indexes))
+        .map(|index| native_index_definition(index, attr_defs))
         .collect()
 }
 
 fn native_index_definition(
     index: &NativeSecondaryIndex<'_>,
     attr_defs: &[AttributeDefinition],
-    use_global_indexes: bool,
 ) -> String {
     let (index_name, index_columns) = native_index_name_and_columns(index, attr_defs);
-    let global = if use_global_indexes { " GLOBAL" } else { "" };
-    format!(
-        "INDEX `{index_name}` ({}){global}",
-        index_columns.join(", ")
-    )
+    format!("INDEX `{index_name}` ({}) GLOBAL", index_columns.join(", "))
 }
 
 fn native_index_name_and_columns(
@@ -631,7 +604,7 @@ mod tests {
             },
         ];
 
-        let ddl = add_native_indexes_ddl("`_ddb_table`", &indexes, &attrs, true);
+        let ddl = add_native_indexes_ddl("`_ddb_table`", &indexes, &attrs);
 
         assert_eq!(ddl.matches("ALTER TABLE").count(), 1);
         assert_eq!(ddl.matches("ADD INDEX IF NOT EXISTS").count(), 2);
@@ -642,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_unpartitioned_native_indexes_are_created_without_global_option() {
+    fn native_indexes_are_always_global() {
         let index_ks = vec![KeySchemaElement {
             attribute_name: "gpk".to_owned(),
             key_type: KeyType::Hash,
@@ -656,13 +629,12 @@ mod tests {
             key_schema: &index_ks,
         }];
 
-        let ddl = add_native_indexes_ddl("`_ddb_table`", &indexes, &attrs, false);
+        let ddl = add_native_indexes_ddl("`_ddb_table`", &indexes, &attrs);
 
         assert_eq!(
             ddl,
-            "ALTER TABLE `_ddb_table` ADD INDEX IF NOT EXISTS `idx_idx1` (edbidx_idx1_pk)"
+            "ALTER TABLE `_ddb_table` ADD INDEX IF NOT EXISTS `idx_idx1` (edbidx_idx1_pk) GLOBAL"
         );
-        assert!(!ddl.contains("GLOBAL"));
     }
 
     #[test]

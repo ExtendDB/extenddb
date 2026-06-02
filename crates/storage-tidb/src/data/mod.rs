@@ -23,6 +23,12 @@ pub(crate) const DYNAMODB_SORT_KEY_COLUMN_BYTES: usize = 1024;
 pub(crate) const DYNAMODB_SORT_KEY_COLUMN_TYPE: &str = "VARBINARY(1024)";
 pub(crate) const DATA_TABLE_SPLIT_REGIONS: u16 = 16;
 pub(crate) const DATA_TABLE_PARTITIONS: u16 = 16;
+pub(crate) const DATA_TABLE_METADATA_LIKE_BIND_PATTERN: &str = "\\_ddb\\_%";
+pub(crate) const DATA_TABLE_METADATA_LIKE_BIND_CLAUSE: &str = "LIKE ? ESCAPE '\\\\'";
+pub(crate) const DATA_TABLE_METADATA_LIKE_CLAUSE: &str = "LIKE '\\\\_ddb\\\\_%' ESCAPE '\\\\'";
+pub(crate) const NATIVE_INDEX_METADATA_LIKE_CLAUSE: &str = "LIKE 'idx\\\\_%' ESCAPE '\\\\'";
+pub(crate) const NATIVE_INDEX_GENERATED_PK_COLUMN_METADATA_LIKE_CLAUSE: &str =
+    "LIKE 'edbidx\\\\_%\\\\_pk' ESCAPE '\\\\'";
 pub(crate) const VARBINARY_SPLIT_LOWER: &str = "X''";
 pub(crate) const DECIMAL_SPLIT_LOWER: &str =
     "-99999999999999999999999999999999999.999999999999999999999999999999";
@@ -303,7 +309,29 @@ mod tests {
 
     use extenddb_core::types::{AttributeValue, KeySchemaElement, KeyType};
 
-    use super::{physical_pk_bytes, validate_native_key_schema_shape};
+    use super::{
+        DATA_TABLE_METADATA_LIKE_BIND_CLAUSE, DATA_TABLE_METADATA_LIKE_BIND_PATTERN,
+        DATA_TABLE_METADATA_LIKE_CLAUSE, NATIVE_INDEX_GENERATED_PK_COLUMN_METADATA_LIKE_CLAUSE,
+        NATIVE_INDEX_METADATA_LIKE_CLAUSE, physical_pk_bytes, validate_native_key_schema_shape,
+    };
+
+    #[test]
+    fn metadata_like_clauses_escape_literal_tidb_prefixes() {
+        assert_eq!(DATA_TABLE_METADATA_LIKE_BIND_PATTERN, "\\_ddb\\_%");
+        assert_eq!(DATA_TABLE_METADATA_LIKE_BIND_CLAUSE, "LIKE ? ESCAPE '\\\\'");
+        assert_eq!(
+            DATA_TABLE_METADATA_LIKE_CLAUSE,
+            "LIKE '\\\\_ddb\\\\_%' ESCAPE '\\\\'"
+        );
+        assert_eq!(
+            NATIVE_INDEX_METADATA_LIKE_CLAUSE,
+            "LIKE 'idx\\\\_%' ESCAPE '\\\\'"
+        );
+        assert_eq!(
+            NATIVE_INDEX_GENERATED_PK_COLUMN_METADATA_LIKE_CLAUSE,
+            "LIKE 'edbidx\\\\_%\\\\_pk' ESCAPE '\\\\'"
+        );
+    }
 
     #[test]
     fn physical_pk_bytes_uses_raw_binary_hash_keys() {

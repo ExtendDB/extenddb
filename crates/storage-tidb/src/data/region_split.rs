@@ -9,7 +9,8 @@ use extenddb_storage::management_store::{OpError, OpResult};
 use sqlx::MySqlPool;
 
 use super::{
-    DATA_TABLE_SPLIT_REGIONS, DECIMAL_SPLIT_LOWER, DECIMAL_SPLIT_UPPER, VARBINARY_SPLIT_LOWER,
+    DATA_TABLE_METADATA_LIKE_CLAUSE, DATA_TABLE_SPLIT_REGIONS, DECIMAL_SPLIT_LOWER,
+    DECIMAL_SPLIT_UPPER, NATIVE_INDEX_METADATA_LIKE_CLAUSE, VARBINARY_SPLIT_LOWER,
     varbinary_split_upper,
 };
 
@@ -23,7 +24,7 @@ struct RegionSplitColumn {
 }
 
 pub(crate) async fn user_data_table_region_split_sqls(pool: &MySqlPool) -> OpResult<Vec<String>> {
-    let rows: Vec<(String, String, String, i64, String)> = sqlx::query_as(
+    let sql = format!(
         r"SELECT s.TABLE_NAME, s.INDEX_NAME, s.COLUMN_NAME, s.SEQ_IN_INDEX, c.COLUMN_TYPE
           FROM information_schema.statistics s
           JOIN information_schema.columns c
@@ -31,16 +32,17 @@ pub(crate) async fn user_data_table_region_split_sqls(pool: &MySqlPool) -> OpRes
            AND c.TABLE_NAME = s.TABLE_NAME
            AND c.COLUMN_NAME = s.COLUMN_NAME
           WHERE s.TABLE_SCHEMA = DATABASE()
-            AND s.TABLE_NAME LIKE '!_ddb!_%' ESCAPE '!'
+            AND s.TABLE_NAME {DATA_TABLE_METADATA_LIKE_CLAUSE}
             AND (
                 s.INDEX_NAME = 'PRIMARY'
-                OR s.INDEX_NAME LIKE 'idx!_%' ESCAPE '!'
+                OR s.INDEX_NAME {NATIVE_INDEX_METADATA_LIKE_CLAUSE}
             )
-          ORDER BY s.TABLE_NAME, s.INDEX_NAME, s.SEQ_IN_INDEX",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| OpError::Internal(format!("Inspect TiDB user data indexes: {e}")))?;
+          ORDER BY s.TABLE_NAME, s.INDEX_NAME, s.SEQ_IN_INDEX"
+    );
+    let rows: Vec<(String, String, String, i64, String)> = sqlx::query_as(&sql)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| OpError::Internal(format!("Inspect TiDB user data indexes: {e}")))?;
 
     let mut grouped: BTreeMap<(String, String), Vec<(i64, RegionSplitColumn)>> = BTreeMap::new();
     for (table_name, index_name, column_name, seq_in_index, column_type) in rows {

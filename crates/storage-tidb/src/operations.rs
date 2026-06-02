@@ -14,7 +14,8 @@ use extenddb_storage::operations::{
 use futures::future::BoxFuture;
 
 use crate::data::{
-    data_table_name, native_index_key_tuple_columns, native_index_name, physical_data_table_name,
+    DATA_TABLE_METADATA_LIKE_BIND_CLAUSE, DATA_TABLE_METADATA_LIKE_BIND_PATTERN, data_table_name,
+    native_index_key_tuple_columns, native_index_name, physical_data_table_name,
 };
 use crate::metadata_engine::{create_table_has_disabled_ttl, create_table_has_native_ttl};
 use crate::tidb_util::{execute_tidb_idempotent_ddl, tidb_pool_options};
@@ -177,14 +178,15 @@ async fn tidb_catalog_check(
         }
     }
 
-    let actual_tables: Vec<(String,)> = sqlx::query_as(
+    let sql = format!(
         "SELECT table_name FROM information_schema.tables \
-         WHERE table_schema = DATABASE() AND table_name LIKE ? ESCAPE '!'",
-    )
-    .bind("!_ddb!_%")
-    .fetch_all(&data_pool)
-    .await
-    .map_err(|e| StorageError::Internal(e.to_string()))?;
+         WHERE table_schema = DATABASE() AND table_name {DATA_TABLE_METADATA_LIKE_BIND_CLAUSE}",
+    );
+    let actual_tables: Vec<(String,)> = sqlx::query_as(&sql)
+        .bind(DATA_TABLE_METADATA_LIKE_BIND_PATTERN)
+        .fetch_all(&data_pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
     let actual: HashSet<String> = actual_tables.into_iter().map(|(name,)| name).collect();
 
     let mut sections = Vec::new();
@@ -368,27 +370,29 @@ async fn check_tidb_native_index_artifacts(
     .await
     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-    let actual_columns: HashSet<(String, String)> = sqlx::query_as::<_, (String, String)>(
+    let sql = format!(
         "SELECT table_name, column_name FROM information_schema.columns \
-         WHERE table_schema = DATABASE() AND table_name LIKE ? ESCAPE '!'",
-    )
-    .bind("!_ddb!_%")
-    .fetch_all(data_pool)
-    .await
-    .map_err(|e| StorageError::Internal(e.to_string()))?
-    .into_iter()
-    .collect();
+         WHERE table_schema = DATABASE() AND table_name {DATA_TABLE_METADATA_LIKE_BIND_CLAUSE}",
+    );
+    let actual_columns: HashSet<(String, String)> = sqlx::query_as::<_, (String, String)>(&sql)
+        .bind(DATA_TABLE_METADATA_LIKE_BIND_PATTERN)
+        .fetch_all(data_pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?
+        .into_iter()
+        .collect();
 
-    let actual_indexes: HashSet<(String, String)> = sqlx::query_as::<_, (String, String)>(
+    let sql = format!(
         "SELECT table_name, index_name FROM information_schema.statistics \
-         WHERE table_schema = DATABASE() AND table_name LIKE ? ESCAPE '!'",
-    )
-    .bind("!_ddb!_%")
-    .fetch_all(data_pool)
-    .await
-    .map_err(|e| StorageError::Internal(e.to_string()))?
-    .into_iter()
-    .collect();
+         WHERE table_schema = DATABASE() AND table_name {DATA_TABLE_METADATA_LIKE_BIND_CLAUSE}",
+    );
+    let actual_indexes: HashSet<(String, String)> = sqlx::query_as::<_, (String, String)>(&sql)
+        .bind(DATA_TABLE_METADATA_LIKE_BIND_PATTERN)
+        .fetch_all(data_pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?
+        .into_iter()
+        .collect();
 
     let mut issues = Vec::new();
     for (table_id, table_name, attr_defs_json, index_id, index_name, key_schema_json) in rows {
