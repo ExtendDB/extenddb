@@ -10,131 +10,89 @@ use serde::de::{self, Deserializer, MapAccess, Visitor};
 
 use crate::types::AttributeValue;
 
-/// Deserialize `ExpressionAttributeNames` with key prefix validation.
-/// Keys must start with `#` and the map must not be empty.
-pub fn deserialize_expression_names<'de, D>(
-    deserializer: D,
-) -> Result<Option<HashMap<String, String>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct NamesVisitor;
+macro_rules! prefixed_map_deserializer {
+    ($fn_name:ident, $value_type:ty, $prefix:expr, $field_name:expr, $expecting:expr) => {
+        pub fn $fn_name<'de, D>(
+            deserializer: D,
+        ) -> Result<Option<HashMap<String, $value_type>>, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            struct V;
 
-    impl<'de> Visitor<'de> for NamesVisitor {
-        type Value = Option<HashMap<String, String>>;
-
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("a map of expression attribute names")
-        }
-
-        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-
-        fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
-            let map: HashMap<String, String> = de::Deserialize::deserialize(d)?;
-            if map.is_empty() {
-                return Err(de::Error::custom(
-                    "ExpressionAttributeNames must not be empty",
-                ));
+            fn check_keys(map: &HashMap<String, $value_type>) -> Result<(), String> {
+                if map.is_empty() {
+                    return Err(concat!($field_name, " must not be empty").to_owned());
+                }
+                for key in map.keys() {
+                    if !key.starts_with($prefix) {
+                        return Err(format!(
+                            concat!(
+                                $field_name,
+                                " contains invalid key: Syntax error; key: \"{}\""
+                            ),
+                            key
+                        ));
+                    }
+                }
+                Ok(())
             }
-            for key in map.keys() {
-                if !key.starts_with('#') {
-                    return Err(de::Error::custom(format!(
-                        "ExpressionAttributeNames contains invalid key: Syntax error; key: \"{key}\""
-                    )));
+
+            impl<'de> Visitor<'de> for V {
+                type Value = Option<HashMap<String, $value_type>>;
+
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str($expecting)
+                }
+
+                fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                    Ok(None)
+                }
+
+                fn visit_some<D2: Deserializer<'de>>(
+                    self,
+                    d: D2,
+                ) -> Result<Self::Value, D2::Error> {
+                    let map: HashMap<String, $value_type> = de::Deserialize::deserialize(d)?;
+                    check_keys(&map).map_err(de::Error::custom)?;
+                    Ok(Some(map))
+                }
+
+                fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                    let m: HashMap<String, $value_type> =
+                        de::Deserialize::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                    check_keys(&m).map_err(de::Error::custom)?;
+                    Ok(Some(m))
                 }
             }
-            Ok(Some(map))
-        }
 
-        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-            let m: HashMap<String, String> =
-                de::Deserialize::deserialize(de::value::MapAccessDeserializer::new(map))?;
-            if m.is_empty() {
-                return Err(de::Error::custom(
-                    "ExpressionAttributeNames must not be empty",
-                ));
-            }
-            for key in m.keys() {
-                if !key.starts_with('#') {
-                    return Err(de::Error::custom(format!(
-                        "ExpressionAttributeNames contains invalid key: Syntax error; key: \"{key}\""
-                    )));
-                }
-            }
-            Ok(Some(m))
+            deserializer.deserialize_option(V)
         }
-    }
-
-    deserializer.deserialize_option(NamesVisitor)
+    };
 }
 
-/// Deserialize `ExpressionAttributeValues` with key prefix validation.
-/// Keys must start with `:` and the map must not be empty.
-pub fn deserialize_expression_values<'de, D>(
-    deserializer: D,
-) -> Result<Option<HashMap<String, AttributeValue>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct ValuesVisitor;
+// Deserialize `ExpressionAttributeNames` — keys must start with `#`, map must not be empty.
+prefixed_map_deserializer!(
+    deserialize_expression_names,
+    String,
+    '#',
+    "ExpressionAttributeNames",
+    "a map of expression attribute names"
+);
 
-    impl<'de> Visitor<'de> for ValuesVisitor {
-        type Value = Option<HashMap<String, AttributeValue>>;
-
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("a map of expression attribute values")
-        }
-
-        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-
-        fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
-            let map: HashMap<String, AttributeValue> = de::Deserialize::deserialize(d)?;
-            if map.is_empty() {
-                return Err(de::Error::custom(
-                    "ExpressionAttributeValues must not be empty",
-                ));
-            }
-            for key in map.keys() {
-                if !key.starts_with(':') {
-                    return Err(de::Error::custom(format!(
-                        "ExpressionAttributeValues contains invalid key: Syntax error; key: \"{key}\""
-                    )));
-                }
-            }
-            Ok(Some(map))
-        }
-
-        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-            let m: HashMap<String, AttributeValue> =
-                de::Deserialize::deserialize(de::value::MapAccessDeserializer::new(map))?;
-            if m.is_empty() {
-                return Err(de::Error::custom(
-                    "ExpressionAttributeValues must not be empty",
-                ));
-            }
-            for key in m.keys() {
-                if !key.starts_with(':') {
-                    return Err(de::Error::custom(format!(
-                        "ExpressionAttributeValues contains invalid key: Syntax error; key: \"{key}\""
-                    )));
-                }
-            }
-            Ok(Some(m))
-        }
-    }
-
-    deserializer.deserialize_option(ValuesVisitor)
-}
+// Deserialize `ExpressionAttributeValues` — keys must start with `:`, map must not be empty.
+prefixed_map_deserializer!(
+    deserialize_expression_values,
+    AttributeValue,
+    ':',
+    "ExpressionAttributeValues",
+    "a map of expression attribute values"
+);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde::Deserialize;
-    use std::collections::HashMap;
 
     #[derive(Debug, Deserialize)]
     struct TestNames {
