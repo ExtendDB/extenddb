@@ -273,10 +273,26 @@ pub(super) async fn delete_item_in_tx(
     key_info: &TableKeyInfo,
     key: &Item,
 ) -> Result<(), StorageError> {
+    delete_item_without_old_item_in_tx(tx, key_info, key)
+        .await
+        .map(|_| ())
+}
+
+/// Delete an item without materializing the old row.
+///
+/// Returns `true` only when TiDB actually removed a row, which is enough to
+/// decide whether a stream `REMOVE` record is needed for views that do not
+/// expose old images.
+pub(super) async fn delete_item_without_old_item_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    key_info: &TableKeyInfo,
+    key: &Item,
+) -> Result<bool, StorageError> {
     let ddb_table = data_table_name(&key_info.table_id);
     let pk = physical_pk_bytes(key, &key_info.key_schema)?;
 
-    if let Some((sk_name, sk_type)) = sk_info(&key_info.key_schema, &key_info.attribute_definitions)
+    let result = if let Some((sk_name, sk_type)) =
+        sk_info(&key_info.key_schema, &key_info.attribute_definitions)
     {
         let sk_value = key
             .get(sk_name)
@@ -307,16 +323,16 @@ pub(super) async fn delete_item_in_tx(
                     .await
             }
         }
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        .map_err(|e| StorageError::Internal(e.to_string()))?
     } else {
         let sql = format!("DELETE FROM {ddb_table} WHERE pk = ?");
         sqlx::query(&sql)
             .bind(pk.as_slice())
             .execute(&mut **tx)
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-    }
-    Ok(())
+            .map_err(|e| StorageError::Internal(e.to_string()))?
+    };
+    Ok(result.rows_affected() > 0)
 }
 
 /// Write a stream record within an existing transaction.

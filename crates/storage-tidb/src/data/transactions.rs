@@ -21,9 +21,10 @@ use super::index::{
 };
 use super::tx_helpers::{
     StreamSequenceAllocator, check_idempotency_token_in_tx, delete_item_in_tx,
-    fetch_item_for_update, fetch_item_in_tx, finalize_stream_records_best_effort,
-    put_item_without_old_item_in_tx, stream_capture_needs_old_item, upsert_item_in_tx,
-    write_stream_record_for_event_in_tx, write_stream_record_in_tx,
+    delete_item_without_old_item_in_tx, fetch_item_for_update, fetch_item_in_tx,
+    finalize_stream_records_best_effort, put_item_without_old_item_in_tx,
+    stream_capture_needs_old_item, upsert_item_in_tx, write_stream_record_for_event_in_tx,
+    write_stream_record_in_tx,
 };
 use crate::TidbEngine;
 use crate::tidb_util::retry_tidb_idempotent_operation;
@@ -181,14 +182,10 @@ impl TidbEngine {
                 }
                 TxnWriteOutcome::StreamFromEvent {
                     event,
+                    source_item,
                     old_item,
                     new_item,
                 } => {
-                    let source_item = new_item.as_ref().or(old_item.as_ref()).ok_or_else(|| {
-                        StorageError::Internal(
-                            "transaction stream event has no source item".to_owned(),
-                        )
-                    })?;
                     write_stream_record_for_event_in_tx(
                         &mut tx,
                         &mut sequence_allocator,
@@ -278,7 +275,7 @@ fn transact_delete_needs_existing_item(
     condition: Option<&extenddb_core::expression::Expr>,
     stream: &Option<StreamCapture>,
 ) -> bool {
-    condition.is_some() || stream.is_some()
+    condition.is_some() || stream.as_ref().is_some_and(stream_capture_needs_old_item)
 }
 
 /// Error type for individual transactional write operations.
@@ -302,6 +299,7 @@ enum TxnWriteOutcome {
     },
     StreamFromEvent {
         event: StreamEventName,
+        source_item: Item,
         old_item: Option<Item>,
         new_item: Option<Item>,
     },
@@ -362,6 +360,7 @@ async fn execute_transact_write_op(
                 return Ok(match event {
                     Some(event) => TxnWriteOutcome::StreamFromEvent {
                         event,
+                        source_item: (*item).clone(),
                         old_item: None,
                         new_item: Some((*item).clone()),
                     },
@@ -410,7 +409,23 @@ async fn execute_transact_write_op(
                 &key_info.attribute_definitions,
             )
             .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
-            let existing = if transact_delete_needs_existing_item(*condition, stream) {
+            if !transact_delete_needs_existing_item(*condition, stream) {
+                let removed = delete_item_without_old_item_in_tx(tx, key_info, key)
+                    .await
+                    .map_err(TxnOpError::Storage)?;
+                return Ok(if stream.is_some() && removed {
+                    TxnWriteOutcome::StreamFromEvent {
+                        event: StreamEventName::Remove,
+                        source_item: (*key).clone(),
+                        old_item: None,
+                        new_item: None,
+                    }
+                } else {
+                    TxnWriteOutcome::NoStream
+                });
+            }
+
+            let existing = {
                 let existing = fetch_item_for_update(tx, key_info, key)
                     .await
                     .map_err(TxnOpError::Storage)?;
@@ -423,8 +438,6 @@ async fn execute_transact_write_op(
                     existing.as_ref(),
                 )?;
                 existing
-            } else {
-                None
             };
             delete_item_in_tx(tx, key_info, key)
                 .await
@@ -629,12 +642,36 @@ mod tests {
     }
 
     #[test]
-    fn transaction_delete_still_reads_existing_item_for_any_stream() {
+    fn transaction_delete_reads_existing_item_only_for_conditions_or_old_image_streams() {
         let condition = condition();
         assert!(transact_delete_needs_existing_item(Some(&condition), &None));
-        assert!(transact_delete_needs_existing_item(
+        assert!(!transact_delete_needs_existing_item(
             None,
             &Some(stream_capture())
+        ));
+        assert!(!transact_delete_needs_existing_item(
+            None,
+            &Some(StreamCapture {
+                view_type: StreamViewType::NewImage,
+                user_identity: None,
+                region: Arc::from("us-east-1"),
+            })
+        ));
+        assert!(transact_delete_needs_existing_item(
+            None,
+            &Some(StreamCapture {
+                view_type: StreamViewType::OldImage,
+                user_identity: None,
+                region: Arc::from("us-east-1"),
+            })
+        ));
+        assert!(transact_delete_needs_existing_item(
+            None,
+            &Some(StreamCapture {
+                view_type: StreamViewType::NewAndOldImages,
+                user_identity: None,
+                region: Arc::from("us-east-1"),
+            })
         ));
     }
 }
