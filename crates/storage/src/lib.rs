@@ -71,22 +71,13 @@ pub struct IdempotencyClaim<'a> {
 }
 
 impl IdempotencyClaim<'_> {
-    /// Return the collision-free, hash-prefixed key stored in shared token tables.
+    /// Return the collision-free key stored in shared token tables.
     ///
-    /// The CRC32 prefix is a placement prefix only; uniqueness comes from the
-    /// netstring-encoded `(account_id, token)` payload. This keeps TiDB's
-    /// clustered primary key distributed without making correctness depend on
-    /// the hash.
+    /// This is a logical identity key, not a physical placement key. Backends
+    /// that need write distribution should express that in their table/index
+    /// layout instead of changing the token identity.
     pub fn storage_key(&self) -> String {
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(self.account_id.as_bytes());
-        hasher.update(&[0]);
-        hasher.update(self.token.as_bytes());
-        let hash = hasher.finalize();
-        format!(
-            "{hash:08x}:{}",
-            util::encode_netstring_composite(&[self.account_id, self.token])
-        )
+        util::encode_netstring_composite(&[self.account_id, self.token])
     }
 }
 
@@ -789,12 +780,12 @@ mod tests {
         .storage_key();
 
         assert_ne!(first, second);
-        assert!(first.ends_with("12:111111111111,10:same-token,"));
-        assert!(second.ends_with("12:222222222222,10:same-token,"));
+        assert_eq!(first, "12:111111111111,10:same-token,");
+        assert_eq!(second, "12:222222222222,10:same-token,");
     }
 
     #[test]
-    fn idempotency_claim_storage_key_uses_hash_prefix_for_distribution_only() {
+    fn idempotency_claim_storage_key_is_logical_identity_only() {
         let key = IdempotencyClaim {
             account_id: "acct",
             token: "token",
@@ -802,10 +793,7 @@ mod tests {
         }
         .storage_key();
 
-        let (prefix, encoded) = key.split_once(':').expect("hash-prefixed key");
-        assert_eq!(prefix.len(), 8);
-        assert!(prefix.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert_eq!(encoded, "4:acct,5:token,");
+        assert_eq!(key, "4:acct,5:token,");
     }
 
     #[test]

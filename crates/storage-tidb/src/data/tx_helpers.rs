@@ -615,15 +615,13 @@ pub(super) async fn check_idempotency_token_in_tx(
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-    let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT fingerprint, claim_id FROM idempotency_tokens \
-         WHERE token = ? \
-         FOR UPDATE",
-    )
-    .bind(storage_key)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|e| StorageError::Internal(e.to_string()))?;
+    let row: Option<(String, String)> = sqlx::query_as(idempotency_token_claim_select_sql())
+        .bind(storage_key)
+        .bind(storage_key)
+        .bind(storage_key)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
 
     match row {
         Some((_, stored_claim_id)) if stored_claim_id == claim_id => Ok(()),
@@ -643,6 +641,14 @@ fn idempotency_token_claim_sql() -> &'static str {
         created_at = IF(created_at <= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 600 SECOND), CURRENT_TIMESTAMP(6), created_at)"
 }
 
+fn idempotency_token_claim_select_sql() -> &'static str {
+    "SELECT fingerprint, claim_id FROM idempotency_tokens \
+     WHERE TIDB_SHARD(token_hash) = TIDB_SHARD(CRC32(?)) \
+       AND token_hash = CRC32(?) \
+       AND token = ? \
+     FOR UPDATE"
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -652,8 +658,9 @@ mod tests {
 
     use super::{
         PendingStreamRecord, STREAM_COMMIT_SEQUENCE_SQL, format_tso_sequence_number,
-        idempotency_token_claim_sql, push_stream_record_id_predicate,
-        stream_capture_needs_old_item, stream_event_from_upsert_rows_affected,
+        idempotency_token_claim_select_sql, idempotency_token_claim_sql,
+        push_stream_record_id_predicate, stream_capture_needs_old_item,
+        stream_event_from_upsert_rows_affected,
     };
 
     #[test]
@@ -683,6 +690,16 @@ mod tests {
         assert!(sql.contains("ON DUPLICATE KEY UPDATE"));
         assert!(sql.contains("claim_id"));
         assert!(!sql.contains("DELETE FROM idempotency_tokens"));
+    }
+
+    #[test]
+    fn idempotency_token_claim_read_uses_native_shard_index_point_lookup() {
+        let sql = idempotency_token_claim_select_sql();
+
+        assert!(sql.contains("TIDB_SHARD(token_hash) = TIDB_SHARD(CRC32(?))"));
+        assert!(sql.contains("token_hash = CRC32(?)"));
+        assert!(sql.contains("token = ?"));
+        assert!(sql.contains("FOR UPDATE"));
     }
 
     #[test]

@@ -1139,13 +1139,18 @@ Storage backends must not implement this as a preflight `SELECT` followed by
 `INSERT`: under multiple frontend writers, both transactions can observe a
 missing row. The unique key is the distributed race detector.
 
-The physical primary key is a backend-owned storage key derived from `(account_id, ClientRequestToken)`, not the raw
-client token. TiDB prefixes that collision-free encoded value with a stable hash placement prefix so the clustered
-primary key distributes naturally across Regions while uniqueness still comes from the encoded account/token payload.
-The TiDB data migrations split this shared clustered primary key at the exact
-hash-prefix boundaries (`10000000:`, `20000000:`, ..., `f0000000:`), matching
-the storage-key format instead of relying on a broad lexicographic string
-range.
+The logical storage key is the netstring-encoded `(account_id,
+ClientRequestToken)` tuple, not the raw client token. That key is only the
+idempotency identity. TiDB keeps physical write distribution in the table
+layout: `idempotency_tokens` uses an `AUTO_RANDOM` clustered `token_id`, a
+generated `token_hash = CRC32(token)` column, and a unique
+`(TIDB_SHARD(token_hash), token_hash, token)` token index. Fresh schemas use
+`PRE_SPLIT_REGIONS` and `merge_option=deny` for the scattered row handle, and
+startup repair rebuilds older clustered-token tables into this native shape.
+The write path claims with one `INSERT ... ON DUPLICATE KEY UPDATE`; the
+follow-up lock/read includes `TIDB_SHARD(token_hash)`, `token_hash`, and
+`token`, so TiDB serves it as a unique-index point lookup instead of scanning
+or relying on an application placement prefix.
 
 TiDB uses the token as the retry boundary for retryable write-conflict,
 deadlock, lock-timeout, and schema-change errors. When a token is present,
@@ -1157,7 +1162,7 @@ outcome could be ambiguous for non-idempotent updates.
 TiDB stores this token table in the data database, not the catalog database,
 so the token claim, item writes, and stream records share one TiDB transaction.
 TiDB does not add a `created_at` lookup index or run a foreground cleanup
-delete for token cleanup: the write path uses one primary-key
+delete for token cleanup: the write path uses one unique-key
 `INSERT ... ON DUPLICATE KEY UPDATE` claim with a per-attempt `claim_id`, and
 native TTL owns retention inside TiDB. If a same-token row has passed the
 10-minute DynamoDB idempotency window but TiDB's TTL job has not deleted it

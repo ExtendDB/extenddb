@@ -313,15 +313,16 @@ For fixed-retention data tables, such as TiDB stream records and transaction
 idempotency tokens, prefer native TTL over frontend cleanup indexes. Keep only
 indexes needed by read/write paths; TTL does not require an application-facing
 `created_at` lookup index. For same-token idempotency-window expiry, use one
-native primary-key upsert claim on a backend-owned `(account_id,
+native unique-key upsert claim on a backend-owned `(account_id,
 ClientRequestToken)` storage key that atomically recycles an expired row and a
 per-attempt `claim_id` to distinguish a newly claimed token from an in-window
 replay; do not put a cleanup delete on the transaction write path. TiDB should
-use a hash-prefixed clustered key for this shared table so token claims from
-busy accounts do not concentrate in one key range. Split that clustered key at
-the hash-prefix boundaries produced by the storage-key encoder instead of using
-an approximate string range; the split layout should follow the native key
-shape.
+keep distribution in native schema rather than in the logical token value: use
+an `AUTO_RANDOM` clustered row handle with `PRE_SPLIT_REGIONS`, generate an
+integer `token_hash = CRC32(token)`, and enforce idempotency with a unique
+`(TIDB_SHARD(token_hash), token_hash, token)` index. Claim reads should bind
+the shard expression, hash, and token so TiDB can perform a unique-index point
+lookup.
 
 For append-only TiDB catalog tables without a clustered primary key, such as
 failed-login attempts, use TiDB `SHARD_ROW_ID_BITS` to scatter implicit row IDs

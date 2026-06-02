@@ -30,9 +30,16 @@ ALTER TABLE stream_records ATTRIBUTES 'merge_option=deny';
 
 -- Idempotency token storage for TransactWriteItems.
 CREATE TABLE IF NOT EXISTS idempotency_tokens (
-    token       VARCHAR(255) PRIMARY KEY CLUSTERED,
+    token_id    BIGINT NOT NULL AUTO_RANDOM(4),
+    token       VARCHAR(255) NOT NULL,
+    token_hash  BIGINT UNSIGNED AS (CRC32(token)) STORED,
     fingerprint TEXT NOT NULL,
     claim_id    VARCHAR(36) NOT NULL,
-    created_at  TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+    created_at  TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (token_id) CLUSTERED,
+    UNIQUE KEY uk_idempotency_tokens_token ((TIDB_SHARD(token_hash)), token_hash, token)
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+  PRE_SPLIT_REGIONS = 4
   TTL = `created_at` + INTERVAL 600 SECOND TTL_JOB_INTERVAL = '10m';
+
+ALTER TABLE idempotency_tokens ATTRIBUTES 'merge_option=deny';
