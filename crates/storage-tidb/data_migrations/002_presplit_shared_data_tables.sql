@@ -47,6 +47,19 @@ SPLIT TABLE stream_records INDEX idx_stream_records_commit_sequence BY
     ('shardId-000000000014-', ''),
     ('shardId-000000000015-', '');
 
-SPLIT TABLE idempotency_tokens
-    BETWEEN ('') AND ('~')
-    REGIONS 16;
+SPLIT TABLE idempotency_tokens BY
+    ('10000000:'),
+    ('20000000:'),
+    ('30000000:'),
+    ('40000000:'),
+    ('50000000:'),
+    ('60000000:'),
+    ('70000000:'),
+    ('80000000:'),
+    ('90000000:'),
+    ('a0000000:'),
+    ('b0000000:'),
+    ('c0000000:'),
+    ('d0000000:'),
+    ('e0000000:'),
+    ('f0000000:');

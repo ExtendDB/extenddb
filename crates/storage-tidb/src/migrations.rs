@@ -788,7 +788,11 @@ mod tests {
         assert!(sql.contains("SPLIT TABLE stream_records BY"));
         assert!(sql.contains("'shardId-000000000001-'"));
         assert!(sql.contains("'shardId-000000000015-'"));
-        assert!(sql.contains("SPLIT TABLE idempotency_tokens"));
+        assert!(sql.contains("SPLIT TABLE idempotency_tokens BY"));
+        assert!(sql.contains("('10000000:')"));
+        assert!(sql.contains("('80000000:')"));
+        assert!(sql.contains("('f0000000:')"));
+        assert!(!sql.contains("BETWEEN ('') AND ('~')"));
     }
 
     #[test]
