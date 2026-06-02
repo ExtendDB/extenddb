@@ -271,9 +271,10 @@ extenddb implements DynamoDB Streams for change data capture. Stream records are
 
 Supported operations: `ListStreams`, `DescribeStream`, `GetShardIterator`, `GetRecords`.
 
-Stream records are retained for 24 hours. Backends with native TTL, such as
-TiDB, delegate retention to the database; backends without native TTL clean up
-expired records with a background worker.
+Stream records and disabled/deleted stream generation metadata are retained for
+24 hours. Backends with native TTL, such as TiDB, delegate retention to the
+database and repair fixed TTL jobs at startup; backends without native TTL clean
+up expired records with a background worker.
 
 ## Deployment Models
 

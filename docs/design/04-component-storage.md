@@ -230,11 +230,13 @@ empty pre-split Regions.
 
 TiDB uses a fixed deterministic stream shard layout, so streamed writes compute
 the shard id from the encoded partition-key tuple. The shard bucket is the
-first varying component in the TiDB shard key (`shardId-<bucket>-<table_id>`),
-so the commit-sequence secondary index can be pre-split by bucket prefix. Fresh
-TiDB schemas store stream rows under an `AUTO_RANDOM` clustered `record_id`;
-the visible shard/sequence tuple remains unique and indexed, but clustered
-writes use TiDB's native random handle instead of appending to one shard range.
+first varying component in the TiDB shard key
+(`shardId-<bucket>-<stream-label>-<table_id>`), so the commit-sequence
+secondary index can be pre-split by bucket prefix while stream disable/re-enable
+cycles remain isolated. Fresh TiDB schemas store stream rows under an
+`AUTO_RANDOM` clustered `record_id`; the visible shard/sequence tuple remains
+unique and indexed, but clustered writes use TiDB's native random handle instead
+of appending to one shard range.
 Stream rows are inserted atomically with item writes under a transaction-local
 storage sequence, then finalized to the user-visible sequence number using
 TiDB's native MVCC `commit_ts` (`TIDB_MVCC_INFO` over `TIDB_ENCODE_RECORD_KEY`)
@@ -245,11 +247,14 @@ iterator code treats sequence numbers as opaque decimal strings and computes
 TSO-plus-ordinal values are wider than native host integers.
 Stream-record retention is backend-specific rather than part of the shared
 stream trait. Postgres runs a concrete cleanup worker for its stream table.
-TiDB does not foreground-delete stream history during `DeleteTable`; table ids
-are immutable, the catalog deletion makes the stream unreachable, and native
-TTL owns retention for the shared `stream_records` table. TiDB data migrations
-pre-split the commit-sequence secondary index at the 16 shard-bucket prefixes,
-while `AUTO_RANDOM` scatters clustered stream writes.
+TiDB does not foreground-delete stream history during `DeleteTable`; immutable
+table ids and stream labels isolate generations, native TTL owns retention for
+the shared `stream_records` table, and catalog-native TTL owns disabled/deleted
+`stream_generations` metadata so Streams consumers can keep reading during the
+24-hour retention window. Startup repair re-enables those fixed TiDB TTL jobs if
+TiDB recovery tooling left them disabled. TiDB data migrations pre-split the
+commit-sequence secondary index at the 16 shard-bucket prefixes, while
+`AUTO_RANDOM` scatters clustered stream writes.
 
 **WorkerStore** (background worker operations):
 - `process_control_plane_transitions` — handles table state transitions

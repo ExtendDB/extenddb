@@ -22,11 +22,52 @@ const TTL_STATUS_ENABLING: &str = "ENABLING";
 const TTL_STATUS_ENABLED: &str = "ENABLED";
 const TTL_STATUS_DISABLING: &str = "DISABLING";
 
-struct FixedNativeTtl<'a> {
-    pool: &'a sqlx::MySqlPool,
+#[derive(Clone, Copy)]
+struct FixedNativeTtlSpec {
     table: &'static str,
     ttl_expr: &'static str,
     job_interval: &'static str,
+}
+
+const CATALOG_FIXED_NATIVE_TTL: &[FixedNativeTtlSpec] = &[
+    FixedNativeTtlSpec {
+        table: "metrics_samples",
+        ttl_expr: "`bucket` + INTERVAL 24 HOUR",
+        job_interval: "1h",
+    },
+    FixedNativeTtlSpec {
+        table: "login_attempts",
+        ttl_expr: "`attempted_at` + INTERVAL 24 HOUR",
+        job_interval: "1h",
+    },
+    FixedNativeTtlSpec {
+        table: "iam_sessions",
+        ttl_expr: "`expires_at` + INTERVAL 24 HOUR",
+        job_interval: "1h",
+    },
+    FixedNativeTtlSpec {
+        table: "stream_generations",
+        ttl_expr: "`expires_at` + INTERVAL 0 SECOND",
+        job_interval: "1h",
+    },
+];
+
+const DATA_FIXED_NATIVE_TTL: &[FixedNativeTtlSpec] = &[
+    FixedNativeTtlSpec {
+        table: "stream_records",
+        ttl_expr: "`created_at` + INTERVAL 24 HOUR",
+        job_interval: "1h",
+    },
+    FixedNativeTtlSpec {
+        table: "idempotency_tokens",
+        ttl_expr: "`created_at` + INTERVAL 600 SECOND",
+        job_interval: "10m",
+    },
+];
+
+struct FixedNativeTtl<'a> {
+    pool: &'a sqlx::MySqlPool,
+    spec: FixedNativeTtlSpec,
 }
 
 fn ttl_json_path(ttl_attribute: &str) -> String {
@@ -489,46 +530,33 @@ impl TidbEngine {
     }
 
     async fn repair_fixed_native_ttl(&self) -> Result<(), StorageError> {
-        for fixed in [
-            FixedNativeTtl {
+        let catalog = CATALOG_FIXED_NATIVE_TTL
+            .iter()
+            .copied()
+            .map(|spec| FixedNativeTtl {
                 pool: &self.pool,
-                table: "metrics_samples",
-                ttl_expr: "`bucket` + INTERVAL 24 HOUR",
-                job_interval: "1h",
-            },
-            FixedNativeTtl {
-                pool: &self.pool,
-                table: "login_attempts",
-                ttl_expr: "`attempted_at` + INTERVAL 24 HOUR",
-                job_interval: "1h",
-            },
-            FixedNativeTtl {
-                pool: &self.pool,
-                table: "iam_sessions",
-                ttl_expr: "`expires_at` + INTERVAL 24 HOUR",
-                job_interval: "1h",
-            },
-            FixedNativeTtl {
+                spec,
+            });
+        let data = DATA_FIXED_NATIVE_TTL
+            .iter()
+            .copied()
+            .map(|spec| FixedNativeTtl {
                 pool: &self.data_pool,
-                table: "stream_records",
-                ttl_expr: "`created_at` + INTERVAL 24 HOUR",
-                job_interval: "1h",
-            },
-            FixedNativeTtl {
-                pool: &self.data_pool,
-                table: "idempotency_tokens",
-                ttl_expr: "`created_at` + INTERVAL 600 SECOND",
-                job_interval: "10m",
-            },
-        ] {
-            if !native_ttl_needs_repair(fixed.pool, fixed.table).await? {
+                spec,
+            });
+
+        for fixed in catalog.chain(data) {
+            if !native_ttl_needs_repair(fixed.pool, fixed.spec.table).await? {
                 continue;
             }
 
-            let ttl =
-                fixed_native_ttl_attribute_sql(fixed.table, fixed.ttl_expr, fixed.job_interval);
+            let ttl = fixed_native_ttl_attribute_sql(
+                fixed.spec.table,
+                fixed.spec.ttl_expr,
+                fixed.spec.job_interval,
+            );
             execute_tidb_idempotent_ddl(fixed.pool, "repair_fixed_native_ttl", &ttl).await?;
-            let enable = native_ttl_enable_sql(fixed.table);
+            let enable = native_ttl_enable_sql(fixed.spec.table);
             execute_tidb_idempotent_ddl(fixed.pool, "repair_fixed_native_ttl_enable_jobs", &enable)
                 .await?;
         }
@@ -733,10 +761,10 @@ impl MetadataEngine for TidbEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_table_has_disabled_ttl, create_table_has_native_ttl, drop_columns_sql,
-        drop_indexes_sql, fixed_native_ttl_attribute_sql, native_ttl_attribute_sql,
-        native_ttl_enable_sql, table_accepts_native_schema_change, tag_delete_sql, ttl_json_path,
-        ttl_status_from_catalog,
+        CATALOG_FIXED_NATIVE_TTL, DATA_FIXED_NATIVE_TTL, create_table_has_disabled_ttl,
+        create_table_has_native_ttl, drop_columns_sql, drop_indexes_sql,
+        fixed_native_ttl_attribute_sql, native_ttl_attribute_sql, native_ttl_enable_sql,
+        table_accepts_native_schema_change, tag_delete_sql, ttl_json_path, ttl_status_from_catalog,
     };
     use extenddb_core::types::TimeToLiveStatus;
 
@@ -776,6 +804,22 @@ mod tests {
         assert_eq!(
             native_ttl_enable_sql("idempotency_tokens"),
             "ALTER TABLE idempotency_tokens TTL_ENABLE = 'ON'"
+        );
+    }
+
+    #[test]
+    fn fixed_native_ttl_repair_covers_stream_generation_retention() {
+        let spec = CATALOG_FIXED_NATIVE_TTL
+            .iter()
+            .find(|spec| spec.table == "stream_generations")
+            .expect("stream generation TTL repair spec");
+
+        assert_eq!(spec.ttl_expr, "`expires_at` + INTERVAL 0 SECOND");
+        assert_eq!(spec.job_interval, "1h");
+        assert!(
+            !DATA_FIXED_NATIVE_TTL
+                .iter()
+                .any(|spec| spec.table == "stream_generations")
         );
     }
 
