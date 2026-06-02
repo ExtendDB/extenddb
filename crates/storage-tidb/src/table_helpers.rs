@@ -9,6 +9,7 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn};
+use sqlx::Row;
 
 use crate::TidbEngine;
 use crate::data::physical_data_table_name;
@@ -49,22 +50,70 @@ pub(crate) struct IndexRow {
     pub provisioned_throughput: Option<serde_json::Value>,
 }
 
+fn current_table_storage_size_sql() -> &'static str {
+    "SELECT CAST(COALESCE(SUM(s.TABLE_SIZE), 0) AS SIGNED) * 1048576 \
+     FROM information_schema.table_storage_stats s \
+     LEFT JOIN information_schema.partitions p \
+       ON p.table_schema = s.table_schema \
+      AND p.table_name = s.table_name \
+      AND p.tidb_partition_id = s.table_id \
+     WHERE s.table_schema = DATABASE() \
+       AND s.table_name = ? \
+       AND ( \
+           p.partition_name IS NOT NULL \
+           OR NOT EXISTS ( \
+               SELECT 1 FROM information_schema.partitions pp \
+               WHERE pp.table_schema = s.table_schema \
+                 AND pp.table_name = s.table_name \
+                 AND pp.partition_name IS NOT NULL \
+           ) \
+       )"
+}
+
+fn current_table_item_count_sql() -> &'static str {
+    "SHOW STATS_META WHERE db_name = DATABASE() AND table_name = ?"
+}
+
+fn item_count_from_stats_meta_rows(rows: &[(String, i64)]) -> i64 {
+    rows.iter()
+        .find_map(|(partition_name, row_count)| (partition_name == "global").then_some(*row_count))
+        .unwrap_or_else(|| {
+            rows.iter()
+                .map(|(_, row_count)| *row_count)
+                .fold(0_i64, i64::saturating_add)
+        })
+}
+
 impl TidbEngine {
     pub(crate) async fn current_table_stats(
         &self,
         table_id: &str,
     ) -> Result<TableStats, StorageError> {
         let physical_table = physical_data_table_name(table_id);
-        let (item_count, table_size_bytes): (i64, i64) = sqlx::query_as(
-            "SELECT COALESCE(TABLE_ROWS, 0), COALESCE(DATA_LENGTH, 0) \
-             FROM information_schema.tables \
-             WHERE table_schema = DATABASE() AND table_name = ?",
-        )
-        .bind(&physical_table)
-        .fetch_optional(&self.data_pool)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?
-        .unwrap_or((0, 0));
+        let table_size_bytes = sqlx::query_scalar(current_table_storage_size_sql())
+            .bind(&physical_table)
+            .fetch_one(&self.data_pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        let stats_meta_rows = sqlx::query(current_table_item_count_sql())
+            .bind(&physical_table)
+            .fetch_all(&self.data_pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let item_count_rows = stats_meta_rows
+            .iter()
+            .map(|row| {
+                let partition_name = row
+                    .try_get::<String, _>(2)
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let row_count = row
+                    .try_get::<i64, _>(5)
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                Ok((partition_name, row_count))
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        let item_count = item_count_from_stats_meta_rows(&item_count_rows);
 
         Ok(TableStats {
             table_size_bytes,
@@ -256,5 +305,51 @@ impl TidbEngine {
             sse_description: None,
             table_class_summary: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        current_table_item_count_sql, current_table_storage_size_sql,
+        item_count_from_stats_meta_rows,
+    };
+
+    #[test]
+    fn table_description_stats_use_tidb_storage_engine_metadata() {
+        let size_sql = current_table_storage_size_sql();
+
+        assert!(size_sql.contains("information_schema.table_storage_stats"));
+        assert!(size_sql.contains("SUM(s.TABLE_SIZE)"));
+        assert!(size_sql.contains("* 1048576"));
+        assert!(size_sql.contains("information_schema.partitions"));
+        assert!(size_sql.contains("p.partition_name IS NOT NULL"));
+        assert!(!size_sql.contains("information_schema.tables"));
+        assert!(!size_sql.contains("TABLE_ROWS"));
+        assert!(!size_sql.contains("DATA_LENGTH"));
+
+        let count_sql = current_table_item_count_sql();
+        assert_eq!(
+            count_sql,
+            "SHOW STATS_META WHERE db_name = DATABASE() AND table_name = ?"
+        );
+    }
+
+    #[test]
+    fn table_description_item_count_prefers_tidb_global_stats_meta_row() {
+        let rows = [
+            ("global".to_owned(), 3),
+            ("p0".to_owned(), 2),
+            ("p1".to_owned(), 1),
+        ];
+
+        assert_eq!(item_count_from_stats_meta_rows(&rows), 3);
+    }
+
+    #[test]
+    fn table_description_item_count_sums_stats_meta_without_global_row() {
+        let rows = [("".to_owned(), 2), ("".to_owned(), 3)];
+
+        assert_eq!(item_count_from_stats_meta_rows(&rows), 5);
     }
 }

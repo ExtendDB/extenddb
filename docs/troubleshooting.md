@@ -706,9 +706,9 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 ### `Stream cleanup worker: <error>`
 
-**Cause:** The background worker that deletes stream records older than 24 hours encountered a database error. Expired records will accumulate until the worker succeeds.
+**Cause:** On backends without native stream-record TTL, the background worker that deletes stream records older than 24 hours encountered a database error. Expired records will accumulate until the worker succeeds.
 
-**Fix:** Check storage backend connectivity. The worker retries every hour automatically.
+**Fix:** Check storage backend connectivity. The worker retries every hour automatically. TiDB does not run this worker; it uses native table TTL on `stream_records`, so TiDB stream-retention failures should be investigated through TiDB TTL job state and table DDL instead.
 
 ## Management Console Errors
 

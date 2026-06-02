@@ -196,7 +196,11 @@ Bulk import writes validated rows through `batch_write_items`, then calls
 metadata as Put, Update, BatchWrite, and TransactWrite before rows reach native
 storage. TiDB implements the valid row batches as native multi-row DML followed
 by `ANALYZE TABLE`, so imported tables immediately plan Query and Scan paths
-from real table and index statistics instead of pseudo statistics.
+from real table and index statistics instead of pseudo statistics. TiDB
+`DescribeTable` and backup metadata read size and row-count estimates from
+TiDB-native metadata: `information_schema.table_storage_stats` for physical
+storage size and `SHOW STATS_META` for row count. They do not use the
+MySQL-compatible `information_schema.tables` counters.
 
 **MetadataEngine** (client-visible TTL and tags):
 - `describe_ttl`, `update_ttl`, `apply_ttl_update`
@@ -687,9 +691,10 @@ schema has two broad categories:
   path for ExtendDB; GSI versus LSI remains DynamoDB API metadata.
 
 - **Table statistics**: TiDB does not cache table size or item count in the
-  ExtendDB table catalog. `DescribeTable` and backup metadata read TiDB's
-  native `information_schema.tables` statistics when needed, keeping catalog
-  rows as control-plane metadata rather than a stale data-plane counter cache.
+  ExtendDB table catalog. `DescribeTable` and backup metadata read TiDB-native
+  storage and optimizer metadata when needed: `table_storage_stats` for size
+  and `SHOW STATS_META` for row count. Catalog rows stay control-plane metadata
+  rather than a stale data-plane counter cache.
 
 - **String-key collation**: TiDB catalog and data metadata tables are created
   with `DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`, and metrics labels use
