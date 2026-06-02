@@ -6,6 +6,7 @@
 use extenddb_core::expression::{ExpressionMaps, KeyCondition};
 use extenddb_core::types::{
     AttributeDefinition, IndexInfo, Item, KeySchemaElement, ScalarAttributeType, TableKeyInfo,
+    combined_lek_key_schema,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{sk_column, sk_column_n, sk_info};
@@ -119,6 +120,14 @@ fn table_ref_for_read(table_id: &str, index: Option<&IndexInfo>) -> String {
         }
         None => table,
     }
+}
+
+fn last_evaluated_key(
+    item: &Item,
+    base_key_schema: &[KeySchemaElement],
+    index: Option<&IndexInfo>,
+) -> Item {
+    build_key(item, &combined_lek_key_schema(base_key_schema, index))
 }
 
 impl TidbEngine {
@@ -303,7 +312,9 @@ impl TidbEngine {
             .collect::<Result<Vec<_>, _>>()?;
 
         let last_key = if has_more {
-            items.last().map(|item| build_key(item, read_key_schema))
+            items
+                .last()
+                .map(|item| last_evaluated_key(item, &key_info.key_schema, index))
         } else {
             None
         };
@@ -407,7 +418,9 @@ impl TidbEngine {
             .collect::<Result<Vec<_>, _>>()?;
 
         let last_key = if has_more {
-            items.last().map(|item| build_key(item, read_key_schema))
+            items
+                .last()
+                .map(|item| last_evaluated_key(item, &key_info.key_schema, index))
         } else {
             None
         };
@@ -419,13 +432,13 @@ impl TidbEngine {
 #[cfg(test)]
 mod tests {
     use extenddb_core::types::{
-        AttributeDefinition, IndexInfo, IndexType, KeySchemaElement, KeyType, Projection,
-        ProjectionType, ScalarAttributeType,
+        AttributeDefinition, AttributeValue, IndexInfo, IndexType, Item, KeySchemaElement, KeyType,
+        Projection, ProjectionType, ScalarAttributeType,
     };
 
     use super::{
-        native_index_query_cursor_columns, native_index_scan_cursor_columns, push_order_by,
-        table_ref_for_read, tuple_comparison,
+        last_evaluated_key, native_index_query_cursor_columns, native_index_scan_cursor_columns,
+        push_order_by, table_ref_for_read, tuple_comparison,
     };
 
     #[test]
@@ -543,6 +556,58 @@ mod tests {
             "`_ddb_tableid` FORCE INDEX (`idx_idx1`)"
         );
         assert_eq!(table_ref_for_read("tableid", None), "`_ddb_tableid`");
+    }
+
+    #[test]
+    fn native_index_last_evaluated_key_includes_base_and_index_keys() {
+        let base_key = vec![
+            KeySchemaElement {
+                attribute_name: "pk".to_owned(),
+                key_type: KeyType::Hash,
+            },
+            KeySchemaElement {
+                attribute_name: "sk".to_owned(),
+                key_type: KeyType::Range,
+            },
+        ];
+        let index = IndexInfo {
+            index_name: "by_customer".to_owned(),
+            index_id: "idx-1".to_owned(),
+            index_type: IndexType::Gsi,
+            key_schema: vec![
+                KeySchemaElement {
+                    attribute_name: "gpk".to_owned(),
+                    key_type: KeyType::Hash,
+                },
+                KeySchemaElement {
+                    attribute_name: "gsk".to_owned(),
+                    key_type: KeyType::Range,
+                },
+            ],
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
+        };
+        let item = Item::from([
+            ("pk".to_owned(), AttributeValue::S("p1".to_owned())),
+            ("sk".to_owned(), AttributeValue::S("s1".to_owned())),
+            ("gpk".to_owned(), AttributeValue::S("g1".to_owned())),
+            ("gsk".to_owned(), AttributeValue::S("r1".to_owned())),
+            (
+                "payload".to_owned(),
+                AttributeValue::S("ignored".to_owned()),
+            ),
+        ]);
+
+        let key = last_evaluated_key(&item, &base_key, Some(&index));
+
+        assert_eq!(key.len(), 4);
+        assert!(key.contains_key("pk"));
+        assert!(key.contains_key("sk"));
+        assert!(key.contains_key("gpk"));
+        assert!(key.contains_key("gsk"));
+        assert!(!key.contains_key("payload"));
     }
 
     #[test]

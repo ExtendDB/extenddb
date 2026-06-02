@@ -13,16 +13,15 @@ use extenddb_core::expression::{
     ExpressionMaps, parse_key_condition, parse_projection, tokenize_for,
 };
 use extenddb_core::types::{
-    IndexType, KeyType, QueryInput, QueryOutput, Select, TableKeyInfo, extract_key, item_size_bytes,
+    IndexType, KeyType, QueryInput, QueryOutput, Select, TableKeyInfo, combined_lek_key_schema,
+    item_size_bytes,
 };
 
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
-use crate::index_helpers::{
-    combined_lek_key_schema, index_projection_for_read, validate_gsi_projection_request,
-};
+use crate::index_helpers::{index_projection_for_read, validate_gsi_projection_request};
 use crate::legacy_filter::{desugar_filter, desugar_key_conditions};
 use crate::read_helpers::apply_post_read;
 use crate::serialize_output;
@@ -405,19 +404,10 @@ pub async fn handle_query(
     // For index queries, the LEK includes both the index key and the base table key.
     let lek_key_schema = combined_lek_key_schema(&key_info.key_schema, index_info.as_ref());
 
-    // For index queries, enrich the storage LEK with base table key attributes.
-    let enriched_storage_last_key = if storage_last_key.is_some() && index_info.is_some() {
-        raw_items
-            .last()
-            .map(|item| extract_key(item, &lek_key_schema))
-    } else {
-        storage_last_key
-    };
-
     // Apply FilterExpression, ProjectionExpression, and 1 MB limit
     let result = apply_post_read(
         &raw_items,
-        enriched_storage_last_key,
+        storage_last_key,
         &filter,
         &projection,
         &combined_maps,

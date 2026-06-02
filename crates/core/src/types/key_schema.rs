@@ -127,6 +127,32 @@ pub fn is_multipart_key_schema(key_schema: &[KeySchemaElement]) -> bool {
     hash_count > 1 || range_count > 1
 }
 
+/// Build the key schema used by Query/Scan `LastEvaluatedKey` and
+/// `ExclusiveStartKey`.
+///
+/// Base table reads use the table key schema. Secondary-index reads include
+/// both the base table key and the index key attributes, deduplicated by
+/// attribute name, matching DynamoDB's cursor format.
+pub fn combined_lek_key_schema(
+    base_key_schema: &[KeySchemaElement],
+    index_info: Option<&IndexInfo>,
+) -> Vec<KeySchemaElement> {
+    let Some(index) = index_info else {
+        return base_key_schema.to_vec();
+    };
+
+    let mut combined = base_key_schema.to_vec();
+    for key in &index.key_schema {
+        if !combined
+            .iter()
+            .any(|existing| existing.attribute_name == key.attribute_name)
+        {
+            combined.push(key.clone());
+        }
+    }
+    combined
+}
+
 /// Index type — GSI or LSI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexType {
@@ -153,6 +179,8 @@ pub struct IndexInfo {
 
 #[cfg(test)]
 mod tests {
+    use crate::types::{Projection, ProjectionType};
+
     use super::*;
 
     fn ks(name: &str, key_type: KeyType) -> KeySchemaElement {
@@ -219,6 +247,35 @@ mod tests {
             ks("sk2", KeyType::Range),
         ];
         assert!(is_multipart_key_schema(&schema));
+    }
+
+    #[test]
+    fn combined_lek_key_schema_uses_base_key_for_table_reads() {
+        let base = vec![ks("pk", KeyType::Hash), ks("sk", KeyType::Range)];
+
+        assert_eq!(combined_lek_key_schema(&base, None), base);
+    }
+
+    #[test]
+    fn combined_lek_key_schema_adds_deduplicated_index_keys() {
+        let base = vec![ks("pk", KeyType::Hash), ks("sk", KeyType::Range)];
+        let index = IndexInfo {
+            index_name: "by_gpk".to_owned(),
+            index_id: "idx1".to_owned(),
+            index_type: IndexType::Gsi,
+            key_schema: vec![ks("gpk", KeyType::Hash), ks("sk", KeyType::Range)],
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
+        };
+
+        let combined = combined_lek_key_schema(&base, Some(&index))
+            .into_iter()
+            .map(|key| key.attribute_name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(combined, vec!["pk", "sk", "gpk"]);
     }
 
     #[test]

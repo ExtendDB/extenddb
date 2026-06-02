@@ -5,30 +5,9 @@
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{ExpressionMaps, PathElement};
-use extenddb_core::types::{IndexInfo, IndexType, Item, KeySchemaElement, ProjectionType, Select};
-
-/// Build the combined key schema for `LastEvaluatedKey` extraction.
-///
-/// For index queries/scans, the LEK includes both the base table key attributes
-/// and the index key attributes (deduplicated), matching real `DynamoDB` behavior.
-pub fn combined_lek_key_schema(
-    base_key_schema: &[KeySchemaElement],
-    index_info: Option<&IndexInfo>,
-) -> Vec<KeySchemaElement> {
-    let Some(idx) = index_info else {
-        return base_key_schema.to_vec();
-    };
-    let mut combined = base_key_schema.to_vec();
-    for ks in &idx.key_schema {
-        if !combined
-            .iter()
-            .any(|k| k.attribute_name == ks.attribute_name)
-        {
-            combined.push(ks.clone());
-        }
-    }
-    combined
-}
+use extenddb_core::types::{
+    IndexInfo, IndexType, Item, KeySchemaElement, ProjectionType, Select, combined_lek_key_schema,
+};
 
 /// Filter an item to only the attributes projected into a secondary index.
 ///

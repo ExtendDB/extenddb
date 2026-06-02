@@ -344,7 +344,9 @@ pub trait DataEngine: Send + Sync {
     /// `index` routes the query to a resolved secondary index read path.
     ///
     /// Returns `(items, last_evaluated_key)`. If `last_evaluated_key` is `Some`,
-    /// there are more items to read.
+    /// there are more items to read. For secondary-index reads, the key must
+    /// include both base-table key attributes and index key attributes so it can
+    /// be passed back unchanged as `ExclusiveStartKey`.
     #[allow(clippy::too_many_arguments)]
     fn query<'a>(
         &'a self,
@@ -365,7 +367,9 @@ pub trait DataEngine: Send + Sync {
     /// `segment` and `total_segments` enable parallel scan.
     /// `index` routes the scan to a resolved secondary index read path.
     ///
-    /// Returns `(items, last_evaluated_key)`.
+    /// Returns `(items, last_evaluated_key)`. For secondary-index reads, the key
+    /// must include both base-table key attributes and index key attributes so
+    /// it can be passed back unchanged as `ExclusiveStartKey`.
     #[allow(clippy::too_many_arguments)]
     fn scan<'a>(
         &'a self,
