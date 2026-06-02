@@ -4,7 +4,7 @@
 
 ## Introduction
 
-extenddb uses a fully trait-based storage abstraction. The default backend is PostgreSQL, implemented in the `storage-postgres` crate. TiDB is available as an optional in-tree backend in `storage-tidb`. This document explains the storage architecture, lists every trait a new backend must implement, and provides guidance for adding a new storage backend.
+extenddb uses a fully trait-based storage abstraction. The default backend is TiDB, implemented in the `storage-tidb` crate. PostgreSQL remains available as an explicit alternate backend in `storage-postgres`. This document explains the storage architecture, lists every trait a new backend must implement, and provides guidance for adding a new storage backend.
 
 As of v0.0.81, the server crate has **no direct database driver dependencies**. All database access goes through traits defined in the `storage` and `auth` crates. Backend-specific code lives in backend crates such as `storage-postgres` and `storage-tidb`, with the `bin` crate acting as the wiring layer.
 
@@ -142,7 +142,7 @@ Key design decisions:
   of letting an impossible online DDL job fail later. Multi-HASH extension
   values are accepted only when their encoded tuple fits the raw 2048-byte
   hash slot. TiDB v8.5.4 or newer is required because this layout depends on
-  non-unique `GLOBAL` secondary indexes. Fresh TiDB data tables should use
+  non-unique `GLOBAL` secondary indexes. TiDB data tables must use
   `PARTITION BY KEY(pk)` so TiDB distributes the raw DynamoDB HASH-key slot
   natively, without adding an application hash prefix that would reduce the
   legal key size or complicate point lookups. If the backend pre-splits fresh
@@ -151,12 +151,12 @@ Key design decisions:
   merge empty split Regions before traffic arrives. Re-apply that attribute
   during startup repair for catalog, shared data, and user `_ddb_*` tables
   because TiDB BR and TiCDC can skip table-attribute DDL.
-- **Partitioned TiDB data tables need global native indexes.** When the base
-  table is key-partitioned, generated-column secondary indexes should be
-  declared `GLOBAL` so GSI and LSI reads use one TiDB index range instead of a
-  partition-local fan-out. Online repair of older unpartitioned TiDB tables
-  must omit `GLOBAL`, because TiDB only accepts global indexes on partitioned
-  tables.
+- **TiDB secondary indexes are global native indexes.** Every DynamoDB GSI and
+  LSI maps to generated key columns plus a TiDB `GLOBAL` secondary index on the
+  partitioned base data table, so `IndexName` reads use one global TiDB index
+  range instead of probing physical partitions. Startup validation rejects
+  older unpartitioned data tables or local-index artifacts; there is no
+  compatibility repair path that keeps a slower physical layout.
 - **Stream shard assignment** should not add a metadata read to every write
   when the backend has a fixed shard layout. The TiDB backend derives the shard
   id directly from the encoded partition-key tuple and uses TiDB's native TSO
@@ -425,7 +425,7 @@ The PostgreSQL implementation (`DbCredentialStore` in `storage-postgres/credenti
 
 ## PostgreSQL Implementation
 
-The `storage-postgres` crate provides the default implementation:
+The `storage-postgres` crate provides the PostgreSQL implementation:
 
 | Struct | Traits Implemented |
 |--------|-------------------|
@@ -542,7 +542,7 @@ Stream sequence numbers must be monotonically increasing within a shard. Your ba
 
 Account deletion must cascade to all child resources (users, groups, roles, policies, access keys, sessions) atomically. Your backend must provide equivalent cascade logic.
 
-## PostgreSQL-isms in the Default Backend
+## PostgreSQL-Specific Implementation Notes
 
 The PostgreSQL implementation makes backend-specific choices. These are implementation details inside `storage-postgres`, not leaks in the trait abstraction:
 

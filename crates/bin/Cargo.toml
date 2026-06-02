@@ -12,7 +12,7 @@ name = "extenddb"
 path = "src/main.rs"
 
 [features]
-default = ["postgres"]
+default = ["tidb"]
 postgres = ["extenddb-storage-postgres"]
 tidb = ["extenddb-storage-tidb"]
 

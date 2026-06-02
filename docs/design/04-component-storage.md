@@ -15,8 +15,8 @@ The trait-based design allows new storage backends to be added by implementing t
 factory function, with no changes needed to the `engine` or `server` crates. The factory pattern enables runtime
 backend selection based on configuration.
 
-**Current status**: PostgreSQL is the default backend. TiDB is available as an optional in-tree backend selected with
-`storage.backend = "tidb"` when compiled with the `tidb` feature.
+**Current status**: TiDB is the default backend. PostgreSQL remains available as an explicit alternate backend when
+compiled with the `postgres` feature and selected with `storage.backend = "postgres"`.
 
 ## 2. Storage Trait Hierarchy
 

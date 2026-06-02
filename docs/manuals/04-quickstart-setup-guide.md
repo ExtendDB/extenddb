@@ -8,7 +8,7 @@ This section gets you from zero to a working extenddb instance as fast as possib
 
 ### Prerequisites
 
-- PostgreSQL 14+ running locally
+- TiDB 8.5.4+ running locally or reachable over the network
 - Rust toolchain 1.85+
 - AWS CLI v2
 
@@ -72,46 +72,30 @@ If step 8 returns your item, extenddb is working correctly.
 
 ## Detailed Setup
 
-### PostgreSQL Installation
+### TiDB Installation
 
-extenddb requires PostgreSQL 14 or later. Install it for your platform:
+The default extenddb build uses TiDB. For local development, run a TiDB
+playground cluster or point extenddb at an existing TiDB 8.5.4+ deployment.
+TiDB listens on port 4000 by default.
 
-**Ubuntu/Debian:**
-
-```bash
-sudo apt-get update
-sudo apt-get install -y postgresql postgresql-client
-sudo systemctl start postgresql
-```
-
-**macOS (Homebrew):**
+One local development option is TiUP playground:
 
 ```bash
-brew install postgresql@16
-brew services start postgresql@16
+tiup playground v8.5.4 --db 1 --pd 1 --kv 3 --without-monitor
 ```
 
-**Amazon Linux 2:**
+Verify TiDB is reachable:
 
 ```bash
-sudo amazon-linux-extras install postgresql14
-sudo systemctl start postgresql
+mysql -h 127.0.0.1 -P 4000 -uroot -e "SELECT VERSION();"
 ```
 
-Verify PostgreSQL is running:
+### TiDB User Setup
 
-```bash
-psql -U postgres -c "SELECT version();"
-```
-
-### PostgreSQL User Setup
-
-`extenddb init` creates a `extenddb` PostgreSQL user automatically. If you prefer to create it manually:
-
-```bash
-sudo -u postgres createuser --createdb extenddb
-sudo -u postgres psql -c "ALTER USER extenddb WITH PASSWORD 'extenddb-local-dev';"
-```
+`extenddb init` connects as the TiDB admin user and creates the `extenddb`
+application SQL user automatically. For local TiUP playground, the default
+admin user is `root` with no password, which matches extenddb's TiDB bootstrap
+defaults.
 
 ### Building extenddb
 
@@ -130,7 +114,7 @@ Check the version:
 ```bash
 ./target/release/extenddb version
 # extenddb 0.1.0
-# catalog 0.0.3
+# catalog 0.0.26 (tidb)
 # commit abc1234
 # built 2026-04-17T12:00:00Z
 ```
@@ -148,11 +132,11 @@ Options:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--catalog-db` | `extenddb_catalog` | Catalog database name |
-| `--data-db` | `<catalog>_data` | Data database name |
-| `--storage-host` | `localhost` | PostgreSQL host |
-| `--storage-port` | `5432` | PostgreSQL port |
-| `--storage-admin-user` | `extenddb` | PostgreSQL user |
-| `--storage-admin-password` | `extenddb-local-dev` | PostgreSQL password |
+| `--data-db` | `extenddb` | Data database name |
+| `--storage-host` | `localhost` | TiDB SQL host |
+| `--storage-port` | `4000` | TiDB SQL port |
+| `--storage-admin-user` | `root` | TiDB admin user |
+| `--storage-admin-password` | unset | TiDB admin password |
 
 The command generates `extenddb.toml` with the connection details. If `extenddb.toml` already exists, `init` loads defaults from it.
 
@@ -380,10 +364,6 @@ The console provides a GUI for managing accounts, users, groups, roles, policies
 Adjust behavior without restarting:
 
 ```bash
-# Reduce PostgreSQL table transition delay for faster test cycles
-./target/release/extenddb settings --config extenddb.toml set \
-    control_plane_delay_seconds 2
-
 # Change log level
 ./target/release/extenddb settings --config extenddb.toml set log_level debug
 ```

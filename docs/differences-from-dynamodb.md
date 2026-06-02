@@ -8,7 +8,7 @@ adaptation when switching between ExtendDB and the real service.
 
 | Area | DynamoDB | ExtendDB |
 |------|----------|------|
-| Storage backend | Proprietary distributed storage | Pluggable SQL storage backend. PostgreSQL is the default; TiDB is available with the `tidb` feature. |
+| Storage backend | Proprietary distributed storage | TiDB is the default storage backend. PostgreSQL remains available when explicitly built and selected. |
 | Global Tables | CreateGlobalTable, replication | Not implemented (returns UnknownOperationException) |
 | DAX (Accelerator) | In-memory caching layer | Not applicable |
 | PartiQL | ExecuteStatement, BatchExecuteStatement | Not implemented (returns UnknownOperationException) |

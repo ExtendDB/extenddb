@@ -131,8 +131,8 @@ def get_extenddb_version() -> str:
 
 
 def get_catalog_version() -> str:
-    """Extract CATALOG_VERSION from storage-postgres lib.rs."""
-    lib_rs = ROOT / "crates" / "storage-postgres" / "src" / "lib.rs"
+    """Extract CATALOG_VERSION from the default TiDB backend."""
+    lib_rs = ROOT / "crates" / "storage-tidb" / "src" / "lib.rs"
     text = lib_rs.read_text()
     m = re.search(r"CatalogVersion::new\((\d+),\s*(\d+),\s*(\d+)\)", text)
     if m:

@@ -21,7 +21,9 @@ A DynamoDB-compatible API adapter, ExtendDB speaks the DynamoDB wire protocol â€
 - CSRF protection, security headers, session management
 - Prometheus-compatible metrics endpoint
 - Daemon mode with syslog logging
-- Pluggable storage backends â€” PostgreSQL by default, TiDB as an optional in-tree backend
+- TiDB-first storage backend with native online DDL, secondary indexes, TTL,
+  follower reads, snapshot reads, and BR backup/restore
+- Optional PostgreSQL backend for local compatibility workflows
 
 ## Quick Start
 
@@ -29,7 +31,7 @@ A DynamoDB-compatible API adapter, ExtendDB speaks the DynamoDB wire protocol â€
 # Build
 cargo build --release
 
-# Initialize (creates databases, admin credentials, TLS cert, config file)
+# Initialize against TiDB (creates databases, admin credentials, TLS cert, config file)
 ./target/release/extenddb init
 
 # Start
@@ -50,7 +52,8 @@ scripts/install-macos.sh   # macOS
 ## Prerequisites
 
 - Rust 1.85+ (`rustup update`)
-- A supported storage backend: PostgreSQL 14+ by default, or TiDB when building with the `tidb` feature
+- TiDB 8.5.4+ for the default backend
+- PostgreSQL 14+ only when explicitly building/running the PostgreSQL backend
 - Python 3.10+ (for test suites and documentation)
 
 ### Python Environment

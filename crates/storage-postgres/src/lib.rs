@@ -71,7 +71,7 @@ inventory::submit! {
         default_config: || {
             Box::new(PostgresStorageConfig::default()) as Box<dyn extenddb_storage::config::StorageConfig>
         },
-        default_priority: Some(100),
+        default_priority: Some(50),
     }
 }
 

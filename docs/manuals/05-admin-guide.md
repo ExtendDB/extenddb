@@ -71,7 +71,7 @@ These settings require a server restart to take effect.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `backend` | `postgres` | Storage backend (`postgres` or `tidb`; PostgreSQL is the default) |
+| `backend` | `tidb` | Storage backend (`tidb` or `postgres`; TiDB is the default) |
 
 #### [storage.postgres]
 
@@ -83,7 +83,7 @@ These settings require a server restart to take effect.
 
 #### [storage.tidb]
 
-Available when the binary is built with the `tidb` feature.
+Default backend for the standard binary build.
 
 | Key | Default | Description |
 |-----|---------|-------------|

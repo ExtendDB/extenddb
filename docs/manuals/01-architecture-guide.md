@@ -4,7 +4,7 @@
 
 ## Overview
 
-extenddb (ExtendDB) is a standalone DynamoDB-compatible API server written in Rust. It receives DynamoDB wire protocol requests over HTTP/HTTPS, authenticates and authorizes them via SigV4 and a local IAM policy engine, executes operation logic in a backend-agnostic engine, and delegates persistence to a pluggable storage backend. PostgreSQL is the default backend; TiDB is available as an optional backend.
+extenddb (ExtendDB) is a standalone DynamoDB-compatible API server written in Rust. It receives DynamoDB wire protocol requests over HTTP/HTTPS, authenticates and authorizes them via SigV4 and a local IAM policy engine, executes operation logic in a backend-agnostic engine, and delegates persistence to a pluggable storage backend. TiDB is the default backend; PostgreSQL remains available as an explicit alternate backend.
 
 extenddb runs as a daemon process, logging to syslog. It is designed for any environment where DynamoDB semantics are needed — local development, CI pipelines, self-hosted production, multi-cloud, or air-gapped deployments. Developers and applications point their AWS SDKs at extenddb and get identical DynamoDB behavior.
 
@@ -102,7 +102,7 @@ PostgreSQL implementation of all storage traits using `sqlx`. Features:
 
 ### storage-tidb
 
-TiDB implementation of the storage traits using the sqlx MySQL driver. It uses TiDB-compatible SQL, MySQL-style connection strings, `ON DUPLICATE KEY UPDATE` upserts, and TiDB/MySQL error classification. Fresh TiDB data tables are partitioned with `PARTITION BY KEY(pk)`, and DynamoDB secondary indexes are generated-column native `GLOBAL` indexes on those partitioned tables. TiDB pre-splits hot shared and user data key ranges with native split/scatter DDL, sets `merge_option=deny` on those tables so PD preserves empty split Regions, and repairs that table attribute at startup because TiDB BR and TiCDC can skip table-attribute DDL. TiDB write pools set the session transaction mode to pessimistic so conditional writes and `SELECT FOR UPDATE` use TiDB's distributed row-locking behavior even on clusters upgraded from older defaults. TiDB default-read pools use native `closest-adaptive` follower read for DynamoDB reads that did not request `ConsistentRead=true`; strong reads and writes use the strong data pool. It is selected with `storage.backend = "tidb"` when the binary is built with the `tidb` feature.
+TiDB implementation of the storage traits using the sqlx MySQL driver. It uses TiDB-compatible SQL, MySQL-style connection strings, `ON DUPLICATE KEY UPDATE` upserts, and TiDB/MySQL error classification. TiDB data tables are partitioned with `PARTITION BY KEY(pk)`, and DynamoDB secondary indexes are generated-column native `GLOBAL` indexes on those partitioned tables. TiDB pre-splits hot shared and user data key ranges with native split/scatter DDL, sets `merge_option=deny` on those tables so PD preserves empty split Regions, and repairs that table attribute at startup because TiDB BR and TiCDC can skip table-attribute DDL. TiDB write pools set the session transaction mode to pessimistic so conditional writes and `SELECT FOR UPDATE` use TiDB's distributed row-locking behavior even on clusters upgraded from older defaults. TiDB default-read pools use native `closest-adaptive` follower read for DynamoDB reads that did not request `ConsistentRead=true`; strong reads and writes use the strong data pool. It is the default backend for the standard binary build.
 
 TiDB backups use BR as the physical backup data plane. ExtendDB stores backup
 metadata in the catalog and delegates snapshot data to BR storage; it does not
@@ -185,7 +185,7 @@ The backend-specific catalog version is stored in the `settings` table as `catal
 
 ### Storage
 
-Storage backends implement thirteen traits (see **storage** section above). The traits use `BoxFuture` for object safety. Backends register at compile time via the `inventory` crate, and the `bin` crate selects the backend by name at startup. PostgreSQL is the default backend, and TiDB is available behind the optional `tidb` feature.
+Storage backends implement thirteen traits (see **storage** section above). The traits use `BoxFuture` for object safety. Backends register at compile time via the `inventory` crate, and the `bin` crate selects the backend by name at startup. TiDB is the default backend for standard builds; PostgreSQL is available only when the binary is explicitly built and configured for it.
 
 ### Authentication
 

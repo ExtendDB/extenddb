@@ -59,12 +59,14 @@ secondary index definition as generated key columns plus a native secondary
 index on the base data table; GSI versus LSI is API metadata, not a separate
 TiDB physical path. The native index contains the DynamoDB index key columns
 only because TiDB already carries the clustered row handle in secondary-index
-entries. On fresh partitioned TiDB tables those native secondary indexes are
-declared `GLOBAL`, so an `IndexName` read uses one global TiDB index range
-instead of probing every partition. Initial indexes are included in the
-physical TiDB `CREATE TABLE`; replay repairs an already-existing physical
-table with TiDB online `IF NOT EXISTS` DDL before activation, and later GSI
-changes use TiDB online DDL.
+entries. TiDB data tables are `PARTITION BY KEY(pk)`, and every native
+secondary index is declared `GLOBAL`, so an `IndexName` read uses one global
+TiDB index range instead of probing every partition. Startup rejects older
+unpartitioned data tables or local-index artifacts rather than preserving a
+slower compatibility path. Initial indexes are included in the physical TiDB
+`CREATE TABLE`; replay repairs an already-existing physical table with TiDB
+online `IF NOT EXISTS` DDL before activation, and later GSI changes use TiDB
+online DDL.
 
 ### Schema Conventions
 

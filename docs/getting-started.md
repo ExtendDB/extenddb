@@ -4,7 +4,9 @@
 
 This guide walks you through initializing a extenddb deployment, starting the server, and running your first DynamoDB commands against it.
 
-### Platform-specific installation guides
+### PostgreSQL Backend Installation Guides
+
+These guides are for the explicit PostgreSQL backend path:
 
 - [macOS (Homebrew)](manuals/09-install-macos.md) — covers Homebrew PostgreSQL, macOS syslog, and `--storage-admin-user $(whoami)`
 - [Linux (Ubuntu/Debian, Amazon Linux, Fedora/RHEL)](manuals/08-install-linux.md) — covers system PostgreSQL, `journalctl`, and `--storage-admin-user postgres`
@@ -29,10 +31,16 @@ software on your behalf. After the script completes, continue from
 
 ## Prerequisites
 
-- A supported storage backend. The default build uses PostgreSQL 14+ locally (see `docs/local-postgres-setup.md`); TiDB is available when building with the `tidb` feature.
+- TiDB 8.5.4+ for the default backend. PostgreSQL 14+ is needed only when explicitly building and selecting the PostgreSQL backend.
 - Rust toolchain (1.85+)
 - AWS CLI v2 (for testing)
 - Python 3.10+ with virtual environment (see [Python Environment Setup](../README.md#python-environment-setup) in the README)
+
+For a local TiDB development cluster, one option is:
+
+```bash
+tiup playground v8.5.4 --db 1 --pd 1 --kv 3 --without-monitor
+```
 
 ## 1. Build extenddb
 
@@ -77,19 +85,22 @@ To use a custom data database name:
 ./target/release/extenddb init --data-db my_data_db
 ```
 
-### Remote PostgreSQL / Aurora
+### Remote TiDB
 
-For remote PostgreSQL or Aurora, supply the admin password with `--storage-admin-password`:
+For remote TiDB, point `extenddb init` at the TiDB SQL endpoint and supply the
+admin credentials:
 
 ```bash
 # Pass the password inline:
 ./target/release/extenddb init \
-  --storage-host my-aurora-cluster.cluster-xxxx.us-east-1.rds.amazonaws.com \
-  --storage-admin-user postgres --storage-admin-password <admin-password>
+  --storage-host tidb.example.com \
+  --storage-port 4000 \
+  --storage-admin-user root \
+  --storage-admin-password <admin-password>
 ```
 
-When `--storage-admin-password` is omitted entirely, `extenddb init` connects without a password, relying on
-PostgreSQL peer/ident authentication (works only on localhost via Unix socket).
+When `--storage-admin-password` is omitted entirely, `extenddb init` connects
+without a password, which matches local TiUP playground's default root user.
 
 ### Custom bind address
 
@@ -159,7 +170,7 @@ extenddb runs as a daemon (background process) and logs to syslog. On startup it
 
 ```bash
 ./target/release/extenddb serve --config extenddb.toml
-# extenddb 0.1.0 (catalog 0.0.3) listening on 127.0.0.1:8000
+# extenddb 0.1.0 (catalog 0.0.26) listening on 127.0.0.1:8000
 ```
 
 Check status (includes the daemon PID):
@@ -1234,7 +1245,7 @@ Each runner requires its tools to be installed. The runner checks prerequisites 
 ```bash
 ./target/release/extenddb version
 # extenddb 0.1.0
-# catalog 0.0.3
+# catalog 0.0.26 (tidb)
 # commit abc1234
 # built 2026-04-17T12:00:00Z
 ```

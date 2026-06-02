@@ -588,4 +588,11 @@ mod tests {
         // ~user should NOT be expanded (we only handle ~/...)
         assert_eq!(expand_tilde("~user/foo"), "~user/foo");
     }
+
+    #[test]
+    #[cfg(feature = "tidb")]
+    fn tidb_is_the_implicit_backend_when_available() {
+        assert_eq!(default_backend(), "tidb");
+        assert_eq!(StorageConfig::default()._backend, "tidb");
+    }
 }

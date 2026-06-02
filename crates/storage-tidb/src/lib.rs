@@ -73,7 +73,7 @@ inventory::submit! {
         default_config: || {
             Box::new(TidbStorageConfig::default()) as Box<dyn extenddb_storage::config::StorageConfig>
         },
-        default_priority: Some(50),
+        default_priority: Some(100),
     }
 }
 

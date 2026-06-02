@@ -105,13 +105,7 @@ global_rps = 0          # 0 = disabled
 per_table_rps = 0       # 0 = disabled
 
 [storage]
-backend = "postgres"     # "postgres" | "tidb"
-
-[storage.postgres]
-connection_string = "postgresql://localhost:5432/extenddb"  # Set credentials via env var in production
-pool_size = 20
-connection_timeout_secs = 5
-statement_timeout_secs = 30
+backend = "tidb"         # "tidb" | "postgres"
 
 [storage.tidb]
 connection_string = "mysql://extenddb:extenddb-local-dev@localhost:4000/extenddb_catalog"
@@ -128,6 +122,12 @@ storage_uri = "local:///var/lib/extenddb/tidb-backups"
 binary = "tiup"
 component = "br"
 send_credentials_to_tikv = false
+
+[storage.postgres]
+connection_string = "postgresql://localhost:5432/extenddb"  # Explicit alternate backend
+pool_size = 20
+connection_timeout_secs = 5
+statement_timeout_secs = 30
 
 [auth]
 provider = "builtin"     # "none" | "builtin" | "aws_iam" | future: "azure_ad"
