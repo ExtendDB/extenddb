@@ -183,10 +183,11 @@ coordination. `TransactGetItems` starts a normal TiDB transaction and performs
 plain reads inside that transaction, getting one native snapshot without
 application-level locks.
 `BatchWriteItem` uses native multi-row DML when streams are disabled. When
-streams are enabled but the selected stream view does not need old images, TiDB
-keeps the whole batch in one transaction, executes native point DML per item,
-and writes all stream records in that same transaction. Old-image stream views
-keep the per-item materialization path because they must fetch the prior row.
+streams are enabled, TiDB keeps the whole batch in one transaction and writes
+all stream records in that same transaction. Old-image stream views fetch the
+prior row with native point `SELECT ... FOR UPDATE` inside the batch
+transaction; key-only and new-image views skip that read and rely on native DML
+outcomes.
 Bulk import writes validated rows through `batch_write_items`, then calls
 `refresh_table_statistics` before reporting completion. Imports fetch
 `table_write_info`, so secondary-index key validation uses the same write

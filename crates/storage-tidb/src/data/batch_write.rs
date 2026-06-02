@@ -10,9 +10,10 @@ use extenddb_storage::{BatchWriteOp, StreamCapture};
 
 use super::index::validate_item_index_key_constraints;
 use super::tx_helpers::{
-    StreamSequenceAllocator, delete_item_without_old_item_in_tx,
+    StreamSequenceAllocator, delete_item_without_old_item_in_tx, fetch_item_for_update,
     finalize_stream_records_best_effort, put_item_without_old_item_in_tx,
-    stream_capture_needs_old_item, write_stream_record_for_event_in_tx,
+    stream_capture_needs_old_item, upsert_item_in_tx, write_stream_record_for_event_in_tx,
+    write_stream_record_in_tx,
 };
 use super::{data_table_name, physical_pk_bytes, repeat_tuple_placeholders};
 use crate::TidbEngine;
@@ -43,13 +44,8 @@ impl TidbEngine {
         }
 
         if let Some(capture) = stream {
-            if batch_stream_capture_can_use_native_tx(capture) {
-                return self
-                    .batch_write_items_with_stream_native(key_info, ops, capture)
-                    .await;
-            }
             return self
-                .batch_write_items_with_stream_loop(key_info, ops, stream)
+                .batch_write_items_with_stream_native(key_info, ops, capture)
                 .await;
         }
 
@@ -95,38 +91,71 @@ impl TidbEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         let mut sequence_allocator = StreamSequenceAllocator::default();
+        let needs_old_item = stream_capture_needs_old_item(capture);
 
         for op in ops {
             match op {
                 BatchWriteOp::Put(item) => {
-                    let event = put_item_without_old_item_in_tx(&mut tx, key_info, item).await?;
-                    write_stream_record_for_event_in_tx(
-                        &mut tx,
-                        &mut sequence_allocator,
-                        key_info,
-                        capture,
-                        event,
-                        item,
-                        None,
-                        Some(item),
-                    )
-                    .await?;
-                }
-                BatchWriteOp::Delete(key) => {
-                    let removed =
-                        delete_item_without_old_item_in_tx(&mut tx, key_info, key).await?;
-                    if removed {
+                    if needs_old_item {
+                        let old_item = fetch_item_for_update(&mut tx, key_info, item).await?;
+                        upsert_item_in_tx(&mut tx, key_info, item).await?;
+                        write_stream_record_in_tx(
+                            &mut tx,
+                            &mut sequence_allocator,
+                            key_info,
+                            capture,
+                            old_item.as_ref(),
+                            Some(item),
+                        )
+                        .await?;
+                    } else {
+                        let event =
+                            put_item_without_old_item_in_tx(&mut tx, key_info, item).await?;
                         write_stream_record_for_event_in_tx(
                             &mut tx,
                             &mut sequence_allocator,
                             key_info,
                             capture,
-                            StreamEventName::Remove,
-                            key,
+                            event,
+                            item,
                             None,
-                            None,
+                            Some(item),
                         )
                         .await?;
+                    }
+                }
+                BatchWriteOp::Delete(key) => {
+                    if needs_old_item {
+                        if let Some(old_item) =
+                            fetch_item_for_update(&mut tx, key_info, key).await?
+                        {
+                            delete_item_without_old_item_in_tx(&mut tx, key_info, key).await?;
+                            write_stream_record_in_tx(
+                                &mut tx,
+                                &mut sequence_allocator,
+                                key_info,
+                                capture,
+                                Some(&old_item),
+                                None,
+                            )
+                            .await?;
+                        }
+                    } else {
+                        let removed =
+                            delete_item_without_old_item_in_tx(&mut tx, key_info, key).await?;
+                        if removed {
+                            write_stream_record_for_event_in_tx(
+                                &mut tx,
+                                &mut sequence_allocator,
+                                key_info,
+                                capture,
+                                StreamEventName::Remove,
+                                key,
+                                None,
+                                None,
+                            )
+                            .await?;
+                        }
                     }
                 }
             }
@@ -141,28 +170,6 @@ impl TidbEngine {
             sequence_allocator.pending_records(),
         )
         .await;
-        Ok(())
-    }
-
-    async fn batch_write_items_with_stream_loop(
-        &self,
-        key_info: &TableKeyInfo,
-        ops: &[BatchWriteOp<'_>],
-        stream: Option<&StreamCapture>,
-    ) -> Result<(), StorageError> {
-        let maps = extenddb_core::expression::ExpressionMaps::default();
-        for op in ops {
-            match op {
-                BatchWriteOp::Put(item) => {
-                    self.put_item_impl(key_info, (*item).clone(), false, None, &maps, stream)
-                        .await?;
-                }
-                BatchWriteOp::Delete(key) => {
-                    self.delete_item_impl(key_info, key, false, None, &maps, stream)
-                        .await?;
-                }
-            }
-        }
         Ok(())
     }
 
@@ -183,10 +190,6 @@ impl TidbEngine {
         }
         Ok(())
     }
-}
-
-fn batch_stream_capture_can_use_native_tx(capture: &StreamCapture) -> bool {
-    !stream_capture_needs_old_item(capture)
 }
 
 pub(super) fn prepare_batch_put(
@@ -313,20 +316,7 @@ fn batch_delete_sql(table: &str, sk_col: Option<&str>, row_count: usize) -> Stri
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use extenddb_core::types::StreamViewType;
-    use extenddb_storage::StreamCapture;
-
-    use super::{batch_delete_sql, batch_put_sql, batch_stream_capture_can_use_native_tx};
-
-    fn capture(view_type: StreamViewType) -> StreamCapture {
-        StreamCapture {
-            view_type,
-            user_identity: None,
-            region: Arc::from("us-east-1"),
-        }
-    }
+    use super::{batch_delete_sql, batch_put_sql};
 
     #[test]
     fn batch_write_put_sql_uses_one_native_multi_row_upsert() {
@@ -352,21 +342,5 @@ mod tests {
             batch_delete_sql("`_ddb_table`", Some("sk_b"), 2),
             "DELETE FROM `_ddb_table` WHERE (pk, sk_b) IN ((?, ?), (?, ?))"
         );
-    }
-
-    #[test]
-    fn stream_batch_native_tx_path_only_uses_views_without_old_images() {
-        assert!(batch_stream_capture_can_use_native_tx(&capture(
-            StreamViewType::KeysOnly
-        )));
-        assert!(batch_stream_capture_can_use_native_tx(&capture(
-            StreamViewType::NewImage
-        )));
-        assert!(!batch_stream_capture_can_use_native_tx(&capture(
-            StreamViewType::OldImage
-        )));
-        assert!(!batch_stream_capture_can_use_native_tx(&capture(
-            StreamViewType::NewAndOldImages
-        )));
     }
 }
