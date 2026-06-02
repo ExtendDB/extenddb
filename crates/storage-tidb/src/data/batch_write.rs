@@ -15,13 +15,13 @@ use super::index::{
 use super::{data_table_name, physical_pk_bytes, repeat_tuple_placeholders};
 use crate::TidbEngine;
 
-struct PreparedPut {
+pub(super) struct PreparedPut {
     pk: Vec<u8>,
     sk: Option<SortKeyValue>,
     item_json: serde_json::Value,
 }
 
-struct PreparedDelete {
+pub(super) struct PreparedDelete {
     pk: Vec<u8>,
     sk: Option<SortKeyValue>,
 }
@@ -128,7 +128,7 @@ impl TidbEngine {
     }
 }
 
-fn prepare_batch_put(
+pub(super) fn prepare_batch_put(
     key_info: &TableKeyInfo,
     item: &Item,
     sk: Option<(&str, ScalarAttributeType)>,
@@ -140,7 +140,7 @@ fn prepare_batch_put(
     Ok(PreparedPut { pk, sk, item_json })
 }
 
-fn prepare_batch_delete(
+pub(super) fn prepare_batch_delete(
     key_info: &TableKeyInfo,
     key: &Item,
     sk: Option<(&str, ScalarAttributeType)>,
@@ -163,12 +163,15 @@ fn prepare_sort_key(
     parse_sk(sk_value, sk_type).map(Some)
 }
 
-async fn execute_batch_puts(
-    pool: &sqlx::MySqlPool,
+pub(super) async fn execute_batch_puts<'e, E>(
+    executor: E,
     table: &str,
     sk_type: Option<ScalarAttributeType>,
     puts: Vec<PreparedPut>,
-) -> Result<(), StorageError> {
+) -> Result<(), StorageError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::MySql>,
+{
     let sql = batch_put_sql(table, sk_type.map(sk_column), puts.len());
     let mut query = sqlx::query(&sql);
     for put in puts {
@@ -179,18 +182,21 @@ async fn execute_batch_puts(
         query = query.bind(put.item_json);
     }
     query
-        .execute(pool)
+        .execute(executor)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
     Ok(())
 }
 
-async fn execute_batch_deletes(
-    pool: &sqlx::MySqlPool,
+pub(super) async fn execute_batch_deletes<'e, E>(
+    executor: E,
     table: &str,
     sk_type: Option<ScalarAttributeType>,
     deletes: Vec<PreparedDelete>,
-) -> Result<(), StorageError> {
+) -> Result<(), StorageError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::MySql>,
+{
     let sql = batch_delete_sql(table, sk_type.map(sk_column), deletes.len());
     let mut query = sqlx::query(&sql);
     for delete in deletes {
@@ -200,7 +206,7 @@ async fn execute_batch_deletes(
         }
     }
     query
-        .execute(pool)
+        .execute(executor)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
     Ok(())

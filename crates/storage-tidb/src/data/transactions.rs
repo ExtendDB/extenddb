@@ -17,6 +17,10 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{SortKeyValue, parse_sk, sk_column, sk_info};
 use extenddb_storage::{TransactGetOp, TransactWriteOp};
 
+use super::batch_write::{
+    PreparedDelete, PreparedPut, execute_batch_deletes, execute_batch_puts, prepare_batch_delete,
+    prepare_batch_put,
+};
 use super::index::{
     WriteIndexKeys, fetch_write_index_key_schemas, has_potential_secondary_index_keys,
     item_has_potential_secondary_index_key, validate_item_index_key_constraints,
@@ -53,6 +57,17 @@ struct TransactGetEntry {
 struct TransactGetGroup<'a> {
     key_info: &'a TableKeyInfo,
     entries: Vec<TransactGetEntry>,
+}
+
+#[derive(Default)]
+struct NativeTxnWriteBatch<'a> {
+    groups: Vec<NativeTxnWriteGroup<'a>>,
+}
+
+struct NativeTxnWriteGroup<'a> {
+    key_info: &'a TableKeyInfo,
+    puts: Vec<PreparedPut>,
+    deletes: Vec<PreparedDelete>,
 }
 
 impl TidbEngine {
@@ -139,16 +154,13 @@ impl TidbEngine {
         // indexes own maintenance; this fetch is only for DynamoDB validation
         // messages before a write reaches TiDB.
         let mut table_indexes: HashMap<String, Vec<WriteIndexKeys>> = HashMap::new();
-        for op in ops {
-            let table_id = transact_op_table_id(op);
-            if !table_indexes.contains_key(table_id) {
-                let indexes = if transact_op_needs_secondary_index_validation(op) {
-                    fetch_write_index_key_schemas(table_id, &self.pool).await?
-                } else {
-                    Vec::new()
-                };
-                table_indexes.insert(table_id.to_owned(), indexes);
-            }
+        for (table_id, needs_validation) in transact_write_table_index_validation_needs(ops) {
+            let indexes = if needs_validation {
+                fetch_write_index_key_schemas(&table_id, &self.pool).await?
+            } else {
+                Vec::new()
+            };
+            table_indexes.insert(table_id, indexes);
         }
 
         let mut tx = self
@@ -164,11 +176,21 @@ impl TidbEngine {
 
         let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());
         let mut op_outcomes = Vec::with_capacity(ops.len());
+        let mut native_batch = NativeTxnWriteBatch::default();
         let mut any_failed = false;
 
         for op in ops {
             let indexes = &table_indexes[transact_op_table_id(op)];
-            let reason = execute_transact_write_op(&mut tx, op, indexes, &self.limits).await;
+            let reason = match stage_native_transact_write_op(
+                op,
+                indexes,
+                &self.limits,
+                &mut native_batch,
+            ) {
+                Ok(Some(outcome)) => Ok(outcome),
+                Ok(None) => execute_transact_write_op(&mut tx, op, indexes, &self.limits).await,
+                Err(err) => Err(err),
+            };
             match reason {
                 Ok(outcome) => {
                     op_outcomes.push(outcome);
@@ -190,6 +212,8 @@ impl TidbEngine {
         if any_failed {
             return Err(StorageError::TransactionCanceled(reasons));
         }
+
+        native_batch.execute(&mut tx).await?;
 
         // Write stream records atomically within the transaction.
         let mut sequence_allocator = StreamSequenceAllocator::default();
@@ -482,6 +506,20 @@ fn transact_op_needs_secondary_index_validation(op: &TransactWriteOp<'_>) -> boo
     }
 }
 
+fn transact_write_table_index_validation_needs(
+    ops: &[TransactWriteOp<'_>],
+) -> HashMap<String, bool> {
+    let mut table_needs = HashMap::new();
+    for op in ops {
+        let needs_validation = transact_op_needs_secondary_index_validation(op);
+        table_needs
+            .entry(transact_op_table_id(op).to_owned())
+            .and_modify(|needs| *needs |= needs_validation)
+            .or_insert(needs_validation);
+    }
+    table_needs
+}
+
 fn transact_put_needs_existing_item(
     condition: Option<&extenddb_core::expression::Expr>,
     stream: &Option<StreamCapture>,
@@ -496,12 +534,114 @@ fn transact_delete_needs_existing_item(
     condition.is_some() || stream.as_ref().is_some_and(stream_capture_needs_old_item)
 }
 
+impl<'a> NativeTxnWriteBatch<'a> {
+    fn push_put(&mut self, key_info: &'a TableKeyInfo, item: &Item) -> Result<(), StorageError> {
+        let sk = sk_info(&key_info.key_schema, &key_info.attribute_definitions);
+        let prepared = prepare_batch_put(key_info, item, sk)?;
+        self.group_mut(key_info).puts.push(prepared);
+        Ok(())
+    }
+
+    fn push_delete(&mut self, key_info: &'a TableKeyInfo, key: &Item) -> Result<(), StorageError> {
+        let sk = sk_info(&key_info.key_schema, &key_info.attribute_definitions);
+        let prepared = prepare_batch_delete(key_info, key, sk)?;
+        self.group_mut(key_info).deletes.push(prepared);
+        Ok(())
+    }
+
+    fn group_mut(&mut self, key_info: &'a TableKeyInfo) -> &mut NativeTxnWriteGroup<'a> {
+        if let Some(pos) = self
+            .groups
+            .iter()
+            .position(|group| group.key_info.table_id == key_info.table_id)
+        {
+            return &mut self.groups[pos];
+        }
+
+        self.groups.push(NativeTxnWriteGroup {
+            key_info,
+            puts: Vec::new(),
+            deletes: Vec::new(),
+        });
+        self.groups.last_mut().expect("just pushed write group")
+    }
+
+    async fn execute(
+        self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    ) -> Result<(), StorageError> {
+        for group in self.groups {
+            execute_native_txn_write_group(tx, group).await?;
+        }
+        Ok(())
+    }
+}
+
+async fn execute_native_txn_write_group(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    group: NativeTxnWriteGroup<'_>,
+) -> Result<(), StorageError> {
+    let ddb_table = data_table_name(&group.key_info.table_id);
+    let sk_type = sk_info(
+        &group.key_info.key_schema,
+        &group.key_info.attribute_definitions,
+    )
+    .map(|(_, ty)| ty);
+
+    if !group.puts.is_empty() {
+        execute_batch_puts(&mut **tx, &ddb_table, sk_type, group.puts).await?;
+    }
+    if !group.deletes.is_empty() {
+        execute_batch_deletes(&mut **tx, &ddb_table, sk_type, group.deletes).await?;
+    }
+
+    Ok(())
+}
+
+fn stage_native_transact_write_op<'a>(
+    op: &TransactWriteOp<'a>,
+    indexes: &[WriteIndexKeys],
+    limits: &LimitsConfig,
+    batch: &mut NativeTxnWriteBatch<'a>,
+) -> Result<Option<TxnWriteOutcome>, TxnOpError> {
+    match op {
+        TransactWriteOp::Put {
+            key_info,
+            item,
+            condition: None,
+            stream: None,
+            ..
+        } => {
+            validate_transact_put(key_info, item, indexes, limits)?;
+            batch
+                .push_put(key_info, item)
+                .map_err(TxnOpError::Storage)?;
+            Ok(Some(TxnWriteOutcome::NoStream))
+        }
+        TransactWriteOp::Delete {
+            key_info,
+            key,
+            condition: None,
+            stream: None,
+            ..
+        } => {
+            validate_transact_key_only(key_info, key)?;
+            batch
+                .push_delete(key_info, key)
+                .map_err(TxnOpError::Storage)?;
+            Ok(Some(TxnWriteOutcome::NoStream))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Error type for individual transactional write operations.
 ///
 /// Separates user-driven cancellations (condition failures, validation errors)
 /// from infrastructure errors (connection failures, transaction errors).
 /// This prevents internal error details from leaking into client-visible
 /// cancellation reasons.
+#[derive(Debug)]
 enum TxnOpError {
     /// User-driven failure — becomes a per-item cancellation reason.
     Cancel(CancellationReason),
@@ -550,18 +690,7 @@ async fn execute_transact_write_op(
             // Key type validation inside the transaction so mismatches produce
             // TransactionCanceledException with ValidationError cancellation
             // reasons, matching real DynamoDB behavior.
-            validation::validate_item_keys(
-                item,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )
-            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
-            validate_txn_index_key_constraints(
-                item,
-                indexes,
-                &key_info.attribute_definitions,
-                limits,
-            )?;
+            validate_transact_put(key_info, item, indexes, limits)?;
             if !transact_put_needs_existing_item(*condition, stream) {
                 let event = if stream.is_some() {
                     Some(
@@ -621,12 +750,7 @@ async fn execute_transact_write_op(
             stream,
             ..
         } => {
-            validation::validate_key_only(
-                key,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )
-            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
+            validate_transact_key_only(key_info, key)?;
             if !transact_delete_needs_existing_item(*condition, stream) {
                 let removed = delete_item_without_old_item_in_tx(tx, key_info, key)
                     .await
@@ -679,12 +803,7 @@ async fn execute_transact_write_op(
             stream,
             ..
         } => {
-            validation::validate_key_only(
-                key,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )
-            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
+            validate_transact_key_only(key_info, key)?;
             let existing = fetch_item_for_update(tx, key_info, key)
                 .await
                 .map_err(TxnOpError::Storage)?;
@@ -734,12 +853,7 @@ async fn execute_transact_write_op(
             maps,
             return_values_on_ccf,
         } => {
-            validation::validate_key_only(
-                key,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )
-            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
+            validate_transact_key_only(key_info, key)?;
             let existing = fetch_item_for_update(tx, key_info, key)
                 .await
                 .map_err(TxnOpError::Storage)?;
@@ -755,6 +869,22 @@ async fn execute_transact_write_op(
             Ok(TxnWriteOutcome::NoStream)
         }
     }
+}
+
+fn validate_transact_put(
+    key_info: &TableKeyInfo,
+    item: &Item,
+    indexes: &[WriteIndexKeys],
+    limits: &LimitsConfig,
+) -> Result<(), TxnOpError> {
+    validation::validate_item_keys(item, &key_info.key_schema, &key_info.attribute_definitions)
+        .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
+    validate_txn_index_key_constraints(item, indexes, &key_info.attribute_definitions, limits)
+}
+
+fn validate_transact_key_only(key_info: &TableKeyInfo, key: &Item) -> Result<(), TxnOpError> {
+    validation::validate_key_only(key, &key_info.key_schema, &key_info.attribute_definitions)
+        .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))
 }
 
 fn validate_txn_index_key_constraints(
@@ -804,14 +934,19 @@ fn eval_condition(
 mod tests {
     use std::sync::Arc;
 
-    use extenddb_core::expression::Expr;
-    use extenddb_core::types::{AttributeValue, StreamViewType, TableKeyInfo};
-    use extenddb_storage::StreamCapture;
+    use extenddb_core::expression::{Expr, ExpressionMaps};
+    use extenddb_core::limits::LimitsConfig;
+    use extenddb_core::types::{
+        AttributeDefinition, AttributeValue, KeySchemaElement, KeyType,
+        ReturnValuesOnConditionCheckFailure, ScalarAttributeType, StreamViewType, TableKeyInfo,
+    };
+    use extenddb_storage::{StreamCapture, TransactWriteOp};
 
     use super::{
-        TransactGetEntry, TransactGetGroup, TransactGetLookupKey,
-        assign_transact_get_group_results, transact_delete_needs_existing_item,
-        transact_get_pk_sk_sql, transact_get_pk_sql, transact_put_needs_existing_item,
+        NativeTxnWriteBatch, TransactGetEntry, TransactGetGroup, TransactGetLookupKey,
+        TxnWriteOutcome, assign_transact_get_group_results, stage_native_transact_write_op,
+        transact_delete_needs_existing_item, transact_get_pk_sk_sql, transact_get_pk_sql,
+        transact_put_needs_existing_item, transact_write_table_index_validation_needs,
     };
 
     fn condition() -> Expr {
@@ -836,8 +971,20 @@ mod tests {
             table_name: "table".to_owned(),
             account_id: "acct".to_owned(),
             table_id: "tableid".to_owned(),
-            key_schema: Vec::new(),
-            attribute_definitions: Vec::new(),
+            key_schema: vec![KeySchemaElement {
+                attribute_name: "pk".to_owned(),
+                key_type: KeyType::Hash,
+            }],
+            attribute_definitions: vec![
+                AttributeDefinition {
+                    attribute_name: "pk".to_owned(),
+                    attribute_type: ScalarAttributeType::S,
+                },
+                AttributeDefinition {
+                    attribute_name: "gpk".to_owned(),
+                    attribute_type: ScalarAttributeType::S,
+                },
+            ],
             has_lsi: false,
             stream_specification: None,
         }
@@ -846,6 +993,12 @@ mod tests {
     fn item(value: &str) -> extenddb_core::types::Item {
         let mut item = extenddb_core::types::Item::new();
         item.insert("pk".to_owned(), AttributeValue::S(value.to_owned()));
+        item
+    }
+
+    fn item_with_index_key(value: &str) -> extenddb_core::types::Item {
+        let mut item = item(value);
+        item.insert("gpk".to_owned(), AttributeValue::S(value.to_owned()));
         item
     }
 
@@ -957,5 +1110,113 @@ mod tests {
         assign_transact_get_group_results(&group, &fetched, &mut results);
 
         assert_eq!(results, vec![Some(item("first")), Some(item("second"))]);
+    }
+
+    #[test]
+    fn transaction_index_validation_plan_uses_all_ops_for_a_table() {
+        let key_info = key_info();
+        let maps = ExpressionMaps::default();
+        let delete_key = item("delete");
+        let put_item = item_with_index_key("put");
+        let ops = vec![
+            TransactWriteOp::Delete {
+                key_info: &key_info,
+                key: &delete_key,
+                condition: None,
+                maps: &maps,
+                return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                stream: None,
+            },
+            TransactWriteOp::Put {
+                key_info: &key_info,
+                item: &put_item,
+                condition: None,
+                maps: &maps,
+                return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                stream: None,
+            },
+        ];
+
+        let needs = transact_write_table_index_validation_needs(&ops);
+
+        assert_eq!(needs.get("tableid"), Some(&true));
+    }
+
+    #[test]
+    fn unconditional_transaction_put_delete_without_stream_stage_native_batch() {
+        let key_info = key_info();
+        let maps = ExpressionMaps::default();
+        let limits = LimitsConfig::default();
+        let put_item = item("put");
+        let delete_key = item("delete");
+        let mut batch = NativeTxnWriteBatch::default();
+
+        let put_op = TransactWriteOp::Put {
+            key_info: &key_info,
+            item: &put_item,
+            condition: None,
+            maps: &maps,
+            return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+            stream: None,
+        };
+        let put_outcome =
+            stage_native_transact_write_op(&put_op, &[], &limits, &mut batch).unwrap();
+
+        let delete_op = TransactWriteOp::Delete {
+            key_info: &key_info,
+            key: &delete_key,
+            condition: None,
+            maps: &maps,
+            return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+            stream: None,
+        };
+        let delete_outcome =
+            stage_native_transact_write_op(&delete_op, &[], &limits, &mut batch).unwrap();
+
+        assert!(matches!(put_outcome, Some(TxnWriteOutcome::NoStream)));
+        assert!(matches!(delete_outcome, Some(TxnWriteOutcome::NoStream)));
+        assert_eq!(batch.groups.len(), 1);
+        assert_eq!(batch.groups[0].puts.len(), 1);
+        assert_eq!(batch.groups[0].deletes.len(), 1);
+    }
+
+    #[test]
+    fn transaction_writes_with_conditions_or_streams_do_not_stage_native_batch() {
+        let key_info = key_info();
+        let maps = ExpressionMaps::default();
+        let limits = LimitsConfig::default();
+        let put_item = item("put");
+        let delete_key = item("delete");
+        let condition = condition();
+        let mut batch = NativeTxnWriteBatch::default();
+
+        let conditioned_put = TransactWriteOp::Put {
+            key_info: &key_info,
+            item: &put_item,
+            condition: Some(&condition),
+            maps: &maps,
+            return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+            stream: None,
+        };
+        let streamed_delete = TransactWriteOp::Delete {
+            key_info: &key_info,
+            key: &delete_key,
+            condition: None,
+            maps: &maps,
+            return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+            stream: Some(stream_capture()),
+        };
+
+        assert!(
+            stage_native_transact_write_op(&conditioned_put, &[], &limits, &mut batch)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            stage_native_transact_write_op(&streamed_delete, &[], &limits, &mut batch)
+                .unwrap()
+                .is_none()
+        );
+        assert!(batch.groups.is_empty());
     }
 }
