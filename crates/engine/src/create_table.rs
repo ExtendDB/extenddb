@@ -28,8 +28,6 @@ pub async fn handle_create_table(
             || msg.contains("parameter values were invalid")
             || msg.contains("must not be empty")
             || msg.contains("Syntax error; key")
-            || msg.contains("AttributeValue is empty")
-            || msg.contains("AttributeValue has more than one datatypes set")
         {
             DynamoDbError::ValidationException(msg)
         } else if msg.contains("missing field") && msg.contains("TableName") {
