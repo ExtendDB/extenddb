@@ -471,6 +471,24 @@ class TestQueryValidation:
             )
         assert exc_info.value.response["Error"]["Code"] == "ValidationException"
 
+    def test_query_all_projected_attributes_without_index_rejected(
+        self, dynamodb_client, query_table
+    ):
+        """Select=ALL_PROJECTED_ATTRIBUTES on the base table is rejected."""
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.query(
+                TableName=query_table,
+                KeyConditionExpression="pk = :pk",
+                ExpressionAttributeValues={":pk": {"S": "user-1"}},
+                Select="ALL_PROJECTED_ATTRIBUTES",
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert (
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
+            in err["Message"]
+        )
+
 
 class TestScanValidation:
     """Scan validation edge cases from recent fixes."""
@@ -505,6 +523,63 @@ class TestScanValidation:
                 ExpressionAttributeValues={":cat": {"S": "a"}, ":extra": {"N": "1"}},
             )
         assert exc_info.value.response["Error"]["Code"] == "ValidationException"
+
+    def test_scan_segment_at_max_accepted(self, dynamodb_client, scan_table):
+        """Segment=999999 with TotalSegments=1000000 is at the documented bound."""
+        dynamodb_client.scan(
+            TableName=scan_table, Segment=999_999, TotalSegments=1_000_000
+        )
+
+    def test_scan_segment_one_over_max_rejected(
+        self, dynamodb_client_no_validation, scan_table
+    ):
+        """Segment > 999999 returns the Coral-format ValidationException."""
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client_no_validation.scan(
+                TableName=scan_table, Segment=1_000_000, TotalSegments=1_000_000
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        msg = err["Message"]
+        assert "1 validation error detected" in msg
+        assert "'1000000' at 'segment'" in msg
+        assert "Member must have value less than or equal to 999999" in msg
+
+    def test_scan_total_segments_at_max_accepted(self, dynamodb_client, scan_table):
+        """TotalSegments=1000000 with Segment=0 is at the documented bound."""
+        dynamodb_client.scan(
+            TableName=scan_table, Segment=0, TotalSegments=1_000_000
+        )
+
+    def test_scan_total_segments_one_over_max_rejected(
+        self, dynamodb_client_no_validation, scan_table
+    ):
+        """TotalSegments > 1000000 returns the Coral-format ValidationException."""
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client_no_validation.scan(
+                TableName=scan_table, Segment=0, TotalSegments=1_000_001
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        msg = err["Message"]
+        assert "1 validation error detected" in msg
+        assert "'1000001' at 'totalSegments'" in msg
+        assert "Member must have value less than or equal to 1000000" in msg
+
+    def test_scan_all_projected_attributes_without_index_rejected(
+        self, dynamodb_client, scan_table
+    ):
+        """Select=ALL_PROJECTED_ATTRIBUTES on a base-table scan is rejected."""
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.scan(
+                TableName=scan_table, Select="ALL_PROJECTED_ATTRIBUTES"
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert (
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
+            in err["Message"]
+        )
 
 
 # ---------------------------------------------------------------------------
