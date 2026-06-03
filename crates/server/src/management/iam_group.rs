@@ -109,12 +109,41 @@ pub async fn delete_group(
         return e;
     }
 
+    // Snapshot members BEFORE deletion so we can invalidate their cached
+    // user-group-policies once the FK cascade has dropped membership rows.
+    // A failed enumeration falls back to TTL-based propagation (logged).
+    let members: Vec<String> = match state
+        .catalog_store
+        .get_group_detail(&account_id, &group_name)
+        .await
+    {
+        Ok(Some(detail)) => detail.members,
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            tracing::warn!(
+                "delete_group: get_group_detail failed before delete; member \
+                 cache invalidation will rely on TTL: {e:?}"
+            );
+            Vec::new()
+        }
+    };
+
     match state
         .catalog_store
         .delete_group(&account_id, &group_name)
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // After the catalog write commits, drop user-group-policies
+            // for every member so policies attached to the (now-gone)
+            // group are removed from each member's effective policy set
+            // immediately.
+            state
+                .auth_cache
+                .invalidate_users_group_policies(&account_id, &members)
+                .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => op_err_to_response(OpError::from_storage(e)),
     }
 }
@@ -137,7 +166,16 @@ pub async fn add_member(
         .add_group_member(&account_id, &group_name, &body.user_name)
         .await
     {
-        Ok(()) => (StatusCode::CREATED, "Member added").into_response(),
+        Ok(()) => {
+            // The user's group_policies cache flattens group membership at fetch
+            // time. Adding the user to the group changes the set of policies
+            // they inherit — drop the cached entry.
+            state
+                .auth_cache
+                .invalidate_user_group_policies(&account_id, &body.user_name)
+                .await;
+            (StatusCode::CREATED, "Member added").into_response()
+        }
         Err(e) => op_err_to_response(OpError::from_storage(e)),
     }
 }
@@ -159,7 +197,13 @@ pub async fn remove_member(
         .remove_group_member(&account_id, &group_name, &user_name)
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            state
+                .auth_cache
+                .invalidate_user_group_policies(&account_id, &user_name)
+                .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => op_err_to_response(OpError::from_storage(e)),
     }
 }

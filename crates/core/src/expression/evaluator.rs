@@ -56,26 +56,25 @@ pub fn evaluate_condition(
             // DynamoDB validates bounds when both are literal placeholders
             if matches!(low.as_ref(), Expr::Placeholder(_))
                 && matches!(high.as_ref(), Expr::Placeholder(_))
+                && let (Some(l), Some(h)) = (lo.as_deref(), hi.as_deref())
             {
-                if let (Some(l), Some(h)) = (lo.as_deref(), hi.as_deref()) {
-                    let l_type = attribute_type_code(l);
-                    let h_type = attribute_type_code(h);
-                    if l_type != h_type {
-                        return Err(DynamoDbError::ValidationException(format!(
-                            "Invalid ConditionExpression: The BETWEEN operator requires same data type for lower and upper bounds; lower bound operand: AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
-                            format_attribute_value(l),
-                            format_attribute_value(h)
-                        )));
-                    }
-                    let lpn = placeholder_numeric(low, maps);
-                    let hpn = placeholder_numeric(high, maps);
-                    if compare_values(l, h, CompareOp::Gt, lpn, hpn) {
-                        return Err(DynamoDbError::ValidationException(format!(
-                            "Invalid ConditionExpression: The BETWEEN operator requires upper bound to be greater than or equal to lower bound; lower bound operand: AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
-                            format_attribute_value(l),
-                            format_attribute_value(h)
-                        )));
-                    }
+                let l_type = attribute_type_code(l);
+                let h_type = attribute_type_code(h);
+                if l_type != h_type {
+                    return Err(DynamoDbError::ValidationException(format!(
+                        "Invalid ConditionExpression: The BETWEEN operator requires same data type for lower and upper bounds; lower bound operand: AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
+                        format_attribute_value(l),
+                        format_attribute_value(h)
+                    )));
+                }
+                let lpn = placeholder_numeric(low, maps);
+                let hpn = placeholder_numeric(high, maps);
+                if compare_values(l, h, CompareOp::Gt, lpn, hpn) {
+                    return Err(DynamoDbError::ValidationException(format!(
+                        "Invalid ConditionExpression: The BETWEEN operator requires upper bound to be greater than or equal to lower bound; lower bound operand: AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
+                        format_attribute_value(l),
+                        format_attribute_value(h)
+                    )));
                 }
             }
             match (&val, &lo, &hi) {
@@ -268,13 +267,13 @@ fn evaluate_function(
             let val = resolve_to_value(&args[0], item, maps)?;
             let prefix = resolve_to_value(&args[1], item, maps)?;
             // Reject invalid operand types — only S and B are allowed
-            if let Some(ref p) = prefix.as_deref() {
-                if !matches!(p, AttributeValue::S(_) | AttributeValue::B(_)) {
-                    let type_code = attribute_type_code(p);
-                    return Err(DynamoDbError::ValidationException(format!(
-                        "Invalid ConditionExpression: Incorrect operand type for operator or function; operator or function: begins_with, operand type: {type_code}"
-                    )));
-                }
+            if let Some(ref p) = prefix.as_deref()
+                && !matches!(p, AttributeValue::S(_) | AttributeValue::B(_))
+            {
+                let type_code = attribute_type_code(p);
+                return Err(DynamoDbError::ValidationException(format!(
+                    "Invalid ConditionExpression: Incorrect operand type for operator or function; operator or function: begins_with, operand type: {type_code}"
+                )));
             }
             match (val.as_deref(), prefix.as_deref()) {
                 (Some(AttributeValue::S(s)), Some(AttributeValue::S(p))) => {
@@ -299,7 +298,16 @@ fn evaluate_function(
                         let parts: Vec<String> = p
                             .iter()
                             .map(|e| match e {
-                                PathElement::Attribute(a) => a.clone(),
+                                PathElement::Attribute(a) => {
+                                    if let Some(ref_name) = a.strip_prefix('#') {
+                                        maps.names
+                                            .get(ref_name)
+                                            .cloned()
+                                            .unwrap_or_else(|| a.clone())
+                                    } else {
+                                        a.clone()
+                                    }
+                                }
                                 PathElement::Index(i) => format!("[{i}]"),
                             })
                             .collect();

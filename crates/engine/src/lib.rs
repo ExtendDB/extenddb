@@ -177,16 +177,15 @@ pub(crate) fn validate_enum_fields(
     };
     let mut errors: Vec<String> = Vec::new();
     for &(json_name, api_name, valid) in fields {
-        if let Some(val) = obj.get(json_name) {
-            if let Some(s) = val.as_str() {
-                if !valid.contains(&s) {
-                    errors.push(format!(
-                        "Value '{s}' at '{api_name}' failed to satisfy constraint: \
+        if let Some(val) = obj.get(json_name)
+            && let Some(s) = val.as_str()
+            && !valid.contains(&s)
+        {
+            errors.push(format!(
+                "Value '{s}' at '{api_name}' failed to satisfy constraint: \
                          Member must satisfy enum value set: [{}]",
-                        valid.join(", ")
-                    ));
-                }
-            }
+                valid.join(", ")
+            ));
         }
     }
     if errors.is_empty() {
@@ -270,6 +269,15 @@ pub struct OperationContext {
     /// Populated for single-table writes that need DynamoDB write validation;
     /// `None` for reads, table-level, batch, and transact operations.
     pub pre_fetched_write_info: Option<extenddb_core::types::TableKeyInfo>,
+    /// Auth/authz cache handles. Used by control-plane and tagging operations
+    /// to issue write-through cache invalidations after the underlying state
+    /// changes (e.g. `TagResource` invalidates the resource-tags cache).
+    pub auth_cache: extenddb_auth::AuthCacheRegistry,
+    /// Optional cached `TableKeyInfo` lookup. When set, batch / transact /
+    /// multi-table engine handlers route through this instead of calling
+    /// `storage.table_key_info` directly. When unset (e.g. unit tests), the
+    /// engine falls back to direct storage lookups.
+    pub table_key_info_lookup: Option<Arc<dyn extenddb_storage::TableKeyInfoLookup>>,
 }
 
 impl OperationContext {
@@ -287,6 +295,9 @@ impl OperationContext {
                 return Ok(table.clone());
             }
         }
+        if let Some(ref lookup) = self.table_key_info_lookup {
+            return lookup.lookup(&self.account_id, table_name).await;
+        }
         self.storage
             .table_key_info(&self.account_id, table_name)
             .await
@@ -298,10 +309,11 @@ impl OperationContext {
         &self,
         table_name: &str,
     ) -> Result<extenddb_core::types::TableKeyInfo, extenddb_storage::error::StorageError> {
-        if let Some(ref table) = self.pre_fetched_write_info {
-            if table.table_name == table_name && *table.account_id == *self.account_id {
-                return Ok(table.clone());
-            }
+        if let Some(ref table) = self.pre_fetched_write_info
+            && table.table_name == table_name
+            && *table.account_id == *self.account_id
+        {
+            return Ok(table.clone());
         }
         self.storage
             .table_write_info(&self.account_id, table_name)

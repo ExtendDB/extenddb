@@ -121,17 +121,39 @@ pub async fn handle_update_item(
         &ctx.limits,
     )?;
 
-    // Parse the update expression
-    let update_expr = effective_update_expr.as_deref().unwrap_or("");
-    let update_tokens = tokenize_for(
-        update_expr,
-        ctx.limits.max_expression_tokens,
-        "UpdateExpression",
-    )?;
-    if ctx.limits.enforce_reserved_keywords {
-        validate_no_reserved_words(&update_tokens)?;
+    // No UpdateExpression and no AttributeUpdates: no-op upsert.
+    // Some("") still errors via tokenize_for.
+    let actions = if let Some(update_expr) = effective_update_expr.as_deref() {
+        let update_tokens = tokenize_for(
+            update_expr,
+            ctx.limits.max_expression_tokens,
+            "UpdateExpression",
+        )?;
+        if ctx.limits.enforce_reserved_keywords {
+            validate_no_reserved_words(&update_tokens)?;
+        }
+        parse_update_from(&update_tokens, update_expr)?
+    } else {
+        Vec::new()
+    };
+
+    // Amazon DynamoDB enforces nesting depth on values that are stored as item
+    // attributes. For UpdateExpression, walk each SET action's RHS to find the
+    // EAV placeholders it references, resolve them against `maps.values`, and
+    // validate those values' depth. Condition-only EAV is left alone.
+    {
+        let mut placeholders: Vec<String> = Vec::new();
+        for action in &actions {
+            if let UpdateAction::Set { value, .. } = action {
+                extenddb_core::expression::collect_value_placeholders(value, &mut placeholders);
+            }
+        }
+        let stored: Vec<&extenddb_core::types::AttributeValue> = placeholders
+            .iter()
+            .filter_map(|name| maps.values.get(name))
+            .collect();
+        extenddb_core::validation::validate_attribute_values_nesting_depth(stored)?;
     }
-    let actions = parse_update_from(&update_tokens, update_expr)?;
 
     if input.expected.is_none() || input.expected.as_ref().is_some_and(|m| m.is_empty()) {
         let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
@@ -186,12 +208,12 @@ pub async fn handle_update_item(
         ReturnValues::None => None,
         ReturnValues::AllOld => old_item,
         ReturnValues::AllNew => new_item,
-        ReturnValues::UpdatedOld => {
-            old_item.map(|item| filter_to_updated_attrs(&item, &actions, &maps))
-        }
-        ReturnValues::UpdatedNew => {
-            new_item.map(|item| filter_to_updated_attrs(&item, &actions, &maps))
-        }
+        ReturnValues::UpdatedOld => old_item
+            .map(|item| filter_to_updated_attrs(&item, &actions, &maps))
+            .filter(|item| !item.is_empty()),
+        ReturnValues::UpdatedNew => new_item
+            .map(|item| filter_to_updated_attrs(&item, &actions, &maps))
+            .filter(|item| !item.is_empty()),
     };
 
     let output = UpdateItemOutput {
@@ -297,7 +319,17 @@ fn filter_to_updated_attrs(item: &Item, actions: &[UpdateAction], maps: &Express
         };
         if let Some(leaf) = resolve_path_value(top_val, &path[1..], maps) {
             let wrapped = wrap_leaf_in_path(&path[1..], &leaf, maps);
-            result.insert(top_name, wrapped);
+            // Merge into existing top-level entry if multiple subpaths target
+            // the same attribute (e.g., SET a.b = :x, a.c = :y).
+            if let Some(existing) = result.get(&top_name) {
+                if let Some(merged) = merge_maps(existing, &wrapped) {
+                    result.insert(top_name, merged);
+                } else {
+                    result.insert(top_name, wrapped);
+                }
+            } else {
+                result.insert(top_name, wrapped);
+            }
         }
     }
     result
@@ -349,6 +381,28 @@ fn wrap_leaf_in_path(
             AttributeValue::M(map)
         }
         PathElement::Index(_) => AttributeValue::L(vec![inner]),
+    }
+}
+
+/// Recursively merge two Map AttributeValues. Returns None if either isn't a Map.
+fn merge_maps(a: &AttributeValue, b: &AttributeValue) -> Option<AttributeValue> {
+    match (a, b) {
+        (AttributeValue::M(ma), AttributeValue::M(mb)) => {
+            let mut merged = ma.clone();
+            for (k, v) in mb {
+                if let Some(existing) = merged.get(k) {
+                    if let Some(deep) = merge_maps(existing, v) {
+                        merged.insert(k.clone(), deep);
+                    } else {
+                        merged.insert(k.clone(), v.clone());
+                    }
+                } else {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
+            Some(AttributeValue::M(merged))
+        }
+        _ => None,
     }
 }
 

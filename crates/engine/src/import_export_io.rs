@@ -120,10 +120,10 @@ fn read_csv(
         let values = split_csv_line(trimmed, delim_byte);
         let mut item = Item::new();
         for (i, header) in headers.iter().enumerate() {
-            if let Some(val) = values.get(i) {
-                if !val.is_empty() {
-                    item.insert(header.clone(), AttributeValue::S(val.clone()));
-                }
+            if let Some(val) = values.get(i)
+                && !val.is_empty()
+            {
+                item.insert(header.clone(), AttributeValue::S(val.clone()));
             }
         }
         if !item.is_empty() {

@@ -19,8 +19,8 @@ A DynamoDB-compatible API adapter, ExtendDB speaks the DynamoDB wire protocol â€
 - Web management console for account and credential administration
 - TLS with automatic self-signed certificate generation (replaceable with CA-signed certs)
 - CSRF protection, security headers, session management
-- Prometheus-compatible metrics endpoint
-- Daemon mode with syslog logging
+- JSON metrics endpoint with DynamoDB CloudWatch-style metric names and dimensions
+- Daemon mode with syslog logging, plus `--foreground` for container and supervisor environments
 - TiDB-first storage backend with native online DDL, secondary indexes, TTL,
   follower reads, bounded stale reads, snapshot reads, and BR backup/restore
 - Optional PostgreSQL backend for local compatibility workflows
@@ -51,7 +51,7 @@ scripts/install-macos.sh   # macOS
 
 ## Prerequisites
 
-- Rust 1.85+ (`rustup update`)
+- Rust 1.88+ (`rustup update`)
 - TiDB 8.5.4+ for the default backend
 - PostgreSQL 14+ only when explicitly building/running the PostgreSQL backend
 - Python 3.10+ (for test suites and documentation)
@@ -107,13 +107,23 @@ cert_path = "/etc/extenddb/tls/cert.pem"
 key_path = "/etc/extenddb/tls/key.pem"
 ```
 
+## Running in Containers
+
+By default `extenddb serve` daemonizes itself, which doesn't play well with container runtimes and process supervisors that expect PID 1 to stay attached. Pass `--foreground` (alias `--no-daemon`) to keep the process in the foreground and stream logs to stderr instead of syslog:
+
+```bash
+extenddb serve --config extenddb.toml --foreground
+```
+
+Use this with Docker, Kubernetes, `systemd Type=simple`, runit, s6, or any other supervisor that captures stdout/stderr. `extenddb status` and `extenddb stop` continue to work as in daemon mode, since the PID file is still written.
+
 ## Monitoring
 
 ```bash
 # Health check
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/health
 
-# Prometheus metrics
+# JSON metrics (DynamoDB CloudWatch-style)
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/metrics
 
 # Syslog (Linux)
@@ -131,6 +141,7 @@ Web-based administration at `https://127.0.0.1:8000/console/`. Manage accounts, 
 
 ```
 extenddb serve --config extenddb.toml          # Start server (daemon)
+extenddb serve --config extenddb.toml --foreground  # Start in foreground
 extenddb init --catalog-db NAME            # Initialize deployment
 extenddb stop --config extenddb.toml           # Graceful shutdown
 extenddb status --config extenddb.toml         # Check if running

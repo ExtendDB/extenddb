@@ -99,6 +99,20 @@ class TestQuery:
         sks = [item["sk"]["S"] for item in resp["Items"]]
         assert sks == ["sort-001", "sort-002", "sort-003"]
 
+    def test_query_key_condition_reversed_sort_key_comparison(self):
+        """Query accepts a value placeholder on the left side of a sort-key comparison."""
+        resp = self.client.query(
+            TableName=self.table,
+            KeyConditionExpression="pk = :pk AND :lo <= sk",
+            ExpressionAttributeValues={
+                ":pk": {"S": "partition-0"},
+                ":lo": {"S": "sort-002"},
+            },
+        )
+        assert resp["Count"] == 3
+        sks = [item["sk"]["S"] for item in resp["Items"]]
+        assert sks == ["sort-002", "sort-003", "sort-004"]
+
     def test_query_scan_index_forward_false(self):
         """Query with ScanIndexForward=False returns items in reverse order."""
         resp = self.client.query(

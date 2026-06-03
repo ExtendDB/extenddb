@@ -171,30 +171,30 @@ impl TidbEngine {
         // throughput values is rejected by DynamoDB. This check runs under the
         // FOR UPDATE lock to eliminate the TOCTOU race that existed when the
         // check was in the engine layer.
-        if matches!(input.billing_mode, Some(BillingMode::Provisioned)) {
-            if let Some(ref pt) = input.provisioned_throughput {
-                let current_pt: Option<ProvisionedThroughput> = current_pt_json
-                    .map(serde_json::from_value)
-                    .transpose()
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                let (current_rcu, current_wcu) = current_pt.as_ref().map_or((0, 0), |pt| {
-                    (pt.read_capacity_units, pt.write_capacity_units)
-                });
+        if matches!(input.billing_mode, Some(BillingMode::Provisioned))
+            && let Some(ref pt) = input.provisioned_throughput
+        {
+            let current_pt: Option<ProvisionedThroughput> = current_pt_json
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let (current_rcu, current_wcu) = current_pt.as_ref().map_or((0, 0), |pt| {
+                (pt.read_capacity_units, pt.write_capacity_units)
+            });
 
-                if current_billing_mode == "PROVISIONED"
-                    && current_rcu == pt.read_capacity_units
-                    && current_wcu == pt.write_capacity_units
-                {
-                    return Err(StorageError::NoOpUpdate(format!(
-                        "The provisioned throughput for the table will not change. \
-                         The requested value equals the current value. \
-                         Current ReadCapacityUnits provisioned for the table: {}. \
-                         Requested ReadCapacityUnits: {}. \
-                         Current WriteCapacityUnits provisioned for the table: {}. \
-                         Requested WriteCapacityUnits: {}.",
-                        current_rcu, pt.read_capacity_units, current_wcu, pt.write_capacity_units
-                    )));
-                }
+            if current_billing_mode == "PROVISIONED"
+                && current_rcu == pt.read_capacity_units
+                && current_wcu == pt.write_capacity_units
+            {
+                return Err(StorageError::NoOpUpdate(format!(
+                    "The provisioned throughput for the table will not change. \
+                     The requested value equals the current value. \
+                     Current ReadCapacityUnits provisioned for the table: {}. \
+                     Requested ReadCapacityUnits: {}. \
+                     Current WriteCapacityUnits provisioned for the table: {}. \
+                     Requested WriteCapacityUnits: {}.",
+                    current_rcu, pt.read_capacity_units, current_wcu, pt.write_capacity_units
+                )));
             }
         }
 

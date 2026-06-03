@@ -1,14 +1,33 @@
 name: Test
 on:
   pull_request:
+  merge_group:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
-  test:
+  run-tests:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: [stable, "1.88.0"]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+
+  test:
+    runs-on: ubuntu-latest
+    needs: run-tests
+    if: always()
+    steps:
+      - run: |
+          if [ "${{ needs.run-tests.result }}" != "success" ]; then
+            exit 1
+          fi

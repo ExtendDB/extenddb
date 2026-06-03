@@ -8,25 +8,25 @@
 # enable "Require review from Code Owners".
 
 # Default — any file not matched below.
-*                              @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan
+*                              @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen
 
 # Wire protocol & DynamoDB-compatible API surface.
-crates/server/                 @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan
-crates/core/                   @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan
+crates/server/                 @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen
+crates/core/                   @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen
 
 # Storage abstraction — breaking changes ripple to every backend.
-crates/storage/                @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan
-crates/storage-postgres/       @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan
-crates/engine/                 @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan
+crates/storage/                @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen
+crates/storage-postgres/       @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen
+crates/engine/                 @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen
 
 # Auth & SigV4 — security-sensitive.
-crates/auth/                   @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan
+crates/auth/                   @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen
 
 # Public CLI surface.
-crates/bin/                    @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan
+crates/bin/                    @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen
 
 # Process & governance documents.
-docs/adr/                      @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan
-docs/rfcs/                     @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan
-CONTRIBUTING.md                @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan
-.github/                       @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan
+docs/adr/                      @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen
+docs/rfcs/                     @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen
+CONTRIBUTING.md                @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen
+.github/                       @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen

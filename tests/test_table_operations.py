@@ -359,3 +359,50 @@ class TestUpdateTable:
         )
         # Should succeed — the table transitions billing mode.
         assert resp["TableDescription"]["TableName"] == unique_table_name
+
+
+
+class TestUpdateTableGsiDeletion:
+    """UpdateTable GSI deletion error handling."""
+
+    def test_delete_nonexistent_gsi_returns_resource_not_found(
+        self, dynamodb_client, create_and_cleanup_table
+    ):
+        """Deleting a non-existent GSI returns ResourceNotFoundException."""
+        resp = create_and_cleanup_table()
+        name = resp["TableDescription"]["TableName"]
+        with pytest.raises(ClientError) as exc:
+            dynamodb_client.update_table(
+                TableName=name,
+                GlobalSecondaryIndexUpdates=[
+                    {"Delete": {"IndexName": "does_not_exist"}}
+                ],
+            )
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ResourceNotFoundException"
+        assert "Requested resource not found" in err["Message"]
+
+
+class TestContainsDuplicateOperand:
+    """contains() with duplicate operand error message."""
+
+    def test_contains_duplicate_path_error_message(
+        self, dynamodb_client, create_and_cleanup_table
+    ):
+        """contains(#a, #a) with same path reports correct error with resolved name."""
+        resp = create_and_cleanup_table()
+        name = resp["TableDescription"]["TableName"]
+        dynamodb_client.put_item(
+            TableName=name, Item={"pk": {"S": "k1"}, "val": {"S": "hello"}}
+        )
+        with pytest.raises(ClientError) as exc:
+            dynamodb_client.put_item(
+                TableName=name,
+                Item={"pk": {"S": "k2"}},
+                ConditionExpression="contains(#a, #a)",
+                ExpressionAttributeNames={"#a": "val"},
+            )
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert "first operand must be distinct" in err["Message"]
+        assert "[val]" in err["Message"]

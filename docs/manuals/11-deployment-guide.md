@@ -107,7 +107,7 @@ Example Dockerfile:
 
 ```dockerfile
 # Match rust-version in Cargo.toml
-FROM rust:1.85 AS builder
+FROM rust:1.95 AS builder
 WORKDIR /src
 COPY . .
 RUN cargo build -j12 --release
@@ -182,7 +182,7 @@ Requirements in the air-gapped environment:
 
 ### Monitoring
 
-- [ ] Scrape `/metrics` with Prometheus (or compatible collector)
+- [ ] Poll `/metrics` for JSON snapshots and forward to your monitoring system (the response is custom JSON, not Prometheus exposition format; convert as needed)
 - [ ] Forward syslog to a log aggregation service
 - [ ] Set up alerts on health check failures (`/health`)
 - [ ] Monitor extenddb process with systemd, supervisord, or equivalent

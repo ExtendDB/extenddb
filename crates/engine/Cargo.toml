@@ -8,6 +8,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+extenddb-auth = { workspace = true }
 extenddb-core = { workspace = true }
 extenddb-storage = { workspace = true }
 serde = { workspace = true }

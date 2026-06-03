@@ -131,7 +131,7 @@ HTTP/HTTPS server built on axum + tower. Responsibilities:
 - DynamoDB wire protocol endpoint (`POST /`)
 - Management REST API (`/management/*`)
 - Web console (`/console/*`) with CSRF protection and security headers
-- Backend-aware health check (`/health`) and Prometheus metrics (`/metrics`)
+- Backend-aware health check (`/health`) and JSON metrics (`/metrics`) with DynamoDB CloudWatch-style metric names and dimensions
 - TLS via rustls (self-signed or CA-signed certificates)
 - Request ID generation, CRC32 checksums, content-type headers
 - Graceful shutdown on SIGTERM/SIGINT

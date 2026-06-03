@@ -8,9 +8,10 @@ This file lists the dependency checks the `extenddb-setup` skill runs before pro
 
 | Dependency | Check command | Minimum version | Rationale |
 |---|---|---|---|
-| Rust toolchain | `cargo --version` and `rustc --version` | 1.85 | extenddb is a Rust workspace; older toolchains fail `cargo build -j12 --release`. |
+| Rust toolchain | `cargo --version` and `rustc --version` | 1.88 | extenddb is a Rust workspace; older toolchains fail `cargo build -j12 --release`. |
 | TiDB/MySQL client | `mysql --version` | n/a | Confirms the operator can check the TiDB SQL endpoint before init. |
 | TiDB SQL readiness | `mysql -h 127.0.0.1 -P 4000 -uroot -e "SELECT VERSION();"` | TiDB 8.5.4+ | Confirms the default backend is reachable before `extenddb init`. |
+| PostgreSQL client | `psql --version` | 14 | Required only when explicitly building and selecting the PostgreSQL backend. |
 | Python 3 | `python3 --version` | 3.10 | Required by the sample apps and the docs build pipeline. |
 
 ## Per-dependency check logic
@@ -29,7 +30,7 @@ If `which cargo` exits nonzero, Rust is not installed. Install:
 - Linux (Fedora/RHEL): `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - macOS: `brew install rustup-init && rustup-init`
 
-If Rust is installed but `rustc --version` reports older than 1.85:
+If Rust is installed but `rustc --version` reports older than 1.88:
 
 ```bash
 rustup update
@@ -86,7 +87,7 @@ If `python3 --version` reports older than 3.10, upgrade via the same package man
 
 ## Version parsing
 
-`rustc --version` prints `rustc 1.85.0 (abcdef0 2025-01-01)`. Extract the version field with `awk`:
+`rustc --version` prints `rustc 1.88.0 (abcdef0 2025-01-01)`. Extract the version field with `awk`:
 
 ```bash
 rustc --version | awk '{print $2}'
@@ -99,11 +100,11 @@ version from `SELECT VERSION()` as the authoritative backend version.
 mysql -h 127.0.0.1 -P 4000 -uroot -e "SELECT VERSION();"
 ```
 
-Compare Rust against 1.85 and TiDB against 8.5.4+.
+Compare Rust against 1.88, TiDB against 8.5.4+, and PostgreSQL against 14 only when the PostgreSQL backend is selected. Split dotted versions on `.` and compare numerically.
 
 ## Rust version upgrade path
 
-If Rust is installed via rustup and `rustc --version` reports older than 1.85, the fix is:
+If Rust is installed via rustup and `rustc --version` reports older than 1.88, the fix is:
 
 ```bash
 rustup update

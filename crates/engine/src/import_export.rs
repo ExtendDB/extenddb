@@ -24,7 +24,7 @@ use extenddb_core::types::{
     ImportTableOutput, Item, TableCreationParameters, TableKeyInfo, extract_key, item_size_bytes,
 };
 use extenddb_core::validation::{
-    validate_attribute_name_sizes, validate_item_keys,
+    validate_attribute_name_sizes, validate_item_keys, validate_item_nesting_depth,
     validate_item_secondary_index_key_constraints, validate_item_size, validate_key_sizes,
 };
 use extenddb_storage::BatchWriteOp;
@@ -91,6 +91,14 @@ pub async fn handle_import_table(
 
     let table_arn = table_desc.table_arn.clone();
     let table_id = table_desc.table_id.clone();
+
+    // Drop any cached negative TableKeyInfo from a prior probe so subsequent
+    // requests against the new table see it without TTL lag. (Tags aren't
+    // propagated through ImportTable today, so resource_tags doesn't need
+    // invalidation here — see create_table_input_from_params.)
+    ctx.auth_cache
+        .invalidate_table_key_info(&ctx.account_id, &tcp.table_name)
+        .await;
 
     wait_for_table_active(ctx, &tcp.table_name).await?;
 
@@ -237,6 +245,8 @@ fn validate_import_item(
 ) -> Result<usize, ImportItemValidationError> {
     validate_item_keys(item, &key_info.key_schema, &key_info.attribute_definitions)
         .map_err(|e| import_item_validation_error("invalid_keys", e))?;
+    validate_item_nesting_depth(item)
+        .map_err(|e| import_item_validation_error("excessive_nesting", e))?;
     validate_item_size(item, limits.max_item_size_bytes)
         .map_err(|e| import_item_validation_error("oversized_item", e))?;
     validate_attribute_name_sizes(item, limits)

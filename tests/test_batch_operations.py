@@ -178,6 +178,30 @@ class TestBatchGetItem:
         # UnprocessedKeys should be empty (or absent)
         unprocessed = resp.get("UnprocessedKeys", {})
         assert len(unprocessed) == 0
+
+    def test_batch_get_unprocessed_keys_always_present(
+        self, dynamodb_client, hash_table
+    ):
+        """BatchGetItem always includes UnprocessedKeys, even when all keys processed.
+
+        Amazon DynamoDB returns ``"UnprocessedKeys": {}`` on the wire when every
+        key is processed; the field is never omitted. A response that drops the
+        field entirely is non-conformant.
+        """
+        dynamodb_client.put_item(
+            TableName=hash_table,
+            Item={"pk": {"S": "present"}},
+        )
+
+        resp = dynamodb_client.batch_get_item(
+            RequestItems={hash_table: {"Keys": [{"pk": {"S": "present"}}]}}
+        )
+
+        assert "UnprocessedKeys" in resp, (
+            "UnprocessedKeys must always be present in the BatchGetItem "
+            "response, even when empty"
+        )
+        assert resp["UnprocessedKeys"] == {}
 # ── BatchWriteItem ────────────────────────────────────────────────────
 class TestBatchWriteItem:
     """Tests for the BatchWriteItem operation."""
@@ -313,6 +337,29 @@ class TestBatchWriteItem:
 
         unprocessed = resp.get("UnprocessedItems", {})
         assert len(unprocessed) == 0
+
+    def test_batch_write_unprocessed_items_always_present(
+        self, dynamodb_client, hash_table
+    ):
+        """BatchWriteItem always includes UnprocessedItems, even on full success.
+
+        Amazon DynamoDB returns ``"UnprocessedItems": {}`` on the wire when every
+        write succeeds; the field is never omitted. A response that drops the
+        field entirely is non-conformant.
+        """
+        resp = dynamodb_client.batch_write_item(
+            RequestItems={
+                hash_table: [
+                    {"PutRequest": {"Item": {"pk": {"S": "always-present"}}}},
+                ]
+            }
+        )
+
+        assert "UnprocessedItems" in resp, (
+            "UnprocessedItems must always be present in the BatchWriteItem "
+            "response, even when empty"
+        )
+        assert resp["UnprocessedItems"] == {}
 
     def test_batch_write_put_wrong_key_type(self, dynamodb_client, hash_table):
         """BatchWriteItem PutRequest with wrong key type returns ValidationException."""

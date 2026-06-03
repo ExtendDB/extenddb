@@ -28,6 +28,26 @@ mysql -h 127.0.0.1 -P 4000 -uroot -e "SELECT VERSION();"
 
 For local development, start TiDB with `tiup playground v8.5.4 --db 1 --pd 1 --kv 3 --without-monitor`, or pass the remote TiDB SQL endpoint to `extenddb init` with `--storage-host` and `--storage-port`.
 
+### `Failed to connect to postgres: Connection error: error with configuration: empty host`
+
+**Cause:** The connection string in `extenddb.toml` has an invalid format, typically from using a Unix socket path with `--pg-host` during `extenddb init` in version tagged 0.1.
+
+**Fix:** Edit `extenddb.toml` and manually percent-encode the Unix socket path in the connection string:
+```toml
+# Before (invalid):
+connection_string = "postgresql://extenddb:***@/var/run/postgresql:5432/extenddb_catalog"
+
+# After (valid):
+connection_string = "postgresql://extenddb:***@%2Fvar%2Frun%2Fpostgresql:5432/extenddb_catalog"
+```
+
+Also update the catalog database:
+```bash
+psql extenddb_catalog -c "UPDATE settings SET value='postgresql://extenddb:***@%2Fvar%2Frun%2Fpostgresql:5432/extenddb' WHERE key='data_database_connection_string';"
+```
+
+**Prevention:** This issue is fixed in versions after 0.1, which automatically encode Unix socket paths correctly.
+
 ### `password authentication failed for user "extenddb"`
 
 **Cause:** The TiDB `extenddb` SQL user doesn't exist, the password doesn't match, or the config points at a TiDB cluster that was not initialized by this deployment.

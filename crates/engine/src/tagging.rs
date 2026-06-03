@@ -40,12 +40,12 @@ async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), 
     })?;
 
     // Check the ARN's account matches the caller's account.
-    if let Some(arn_account) = extract_account_from_arn(arn) {
-        if arn_account != ctx.account_id.as_ref() {
-            return Err(DynamoDbError::AccessDeniedException(
-                "Access is denied".to_owned(),
-            ));
-        }
+    if let Some(arn_account) = extract_account_from_arn(arn)
+        && arn_account != ctx.account_id.as_ref()
+    {
+        return Err(DynamoDbError::AccessDeniedException(
+            "Access is denied".to_owned(),
+        ));
     }
 
     // Verify the table exists via table_key_info (lightweight check).
@@ -85,6 +85,12 @@ pub async fn handle_tag_resource(
         .await
         .map_err(sanitize_storage_error)?;
 
+    // Drop any cached resource-tag entry so the new tags are visible to
+    // ABAC policy evaluation immediately.
+    ctx.auth_cache
+        .invalidate_resource_tags(&input.resource_arn)
+        .await;
+
     // TagResource returns an empty body on success.
     Ok(Value::Object(serde_json::Map::new()))
 }
@@ -115,6 +121,10 @@ pub async fn handle_untag_resource(
         .untag_resource(&input.resource_arn, &input.tag_keys)
         .await
         .map_err(sanitize_storage_error)?;
+
+    ctx.auth_cache
+        .invalidate_resource_tags(&input.resource_arn)
+        .await;
 
     // UntagResource returns an empty body on success.
     Ok(Value::Object(serde_json::Map::new()))

@@ -138,6 +138,7 @@ impl DbCredentialStore {
             is_session: false,
             session_token: None,
             is_active,
+            expires_at: None,
         }))
     }
 
@@ -195,6 +196,7 @@ impl DbCredentialStore {
             is_session: true,
             session_token: Some(session_token),
             is_active: true,
+            expires_at: Some(expires_at),
         }))
     }
 }

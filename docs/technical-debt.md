@@ -87,16 +87,15 @@ See `docs/dynamodb-limits.md` for the full catalog. The following are the highes
 
 | # | Limit | DynamoDB Value | Priority | Origin |
 |---|-------|---------------|----------|--------|
-| L-1 | Attribute nesting depth | 32 levels | Medium | P42 |
-| L-2 | Projected attributes across all indexes | 100 | Medium | P42 |
-| L-3 | Expression size limits (condition/filter/projection) | 4 KB each | Low | P42 |
-| L-4 | Batch/transaction aggregate request size | 4–16 MB | Low | P42 |
-| L-5 | GetRecords max per call | 1,000 records | Low | P42 |
-| L-6 | Shard iterator lifetime | 15 minutes | Medium | P42 |
-| L-7 | Tag count per resource | 50 | Low | P42 |
-| L-8 | Tag key/value length limits | 128/256 chars | Low | P42 |
-| L-9 | LSI item collection size | 10 GB | Low | P42 |
-| L-10 | Provisioned capacity decrease limit | 27/day | Low | P42 |
+| L-1 | Projected attributes across all indexes | 100 | Medium | P42 |
+| L-2 | Expression size limits (condition/filter/projection) | 4 KB each | Low | P42 |
+| L-3 | Batch/transaction aggregate request size | 4–16 MB | Low | P42 |
+| L-4 | GetRecords max per call | 1,000 records | Low | P42 |
+| L-5 | Shard iterator lifetime | 15 minutes | Medium | P42 |
+| L-6 | Tag count per resource | 50 | Low | P42 |
+| L-7 | Tag key/value length limits | 128/256 chars | Low | P42 |
+| L-8 | LSI item collection size | 10 GB | Low | P42 |
+| L-9 | Provisioned capacity decrease limit | 27/day | Low | P42 |
 
 ## File Size Overages (>500 lines)
 

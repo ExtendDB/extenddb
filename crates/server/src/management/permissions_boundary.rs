@@ -112,7 +112,10 @@ async fn set_boundary(
     };
 
     match result {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            invalidate_boundary_cache(state, account_id, principal_type, principal_name).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => op_err_to_response(OpError::from_storage(e)),
     }
 }
@@ -202,7 +205,33 @@ async fn delete_boundary(
     };
 
     match result {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            invalidate_boundary_cache(state, account_id, principal_type, principal_name).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => op_err_to_response(OpError::from_storage(e)),
+    }
+}
+
+async fn invalidate_boundary_cache(
+    state: &ManagementState,
+    account_id: &str,
+    principal_type: &str,
+    principal_name: &str,
+) {
+    match principal_type {
+        "user" => {
+            state
+                .auth_cache
+                .invalidate_user_boundary(account_id, principal_name)
+                .await;
+        }
+        "role" => {
+            state
+                .auth_cache
+                .invalidate_role_boundary(account_id, principal_name)
+                .await;
+        }
+        _ => {}
     }
 }

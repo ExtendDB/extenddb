@@ -26,7 +26,8 @@ use extenddb_core::types::{
     TableKeyInfo, TransactWriteItem, TransactWriteItemsInput, TransactWriteItemsOutput,
 };
 use extenddb_core::validation::{
-    validate_attribute_name_sizes, validate_item_size, validate_key_sizes,
+    validate_attribute_name_sizes, validate_attribute_values_nesting_depth,
+    validate_item_nesting_depth, validate_item_size, validate_key_sizes,
 };
 use extenddb_storage::IdempotencyClaim;
 
@@ -176,7 +177,7 @@ pub async fn handle_transact_write_items(
     let wcu: f64 = prepared
         .iter()
         .map(|op| {
-            let item_wcu = capacity_helpers::write_capacity_units(op.write_bytes());
+            let item_wcu = capacity_helpers::write_capacity_units(op.write_bytes()) * 2.0; // transactions cost 2x
             *per_table_wcu.entry(op.table_name().to_owned()).or_default() += item_wcu;
             item_wcu
         })
@@ -254,6 +255,7 @@ fn prepare_write_op(
     key_info: TableKeyInfo,
 ) -> Result<PreparedOp, DynamoDbError> {
     if let Some(put) = &twi.put {
+        validate_item_nesting_depth(&put.item)?;
         validate_item_size(&put.item, ctx.limits.max_item_size_bytes)?;
         validate_attribute_name_sizes(&put.item, &ctx.limits)?;
         validate_key_sizes(&put.item, &key_info.key_schema, &ctx.limits)?;
@@ -331,6 +333,21 @@ fn prepare_write_op(
             crate::expression_helpers::tokenize_expression(&upd.update_expression, &ctx.limits)?;
         let actions = parse_update(&update_tokens)?;
         validate_no_key_updates(&actions, &key_info, &maps)?;
+
+        // Validate nesting depth of EAV values that get stored via SET actions.
+        {
+            let mut placeholders: Vec<String> = Vec::new();
+            for action in &actions {
+                if let extenddb_core::expression::UpdateAction::Set { value, .. } = action {
+                    extenddb_core::expression::collect_value_placeholders(value, &mut placeholders);
+                }
+            }
+            let stored: Vec<&extenddb_core::types::AttributeValue> = placeholders
+                .iter()
+                .filter_map(|name| maps.values.get(name))
+                .collect();
+            validate_attribute_values_nesting_depth(stored)?;
+        }
         let condition = parse_optional_condition(upd.condition_expression.as_deref(), &ctx.limits)?;
         {
             let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();

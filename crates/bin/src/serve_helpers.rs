@@ -48,10 +48,10 @@ pub fn verify_daemon_started(pid_file: &PathBuf, bind_addr: &str) -> anyhow::Res
     // empty or partially written, so we retry both read and parse.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let pid: u32 = loop {
-        if let Ok(content) = std::fs::read_to_string(pid_file) {
-            if let Ok(p) = content.trim().parse::<u32>() {
-                break p;
-            }
+        if let Ok(content) = std::fs::read_to_string(pid_file)
+            && let Ok(p) = content.trim().parse::<u32>()
+        {
+            break p;
         }
         if std::time::Instant::now() >= deadline {
             eprintln!("Server failed to start: PID file not created within 5 seconds.\n{hint}");

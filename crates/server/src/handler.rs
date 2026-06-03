@@ -39,12 +39,11 @@ pub(crate) async fn handle_request(
 
     // HTTP/2 uses :authority instead of Host. Ensure the Host header is
     // populated so SigV4 verification can find it in the canonical request.
-    if !headers.contains_key("host") {
-        if let Some(authority) = uri.authority() {
-            if let Ok(val) = authority.as_str().parse() {
-                headers.insert("host", val);
-            }
-        }
+    if !headers.contains_key("host")
+        && let Some(authority) = uri.authority()
+        && let Ok(val) = authority.as_str().parse()
+    {
+        headers.insert("host", val);
     }
     let request_id = uuid::Uuid::new_v4().to_string();
 
@@ -110,7 +109,7 @@ pub(crate) async fn handle_request(
     let pre_fetched_read_info;
     let pre_fetched_write_info;
     {
-        let Some(catalog_store) = &state.catalog_store else {
+        if state.catalog_store.is_none() {
             tracing::error!("Authorization required but catalog_store is not configured");
             return error_response(
                 &DynamoDbError::AccessDeniedException(
@@ -119,16 +118,7 @@ pub(crate) async fn handle_request(
                 &request_id,
             );
         };
-        match authorize_request(
-            &state,
-            catalog_store.as_ref(),
-            &identity,
-            &input,
-            &operation,
-            &account_id,
-        )
-        .await
-        {
+        match authorize_request(&state, &identity, &input, &operation, &account_id).await {
             Ok(info) => {
                 pre_fetched_read_info = info.read_info;
                 pre_fetched_write_info = info.write_info;
@@ -149,6 +139,10 @@ pub(crate) async fn handle_request(
         export_paths: state.export_paths.clone(),
         pre_fetched_read_info,
         pre_fetched_write_info,
+        auth_cache: state.auth_cache.clone(),
+        table_key_info_lookup: Some(
+            state.table_key_info_cache.clone() as Arc<dyn extenddb_storage::TableKeyInfoLookup>
+        ),
     };
 
     let table_name = extract_table_name(&input);
@@ -158,58 +152,56 @@ pub(crate) async fn handle_request(
     let partition_value = if let Some(throttle) = &state.throttle {
         let (is_read_op, is_write_op) = classify_data_operation(&operation);
         let partition_value = extract_partition_value(&input, &operation);
-        if let Some(ref tn) = table_name {
-            if is_read_op || is_write_op {
-                if !throttle.is_registered(&ctx.account_id, tn) {
-                    if let Ok(desc) = ctx
-                        .storage
-                        .describe_table(
-                            &ctx.account_id,
-                            extenddb_core::types::DescribeTableInput {
-                                table_name: tn.clone(),
-                            },
-                        )
-                        .await
-                    {
-                        let throughput = table_description_to_throughput(&desc);
-                        throttle.register_table(&ctx.account_id, tn, throughput);
-                    }
-                }
+        if let Some(ref tn) = table_name
+            && (is_read_op || is_write_op)
+        {
+            if !throttle.is_registered(&ctx.account_id, tn)
+                && let Ok(desc) = ctx
+                    .storage
+                    .describe_table(
+                        &ctx.account_id,
+                        extenddb_core::types::DescribeTableInput {
+                            table_name: tn.clone(),
+                        },
+                    )
+                    .await
+            {
+                let throughput = table_description_to_throughput(&desc);
+                throttle.register_table(&ctx.account_id, tn, throughput);
+            }
 
-                let result = throttle.check_capacity_with_partition(
-                    &ctx.account_id,
-                    tn,
-                    is_read_op,
-                    is_write_op,
-                    partition_value.as_deref(),
+            let result = throttle.check_capacity_with_partition(
+                &ctx.account_id,
+                tn,
+                is_read_op,
+                is_write_op,
+                partition_value.as_deref(),
+            );
+            if result != extenddb_core::throttle::ThrottleResult::Allowed {
+                let metric = if result == extenddb_core::throttle::ThrottleResult::ThrottledRead {
+                    extenddb_core::metrics::MetricName::ReadThrottleEvents
+                } else {
+                    extenddb_core::metrics::MetricName::WriteThrottleEvents
+                };
+                state
+                    .metrics
+                    .record(metric, 1.0, Some(tn), None, Some(&operation));
+                state.metrics.record(
+                    extenddb_core::metrics::MetricName::ThrottledRequests,
+                    1.0,
+                    Some(tn),
+                    None,
+                    Some(&operation),
                 );
-                if result != extenddb_core::throttle::ThrottleResult::Allowed {
-                    let metric = if result == extenddb_core::throttle::ThrottleResult::ThrottledRead
-                    {
-                        extenddb_core::metrics::MetricName::ReadThrottleEvents
-                    } else {
-                        extenddb_core::metrics::MetricName::WriteThrottleEvents
-                    };
-                    state
-                        .metrics
-                        .record(metric, 1.0, Some(tn), None, Some(&operation));
-                    state.metrics.record(
-                        extenddb_core::metrics::MetricName::ThrottledRequests,
-                        1.0,
-                        Some(tn),
-                        None,
-                        Some(&operation),
-                    );
-                    return error_response(
-                        &DynamoDbError::ProvisionedThroughputExceededException(
-                            "The level of configured provisioned throughput for the table \
-                             was exceeded. Consider increasing your provisioning level \
-                             with the UpdateTable API."
-                                .to_owned(),
-                        ),
-                        &request_id,
-                    );
-                }
+                return error_response(
+                    &DynamoDbError::ProvisionedThroughputExceededException(
+                        "The level of configured provisioned throughput for the table \
+                         was exceeded. Consider increasing your provisioning level \
+                         with the UpdateTable API."
+                            .to_owned(),
+                    ),
+                    &request_id,
+                );
             }
         }
         partition_value

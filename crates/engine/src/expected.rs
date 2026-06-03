@@ -80,16 +80,14 @@ fn desugar_one(
             ));
         }
         // Exists: true + Value → EQ comparison (legacy shorthand)
-        if exists {
-            if let Some(val) = &expected.value {
-                let placeholder = next_placeholder(counter);
-                values.insert(placeholder.clone(), val.clone());
-                return Ok(Expr::Compare {
-                    left: Box::new(path.clone()),
-                    op: CompareOp::Eq,
-                    right: Box::new(Expr::Placeholder(placeholder)),
-                });
-            }
+        if exists && let Some(val) = &expected.value {
+            let placeholder = next_placeholder(counter);
+            values.insert(placeholder.clone(), val.clone());
+            return Ok(Expr::Compare {
+                left: Box::new(path.clone()),
+                op: CompareOp::Eq,
+                right: Box::new(Expr::Placeholder(placeholder)),
+            });
         }
         let fn_name = if exists {
             "attribute_exists"

@@ -126,7 +126,14 @@ pub async fn delete_account(
     }
 
     match state.catalog_store.delete_account(&id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // Cascade invalidation: drop every cached entry across every
+            // authz subcache (and the credential cache) that belongs to
+            // this account, so a recreate (same id) doesn't inherit the
+            // deleted account's principals/policies.
+            state.auth_cache.invalidate_account(&id).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => op_err_to_response(super::ops::OpError::from_storage(e)),
     }
 }

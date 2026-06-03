@@ -272,7 +272,32 @@ pub async fn delete_role(
         .delete_role(&account_id, &role_name)
         .await
     {
-        Ok(()) => Redirect::to(&format!("/console/accounts/{account_id}")).into_response(),
+        Ok(()) => {
+            // Mirror management::iam_role::delete_role: cascade invalidate
+            // session credentials, role-level authz, and any cached
+            // session_data entries for this role.
+            state
+                .auth_cache
+                .invalidate_principal_credentials(&account_id, &role_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_role_policies(&account_id, &role_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_role_boundary(&account_id, &role_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_role_tags(&account_id, &role_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_role_sessions(&account_id, &role_name)
+                .await;
+            Redirect::to(&format!("/console/accounts/{account_id}")).into_response()
+        }
         Err(e) => {
             let nav = html::nav_bar(&identity_label(&session.identity));
             let content = format!(

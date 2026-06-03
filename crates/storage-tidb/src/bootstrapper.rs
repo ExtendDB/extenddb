@@ -416,6 +416,18 @@ impl Bootstrapper for TidbBootstrapper {
     fn catalog_connection_url(&self) -> String {
         self.app_connection_url(&self.config.catalog_db)
     }
+
+    fn generate_backend_config_section(&self) -> String {
+        format!(
+            r#"[storage.tidb]
+connection_string = "{}"
+# pool_size = 20
+# default_read_staleness_seconds = 0
+# catalog_pool_size = 20
+# resource_group = "extenddb_api""#,
+            self.catalog_connection_url()
+        )
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -537,13 +549,13 @@ impl TidbBootstrapper {
                 "--extenddb-pass",
             )?;
 
-            if let Some(ref cli_catalog) = options.catalog_db {
-                if cli_catalog != &parts.database {
-                    return Err(StorageError::Internal(format!(
-                        "--catalog-db '{}' conflicts with config file catalog database '{}'",
-                        cli_catalog, parts.database
-                    )));
-                }
+            if let Some(ref cli_catalog) = options.catalog_db
+                && cli_catalog != &parts.database
+            {
+                return Err(StorageError::Internal(format!(
+                    "--catalog-db '{}' conflicts with config file catalog database '{}'",
+                    cli_catalog, parts.database
+                )));
             }
 
             (
@@ -599,13 +611,13 @@ fn check_conflict<T: PartialEq + std::fmt::Display>(
     config_val: &T,
     flag: &str,
 ) -> Result<(), extenddb_storage::error::StorageError> {
-    if let Some(v) = cli_val {
-        if v != config_val {
-            return Err(extenddb_storage::error::StorageError::Internal(format!(
-                "{} value '{}' conflicts with config file value '{}'",
-                flag, v, config_val
-            )));
-        }
+    if let Some(v) = cli_val
+        && v != config_val
+    {
+        return Err(extenddb_storage::error::StorageError::Internal(format!(
+            "{} value '{}' conflicts with config file value '{}'",
+            flag, v, config_val
+        )));
     }
     Ok(())
 }

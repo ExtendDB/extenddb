@@ -53,12 +53,13 @@ pub async fn handle_update_table(
     }
 
     // Validate: enabling streams requires a view type.
-    if let Some(spec) = &input.stream_specification {
-        if spec.stream_enabled && spec.stream_view_type.is_none() {
-            return Err(DynamoDbError::ValidationException(
-                "StreamViewType must be specified when StreamEnabled is true".to_owned(),
-            ));
-        }
+    if let Some(spec) = &input.stream_specification
+        && spec.stream_enabled
+        && spec.stream_view_type.is_none()
+    {
+        return Err(DynamoDbError::ValidationException(
+            "StreamViewType must be specified when StreamEnabled is true".to_owned(),
+        ));
     }
 
     // Switching to PROVISIONED requires explicit throughput values.
@@ -80,12 +81,12 @@ pub async fn handle_update_table(
     }
 
     // Validate throughput values (must be > 0).
-    if let Some(ref tp) = input.provisioned_throughput {
-        if tp.read_capacity_units < 1 || tp.write_capacity_units < 1 {
-            return Err(DynamoDbError::ValidationException(
+    if let Some(ref tp) = input.provisioned_throughput
+        && (tp.read_capacity_units < 1 || tp.write_capacity_units < 1)
+    {
+        return Err(DynamoDbError::ValidationException(
                 "One or more parameter values were invalid: ReadCapacityUnits and WriteCapacityUnits must each be at least 1".to_owned(),
             ));
-        }
     }
 
     // Validate GSI updates: each entry must have exactly one of Create, Update, or Delete.
@@ -148,6 +149,7 @@ pub async fn handle_update_table(
         }
     }
 
+    let table_name = input.table_name.clone();
     let desc = ctx
         .storage
         .update_table(&ctx.account_id, input)
@@ -168,7 +170,8 @@ pub async fn handle_update_table(
             }
             extenddb_storage::error::StorageError::IndexNotFound(name) => {
                 DynamoDbError::ResourceNotFoundException(format!(
-                    "One or more parameter values were invalid: Index not found: {name}"
+                    "Requested resource not found: Index {name} for table {}",
+                    table_name
                 ))
             }
             extenddb_storage::error::StorageError::NoOpUpdate(msg) => {
@@ -182,6 +185,18 @@ pub async fn handle_update_table(
                 DynamoDbError::InternalServerError("Internal server error".to_owned())
             }
         })?;
+
+    // Drop the cached TableKeyInfo: index changes, stream-spec changes, and
+    // throughput changes all alter what the cached value contains.
+    //
+    // NOTE: UpdateTable does NOT currently accept Tags. If that ever
+    // changes, also invalidate `resource_tags` for the table ARN here —
+    // the request itself populates resource_tags during authorize_request,
+    // so a stale empty entry would otherwise hide the new tags. See
+    // handle_create_table for the same pattern.
+    ctx.auth_cache
+        .invalidate_table_key_info(&ctx.account_id, &table_name)
+        .await;
 
     let output = extenddb_core::types::UpdateTableOutput {
         table_description: desc,

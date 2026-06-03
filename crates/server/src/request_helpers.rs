@@ -66,9 +66,12 @@ pub(crate) struct AuthorizationPrefetch {
 /// roundtrips in the engine layer. Read operations fetch lightweight read
 /// metadata; write operations that can change secondary-index keys fetch
 /// explicit write metadata.
+///
+/// All authorization data is fetched via `state.authz_cache`, which sits on
+/// top of the underlying `AuthorizationStore` and serves cached, pre-parsed
+/// `PolicyDocument`s.
 pub(crate) async fn authorize_request(
     state: &AppState,
-    store: &dyn extenddb_storage::authorization_store::AuthorizationStore,
     identity: &extenddb_auth::AuthIdentity,
     input: &Value,
     operation: &str,
@@ -94,14 +97,12 @@ pub(crate) async fn authorize_request(
         }
         "GetItem" | "DeleteItem" => {
             if let Some(ref tn) = table_name {
-                (
-                    state
-                        .storage
-                        .table_read_info(account_id, tn, None)
-                        .await
-                        .ok(),
-                    None,
-                )
+                let read_info = state
+                    .table_key_info_cache
+                    .get_optional(account_id, tn)
+                    .await
+                    .map(|table| TableReadInfo { table, index: None });
+                (read_info, None)
             } else {
                 (None, None)
             }
@@ -150,7 +151,7 @@ pub(crate) async fn authorize_request(
         ..Default::default()
     };
     authorization::check_authorization(
-        store,
+        state.authz_cache.as_ref(),
         identity,
         operation,
         &resource_arn,

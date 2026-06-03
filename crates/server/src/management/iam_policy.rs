@@ -203,7 +203,10 @@ async fn put_policy(
         )
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            invalidate_policy_caches(state, account_id, principal_type, principal_name).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => op_err_to_response(OpError::from_storage(e)),
     }
 }
@@ -265,7 +268,62 @@ async fn delete_policy(
         .delete_policy(account_id, principal_type, principal_name, policy_name)
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            invalidate_policy_caches(state, account_id, principal_type, principal_name).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => op_err_to_response(OpError::from_storage(e)),
+    }
+}
+
+/// Drop the cache entries affected by a policy mutation on the given principal.
+///
+/// - **user**: invalidates `user_policies` for that user.
+/// - **role**: invalidates `role_policies` for that role.
+/// - **group**: invalidates `user_group_policies` for **every member** of the
+///   group (the cache key is per-user, since membership is flattened during the
+///   loader fetch). A failed member listing leaves stale entries that age out
+///   at the configured TTL.
+async fn invalidate_policy_caches(
+    state: &ManagementState,
+    account_id: &str,
+    principal_type: &str,
+    principal_name: &str,
+) {
+    match principal_type {
+        "user" => {
+            state
+                .auth_cache
+                .invalidate_user_policies(account_id, principal_name)
+                .await;
+        }
+        "role" => {
+            state
+                .auth_cache
+                .invalidate_role_policies(account_id, principal_name)
+                .await;
+        }
+        "group" => {
+            let members = match state
+                .catalog_store
+                .get_group_detail(account_id, principal_name)
+                .await
+            {
+                Ok(Some(detail)) => detail.members,
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    tracing::warn!(
+                        "invalidate_policy_caches: get_group_detail failed for {principal_name}: {e:?}; \
+                         members' cached group policies will age out at TTL"
+                    );
+                    Vec::new()
+                }
+            };
+            state
+                .auth_cache
+                .invalidate_users_group_policies(account_id, &members)
+                .await;
+        }
+        _ => {}
     }
 }

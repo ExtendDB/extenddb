@@ -377,7 +377,8 @@ class TestInOrderDelivery:
                 dynamodb_client.update_item(
                     TableName=name,
                     Key={"pk": {"S": "ordered-key"}},
-                    UpdateExpression="SET counter = :c",
+                    UpdateExpression="SET #c = :c",
+                    ExpressionAttributeNames={"#c": "counter"},
                     ExpressionAttributeValues={":c": {"N": str(i)}},
                 )
             time.sleep(2)
