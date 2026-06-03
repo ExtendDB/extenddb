@@ -11,7 +11,10 @@ use sqlx::{MySql, QueryBuilder};
 
 use crate::TidbEngine;
 use crate::data;
-use crate::tidb_util::{execute_tidb_idempotent_ddl, is_table_not_found_tidb_storage_error};
+use crate::tidb_util::{
+    defer_if_table_has_active_ddl_job, execute_tidb_idempotent_ddl,
+    is_table_not_found_tidb_storage_error,
+};
 
 const TTL_EXPIRES_AT_COLUMN: &str = "_edb_ttl_expires_at";
 const TTL_EXPIRES_AT_INDEX: &str = "_edb_ttl_expires_at_idx";
@@ -124,6 +127,14 @@ async fn show_create_table(
             .map_err(|e| StorageError::Internal(e.to_string()))?;
     let create_table = create_table.to_ascii_uppercase();
     Ok(create_table)
+}
+
+async fn table_has_active_native_ddl_job(
+    pool: &sqlx::MySqlPool,
+    operation: &'static str,
+    physical_table_name: &str,
+) -> Result<bool, StorageError> {
+    defer_if_table_has_active_ddl_job(pool, operation, physical_table_name).await
 }
 
 pub(crate) fn create_table_has_native_ttl(create_table: &str) -> bool {
@@ -546,6 +557,16 @@ impl TidbEngine {
             });
 
         for fixed in catalog.chain(data) {
+            if table_has_active_native_ddl_job(
+                fixed.pool,
+                "repair_fixed_native_ttl",
+                fixed.spec.table,
+            )
+            .await?
+            {
+                continue;
+            }
+
             if !native_ttl_needs_repair(fixed.pool, fixed.spec.table).await? {
                 continue;
             }
@@ -575,6 +596,17 @@ impl TidbEngine {
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         for (table_id, ttl_attribute, ttl_status) in rows {
+            let physical_table_name = data::physical_data_table_name(&table_id);
+            if table_has_active_native_ddl_job(
+                &self.data_pool,
+                "repair_user_table_native_ttl",
+                &physical_table_name,
+            )
+            .await?
+            {
+                continue;
+            }
+
             let Some(ttl_attribute) = ttl_attribute else {
                 sqlx::query("UPDATE tables SET ttl_status = 'DISABLED' WHERE table_id = ?")
                     .bind(&table_id)

@@ -219,7 +219,9 @@ empty pre-split Regions.
   instead of inferring intent from artifact booleans. Legacy readiness booleans
   are migrated into that explicit status and then dropped. Repair also reads
   physical table TTL state and re-enables `TTL_ENABLE` when TiDB recovery tools
-  such as BR or Flashback have disabled TTL jobs.
+  such as BR or Flashback have disabled TTL jobs. Startup repair checks TiDB's
+  native DDL job queue before issuing repair DDL, so concurrently starting
+  frontends defer to TiDB's active online schema job instead of duplicating it.
 
 **StreamEngine** (DynamoDB Streams):
 - `write_stream_record` — writes stream record atomically with data write
@@ -457,6 +459,8 @@ missing native DDL progress is reported with the TiDB job state.
 The TiDB reconciler uses the same native DDL-job view before submitting table
 DDL, so multiple frontend nodes defer while TiDB already has a queued or
 running job for that physical table instead of creating duplicate DDL pressure.
+Startup native TTL repair follows the same rule for fixed-retention tables and
+user `_ddb_*` tables.
 The binary only loads config, refuses to run while the server PID is alive, and
 prints the backend report.
 
@@ -980,8 +984,8 @@ when the transition fires. TiDB uses immediate eligibility and idempotent `DROP 
 - TiDB does not elect an ExtendDB DDL owner. Multiple frontend nodes may replay
   the same catalog intent concurrently; idempotent `IF EXISTS` / `IF NOT EXISTS`
   DDL, native `information_schema.ddl_jobs` deferral for already-active table
-  jobs, and conditional catalog publication converge on the TiDB-owned schema
-  state.
+  jobs, DDL-aware startup TTL repair, and conditional catalog publication
+  converge on the TiDB-owned schema state.
 
 **Crash recovery and in-flight operation tracking:**
 
@@ -1382,11 +1386,12 @@ internals):
   online DDL owns schema jobs, TiDB native TTL handles all item TTL plus
   stream-record, idempotency-token, metrics, login-attempt, and assume-role
   session retention, startup repair re-enables native TTL jobs if TiDB tooling
-  left `TTL_ENABLE = 'OFF'`, startup repair re-applies `merge_option=deny` for
-  pre-split catalog, shared data, and user data tables if TiDB tooling omitted
-  table attributes, one-time data migrations pre-split shared write tables with
-  TiDB Region split/scatter using boundaries derived from their native key
-  layout, and TiDB `information_schema` table statistics are read on demand
+  left `TTL_ENABLE = 'OFF'` and no TiDB DDL job is already active for the table,
+  startup repair re-applies `merge_option=deny` for pre-split catalog, shared
+  data, and user data tables if TiDB tooling omitted table attributes, one-time
+  data migrations pre-split shared write tables with TiDB Region split/scatter
+  using boundaries derived from their native key layout, and TiDB
+  `information_schema` table statistics are read on demand
   instead of refreshed by a frontend worker.
 - Runtime hooks also expose backend readiness to `/health`, so TiDB checks every
   pool opened by the frontend instead of reporting web-process liveness only.

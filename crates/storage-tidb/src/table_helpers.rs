@@ -15,6 +15,9 @@ use crate::TidbEngine;
 use crate::data::physical_data_table_name;
 use crate::throughput::zero_provisioned_throughput_description;
 
+const STATS_META_PARTITION_NAME_COLUMN: &str = "Partition_name";
+const STATS_META_ROW_COUNT_COLUMN: &str = "Row_count";
+
 /// Row type for table metadata queries.
 #[derive(sqlx::FromRow)]
 pub(crate) struct TableRow {
@@ -91,10 +94,10 @@ impl TidbEngine {
             .iter()
             .map(|row| {
                 let partition_name = row
-                    .try_get::<String, _>(2)
+                    .try_get::<String, _>(STATS_META_PARTITION_NAME_COLUMN)
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
                 let row_count = row
-                    .try_get::<i64, _>(5)
+                    .try_get::<i64, _>(STATS_META_ROW_COUNT_COLUMN)
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
                 Ok((partition_name, row_count))
             })
@@ -301,6 +304,7 @@ impl TidbEngine {
 #[cfg(test)]
 mod tests {
     use super::{
+        STATS_META_PARTITION_NAME_COLUMN, STATS_META_ROW_COUNT_COLUMN,
         current_table_item_count_sql, current_table_logical_size_sql,
         item_count_from_stats_meta_rows,
     };
@@ -339,5 +343,11 @@ mod tests {
         let rows = [("".to_owned(), 2), ("".to_owned(), 3)];
 
         assert_eq!(item_count_from_stats_meta_rows(&rows), 5);
+    }
+
+    #[test]
+    fn table_description_reads_tidb_stats_meta_by_documented_column_names() {
+        assert_eq!(STATS_META_PARTITION_NAME_COLUMN, "Partition_name");
+        assert_eq!(STATS_META_ROW_COUNT_COLUMN, "Row_count");
     }
 }
