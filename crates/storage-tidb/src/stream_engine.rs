@@ -13,7 +13,7 @@ use extenddb_storage::util::{parse_stream_arn, stream_arn};
 use futures::future::BoxFuture;
 
 use crate::TidbEngine;
-use crate::data::finalize_pending_stream_records_for_shard;
+use crate::data::{finalize_pending_stream_record_batch_for_shard, next_stream_sequence};
 
 /// Number of fixed shards per stream (hash-based assignment).
 ///
@@ -55,22 +55,6 @@ pub(crate) fn stream_shard_id_for_partition_key(
     partition_key: &[u8],
 ) -> String {
     stream_shard_id(table_id, stream_label, stream_shard_index(partition_key))
-}
-
-async fn latest_committed_sequence_number(
-    pool: &sqlx::MySqlPool,
-    shard_id: &str,
-) -> Result<Option<String>, StorageError> {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT commit_sequence_number FROM stream_records \
-         WHERE shard_id = ? AND commit_sequence_number IS NOT NULL \
-         ORDER BY commit_sequence_number DESC LIMIT 1",
-    )
-    .bind(shard_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| StorageError::Internal(e.to_string()))?;
-    Ok(row.map(|(sequence,)| sequence))
 }
 
 const STREAM_FINALIZE_READ_REPAIR_BATCH_SIZE: i64 = 256;
@@ -207,7 +191,7 @@ impl StreamEngine for TidbEngine {
         let shard_id = shard_id.to_string();
         let after_sequence = after_sequence.map(|s| s.to_string());
         Box::pin(async move {
-            finalize_pending_stream_records_for_shard(
+            finalize_pending_stream_record_batch_for_shard(
                 &self.data_pool,
                 &shard_id,
                 STREAM_FINALIZE_READ_REPAIR_BATCH_SIZE,
@@ -520,13 +504,12 @@ impl StreamEngine for TidbEngine {
     ) -> BoxFuture<'_, Result<Option<String>, StorageError>> {
         let shard_id = shard_id.to_string();
         Box::pin(async move {
-            finalize_pending_stream_records_for_shard(
-                &self.data_pool,
-                &shard_id,
-                STREAM_FINALIZE_READ_REPAIR_BATCH_SIZE,
-            )
-            .await?;
-            latest_committed_sequence_number(&self.data_pool, &shard_id).await
+            // LATEST needs a high-water mark, not stream-row maintenance. TiDB's
+            // current TSO is a native cluster-wide marker; future stream commit
+            // TSOs will sort after it, while already-committed rows sort before it.
+            next_stream_sequence(&self.data_pool, &shard_id)
+                .await
+                .map(Some)
         })
     }
 }

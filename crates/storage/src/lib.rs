@@ -611,10 +611,13 @@ pub trait StreamEngine: Send + Sync {
         shard_id: &str,
     ) -> BoxFuture<'_, Result<(), StorageError>>;
 
-    /// Return the latest sequence number in a shard, or `None` if the shard is empty.
+    /// Return a sequence marker for the current end of a shard.
     ///
     /// Used by `GetShardIterator` with `LATEST` to resolve the current position
     /// so that only records written after the iterator was created are returned.
+    /// Backends may return either the latest committed stream record sequence or
+    /// a backend-native high-water marker that future sequence numbers sort
+    /// after.
     fn latest_sequence_number(
         &self,
         shard_id: &str,

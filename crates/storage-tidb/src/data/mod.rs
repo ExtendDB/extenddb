@@ -301,7 +301,7 @@ pub(crate) use region_split::{
 };
 
 pub(crate) use index::{native_index_key_tuple_columns, native_index_name};
-pub(crate) use tx_helpers::{finalize_pending_stream_records_for_shard, next_stream_sequence};
+pub(crate) use tx_helpers::{finalize_pending_stream_record_batch_for_shard, next_stream_sequence};
 
 #[cfg(test)]
 mod tests {

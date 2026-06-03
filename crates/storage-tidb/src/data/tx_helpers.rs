@@ -539,65 +539,47 @@ pub(crate) async fn finalize_stream_records_best_effort(
     }
 }
 
-pub(crate) async fn finalize_pending_stream_records_for_shard(
+const PENDING_STREAM_RECORD_REPAIR_SELECT_SQL: &str = "SELECT record_id, shard_id, sequence_number \
+     FROM stream_records \
+     WHERE shard_id = ? AND commit_sequence_number IS NULL \
+     ORDER BY sequence_number LIMIT ?";
+
+pub(crate) async fn finalize_pending_stream_record_batch_for_shard(
     pool: &sqlx::MySqlPool,
     shard_id: &str,
     limit: i64,
 ) -> Result<u64, StorageError> {
-    let mut total_finalized = 0_u64;
-    loop {
-        let rows: Vec<(i64, String, String)> = sqlx::query_as(
-            "SELECT record_id, shard_id, sequence_number \
-             FROM stream_records \
-             WHERE shard_id = ? AND commit_sequence_number IS NULL \
-             ORDER BY sequence_number LIMIT ?",
-        )
+    let rows: Vec<(i64, String, String)> = sqlx::query_as(PENDING_STREAM_RECORD_REPAIR_SELECT_SQL)
         .bind(shard_id)
         .bind(limit)
         .fetch_all(pool)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let pending = rows
-            .into_iter()
-            .map(
-                |(record_id, shard_id, storage_sequence_number)| PendingStreamRecord {
-                    record_id,
-                    shard_id,
-                    storage_sequence_number,
-                },
-            )
-            .collect::<Vec<_>>();
+    let pending = rows
+        .into_iter()
+        .map(
+            |(record_id, shard_id, storage_sequence_number)| PendingStreamRecord {
+                record_id,
+                shard_id,
+                storage_sequence_number,
+            },
+        )
+        .collect::<Vec<_>>();
 
-        if pending.is_empty() {
-            return Ok(total_finalized);
-        }
-
-        let row_count = pending.len();
-
-        let finalized = finalize_stream_records(pool, &pending).await?;
-        if finalized == 0 {
-            let remaining: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM stream_records \
-                 WHERE shard_id = ? AND commit_sequence_number IS NULL",
-            )
-            .bind(shard_id)
-            .fetch_one(pool)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-            if remaining > 0 {
-                return Err(StorageError::Internal(format!(
-                    "unable to finalize {remaining} TiDB stream records from MVCC commit metadata"
-                )));
-            }
-            return Ok(total_finalized);
-        }
-
-        total_finalized += finalized;
-        if row_count < usize::try_from(limit).unwrap_or(usize::MAX) {
-            return Ok(total_finalized);
-        }
+    if pending.is_empty() {
+        return Ok(0);
     }
+
+    let finalized = finalize_stream_records(pool, &pending).await?;
+    if finalized == 0 {
+        tracing::warn!(
+            selected = pending.len(),
+            "TiDB stream read repair found no records to finalize; another reader may have repaired them first"
+        );
+    }
+
+    Ok(finalized)
 }
 
 /// Check an idempotency token within an existing transaction.
@@ -663,10 +645,10 @@ mod tests {
     use extenddb_storage::StreamCapture;
 
     use super::{
-        PendingStreamRecord, STREAM_COMMIT_SEQUENCE_SQL, format_tso_sequence_number,
-        idempotency_token_claim_select_sql, idempotency_token_claim_sql,
-        push_stream_record_id_predicate, stream_capture_needs_old_item,
-        stream_event_from_upsert_rows_affected,
+        PENDING_STREAM_RECORD_REPAIR_SELECT_SQL, PendingStreamRecord, STREAM_COMMIT_SEQUENCE_SQL,
+        format_tso_sequence_number, idempotency_token_claim_select_sql,
+        idempotency_token_claim_sql, push_stream_record_id_predicate,
+        stream_capture_needs_old_item, stream_event_from_upsert_rows_affected,
     };
 
     #[test]
@@ -777,5 +759,14 @@ mod tests {
 
         assert!(sql.contains("TIDB_ENCODE_RECORD_KEY(DATABASE(), 'stream_records', record_id)"));
         assert!(!sql.contains("shard_id, sequence_number"));
+    }
+
+    #[test]
+    fn stream_read_repair_selects_one_ordered_batch() {
+        let sql = PENDING_STREAM_RECORD_REPAIR_SELECT_SQL;
+
+        assert!(sql.contains("WHERE shard_id = ? AND commit_sequence_number IS NULL"));
+        assert!(sql.contains("ORDER BY sequence_number LIMIT ?"));
+        assert!(!sql.contains("COUNT(*)"));
     }
 }
