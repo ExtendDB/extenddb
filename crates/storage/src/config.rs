@@ -26,7 +26,9 @@ pub trait StorageConfig: Send + Sync + std::fmt::Debug {
     /// Enable downcasting to specific storage engine config types to allow
     /// access to engine-specific configuration (e.g. `keyspace_prefix` for
     /// the Cassandra backend).
-    fn as_any(&self) -> &dyn std::any::Any where Self: 'static;
+    fn as_any(&self) -> &dyn std::any::Any
+    where
+        Self: 'static;
 }
 
 impl Clone for Box<dyn StorageConfig> {
