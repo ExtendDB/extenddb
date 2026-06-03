@@ -116,7 +116,9 @@ Key design decisions:
   `tidb_txn_mode = 'pessimistic'` so write-path row locks are explicit and do
   not depend on cluster upgrade history.
 - **Default reads should use native read routing.** TiDB uses a separate
-  `closest-adaptive` follower-read pool for default DynamoDB reads.
+  `closest-adaptive` follower-read pool for default DynamoDB reads and can add
+  statement-level bounded stale read for base-table default reads when
+  configured.
   `TransactGetItems` runs plain reads inside one TiDB transaction, getting a
   native snapshot without application-level locks.
 - **Conditional create after an absent-key read** should rely on backend-native

@@ -49,6 +49,27 @@ pub(crate) fn data_table_name(table_id: &str) -> String {
     format!("`{}`", physical_data_table_name(table_id))
 }
 
+/// SQL table reference for an eventually consistent base-table read.
+///
+/// TiDB bounded stale read lets default DynamoDB reads use any suitable MVCC
+/// replica while preserving a transactionally consistent snapshot. Strong reads
+/// and native secondary-index reads intentionally do not use this helper.
+pub(crate) fn data_table_read_ref(
+    table_id: &str,
+    default_read_staleness_seconds: Option<u32>,
+) -> String {
+    let table = data_table_name(table_id);
+    match default_read_staleness_seconds.filter(|seconds| *seconds > 0) {
+        Some(seconds) => {
+            format!(
+                "{table} AS OF TIMESTAMP \
+                 TIDB_BOUNDED_STALENESS(NOW() - INTERVAL {seconds} SECOND, NOW())"
+            )
+        }
+        None => table,
+    }
+}
+
 /// Raw TiDB table name for a Virtual `DynamoDB` table.
 pub(crate) fn physical_data_table_name(table_id: &str) -> String {
     format!("_ddb_{table_id}")
@@ -312,7 +333,8 @@ mod tests {
     use super::{
         DATA_TABLE_METADATA_LIKE_BIND_CLAUSE, DATA_TABLE_METADATA_LIKE_BIND_PATTERN,
         DATA_TABLE_METADATA_LIKE_CLAUSE, NATIVE_INDEX_GENERATED_PK_COLUMN_METADATA_LIKE_CLAUSE,
-        NATIVE_INDEX_METADATA_LIKE_CLAUSE, physical_pk_bytes, validate_native_key_schema_shape,
+        NATIVE_INDEX_METADATA_LIKE_CLAUSE, data_table_read_ref, physical_pk_bytes,
+        validate_native_key_schema_shape,
     };
 
     #[test]
@@ -331,6 +353,20 @@ mod tests {
             NATIVE_INDEX_GENERATED_PK_COLUMN_METADATA_LIKE_CLAUSE,
             "LIKE 'edbidx\\\\_%\\\\_pk' ESCAPE '\\\\'"
         );
+    }
+
+    #[test]
+    fn data_table_read_ref_can_use_tidb_bounded_staleness() {
+        assert_eq!(
+            data_table_read_ref("tableid", Some(5)),
+            "`_ddb_tableid` AS OF TIMESTAMP TIDB_BOUNDED_STALENESS(NOW() - INTERVAL 5 SECOND, NOW())"
+        );
+    }
+
+    #[test]
+    fn zero_data_table_read_staleness_uses_latest_schema() {
+        assert_eq!(data_table_read_ref("tableid", None), "`_ddb_tableid`");
+        assert_eq!(data_table_read_ref("tableid", Some(0)), "`_ddb_tableid`");
     }
 
     #[test]

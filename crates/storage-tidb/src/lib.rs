@@ -144,6 +144,9 @@ pub struct TidbConfig {
     pub pool_size: u32,
     /// Maximum connections for catalog metadata and control-plane work.
     pub catalog_pool_size: u32,
+    /// Optional bounded-staleness window for DynamoDB eventually consistent
+    /// default reads.
+    pub default_read_staleness_seconds: Option<u32>,
     /// Runtime limits that TiDB must enforce after storage-side mutations.
     pub limits: LimitsConfig,
     pub native_backup: extenddb_storage::config::NativeBackupConfig,
@@ -168,6 +171,7 @@ pub struct TidbEngine {
     /// Read-only data pool for DynamoDB reads that did not request
     /// `ConsistentRead=true`.
     pub(crate) data_default_read_pool: MySqlPool,
+    pub(crate) default_read_staleness_seconds: Option<u32>,
     pub(crate) region: String,
     pub(crate) limits: LimitsConfig,
     pub(crate) native_backup: backup_engine::TidbNativeBackupConfig,
@@ -255,6 +259,7 @@ impl TidbEngine {
             pool,
             data_pool,
             data_default_read_pool,
+            default_read_staleness_seconds: config.default_read_staleness_seconds,
             region: region.to_owned(),
             limits: config.limits.clone(),
             native_backup: backup_engine::TidbNativeBackupConfig::from_storage_config(
@@ -357,6 +362,14 @@ impl TidbEngine {
             &self.data_pool
         } else {
             &self.data_default_read_pool
+        }
+    }
+
+    pub(crate) fn default_read_staleness_seconds(&self, consistent_read: bool) -> Option<u32> {
+        if consistent_read {
+            None
+        } else {
+            self.default_read_staleness_seconds
         }
     }
 }
@@ -574,6 +587,7 @@ inventory::submit! {
             let limits = config.runtime_limits().cloned().unwrap_or_default();
             let native_backup = config.native_backup_config().unwrap_or_default();
             let resource_group = config.native_capacity_resource_group().map(str::to_owned);
+            let default_read_staleness_seconds = config.native_default_read_staleness_seconds();
             let region = region.to_string();
             Box::pin(async move {
                 let pool_size = normalized_pool_size("storage.tidb.pool_size", max_connections);
@@ -587,6 +601,7 @@ inventory::submit! {
                     connection_string: connection_string.clone(),
                     pool_size,
                     catalog_pool_size,
+                    default_read_staleness_seconds,
                     limits,
                     native_backup,
                     resource_group: resource_group.clone(),

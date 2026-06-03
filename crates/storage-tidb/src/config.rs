@@ -21,6 +21,9 @@ pub struct TidbStorageConfig {
     /// Optional TiDB Resource Control group bound to every runtime SQL session.
     #[serde(default)]
     pub resource_group: Option<String>,
+    /// Optional TiDB bounded-staleness window for DynamoDB default reads.
+    #[serde(default)]
+    pub default_read_staleness_seconds: Option<u32>,
     #[serde(default)]
     pub backup: TidbBackupConfig,
 }
@@ -56,6 +59,7 @@ impl Default for TidbStorageConfig {
             pool_size: default_pool_size(),
             catalog_pool_size: None,
             resource_group: None,
+            default_read_staleness_seconds: None,
             backup: TidbBackupConfig::default(),
         }
     }
@@ -233,6 +237,11 @@ impl extenddb_storage::config::StorageConfig for TidbStorageConfig {
         self.resource_group.as_deref()
     }
 
+    fn native_default_read_staleness_seconds(&self) -> Option<u32> {
+        self.default_read_staleness_seconds
+            .filter(|seconds| *seconds > 0)
+    }
+
     fn clone_box(&self) -> Box<dyn extenddb_storage::config::StorageConfig> {
         Box::new(self.clone())
     }
@@ -301,5 +310,31 @@ resource_group = "extenddb_api"
             config.native_capacity_resource_group(),
             Some("extenddb_api")
         );
+    }
+
+    #[test]
+    fn tidb_exposes_configured_native_default_read_staleness() {
+        let config: TidbStorageConfig = toml::from_str(
+            r#"
+connection_string = "mysql://extenddb:extenddb-local-dev@localhost:4000/extenddb_catalog"
+default_read_staleness_seconds = 5
+"#,
+        )
+        .expect("tidb config should parse");
+
+        assert_eq!(config.native_default_read_staleness_seconds(), Some(5));
+    }
+
+    #[test]
+    fn zero_default_read_staleness_is_disabled() {
+        let config: TidbStorageConfig = toml::from_str(
+            r#"
+connection_string = "mysql://extenddb:extenddb-local-dev@localhost:4000/extenddb_catalog"
+default_read_staleness_seconds = 0
+"#,
+        )
+        .expect("tidb config should parse");
+
+        assert_eq!(config.native_default_read_staleness_seconds(), None);
     }
 }

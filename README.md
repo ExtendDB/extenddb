@@ -22,7 +22,7 @@ A DynamoDB-compatible API adapter, ExtendDB speaks the DynamoDB wire protocol â€
 - Prometheus-compatible metrics endpoint
 - Daemon mode with syslog logging
 - TiDB-first storage backend with native online DDL, secondary indexes, TTL,
-  follower reads, snapshot reads, and BR backup/restore
+  follower reads, bounded stale reads, snapshot reads, and BR backup/restore
 - Optional PostgreSQL backend for local compatibility workflows
 
 ## Quick Start

@@ -753,7 +753,11 @@ native topology metadata so ExtendDB can prove they share one cluster. The
 strong-data pool uses leader reads for writes and `ConsistentRead=true`; the
 default-read pool sets
 `tidb_replica_read = 'closest-adaptive'` for DynamoDB reads that did not request
-`ConsistentRead=true`.
+`ConsistentRead=true`. Operators that want lower latency and can tolerate
+DynamoDB's default eventual-read semantics can set
+`storage.tidb.default_read_staleness_seconds`; base-table default reads then add
+TiDB's statement-level `AS OF TIMESTAMP TIDB_BOUNDED_STALENESS(...)` clause.
+Strong reads and native secondary-index reads stay on the latest-schema path.
 
 ### 5.3 Read Consistency Model
 
@@ -769,7 +773,12 @@ trait carries the consistency signal for backends that can use it.
 dedicated default-read pool with TiDB's `closest-adaptive` follower-read mode.
 TiDB follower read is still strongly consistent, but it lets TiDB offload larger
 read-only statements to local replicas and reduce leader/AZ pressure while
-remaining valid for DynamoDB's weaker default read contract.
+remaining valid for DynamoDB's weaker default read contract. If
+`storage.tidb.default_read_staleness_seconds` is configured above zero,
+base-table default reads also use TiDB bounded stale read so TiDB can choose the
+newest non-blocking MVCC timestamp inside that window. The backend deliberately
+does not apply that stale-read clause to secondary-index reads, because a
+recently published native index must be read against the latest schema.
 
 **Which operations are affected:**
 - `GetItem`: uses `consistent_read` field (default `false` in DynamoDB)

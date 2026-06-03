@@ -160,7 +160,7 @@ The existing "No Caching Rule" is preserved and strengthened. Frontends remain s
 
 The storage adapter is responsible for mapping the DynamoDB `ConsistentRead` flag to the backend's native read path. The engine passes the raw `consistent_read: bool` to `get_item`, `query`, and `scan`; it does not know whether a backend uses one pool, a replica endpoint, TiDB follower reads, or a clustered SQL gateway.
 
-**Rationale:** Different backends implement replication differently. The storage adapter is the right place to abstract this. TiDB maps default reads to a default-read pool configured with `tidb_replica_read = 'closest-adaptive'` and maps writes plus `ConsistentRead=true` reads to the strong data pool. PostgreSQL currently uses its configured primary pool for both values.
+**Rationale:** Different backends implement replication differently. The storage adapter is the right place to abstract this. TiDB maps default reads to a default-read pool configured with `tidb_replica_read = 'closest-adaptive'`, can add statement-level bounded stale read for base-table default reads when configured, and maps writes plus `ConsistentRead=true` reads to the strong data pool. PostgreSQL currently uses its configured primary pool for both values.
 
 ### D3: Leadership Is Per-Catalog, Not Per-Frontend
 
@@ -270,7 +270,7 @@ Methods that do NOT need it:
 
 **`BatchGetItem` routing:** The engine handles `BatchGetItem` by calling `get_item` per key in a loop. `BatchGetItem` has per-table `ConsistentRead` — different tables in the same batch can specify different consistency levels. The `batch_get_item` engine handler passes `ka.consistent_read.unwrap_or(false)` to each `get_item` call. This means a single `BatchGetItem` request may route some reads through the backend's strong path and others through the backend's default-read path, depending on per-table settings. This is correct behavior because each table in a DynamoDB batch independently honors its `ConsistentRead` setting.
 
-For TiDB, `consistent_read = false` selects the read-only data pool configured with `tidb_replica_read = 'closest-adaptive'`; `consistent_read = true` selects the strong data pool. For PostgreSQL, both values currently select the same configured primary data pool.
+For TiDB, `consistent_read = false` selects the read-only data pool configured with `tidb_replica_read = 'closest-adaptive'`; if `storage.tidb.default_read_staleness_seconds` is configured, base-table default reads also add TiDB `AS OF TIMESTAMP TIDB_BOUNDED_STALENESS(...)`. `consistent_read = true` selects the strong data pool. For PostgreSQL, both values currently select the same configured primary data pool.
 
 **TransactGetItems:** DynamoDB requires `ConsistentRead = true` for all items in a `TransactGetItems` request. The operation is always strongly consistent. TiDB runs plain reads inside one TiDB transaction to get a native snapshot without acquiring application-level locks. PostgreSQL uses its normal transaction path.
 
@@ -343,7 +343,7 @@ The `DataEngine` read methods accept `consistent_read: bool`, and the engine thr
 
 TiDB uses backend-native primitives instead of ExtendDB ownership layers:
 
-- Default reads use a read-only data pool configured with `tidb_replica_read = 'closest-adaptive'`.
+- Default reads use a read-only data pool configured with `tidb_replica_read = 'closest-adaptive'`; optional base-table bounded stale reads use TiDB `AS OF TIMESTAMP TIDB_BOUNDED_STALENESS(...)`.
 - Strong reads and writes use the strong data pool.
 - `TransactGetItems` uses one TiDB transaction snapshot with plain reads.
 - GSI and LSI are represented with generated columns plus native TiDB secondary indexes.

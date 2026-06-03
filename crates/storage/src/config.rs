@@ -86,6 +86,16 @@ pub trait StorageConfig: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Optional bounded-staleness window for backend-native eventually
+    /// consistent default reads.
+    ///
+    /// Backends that support statement-level historical reads can expose a
+    /// window here. `ConsistentRead=true` paths must ignore this and use the
+    /// latest strongly consistent read path.
+    fn native_default_read_staleness_seconds(&self) -> Option<u32> {
+        None
+    }
+
     /// Clone this config into a boxed trait object.
     fn clone_box(&self) -> Box<dyn StorageConfig>;
 }
