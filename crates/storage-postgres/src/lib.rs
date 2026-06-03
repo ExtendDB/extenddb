@@ -155,24 +155,6 @@ pub struct PostgresEngine {
     /// P119: Cached GSI default propagation delay (milliseconds). Updated by
     /// background poller every 30s. Avoids per-request DB query on write path.
     pub gsi_default_delay_ms: Arc<std::sync::atomic::AtomicU64>,
-    /// Cache for base table key schema info, keyed by table_id.
-    /// Avoids per-request catalog queries during index pagination.
-    /// Entries are never invalidated because key schemas are immutable for a
-    /// table's lifetime and table_ids are never reused. The cache is bounded
-    /// to prevent unbounded memory growth from deleted tables.
-    pub(crate) base_key_cache: tokio::sync::RwLock<std::collections::HashMap<String, BaseKeyInfo>>,
-}
-
-/// Maximum cached base key info entries. Realistic deployments have 10-200 tables
-/// with indexes; 500 provides headroom while bounding memory (~100 KB typical,
-/// ~65 MB worst case with max-length attribute names).
-const BASE_KEY_CACHE_MAX_ENTRIES: usize = 500;
-
-/// Cached base table key information for index pagination.
-#[derive(Clone)]
-pub(crate) struct BaseKeyInfo {
-    pub pk_attr_name: String,
-    pub sk_info: Option<(String, extenddb_core::types::ScalarAttributeType)>,
 }
 
 impl PostgresEngine {
@@ -243,7 +225,6 @@ impl PostgresEngine {
             control_plane_notify: Arc::new(tokio::sync::Notify::new()),
             gsi_queue: None,
             gsi_default_delay_ms: Arc::new(std::sync::atomic::AtomicU64::new(initial_gsi_delay)),
-            base_key_cache: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         })
     }
 

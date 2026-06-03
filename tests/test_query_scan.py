@@ -1186,3 +1186,129 @@ class TestGSIOnHashOnlyBaseTable:
             assert len(all_items) == 7, (
                 f"Run {run+1}: expected 7 items but got {len(all_items)}"
             )
+
+
+@pytest.fixture(scope="class")
+def base_key_schema_table(dynamodb_client):
+    """Table with GSI for testing base_key_schema propagation.
+
+    Base table: pk (HASH, S) + sk (RANGE, N)
+    GSI: gsi_pk (HASH, S) + gsi_sk (RANGE, S)
+
+    This verifies that the storage layer receives correct base table key
+    schema for both base table queries and index queries.
+    """
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "N"},
+            {"AttributeName": "gsi_pk", "AttributeType": "S"},
+            {"AttributeName": "gsi_sk", "AttributeType": "S"},
+        ],
+        key_schema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        GlobalSecondaryIndexes=[{
+            "IndexName": "TestGSI",
+            "KeySchema": [
+                {"AttributeName": "gsi_pk", "KeyType": "HASH"},
+                {"AttributeName": "gsi_sk", "KeyType": "RANGE"},
+            ],
+            "Projection": {"ProjectionType": "ALL"},
+        }],
+    ) as table_name:
+        items = [
+            {"pk": {"S": f"user#{i % 3}"}, "sk": {"N": str(i)},
+             "gsi_pk": {"S": "shared"}, "gsi_sk": {"S": f"sort#{i:03d}"},
+             "data": {"S": f"item-{i}"}}
+            for i in range(12)
+        ]
+        for item in items:
+            dynamodb_client.put_item(TableName=table_name, Item=item)
+        yield table_name
+
+
+class TestBaseKeySchemaFlow:
+    """Verify base_key_schema is available for both base table and index queries.
+
+    These tests confirm pagination works correctly when the storage layer
+    derives base PK/SK info from the base_key_schema field on TableKeyInfo.
+    """
+
+    def test_base_table_pagination_uses_own_key_schema(
+        self, dynamodb_client, base_key_schema_table
+    ):
+        """Base table query: base_key_schema == key_schema, pagination works."""
+        all_items = []
+        exclusive_start_key = None
+        while True:
+            kwargs = {
+                "TableName": base_key_schema_table,
+                "KeyConditionExpression": "pk = :pk",
+                "ExpressionAttributeValues": {":pk": {"S": "user#0"}},
+                "Limit": 2,
+            }
+            if exclusive_start_key:
+                kwargs["ExclusiveStartKey"] = exclusive_start_key
+            resp = dynamodb_client.query(**kwargs)
+            all_items.extend(resp["Items"])
+            if "LastEvaluatedKey" not in resp:
+                break
+            exclusive_start_key = resp["LastEvaluatedKey"]
+
+        assert len(all_items) == 4
+        sks = [int(item["sk"]["N"]) for item in all_items]
+        assert sks == sorted(sks)
+
+    def test_index_pagination_uses_base_key_schema_for_tiebreaker(
+        self, dynamodb_client, base_key_schema_table
+    ):
+        """GSI query: base_key_schema differs from key_schema, used for tie-breaking."""
+        all_items = []
+        exclusive_start_key = None
+        while True:
+            kwargs = {
+                "TableName": base_key_schema_table,
+                "IndexName": "TestGSI",
+                "KeyConditionExpression": "gsi_pk = :gpk",
+                "ExpressionAttributeValues": {":gpk": {"S": "shared"}},
+                "Limit": 3,
+            }
+            if exclusive_start_key:
+                kwargs["ExclusiveStartKey"] = exclusive_start_key
+            resp = dynamodb_client.query(**kwargs)
+            all_items.extend(resp["Items"])
+            if "LastEvaluatedKey" not in resp:
+                break
+            exclusive_start_key = resp["LastEvaluatedKey"]
+
+        assert len(all_items) == 12
+        # No duplicates across pages
+        item_keys = [(i["pk"]["S"], i["sk"]["N"]) for i in all_items]
+        assert len(item_keys) == len(set(item_keys))
+
+    def test_index_scan_pagination_uses_base_key_schema(
+        self, dynamodb_client, base_key_schema_table
+    ):
+        """GSI scan: base_key_schema provides base PK/SK for compound pagination."""
+        all_items = []
+        exclusive_start_key = None
+        while True:
+            kwargs = {
+                "TableName": base_key_schema_table,
+                "IndexName": "TestGSI",
+                "Limit": 4,
+            }
+            if exclusive_start_key:
+                kwargs["ExclusiveStartKey"] = exclusive_start_key
+            resp = dynamodb_client.scan(**kwargs)
+            all_items.extend(resp["Items"])
+            if "LastEvaluatedKey" not in resp:
+                break
+            exclusive_start_key = resp["LastEvaluatedKey"]
+
+        assert len(all_items) == 12
+        item_keys = [(i["pk"]["S"], i["sk"]["N"]) for i in all_items]
+        assert len(item_keys) == len(set(item_keys))

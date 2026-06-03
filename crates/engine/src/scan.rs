@@ -129,6 +129,7 @@ pub async fn handle_scan(
             account_id: key_info.account_id.clone(),
             table_id: key_info.table_id.clone(),
             key_schema: idx.key_schema.clone(),
+            base_key_schema: key_info.key_schema.clone(),
             attribute_definitions: key_info.attribute_definitions.clone(),
             has_lsi: key_info.has_lsi,
             stream_specification: None, // Scans don't capture stream records

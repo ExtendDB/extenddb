@@ -4,7 +4,7 @@
 //! `query` and `scan` implementations for the `PostgreSQL` backend.
 
 use extenddb_core::expression::{ExpressionMaps, KeyCondition};
-use extenddb_core::types::{Item, KeySchemaElement, ScalarAttributeType, TableKeyInfo};
+use extenddb_core::types::{Item, ScalarAttributeType, TableKeyInfo};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
     encode_netstring_composite, parse_sk, pk_to_text, sk_column, sk_column_n, sk_info,
@@ -186,11 +186,12 @@ impl PostgresEngine {
             }
         }
 
-        // For index queries, fetch the base table's sort key info. This is needed
-        // for both ORDER BY (sub-sort by base SK when index SKs are equal) and
-        // pagination (compound ExclusiveStartKey condition).
+        // For index queries, derive the base table's sort key info from
+        // base_key_schema. Needed for ORDER BY (sub-sort by base SK when index
+        // SKs are equal) and pagination (compound ExclusiveStartKey condition).
         let base_sk_info: Option<(String, ScalarAttributeType)> = if index_name.is_some() {
-            self.fetch_base_table_sk_info(&key_info.table_id).await?
+            sk_info(&key_info.base_key_schema, &key_info.attribute_definitions)
+                .map(|(name, ty)| (name.to_owned(), ty))
         } else {
             None
         };
@@ -283,18 +284,22 @@ impl PostgresEngine {
                 }
             } else if index_name.is_some() && sk_info_val.is_some() {
                 // Index with SK but no base SK — SQL has $N for base_pk
-                match self
-                    .resolve_base_pk_from_start_key(&key_info.table_id, start_key)
-                    .await?
-                {
-                    Some(pk_text) => PaginationBinds::BasePkOnly { pk_text },
+                let base_pk_attr = &key_info.base_key_schema[0].attribute_name;
+                match start_key.get(base_pk_attr.as_str()) {
+                    Some(pk_val) => {
+                        let pk_text = pk_to_text(pk_val)?.into_owned();
+                        PaginationBinds::BasePkOnly { pk_text }
+                    }
                     None => PaginationBinds::None,
                 }
             } else if index_name.is_some() && sk_info_val.is_none() {
                 // Hash-only index — SQL may have $N for base_pk and $N+1 for base_sk
-                let base_pk = self
-                    .resolve_base_pk_from_start_key(&key_info.table_id, start_key)
-                    .await?;
+                let base_pk_attr = &key_info.base_key_schema[0].attribute_name;
+                let base_pk = start_key
+                    .get(base_pk_attr.as_str())
+                    .map(|v| pk_to_text(v))
+                    .transpose()?
+                    .map(|c| c.into_owned());
                 match (base_pk, &base_sk_info) {
                     (Some(pk_text), Some((sk_name, sk_type))) => {
                         if let Some(sk_val) = start_key.get(sk_name.as_str()) {
@@ -370,9 +375,10 @@ impl PostgresEngine {
         };
         let sk_info_val = sk_info(&key_info.key_schema, &key_info.attribute_definitions);
 
-        // For index scans, fetch base table SK info for compound pagination.
+        // For index scans, derive base table SK info for compound pagination.
         let base_sk_info: Option<(String, ScalarAttributeType)> = if index_name.is_some() {
-            self.fetch_base_table_sk_info(&key_info.table_id).await?
+            sk_info(&key_info.base_key_schema, &key_info.attribute_definitions)
+                .map(|(name, ty)| (name.to_owned(), ty))
         } else {
             None
         };
@@ -509,10 +515,10 @@ impl PostgresEngine {
         let fetch_limit = limit.map_or(1_000_001, |l| l + 1);
         let _ = write!(sql, " LIMIT {fetch_limit}");
 
-        // Resolve base table PK attribute name for index scan binding.
-        let base_pk_attr_name: Option<String> =
+        // Derive base table PK attribute name for index scan binding.
+        let base_pk_attr_name: Option<&str> =
             if index_name.is_some() && exclusive_start_key.is_some() {
-                self.resolve_base_pk_attr_name(&key_info.table_id).await?
+                Some(key_info.base_key_schema[0].attribute_name.as_str())
             } else {
                 None
             };
@@ -524,7 +530,7 @@ impl PostgresEngine {
             &key_info.key_schema,
             &key_info.attribute_definitions,
             base_sk_info.as_ref(),
-            base_pk_attr_name.as_deref(),
+            base_pk_attr_name,
             &self.data_pool,
         )
         .await?;
@@ -547,92 +553,5 @@ impl PostgresEngine {
         };
 
         Ok((items, last_key))
-    }
-
-    /// Fetch and cache the base table's key info for a given `table_id`.
-    /// Returns both PK attribute name and optional SK info.
-    async fn get_base_key_info(&self, table_id: &str) -> Result<crate::BaseKeyInfo, StorageError> {
-        // Check cache first
-        {
-            let cache = self.base_key_cache.read().await;
-            if let Some(info) = cache.get(table_id) {
-                return Ok(info.clone());
-            }
-        }
-
-        // Cache miss — query catalog
-        let row: Option<(serde_json::Value, serde_json::Value)> = sqlx::query_as(
-            "SELECT key_schema, attribute_definitions FROM tables WHERE table_id = $1",
-        )
-        .bind(table_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-        let Some((ks_json, ad_json)) = row else {
-            return Err(StorageError::Internal(format!(
-                "base table not found for table_id: {table_id}"
-            )));
-        };
-
-        let key_schema: Vec<KeySchemaElement> =
-            serde_json::from_value(ks_json).map_err(|e| StorageError::Internal(e.to_string()))?;
-        let attr_defs: Vec<extenddb_core::types::AttributeDefinition> =
-            serde_json::from_value(ad_json).map_err(|e| StorageError::Internal(e.to_string()))?;
-
-        let pk_attr_name = key_schema
-            .iter()
-            .find(|ks| ks.key_type == extenddb_core::types::KeyType::Hash)
-            .map(|ks| ks.attribute_name.clone())
-            .unwrap_or_default();
-
-        let sk = sk_info(&key_schema, &attr_defs).map(|(name, ty)| (name.to_owned(), ty));
-
-        let info = crate::BaseKeyInfo {
-            pk_attr_name,
-            sk_info: sk,
-        };
-
-        // Store in cache (bounded to prevent unbounded growth from deleted tables)
-        {
-            let mut cache = self.base_key_cache.write().await;
-            if cache.len() >= crate::BASE_KEY_CACHE_MAX_ENTRIES {
-                cache.clear();
-            }
-            cache.insert(table_id.to_owned(), info.clone());
-        }
-
-        Ok(info)
-    }
-
-    /// Fetch the base table's sort key attribute name and type for a given `table_id`.
-    async fn fetch_base_table_sk_info(
-        &self,
-        table_id: &str,
-    ) -> Result<Option<(String, ScalarAttributeType)>, StorageError> {
-        Ok(self.get_base_key_info(table_id).await?.sk_info)
-    }
-
-    /// Resolve the base table PK value from an `ExclusiveStartKey` for hash-only index pagination.
-    async fn resolve_base_pk_from_start_key(
-        &self,
-        table_id: &str,
-        start_key: &Item,
-    ) -> Result<Option<String>, StorageError> {
-        let info = self.get_base_key_info(table_id).await?;
-        let Some(pk_val) = start_key.get(&info.pk_attr_name) else {
-            return Ok(None);
-        };
-        let pk_text = pk_to_text(pk_val)?.into_owned();
-        Ok(Some(pk_text))
-    }
-
-    /// Resolve the base table PK attribute name for a given `table_id`.
-    async fn resolve_base_pk_attr_name(
-        &self,
-        table_id: &str,
-    ) -> Result<Option<String>, StorageError> {
-        let info = self.get_base_key_info(table_id).await?;
-        Ok(Some(info.pk_attr_name))
     }
 }

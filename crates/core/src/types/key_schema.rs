@@ -77,6 +77,12 @@ pub struct TableKeyInfo {
     pub account_id: String,
     pub table_id: String,
     pub key_schema: Vec<KeySchemaElement>,
+    /// The base table's key schema (always populated).
+    /// For base table operations this equals `key_schema`.
+    /// For index operations `key_schema` has the index's schema while this
+    /// retains the original table schema, enabling the storage layer to
+    /// derive base PK/SK info for pagination without a catalog query.
+    pub base_key_schema: Vec<KeySchemaElement>,
     pub attribute_definitions: Vec<AttributeDefinition>,
     /// Whether the table has at least one local secondary index.
     /// Used to decide whether `ItemCollectionMetrics` should be returned.
@@ -238,5 +244,41 @@ mod tests {
             let json = serde_json::to_string(&typ).unwrap();
             assert_eq!(json, expected);
         }
+    }
+
+    #[test]
+    fn table_key_info_base_key_schema_for_base_table() {
+        let schema = vec![ks("pk", KeyType::Hash), ks("sk", KeyType::Range)];
+        let info = TableKeyInfo {
+            table_name: "TestTable".into(),
+            account_id: "123".into(),
+            table_id: "t1".into(),
+            key_schema: schema.clone(),
+            base_key_schema: schema.clone(),
+            attribute_definitions: vec![],
+            has_lsi: false,
+            stream_specification: None,
+        };
+        assert_eq!(info.key_schema, info.base_key_schema);
+    }
+
+    #[test]
+    fn table_key_info_base_key_schema_for_index_query() {
+        let base_schema = vec![ks("pk", KeyType::Hash), ks("sk", KeyType::Range)];
+        let index_schema = vec![ks("gsi_pk", KeyType::Hash), ks("gsi_sk", KeyType::Range)];
+        let info = TableKeyInfo {
+            table_name: "TestTable".into(),
+            account_id: "123".into(),
+            table_id: "t1".into(),
+            key_schema: index_schema.clone(),
+            base_key_schema: base_schema.clone(),
+            attribute_definitions: vec![],
+            has_lsi: false,
+            stream_specification: None,
+        };
+        assert_eq!(info.key_schema, index_schema);
+        assert_eq!(info.base_key_schema, base_schema);
+        assert_ne!(info.key_schema, info.base_key_schema);
+        assert_eq!(info.base_key_schema[0].attribute_name, "pk");
     }
 }
