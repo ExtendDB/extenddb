@@ -26,8 +26,9 @@ use extenddb_core::types::{
     TableKeyInfo, TransactWriteItem, TransactWriteItemsInput, TransactWriteItemsOutput,
 };
 use extenddb_core::validation::{
-    validate_attribute_name_sizes, validate_attribute_values_nesting_depth,
-    validate_item_nesting_depth, validate_item_size, validate_key_sizes,
+    validate_attribute_name_sizes, validate_attribute_values_name_sizes,
+    validate_attribute_values_nesting_depth, validate_item_nesting_depth, validate_item_size,
+    validate_key_sizes,
 };
 use extenddb_storage::IdempotencyClaim;
 
@@ -346,7 +347,8 @@ fn prepare_write_op(
                 .iter()
                 .filter_map(|name| maps.values.get(name))
                 .collect();
-            validate_attribute_values_nesting_depth(stored)?;
+            validate_attribute_values_nesting_depth(stored.iter().copied())?;
+            validate_attribute_values_name_sizes(stored.iter().copied(), &ctx.limits)?;
         }
         let condition = parse_optional_condition(upd.condition_expression.as_deref(), &ctx.limits)?;
         {

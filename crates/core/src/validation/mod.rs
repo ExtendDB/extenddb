@@ -539,6 +539,10 @@ pub fn validate_update_item(
 
     if let Some(updates) = &input.attribute_updates {
         validate_attribute_values_nesting_depth(updates.values().filter_map(|u| u.value.as_ref()))?;
+        validate_attribute_values_name_sizes(
+            updates.values().filter_map(|u| u.value.as_ref()),
+            limits,
+        )?;
     }
 
     Ok(())
@@ -553,15 +557,56 @@ pub fn validate_attribute_name_sizes(
     item: &Item,
     limits: &LimitsConfig,
 ) -> Result<(), DynamoDbError> {
-    for name in item.keys() {
-        if name.len() > limits.max_attribute_name_bytes {
-            return Err(DynamoDbError::ValidationException(format!(
-                "One or more parameter values were invalid: Size of attribute name '{}' \
-                 has exceeded the maximum size limit of {} bytes",
-                truncate_for_error(name),
-                limits.max_attribute_name_bytes
-            )));
+    for (name, value) in item {
+        check_attribute_name_size(name, limits)?;
+        check_attribute_value_name_sizes(value, limits)?;
+    }
+    Ok(())
+}
+
+/// Validate map attribute names for values introduced outside of an `Item`.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` if any stored map key exceeds
+/// the configured attribute-name byte limit.
+pub fn validate_attribute_values_name_sizes<'a, I>(
+    values: I,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError>
+where
+    I: IntoIterator<Item = &'a AttributeValue>,
+{
+    for value in values {
+        check_attribute_value_name_sizes(value, limits)?;
+    }
+    Ok(())
+}
+
+fn check_attribute_value_name_sizes(
+    value: &AttributeValue,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    match value {
+        AttributeValue::M(map) => validate_attribute_name_sizes(map, limits)?,
+        AttributeValue::L(list) => {
+            for v in list {
+                check_attribute_value_name_sizes(v, limits)?;
+            }
         }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn check_attribute_name_size(name: &str, limits: &LimitsConfig) -> Result<(), DynamoDbError> {
+    if name.len() > limits.max_attribute_name_bytes {
+        return Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: Size of attribute name '{}' \
+             has exceeded the maximum size limit of {} bytes",
+            truncate_for_error(name),
+            limits.max_attribute_name_bytes
+        )));
     }
     Ok(())
 }
@@ -1078,7 +1123,7 @@ fn validate_unique_index_names(input: &CreateTableInput) -> Result<(), DynamoDbE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{GsiInput, Projection, ProjectionType};
+    use crate::types::{AttributeValueUpdate, GsiInput, Projection, ProjectionType};
 
     fn make_ks(name: &str, key_type: KeyType) -> KeySchemaElement {
         KeySchemaElement {
@@ -1314,6 +1359,45 @@ mod tests {
     }
 
     #[test]
+    fn nested_map_attribute_name_exceeding_limit_rejected() {
+        let limits = LimitsConfig {
+            max_attribute_name_bytes: 10,
+            ..Default::default()
+        };
+        let mut nested = Item::new();
+        nested.insert("nested_name".to_owned(), AttributeValue::S("v".to_owned()));
+        let mut item = Item::new();
+        item.insert("doc".to_owned(), AttributeValue::M(nested));
+
+        let err = validate_attribute_name_sizes(&item, &limits).unwrap_err();
+
+        assert!(
+            err.to_string().contains("Size of attribute name"),
+            "unexpected error: {err}"
+        );
+        assert!(err.to_string().contains("nested_name"));
+    }
+
+    #[test]
+    fn list_nested_map_attribute_name_exceeding_limit_rejected() {
+        let limits = LimitsConfig {
+            max_attribute_name_bytes: 10,
+            ..Default::default()
+        };
+        let mut nested = Item::new();
+        nested.insert("nested_name".to_owned(), AttributeValue::S("v".to_owned()));
+        let values = [AttributeValue::L(vec![AttributeValue::M(nested)])];
+
+        let err = validate_attribute_values_name_sizes(values.iter(), &limits).unwrap_err();
+
+        assert!(
+            err.to_string().contains("Size of attribute name"),
+            "unexpected error: {err}"
+        );
+        assert!(err.to_string().contains("nested_name"));
+    }
+
+    #[test]
     fn validate_key_sizes_rejects_empty_binary_partition_key() {
         let limits = LimitsConfig::default();
         let mut item = Item::new();
@@ -1529,6 +1613,36 @@ mod tests {
         let mut input = update_input_no_directives();
         input.attribute_updates = Some(std::collections::HashMap::new());
         assert!(validate_update_item(&input, &limits, &key_schema, &attr_defs).is_ok());
+    }
+
+    #[test]
+    fn update_item_attribute_updates_reject_nested_attribute_name_over_limit() {
+        let limits = LimitsConfig {
+            max_attribute_name_bytes: 10,
+            ..Default::default()
+        };
+        let key_schema = vec![make_ks("pk", KeyType::Hash)];
+        let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
+        let mut nested = Item::new();
+        nested.insert("nested_name".to_owned(), AttributeValue::S("v".to_owned()));
+        let mut updates = std::collections::HashMap::new();
+        updates.insert(
+            "doc".to_owned(),
+            AttributeValueUpdate {
+                value: Some(AttributeValue::M(nested)),
+                action: "PUT".to_owned(),
+            },
+        );
+        let mut input = update_input_no_directives();
+        input.attribute_updates = Some(updates);
+
+        let err = validate_update_item(&input, &limits, &key_schema, &attr_defs).unwrap_err();
+
+        assert!(
+            err.to_string().contains("Size of attribute name"),
+            "unexpected error: {err}"
+        );
+        assert!(err.to_string().contains("nested_name"));
     }
 
     #[test]

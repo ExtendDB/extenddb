@@ -29,7 +29,7 @@ Last updated: 2026-06-03 (P160)
 | F-14 | POSIX syslog single-identity limitation prevents separate `extenddb-sqlx` syslog identity | `bin/cmd_serve.rs` | Low | P25 |
 | F-15 | ~~PostgreSQL TTL worker bypasses stream capture — expired item deletions don't generate REMOVE stream records~~ | `storage-postgres/src/ttl_worker.rs` | ~~High~~ | P26 |
 | F-16 | ~~`TransactWriteItems` stream records omitted `OldImage` for transaction-originated MODIFY/REMOVE events~~ | ~~`engine/transact_write_items.rs`~~ | ~~Medium~~ | P27 |
-| F-17 | `validate_attribute_name_sizes` only checks top-level attribute names — nested map keys not validated | `core/validation/mod.rs` | Low | P30 |
+| F-17 | ~~`validate_attribute_name_sizes` only checked top-level attribute names — nested map keys were not validated~~ | ~~`core/validation/mod.rs`~~ | ~~Low~~ | P30 |
 
 ## Cleanup
 
@@ -126,6 +126,7 @@ Resolved (split in P94–P96):
 ## Resolved in P160
 
 - ~~F-16: TransactWriteItems stream records omitted OldImage~~ (fixed: storage-owned transaction stream capture now reads old items only when conditions or OldImage stream views require it; covered by `tests/test_streams.py::TestMixedWorkload::test_transact_write_update_delete_emit_old_images`)
+- ~~F-17: Nested map keys were not validated against the attribute-name byte limit~~ (fixed: recursive validation now covers item maps, maps inside lists, AttributeUpdates values, and UpdateExpression/TransactWrite SET expression values)
 
 ## Resolved in P30
 

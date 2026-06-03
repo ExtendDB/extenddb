@@ -152,7 +152,11 @@ pub async fn handle_update_item(
             .iter()
             .filter_map(|name| maps.values.get(name))
             .collect();
-        extenddb_core::validation::validate_attribute_values_nesting_depth(stored)?;
+        extenddb_core::validation::validate_attribute_values_nesting_depth(stored.iter().copied())?;
+        extenddb_core::validation::validate_attribute_values_name_sizes(
+            stored.iter().copied(),
+            &ctx.limits,
+        )?;
     }
 
     if input.expected.is_none() || input.expected.as_ref().is_some_and(|m| m.is_empty()) {
