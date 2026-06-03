@@ -5,12 +5,13 @@
 
 use std::collections::HashMap;
 
+use futures::future::join_all;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{
     BatchWriteItemInput, BatchWriteItemOutput, Item, KeySchemaElement, ReturnItemCollectionMetrics,
-    WriteRequest, extract_key, item_size_bytes,
+    TableKeyInfo, WriteRequest, extract_key, item_size_bytes,
 };
 use extenddb_core::validation::{
     validate_attribute_name_sizes, validate_batch_item_keys, validate_batch_key_only,
@@ -102,24 +103,19 @@ pub async fn handle_batch_write_item(
         HashMap::new();
     let mut total_wcu: f64 = 0.0;
     let mut per_table_wcu: HashMap<String, f64> = HashMap::new();
+    let table_infos = batch_write_table_infos(ctx, &input.request_items).await?;
 
     for (table_name, reqs) in &input.request_items {
-        let has_put = reqs.iter().any(|request| request.put_request.is_some());
-        let key_info = if has_put {
-            ctx.storage
-                .table_write_info(&ctx.account_id, table_name)
-                .await
-        } else {
-            ctx.storage
-                .table_key_info(&ctx.account_id, table_name)
-                .await
-        }
-        .map_err(storage_err_to_dynamo)?;
+        let key_info = table_infos.get(table_name).ok_or_else(|| {
+            DynamoDbError::InternalServerError(format!(
+                "missing batch metadata for table {table_name}"
+            ))
+        })?;
 
         // Validate: no duplicate keys within the same table (using key schema)
         validate_no_duplicate_keys(reqs, &key_info.key_schema)?;
 
-        let view_type = stream_capture::stream_view_type(&key_info);
+        let view_type = stream_capture::stream_view_type(key_info);
         let stream = view_type.map(|vt| extenddb_storage::StreamCapture {
             view_type: vt,
             user_identity: None,
@@ -140,7 +136,7 @@ pub async fn handle_batch_write_item(
 
                 collect_icm_if_needed(
                     input.return_item_collection_metrics,
-                    &key_info,
+                    key_info,
                     &put.item,
                     table_name,
                     &mut all_icm,
@@ -159,7 +155,7 @@ pub async fn handle_batch_write_item(
 
                 collect_icm_if_needed(
                     input.return_item_collection_metrics,
-                    &key_info,
+                    key_info,
                     &del.key,
                     table_name,
                     &mut all_icm,
@@ -175,7 +171,7 @@ pub async fn handle_batch_write_item(
         }
 
         ctx.storage
-            .batch_write_items(&key_info, &ops, stream.as_ref())
+            .batch_write_items(key_info, &ops, stream.as_ref())
             .await
             .map_err(storage_err_to_dynamo)?;
     }
@@ -205,6 +201,38 @@ pub async fn handle_batch_write_item(
             ..Default::default()
         },
     })
+}
+
+async fn batch_write_table_infos(
+    ctx: &OperationContext,
+    request_items: &HashMap<String, Vec<WriteRequest>>,
+) -> Result<HashMap<String, TableKeyInfo>, DynamoDbError> {
+    let mut table_plans = request_items
+        .iter()
+        .map(|(table_name, reqs)| {
+            (
+                table_name.clone(),
+                reqs.iter().any(|request| request.put_request.is_some()),
+            )
+        })
+        .collect::<Vec<_>>();
+    table_plans.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let results = join_all(table_plans.iter().map(|(table_name, has_put)| async move {
+        let result = if *has_put {
+            ctx.table_write_info(table_name).await
+        } else {
+            ctx.table_key_info(table_name).await
+        };
+        (table_name.clone(), result.map_err(storage_err_to_dynamo))
+    }))
+    .await;
+
+    let mut table_infos = HashMap::with_capacity(results.len());
+    for (table_name, result) in results {
+        table_infos.insert(table_name, result?);
+    }
+    Ok(table_infos)
 }
 
 /// Validate that no two write requests in the same table target the same key.

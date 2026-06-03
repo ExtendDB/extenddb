@@ -5,11 +5,14 @@
 
 use std::collections::{HashMap, HashSet};
 
+use futures::future::join_all;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{apply_projection, parse_projection};
-use extenddb_core::types::{BatchGetItemInput, BatchGetItemOutput, Item, item_size_bytes};
+use extenddb_core::types::{
+    BatchGetItemInput, BatchGetItemOutput, Item, KeysAndAttributes, TableKeyInfo, item_size_bytes,
+};
 use extenddb_core::validation::validate_batch_key_only;
 
 use crate::OperationContext;
@@ -77,13 +80,14 @@ pub async fn handle_batch_get_item(
     let mut total_pre_proj_bytes: usize = 0;
     let mut returned_count: u64 = 0;
     let mut per_table_rcu: HashMap<String, f64> = HashMap::new();
+    let table_infos = batch_get_table_infos(ctx, &input.request_items).await?;
 
     for (table_name, ka) in &input.request_items {
-        let key_info = ctx
-            .storage
-            .table_key_info(&ctx.account_id, table_name)
-            .await
-            .map_err(storage_err_to_dynamo)?;
+        let key_info = table_infos.get(table_name).ok_or_else(|| {
+            DynamoDbError::InternalServerError(format!(
+                "missing batch metadata for table {table_name}"
+            ))
+        })?;
 
         // Parse per-table projection. AttributesToGet is desugared into a
         // ProjectionExpression with synthetic name placeholders.
@@ -151,7 +155,7 @@ pub async fn handle_batch_get_item(
         let strongly_consistent = ka.consistent_read == Some(true);
         let items = ctx
             .storage
-            .batch_get_items(&key_info, &ka.keys, strongly_consistent)
+            .batch_get_items(key_info, &ka.keys, strongly_consistent)
             .await
             .map_err(storage_err_to_dynamo)?;
 
@@ -199,4 +203,28 @@ pub async fn handle_batch_get_item(
 
 fn serialize_key_for_dedup(key: &Item) -> Vec<u8> {
     serde_json::to_vec(key).unwrap_or_default()
+}
+
+async fn batch_get_table_infos(
+    ctx: &OperationContext,
+    request_items: &HashMap<String, KeysAndAttributes>,
+) -> Result<HashMap<String, TableKeyInfo>, DynamoDbError> {
+    let mut table_names = request_items.keys().cloned().collect::<Vec<_>>();
+    table_names.sort();
+
+    let results = join_all(table_names.iter().map(|table_name| async move {
+        (
+            table_name.clone(),
+            ctx.table_key_info(table_name)
+                .await
+                .map_err(storage_err_to_dynamo),
+        )
+    }))
+    .await;
+
+    let mut table_infos = HashMap::with_capacity(results.len());
+    for (table_name, result) in results {
+        table_infos.insert(table_name, result?);
+    }
+    Ok(table_infos)
 }

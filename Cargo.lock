@@ -917,6 +917,7 @@ dependencies = [
  "crc32fast",
  "extenddb-core",
  "extenddb-storage",
+ "futures",
  "hex",
  "hmac",
  "serde",
