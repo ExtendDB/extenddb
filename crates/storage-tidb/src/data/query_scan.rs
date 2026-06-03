@@ -19,8 +19,8 @@ use super::index::{
     native_index_non_null_predicates, native_index_sort_columns,
 };
 use super::query::{
-    build_key, build_sk_sql, execute_query_sql, execute_scan_sql, resolve_expr_to_av,
-    scan_segment_range,
+    KeyTupleBinding, ReadPageLimits, build_key, build_sk_sql, execute_query_sql, execute_scan_sql,
+    resolve_expr_to_av, scan_segment_range,
 };
 use super::{all_sort_key_info, data_table_name, json_to_item, physical_pk_bytes_from_values};
 use crate::TidbEngine;
@@ -28,6 +28,9 @@ use crate::tidb_util::{
     current_tidb_tso, map_tidb_snapshot_read_sqlx_error, tidb_as_of_epoch_clause,
     tidb_as_of_tso_clause,
 };
+
+const DYNAMODB_READ_PAGE_BYTES: usize = 1_048_576;
+const DEFAULT_READ_PAGE_ITEM_LIMIT: usize = 8192;
 
 fn sort_key_columns(
     key_schema: &[KeySchemaElement],
@@ -169,6 +172,18 @@ fn tidb_export_sql(table_id: &str, snapshot_clause: &str, order_columns: &[Strin
     )
 }
 
+fn read_page_item_limit(limit: Option<i64>) -> usize {
+    limit
+        .and_then(|value| usize::try_from(value.max(0)).ok())
+        .map_or(DEFAULT_READ_PAGE_ITEM_LIMIT, |value| {
+            value.min(DEFAULT_READ_PAGE_ITEM_LIMIT)
+        })
+}
+
+fn read_fetch_limit(page_item_limit: usize) -> usize {
+    page_item_limit.saturating_add(1)
+}
+
 impl TidbEngine {
     /// Implementation of `DataEngine::query`.
     #[allow(clippy::too_many_arguments)]
@@ -301,12 +316,18 @@ impl TidbEngine {
 
         push_order_by(&mut sql, &cursor_columns.order, forward);
 
-        // LIMIT — fetch one extra to detect pagination
-        let fetch_limit = limit.map_or(1_000_001, |l| l + 1);
+        // LIMIT — fetch one extra to detect pagination while keeping raw
+        // DynamoDB pages bounded before the engine applies filters/projection.
+        let page_item_limit = read_page_item_limit(limit);
+        let fetch_limit = read_fetch_limit(page_item_limit);
         let _ = write!(sql, " LIMIT {fetch_limit}");
 
         // Execute with dynamic bindings
-        let rows = execute_query_sql(
+        let page_limits = ReadPageLimits {
+            item_limit: page_item_limit,
+            byte_limit: DYNAMODB_READ_PAGE_BYTES,
+        };
+        let page = execute_query_sql(
             &sql,
             &pk,
             key_condition,
@@ -316,24 +337,17 @@ impl TidbEngine {
             sk_info_val,
             &extra_sk_col_indices,
             exclusive_start_key,
-            index.map(|_| {
-                (
-                    key_info.key_schema.as_slice(),
-                    key_info.attribute_definitions.as_slice(),
-                )
+            index.map(|_| KeyTupleBinding {
+                key_schema: key_info.key_schema.as_slice(),
+                attr_defs: key_info.attribute_definitions.as_slice(),
             }),
+            page_limits,
             self.data_read_pool(consistent_read),
         )
         .await?;
 
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let actual_limit = limit.map_or(1_000_000_usize, |l| l.max(0) as usize);
-        let has_more = rows.len() > actual_limit;
-        let items: Vec<Item> = rows
-            .into_iter()
-            .take(actual_limit)
-            .map(json_to_item)
-            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = page.has_more;
+        let items = page.items;
 
         let last_key = if has_more {
             items
@@ -422,34 +436,34 @@ impl TidbEngine {
 
         let _ = write!(sql, " ORDER BY {}", cursor_columns.order.join(", "));
 
-        let fetch_limit = limit.map_or(1_000_001, |l| l + 1);
+        let page_item_limit = read_page_item_limit(limit);
+        let fetch_limit = read_fetch_limit(page_item_limit);
         let _ = write!(sql, " LIMIT {fetch_limit}");
 
         // Execute
-        let rows = execute_scan_sql(
+        let page_limits = ReadPageLimits {
+            item_limit: page_item_limit,
+            byte_limit: DYNAMODB_READ_PAGE_BYTES,
+        };
+        let page = execute_scan_sql(
             &sql,
             segment_range.as_ref(),
             exclusive_start_key,
-            read_key_schema,
-            attr_defs,
-            index.map(|_| {
-                (
-                    key_info.key_schema.as_slice(),
-                    key_info.attribute_definitions.as_slice(),
-                )
+            KeyTupleBinding {
+                key_schema: read_key_schema,
+                attr_defs,
+            },
+            index.map(|_| KeyTupleBinding {
+                key_schema: key_info.key_schema.as_slice(),
+                attr_defs: key_info.attribute_definitions.as_slice(),
             }),
+            page_limits,
             self.data_read_pool(consistent_read),
         )
         .await?;
 
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let actual_limit = limit.map_or(1_000_000_usize, |l| l.max(0) as usize);
-        let has_more = rows.len() > actual_limit;
-        let items: Vec<Item> = rows
-            .into_iter()
-            .take(actual_limit)
-            .map(json_to_item)
-            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = page.has_more;
+        let items = page.items;
 
         let last_key = if has_more {
             items
@@ -511,8 +525,9 @@ mod tests {
     };
 
     use super::{
-        key_condition_attribute_name, last_evaluated_key, native_index_query_cursor_columns,
-        native_index_scan_cursor_columns, push_order_by, table_ref_for_read, tidb_export_sql,
+        DEFAULT_READ_PAGE_ITEM_LIMIT, key_condition_attribute_name, last_evaluated_key,
+        native_index_query_cursor_columns, native_index_scan_cursor_columns, push_order_by,
+        read_fetch_limit, read_page_item_limit, table_ref_for_read, tidb_export_sql,
         tuple_comparison,
     };
     use crate::tidb_util::{tidb_as_of_epoch_clause, tidb_as_of_tso_clause};
@@ -534,6 +549,22 @@ mod tests {
     fn tuple_comparison_keeps_single_column_syntax_simple() {
         let cols = vec!["base_pk".to_owned()];
         assert_eq!(tuple_comparison(&cols, "<"), "base_pk < ?");
+    }
+
+    #[test]
+    fn unbounded_read_pages_use_a_fixed_prefetch_cap() {
+        assert_eq!(read_page_item_limit(None), DEFAULT_READ_PAGE_ITEM_LIMIT);
+        assert_eq!(read_fetch_limit(DEFAULT_READ_PAGE_ITEM_LIMIT), 8193);
+    }
+
+    #[test]
+    fn explicit_large_limits_are_capped_before_tidb_fetches_rows() {
+        assert_eq!(read_page_item_limit(Some(2)), 2);
+        assert_eq!(
+            read_page_item_limit(Some(1_000_000)),
+            DEFAULT_READ_PAGE_ITEM_LIMIT
+        );
+        assert_eq!(read_page_item_limit(Some(-1)), 0);
     }
 
     #[test]

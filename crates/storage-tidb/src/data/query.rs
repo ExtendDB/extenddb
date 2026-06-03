@@ -9,15 +9,34 @@
 use extenddb_core::expression::{self, Expr, ExpressionMaps, KeyCondition, SortKeyCondition};
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, Item, KeySchemaElement, ScalarAttributeType, extract_key,
+    item_size_bytes,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::SortKeyValue;
 use extenddb_storage::util::parse_sk;
+use futures::TryStreamExt;
 
-use super::{all_sort_key_info, physical_pk_bytes};
+use super::{all_sort_key_info, json_to_item, physical_pk_bytes};
 
 pub(crate) type JsonRowsQuery<'q> =
     sqlx::query::QueryAs<'q, sqlx::MySql, (serde_json::Value,), sqlx::mysql::MySqlArguments>;
+
+pub(crate) struct ReadPage {
+    pub(crate) items: Vec<Item>,
+    pub(crate) has_more: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ReadPageLimits {
+    pub(crate) item_limit: usize,
+    pub(crate) byte_limit: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct KeyTupleBinding<'a> {
+    pub(crate) key_schema: &'a [KeySchemaElement],
+    pub(crate) attr_defs: &'a [AttributeDefinition],
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ScanSegmentRange {
@@ -204,9 +223,10 @@ pub(crate) async fn execute_query_sql(
     sk_info: Option<(&str, ScalarAttributeType)>,
     extra_sk_col_indices: &[(usize, ScalarAttributeType)],
     exclusive_start_key: Option<&Item>,
-    base_table_key: Option<(&[KeySchemaElement], &[AttributeDefinition])>,
+    base_table_key: Option<KeyTupleBinding<'_>>,
+    page_limits: ReadPageLimits,
     pool: &sqlx::MySqlPool,
-) -> Result<Vec<serde_json::Value>, StorageError> {
+) -> Result<ReadPage, StorageError> {
     let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sql);
     query = query.bind(pk.to_vec());
 
@@ -226,17 +246,12 @@ pub(crate) async fn execute_query_sql(
 
     if let Some(start_key) = exclusive_start_key {
         query = bind_sort_key_tuple(query, start_key, key_schema, attr_defs)?;
-        if let Some((base_key_schema, base_attr_defs)) = base_table_key {
-            query = bind_key_tuple(query, start_key, base_key_schema, base_attr_defs)?;
+        if let Some(base) = base_table_key {
+            query = bind_key_tuple(query, start_key, base.key_schema, base.attr_defs)?;
         }
     }
 
-    let rows: Vec<(serde_json::Value,)> = query
-        .fetch_all(pool)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-    Ok(rows.into_iter().map(|(v,)| v).collect())
+    collect_read_page(query, pool, page_limits).await
 }
 
 /// Bind sort key condition values to a query.
@@ -312,11 +327,11 @@ pub(crate) async fn execute_scan_sql(
     sql: &str,
     segment_range: Option<&ScanSegmentRange>,
     exclusive_start_key: Option<&Item>,
-    key_schema: &[KeySchemaElement],
-    attr_defs: &[AttributeDefinition],
-    base_table_key: Option<(&[KeySchemaElement], &[AttributeDefinition])>,
+    key_binding: KeyTupleBinding<'_>,
+    base_table_key: Option<KeyTupleBinding<'_>>,
+    page_limits: ReadPageLimits,
     pool: &sqlx::MySqlPool,
-) -> Result<Vec<serde_json::Value>, StorageError> {
+) -> Result<ReadPage, StorageError> {
     let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sql);
 
     if let Some(range) = segment_range {
@@ -329,18 +344,72 @@ pub(crate) async fn execute_scan_sql(
     }
 
     if let Some(start_key) = exclusive_start_key {
-        query = bind_key_tuple(query, start_key, key_schema, attr_defs)?;
-        if let Some((base_key_schema, base_attr_defs)) = base_table_key {
-            query = bind_key_tuple(query, start_key, base_key_schema, base_attr_defs)?;
+        query = bind_key_tuple(
+            query,
+            start_key,
+            key_binding.key_schema,
+            key_binding.attr_defs,
+        )?;
+        if let Some(base) = base_table_key {
+            query = bind_key_tuple(query, start_key, base.key_schema, base.attr_defs)?;
         }
     }
 
-    let rows: Vec<(serde_json::Value,)> = query
-        .fetch_all(pool)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+    collect_read_page(query, pool, page_limits).await
+}
 
-    Ok(rows.into_iter().map(|(v,)| v).collect())
+async fn collect_read_page(
+    query: JsonRowsQuery<'_>,
+    pool: &sqlx::MySqlPool,
+    limits: ReadPageLimits,
+) -> Result<ReadPage, StorageError> {
+    let mut stream = query.fetch(pool);
+    let mut items = Vec::new();
+    let mut page_bytes = 0usize;
+
+    while let Some((json,)) = stream
+        .try_next()
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?
+    {
+        if items.len() >= limits.item_limit {
+            return Ok(ReadPage {
+                items,
+                has_more: true,
+            });
+        }
+
+        let item = json_to_item(json)?;
+        let item_bytes = item_size_bytes(&item);
+        if read_page_byte_limit_reached(
+            !items.is_empty(),
+            page_bytes,
+            item_bytes,
+            limits.byte_limit,
+        ) {
+            return Ok(ReadPage {
+                items,
+                has_more: true,
+            });
+        }
+
+        page_bytes = page_bytes.saturating_add(item_bytes);
+        items.push(item);
+    }
+
+    Ok(ReadPage {
+        items,
+        has_more: false,
+    })
+}
+
+fn read_page_byte_limit_reached(
+    has_items: bool,
+    page_bytes: usize,
+    next_item_bytes: usize,
+    page_byte_limit: usize,
+) -> bool {
+    has_items && page_bytes.saturating_add(next_item_bytes) > page_byte_limit
 }
 
 /// Build a `LastEvaluatedKey` from an item by extracting key attributes.
@@ -355,7 +424,10 @@ mod tests {
     use extenddb_core::expression::{Expr, SortKeyCondition};
     use extenddb_core::types::{AttributeValue, ScalarAttributeType};
 
-    use super::{ScanSegmentRange, build_sk_sql, next_prefix_bytes, scan_segment_range};
+    use super::{
+        ScanSegmentRange, build_sk_sql, next_prefix_bytes, read_page_byte_limit_reached,
+        scan_segment_range,
+    };
 
     #[test]
     fn prefix_upper_bound_uses_half_open_byte_range() {
@@ -425,6 +497,13 @@ mod tests {
         assert_eq!(range.lower, None);
         assert_eq!(range.upper, None);
         assert!(range.predicates("pk").is_empty());
+    }
+
+    #[test]
+    fn read_page_byte_cap_keeps_first_item_and_pages_before_overflow() {
+        assert!(!read_page_byte_limit_reached(false, 0, 2_000_000, 1));
+        assert!(!read_page_byte_limit_reached(true, 512, 512, 1024));
+        assert!(read_page_byte_limit_reached(true, 900, 200, 1024));
     }
 
     #[test]
