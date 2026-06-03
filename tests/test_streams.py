@@ -628,6 +628,57 @@ class TestMixedWorkload:
         remove_rec = our_records[2]
         assert "OldImage" in remove_rec["dynamodb"]
         assert remove_rec["dynamodb"]["OldImage"]["val"]["N"] == "2"
+
+    def test_transact_write_update_delete_emit_old_images(
+        self, dynamodb_client, streams_client, stream_table,
+    ):
+        table_name, stream_arn = stream_table
+        pk = f"txn-stream-{uuid.uuid4().hex[:8]}"
+
+        dynamodb_client.put_item(
+            TableName=table_name,
+            Item={"pk": {"S": pk}, "val": {"N": "1"}},
+        )
+        dynamodb_client.transact_write_items(
+            TransactItems=[
+                {
+                    "Update": {
+                        "TableName": table_name,
+                        "Key": {"pk": {"S": pk}},
+                        "UpdateExpression": "SET val = :v",
+                        "ExpressionAttributeValues": {":v": {"N": "2"}},
+                    }
+                }
+            ]
+        )
+        dynamodb_client.transact_write_items(
+            TransactItems=[
+                {
+                    "Delete": {
+                        "TableName": table_name,
+                        "Key": {"pk": {"S": pk}},
+                    }
+                }
+            ]
+        )
+
+        records = _wait_for_stream_records(
+            streams_client, stream_arn, min_count=3, prefix=pk,
+        )
+        our_records = [
+            r for r in records
+            if r["dynamodb"]["Keys"]["pk"]["S"] == pk
+        ]
+
+        events = [r["eventName"] for r in our_records]
+        assert events == ["INSERT", "MODIFY", "REMOVE"]
+
+        modify_rec = our_records[1]
+        assert modify_rec["dynamodb"]["OldImage"]["val"]["N"] == "1"
+        assert modify_rec["dynamodb"]["NewImage"]["val"]["N"] == "2"
+
+        remove_rec = our_records[2]
+        assert remove_rec["dynamodb"]["OldImage"]["val"]["N"] == "2"
 class TestGetShardIterator:
     """Edge cases for GetShardIterator."""
 

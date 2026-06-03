@@ -1,6 +1,6 @@
 # Technical Debt Tracker
 
-Last updated: 2026-05-04 (P112)
+Last updated: 2026-06-03 (P160)
 
 ## Categories
 
@@ -28,7 +28,7 @@ Last updated: 2026-05-04 (P112)
 | F-13 | HTTP 500 returned for pool exhaustion instead of 503 | `server/lib.rs` | Medium | P25 |
 | F-14 | POSIX syslog single-identity limitation prevents separate `extenddb-sqlx` syslog identity | `bin/cmd_serve.rs` | Low | P25 |
 | F-15 | ~~PostgreSQL TTL worker bypasses stream capture — expired item deletions don't generate REMOVE stream records~~ | `storage-postgres/src/ttl_worker.rs` | ~~High~~ | P26 |
-| F-16 | `transact_write_items.rs` passes `None` for `old_item` in stream capture — `OldImage` always `None` for transaction-originated stream records | `engine/transact_write_items.rs` | Medium | P27 |
+| F-16 | ~~`TransactWriteItems` stream records omitted `OldImage` for transaction-originated MODIFY/REMOVE events~~ | ~~`engine/transact_write_items.rs`~~ | ~~Medium~~ | P27 |
 | F-17 | `validate_attribute_name_sizes` only checks top-level attribute names — nested map keys not validated | `core/validation/mod.rs` | Low | P30 |
 
 ## Cleanup
@@ -122,6 +122,10 @@ Resolved (split in P94–P96):
 - ~~FS-2: `storage-postgres/src/lib.rs` (1980)~~ — split into focused modules (now 216 lines)
 - ~~FS-3: `bin/src/cmd_manage.rs` (1117)~~ — refactored (now 44 lines)
 - ~~FS-9: `engine/src/transact_write_items.rs` (611)~~ — split into helpers (now 317 lines)
+
+## Resolved in P160
+
+- ~~F-16: TransactWriteItems stream records omitted OldImage~~ (fixed: storage-owned transaction stream capture now reads old items only when conditions or OldImage stream views require it; covered by `tests/test_streams.py::TestMixedWorkload::test_transact_write_update_delete_emit_old_images`)
 
 ## Resolved in P30
 
