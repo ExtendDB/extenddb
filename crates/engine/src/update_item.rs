@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
-    ExpressionMaps, PathElement, UpdateAction, parse_update_from, tokenize_for,
+    ExpressionKind, ExpressionMaps, PathElement, UpdateAction, parse_update_from, tokenize_for,
     validate_no_reserved_words,
 };
 use extenddb_core::types::{
@@ -126,7 +126,7 @@ pub async fn handle_update_item(
         has_expr,
         input.expression_attribute_values.as_ref(),
         has_expr,
-        &["UpdateExpression", "ConditionExpression"],
+        &[ExpressionKind::Update, ExpressionKind::Condition],
     )?;
 
     let (condition, maps) = resolve_condition(
@@ -144,7 +144,7 @@ pub async fn handle_update_item(
         tokenize_for(
             update_expr,
             ctx.limits.max_expression_tokens,
-            "UpdateExpression",
+            ExpressionKind::Update,
         )
         .and_then(|update_tokens| {
             if ctx.limits.enforce_reserved_keywords {
@@ -152,7 +152,9 @@ pub async fn handle_update_item(
             }
             parse_update_from(&update_tokens, update_expr)
         })
-        .map_err(|e| crate::expression_helpers::prefix_expression_error(e, "UpdateExpression"))?
+        .map_err(|e| {
+            crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Update)
+        })?
     } else {
         Vec::new()
     };

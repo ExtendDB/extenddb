@@ -11,6 +11,7 @@
 mod ast;
 mod evaluator;
 mod key_condition;
+mod kind;
 mod parser;
 mod parser_common;
 mod projection;
@@ -23,6 +24,7 @@ mod update_parser;
 pub use ast::{ArithOp, CompareOp, Expr, PathElement, UpdateAction};
 pub use evaluator::evaluate_condition;
 pub use key_condition::{KeyCondition, SortKeyCondition, parse_key_condition};
+pub use kind::ExpressionKind;
 pub use parser::{parse_condition, parse_condition_with_depth_limit};
 pub use projection::{apply_projection, parse_projection};
 pub use reserved_words::validate_no_reserved_words;

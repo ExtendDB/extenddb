@@ -200,11 +200,11 @@ pub fn tokenize_with_limit(input: &str, max_tokens: usize) -> Result<Vec<Token>,
 pub fn tokenize_for(
     input: &str,
     max_tokens: usize,
-    expr_type: &str,
+    kind: super::ExpressionKind,
 ) -> Result<Vec<Token>, DynamoDbError> {
     if input.is_empty() {
         return Err(DynamoDbError::ValidationException(format!(
-            "Invalid {expr_type}: The expression can not be empty;"
+            "Invalid {kind}: The expression can not be empty;"
         )));
     }
     let mut tokens = Vec::new();
@@ -279,7 +279,7 @@ pub fn tokenize_for(
                 }
                 if i == start {
                     return Err(DynamoDbError::ValidationException(format!(
-                        "Invalid {expr_type}: Syntax error; token: \"#\", near: \"#\""
+                        "Invalid {kind}: Syntax error; token: \"#\", near: \"#\""
                     )));
                 }
                 push_token(
@@ -296,7 +296,7 @@ pub fn tokenize_for(
                 }
                 if i == start {
                     return Err(DynamoDbError::ValidationException(format!(
-                        "Invalid {expr_type}: Syntax error; token: \":\", near: \":\""
+                        "Invalid {kind}: Syntax error; token: \":\", near: \":\""
                     )));
                 }
                 push_token(
@@ -342,7 +342,7 @@ pub fn tokenize_for(
                 };
                 let near = &input[i..near_end];
                 return Err(DynamoDbError::ValidationException(format!(
-                    "Invalid {expr_type}: Syntax error; token: \"{ch}\", near: \"{near}\""
+                    "Invalid {kind}: Syntax error; token: \"{ch}\", near: \"{near}\""
                 )));
             }
         }
@@ -568,19 +568,20 @@ mod tests {
     #[test]
     fn tokenize_for_multibyte_utf8_does_not_panic() {
         // Emoji (4-byte UTF-8) should produce a validation error, not a panic.
-        let err = tokenize_for("a = 😀", 4096, "ConditionExpression").unwrap_err();
+        let err =
+            tokenize_for("a = 😀", 4096, super::super::ExpressionKind::Condition).unwrap_err();
         assert!(
             matches!(err, DynamoDbError::ValidationException(ref msg) if msg.contains("Syntax error"))
         );
 
         // Accented character (2-byte UTF-8)
-        let err = tokenize_for("café", 4096, "FilterExpression").unwrap_err();
+        let err = tokenize_for("café", 4096, super::super::ExpressionKind::Filter).unwrap_err();
         assert!(
             matches!(err, DynamoDbError::ValidationException(ref msg) if msg.contains("Syntax error"))
         );
 
         // Multi-byte at the very end
-        let err = tokenize_for("x + ñ", 4096, "UpdateExpression").unwrap_err();
+        let err = tokenize_for("x + ñ", 4096, super::super::ExpressionKind::Update).unwrap_err();
         assert!(
             matches!(err, DynamoDbError::ValidationException(ref msg) if msg.contains("Syntax error"))
         );

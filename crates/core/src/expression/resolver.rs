@@ -214,7 +214,8 @@ pub fn resolve_element_name<'a>(
 /// `value_expr_present` is true when any expression that can carry a `:value` is
 /// present (condition, filter, key condition, update; not projection).
 /// `value_expr_params` is the API's static list of value-capable expression
-/// parameter names, used to build the values suffix.
+/// parameter kinds, used to build the values suffix. An empty list yields no
+/// suffix (matching Query).
 ///
 /// # Errors
 ///
@@ -225,7 +226,7 @@ pub fn validate_expression_param_usage(
     name_expr_present: bool,
     values: Option<&HashMap<String, AttributeValue>>,
     value_expr_present: bool,
-    value_expr_params: &[&str],
+    value_expr_params: &[super::ExpressionKind],
 ) -> Result<(), DynamoDbError> {
     if !name_expr_present && names.is_some_and(|m| !m.is_empty()) {
         return Err(DynamoDbError::ValidationException(
@@ -233,14 +234,20 @@ pub fn validate_expression_param_usage(
         ));
     }
     if !value_expr_present && values.is_some_and(|m| !m.is_empty()) {
-        let suffix = match value_expr_params {
-            [] => String::new(),
-            [one] => format!("{one} is null"),
-            many => format!("{} are null", many.join(" and ")),
+        let base = "ExpressionAttributeValues can only be specified when using expressions";
+        let msg = match value_expr_params {
+            [] => base.to_owned(),
+            [one] => format!("{base}: {one} is null"),
+            many => {
+                let joined = many
+                    .iter()
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                format!("{base}: {joined} are null")
+            }
         };
-        return Err(DynamoDbError::ValidationException(format!(
-            "ExpressionAttributeValues can only be specified when using expressions: {suffix}"
-        )));
+        return Err(DynamoDbError::ValidationException(msg));
     }
     Ok(())
 }

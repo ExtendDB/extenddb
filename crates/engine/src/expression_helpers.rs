@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
-    Expr, ExpressionMaps, PathElement, Token, parse_condition_with_depth_limit, parse_projection,
-    tokenize_for, tokenize_with_limit, validate_no_reserved_words,
+    Expr, ExpressionKind, ExpressionMaps, PathElement, Token, parse_condition_with_depth_limit,
+    parse_projection, tokenize_for, tokenize_with_limit, validate_no_reserved_words,
 };
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{AttributeValue, ConditionalOperator, ExpectedAttributeValue};
@@ -72,7 +72,7 @@ pub fn parse_optional_condition(
             });
             parsed
                 .map(Some)
-                .map_err(|e| prefix_expression_error(e, "ConditionExpression"))
+                .map_err(|e| prefix_expression_error(e, ExpressionKind::Condition))
         }
         _ => Ok(None),
     }
@@ -91,7 +91,7 @@ pub fn parse_optional_filter(
     limits: &LimitsConfig,
 ) -> Result<Option<Expr>, DynamoDbError> {
     parse_optional_condition(expr, limits)
-        .map_err(|e| prefix_expression_error(e, "FilterExpression"))
+        .map_err(|e| prefix_expression_error(e, ExpressionKind::Filter))
 }
 
 /// Resolve a condition from either `ConditionExpression` or legacy `Expected`.
@@ -164,7 +164,7 @@ pub fn parse_projection_expr(
     let result = tokenize_for(
         proj_str,
         limits.max_expression_tokens,
-        "ProjectionExpression",
+        ExpressionKind::Projection,
     )
     .and_then(|tokens| {
         if limits.enforce_reserved_keywords {
@@ -172,7 +172,7 @@ pub fn parse_projection_expr(
         }
         parse_projection(&tokens)
     });
-    result.map_err(|e| prefix_expression_error(e, "ProjectionExpression"))
+    result.map_err(|e| prefix_expression_error(e, ExpressionKind::Projection))
 }
 
 /// Prefix an expression error with the expression type, matching DynamoDB's format.
@@ -181,17 +181,17 @@ pub fn parse_projection_expr(
 /// `ConditionExpression`; those are relabelled to `expr_type`. Errors already
 /// labelled with another expression type, or non-expression validation errors,
 /// are returned unchanged.
-pub fn prefix_expression_error(err: DynamoDbError, expr_type: &str) -> DynamoDbError {
+pub fn prefix_expression_error(err: DynamoDbError, kind: ExpressionKind) -> DynamoDbError {
     match err {
         DynamoDbError::ValidationException(msg) => {
             if let Some(rest) = msg.strip_prefix("Invalid ConditionExpression:") {
-                DynamoDbError::ValidationException(format!("Invalid {expr_type}:{rest}"))
+                DynamoDbError::ValidationException(format!("Invalid {kind}:{rest}"))
             } else if let Some(rest) = msg.strip_prefix("Invalid expression:") {
-                DynamoDbError::ValidationException(format!("Invalid {expr_type}:{rest}"))
+                DynamoDbError::ValidationException(format!("Invalid {kind}:{rest}"))
             } else if msg.starts_with("Invalid ") || msg.starts_with("1 validation") {
                 DynamoDbError::ValidationException(msg)
             } else {
-                DynamoDbError::ValidationException(format!("Invalid {expr_type}: {msg}"))
+                DynamoDbError::ValidationException(format!("Invalid {kind}: {msg}"))
             }
         }
         other => other,

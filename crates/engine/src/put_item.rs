@@ -87,7 +87,7 @@ pub async fn handle_put_item(
         has_expression,
         input.expression_attribute_values.as_ref(),
         has_expression,
-        &["ConditionExpression"],
+        &[extenddb_core::expression::ExpressionKind::Condition],
     )?;
 
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;

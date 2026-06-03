@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::ExpressionMaps;
+use extenddb_core::expression::{ExpressionKind, ExpressionMaps};
 use extenddb_core::types::{
     IndexType, ScanInput, ScanOutput, Select, TableKeyInfo, extract_key, item_size_bytes,
 };
@@ -171,7 +171,7 @@ pub async fn handle_scan(
         has_proj_expr || has_filter_expr,
         input.expression_attribute_values.as_ref(),
         has_filter_expr,
-        &["FilterExpression"],
+        &[ExpressionKind::Filter],
     )?;
 
     // Parse FilterExpression or desugar legacy ScanFilter
@@ -293,7 +293,7 @@ pub async fn handle_scan(
     // Validate begins_with operand types upfront (before any rows are scanned).
     if let Some(ref f) = filter {
         extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
-            |e| crate::expression_helpers::prefix_expression_error(e, "FilterExpression"),
+            |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
         )?;
     }
 

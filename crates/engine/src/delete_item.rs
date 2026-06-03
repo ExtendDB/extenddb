@@ -63,7 +63,7 @@ pub async fn handle_delete_item(
         has_condition,
         input.expression_attribute_values.as_ref(),
         has_condition,
-        &["ConditionExpression"],
+        &[extenddb_core::expression::ExpressionKind::Condition],
     )?;
 
     let (condition, maps) = resolve_condition(

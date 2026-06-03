@@ -144,3 +144,35 @@ class TestExpressionParamsWithoutExpression:
             ),
             f"{VALUES_PREFIX}: ConditionExpression is null",
         )
+
+    def test_query_names_no_expression(self, dynamodb_client, hash_table):
+        # Legacy KeyConditions is not an expression; stray names are rejected.
+        _expect_validation(
+            lambda: dynamodb_client.query(
+                TableName=hash_table,
+                KeyConditions={
+                    "pk": {
+                        "AttributeValueList": [{"S": "k1"}],
+                        "ComparisonOperator": "EQ",
+                    }
+                },
+                ExpressionAttributeNames={"#a": "pk"},
+            ),
+            NAMES_MSG,
+        )
+
+    def test_query_values_no_expression(self, dynamodb_client, hash_table):
+        # Query emits no values suffix, unlike Scan/Delete/Update.
+        _expect_validation(
+            lambda: dynamodb_client.query(
+                TableName=hash_table,
+                KeyConditions={
+                    "pk": {
+                        "AttributeValueList": [{"S": "k1"}],
+                        "ComparisonOperator": "EQ",
+                    }
+                },
+                ExpressionAttributeValues={":v": {"S": "x"}},
+            ),
+            VALUES_PREFIX,
+        )

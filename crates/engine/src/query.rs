@@ -9,7 +9,9 @@ use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::PathElement;
-use extenddb_core::expression::{ExpressionMaps, parse_key_condition, tokenize_for};
+use extenddb_core::expression::{
+    ExpressionKind, ExpressionMaps, parse_key_condition, tokenize_for,
+};
 use extenddb_core::types::{
     IndexType, KeyType, QueryInput, QueryOutput, Select, TableKeyInfo, extract_key, item_size_bytes,
 };
@@ -137,6 +139,28 @@ pub async fn handle_query(
         input.expression_attribute_values.as_ref(),
     );
 
+    // Reject EAN/EAV supplied with no expression that references them. Legacy
+    // KeyConditions does not count as an expression. Query emits no values suffix.
+    let has_kce = input
+        .key_condition_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    let has_filter_expr = input
+        .filter_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    let has_proj_expr = input
+        .projection_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    extenddb_core::expression::validate_expression_param_usage(
+        input.expression_attribute_names.as_ref(),
+        has_kce || has_filter_expr || has_proj_expr,
+        input.expression_attribute_values.as_ref(),
+        has_kce || has_filter_expr,
+        &[],
+    )?;
+
     // Parse KeyConditionExpression or desugar legacy KeyConditions
     let (mut key_condition, legacy_kc_maps) = if let Some(kce_str) =
         input.key_condition_expression.as_deref()
@@ -144,7 +168,7 @@ pub async fn handle_query(
         let parsed = tokenize_for(
             kce_str,
             ctx.limits.max_expression_tokens,
-            "KeyConditionExpression",
+            ExpressionKind::KeyCondition,
         )
         .and_then(|tokens| {
             if ctx.limits.enforce_reserved_keywords {
@@ -153,7 +177,7 @@ pub async fn handle_query(
             parse_key_condition(&tokens)
         })
         .map_err(|e| {
-            crate::expression_helpers::prefix_expression_error(e, "KeyConditionExpression")
+            crate::expression_helpers::prefix_expression_error(e, ExpressionKind::KeyCondition)
         })?;
         (parsed, None)
     } else if let Some(ref kc) = input.key_conditions {
@@ -248,7 +272,7 @@ pub async fn handle_query(
     // Validate #name references in filter are defined in ExpressionAttributeNames
     if let Some(ref filter_expr) = filter {
         let names = input.expression_attribute_names.as_ref();
-        validate_name_refs_in_expr(filter_expr, names, "FilterExpression")?;
+        validate_name_refs_in_expr(filter_expr, names, ExpressionKind::Filter)?;
     }
 
     // Parse ProjectionExpression or desugar legacy AttributesToGet
@@ -360,7 +384,7 @@ pub async fn handle_query(
     // Validate begins_with operand types upfront (before any rows are read).
     if let Some(ref f) = filter {
         extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
-            |e| crate::expression_helpers::prefix_expression_error(e, "FilterExpression"),
+            |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
         )?;
     }
 
@@ -463,7 +487,7 @@ fn resolve_path_attr_name(
 fn validate_name_refs_in_expr(
     expr: &extenddb_core::expression::Expr,
     names: Option<&HashMap<String, String>>,
-    expr_type: &str,
+    expr_type: ExpressionKind,
 ) -> Result<(), DynamoDbError> {
     use extenddb_core::expression::Expr;
     match expr {
