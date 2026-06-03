@@ -316,10 +316,7 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
     match e {
         StorageError::Validation(msg) => DynamoDbError::ValidationException(msg),
         StorageError::TableNotFound(name) => DynamoDbError::ResourceNotFoundException(name),
-        other => {
-            tracing::error!(internal_error = %other, "storage internal error");
-            DynamoDbError::InternalServerError("Internal server error".to_owned())
-        }
+        other => crate::storage_other_to_dynamo(other, "streams storage error"),
     }
 }
 

@@ -180,10 +180,7 @@ pub async fn handle_update_table(
             extenddb_storage::error::StorageError::Validation(msg) => {
                 DynamoDbError::ValidationException(msg)
             }
-            other => {
-                tracing::error!(internal_error = %other, "storage internal error");
-                DynamoDbError::InternalServerError("Internal server error".to_owned())
-            }
+            other => crate::storage_other_to_dynamo(other, "update table storage error"),
         })?;
 
     // Drop the cached TableKeyInfo: index changes, stream-spec changes, and

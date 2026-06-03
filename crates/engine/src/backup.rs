@@ -397,10 +397,7 @@ fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> DynamoDbEr
                 DynamoDbError::ValidationException(msg)
             }
         }
-        other => {
-            tracing::error!(internal_error = %other, "backup storage error");
-            DynamoDbError::InternalServerError("Internal server error".to_owned())
-        }
+        other => crate::storage_other_to_dynamo(other, "backup storage error"),
     }
 }
 

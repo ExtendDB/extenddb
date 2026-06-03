@@ -25,7 +25,7 @@ Last updated: 2026-06-03 (P160)
 | F-10 | `ACTIVE_WINDOW` hardcoded to 10s; real DynamoDB varies | `bin/cmd_serve.rs:346` | Low | P1 |
 | F-11 | `describe_table` + `list_tags` not in a transaction — concurrent race possible | `storage-postgres/lib.rs:1073` | Low | P9 |
 | F-12 | ~~Tagging operations don't validate resource existence (real DynamoDB returns `ResourceNotFoundException`)~~ | ~~`engine/tagging.rs`~~ | ~~Medium~~ | P26 |
-| F-13 | HTTP 500 returned for pool exhaustion instead of 503 | `server/lib.rs` | Medium | P25 |
+| F-13 | ~~HTTP 500 returned for pool exhaustion instead of 503~~ | ~~`server/lib.rs`~~ | ~~Medium~~ | P25 |
 | F-14 | POSIX syslog single-identity limitation prevents separate `extenddb-sqlx` syslog identity | `bin/cmd_serve.rs` | Low | P25 |
 | F-15 | ~~PostgreSQL TTL worker bypasses stream capture — expired item deletions don't generate REMOVE stream records~~ | `storage-postgres/src/ttl_worker.rs` | ~~High~~ | P26 |
 | F-16 | ~~`TransactWriteItems` stream records omitted `OldImage` for transaction-originated MODIFY/REMOVE events~~ | ~~`engine/transact_write_items.rs`~~ | ~~Medium~~ | P27 |
@@ -127,6 +127,7 @@ Resolved (split in P94–P96):
 
 - ~~F-16: TransactWriteItems stream records omitted OldImage~~ (fixed: storage-owned transaction stream capture now reads old items only when conditions or OldImage stream views require it; covered by `tests/test_streams.py::TestMixedWorkload::test_transact_write_update_delete_emit_old_images`)
 - ~~F-17: Nested map keys were not validated against the attribute-name byte limit~~ (fixed: recursive validation now covers item maps, maps inside lists, AttributeUpdates values, and UpdateExpression/TransactWrite SET expression values)
+- ~~F-13: HTTP 500 returned for pool exhaustion instead of 503~~ (fixed: shared storage-error fallback now maps typed backend unavailability plus sqlx pool timeout/closed-pool messages to DynamoDB `ServiceUnavailable` / HTTP 503 while preserving sanitized 500s for real internals)
 
 ## Resolved in P30
 

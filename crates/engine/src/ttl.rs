@@ -142,10 +142,7 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
             DynamoDbError::ResourceInUseException(format!("Table {name} is not in ACTIVE state"))
         }
         StorageError::Validation(message) => DynamoDbError::ValidationException(message),
-        other => {
-            tracing::error!(internal_error = %other, "storage internal error");
-            DynamoDbError::InternalServerError("Internal server error".to_owned())
-        }
+        other => crate::storage_other_to_dynamo(other, "ttl storage error"),
     }
 }
 

@@ -96,9 +96,8 @@ pub(crate) fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) ->
         StorageError::DeletionProtected(arn) => DynamoDbError::ValidationException(format!(
             "Resource '{arn}' cannot be deleted as it is currently protected against deletion. Disable deletion protection first then try again."
         )),
-        StorageError::Connection(msg) => {
-            tracing::error!(internal_error = %msg, "storage connection error");
-            DynamoDbError::ServiceUnavailable("Service is temporarily unavailable".to_owned())
+        StorageError::Connection(msg) | StorageError::Unavailable(msg) => {
+            crate::storage_unavailable_to_dynamo(msg, "storage connection error")
         }
         StorageError::Configuration(msg) => {
             tracing::error!(configuration_error = %msg, "storage configuration error");
@@ -137,6 +136,9 @@ pub(crate) fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) ->
             DynamoDbError::InternalServerError("Internal server error".to_owned())
         }
         StorageError::Internal(msg) => {
+            if crate::storage_internal_message_is_unavailable(&msg) {
+                return crate::storage_unavailable_to_dynamo(msg, "storage internal error");
+            }
             // Log the raw message for debugging but do not expose storage
             // backend details (e.g. PostgreSQL error text) to the client.
             // REQ-ERR: tenet 4 — only DynamoDB-shaped errors cross the wire.
@@ -168,5 +170,30 @@ pub(crate) fn storage_err_to_dynamo_with_ccf(
             )
         }
         other => storage_err_to_dynamo(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::storage_err_to_dynamo;
+    use extenddb_core::error::DynamoDbError;
+    use extenddb_storage::error::StorageError;
+
+    #[test]
+    fn storage_err_to_dynamo_maps_pool_timeout_to_service_unavailable() {
+        let error = storage_err_to_dynamo(StorageError::Internal(
+            "pool timed out while waiting for an open connection".into(),
+        ));
+
+        assert!(matches!(error, DynamoDbError::ServiceUnavailable(_)));
+        assert_eq!(error.status_code(), 503);
+    }
+
+    #[test]
+    fn storage_err_to_dynamo_keeps_generic_internal_as_500() {
+        let error = storage_err_to_dynamo(StorageError::Internal("corrupt catalog row".into()));
+
+        assert!(matches!(error, DynamoDbError::InternalServerError(_)));
+        assert_eq!(error.status_code(), 500);
     }
 }

@@ -36,6 +36,8 @@ pub enum StorageError {
     CatalogNotInitialized,
     #[error("Connection error: {0}")]
     Connection(String),
+    #[error("Storage unavailable: {0}")]
+    Unavailable(String),
     #[error("Configuration error: {0}")]
     Configuration(String),
     #[error("Internal error: {0}")]

@@ -137,8 +137,36 @@ pub(crate) fn serialize_output(
 /// Use this for storage calls that don't go through `storage_err_to_dynamo`
 /// (e.g., tagging, metadata operations that return `StorageError` directly).
 pub(crate) fn sanitize_storage_error(e: extenddb_storage::error::StorageError) -> DynamoDbError {
-    tracing::error!(internal_error = %e, "storage internal error");
-    DynamoDbError::InternalServerError("Internal server error".to_owned())
+    storage_other_to_dynamo(e, "storage internal error")
+}
+
+pub(crate) fn storage_other_to_dynamo(
+    e: extenddb_storage::error::StorageError,
+    context: &'static str,
+) -> DynamoDbError {
+    use extenddb_storage::error::StorageError;
+    match e {
+        StorageError::Connection(msg) | StorageError::Unavailable(msg) => {
+            storage_unavailable_to_dynamo(msg, context)
+        }
+        StorageError::Internal(msg) if storage_internal_message_is_unavailable(&msg) => {
+            storage_unavailable_to_dynamo(msg, context)
+        }
+        other => {
+            tracing::error!(internal_error = %other, context, "storage internal error");
+            DynamoDbError::InternalServerError("Internal server error".to_owned())
+        }
+    }
+}
+
+pub(crate) fn storage_unavailable_to_dynamo(msg: String, context: &'static str) -> DynamoDbError {
+    tracing::error!(internal_error = %msg, context, "storage backend unavailable");
+    DynamoDbError::ServiceUnavailable("Service is temporarily unavailable".to_owned())
+}
+
+fn storage_internal_message_is_unavailable(message: &str) -> bool {
+    message.contains("pool timed out while waiting for an open connection")
+        || message.contains("attempted to acquire a connection on a closed pool")
 }
 
 /// Map a serde deserialization error to the appropriate DynamoDB error type.
@@ -198,6 +226,66 @@ pub(crate) fn validate_enum_fields(
         errors.join("; ")
     );
     Err(DynamoDbError::ValidationException(msg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use extenddb_storage::error::StorageError;
+
+    #[test]
+    fn storage_other_to_dynamo_maps_pool_timeout_to_service_unavailable() {
+        let error = storage_other_to_dynamo(
+            StorageError::Internal("pool timed out while waiting for an open connection".into()),
+            "test",
+        );
+
+        assert!(matches!(error, DynamoDbError::ServiceUnavailable(_)));
+        assert_eq!(error.status_code(), 503);
+    }
+
+    #[test]
+    fn storage_other_to_dynamo_maps_wrapped_pool_timeout_to_service_unavailable() {
+        let error = storage_other_to_dynamo(
+            StorageError::Internal(
+                "Database error: pool timed out while waiting for an open connection".into(),
+            ),
+            "test",
+        );
+
+        assert!(matches!(error, DynamoDbError::ServiceUnavailable(_)));
+        assert_eq!(error.status_code(), 503);
+    }
+
+    #[test]
+    fn storage_other_to_dynamo_maps_closed_pool_to_service_unavailable() {
+        let error = storage_other_to_dynamo(
+            StorageError::Internal("attempted to acquire a connection on a closed pool".into()),
+            "test",
+        );
+
+        assert!(matches!(error, DynamoDbError::ServiceUnavailable(_)));
+        assert_eq!(error.status_code(), 503);
+    }
+
+    #[test]
+    fn storage_other_to_dynamo_maps_typed_unavailable_to_service_unavailable() {
+        let error = storage_other_to_dynamo(
+            StorageError::Unavailable("backend saturated".into()),
+            "test",
+        );
+
+        assert!(matches!(error, DynamoDbError::ServiceUnavailable(_)));
+        assert_eq!(error.status_code(), 503);
+    }
+
+    #[test]
+    fn storage_other_to_dynamo_keeps_generic_internal_as_500() {
+        let error = storage_other_to_dynamo(StorageError::Internal("corrupt row".into()), "test");
+
+        assert!(matches!(error, DynamoDbError::InternalServerError(_)));
+        assert_eq!(error.status_code(), 500);
+    }
 }
 ///
 /// Populated by engine handlers so the server layer can record capacity,
