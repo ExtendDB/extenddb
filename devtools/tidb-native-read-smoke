@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Verify the TiDB-native default-read path used by the storage-tidb backend.
+#
+# The smoke creates a throwaway database, writes one DynamoDB-shaped JSON item,
+# waits for the requested stale-read window, then verifies that one TiDB session
+# can read through both the base table and a native secondary index with:
+#
+#   SET SESSION tidb_replica_read = 'closest-adaptive'
+#   SET SESSION tidb_read_staleness = '-N'
+#
+# Usage:
+#   devtools/tidb-native-read-smoke [options]
+#
+# Options:
+#   --mysql PATH                 mysql client binary (default: mysql)
+#   --host HOST                  TiDB SQL host (default: 127.0.0.1)
+#   --port PORT                  TiDB SQL port (default: 4000)
+#   --user USER                  TiDB SQL user (default: root)
+#   --password PASSWORD          TiDB SQL password (default: EXTENDDB_TIDB_PASSWORD)
+#   --plugin-dir PATH            mysql auth plugin directory
+#   --staleness-seconds SECONDS  positive stale-read window (default: 5)
+#   -h, --help                   show this help
+#
+# Environment variables mirror the long options with EXTENDDB_TIDB_* names:
+#   EXTENDDB_TIDB_MYSQL, EXTENDDB_TIDB_HOST, EXTENDDB_TIDB_PORT,
+#   EXTENDDB_TIDB_USER, EXTENDDB_TIDB_PASSWORD,
+#   EXTENDDB_TIDB_MYSQL_PLUGIN_DIR, EXTENDDB_TIDB_STALENESS_SECONDS.
+
+set -euo pipefail
+exec < /dev/null
+
+MYSQL_BIN="${EXTENDDB_TIDB_MYSQL:-mysql}"
+HOST="${EXTENDDB_TIDB_HOST:-127.0.0.1}"
+PORT="${EXTENDDB_TIDB_PORT:-4000}"
+USER="${EXTENDDB_TIDB_USER:-root}"
+PASSWORD="${EXTENDDB_TIDB_PASSWORD:-}"
+PLUGIN_DIR="${EXTENDDB_TIDB_MYSQL_PLUGIN_DIR:-}"
+STALENESS_SECONDS="${EXTENDDB_TIDB_STALENESS_SECONDS:-5}"
+
+usage() {
+    printf '%s\n' \
+        "Usage:" \
+        "  devtools/tidb-native-read-smoke [options]" \
+        "" \
+        "Options:" \
+        "  --mysql PATH                 mysql client binary (default: mysql)" \
+        "  --host HOST                  TiDB SQL host (default: 127.0.0.1)" \
+        "  --port PORT                  TiDB SQL port (default: 4000)" \
+        "  --user USER                  TiDB SQL user (default: root)" \
+        "  --password PASSWORD          TiDB SQL password (default: EXTENDDB_TIDB_PASSWORD)" \
+        "  --plugin-dir PATH            mysql auth plugin directory" \
+        "  --staleness-seconds SECONDS  positive stale-read window (default: 5)" \
+        "  -h, --help                   show this help" \
+        "" \
+        "Environment:" \
+        "  EXTENDDB_TIDB_MYSQL, EXTENDDB_TIDB_HOST, EXTENDDB_TIDB_PORT," \
+        "  EXTENDDB_TIDB_USER, EXTENDDB_TIDB_PASSWORD," \
+        "  EXTENDDB_TIDB_MYSQL_PLUGIN_DIR, EXTENDDB_TIDB_STALENESS_SECONDS"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --mysql) MYSQL_BIN="$2"; shift 2 ;;
+        --host) HOST="$2"; shift 2 ;;
+        --port) PORT="$2"; shift 2 ;;
+        --user) USER="$2"; shift 2 ;;
+        --password) PASSWORD="$2"; shift 2 ;;
+        --plugin-dir) PLUGIN_DIR="$2"; shift 2 ;;
+        --staleness-seconds) STALENESS_SECONDS="$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "error: unknown option: $1"; usage; exit 1 ;;
+    esac
+done
+
+if [[ ! "$STALENESS_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: --staleness-seconds must be a positive integer"
+    exit 1
+fi
+
+MYSQL_ARGS=("$MYSQL_BIN")
+if [[ -n "$PLUGIN_DIR" ]]; then
+    MYSQL_ARGS+=("--plugin-dir=$PLUGIN_DIR")
+fi
+MYSQL_ARGS+=(
+    "--protocol=tcp"
+    "--connect-timeout=5"
+    "-h" "$HOST"
+    "-P" "$PORT"
+    "-u" "$USER"
+    "--batch"
+    "--raw"
+    "--skip-column-names"
+)
+if [[ -n "$PASSWORD" ]]; then
+    MYSQL_ARGS+=("--password=$PASSWORD")
+fi
+
+DB_NAME="extenddb_tidb_read_smoke_$(date +%Y%m%d%H%M%S)_$$"
+CREATED_DB=0
+
+mysql_sql() {
+    "${MYSQL_ARGS[@]}" -e "$1"
+}
+
+cleanup() {
+    if [[ "$CREATED_DB" == "1" ]]; then
+        mysql_sql "DROP DATABASE IF EXISTS \`${DB_NAME}\`" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT
+
+echo "=== TiDB Native Read Smoke ==="
+echo "  endpoint: ${HOST}:${PORT}"
+echo "  user:     ${USER}"
+echo "  window:   ${STALENESS_SECONDS}s"
+echo "  database: ${DB_NAME}"
+echo ""
+
+VERSION="$(mysql_sql "SELECT VERSION();" | tr -d '\r')"
+if [[ "$VERSION" != *TiDB* ]]; then
+    echo "error: endpoint is not TiDB: ${VERSION}"
+    exit 1
+fi
+echo "[ok] connected to ${VERSION}"
+
+mysql_sql "
+CREATE DATABASE \`${DB_NAME}\`;
+CREATE TABLE \`${DB_NAME}\`.\`items\` (
+    pk VARBINARY(2048) NOT NULL,
+    item_data JSON NOT NULL,
+    gpk VARBINARY(2048) AS (
+        CAST(JSON_UNQUOTE(JSON_EXTRACT(item_data, '\$.\"gpk\".\"S\"')) AS BINARY)
+    ) VIRTUAL,
+    PRIMARY KEY (pk),
+    KEY idx_gpk (gpk)
+);
+INSERT INTO \`${DB_NAME}\`.\`items\` (pk, item_data)
+VALUES (
+    CAST('p1' AS BINARY),
+    CAST('{\"pk\":{\"S\":\"p1\"},\"gpk\":{\"S\":\"g1\"},\"v\":{\"S\":\"ok\"}}' AS JSON)
+);
+"
+CREATED_DB=1
+echo "[ok] created DynamoDB-shaped row and native TiDB index"
+
+sleep_seconds=$((STALENESS_SECONDS + 1))
+echo "[info] waiting ${sleep_seconds}s for the stale-read window"
+sleep "$sleep_seconds"
+
+OUTPUT="$(mysql_sql "
+USE \`${DB_NAME}\`;
+SET SESSION tidb_replica_read = 'closest-adaptive';
+SET SESSION tidb_read_staleness = '-${STALENESS_SECONDS}';
+SELECT @@tidb_read_staleness, @@tidb_replica_read;
+SELECT JSON_UNQUOTE(JSON_EXTRACT(item_data, '\$.\"v\".\"S\"'))
+FROM \`items\`
+WHERE pk = CAST('p1' AS BINARY);
+SELECT JSON_UNQUOTE(JSON_EXTRACT(item_data, '\$.\"v\".\"S\"'))
+FROM \`items\` FORCE INDEX (idx_gpk)
+WHERE gpk = CAST('g1' AS BINARY);
+" | tr -d '\r')"
+
+EXPECTED="-${STALENESS_SECONDS}"$'\t'"closest-adaptive"$'\n'"ok"$'\n'"ok"
+if [[ "$OUTPUT" != "$EXPECTED" ]]; then
+    echo "error: TiDB native read smoke returned unexpected output"
+    echo ""
+    echo "expected:"
+    printf '%s\n' "$EXPECTED"
+    echo ""
+    echo "actual:"
+    printf '%s\n' "$OUTPUT"
+    exit 1
+fi
+
+echo "[ok] session stale-read variables applied"
+echo "[ok] base-table default read returned the expected item"
+echo "[ok] native-index default read returned the expected item"
+echo ""
+echo "=== TiDB native read smoke passed ==="

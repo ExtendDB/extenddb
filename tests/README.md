@@ -39,6 +39,32 @@ devtools/run-tests --extenddb --all
 
 The test runner script automatically provisions test credentials and configures the Java truststore for external tests.
 
+### TiDB acceptance loop
+
+For TiDB backend work, use the focused acceptance loop before falling back to
+the full integration suite:
+
+```bash
+# Select checks from files changed from HEAD
+devtools/tidb-acceptance --changed
+
+# Run the full TiDB backend developer gate
+devtools/tidb-acceptance --full
+```
+
+`devtools/tidb-acceptance --changed` maps touched files to the relevant shell,
+diff, live-smoke, Rust, and documentation checks. `--full` runs the complete
+TiDB developer gate: shell checks, whitespace, the live native-read smoke,
+`storage-tidb` tests and clippy, `extenddb --features tidb` tests and clippy,
+and documentation build.
+
+The live smoke uses `devtools/tidb-native-read-smoke`, which defaults to
+`127.0.0.1:4000` as `root` with no password. It creates a throwaway database,
+verifies session-level stale reads through both the base table and a forced TiDB
+native secondary index, then drops the database on exit. If your mysql client
+needs an explicit auth plugin directory, set `EXTENDDB_TIDB_MYSQL_PLUGIN_DIR` or
+pass `--plugin-dir`.
+
 ## Running against real DynamoDB
 
 ```bash

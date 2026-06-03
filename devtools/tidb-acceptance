@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Fast TiDB backend acceptance loop.
+#
+# This script collects the checks that repeatedly come up while hardening the
+# TiDB backend. Use `--changed` during iteration, `--smoke` for live TiDB-native
+# behavior, and `--full` before claiming a TiDB backend fix is ready.
+
+set -euo pipefail
+exec < /dev/null
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_DIR"
+
+RUN_CHANGED=false
+RUN_SMOKE=false
+RUN_RUST=false
+RUN_DOCS=false
+RUN_SHELL=false
+RUN_DIFF=true
+
+MYSQL_BIN="${EXTENDDB_TIDB_MYSQL:-}"
+TIDB_HOST="${EXTENDDB_TIDB_HOST:-}"
+TIDB_PORT="${EXTENDDB_TIDB_PORT:-}"
+TIDB_USER="${EXTENDDB_TIDB_USER:-}"
+TIDB_PASSWORD="${EXTENDDB_TIDB_PASSWORD:-}"
+PLUGIN_DIR="${EXTENDDB_TIDB_MYSQL_PLUGIN_DIR:-}"
+STALENESS_SECONDS="${EXTENDDB_TIDB_STALENESS_SECONDS:-5}"
+
+usage() {
+    cat <<'EOF'
+Usage: devtools/tidb-acceptance MODE [options]
+
+Modes:
+  --changed                  select checks from files changed from HEAD
+  --smoke                    run live TiDB-native smoke checks
+  --rust                     run TiDB Rust tests and clippy checks
+  --docs                     rebuild documentation artifacts
+  --full                     run shell, diff, smoke, rust, and docs checks
+
+Options passed through to the live smoke:
+  --mysql PATH
+  --host HOST
+  --port PORT
+  --user USER
+  --password PASSWORD
+  --plugin-dir PATH
+  --staleness-seconds SECONDS
+
+Environment:
+  EXTENDDB_TIDB_MYSQL, EXTENDDB_TIDB_HOST, EXTENDDB_TIDB_PORT,
+  EXTENDDB_TIDB_USER, EXTENDDB_TIDB_PASSWORD,
+  EXTENDDB_TIDB_MYSQL_PLUGIN_DIR, EXTENDDB_TIDB_STALENESS_SECONDS.
+EOF
+}
+
+if [[ $# -eq 0 ]]; then
+    usage
+    exit 1
+fi
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --changed) RUN_CHANGED=true; shift ;;
+        --smoke) RUN_SMOKE=true; shift ;;
+        --rust) RUN_RUST=true; shift ;;
+        --docs) RUN_DOCS=true; shift ;;
+        --full)
+            RUN_SMOKE=true
+            RUN_RUST=true
+            RUN_DOCS=true
+            RUN_SHELL=true
+            shift
+            ;;
+        --mysql) MYSQL_BIN="$2"; shift 2 ;;
+        --host) TIDB_HOST="$2"; shift 2 ;;
+        --port) TIDB_PORT="$2"; shift 2 ;;
+        --user) TIDB_USER="$2"; shift 2 ;;
+        --password) TIDB_PASSWORD="$2"; shift 2 ;;
+        --plugin-dir) PLUGIN_DIR="$2"; shift 2 ;;
+        --staleness-seconds) STALENESS_SECONDS="$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "error: unknown option: $1"; usage; exit 1 ;;
+    esac
+done
+
+if [[ ! "$STALENESS_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: --staleness-seconds must be a positive integer"
+    exit 1
+fi
+
+if ! $RUN_CHANGED && ! $RUN_SMOKE && ! $RUN_RUST && ! $RUN_DOCS && ! $RUN_SHELL; then
+    echo "error: choose at least one mode"
+    usage
+    exit 1
+fi
+
+mkdir -p discussions
+HASH="$(git rev-parse --short HEAD)"
+STAMP="$(date +%Y%m%d%H%M%S)"
+ARTIFACT="discussions/tidb-acceptance-${HASH}-${STAMP}.txt"
+exec > >(tee "$ARTIFACT") 2>&1
+
+changed_files() {
+    {
+        git diff --name-only --diff-filter=ACMRT HEAD --
+        git ls-files --others --exclude-standard
+    } | sort -u | while IFS= read -r file; do
+        case "$file" in
+            discussions/tidb-acceptance-*.txt) ;;
+            *) printf '%s\n' "$file" ;;
+        esac
+    done
+}
+
+select_changed_checks() {
+    local files
+    files="$(changed_files)"
+    if [[ -z "$files" ]]; then
+        echo "[info] no changed files from HEAD"
+        return
+    fi
+
+    echo "=== Changed files ==="
+    printf '%s\n' "$files"
+    echo ""
+
+    while IFS= read -r file; do
+        case "$file" in
+            Cargo.toml|Cargo.lock|crates/core/*|crates/engine/*|crates/server/*|crates/storage/*|crates/storage-tidb/*)
+                RUN_RUST=true
+                ;;
+        esac
+        case "$file" in
+            crates/storage-tidb/*|devtools/tidb-*|extenddb.sample.toml)
+                RUN_SMOKE=true
+                ;;
+        esac
+        case "$file" in
+            docs/*|tests/README.md)
+                RUN_DOCS=true
+                ;;
+        esac
+        case "$file" in
+            devtools/*|scripts/*)
+                RUN_SHELL=true
+                ;;
+        esac
+    done <<< "$files"
+}
+
+if $RUN_CHANGED; then
+    select_changed_checks
+fi
+
+PASS=true
+
+run_step() {
+    local name="$1"
+    shift
+    echo "=== ${name} ==="
+    if "$@"; then
+        echo "[ok] ${name}"
+    else
+        echo "[fail] ${name}"
+        PASS=false
+    fi
+    echo ""
+}
+
+run_shell_checks() {
+    bash -n devtools/tidb-native-read-smoke
+    bash -n devtools/tidb-acceptance
+    devtools/tidb-native-read-smoke --help >/dev/null
+    devtools/tidb-acceptance --help >/dev/null
+}
+
+run_smoke_checks() {
+    local smoke_args
+    smoke_args=(devtools/tidb-native-read-smoke --staleness-seconds "$STALENESS_SECONDS")
+    if [[ -n "$MYSQL_BIN" ]]; then
+        smoke_args+=(--mysql "$MYSQL_BIN")
+    fi
+    if [[ -n "$TIDB_HOST" ]]; then
+        smoke_args+=(--host "$TIDB_HOST")
+    fi
+    if [[ -n "$TIDB_PORT" ]]; then
+        smoke_args+=(--port "$TIDB_PORT")
+    fi
+    if [[ -n "$TIDB_USER" ]]; then
+        smoke_args+=(--user "$TIDB_USER")
+    fi
+    if [[ -n "$TIDB_PASSWORD" ]]; then
+        smoke_args+=(--password "$TIDB_PASSWORD")
+    fi
+    if [[ -n "$PLUGIN_DIR" ]]; then
+        smoke_args+=(--plugin-dir "$PLUGIN_DIR")
+    fi
+    "${smoke_args[@]}"
+}
+
+python_for_docs() {
+    if [[ -x ".venv/bin/python" ]]; then
+        printf '%s\n' ".venv/bin/python"
+    else
+        printf '%s\n' "python3"
+    fi
+}
+
+run_docs_check() {
+    local python_bin
+    python_bin="$(python_for_docs)"
+    "$python_bin" docs/build-docs.py
+}
+
+echo "=== TiDB acceptance ==="
+echo "  commit:   ${HASH}"
+echo "  artifact: ${ARTIFACT}"
+echo "  shell:    ${RUN_SHELL}"
+echo "  diff:     ${RUN_DIFF}"
+echo "  smoke:    ${RUN_SMOKE}"
+echo "  rust:     ${RUN_RUST}"
+echo "  docs:     ${RUN_DOCS}"
+echo ""
+
+if $RUN_SHELL; then
+    run_step "shell script checks" run_shell_checks
+fi
+
+if $RUN_DIFF; then
+    run_step "diff whitespace check" git diff --check
+fi
+
+if $RUN_SMOKE; then
+    run_step "TiDB native live smoke" run_smoke_checks
+fi
+
+if $RUN_RUST; then
+    run_step "cargo fmt" cargo fmt --all -- --check
+    run_step "storage-tidb tests" cargo test -j12 -p extenddb-storage-tidb
+    run_step "storage-tidb clippy" cargo clippy -j12 -p extenddb-storage-tidb --all-targets -- -D warnings
+    run_step "extenddb tidb feature tests" cargo test -j12 -p extenddb --features tidb
+    run_step "extenddb tidb feature clippy" cargo clippy -j12 -p extenddb --features tidb --all-targets -- -D warnings
+fi
+
+if $RUN_DOCS; then
+    run_step "documentation build" run_docs_check
+fi
+
+if $PASS; then
+    echo "=== TiDB acceptance passed ==="
+    echo "artifact: ${ARTIFACT}"
+else
+    echo "=== TiDB acceptance failed ==="
+    echo "artifact: ${ARTIFACT}"
+    exit 1
+fi

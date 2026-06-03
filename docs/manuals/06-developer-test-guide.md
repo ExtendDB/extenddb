@@ -174,6 +174,35 @@ The `run-tests` script automatically:
 - `test-comprehensive-<hash>.txt` — Comprehensive test output
 - `test-cli-<hash>.txt` — CLI lifecycle test output
 
+### TiDB Acceptance Loop
+
+Use `devtools/tidb-acceptance` for TiDB backend changes before escalating to the
+full customer-facing integration suites:
+
+```bash
+# Select checks from files changed from HEAD
+devtools/tidb-acceptance --changed
+
+# Run the full TiDB backend developer gate
+devtools/tidb-acceptance --full
+```
+
+`--changed` maps touched files to shell, whitespace, live-smoke, Rust, and
+documentation checks. `--full` runs shell checks, `git diff --check`, the live
+TiDB native-read smoke, `storage-tidb` tests and clippy, `extenddb --features
+tidb` tests and clippy, and documentation build. Each run writes a single
+artifact under `discussions/`, so TiDB backend proof is not lost in terminal
+scrollback.
+
+The live smoke is `devtools/tidb-native-read-smoke`. It expects a TiDB SQL
+endpoint at `127.0.0.1:4000` with user `root` and no password by default. It
+creates a throwaway database, writes one DynamoDB-shaped JSON item, sets
+session-level `tidb_replica_read` and `tidb_read_staleness`, then verifies both
+base-table and forced native-index reads before dropping the database on exit.
+Configure non-default endpoints with `EXTENDDB_TIDB_HOST`, `EXTENDDB_TIDB_PORT`,
+`EXTENDDB_TIDB_USER`, `EXTENDDB_TIDB_PASSWORD`, and
+`EXTENDDB_TIDB_MYSQL_PLUGIN_DIR`, or use the matching command-line flags.
+
 ### Test Suites
 
 | Suite | Count | Description |
