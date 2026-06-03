@@ -20,8 +20,8 @@ Last updated: 2026-06-03 (P160)
 | F-5 | `PutItem` returns `None` for `Item` field instead of omitting it | `server/lib.rs:235` | Low | P2 |
 | F-6 | `extract_key_from_item` returns alphabetically first key, not necessarily the correct one for multi-key tables | `server/lib.rs:256` | Low | P7 |
 | F-7 | `MissingAuthenticationToken` returned regardless of auth provider state | `server/lib.rs:190` | Low | P12 |
-| F-8 | IAM policies have no FK on `principal_name` — can reference nonexistent principals | `server/management/iam_policy.rs:144` | Medium | P12c |
-| F-9 | Permissions boundary has no FK enforcement on principal existence | `server/management/permissions_boundary.rs:110` | Medium | P12c |
+| F-8 | ~~IAM policies have no FK on `principal_name` — can reference nonexistent principals~~ | ~~`server/management/iam_policy.rs`~~ | ~~Medium~~ | P12c |
+| F-9 | ~~Permissions boundary has no FK enforcement on principal existence~~ | ~~`server/management/permissions_boundary.rs`~~ | ~~Medium~~ | P12c |
 | F-10 | `ACTIVE_WINDOW` hardcoded to 10s; real DynamoDB varies | `bin/cmd_serve.rs:346` | Low | P1 |
 | F-11 | `describe_table` + `list_tags` not in a transaction — concurrent race possible | `storage-postgres/lib.rs:1073` | Low | P9 |
 | F-12 | ~~Tagging operations don't validate resource existence (real DynamoDB returns `ResourceNotFoundException`)~~ | ~~`engine/tagging.rs`~~ | ~~Medium~~ | P26 |
@@ -128,6 +128,7 @@ Resolved (split in P94–P96):
 - ~~F-16: TransactWriteItems stream records omitted OldImage~~ (fixed: storage-owned transaction stream capture now reads old items only when conditions or OldImage stream views require it; covered by `tests/test_streams.py::TestMixedWorkload::test_transact_write_update_delete_emit_old_images`)
 - ~~F-17: Nested map keys were not validated against the attribute-name byte limit~~ (fixed: recursive validation now covers item maps, maps inside lists, AttributeUpdates values, and UpdateExpression/TransactWrite SET expression values)
 - ~~F-13: HTTP 500 returned for pool exhaustion instead of 503~~ (fixed: shared storage-error fallback now maps typed backend unavailability plus sqlx pool timeout/closed-pool messages to DynamoDB `ServiceUnavailable` / HTTP 503 while preserving sanitized 500s for real internals)
+- ~~F-8/F-9: IAM policy and permissions-boundary writes could target nonexistent principals~~ (fixed: management API now verifies user/group/role existence through the catalog store before persisting policies or user/role permissions boundaries)
 
 ## Resolved in P30
 

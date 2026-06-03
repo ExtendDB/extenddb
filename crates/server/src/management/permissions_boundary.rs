@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use super::ManagementState;
 use super::auth::authenticate_admin;
+use super::ensure_principal_exists;
 use super::is_valid_iam_name;
 use super::ops::{OpError, op_err_to_response};
 
@@ -93,6 +94,17 @@ async fn set_boundary(
             "Permissions boundary must contain Version and Statement",
         )
             .into_response();
+    }
+
+    if let Err(e) = ensure_principal_exists(
+        &*state.catalog_store,
+        account_id,
+        principal_type,
+        principal_name,
+    )
+    .await
+    {
+        return op_err_to_response(e);
     }
 
     let result = match principal_type {

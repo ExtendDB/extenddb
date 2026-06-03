@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use super::ManagementState;
 use super::auth::authenticate_admin;
+use super::ensure_principal_exists;
 use super::is_valid_iam_name;
 use super::ops::{OpError, op_err_to_response};
 
@@ -174,10 +175,27 @@ async fn put_policy(
         ));
     }
 
+    if !is_valid_iam_name(principal_name) {
+        return op_err_to_response(OpError::Validation(
+            "principal_name must be 1-128 characters: alphanumeric, hyphens, underscores, dots, plus, equals, at".to_owned(),
+        ));
+    }
+
     if document.get("Version").is_none() || document.get("Statement").is_none() {
         return op_err_to_response(OpError::Validation(
             "Policy document must contain Version and Statement".to_owned(),
         ));
+    }
+
+    if let Err(e) = ensure_principal_exists(
+        &*state.catalog_store,
+        account_id,
+        principal_type,
+        principal_name,
+    )
+    .await
+    {
+        return op_err_to_response(e);
     }
 
     // Strict parse-on-write: reject documents the policy evaluator cannot parse.

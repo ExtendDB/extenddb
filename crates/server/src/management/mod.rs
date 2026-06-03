@@ -223,6 +223,52 @@ pub(crate) fn is_valid_iam_name(name: &str) -> bool {
         })
 }
 
+pub(crate) async fn ensure_principal_exists(
+    store: &dyn extenddb_storage::CatalogStore,
+    account_id: &str,
+    principal_type: &str,
+    principal_name: &str,
+) -> Result<(), ops::OpError> {
+    let exists = match principal_type {
+        "user" => store
+            .get_user_detail(account_id, principal_name)
+            .await
+            .map_err(ops::OpError::from_storage)?
+            .is_some(),
+        "group" => store
+            .get_group_detail(account_id, principal_name)
+            .await
+            .map_err(ops::OpError::from_storage)?
+            .is_some(),
+        "role" => store
+            .get_role_detail(account_id, principal_name)
+            .await
+            .map_err(ops::OpError::from_storage)?
+            .is_some(),
+        _ => {
+            return Err(ops::OpError::Validation(format!(
+                "Unsupported principal type: {principal_type}"
+            )));
+        }
+    };
+
+    if exists {
+        Ok(())
+    } else {
+        Err(principal_not_found(principal_type, principal_name))
+    }
+}
+
+fn principal_not_found(principal_type: &str, principal_name: &str) -> ops::OpError {
+    let label = match principal_type {
+        "user" => "IAM user",
+        "group" => "IAM group",
+        "role" => "IAM role",
+        _ => "IAM principal",
+    };
+    ops::OpError::NotFound(format!("{label} not found: {principal_name}"))
+}
+
 /// Validate admin name: 1-64 chars, alphanumeric, hyphens, or underscores.
 fn is_valid_admin_name(name: &str) -> bool {
     !name.is_empty()
@@ -230,4 +276,24 @@ fn is_valid_admin_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_valid_iam_name, principal_not_found};
+    use crate::management::ops::OpError;
+
+    #[test]
+    fn principal_not_found_uses_specific_entity_label() {
+        let err = principal_not_found("role", "writer");
+
+        assert!(matches!(err, OpError::NotFound(ref msg) if msg == "IAM role not found: writer"));
+    }
+
+    #[test]
+    fn iam_name_validation_accepts_aws_iam_policy_name_chars() {
+        assert!(is_valid_iam_name("alice-_.+=@"));
+        assert!(!is_valid_iam_name(""));
+        assert!(!is_valid_iam_name("contains/slash"));
+    }
 }
