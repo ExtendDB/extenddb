@@ -183,6 +183,9 @@ full customer-facing integration suites:
 # Select checks from files changed from HEAD
 devtools/tidb-acceptance --changed
 
+# Select checks and start/stop a local TiUP playground when needed
+devtools/tidb-acceptance --changed --with-playground
+
 # Run the full TiDB backend developer gate
 devtools/tidb-acceptance --full
 ```
@@ -193,6 +196,14 @@ TiDB native-read smoke, `storage-tidb` tests and clippy, `extenddb --features
 tidb` tests and clippy, and documentation build. Each run writes a single
 artifact under `discussions/`, so TiDB backend proof is not lost in terminal
 scrollback.
+
+Pass `--with-playground` to have the acceptance loop check the local TiDB SQL
+endpoint first, start `tiup playground` only when the endpoint is down, wait for
+readiness, and stop only the playground process it started. The managed
+playground defaults to TiDB `v8.5.6`, tag `extenddb-acceptance-smoke`, host
+`127.0.0.1`, and SQL port `4000`. Override the version or tag with
+`--playground-version`, `--playground-tag`,
+`EXTENDDB_TIDB_PLAYGROUND_VERSION`, or `EXTENDDB_TIDB_PLAYGROUND_TAG`.
 
 The live smoke is `devtools/tidb-native-read-smoke`. It expects a TiDB SQL
 endpoint at `127.0.0.1:4000` with user `root` and no password by default. It

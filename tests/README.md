@@ -48,6 +48,9 @@ the full integration suite:
 # Select checks from files changed from HEAD
 devtools/tidb-acceptance --changed
 
+# Select checks and start/stop a local TiUP playground when needed
+devtools/tidb-acceptance --changed --with-playground
+
 # Run the full TiDB backend developer gate
 devtools/tidb-acceptance --full
 ```
@@ -57,6 +60,12 @@ diff, live-smoke, Rust, and documentation checks. `--full` runs the complete
 TiDB developer gate: shell checks, whitespace, the live native-read smoke,
 `storage-tidb` tests and clippy, `extenddb --features tidb` tests and clippy,
 and documentation build.
+
+Pass `--with-playground` to let the acceptance loop start a local TiUP
+playground only when `127.0.0.1:4000` is down, wait for TiDB readiness, run the
+selected gate, and stop only the playground process it started. Use
+`--playground-version` or `--playground-tag` to override the managed TiUP
+defaults.
 
 The live smoke uses `devtools/tidb-native-read-smoke`, which defaults to
 `127.0.0.1:4000` as `root` with no password. It creates a throwaway database,

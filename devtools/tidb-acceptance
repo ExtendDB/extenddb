@@ -21,6 +21,7 @@ RUN_RUST=false
 RUN_DOCS=false
 RUN_SHELL=false
 RUN_DIFF=true
+MANAGE_PLAYGROUND=false
 
 MYSQL_BIN="${EXTENDDB_TIDB_MYSQL:-}"
 TIDB_HOST="${EXTENDDB_TIDB_HOST:-}"
@@ -29,6 +30,11 @@ TIDB_USER="${EXTENDDB_TIDB_USER:-}"
 TIDB_PASSWORD="${EXTENDDB_TIDB_PASSWORD:-}"
 PLUGIN_DIR="${EXTENDDB_TIDB_MYSQL_PLUGIN_DIR:-}"
 STALENESS_SECONDS="${EXTENDDB_TIDB_STALENESS_SECONDS:-5}"
+PLAYGROUND_VERSION="${EXTENDDB_TIDB_PLAYGROUND_VERSION:-v8.5.6}"
+PLAYGROUND_TAG="${EXTENDDB_TIDB_PLAYGROUND_TAG:-extenddb-acceptance-smoke}"
+PLAYGROUND_PID=""
+PLAYGROUND_COMPONENT_PID=""
+PLAYGROUND_LOG=""
 
 usage() {
     cat <<'EOF'
@@ -50,10 +56,16 @@ Options passed through to the live smoke:
   --plugin-dir PATH
   --staleness-seconds SECONDS
 
+Managed local TiDB playground:
+  --with-playground           start TiUP playground if the smoke endpoint is down
+  --playground-version VER    TiDB playground version (default: v8.5.6)
+  --playground-tag TAG        TiUP data tag (default: extenddb-acceptance-smoke)
+
 Environment:
   EXTENDDB_TIDB_MYSQL, EXTENDDB_TIDB_HOST, EXTENDDB_TIDB_PORT,
   EXTENDDB_TIDB_USER, EXTENDDB_TIDB_PASSWORD,
-  EXTENDDB_TIDB_MYSQL_PLUGIN_DIR, EXTENDDB_TIDB_STALENESS_SECONDS.
+  EXTENDDB_TIDB_MYSQL_PLUGIN_DIR, EXTENDDB_TIDB_STALENESS_SECONDS,
+  EXTENDDB_TIDB_PLAYGROUND_VERSION, EXTENDDB_TIDB_PLAYGROUND_TAG.
 EOF
 }
 
@@ -82,6 +94,9 @@ while [[ $# -gt 0 ]]; do
         --password) TIDB_PASSWORD="$2"; shift 2 ;;
         --plugin-dir) PLUGIN_DIR="$2"; shift 2 ;;
         --staleness-seconds) STALENESS_SECONDS="$2"; shift 2 ;;
+        --with-playground) MANAGE_PLAYGROUND=true; shift ;;
+        --playground-version) PLAYGROUND_VERSION="$2"; shift 2 ;;
+        --playground-tag) PLAYGROUND_TAG="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "error: unknown option: $1"; usage; exit 1 ;;
     esac
@@ -171,6 +186,133 @@ run_step() {
     echo ""
 }
 
+tidb_endpoint_ready() {
+    local mysql_bin host port user version
+    mysql_bin="${MYSQL_BIN:-mysql}"
+    host="${TIDB_HOST:-127.0.0.1}"
+    port="${TIDB_PORT:-4000}"
+    user="${TIDB_USER:-root}"
+
+    local mysql_args=("$mysql_bin")
+    if [[ -n "$PLUGIN_DIR" ]]; then
+        mysql_args+=("--plugin-dir=$PLUGIN_DIR")
+    fi
+    mysql_args+=(
+        "--protocol=tcp"
+        "--connect-timeout=5"
+        "-h" "$host"
+        "-P" "$port"
+        "-u" "$user"
+        "--batch"
+        "--raw"
+        "--skip-column-names"
+    )
+    if [[ -n "$TIDB_PASSWORD" ]]; then
+        mysql_args+=("--password=$TIDB_PASSWORD")
+    fi
+
+    if ! version="$("${mysql_args[@]}" -e "SELECT VERSION();" 2>/dev/null | tr -d '\r')"; then
+        return 1
+    fi
+    [[ "$version" == *TiDB* ]]
+}
+
+managed_playground_component_pid() {
+    if [[ -z "$PLAYGROUND_PID" ]]; then
+        return
+    fi
+    ps -axo pid=,ppid=,command= | awk \
+        -v parent_pid="$PLAYGROUND_PID" \
+        -v tag="$PLAYGROUND_TAG" \
+        '$2 == parent_pid && index($0, "tiup-playground") && index($0, tag) { print $1; exit }'
+}
+
+start_managed_playground() {
+    local host port attempt
+    host="${TIDB_HOST:-127.0.0.1}"
+    port="${TIDB_PORT:-4000}"
+
+    if tidb_endpoint_ready; then
+        echo "[info] TiDB endpoint already ready; managed playground not started"
+        return 0
+    fi
+    if [[ "$host" != "127.0.0.1" && "$host" != "localhost" ]]; then
+        echo "error: --with-playground only manages local host endpoints"
+        return 1
+    fi
+    if [[ "$port" != "4000" ]]; then
+        echo "error: --with-playground currently requires the default TiDB SQL port 4000"
+        return 1
+    fi
+    if ! command -v tiup >/dev/null 2>&1; then
+        echo "error: --with-playground requires tiup on PATH"
+        return 1
+    fi
+
+    PLAYGROUND_LOG="discussions/tidb-playground-${HASH}-${STAMP}.txt"
+    echo "[info] starting TiUP playground ${PLAYGROUND_VERSION} with tag ${PLAYGROUND_TAG}"
+    echo "[info] playground log: ${PLAYGROUND_LOG}"
+    tiup playground "$PLAYGROUND_VERSION" \
+        --tag "$PLAYGROUND_TAG" \
+        --db 1 \
+        --pd 1 \
+        --kv 1 \
+        --tiflash 0 \
+        --without-monitor \
+        --host "$host" >"$PLAYGROUND_LOG" 2>&1 &
+    PLAYGROUND_PID="$!"
+
+    for attempt in $(seq 1 90); do
+        if [[ -z "$PLAYGROUND_COMPONENT_PID" ]]; then
+            PLAYGROUND_COMPONENT_PID="$(managed_playground_component_pid || true)"
+        fi
+        if tidb_endpoint_ready; then
+            echo "[ok] managed TiDB playground is ready on ${host}:${port}"
+            return 0
+        fi
+        if ! kill -0 "$PLAYGROUND_PID" 2>/dev/null; then
+            echo "error: managed TiDB playground exited before becoming ready"
+            tail -40 "$PLAYGROUND_LOG" || true
+            wait "$PLAYGROUND_PID" 2>/dev/null || true
+            PLAYGROUND_PID=""
+            return 1
+        fi
+        sleep 1
+    done
+
+    echo "error: managed TiDB playground did not become ready within 90s"
+    tail -40 "$PLAYGROUND_LOG" || true
+    return 1
+}
+
+stop_managed_playground() {
+    if [[ -z "$PLAYGROUND_PID" ]]; then
+        return
+    fi
+    local attempt stop_pid
+    stop_pid="${PLAYGROUND_COMPONENT_PID:-$PLAYGROUND_PID}"
+
+    echo ""
+    echo "=== Stop managed TiDB playground ==="
+    kill -INT "$stop_pid" 2>/dev/null || true
+    for attempt in $(seq 1 30); do
+        if ! kill -0 "$stop_pid" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+    if kill -0 "$stop_pid" 2>/dev/null; then
+        echo "[warn] managed TiDB playground did not stop after SIGINT; sending SIGTERM"
+        kill -TERM "$stop_pid" 2>/dev/null || true
+    fi
+    wait "$PLAYGROUND_PID" 2>/dev/null || true
+    PLAYGROUND_PID=""
+    PLAYGROUND_COMPONENT_PID=""
+    echo "[ok] managed TiDB playground stopped"
+}
+
+trap stop_managed_playground EXIT
+
 run_shell_checks() {
     bash -n devtools/tidb-native-read-smoke
     bash -n devtools/tidb-acceptance
@@ -224,6 +366,7 @@ echo "  diff:     ${RUN_DIFF}"
 echo "  smoke:    ${RUN_SMOKE}"
 echo "  rust:     ${RUN_RUST}"
 echo "  docs:     ${RUN_DOCS}"
+echo "  playground: ${MANAGE_PLAYGROUND}"
 echo ""
 
 if $RUN_SHELL; then
@@ -232,6 +375,10 @@ fi
 
 if $RUN_DIFF; then
     run_step "diff whitespace check" git diff --check
+fi
+
+if $MANAGE_PLAYGROUND && $RUN_SMOKE; then
+    run_step "managed TiDB playground" start_managed_playground
 fi
 
 if $RUN_SMOKE; then
