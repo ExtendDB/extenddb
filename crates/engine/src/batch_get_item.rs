@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::{apply_projection, parse_projection};
+use extenddb_core::expression::apply_projection;
 use extenddb_core::types::{BatchGetItemInput, BatchGetItemOutput, Item, item_size_bytes};
 use extenddb_core::validation::validate_batch_key_only;
 
@@ -97,6 +97,16 @@ pub async fn handle_batch_get_item(
             ));
         }
 
+        extenddb_core::expression::validate_expression_param_usage(
+            ka.expression_attribute_names.as_ref(),
+            ka.projection_expression
+                .as_ref()
+                .is_some_and(|s| !s.is_empty()),
+            None,
+            true,
+            &[],
+        )?;
+
         let (effective_proj_str, extra_proj_names) = if ka.projection_expression.is_some() {
             (ka.projection_expression.clone(), HashMap::new())
         } else if let Some(attrs) = &ka.attributes_to_get {
@@ -116,12 +126,24 @@ pub async fn handle_batch_get_item(
         };
 
         let projection = if let Some(ref proj_str) = effective_proj_str {
-            let proj_tokens =
-                crate::expression_helpers::tokenize_expression(proj_str, &ctx.limits)?;
-            Some(parse_projection(&proj_tokens)?)
+            Some(crate::expression_helpers::parse_projection_expr(
+                proj_str,
+                &ctx.limits,
+            )?)
         } else {
             None
         };
+        // Reject ExpressionAttributeNames entries the projection never
+        // references, matching Amazon DynamoDB. Scoped to a user-supplied
+        // ProjectionExpression; desugared AttributesToGet uses synthetic names.
+        if ka.projection_expression.is_some()
+            && let Some(ref paths) = projection
+        {
+            crate::read_helpers::validate_projection_unused_names(
+                ka.expression_attribute_names.as_ref(),
+                paths,
+            )?;
+        }
         let ean = if extra_proj_names.is_empty() {
             ka.expression_attribute_names.as_ref()
         } else {

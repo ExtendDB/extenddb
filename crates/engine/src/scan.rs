@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::{ExpressionMaps, parse_projection, tokenize_with_limit};
+use extenddb_core::expression::ExpressionMaps;
 use extenddb_core::types::{
     IndexType, ScanInput, ScanOutput, Select, TableKeyInfo, extract_key, item_size_bytes,
 };
@@ -158,6 +158,22 @@ pub async fn handle_scan(
         input.expression_attribute_values.as_ref(),
     );
 
+    let has_filter_expr = input
+        .filter_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    let has_proj_expr = input
+        .projection_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    extenddb_core::expression::validate_expression_param_usage(
+        input.expression_attribute_names.as_ref(),
+        has_proj_expr || has_filter_expr,
+        input.expression_attribute_values.as_ref(),
+        has_filter_expr,
+        &["FilterExpression"],
+    )?;
+
     // Parse FilterExpression or desugar legacy ScanFilter
     let (filter, filter_maps) = if let Some(ref sf) = input.scan_filter {
         if !sf.is_empty() {
@@ -197,8 +213,10 @@ pub async fn handle_scan(
     };
 
     let projection = if let Some(ref proj_str) = effective_projection_str {
-        let proj_tokens = tokenize_with_limit(proj_str, ctx.limits.max_expression_tokens)?;
-        Some(parse_projection(&proj_tokens)?)
+        Some(crate::expression_helpers::parse_projection_expr(
+            proj_str,
+            &ctx.limits,
+        )?)
     } else {
         None
     };

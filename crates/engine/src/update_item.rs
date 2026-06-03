@@ -112,6 +112,23 @@ pub async fn handle_update_item(
         &key_info.attribute_definitions,
     )?;
 
+    let has_update_expr = input
+        .update_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    let has_condition = input
+        .condition_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    let has_expr = has_update_expr || has_condition;
+    extenddb_core::expression::validate_expression_param_usage(
+        input.expression_attribute_names.as_ref(),
+        has_expr,
+        input.expression_attribute_values.as_ref(),
+        has_expr,
+        &["UpdateExpression", "ConditionExpression"],
+    )?;
+
     let (condition, maps) = resolve_condition(
         input.condition_expression.as_deref(),
         effective_expr_names.as_ref(),
@@ -124,15 +141,18 @@ pub async fn handle_update_item(
     // No UpdateExpression and no AttributeUpdates: no-op upsert.
     // Some("") still errors via tokenize_for.
     let actions = if let Some(update_expr) = effective_update_expr.as_deref() {
-        let update_tokens = tokenize_for(
+        tokenize_for(
             update_expr,
             ctx.limits.max_expression_tokens,
             "UpdateExpression",
-        )?;
-        if ctx.limits.enforce_reserved_keywords {
-            validate_no_reserved_words(&update_tokens)?;
-        }
-        parse_update_from(&update_tokens, update_expr)?
+        )
+        .and_then(|update_tokens| {
+            if ctx.limits.enforce_reserved_keywords {
+                validate_no_reserved_words(&update_tokens)?;
+            }
+            parse_update_from(&update_tokens, update_expr)
+        })
+        .map_err(|e| crate::expression_helpers::prefix_expression_error(e, "UpdateExpression"))?
     } else {
         Vec::new()
     };

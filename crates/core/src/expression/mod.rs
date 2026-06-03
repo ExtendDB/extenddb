@@ -28,7 +28,8 @@ pub use projection::{apply_projection, parse_projection};
 pub use reserved_words::validate_no_reserved_words;
 pub use resolver::{
     ExpressionMaps, collect_key_condition_refs, collect_value_placeholders, resolve_element_name,
-    resolve_name_ref, resolve_path, validate_begins_with_operands, validate_unused_attributes,
+    resolve_name_ref, resolve_path, validate_begins_with_operands, validate_expression_param_usage,
+    validate_unused_attributes,
 };
 pub use tokenizer::{Token, tokenize, tokenize_for, tokenize_with_limit};
 pub use update_evaluator::apply_update;
