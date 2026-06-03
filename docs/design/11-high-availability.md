@@ -386,6 +386,11 @@ distributed schema changes and backfill, and TiDB native TTL owns expiration.
 The best design is to remove the worker-specific coordination problem:
 
 - TiDB control-plane transitions are durable catalog intents. Any frontend may replay them; idempotent `IF EXISTS` / `IF NOT EXISTS` DDL, native `information_schema.ddl_jobs` deferral for already-active table DDL, DDL-aware startup TTL repair, and conditional catalog publication converge on the TiDB-owned schema state. The whole per-table replay plan is retried on TiDB write conflicts, schema-version races, lock waits, and deadlocks, so transient multi-frontend races re-enter from the catalog intent instead of relying on a partially completed step. A table in `UPDATING` is not protected by an ExtendDB DDL owner: additional compatible GSI, TTL, billing, stream, or delete intent can be appended under a short catalog row transaction while TiDB schedules the physical online DDL.
+- TiDB's catalog control-plane queue is indexed by due time first:
+  `(status_transition_at, table_name, table_status)`. The distributed poller
+  asks TiDB for the next eligible work ordered by due time, so this avoids
+  status-bucket scans and frontend-side ordering when many frontends are
+  processing table lifecycle work.
 - TiDB GSI creation uses native secondary indexes. The reconciler batches
   generated-column additions per table, and TiDB online DDL performs distributed
   backfill before maintaining each index transactionally with the base table.

@@ -71,6 +71,9 @@ online DDL. Reconciliation checks TiDB's native DDL job queue before submitting
 table DDL, so another frontend leaves a queued or running schema job with
 TiDB's DDL owner instead of duplicating it. Startup native TTL repair follows
 the same DDL-job-aware rule for fixed-retention tables and user `_ddb_*` tables.
+The TiDB catalog control-plane queue is indexed by due time first
+(`status_transition_at, table_name, table_status`) to match the distributed
+poller's next-eligible-work scan.
 
 ### Schema Conventions
 

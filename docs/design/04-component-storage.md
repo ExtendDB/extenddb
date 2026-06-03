@@ -962,8 +962,11 @@ when the transition fires. TiDB uses immediate eligibility and idempotent `DROP 
   deleting catalog metadata.
 - On startup, `process_control_plane_transitions()` recovers any in-flight
   operations from a previous server instance.
-- A backend-appropriate work index over pending table status and transition
-  time keeps the poller query efficient regardless of table count.
+- A backend-appropriate work index keeps the poller query efficient regardless
+  of table count. TiDB uses a due-time-first index on
+  `(status_transition_at, table_name, table_status)` because its distributed
+  poller reads the next eligible transitions in `status_transition_at,
+  table_name` order; status is a filter, not the leading queue dimension.
 
 **Design decisions and future direction (from Phase 1c human review):**
 

@@ -192,7 +192,13 @@ If an upgrade fails:
 
 ## Version History
 
-### TiDB Catalog 0.0.27 (Current)
+### TiDB Catalog 0.0.28 (Current)
+
+Changes the TiDB control-plane work index to due-time order so distributed
+pollers can read next-eligible table lifecycle work through TiDB's native
+ordered range scan.
+
+### TiDB Catalog 0.0.27
 
 Adds `stream_generations`, a TiDB-native-TTL catalog table that keeps disabled
 or deleted DynamoDB stream generations readable for the 24-hour Streams

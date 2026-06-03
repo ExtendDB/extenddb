@@ -122,6 +122,10 @@ pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
         "027_stream_generations.sql",
         include_str!("../../storage-tidb/migrations/027_stream_generations.sql"),
     ),
+    (
+        "028_control_plane_due_time_index.sql",
+        include_str!("../../storage-tidb/migrations/028_control_plane_due_time_index.sql"),
+    ),
 ];
 
 const DATA_SCHEMA_MIGRATION: &str =
@@ -1134,14 +1138,28 @@ mod tests {
     }
 
     #[test]
-    fn latest_catalog_migration_adds_stream_generations() {
-        let (filename, sql) = CATALOG_MIGRATIONS.last().expect("latest migration");
+    fn catalog_migration_adds_stream_generations() {
+        let (filename, sql) = CATALOG_MIGRATIONS
+            .iter()
+            .find(|(filename, _)| *filename == "027_stream_generations.sql")
+            .expect("stream generations migration");
 
         assert_eq!(*filename, "027_stream_generations.sql");
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS stream_generations"));
         assert!(sql.contains("TTL = `expires_at` + INTERVAL 0 SECOND"));
         assert!(sql.contains("INSERT IGNORE INTO stream_generations"));
         assert!(sql.contains("0.0.27"));
+    }
+
+    #[test]
+    fn latest_catalog_migration_uses_due_time_control_plane_queue_index() {
+        let (filename, sql) = CATALOG_MIGRATIONS.last().expect("latest migration");
+
+        assert_eq!(*filename, "028_control_plane_due_time_index.sql");
+        assert!(sql.contains("DROP INDEX IF EXISTS idx_tables_control_plane_work ON tables"));
+        assert!(sql.contains("CREATE INDEX IF NOT EXISTS idx_tables_control_plane_work"));
+        assert!(sql.contains("ON tables (status_transition_at, table_name, table_status)"));
+        assert!(sql.contains("0.0.28"));
     }
 
     #[test]
@@ -1204,6 +1222,7 @@ mod tests {
         )));
         assert!(!sql.contains("idx_tables_pending_transition"));
         assert!(sql.contains("idx_tables_control_plane_work"));
+        assert!(sql.contains("ON tables (status_transition_at, table_name, table_status)"));
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS stream_generations"));
         assert!(sql.contains("TTL = `expires_at` + INTERVAL 0 SECOND"));
     }

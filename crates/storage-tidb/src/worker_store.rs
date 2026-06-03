@@ -755,11 +755,12 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_transition_scan_uses_status_due_time_queue() {
+    fn control_plane_transition_scan_uses_due_time_queue() {
         let sql = CONTROL_PLANE_TRANSITION_CANDIDATES_SQL;
 
         assert!(sql.contains("table_status IN ('CREATING', 'UPDATING', 'DELETING')"));
         assert!(sql.contains("status_transition_at <= CURRENT_TIMESTAMP(6)"));
+        assert!(sql.contains("ORDER BY status_transition_at, table_name"));
         assert!(!sql.contains("status_transition_at IS NULL"));
         assert!(!sql.contains(" OR "));
     }
