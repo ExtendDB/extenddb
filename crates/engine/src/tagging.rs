@@ -49,17 +49,12 @@ async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), 
     }
 
     // Verify the table exists via table_key_info (lightweight check).
-    ctx.storage
-        .table_key_info(&ctx.account_id, table_name)
-        .await
-        .map_err(|e| match e {
-            extenddb_storage::error::StorageError::TableNotFound(_) => {
-                DynamoDbError::ResourceNotFoundException(format!(
-                    "Requested resource not found: {arn}"
-                ))
-            }
-            other => sanitize_storage_error(other),
-        })?;
+    ctx.table_key_info(table_name).await.map_err(|e| match e {
+        extenddb_storage::error::StorageError::TableNotFound(_) => {
+            DynamoDbError::ResourceNotFoundException(format!("Requested resource not found: {arn}"))
+        }
+        other => sanitize_storage_error(other),
+    })?;
 
     Ok(())
 }

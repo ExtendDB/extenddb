@@ -95,8 +95,7 @@ pub async fn handle_import_table(
     wait_for_table_active(ctx, &tcp.table_name).await?;
 
     let key_info = ctx
-        .storage
-        .table_write_info(&ctx.account_id, &tcp.table_name)
+        .table_write_info(&tcp.table_name)
         .await
         .map_err(storage_err_to_dynamo)?;
 
@@ -310,8 +309,7 @@ pub async fn handle_export_table(
     let table_name = extract_table_name_from_arn(&input.table_arn)?;
 
     let key_info = ctx
-        .storage
-        .table_key_info(&ctx.account_id, &table_name)
+        .table_key_info(&table_name)
         .await
         .map_err(storage_err_to_dynamo)?;
 
