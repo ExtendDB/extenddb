@@ -353,7 +353,9 @@ TiDB uses backend-native primitives instead of ExtendDB ownership layers:
   DROP TABLE or DROP INDEX finishes before SQL execution, TiDB's missing
   physical `_ddb_*` table or forced native-index signal becomes the matching
   DynamoDB `TableNotFound` or `IndexNotFound` response. Missing internal
-  catalog/stream tables remain internal errors.
+  catalog/stream tables remain internal errors. Idempotent read operations
+  re-enter the whole TiDB statement or transaction on TiDB retryable
+  schema-version, lock-timeout, deadlock, and write-conflict errors.
 - TTL uses TiDB native table TTL.
 - On-demand backup and restore use TiDB BR metadata instead of row-copy backup payloads.
 - `ExportTableToPointInTime` uses TiDB native `AS OF TIMESTAMP` snapshot reads.
@@ -397,6 +399,9 @@ The best design is to remove the worker-specific coordination problem:
   on TiDB's native schema versioning; if the physical table or forced native
   index has disappeared by execution time, the TiDB-specific storage boundary
   maps only that named artifact to the corresponding DynamoDB not-found result.
+  Idempotent reads retry from the storage request boundary on TiDB retryable
+  transient errors; write paths with streams or conditions are not blindly
+  replayed unless they already have backend-owned idempotency.
 - TiDB's catalog control-plane queue is indexed by due time first:
   `(status_transition_at, table_name, table_status)`. The distributed poller
   asks TiDB for the next eligible work ordered by due time, so this avoids

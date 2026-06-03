@@ -19,7 +19,7 @@ use super::{native_index_name, physical_data_table_name};
 use crate::TidbEngine;
 use crate::tidb_util::{
     is_index_not_found_tidb_storage_error_for_index_on_table,
-    is_table_not_found_tidb_storage_error_for_table,
+    is_table_not_found_tidb_storage_error_for_table, retry_tidb_idempotent_operation,
 };
 
 impl DataEngine for TidbEngine {
@@ -44,7 +44,9 @@ impl DataEngine for TidbEngine {
         key: &'a Item,
         consistent_read: bool,
     ) -> BoxFuture<'a, Result<Option<Item>, StorageError>> {
-        data_table_future(key_info, self.get_item_impl(key_info, key, consistent_read))
+        retrying_data_table_future("get_item", key_info, move || {
+            self.get_item_impl(key_info, key, consistent_read)
+        })
     }
 
     fn batch_get_items<'a>(
@@ -53,10 +55,9 @@ impl DataEngine for TidbEngine {
         keys: &'a [Item],
         consistent_read: bool,
     ) -> BoxFuture<'a, Result<Vec<Item>, StorageError>> {
-        data_table_future(
-            key_info,
-            self.batch_get_items_impl(key_info, keys, consistent_read),
-        )
+        retrying_data_table_future("batch_get_items", key_info, move || {
+            self.batch_get_items_impl(key_info, keys, consistent_read)
+        })
     }
 
     fn batch_write_items<'a>(
@@ -113,9 +114,7 @@ impl DataEngine for TidbEngine {
         index: Option<&'a IndexInfo>,
         consistent_read: bool,
     ) -> BoxFuture<'a, Result<(Vec<Item>, Option<Item>), StorageError>> {
-        read_table_future(
-            key_info,
-            index,
+        retrying_read_table_future("query", key_info, index, move || {
             self.query_impl(
                 key_info,
                 key_condition,
@@ -125,8 +124,8 @@ impl DataEngine for TidbEngine {
                 exclusive_start_key,
                 index,
                 consistent_read,
-            ),
-        )
+            )
+        })
     }
 
     fn scan<'a>(
@@ -139,9 +138,7 @@ impl DataEngine for TidbEngine {
         index: Option<&'a IndexInfo>,
         consistent_read: bool,
     ) -> BoxFuture<'a, Result<(Vec<Item>, Option<Item>), StorageError>> {
-        read_table_future(
-            key_info,
-            index,
+        retrying_read_table_future("scan", key_info, index, move || {
             self.scan_impl(
                 key_info,
                 limit,
@@ -150,8 +147,8 @@ impl DataEngine for TidbEngine {
                 total_segments,
                 index,
                 consistent_read,
-            ),
-        )
+            )
+        })
     }
 
     fn export_table_items<'a>(
@@ -178,7 +175,7 @@ impl DataEngine for TidbEngine {
         &'a self,
         ops: &'a [TransactGetOp<'a>],
     ) -> BoxFuture<'a, Result<Vec<Option<Item>>, StorageError>> {
-        transact_get_future(ops, self.transact_get_items_impl(ops))
+        retrying_transact_get_future(ops, move || self.transact_get_items_impl(ops))
     }
 
     fn transact_write_items<'a>(
@@ -201,28 +198,51 @@ where
     Box::pin(async move { normalize_data_table_error(key_info, future.await) })
 }
 
-fn read_table_future<'a, T, F>(
+fn retrying_data_table_future<'a, T, F, Fut>(
+    operation: &'static str,
     key_info: &'a TableKeyInfo,
-    index: Option<&'a IndexInfo>,
-    future: F,
+    mut make_future: F,
 ) -> BoxFuture<'a, Result<T, StorageError>>
 where
     T: Send + 'a,
-    F: Future<Output = Result<T, StorageError>> + Send + 'a,
-{
-    Box::pin(async move { normalize_read_table_error(key_info, index, future.await) })
-}
-
-fn transact_get_future<'a, T, F>(
-    ops: &'a [TransactGetOp<'a>],
-    future: F,
-) -> BoxFuture<'a, Result<T, StorageError>>
-where
-    T: Send + 'a,
-    F: Future<Output = Result<T, StorageError>> + Send + 'a,
+    F: FnMut() -> Fut + Send + 'a,
+    Fut: Future<Output = Result<T, StorageError>> + Send + 'a,
 {
     Box::pin(async move {
-        normalize_multi_data_table_error(ops.iter().map(|op| op.key_info), future.await)
+        let result = retry_tidb_idempotent_operation(operation, &mut make_future).await;
+        normalize_data_table_error(key_info, result)
+    })
+}
+
+fn retrying_read_table_future<'a, T, F, Fut>(
+    operation: &'static str,
+    key_info: &'a TableKeyInfo,
+    index: Option<&'a IndexInfo>,
+    mut make_future: F,
+) -> BoxFuture<'a, Result<T, StorageError>>
+where
+    T: Send + 'a,
+    F: FnMut() -> Fut + Send + 'a,
+    Fut: Future<Output = Result<T, StorageError>> + Send + 'a,
+{
+    Box::pin(async move {
+        let result = retry_tidb_idempotent_operation(operation, &mut make_future).await;
+        normalize_read_table_error(key_info, index, result)
+    })
+}
+
+fn retrying_transact_get_future<'a, T, F, Fut>(
+    ops: &'a [TransactGetOp<'a>],
+    mut make_future: F,
+) -> BoxFuture<'a, Result<T, StorageError>>
+where
+    T: Send + 'a,
+    F: FnMut() -> Fut + Send + 'a,
+    Fut: Future<Output = Result<T, StorageError>> + Send + 'a,
+{
+    Box::pin(async move {
+        let result = retry_tidb_idempotent_operation("transact_get_items", &mut make_future).await;
+        normalize_multi_data_table_error(ops.iter().map(|op| op.key_info), result)
     })
 }
 
@@ -424,5 +444,60 @@ mod tests {
         let error = normalize_read_table_error(&table, Some(&index), result).unwrap_err();
 
         assert!(matches!(error, StorageError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn retrying_data_table_future_reenters_tidb_retryable_read() {
+        let table = key_info("orders", "tableid");
+        let mut attempts = 0;
+
+        let result = retrying_data_table_future("test_retrying_read", &table, || {
+            attempts += 1;
+            let attempt = attempts;
+            async move {
+                if attempt == 1 {
+                    Err(StorageError::Internal(
+                        "ERROR 8028 (HY000): Information schema is changed. [try again later]"
+                            .to_owned(),
+                    ))
+                } else {
+                    Ok(attempt)
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn retrying_read_table_future_normalizes_after_retries() {
+        let table = key_info("orders", "tableid");
+        let index = index_info("by_customer", "idx-1");
+        let mut attempts = 0;
+
+        let result: Result<(), StorageError> =
+            retrying_read_table_future("test_retrying_index_read", &table, Some(&index), || {
+                attempts += 1;
+                let attempt = attempts;
+                async move {
+                    if attempt == 1 {
+                        Err(StorageError::Internal(
+                            "ERROR 9007 (HY000): Write conflict".to_owned(),
+                        ))
+                    } else {
+                        Err(StorageError::Internal(
+                            "ERROR 1176 (42000): Key 'idx_idx1' doesn't exist in table '_ddb_tableid'"
+                                .to_owned(),
+                        ))
+                    }
+                }
+            })
+            .await;
+
+        let error = result.unwrap_err();
+
+        assert!(matches!(error, StorageError::IndexNotFound(name) if name == "by_customer"));
+        assert_eq!(attempts, 2);
     }
 }
