@@ -148,6 +148,11 @@ impl StorageConfig {
     pub fn native_capacity_resource_group(&self) -> Option<&str> {
         self.config.native_capacity_resource_group()
     }
+
+    /// Optional backend-native bounded-staleness window for default reads.
+    pub fn native_default_read_staleness_seconds(&self) -> Option<u32> {
+        self.config.native_default_read_staleness_seconds()
+    }
 }
 
 /// Storage config view enriched with runtime limits from the top-level config.
@@ -212,6 +217,10 @@ impl extenddb_storage::config::StorageConfig for RuntimeStorageConfig<'_> {
         self.base.native_capacity_resource_group()
     }
 
+    fn native_default_read_staleness_seconds(&self) -> Option<u32> {
+        self.base.native_default_read_staleness_seconds()
+    }
+
     fn clone_box(&self) -> Box<dyn extenddb_storage::config::StorageConfig> {
         Box::new(OwnedRuntimeStorageConfig {
             base: self.base.clone_box(),
@@ -255,6 +264,10 @@ impl extenddb_storage::config::StorageConfig for OwnedRuntimeStorageConfig {
 
     fn native_capacity_resource_group(&self) -> Option<&str> {
         self.base.native_capacity_resource_group()
+    }
+
+    fn native_default_read_staleness_seconds(&self) -> Option<u32> {
+        self.base.native_default_read_staleness_seconds()
     }
 
     fn clone_box(&self) -> Box<dyn extenddb_storage::config::StorageConfig> {
@@ -538,6 +551,13 @@ pub fn build_config_entries(cfg: &AppConfig) -> Vec<(String, String)> {
         ));
     }
 
+    if let Some(seconds) = cfg.storage.native_default_read_staleness_seconds() {
+        entries.push((
+            format!("storage.{backend}.default_read_staleness_seconds"),
+            seconds.to_string(),
+        ));
+    }
+
     // Commonly adjusted limits (full list in [limits] section of extenddb.sample.toml).
     let lim = &cfg.limits;
     entries.extend([
@@ -594,5 +614,43 @@ mod tests {
     fn tidb_is_the_implicit_backend_when_available() {
         assert_eq!(default_backend(), "tidb");
         assert_eq!(StorageConfig::default()._backend, "tidb");
+    }
+
+    #[test]
+    #[cfg(feature = "tidb")]
+    fn tidb_default_read_staleness_survives_runtime_config_wrappers() {
+        let cfg: AppConfig = toml::from_str(
+            r#"
+[storage]
+backend = "tidb"
+
+[storage.tidb]
+connection_string = "mysql://extenddb:extenddb-local-dev@localhost:4000/extenddb_catalog"
+default_read_staleness_seconds = 5
+"#,
+        )
+        .expect("TiDB app config should parse");
+
+        assert_eq!(cfg.storage.native_default_read_staleness_seconds(), Some(5));
+
+        let runtime = RuntimeStorageConfig::new(cfg.storage.as_trait(), &cfg.limits);
+        assert_eq!(
+            extenddb_storage::config::StorageConfig::native_default_read_staleness_seconds(
+                &runtime
+            ),
+            Some(5)
+        );
+
+        let owned = extenddb_storage::config::StorageConfig::clone_box(&runtime);
+        assert_eq!(owned.native_default_read_staleness_seconds(), Some(5));
+
+        let entries = build_config_entries(&cfg);
+        assert_eq!(
+            entries
+                .iter()
+                .find(|(key, _)| key == "storage.tidb.default_read_staleness_seconds")
+                .map(|(_, value)| value.as_str()),
+            Some("5")
+        );
     }
 }

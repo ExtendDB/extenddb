@@ -51,6 +51,7 @@ Environment variables use double-underscore (`__`) as a nesting separator, prefi
 | `storage.backend` | `EXTENDDB__STORAGE__BACKEND` |
 | `storage.tidb.connection_string` | `EXTENDDB__STORAGE__TIDB__CONNECTION_STRING` |
 | `storage.tidb.resource_group` | `EXTENDDB__STORAGE__TIDB__RESOURCE_GROUP` |
+| `storage.tidb.default_read_staleness_seconds` | `EXTENDDB__STORAGE__TIDB__DEFAULT_READ_STALENESS_SECONDS` |
 | `auth.provider` | `EXTENDDB__AUTH__PROVIDER` |
 | `auth.encryption_key` | `EXTENDDB__AUTH__ENCRYPTION_KEY` |
 | `limits.max_item_size_bytes` | `EXTENDDB__LIMITS__MAX_ITEM_SIZE_BYTES` |
