@@ -20,6 +20,7 @@ use crate::TidbEngine;
 use crate::tidb_util::{
     is_index_not_found_tidb_storage_error_for_index_on_table,
     is_table_not_found_tidb_storage_error_for_table, retry_tidb_idempotent_operation,
+    retry_tidb_idempotent_storage_error,
 };
 
 impl DataEngine for TidbEngine {
@@ -32,10 +33,7 @@ impl DataEngine for TidbEngine {
         maps: &'a ExpressionMaps,
         stream: Option<&'a StreamCapture>,
     ) -> BoxFuture<'a, Result<Option<Item>, StorageError>> {
-        data_table_future(
-            key_info,
-            self.put_item_impl(key_info, item, return_old, condition, maps, stream),
-        )
+        put_item_future(self, key_info, item, return_old, condition, maps, stream)
     }
 
     fn get_item<'a>(
@@ -78,10 +76,16 @@ impl DataEngine for TidbEngine {
         maps: &'a ExpressionMaps,
         stream: Option<&'a StreamCapture>,
     ) -> BoxFuture<'a, Result<Option<Item>, StorageError>> {
-        data_table_future(
-            key_info,
-            self.delete_item_impl(key_info, key, return_old, condition, maps, stream),
-        )
+        if can_retry_delete_item(return_old, condition, stream) {
+            retrying_data_table_future("delete_item", key_info, move || {
+                self.delete_item_impl(key_info, key, return_old, condition, maps, stream)
+            })
+        } else {
+            data_table_future(
+                key_info,
+                self.delete_item_impl(key_info, key, return_old, condition, maps, stream),
+            )
+        }
     }
 
     fn update_item<'a>(
@@ -185,6 +189,70 @@ impl DataEngine for TidbEngine {
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         transact_write_future(ops, self.transact_write_items_impl(ops, idempotency))
     }
+}
+
+fn put_item_future<'a>(
+    engine: &'a TidbEngine,
+    key_info: &'a TableKeyInfo,
+    item: Item,
+    return_old: bool,
+    condition: Option<&'a Expr>,
+    maps: &'a ExpressionMaps,
+    stream: Option<&'a StreamCapture>,
+) -> BoxFuture<'a, Result<Option<Item>, StorageError>> {
+    let retryable = can_retry_put_item(return_old, condition, stream);
+    Box::pin(async move {
+        let result = if retryable {
+            retry_put_item(engine, key_info, &item, return_old, condition, maps, stream).await
+        } else {
+            engine
+                .put_item_impl(key_info, &item, return_old, condition, maps, stream)
+                .await
+        };
+        normalize_data_table_error(key_info, result)
+    })
+}
+
+async fn retry_put_item(
+    engine: &TidbEngine,
+    key_info: &TableKeyInfo,
+    item: &Item,
+    return_old: bool,
+    condition: Option<&Expr>,
+    maps: &ExpressionMaps,
+    stream: Option<&StreamCapture>,
+) -> Result<Option<Item>, StorageError> {
+    let mut retries = 0;
+    loop {
+        match engine
+            .put_item_impl(key_info, item, return_old, condition, maps, stream)
+            .await
+        {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if retry_tidb_idempotent_storage_error("put_item", &mut retries, &error).await {
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+fn can_retry_put_item(
+    return_old: bool,
+    condition: Option<&Expr>,
+    stream: Option<&StreamCapture>,
+) -> bool {
+    !return_old && condition.is_none() && stream.is_none()
+}
+
+fn can_retry_delete_item(
+    return_old: bool,
+    condition: Option<&Expr>,
+    stream: Option<&StreamCapture>,
+) -> bool {
+    !return_old && condition.is_none() && stream.is_none()
 }
 
 fn data_table_future<'a, T, F>(
@@ -340,10 +408,14 @@ fn transact_write_key_info<'a>(op: &'a TransactWriteOp<'_>) -> &'a TableKeyInfo 
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use extenddb_core::expression::{Expr, PathElement};
     use extenddb_core::types::{
         AttributeDefinition, IndexInfo, IndexType, KeySchemaElement, KeyType, Projection,
-        ProjectionType, ScalarAttributeType,
+        ProjectionType, ScalarAttributeType, StreamViewType,
     };
+    use extenddb_storage::StreamCapture;
 
     use super::*;
 
@@ -381,6 +453,43 @@ mod tests {
                 non_key_attributes: None,
             },
         }
+    }
+
+    fn condition() -> Expr {
+        Expr::Function {
+            name: "attribute_exists".to_owned(),
+            args: vec![Expr::Path(vec![PathElement::Attribute("pk".to_owned())])],
+        }
+    }
+
+    fn stream_capture() -> StreamCapture {
+        StreamCapture {
+            view_type: StreamViewType::NewImage,
+            user_identity: None,
+            region: Arc::from("us-east-1"),
+        }
+    }
+
+    #[test]
+    fn put_item_retry_boundary_allows_only_final_state_blind_writes() {
+        let condition = condition();
+        let stream = stream_capture();
+
+        assert!(can_retry_put_item(false, None, None));
+        assert!(!can_retry_put_item(true, None, None));
+        assert!(!can_retry_put_item(false, Some(&condition), None));
+        assert!(!can_retry_put_item(false, None, Some(&stream)));
+    }
+
+    #[test]
+    fn delete_item_retry_boundary_allows_only_final_state_blind_writes() {
+        let condition = condition();
+        let stream = stream_capture();
+
+        assert!(can_retry_delete_item(false, None, None));
+        assert!(!can_retry_delete_item(true, None, None));
+        assert!(!can_retry_delete_item(false, Some(&condition), None));
+        assert!(!can_retry_delete_item(false, None, Some(&stream)));
     }
 
     #[test]

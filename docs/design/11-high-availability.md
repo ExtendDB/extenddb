@@ -400,8 +400,13 @@ The best design is to remove the worker-specific coordination problem:
   index has disappeared by execution time, the TiDB-specific storage boundary
   maps only that named artifact to the corresponding DynamoDB not-found result.
   Idempotent reads retry from the storage request boundary on TiDB retryable
-  transient errors; write paths with streams or conditions are not blindly
-  replayed unless they already have backend-owned idempotency.
+  transient errors. Final-state blind writes (`PutItem`/`DeleteItem` without
+  conditions, return images, or streams) also retry at that boundary. No-stream
+  `BatchWriteItem` retries each native multi-row put/delete statement inside
+  the batch writer, so a retry never replays an earlier successful statement in
+  a mixed batch. Write paths with streams, conditions, return images, or
+  read-modify-write semantics are not blindly replayed unless they already have
+  backend-owned idempotency.
 - TiDB's catalog control-plane queue is indexed by due time first:
   `(status_transition_at, table_name, table_status)`. The distributed poller
   asks TiDB for the next eligible work ordered by due time, so this avoids

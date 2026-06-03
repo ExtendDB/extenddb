@@ -17,6 +17,7 @@ use super::tx_helpers::{
 };
 use super::{data_table_name, physical_pk_bytes, repeat_tuple_placeholders};
 use crate::TidbEngine;
+use crate::tidb_util::retry_tidb_idempotent_storage_error;
 
 pub(super) struct PreparedPut {
     pk: Vec<u8>,
@@ -67,11 +68,17 @@ impl TidbEngine {
         }
 
         if !puts.is_empty() {
-            execute_batch_puts(&self.data_pool, &ddb_table, sk.map(|(_, ty)| ty), puts).await?;
+            execute_batch_puts_with_retry(&self.data_pool, &ddb_table, sk.map(|(_, ty)| ty), &puts)
+                .await?;
         }
         if !deletes.is_empty() {
-            execute_batch_deletes(&self.data_pool, &ddb_table, sk.map(|(_, ty)| ty), deletes)
-                .await?;
+            execute_batch_deletes_with_retry(
+                &self.data_pool,
+                &ddb_table,
+                sk.map(|(_, ty)| ty),
+                &deletes,
+            )
+            .await?;
         }
 
         Ok(())
@@ -231,7 +238,7 @@ pub(super) async fn execute_batch_puts<'e, E>(
     executor: E,
     table: &str,
     sk_type: Option<ScalarAttributeType>,
-    puts: Vec<PreparedPut>,
+    puts: &[PreparedPut],
 ) -> Result<(), StorageError>
 where
     E: sqlx::Executor<'e, Database = sqlx::MySql>,
@@ -239,11 +246,11 @@ where
     let sql = batch_put_sql(table, sk_type.map(sk_column), puts.len());
     let mut query = sqlx::query(&sql);
     for put in puts {
-        query = query.bind(put.pk);
-        if let Some(sk) = put.sk {
+        query = query.bind(put.pk.as_slice());
+        if let Some(sk) = &put.sk {
             query = bind_sort_key(query, sk);
         }
-        query = query.bind(put.item_json);
+        query = query.bind(&put.item_json);
     }
     query
         .execute(executor)
@@ -256,7 +263,7 @@ pub(super) async fn execute_batch_deletes<'e, E>(
     executor: E,
     table: &str,
     sk_type: Option<ScalarAttributeType>,
-    deletes: Vec<PreparedDelete>,
+    deletes: &[PreparedDelete],
 ) -> Result<(), StorageError>
 where
     E: sqlx::Executor<'e, Database = sqlx::MySql>,
@@ -264,8 +271,8 @@ where
     let sql = batch_delete_sql(table, sk_type.map(sk_column), deletes.len());
     let mut query = sqlx::query(&sql);
     for delete in deletes {
-        query = query.bind(delete.pk);
-        if let Some(sk) = delete.sk {
+        query = query.bind(delete.pk.as_slice());
+        if let Some(sk) = &delete.sk {
             query = bind_sort_key(query, sk);
         }
     }
@@ -276,11 +283,55 @@ where
     Ok(())
 }
 
-fn bind_sort_key<'q>(query: WriteQuery<'q>, sk: SortKeyValue) -> WriteQuery<'q> {
+async fn execute_batch_puts_with_retry(
+    pool: &sqlx::MySqlPool,
+    table: &str,
+    sk_type: Option<ScalarAttributeType>,
+    puts: &[PreparedPut],
+) -> Result<(), StorageError> {
+    let mut retries = 0;
+    loop {
+        match execute_batch_puts(pool, table, sk_type, puts).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if retry_tidb_idempotent_storage_error("batch_write_puts", &mut retries, &error)
+                    .await
+                {
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+async fn execute_batch_deletes_with_retry(
+    pool: &sqlx::MySqlPool,
+    table: &str,
+    sk_type: Option<ScalarAttributeType>,
+    deletes: &[PreparedDelete],
+) -> Result<(), StorageError> {
+    let mut retries = 0;
+    loop {
+        match execute_batch_deletes(pool, table, sk_type, deletes).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if retry_tidb_idempotent_storage_error("batch_write_deletes", &mut retries, &error)
+                    .await
+                {
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+fn bind_sort_key<'q>(query: WriteQuery<'q>, sk: &SortKeyValue) -> WriteQuery<'q> {
     match sk {
-        SortKeyValue::S(s) => query.bind(s.into_bytes()),
-        SortKeyValue::N(n) => query.bind(n),
-        SortKeyValue::B(b) => query.bind(b),
+        SortKeyValue::S(s) => query.bind(s.as_bytes().to_vec()),
+        SortKeyValue::N(n) => query.bind(n.clone()),
+        SortKeyValue::B(b) => query.bind(b.clone()),
     }
 }
 

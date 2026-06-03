@@ -526,10 +526,10 @@ async fn execute_native_txn_write_group(
     .map(|(_, ty)| ty);
 
     if !group.puts.is_empty() {
-        execute_batch_puts(&mut **tx, &ddb_table, sk_type, group.puts).await?;
+        execute_batch_puts(&mut **tx, &ddb_table, sk_type, &group.puts).await?;
     }
     if !group.deletes.is_empty() {
-        execute_batch_deletes(&mut **tx, &ddb_table, sk_type, group.deletes).await?;
+        execute_batch_deletes(&mut **tx, &ddb_table, sk_type, &group.deletes).await?;
     }
 
     Ok(())

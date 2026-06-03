@@ -28,7 +28,7 @@ impl TidbEngine {
     pub(crate) async fn put_item_impl(
         &self,
         key_info: &TableKeyInfo,
-        item: Item,
+        item: &Item,
         return_old: bool,
         condition: Option<&Expr>,
         maps: &ExpressionMaps,
@@ -36,13 +36,13 @@ impl TidbEngine {
     ) -> Result<Option<Item>, StorageError> {
         let ddb_table = data_table_name(&key_info.table_id);
 
-        let pk = physical_pk_bytes(&item, &key_info.key_schema)?;
+        let pk = physical_pk_bytes(item, &key_info.key_schema)?;
 
         let item_json =
-            serde_json::to_value(&item).map_err(|e| StorageError::Internal(e.to_string()))?;
+            serde_json::to_value(item).map_err(|e| StorageError::Internal(e.to_string()))?;
 
         validate_item_secondary_index_key_constraints(
-            &item,
+            item,
             &key_info.secondary_index_key_schemas,
             &key_info.attribute_definitions,
             &self.limits,
@@ -69,7 +69,7 @@ impl TidbEngine {
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
                 let event = put_prepared_item_without_old_item_in_tx(
-                    &mut tx, key_info, &item, &pk, &item_json,
+                    &mut tx, key_info, item, &pk, &item_json,
                 )
                 .await?;
 
@@ -79,7 +79,7 @@ impl TidbEngine {
                     key_info,
                     capture,
                     event,
-                    &item,
+                    item,
                 )
                 .await?;
                 return Ok(None);
@@ -156,7 +156,7 @@ impl TidbEngine {
                         key_info,
                         capture,
                         old_for_stream.as_ref(),
-                        Some(&item),
+                        Some(item),
                     )
                     .await?;
                 }
@@ -194,7 +194,7 @@ impl TidbEngine {
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
                 let event = put_prepared_item_without_old_item_in_tx(
-                    &mut tx, key_info, &item, &pk, &item_json,
+                    &mut tx, key_info, item, &pk, &item_json,
                 )
                 .await?;
 
@@ -204,7 +204,7 @@ impl TidbEngine {
                     key_info,
                     capture,
                     event,
-                    &item,
+                    item,
                 )
                 .await?;
                 return Ok(None);
@@ -290,7 +290,7 @@ impl TidbEngine {
                         key_info,
                         capture,
                         old_for_stream.as_ref(),
-                        Some(&item),
+                        Some(item),
                     )
                     .await?;
                 }

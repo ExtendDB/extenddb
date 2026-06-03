@@ -187,6 +187,14 @@ all stream records in that same transaction. Old-image stream views fetch the
 prior row with native point `SELECT ... FOR UPDATE` inside the batch
 transaction; key-only and new-image views skip that read and rely on native DML
 outcomes.
+TiDB retries storage-boundary transient schema/lock/write-conflict errors only
+for operations whose retry is externally idempotent: default reads, strong
+reads, `TransactGetItems`, and blind no-stream `PutItem`/`DeleteItem`.
+No-stream `BatchWriteItem` retries each native multi-row put/delete statement
+inside the batch writer, so a retry does not replay an earlier successful
+statement in a mixed batch. Streamed writes, conditional writes, return-image
+writes, `UpdateItem`, exports, and transaction writes without an idempotency
+claim remain single-execution at the adapter boundary.
 Transaction idempotency-token retention is backend-specific rather than part
 of `DataEngine`: Postgres runs a concrete cleanup worker, while TiDB uses
 native table TTL and handles same-token expiry in the token-claim upsert path.

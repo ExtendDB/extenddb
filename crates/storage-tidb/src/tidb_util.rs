@@ -224,23 +224,35 @@ where
     loop {
         match op().await {
             Ok(value) => return Ok(value),
-            Err(error)
-                if retries < MAX_TIDB_OPERATION_RETRIES
-                    && is_retryable_tidb_storage_error(&error) =>
-            {
-                retries += 1;
-                let delay = transaction_retry_delay(retries);
-                tracing::debug!(
-                    operation,
-                    retries,
-                    delay_ms = delay.as_millis(),
-                    "retrying TiDB idempotent operation after retryable error: {error}"
-                );
-                tokio::time::sleep(delay).await;
+            Err(error) => {
+                if retry_tidb_idempotent_storage_error(operation, &mut retries, &error).await {
+                    continue;
+                }
+                return Err(error);
             }
-            Err(error) => return Err(error),
         }
     }
+}
+
+pub(crate) async fn retry_tidb_idempotent_storage_error(
+    operation: &'static str,
+    retries: &mut usize,
+    error: &StorageError,
+) -> bool {
+    if *retries >= MAX_TIDB_OPERATION_RETRIES || !is_retryable_tidb_storage_error(error) {
+        return false;
+    }
+
+    *retries += 1;
+    let delay = transaction_retry_delay(*retries);
+    tracing::debug!(
+        operation,
+        retries = *retries,
+        delay_ms = delay.as_millis(),
+        "retrying TiDB idempotent operation after retryable error: {error}"
+    );
+    tokio::time::sleep(delay).await;
+    true
 }
 
 fn active_tidb_ddl_job_for_table_sql() -> String {
