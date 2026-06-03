@@ -91,7 +91,7 @@ Default backend for the standard binary build.
 | `pool_size` | `20` | Maximum connections for strong and default-read data pools (minimum: 10) |
 | `catalog_pool_size` | (= `pool_size`) | Maximum connections for catalog metadata, control-plane, management, and authz pools (minimum: 10) |
 | `resource_group` | unset | Optional TiDB Resource Control group. When set, ExtendDB binds every runtime TiDB pool session with `SET RESOURCE GROUP`. |
-| `default_read_staleness_seconds` | unset | Optional TiDB bounded-staleness window for DynamoDB default reads. When set above 0, base-table reads without `ConsistentRead=true` use `AS OF TIMESTAMP TIDB_BOUNDED_STALENESS(...)`; strong reads and index reads stay on the latest-schema path. |
+| `default_read_staleness_seconds` | unset | Optional TiDB stale-read window for DynamoDB default reads. When set above 0, the default-read pool sets session `tidb_read_staleness`; writes and `ConsistentRead=true` reads stay on the strong path. |
 
 TiDB capacity governance is configured in TiDB, not in ExtendDB. A typical
 deployment creates a TiDB resource group and binds the ExtendDB SQL user to it:

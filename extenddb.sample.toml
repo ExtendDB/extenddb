@@ -42,9 +42,9 @@
                                 # and one default-read pool using native
                                 # closest-adaptive follower read.
 # default_read_staleness_seconds = 0
-                                # Optional TiDB bounded stale read window for
-                                # DynamoDB default reads. 0/unset keeps latest
-                                # reads with closest-adaptive follower routing.
+                                # Optional TiDB session-level stale read window
+                                # for the default-read pool. 0/unset keeps
+                                # latest reads with closest-adaptive follower routing.
 # catalog_pool_size = 20       # Max connections for each TiDB catalog pool:
                                 # one engine metadata/control-plane pool and
                                 # one management/authz/IAM/console pool.
@@ -166,7 +166,7 @@
 # pool_size = 50               # creates strong and default-read data pools
 # catalog_pool_size = 50       # creates engine catalog and auth/catalog pools
 # resource_group = "extenddb_api"
-# default_read_staleness_seconds = 5
+# default_read_staleness_seconds = 5  # default-read pool sets tidb_read_staleness
 #
 # [auth]
 # provider = "builtin"

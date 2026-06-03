@@ -282,9 +282,8 @@ inventing delay queues or app-side consistency machinery.
 - TiDB uses a dedicated default-read pool with native `closest-adaptive` follower
   read for default reads. TiDB follower read remains strongly consistent, but it
   lets TiDB reduce leader and cross-AZ read pressure for larger read-only
-  statements. TiDB can also use statement-level bounded stale read for
-  base-table default reads when `storage.tidb.default_read_staleness_seconds`
-  is configured.
+  statements. TiDB can also use session-level stale read on the default-read
+  pool when `storage.tidb.default_read_staleness_seconds` is configured.
 - Capacity calculations always reflect the requested consistency mode
   (0.5 RCU for eventually consistent, 1.0 RCU for strongly consistent)
   regardless of the backend's physical routing choice.

@@ -22,10 +22,7 @@ use super::query::{
     build_key, build_sk_sql, execute_query_sql, execute_scan_sql, resolve_expr_to_av,
     scan_segment_range,
 };
-use super::{
-    all_sort_key_info, data_table_name, data_table_read_ref, json_to_item,
-    physical_pk_bytes_from_values,
-};
+use super::{all_sort_key_info, data_table_name, json_to_item, physical_pk_bytes_from_values};
 use crate::TidbEngine;
 use crate::tidb_util::{
     current_tidb_tso, map_tidb_snapshot_read_sqlx_error, tidb_as_of_epoch_clause,
@@ -145,16 +142,12 @@ fn key_condition_attribute_name(
     }
 }
 
-fn table_ref_for_read(
-    table_id: &str,
-    index: Option<&IndexInfo>,
-    default_read_staleness_seconds: Option<u32>,
-) -> String {
-    let table = data_table_read_ref(table_id, default_read_staleness_seconds);
+fn table_ref_for_read(table_id: &str, index: Option<&IndexInfo>) -> String {
+    let table = data_table_name(table_id);
     match index {
         Some(idx) => {
             let index_name = native_index_name(&idx.index_id);
-            format!("{} FORCE INDEX (`{index_name}`)", data_table_name(table_id))
+            format!("{table} FORCE INDEX (`{index_name}`)")
         }
         None => table,
     }
@@ -196,11 +189,7 @@ impl TidbEngine {
             idx.key_schema.as_slice()
         });
         let attr_defs = key_info.attribute_definitions.as_slice();
-        let ddb_table = table_ref_for_read(
-            &key_info.table_id,
-            index,
-            self.default_read_staleness_seconds(consistent_read),
-        );
+        let ddb_table = table_ref_for_read(&key_info.table_id, index);
         let pk_column = index.map_or_else(
             || "pk".to_owned(),
             |idx| native_index_hash_column(&idx.index_id),
@@ -375,11 +364,7 @@ impl TidbEngine {
             idx.key_schema.as_slice()
         });
         let attr_defs = key_info.attribute_definitions.as_slice();
-        let ddb_table = table_ref_for_read(
-            &key_info.table_id,
-            index,
-            self.default_read_staleness_seconds(consistent_read),
-        );
+        let ddb_table = table_ref_for_read(&key_info.table_id, index);
 
         let mut sql = format!("SELECT item_data FROM {ddb_table}");
         let mut conditions: Vec<String> = Vec::new();
@@ -661,14 +646,10 @@ mod tests {
         };
 
         assert_eq!(
-            table_ref_for_read("tableid", Some(&index), None),
+            table_ref_for_read("tableid", Some(&index)),
             "`_ddb_tableid` FORCE INDEX (`idx_idx1`)"
         );
-        assert_eq!(table_ref_for_read("tableid", None, None), "`_ddb_tableid`");
-        assert_eq!(
-            table_ref_for_read("tableid", Some(&index), Some(5)),
-            "`_ddb_tableid` FORCE INDEX (`idx_idx1`)"
-        );
+        assert_eq!(table_ref_for_read("tableid", None), "`_ddb_tableid`");
     }
 
     #[test]

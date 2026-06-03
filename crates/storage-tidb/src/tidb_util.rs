@@ -33,29 +33,35 @@ pub(crate) struct TidbActiveDdlJob {
 struct TidbSessionInit {
     resource_group: Option<String>,
     replica_read: Option<&'static str>,
+    read_staleness_seconds: Option<u32>,
 }
 
 impl TidbSessionInit {
     fn new(
         resource_group: Option<&str>,
         replica_read: Option<&'static str>,
+        read_staleness_seconds: Option<u32>,
     ) -> Result<Self, StorageError> {
         Ok(Self {
             resource_group: resource_group
                 .map(quote_tidb_resource_group_name)
                 .transpose()?,
             replica_read,
+            read_staleness_seconds: read_staleness_seconds.filter(|seconds| *seconds > 0),
         })
     }
 
     fn init_statements(&self) -> Vec<String> {
-        let mut statements = Vec::with_capacity(3);
+        let mut statements = Vec::with_capacity(4);
         if let Some(resource_group) = &self.resource_group {
             statements.push(format!("SET RESOURCE GROUP {resource_group}"));
         }
         statements.push("SET SESSION tidb_txn_mode = 'pessimistic'".to_owned());
         if let Some(replica_read) = self.replica_read {
             statements.push(format!("SET SESSION tidb_replica_read = '{replica_read}'"));
+        }
+        if let Some(seconds) = self.read_staleness_seconds {
+            statements.push(format!("SET SESSION tidb_read_staleness = '-{seconds}'"));
         }
         statements
     }
@@ -83,7 +89,7 @@ pub(crate) fn tidb_pool_options_with_resource_group(
     Ok(tidb_pool_options_with_session(
         max_connections,
         min_connections,
-        TidbSessionInit::new(resource_group, None)?,
+        TidbSessionInit::new(resource_group, None, None)?,
     ))
 }
 
@@ -92,17 +98,25 @@ pub(crate) fn tidb_pool_options_with_resource_group(
 /// `tidb_replica_read = 'closest-adaptive'` lets TiDB route larger read-only
 /// statements to local replicas while keeping strong consistency through
 /// follower read. Point reads stay on leaders when TiDB estimates that follower
-/// read would add latency. When `resource_group` is set, every pooled session is
-/// also bound to TiDB Resource Control before request traffic starts.
+/// read would add latency. When `read_staleness_seconds` is set, the dedicated
+/// default-read pool uses TiDB's session-level stale read so all default reads,
+/// including forced native-index reads, share one native snapshot policy.
+/// When `resource_group` is set, every pooled session is also bound to TiDB
+/// Resource Control before request traffic starts.
 pub(crate) fn tidb_default_read_pool_options_with_resource_group(
     max_connections: u32,
     min_connections: u32,
     resource_group: Option<&str>,
+    read_staleness_seconds: Option<u32>,
 ) -> Result<sqlx::mysql::MySqlPoolOptions, StorageError> {
     Ok(tidb_pool_options_with_session(
         max_connections,
         min_connections,
-        TidbSessionInit::new(resource_group, Some(TIDB_REPLICA_READ_CLOSEST_ADAPTIVE))?,
+        TidbSessionInit::new(
+            resource_group,
+            Some(TIDB_REPLICA_READ_CLOSEST_ADAPTIVE),
+            read_staleness_seconds,
+        )?,
     ))
 }
 
@@ -779,6 +793,7 @@ mod tests {
         let init = TidbSessionInit::new(
             Some("extenddb-api"),
             Some(TIDB_REPLICA_READ_CLOSEST_ADAPTIVE),
+            Some(5),
         )
         .expect("resource group should validate");
 
@@ -786,6 +801,21 @@ mod tests {
             init.init_statements(),
             vec![
                 "SET RESOURCE GROUP `extenddb-api`",
+                "SET SESSION tidb_txn_mode = 'pessimistic'",
+                "SET SESSION tidb_replica_read = 'closest-adaptive'",
+                "SET SESSION tidb_read_staleness = '-5'",
+            ]
+        );
+    }
+
+    #[test]
+    fn zero_read_staleness_does_not_set_session_stale_read() {
+        let init = TidbSessionInit::new(None, Some(TIDB_REPLICA_READ_CLOSEST_ADAPTIVE), Some(0))
+            .expect("read pool session should validate");
+
+        assert_eq!(
+            init.init_statements(),
+            vec![
                 "SET SESSION tidb_txn_mode = 'pessimistic'",
                 "SET SESSION tidb_replica_read = 'closest-adaptive'",
             ]

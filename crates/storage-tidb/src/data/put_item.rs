@@ -16,10 +16,7 @@ use super::tx_helpers::{
     put_prepared_item_without_old_item_in_tx, stream_capture_needs_old_item,
     write_stream_record_for_event_in_tx, write_stream_record_in_tx,
 };
-use super::{
-    data_table_name, data_table_read_ref, json_to_item, physical_pk_bytes,
-    repeat_tuple_placeholders,
-};
+use super::{data_table_name, json_to_item, physical_pk_bytes, repeat_tuple_placeholders};
 use crate::TidbEngine;
 use crate::tidb_util::is_unique_violation;
 
@@ -336,10 +333,7 @@ impl TidbEngine {
             return Ok(Vec::new());
         }
 
-        let ddb_table = data_table_read_ref(
-            &key_info.table_id,
-            self.default_read_staleness_seconds(consistent_read),
-        );
+        let ddb_table = data_table_name(&key_info.table_id);
         let pool = self.data_read_pool(consistent_read);
         let rows: Vec<(serde_json::Value,)> = if let Some((sk_name, sk_type)) =
             sk_info(&key_info.key_schema, &key_info.attribute_definitions)
@@ -381,10 +375,7 @@ impl TidbEngine {
         key: &Item,
         consistent_read: bool,
     ) -> Result<Option<Item>, StorageError> {
-        let ddb_table = data_table_read_ref(
-            &key_info.table_id,
-            self.default_read_staleness_seconds(consistent_read),
-        );
+        let ddb_table = data_table_name(&key_info.table_id);
         let pk = physical_pk_bytes(key, &key_info.key_schema)?;
         let pool = self.data_read_pool(consistent_read);
 

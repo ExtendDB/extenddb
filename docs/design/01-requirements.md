@@ -443,7 +443,7 @@ The catalog database stores extenddb metadata: table definitions, indexes, tags,
 - REQ-TIDB-005: Use TiDB native online DDL and idempotent catalog reconciliation for table create, delete, update, and TTL transitions; do not add frontend DDL leases or ownership locks
 - REQ-TIDB-006: Use TiDB native TTL for all user tables and fixed-retention internal tables; do not run a parallel ExtendDB TTL worker for TiDB tables
 - REQ-TIDB-007: Use TiDB BR for native physical backup/restore instead of catalog row-copy backup data
-- REQ-TIDB-008: Route default data-plane reads through a TiDB session configured for native follower-read locality (`tidb_replica_read = 'closest-adaptive'`); when configured, use TiDB bounded stale reads for base-table default reads; route writes and `ConsistentRead=true` reads through the strong data pool
+- REQ-TIDB-008: Route default data-plane reads through a TiDB session configured for native follower-read locality (`tidb_replica_read = 'closest-adaptive'`); when configured, set TiDB session `tidb_read_staleness` on that default-read pool; route writes and `ConsistentRead=true` reads through the strong data pool
 - REQ-TIDB-009: Run `TransactGetItems` inside a TiDB transaction so multi-item transactional reads use one native snapshot instead of application-level locking
 - REQ-TIDB-010: Run `ExportTableToPointInTime` through TiDB native `AS OF TIMESTAMP` snapshot reads; do not emulate point-in-time export with engine-level paginated scans
 - REQ-TIDB-011: Use TiDB Resource Control/resource groups for distributed capacity governance; do not use per-frontend token buckets for TiDB

@@ -114,7 +114,7 @@ catalog_pool_size = 20
 # separately sizes catalog metadata, control-plane, authz, IAM, and console pools.
 # TiDB default reads use native closest-adaptive follower read; ConsistentRead=true
 # and writes use the strong data pool.
-# default_read_staleness_seconds = 5  # optional bounded stale read for base-table default reads
+# default_read_staleness_seconds = 5  # optional session-level stale read for default reads
 
 [storage.tidb.backup]
 pd_endpoint = "127.0.0.1:2379"

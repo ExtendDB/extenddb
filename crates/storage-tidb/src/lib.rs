@@ -171,7 +171,6 @@ pub struct TidbEngine {
     /// Read-only data pool for DynamoDB reads that did not request
     /// `ConsistentRead=true`.
     pub(crate) data_default_read_pool: MySqlPool,
-    pub(crate) default_read_staleness_seconds: Option<u32>,
     pub(crate) region: String,
     pub(crate) limits: LimitsConfig,
     pub(crate) native_backup: backup_engine::TidbNativeBackupConfig,
@@ -248,6 +247,7 @@ impl TidbEngine {
             data_pool_size,
             data_min_conns,
             config.resource_group.as_deref(),
+            config.default_read_staleness_seconds,
         )?;
         let data_default_read_pool = data_default_read_pool_options
             .connect(&data_connection_string)
@@ -259,7 +259,6 @@ impl TidbEngine {
             pool,
             data_pool,
             data_default_read_pool,
-            default_read_staleness_seconds: config.default_read_staleness_seconds,
             region: region.to_owned(),
             limits: config.limits.clone(),
             native_backup: backup_engine::TidbNativeBackupConfig::from_storage_config(
@@ -362,14 +361,6 @@ impl TidbEngine {
             &self.data_pool
         } else {
             &self.data_default_read_pool
-        }
-    }
-
-    pub(crate) fn default_read_staleness_seconds(&self, consistent_read: bool) -> Option<u32> {
-        if consistent_read {
-            None
-        } else {
-            self.default_read_staleness_seconds
         }
     }
 }
