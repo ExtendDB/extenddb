@@ -15,6 +15,13 @@ use serde_json::Value;
 use crate::OperationContext;
 use crate::serialize_output;
 
+struct ShardIteratorToken {
+    shard_id: String,
+    sequence: String,
+    created_at: u64,
+    stream_arn: String,
+}
+
 fn stream_limit_or_default(
     limit: Option<i64>,
     default: i64,
@@ -140,8 +147,6 @@ pub async fn handle_get_shard_iterator(
     // All iterator types are encoded as AFTER_SEQUENCE_NUMBER in the token.
     // TRIM_HORIZON has seq="" which means "read from beginning".
     // LATEST has seq=<current max> which means "read after current position".
-    let type_str = "AFTER_SEQUENCE_NUMBER";
-
     // Encode creation timestamp (seconds since epoch) for 15-minute expiration.
     // unwrap_or_default: returns epoch 0 if system clock is before 1970 — safe
     // because the iterator would just expire immediately on the next GetRecords.
@@ -150,11 +155,13 @@ pub async fn handle_get_shard_iterator(
         .unwrap_or_default()
         .as_secs();
 
-    let token = format!("{}|{}|{}|{}", input.shard_id, type_str, seq, created_at);
-    let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, token);
-
     let output = GetShardIteratorOutput {
-        shard_iterator: Some(encoded),
+        shard_iterator: Some(encode_shard_iterator(
+            &input.shard_id,
+            &seq,
+            created_at,
+            &input.stream_arn,
+        )),
     };
     serialize_output(&output)
 }
@@ -179,76 +186,59 @@ pub async fn handle_get_records(
     let input: GetRecordsInput = serde_json::from_value(body)
         .map_err(|e| DynamoDbError::SerializationException(e.to_string()))?;
 
-    let decoded = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &input.shard_iterator,
-    )
-    .map_err(|_| DynamoDbError::ValidationException("Invalid shard iterator".to_owned()))?;
-    let token = String::from_utf8(decoded).map_err(|_| {
-        DynamoDbError::ValidationException("Invalid shard iterator encoding".to_owned())
-    })?;
+    let token = decode_shard_iterator(&input.shard_iterator)?;
 
-    let parts: Vec<&str> = token.splitn(4, '|').collect();
-    if parts.len() < 2 {
-        return Err(DynamoDbError::ValidationException(
-            "Invalid shard iterator format".to_owned(),
+    // Check iterator expiration (15 minutes).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now.saturating_sub(token.created_at) > SHARD_ITERATOR_EXPIRY_SECS {
+        return Err(DynamoDbError::ExpiredIteratorException(
+            "The shard iterator has expired and can no longer be \
+             used to retrieve stream records. A new shard iterator \
+             must be obtained by calling GetShardIterator."
+                .to_owned(),
         ));
     }
 
-    let shard_id = parts[0];
-    // The type field is parsed but unused — all iterators are now normalized to
-    // AFTER_SEQUENCE_NUMBER at GetShardIterator time. We keep the field in the
-    // token format for backward compatibility with any iterators created before
-    // this normalization was introduced.
-    let _iter_type = parts[1];
-    let seq = if parts.len() >= 3 { parts[2] } else { "" };
-
-    // Check iterator expiration (15 minutes).
-    if parts.len() >= 4 {
-        if let Ok(created_at) = parts[3].parse::<u64>() {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if now.saturating_sub(created_at) > SHARD_ITERATOR_EXPIRY_SECS {
-                return Err(DynamoDbError::ExpiredIteratorException(
-                    "The shard iterator has expired and can no longer be \
-                     used to retrieve stream records. A new shard iterator \
-                     must be obtained by calling GetShardIterator."
-                        .to_owned(),
-                ));
-            }
-        }
-    }
+    // The iterator token is opaque to clients but not self-authorizing. Rebind
+    // it to the authenticated account and original stream before trusting the
+    // shard id for a records read.
+    ctx.storage
+        .validate_shard(&ctx.account_id, &token.stream_arn, &token.shard_id)
+        .await
+        .map_err(storage_to_dynamo)?;
 
     let limit = stream_limit_or_default(input.limit, 1000, 1000)?;
 
     // All iterator types are now resolved to AFTER_SEQUENCE_NUMBER at
     // GetShardIterator time. Empty seq means "read from beginning".
-    let after_sequence: Option<String> = if seq.is_empty() {
+    let after_sequence: Option<String> = if token.sequence.is_empty() {
         None
     } else {
-        Some(seq.to_owned())
+        Some(token.sequence.clone())
     };
 
     let (records, last_seq) = ctx
         .storage
-        .get_stream_records(shard_id, after_sequence.as_deref(), limit)
+        .get_stream_records(&token.shard_id, after_sequence.as_deref(), limit)
         .await
         .map_err(storage_to_dynamo)?;
 
     // Build next iterator — points to after the last record read.
     // Carries a fresh creation timestamp so the 15-minute window resets.
     let next_iterator = {
-        let next_seq = last_seq.unwrap_or_else(|| seq.to_owned());
+        let next_seq = last_seq.unwrap_or(token.sequence);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let next_token = format!("{shard_id}|AFTER_SEQUENCE_NUMBER|{next_seq}|{now}");
-        Some(base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            next_token,
+        Some(encode_shard_iterator(
+            &token.shard_id,
+            &next_seq,
+            now,
+            &token.stream_arn,
         ))
     };
 
@@ -257,6 +247,46 @@ pub async fn handle_get_records(
         next_shard_iterator: next_iterator,
     };
     serialize_output(&output)
+}
+
+fn encode_shard_iterator(
+    shard_id: &str,
+    sequence: &str,
+    created_at: u64,
+    stream_arn: &str,
+) -> String {
+    let token = format!("{shard_id}|AFTER_SEQUENCE_NUMBER|{sequence}|{created_at}|{stream_arn}");
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, token)
+}
+
+fn decode_shard_iterator(encoded: &str) -> Result<ShardIteratorToken, DynamoDbError> {
+    let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+        .map_err(|_| DynamoDbError::ValidationException("Invalid shard iterator".to_owned()))?;
+    let token = String::from_utf8(decoded).map_err(|_| {
+        DynamoDbError::ValidationException("Invalid shard iterator encoding".to_owned())
+    })?;
+
+    let parts: Vec<&str> = token.splitn(5, '|').collect();
+    if parts.len() != 5 || parts[0].is_empty() || parts[1] != "AFTER_SEQUENCE_NUMBER" {
+        return Err(DynamoDbError::ValidationException(
+            "Invalid shard iterator format".to_owned(),
+        ));
+    }
+    let created_at = parts[3].parse::<u64>().map_err(|_| {
+        DynamoDbError::ValidationException("Invalid shard iterator format".to_owned())
+    })?;
+    if parts[4].is_empty() {
+        return Err(DynamoDbError::ValidationException(
+            "Invalid shard iterator format".to_owned(),
+        ));
+    }
+
+    Ok(ShardIteratorToken {
+        shard_id: parts[0].to_owned(),
+        sequence: parts[2].to_owned(),
+        created_at,
+        stream_arn: parts[4].to_owned(),
+    })
 }
 
 fn previous_decimal_sequence(raw: &str) -> Result<String, DynamoDbError> {
@@ -295,7 +325,10 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
 
 #[cfg(test)]
 mod tests {
-    use super::{previous_decimal_sequence, stream_limit_or_default};
+    use super::{
+        decode_shard_iterator, encode_shard_iterator, previous_decimal_sequence,
+        stream_limit_or_default,
+    };
 
     #[test]
     fn stream_limit_defaults_and_caps_large_values() {
@@ -344,5 +377,28 @@ mod tests {
     fn sequence_predecessor_rejects_non_decimal_input() {
         assert!(previous_decimal_sequence("").is_err());
         assert!(previous_decimal_sequence("123abc").is_err());
+    }
+
+    #[test]
+    fn shard_iterator_round_trips_stream_binding() {
+        let stream_arn = "arn:aws:dynamodb:us-east-1:123456789012:table/t/stream/label";
+        let encoded =
+            encode_shard_iterator("shardId-000000000001-label-table", "42", 123, stream_arn);
+        let decoded = decode_shard_iterator(&encoded).expect("valid iterator");
+
+        assert_eq!(decoded.shard_id, "shardId-000000000001-label-table");
+        assert_eq!(decoded.sequence, "42");
+        assert_eq!(decoded.created_at, 123);
+        assert_eq!(decoded.stream_arn, stream_arn);
+    }
+
+    #[test]
+    fn shard_iterator_rejects_legacy_unbound_tokens() {
+        let legacy = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            "shardId-000000000001-label-table|AFTER_SEQUENCE_NUMBER|42|123",
+        );
+
+        assert!(decode_shard_iterator(&legacy).is_err());
     }
 }
