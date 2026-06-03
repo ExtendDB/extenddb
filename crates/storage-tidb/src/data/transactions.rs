@@ -186,7 +186,7 @@ impl TidbEngine {
                 Err(TxnOpError::Storage(e)) => {
                     // Infrastructure error — abort the entire transaction
                     // without leaking internal details into cancellation reasons.
-                    return Err(StorageError::Internal(e.to_string()));
+                    return Err(e);
                 }
             }
         }

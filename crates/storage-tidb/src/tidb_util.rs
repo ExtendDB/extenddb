@@ -399,6 +399,34 @@ pub(crate) fn is_table_not_found_tidb_storage_error(error: &StorageError) -> boo
     }
 }
 
+pub(crate) fn is_table_not_found_tidb_storage_error_for_table(
+    error: &StorageError,
+    physical_table_name: &str,
+) -> bool {
+    match error {
+        StorageError::Internal(message) => {
+            is_table_not_found_tidb_error_text(message)
+                && tidb_error_message_mentions_identifier(message, physical_table_name)
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn is_index_not_found_tidb_storage_error_for_index_on_table(
+    error: &StorageError,
+    native_index_name: &str,
+    physical_table_name: &str,
+) -> bool {
+    match error {
+        StorageError::Internal(message) => {
+            is_index_not_found_tidb_error_text(message)
+                && tidb_error_message_mentions_identifier(message, native_index_name)
+                && tidb_error_message_mentions_identifier(message, physical_table_name)
+        }
+        _ => false,
+    }
+}
+
 fn is_retryable_tidb_error_text(message: &str) -> bool {
     RETRYABLE_TIDB_ERROR_CODES
         .iter()
@@ -419,6 +447,29 @@ fn is_table_not_found_tidb_error_text(message: &str) -> bool {
     message_contains_db_error_code(message, "1146")
         || (message.contains("Table") && message.contains("doesn't exist"))
         || (message.contains("Table") && message.contains("does not exist"))
+}
+
+fn is_index_not_found_tidb_error_text(message: &str) -> bool {
+    message_contains_db_error_code(message, "1176")
+        || (message.contains("Key") && message.contains("doesn't exist"))
+        || (message.contains("Key") && message.contains("does not exist"))
+}
+
+fn tidb_error_message_mentions_identifier(message: &str, identifier: &str) -> bool {
+    if identifier.is_empty() {
+        return false;
+    }
+
+    message.match_indices(identifier).any(|(idx, _)| {
+        let before = message[..idx].chars().next_back();
+        let after = message[idx + identifier.len()..].chars().next();
+        before.is_none_or(|c| !is_tidb_identifier_char(c))
+            && after.is_none_or(|c| !is_tidb_identifier_char(c))
+    })
+}
+
+fn is_tidb_identifier_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '$'
 }
 
 fn is_tidb_snapshot_read_error_text(message: &str) -> bool {
@@ -478,8 +529,9 @@ mod tests {
 
     use super::{
         TIDB_REPLICA_READ_CLOSEST_ADAPTIVE, TidbSessionInit, active_tidb_ddl_job_for_table_sql,
-        is_retryable_tidb_storage_error, is_table_exists_tidb_error_text,
-        is_table_not_found_tidb_sqlx_error, is_table_not_found_tidb_storage_error,
+        is_index_not_found_tidb_storage_error_for_index_on_table, is_retryable_tidb_storage_error,
+        is_table_exists_tidb_error_text, is_table_not_found_tidb_sqlx_error,
+        is_table_not_found_tidb_storage_error, is_table_not_found_tidb_storage_error_for_table,
         is_tidb_snapshot_read_error_text, quote_tidb_resource_group_name,
         retry_tidb_idempotent_operation, tidb_as_of_epoch_clause, tidb_as_of_tso_clause,
     };
@@ -595,6 +647,69 @@ mod tests {
         }));
 
         assert!(is_table_not_found_tidb_sqlx_error(&error));
+    }
+
+    #[test]
+    fn table_specific_not_found_classifier_requires_matching_physical_table() {
+        let data_error = StorageError::Internal(
+            "ERROR 1146 (42S02): Table 'extenddb_data._ddb_tableid' doesn't exist".to_owned(),
+        );
+        let stream_error = StorageError::Internal(
+            "ERROR 1146 (42S02): Table 'extenddb_data.stream_records' doesn't exist".to_owned(),
+        );
+        let prefix_error = StorageError::Internal(
+            "ERROR 1146 (42S02): Table 'extenddb_data._ddb_tableid2' doesn't exist".to_owned(),
+        );
+
+        assert!(is_table_not_found_tidb_storage_error_for_table(
+            &data_error,
+            "_ddb_tableid"
+        ));
+        assert!(!is_table_not_found_tidb_storage_error_for_table(
+            &stream_error,
+            "_ddb_tableid"
+        ));
+        assert!(!is_table_not_found_tidb_storage_error_for_table(
+            &prefix_error,
+            "_ddb_tableid"
+        ));
+    }
+
+    #[test]
+    fn index_specific_not_found_classifier_requires_matching_native_index() {
+        let index_error = StorageError::Internal(
+            "ERROR 1176 (42000): Key 'idx_idx1' doesn't exist in table '_ddb_tableid'".to_owned(),
+        );
+        let other_index_error = StorageError::Internal(
+            "ERROR 1176 (42000): Key 'idx_idx12' doesn't exist in table '_ddb_tableid'".to_owned(),
+        );
+        let other_table_error = StorageError::Internal(
+            "ERROR 1176 (42000): Key 'idx_idx1' doesn't exist in table '_ddb_tableid2'".to_owned(),
+        );
+        let table_error = StorageError::Internal(
+            "ERROR 1146 (42S02): Table 'extenddb_data._ddb_tableid' doesn't exist".to_owned(),
+        );
+
+        assert!(is_index_not_found_tidb_storage_error_for_index_on_table(
+            &index_error,
+            "idx_idx1",
+            "_ddb_tableid",
+        ));
+        assert!(!is_index_not_found_tidb_storage_error_for_index_on_table(
+            &other_index_error,
+            "idx_idx1",
+            "_ddb_tableid",
+        ));
+        assert!(!is_index_not_found_tidb_storage_error_for_index_on_table(
+            &other_table_error,
+            "idx_idx1",
+            "_ddb_tableid",
+        ));
+        assert!(!is_index_not_found_tidb_storage_error_for_index_on_table(
+            &table_error,
+            "idx_idx1",
+            "_ddb_tableid",
+        ));
     }
 
     #[tokio::test]

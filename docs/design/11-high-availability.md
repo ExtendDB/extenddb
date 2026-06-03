@@ -348,6 +348,12 @@ TiDB uses backend-native primitives instead of ExtendDB ownership layers:
 - `TransactGetItems` uses one TiDB transaction snapshot with plain reads.
 - GSI and LSI are represented with generated columns plus native TiDB secondary indexes.
 - Schema changes rely on TiDB online DDL and idempotent catalog publication.
+- Data-plane operations normalize TiDB online DDL races at the storage boundary:
+  if a request already fetched catalog metadata but another frontend's native
+  DROP TABLE or DROP INDEX finishes before SQL execution, TiDB's missing
+  physical `_ddb_*` table or forced native-index signal becomes the matching
+  DynamoDB `TableNotFound` or `IndexNotFound` response. Missing internal
+  catalog/stream tables remain internal errors.
 - TTL uses TiDB native table TTL.
 - On-demand backup and restore use TiDB BR metadata instead of row-copy backup payloads.
 - `ExportTableToPointInTime` uses TiDB native `AS OF TIMESTAMP` snapshot reads.
@@ -386,6 +392,11 @@ distributed schema changes and backfill, and TiDB native TTL owns expiration.
 The best design is to remove the worker-specific coordination problem:
 
 - TiDB control-plane transitions are durable catalog intents. Any frontend may replay them; idempotent `IF EXISTS` / `IF NOT EXISTS` DDL, native `information_schema.ddl_jobs` deferral for already-active table DDL, DDL-aware startup TTL repair, and conditional catalog publication converge on the TiDB-owned schema state. The whole per-table replay plan is retried on TiDB write conflicts, schema-version races, lock waits, and deadlocks, so transient multi-frontend races re-enter from the catalog intent instead of relying on a partially completed step. A table in `UPDATING` is not protected by an ExtendDB DDL owner: additional compatible GSI, TTL, billing, stream, or delete intent can be appended under a short catalog row transaction while TiDB schedules the physical online DDL.
+- TiDB data-plane requests do not re-fetch catalog metadata or take a frontend
+  schema lock. The request uses the catalog row it already fetched and relies
+  on TiDB's native schema versioning; if the physical table or forced native
+  index has disappeared by execution time, the TiDB-specific storage boundary
+  maps only that named artifact to the corresponding DynamoDB not-found result.
 - TiDB's catalog control-plane queue is indexed by due time first:
   `(status_transition_at, table_name, table_status)`. The distributed poller
   asks TiDB for the next eligible work ordered by due time, so this avoids
