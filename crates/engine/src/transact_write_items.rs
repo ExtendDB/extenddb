@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use futures::future::join_all;
 use serde_json::Value;
 
 use crate::OperationContext;
@@ -96,8 +97,7 @@ pub async fn handle_transact_write_items(
     // Resolve table metadata, validate inputs, parse expressions, and check
     // for duplicate targets in one pass to avoid redundant catalog lookups.
     let metadata_plan = transact_write_metadata_plan(&input.transact_items);
-    let mut table_info_cache: HashMap<String, TableKeyInfo> =
-        HashMap::with_capacity(metadata_plan.len());
+    let table_infos = transact_write_table_infos(ctx, &metadata_plan).await?;
     let mut prepared: Vec<PreparedOp> = Vec::with_capacity(input.transact_items.len());
     let mut seen_targets: HashSet<String> = HashSet::with_capacity(input.transact_items.len());
     for twi in &input.transact_items {
@@ -106,13 +106,11 @@ pub async fn handle_transact_write_items(
                 "TransactWriteItem must contain exactly one operation".to_owned(),
             )
         })?;
-        let metadata_kind = metadata_plan
-            .get(table_name)
-            .copied()
-            .unwrap_or(TableMetadataKind::Key);
-        let key_info =
-            transact_write_table_info(ctx, &mut table_info_cache, table_name, metadata_kind)
-                .await?;
+        let key_info = table_infos.get(table_name).cloned().ok_or_else(|| {
+            DynamoDbError::InternalServerError(format!(
+                "missing transaction metadata for table {table_name}"
+            ))
+        })?;
         let op = prepare_write_op(twi, ctx, key_info)?;
         let target_key = op.canonical_target();
         if !seen_targets.insert(target_key) {
@@ -219,31 +217,34 @@ pub async fn handle_transact_write_items(
     })
 }
 
-async fn transact_write_table_info(
+async fn transact_write_table_infos(
     ctx: &OperationContext,
-    cache: &mut HashMap<String, TableKeyInfo>,
-    table_name: &str,
-    metadata_kind: TableMetadataKind,
-) -> Result<TableKeyInfo, DynamoDbError> {
-    if let Some(key_info) = cache.get(table_name) {
-        return Ok(key_info.clone());
-    }
+    metadata_plan: &HashMap<String, TableMetadataKind>,
+) -> Result<HashMap<String, TableKeyInfo>, DynamoDbError> {
+    let mut table_plans = metadata_plan
+        .iter()
+        .map(|(table_name, metadata_kind)| (table_name.clone(), *metadata_kind))
+        .collect::<Vec<_>>();
+    table_plans.sort_by(|left, right| left.0.cmp(&right.0));
 
-    let key_info = match metadata_kind {
-        TableMetadataKind::Key => {
-            ctx.storage
-                .table_key_info(&ctx.account_id, table_name)
-                .await
-        }
-        TableMetadataKind::Write => {
-            ctx.storage
-                .table_write_info(&ctx.account_id, table_name)
-                .await
-        }
+    let results = join_all(
+        table_plans
+            .iter()
+            .map(|(table_name, metadata_kind)| async move {
+                let result = match *metadata_kind {
+                    TableMetadataKind::Key => ctx.table_key_info(table_name).await,
+                    TableMetadataKind::Write => ctx.table_write_info(table_name).await,
+                };
+                (table_name.clone(), result.map_err(storage_err_to_dynamo))
+            }),
+    )
+    .await;
+
+    let mut table_infos = HashMap::with_capacity(results.len());
+    for (table_name, result) in results {
+        table_infos.insert(table_name, result?);
     }
-    .map_err(storage_err_to_dynamo)?;
-    cache.insert(table_name.to_owned(), key_info.clone());
-    Ok(key_info)
+    Ok(table_infos)
 }
 
 /// Parse and validate a single `TransactWriteItem`, returning a `PreparedOp`.
