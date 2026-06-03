@@ -15,6 +15,20 @@ use serde_json::Value;
 use crate::OperationContext;
 use crate::serialize_output;
 
+fn stream_limit_or_default(
+    limit: Option<i64>,
+    default: i64,
+    max: i64,
+) -> Result<i64, DynamoDbError> {
+    let raw_limit = limit.unwrap_or(default);
+    if raw_limit < 1 {
+        return Err(DynamoDbError::ValidationException(format!(
+            "1 validation error detected: Value '{raw_limit}' at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
+        )));
+    }
+    Ok(raw_limit.min(max))
+}
+
 /// Handle `DescribeStream`.
 ///
 /// # Errors
@@ -25,8 +39,9 @@ pub async fn handle_describe_stream(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
-    let input: DescribeStreamInput = serde_json::from_value(body)
+    let mut input: DescribeStreamInput = serde_json::from_value(body)
         .map_err(|e| DynamoDbError::SerializationException(e.to_string()))?;
+    input.limit = Some(stream_limit_or_default(input.limit, 100, 100)?);
 
     let desc = ctx
         .storage
@@ -52,7 +67,7 @@ pub async fn handle_list_streams(
     let input: ListStreamsInput = serde_json::from_value(body)
         .map_err(|e| DynamoDbError::SerializationException(e.to_string()))?;
 
-    let limit = input.limit.unwrap_or(100).min(100);
+    let limit = stream_limit_or_default(input.limit, 100, 100)?;
     let (streams, last_arn) = ctx
         .storage
         .list_streams(
@@ -206,7 +221,7 @@ pub async fn handle_get_records(
         }
     }
 
-    let limit = input.limit.unwrap_or(1000).min(1000);
+    let limit = stream_limit_or_default(input.limit, 1000, 1000)?;
 
     // All iterator types are now resolved to AFTER_SEQUENCE_NUMBER at
     // GetShardIterator time. Empty seq means "read from beginning".
@@ -280,7 +295,32 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
 
 #[cfg(test)]
 mod tests {
-    use super::previous_decimal_sequence;
+    use super::{previous_decimal_sequence, stream_limit_or_default};
+
+    #[test]
+    fn stream_limit_defaults_and_caps_large_values() {
+        assert_eq!(
+            stream_limit_or_default(None, 100, 100).expect("default"),
+            100
+        );
+        assert_eq!(
+            stream_limit_or_default(Some(7), 100, 100).expect("limit"),
+            7
+        );
+        assert_eq!(
+            stream_limit_or_default(Some(1_000), 100, 100).expect("capped"),
+            100
+        );
+    }
+
+    #[test]
+    fn stream_limit_rejects_non_positive_values_before_storage() {
+        for limit in [0, -1] {
+            let err = stream_limit_or_default(Some(limit), 100, 100)
+                .expect_err("non-positive stream limits must fail");
+            assert!(err.to_string().contains("greater than or equal to 1"));
+        }
+    }
 
     #[test]
     fn sequence_predecessor_preserves_width_for_tidb_tso_ordinals() {
