@@ -376,7 +376,13 @@ pub async fn delete_account(
     }
 
     match state.catalog_store.delete_account(&account_id).await {
-        Ok(()) => Redirect::to("/console/accounts").into_response(),
+        Ok(()) => {
+            // Mirror management::account::delete_account: cascade invalidate
+            // every cached entry across every authz subcache (and the
+            // credential cache) that belongs to this account.
+            state.auth_cache.invalidate_account(&account_id).await;
+            Redirect::to("/console/accounts").into_response()
+        }
         Err(e) => {
             let nav = html::nav_bar(&identity_label(&session.identity));
             let msg = op_error_message(e);

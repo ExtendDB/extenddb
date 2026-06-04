@@ -372,6 +372,76 @@ class TestCliLifecycle:
         # (exact behavior depends on implementation)
         assert result.returncode != 0 or "not running" in result.stdout.lower()
 
+    def test_init_with_unix_socket(self, cli_env):
+        """extenddb init with Unix socket path generates valid connection string and daemon starts."""
+        import platform
+        import psycopg2
+
+        # Only run on Linux or macOS
+        if platform.system() not in ("Linux", "Darwin"):
+            pytest.skip(f"Unix socket test only runs on Linux/macOS, not {platform.system()}")
+
+        # Try to find PostgreSQL's Unix socket by connecting without host
+        # (psycopg2 defaults to Unix socket on Linux/macOS)
+        socket_path = None
+        try:
+            # Connect using Unix socket to discover the socket directory
+            conn = psycopg2.connect(
+                dbname="postgres",
+                user=PG_USER,
+                password=PG_PASS,
+            )
+            # Query the socket directory from PostgreSQL
+            with conn.cursor() as cur:
+                cur.execute("SHOW unix_socket_directories")
+                socket_dirs = cur.fetchone()[0]
+                # Take the first directory if multiple are listed
+                socket_path = socket_dirs.split(",")[0].strip()
+            conn.close()
+
+            # Verify the socket directory exists and is accessible
+            if not os.path.isdir(socket_path):
+                socket_path = None
+        except Exception as e:
+            # If Unix socket connection fails, PostgreSQL might not be configured for it
+            # This is expected and we skip the test rather than fail
+            pytest.skip(f"PostgreSQL Unix socket not available: {e}")
+
+        if not socket_path:
+            pytest.skip("PostgreSQL Unix socket directory not found")
+
+        # Override pg_host with Unix socket path
+        cli_env["pg_host"] = socket_path
+
+        # Init with Unix socket
+        result = _run_extenddb(
+            "init", *_init_args(cli_env),
+            config=cli_env["config_path"],
+            env_override={"EXTENDDB_ADMIN_PASSWORD": "TestPass1!"},
+        )
+        assert result.returncode == 0, f"Init failed: {result.stderr}"
+
+        # Verify config contains percent-encoded socket path
+        with open(cli_env["config_path"]) as f:
+            config_content = f.read()
+
+        # Socket path should be percent-encoded in connection string
+        encoded_path = socket_path.replace("/", "%2F")
+        assert encoded_path in config_content, (
+            f"Connection string should contain percent-encoded socket path {encoded_path}"
+        )
+
+        # Verify daemon can start with the generated config
+        _patch_config_port(cli_env["config_path"], cli_env["port"])
+        result = _run_extenddb("serve", config=cli_env["config_path"])
+        assert result.returncode == 0, f"Serve failed: {result.stderr}"
+
+        # Wait for server to be healthy
+        assert _wait_for_server(cli_env["port"]), "Server did not become healthy with Unix socket connection"
+
+        # Stop
+        _run_extenddb("stop", config=cli_env["config_path"])
+
 
 class TestCliMultiInstance:
     """Test multi-instance isolation — two extenddb instances on different ports/databases."""

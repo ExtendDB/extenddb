@@ -15,12 +15,12 @@ A DynamoDB-compatible API adapter, ExtendDB speaks the DynamoDB wire protocol â€
 ## Features
 
 - Full DynamoDB wire protocol: CRUD, Query, Scan, Batch, Transactions, Streams, TTL, Import/Export
-- SigV4 authentication with local IAM: users, groups, roles, policies, permissions boundaries
+- SigV4 authentication with IAM compatibility: users, groups, roles, policies, permissions boundaries
 - Web management console for account and credential administration
 - TLS with automatic self-signed certificate generation (replaceable with CA-signed certs)
 - CSRF protection, security headers, session management
-- Prometheus-compatible metrics endpoint
-- Daemon mode with syslog logging
+- JSON metrics endpoint with DynamoDB CloudWatch-style metric names and dimensions
+- Daemon mode with syslog logging, plus `--foreground` for container and supervisor environments
 - PostgreSQL storage â€” use standard backup, replication, and HA tools
 
 ## Quick Start
@@ -49,7 +49,7 @@ scripts/install-macos.sh   # macOS
 
 ## Prerequisites
 
-- Rust 1.85+ (`rustup update`)
+- Rust 1.88+ (`rustup update`)
 - PostgreSQL 14+ (see `docs/local-postgres-setup.md`)
 - Python 3.10+ (for test suites and documentation)
 
@@ -104,13 +104,23 @@ cert_path = "/etc/extenddb/tls/cert.pem"
 key_path = "/etc/extenddb/tls/key.pem"
 ```
 
+## Running in Containers
+
+By default `extenddb serve` daemonizes itself, which doesn't play well with container runtimes and process supervisors that expect PID 1 to stay attached. Pass `--foreground` (alias `--no-daemon`) to keep the process in the foreground and stream logs to stderr instead of syslog:
+
+```bash
+extenddb serve --config extenddb.toml --foreground
+```
+
+Use this with Docker, Kubernetes, `systemd Type=simple`, runit, s6, or any other supervisor that captures stdout/stderr. `extenddb status` and `extenddb stop` continue to work as in daemon mode, since the PID file is still written.
+
 ## Monitoring
 
 ```bash
 # Health check
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/health
 
-# Prometheus metrics
+# JSON metrics (DynamoDB CloudWatch-style)
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/metrics
 
 # Syslog (Linux)
@@ -128,6 +138,7 @@ Web-based administration at `https://127.0.0.1:8000/console/`. Manage accounts, 
 
 ```
 extenddb serve --config extenddb.toml          # Start server (daemon)
+extenddb serve --config extenddb.toml --foreground  # Start in foreground
 extenddb init --catalog-db NAME            # Initialize deployment
 extenddb stop --config extenddb.toml           # Graceful shutdown
 extenddb status --config extenddb.toml         # Check if running
@@ -194,6 +205,21 @@ Build PDFs:
 ```bash
 python3 docs/build-docs.py
 ```
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for build,
+test, and code-style requirements.
+
+ExtendDB uses two lightweight processes for tracking decisions:
+
+- **[ADRs](docs/adr/README.md)** record decisions that have been made.
+- **[RFCs](docs/rfcs/README.md)** propose changes that affect the wire protocol,
+  storage trait, auth model, on-disk format, public CLI, or any significant
+  new feature or subsystem. Substantial changes go through an RFC before
+  implementation.
+
+Code in protected paths is reviewed via [`.github/CODEOWNERS`](.github/CODEOWNERS).
 
 ## License
 

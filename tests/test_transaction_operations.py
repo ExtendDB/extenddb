@@ -11,13 +11,12 @@ from __future__ import annotations
 import pytest
 from botocore.exceptions import ClientError
 
-from conftest import wait_for_active
-@pytest.fixture()
-def hash_table(dynamodb_client, create_and_cleanup_table, unique_table_name):
-    """Create a hash-only table and wait for ACTIVE."""
-    create_and_cleanup_table(unique_table_name)
-    wait_for_active(dynamodb_client, unique_table_name)
-    return unique_table_name
+from conftest import wait_for_active, scoped_table
+@pytest.fixture(scope="module")
+def hash_table(dynamodb_client):
+    """Create a hash-only table for the module, delete on teardown."""
+    with scoped_table(dynamodb_client) as name:
+        yield name
 # ---------------------------------------------------------------------------
 # TransactWriteItems — happy paths
 # ---------------------------------------------------------------------------
@@ -326,3 +325,202 @@ def test_transact_write_conditional_put_fail(dynamodb_client, hash_table):
     # Original item unchanged
     resp = dynamodb_client.get_item(TableName=hash_table, Key={"pk": {"S": "cp-2"}})
     assert resp["Item"]["v"]["S"] == "old"
+
+
+# ---------------------------------------------------------------------------
+# TransactWriteItems — size limit and condition edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_transact_write_total_size_exceeds_4mb(dynamodb_client, hash_table):
+    """TransactWriteItems with total item size > 4MB is rejected."""
+    # Each item is ~400KB, 11 items = ~4.4MB > 4MB limit.
+    items = []
+    for i in range(11):
+        items.append({
+            "Put": {
+                "TableName": hash_table,
+                "Item": {
+                    "pk": {"S": f"big-{i}"},
+                    "data": {"S": "x" * (390 * 1024)},
+                },
+            }
+        })
+    with pytest.raises(ClientError) as exc_info:
+        dynamodb_client.transact_write_items(TransactItems=items)
+    assert exc_info.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_transact_write_condition_on_nonexistent_item(dynamodb_client, hash_table):
+    """ConditionCheck with attribute_not_exists on missing item passes."""
+    dynamodb_client.transact_write_items(
+        TransactItems=[
+            {
+                "ConditionCheck": {
+                    "TableName": hash_table,
+                    "Key": {"pk": {"S": "tw-ghost-check"}},
+                    "ConditionExpression": "attribute_not_exists(pk)",
+                }
+            },
+            {
+                "Put": {
+                    "TableName": hash_table,
+                    "Item": {"pk": {"S": "tw-after-ghost"}, "v": {"S": "ok"}},
+                }
+            },
+        ]
+    )
+    resp = dynamodb_client.get_item(TableName=hash_table, Key={"pk": {"S": "tw-after-ghost"}})
+    assert resp["Item"]["v"]["S"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# TransactGetItems — empty projection omits Item (0acc23c)
+# ---------------------------------------------------------------------------
+
+
+def test_transact_get_empty_projection_omits_item(dynamodb_client, hash_table):
+    """TransactGetItems with projection resolving to no attributes omits Item."""
+    dynamodb_client.put_item(
+        TableName=hash_table,
+        Item={"pk": {"S": "proj-empty"}, "real_attr": {"S": "value"}},
+    )
+    resp = dynamodb_client.transact_get_items(
+        TransactItems=[
+            {
+                "Get": {
+                    "TableName": hash_table,
+                    "Key": {"pk": {"S": "proj-empty"}},
+                    "ProjectionExpression": "nonexistent_attr",
+                }
+            }
+        ]
+    )
+    # Item exists but projection yields nothing — no Item key in response
+    assert "Item" not in resp["Responses"][0]
+
+
+def test_transact_get_valid_projection_includes_item(dynamodb_client, hash_table):
+    """TransactGetItems with projection resolving to attributes includes Item."""
+    dynamodb_client.put_item(
+        TableName=hash_table,
+        Item={"pk": {"S": "proj-valid"}, "a": {"S": "val"}},
+    )
+    resp = dynamodb_client.transact_get_items(
+        TransactItems=[
+            {
+                "Get": {
+                    "TableName": hash_table,
+                    "Key": {"pk": {"S": "proj-valid"}},
+                    "ProjectionExpression": "a",
+                }
+            }
+        ]
+    )
+    assert resp["Responses"][0]["Item"]["a"]["S"] == "val"
+
+
+def test_transact_get_missing_item_with_projection_omits_item(dynamodb_client, hash_table):
+    """TransactGetItems on missing item with projection still omits Item."""
+    resp = dynamodb_client.transact_get_items(
+        TransactItems=[
+            {
+                "Get": {
+                    "TableName": hash_table,
+                    "Key": {"pk": {"S": "truly-missing"}},
+                    "ProjectionExpression": "anything",
+                }
+            }
+        ]
+    )
+    assert "Item" not in resp["Responses"][0]
+
+
+# ---------------------------------------------------------------------------
+# TransactGetItems — consumed capacity uses 2x RCU (ff1eed1)
+# ---------------------------------------------------------------------------
+
+
+def test_transact_get_single_item_costs_2_rcu(dynamodb_client, hash_table):
+    """A single small existing item costs 2 RCU in TransactGetItems."""
+    dynamodb_client.put_item(
+        TableName=hash_table, Item={"pk": {"S": "rcu-single"}, "v": {"S": "x"}},
+    )
+    resp = dynamodb_client.transact_get_items(
+        ReturnConsumedCapacity="TOTAL",
+        TransactItems=[
+            {"Get": {"TableName": hash_table, "Key": {"pk": {"S": "rcu-single"}}}}
+        ],
+    )
+    cap = resp["ConsumedCapacity"][0]
+    assert cap["CapacityUnits"] == 2.0
+    assert cap["ReadCapacityUnits"] == 2.0
+
+
+def test_transact_get_missing_item_costs_2_rcu(dynamodb_client, hash_table):
+    """A missing item still costs 2 RCU in TransactGetItems."""
+    resp = dynamodb_client.transact_get_items(
+        ReturnConsumedCapacity="TOTAL",
+        TransactItems=[
+            {"Get": {"TableName": hash_table, "Key": {"pk": {"S": "rcu-ghost"}}}}
+        ],
+    )
+    cap = resp["ConsumedCapacity"][0]
+    assert cap["CapacityUnits"] == 2.0
+    assert cap["ReadCapacityUnits"] == 2.0
+
+
+def test_transact_get_two_items_costs_4_rcu(dynamodb_client, hash_table):
+    """Two items (one existing, one missing) cost 4 RCU total."""
+    dynamodb_client.put_item(
+        TableName=hash_table, Item={"pk": {"S": "rcu-pair"}},
+    )
+    resp = dynamodb_client.transact_get_items(
+        ReturnConsumedCapacity="TOTAL",
+        TransactItems=[
+            {"Get": {"TableName": hash_table, "Key": {"pk": {"S": "rcu-pair"}}}},
+            {"Get": {"TableName": hash_table, "Key": {"pk": {"S": "rcu-pair-miss"}}}},
+        ],
+    )
+    cap = resp["ConsumedCapacity"][0]
+    assert cap["CapacityUnits"] == 4.0
+    assert cap["ReadCapacityUnits"] == 4.0
+
+
+# ---------------------------------------------------------------------------
+# TransactGetItems — capacity breakdown includes RCU/WCU fields (34cec40)
+# ---------------------------------------------------------------------------
+
+
+def test_transact_get_indexes_capacity_has_rcu_field(dynamodb_client, hash_table):
+    """INDEXES-level capacity includes ReadCapacityUnits in Table breakdown."""
+    dynamodb_client.put_item(
+        TableName=hash_table, Item={"pk": {"S": "cap-idx"}},
+    )
+    resp = dynamodb_client.transact_get_items(
+        ReturnConsumedCapacity="INDEXES",
+        TransactItems=[
+            {"Get": {"TableName": hash_table, "Key": {"pk": {"S": "cap-idx"}}}}
+        ],
+    )
+    cap = resp["ConsumedCapacity"][0]
+    assert cap["ReadCapacityUnits"] == 2.0
+    # Table breakdown should also have ReadCapacityUnits
+    table_cap = cap.get("Table", {})
+    assert table_cap.get("ReadCapacityUnits") == 2.0
+    # WriteCapacityUnits should not be present for reads
+    assert table_cap.get("WriteCapacityUnits") is None
+
+
+def test_transact_write_charges_2x_wcu(dynamodb_client, hash_table):
+    """TransactWriteItems charges 2 WCU per item (transaction cost)."""
+    resp = dynamodb_client.transact_write_items(
+        ReturnConsumedCapacity="TOTAL",
+        TransactItems=[
+            {"Put": {"TableName": hash_table, "Item": {"pk": {"S": "tw-cap-1"}}}},
+            {"Put": {"TableName": hash_table, "Item": {"pk": {"S": "tw-cap-2"}}}},
+        ],
+    )
+    # 2 items × 1 WCU each × 2 (transaction) = 4.0
+    total = sum(c["CapacityUnits"] for c in resp["ConsumedCapacity"])
+    assert total == 4.0

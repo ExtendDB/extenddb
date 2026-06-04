@@ -29,6 +29,27 @@ pub use server_components::{
 
 pub use hooks::{ServerRuntimeHooks, WorkerContext};
 
+/// Pluggable lookup for `TableKeyInfo`.
+///
+/// Allows the engine layer to consult an in-memory cache transparently
+/// instead of calling `StorageEngine::table_key_info` directly. The server
+/// crate provides a SWR-cached implementation; tests and embedded uses can
+/// pass `None` to fall back to direct storage lookups.
+///
+/// Defined here (rather than in `extenddb-engine`) so the cache wrapper in
+/// `extenddb-server` can implement it without creating a circular crate
+/// dependency.
+pub trait TableKeyInfoLookup: Send + Sync {
+    fn lookup<'a>(
+        &'a self,
+        account_id: &'a str,
+        table_name: &'a str,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<extenddb_core::types::TableKeyInfo, error::StorageError>,
+    >;
+}
+
 pub mod util;
 
 use std::sync::Arc;
@@ -402,9 +423,7 @@ pub trait MetadataEngine: Send + Sync {
     ) -> BoxFuture<'_, Result<Vec<(String, String)>, StorageError>>;
 
     /// List all tables with TTL enabled across all accounts: `(account_id, table_name, ttl_attribute)`.
-    fn all_tables_with_ttl(
-        &self,
-    ) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>>;
+    fn all_tables_with_ttl(&self) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>>;
 
     /// List all tables with TTL enabled AND index ready: `(account_id, table_name, ttl_attribute)`.
     fn all_tables_with_ttl_index_ready(

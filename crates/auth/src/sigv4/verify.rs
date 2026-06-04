@@ -64,12 +64,12 @@ pub fn verify_signature(
 
     // Reject UNSIGNED-PAYLOAD: real DynamoDB requires a computed body hash
     // for all API calls. UNSIGNED-PAYLOAD is only valid for S3.
-    if let Some(content_sha) = headers.get("x-amz-content-sha256") {
-        if content_sha.as_bytes() == b"UNSIGNED-PAYLOAD" {
-            return Err(DynamoDbError::InvalidSignatureException(
-                "UNSIGNED-PAYLOAD is not supported for DynamoDB operations.".to_owned(),
-            ));
-        }
+    if let Some(content_sha) = headers.get("x-amz-content-sha256")
+        && content_sha.as_bytes() == b"UNSIGNED-PAYLOAD"
+    {
+        return Err(DynamoDbError::InvalidSignatureException(
+            "UNSIGNED-PAYLOAD is not supported for DynamoDB operations.".to_owned(),
+        ));
     }
 
     // Build canonical request

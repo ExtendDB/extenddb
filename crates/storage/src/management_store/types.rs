@@ -6,7 +6,7 @@
 // ── Error types ────────────────────────────────────────────────────────
 
 /// Error from a management or operational storage operation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum OpError {
     /// Input validation failed (caller should have caught this).
     Validation(String),

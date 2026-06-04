@@ -165,3 +165,316 @@ class TestScanEdgeCases:
         item = resp["Items"][0]
         assert "a" in item
         assert "b" not in item
+
+    def test_scan_malformed_exclusive_start_key(self, table_factory, dynamodb_client):
+        """Scan with ExclusiveStartKey that doesn't match schema returns ValidationException."""
+        name = table_factory()
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.scan(
+                TableName=name,
+                ExclusiveStartKey={"bad": {"S": "p"}},
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == "The provided starting key is invalid: The provided key element does not match the schema"
+
+    def test_query_malformed_exclusive_start_key(self, table_factory, dynamodb_client):
+        """Query with ExclusiveStartKey that doesn't match schema returns ValidationException."""
+        name = table_factory()
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.query(
+                TableName=name,
+                KeyConditionExpression="pk = :v",
+                ExpressionAttributeValues={":v": {"S": "x"}},
+                ExclusiveStartKey={"bad": {"S": "p"}},
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == "The provided starting key is invalid"
+
+    def test_scan_malformed_exclusive_start_key_on_gsi(self, dynamodb_client):
+        """Scan GSI with ExclusiveStartKey missing index key returns ValidationException."""
+        name = unique_name("gsi-esk")
+        dynamodb_client.create_table(
+            TableName=name,
+            AttributeDefinitions=[
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "gsi_pk", "AttributeType": "S"},
+            ],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "gsi1",
+                    "KeySchema": [{"AttributeName": "gsi_pk", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        waiter = dynamodb_client.get_waiter("table_exists")
+        waiter.wait(TableName=name, WaiterConfig={"Delay": 1, "MaxAttempts": 30})
+        # Start key has table PK but missing GSI PK
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.scan(
+                TableName=name,
+                IndexName="gsi1",
+                ExclusiveStartKey={"pk": {"S": "x"}},
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == "The provided starting key is invalid"
+        dynamodb_client.delete_table(TableName=name)
+
+    def test_query_malformed_exclusive_start_key_on_gsi(self, dynamodb_client):
+        """Query GSI with ExclusiveStartKey missing index key returns ValidationException."""
+        name = unique_name("gsi-esk-q")
+        dynamodb_client.create_table(
+            TableName=name,
+            AttributeDefinitions=[
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "gsi_pk", "AttributeType": "S"},
+            ],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "gsi1",
+                    "KeySchema": [{"AttributeName": "gsi_pk", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        waiter = dynamodb_client.get_waiter("table_exists")
+        waiter.wait(TableName=name, WaiterConfig={"Delay": 1, "MaxAttempts": 30})
+        # Start key has table PK but missing GSI PK
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.query(
+                TableName=name,
+                IndexName="gsi1",
+                KeyConditionExpression="gsi_pk = :v",
+                ExpressionAttributeValues={":v": {"S": "x"}},
+                ExclusiveStartKey={"pk": {"S": "x"}},
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == "The provided starting key is invalid"
+        dynamodb_client.delete_table(TableName=name)
+
+    def test_scan_empty_exclusive_start_key(self, table_factory, dynamodb_client):
+        """Scan with an empty {} ExclusiveStartKey returns ValidationException."""
+        name = table_factory()
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.scan(TableName=name, ExclusiveStartKey={})
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == (
+            "The provided starting key is invalid: "
+            "The provided key element does not match the schema"
+        )
+
+    def test_query_empty_exclusive_start_key(self, table_factory, dynamodb_client):
+        """Query with an empty {} ExclusiveStartKey returns ValidationException."""
+        name = table_factory()
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.query(
+                TableName=name,
+                KeyConditionExpression="pk = :v",
+                ExpressionAttributeValues={":v": {"S": "x"}},
+                ExclusiveStartKey={},
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == "The provided starting key is invalid"
+
+    def test_scan_extra_attribute_in_exclusive_start_key(self, table_factory, dynamodb_client):
+        """Scan with a valid composite start key plus an extra non-key attr."""
+        name = table_factory(range_key="sk")
+        dynamodb_client.put_item(
+            TableName=name,
+            Item={"pk": {"S": "P"}, "sk": {"S": "S"}},
+        )
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.scan(
+                TableName=name,
+                ExclusiveStartKey={
+                    "pk": {"S": "P"},
+                    "sk": {"S": "S"},
+                    "extra": {"S": "junk"},
+                },
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == (
+            "The provided starting key is invalid: "
+            "The provided key element does not match the schema"
+        )
+
+    def test_query_extra_attribute_in_exclusive_start_key(self, table_factory, dynamodb_client):
+        """Query with a valid composite start key plus an extra non-key attr."""
+        name = table_factory(range_key="sk")
+        dynamodb_client.put_item(
+            TableName=name,
+            Item={"pk": {"S": "P"}, "sk": {"S": "S"}},
+        )
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.query(
+                TableName=name,
+                KeyConditionExpression="pk = :v",
+                ExpressionAttributeValues={":v": {"S": "P"}},
+                ExclusiveStartKey={
+                    "pk": {"S": "P"},
+                    "sk": {"S": "S"},
+                    "extra": {"S": "junk"},
+                },
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == "The provided starting key is invalid"
+
+    def test_scan_wrong_scalar_type_in_exclusive_start_key(
+        self, table_factory, dynamodb_client
+    ):
+        """Scan with PK declared S but supplied as N raises ValidationException."""
+        name = table_factory(range_key="sk")
+        dynamodb_client.put_item(
+            TableName=name,
+            Item={"pk": {"S": "P"}, "sk": {"S": "S"}},
+        )
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.scan(
+                TableName=name,
+                ExclusiveStartKey={
+                    "pk": {"N": "42"},
+                    "sk": {"S": "S"},
+                },
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == (
+            "The provided starting key is invalid: "
+            "The provided key element does not match the schema"
+        )
+
+    def test_query_wrong_scalar_type_in_exclusive_start_key(
+        self, table_factory, dynamodb_client
+    ):
+        """Query with PK declared S but supplied as N raises ValidationException."""
+        name = table_factory(range_key="sk")
+        dynamodb_client.put_item(
+            TableName=name,
+            Item={"pk": {"S": "P"}, "sk": {"S": "S"}},
+        )
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.query(
+                TableName=name,
+                KeyConditionExpression="pk = :v",
+                ExpressionAttributeValues={":v": {"S": "P"}},
+                ExclusiveStartKey={
+                    "pk": {"N": "42"},
+                    "sk": {"S": "S"},
+                },
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == "The provided starting key is invalid"
+
+    def test_scan_simple_table_extra_attribute_in_exclusive_start_key(
+        self, table_factory, dynamodb_client
+    ):
+        """Scan on a single-key table rejects an extra sk in the start key."""
+        name = table_factory()  # default: pk only
+        dynamodb_client.put_item(
+            TableName=name,
+            Item={"pk": {"S": "P"}},
+        )
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.scan(
+                TableName=name,
+                ExclusiveStartKey={"pk": {"S": "P"}, "sk": {"S": "S"}},
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == (
+            "The provided starting key is invalid: "
+            "The provided key element does not match the schema"
+        )
+
+    def test_query_simple_table_extra_attribute_in_exclusive_start_key(
+        self, table_factory, dynamodb_client
+    ):
+        """Query on a single-key table rejects an extra sk in the start key."""
+        name = table_factory()  # default: pk only
+        dynamodb_client.put_item(
+            TableName=name,
+            Item={"pk": {"S": "P"}},
+        )
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.query(
+                TableName=name,
+                KeyConditionExpression="pk = :v",
+                ExpressionAttributeValues={":v": {"S": "P"}},
+                ExclusiveStartKey={"pk": {"S": "P"}, "sk": {"S": "S"}},
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == "The provided starting key is invalid"
+
+    def test_scan_full_composite_exclusive_start_key_is_accepted(
+        self, table_factory, dynamodb_client
+    ):
+        """Sanity: a complete, well-typed ExclusiveStartKey paginates without error."""
+        name = table_factory(range_key="sk")
+        dynamodb_client.put_item(
+            TableName=name,
+            Item={"pk": {"S": "P"}, "sk": {"S": "S"}, "v": {"N": "1"}},
+        )
+        resp = dynamodb_client.scan(
+            TableName=name,
+            ExclusiveStartKey={"pk": {"S": "P"}, "sk": {"S": "S"}},
+        )
+        # Implementation detail: the storage layer is free to return zero or
+        # more items past the cursor. Contract under test is "no error".
+        assert "Items" in resp
+
+    def test_query_full_composite_exclusive_start_key_is_accepted(
+        self, table_factory, dynamodb_client
+    ):
+        """Sanity: a complete, well-typed Query ExclusiveStartKey paginates without error."""
+        name = table_factory(range_key="sk")
+        dynamodb_client.put_item(
+            TableName=name,
+            Item={"pk": {"S": "P"}, "sk": {"S": "S"}, "v": {"N": "1"}},
+        )
+        resp = dynamodb_client.query(
+            TableName=name,
+            KeyConditionExpression="pk = :v",
+            ExpressionAttributeValues={":v": {"S": "P"}},
+            ExclusiveStartKey={"pk": {"S": "P"}, "sk": {"S": "S"}},
+        )
+        assert "Items" in resp
+
+
+    def test_scan_rejects_negative_segment(self, table_factory, dynamodb_client):
+        """Scan with negative Segment returns ValidationException."""
+        import os
+        import boto3
+        import botocore.config
+
+        name = table_factory()
+        # Create a client without parameter validation to bypass boto3 client-side checks
+        endpoint = os.environ.get("DYNAMODB_ENDPOINT")
+        kwargs = {
+            "service_name": "dynamodb",
+            "region_name": os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+            "config": botocore.config.Config(parameter_validation=False),
+        }
+        if endpoint:
+            kwargs["endpoint_url"] = endpoint
+            if endpoint.startswith("https://"):
+                kwargs["verify"] = False
+        raw_client = boto3.client(**kwargs)
+        with pytest.raises(ClientError) as exc:
+            raw_client.scan(TableName=name, Segment=-1, TotalSegments=4)
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert "greater than or equal to 0" in err["Message"]

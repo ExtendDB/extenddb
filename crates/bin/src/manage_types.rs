@@ -402,4 +402,76 @@ pub enum ManageCommand {
         #[arg(long)]
         role_name: String,
     },
+    /// Cache management (admin-only break-glass invalidation)
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CacheAction {
+    /// Invalidate cache entries. See `cache invalidate --help` for scopes.
+    Invalidate {
+        #[command(subcommand)]
+        scope: CacheInvalidateScope,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CacheInvalidateScope {
+    /// Invalidate every cached entry across every cache (requires --yes).
+    All {
+        /// Confirm the global flush. Refuses to run without it.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Invalidate every cached entry for a specific account.
+    Account {
+        #[arg(long)]
+        account_id: String,
+    },
+    /// Invalidate a single cached credential by access key.
+    Credential {
+        #[arg(long)]
+        access_key_id: String,
+    },
+    /// Invalidate everything cached about an IAM user (policies, group
+    /// policies, boundary, tags, credentials).
+    User {
+        #[arg(long)]
+        account_id: String,
+        #[arg(long)]
+        user_name: String,
+    },
+    /// Invalidate everything cached about an IAM role (policies, boundary,
+    /// tags, sessions, credentials).
+    Role {
+        #[arg(long)]
+        account_id: String,
+        #[arg(long)]
+        role_name: String,
+    },
+    /// Invalidate the cached group_policies for a list of users (used
+    /// after a group-membership change that the write-through hooks
+    /// missed).
+    GroupMembers {
+        #[arg(long)]
+        account_id: String,
+        /// Comma-separated user names.
+        #[arg(long)]
+        user_names: String,
+    },
+    /// Invalidate the TableKeyInfo cache for a single table.
+    TableKeyInfo {
+        #[arg(long)]
+        account_id: String,
+        #[arg(long)]
+        table_name: String,
+    },
+    /// Invalidate the resource_tags cache for a resource ARN.
+    ResourceTags {
+        #[arg(long)]
+        arn: String,
+    },
 }

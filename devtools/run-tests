@@ -30,6 +30,7 @@
 # Options:
 #   --release         use release build for Rust tests
 #   --filter PATTERN  pass to cargo test / pytest -k
+#   --parallel[=N]    run pytest in parallel (default: 1/3 of CPU cores)
 #   --config PATH     config file path (default: extenddb.toml in repo root)
 #
 # REQ-TEST-001, D-1, D-2, D-3, D-4, D-5
@@ -65,6 +66,7 @@ RUN_CATALOG_CHECK=false
 RELEASE=false
 FILTER=""
 CONFIG_PATH=""
+PARALLEL=""
 
 usage() {
     cat <<'EOF'
@@ -86,6 +88,7 @@ Suites (at least one required):
 Options:
   --release         release build for Rust tests
   --filter PATTERN  filter for cargo test / pytest -k
+  --parallel[=N]    run pytest in parallel (default: 1/3 of CPU cores)
   --config PATH     config file path
 EOF
     exit 1
@@ -109,6 +112,13 @@ while [[ $# -gt 0 ]]; do
         --filter)         FILTER="$2"; shift 2 ;;
         --catalog-check)  RUN_CATALOG_CHECK=true; shift ;;
         --config)         CONFIG_PATH="$2"; shift 2 ;;
+        --parallel)
+            # --parallel (no argument) or --parallel=N
+            PARALLEL="auto"; shift
+            ;;
+        --parallel=*)
+            PARALLEL="${1#--parallel=}"; shift
+            ;;
         -h|--help)        usage ;;
         *)                echo "error: unknown option: $1"; usage ;;
     esac
@@ -414,6 +424,16 @@ if $RUN_PYTEST; then
     echo "  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}"
     # CLI lifecycle tests manage their own server; exclude from main suite
     PYTEST_ARGS=(python3 -m pytest tests/ -v --ignore=tests/python --ignore=tests/test_cli_lifecycle.py)
+    # Parallel execution (--parallel): distribute by file so module/class-scoped
+    # fixtures stay within a single worker.
+    if [[ -n "$PARALLEL" ]] && python3 -c "import xdist" 2>/dev/null; then
+        if [[ "$PARALLEL" == "auto" ]]; then
+            XDIST_WORKERS=$(python3 -c "import os; print(max(2, os.cpu_count() // 3))")
+        else
+            XDIST_WORKERS="$PARALLEL"
+        fi
+        PYTEST_ARGS+=(-n "$XDIST_WORKERS" --dist loadfile)
+    fi
     if [[ -n "$FILTER" ]]; then
         PYTEST_ARGS+=(-k "$FILTER")
     fi

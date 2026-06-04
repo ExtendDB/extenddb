@@ -149,12 +149,66 @@ pub async fn delete_user(
         return e;
     }
 
+    // Snapshot the user's access keys before deletion so we can invalidate
+    // their cached credentials after the cascade delete succeeds. A failed
+    // list shouldn't block deletion — fall back to TTL-based propagation
+    // (auth.cache.ttl_seconds).
+    //
+    // The snapshot is racy by design: a CreateAccessKey concurrent with this
+    // delete may produce a key not in `access_key_ids`. The defensive
+    // `invalidate_principal_credentials` fanout below handles that case by
+    // matching on (account_id, principal_name) over the cache values.
+    let access_key_ids: Vec<String> = match state
+        .catalog_store
+        .list_access_keys(&account_id, &user_name)
+        .await
+    {
+        Ok(rows) => rows.into_iter().map(|(id, _, _)| id).collect(),
+        Err(e) => {
+            tracing::warn!(
+                "delete_user: list_access_keys failed before delete; cache invalidation will rely on TTL: {e:?}"
+            );
+            Vec::new()
+        }
+    };
+
     match state
         .catalog_store
         .delete_user(&account_id, &user_name)
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // Cascade invalidations: every cached entry keyed by this user
+            // must be dropped so a subsequent recreate (same name) doesn't
+            // inherit the deleted user's policies/tags.
+            for key_id in &access_key_ids {
+                state.auth_cache.invalidate_credential(key_id).await;
+            }
+            // Defensive: any cached credential whose principal_name matches
+            // the deleted user (e.g. a key not in our snapshot due to race
+            // conditions) is also dropped.
+            state
+                .auth_cache
+                .invalidate_principal_credentials(&account_id, &user_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_user_policies(&account_id, &user_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_user_group_policies(&account_id, &user_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_user_boundary(&account_id, &user_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_user_tags(&account_id, &user_name)
+                .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => op_err_to_response(OpError::from_storage(e)),
     }
 }
@@ -197,6 +251,10 @@ pub async fn tag_user(
         .await
     {
         Ok(()) => {
+            state
+                .auth_cache
+                .invalidate_user_tags(&account_id, &user_name)
+                .await;
             tracing::warn!(
                 target: "extenddb::audit::manage",
                 "tag-user: account={}, user={}, keys=[{}]",
@@ -228,6 +286,10 @@ pub async fn untag_user(
         .await
     {
         Ok(()) => {
+            state
+                .auth_cache
+                .invalidate_user_tags(&account_id, &user_name)
+                .await;
             tracing::warn!(
                 target: "extenddb::audit::manage",
                 "untag-user: account={}, user={}, keys=[{}]",

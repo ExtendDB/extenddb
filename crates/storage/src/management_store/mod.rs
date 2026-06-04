@@ -37,7 +37,13 @@ pub type UserListEntry = (String, String, String, bool, time::OffsetDateTime);
 /// Group info: `(account_id, group_name, group_arn, created_at)`.
 pub type GroupListEntry = (String, String, String, time::OffsetDateTime);
 /// Role info: `(account_id, role_name, role_arn, assume_role_policy, created_at)`.
-pub type RoleListEntry = (String, String, String, serde_json::Value, time::OffsetDateTime);
+pub type RoleListEntry = (
+    String,
+    String,
+    String,
+    serde_json::Value,
+    time::OffsetDateTime,
+);
 
 // ── Settings store ─────────────────────────────────────────────────────
 
@@ -180,10 +186,7 @@ pub trait ManagementStore: Send + Sync {
     fn delete_user(&self, account_id: &str, user_name: &str) -> BoxFuture<'_, OpResult<()>>;
 
     /// List users in an account as `(account_id, user_name, user_arn, has_password, created_at)`.
-    fn list_users(
-        &self,
-        account_id: &str,
-    ) -> BoxFuture<'_, OpResult<Vec<UserListEntry>>>;
+    fn list_users(&self, account_id: &str) -> BoxFuture<'_, OpResult<Vec<UserListEntry>>>;
 
     fn get_user_detail(
         &self,
@@ -239,10 +242,7 @@ pub trait ManagementStore: Send + Sync {
     fn delete_group(&self, account_id: &str, group_name: &str) -> BoxFuture<'_, OpResult<()>>;
 
     /// List groups in an account as `(account_id, group_name, group_arn, created_at)`.
-    fn list_groups(
-        &self,
-        account_id: &str,
-    ) -> BoxFuture<'_, OpResult<Vec<GroupListEntry>>>;
+    fn list_groups(&self, account_id: &str) -> BoxFuture<'_, OpResult<Vec<GroupListEntry>>>;
 
     fn get_group_detail(
         &self,
@@ -276,10 +276,7 @@ pub trait ManagementStore: Send + Sync {
     fn delete_role(&self, account_id: &str, role_name: &str) -> BoxFuture<'_, OpResult<()>>;
 
     /// List roles in an account as `(account_id, role_name, role_arn, trust_policy, created_at)`.
-    fn list_roles(
-        &self,
-        account_id: &str,
-    ) -> BoxFuture<'_, OpResult<Vec<RoleListEntry>>>;
+    fn list_roles(&self, account_id: &str) -> BoxFuture<'_, OpResult<Vec<RoleListEntry>>>;
 
     fn get_role_detail(
         &self,

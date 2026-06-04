@@ -8,7 +8,7 @@ This file lists the dependency checks the `extenddb-setup` skill runs before pro
 
 | Dependency | Check command | Minimum version | Rationale |
 |---|---|---|---|
-| Rust toolchain | `cargo --version` and `rustc --version` | 1.85 | extenddb is a Rust workspace; older toolchains fail `cargo build --release`. |
+| Rust toolchain | `cargo --version` and `rustc --version` | 1.88 | extenddb is a Rust workspace; older toolchains fail `cargo build --release`. |
 | PostgreSQL client | `psql --version` | 14 | extenddb speaks the Postgres protocol at init and runtime; older clients may lack required features. |
 | PostgreSQL server readiness | `pg_isready` | n/a (server-side check) | Confirms the server is reachable before `extenddb init`. |
 | Python 3 | `python3 --version` | 3.10 | Required by the sample apps and the docs build pipeline. |
@@ -29,7 +29,7 @@ If `which cargo` exits nonzero, Rust is not installed. Install:
 - Linux (Fedora/RHEL): `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - macOS: `brew install rustup-init && rustup-init`
 
-If Rust is installed but `rustc --version` reports older than 1.85:
+If Rust is installed but `rustc --version` reports older than 1.88:
 
 ```bash
 rustup update
@@ -84,7 +84,7 @@ If `python3 --version` reports older than 3.10, upgrade via the same package man
 
 ## Version parsing
 
-`rustc --version` prints `rustc 1.85.0 (abcdef0 2025-01-01)`. Extract the version field with `awk`:
+`rustc --version` prints `rustc 1.88.0 (abcdef0 2025-01-01)`. Extract the version field with `awk`:
 
 ```bash
 rustc --version | awk '{print $2}'
@@ -96,11 +96,11 @@ rustc --version | awk '{print $2}'
 psql --version | awk '{print $3}'
 ```
 
-Compare the extracted version against the minimum (1.85 for Rust, 14 for Postgres) by splitting on `.` and comparing numerically. For skill-level checks, a string prefix comparison (`[[ "$PG_VER" < "14" ]]`) is adequate because major versions are single or double digits.
+Compare the extracted version against the minimum (1.88 for Rust, 14 for Postgres) by splitting on `.` and comparing numerically. For skill-level checks, a string prefix comparison (`[[ "$PG_VER" < "14" ]]`) is adequate because major versions are single or double digits.
 
 ## Rust version upgrade path
 
-If Rust is installed via rustup and `rustc --version` reports older than 1.85, the fix is:
+If Rust is installed via rustup and `rustc --version` reports older than 1.88, the fix is:
 
 ```bash
 rustup update

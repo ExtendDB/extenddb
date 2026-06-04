@@ -79,14 +79,23 @@ pub async fn create_access_key(
         .create_access_key(&account_id, &user_name)
         .await
     {
-        Ok(key) => (
-            StatusCode::CREATED,
-            axum::Json(AccessKeyCreated {
-                access_key_id: key.access_key_id,
-                secret_access_key: key.secret_access_key,
-            }),
-        )
-            .into_response(),
+        Ok(key) => {
+            // Write-through invalidation: the new key may have a cached negative
+            // (Ok(None)) entry from a prior lookup attempt. Drop it so the next
+            // SigV4 verification picks up the credential immediately.
+            state
+                .auth_cache
+                .invalidate_credential(&key.access_key_id)
+                .await;
+            (
+                StatusCode::CREATED,
+                axum::Json(AccessKeyCreated {
+                    access_key_id: key.access_key_id,
+                    secret_access_key: key.secret_access_key,
+                }),
+            )
+                .into_response()
+        }
         Err(e) => op_err_to_response(OpError::from_storage(e)),
     }
 }
@@ -151,7 +160,12 @@ pub async fn delete_access_key(
         .delete_access_key(&account_id, &user_name, &key_id)
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // Write-through invalidation: ensure subsequent SigV4 verifications
+            // for the deleted key see UnrecognizedClientException without TTL lag.
+            state.auth_cache.invalidate_credential(&key_id).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => op_err_to_response(OpError::from_storage(e)),
     }
 }
@@ -196,6 +210,10 @@ pub async fn change_user_password(
         .change_user_password(&account_id, &user_name, &hash)
         .await
     {
+        // No cache invalidation: passwords are only used by the management
+        // API's Basic auth path, which queries the catalog directly and
+        // does not consult the auth cache. SigV4 (the cached path) uses
+        // access keys, not passwords.
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => op_err_to_response(OpError::from_storage(e)),
     }
@@ -268,7 +286,14 @@ pub async fn import_access_key(
         )
         .await
     {
-        Ok(()) => (StatusCode::CREATED, "Access key imported").into_response(),
+        Ok(()) => {
+            // Drop any cached negative entry for this key.
+            state
+                .auth_cache
+                .invalidate_credential(&body.access_key_id)
+                .await;
+            (StatusCode::CREATED, "Access key imported").into_response()
+        }
         Err(e) => op_err_to_response(OpError::from_storage(e)),
     }
 }

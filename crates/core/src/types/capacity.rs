@@ -42,6 +42,12 @@ pub struct Capacity {
     /// Approximate capacity units consumed.
     #[serde(rename = "CapacityUnits")]
     pub capacity_units: f64,
+    /// Read capacity units consumed (present for read operations).
+    #[serde(rename = "ReadCapacityUnits", skip_serializing_if = "Option::is_none")]
+    pub read_capacity_units: Option<f64>,
+    /// Write capacity units consumed (present for write operations).
+    #[serde(rename = "WriteCapacityUnits", skip_serializing_if = "Option::is_none")]
+    pub write_capacity_units: Option<f64>,
 }
 
 /// Consumed capacity information returned when requested.
@@ -153,7 +159,11 @@ impl ConsumedCapacity {
             read_capacity_units: Some(cu),
             write_capacity_units: None,
             table: if indexes {
-                Some(Capacity { capacity_units: cu })
+                Some(Capacity {
+                    capacity_units: cu,
+                    read_capacity_units: Some(cu),
+                    write_capacity_units: None,
+                })
             } else {
                 None
             },
@@ -171,7 +181,11 @@ impl ConsumedCapacity {
             read_capacity_units: None,
             write_capacity_units: Some(cu),
             table: if indexes {
-                Some(Capacity { capacity_units: cu })
+                Some(Capacity {
+                    capacity_units: cu,
+                    read_capacity_units: None,
+                    write_capacity_units: Some(cu),
+                })
             } else {
                 None
             },

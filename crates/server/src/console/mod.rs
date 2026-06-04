@@ -44,6 +44,13 @@ pub struct ConsoleState {
     /// Runtime documentation store. `None` if `docs_dir` is not configured or
     /// the directory is missing/invalid.
     pub docs_store: Option<docs_embed::DocsStore>,
+    /// Auth/authz cache registry. Used by mutation handlers to issue
+    /// write-through invalidations after IAM changes — the same hooks the
+    /// management API calls. Also used by the `/console/cache` admin
+    /// break-glass page to drive manual invalidation. Without this,
+    /// console-driven mutations leave stale entries in the cache for up
+    /// to `auth.cache.ttl_seconds`.
+    pub auth_cache: extenddb_auth::AuthCacheRegistry,
 }
 
 /// Build the console router.
@@ -63,6 +70,10 @@ pub fn router() -> Router<Arc<ConsoleState>> {
         .route("/metrics", get(pages::metrics_page))
         // Settings (read-only, admin-only)
         .route("/settings", get(pages::settings_page))
+        // Cache (admin-only break-glass invalidation).
+        // See docs/design/12-auth-authz-cache.md §6.1.
+        .route("/cache", get(pages::cache_page))
+        .route("/cache/invalidate", post(pages::invalidate_cache))
         // Accounts
         .route("/accounts", get(pages::list_accounts))
         .route("/accounts/new", get(pages::new_account_form))

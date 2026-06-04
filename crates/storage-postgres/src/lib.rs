@@ -331,7 +331,7 @@ impl PostgresEngine {
 // ServerComponents Factory Registration
 // ============================================================================
 
-use extenddb_auth::BuiltinAuthProvider;
+use extenddb_auth::CredentialStore;
 use extenddb_storage::hooks::{ServerRuntimeHooks, WorkerContext};
 use extenddb_storage::server_components::{
     BackendError, ServerComponents, ServerComponentsRegistration,
@@ -504,8 +504,8 @@ inventory::submit! {
                 // Create auth provider
                 let enc_key = extenddb_storage::CatalogStore::cached_encryption_key(&*catalog_store)
                     .ok_or(BackendError::MissingEncryptionKey)?;
-                let cred_store = DbCredentialStore::new(catalog_pool.clone(), enc_key);
-                let auth_provider = Arc::new(BuiltinAuthProvider::new(cred_store));
+                let cred_store: Arc<dyn CredentialStore> =
+                    Arc::new(DbCredentialStore::new(catalog_pool.clone(), enc_key));
 
                 // Create runtime hooks
                 let runtime_hooks = Box::new(PostgresRuntimeHooks {
@@ -518,7 +518,7 @@ inventory::submit! {
                 Ok(ServerComponents {
                     engine,
                     catalog_store,
-                    auth_provider,
+                    credential_store: cred_store,
                     runtime_hooks: Some(runtime_hooks),
                 })
             })

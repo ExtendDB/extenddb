@@ -151,11 +151,11 @@ pub(crate) async fn execute_query_sql(
     }
 
     // Bind exclusive start key SK value
-    if let (Some(start_key), Some((sk_name, sk_type))) = (exclusive_start_key, sk_info) {
-        if let Some(sk_val) = start_key.get(sk_name) {
-            let sk = parse_sk(sk_val, sk_type)?;
-            query = bind_sk_value(query, &sk);
-        }
+    if let (Some(start_key), Some((sk_name, sk_type))) = (exclusive_start_key, sk_info)
+        && let Some(sk_val) = start_key.get(sk_name)
+    {
+        let sk = parse_sk(sk_val, sk_type)?;
+        query = bind_sk_value(query, &sk);
     }
 
     let rows: Vec<(serde_json::Value,)> = query
@@ -273,11 +273,11 @@ where
         let pk_text = pk_to_text(pk_val)?;
         query = query.bind(pk_text.into_owned());
 
-        if let Some((sk_name, sk_type)) = sk_info(key_schema, attr_defs) {
-            if let Some(sk_val) = start_key.get(sk_name) {
-                let sk = parse_sk(sk_val, sk_type)?;
-                query = bind_sk_value(query, &sk);
-            }
+        if let Some((sk_name, sk_type)) = sk_info(key_schema, attr_defs)
+            && let Some(sk_val) = start_key.get(sk_name)
+        {
+            let sk = parse_sk(sk_val, sk_type)?;
+            query = bind_sk_value(query, &sk);
         }
     }
 

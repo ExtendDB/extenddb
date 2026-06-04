@@ -95,7 +95,8 @@ class TestConditionExpressions:
         dynamodb_client.delete_item(
             TableName=name,
             Key={"pk": {"S": "k1"}},
-            ConditionExpression="status IN (:a, :b)",
+            ConditionExpression="#s IN (:a, :b)",
+            ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":a": {"S": "active"},
                 ":b": {"S": "pending"},
@@ -278,7 +279,8 @@ class TestUpdateExpressions:
         dynamodb_client.update_item(
             TableName=name,
             Key={"pk": {"S": "k1"}},
-            UpdateExpression="SET items = list_append(items, :new)",
+            UpdateExpression="SET #i = list_append(#i, :new)",
+            ExpressionAttributeNames={"#i": "items"},
             ExpressionAttributeValues={":new": {"L": [{"S": "b"}, {"S": "c"}]}},
         )
         resp = dynamodb_client.get_item(TableName=name, Key={"pk": {"S": "k1"}})
@@ -316,7 +318,8 @@ class TestUpdateExpressions:
         dynamodb_client.update_item(
             TableName=name,
             Key={"pk": {"S": "k1"}},
-            UpdateExpression="SET added = :v REMOVE drop",
+            UpdateExpression="SET added = :v REMOVE #d",
+            ExpressionAttributeNames={"#d": "drop"},
             ExpressionAttributeValues={":v": {"S": "new"}},
         )
         resp = dynamodb_client.get_item(TableName=name, Key={"pk": {"S": "k1"}})

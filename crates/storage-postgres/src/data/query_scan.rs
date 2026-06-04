@@ -220,7 +220,9 @@ impl PostgresEngine {
         if let Some(start_key) = exclusive_start_key {
             let pk_name = &key_info.key_schema[0].attribute_name;
             if !start_key.contains_key(pk_name) {
-                return Err(StorageError::Internal("missing pk in start key".to_owned()));
+                return Err(StorageError::Validation(
+                    "The provided starting key is invalid: The provided key element does not match the schema".to_owned(),
+                ));
             }
             // Actual PK/SK binding happens in execute_scan_sql.
 

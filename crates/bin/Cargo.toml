@@ -16,11 +16,12 @@ default = ["postgres"]
 postgres = ["extenddb-storage-postgres"]
 
 [dependencies]
+extenddb-auth = { workspace = true }
+extenddb-cache = { workspace = true }
 extenddb-core = { workspace = true }
 extenddb-engine = { workspace = true }
 extenddb-storage = { workspace = true }
 extenddb-storage-postgres = { workspace = true, optional = true }
-extenddb-auth = { workspace = true }
 extenddb-server = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
@@ -35,9 +36,6 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 syslog-tracing = { workspace = true }
-bcrypt = { workspace = true }
-aes-gcm = { workspace = true }
-rand = { workspace = true }
 base64 = { workspace = true }
 libc = { workspace = true }
 rcgen = { workspace = true }

@@ -26,7 +26,7 @@ If you prefer to run each step yourself, follow the sections below.
 
 ## Prerequisites
 
-- Rust 1.85+ (`rustup update`)
+- Rust 1.88+ (`rustup update`)
 - PostgreSQL 14+ via Homebrew (`brew install postgresql@17`)
 - Python 3.10+ (for test suites)
 - AWS CLI v2 (for testing)

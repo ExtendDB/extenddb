@@ -150,11 +150,18 @@ This is the minimal mechanism needed to honor DynamoDB's consistency model. It w
 
 ## 6. Design Decisions
 
-### D1: No In-Process State (Preserved)
+### D1: No In-Process State on the Data Path (Preserved, with one explicit revision)
 
-The existing "No Caching Rule" is preserved and strengthened. Frontends remain stateless. This is what makes horizontal frontend scaling trivial — any frontend can serve any request because all state lives in the catalog.
+The "No Caching Rule" applies to data-path state: items, query results, throttle buckets, stream cursors, and anything that varies per write. Frontends remain stateless on the data path — any frontend can serve any data request because all data state lives in the catalog.
 
-**Rationale:** Multiple frontends sharing a catalog would have stale caches. The No Caching Rule already anticipated this.
+**Revision (2026-05):** The auth/authz layer now caches IAM data (credentials, parsed policies, principal/resource tags, table key info) in-process for the request hot path. See [`12-auth-authz-cache.md`](12-auth-authz-cache.md) for the full design. This was a deliberate trade-off, not a violation of D1:
+
+- Auth/authz reads on the hot path were ~6 catalog queries per request (now ~0 in steady state). The performance gap had no other fix.
+- IAM data has bounded staleness tolerance: AWS IAM itself documents policy-propagation delays of ~30 s–2 min. ExtendDB exposes the same bound as `auth.cache.ttl_seconds` (default 60 s) and makes it operator-tunable.
+- Self-induced changes (admin API mutations) propagate **instantly** within a single instance via write-through invalidation hooks. Off-instance changes (multi-frontend, or direct DB writes) are bounded by the configured TTL.
+- The kill switch (`auth.cache.enabled = false`) restores the original "no caching" behavior without restart-triggered code changes.
+
+**Rationale (still valid for the data path):** Multiple frontends sharing a catalog would have stale caches. For data, that's intolerable. For IAM, bounded staleness is the same trade-off real AWS IAM exposes. Cross-frontend invalidation fanout for the IAM cache is designed in [Appendix B of `12-auth-authz-cache.md`](12-auth-authz-cache.md#appendix-b--multi-instance-cache-invalidation-deferred) but not yet implemented; deployments running multiple frontends should treat `auth.cache.ttl_seconds` as the worst-case lag for off-instance IAM mutations.
 
 ### D2: Consistency Routing Lives in the Storage Adapter
 
@@ -234,14 +241,16 @@ The `extenddb.toml` configuration accepts `pool_size` per connection target. The
 - DynamoDB's API doesn't expose partitioning to clients — any frontend must be able to serve any request.
 - Contradicts the "equally comfortable on a Raspberry Pi" requirement.
 
-### A3: Frontend-Level Read Replicas (Cached Reads)
+### A3: Frontend-Level Read Replicas (Cached Data Reads)
 
-**Approach:** Frontends cache recent reads and serve eventually-consistent reads from cache.
+**Approach:** Frontends cache recent **data** reads (item bodies, query results) and serve eventually-consistent reads from cache.
 
 **Rejected because:**
-- Violates the No Caching Rule.
-- Cache invalidation across frontends is the exact problem the No Caching Rule was designed to avoid.
+- Violates the No Caching Rule for data-path state.
+- Cache invalidation across frontends for arbitrary item writes is the exact problem the No Caching Rule was designed to avoid — every PutItem/UpdateItem would need to fan out to every frontend.
 - PostgreSQL's buffer pool already provides memory-resident access to hot data.
+
+**Note:** A narrow, bounded cache for **IAM data** (credentials, policies, tags) is implemented in [`12-auth-authz-cache.md`](12-auth-authz-cache.md). It applies the trade-off described in D1: bounded staleness on a slow-mutation, high-read-rate dataset, with TTLs that match AWS IAM's documented propagation window. That cache does not extend to data-path reads.
 
 ### A4: Single-Writer with Read Replicas at Frontend Level
 

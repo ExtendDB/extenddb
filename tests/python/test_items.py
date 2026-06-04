@@ -210,6 +210,17 @@ class TestPutItem:
             )
         assert exc_info.value.response["Error"]["Code"] == "ValidationException"
 
+    def test_put_item_rejects_empty_binary_key(self, table_factory, dynamodb_client):
+        """PutItem rejects empty binary values in key positions"""
+
+        name = table_factory(hash_type="B")
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.put_item(TableName=name, Item={"pk": {"B": b""}})
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException", err
+        assert "empty binary value" in err["Message"], err["Message"]
+        assert "Key: pk" in err["Message"], err["Message"]
+
 
 class TestGetItem:
     """GetItem API tests."""
@@ -381,7 +392,8 @@ class TestUpdateItem:
         dynamodb_client.update_item(
             TableName=name,
             Key={"pk": {"S": "key1"}},
-            UpdateExpression="ADD counter :inc",
+            UpdateExpression="ADD #c :inc",
+            ExpressionAttributeNames={"#c": "counter"},
             ExpressionAttributeValues={":inc": {"N": "5"}},
         )
         resp = dynamodb_client.get_item(TableName=name, Key={"pk": {"S": "key1"}})
@@ -522,7 +534,8 @@ class TestUpdateItem:
         dynamodb_client.update_item(
             TableName=name,
             Key={"pk": {"S": "key1"}},
-            UpdateExpression="SET items = list_append(items, :new)",
+            UpdateExpression="SET #i = list_append(#i, :new)",
+            ExpressionAttributeNames={"#i": "items"},
             ExpressionAttributeValues={":new": {"L": [{"S": "b"}]}},
         )
         resp = dynamodb_client.get_item(TableName=name, Key={"pk": {"S": "key1"}})

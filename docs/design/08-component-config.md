@@ -171,7 +171,7 @@ request_logging = true   # Log every request
 
 [metrics]
 enabled = true
-endpoint = "/metrics"    # Prometheus scrape endpoint path
+endpoint = "/metrics"    # JSON metrics endpoint path
 
 [ttl]
 enabled = true
@@ -280,22 +280,27 @@ Every request logs:
 
 ## 6. Metrics
 
-Using the `metrics` crate with `metrics-exporter-prometheus`:
+Metrics are collected in-memory by `MetricsCollector` (`crates/core/src/metrics/`)
+and exposed as JSON at `/metrics` (and persisted via `MetricsStore` for
+time-series queries). Names and dimensions follow the DynamoDB CloudWatch
+vocabulary; the wire format is custom JSON, not Prometheus exposition format.
+See `docs/design/06-component-server.md` §7.2 for the full schema and metric list.
+
+Recording is done through the collector's `record_*` methods rather than a
+generic `metrics` facade:
 
 ```rust
-use metrics::{counter, histogram};
+use extenddb_core::metrics::{MetricsCollector, MetricName, Dimension};
 
-pub fn record_request(operation: &str, status: u16, latency: Duration) {
-    counter!("dynamodb_requests_total", "operation" => operation.to_string(), "status" => status.to_string()).increment(1);
-    histogram!("dynamodb_request_duration_seconds", "operation" => operation.to_string()).record(latency.as_secs_f64());
-}
-
-pub fn record_capacity(table: &str, rcu: f64, wcu: f64) {
-    // Track in milli-units to preserve fractional capacity (e.g., 0.5 RCU for eventually consistent reads)
-    counter!("dynamodb_consumed_rcu_milli_total", "table" => table.to_string()).increment((rcu * 1000.0) as u64);
-    counter!("dynamodb_consumed_wcu_milli_total", "table" => table.to_string()).increment((wcu * 1000.0) as u64);
+fn record_request(metrics: &MetricsCollector, operation: &str, latency_us: f64) {
+    metrics.record(
+        MetricName::SuccessfulRequestLatency,
+        &[Dimension::Operation(operation.to_owned())],
+        latency_us,
+    );
 }
 ```
+
 
 ## 7. Background Workers
 

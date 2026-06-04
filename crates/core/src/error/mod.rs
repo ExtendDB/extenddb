@@ -10,7 +10,7 @@ use crate::types::{CancellationReason, Item};
 ///
 /// REQ-ERR-001 through REQ-ERR-004: error JSON format, status codes, and SDK retry behavior.
 /// SP-ERR-002: HTTP status codes match the real DynamoDB error catalog exactly.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum DynamoDbError {
     #[error("{0}")]

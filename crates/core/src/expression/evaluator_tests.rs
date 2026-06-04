@@ -153,11 +153,36 @@ fn begins_with_false() {
 }
 
 #[test]
+fn begins_with_rejects_number_operand() {
+    let item = simple_item();
+    let mut values = HashMap::new();
+    values.insert("p".into(), AttributeValue::N("1".into()));
+    let result = eval("begins_with(name, :p)", &item, HashMap::new(), values);
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("operand type: N"));
+}
+
+#[test]
 fn contains_string_substring() {
     let item = simple_item();
     let mut values = HashMap::new();
     values.insert("s".into(), AttributeValue::S("lic".into()));
     assert!(eval("contains(name, :s)", &item, HashMap::new(), values).unwrap());
+}
+
+#[test]
+fn contains_duplicate_operand_rejected() {
+    let item = simple_item();
+    let result = eval(
+        "contains(name, name)",
+        &item,
+        HashMap::new(),
+        HashMap::new(),
+    );
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("first operand must be distinct"));
 }
 
 #[test]
@@ -221,6 +246,16 @@ fn size_function_in_comparison() {
     let mut values = HashMap::new();
     values.insert("sz".into(), AttributeValue::N("3".into()));
     assert!(eval("size(data) > :sz", &item, HashMap::new(), values).unwrap());
+}
+
+#[test]
+fn size_function_uses_utf16_code_units() {
+    // "é" = 1 UTF-16 code unit, "𝄞" = 2 UTF-16 code units (surrogate pair) → total 3
+    let mut item = BTreeMap::new();
+    item.insert("s".into(), AttributeValue::S("é𝄞".into()));
+    let mut values = HashMap::new();
+    values.insert("n".into(), AttributeValue::N("3".into()));
+    assert!(eval("size(s) = :n", &item, HashMap::new(), values).unwrap());
 }
 
 #[test]

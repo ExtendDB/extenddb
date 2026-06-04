@@ -13,6 +13,8 @@ pub(crate) use account::generate_account_id;
 mod admin;
 mod assume_role;
 mod auth;
+pub mod cache_invalidate;
+mod cache_metrics;
 pub(crate) mod crypto;
 mod iam_group;
 mod iam_policy;
@@ -36,6 +38,17 @@ pub use auth::CallerIdentity;
 pub struct ManagementState {
     /// Catalog store implementing operational storage traits.
     pub catalog_store: Arc<dyn extenddb_storage::CatalogStore>,
+    /// Auth/authz cache registry. Used by mutation handlers to issue
+    /// write-through invalidations so self-induced IAM changes propagate
+    /// instantly within the local instance.
+    pub auth_cache: extenddb_auth::AuthCacheRegistry,
+    /// Concrete authorization cache handle, used by the `/management/auth-cache-metrics`
+    /// endpoint to expose per-sub-cache counters. The same instance is held
+    /// trait-object-style in `auth_cache.authz` for invalidation calls.
+    pub authz_cache: Arc<crate::CachedAuthzStore>,
+    /// Concrete TableKeyInfo cache handle, used by the auth-cache-metrics
+    /// endpoint. Same instance is held in `auth_cache.table_key_info`.
+    pub table_key_info_cache: Arc<crate::CachedTableKeyInfoStore>,
 }
 
 /// Build the management API router.
@@ -186,6 +199,16 @@ pub fn router() -> Router<Arc<ManagementState>> {
         .route("/settings", get(settings::list_settings))
         .route("/settings/{key}", get(settings::get_setting))
         .route("/settings/{key}", put(settings::set_setting))
+        // Cache observability (admin only). Exposes per-cache hit/miss/
+        // refresh counters and current entry counts. Authenticated via the
+        // standard admin Basic auth.
+        .route(
+            "/auth-cache-metrics",
+            get(cache_metrics::auth_cache_metrics),
+        )
+        // Manual cache invalidation (admin only break-glass tool).
+        // See docs/design/12-auth-authz-cache.md §6.1.
+        .route("/cache/invalidate", post(cache_invalidate::invalidate))
 }
 
 /// Validate an IAM name: 1-128 chars, alphanumeric, hyphens, underscores, dots, plus, equals, at.

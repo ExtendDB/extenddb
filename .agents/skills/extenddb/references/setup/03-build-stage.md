@@ -59,4 +59,4 @@ This should print the extenddb version string. If it does not, the build failed 
 cargo build --release --verbose
 ```
 
-Common causes of silent build failure are a missing system library (for example, `libpq-dev` or `openssl-dev` on Linux), a Rust toolchain older than 1.85, or a disk full condition under `target/`. The verbose output names the failing crate and the missing dependency.
+Common causes of silent build failure are a missing system library (for example, `libpq-dev` or `openssl-dev` on Linux), a Rust toolchain older than 1.88, or a disk full condition under `target/`. The verbose output names the failing crate and the missing dependency.

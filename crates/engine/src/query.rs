@@ -13,14 +13,14 @@ use extenddb_core::expression::{
     ExpressionMaps, parse_key_condition, parse_projection, tokenize_for,
 };
 use extenddb_core::types::{
-    IndexType, KeyType, QueryInput, QueryOutput, Select, TableKeyInfo, item_size_bytes,
+    IndexType, KeyType, QueryInput, QueryOutput, Select, TableKeyInfo, extract_key, item_size_bytes,
 };
 
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
-use crate::index_helpers::combined_lek_key_schema;
+use crate::index_helpers::{combined_lek_key_schema, validate_query_exclusive_start_key};
 use crate::legacy_filter::{desugar_filter, desugar_key_conditions};
 use crate::read_helpers::apply_post_read;
 use crate::serialize_output;
@@ -62,23 +62,22 @@ pub async fn handle_query(
     };
 
     // ConsistentRead is not supported on GSI queries (tenet 1: fidelity).
-    if input.consistent_read == Some(true) {
-        if let Some(ref idx) = index_info {
-            if idx.index_type == IndexType::Gsi {
-                return Err(DynamoDbError::ValidationException(
-                    "Consistent reads are not supported on global secondary indexes".to_owned(),
-                ));
-            }
-        }
+    if input.consistent_read == Some(true)
+        && let Some(ref idx) = index_info
+        && idx.index_type == IndexType::Gsi
+    {
+        return Err(DynamoDbError::ValidationException(
+            "Consistent reads are not supported on global secondary indexes".to_owned(),
+        ));
     }
 
     // Validate Limit >= 1 (REQ-QUERY-001)
-    if let Some(limit) = input.limit {
-        if limit < 1 {
-            return Err(DynamoDbError::ValidationException(
+    if let Some(limit) = input.limit
+        && limit < 1
+    {
+        return Err(DynamoDbError::ValidationException(
                 "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1".to_owned(),
             ));
-        }
     }
 
     // For index queries, build a key_info that reflects the index's key schema
@@ -284,10 +283,10 @@ pub async fn handle_query(
         if let Some(ref proj) = projection {
             for path in proj {
                 for el in path {
-                    if let PathElement::Attribute(name) = el {
-                        if let Some(ref_name) = name.strip_prefix('#') {
-                            kc_names.insert(ref_name.to_owned());
-                        }
+                    if let PathElement::Attribute(name) = el
+                        && let Some(ref_name) = name.strip_prefix('#')
+                    {
+                        kc_names.insert(ref_name.to_owned());
                     }
                 }
             }
@@ -303,26 +302,26 @@ pub async fn handle_query(
     }
 
     // Validate Select vs ProjectionExpression and index requirements
-    if let Some(Select::SpecificAttributes) = input.select {
-        if effective_projection_str.is_none() {
-            return Err(DynamoDbError::ValidationException(
+    if let Some(Select::SpecificAttributes) = input.select
+        && effective_projection_str.is_none()
+    {
+        return Err(DynamoDbError::ValidationException(
                 "1 validation error detected: Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES".to_owned(),
             ));
-        }
     }
-    if let Some(Select::AllProjectedAttributes) = input.select {
-        if index_info.is_none() {
-            return Err(DynamoDbError::ValidationException(
-                "ALL_PROJECTED_ATTRIBUTES can be used only when querying an index".to_owned(),
-            ));
-        }
+    if let Some(Select::AllProjectedAttributes) = input.select
+        && index_info.is_none()
+    {
+        return Err(DynamoDbError::ValidationException(
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_owned(),
+        ));
     }
-    if let Some(Select::Count) = input.select {
-        if effective_projection_str.is_some() {
-            return Err(DynamoDbError::ValidationException(
-                "Cannot specify the ProjectionExpression when Select is COUNT".to_owned(),
-            ));
-        }
+    if let Some(Select::Count) = input.select
+        && effective_projection_str.is_some()
+    {
+        return Err(DynamoDbError::ValidationException(
+            "Cannot specify the ProjectionExpression when Select is COUNT".to_owned(),
+        ));
     }
 
     // When Select=ALL_PROJECTED_ATTRIBUTES, capture the index info for post-read filtering.
@@ -353,6 +352,18 @@ pub async fn handle_query(
         ExpressionMaps::new(names, values)
     };
 
+    // Validate begins_with operand types upfront (before any rows are read).
+    if let Some(ref f) = filter {
+        extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
+            |e| crate::expression_helpers::prefix_expression_error(e, "FilterExpression"),
+        )?;
+    }
+
+    // Validate ExclusiveStartKey matches the key schema
+    if let Some(ref start_key) = input.exclusive_start_key {
+        validate_query_exclusive_start_key(start_key, &key_info, index_info.as_ref())?;
+    }
+
     // Query storage
     let (raw_items, storage_last_key) = ctx
         .storage
@@ -377,10 +388,19 @@ pub async fn handle_query(
     // For index queries, the LEK includes both the index key and the base table key.
     let lek_key_schema = combined_lek_key_schema(&key_info.key_schema, index_info.as_ref());
 
+    // For index queries, enrich the storage LEK with base table key attributes.
+    let enriched_storage_last_key = if storage_last_key.is_some() && index_info.is_some() {
+        raw_items
+            .last()
+            .map(|item| extract_key(item, &lek_key_schema))
+    } else {
+        storage_last_key
+    };
+
     // Apply FilterExpression, ProjectionExpression, and 1 MB limit
     let result = apply_post_read(
         &raw_items,
-        storage_last_key,
+        enriched_storage_last_key,
         &filter,
         &projection,
         &combined_maps,
@@ -444,17 +464,17 @@ fn validate_name_refs_in_expr(
     match expr {
         Expr::Path(elements) => {
             for el in elements {
-                if let PathElement::Attribute(name) = el {
-                    if let Some(ref_name) = name.strip_prefix('#') {
-                        let key_with_hash = format!("#{ref_name}");
-                        let defined = names.as_ref().is_some_and(|m| {
-                            m.contains_key(ref_name) || m.contains_key(key_with_hash.as_str())
-                        });
-                        if !defined {
-                            return Err(DynamoDbError::ValidationException(format!(
-                                "Invalid {expr_type}: An expression attribute name used in the document path is not defined; attribute name: #{ref_name}"
-                            )));
-                        }
+                if let PathElement::Attribute(name) = el
+                    && let Some(ref_name) = name.strip_prefix('#')
+                {
+                    let key_with_hash = format!("#{ref_name}");
+                    let defined = names.as_ref().is_some_and(|m| {
+                        m.contains_key(ref_name) || m.contains_key(key_with_hash.as_str())
+                    });
+                    if !defined {
+                        return Err(DynamoDbError::ValidationException(format!(
+                            "Invalid {expr_type}: An expression attribute name used in the document path is not defined; attribute name: #{ref_name}"
+                        )));
                     }
                 }
             }

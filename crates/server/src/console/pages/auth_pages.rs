@@ -87,7 +87,8 @@ pub async fn logout(State(state): State<Arc<ConsoleState>>, headers: HeaderMap) 
     if let Some(token) = extract_session_token(&headers) {
         state.sessions.remove(&token).await;
     }
-    let cookie = "extenddb_session=; Path=/console; HttpOnly; SameSite=Strict; Max-Age=0".to_string();
+    let cookie =
+        "extenddb_session=; Path=/console; HttpOnly; SameSite=Strict; Max-Age=0".to_string();
     (
         StatusCode::SEE_OTHER,
         [("location", "/console/login"), ("set-cookie", &cookie)],

@@ -65,6 +65,12 @@ pub async fn create_access_key(
         .await
     {
         Ok(key) => {
+            // Drop any negative cache entry for this newly-issued key id —
+            // mirrors management::iam_user_self::create_access_key.
+            state
+                .auth_cache
+                .invalidate_credential(&key.access_key_id)
+                .await;
             let content = format!(
                 r#"{crumbs}<h1>Access Key Created</h1>
 {}
@@ -138,8 +144,12 @@ pub async fn delete_access_key(
         .delete_access_key(&account_id, &user_name, &key_id)
         .await
     {
-        Ok(()) => Redirect::to(&format!("/console/accounts/{account_id}/users/{user_name}"))
-            .into_response(),
+        Ok(()) => {
+            // Mirror management::iam_user_self::delete_access_key.
+            state.auth_cache.invalidate_credential(&key_id).await;
+            Redirect::to(&format!("/console/accounts/{account_id}/users/{user_name}"))
+                .into_response()
+        }
         Err(e) => {
             let nav = html::nav_bar(&identity_label(&session.identity));
             let content = format!("<h1>Error</h1>{}", html::alert_error(&op_error_message(e)));

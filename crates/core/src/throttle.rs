@@ -314,23 +314,23 @@ impl ThrottleManager {
         }
 
         // Check per-partition bucket (1000 WCU/s, 3000 RCU/s per partition).
-        if let Some(pv) = partition_value {
-            if let Ok(mut partitions) = self.partitions.write() {
-                let pk = PartitionKey {
-                    account_id: account_id.to_owned(),
-                    table_name: table_name.to_owned(),
-                    partition_value: pv.to_owned(),
-                };
-                let buckets = partitions.entry(pk).or_insert_with(|| TableBuckets {
-                    read: TokenBucket::new(PARTITION_RCU_LIMIT),
-                    write: TokenBucket::new(PARTITION_WCU_LIMIT),
-                });
-                if is_read && !buckets.read.has_capacity(now) {
-                    return ThrottleResult::ThrottledRead;
-                }
-                if is_write && !buckets.write.has_capacity(now) {
-                    return ThrottleResult::ThrottledWrite;
-                }
+        if let Some(pv) = partition_value
+            && let Ok(mut partitions) = self.partitions.write()
+        {
+            let pk = PartitionKey {
+                account_id: account_id.to_owned(),
+                table_name: table_name.to_owned(),
+                partition_value: pv.to_owned(),
+            };
+            let buckets = partitions.entry(pk).or_insert_with(|| TableBuckets {
+                read: TokenBucket::new(PARTITION_RCU_LIMIT),
+                write: TokenBucket::new(PARTITION_WCU_LIMIT),
+            });
+            if is_read && !buckets.read.has_capacity(now) {
+                return ThrottleResult::ThrottledRead;
+            }
+            if is_write && !buckets.write.has_capacity(now) {
+                return ThrottleResult::ThrottledWrite;
             }
         }
 
@@ -391,23 +391,23 @@ impl ThrottleManager {
         }
 
         // Consume from per-partition bucket if partition value is known.
-        if let Some(pv) = partition_value {
-            if let Ok(mut partitions) = self.partitions.write() {
-                let pk = PartitionKey {
-                    account_id: account_id.to_owned(),
-                    table_name: table_name.to_owned(),
-                    partition_value: pv.to_owned(),
-                };
-                let buckets = partitions.entry(pk).or_insert_with(|| TableBuckets {
-                    read: TokenBucket::new(PARTITION_RCU_LIMIT),
-                    write: TokenBucket::new(PARTITION_WCU_LIMIT),
-                });
-                if read_units > 0.0 {
-                    buckets.read.consume(read_units, now);
-                }
-                if write_units > 0.0 {
-                    buckets.write.consume(write_units, now);
-                }
+        if let Some(pv) = partition_value
+            && let Ok(mut partitions) = self.partitions.write()
+        {
+            let pk = PartitionKey {
+                account_id: account_id.to_owned(),
+                table_name: table_name.to_owned(),
+                partition_value: pv.to_owned(),
+            };
+            let buckets = partitions.entry(pk).or_insert_with(|| TableBuckets {
+                read: TokenBucket::new(PARTITION_RCU_LIMIT),
+                write: TokenBucket::new(PARTITION_WCU_LIMIT),
+            });
+            if read_units > 0.0 {
+                buckets.read.consume(read_units, now);
+            }
+            if write_units > 0.0 {
+                buckets.write.consume(write_units, now);
             }
         }
 

@@ -165,38 +165,36 @@ impl PostgresEngine {
                     return Err(StorageError::ConditionFailed(winner_item));
                 }
             }
+        } else if old_json.is_some() {
+            let update_sql = format!("UPDATE {ddb_table} SET item_data = $2 WHERE pk = $1");
+            sqlx::query(&update_sql)
+                .bind(pk_text.as_ref())
+                .bind(&item_json)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
         } else {
-            if old_json.is_some() {
-                let update_sql = format!("UPDATE {ddb_table} SET item_data = $2 WHERE pk = $1");
-                sqlx::query(&update_sql)
+            let insert_sql = format!(
+                "INSERT INTO {ddb_table} (pk, item_data) VALUES ($1, $2) \
+                 ON CONFLICT (pk) DO NOTHING"
+            );
+            let result = sqlx::query(&insert_sql)
+                .bind(pk_text.as_ref())
+                .bind(&item_json)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if result.rows_affected() == 0 {
+                // Another transaction inserted between our SELECT and INSERT.
+                // Fetch the winner to return with ConditionFailed.
+                let winner_sql = format!("SELECT item_data FROM {ddb_table} WHERE pk = $1");
+                let winner: Option<(serde_json::Value,)> = sqlx::query_as(&winner_sql)
                     .bind(pk_text.as_ref())
-                    .bind(&item_json)
-                    .execute(&mut *tx)
+                    .fetch_optional(&mut *tx)
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
-            } else {
-                let insert_sql = format!(
-                    "INSERT INTO {ddb_table} (pk, item_data) VALUES ($1, $2) \
-                     ON CONFLICT (pk) DO NOTHING"
-                );
-                let result = sqlx::query(&insert_sql)
-                    .bind(pk_text.as_ref())
-                    .bind(&item_json)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                if result.rows_affected() == 0 {
-                    // Another transaction inserted between our SELECT and INSERT.
-                    // Fetch the winner to return with ConditionFailed.
-                    let winner_sql = format!("SELECT item_data FROM {ddb_table} WHERE pk = $1");
-                    let winner: Option<(serde_json::Value,)> = sqlx::query_as(&winner_sql)
-                        .bind(pk_text.as_ref())
-                        .fetch_optional(&mut *tx)
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    let winner_item = winner.map(|(v,)| json_to_item(v)).transpose()?;
-                    return Err(StorageError::ConditionFailed(winner_item));
-                }
+                let winner_item = winner.map(|(v,)| json_to_item(v)).transpose()?;
+                return Err(StorageError::ConditionFailed(winner_item));
             }
         }
 

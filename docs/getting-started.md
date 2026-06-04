@@ -30,7 +30,7 @@ software on your behalf. After the script completes, continue from
 ## Prerequisites
 
 - PostgreSQL 14+ running locally (see `docs/local-postgres-setup.md`)
-- Rust toolchain (1.85+)
+- Rust toolchain (1.88+)
 - AWS CLI v2 (for testing)
 - Python 3.10+ with virtual environment (see [Python Environment Setup](../README.md#python-environment-setup) in the README)
 
@@ -90,6 +90,9 @@ For remote PostgreSQL or Aurora, supply the admin password with `--pg-pass`:
 
 When `--pg-pass` is omitted entirely, `extenddb init` connects without a password, relying on
 PostgreSQL peer/ident authentication (works only on localhost via Unix socket).
+
+**Note:** When using Unix socket connections, specify the socket directory with `--pg-host` using an
+absolute path (e.g., `--pg-host /var/run/postgresql`). Relative paths are not supported.
 
 ### Custom bind address
 
@@ -1283,6 +1286,30 @@ catalog_pool_size = 50
 - **Different items:** Fully concurrent up to `pool_size`. No contention.
 - **Same item:** Concurrent writes to the same item serialize on PostgreSQL's row lock (`SELECT ... FOR UPDATE`). All updates succeed, but throughput for a single hot item is bounded by single-row transaction rate.
 - **Reads:** GetItem and Query do not acquire row locks and proceed concurrently with writes.
+
+### Auth/authz caching
+
+Each DynamoDB request normally issues ~6 catalog queries during auth/authz (credential lookup, identity policies, group policies, permissions boundary, principal tags, resource tags) plus a 7th for the table's key schema. ExtendDB layers an in-memory stale-while-revalidate cache over each of these to eliminate the round-trip in steady state.
+
+Configured via `[auth.cache]`:
+
+```toml
+[auth.cache]
+enabled            = true   # master kill switch
+ttl_seconds        = 60     # hard TTL — entries older than this are full misses
+soft_ttl_seconds   = 30     # entries older than this serve cached AND trigger
+                            #   a background refresh (request does not block)
+negative_ttl_seconds = 5    # how long "not found" results are remembered
+max_entries        = 10000  # per-cache LRU cap
+```
+
+**Self-induced changes** (admin API and console mutations: `CreateAccessKey`, `PutUserPolicy`, `TagResource`, `CreateTable`, etc.) propagate instantly via write-through invalidation on the local instance.
+
+**Fanout invalidations** (`DeleteAccount`, `DeleteRole` session sweep, `DeleteGroup` member fanout) complete asynchronously; there is a brief (~ms) window between the API responding success and the eviction landing. For hard cutover, prefer single-key invalidations (`DeleteAccessKey`) over cascades.
+
+**Off-instance changes** (multi-node deployments, or direct DB writes outside the management API) take up to `ttl_seconds` to propagate.
+
+Cache statistics are exposed at `/management/auth-cache-metrics` (JSON, admin-authenticated): hit / stale-hit / miss counts, refresh successes and failures, current entry counts per cache, and a `pass_through` flag per cache (distinguishes "disabled" from "cold").
 
 ## Troubleshooting
 

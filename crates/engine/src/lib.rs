@@ -151,6 +151,12 @@ pub(crate) fn deserialize_error(e: serde_json::Error) -> DynamoDbError {
     if msg.contains("validation error detected")
         || msg.contains("may not be empty")
         || msg.contains("contains duplicates")
+        || msg.contains("must not be empty")
+        || msg.contains("contains invalid key")
+        || msg.contains("Syntax error; key")
+        || msg.contains("AttributeValue is empty")
+        || msg.contains("AttributeValue has more than one datatypes set")
+        || msg.contains("parameter values were invalid")
     {
         DynamoDbError::ValidationException(msg)
     } else {
@@ -174,16 +180,15 @@ pub(crate) fn validate_enum_fields(
     };
     let mut errors: Vec<String> = Vec::new();
     for &(json_name, api_name, valid) in fields {
-        if let Some(val) = obj.get(json_name) {
-            if let Some(s) = val.as_str() {
-                if !valid.contains(&s) {
-                    errors.push(format!(
-                        "Value '{s}' at '{api_name}' failed to satisfy constraint: \
+        if let Some(val) = obj.get(json_name)
+            && let Some(s) = val.as_str()
+            && !valid.contains(&s)
+        {
+            errors.push(format!(
+                "Value '{s}' at '{api_name}' failed to satisfy constraint: \
                          Member must satisfy enum value set: [{}]",
-                        valid.join(", ")
-                    ));
-                }
-            }
+                valid.join(", ")
+            ));
         }
     }
     if errors.is_empty() {
@@ -262,6 +267,15 @@ pub struct OperationContext {
     /// Populated for single-table item-level operations; `None` for table-level
     /// and batch/transact operations.
     pub pre_fetched_key_info: Option<extenddb_core::types::TableKeyInfo>,
+    /// Auth/authz cache handles. Used by control-plane and tagging operations
+    /// to issue write-through cache invalidations after the underlying state
+    /// changes (e.g. `TagResource` invalidates the resource-tags cache).
+    pub auth_cache: extenddb_auth::AuthCacheRegistry,
+    /// Optional cached `TableKeyInfo` lookup. When set, batch / transact /
+    /// multi-table engine handlers route through this instead of calling
+    /// `storage.table_key_info` directly. When unset (e.g. unit tests), the
+    /// engine falls back to direct storage lookups.
+    pub table_key_info_lookup: Option<Arc<dyn extenddb_storage::TableKeyInfoLookup>>,
 }
 
 impl OperationContext {
@@ -272,10 +286,14 @@ impl OperationContext {
         &self,
         table_name: &str,
     ) -> Result<extenddb_core::types::TableKeyInfo, extenddb_storage::error::StorageError> {
-        if let Some(ref ki) = self.pre_fetched_key_info {
-            if ki.table_name == table_name && *ki.account_id == *self.account_id {
-                return Ok(ki.clone());
-            }
+        if let Some(ref ki) = self.pre_fetched_key_info
+            && ki.table_name == table_name
+            && *ki.account_id == *self.account_id
+        {
+            return Ok(ki.clone());
+        }
+        if let Some(ref lookup) = self.table_key_info_lookup {
+            return lookup.lookup(&self.account_id, table_name).await;
         }
         self.storage
             .table_key_info(&self.account_id, table_name)

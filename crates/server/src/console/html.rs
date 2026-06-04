@@ -172,6 +172,7 @@ pub fn nav_bar(identity_label: &str) -> String {
 <a href="/console/accounts">Accounts</a>
 <a href="/console/metrics">Metrics</a>
 <a href="/console/settings">Settings</a>
+<a href="/console/cache">Cache</a>
 <span class="spacer"></span>
 <span>{identity}</span>
 <form class="inline" method="post" action="/console/logout">

@@ -86,8 +86,7 @@ impl PreparedOp {
                 // Use key size + expression attribute values size as a better
                 // approximation of the data involved in the update.
                 let key_size = extenddb_core::types::item_size_bytes(key);
-                let values_size: usize =
-                    maps.values.values().map(attribute_value_size).sum();
+                let values_size: usize = maps.values.values().map(attribute_value_size).sum();
                 key_size + values_size
             }
         }
@@ -308,6 +307,17 @@ pub(crate) fn validate_no_key_updates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transact_condition_redundant_parens_rejected_with_canonical_message() {
+        let limits = extenddb_core::limits::LimitsConfig::default();
+        let err = parse_optional_condition(Some("((a = :v))"), &limits).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if msg == "Invalid ConditionExpression: The expression has redundant parentheses;"),
+            "got {err:?}"
+        );
+    }
 
     #[test]
     fn validate_token_valid() {
