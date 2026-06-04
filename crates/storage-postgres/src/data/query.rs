@@ -323,19 +323,19 @@ pub(crate) async fn execute_scan_sql(
         }
 
         // Bind base table PK for index scans
-        if let Some(base_pk_name) = base_pk_attr_name {
-            if let Some(base_pk_val) = start_key.get(base_pk_name) {
-                let base_pk_text = pk_to_text(base_pk_val)?;
-                query = query.bind(base_pk_text.into_owned());
-            }
+        if let Some(base_pk_name) = base_pk_attr_name
+            && let Some(base_pk_val) = start_key.get(base_pk_name)
+        {
+            let base_pk_text = pk_to_text(base_pk_val)?;
+            query = query.bind(base_pk_text.into_owned());
         }
 
         // Bind base table SK for index scans (if base table has a sort key)
-        if let Some((base_sk_name, base_sk_type)) = base_sk_info {
-            if let Some(base_sk_val) = start_key.get(base_sk_name.as_str()) {
-                let sk = parse_sk(base_sk_val, *base_sk_type)?;
-                query = bind_sk_value(query, &sk);
-            }
+        if let Some((base_sk_name, base_sk_type)) = base_sk_info
+            && let Some(base_sk_val) = start_key.get(base_sk_name.as_str())
+        {
+            let sk = parse_sk(base_sk_val, *base_sk_type)?;
+            query = bind_sk_value(query, &sk);
         }
     }
 

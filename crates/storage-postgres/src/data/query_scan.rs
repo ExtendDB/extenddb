@@ -46,6 +46,10 @@ fn build_pagination_where(
             } else {
                 ""
             };
+            // LSI: base SK follows ScanIndexForward because items share the
+            // same partition and the base SK is part of the composite sort order.
+            // GSI: base SK is always ">" (ascending) because it's only a
+            // uniqueness tie-breaker, not a user-visible sort dimension.
             let base_cmp = if is_lsi { cmp } else { ">" };
             format!(
                 " AND ({sk_col}{collate} {cmp} ${p1} OR \
@@ -297,7 +301,7 @@ impl PostgresEngine {
                 let base_pk_attr = &key_info.base_key_schema[0].attribute_name;
                 let base_pk = start_key
                     .get(base_pk_attr.as_str())
-                    .map(|v| pk_to_text(v))
+                    .map(pk_to_text)
                     .transpose()?
                     .map(|c| c.into_owned());
                 match (base_pk, &base_sk_info) {

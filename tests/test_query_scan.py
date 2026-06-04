@@ -1187,6 +1187,41 @@ class TestGSIOnHashOnlyBaseTable:
                 f"Run {run+1}: expected 7 items but got {len(all_items)}"
             )
 
+    def test_paginate_reverse_gsi_with_tied_sort_keys(
+        self, dynamodb_client, gsi_on_hash_only_base_table
+    ):
+        """Reverse GSI pagination (ScanIndexForward=False) with tied sort keys.
+
+        All 7 items share the same GSI sort key (priority=1). The tie-breaker
+        for GSI uses base_pk in ascending order regardless of ScanIndexForward.
+        If the tie-breaker accidentally followed ScanIndexForward, reverse
+        pagination would skip items or loop.
+        """
+        all_items = []
+        exclusive_start_key = None
+        while True:
+            kwargs = {
+                "TableName": gsi_on_hash_only_base_table,
+                "IndexName": "CategoryPriorityGSI",
+                "KeyConditionExpression": "category = :c",
+                "ExpressionAttributeValues": {":c": {"S": "urgent"}},
+                "ScanIndexForward": False,
+                "Limit": 3,
+            }
+            if exclusive_start_key:
+                kwargs["ExclusiveStartKey"] = exclusive_start_key
+            resp = dynamodb_client.query(**kwargs)
+            all_items.extend(resp["Items"])
+            if "LastEvaluatedKey" not in resp:
+                break
+            exclusive_start_key = resp["LastEvaluatedKey"]
+
+        assert len(all_items) == 7, (
+            f"Reverse GSI pagination: expected 7 items but got {len(all_items)}"
+        )
+        ids = [item["itemId"]["S"] for item in all_items]
+        assert len(ids) == len(set(ids)), "Duplicate items in reverse GSI pagination"
+
 
 @pytest.fixture(scope="class")
 def base_key_schema_table(dynamodb_client):
