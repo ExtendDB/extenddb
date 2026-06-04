@@ -68,6 +68,8 @@ pub async fn handle_put_item(
             || msg.contains("validation error detected")
             || msg.contains("must not be empty")
             || msg.contains("Syntax error; key")
+            || msg.contains("AttributeValue is empty")
+            || msg.contains("AttributeValue has more than one datatypes set")
         {
             DynamoDbError::ValidationException(msg)
         } else {

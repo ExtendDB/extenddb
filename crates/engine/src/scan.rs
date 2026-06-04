@@ -87,10 +87,20 @@ pub async fn handle_scan(
                     "The parameter TotalSegments should be greater than or equal to 1".to_owned(),
                 ));
             }
+            if total > 1_000_000 {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "1 validation error detected: Value '{total}' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"
+                )));
+            }
             if seg < 0 {
                 return Err(DynamoDbError::ValidationException(format!(
                     "1 validation error detected: Value '{}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0",
                     seg
+                )));
+            }
+            if seg > 999_999 {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value less than or equal to 999999"
                 )));
             }
             if seg >= total {
@@ -233,7 +243,7 @@ pub async fn handle_scan(
         && index_info.is_none()
     {
         return Err(DynamoDbError::ValidationException(
-            "ALL_PROJECTED_ATTRIBUTES can be used only when scanning an index".to_owned(),
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_owned(),
         ));
     }
     if let Some(Select::Count) = input.select

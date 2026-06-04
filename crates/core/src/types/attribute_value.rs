@@ -78,12 +78,16 @@ impl<'de> Visitor<'de> for AttributeValueVisitor {
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let (key, value): (String, serde_json::Value) = map
             .next_entry()?
-            .ok_or_else(|| de::Error::custom("empty AttributeValue map"))?;
+            .ok_or_else(|| {
+                de::Error::custom(
+                    "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes",
+                )
+            })?;
 
         // REQ-TYPE-001: reject if multiple keys
         if map.next_key::<String>()?.is_some() {
             return Err(de::Error::custom(
-                "Supplied AttributeValue has more than one datatypes set",
+                "Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes",
             ));
         }
 
@@ -127,7 +131,11 @@ impl<'de> Visitor<'de> for AttributeValueVisitor {
                     .map(|v| {
                         v.as_str()
                             .map(std::borrow::ToOwned::to_owned)
-                            .ok_or_else(|| de::Error::custom("SS elements must be strings"))
+                            .ok_or_else(|| {
+                                de::Error::custom(
+                                    "One or more parameter values were invalid: An string set may not have a null string as a member",
+                                )
+                            })
                     })
                     .collect::<Result<_, _>>()?;
                 let values: Vec<String> = arr
@@ -156,7 +164,11 @@ impl<'de> Visitor<'de> for AttributeValueVisitor {
                     .map(|v| {
                         let s = v
                             .as_str()
-                            .ok_or_else(|| de::Error::custom("NS elements must be strings"))?;
+                            .ok_or_else(|| {
+                                de::Error::custom(
+                                    "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes",
+                                )
+                            })?;
                         Ok(crate::validation::number::validate_and_normalize_number(s)
                             .unwrap_or_else(|_| s.to_owned()))
                     })
@@ -184,7 +196,11 @@ impl<'de> Visitor<'de> for AttributeValueVisitor {
                     .map(|v| {
                         let b64 = v
                             .as_str()
-                            .ok_or_else(|| de::Error::custom("BS elements must be strings"))?;
+                            .ok_or_else(|| {
+                                de::Error::custom(
+                                    "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes",
+                                )
+                            })?;
                         BASE64
                             .decode(b64)
                             .map_err(|e| de::Error::custom(format!("invalid base64: {e}")))
@@ -459,5 +475,101 @@ mod tests {
         let json = serde_json::to_string(&val).unwrap();
         let parsed: AttributeValue = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, val);
+    }
+
+    // ─── Empty AttributeValue map and multiple-keys (DDB error parity) ─────
+    //
+    // The AWS Java SDK omits null-valued fields from JSON, so calls like
+    // `attrVal.setBOOL(null)` serialize to a literal `{}` AttributeValue.
+    // Real DynamoDB rejects these with a `ValidationException` whose
+    // message starts with "Supplied AttributeValue is empty". Match that
+    // wording so the engine-level error classifier promotes it to
+    // `ValidationException` instead of `SerializationException`.
+
+    #[test]
+    fn empty_map_rejected_with_ddb_message() {
+        let err = serde_json::from_str::<AttributeValue>("{}").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Supplied AttributeValue is empty"),
+            "expected DDB EMPTY_ATTRIBUTE_VALUE wording, got: {msg}"
+        );
+        assert!(
+            msg.contains("must contain exactly one of the supported datatypes"),
+            "expected DDB suffix, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn multi_key_rejected_with_ddb_message() {
+        let err = serde_json::from_str::<AttributeValue>(r#"{"S":"a","N":"1"}"#).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Supplied AttributeValue has more than one datatypes set"),
+            "expected DDB MULTI_ATTRIBUTE_VALUE wording, got: {msg}"
+        );
+        assert!(
+            msg.contains("must contain exactly one of the supported datatypes"),
+            "expected DDB suffix, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ss_with_null_element_rejected_with_ddb_message() {
+        // Real DynamoDB returns INVALID_PARAMETER_VALUE with a SS-specific
+        // suffix (note the "An string set" wording is preserved from the
+        // upstream service — it's grammatically awkward but verbatim).
+        let err = serde_json::from_str::<AttributeValue>(r#"{"SS":["a",null]}"#).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("One or more parameter values were invalid"),
+            "expected INVALID_PARAMETER_VALUE wording, got: {msg}"
+        );
+        assert!(
+            msg.contains("An string set may not have a null string as a member"),
+            "expected SS-specific suffix, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ns_with_null_element_rejected_with_ddb_message() {
+        let err = serde_json::from_str::<AttributeValue>(r#"{"NS":["1",null]}"#).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Supplied AttributeValue is empty"),
+            "expected DDB EMPTY_ATTRIBUTE_VALUE wording for null NS element, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn bs_with_null_element_rejected_with_ddb_message() {
+        let err = serde_json::from_str::<AttributeValue>(r#"{"BS":["QQ==",null]}"#).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Supplied AttributeValue is empty"),
+            "expected DDB EMPTY_ATTRIBUTE_VALUE wording for null BS element, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn empty_map_inside_list_rejected_with_ddb_message() {
+        // Common path: PutItem with a List whose element is `attrVal.setBOOL(null)`.
+        let err = serde_json::from_str::<AttributeValue>(r#"{"L":[{}]}"#).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Supplied AttributeValue is empty"),
+            "expected DDB EMPTY_ATTRIBUTE_VALUE wording for empty inside L, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn empty_map_inside_map_rejected_with_ddb_message() {
+        // Common path: PutItem with a Map whose value is `attrVal.setM(null)`.
+        let err = serde_json::from_str::<AttributeValue>(r#"{"M":{"k":{}}}"#).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Supplied AttributeValue is empty"),
+            "expected DDB EMPTY_ATTRIBUTE_VALUE wording for empty inside M, got: {msg}"
+        );
     }
 }
