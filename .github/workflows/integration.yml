@@ -70,6 +70,7 @@ jobs:
           EXTENDDB_TEST_ENDPOINT: https://127.0.0.1:8000
           EXTENDDB_ADMIN_USER: admin
           EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
+          EXTENDDB_TEST_PG_ADMIN_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
         run: devtools/run-tests --extenddb --pytest --comprehensive --parallel --filter "not import_export"
 
   integration:

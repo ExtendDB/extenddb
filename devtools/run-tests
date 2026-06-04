@@ -519,6 +519,7 @@ if $RUN_PYTEST && [[ "$TARGET" != "real-dynamodb" && -n "${EXTENDDB_TEST_PG_CONN
         echo "  ✓ CLI lifecycle tests passed"
     else
         echo "  ✗ CLI lifecycle tests failed"
+        PASS=false
     fi
     echo ""
 fi
