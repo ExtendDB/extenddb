@@ -224,54 +224,108 @@ pub async fn handle_export_table(
             DynamoDbError::ValidationException("Cannot create output directory".to_owned())
         })?;
     }
-    let mut file = tokio::fs::File::create(&output_path)
+    let file = tokio::fs::File::create(&output_path)
         .await
         .map_err(|_| DynamoDbError::ValidationException("Cannot create export file".to_owned()))?;
 
-    let mut item_count: i64 = 0;
+    // Run the entire scan inside a snapshot so the resulting file is
+    // consistent with respect to writes that happen during the export.
+    // The storage layer holds a REPEATABLE READ transaction for the
+    // duration; pages emitted via `on_page` reflect a single point-in-
+    // time view of the table.
+    //
+    // Note: "page" here is the snapshot scan's internal memory unit —
+    // it is unrelated to the Scan API's user-facing pagination and to
+    // the BatchGetItem / BatchWriteItem operation families.
     let max_export_items = ctx.limits.max_export_item_count;
-    let mut exclusive_start_key: Option<Item> = None;
-    loop {
-        let (items, last_key) = ctx
-            .storage
-            .scan(
-                &key_info,
-                Some(1000),
-                exclusive_start_key.as_ref(),
-                None,
-                None,
-                None,
-            )
-            .await
-            .map_err(storage_err_to_dynamo)?;
 
-        item_count += i64::from(u16::try_from(items.len()).unwrap_or(u16::MAX));
+    // Bridge the storage layer's per-page callback into the file writer
+    // via an mpsc channel: the callback sends each page; a writer task
+    // drains the channel and writes to disk. This keeps the closure
+    // simple (no &mut File capture issues) and decouples disk I/O
+    // latency from the scan.
+    let (page_tx, mut page_rx) = tokio::sync::mpsc::channel::<Vec<Item>>(4);
 
-        if u64::try_from(item_count).unwrap_or(u64::MAX) > max_export_items {
-            return Err(DynamoDbError::ValidationException(format!(
-                "Export item count exceeds maximum ({max_export_items})"
-            )));
-        }
+    let writer_task: tokio::task::JoinHandle<Result<(), DynamoDbError>> = {
+        let mut file = file;
+        tokio::spawn(async move {
+            while let Some(items) = page_rx.recv().await {
+                for item in &items {
+                    let wrapper = serde_json::json!({"Item": item});
+                    let mut line = serde_json::to_string(&wrapper).map_err(|e| {
+                        tracing::error!(internal_error = %e, "failed to serialize export item");
+                        DynamoDbError::InternalServerError("Internal server error".to_owned())
+                    })?;
+                    line.push('\n');
+                    tokio::io::AsyncWriteExt::write_all(&mut file, line.as_bytes())
+                        .await
+                        .map_err(|_| {
+                            DynamoDbError::ValidationException(
+                                "Cannot write export file".to_owned(),
+                            )
+                        })?;
+                }
+            }
+            // Best-effort flush; if it fails the writer task error wins.
+            let _ = tokio::io::AsyncWriteExt::flush(&mut file).await;
+            Ok(())
+        })
+    };
 
-        for item in &items {
-            let wrapper = serde_json::json!({"Item": item});
-            let mut line = serde_json::to_string(&wrapper).map_err(|e| {
-                tracing::error!(internal_error = %e, "failed to serialize export item");
-                DynamoDbError::InternalServerError("Internal server error".to_owned())
-            })?;
-            line.push('\n');
-            tokio::io::AsyncWriteExt::write_all(&mut file, line.as_bytes())
-                .await
-                .map_err(|_| {
-                    DynamoDbError::ValidationException("Cannot write export file".to_owned())
+    let scan_result: Result<u64, DynamoDbError> = {
+        // Track count inside the closure so we can short-circuit the
+        // snapshot scan as soon as `max_export_item_count` is exceeded.
+        // Returning Err from `on_page` propagates through
+        // `scan_full_table_snapshot_impl`, which exits its loop without
+        // committing — releasing the REPEATABLE READ snapshot promptly so
+        // VACUUM can resume reclaiming dead tuples on the table.
+        let mut count: u64 = 0;
+        let on_page: extenddb_storage::SnapshotPageHandler<'_> = Box::new(move |items| {
+            count += items.len() as u64;
+            let exceeded = count > max_export_items;
+            let owned = items.to_vec();
+            let tx = page_tx.clone();
+            Box::pin(async move {
+                if exceeded {
+                    return Err(extenddb_storage::error::StorageError::Validation(format!(
+                        "Export item count exceeds maximum ({max_export_items})"
+                    )));
+                }
+                tx.send(owned).await.map_err(|_| {
+                    extenddb_storage::error::StorageError::Internal(
+                        "export writer task closed early".to_owned(),
+                    )
                 })?;
-        }
+                Ok(())
+            })
+        });
+        // The original `page_tx` sender is moved into `on_page`; once the
+        // scan returns, `on_page` is dropped and with it the last sender,
+        // closing the channel and letting the writer task exit cleanly.
+        ctx.storage
+            .scan_full_table_snapshot(&key_info, 1000, on_page)
+            .await
+            .map_err(storage_err_to_dynamo)
+    };
 
-        if last_key.is_none() {
-            break;
+    // Wait for the writer to finish flushing whatever the scan sent.
+    let writer_result = writer_task.await.unwrap_or_else(|e| {
+        Err(DynamoDbError::InternalServerError(format!(
+            "export writer task panicked: {e}"
+        )))
+    });
+
+    // Combine results. A successful scan return (Ok(n)) implies n is at or
+    // under max_export_item_count — the over-limit case is now handled
+    // inside the snapshot transaction. On any error, remove the partial
+    // file before propagating.
+    let item_count: i64 = match (scan_result, writer_result) {
+        (Ok(n), Ok(())) => i64::try_from(n).unwrap_or(i64::MAX),
+        (Err(e), _) | (Ok(_), Err(e)) => {
+            let _ = tokio::fs::remove_file(&output_path).await;
+            return Err(e);
         }
-        exclusive_start_key = last_key;
-    }
+    };
 
     let end_time = epoch_seconds();
     let export_arn = format!("{}:export/{}", input.table_arn, uuid::Uuid::new_v4());

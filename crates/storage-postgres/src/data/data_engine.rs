@@ -162,6 +162,19 @@ impl DataEngine for PostgresEngine {
         })
     }
 
+    fn scan_full_table_snapshot<'a>(
+        &'a self,
+        key_info: &'a TableKeyInfo,
+        page_size: i64,
+        on_page: extenddb_storage::SnapshotPageHandler<'a>,
+    ) -> BoxFuture<'a, Result<u64, StorageError>> {
+        let key_info = key_info.clone();
+        Box::pin(async move {
+            self.scan_full_table_snapshot_impl(&key_info, page_size, on_page)
+                .await
+        })
+    }
+
     fn transact_get_items(
         &self,
         ops: &[TransactGetOp<'_>],

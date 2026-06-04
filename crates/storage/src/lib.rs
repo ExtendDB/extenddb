@@ -166,6 +166,21 @@ pub trait TableEngine: Send + Sync {
     ) -> BoxFuture<'_, Result<IndexInfo, StorageError>>;
 }
 
+/// Callback invoked once per page of items produced by
+/// [`DataEngine::scan_full_table_snapshot`]. The implementation calls
+/// this sequentially for every page until the table is fully scanned;
+/// returning `Err` short-circuits the snapshot and rolls back the
+/// underlying transaction without committing.
+///
+/// "Page" here refers to an internal memory-efficiency unit — it is
+/// *not* the user-facing pagination of the public `Scan` API, and it
+/// is unrelated to the `BatchGetItem` / `BatchWriteItem` operation
+/// families. The whole snapshot is one logical read from the caller's
+/// perspective; pages exist only so the implementation can avoid
+/// buffering the entire table in memory.
+pub type SnapshotPageHandler<'a> =
+    Box<dyn for<'b> FnMut(&'b [Item]) -> BoxFuture<'b, Result<(), StorageError>> + Send + 'a>;
+
 /// Item-level data operations.
 ///
 /// All methods receive a `TableKeyInfo` from the engine layer, which has
@@ -290,6 +305,37 @@ pub trait DataEngine: Send + Sync {
         total_segments: Option<i64>,
         index_name: Option<&str>,
     ) -> BoxFuture<'_, QueryResult>;
+
+    /// Scan every item in a base table under a single consistent
+    /// snapshot, invoking `on_page` once for each page of items.
+    ///
+    /// This is a **full-table** snapshot read: it always covers the
+    /// entire base table, never a secondary index, never a key range,
+    /// and never with a filter expression. It is intended for whole-
+    /// table operations such as `ExportTableToPointInTime` that must
+    /// observe a single point-in-time view of the table even while
+    /// concurrent writers are modifying it.
+    ///
+    /// Implementations MUST guarantee that every page reflects the
+    /// table state at the time of the first read. Items written or
+    /// deleted by other connections after the snapshot is taken MUST
+    /// NOT appear in any page. On PostgreSQL this is achieved by
+    /// running every page query inside one transaction with snapshot
+    /// isolation (`REPEATABLE READ`).
+    ///
+    /// `page_size` is purely an internal memory-efficiency knob — it
+    /// has no effect on what items are returned, only on how many are
+    /// buffered per call to `on_page`. It is unrelated to the
+    /// `Scan` API's user-facing `Limit` parameter and to the multi-
+    /// operation `BatchGetItem` / `BatchWriteItem` families.
+    ///
+    /// Returns the total item count emitted across all pages.
+    fn scan_full_table_snapshot<'a>(
+        &'a self,
+        key_info: &'a TableKeyInfo,
+        page_size: i64,
+        on_page: SnapshotPageHandler<'a>,
+    ) -> BoxFuture<'a, Result<u64, StorageError>>;
 
     /// Execute multiple get operations in a single consistent snapshot.
     ///

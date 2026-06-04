@@ -249,13 +249,20 @@ pub(crate) fn bind_sk_value<'q>(
 }
 
 /// Execute a scan SQL statement with dynamic parameter binding.
-pub(crate) async fn execute_scan_sql(
+///
+/// `executor` is generic so the caller can pass either a `&PgPool`
+/// (the default, autocommit) or a `&mut Transaction<'_, Postgres>`
+/// (for snapshot-isolated reads via `scan_full_table_snapshot`).
+pub(crate) async fn execute_scan_sql<'e, E>(
     sql: &str,
     exclusive_start_key: Option<&Item>,
     key_schema: &[KeySchemaElement],
     attr_defs: &[AttributeDefinition],
-    pool: &sqlx::PgPool,
-) -> Result<Vec<serde_json::Value>, StorageError> {
+    executor: E,
+) -> Result<Vec<serde_json::Value>, StorageError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sql);
 
     if let Some(start_key) = exclusive_start_key {
@@ -275,7 +282,7 @@ pub(crate) async fn execute_scan_sql(
     }
 
     let rows: Vec<(serde_json::Value,)> = query
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 

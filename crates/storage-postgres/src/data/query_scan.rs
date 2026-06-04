@@ -293,4 +293,135 @@ impl PostgresEngine {
 
         Ok((items, last_key))
     }
+
+    /// Run a full-table scan inside a `REPEATABLE READ READ ONLY`
+    /// transaction, emitting items to `on_page` one snapshot page at a time.
+    ///
+    /// Snapshot isolation guarantees that all pages reflect the table state
+    /// at the time of the transaction's first read, regardless of concurrent
+    /// writers. The transaction is committed when the scan completes; if any
+    /// page handler returns `Err`, the transaction is rolled back instead.
+    ///
+    /// "Page" here is the implementation's internal unit of work and has no
+    /// connection to the public Scan API's pagination or to the BatchGet/
+    /// BatchWrite operation families.
+    ///
+    /// Always scans the base table — no GSI/LSI routing, no parallel-scan
+    /// segments, no filter expressions. This is the right shape for whole-
+    /// table operations like `ExportTableToPointInTime`; range or filtered
+    /// reads use [`scan_impl`] instead.
+    pub(crate) async fn scan_full_table_snapshot_impl(
+        &self,
+        key_info: &TableKeyInfo,
+        page_size: i64,
+        mut on_page: extenddb_storage::SnapshotPageHandler<'_>,
+    ) -> Result<u64, StorageError> {
+        use std::fmt::Write;
+
+        // REPEATABLE READ on PostgreSQL gives snapshot isolation: every
+        // query in this transaction sees the same view of the database, as
+        // of the moment of the first read. READ ONLY is a hint that lets
+        // the planner skip locks we don't need. This combination is the
+        // standard PG idiom for "give me a consistent multi-statement
+        // read"; SERIALIZABLE would add serialization-failure retry
+        // overhead that's unnecessary for a read-only export.
+        let mut tx = self
+            .data_pool
+            .begin()
+            .await
+            .map_err(|e| StorageError::Internal(format!("begin snapshot: {e}")))?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(format!("set isolation: {e}")))?;
+
+        let ddb_table = data_table_name(&key_info.table_id);
+        let sk_info_val = sk_info(&key_info.key_schema, &key_info.attribute_definitions);
+
+        let mut total: u64 = 0;
+        let mut exclusive_start_key: Option<Item> = None;
+
+        loop {
+            // Build SQL — same pagination shape as `scan_impl`, but with a
+            // fixed `page_size` and no parallel-scan / index variants
+            // (full-table snapshot scans are always base-table only).
+            let mut sql = format!("SELECT item_data FROM {ddb_table}");
+            let param_idx: u32 = 1;
+            let mut conditions: Vec<String> = Vec::new();
+
+            if let Some(start_key) = exclusive_start_key.as_ref() {
+                let pk_name = &key_info.key_schema[0].attribute_name;
+                if !start_key.contains_key(pk_name) {
+                    return Err(StorageError::Internal("missing pk in start key".to_owned()));
+                }
+                if let Some((_, sk_type)) = sk_info_val {
+                    let sk_col = sk_column(sk_type);
+                    let collate = if sk_type == ScalarAttributeType::S {
+                        " COLLATE \"C\""
+                    } else {
+                        ""
+                    };
+                    conditions.push(format!(
+                        "(pk, {sk_col}{collate}) > (${param_idx}, ${next})",
+                        next = param_idx + 1
+                    ));
+                } else {
+                    conditions.push(format!("pk > ${param_idx}"));
+                }
+            }
+            if !conditions.is_empty() {
+                sql.push_str(" WHERE ");
+                sql.push_str(&conditions.join(" AND "));
+            }
+            if let Some((_, sk_type)) = sk_info_val {
+                let sk_col = sk_column(sk_type);
+                let collate = if sk_type == ScalarAttributeType::S {
+                    " COLLATE \"C\""
+                } else {
+                    ""
+                };
+                let _ = write!(sql, " ORDER BY pk, {sk_col}{collate}");
+            } else {
+                sql.push_str(" ORDER BY pk");
+            }
+            let _ = write!(sql, " LIMIT {}", page_size + 1);
+
+            // Critical: pass `&mut *tx` so this query runs inside the
+            // snapshot transaction, not on a fresh pool connection.
+            let rows = execute_scan_sql(
+                &sql,
+                exclusive_start_key.as_ref(),
+                &key_info.key_schema,
+                &key_info.attribute_definitions,
+                &mut *tx,
+            )
+            .await?;
+
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let actual_page = page_size.max(0) as usize;
+            let has_more = rows.len() > actual_page;
+            let items: Vec<Item> = rows
+                .into_iter()
+                .take(actual_page)
+                .map(json_to_item)
+                .collect::<Result<Vec<_>, _>>()?;
+
+            if items.is_empty() {
+                break;
+            }
+
+            total += items.len() as u64;
+            on_page(&items).await?;
+
+            if !has_more {
+                break;
+            }
+            exclusive_start_key = items.last().map(|i| build_key(i, &key_info.key_schema));
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| StorageError::Internal(format!("commit snapshot: {e}")))?;
+        Ok(total)
+    }
 }
