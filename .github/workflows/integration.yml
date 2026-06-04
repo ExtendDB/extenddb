@@ -1,0 +1,82 @@
+name: Integration Tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  run-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: devpass
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Initialize ExtendDB
+        id: init
+        run: |
+          output=$(./target/release/extenddb init --config extenddb.toml \
+            --pg-host 127.0.0.1 --pg-port 5432 --pg-user postgres --pg-pass devpass 2>&1)
+          echo "$output"
+          password=$(echo "$output" | grep -oP 'Password: \K\S+')
+          echo "admin_password=$password" >> "$GITHUB_OUTPUT"
+
+      - name: Start ExtendDB
+        run: |
+          ./target/release/extenddb serve --config extenddb.toml --foreground &
+          for i in $(seq 1 30); do
+            if curl -sk https://127.0.0.1:8000/health | grep -q healthy; then
+              echo "Server ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server failed to start"
+          exit 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run integration tests
+        env:
+          EXTENDDB_TEST_ENDPOINT: https://127.0.0.1:8000
+          EXTENDDB_ADMIN_USER: admin
+          EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
+        run: devtools/run-tests --extenddb --pytest --comprehensive --parallel --filter "not import_export"
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: run-integration
+    if: always()
+    steps:
+      - run: |
+          if [ "${{ needs.run-integration.result }}" != "success" ]; then
+            exit 1
+          fi
