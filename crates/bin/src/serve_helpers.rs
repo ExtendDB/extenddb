@@ -92,7 +92,7 @@ pub fn pid_file_path(run_dir: &str, port: u16) -> PathBuf {
 /// PID file path using the default run directory. Used by `status` when
 /// no config file is loaded.
 pub fn pid_file_path_default(port: u16) -> PathBuf {
-    let run_dir = config::AppConfig::default().server.run_dir;
+    let run_dir = config::ServerConfig::default().run_dir;
     pid_file_path(&run_dir, port)
 }
 
