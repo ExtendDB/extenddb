@@ -10,16 +10,17 @@ use serde_json::Value;
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
-use crate::expression_helpers::build_expression_maps;
+use crate::expression_helpers::{build_expression_maps, parse_optional_condition};
 use crate::serialize_output;
 use crate::stream_capture;
 use crate::transact_write_helpers::{
-    PreparedOp, compute_fingerprint, parse_optional_condition, validate_client_request_token,
-    validate_no_key_updates,
+    PreparedOp, compute_fingerprint, validate_client_request_token, validate_no_key_updates,
 };
 use crate::{DispatchMetrics, DispatchResult};
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::parse_update;
+use extenddb_core::expression::{
+    ExpressionKind, parse_update_from, tokenize_for, validate_no_reserved_words,
+};
 use extenddb_core::types::{TransactWriteItem, TransactWriteItemsInput, TransactWriteItemsOutput};
 use extenddb_core::validation::{
     validate_attribute_name_sizes, validate_attribute_values_nesting_depth,
@@ -218,7 +219,9 @@ async fn prepare_write_op(
             put.expression_attribute_values.as_ref(),
         );
         let condition = parse_optional_condition(put.condition_expression.as_deref(), &ctx.limits)?;
-        {
+        // Transactions accept names/values with no expression (unlike single-item
+        // APIs); only check for unused refs when a condition is present.
+        if condition.is_some() {
             let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
             extenddb_core::expression::validate_unused_attributes(
                 &maps.names,
@@ -256,7 +259,7 @@ async fn prepare_write_op(
             del.expression_attribute_values.as_ref(),
         );
         let condition = parse_optional_condition(del.condition_expression.as_deref(), &ctx.limits)?;
-        {
+        if condition.is_some() {
             let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
             extenddb_core::expression::validate_unused_attributes(
                 &maps.names,
@@ -293,9 +296,20 @@ async fn prepare_write_op(
             upd.expression_attribute_names.as_ref(),
             upd.expression_attribute_values.as_ref(),
         );
-        let update_tokens =
-            crate::expression_helpers::tokenize_expression(&upd.update_expression, &ctx.limits)?;
-        let actions = parse_update(&update_tokens)?;
+        let actions = tokenize_for(
+            &upd.update_expression,
+            ctx.limits.max_expression_tokens,
+            ExpressionKind::Update,
+        )
+        .and_then(|update_tokens| {
+            if ctx.limits.enforce_reserved_keywords {
+                validate_no_reserved_words(&update_tokens)?;
+            }
+            parse_update_from(&update_tokens, &upd.update_expression)
+        })
+        .map_err(|e| {
+            crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Update)
+        })?;
         validate_no_key_updates(&actions, &key_info, &maps)?;
 
         // Validate nesting depth of EAV values that get stored via SET actions.
@@ -351,12 +365,17 @@ async fn prepare_write_op(
             cc.expression_attribute_names.as_ref(),
             cc.expression_attribute_values.as_ref(),
         );
-        let tokens =
-            crate::expression_helpers::tokenize_expression(&cc.condition_expression, &ctx.limits)?;
-        let condition = extenddb_core::expression::parse_condition_with_depth_limit(
-            &tokens,
-            ctx.limits.max_expression_depth,
-        )?;
+        let condition =
+            crate::expression_helpers::tokenize_expression(&cc.condition_expression, &ctx.limits)
+                .and_then(|tokens| {
+                    extenddb_core::expression::parse_condition_with_depth_limit(
+                        &tokens,
+                        ctx.limits.max_expression_depth,
+                    )
+                })
+                .map_err(|e| {
+                    crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Condition)
+                })?;
         {
             let exprs: Vec<&extenddb_core::expression::Expr> = vec![&condition];
             extenddb_core::expression::validate_unused_attributes(
