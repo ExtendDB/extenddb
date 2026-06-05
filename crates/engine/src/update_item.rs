@@ -11,10 +11,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::{
-    ExpressionKind, ExpressionMaps, PathElement, UpdateAction, parse_update_from, tokenize_for,
-    validate_no_reserved_words,
-};
+use extenddb_core::expression::{ExpressionKind, ExpressionMaps, PathElement, UpdateAction};
 use extenddb_core::types::{
     AttributeValue, Item, ReturnValues, TableKeyInfo, UpdateItemInput, UpdateItemOutput,
     item_size_bytes,
@@ -139,22 +136,9 @@ pub async fn handle_update_item(
     )?;
 
     // No UpdateExpression and no AttributeUpdates: no-op upsert.
-    // Some("") still errors via tokenize_for.
+    // Some("") still errors via parse_update_expr.
     let actions = if let Some(update_expr) = effective_update_expr.as_deref() {
-        tokenize_for(
-            update_expr,
-            ctx.limits.max_expression_tokens,
-            ExpressionKind::Update,
-        )
-        .and_then(|update_tokens| {
-            if ctx.limits.enforce_reserved_keywords {
-                validate_no_reserved_words(&update_tokens)?;
-            }
-            parse_update_from(&update_tokens, update_expr)
-        })
-        .map_err(|e| {
-            crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Update)
-        })?
+        crate::expression_helpers::parse_update_expr(update_expr, &ctx.limits)?
     } else {
         Vec::new()
     };

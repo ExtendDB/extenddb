@@ -18,9 +18,6 @@ use crate::transact_write_helpers::{
 };
 use crate::{DispatchMetrics, DispatchResult};
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::{
-    ExpressionKind, parse_update_from, tokenize_for, validate_no_reserved_words,
-};
 use extenddb_core::types::{TransactWriteItem, TransactWriteItemsInput, TransactWriteItemsOutput};
 use extenddb_core::validation::{
     validate_attribute_name_sizes, validate_attribute_values_nesting_depth,
@@ -296,20 +293,8 @@ async fn prepare_write_op(
             upd.expression_attribute_names.as_ref(),
             upd.expression_attribute_values.as_ref(),
         );
-        let actions = tokenize_for(
-            &upd.update_expression,
-            ctx.limits.max_expression_tokens,
-            ExpressionKind::Update,
-        )
-        .and_then(|update_tokens| {
-            if ctx.limits.enforce_reserved_keywords {
-                validate_no_reserved_words(&update_tokens)?;
-            }
-            parse_update_from(&update_tokens, &upd.update_expression)
-        })
-        .map_err(|e| {
-            crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Update)
-        })?;
+        let actions =
+            crate::expression_helpers::parse_update_expr(&upd.update_expression, &ctx.limits)?;
         validate_no_key_updates(&actions, &key_info, &maps)?;
 
         // Validate nesting depth of EAV values that get stored via SET actions.
@@ -366,16 +351,7 @@ async fn prepare_write_op(
             cc.expression_attribute_values.as_ref(),
         );
         let condition =
-            crate::expression_helpers::tokenize_expression(&cc.condition_expression, &ctx.limits)
-                .and_then(|tokens| {
-                    extenddb_core::expression::parse_condition_with_depth_limit(
-                        &tokens,
-                        ctx.limits.max_expression_depth,
-                    )
-                })
-                .map_err(|e| {
-                    crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Condition)
-                })?;
+            crate::expression_helpers::parse_condition_expr(&cc.condition_expression, &ctx.limits)?;
         {
             let exprs: Vec<&extenddb_core::expression::Expr> = vec![&condition];
             extenddb_core::expression::validate_unused_attributes(

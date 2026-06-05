@@ -7,8 +7,9 @@ use std::collections::HashMap;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
-    Expr, ExpressionKind, ExpressionMaps, PathElement, Token, parse_condition_with_depth_limit,
-    parse_projection, tokenize_for, tokenize_with_limit, validate_no_reserved_words,
+    Expr, ExpressionKind, ExpressionMaps, PathElement, Token, UpdateAction,
+    parse_condition_with_depth_limit, parse_projection, parse_update_from, tokenize_for,
+    tokenize_with_limit, validate_no_reserved_words,
 };
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{AttributeValue, ConditionalOperator, ExpectedAttributeValue};
@@ -54,6 +55,44 @@ pub fn build_expression_maps(
     )
 }
 
+/// Tokenize, reserved-word check, and parse a required `ConditionExpression`.
+///
+/// Errors carry the `ConditionExpression` prefix, matching Amazon DynamoDB.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` for syntax or reserved-word errors.
+pub fn parse_condition_expr(expr: &str, limits: &LimitsConfig) -> Result<Expr, DynamoDbError> {
+    tokenize_expression(expr, limits)
+        .and_then(|tokens| parse_condition_with_depth_limit(&tokens, limits.max_expression_depth))
+        .map_err(|e| prefix_expression_error(e, ExpressionKind::Condition))
+}
+
+/// Tokenize, reserved-word check, and parse an `UpdateExpression`.
+///
+/// Errors carry the `UpdateExpression` prefix, matching Amazon DynamoDB.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` for syntax or reserved-word errors.
+pub fn parse_update_expr(
+    update_expr: &str,
+    limits: &LimitsConfig,
+) -> Result<Vec<UpdateAction>, DynamoDbError> {
+    tokenize_for(
+        update_expr,
+        limits.max_expression_tokens,
+        ExpressionKind::Update,
+    )
+    .and_then(|update_tokens| {
+        if limits.enforce_reserved_keywords {
+            validate_no_reserved_words(&update_tokens)?;
+        }
+        parse_update_from(&update_tokens, update_expr)
+    })
+    .map_err(|e| prefix_expression_error(e, ExpressionKind::Update))
+}
+
 /// Parse an optional condition expression string into an AST.
 ///
 /// Returns `None` if the input is `None` or empty.
@@ -66,14 +105,7 @@ pub fn parse_optional_condition(
     limits: &LimitsConfig,
 ) -> Result<Option<Expr>, DynamoDbError> {
     match expr {
-        Some(s) if !s.is_empty() => {
-            let parsed = tokenize_expression(s, limits).and_then(|tokens| {
-                parse_condition_with_depth_limit(&tokens, limits.max_expression_depth)
-            });
-            parsed
-                .map(Some)
-                .map_err(|e| prefix_expression_error(e, ExpressionKind::Condition))
-        }
+        Some(s) if !s.is_empty() => parse_condition_expr(s, limits).map(Some),
         _ => Ok(None),
     }
 }

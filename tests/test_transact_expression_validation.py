@@ -36,6 +36,15 @@ RESERVED_CONDITION = (
     "Invalid ConditionExpression: Attribute name is a reserved keyword; "
     "reserved keyword: status"
 )
+REDUNDANT_PARENS_CONDITION = (
+    "Invalid ConditionExpression: The expression has redundant parentheses;"
+)
+UNUSED_NAME_MSG = (
+    "Value provided in ExpressionAttributeNames unused in expressions: keys: {#n}"
+)
+UNUSED_VALUE_MSG = (
+    "Value provided in ExpressionAttributeValues unused in expressions: keys: {:v}"
+)
 
 
 @pytest.fixture(scope="class")
@@ -137,6 +146,44 @@ class TestTransactNamesValuesWithoutExpression:
         assert resp["Responses"][0]["Item"]["pk"]["S"] == "k1"
 
 
+class TestTransactReferencedExpressionAccepted:
+    """Names/values that ARE referenced by an expression are accepted."""
+
+    def test_twi_put_name_referenced_by_condition_accepted(
+        self, dynamodb_client, hash_table
+    ):
+        dynamodb_client.transact_write_items(
+            TransactItems=[
+                {
+                    "Put": {
+                        "TableName": hash_table,
+                        "Item": {"pk": {"S": "p-ref"}},
+                        "ConditionExpression": "attribute_not_exists(#n)",
+                        "ExpressionAttributeNames": {"#n": "pk"},
+                    }
+                }
+            ]
+        )
+        got = dynamodb_client.get_item(TableName=hash_table, Key={"pk": {"S": "p-ref"}})
+        assert got["Item"]["pk"]["S"] == "p-ref"
+
+    def test_twi_update_value_referenced_accepted(self, dynamodb_client, hash_table):
+        dynamodb_client.transact_write_items(
+            TransactItems=[
+                {
+                    "Update": {
+                        "TableName": hash_table,
+                        "Key": {"pk": {"S": "k1"}},
+                        "UpdateExpression": "SET foo = :v",
+                        "ExpressionAttributeValues": {":v": {"S": "set"}},
+                    }
+                }
+            ]
+        )
+        got = dynamodb_client.get_item(TableName=hash_table, Key={"pk": {"S": "k1"}})
+        assert got["Item"]["foo"]["S"] == "set"
+
+
 class TestTransactUnusedWithExpression:
     """With an expression present, unused names/values are still rejected."""
 
@@ -156,7 +203,45 @@ class TestTransactUnusedWithExpression:
                     }
                 ]
             ),
-            "Value provided in ExpressionAttributeNames unused in expressions: keys: {#n}",
+            UNUSED_NAME_MSG,
+        )
+
+    def test_twi_delete_unused_value_with_condition_rejected(
+        self, dynamodb_client, hash_table
+    ):
+        _expect_validation(
+            lambda: dynamodb_client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Delete": {
+                            "TableName": hash_table,
+                            "Key": {"pk": {"S": "k1"}},
+                            "ConditionExpression": "attribute_exists(pk)",
+                            "ExpressionAttributeValues": {":v": {"N": "1"}},
+                        }
+                    }
+                ]
+            ),
+            UNUSED_VALUE_MSG,
+        )
+
+    def test_twi_condition_check_unused_name_rejected(
+        self, dynamodb_client, hash_table
+    ):
+        _expect_validation(
+            lambda: dynamodb_client.transact_write_items(
+                TransactItems=[
+                    {
+                        "ConditionCheck": {
+                            "TableName": hash_table,
+                            "Key": {"pk": {"S": "k1"}},
+                            "ConditionExpression": "attribute_exists(pk)",
+                            "ExpressionAttributeNames": {"#n": "foo"},
+                        }
+                    }
+                ]
+            ),
+            UNUSED_NAME_MSG,
         )
 
     def test_tgi_get_unused_name_with_projection_rejected(
@@ -175,7 +260,7 @@ class TestTransactUnusedWithExpression:
                     }
                 ]
             ),
-            "Value provided in ExpressionAttributeNames unused in expressions: keys: {#n}",
+            UNUSED_NAME_MSG,
         )
 
 
@@ -248,4 +333,42 @@ class TestTransactParseErrorPrefix:
                 ]
             ),
             RESERVED_CONDITION,
+        )
+
+    def test_twi_update_syntax_error_prefix(self, dynamodb_client, hash_table):
+        # Syntax error also carries the UpdateExpression prefix.
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Update": {
+                            "TableName": hash_table,
+                            "Key": {"pk": {"S": "k1"}},
+                            "UpdateExpression": "SET foo = ",
+                            "ExpressionAttributeValues": {":v": {"N": "1"}},
+                        }
+                    }
+                ]
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"].startswith("Invalid UpdateExpression:")
+
+    def test_twi_condition_check_redundant_parens_prefix(
+        self, dynamodb_client, hash_table
+    ):
+        _expect_validation(
+            lambda: dynamodb_client.transact_write_items(
+                TransactItems=[
+                    {
+                        "ConditionCheck": {
+                            "TableName": hash_table,
+                            "Key": {"pk": {"S": "k1"}},
+                            "ConditionExpression": "((pk = :v))",
+                            "ExpressionAttributeValues": {":v": {"S": "k1"}},
+                        }
+                    }
+                ]
+            ),
+            REDUNDANT_PARENS_CONDITION,
         )
