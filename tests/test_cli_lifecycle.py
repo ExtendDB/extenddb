@@ -46,17 +46,22 @@ EXTENDDB_BINARY = os.environ.get(
 # PostgreSQL connection string for creating test databases.
 PG_CONN = os.environ.get("EXTENDDB_TEST_PG_CONNECTION_STRING", "")
 
+# Admin connection for privileged ops (CREATE/DROP DATABASE, CREATE ROLE).
+# PG_CONN is the unprivileged app role; falls back to it for local superuser setups.
+PG_ADMIN_CONN = os.environ.get("EXTENDDB_TEST_PG_ADMIN_CONNECTION_STRING", "") or PG_CONN
 
-def _parse_pg_credentials():
-    """Extract user and password from PG_CONN (postgresql://user:pass@host:port)."""
-    if not PG_CONN:
+
+def _parse_pg_credentials(conn):
+    """Extract user and password from a connection string (postgresql://user:pass@host:port)."""
+    if not conn:
         return None, None
     from urllib.parse import urlparse
-    parsed = urlparse(PG_CONN)
+    parsed = urlparse(conn)
     return parsed.username, parsed.password
 
 
-PG_USER, PG_PASS = _parse_pg_credentials()
+PG_USER, PG_PASS = _parse_pg_credentials(PG_CONN)
+PG_ADMIN_USER, PG_ADMIN_PASS = _parse_pg_credentials(PG_ADMIN_CONN)
 
 
 def _fail_if_no_pg():
@@ -78,12 +83,13 @@ def _fail_if_no_binary():
 
 
 def _pg_args():
-    """Return --pg-user and --pg-pass args for commands that connect as admin."""
+    """Return --pg-user and --pg-pass args for commands that connect as the
+    PostgreSQL admin (catalog database and application-role creation)."""
     args = []
-    if PG_USER:
-        args.extend(["--pg-user", PG_USER])
-    if PG_PASS:
-        args.extend(["--pg-pass", PG_PASS])
+    if PG_ADMIN_USER:
+        args.extend(["--pg-user", PG_ADMIN_USER])
+    if PG_ADMIN_PASS:
+        args.extend(["--pg-pass", PG_ADMIN_PASS])
     return args
 
 
@@ -212,7 +218,7 @@ def _drop_database(db_name):
     import psycopg2
 
     try:
-        conn = psycopg2.connect(PG_CONN + "/postgres")
+        conn = psycopg2.connect(PG_ADMIN_CONN + "/postgres")
         conn.autocommit = True
         with conn.cursor() as cur:
             # Terminate existing connections
@@ -388,8 +394,8 @@ class TestCliLifecycle:
             # Connect using Unix socket to discover the socket directory
             conn = psycopg2.connect(
                 dbname="postgres",
-                user=PG_USER,
-                password=PG_PASS,
+                user=PG_ADMIN_USER,
+                password=PG_ADMIN_PASS,
             )
             # Query the socket directory from PostgreSQL
             with conn.cursor() as cur:
