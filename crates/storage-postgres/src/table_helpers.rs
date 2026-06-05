@@ -337,8 +337,8 @@ impl PostgresEngine {
                         status: "ENABLED".to_string(),
                         sse_type: Some(SseType::KMS),
                         kms_master_key_arn: Some(format!(
-                            "arn:aws:kms:us-east-1:{}:key/default",
-                            account_id
+                            "arn:aws:kms:{}:{}:key/default",
+                            self.region, account_id
                         )),
                     })
                 } else {
