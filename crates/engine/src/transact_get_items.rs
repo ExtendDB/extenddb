@@ -161,14 +161,7 @@ pub async fn handle_transact_get_items(
                     .filter(|i| !i.is_empty());
                 Ok(ItemResponse { item })
             } else {
-                extenddb_core::expression::validate_unused_attributes(
-                    &maps.names,
-                    &maps.values,
-                    &[],
-                    &[],
-                    &std::collections::HashSet::new(),
-                    &std::collections::HashSet::new(),
-                )?;
+                // No projection: transactions accept names with no expression.
                 Ok(ItemResponse { item: opt })
             }
         })
