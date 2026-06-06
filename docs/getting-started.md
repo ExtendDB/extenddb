@@ -29,7 +29,9 @@ software on your behalf. After the script completes, continue from
 
 ## Prerequisites
 
-- PostgreSQL 14+ running locally (see `docs/local-postgres-setup.md`)
+- **Storage backend** (one of):
+  - PostgreSQL 14+ running locally (see `docs/local-postgres-setup.md`)
+  - MongoDB 6.0+ with replica set (see `docs/local-mongodb-setup.md`)
 - Rust toolchain (1.88+)
 - AWS CLI v2 (for testing)
 - Python 3.10+ with virtual environment (see [Python Environment Setup](../README.md#python-environment-setup) in the README)
@@ -37,7 +39,14 @@ software on your behalf. After the script completes, continue from
 ## 1. Build extenddb
 
 ```bash
+# PostgreSQL backend (default)
 cargo build --release
+
+# MongoDB backend
+cargo build --release --features mongodb
+
+# Both backends
+cargo build --release --features postgres,mongodb
 ```
 
 The binary is at `target/release/extenddb`.
@@ -47,15 +56,17 @@ The binary is at `target/release/extenddb`.
 Run `extenddb init` to create the catalog and data databases:
 
 ```bash
+# PostgreSQL (default)
 ./target/release/extenddb init
+
+# MongoDB
+./target/release/extenddb init --backend mongodb
 ```
 
 This will:
-- Create a `extenddb` PostgreSQL user (if it doesn't exist)
 - Create the `extenddb_catalog` database (catalog metadata)
-- Create the `extenddb` database (user item data)
-- Run schema migrations
-- Generate an AES-256-GCM encryption key (for future access key storage)
+- Create the data database (user item data)
+- Generate an AES-256-GCM encryption key (for access key storage)
 - Create a default account and print the account ID
 - Create an `admin` user and print the credentials once
 - Generate a self-signed TLS certificate at `~/.extenddb/tls/`
