@@ -9,6 +9,7 @@ members = [
     "crates/storage",
     "crates/config",
     "crates/storage-postgres",
+    "crates/storage-mongodb",
     "crates/storage-sqlite",
     "crates/auth",
     "crates/server",
@@ -30,6 +31,7 @@ extenddb-engine = { path = "crates/engine" }
 extenddb-storage = { path = "crates/storage" }
 extenddb-config = { path = "crates/config" }
 extenddb-storage-postgres = { path = "crates/storage-postgres" }
+extenddb-storage-mongodb = { path = "crates/storage-mongodb" }
 extenddb-storage-sqlite = { path = "crates/storage-sqlite" }
 extenddb-auth = { path = "crates/auth" }
 extenddb-server = { path = "crates/server" }
@@ -62,6 +64,9 @@ moka = { version = "0.12", features = ["future"] }
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "json", "time", "uuid", "bigdecimal"] }
+mongodb = "3"
+bson = "2.13"
+dashmap = "6"
 
 # Crypto & checksums
 crc32fast = "1"
