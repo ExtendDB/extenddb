@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Parse the AWS SigV4 `Authorization` header.
+//! Parse the AWS `SigV4` `Authorization` header.
 //!
 //! Format:
 //! ```text
@@ -12,7 +12,7 @@
 
 use extenddb_core::error::DynamoDbError;
 
-/// Parsed components of a SigV4 `Authorization` header.
+/// Parsed components of a `SigV4` `Authorization` header.
 #[derive(Debug, PartialEq)]
 pub struct ParsedAuthorization {
     /// The access key ID (e.g. `AKIAIOSFODNN7EXAMPLE`).
@@ -29,7 +29,7 @@ pub struct ParsedAuthorization {
     pub signature: String,
 }
 
-/// Parse a SigV4 `Authorization` header value.
+/// Parse a `SigV4` `Authorization` header value.
 ///
 /// Returns `IncompleteSignature` if the header is malformed.
 /// S-2: Rejects headers exceeding 8 KB to prevent heap abuse.

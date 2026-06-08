@@ -13,7 +13,7 @@ use super::{AttributeDefinition, BillingMode, GsiInput, KeySchemaElement, Provis
 /// Input format for import operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputFormat {
-    /// DynamoDB JSON format (`{"Item": {"pk": {"S": "val"}, ...}}`).
+    /// `DynamoDB` JSON format (`{"Item": {"pk": {"S": "val"}, ...}}`).
     #[serde(rename = "DYNAMODB_JSON")]
     DynamoDbJson,
     /// Amazon Ion text format.
@@ -27,7 +27,7 @@ pub enum InputFormat {
 /// Export format (CSV is not supported for export).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExportFormat {
-    /// DynamoDB JSON format.
+    /// `DynamoDB` JSON format.
     #[serde(rename = "DYNAMODB_JSON")]
     DynamoDbJson,
     /// Amazon Ion text format.
@@ -219,7 +219,7 @@ pub struct ExportTableToPointInTimeInput {
     /// Standard `DynamoDB` field — accepted but ignored.
     #[serde(rename = "IncrementalExportSpecification")]
     _incremental_export_spec: Option<serde_json::Value>,
-    /// Export format (default: DYNAMODB_JSON).
+    /// Export format (default: `DYNAMODB_JSON`).
     #[serde(rename = "ExportFormat")]
     pub export_format: Option<ExportFormat>,
 }

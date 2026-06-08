@@ -44,6 +44,7 @@ impl Default for SessionStore {
 
 impl SessionStore {
     /// Create an empty session store.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),

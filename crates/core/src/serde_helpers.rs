@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Custom serde deserializers for DynamoDB input validation.
+//! Custom serde deserializers for `DynamoDB` input validation.
 
 use std::collections::HashMap;
 use std::fmt;

@@ -166,8 +166,7 @@ pub async fn handle_update_table(
             }
             extenddb_storage::error::StorageError::IndexNotFound(name) => {
                 DynamoDbError::ResourceNotFoundException(format!(
-                    "Requested resource not found: Index {name} for table {}",
-                    table_name
+                    "Requested resource not found: Index {name} for table {table_name}"
                 ))
             }
             extenddb_storage::error::StorageError::NoOpUpdate(msg) => {

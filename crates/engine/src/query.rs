@@ -253,15 +253,15 @@ pub async fn handle_query(
 
     // Parse FilterExpression or desugar legacy QueryFilter
     let (filter, filter_maps) = if let Some(ref qf) = input.query_filter {
-        if !qf.is_empty() {
-            let cond_op = input.conditional_operator.unwrap_or_default();
-            let (expr, fmaps) = desugar_filter(qf, cond_op)?;
-            (Some(expr), Some(fmaps))
-        } else {
+        if qf.is_empty() {
             (
                 parse_optional_filter(input.filter_expression.as_deref(), &ctx.limits)?,
                 None,
             )
+        } else {
+            let cond_op = input.conditional_operator.unwrap_or_default();
+            let (expr, fmaps) = desugar_filter(qf, cond_op)?;
+            (Some(expr), Some(fmaps))
         }
     } else {
         (

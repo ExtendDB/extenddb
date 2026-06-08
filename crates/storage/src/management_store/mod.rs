@@ -157,7 +157,7 @@ pub trait ManagementStore: Send + Sync {
     /// List all accounts as `(account_id, account_name)`.
     fn list_all_accounts(&self) -> BoxFuture<'_, OpResult<Vec<(String, String)>>>;
 
-    /// List all accounts with created_at as `(account_id, account_name, created_at)`.
+    /// List all accounts with `created_at` as `(account_id, account_name, created_at)`.
     fn list_all_accounts_full(
         &self,
     ) -> BoxFuture<'_, OpResult<Vec<(String, String, time::OffsetDateTime)>>>;

@@ -379,9 +379,9 @@ pub fn attribute_value_size(value: &AttributeValue) -> usize {
     }
 }
 
-/// Calculate the DynamoDB size of a number in bytes.
+/// Calculate the `DynamoDB` size of a number in bytes.
 ///
-/// DynamoDB number sizing: approximately 1 byte per 2 significant digits + 1 byte.
+/// `DynamoDB` number sizing: approximately 1 byte per 2 significant digits + 1 byte.
 /// Zero is 1 byte. Negative numbers add 1 byte. Max 21 bytes.
 fn dynamodb_number_size(n: &str) -> usize {
     let s = n.trim_start_matches('-');

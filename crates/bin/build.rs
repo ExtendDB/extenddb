@@ -44,7 +44,7 @@ fn main() {
             let era = z.div_euclid(146_097);
             #[allow(clippy::cast_possible_truncation)]
             let doe = z.rem_euclid(146_097) as u64;
-            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
             #[allow(clippy::cast_possible_wrap)]
             let y = (yoe as i64) + era * 400;
             let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);

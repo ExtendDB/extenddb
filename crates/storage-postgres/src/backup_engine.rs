@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Backup and point-in-time recovery implementation for PostgreSQL storage.
+//! Backup and point-in-time recovery implementation for `PostgreSQL` storage.
 
 use extenddb_core::types::{
     BackupDescription, BackupDetails, BackupSummary, ContinuousBackupsDescription,
@@ -23,7 +23,7 @@ fn epoch_millis() -> u128 {
         .as_millis()
 }
 
-/// Convert a PostgreSQL `TIMESTAMPTZ` to epoch seconds as `f64`.
+/// Convert a `PostgreSQL` `TIMESTAMPTZ` to epoch seconds as `f64`.
 #[allow(clippy::cast_precision_loss)]
 fn pg_timestamp_to_epoch(ts: time::OffsetDateTime) -> f64 {
     ts.unix_timestamp() as f64
@@ -168,7 +168,7 @@ impl BackupEngine for PostgresEngine {
 
             Ok(BackupDetails {
                 backup_arn,
-                backup_name: backup_name.to_owned(),
+                backup_name: backup_name.clone(),
                 backup_status: "AVAILABLE".to_owned(),
                 backup_type: "USER".to_owned(),
                 backup_size_bytes: size_bytes,
@@ -235,7 +235,7 @@ impl BackupEngine for PostgresEngine {
 
             Ok(BackupDescription {
                 backup_details: BackupDetails {
-                    backup_arn: backup_arn.to_owned(),
+                    backup_arn: backup_arn.clone(),
                     backup_name: name,
                     backup_status: status,
                     backup_type: "USER".to_owned(),
@@ -262,7 +262,7 @@ impl BackupEngine for PostgresEngine {
         table_name: Option<&str>,
     ) -> BoxFuture<'_, Result<Vec<BackupSummary>, StorageError>> {
         let account_id = account_id.to_string();
-        let table_name = table_name.map(|s| s.to_string());
+        let table_name = table_name.map(std::string::ToString::to_string);
         Box::pin(async move {
             let rows: Vec<(
                 String,
@@ -400,7 +400,7 @@ impl BackupEngine for PostgresEngine {
             };
 
             let create_input = extenddb_core::types::CreateTableInput {
-                table_name: target_table_name.to_owned(),
+                table_name: target_table_name.clone(),
                 key_schema,
                 attribute_definitions: attr_defs,
                 billing_mode,

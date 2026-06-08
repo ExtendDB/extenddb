@@ -46,7 +46,7 @@ pub async fn run(args: SettingsArgs) -> anyhow::Result<()> {
         );
     }
     let app_config = config::load(&args.config)?;
-    let backend = &app_config.storage._backend;
+    let backend = &app_config.storage.backend;
     let store = extenddb_storage::settings_store::create_settings_store(
         backend,
         app_config.storage.connection_config(),

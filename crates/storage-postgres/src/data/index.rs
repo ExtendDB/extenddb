@@ -222,7 +222,7 @@ pub(crate) async fn enqueue_async_indexes(
 }
 
 /// Compute a hash of the partition key text for queue partitioning.
-/// Uses crc32 for stability across Rust versions (DefaultHasher is not stable).
+/// Uses crc32 for stability across Rust versions (`DefaultHasher` is not stable).
 pub(crate) fn pk_hash(pk_text: &str) -> u64 {
     u64::from(crc32fast::hash(pk_text.as_bytes()))
 }

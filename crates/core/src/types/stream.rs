@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! DynamoDB Streams types — stream records, shard iterators, and API input/output.
+//! `DynamoDB` Streams types — stream records, shard iterators, and API input/output.
 
 use std::collections::BTreeMap;
 
@@ -60,7 +60,7 @@ pub struct StreamRecordData {
 
 /// Identity of the principal that triggered a stream record.
 ///
-/// For TTL-originated deletions, DynamoDB sets `Type` to `"Service"` and
+/// For TTL-originated deletions, `DynamoDB` sets `Type` to `"Service"` and
 /// `PrincipalId` to `"dynamodb.amazonaws.com"`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserIdentity {

@@ -452,7 +452,7 @@ pub enum CacheInvalidateScope {
         #[arg(long)]
         role_name: String,
     },
-    /// Invalidate the cached group_policies for a list of users (used
+    /// Invalidate the cached `group_policies` for a list of users (used
     /// after a group-membership change that the write-through hooks
     /// missed).
     GroupMembers {
@@ -462,14 +462,14 @@ pub enum CacheInvalidateScope {
         #[arg(long)]
         user_names: String,
     },
-    /// Invalidate the TableKeyInfo cache for a single table.
+    /// Invalidate the `TableKeyInfo` cache for a single table.
     TableKeyInfo {
         #[arg(long)]
         account_id: String,
         #[arg(long)]
         table_name: String,
     },
-    /// Invalidate the resource_tags cache for a resource ARN.
+    /// Invalidate the `resource_tags` cache for a resource ARN.
     ResourceTags {
         #[arg(long)]
         arn: String,

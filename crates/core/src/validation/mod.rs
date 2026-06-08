@@ -104,7 +104,7 @@ pub fn validate_create_table(
     Ok(())
 }
 
-/// Format KeySchema elements in DynamoDB's Java-toString style for error messages.
+/// Format `KeySchema` elements in `DynamoDB`'s Java-toString style for error messages.
 fn format_key_schema_value(ks: &[KeySchemaElement]) -> String {
     let elements: Vec<String> = ks
         .iter()
@@ -245,7 +245,7 @@ fn validate_gsi_key_schemas(input: &CreateTableInput) -> Result<(), DynamoDbErro
 
 /// Validate LSI key schemas: each must have exactly 2 elements, HASH key must match
 /// the table's HASH key, second element must be RANGE.
-/// LSIs do not support multi-part keys (same as real DynamoDB).
+/// LSIs do not support multi-part keys (same as real `DynamoDB`).
 fn validate_lsi_key_schemas(input: &CreateTableInput) -> Result<(), DynamoDbError> {
     let Some(lsis) = &input.local_secondary_indexes else {
         return Ok(());
@@ -378,9 +378,9 @@ fn validate_provisioned_throughput(input: &CreateTableInput) -> Result<(), Dynam
 }
 
 /// Reject `ProvisionedThroughput` on GSIs when the table uses `PayPerRequest`.
-/// Real DynamoDB returns: "One or more parameter values were invalid:
-/// ProvisionedThroughput should not be specified for index: <name> when
-/// BillingMode is PAY_PER_REQUEST"
+/// Real `DynamoDB` returns: "One or more parameter values were invalid:
+/// `ProvisionedThroughput` should not be specified for index: <name> when
+/// `BillingMode` is `PAY_PER_REQUEST`"
 fn validate_gsi_provisioned_throughput(input: &CreateTableInput) -> Result<(), DynamoDbError> {
     let billing = input.billing_mode.unwrap_or(BillingMode::Provisioned);
     if billing != BillingMode::PayPerRequest {
@@ -656,7 +656,7 @@ pub fn validate_batch_item_keys(
 
 /// Remap key type-mismatch errors to the batch/transaction-specific message.
 ///
-/// Real DynamoDB uses "The provided key element does not match the schema"
+/// Real `DynamoDB` uses "The provided key element does not match the schema"
 /// for batch and transaction operations, not the single-item "Type mismatch"
 /// message.
 fn remap_key_type_mismatch(err: DynamoDbError) -> DynamoDbError {
@@ -793,7 +793,7 @@ pub fn validate_item_size(item: &Item, max_bytes: usize) -> Result<(), DynamoDbE
     Ok(())
 }
 
-/// Validate all number values in an item are within DynamoDB limits.
+/// Validate all number values in an item are within `DynamoDB` limits.
 pub fn validate_item_numbers(item: &Item) -> Result<(), DynamoDbError> {
     for value in item.values() {
         validate_attribute_number(value)?;
@@ -843,7 +843,7 @@ fn validate_attribute_number(value: &AttributeValue) -> Result<(), DynamoDbError
     Ok(())
 }
 
-/// Maximum total nesting levels (M/L wrappers plus the leaf) DynamoDB allows.
+/// Maximum total nesting levels (M/L wrappers plus the leaf) `DynamoDB` allows.
 pub(crate) const MAX_ITEM_NESTING_DEPTH: usize = 32;
 
 /// Validate that no attribute value in `item` nests beyond `MAX_ITEM_NESTING_DEPTH`.

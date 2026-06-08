@@ -113,7 +113,7 @@ impl Default for TlsConfig {
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
     /// Storage backend selector (e.g. "postgres").
-    pub _backend: String,
+    pub backend: String,
     /// Backend-specific configuration (trait object).
     config: Box<dyn extenddb_storage::config::StorageConfig>,
 }
@@ -172,10 +172,7 @@ impl<'de> serde::Deserialize<'de> for StorageConfig {
         let config = extenddb_storage::config::deserialize_storage_config(&backend, backend_table)
             .map_err(D::Error::custom)?;
 
-        Ok(StorageConfig {
-            _backend: backend,
-            config,
-        })
+        Ok(StorageConfig { backend, config })
     }
 }
 
@@ -183,7 +180,7 @@ impl<'de> serde::Deserialize<'de> for StorageConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            _backend: default_backend(),
+            backend: default_backend(),
             config: Box::new(extenddb_storage_postgres::PostgresStorageConfig::default()),
         }
     }
@@ -414,7 +411,7 @@ fn redact_if_sensitive(key: &str, val: &str) -> String {
 /// sensitive values (connection strings, passwords, keys).
 pub fn build_config_entries(cfg: &AppConfig) -> Vec<(String, String)> {
     let r = redact_if_sensitive;
-    let backend = &cfg.storage._backend;
+    let backend = &cfg.storage.backend;
     let mut entries = vec![
         ("server.bind_addr".into(), cfg.server.bind_addr.clone()),
         ("server.port".into(), cfg.server.port.to_string()),

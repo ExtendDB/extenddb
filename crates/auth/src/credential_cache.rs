@@ -122,7 +122,7 @@ impl CachedCredentialStore {
     ) -> Result<(), extenddb_cache::PredicateError> {
         let acct = account_id.to_owned();
         self.cache
-            .invalidate_if_value(move |v| v.map(|cred| cred.account_id == acct).unwrap_or(false))
+            .invalidate_if_value(move |v| v.is_some_and(|cred| cred.account_id == acct))
     }
 
     /// Drop every cached credential for `principal_name` in `account_id`.
@@ -140,8 +140,7 @@ impl CachedCredentialStore {
         let acct = account_id.to_owned();
         let principal = principal_name.to_owned();
         self.cache.invalidate_if_value(move |v| {
-            v.map(|cred| cred.account_id == acct && cred.principal_name == principal)
-                .unwrap_or(false)
+            v.is_some_and(|cred| cred.account_id == acct && cred.principal_name == principal)
         })
     }
 

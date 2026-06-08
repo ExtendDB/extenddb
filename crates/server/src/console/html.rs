@@ -84,7 +84,7 @@ f.appendChild(i);
     };
     let tls_line = match listen_url {
         Some(url) => format!(
-            r#"Self-signed TLS certificate bound to <strong>{}</strong>"#,
+            r"Self-signed TLS certificate bound to <strong>{}</strong>",
             escape(url),
         ),
         None => String::new(),

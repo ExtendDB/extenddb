@@ -186,13 +186,11 @@ impl PostgresEngine {
                 // Derive pk_text from whichever item is available.
                 let pk_item = new_item.as_ref().or(old_item.as_ref());
                 let Some(pk_item) = pk_item else { continue }; // ConditionCheck — no index changes
-                let pk_value = match pk_item.get(pk_name) {
-                    Some(v) => v,
-                    None => continue,
+                let Some(pk_value) = pk_item.get(pk_name) else {
+                    continue;
                 };
-                let pk_text = match pk_to_text(pk_value) {
-                    Ok(t) => t,
-                    Err(_) => continue,
+                let Ok(pk_text) = pk_to_text(pk_value) else {
+                    continue;
                 };
                 enqueue_async_indexes(
                     q,
@@ -243,7 +241,7 @@ fn transact_op_table_name<'a>(op: &'a TransactWriteOp<'_>) -> &'a str {
     }
 }
 
-/// Extract the table_id from a transactional write operation.
+/// Extract the `table_id` from a transactional write operation.
 fn transact_op_table_id<'a>(op: &'a TransactWriteOp<'_>) -> &'a str {
     match op {
         TransactWriteOp::Put { key_info, .. }

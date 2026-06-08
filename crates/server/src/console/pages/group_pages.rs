@@ -184,7 +184,7 @@ pub async fn group_detail(
         );
     }
 
-    content.push_str(r#"<table><thead><tr><th>User Name</th><th></th></tr></thead><tbody>"#);
+    content.push_str(r"<table><thead><tr><th>User Name</th><th></th></tr></thead><tbody>");
     for uname in &detail.members {
         let eu = html::escape(uname);
         let remove_btn = if is_admin(&session.identity) {
@@ -211,7 +211,7 @@ pub async fn group_detail(
             r#"<a href="/console/accounts/{eid}/groups/{egn}/policies/new" class="btn btn-primary btn-sm" style="margin-bottom:0.5rem;display:inline-block">Add Policy</a>"#
         );
     }
-    content.push_str(r#"<table><thead><tr><th>Policy Name</th><th></th></tr></thead><tbody>"#);
+    content.push_str(r"<table><thead><tr><th>Policy Name</th><th></th></tr></thead><tbody>");
     for pname in &detail.policies {
         let ep = html::escape(pname);
         let delete_btn = if is_admin(&session.identity) {

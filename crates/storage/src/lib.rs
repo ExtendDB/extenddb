@@ -226,7 +226,7 @@ pub trait DataEngine: Send + Sync {
 
     /// Update an item by primary key using update actions.
     ///
-    /// UpdateItem is an upsert: if the item doesn't exist, a new item is created
+    /// `UpdateItem` is an upsert: if the item doesn't exist, a new item is created
     /// containing the key attributes plus the SET values.
     ///
     /// If `condition` is `Some`, evaluates the condition against the existing item
@@ -339,7 +339,7 @@ pub trait DataEngine: Send + Sync {
 /// TTL, tag, and table-size management operations.
 ///
 /// Methods that operate on table-scoped resources receive `account_id`.
-/// Tag methods use ARN (which embeds account_id) so they don't need it separately.
+/// Tag methods use ARN (which embeds `account_id`) so they don't need it separately.
 pub trait MetadataEngine: Send + Sync {
     /// Return the TTL configuration for a table.
     fn describe_ttl(
@@ -427,7 +427,7 @@ pub trait MetadataEngine: Send + Sync {
     fn all_active_tables(&self) -> BoxFuture<'_, Result<Vec<(String, String)>, StorageError>>;
 }
 
-/// DynamoDB Streams record storage and retrieval.
+/// `DynamoDB` Streams record storage and retrieval.
 pub trait StreamEngine: Send + Sync {
     /// Write a stream record atomically (called within the data write transaction).
     fn write_stream_record(
@@ -577,11 +577,11 @@ pub trait BackupEngine: Send + Sync {
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>>;
 }
 
-/// Supertrait combining all DynamoDB operation traits.
+/// Supertrait combining all `DynamoDB` operation traits.
 ///
 /// All storage backends must implement this to provide a complete
 /// DynamoDB-compatible API. This trait has NO additional methods beyond
-/// the trait bounds — backend-specific concerns belong in ServerRuntimeHooks.
+/// the trait bounds — backend-specific concerns belong in `ServerRuntimeHooks`.
 pub trait StorageEngine:
     TableEngine + DataEngine + MetadataEngine + StreamEngine + BackupEngine + WorkerStore + Send + Sync
 {
@@ -617,7 +617,7 @@ pub trait CatalogStore:
     /// Get the cached encryption key (if available).
     ///
     /// Returns None if encryption key is not cached. This is used by
-    /// cmd_serve to construct the auth provider without re-querying
+    /// `cmd_serve` to construct the auth provider without re-querying
     /// the settings table.
     fn cached_encryption_key(&self) -> Option<String>;
 }

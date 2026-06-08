@@ -5,9 +5,9 @@
 
 use std::fmt;
 
-/// A DynamoDB expression parameter.
+/// A `DynamoDB` expression parameter.
 ///
-/// The string form is the exact wire-format parameter name DynamoDB uses in
+/// The string form is the exact wire-format parameter name `DynamoDB` uses in
 /// error messages (`Invalid <Kind>: ...`). Centralizing it here keeps those
 /// labels typo-safe instead of repeating string literals at each call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +20,7 @@ pub enum ExpressionKind {
 }
 
 impl ExpressionKind {
-    /// The canonical DynamoDB parameter name.
+    /// The canonical `DynamoDB` parameter name.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {

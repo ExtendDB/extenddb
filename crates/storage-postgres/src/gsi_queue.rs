@@ -5,7 +5,7 @@
 //!
 //! Base table writes commit independently. For GSIs with a non-zero
 //! propagation delay, index updates are enqueued here and applied after a
-//! random delay, simulating real DynamoDB eventual consistency.
+//! random delay, simulating real `DynamoDB` eventual consistency.
 //!
 //! Each queue partition is consumed by a single worker task, guaranteeing
 //! per-key FIFO ordering. Workers are event-driven via `Notify` and sleep
@@ -27,7 +27,7 @@ use crate::data::{
 /// Number of queue partitions. Each partition has one consumer task.
 const NUM_PARTITIONS: usize = 4;
 
-/// PostgreSQL SQLSTATE code for "undefined_table" (relation does not exist).
+/// `PostgreSQL` SQLSTATE code for "`undefined_table`" (relation does not exist).
 const PG_UNDEFINED_TABLE: &str = "42P01";
 
 /// Check if a `StorageError` is caused by an undefined table (SQLSTATE 42P01).

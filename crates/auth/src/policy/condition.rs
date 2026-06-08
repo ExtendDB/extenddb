@@ -5,7 +5,7 @@
 //!
 //! Evaluates condition blocks against a `ConditionContext`. Supports all IAM
 //! condition operators: String*, Numeric*, Date*, Bool, Null, Arn*, and the
-//! set operators ForAllValues/ForAnyValue with optional IfExists suffix.
+//! set operators ForAllValues/ForAnyValue with optional `IfExists` suffix.
 
 use super::context::ConditionContext;
 use super::document::{Condition, ConditionOperator};
@@ -160,10 +160,10 @@ fn unwrap_if_exists(op: &ConditionOperator) -> (bool, &ConditionOperator) {
 /// For multi-valued keys (e.g., `dynamodb:LeadingKeys`), all context values
 /// must satisfy the condition (implicit AND).
 ///
-/// For positive operators (StringEquals, NumericEquals, etc.): each context
+/// For positive operators (`StringEquals`, `NumericEquals`, etc.): each context
 /// value must match at least one policy value (OR semantics — "value in set").
 ///
-/// For negative operators (StringNotEquals, NumericNotEquals, etc.): each
+/// For negative operators (`StringNotEquals`, `NumericNotEquals`, etc.): each
 /// context value must satisfy the negative comparison against ALL policy
 /// values (AND semantics — "value not in set"). This matches AWS IAM behavior
 /// where `StringNotEquals` with `["a", "b"]` means "value is neither a nor b".

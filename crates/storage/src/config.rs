@@ -1,4 +1,4 @@
-// Copyright 2026 DynamoDB Open contributors
+// Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Storage configuration trait and registry for storage backends.
@@ -11,7 +11,7 @@
 pub trait StorageConfig: Send + Sync + std::fmt::Debug {
     /// Backend-specific connection configuration as a string.
     ///
-    /// For PostgreSQL: connection string (postgresql://...)
+    /// For `PostgreSQL`: connection string (postgresql://...)
     fn connection_config(&self) -> &str;
 
     /// Maximum concurrent connections for data operations.
@@ -63,5 +63,5 @@ pub fn deserialize_storage_config(
             return (reg.deserializer)(table);
         }
     }
-    Err(format!("Unknown backend: {}", backend))
+    Err(format!("Unknown backend: {backend}"))
 }

@@ -4,7 +4,7 @@
 //! Authentication and authorization for extenddb.
 //!
 //! Defines the `AuthProvider` trait for pluggable auth backends. Ships with
-//! `BuiltinAuthProvider` (full SigV4 verification with local credential store).
+//! `BuiltinAuthProvider` (full `SigV4` verification with local credential store).
 
 pub mod cache_registry;
 pub mod credential_cache;
@@ -20,7 +20,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Auth provider trait — pluggable authentication.
 ///
-/// `BuiltinAuthProvider` performs SigV4 verification.
+/// `BuiltinAuthProvider` performs `SigV4` verification.
 /// Fix #11: Accept `&HeaderMap` directly to avoid per-request `HashMap` allocation.
 #[async_trait::async_trait]
 pub trait AuthProvider: Send + Sync {
@@ -102,10 +102,10 @@ pub trait CredentialStore: Send + Sync {
     ) -> Result<Option<StoredCredential>, DynamoDbError>;
 }
 
-/// SigV4 auth provider with local credential store.
+/// `SigV4` auth provider with local credential store.
 ///
 /// Parses the `Authorization` header, looks up the access key, decrypts the
-/// secret, verifies the SigV4 signature, and validates the request timestamp.
+/// secret, verifies the `SigV4` signature, and validates the request timestamp.
 /// Handles both long-lived (AKIA*) and temporary (ASIA* + X-Amz-Security-Token)
 /// credentials.
 pub struct BuiltinAuthProvider<C: CredentialStore> {

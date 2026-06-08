@@ -80,7 +80,7 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
     }
 
     // Validate backend is supported and get catalog version (fail fast before binding port)
-    let backend = &app_config.storage._backend;
+    let backend = &app_config.storage.backend;
     let catalog_version = extenddb_storage::operations::catalog_version(backend)?;
 
     let port = args.port.unwrap_or(app_config.server.port);
@@ -204,7 +204,7 @@ async fn serve(
     // server (e.g., Postgres connection failure). The PID file was already
     // written by Daemonize in run().
     let pid_path = pid_file_path(&run_dir, port);
-    let backend = app_config.storage._backend.clone();
+    let backend = app_config.storage.backend.clone();
     let result = serve_inner(app_config, std_listener, port, run_dir, backend, foreground).await;
     if let Err(ref e) = result {
         let _ = std::fs::remove_file(&pid_path);

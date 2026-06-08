@@ -93,6 +93,7 @@ pub struct TableKeyInfo {
 }
 
 /// Extract all HASH key elements from a key schema (preserving order).
+#[must_use]
 pub fn hash_key_elements(key_schema: &[KeySchemaElement]) -> Vec<&KeySchemaElement> {
     key_schema
         .iter()
@@ -101,6 +102,7 @@ pub fn hash_key_elements(key_schema: &[KeySchemaElement]) -> Vec<&KeySchemaEleme
 }
 
 /// Extract all RANGE key elements from a key schema (preserving order).
+#[must_use]
 pub fn range_key_elements(key_schema: &[KeySchemaElement]) -> Vec<&KeySchemaElement> {
     key_schema
         .iter()
@@ -109,6 +111,7 @@ pub fn range_key_elements(key_schema: &[KeySchemaElement]) -> Vec<&KeySchemaElem
 }
 
 /// Returns `true` if the key schema has more than one HASH or more than one RANGE element.
+#[must_use]
 pub fn is_multipart_key_schema(key_schema: &[KeySchemaElement]) -> bool {
     let hash_count = key_schema
         .iter()

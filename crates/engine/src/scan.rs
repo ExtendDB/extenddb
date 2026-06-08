@@ -94,8 +94,7 @@ pub async fn handle_scan(
             }
             if seg < 0 {
                 return Err(DynamoDbError::ValidationException(format!(
-                    "1 validation error detected: Value '{}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0",
-                    seg
+                    "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0"
                 )));
             }
             if seg > 999_999 {
@@ -187,15 +186,15 @@ pub async fn handle_scan(
 
     // Parse FilterExpression or desugar legacy ScanFilter
     let (filter, filter_maps) = if let Some(ref sf) = input.scan_filter {
-        if !sf.is_empty() {
-            let cond_op = input.conditional_operator.unwrap_or_default();
-            let (expr, fmaps) = desugar_filter(sf, cond_op)?;
-            (Some(expr), Some(fmaps))
-        } else {
+        if sf.is_empty() {
             (
                 parse_optional_filter(input.filter_expression.as_deref(), &ctx.limits)?,
                 None,
             )
+        } else {
+            let cond_op = input.conditional_operator.unwrap_or_default();
+            let (expr, fmaps) = desugar_filter(sf, cond_op)?;
+            (Some(expr), Some(fmaps))
         }
     } else {
         (

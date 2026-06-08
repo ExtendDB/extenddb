@@ -68,7 +68,7 @@ pub async fn handle_batch_write_item(
     }
 
     // Validate: total operations across all tables <= 25
-    let total_ops: usize = input.request_items.values().map(|r| r.len()).sum();
+    let total_ops: usize = input.request_items.values().map(std::vec::Vec::len).sum();
     if total_ops > MAX_BATCH_WRITE_ITEMS {
         return Err(DynamoDbError::ValidationException(
             "Too many items requested for the BatchWriteItem call".to_owned(),

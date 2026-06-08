@@ -38,7 +38,7 @@ pub async fn run(args: DestroyArgs) -> anyhow::Result<()> {
         );
     }
     let app_config = config::load(&args.config)?;
-    let backend = &app_config.storage._backend;
+    let backend = &app_config.storage.backend;
 
     // Collect CLI args for backend-specific parsing
     let cli_args: Vec<String> = std::env::args().collect();

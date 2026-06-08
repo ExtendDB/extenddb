@@ -23,7 +23,7 @@ pub enum SortKeyValue {
 /// For single-attribute keys, returns the value directly (no encoding).
 /// For multi-attribute keys, uses netstring encoding: each part is encoded as
 /// `<decimal-length>:<value>,` and concatenated. This is provably collision-free
-/// regardless of value content, and compatible with PostgreSQL TEXT columns
+/// regardless of value content, and compatible with `PostgreSQL` TEXT columns
 /// (no null bytes).
 pub fn composite_pk_to_text(
     item: &Item,
@@ -86,6 +86,7 @@ pub fn pk_to_text(value: &AttributeValue) -> Result<Cow<'_, str>, StorageError> 
 }
 
 /// Determine which sort key column to use based on the attribute type.
+#[must_use]
 pub fn sk_column(attr_type: ScalarAttributeType) -> &'static str {
     match attr_type {
         ScalarAttributeType::S => "sk_s",
@@ -100,6 +101,7 @@ pub fn sk_column(attr_type: ScalarAttributeType) -> &'static str {
 /// backward compatible with single-SK tables), index 1 → `sk2_s`, index 2 →
 /// `sk3_s`, etc. The offset-by-one is intentional to preserve backward
 /// compatibility with existing single-SK data tables.
+#[must_use]
 pub fn sk_column_n(index: usize, attr_type: ScalarAttributeType) -> String {
     let suffix = match attr_type {
         ScalarAttributeType::S => "s",
@@ -114,6 +116,7 @@ pub fn sk_column_n(index: usize, attr_type: ScalarAttributeType) -> String {
 }
 
 /// Look up the sort key attribute definition from the key schema.
+#[must_use]
 pub fn sk_info<'a>(
     key_schema: &'a [KeySchemaElement],
     attr_defs: &'a [AttributeDefinition],
@@ -129,6 +132,7 @@ pub fn sk_info<'a>(
 ///
 /// Format: `<len>:<value>,<len>:<value>,...` — e.g., `"abc"` + `"de"` → `"3:abc,2:de,"`.
 /// This encoding is unambiguous for arbitrary byte content and contains no null bytes.
+#[must_use]
 pub fn encode_netstring_composite(parts: &[String]) -> String {
     let mut out = String::new();
     for p in parts {

@@ -74,7 +74,7 @@ impl extenddb_storage::management_store::ManagementStore for PostgresCatalogStor
     ) -> BoxFuture<'_, OpResult<()>> {
         let account_id = account_id.to_string();
         let user_name = user_name.to_string();
-        let password_hash = password_hash.map(|s| s.to_string());
+        let password_hash = password_hash.map(std::string::ToString::to_string);
         Box::pin(async move {
             self.create_user_impl(&account_id, &user_name, password_hash.as_deref())
                 .await

@@ -46,7 +46,7 @@ pub struct ManagementState {
     /// endpoint to expose per-sub-cache counters. The same instance is held
     /// trait-object-style in `auth_cache.authz` for invalidation calls.
     pub authz_cache: Arc<crate::CachedAuthzStore>,
-    /// Concrete TableKeyInfo cache handle, used by the auth-cache-metrics
+    /// Concrete `TableKeyInfo` cache handle, used by the auth-cache-metrics
     /// endpoint. Same instance is held in `auth_cache.table_key_info`.
     pub table_key_info_cache: Arc<crate::CachedTableKeyInfoStore>,
 }

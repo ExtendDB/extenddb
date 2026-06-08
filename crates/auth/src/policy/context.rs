@@ -1,18 +1,18 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Condition context trait and DynamoDB request context.
+//! Condition context trait and `DynamoDB` request context.
 //!
 //! `ConditionContext` is the shared trait for resolving condition keys during
-//! policy evaluation. `RequestContext` implements it for DynamoDB operations;
+//! policy evaluation. `RequestContext` implements it for `DynamoDB` operations;
 //! `AssumeRoleContext` implements it for trust policy evaluation.
 
 use std::collections::HashMap;
 
 /// Trait for resolving condition keys during policy evaluation.
 ///
-/// Implemented by `RequestContext` (DynamoDB operations) and
-/// `AssumeRoleContext` (trust policy / AssumeRole).
+/// Implemented by `RequestContext` (`DynamoDB` operations) and
+/// `AssumeRoleContext` (trust policy / `AssumeRole`).
 pub trait ConditionContext {
     /// Resolve a condition key to its value(s).
     ///
@@ -21,29 +21,29 @@ pub trait ConditionContext {
     fn resolve_key(&self, key: &str) -> Option<Vec<&str>>;
 }
 
-/// Request parameters extracted from a DynamoDB operation for condition evaluation.
+/// Request parameters extracted from a `DynamoDB` operation for condition evaluation.
 #[derive(Debug, Default)]
 pub struct RequestParams {
     /// Partition key values being accessed (for `dynamodb:LeadingKeys`).
-    /// `None` for table-level operations (CreateTable, etc.).
+    /// `None` for table-level operations (`CreateTable`, etc.).
     pub leading_keys: Option<Vec<String>>,
     /// Attribute names being read/written (for `dynamodb:Attributes`).
     /// `None` when not applicable.
     pub attributes: Option<Vec<String>>,
     /// The Select parameter value (for `dynamodb:Select`).
     pub select: Option<String>,
-    /// The ReturnValues parameter value (for `dynamodb:ReturnValues`).
+    /// The `ReturnValues` parameter value (for `dynamodb:ReturnValues`).
     pub return_values: Option<String>,
-    /// The ReturnConsumedCapacity parameter value.
+    /// The `ReturnConsumedCapacity` parameter value.
     pub return_consumed_capacity: Option<String>,
     /// The enclosing operation for batch/transact sub-operations.
     pub enclosing_operation: Option<String>,
 }
 
-/// Context for evaluating conditions on DynamoDB operations.
+/// Context for evaluating conditions on `DynamoDB` operations.
 ///
 /// Built by the server middleware before policy evaluation. Contains all
-/// condition keys that IAM policies can reference for DynamoDB access control.
+/// condition keys that IAM policies can reference for `DynamoDB` access control.
 #[derive(Debug)]
 pub struct RequestContext {
     /// Tags on the authenticated principal (`aws:PrincipalTag/*`).
@@ -56,9 +56,9 @@ pub struct RequestContext {
     pub attributes: Option<Vec<String>>,
     /// The Select parameter value.
     pub select: Option<String>,
-    /// The ReturnValues parameter value.
+    /// The `ReturnValues` parameter value.
     pub return_values: Option<String>,
-    /// The ReturnConsumedCapacity parameter value.
+    /// The `ReturnConsumedCapacity` parameter value.
     pub return_consumed_capacity: Option<String>,
     /// Whether this is a Scan operation.
     pub full_table_scan: Option<bool>,
@@ -67,11 +67,12 @@ pub struct RequestContext {
 }
 
 impl RequestContext {
-    /// Build context for a DynamoDB operation.
+    /// Build context for a `DynamoDB` operation.
     ///
     /// `principal_tags` and `resource_tags` come from the identity and target
     /// table respectively. `is_scan` should be true for Scan operations.
     /// `params` carries operation-specific request parameters.
+    #[must_use]
     pub fn build(
         principal_tags: HashMap<String, String>,
         resource_tags: HashMap<String, String>,
@@ -103,11 +104,11 @@ impl ConditionContext for RequestContext {
                 "dynamodb:LeadingKeys" => self
                     .leading_keys
                     .as_ref()
-                    .map(|v| v.iter().map(|s| s.as_str()).collect()),
+                    .map(|v| v.iter().map(std::string::String::as_str).collect()),
                 "dynamodb:Attributes" => self
                     .attributes
                     .as_ref()
-                    .map(|v| v.iter().map(|s| s.as_str()).collect()),
+                    .map(|v| v.iter().map(std::string::String::as_str).collect()),
                 "dynamodb:Select" => self.select.as_deref().map(|v| vec![v]),
                 "dynamodb:ReturnValues" => self.return_values.as_deref().map(|v| vec![v]),
                 "dynamodb:ReturnConsumedCapacity" => {
@@ -125,7 +126,7 @@ impl ConditionContext for RequestContext {
     }
 }
 
-/// Context for evaluating trust policy conditions during AssumeRole.
+/// Context for evaluating trust policy conditions during `AssumeRole`.
 ///
 /// Trust policies can reference `aws:PrincipalTag/*` and `sts:ExternalId`.
 /// DynamoDB-specific keys are not applicable.
@@ -133,7 +134,7 @@ impl ConditionContext for RequestContext {
 pub struct AssumeRoleContext {
     /// Tags on the calling principal.
     pub principal_tags: HashMap<String, String>,
-    /// The external ID provided in the AssumeRole call (if any).
+    /// The external ID provided in the `AssumeRole` call (if any).
     pub external_id: Option<String>,
 }
 

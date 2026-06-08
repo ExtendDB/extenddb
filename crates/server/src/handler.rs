@@ -116,7 +116,7 @@ pub(crate) async fn handle_request(
                 ),
                 &request_id,
             );
-        };
+        }
         match authorize_request(&state, &identity, &input, &operation, &account_id).await {
             Ok(ki) => pre_fetched_key_info = ki,
             Err(e) => return error_response(&e, &request_id),
