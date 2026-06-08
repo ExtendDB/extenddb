@@ -144,9 +144,8 @@ async fn try_admin_login(
     password: &str,
     store: &dyn extenddb_storage::management_store::AdminStore,
 ) -> AdminLoginResult {
-    let result = match store.verify_admin_password(username, password).await {
-        Ok(r) => r,
-        Err(_) => return AdminLoginResult::NotFound,
+    let Ok(result) = store.verify_admin_password(username, password).await else {
+        return AdminLoginResult::NotFound;
     };
     match result {
         Some(true) => AdminLoginResult::Authenticated(CallerIdentity::Admin(username.to_owned())),

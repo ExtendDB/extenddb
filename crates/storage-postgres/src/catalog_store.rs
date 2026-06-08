@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! PostgreSQL implementations of `SettingsStore`, `MetricsStore`, and
+//! `PostgreSQL` implementations of `SettingsStore`, `MetricsStore`, and
 //! `RateLimitStore`.
 //!
 //! `PostgresCatalogStore` wraps a `PgPool` connected to the catalog database
@@ -28,6 +28,7 @@ pub struct PostgresCatalogStore {
 
 impl PostgresCatalogStore {
     /// Create a new catalog store wrapping the given pool.
+    #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
@@ -36,6 +37,7 @@ impl PostgresCatalogStore {
     }
 
     /// Create a new catalog store with a pre-loaded encryption key (P119).
+    #[must_use]
     pub fn with_encryption_key(pool: PgPool, encryption_key: String) -> Self {
         Self {
             pool,
@@ -44,11 +46,13 @@ impl PostgresCatalogStore {
     }
 
     /// Borrow the underlying pool (escape hatch for callers not yet migrated).
+    #[must_use]
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
 
     /// Get the cached encryption key. Returns `None` if not loaded at startup.
+    #[must_use]
     pub fn encryption_key(&self) -> Option<&Arc<str>> {
         self.encryption_key.as_ref()
     }
@@ -109,7 +113,9 @@ impl extenddb_storage::management_store::SettingsStore for PostgresCatalogStore 
     }
 
     fn cached_encryption_key(&self) -> Option<String> {
-        self.encryption_key.as_ref().map(|k| k.to_string())
+        self.encryption_key
+            .as_ref()
+            .map(std::string::ToString::to_string)
     }
 }
 
@@ -232,8 +238,8 @@ impl extenddb_storage::management_store::MetricsStore for PostgresCatalogStore {
         table_name: Option<&str>,
         metric: Option<&str>,
     ) -> BoxFuture<'_, OpResult<Vec<MetricsRow>>> {
-        let table_name = table_name.map(|s| s.to_owned());
-        let metric = metric.map(|s| s.to_owned());
+        let table_name = table_name.map(std::borrow::ToOwned::to_owned);
+        let metric = metric.map(std::borrow::ToOwned::to_owned);
         Box::pin(async move {
             use std::fmt::Write as _;
 
@@ -385,7 +391,7 @@ impl extenddb_storage::management_store::RateLimitStore for PostgresCatalogStore
 
     fn record_failed_login(&self, principal: &str, source_ip: Option<&str>) -> BoxFuture<'_, ()> {
         let principal = principal.to_owned();
-        let source_ip = source_ip.map(|s| s.to_owned());
+        let source_ip = source_ip.map(std::borrow::ToOwned::to_owned);
         Box::pin(async move {
             let result = sqlx::query(
                 "INSERT INTO login_attempts (principal, success, source_ip) VALUES ($1, false, $2)",
@@ -426,6 +432,8 @@ impl extenddb_storage::management_store::RateLimitStore for PostgresCatalogStore
 // Implement CatalogStore supertrait
 impl extenddb_storage::CatalogStore for PostgresCatalogStore {
     fn cached_encryption_key(&self) -> Option<String> {
-        self.encryption_key.as_ref().map(|arc| arc.to_string())
+        self.encryption_key
+            .as_ref()
+            .map(std::string::ToString::to_string)
     }
 }

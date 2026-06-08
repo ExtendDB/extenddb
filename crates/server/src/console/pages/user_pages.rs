@@ -238,7 +238,7 @@ pub async fn user_detail(
 </form>"#
     );
     content.push_str(
-        r#"<table><thead><tr><th>Access Key ID</th><th>Status</th><th></th></tr></thead><tbody>"#,
+        r"<table><thead><tr><th>Access Key ID</th><th>Status</th><th></th></tr></thead><tbody>",
     );
     for (kid, is_active) in &detail.keys {
         let ekid = html::escape(kid);
@@ -262,7 +262,7 @@ pub async fn user_detail(
             r#"<a href="/console/accounts/{eid}/users/{eun}/policies/new" class="btn btn-primary btn-sm" style="margin-bottom:0.5rem;display:inline-block">Add Policy</a>"#
         );
     }
-    content.push_str(r#"<table><thead><tr><th>Policy Name</th><th></th></tr></thead><tbody>"#);
+    content.push_str(r"<table><thead><tr><th>Policy Name</th><th></th></tr></thead><tbody>");
     for pname in &detail.policies {
         let ep = html::escape(pname);
         let delete_btn = if is_admin(&session.identity) {
@@ -281,7 +281,7 @@ pub async fn user_detail(
 
     // Groups section.
     let _ = write!(content, "<h2>Groups ({})</h2>", detail.groups.len());
-    content.push_str(r#"<table><thead><tr><th>Group Name</th></tr></thead><tbody>"#);
+    content.push_str(r"<table><thead><tr><th>Group Name</th></tr></thead><tbody>");
     for gname in &detail.groups {
         let eg = html::escape(gname);
         let _ = write!(
@@ -293,7 +293,7 @@ pub async fn user_detail(
 
     // Tags section.
     let _ = write!(content, "<h2>Tags ({})</h2>", detail.tags.len());
-    content.push_str(r#"<table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>"#);
+    content.push_str(r"<table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>");
     for (k, v) in &detail.tags {
         let _ = write!(
             content,

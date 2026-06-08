@@ -19,7 +19,7 @@ use crate::PostgresEngine;
 const SHARDS_PER_STREAM: u32 = 4;
 
 impl PostgresEngine {
-    /// Initialize stream shards for a table and set the stream_label.
+    /// Initialize stream shards for a table and set the `stream_label`.
     ///
     /// Updates the stream label in the catalog (via the provided catalog
     /// transaction) and creates shard rows in the data database within a
@@ -126,7 +126,7 @@ impl StreamEngine for PostgresEngine {
         limit: i64,
     ) -> BoxFuture<'_, Result<(Vec<StreamRecord>, Option<String>), StorageError>> {
         let shard_id = shard_id.to_string();
-        let after_sequence = after_sequence.map(|s| s.to_string());
+        let after_sequence = after_sequence.map(std::string::ToString::to_string);
         Box::pin(async move {
             let rows: Vec<(serde_json::Value,)> = if let Some(after) = after_sequence {
                 sqlx::query_as(
@@ -192,8 +192,7 @@ impl StreamEngine for PostgresEngine {
             let (ks_json, _ad_json, stream_spec_json, table_status, table_id) =
                 row.ok_or_else(|| {
                     StorageError::TableNotFound(format!(
-                        "Requested resource not found: Stream: {arn} not found.",
-                        arn = stream_arn
+                        "Requested resource not found: Stream: {stream_arn} not found."
                     ))
                 })?;
 
@@ -285,8 +284,9 @@ impl StreamEngine for PostgresEngine {
         exclusive_start_stream_arn: Option<&str>,
     ) -> BoxFuture<'_, Result<(Vec<StreamSummary>, Option<String>), StorageError>> {
         let account_id = account_id.to_string();
-        let table_name = table_name.map(|s| s.to_string());
-        let exclusive_start_stream_arn = exclusive_start_stream_arn.map(|s| s.to_string());
+        let table_name = table_name.map(std::string::ToString::to_string);
+        let exclusive_start_stream_arn =
+            exclusive_start_stream_arn.map(std::string::ToString::to_string);
         Box::pin(async move {
             let rows: Vec<(String, String, String)> = match (
                 table_name.as_deref(),

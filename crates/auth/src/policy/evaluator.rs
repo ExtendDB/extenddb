@@ -33,8 +33,8 @@ pub enum AuthzDecision {
 ///
 /// - `identity_policies`: user + group policies, or role policies.
 /// - `permissions_boundary`: optional boundary policy on the user or role.
-/// - `session_policy`: optional inline policy from AssumeRole.
-/// - `action`: the DynamoDB action (e.g., "dynamodb:PutItem").
+/// - `session_policy`: optional inline policy from `AssumeRole`.
+/// - `action`: the `DynamoDB` action (e.g., "dynamodb:PutItem").
 /// - `resource_arn`: the target resource ARN.
 /// - `context`: condition context for evaluating condition blocks.
 pub fn evaluate_policies(

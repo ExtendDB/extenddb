@@ -330,7 +330,7 @@ impl PostgresEngine {
             sse_description: row.sse_specification.as_ref().and_then(|spec| {
                 let enabled = spec
                     .get("Enabled")
-                    .and_then(|v| v.as_bool())
+                    .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
                 if enabled {
                     Some(SseDescription {

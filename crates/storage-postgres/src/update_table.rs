@@ -59,18 +59,18 @@ impl PostgresEngine {
 
             if let Some((current_bm, current_pt_opt)) = current_row {
                 let current_pt =
-                    current_pt_opt.unwrap_or(serde_json::Value::Object(Default::default()));
+                    current_pt_opt.unwrap_or(serde_json::Value::Object(serde_json::Map::default()));
                 let is_provisioned =
                     current_bm.as_deref() == Some("PROVISIONED") || current_bm.is_none();
                 let current_rcu = current_pt
                     .get("ReadCapacityUnits")
                     .or_else(|| current_pt.get("read_capacity_units"))
-                    .and_then(|v| v.as_i64())
+                    .and_then(serde_json::Value::as_i64)
                     .unwrap_or(0);
                 let current_wcu = current_pt
                     .get("WriteCapacityUnits")
                     .or_else(|| current_pt.get("write_capacity_units"))
-                    .and_then(|v| v.as_i64())
+                    .and_then(serde_json::Value::as_i64)
                     .unwrap_or(0);
 
                 if is_provisioned

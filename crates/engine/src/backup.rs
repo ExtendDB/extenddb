@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Engine handlers for DynamoDB backup and point-in-time recovery operations.
+//! Engine handlers for `DynamoDB` backup and point-in-time recovery operations.
 
 use extenddb_core::error::DynamoDbError;
 use serde_json::{Value, json};
@@ -196,7 +196,7 @@ pub(crate) async fn handle_update_continuous_backups(
     let pitr_enabled = body
         .get("PointInTimeRecoverySpecification")
         .and_then(|v| v.get("PointInTimeRecoveryEnabled"))
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
     let desc = ctx
@@ -227,7 +227,7 @@ pub(crate) async fn handle_restore_table_to_point_in_time(
     ))
 }
 
-/// Convert storage errors to DynamoDB errors.
+/// Convert storage errors to `DynamoDB` errors.
 fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> DynamoDbError {
     match e {
         extenddb_storage::error::StorageError::TableNotFound(msg) => {

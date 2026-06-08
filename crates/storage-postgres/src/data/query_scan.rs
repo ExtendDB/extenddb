@@ -17,7 +17,7 @@ use super::query::{
 use super::{all_sort_key_info, data_table_name, index_table_name, json_to_item};
 use crate::PostgresEngine;
 
-/// Build the WHERE clause fragment for ExclusiveStartKey pagination.
+/// Build the WHERE clause fragment for `ExclusiveStartKey` pagination.
 ///
 /// Self-contained: takes `param_idx` (the next available placeholder number),
 /// returns a complete SQL fragment. No mutable state leaks out.
@@ -161,12 +161,11 @@ impl PostgresEngine {
             let attr_name = match path.first() {
                 Some(extenddb_core::expression::PathElement::Attribute(name)) => {
                     if let Some(ref_name) = name.strip_prefix('#') {
-                        match maps.names.get(ref_name) {
-                            Some(resolved) => resolved.clone(),
-                            None => {
-                                tracing::warn!(name_ref = %ref_name, "unresolved expression attribute name in extra SK condition, skipping");
-                                continue;
-                            }
+                        if let Some(resolved) = maps.names.get(ref_name) {
+                            resolved.clone()
+                        } else {
+                            tracing::warn!(name_ref = %ref_name, "unresolved expression attribute name in extra SK condition, skipping");
+                            continue;
                         }
                     } else {
                         name.clone()
@@ -303,7 +302,7 @@ impl PostgresEngine {
                     .get(base_pk_attr.as_str())
                     .map(pk_to_text)
                     .transpose()?
-                    .map(|c| c.into_owned());
+                    .map(std::borrow::Cow::into_owned);
                 match (base_pk, &base_sk_info) {
                     (Some(pk_text), Some((sk_name, sk_type))) => {
                         if let Some(sk_val) = start_key.get(sk_name.as_str()) {

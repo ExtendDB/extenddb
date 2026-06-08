@@ -23,7 +23,7 @@ fn extract_table_name_from_arn(arn: &str) -> Option<&str> {
     Some(table_name.split('/').next().unwrap_or(table_name))
 }
 
-/// Extract the account ID from a DynamoDB table ARN.
+/// Extract the account ID from a `DynamoDB` table ARN.
 fn extract_account_from_arn(arn: &str) -> Option<&str> {
     arn.strip_prefix("arn:aws:dynamodb:")?.split(':').nth(1)
 }

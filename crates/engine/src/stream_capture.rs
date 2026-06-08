@@ -3,8 +3,8 @@
 
 //! Stream record capture helpers for write operations.
 //!
-//! When a table has streams enabled, write operations (PutItem, DeleteItem,
-//! UpdateItem) generate stream records. This module provides the
+//! When a table has streams enabled, write operations (`PutItem`, `DeleteItem`,
+//! `UpdateItem`) generate stream records. This module provides the
 //! `stream_view_type` helper to check whether a table has streams enabled
 //! and determine the view type.
 
@@ -14,6 +14,7 @@ use extenddb_core::types::{StreamViewType, TableKeyInfo};
 ///
 /// Reads the stream specification from the cached `TableKeyInfo` — no extra
 /// SQL round-trip required.
+#[must_use]
 pub fn stream_view_type(key_info: &TableKeyInfo) -> Option<StreamViewType> {
     let spec = key_info.stream_specification.as_ref()?;
     if !spec.stream_enabled {

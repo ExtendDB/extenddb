@@ -1,4 +1,4 @@
-// Copyright 2026 DynamoDB Open contributors
+// Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Backend operations for ddbo CLI commands.
@@ -8,8 +8,8 @@
 //! support the ddbo platform lifecycle, runtime operations, and diagnostics.
 //!
 //! This is distinct from:
-//! - Data plane operations (PutItem, Query) — handled by `DataEngine`
-//! - Control plane operations (CreateTable) — handled by `TableEngine`
+//! - Data plane operations (`PutItem`, Query) — handled by `DataEngine`
+//! - Control plane operations (`CreateTable`) — handled by `TableEngine`
 //! - Management operations (IAM, accounts) — handled by `ManagementStore`
 
 use crate::error::StorageError;
@@ -72,6 +72,7 @@ pub fn get_operations_engine(backend: &str) -> Result<&'static dyn OperationsEng
 }
 
 /// List all registered backend names.
+#[must_use]
 pub fn list_operations_backends() -> Vec<&'static str> {
     inventory::iter::<OperationsEngineRegistration>()
         .map(|r| r.name)
@@ -82,7 +83,7 @@ pub fn list_operations_backends() -> Vec<&'static str> {
 
 /// Get the catalog version for a backend.
 pub fn catalog_version(backend: &str) -> Result<String, StorageError> {
-    get_operations_engine(backend).map(|ops| ops.catalog_version())
+    get_operations_engine(backend).map(OperationsEngine::catalog_version)
 }
 
 /// Redact sensitive information from a connection string.

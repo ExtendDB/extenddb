@@ -267,8 +267,8 @@ fn evaluate_function(
             let val = resolve_to_value(&args[0], item, maps)?;
             let prefix = resolve_to_value(&args[1], item, maps)?;
             // Reject invalid operand types — only S and B are allowed
-            if let Some(ref p) = prefix.as_deref()
-                && !matches!(p, AttributeValue::S(_) | AttributeValue::B(_))
+            if let Some(p) = prefix.as_deref()
+                && !matches!(&p, AttributeValue::S(_) | AttributeValue::B(_))
             {
                 let type_code = attribute_type_code(p);
                 return Err(DynamoDbError::ValidationException(format!(
@@ -343,7 +343,7 @@ fn evaluate_function(
 /// Evaluate the `size()` function, returning the size as a number `AttributeValue`.
 ///
 /// Returns `None` if the argument resolves to a missing attribute, matching
-/// DynamoDB's behavior where `size(nonexistent)` causes the enclosing
+/// `DynamoDB`'s behavior where `size(nonexistent)` causes the enclosing
 /// comparison to evaluate to false (the item is skipped).
 fn evaluate_size<'a>(
     args: &'a [Expr],

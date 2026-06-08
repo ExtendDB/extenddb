@@ -67,7 +67,7 @@ pub struct TransactGetItemsOutput {
 
 /// A single item response within `TransactGetItems` output.
 ///
-/// Real DynamoDB returns `{}` (no `Item` key) for missing items. When an item
+/// Real `DynamoDB` returns `{}` (no `Item` key) for missing items. When an item
 /// exists, it returns `{"Item": {...}}`. The AWS SDK API model marks `Item` as
 /// optional, and SDKs deserialize an absent `Item` key as `None`/`null`.
 #[derive(Debug, Clone, Serialize)]

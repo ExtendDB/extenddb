@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! DynamoDB reserved word list.
+//! `DynamoDB` reserved word list.
 //!
 //! Bare identifiers matching these words are rejected in expressions unless
 //! aliased via `ExpressionAttributeNames`.

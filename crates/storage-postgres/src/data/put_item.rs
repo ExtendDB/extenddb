@@ -110,7 +110,9 @@ impl PostgresEngine {
                 }
 
                 // Sync GSI/LSI update within transaction (D-4).
-                let old_item_for_idx = if !indexes.is_empty() {
+                let old_item_for_idx = if indexes.is_empty() {
+                    None
+                } else {
                     let oi = old
                         .as_ref()
                         .map(|(v,)| json_to_item(v.clone()))
@@ -127,8 +129,6 @@ impl PostgresEngine {
                     )
                     .await?;
                     oi
-                } else {
-                    None
                 };
 
                 // Write stream record atomically within the transaction.
@@ -255,7 +255,9 @@ impl PostgresEngine {
                 }
 
                 // Sync GSI/LSI update within transaction (D-4).
-                let old_item_for_idx = if !indexes.is_empty() {
+                let old_item_for_idx = if indexes.is_empty() {
+                    None
+                } else {
                     let oi = old
                         .as_ref()
                         .map(|(v,)| json_to_item(v.clone()))
@@ -272,8 +274,6 @@ impl PostgresEngine {
                     )
                     .await?;
                     oi
-                } else {
-                    None
                 };
 
                 // Write stream record atomically within the transaction.

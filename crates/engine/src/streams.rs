@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! DynamoDB Streams operation handlers.
+//! `DynamoDB` Streams operation handlers.
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{
@@ -153,7 +153,7 @@ pub async fn handle_get_shard_iterator(
     serialize_output(&output)
 }
 
-/// Shard iterator expiration: 15 minutes (900 seconds), matching real DynamoDB.
+/// Shard iterator expiration: 15 minutes (900 seconds), matching real `DynamoDB`.
 const SHARD_ITERATOR_EXPIRY_SECS: u64 = 900;
 
 /// Handle `GetRecords`.

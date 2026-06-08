@@ -196,7 +196,7 @@ impl KeyCondition {
         } else {
             self.sk_condition = None;
             self.extra_sk_conditions = Vec::new();
-        };
+        }
 
         Ok(())
     }

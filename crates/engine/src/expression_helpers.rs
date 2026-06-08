@@ -184,7 +184,7 @@ pub fn resolve_condition(
 
 /// Tokenize, reserved-word check, and parse a `ProjectionExpression`.
 ///
-/// Errors carry the `ProjectionExpression` prefix, matching Amazon DynamoDB.
+/// Errors carry the `ProjectionExpression` prefix, matching Amazon `DynamoDB`.
 ///
 /// # Errors
 ///
@@ -207,7 +207,7 @@ pub fn parse_projection_expr(
     result.map_err(|e| prefix_expression_error(e, ExpressionKind::Projection))
 }
 
-/// Prefix an expression error with the expression type, matching DynamoDB's format.
+/// Prefix an expression error with the expression type, matching `DynamoDB`'s format.
 ///
 /// `FilterExpression` shares the condition parser, so its errors arrive labelled
 /// `ConditionExpression`; those are relabelled to `expr_type`. Errors already

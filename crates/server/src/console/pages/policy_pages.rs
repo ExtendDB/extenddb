@@ -268,22 +268,21 @@ async fn put_policy(
     }
 
     // Validate JSON.
-    let doc: serde_json::Value = match serde_json::from_str(&form.policy_document) {
-        Ok(v) => v,
-        Err(_) => {
-            let nav = html::nav_bar(&identity_label(&session.identity));
-            let content = format!(
-                "<h1>Add Policy</h1>{}",
-                html::alert_error("Policy document is not valid JSON")
-            );
-            return Html(html::layout_csrf(
-                "New Policy",
-                &nav,
-                &content,
-                &session.csrf_token,
-            ))
-            .into_response();
-        }
+    let doc: serde_json::Value = if let Ok(v) = serde_json::from_str(&form.policy_document) {
+        v
+    } else {
+        let nav = html::nav_bar(&identity_label(&session.identity));
+        let content = format!(
+            "<h1>Add Policy</h1>{}",
+            html::alert_error("Policy document is not valid JSON")
+        );
+        return Html(html::layout_csrf(
+            "New Policy",
+            &nav,
+            &content,
+            &session.csrf_token,
+        ))
+        .into_response();
     };
 
     match state

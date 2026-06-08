@@ -49,7 +49,7 @@ pub enum Scope {
 }
 
 impl Scope {
-    /// Canonical snake_case name (matches the JSON wire format, the CLI
+    /// Canonical `snake_case` name (matches the JSON wire format, the CLI
     /// subcommand names, and the design doc table). Used in audit logs
     /// and the console success page so operators see the same
     /// identifier across every surface.

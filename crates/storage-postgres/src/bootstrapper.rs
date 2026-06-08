@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! PostgreSQL implementation of `Bootstrapper`.
+//! `PostgreSQL` implementation of `Bootstrapper`.
 //!
 //! Handles `CREATE DATABASE`, schema migrations, user provisioning, and
 //! teardown using PostgreSQL-specific DDL. Connection pools are created
@@ -23,7 +23,7 @@ use tokio::sync::OnceCell;
 use crate::CATALOG_VERSION;
 use crate::migrations;
 
-/// Utilities for bootstrapping a PostgreSQL backend store.
+/// Utilities for bootstrapping a `PostgreSQL` backend store.
 ///
 /// Holds the bootstrap configuration and lazily-created connection pools.
 /// The admin pool connects to the `postgres` database for DDL operations
@@ -37,6 +37,7 @@ pub struct PostgresBootstrapper {
 impl PostgresBootstrapper {
     /// Create a new bootstrapper. The admin pool is created lazily on
     /// first use, so this constructor never opens a database connection.
+    #[must_use]
     pub fn new(config: BootstrapConfig) -> Self {
         Self {
             config,
@@ -93,7 +94,7 @@ impl PostgresBootstrapper {
     /// - Passwords with special chars (e.g., `pass@word` → `pass%40word`)
     /// - Database names with special chars
     ///
-    /// PostgreSQL's libpq automatically decodes percent-encoded values per RFC 3986.
+    /// `PostgreSQL`'s libpq automatically decodes percent-encoded values per RFC 3986.
     fn app_connection_url(&self, database: &str) -> String {
         let host_encoded = urlencoding::encode(&self.config.host);
         let user_encoded = urlencoding::encode(&self.config.app_user);
@@ -348,9 +349,8 @@ impl Bootstrapper for PostgresBootstrapper {
     }
 
     async fn list_table_names(&self) -> OpResult<Vec<String>> {
-        let pool = match self.app_pool(&self.config.catalog_db).await {
-            Ok(p) => p,
-            Err(_) => return Ok(Vec::new()),
+        let Ok(pool) = self.app_pool(&self.config.catalog_db).await else {
+            return Ok(Vec::new());
         };
         let tables: Vec<(String,)> =
             sqlx::query_as("SELECT table_name FROM tables ORDER BY table_name")
@@ -361,9 +361,8 @@ impl Bootstrapper for PostgresBootstrapper {
     }
 
     async fn get_data_db_name(&self) -> OpResult<Option<String>> {
-        let pool = match self.app_pool(&self.config.catalog_db).await {
-            Ok(p) => p,
-            Err(_) => return Ok(None),
+        let Ok(pool) = self.app_pool(&self.config.catalog_db).await else {
+            return Ok(None);
         };
         let row = sqlx::query_as::<_, (String,)>(
             "SELECT value FROM settings WHERE key = 'data_database_name'",
@@ -491,7 +490,7 @@ impl PostgresBootstrapper {
         let (host, port, user, password, catalog_db_name) = if std::path::Path::new(config_path)
             .exists()
         {
-            println!("--- Loading defaults from {}", config_path);
+            println!("--- Loading defaults from {config_path}");
 
             // Parse connection string from config
             let config_content = std::fs::read_to_string(config_path)

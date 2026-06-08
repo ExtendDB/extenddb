@@ -31,7 +31,7 @@ pub async fn run(args: VerifyArgs) -> anyhow::Result<()> {
         );
     }
     let app_config = config::load(&args.config)?;
-    let backend = &app_config.storage._backend;
+    let backend = &app_config.storage.backend;
     let expected_version = extenddb_storage::operations::catalog_version(backend)
         .unwrap_or_else(|_| "unknown".to_string());
 

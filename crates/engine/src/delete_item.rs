@@ -75,7 +75,12 @@ pub async fn handle_delete_item(
         &ctx.limits,
     )?;
 
-    if input.expected.is_none() || input.expected.as_ref().is_some_and(|m| m.is_empty()) {
+    if input.expected.is_none()
+        || input
+            .expected
+            .as_ref()
+            .is_some_and(std::collections::HashMap::is_empty)
+    {
         let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
         extenddb_core::expression::validate_unused_attributes(
             &maps.names,

@@ -9,7 +9,7 @@ use crate::types::{CancellationReason, Item};
 /// All Virtual `DynamoDB` error types with HTTP status codes.
 ///
 /// REQ-ERR-001 through REQ-ERR-004: error JSON format, status codes, and SDK retry behavior.
-/// SP-ERR-002: HTTP status codes match the real DynamoDB error catalog exactly.
+/// SP-ERR-002: HTTP status codes match the real `DynamoDB` error catalog exactly.
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum DynamoDbError {
@@ -84,7 +84,7 @@ pub enum DynamoDbError {
     /// SP-ERR-002: Per-request timeout. HTTP 408.
     #[error("{0}")]
     RequestTimeoutException(String),
-    /// SP-ERR-002: SigV4 signature mismatch. HTTP 403.
+    /// SP-ERR-002: `SigV4` signature mismatch. HTTP 403.
     #[error("{0}")]
     InvalidSignatureException(String),
 }
@@ -92,7 +92,7 @@ pub enum DynamoDbError {
 impl DynamoDbError {
     /// HTTP status code for this error.
     ///
-    /// SP-ERR-002: status codes match the real DynamoDB error catalog.
+    /// SP-ERR-002: status codes match the real `DynamoDB` error catalog.
     #[must_use]
     pub fn status_code(&self) -> u16 {
         match self {
@@ -180,7 +180,7 @@ impl DynamoDbError {
     ///   `InvalidSignatureException`)
     /// - All other `DynamoDB` errors → `com.amazonaws.dynamodb.v20120810#`
     ///
-    /// Verified against real DynamoDB 2026-05-04.
+    /// Verified against real `DynamoDB` 2026-05-04.
     #[must_use]
     pub fn full_error_type(&self) -> String {
         let prefix = match self {

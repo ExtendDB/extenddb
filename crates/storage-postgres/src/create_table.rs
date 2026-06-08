@@ -45,7 +45,7 @@ impl PostgresEngine {
             .transpose()
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         let deletion_protection = input.deletion_protection_enabled.unwrap_or(false);
-        let sse_spec_json = input.sse_specification.as_ref().cloned();
+        let sse_spec_json = input.sse_specification.clone();
         let on_demand_json = input
             .on_demand_throughput
             .as_ref()
@@ -400,7 +400,7 @@ impl PostgresEngine {
             sse_description: input.sse_specification.as_ref().and_then(|spec| {
                 let enabled = spec
                     .get("Enabled")
-                    .and_then(|v| v.as_bool())
+                    .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
                 if enabled {
                     Some(SseDescription {

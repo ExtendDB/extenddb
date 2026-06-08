@@ -105,7 +105,10 @@ pub async fn handle_transact_write_items(
     }
 
     // Validate total transaction size <= 4MB
-    let total_size: usize = prepared.iter().map(|op| op.item_size()).sum();
+    let total_size: usize = prepared
+        .iter()
+        .map(super::transact_write_helpers::PreparedOp::item_size)
+        .sum();
     if total_size > 4 * 1024 * 1024 {
         return Err(DynamoDbError::ValidationException(
             "Transaction item size has exceeded the 4 MB limit".to_owned(),

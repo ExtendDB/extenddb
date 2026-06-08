@@ -1,10 +1,10 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Canonical request construction for SigV4 verification.
+//! Canonical request construction for `SigV4` verification.
 //!
 //! Builds the canonical request string from the HTTP method, URI path,
-//! query string, signed headers, and body hash per the AWS SigV4 spec.
+//! query string, signed headers, and body hash per the AWS `SigV4` spec.
 
 use axum::http::HeaderMap;
 use sha2::{Digest, Sha256};
@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 /// HashedPayload
 /// ```
 ///
-/// For DynamoDB, the URI is always `/` and there is no query string.
+/// For `DynamoDB`, the URI is always `/` and there is no query string.
 pub fn canonical_request(
     method: &str,
     uri_path: &str,
@@ -39,15 +39,14 @@ pub fn canonical_request(
     let payload_hash = headers
         .get("x-amz-content-sha256")
         .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-        .unwrap_or_else(|| sha256_hex(body));
+        .map_or_else(|| sha256_hex(body), str::to_owned);
 
     format!(
         "{method}\n{uri_path}\n{query_string}\n{canonical_headers}\n{signed_lower}\n{payload_hash}"
     )
 }
 
-/// Build the string-to-sign for SigV4.
+/// Build the string-to-sign for `SigV4`.
 ///
 /// Format:
 /// ```text
@@ -56,6 +55,7 @@ pub fn canonical_request(
 /// <scope>\n
 /// Hex(SHA256(canonical_request))
 /// ```
+#[must_use]
 pub fn string_to_sign(timestamp: &str, scope: &str, canonical_request: &str) -> String {
     let hashed = sha256_hex(canonical_request.as_bytes());
     format!("AWS4-HMAC-SHA256\n{timestamp}\n{scope}\n{hashed}")

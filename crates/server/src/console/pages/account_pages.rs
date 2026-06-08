@@ -81,7 +81,7 @@ pub async fn list_accounts(State(state): State<Arc<ConsoleState>>, headers: Head
     };
 
     let mut table = String::from(
-        r#"<table><thead><tr><th>Account ID</th><th>Name</th><th></th></tr></thead><tbody>"#,
+        r"<table><thead><tr><th>Account ID</th><th>Name</th><th></th></tr></thead><tbody>",
     );
     for (id, name) in &rows {
         let eid = html::escape(id);
@@ -302,7 +302,7 @@ pub async fn account_detail(
         );
     }
 
-    content.push_str(r#"<table><thead><tr><th>User Name</th></tr></thead><tbody>"#);
+    content.push_str(r"<table><thead><tr><th>User Name</th></tr></thead><tbody>");
     for name in &detail.users {
         let en = html::escape(name);
         let _ = write!(
@@ -320,7 +320,7 @@ pub async fn account_detail(
             r#"<a href="/console/accounts/{eid}/groups/new" class="btn btn-primary btn-sm" style="margin-bottom:0.5rem;display:inline-block">New Group</a>"#
         );
     }
-    content.push_str(r#"<table><thead><tr><th>Group Name</th></tr></thead><tbody>"#);
+    content.push_str(r"<table><thead><tr><th>Group Name</th></tr></thead><tbody>");
     for name in &detail.groups {
         let en = html::escape(name);
         let _ = write!(
@@ -338,7 +338,7 @@ pub async fn account_detail(
             r#"<a href="/console/accounts/{eid}/roles/new" class="btn btn-primary btn-sm" style="margin-bottom:0.5rem;display:inline-block">New Role</a>"#
         );
     }
-    content.push_str(r#"<table><thead><tr><th>Role Name</th></tr></thead><tbody>"#);
+    content.push_str(r"<table><thead><tr><th>Role Name</th></tr></thead><tbody>");
     for name in &detail.roles {
         let en = html::escape(name);
         let _ = write!(

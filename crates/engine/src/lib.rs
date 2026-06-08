@@ -71,7 +71,7 @@ use extenddb_core::limits::LimitsConfig;
 
 /// Check whether an operation name is recognized by the dispatch table.
 ///
-/// Real DynamoDB validates the operation name before checking authentication.
+/// Real `DynamoDB` validates the operation name before checking authentication.
 /// An unknown operation with no auth headers returns `UnknownOperationException`,
 /// not `MissingAuthenticationToken`. The server layer calls this before auth.
 #[must_use]
@@ -141,7 +141,7 @@ pub(crate) fn sanitize_storage_error(e: extenddb_storage::error::StorageError) -
     DynamoDbError::InternalServerError("Internal server error".to_owned())
 }
 
-/// Map a serde deserialization error to the appropriate DynamoDB error type.
+/// Map a serde deserialization error to the appropriate `DynamoDB` error type.
 ///
 /// Enum validation errors (produced by custom Deserialize impls) contain
 /// "validation error detected" and should be returned as `ValidationException`.
@@ -168,15 +168,14 @@ pub(crate) fn deserialize_error(e: serde_json::Error) -> DynamoDbError {
 
 /// Pre-validate enum fields in a JSON body and return a combined error if multiple are invalid.
 ///
-/// DynamoDB reports all invalid enum fields together rather than stopping at the first.
+/// `DynamoDB` reports all invalid enum fields together rather than stopping at the first.
 /// Each entry is `(json_field_name, api_field_name, valid_values)`.
 pub(crate) fn validate_enum_fields(
     body: &serde_json::Value,
     fields: &[(&str, &str, &[&str])],
 ) -> Result<(), DynamoDbError> {
-    let obj = match body.as_object() {
-        Some(o) => o,
-        None => return Ok(()),
+    let Some(obj) = body.as_object() else {
+        return Ok(());
     };
     let mut errors: Vec<String> = Vec::new();
     for &(json_name, api_name, valid) in fields {
@@ -215,7 +214,7 @@ pub struct DispatchMetrics {
     /// Number of items returned to the client.
     pub returned_item_count: u64,
     /// Total bytes of items returned to the client (pre-projection scanned size,
-    /// consistent with how DynamoDB charges capacity on scanned data).
+    /// consistent with how `DynamoDB` charges capacity on scanned data).
     pub returned_bytes: u64,
     /// GSI/LSI name when the operation targets a secondary index.
     /// Used to attribute metrics to the specific index.

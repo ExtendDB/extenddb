@@ -161,7 +161,12 @@ pub async fn handle_update_item(
         extenddb_core::validation::validate_attribute_values_nesting_depth(stored)?;
     }
 
-    if input.expected.is_none() || input.expected.as_ref().is_some_and(|m| m.is_empty()) {
+    if input.expected.is_none()
+        || input
+            .expected
+            .as_ref()
+            .is_some_and(std::collections::HashMap::is_empty)
+    {
         let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
         extenddb_core::expression::validate_unused_attributes(
             &maps.names,
@@ -347,7 +352,7 @@ fn filter_to_updated_attrs(item: &Item, actions: &[UpdateAction], maps: &Express
     result
 }
 
-/// Resolve a value at a nested path within an AttributeValue.
+/// Resolve a value at a nested path within an `AttributeValue`.
 fn resolve_path_value(
     val: &AttributeValue,
     path: &[PathElement],
@@ -396,7 +401,7 @@ fn wrap_leaf_in_path(
     }
 }
 
-/// Recursively merge two Map AttributeValues. Returns None if either isn't a Map.
+/// Recursively merge two Map `AttributeValues`. Returns None if either isn't a Map.
 fn merge_maps(a: &AttributeValue, b: &AttributeValue) -> Option<AttributeValue> {
     match (a, b) {
         (AttributeValue::M(ma), AttributeValue::M(mb)) => {

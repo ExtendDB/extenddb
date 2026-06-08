@@ -3,7 +3,7 @@
 
 //! Legacy filter parameter desugaring.
 //!
-//! Converts pre-expression parameters (KeyConditions, QueryFilter, ScanFilter)
+//! Converts pre-expression parameters (`KeyConditions`, `QueryFilter`, `ScanFilter`)
 //! into expression-based equivalents.
 
 use std::collections::HashMap;
@@ -16,8 +16,8 @@ use extenddb_core::types::{AttributeValue, Condition, ConditionalOperator};
 
 /// Desugar legacy `KeyConditions` into a `KeyCondition` struct and expression maps.
 ///
-/// The hash key must have ComparisonOperator = "EQ".
-/// The optional range key supports: EQ, LE, LT, GE, GT, BEGINS_WITH, BETWEEN.
+/// The hash key must have `ComparisonOperator` = "EQ".
+/// The optional range key supports: EQ, LE, LT, GE, GT, `BEGINS_WITH`, BETWEEN.
 pub fn desugar_key_conditions(
     conditions: &HashMap<String, Condition>,
     key_schema: &[(String, bool)], // Vec of (attr_name, is_hash)
@@ -164,7 +164,7 @@ fn desugar_sk_condition(
 
 /// Desugar legacy `QueryFilter` or `ScanFilter` into a condition expression AST.
 ///
-/// Each entry maps an attribute name to a Condition with ComparisonOperator and values.
+/// Each entry maps an attribute name to a Condition with `ComparisonOperator` and values.
 /// Multiple entries are combined with the `ConditionalOperator` (default AND).
 pub fn desugar_filter(
     filter: &HashMap<String, Condition>,

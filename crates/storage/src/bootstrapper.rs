@@ -4,7 +4,7 @@
 //! Bootstrapper storage trait for init/destroy/migrate operations.
 //!
 //! These operations are inherently backend-specific (e.g., `CREATE DATABASE`
-//! is PostgreSQL DDL). The trait abstracts the high-level operations so the
+//! is `PostgreSQL` DDL). The trait abstracts the high-level operations so the
 //! CLI commands don't depend on a specific storage backend.
 
 use async_trait::async_trait;
@@ -44,7 +44,7 @@ pub struct AdminBootstrapResult {
 /// High-level bootstrap operations for storage backends.
 ///
 /// Covers the init, destroy, and migrate command paths. Implementations
-/// handle backend-specific DDL (e.g., `CREATE DATABASE` for PostgreSQL).
+/// handle backend-specific DDL (e.g., `CREATE DATABASE` for `PostgreSQL`).
 #[async_trait]
 pub trait Bootstrapper: Send + Sync {
     /// Ensure the application user exists in the storage backend.
@@ -111,7 +111,7 @@ pub trait Bootstrapper: Send + Sync {
     fn catalog_connection_url(&self) -> String;
 
     /// Generate the backend-specific configuration subsection for extenddb.toml.
-    /// Returns only the [storage.backend_name] section content, not the [storage] header.
+    /// Returns only the [`storage.backend_name`] section content, not the [storage] header.
     fn generate_backend_config_section(&self) -> String;
 }
 
@@ -179,6 +179,7 @@ pub async fn create_bootstrapper(
 }
 
 /// List all registered backends.
+#[must_use]
 pub fn list_backends() -> Vec<&'static str> {
     inventory::iter::<BackendRegistration>()
         .map(|r| r.name)
@@ -191,6 +192,7 @@ pub mod helpers {
     use crate::management_store::OpResult;
 
     /// Generate a random 12-digit numeric account ID (matches AWS account ID format).
+    #[must_use]
     pub fn generate_account_id() -> String {
         use rand::Rng;
         let mut rng = rand::rng();
@@ -203,6 +205,7 @@ pub mod helpers {
     /// Restricted to `[a-zA-Z0-9]` to avoid URL-encoding issues in form submissions,
     /// shell copy-paste problems, and other contexts where special characters break.
     /// At 24 characters from a 62-char alphabet, entropy is ~143 bits.
+    #[must_use]
     pub fn generate_random_password() -> String {
         use rand::Rng;
         const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -219,8 +222,8 @@ pub mod helpers {
     pub async fn hash_password_async(password: String) -> OpResult<String> {
         tokio::task::spawn_blocking(move || bcrypt::hash(password, bcrypt::DEFAULT_COST))
             .await
-            .map_err(|e| OpError::Internal(format!("bcrypt hash task failed: {}", e)))?
-            .map_err(|e| OpError::Internal(format!("bcrypt hash failed: {}", e)))
+            .map_err(|e| OpError::Internal(format!("bcrypt hash task failed: {e}")))?
+            .map_err(|e| OpError::Internal(format!("bcrypt hash failed: {e}")))
     }
 
     /// Generate a 256-bit AES-GCM encryption key and return it as base64.
@@ -245,14 +248,14 @@ pub mod helpers {
             && v != config_val
         {
             return Err(crate::error::StorageError::Internal(format!(
-                "{} value '{}' conflicts with config file value '{}'",
-                flag, v, config_val
+                "{flag} value '{v}' conflicts with config file value '{config_val}'"
             )));
         }
         Ok(())
     }
 
     /// Extract a CLI argument value by flag name.
+    #[must_use]
     pub fn extract_arg(args: &[String], flag: &str) -> Option<String> {
         args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
     }

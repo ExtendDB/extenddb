@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Authorization layer for DynamoDB requests.
+//! Authorization layer for `DynamoDB` requests.
 //!
 //! After authentication resolves an `AuthIdentity`, this module fetches the
 //! applicable IAM policies, permissions boundary, and session policy via
@@ -25,7 +25,7 @@ use extenddb_storage::management_store::OpError;
 use crate::authz_cache::{CachedAuthzStore, PolicyList, TagMap};
 
 /// Evaluate whether the authenticated identity is authorized for the given
-/// DynamoDB operation on the given resource.
+/// `DynamoDB` operation on the given resource.
 ///
 /// For `AuthIdentity::User` and `AuthIdentity::RoleSession`, the full IAM
 /// evaluation algorithm runs: explicit deny → permissions boundary → session

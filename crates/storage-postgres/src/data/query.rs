@@ -22,11 +22,11 @@ use extenddb_storage::util::{parse_sk, pk_to_text, sk_info};
 pub(crate) enum PaginationBinds {
     /// Base table query or index query with no extra pagination binds needed.
     None,
-    /// Index query where base table has no SK — only base_pk as tie-breaker.
+    /// Index query where base table has no SK — only `base_pk` as tie-breaker.
     BasePkOnly { pk_text: String },
-    /// Index query where base table has a SK — base_sk as tie-breaker.
+    /// Index query where base table has a SK — `base_sk` as tie-breaker.
     BaseSkOnly { sk: SortKeyValue },
-    /// Hash-only index where base table has a SK — both base_pk and base_sk.
+    /// Hash-only index where base table has a SK — both `base_pk` and `base_sk`.
     BasePkAndSk { pk_text: String, sk: SortKeyValue },
 }
 
@@ -72,9 +72,9 @@ pub(crate) struct SkSqlInfo {
 
 /// Build a SQL WHERE fragment for a sort key condition.
 ///
-/// DynamoDB sorts strings by UTF-8 byte order, not by locale. We use
+/// `DynamoDB` sorts strings by UTF-8 byte order, not by locale. We use
 /// `COLLATE "C"` on string columns to match this behavior regardless of
-/// the PostgreSQL database's `lc_collate` setting.
+/// the `PostgreSQL` database's `lc_collate` setting.
 pub(crate) fn build_sk_sql(
     sk_cond: &SortKeyCondition,
     sk_col: &str,
@@ -140,10 +140,10 @@ pub(crate) fn build_sk_sql(
 /// Execute a query SQL statement with dynamic parameter binding.
 ///
 /// # Parameter binding order:
-/// 1. pk_text (partition key)
+/// 1. `pk_text` (partition key)
 /// 2. SK condition params (from `build_sk_sql`)
 /// 3. Extra SK equality params (multi-range schemas)
-/// 4. ExclusiveStartKey index SK value (if paginating with sort key)
+/// 4. `ExclusiveStartKey` index SK value (if paginating with sort key)
 /// 5. Pagination extra binds (from `PaginationBinds` enum — built in `query_scan.rs`
 ///    in the same branch that generates the SQL, so order cannot diverge)
 #[allow(clippy::too_many_arguments)]
@@ -259,7 +259,7 @@ fn bind_sk_condition<'q>(
 ///
 /// Increments the last non-0xFF byte and truncates trailing 0xFF bytes.
 /// If the prefix is all 0xFF, returns a 1025-byte all-0xFF vector (longer
-/// than any valid DynamoDB sort key, so `< upper` is always true).
+/// than any valid `DynamoDB` sort key, so `< upper` is always true).
 fn increment_bytes(prefix: &[u8]) -> Vec<u8> {
     let mut result = prefix.to_vec();
     for i in (0..result.len()).rev() {
@@ -291,7 +291,7 @@ pub(crate) fn bind_sk_value<'q>(
 
 /// Execute a scan SQL statement with dynamic parameter binding.
 ///
-/// Bind order for index scans: pk, sk (if present), base_pk, base_sk (if present).
+/// Bind order for index scans: pk, sk (if present), `base_pk`, `base_sk` (if present).
 /// Bind order for base table scans: pk, sk (if present).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_scan_sql(

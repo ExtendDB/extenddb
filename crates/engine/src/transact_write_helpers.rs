@@ -69,8 +69,8 @@ impl PreparedOp {
     /// Approximate item size for transaction size limit enforcement.
     ///
     /// For Put operations, this returns the exact item size. For Update, Delete,
-    /// and ConditionCheck, the full item is not yet available at validation time
-    /// (it will be fetched during execution). DynamoDB's 4MB limit counts the
+    /// and `ConditionCheck`, the full item is not yet available at validation time
+    /// (it will be fetched during execution). `DynamoDB`'s 4MB limit counts the
     /// full item size as it exists or will exist post-mutation.
     ///
     /// To avoid bypassing the limit with updates that produce large items, we

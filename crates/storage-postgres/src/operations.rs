@@ -1,12 +1,12 @@
-// Copyright 2026 DynamoDB Open contributors
+// Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! PostgreSQL implementation of `OperationsEngine`.
+//! `PostgreSQL` implementation of `OperationsEngine`.
 
 use extenddb_storage::error::StorageError;
 use extenddb_storage::operations::{ConnectionParts, OperationsEngine};
 
-/// PostgreSQL operations engine for ddbo CLI commands.
+/// `PostgreSQL` operations engine for ddbo CLI commands.
 pub struct PostgresOperationsEngine;
 
 impl OperationsEngine for PostgresOperationsEngine {

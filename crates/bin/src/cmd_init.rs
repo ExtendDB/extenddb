@@ -119,7 +119,7 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
         b.clone()
     } else if Path::new(&args.config).exists() {
         let app_config = config::load(&args.config)?;
-        app_config.storage._backend
+        app_config.storage.backend
     } else {
         "postgres".to_owned()
     };

@@ -488,6 +488,7 @@ impl CachedAuthzStore {
     /// Snapshot per-sub-cache counters for export to `/auth-cache-metrics`.
     /// Returns `None` if metrics are unavailable for any reason (currently
     /// always returns `Some`).
+    #[must_use]
     pub fn metrics_snapshot(&self) -> Option<AuthzCacheMetricsSnapshot> {
         Some(AuthzCacheMetricsSnapshot {
             user_policies: self.user_policies.metrics().snapshot(),

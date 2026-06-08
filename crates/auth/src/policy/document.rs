@@ -26,9 +26,9 @@ pub struct Statement {
     pub sid: Option<String>,
     /// Allow or Deny.
     pub effect: Effect,
-    /// Action or NotAction matching.
+    /// Action or `NotAction` matching.
     pub action_match: ActionMatch,
-    /// Resource or NotResource matching.
+    /// Resource or `NotResource` matching.
     pub resource_match: ResourceMatch,
     /// Conditions that must all be true for the statement to apply.
     pub conditions: Vec<Condition>,
@@ -43,7 +43,7 @@ pub enum Effect {
     Deny,
 }
 
-/// Action matching: either Action (include list) or NotAction (exclude list).
+/// Action matching: either Action (include list) or `NotAction` (exclude list).
 /// A statement uses exactly one — never both.
 #[derive(Debug, Clone)]
 pub enum ActionMatch {
@@ -53,7 +53,7 @@ pub enum ActionMatch {
     NotActions(Vec<String>),
 }
 
-/// Resource matching: either Resource (include list) or NotResource (exclude list).
+/// Resource matching: either Resource (include list) or `NotResource` (exclude list).
 #[derive(Debug, Clone)]
 pub enum ResourceMatch {
     /// Matches listed resources.
@@ -82,7 +82,7 @@ pub struct Condition {
     pub values: Vec<String>,
 }
 
-/// All IAM condition operators relevant to DynamoDB access control.
+/// All IAM condition operators relevant to `DynamoDB` access control.
 ///
 /// Set operators (`ForAllValues`, `ForAnyValue`) and `IfExists` wrap a base
 /// operator. Valid nestings: `ForAllValues(IfExists(base))`,
@@ -148,7 +148,7 @@ impl PolicyDocument {
     /// # Errors
     ///
     /// Returns `PolicyParseError` if the JSON is malformed or contains
-    /// invalid policy constructs (e.g., both Action and NotAction).
+    /// invalid policy constructs (e.g., both Action and `NotAction`).
     pub fn from_json(json: &str) -> Result<Self, PolicyParseError> {
         Self::from_json_with_size_limit(json, 6_144)
     }
@@ -214,7 +214,7 @@ fn parse_statement(value: &Value) -> Result<Statement, PolicyParseError> {
     })
 }
 
-/// Parse Action or NotAction (mutually exclusive).
+/// Parse Action or `NotAction` (mutually exclusive).
 fn parse_action_match(value: &Value) -> Result<ActionMatch, PolicyParseError> {
     let has_action = !value["Action"].is_null();
     let has_not_action = !value["NotAction"].is_null();
@@ -234,7 +234,7 @@ fn parse_action_match(value: &Value) -> Result<ActionMatch, PolicyParseError> {
     }
 }
 
-/// Parse Resource or NotResource (mutually exclusive).
+/// Parse Resource or `NotResource` (mutually exclusive).
 fn parse_resource_match(value: &Value) -> Result<ResourceMatch, PolicyParseError> {
     let has_resource = !value["Resource"].is_null();
     let has_not_resource = !value["NotResource"].is_null();
@@ -254,7 +254,7 @@ fn parse_resource_match(value: &Value) -> Result<ResourceMatch, PolicyParseError
     }
 }
 
-/// Parse Principal or NotPrincipal (optional, for trust policies).
+/// Parse Principal or `NotPrincipal` (optional, for trust policies).
 fn parse_principal_match(value: &Value) -> Result<Option<PrincipalMatch>, PolicyParseError> {
     let has_principal = !value["Principal"].is_null();
     let has_not_principal = !value["NotPrincipal"].is_null();

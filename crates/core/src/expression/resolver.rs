@@ -201,7 +201,7 @@ pub fn resolve_element_name<'a>(
 }
 
 /// Reject `ExpressionAttributeNames`/`Values` supplied with no expression that
-/// can reference them. Matches Amazon DynamoDB:
+/// can reference them. Matches Amazon `DynamoDB`:
 ///
 /// - names: `ExpressionAttributeNames can only be specified when using expressions`
 ///   (no suffix), for every API.
@@ -411,6 +411,7 @@ fn collect_path_refs(elements: &[PathElement], names: &mut std::collections::Has
 ///
 /// Returns `(used_names, used_values)` sets suitable for passing to
 /// `validate_unused_attributes`.
+#[must_use]
 pub fn collect_key_condition_refs(
     kc: &super::key_condition::KeyCondition,
 ) -> (
@@ -455,7 +456,7 @@ pub fn collect_key_condition_refs(
 
 /// Validate `begins_with` operand types in a parsed expression.
 ///
-/// DynamoDB rejects `begins_with(path, value)` upfront when `value` is not
+/// `DynamoDB` rejects `begins_with(path, value)` upfront when `value` is not
 /// a string or binary type. This validation runs before evaluation so that
 /// empty scans/queries still reject invalid operand types.
 ///

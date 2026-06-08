@@ -48,7 +48,7 @@ pub struct BatchGetItemInput {
 pub struct BatchGetItemOutput {
     #[serde(rename = "Responses")]
     pub responses: HashMap<String, Vec<Item>>,
-    /// Always serialized, even when empty: Amazon DynamoDB returns
+    /// Always serialized, even when empty: Amazon `DynamoDB` returns
     /// `"UnprocessedKeys": {}` when all keys are processed rather than omitting it.
     #[serde(rename = "UnprocessedKeys")]
     pub unprocessed_keys: HashMap<String, KeysAndAttributes>,
@@ -118,7 +118,7 @@ pub struct BatchWriteItemInput {
 /// `BatchWriteItem` response body.
 #[derive(Debug, Clone, Serialize)]
 pub struct BatchWriteItemOutput {
-    /// Always serialized, even when empty: Amazon DynamoDB returns
+    /// Always serialized, even when empty: Amazon `DynamoDB` returns
     /// `"UnprocessedItems": {}` on full success rather than omitting the field.
     #[serde(rename = "UnprocessedItems")]
     pub unprocessed_items: HashMap<String, Vec<WriteRequest>>,

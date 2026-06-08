@@ -37,7 +37,7 @@ pub async fn run(args: MigrateArgs) -> anyhow::Result<()> {
         );
     }
     let app_config = config::load(&args.config)?;
-    let backend = &app_config.storage._backend;
+    let backend = &app_config.storage.backend;
 
     println!("=== extenddb migrate ===");
     println!("Config:           {}", args.config);

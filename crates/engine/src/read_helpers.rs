@@ -24,7 +24,7 @@ use crate::index_helpers::apply_index_projection;
 ///
 /// Mirrors the unused-attribute check Query and Scan run via
 /// `validate_unused_attributes`, narrowed to read handlers that accept only a
-/// projection (GetItem, BatchGetItem). `names` is the raw request map with
+/// projection (`GetItem`, `BatchGetItem`). `names` is the raw request map with
 /// keys still carrying their `#` prefix. The caller passes this only for a
 /// user-supplied `ProjectionExpression`; desugared `AttributesToGet` uses
 /// synthetic placeholders and is governed by a separate rule.
@@ -67,7 +67,7 @@ pub struct PostReadResult {
     pub last_evaluated_key: Option<Item>,
 }
 
-/// Apply FilterExpression, ProjectionExpression, and 1 MB response size limit
+/// Apply `FilterExpression`, `ProjectionExpression`, and 1 MB response size limit
 /// to raw items returned from storage.
 ///
 /// This is the shared pipeline used by both `Query` and `Scan`.

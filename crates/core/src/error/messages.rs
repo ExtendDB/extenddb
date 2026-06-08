@@ -1,10 +1,10 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Error message templates captured from real DynamoDB.
-//! These are the exact messages DynamoDB returns — tenet 4 (errors are contracts).
+//! Error message templates captured from real `DynamoDB`.
+//! These are the exact messages `DynamoDB` returns — tenet 4 (errors are contracts).
 
-/// Format a single validation constraint error in DynamoDB's exact format.
+/// Format a single validation constraint error in `DynamoDB`'s exact format.
 #[must_use]
 pub fn validation_error(value: &str, field: &str, constraint: &str) -> String {
     format!(
@@ -12,7 +12,7 @@ pub fn validation_error(value: &str, field: &str, constraint: &str) -> String {
     )
 }
 
-/// Format multiple validation constraint errors in DynamoDB's exact format.
+/// Format multiple validation constraint errors in `DynamoDB`'s exact format.
 #[must_use]
 pub fn validation_errors(errors: &[(&str, &str, &str)]) -> String {
     let count = errors.len();

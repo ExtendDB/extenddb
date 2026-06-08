@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Types for DynamoDB backup and point-in-time recovery operations.
+//! Types for `DynamoDB` backup and point-in-time recovery operations.
 
 use serde::{Deserialize, Serialize};
 

@@ -65,7 +65,7 @@ pub fn apply_index_projection(
 }
 
 /// Validate `ExclusiveStartKey` against the (table or index) key schema for
-/// `Scan`. Base-table scans use the long DynamoDB error message; index scans
+/// `Scan`. Base-table scans use the long `DynamoDB` error message; index scans
 /// use the short one.
 ///
 /// # Errors
@@ -88,7 +88,7 @@ pub fn validate_scan_exclusive_start_key(
 }
 
 /// Validate `ExclusiveStartKey` for `Query`. Same rules as Scan; uses the
-/// short DynamoDB error message in all cases.
+/// short `DynamoDB` error message in all cases.
 ///
 /// # Errors
 ///

@@ -287,7 +287,7 @@ fn cleanup_pid_file(pid_file: Option<&std::path::Path>) {
 
 /// AI-2: Acceptor that detects plain HTTP connections on the TLS port.
 ///
-/// Peeks the first byte of each connection. If it's `0x16` (TLS ClientHello),
+/// Peeks the first byte of each connection. If it's `0x16` (TLS `ClientHello`),
 /// the connection passes through to the TLS acceptor. If it's a plain HTTP
 /// verb, a 301 redirect to `https://` is written and the connection is
 /// rejected with an IO error (which `axum_server` handles by dropping it).
