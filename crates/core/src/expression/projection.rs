@@ -84,6 +84,81 @@ pub fn apply_projection(
     Ok(result)
 }
 
+/// A path element after `#name` resolution, used for overlap detection.
+#[derive(PartialEq, Eq)]
+enum ResolvedElement {
+    Attr(String),
+    Index(usize),
+}
+
+/// Reject a `ProjectionExpression` whose paths overlap, matching Amazon DynamoDB.
+///
+/// Two paths overlap when one is a prefix of the other (this includes equal
+/// paths), for example `a` and `a.b`, or `a[0]` and `a[0].b`, or a duplicate
+/// `a` and `a`. Sibling paths such as `a.b` and `a.c`, or `a[0]` and `a[1]`,
+/// do not overlap. `#name` references are resolved first, so the reported
+/// paths use the resolved attribute names. The first offending pair in
+/// expression order is reported.
+///
+/// # Errors
+///
+/// Returns `ValidationException` with the overlap message, or an unresolvable
+/// `#name` reference error.
+pub fn detect_overlapping_paths(
+    paths: &[Vec<PathElement>],
+    maps: &ExpressionMaps,
+) -> Result<(), DynamoDbError> {
+    let mut resolved: Vec<Vec<ResolvedElement>> = Vec::with_capacity(paths.len());
+    for path in paths {
+        if path.is_empty() {
+            continue;
+        }
+        let mut elems = Vec::with_capacity(path.len());
+        for element in path {
+            match element {
+                PathElement::Attribute(raw) => {
+                    elems.push(ResolvedElement::Attr(
+                        resolve_name_ref(raw, maps)?.into_owned(),
+                    ));
+                }
+                PathElement::Index(idx) => elems.push(ResolvedElement::Index(*idx)),
+            }
+        }
+        resolved.push(elems);
+    }
+
+    for i in 0..resolved.len() {
+        for j in (i + 1)..resolved.len() {
+            if is_prefix(&resolved[i], &resolved[j]) || is_prefix(&resolved[j], &resolved[i]) {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "Invalid ProjectionExpression: Two document paths overlap with each other; \
+                     must remove or rewrite one of these paths; path one: {}, path two: {}",
+                    render_path(&resolved[i]),
+                    render_path(&resolved[j]),
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Return true when `a` is a prefix of `b` (equal paths included).
+fn is_prefix(a: &[ResolvedElement], b: &[ResolvedElement]) -> bool {
+    a.len() <= b.len() && a == &b[..a.len()]
+}
+
+/// Render a resolved path as DynamoDB does: `[a, [0], b]`.
+fn render_path(path: &[ResolvedElement]) -> String {
+    let parts: Vec<String> = path
+        .iter()
+        .map(|el| match el {
+            ResolvedElement::Attr(name) => name.clone(),
+            ResolvedElement::Index(idx) => format!("[{idx}]"),
+        })
+        .collect();
+    format!("[{}]", parts.join(", "))
+}
+
 /// Build the projection trie from the parsed paths, resolving `#name` refs.
 fn build_trie(
     paths: &[Vec<PathElement>],
@@ -451,6 +526,92 @@ mod tests {
         expected.insert("a".into(), AttributeValue::S("av".into()));
         expected.insert("c".into(), AttributeValue::S("cv".into()));
         assert_list(&result, "l", &[AttributeValue::M(expected)]);
+    }
+
+    fn check_overlap(expr: &str, names: HashMap<String, String>) -> Result<(), DynamoDbError> {
+        let tokens = tokenize(expr).unwrap();
+        let paths = parse_projection(&tokens).unwrap();
+        let maps = ExpressionMaps::new(names, HashMap::new());
+        detect_overlapping_paths(&paths, &maps)
+    }
+
+    fn overlap_msg(expr: &str) -> String {
+        match check_overlap(expr, HashMap::new()) {
+            Err(DynamoDbError::ValidationException(m)) => m,
+            other => panic!("expected ValidationException, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overlap_parent_then_child() {
+        assert_eq!(
+            overlap_msg("a, a.b"),
+            "Invalid ProjectionExpression: Two document paths overlap with each other; \
+             must remove or rewrite one of these paths; path one: [a], path two: [a, b]"
+        );
+    }
+
+    #[test]
+    fn overlap_child_then_parent() {
+        assert_eq!(
+            overlap_msg("a.b, a"),
+            "Invalid ProjectionExpression: Two document paths overlap with each other; \
+             must remove or rewrite one of these paths; path one: [a, b], path two: [a]"
+        );
+    }
+
+    #[test]
+    fn overlap_exact_duplicate() {
+        assert_eq!(
+            overlap_msg("a, a"),
+            "Invalid ProjectionExpression: Two document paths overlap with each other; \
+             must remove or rewrite one of these paths; path one: [a], path two: [a]"
+        );
+    }
+
+    #[test]
+    fn overlap_index_path_rendering() {
+        assert_eq!(
+            overlap_msg("a[0], a"),
+            "Invalid ProjectionExpression: Two document paths overlap with each other; \
+             must remove or rewrite one of these paths; path one: [a, [0]], path two: [a]"
+        );
+        assert_eq!(
+            overlap_msg("a[0].b, a[0]"),
+            "Invalid ProjectionExpression: Two document paths overlap with each other; \
+             must remove or rewrite one of these paths; path one: [a, [0], b], path two: [a, [0]]"
+        );
+    }
+
+    #[test]
+    fn overlap_reports_first_pair_in_order() {
+        assert_eq!(
+            overlap_msg("x, a.b, a"),
+            "Invalid ProjectionExpression: Two document paths overlap with each other; \
+             must remove or rewrite one of these paths; path one: [a, b], path two: [a]"
+        );
+    }
+
+    #[test]
+    fn overlap_uses_resolved_names() {
+        let mut names = HashMap::new();
+        names.insert("p".into(), "a".into());
+        names.insert("q".into(), "b".into());
+        match check_overlap("#p, #p.#q", names) {
+            Err(DynamoDbError::ValidationException(m)) => assert_eq!(
+                m,
+                "Invalid ProjectionExpression: Two document paths overlap with each other; \
+                 must remove or rewrite one of these paths; path one: [a], path two: [a, b]"
+            ),
+            other => panic!("expected ValidationException, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_overlap_for_siblings() {
+        assert!(check_overlap("a.b, a.c", HashMap::new()).is_ok());
+        assert!(check_overlap("a[0], a[1]", HashMap::new()).is_ok());
+        assert!(check_overlap("a, b, c", HashMap::new()).is_ok());
     }
 
     #[test]

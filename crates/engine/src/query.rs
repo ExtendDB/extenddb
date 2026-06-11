@@ -304,6 +304,15 @@ pub async fn handle_query(
         None
     };
 
+    if input.projection_expression.is_some()
+        && let Some(ref paths) = projection
+    {
+        crate::read_helpers::validate_projection_overlap(
+            input.expression_attribute_names.as_ref(),
+            paths,
+        )?;
+    }
+
     // Validate unused expression attributes
     {
         let exprs: Vec<&extenddb_core::expression::Expr> = filter.iter().collect();

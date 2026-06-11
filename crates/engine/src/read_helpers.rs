@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
-    Expr, ExpressionMaps, PathElement, apply_projection, evaluate_condition,
-    validate_unused_attributes,
+    Expr, ExpressionMaps, PathElement, apply_projection, detect_overlapping_paths,
+    evaluate_condition, validate_unused_attributes,
 };
 use extenddb_core::types::{
     IndexInfo, Item, KeySchemaElement, Select, extract_key, item_size_bytes,
@@ -57,6 +57,23 @@ pub fn validate_projection_unused_names(
         &used_names,
         &HashSet::new(),
     )
+}
+
+/// Reject a user-supplied `ProjectionExpression` whose paths overlap.
+///
+/// Resolves `#name` references using `names`, then matches Amazon DynamoDB's
+/// "Two document paths overlap" validation. Scoped to a user-supplied
+/// `ProjectionExpression`; desugared `AttributesToGet` is governed separately.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` when two paths overlap.
+pub fn validate_projection_overlap(
+    names: Option<&HashMap<String, String>>,
+    projection: &[Vec<PathElement>],
+) -> Result<(), DynamoDbError> {
+    let maps = crate::expression_helpers::build_expression_maps(names, None);
+    detect_overlapping_paths(projection, &maps)
 }
 
 /// Result of the post-read processing pipeline.

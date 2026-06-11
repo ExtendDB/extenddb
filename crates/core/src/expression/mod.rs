@@ -26,7 +26,7 @@ pub use evaluator::evaluate_condition;
 pub use key_condition::{KeyCondition, SortKeyCondition, parse_key_condition};
 pub use kind::ExpressionKind;
 pub use parser::{parse_condition, parse_condition_with_depth_limit};
-pub use projection::{apply_projection, parse_projection};
+pub use projection::{apply_projection, detect_overlapping_paths, parse_projection};
 pub use reserved_words::validate_no_reserved_words;
 pub use resolver::{
     ExpressionMaps, collect_key_condition_refs, collect_value_placeholders, resolve_element_name,

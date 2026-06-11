@@ -137,6 +137,10 @@ pub async fn handle_transact_get_items(
                     ExpressionKind::Projection,
                 )?;
                 let projection = parse_projection(&proj_tokens)?;
+                crate::read_helpers::validate_projection_overlap(
+                    tgi.get.expression_attribute_names.as_ref(),
+                    &projection,
+                )?;
                 let mut extra_names = std::collections::HashSet::new();
                 for path in &projection {
                     for el in path {
