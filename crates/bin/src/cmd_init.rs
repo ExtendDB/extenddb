@@ -28,7 +28,7 @@ pub struct InitArgs {
     #[arg(long)]
     catalog_db: Option<String>,
 
-    /// PostgreSQL host
+    /// PostgreSQL host (hostname, IP address, or absolute Unix socket directory path)
     #[arg(long)]
     pg_host: Option<String>,
 

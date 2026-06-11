@@ -79,19 +79,9 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         );
     }
 
-    // Check backend is supported by this build
+    // Validate backend is supported and get catalog version (fail fast before binding port)
     let backend = &app_config.storage._backend;
-    #[cfg(not(feature = "postgres"))]
-    if backend == "postgres" {
-        anyhow::bail!("PostgreSQL backend not enabled. Rebuild with --features postgres");
-    }
-    #[cfg(feature = "postgres")]
-    if backend != "postgres" {
-        anyhow::bail!(
-            "Unknown backend '{}'. This build only supports 'postgres'.",
-            backend
-        );
-    }
+    let catalog_version = extenddb_storage::operations::catalog_version(backend)?;
 
     let port = args.port.unwrap_or(app_config.server.port);
     let bind_addr = format!("{}:{}", app_config.server.bind_addr, port);
@@ -112,9 +102,6 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
     // it to stderr so a process supervisor receives banner and tracing logs
     // on the same stream — mixing stdout and stderr makes container log
     // capture noisier than necessary.
-    let backend = &app_config.storage._backend;
-    let catalog_version = extenddb_storage::operations::catalog_version(backend)
-        .unwrap_or_else(|_| "unknown".to_string());
     let banner_line1 = format!(
         "extenddb {} (catalog {}) starting on {}",
         env!("CARGO_PKG_VERSION"),

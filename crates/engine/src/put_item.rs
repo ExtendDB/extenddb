@@ -68,6 +68,8 @@ pub async fn handle_put_item(
             || msg.contains("validation error detected")
             || msg.contains("must not be empty")
             || msg.contains("Syntax error; key")
+            || msg.contains("AttributeValue is empty")
+            || msg.contains("AttributeValue has more than one datatypes set")
         {
             DynamoDbError::ValidationException(msg)
         } else {
@@ -77,31 +79,18 @@ pub async fn handle_put_item(
         }
     })?;
 
-    // Reject EAV/EAN without an expression
+    // Reject EAN/EAV supplied without a referencing expression.
     let has_expression = input
         .condition_expression
         .as_ref()
         .is_some_and(|s| !s.is_empty());
-    if !has_expression
-        && input
-            .expression_attribute_values
-            .as_ref()
-            .is_some_and(|m| !m.is_empty())
-    {
-        return Err(DynamoDbError::ValidationException(
-            "ExpressionAttributeValues can only be specified when using expressions: ConditionExpression is null".to_owned(),
-        ));
-    }
-    if !has_expression
-        && input
-            .expression_attribute_names
-            .as_ref()
-            .is_some_and(|m| !m.is_empty())
-    {
-        return Err(DynamoDbError::ValidationException(
-            "ExpressionAttributeNames can only be specified when using expressions: ConditionExpression is null".to_owned(),
-        ));
-    }
+    extenddb_core::expression::validate_expression_param_usage(
+        input.expression_attribute_names.as_ref(),
+        has_expression,
+        input.expression_attribute_values.as_ref(),
+        has_expression,
+        &[extenddb_core::expression::ExpressionKind::Condition],
+    )?;
 
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
 

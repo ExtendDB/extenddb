@@ -200,6 +200,58 @@ pub fn resolve_element_name<'a>(
     }
 }
 
+/// Reject `ExpressionAttributeNames`/`Values` supplied with no expression that
+/// can reference them. Matches Amazon DynamoDB:
+///
+/// - names: `ExpressionAttributeNames can only be specified when using expressions`
+///   (no suffix), for every API.
+/// - values: `ExpressionAttributeValues can only be specified when using
+///   expressions: <params> is/are null`, listing the value-capable expression
+///   parameter(s) of the API.
+///
+/// `name_expr_present` is true when any expression that can carry a `#name` is
+/// present (projection, condition, filter, key condition, update).
+/// `value_expr_present` is true when any expression that can carry a `:value` is
+/// present (condition, filter, key condition, update; not projection).
+/// `value_expr_params` is the API's static list of value-capable expression
+/// parameter kinds, used to build the values suffix. An empty list yields no
+/// suffix (matching Query).
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` when a map is supplied with no
+/// referencing expression.
+pub fn validate_expression_param_usage(
+    names: Option<&HashMap<String, String>>,
+    name_expr_present: bool,
+    values: Option<&HashMap<String, AttributeValue>>,
+    value_expr_present: bool,
+    value_expr_params: &[super::ExpressionKind],
+) -> Result<(), DynamoDbError> {
+    if !name_expr_present && names.is_some_and(|m| !m.is_empty()) {
+        return Err(DynamoDbError::ValidationException(
+            "ExpressionAttributeNames can only be specified when using expressions".to_owned(),
+        ));
+    }
+    if !value_expr_present && values.is_some_and(|m| !m.is_empty()) {
+        let base = "ExpressionAttributeValues can only be specified when using expressions";
+        let msg = match value_expr_params {
+            [] => base.to_owned(),
+            [one] => format!("{base}: {one} is null"),
+            many => {
+                let joined = many
+                    .iter()
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                format!("{base}: {joined} are null")
+            }
+        };
+        return Err(DynamoDbError::ValidationException(msg));
+    }
+    Ok(())
+}
+
 /// Validate that all provided ExpressionAttributeNames/Values were used.
 ///
 /// Collects `#name` and `:value` references from the given expressions,

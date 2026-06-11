@@ -7,14 +7,90 @@ use extenddb_core::expression::{ExpressionMaps, KeyCondition};
 use extenddb_core::types::{Item, ScalarAttributeType, TableKeyInfo};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
-    encode_netstring_composite, pk_to_text, sk_column, sk_column_n, sk_info,
+    encode_netstring_composite, parse_sk, pk_to_text, sk_column, sk_column_n, sk_info,
 };
 
 use super::query::{
-    build_key, build_sk_sql, execute_query_sql, execute_scan_sql, resolve_expr_to_av,
+    PaginationBinds, build_key, build_sk_sql, execute_query_sql, execute_scan_sql,
+    resolve_expr_to_av,
 };
 use super::{all_sort_key_info, data_table_name, index_table_name, json_to_item};
 use crate::PostgresEngine;
+
+/// Build the WHERE clause fragment for ExclusiveStartKey pagination.
+///
+/// Self-contained: takes `param_idx` (the next available placeholder number),
+/// returns a complete SQL fragment. No mutable state leaks out.
+fn build_pagination_where(
+    param_idx: u32,
+    sk_info_val: Option<(&str, ScalarAttributeType)>,
+    base_sk_info: &Option<(String, ScalarAttributeType)>,
+    is_index: bool,
+    is_lsi: bool,
+    forward: bool,
+) -> String {
+    if let Some((_, sk_type)) = sk_info_val {
+        let sk_col = sk_column(sk_type);
+        let collate = if sk_type == ScalarAttributeType::S {
+            " COLLATE \"C\""
+        } else {
+            ""
+        };
+        let cmp = if forward { ">" } else { "<" };
+
+        if let Some((_, base_sk_type)) = base_sk_info {
+            // Index with base SK tie-breaker
+            let base_col = format!("base_{}", sk_column(*base_sk_type));
+            let base_collate = if *base_sk_type == ScalarAttributeType::S {
+                " COLLATE \"C\""
+            } else {
+                ""
+            };
+            // LSI: base SK follows ScanIndexForward because items share the
+            // same partition and the base SK is part of the composite sort order.
+            // GSI: base SK is always ">" (ascending) because it's only a
+            // uniqueness tie-breaker, not a user-visible sort dimension.
+            let base_cmp = if is_lsi { cmp } else { ">" };
+            format!(
+                " AND ({sk_col}{collate} {cmp} ${p1} OR \
+                 ({sk_col}{collate} = ${p1} AND {base_col}{base_collate} {base_cmp} ${p2}))",
+                p1 = param_idx,
+                p2 = param_idx + 1
+            )
+        } else if is_index {
+            // Index with no base SK — use base_pk as tie-breaker
+            format!(
+                " AND ({sk_col}{collate} {cmp} ${p1} OR \
+                 ({sk_col}{collate} = ${p1} AND base_pk COLLATE \"C\" > ${p2}))",
+                p1 = param_idx,
+                p2 = param_idx + 1
+            )
+        } else {
+            // Base table — simple comparison
+            format!(" AND {sk_col}{collate} {cmp} ${param_idx}")
+        }
+    } else if is_index {
+        // Hash-only index — paginate using base table PK
+        if let Some((_, base_sk_type)) = base_sk_info {
+            let base_sk_col = format!("base_{}", sk_column(*base_sk_type));
+            let base_sk_collate = if *base_sk_type == ScalarAttributeType::S {
+                " COLLATE \"C\""
+            } else {
+                ""
+            };
+            format!(
+                " AND (base_pk COLLATE \"C\" > ${p1} OR \
+                 (base_pk = ${p1} AND {base_sk_col}{base_sk_collate} > ${p2}))",
+                p1 = param_idx,
+                p2 = param_idx + 1
+            )
+        } else {
+            format!(" AND base_pk COLLATE \"C\" > ${param_idx}")
+        }
+    } else {
+        String::new()
+    }
+}
 
 impl PostgresEngine {
     /// Implementation of `DataEngine::query`.
@@ -31,13 +107,14 @@ impl PostgresEngine {
     ) -> Result<(Vec<Item>, Option<Item>), StorageError> {
         use std::fmt::Write;
 
-        let ddb_table = if let Some(idx_name) = index_name {
+        let (ddb_table, is_lsi) = if let Some(idx_name) = index_name {
             let idx_info = self
                 .fetch_index_info_by_table_id(&key_info.table_id, idx_name)
                 .await?;
-            index_table_name(&idx_info.index_id)
+            let lsi = idx_info.index_type == extenddb_core::types::IndexType::Lsi;
+            (index_table_name(&idx_info.index_id), lsi)
         } else {
-            data_table_name(&key_info.table_id)
+            (data_table_name(&key_info.table_id), false)
         };
 
         // Resolve partition key value(s) — for multi-part keys, encode
@@ -113,22 +190,31 @@ impl PostgresEngine {
             }
         }
 
-        // Pagination: exclusive start key
-        if let (Some(_), Some((_, sk_type))) = (exclusive_start_key, sk_info_val) {
-            let sk_col = sk_column(sk_type);
-            let collate = if sk_type == ScalarAttributeType::S {
-                " COLLATE \"C\""
-            } else {
-                ""
-            };
-            if forward {
-                let _ = write!(sql, " AND {sk_col}{collate} > ${param_idx}");
-            } else {
-                let _ = write!(sql, " AND {sk_col}{collate} < ${param_idx}");
-            }
-        } else if exclusive_start_key.is_some() && sk_info_val.is_none() {
-            // PK-only table with start key — no more items for this PK
+        // For index queries, derive the base table's sort key info from
+        // base_key_schema. Needed for ORDER BY (sub-sort by base SK when index
+        // SKs are equal) and pagination (compound ExclusiveStartKey condition).
+        let base_sk_info: Option<(String, ScalarAttributeType)> = if index_name.is_some() {
+            sk_info(&key_info.base_key_schema, &key_info.attribute_definitions)
+                .map(|(name, ty)| (name.to_owned(), ty))
+        } else {
+            None
+        };
+
+        if exclusive_start_key.is_some() && sk_info_val.is_none() && index_name.is_none() {
+            // PK-only base table with start key — no more items for this PK
             return Ok((Vec::new(), None));
+        }
+
+        if exclusive_start_key.is_some() {
+            let pagination_sql = build_pagination_where(
+                param_idx,
+                sk_info_val,
+                &base_sk_info,
+                index_name.is_some(),
+                is_lsi,
+                forward,
+            );
+            sql.push_str(&pagination_sql);
         }
 
         // ORDER BY — use COLLATE "C" for string sort keys to match DynamoDB
@@ -141,12 +227,101 @@ impl PostgresEngine {
                 ""
             };
             let dir = if forward { "ASC" } else { "DESC" };
-            let _ = write!(sql, " ORDER BY {sk_col}{collate} {dir}");
+            if let Some((_, base_sk_type)) = &base_sk_info {
+                // Index queries sub-sort by base table SK when index sort keys are equal.
+                // LSI: base SK follows ScanIndexForward (same partition, composite sort).
+                // GSI: base SK is always ASC (just a uniqueness tie-breaker).
+                let base_col = format!("base_{}", sk_column(*base_sk_type));
+                let base_collate = if *base_sk_type == ScalarAttributeType::S {
+                    " COLLATE \"C\""
+                } else {
+                    ""
+                };
+                let base_dir = if is_lsi { dir } else { "ASC" };
+                let _ = write!(
+                    sql,
+                    " ORDER BY {sk_col}{collate} {dir}, {base_col}{base_collate} {base_dir}"
+                );
+            } else if index_name.is_some() {
+                // Index with SK but no base SK: use base_pk as secondary sort
+                let _ = write!(
+                    sql,
+                    " ORDER BY {sk_col}{collate} {dir}, base_pk COLLATE \"C\" ASC"
+                );
+            } else {
+                let _ = write!(sql, " ORDER BY {sk_col}{collate} {dir}");
+            }
+        } else if index_name.is_some() {
+            // Hash-only index: order by base table PK for deterministic pagination.
+            let dir = if forward { "ASC" } else { "DESC" };
+            if let Some((_, base_sk_type)) = &base_sk_info {
+                let base_sk_col = format!("base_{}", sk_column(*base_sk_type));
+                let base_sk_collate = if *base_sk_type == ScalarAttributeType::S {
+                    " COLLATE \"C\""
+                } else {
+                    ""
+                };
+                let _ = write!(
+                    sql,
+                    " ORDER BY base_pk COLLATE \"C\" {dir}, {base_sk_col}{base_sk_collate} {dir}"
+                );
+            } else {
+                let _ = write!(sql, " ORDER BY base_pk COLLATE \"C\" {dir}");
+            }
         }
 
         // LIMIT — fetch one extra to detect pagination
         let fetch_limit = limit.map_or(1_000_001, |l| l + 1);
         let _ = write!(sql, " LIMIT {fetch_limit}");
+
+        // Build pagination bind values in the same place as the SQL placeholders.
+        // The enum variant determines exactly which values are bound and in what order,
+        // preventing bind-order divergence between SQL generation and execution.
+        let pagination_binds = if let Some(start_key) = exclusive_start_key {
+            if let Some((ref base_sk_name, base_sk_type)) = base_sk_info {
+                // Index with base SK tie-breaker (SQL has $N for base_sk)
+                if let Some(base_sk_val) = start_key.get(base_sk_name.as_str()) {
+                    let sk = parse_sk(base_sk_val, base_sk_type)?;
+                    PaginationBinds::BaseSkOnly { sk }
+                } else {
+                    PaginationBinds::None
+                }
+            } else if index_name.is_some() && sk_info_val.is_some() {
+                // Index with SK but no base SK — SQL has $N for base_pk
+                let base_pk_attr = &key_info.base_key_schema[0].attribute_name;
+                match start_key.get(base_pk_attr.as_str()) {
+                    Some(pk_val) => {
+                        let pk_text = pk_to_text(pk_val)?.into_owned();
+                        PaginationBinds::BasePkOnly { pk_text }
+                    }
+                    None => PaginationBinds::None,
+                }
+            } else if index_name.is_some() && sk_info_val.is_none() {
+                // Hash-only index — SQL may have $N for base_pk and $N+1 for base_sk
+                let base_pk_attr = &key_info.base_key_schema[0].attribute_name;
+                let base_pk = start_key
+                    .get(base_pk_attr.as_str())
+                    .map(pk_to_text)
+                    .transpose()?
+                    .map(|c| c.into_owned());
+                match (base_pk, &base_sk_info) {
+                    (Some(pk_text), Some((sk_name, sk_type))) => {
+                        if let Some(sk_val) = start_key.get(sk_name.as_str()) {
+                            let sk = parse_sk(sk_val, *sk_type)?;
+                            PaginationBinds::BasePkAndSk { pk_text, sk }
+                        } else {
+                            PaginationBinds::BasePkOnly { pk_text }
+                        }
+                    }
+                    (Some(pk_text), None) => PaginationBinds::BasePkOnly { pk_text },
+                    _ => PaginationBinds::None,
+                }
+            } else {
+                PaginationBinds::None
+            }
+        } else {
+            PaginationBinds::None
+        };
 
         // Execute with dynamic bindings
         let rows = execute_query_sql(
@@ -157,6 +332,7 @@ impl PostgresEngine {
             sk_info_val,
             &extra_sk_col_indices,
             exclusive_start_key,
+            &pagination_binds,
             &self.data_pool,
         )
         .await?;
@@ -203,6 +379,14 @@ impl PostgresEngine {
         };
         let sk_info_val = sk_info(&key_info.key_schema, &key_info.attribute_definitions);
 
+        // For index scans, derive base table SK info for compound pagination.
+        let base_sk_info: Option<(String, ScalarAttributeType)> = if index_name.is_some() {
+            sk_info(&key_info.base_key_schema, &key_info.attribute_definitions)
+                .map(|(name, ty)| (name.to_owned(), ty))
+        } else {
+            None
+        };
+
         let mut sql = format!("SELECT item_data FROM {ddb_table}");
         let mut conditions: Vec<String> = Vec::new();
         let param_idx: u32 = 1;
@@ -226,19 +410,59 @@ impl PostgresEngine {
             }
             // Actual PK/SK binding happens in execute_scan_sql.
 
-            if let Some((_, sk_type)) = sk_info_val {
-                let sk_col = sk_column(sk_type);
-                let collate = if sk_type == ScalarAttributeType::S {
-                    " COLLATE \"C\""
+            if index_name.is_some() {
+                // Index scan: use compound condition including base table key
+                // to handle duplicate (pk, sk) pairs on GSIs.
+                if let Some((_, sk_type)) = sk_info_val {
+                    let sk_col = sk_column(sk_type);
+                    let collate = if sk_type == ScalarAttributeType::S {
+                        " COLLATE \"C\""
+                    } else {
+                        ""
+                    };
+                    if let Some((_, base_sk_type)) = &base_sk_info {
+                        let base_sk_col = format!("base_{}", sk_column(*base_sk_type));
+                        let base_collate = if *base_sk_type == ScalarAttributeType::S {
+                            " COLLATE \"C\""
+                        } else {
+                            ""
+                        };
+                        conditions.push(format!(
+                            "(pk, {sk_col}{collate}, base_pk COLLATE \"C\", {base_sk_col}{base_collate}) > \
+                             (${p1}, ${p2}, ${p3}, ${p4})",
+                            p1 = param_idx, p2 = param_idx + 1,
+                            p3 = param_idx + 2, p4 = param_idx + 3
+                        ));
+                    } else {
+                        conditions.push(format!(
+                            "(pk, {sk_col}{collate}, base_pk COLLATE \"C\") > (${p1}, ${p2}, ${p3})",
+                            p1 = param_idx, p2 = param_idx + 1, p3 = param_idx + 2
+                        ));
+                    }
                 } else {
-                    ""
-                };
-                conditions.push(format!(
-                    "(pk, {sk_col}{collate}) > (${param_idx}, ${next})",
-                    next = param_idx + 1
-                ));
+                    // Hash-only index scan
+                    conditions.push(format!(
+                        "(pk, base_pk COLLATE \"C\") > (${p1}, ${p2})",
+                        p1 = param_idx,
+                        p2 = param_idx + 1
+                    ));
+                }
             } else {
-                conditions.push(format!("pk > ${param_idx}"));
+                // Base table scan: standard row-value comparison
+                if let Some((_, sk_type)) = sk_info_val {
+                    let sk_col = sk_column(sk_type);
+                    let collate = if sk_type == ScalarAttributeType::S {
+                        " COLLATE \"C\""
+                    } else {
+                        ""
+                    };
+                    conditions.push(format!(
+                        "(pk, {sk_col}{collate}) > (${param_idx}, ${next})",
+                        next = param_idx + 1
+                    ));
+                } else {
+                    conditions.push(format!("pk > ${param_idx}"));
+                }
             }
         }
 
@@ -247,22 +471,61 @@ impl PostgresEngine {
             sql.push_str(&conditions.join(" AND "));
         }
 
-        // Deterministic ordering for pagination — COLLATE "C" for string
-        // sort keys to match DynamoDB UTF-8 byte order.
-        if let Some((_, sk_type)) = sk_info_val {
-            let sk_col = sk_column(sk_type);
-            let collate = if sk_type == ScalarAttributeType::S {
-                " COLLATE \"C\""
+        // Deterministic ordering for pagination.
+        if index_name.is_some() {
+            // Index scan: include base table key columns for deterministic ordering.
+            if let Some((_, sk_type)) = sk_info_val {
+                let sk_col = sk_column(sk_type);
+                let collate = if sk_type == ScalarAttributeType::S {
+                    " COLLATE \"C\""
+                } else {
+                    ""
+                };
+                if let Some((_, base_sk_type)) = &base_sk_info {
+                    let base_sk_col = format!("base_{}", sk_column(*base_sk_type));
+                    let base_collate = if *base_sk_type == ScalarAttributeType::S {
+                        " COLLATE \"C\""
+                    } else {
+                        ""
+                    };
+                    let _ = write!(
+                        sql,
+                        " ORDER BY pk, {sk_col}{collate}, base_pk COLLATE \"C\", {base_sk_col}{base_collate}"
+                    );
+                } else {
+                    let _ = write!(
+                        sql,
+                        " ORDER BY pk, {sk_col}{collate}, base_pk COLLATE \"C\""
+                    );
+                }
             } else {
-                ""
-            };
-            let _ = write!(sql, " ORDER BY pk, {sk_col}{collate}");
+                let _ = write!(sql, " ORDER BY pk, base_pk COLLATE \"C\"");
+            }
         } else {
-            sql.push_str(" ORDER BY pk");
+            // Base table scan: standard ordering.
+            if let Some((_, sk_type)) = sk_info_val {
+                let sk_col = sk_column(sk_type);
+                let collate = if sk_type == ScalarAttributeType::S {
+                    " COLLATE \"C\""
+                } else {
+                    ""
+                };
+                let _ = write!(sql, " ORDER BY pk, {sk_col}{collate}");
+            } else {
+                sql.push_str(" ORDER BY pk");
+            }
         }
 
         let fetch_limit = limit.map_or(1_000_001, |l| l + 1);
         let _ = write!(sql, " LIMIT {fetch_limit}");
+
+        // Derive base table PK attribute name for index scan binding.
+        let base_pk_attr_name: Option<&str> =
+            if index_name.is_some() && exclusive_start_key.is_some() {
+                Some(key_info.base_key_schema[0].attribute_name.as_str())
+            } else {
+                None
+            };
 
         // Execute
         let rows = execute_scan_sql(
@@ -270,6 +533,8 @@ impl PostgresEngine {
             exclusive_start_key,
             &key_info.key_schema,
             &key_info.attribute_definitions,
+            base_sk_info.as_ref(),
+            base_pk_attr_name,
             &self.data_pool,
         )
         .await?;

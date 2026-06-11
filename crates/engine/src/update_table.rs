@@ -45,6 +45,8 @@ pub async fn handle_update_table(
         && input.provisioned_throughput.is_none()
         && input.deletion_protection_enabled.is_none()
         && input.stream_specification.is_none()
+        && input.table_class.is_none()
+        && input.on_demand_throughput.is_none()
         && !has_gsi_updates
     {
         return Err(DynamoDbError::ValidationException(
@@ -164,7 +166,8 @@ pub async fn handle_update_table(
             }
             extenddb_storage::error::StorageError::IndexNotFound(name) => {
                 DynamoDbError::ResourceNotFoundException(format!(
-                    "One or more parameter values were invalid: Index not found: {name}"
+                    "Requested resource not found: Index {name} for table {}",
+                    table_name
                 ))
             }
             extenddb_storage::error::StorageError::NoOpUpdate(msg) => {

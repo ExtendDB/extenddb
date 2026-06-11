@@ -91,6 +91,9 @@ For remote PostgreSQL or Aurora, supply the admin password with `--pg-pass`:
 When `--pg-pass` is omitted entirely, `extenddb init` connects without a password, relying on
 PostgreSQL peer/ident authentication (works only on localhost via Unix socket).
 
+**Note:** When using Unix socket connections, specify the socket directory with `--pg-host` using an
+absolute path (e.g., `--pg-host /var/run/postgresql`). Relative paths are not supported.
+
 ### Custom bind address
 
 To bind the server to a specific address (e.g., for remote access), pass `--bind-addr` during init. The address is included as a SAN in the self-signed certificate and written to the generated config file:

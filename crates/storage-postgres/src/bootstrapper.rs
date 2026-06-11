@@ -87,14 +87,22 @@ impl PostgresBootstrapper {
     }
 
     /// Build the connection URL for the application user and a named database.
+    ///
+    /// URL-encodes all components to handle special characters:
+    /// - Unix socket paths (e.g., `/var/run/postgresql` → `%2Fvar%2Frun%2Fpostgresql`)
+    /// - Passwords with special chars (e.g., `pass@word` → `pass%40word`)
+    /// - Database names with special chars
+    ///
+    /// PostgreSQL's libpq automatically decodes percent-encoded values per RFC 3986.
     fn app_connection_url(&self, database: &str) -> String {
+        let host_encoded = urlencoding::encode(&self.config.host);
+        let user_encoded = urlencoding::encode(&self.config.app_user);
+        let pass_encoded = urlencoding::encode(&self.config.app_password);
+        let db_encoded = urlencoding::encode(database);
+
         format!(
             "postgresql://{}:{}@{}:{}/{}",
-            self.config.app_user,
-            self.config.app_password,
-            self.config.host,
-            self.config.port,
-            database,
+            user_encoded, pass_encoded, host_encoded, self.config.port, db_encoded,
         )
     }
 
@@ -565,5 +573,129 @@ impl PostgresBootstrapper {
         Self::connect(config)
             .await
             .map_err(|e| StorageError::Internal(format!("{e:?}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use extenddb_storage::bootstrapper::BootstrapConfig;
+
+    #[test]
+    fn test_connection_url_tcp_host() {
+        let config = BootstrapConfig {
+            host: "localhost".to_string(),
+            port: 5432,
+            admin_user: "postgres".to_string(),
+            admin_password: None,
+            app_user: "extenddb".to_string(),
+            app_password: "testpass".to_string(),
+            catalog_db: "extenddb_catalog".to_string(),
+            data_db: "extenddb".to_string(),
+        };
+        let bootstrapper = PostgresBootstrapper::new(config);
+        let url = bootstrapper.catalog_connection_url();
+
+        assert_eq!(
+            url,
+            "postgresql://extenddb:testpass@localhost:5432/extenddb_catalog"
+        );
+    }
+
+    #[test]
+    fn test_connection_url_unix_socket() {
+        let config = BootstrapConfig {
+            host: "/var/run/postgresql".to_string(),
+            port: 5432,
+            admin_user: "postgres".to_string(),
+            admin_password: None,
+            app_user: "extenddb".to_string(),
+            app_password: "testpass".to_string(),
+            catalog_db: "extenddb_catalog".to_string(),
+            data_db: "extenddb".to_string(),
+        };
+        let bootstrapper = PostgresBootstrapper::new(config);
+        let url = bootstrapper.catalog_connection_url();
+
+        assert_eq!(
+            url,
+            "postgresql://extenddb:testpass@%2Fvar%2Frun%2Fpostgresql:5432/extenddb_catalog"
+        );
+    }
+
+    #[test]
+    fn test_connection_url_password_with_special_chars() {
+        let config = BootstrapConfig {
+            host: "localhost".to_string(),
+            port: 5432,
+            admin_user: "postgres".to_string(),
+            admin_password: None,
+            app_user: "extenddb".to_string(),
+            app_password: "pass@word:with/special".to_string(),
+            catalog_db: "extenddb_catalog".to_string(),
+            data_db: "extenddb".to_string(),
+        };
+        let bootstrapper = PostgresBootstrapper::new(config);
+        let url = bootstrapper.catalog_connection_url();
+
+        assert_eq!(
+            url,
+            "postgresql://extenddb:pass%40word%3Awith%2Fspecial@localhost:5432/extenddb_catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connection_url_round_trip_tcp() {
+        let config = BootstrapConfig {
+            host: "localhost".to_string(),
+            port: 5432,
+            admin_user: "postgres".to_string(),
+            admin_password: None,
+            app_user: "extenddb".to_string(),
+            app_password: "testpass".to_string(),
+            catalog_db: "extenddb_catalog".to_string(),
+            data_db: "extenddb".to_string(),
+        };
+        let bootstrapper = PostgresBootstrapper::new(config);
+        let url = bootstrapper.catalog_connection_url();
+
+        // Should parse without error
+        let opts = url
+            .parse::<sqlx::postgres::PgConnectOptions>()
+            .expect("Generated URL should parse");
+
+        // Verify parsed values match original config
+        assert_eq!(opts.get_host(), "localhost");
+        assert_eq!(opts.get_port(), 5432);
+        assert_eq!(opts.get_username(), "extenddb");
+        assert_eq!(opts.get_database().unwrap(), "extenddb_catalog");
+    }
+
+    #[tokio::test]
+    async fn test_connection_url_round_trip_unix_socket() {
+        let config = BootstrapConfig {
+            host: "/var/run/postgresql".to_string(),
+            port: 5432,
+            admin_user: "postgres".to_string(),
+            admin_password: None,
+            app_user: "extenddb".to_string(),
+            app_password: "testpass".to_string(),
+            catalog_db: "extenddb_catalog".to_string(),
+            data_db: "extenddb".to_string(),
+        };
+        let bootstrapper = PostgresBootstrapper::new(config);
+        let url = bootstrapper.catalog_connection_url();
+
+        // Should parse without error - this is the key test
+        let opts = url
+            .parse::<sqlx::postgres::PgConnectOptions>()
+            .expect("Generated URL should parse");
+
+        // Note: sqlx may show "localhost" for get_host() even with a Unix socket path,
+        // but the actual connection uses the percent-encoded socket path correctly.
+        // The important thing is that the URL parses and the connection will work.
+        assert_eq!(opts.get_port(), 5432);
+        assert_eq!(opts.get_username(), "extenddb");
+        assert_eq!(opts.get_database().unwrap(), "extenddb_catalog");
     }
 }

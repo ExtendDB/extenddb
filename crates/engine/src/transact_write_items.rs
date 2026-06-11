@@ -10,16 +10,14 @@ use serde_json::Value;
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
-use crate::expression_helpers::build_expression_maps;
+use crate::expression_helpers::{build_expression_maps, parse_optional_condition};
 use crate::serialize_output;
 use crate::stream_capture;
 use crate::transact_write_helpers::{
-    PreparedOp, compute_fingerprint, parse_optional_condition, validate_client_request_token,
-    validate_no_key_updates,
+    PreparedOp, compute_fingerprint, validate_client_request_token, validate_no_key_updates,
 };
 use crate::{DispatchMetrics, DispatchResult};
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::parse_update;
 use extenddb_core::types::{TransactWriteItem, TransactWriteItemsInput, TransactWriteItemsOutput};
 use extenddb_core::validation::{
     validate_attribute_name_sizes, validate_attribute_values_nesting_depth,
@@ -157,7 +155,7 @@ pub async fn handle_transact_write_items(
     let wcu: f64 = prepared
         .iter()
         .map(|op| {
-            let item_wcu = capacity_helpers::write_capacity_units(op.write_bytes());
+            let item_wcu = capacity_helpers::write_capacity_units(op.write_bytes()) * 2.0; // transactions cost 2x
             *per_table_wcu.entry(op.table_name().to_owned()).or_default() += item_wcu;
             item_wcu
         })
@@ -218,7 +216,9 @@ async fn prepare_write_op(
             put.expression_attribute_values.as_ref(),
         );
         let condition = parse_optional_condition(put.condition_expression.as_deref(), &ctx.limits)?;
-        {
+        // Transactions accept names/values with no expression (unlike single-item
+        // APIs); only check for unused refs when a condition is present.
+        if condition.is_some() {
             let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
             extenddb_core::expression::validate_unused_attributes(
                 &maps.names,
@@ -256,7 +256,7 @@ async fn prepare_write_op(
             del.expression_attribute_values.as_ref(),
         );
         let condition = parse_optional_condition(del.condition_expression.as_deref(), &ctx.limits)?;
-        {
+        if condition.is_some() {
             let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
             extenddb_core::expression::validate_unused_attributes(
                 &maps.names,
@@ -293,9 +293,8 @@ async fn prepare_write_op(
             upd.expression_attribute_names.as_ref(),
             upd.expression_attribute_values.as_ref(),
         );
-        let update_tokens =
-            crate::expression_helpers::tokenize_expression(&upd.update_expression, &ctx.limits)?;
-        let actions = parse_update(&update_tokens)?;
+        let actions =
+            crate::expression_helpers::parse_update_expr(&upd.update_expression, &ctx.limits)?;
         validate_no_key_updates(&actions, &key_info, &maps)?;
 
         // Validate nesting depth of EAV values that get stored via SET actions.
@@ -351,12 +350,8 @@ async fn prepare_write_op(
             cc.expression_attribute_names.as_ref(),
             cc.expression_attribute_values.as_ref(),
         );
-        let tokens =
-            crate::expression_helpers::tokenize_expression(&cc.condition_expression, &ctx.limits)?;
-        let condition = extenddb_core::expression::parse_condition_with_depth_limit(
-            &tokens,
-            ctx.limits.max_expression_depth,
-        )?;
+        let condition =
+            crate::expression_helpers::parse_condition_expr(&cc.condition_expression, &ctx.limits)?;
         {
             let exprs: Vec<&extenddb_core::expression::Expr> = vec![&condition];
             extenddb_core::expression::validate_unused_attributes(

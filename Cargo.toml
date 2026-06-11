@@ -48,6 +48,7 @@ axum = { version = "0.8", features = ["macros"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["compression-gzip", "cors", "set-header"] }
 hyper = { version = "1" }
+urlencoding = { version = "2.1" }
 
 # Database plugin registry
 inventory = "0.3"

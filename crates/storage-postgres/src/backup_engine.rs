@@ -415,6 +415,7 @@ impl BackupEngine for PostgresEngine {
                 deletion_protection_enabled: None,
                 sse_specification: None,
                 table_class: None,
+                on_demand_throughput: None,
             };
 
             let desc = self.create_table(&account_id, create_input).await?;

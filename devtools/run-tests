@@ -441,6 +441,7 @@ if $RUN_PYTEST; then
         echo "  ✓ Pytest passed"
     else
         echo "  ✗ Pytest failed (check output for details)"
+        PASS=false
     fi
     echo ""
 fi
@@ -459,6 +460,7 @@ if $RUN_EXTERNAL; then
             echo "  ✓ External tests passed"
         else
             echo "  ✗ External tests had failures (check output for details)"
+            PASS=false
         fi
     else
         export EXTENDDB_ENDPOINT="${EXTENDDB_TEST_ENDPOINT}"
@@ -467,6 +469,7 @@ if $RUN_EXTERNAL; then
             echo "  ✓ External tests passed"
         else
             echo "  ✗ External tests had failures (check output for details)"
+            PASS=false
         fi
     fi
     echo ""
@@ -500,6 +503,7 @@ if $RUN_COMPREHENSIVE; then
         echo "  ✓ Comprehensive tests passed"
     else
         echo "  ✗ Comprehensive tests had failures (check output for details)"
+        PASS=false
     fi
     echo ""
 fi
@@ -516,6 +520,7 @@ if $RUN_PYTEST && [[ "$TARGET" != "real-dynamodb" && -n "${EXTENDDB_TEST_PG_CONN
         echo "  ✓ CLI lifecycle tests passed"
     else
         echo "  ✗ CLI lifecycle tests failed"
+        PASS=false
     fi
     echo ""
 fi

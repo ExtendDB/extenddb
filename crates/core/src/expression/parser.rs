@@ -473,6 +473,7 @@ mod tests {
             "(((a = :v)))",
             "((a = :v AND b = :v2))",
             "((NOT (a = :v)))",
+            "(a = :v) AND ((b = :v2))",
         ];
         for expr in cases {
             let tokens = tokenize(expr).unwrap();

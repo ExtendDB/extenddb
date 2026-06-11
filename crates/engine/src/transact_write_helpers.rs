@@ -207,24 +207,6 @@ impl PreparedOp {
     }
 }
 
-/// Parse an optional condition expression string.
-pub(crate) fn parse_optional_condition(
-    expr: Option<&str>,
-    limits: &extenddb_core::limits::LimitsConfig,
-) -> Result<Option<extenddb_core::expression::Expr>, DynamoDbError> {
-    match expr {
-        Some(s) if !s.is_empty() => {
-            let tokens = crate::expression_helpers::tokenize_expression(s, limits)?;
-            let ast = extenddb_core::expression::parse_condition_with_depth_limit(
-                &tokens,
-                limits.max_expression_depth,
-            )?;
-            Ok(Some(ast))
-        }
-        _ => Ok(None),
-    }
-}
-
 /// Validate `ClientRequestToken` format.
 ///
 /// Real `DynamoDB` requires 1–36 characters, alphanumeric plus hyphens.
@@ -307,17 +289,6 @@ pub(crate) fn validate_no_key_updates(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn transact_condition_redundant_parens_rejected_with_canonical_message() {
-        let limits = extenddb_core::limits::LimitsConfig::default();
-        let err = parse_optional_condition(Some("((a = :v))"), &limits).unwrap_err();
-        assert!(
-            matches!(&err, DynamoDbError::ValidationException(msg)
-                if msg == "Invalid ConditionExpression: The expression has redundant parentheses;"),
-            "got {err:?}"
-        );
-    }
 
     #[test]
     fn validate_token_valid() {

@@ -14,13 +14,17 @@ publish = false
 # product workspace (tenet 6: tests live outside the core).
 [workspace]
 
+# To override AWS SDK crates with a local checkout, create .cargo/config.toml:
+#   [paths]
+#   paths = ["../../../aws-sdk-rust/sdk/dynamodb", "../../../aws-sdk-rust/sdk/aws-config", ...]
+# See https://doc.rust-lang.org/cargo/reference/overriding-dependencies.html#paths-overrides
 [dependencies]
-aws-sdk-dynamodb = { path = "../../../aws-sdk-rust/sdk/dynamodb" }
-aws-config = { path = "../../../aws-sdk-rust/sdk/aws-config", features = ["behavior-version-latest"] }
-aws-credential-types = { path = "../../../aws-sdk-rust/sdk/aws-credential-types" }
-aws-smithy-types = { path = "../../../aws-sdk-rust/sdk/aws-smithy-types" }
-aws-smithy-runtime-api = { path = "../../../aws-sdk-rust/sdk/aws-smithy-runtime-api" }
-aws-smithy-http-client = { path = "../../../aws-sdk-rust/sdk/aws-smithy-http-client", features = ["rustls-ring"] }
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+aws-credential-types = "1"
+aws-smithy-types = "1"
+aws-smithy-runtime-api = "1"
+aws-smithy-http-client = { version = "1", features = ["rustls-ring"] }
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12.15", features = ["rustls-tls", "json"], default-features = false }

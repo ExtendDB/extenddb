@@ -6,12 +6,11 @@
 use extenddb_core::limits::LimitsConfig;
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
     pub server: ServerConfig,
-    #[serde(default)]
     pub storage: StorageConfig,
     /// Auth provider configuration. `provider = "builtin"` for `SigV4` with
     /// local credential store. The server refuses to start with `provider = "none"`.
@@ -180,6 +179,7 @@ impl<'de> serde::Deserialize<'de> for StorageConfig {
     }
 }
 
+#[cfg(feature = "postgres")]
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
@@ -315,6 +315,7 @@ pub fn expand_tilde(path: &str) -> String {
     }
     path.to_owned()
 }
+#[cfg(feature = "postgres")]
 fn default_backend() -> String {
     "postgres".to_owned()
 }

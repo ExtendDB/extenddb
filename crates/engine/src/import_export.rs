@@ -309,6 +309,7 @@ fn create_table_input_from_params(tcp: &TableCreationParameters) -> CreateTableI
         tags: None,
         deletion_protection_enabled: None,
         table_class: None,
+        on_demand_throughput: None,
     }
 }
 

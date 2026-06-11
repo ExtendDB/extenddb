@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::{ExpressionMaps, parse_projection, tokenize_with_limit};
+use extenddb_core::expression::{ExpressionKind, ExpressionMaps};
 use extenddb_core::types::{
     IndexType, ScanInput, ScanOutput, Select, TableKeyInfo, extract_key, item_size_bytes,
 };
@@ -87,10 +87,21 @@ pub async fn handle_scan(
                     "The parameter TotalSegments should be greater than or equal to 1".to_owned(),
                 ));
             }
+            if total > 1_000_000 {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "1 validation error detected: Value '{total}' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"
+                )));
+            }
             if seg < 0 {
-                return Err(DynamoDbError::ValidationException(
-                    "The parameter Segment should be greater than or equal to 0".to_owned(),
-                ));
+                return Err(DynamoDbError::ValidationException(format!(
+                    "1 validation error detected: Value '{}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0",
+                    seg
+                )));
+            }
+            if seg > 999_999 {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value less than or equal to 999999"
+                )));
             }
             if seg >= total {
                 return Err(DynamoDbError::ValidationException(format!(
@@ -118,6 +129,7 @@ pub async fn handle_scan(
             account_id: key_info.account_id.clone(),
             table_id: key_info.table_id.clone(),
             key_schema: idx.key_schema.clone(),
+            base_key_schema: key_info.key_schema.clone(),
             attribute_definitions: key_info.attribute_definitions.clone(),
             has_lsi: key_info.has_lsi,
             stream_specification: None, // Scans don't capture stream records
@@ -156,6 +168,22 @@ pub async fn handle_scan(
         input.expression_attribute_names.as_ref(),
         input.expression_attribute_values.as_ref(),
     );
+
+    let has_filter_expr = input
+        .filter_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    let has_proj_expr = input
+        .projection_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    extenddb_core::expression::validate_expression_param_usage(
+        input.expression_attribute_names.as_ref(),
+        has_proj_expr || has_filter_expr,
+        input.expression_attribute_values.as_ref(),
+        has_filter_expr,
+        &[ExpressionKind::Filter],
+    )?;
 
     // Parse FilterExpression or desugar legacy ScanFilter
     let (filter, filter_maps) = if let Some(ref sf) = input.scan_filter {
@@ -196,8 +224,10 @@ pub async fn handle_scan(
     };
 
     let projection = if let Some(ref proj_str) = effective_projection_str {
-        let proj_tokens = tokenize_with_limit(proj_str, ctx.limits.max_expression_tokens)?;
-        Some(parse_projection(&proj_tokens)?)
+        Some(crate::expression_helpers::parse_projection_expr(
+            proj_str,
+            &ctx.limits,
+        )?)
     } else {
         None
     };
@@ -232,7 +262,7 @@ pub async fn handle_scan(
         && index_info.is_none()
     {
         return Err(DynamoDbError::ValidationException(
-            "ALL_PROJECTED_ATTRIBUTES can be used only when scanning an index".to_owned(),
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_owned(),
         ));
     }
     if let Some(Select::Count) = input.select
@@ -274,7 +304,7 @@ pub async fn handle_scan(
     // Validate begins_with operand types upfront (before any rows are scanned).
     if let Some(ref f) = filter {
         extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
-            |e| crate::expression_helpers::prefix_expression_error(e, "FilterExpression"),
+            |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
         )?;
     }
 

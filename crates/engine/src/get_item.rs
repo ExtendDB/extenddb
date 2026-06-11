@@ -10,9 +10,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::{
-    apply_projection, parse_projection, tokenize_for, validate_no_reserved_words,
-};
+use extenddb_core::expression::apply_projection;
 use extenddb_core::types::GetItemInput;
 use extenddb_core::types::GetItemOutput;
 use extenddb_core::types::item_size_bytes;
@@ -48,6 +46,19 @@ pub async fn handle_get_item(
         &ctx.limits,
         &key_info.key_schema,
         &key_info.attribute_definitions,
+    )?;
+
+    // Reject ExpressionAttributeNames supplied with no ProjectionExpression
+    // (legacy AttributesToGet does not count as an expression).
+    extenddb_core::expression::validate_expression_param_usage(
+        input.expression_attribute_names.as_ref(),
+        input
+            .projection_expression
+            .as_ref()
+            .is_some_and(|s| !s.is_empty()),
+        None,
+        true,
+        &[],
     )?;
 
     let item = ctx
@@ -104,28 +115,29 @@ pub async fn handle_get_item(
         Some(merged)
     };
 
-    // Validate projection expression upfront (before item fetch result matters)
-    if let Some(ref proj_str) = effective_projection {
-        let proj_tokens = tokenize_for(
-            proj_str,
-            ctx.limits.max_expression_tokens,
-            "ProjectionExpression",
-        )?;
-        if ctx.limits.enforce_reserved_keywords {
-            validate_no_reserved_words(&proj_tokens)?;
+    // Parse and validate the projection once, before the item fetch result
+    // matters, so the unused-name check runs whether or not the item exists.
+    let projection = match effective_projection {
+        Some(ref proj_str) => {
+            let parsed = crate::expression_helpers::parse_projection_expr(proj_str, &ctx.limits)?;
+            // Reject ExpressionAttributeNames entries the projection never
+            // references. Scoped to a user-supplied ProjectionExpression;
+            // desugared AttributesToGet uses synthetic placeholders.
+            if input.projection_expression.is_some() {
+                crate::read_helpers::validate_projection_unused_names(
+                    input.expression_attribute_names.as_ref(),
+                    &parsed,
+                )?;
+            }
+            Some(parsed)
         }
-    }
+        None => None,
+    };
 
-    let item = match (&effective_projection, item) {
-        (Some(proj_str), Some(fetched)) => {
-            let proj_tokens = tokenize_for(
-                proj_str,
-                ctx.limits.max_expression_tokens,
-                "ProjectionExpression",
-            )?;
-            let projection = parse_projection(&proj_tokens)?;
+    let item = match (projection, item) {
+        (Some(paths), Some(fetched)) => {
             let maps = build_expression_maps(effective_proj_names.as_ref(), None);
-            Some(apply_projection(&fetched, &projection, &maps)?)
+            Some(apply_projection(&fetched, &paths, &maps)?)
         }
         (_, item) => item,
     };

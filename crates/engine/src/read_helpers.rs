@@ -7,15 +7,57 @@
 //! after fetching raw items from storage. This module extracts that shared
 //! logic to avoid duplication.
 
+use std::collections::{HashMap, HashSet};
+
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     Expr, ExpressionMaps, PathElement, apply_projection, evaluate_condition,
+    validate_unused_attributes,
 };
 use extenddb_core::types::{
     IndexInfo, Item, KeySchemaElement, Select, extract_key, item_size_bytes,
 };
 
 use crate::index_helpers::apply_index_projection;
+
+/// Reject `ExpressionAttributeNames` entries the projection never references.
+///
+/// Mirrors the unused-attribute check Query and Scan run via
+/// `validate_unused_attributes`, narrowed to read handlers that accept only a
+/// projection (GetItem, BatchGetItem). `names` is the raw request map with
+/// keys still carrying their `#` prefix. The caller passes this only for a
+/// user-supplied `ProjectionExpression`; desugared `AttributesToGet` uses
+/// synthetic placeholders and is governed by a separate rule.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` when a declared name is unused.
+pub fn validate_projection_unused_names(
+    names: Option<&HashMap<String, String>>,
+    projection: &[Vec<PathElement>],
+) -> Result<(), DynamoDbError> {
+    let Some(names) = names.filter(|m| !m.is_empty()) else {
+        return Ok(());
+    };
+    let mut used_names: HashSet<String> = HashSet::new();
+    for path in projection {
+        for el in path {
+            if let PathElement::Attribute(name) = el
+                && let Some(stripped) = name.strip_prefix('#')
+            {
+                used_names.insert(stripped.to_owned());
+            }
+        }
+    }
+    validate_unused_attributes(
+        names,
+        &HashMap::new(),
+        &[],
+        &[],
+        &used_names,
+        &HashSet::new(),
+    )
+}
 
 /// Result of the post-read processing pipeline.
 pub struct PostReadResult {

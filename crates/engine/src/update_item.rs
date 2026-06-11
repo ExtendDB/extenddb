@@ -11,10 +11,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::{
-    ExpressionMaps, PathElement, UpdateAction, parse_update_from, tokenize_for,
-    validate_no_reserved_words,
-};
+use extenddb_core::expression::{ExpressionKind, ExpressionMaps, PathElement, UpdateAction};
 use extenddb_core::types::{
     AttributeValue, Item, ReturnValues, TableKeyInfo, UpdateItemInput, UpdateItemOutput,
     item_size_bytes,
@@ -112,6 +109,23 @@ pub async fn handle_update_item(
         &key_info.attribute_definitions,
     )?;
 
+    let has_update_expr = input
+        .update_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    let has_condition = input
+        .condition_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    let has_expr = has_update_expr || has_condition;
+    extenddb_core::expression::validate_expression_param_usage(
+        input.expression_attribute_names.as_ref(),
+        has_expr,
+        input.expression_attribute_values.as_ref(),
+        has_expr,
+        &[ExpressionKind::Update, ExpressionKind::Condition],
+    )?;
+
     let (condition, maps) = resolve_condition(
         input.condition_expression.as_deref(),
         effective_expr_names.as_ref(),
@@ -122,17 +136,9 @@ pub async fn handle_update_item(
     )?;
 
     // No UpdateExpression and no AttributeUpdates: no-op upsert.
-    // Some("") still errors via tokenize_for.
+    // Some("") still errors via parse_update_expr.
     let actions = if let Some(update_expr) = effective_update_expr.as_deref() {
-        let update_tokens = tokenize_for(
-            update_expr,
-            ctx.limits.max_expression_tokens,
-            "UpdateExpression",
-        )?;
-        if ctx.limits.enforce_reserved_keywords {
-            validate_no_reserved_words(&update_tokens)?;
-        }
-        parse_update_from(&update_tokens, update_expr)?
+        crate::expression_helpers::parse_update_expr(update_expr, &ctx.limits)?
     } else {
         Vec::new()
     };
@@ -325,7 +331,17 @@ fn filter_to_updated_attrs(item: &Item, actions: &[UpdateAction], maps: &Express
         };
         if let Some(leaf) = resolve_path_value(top_val, &path[1..], maps) {
             let wrapped = wrap_leaf_in_path(&path[1..], &leaf, maps);
-            result.insert(top_name, wrapped);
+            // Merge into existing top-level entry if multiple subpaths target
+            // the same attribute (e.g., SET a.b = :x, a.c = :y).
+            if let Some(existing) = result.get(&top_name) {
+                if let Some(merged) = merge_maps(existing, &wrapped) {
+                    result.insert(top_name, merged);
+                } else {
+                    result.insert(top_name, wrapped);
+                }
+            } else {
+                result.insert(top_name, wrapped);
+            }
         }
     }
     result
@@ -377,6 +393,28 @@ fn wrap_leaf_in_path(
             AttributeValue::M(map)
         }
         PathElement::Index(_) => AttributeValue::L(vec![inner]),
+    }
+}
+
+/// Recursively merge two Map AttributeValues. Returns None if either isn't a Map.
+fn merge_maps(a: &AttributeValue, b: &AttributeValue) -> Option<AttributeValue> {
+    match (a, b) {
+        (AttributeValue::M(ma), AttributeValue::M(mb)) => {
+            let mut merged = ma.clone();
+            for (k, v) in mb {
+                if let Some(existing) = merged.get(k) {
+                    if let Some(deep) = merge_maps(existing, v) {
+                        merged.insert(k.clone(), deep);
+                    } else {
+                        merged.insert(k.clone(), v.clone());
+                    }
+                } else {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
+            Some(AttributeValue::M(merged))
+        }
+        _ => None,
     }
 }
 

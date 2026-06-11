@@ -295,6 +295,7 @@ impl PostgresEngine {
             table_name: table_name.to_owned(),
             account_id: account_id.to_owned(),
             table_id,
+            base_key_schema: key_schema.clone(),
             key_schema,
             attribute_definitions,
             has_lsi: has_lsi.unwrap_or(false),

@@ -5,7 +5,8 @@
 
 use extenddb_core::types::{
     AttributeDefinition, BillingMode, BillingModeSummary, GsiDescription, KeySchemaElement,
-    LsiDescription, Projection, ProvisionedThroughputDescription, TableDescription, TableStatus,
+    LsiDescription, Projection, ProvisionedThroughputDescription, SseDescription, SseType,
+    TableDescription, TableStatus,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn};
@@ -30,6 +31,9 @@ pub(crate) struct TableRow {
     pub table_id: String,
     pub deletion_protection_enabled: bool,
     pub stream_label: Option<String>,
+    pub table_class: Option<String>,
+    pub sse_specification: Option<serde_json::Value>,
+    pub on_demand_throughput: Option<serde_json::Value>,
 }
 
 /// Row type for index metadata queries.
@@ -149,7 +153,8 @@ impl PostgresEngine {
                       provisioned_throughput, stream_specification, table_status,
                       EXTRACT(EPOCH FROM creation_date_time)::FLOAT8 as creation_epoch,
                       table_size_bytes, item_count, table_arn, table_id,
-                      deletion_protection_enabled, stream_label
+                      deletion_protection_enabled, stream_label,
+                      table_class, sse_specification, on_demand_throughput
                FROM tables WHERE account_id = $1 AND table_name = $2",
         )
         .bind(account_id)
@@ -322,8 +327,31 @@ impl PostgresEngine {
             latest_stream_arn,
             latest_stream_label: row.stream_label,
             deletion_protection_enabled: row.deletion_protection_enabled,
-            sse_description: None,
-            table_class_summary: None,
+            sse_description: row.sse_specification.as_ref().and_then(|spec| {
+                let enabled = spec
+                    .get("Enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if enabled {
+                    Some(SseDescription {
+                        status: "ENABLED".to_string(),
+                        sse_type: Some(SseType::KMS),
+                        kms_master_key_arn: Some(format!(
+                            "arn:aws:kms:{}:{}:key/default",
+                            self.region, account_id
+                        )),
+                    })
+                } else {
+                    None
+                }
+            }),
+            table_class_summary: row
+                .table_class
+                .as_ref()
+                .map(|tc| serde_json::json!({ "TableClass": tc })),
+            on_demand_throughput: row
+                .on_demand_throughput
+                .and_then(|v| serde_json::from_value(v).ok()),
         })
     }
 }

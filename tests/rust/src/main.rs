@@ -42,6 +42,8 @@ mod gsi;
 #[cfg(test)]
 mod gsi_more;
 #[cfg(test)]
+mod lsi;
+#[cfg(test)]
 mod misc_control_plane;
 #[cfg(test)]
 mod put_item;
