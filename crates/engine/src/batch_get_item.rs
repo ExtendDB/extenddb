@@ -143,6 +143,10 @@ pub async fn handle_batch_get_item(
                 ka.expression_attribute_names.as_ref(),
                 paths,
             )?;
+            crate::read_helpers::validate_projection_overlap(
+                ka.expression_attribute_names.as_ref(),
+                paths,
+            )?;
         }
         let ean = if extra_proj_names.is_empty() {
             ka.expression_attribute_names.as_ref()

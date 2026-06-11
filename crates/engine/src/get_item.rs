@@ -128,6 +128,10 @@ pub async fn handle_get_item(
                     input.expression_attribute_names.as_ref(),
                     &parsed,
                 )?;
+                crate::read_helpers::validate_projection_overlap(
+                    input.expression_attribute_names.as_ref(),
+                    &parsed,
+                )?;
             }
             Some(parsed)
         }
