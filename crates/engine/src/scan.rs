@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::{ExpressionKind, ExpressionMaps};
+use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
 use extenddb_core::types::{
     IndexType, ScanInput, ScanOutput, Select, TableKeyInfo, extract_key, item_size_bytes,
 };
@@ -231,14 +231,24 @@ pub async fn handle_scan(
         None
     };
 
-    if input.projection_expression.is_some()
-        && let Some(ref paths) = projection
-    {
-        crate::read_helpers::validate_projection_overlap(
-            input.expression_attribute_names.as_ref(),
-            paths,
-        )?;
-    }
+    // Compile once: resolves #names and rejects overlapping paths. Overlap
+    // rejection is scoped to a user-supplied ProjectionExpression.
+    let compiled_projection = match projection {
+        Some(ref paths) => {
+            let mut names = maps.names.clone();
+            for (k, v) in &extra_proj_names {
+                let stripped = k.strip_prefix('#').unwrap_or(k);
+                names.insert(stripped.to_owned(), v.clone());
+            }
+            let proj_maps = ExpressionMaps::new(names, HashMap::new());
+            Some(Projection::compile(
+                paths,
+                &proj_maps,
+                input.projection_expression.is_some(),
+            )?)
+        }
+        None => None,
+    };
 
     // Validate unused expression attributes
     {
@@ -354,7 +364,7 @@ pub async fn handle_scan(
         &raw_items,
         enriched_storage_last_key,
         &filter,
-        &projection,
+        compiled_projection.as_ref(),
         &combined_maps,
         &lek_key_schema,
         input.select.as_ref(),

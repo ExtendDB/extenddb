@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use super::ast::PathElement;
-use super::resolver::{ExpressionMaps, resolve_element_name, resolve_name_ref};
+use super::resolver::{ExpressionMaps, resolve_name_ref};
 use super::tokenizer::Token;
 use crate::error::DynamoDbError;
 use crate::types::{AttributeValue, Item};
@@ -55,78 +55,117 @@ struct ProjNode {
     indices: BTreeMap<usize, ProjNode>,
 }
 
-/// Apply a projection to an item, returning only the requested attributes.
-///
-/// List elements selected by index are returned in a new list compacted in
-/// ascending original-index order (matching Amazon DynamoDB), not in the order
-/// the indices appear in the expression. Map keys not on a projected path are
-/// dropped. The structure of the original item is otherwise preserved.
-///
-/// # Errors
-///
-/// Returns `ValidationException` for unresolvable `#name` references or a path
-/// that starts with an index.
-pub fn apply_projection(
+/// A compiled projection: `#name` references resolved and paths merged into a
+/// trie. Compile once per request, then apply to any number of items.
+pub struct Projection {
+    root: ProjNode,
+}
+
+impl Projection {
+    /// Compile parsed paths into a trie, resolving `#name` references once.
+    /// With `reject_overlap`, rejects paths where one is a prefix of another
+    /// (DynamoDB's rule); pass `false` for desugared `AttributesToGet`.
+    pub fn compile(
+        paths: &[Vec<PathElement>],
+        maps: &ExpressionMaps,
+        reject_overlap: bool,
+    ) -> Result<Self, DynamoDbError> {
+        let resolved = resolve_paths(paths, maps).map_err(prefix_projection_error)?;
+        if reject_overlap {
+            check_overlap(&resolved)?;
+        }
+        Ok(Self {
+            root: build_trie(resolved),
+        })
+    }
+
+    /// Apply the projection to an item, returning only the requested attributes.
+    ///
+    /// List elements selected by index are returned in a new list compacted in
+    /// ascending original-index order (matching Amazon DynamoDB), not in the
+    /// order the indices appear in the expression. Map keys not on a projected
+    /// path are dropped. The structure of the original item is otherwise
+    /// preserved.
+    #[must_use]
+    pub fn apply(&self, item: &Item) -> Item {
+        let mut result = BTreeMap::new();
+        for (name, child) in &self.root.attrs {
+            if let Some(val) = item.get(name)
+                && let Some(projected) = project_value(val, child)
+            {
+                result.insert(name.clone(), projected);
+            }
+        }
+        result
+    }
+}
+
+/// Compile (no overlap rejection) and apply to one item. Test-only helper;
+/// production callers compile once via `Projection::compile` and apply per item.
+#[cfg(test)]
+fn apply_projection(
     item: &Item,
     paths: &[Vec<PathElement>],
     maps: &ExpressionMaps,
 ) -> Result<Item, DynamoDbError> {
-    let root = build_trie(paths, maps)?;
-
-    let mut result = BTreeMap::new();
-    for (name, child) in &root.attrs {
-        if let Some(val) = item.get(name)
-            && let Some(projected) = project_value(val, child)
-        {
-            result.insert(name.clone(), projected);
-        }
-    }
-    Ok(result)
+    Ok(Projection::compile(paths, maps, false)?.apply(item))
 }
 
-/// A path element after `#name` resolution, used for overlap detection.
+/// Prefix a projection resolve error with `Invalid ProjectionExpression:`,
+/// matching Amazon DynamoDB. Messages already carrying an `Invalid ` prefix
+/// (for example a path that starts with an index) are left unchanged.
+fn prefix_projection_error(err: DynamoDbError) -> DynamoDbError {
+    match err {
+        DynamoDbError::ValidationException(msg) if !msg.starts_with("Invalid ") => {
+            DynamoDbError::ValidationException(format!("Invalid ProjectionExpression: {msg}"))
+        }
+        other => other,
+    }
+}
+
+/// A path element after `#name` resolution.
 #[derive(PartialEq, Eq)]
 enum ResolvedElement {
     Attr(String),
     Index(usize),
 }
 
-/// Reject a `ProjectionExpression` whose paths overlap, matching Amazon DynamoDB.
-///
-/// Two paths overlap when one is a prefix of the other (this includes equal
-/// paths), for example `a` and `a.b`, or `a[0]` and `a[0].b`, or a duplicate
-/// `a` and `a`. Sibling paths such as `a.b` and `a.c`, or `a[0]` and `a[1]`,
-/// do not overlap. `#name` references are resolved first, so the reported
-/// paths use the resolved attribute names. The first offending pair in
-/// expression order is reported.
-///
-/// # Errors
-///
-/// Returns `ValidationException` with the overlap message, or an unresolvable
-/// `#name` reference error.
-pub fn detect_overlapping_paths(
+/// Resolve `#name` references in parsed paths, rejecting index-start paths.
+fn resolve_paths(
     paths: &[Vec<PathElement>],
     maps: &ExpressionMaps,
-) -> Result<(), DynamoDbError> {
-    let mut resolved: Vec<Vec<ResolvedElement>> = Vec::with_capacity(paths.len());
+) -> Result<Vec<Vec<ResolvedElement>>, DynamoDbError> {
+    let mut resolved = Vec::with_capacity(paths.len());
     for path in paths {
         if path.is_empty() {
             continue;
         }
         let mut elems = Vec::with_capacity(path.len());
-        for element in path {
+        for (i, element) in path.iter().enumerate() {
             match element {
                 PathElement::Attribute(raw) => {
                     elems.push(ResolvedElement::Attr(
                         resolve_name_ref(raw, maps)?.into_owned(),
                     ));
                 }
-                PathElement::Index(idx) => elems.push(ResolvedElement::Index(*idx)),
+                PathElement::Index(idx) => {
+                    if i == 0 {
+                        return Err(DynamoDbError::ValidationException(
+                            "Invalid expression: path cannot start with an index".to_owned(),
+                        ));
+                    }
+                    elems.push(ResolvedElement::Index(*idx));
+                }
             }
         }
         resolved.push(elems);
     }
+    Ok(resolved)
+}
 
+/// Reject paths where one is a prefix of another (DynamoDB's overlap rule),
+/// reporting the first offending pair in expression order. Siblings are fine.
+fn check_overlap(resolved: &[Vec<ResolvedElement>]) -> Result<(), DynamoDbError> {
     for i in 0..resolved.len() {
         for j in (i + 1)..resolved.len() {
             if is_prefix(&resolved[i], &resolved[j]) || is_prefix(&resolved[j], &resolved[i]) {
@@ -159,45 +198,20 @@ fn render_path(path: &[ResolvedElement]) -> String {
     format!("[{}]", parts.join(", "))
 }
 
-/// Build the projection trie from the parsed paths, resolving `#name` refs.
-fn build_trie(
-    paths: &[Vec<PathElement>],
-    maps: &ExpressionMaps,
-) -> Result<ProjNode, DynamoDbError> {
+/// Build the projection trie from resolved paths.
+fn build_trie(resolved: Vec<Vec<ResolvedElement>>) -> ProjNode {
     let mut root = ProjNode::default();
-    for path in paths {
-        if path.is_empty() {
-            continue;
-        }
+    for path in resolved {
         let mut node = &mut root;
-        for (i, element) in path.iter().enumerate() {
-            match element {
-                PathElement::Attribute(_) => {
-                    // The first element must be an attribute; `resolve_element_name`
-                    // rejects an index-start path, matching the prior behavior.
-                    let name = if i == 0 {
-                        resolve_element_name(element, maps)?
-                    } else {
-                        let PathElement::Attribute(raw) = element else {
-                            unreachable!()
-                        };
-                        resolve_name_ref(raw, maps)?
-                    };
-                    node = node.attrs.entry(name.into_owned()).or_default();
-                }
-                PathElement::Index(idx) => {
-                    if i == 0 {
-                        return Err(DynamoDbError::ValidationException(
-                            "Invalid expression: path cannot start with an index".to_owned(),
-                        ));
-                    }
-                    node = node.indices.entry(*idx).or_default();
-                }
-            }
+        for element in path {
+            node = match element {
+                ResolvedElement::Attr(name) => node.attrs.entry(name).or_default(),
+                ResolvedElement::Index(idx) => node.indices.entry(idx).or_default(),
+            };
         }
         node.terminal = true;
     }
-    Ok(root)
+    root
 }
 
 /// Project a single value against a trie node.
@@ -532,7 +546,30 @@ mod tests {
         let tokens = tokenize(expr).unwrap();
         let paths = parse_projection(&tokens).unwrap();
         let maps = ExpressionMaps::new(names, HashMap::new());
-        detect_overlapping_paths(&paths, &maps)
+        Projection::compile(&paths, &maps, true).map(|_| ())
+    }
+
+    #[test]
+    fn compile_without_overlap_rejection_accepts_duplicates() {
+        // Desugared AttributesToGet keeps the legacy accept-duplicates behavior.
+        let tokens = tokenize("a, a").unwrap();
+        let paths = parse_projection(&tokens).unwrap();
+        let maps = ExpressionMaps::new(HashMap::new(), HashMap::new());
+        assert!(Projection::compile(&paths, &maps, false).is_ok());
+    }
+
+    #[test]
+    fn compiled_projection_reusable_across_items() {
+        let tokens = tokenize("name").unwrap();
+        let paths = parse_projection(&tokens).unwrap();
+        let maps = ExpressionMaps::new(HashMap::new(), HashMap::new());
+        let proj = Projection::compile(&paths, &maps, true).unwrap();
+        let item = sample_item();
+        for _ in 0..2 {
+            let out = proj.apply(&item);
+            assert_eq!(out.len(), 1);
+            assert!(out.contains_key("name"));
+        }
     }
 
     fn overlap_msg(expr: &str) -> String {

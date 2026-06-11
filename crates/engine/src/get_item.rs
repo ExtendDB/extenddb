@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::apply_projection;
+use extenddb_core::expression::Projection;
 use extenddb_core::types::GetItemInput;
 use extenddb_core::types::GetItemOutput;
 use extenddb_core::types::item_size_bytes;
@@ -116,33 +116,32 @@ pub async fn handle_get_item(
     };
 
     // Parse and validate the projection once, before the item fetch result
-    // matters, so the unused-name check runs whether or not the item exists.
+    // matters, so validation runs whether or not the item exists.
     let projection = match effective_projection {
         Some(ref proj_str) => {
             let parsed = crate::expression_helpers::parse_projection_expr(proj_str, &ctx.limits)?;
-            // Reject ExpressionAttributeNames entries the projection never
-            // references. Scoped to a user-supplied ProjectionExpression;
-            // desugared AttributesToGet uses synthetic placeholders.
+            // Compile once: resolves #names and rejects overlapping paths.
+            // DynamoDB checks overlap before the unused-name check, so this
+            // runs first. Overlap rejection is scoped to a user-supplied
+            // expression.
+            let maps = build_expression_maps(effective_proj_names.as_ref(), None);
+            let compiled =
+                Projection::compile(&parsed, &maps, input.projection_expression.is_some())?;
+            // Then reject ExpressionAttributeNames entries the projection never
+            // references. Scoped to a user-supplied ProjectionExpression.
             if input.projection_expression.is_some() {
                 crate::read_helpers::validate_projection_unused_names(
                     input.expression_attribute_names.as_ref(),
                     &parsed,
                 )?;
-                crate::read_helpers::validate_projection_overlap(
-                    input.expression_attribute_names.as_ref(),
-                    &parsed,
-                )?;
             }
-            Some(parsed)
+            Some(compiled)
         }
         None => None,
     };
 
     let item = match (projection, item) {
-        (Some(paths), Some(fetched)) => {
-            let maps = build_expression_maps(effective_proj_names.as_ref(), None);
-            Some(apply_projection(&fetched, &paths, &maps)?)
-        }
+        (Some(projection), Some(fetched)) => Some(projection.apply(&fetched)),
         (_, item) => item,
     };
 

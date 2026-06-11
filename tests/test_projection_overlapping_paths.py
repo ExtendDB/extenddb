@@ -157,6 +157,56 @@ class TestProjectionOverlap:
             )
         assert _validation_message(ei) == OVERLAP.format(one="[a]", two="[a, b]")
 
+    def test_overlap_precedes_unused_name_get_item(self, dynamodb_client, overlap_table):
+        # With both an unused #name and an overlap, DynamoDB reports the overlap.
+        with pytest.raises(ClientError) as ei:
+            dynamodb_client.get_item(
+                TableName=overlap_table,
+                Key={"pk": {"S": "k1"}},
+                ProjectionExpression="a, a.b",
+                ExpressionAttributeNames={"#z": "zzz"},
+            )
+        assert _validation_message(ei) == OVERLAP.format(one="[a]", two="[a, b]")
+
+    def test_overlap_precedes_unused_name_query(self, dynamodb_client, overlap_table):
+        with pytest.raises(ClientError) as ei:
+            dynamodb_client.query(
+                TableName=overlap_table,
+                KeyConditionExpression="pk = :p",
+                ExpressionAttributeValues={":p": {"S": "k1"}},
+                ProjectionExpression="a, a.b",
+                ExpressionAttributeNames={"#z": "zzz"},
+            )
+        assert _validation_message(ei) == OVERLAP.format(one="[a]", two="[a, b]")
+
+    def test_undefined_name_query_zero_match_validates_before_read(
+        self, dynamodb_client, overlap_table
+    ):
+        # An undefined #name in the projection is rejected up front, even when
+        # the query matches no items (validation runs before the read).
+        with pytest.raises(ClientError) as ei:
+            dynamodb_client.query(
+                TableName=overlap_table,
+                KeyConditionExpression="pk = :p",
+                ExpressionAttributeValues={":p": {"S": "no-such-pk"}},
+                ProjectionExpression="a.#u",
+            )
+        assert _validation_message(ei) == (
+            "Invalid ProjectionExpression: An expression attribute name used in the "
+            "document path is not defined; attribute name: #u"
+        )
+
+    def test_undefined_name_scan_validates_before_read(self, dynamodb_client, overlap_table):
+        with pytest.raises(ClientError) as ei:
+            dynamodb_client.scan(
+                TableName=overlap_table,
+                ProjectionExpression="a.#u",
+            )
+        assert _validation_message(ei) == (
+            "Invalid ProjectionExpression: An expression attribute name used in the "
+            "document path is not defined; attribute name: #u"
+        )
+
     def test_siblings_accepted(self, dynamodb_client, overlap_table):
         # Non-overlapping sibling paths must still work.
         resp = dynamodb_client.get_item(

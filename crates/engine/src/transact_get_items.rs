@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::{ExpressionKind, apply_projection, parse_projection, tokenize_for};
+use extenddb_core::expression::{ExpressionKind, Projection, parse_projection, tokenize_for};
 use extenddb_core::types::{
     ItemResponse, TransactGetItemsInput, TransactGetItemsOutput, item_size_bytes,
 };
@@ -82,6 +82,45 @@ pub async fn handle_transact_get_items(
         key_infos.push(key_info);
     }
 
+    // Validate and compile each projection before the transactional read, so a
+    // malformed request fails with ValidationException instead of executing the
+    // transaction. DynamoDB checks overlap before the unused-name check.
+    let mut projections: Vec<Option<Projection>> = Vec::with_capacity(input.transact_items.len());
+    for tgi in &input.transact_items {
+        if let Some(ref proj_str) = tgi.get.projection_expression {
+            let maps = build_expression_maps(tgi.get.expression_attribute_names.as_ref(), None);
+            let proj_tokens = tokenize_for(
+                proj_str,
+                ctx.limits.max_expression_tokens,
+                ExpressionKind::Projection,
+            )?;
+            let projection = parse_projection(&proj_tokens)?;
+            let compiled = Projection::compile(&projection, &maps, true)?;
+            let mut extra_names = HashSet::new();
+            for path in &projection {
+                for el in path {
+                    if let extenddb_core::expression::PathElement::Attribute(name) = el
+                        && let Some(ref_name) = name.strip_prefix('#')
+                    {
+                        extra_names.insert(ref_name.to_owned());
+                    }
+                }
+            }
+            extenddb_core::expression::validate_unused_attributes(
+                &maps.names,
+                &maps.values,
+                &[],
+                &[],
+                &extra_names,
+                &HashSet::new(),
+            )?;
+            projections.push(Some(compiled));
+        } else {
+            // No projection: transactions accept names with no expression.
+            projections.push(None);
+        }
+    }
+
     // Build storage operations
     let ops: Vec<TransactGetOp<'_>> = input
         .transact_items
@@ -124,52 +163,18 @@ pub async fn handle_transact_get_items(
         .sum();
     let returned_count = items.iter().filter(|opt| opt.is_some()).count() as u64;
 
-    // Apply per-item projection
+    // Apply per-item projection using the projections compiled before the read.
     let responses: Vec<ItemResponse> = items
         .into_iter()
-        .zip(input.transact_items.iter())
-        .map(|(opt, tgi)| {
-            let maps = build_expression_maps(tgi.get.expression_attribute_names.as_ref(), None);
-            if let Some(ref proj_str) = tgi.get.projection_expression {
-                let proj_tokens = tokenize_for(
-                    proj_str,
-                    ctx.limits.max_expression_tokens,
-                    ExpressionKind::Projection,
-                )?;
-                let projection = parse_projection(&proj_tokens)?;
-                crate::read_helpers::validate_projection_overlap(
-                    tgi.get.expression_attribute_names.as_ref(),
-                    &projection,
-                )?;
-                let mut extra_names = std::collections::HashSet::new();
-                for path in &projection {
-                    for el in path {
-                        if let extenddb_core::expression::PathElement::Attribute(name) = el
-                            && let Some(ref_name) = name.strip_prefix('#')
-                        {
-                            extra_names.insert(ref_name.to_owned());
-                        }
-                    }
-                }
-                extenddb_core::expression::validate_unused_attributes(
-                    &maps.names,
-                    &maps.values,
-                    &[],
-                    &[],
-                    &extra_names,
-                    &std::collections::HashSet::new(),
-                )?;
-                let item = opt
-                    .map(|item| apply_projection(&item, &projection, &maps))
-                    .transpose()?
-                    .filter(|i| !i.is_empty());
-                Ok(ItemResponse { item })
-            } else {
-                // No projection: transactions accept names with no expression.
-                Ok(ItemResponse { item: opt })
-            }
+        .zip(projections)
+        .map(|(opt, proj)| {
+            let item = match proj {
+                Some(p) => opt.map(|item| p.apply(&item)).filter(|i| !i.is_empty()),
+                None => opt,
+            };
+            ItemResponse { item }
         })
-        .collect::<Result<Vec<_>, DynamoDbError>>()?;
+        .collect();
 
     let consumed_capacity = capacity_helpers::batch_read_capacity(
         input.return_consumed_capacity,
