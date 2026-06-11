@@ -547,4 +547,25 @@ mod tests {
         let actions = parse("SET c = (c - :v)").unwrap();
         assert!(matches!(&actions[0], UpdateAction::Set { .. }));
     }
+
+    #[test]
+    fn unmatched_paren_rejected() {
+        // Opening paren with no matching close must be a ValidationException,
+        // not a panic or a silently-accepted expression.
+        let err = parse("SET c = (c - :v").unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg) if msg.contains("closing")),
+            "Expected unmatched-paren error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn unmatched_close_paren_rejected() {
+        // A stray closing paren with no matching open must also be rejected.
+        let err = parse("SET c = c - :v)").unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(_)),
+            "Expected validation error for stray ')', got: {err:?}"
+        );
+    }
 }
