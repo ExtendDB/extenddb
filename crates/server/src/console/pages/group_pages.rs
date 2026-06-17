@@ -184,7 +184,7 @@ pub async fn group_detail(
         );
     }
 
-    content.push_str(r#"<table><thead><tr><th>User Name</th><th></th></tr></thead><tbody>"#);
+    content.push_str(r"<table><thead><tr><th>User Name</th><th></th></tr></thead><tbody>");
     for uname in &detail.members {
         let eu = html::escape(uname);
         let remove_btn = if is_admin(&session.identity) {
@@ -211,7 +211,7 @@ pub async fn group_detail(
             r#"<a href="/console/accounts/{eid}/groups/{egn}/policies/new" class="btn btn-primary btn-sm" style="margin-bottom:0.5rem;display:inline-block">Add Policy</a>"#
         );
     }
-    content.push_str(r#"<table><thead><tr><th>Policy Name</th><th></th></tr></thead><tbody>"#);
+    content.push_str(r"<table><thead><tr><th>Policy Name</th><th></th></tr></thead><tbody>");
     for pname in &detail.policies {
         let ep = html::escape(pname);
         let delete_btn = if is_admin(&session.identity) {
@@ -255,12 +255,37 @@ pub async fn delete_group(
         return r;
     }
 
+    // Mirror management::iam_group::delete_group: snapshot members BEFORE
+    // delete so we can drop their cached user_group_policies after the
+    // FK cascade removes membership rows.
+    let members: Vec<String> = match state
+        .catalog_store
+        .get_group_detail(&account_id, &group_name)
+        .await
+    {
+        Ok(Some(detail)) => detail.members,
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            tracing::warn!(
+                "console delete_group: get_group_detail failed before delete; member \
+                 cache invalidation will rely on TTL: {e:?}"
+            );
+            Vec::new()
+        }
+    };
+
     match state
         .catalog_store
         .delete_group(&account_id, &group_name)
         .await
     {
-        Ok(()) => Redirect::to(&format!("/console/accounts/{account_id}")).into_response(),
+        Ok(()) => {
+            state
+                .auth_cache
+                .invalidate_users_group_policies(&account_id, &members)
+                .await;
+            Redirect::to(&format!("/console/accounts/{account_id}")).into_response()
+        }
         Err(e) => {
             let nav = html::nav_bar(&identity_label(&session.identity));
             let content = format!(
@@ -313,7 +338,16 @@ pub async fn add_group_member(
         .add_group_member(&account_id, &group_name, &form.user_name)
         .await
     {
-        Ok(()) => Redirect::to(&redirect).into_response(),
+        Ok(()) => {
+            // Mirror management::iam_group::add_member: the user's
+            // group_policies cache flattens membership at fetch time, so
+            // adding the user changes their effective policy set.
+            state
+                .auth_cache
+                .invalidate_user_group_policies(&account_id, &form.user_name)
+                .await;
+            Redirect::to(&redirect).into_response()
+        }
         Err(e) => {
             let nav = html::nav_bar(&identity_label(&session.identity));
             let content = format!(
@@ -359,7 +393,13 @@ pub async fn remove_group_member(
         .remove_group_member(&account_id, &group_name, &user_name)
         .await
     {
-        Ok(()) => Redirect::to(&redirect).into_response(),
+        Ok(()) => {
+            state
+                .auth_cache
+                .invalidate_user_group_policies(&account_id, &user_name)
+                .await;
+            Redirect::to(&redirect).into_response()
+        }
         Err(e) => {
             let nav = html::nav_bar(&identity_label(&session.identity));
             let content = format!(

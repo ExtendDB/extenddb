@@ -10,19 +10,18 @@ use serde_json::Value;
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
-use crate::expression_helpers::build_expression_maps;
+use crate::expression_helpers::{build_expression_maps, parse_optional_condition};
 use crate::serialize_output;
 use crate::stream_capture;
 use crate::transact_write_helpers::{
-    PreparedOp, compute_fingerprint, parse_optional_condition, validate_client_request_token,
-    validate_no_key_updates,
+    PreparedOp, compute_fingerprint, validate_client_request_token, validate_no_key_updates,
 };
 use crate::{DispatchMetrics, DispatchResult};
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::parse_update;
 use extenddb_core::types::{TransactWriteItem, TransactWriteItemsInput, TransactWriteItemsOutput};
 use extenddb_core::validation::{
-    validate_attribute_name_sizes, validate_item_size, validate_key_sizes,
+    validate_attribute_name_sizes, validate_attribute_values_nesting_depth,
+    validate_item_nesting_depth, validate_item_size, validate_key_sizes,
 };
 
 /// Maximum number of items in a single `TransactWriteItems` request.
@@ -106,7 +105,10 @@ pub async fn handle_transact_write_items(
     }
 
     // Validate total transaction size <= 4MB
-    let total_size: usize = prepared.iter().map(|op| op.item_size()).sum();
+    let total_size: usize = prepared
+        .iter()
+        .map(super::transact_write_helpers::PreparedOp::item_size)
+        .sum();
     if total_size > 4 * 1024 * 1024 {
         return Err(DynamoDbError::ValidationException(
             "Transaction item size has exceeded the 4 MB limit".to_owned(),
@@ -156,7 +158,7 @@ pub async fn handle_transact_write_items(
     let wcu: f64 = prepared
         .iter()
         .map(|op| {
-            let item_wcu = capacity_helpers::write_capacity_units(op.write_bytes());
+            let item_wcu = capacity_helpers::write_capacity_units(op.write_bytes()) * 2.0; // transactions cost 2x
             *per_table_wcu.entry(op.table_name().to_owned()).or_default() += item_wcu;
             item_wcu
         })
@@ -208,6 +210,7 @@ async fn prepare_write_op(
             .table_key_info(&ctx.account_id, &put.table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
+        validate_item_nesting_depth(&put.item)?;
         validate_item_size(&put.item, ctx.limits.max_item_size_bytes)?;
         validate_attribute_name_sizes(&put.item, &ctx.limits)?;
         validate_key_sizes(&put.item, &key_info.key_schema, &ctx.limits)?;
@@ -216,7 +219,9 @@ async fn prepare_write_op(
             put.expression_attribute_values.as_ref(),
         );
         let condition = parse_optional_condition(put.condition_expression.as_deref(), &ctx.limits)?;
-        {
+        // Transactions accept names/values with no expression (unlike single-item
+        // APIs); only check for unused refs when a condition is present.
+        if condition.is_some() {
             let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
             extenddb_core::expression::validate_unused_attributes(
                 &maps.names,
@@ -254,7 +259,7 @@ async fn prepare_write_op(
             del.expression_attribute_values.as_ref(),
         );
         let condition = parse_optional_condition(del.condition_expression.as_deref(), &ctx.limits)?;
-        {
+        if condition.is_some() {
             let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
             extenddb_core::expression::validate_unused_attributes(
                 &maps.names,
@@ -291,10 +296,24 @@ async fn prepare_write_op(
             upd.expression_attribute_names.as_ref(),
             upd.expression_attribute_values.as_ref(),
         );
-        let update_tokens =
-            crate::expression_helpers::tokenize_expression(&upd.update_expression, &ctx.limits)?;
-        let actions = parse_update(&update_tokens)?;
+        let actions =
+            crate::expression_helpers::parse_update_expr(&upd.update_expression, &ctx.limits)?;
         validate_no_key_updates(&actions, &key_info, &maps)?;
+
+        // Validate nesting depth of EAV values that get stored via SET actions.
+        {
+            let mut placeholders: Vec<String> = Vec::new();
+            for action in &actions {
+                if let extenddb_core::expression::UpdateAction::Set { value, .. } = action {
+                    extenddb_core::expression::collect_value_placeholders(value, &mut placeholders);
+                }
+            }
+            let stored: Vec<&extenddb_core::types::AttributeValue> = placeholders
+                .iter()
+                .filter_map(|name| maps.values.get(name))
+                .collect();
+            validate_attribute_values_nesting_depth(stored)?;
+        }
         let condition = parse_optional_condition(upd.condition_expression.as_deref(), &ctx.limits)?;
         {
             let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
@@ -334,12 +353,8 @@ async fn prepare_write_op(
             cc.expression_attribute_names.as_ref(),
             cc.expression_attribute_values.as_ref(),
         );
-        let tokens =
-            crate::expression_helpers::tokenize_expression(&cc.condition_expression, &ctx.limits)?;
-        let condition = extenddb_core::expression::parse_condition_with_depth_limit(
-            &tokens,
-            ctx.limits.max_expression_depth,
-        )?;
+        let condition =
+            crate::expression_helpers::parse_condition_expr(&cc.condition_expression, &ctx.limits)?;
         {
             let exprs: Vec<&extenddb_core::expression::Expr> = vec![&condition];
             extenddb_core::expression::validate_unused_attributes(

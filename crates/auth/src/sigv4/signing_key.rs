@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! SigV4 signing key derivation.
+//! `SigV4` signing key derivation.
 //!
 //! Derives the signing key via the 4-step HMAC-SHA256 chain:
 //! ```text
@@ -16,7 +16,7 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Derive the SigV4 signing key from a secret access key.
+/// Derive the `SigV4` signing key from a secret access key.
 ///
 /// # Arguments
 /// * `secret` — The plaintext secret access key.
@@ -31,7 +31,7 @@ pub fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str)
     hmac_sha256(&k_service, b"aws4_request")
 }
 
-/// Compute the final signature: HMAC-SHA256(signing_key, string_to_sign), hex-encoded.
+/// Compute the final signature: HMAC-SHA256(signing_key, `string_to_sign`), hex-encoded.
 #[must_use]
 pub fn compute_signature(signing_key: &[u8], string_to_sign: &str) -> String {
     hex::encode(hmac_sha256(signing_key, string_to_sign.as_bytes()))

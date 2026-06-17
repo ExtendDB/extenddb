@@ -1,12 +1,12 @@
-// Copyright 2026 DynamoDB Open contributors
+// Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! PostgreSQL implementation of `OperationsEngine`.
+//! `PostgreSQL` implementation of `OperationsEngine`.
 
 use extenddb_storage::error::StorageError;
 use extenddb_storage::operations::{ConnectionParts, OperationsEngine};
 
-/// PostgreSQL operations engine for ddbo CLI commands.
+/// `PostgreSQL` operations engine for ddbo CLI commands.
 pub struct PostgresOperationsEngine;
 
 impl OperationsEngine for PostgresOperationsEngine {
@@ -26,12 +26,12 @@ impl OperationsEngine for PostgresOperationsEngine {
 
     fn redact_connection_string(&self, s: &str) -> String {
         // Redact password from postgresql://user:password@host:port/database
-        if let Some(at) = s.find('@') {
-            if let Some(colon) = s[..at].rfind(':') {
-                let scheme_end = s.find("://").map_or(0, |i| i + 3);
-                if colon >= scheme_end {
-                    return format!("{}:***@{}", &s[..colon], &s[at + 1..]);
-                }
+        if let Some(at) = s.find('@')
+            && let Some(colon) = s[..at].rfind(':')
+        {
+            let scheme_end = s.find("://").map_or(0, |i| i + 3);
+            if colon >= scheme_end {
+                return format!("{}:***@{}", &s[..colon], &s[at + 1..]);
             }
         }
         s.to_owned()

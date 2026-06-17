@@ -188,11 +188,23 @@ The primary test suite is in Python, testing extenddb through the same AWS SDK i
 # Via run-tests script (recommended)
 devtools/run-tests --extenddb --pytest
 
+# Run in parallel (uses 1/3 of CPU cores by default)
+devtools/run-tests --extenddb --pytest --parallel
+
+# Run in parallel with a specific worker count
+devtools/run-tests --extenddb --pytest --parallel=4
+
 # Direct execution (for quick iteration during development)
 python3 -m pytest tests/ -v
 python3 -m pytest tests/test_put_item.py -v
 python3 -m pytest tests/test_put_item.py::test_put_item_basic -v
 ```
+
+The `--parallel` flag enables pytest-xdist with `--dist loadfile`, which
+distributes entire test files across workers. This keeps module/class-scoped
+fixtures on a single worker while running independent files concurrently. The
+default worker count (1/3 of CPU cores, minimum 2) leaves headroom for the
+extenddb server and its Postgres backend.
 
 ### Comprehensive Tests
 

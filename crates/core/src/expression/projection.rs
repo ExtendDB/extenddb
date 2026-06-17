@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use super::ast::PathElement;
-use super::resolver::{ExpressionMaps, resolve_element_name, resolve_path};
+use super::resolver::{ExpressionMaps, resolve_element_name, resolve_name_ref};
 use super::tokenizer::Token;
 use crate::error::DynamoDbError;
 use crate::types::{AttributeValue, Item};
@@ -39,112 +39,134 @@ pub fn parse_projection(tokens: &[Token]) -> Result<Vec<Vec<PathElement>>, Dynam
     Ok(paths)
 }
 
+/// A node in the projection trie.
+///
+/// Each node selects part of the item. `terminal` means the whole value at
+/// this position is projected. Otherwise the node descends via `attrs` (for a
+/// map) or `indices` (for a list). A value is either a map or a list, so only
+/// one of the two child maps is populated on a given node in practice.
+///
+/// `indices` is a `BTreeMap` so selected list elements come out in ascending
+/// original-index order, which is how DynamoDB compacts list projections.
+#[derive(Default)]
+struct ProjNode {
+    terminal: bool,
+    attrs: BTreeMap<String, ProjNode>,
+    indices: BTreeMap<usize, ProjNode>,
+}
+
 /// Apply a projection to an item, returning only the requested attributes.
+///
+/// List elements selected by index are returned in a new list compacted in
+/// ascending original-index order (matching Amazon DynamoDB), not in the order
+/// the indices appear in the expression. Map keys not on a projected path are
+/// dropped. The structure of the original item is otherwise preserved.
 ///
 /// # Errors
 ///
-/// Returns `ValidationException` for unresolvable `#name` references.
+/// Returns `ValidationException` for unresolvable `#name` references or a path
+/// that starts with an index.
 pub fn apply_projection(
     item: &Item,
     paths: &[Vec<PathElement>],
     maps: &ExpressionMaps,
 ) -> Result<Item, DynamoDbError> {
-    let mut result = BTreeMap::new();
+    let root = build_trie(paths, maps)?;
 
+    let mut result = BTreeMap::new();
+    for (name, child) in &root.attrs {
+        if let Some(val) = item.get(name)
+            && let Some(projected) = project_value(val, child)
+        {
+            result.insert(name.clone(), projected);
+        }
+    }
+    Ok(result)
+}
+
+/// Build the projection trie from the parsed paths, resolving `#name` refs.
+fn build_trie(
+    paths: &[Vec<PathElement>],
+    maps: &ExpressionMaps,
+) -> Result<ProjNode, DynamoDbError> {
+    let mut root = ProjNode::default();
     for path in paths {
         if path.is_empty() {
             continue;
         }
-        let top_name = resolve_element_name(&path[0], maps)?;
-        if path.len() == 1 {
-            // Top-level attribute
-            if let Some(val) = item.get(top_name.as_ref()) {
-                result.insert(top_name.into_owned(), val.clone());
-            }
-        } else {
-            // Nested path — resolve the value and insert at the top level
-            // with the nested structure preserved
-            if let Some(val) = resolve_path(path, item, maps)? {
-                insert_nested(&mut result, path, maps, val)?;
-            }
-        }
-    }
-
-    Ok(result)
-}
-
-/// Insert a value at a nested path in the result item, creating intermediate
-/// maps/lists as needed.
-///
-/// DynamoDB projection semantics for list indices: projecting `mylist[N]`
-/// returns `{"mylist": [value]}` — a single-element list wrapping the value.
-fn insert_nested(
-    result: &mut Item,
-    path: &[PathElement],
-    maps: &ExpressionMaps,
-    value: &AttributeValue,
-) -> Result<(), DynamoDbError> {
-    if path.is_empty() {
-        return Ok(());
-    }
-
-    let top_name = resolve_element_name(&path[0], maps)?.into_owned();
-
-    if path.len() == 1 {
-        result.insert(top_name, value.clone());
-        return Ok(());
-    }
-
-    if path.len() == 2 {
-        if let PathElement::Index(_) = &path[1] {
-            // mylist[N] → {"mylist": [value]}
-            result.insert(top_name, AttributeValue::L(vec![value.clone()]));
-            return Ok(());
-        }
-    }
-
-    // For nested paths, we need to build the intermediate structure
-    let entry = result
-        .entry(top_name)
-        .or_insert_with(|| AttributeValue::M(BTreeMap::new()));
-
-    let mut current = entry;
-    for element in &path[1..path.len() - 1] {
-        match element {
-            PathElement::Attribute(name) => {
-                let resolved = super::resolver::resolve_name_ref(name, maps)?;
-                if let AttributeValue::M(map) = current {
-                    current = map
-                        .entry(resolved.into_owned())
-                        .or_insert_with(|| AttributeValue::M(BTreeMap::new()));
-                } else {
-                    return Ok(());
+        let mut node = &mut root;
+        for (i, element) in path.iter().enumerate() {
+            match element {
+                PathElement::Attribute(_) => {
+                    // The first element must be an attribute; `resolve_element_name`
+                    // rejects an index-start path, matching the prior behavior.
+                    let name = if i == 0 {
+                        resolve_element_name(element, maps)?
+                    } else {
+                        let PathElement::Attribute(raw) = element else {
+                            unreachable!()
+                        };
+                        resolve_name_ref(raw, maps)?
+                    };
+                    node = node.attrs.entry(name.into_owned()).or_default();
+                }
+                PathElement::Index(idx) => {
+                    if i == 0 {
+                        return Err(DynamoDbError::ValidationException(
+                            "Invalid expression: path cannot start with an index".to_owned(),
+                        ));
+                    }
+                    node = node.indices.entry(*idx).or_default();
                 }
             }
-            PathElement::Index(_) => {
-                // Intermediate list index: wrap remaining path in a single-element list
-                let remaining_value = value.clone();
-                *current = AttributeValue::L(vec![remaining_value]);
-                return Ok(());
-            }
         }
+        node.terminal = true;
+    }
+    Ok(root)
+}
+
+/// Project a single value against a trie node.
+///
+/// Returns `None` when nothing is selected (missing key, out-of-bounds index,
+/// or a path that does not match the value's type), so the caller omits the
+/// attribute entirely.
+fn project_value(value: &AttributeValue, node: &ProjNode) -> Option<AttributeValue> {
+    if node.terminal {
+        return Some(value.clone());
     }
 
-    // Set the final value
-    match &path[path.len() - 1] {
-        PathElement::Attribute(name) => {
-            let resolved = super::resolver::resolve_name_ref(name, maps)?;
-            if let AttributeValue::M(map) = current {
-                map.insert(resolved.into_owned(), value.clone());
+    if !node.attrs.is_empty() {
+        let AttributeValue::M(map) = value else {
+            return None;
+        };
+        let mut out = BTreeMap::new();
+        for (name, child) in &node.attrs {
+            if let Some(child_val) = map.get(name)
+                && let Some(projected) = project_value(child_val, child)
+            {
+                out.insert(name.clone(), projected);
             }
         }
-        PathElement::Index(_) => {
-            // List index at leaf of a deeper path — wrap in single-element list
-            *current = AttributeValue::L(vec![value.clone()]);
-        }
+        return (!out.is_empty()).then_some(AttributeValue::M(out));
     }
 
-    Ok(())
+    if !node.indices.is_empty() {
+        let AttributeValue::L(list) = value else {
+            return None;
+        };
+        let mut out = Vec::new();
+        // BTreeMap iterates indices ascending, compacting the projected list.
+        for (idx, child) in &node.indices {
+            if let Some(element) = list.get(*idx)
+                && let Some(projected) = project_value(element, child)
+            {
+                out.push(projected);
+            }
+        }
+        return (!out.is_empty()).then_some(AttributeValue::L(out));
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -278,5 +300,187 @@ mod tests {
         // Out-of-bounds index returns empty
         let result = project("mylist[5]", &item, HashMap::new()).unwrap();
         assert!(result.is_empty());
+    }
+
+    fn list_item() -> Item {
+        let mut item = BTreeMap::new();
+        item.insert("pk".into(), AttributeValue::S("p1".into()));
+        item.insert(
+            "mylist".into(),
+            AttributeValue::L(vec![
+                AttributeValue::S("zero".into()),
+                AttributeValue::S("one".into()),
+                AttributeValue::S("two".into()),
+                AttributeValue::S("three".into()),
+            ]),
+        );
+        item.insert(
+            "with_null".into(),
+            AttributeValue::L(vec![
+                AttributeValue::S("keep0".into()),
+                AttributeValue::Null,
+                AttributeValue::S("keep2".into()),
+            ]),
+        );
+        item
+    }
+
+    fn assert_list(result: &Item, key: &str, expected: &[AttributeValue]) {
+        match result.get(key) {
+            Some(AttributeValue::L(list)) => assert_eq!(list.as_slice(), expected),
+            other => panic!("Expected L for {key}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_two_list_indices_compacted() {
+        let item = list_item();
+        let result = project("mylist[0], mylist[2]", &item, HashMap::new()).unwrap();
+        assert_list(
+            &result,
+            "mylist",
+            &[
+                AttributeValue::S("zero".into()),
+                AttributeValue::S("two".into()),
+            ],
+        );
+    }
+
+    #[test]
+    fn project_list_indices_ordered_by_index_not_expression() {
+        let item = list_item();
+        // Reversed expression order still comes out in ascending index order.
+        let result = project("mylist[2], mylist[0]", &item, HashMap::new()).unwrap();
+        assert_list(
+            &result,
+            "mylist",
+            &[
+                AttributeValue::S("zero".into()),
+                AttributeValue::S("two".into()),
+            ],
+        );
+    }
+
+    #[test]
+    fn project_list_index_gap_compacted() {
+        let item = list_item();
+        let result = project("mylist[1], mylist[3]", &item, HashMap::new()).unwrap();
+        assert_list(
+            &result,
+            "mylist",
+            &[
+                AttributeValue::S("one".into()),
+                AttributeValue::S("three".into()),
+            ],
+        );
+    }
+
+    #[test]
+    fn project_null_element_by_index_preserved() {
+        let item = list_item();
+        let result = project("with_null[1]", &item, HashMap::new()).unwrap();
+        assert_list(&result, "with_null", &[AttributeValue::Null]);
+    }
+
+    #[test]
+    fn project_unselected_null_dropped() {
+        let item = list_item();
+        let result = project("with_null[0], with_null[2]", &item, HashMap::new()).unwrap();
+        assert_list(
+            &result,
+            "with_null",
+            &[
+                AttributeValue::S("keep0".into()),
+                AttributeValue::S("keep2".into()),
+            ],
+        );
+    }
+
+    #[test]
+    fn project_whole_list_preserves_null() {
+        let item = list_item();
+        let result = project("with_null", &item, HashMap::new()).unwrap();
+        assert_list(
+            &result,
+            "with_null",
+            &[
+                AttributeValue::S("keep0".into()),
+                AttributeValue::Null,
+                AttributeValue::S("keep2".into()),
+            ],
+        );
+    }
+
+    #[test]
+    fn project_list_of_maps_subfield_multi() {
+        let mut item = BTreeMap::new();
+        item.insert("pk".into(), AttributeValue::S("p".into()));
+        let mk = |v: &str, x: &str| {
+            let mut m = BTreeMap::new();
+            m.insert("val".into(), AttributeValue::S(v.into()));
+            m.insert("x".into(), AttributeValue::S(x.into()));
+            AttributeValue::M(m)
+        };
+        item.insert(
+            "lom".into(),
+            AttributeValue::L(vec![mk("a0", "x0"), mk("a1", "x1"), mk("a2", "x2")]),
+        );
+
+        let result = project("lom[0].val, lom[2].val", &item, HashMap::new()).unwrap();
+        let only_val = |v: &str| {
+            let mut m = BTreeMap::new();
+            m.insert("val".into(), AttributeValue::S(v.into()));
+            AttributeValue::M(m)
+        };
+        assert_list(&result, "lom", &[only_val("a0"), only_val("a2")]);
+    }
+
+    #[test]
+    fn project_same_index_merges_subfields() {
+        let mut item = BTreeMap::new();
+        item.insert("pk".into(), AttributeValue::S("p".into()));
+        let mut m = BTreeMap::new();
+        m.insert("a".into(), AttributeValue::S("av".into()));
+        m.insert("b".into(), AttributeValue::S("bv".into()));
+        m.insert("c".into(), AttributeValue::S("cv".into()));
+        item.insert("l".into(), AttributeValue::L(vec![AttributeValue::M(m)]));
+
+        // Two paths selecting the same element merge their subfields.
+        let result = project("l[0].a, l[0].c", &item, HashMap::new()).unwrap();
+        let mut expected = BTreeMap::new();
+        expected.insert("a".into(), AttributeValue::S("av".into()));
+        expected.insert("c".into(), AttributeValue::S("cv".into()));
+        assert_list(&result, "l", &[AttributeValue::M(expected)]);
+    }
+
+    #[test]
+    fn project_list_index_into_map_preserves_structure() {
+        let mut item = BTreeMap::new();
+        item.insert("pk".into(), AttributeValue::S("p".into()));
+        let mut map0 = BTreeMap::new();
+        map0.insert("val".into(), AttributeValue::S("target".into()));
+        map0.insert("x".into(), AttributeValue::S("0".into()));
+        let mut map1 = BTreeMap::new();
+        map1.insert("x".into(), AttributeValue::S("0".into()));
+        item.insert(
+            "a_list".into(),
+            AttributeValue::L(vec![AttributeValue::M(map0), AttributeValue::M(map1)]),
+        );
+
+        let result = project("a_list[0].val", &item, HashMap::new()).unwrap();
+        // Should preserve: {"a_list": [{"val": "target"}]}
+        match result.get("a_list") {
+            Some(AttributeValue::L(list)) => {
+                assert_eq!(list.len(), 1);
+                match &list[0] {
+                    AttributeValue::M(m) => {
+                        assert_eq!(m.get("val"), Some(&AttributeValue::S("target".into())));
+                        assert!(!m.contains_key("x"));
+                    }
+                    other => panic!("Expected M, got {other:?}"),
+                }
+            }
+            other => panic!("Expected L, got {other:?}"),
+        }
     }
 }

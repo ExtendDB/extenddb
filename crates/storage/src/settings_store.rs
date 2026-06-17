@@ -1,4 +1,4 @@
-// Copyright 2026 DynamoDB Open contributors
+// Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Settings store factory registry for backend-agnostic instantiation.

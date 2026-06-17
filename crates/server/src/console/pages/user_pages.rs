@@ -111,21 +111,21 @@ pub async fn create_user(
 
     let pw = form.password.as_deref().filter(|p| !p.is_empty());
 
-    if let Some(p) = pw {
-        if p.len() > 72 {
-            let nav = html::nav_bar(&identity_label(&session.identity));
-            let content = format!(
-                "<h1>Create User</h1>{}",
-                html::alert_error("password must not exceed 72 bytes (bcrypt limit)")
-            );
-            return Html(html::layout_csrf(
-                "New User",
-                &nav,
-                &content,
-                &session.csrf_token,
-            ))
-            .into_response();
-        }
+    if let Some(p) = pw
+        && p.len() > 72
+    {
+        let nav = html::nav_bar(&identity_label(&session.identity));
+        let content = format!(
+            "<h1>Create User</h1>{}",
+            html::alert_error("password must not exceed 72 bytes (bcrypt limit)")
+        );
+        return Html(html::layout_csrf(
+            "New User",
+            &nav,
+            &content,
+            &session.csrf_token,
+        ))
+        .into_response();
     }
 
     let password_hash = match pw {
@@ -238,7 +238,7 @@ pub async fn user_detail(
 </form>"#
     );
     content.push_str(
-        r#"<table><thead><tr><th>Access Key ID</th><th>Status</th><th></th></tr></thead><tbody>"#,
+        r"<table><thead><tr><th>Access Key ID</th><th>Status</th><th></th></tr></thead><tbody>",
     );
     for (kid, is_active) in &detail.keys {
         let ekid = html::escape(kid);
@@ -262,7 +262,7 @@ pub async fn user_detail(
             r#"<a href="/console/accounts/{eid}/users/{eun}/policies/new" class="btn btn-primary btn-sm" style="margin-bottom:0.5rem;display:inline-block">Add Policy</a>"#
         );
     }
-    content.push_str(r#"<table><thead><tr><th>Policy Name</th><th></th></tr></thead><tbody>"#);
+    content.push_str(r"<table><thead><tr><th>Policy Name</th><th></th></tr></thead><tbody>");
     for pname in &detail.policies {
         let ep = html::escape(pname);
         let delete_btn = if is_admin(&session.identity) {
@@ -281,7 +281,7 @@ pub async fn user_detail(
 
     // Groups section.
     let _ = write!(content, "<h2>Groups ({})</h2>", detail.groups.len());
-    content.push_str(r#"<table><thead><tr><th>Group Name</th></tr></thead><tbody>"#);
+    content.push_str(r"<table><thead><tr><th>Group Name</th></tr></thead><tbody>");
     for gname in &detail.groups {
         let eg = html::escape(gname);
         let _ = write!(
@@ -293,7 +293,7 @@ pub async fn user_detail(
 
     // Tags section.
     let _ = write!(content, "<h2>Tags ({})</h2>", detail.tags.len());
-    content.push_str(r#"<table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>"#);
+    content.push_str(r"<table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>");
     for (k, v) in &detail.tags {
         let _ = write!(
             content,
@@ -331,12 +331,55 @@ pub async fn delete_user(
         return r;
     }
 
+    // Mirror management::iam_user::delete_user: snapshot the user's access
+    // keys BEFORE deletion so cache fanout can drop them after the cascade
+    // succeeds. The defensive principal-fanout below covers any keys
+    // created concurrently with this delete.
+    let access_key_ids: Vec<String> = match state
+        .catalog_store
+        .list_access_keys(&account_id, &user_name)
+        .await
+    {
+        Ok(rows) => rows.into_iter().map(|(id, _, _)| id).collect(),
+        Err(e) => {
+            tracing::warn!(
+                "console delete_user: list_access_keys failed before delete; cache invalidation will rely on TTL: {e:?}"
+            );
+            Vec::new()
+        }
+    };
+
     match state
         .catalog_store
         .delete_user(&account_id, &user_name)
         .await
     {
-        Ok(()) => Redirect::to(&format!("/console/accounts/{account_id}")).into_response(),
+        Ok(()) => {
+            for key_id in &access_key_ids {
+                state.auth_cache.invalidate_credential(key_id).await;
+            }
+            state
+                .auth_cache
+                .invalidate_principal_credentials(&account_id, &user_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_user_policies(&account_id, &user_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_user_group_policies(&account_id, &user_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_user_boundary(&account_id, &user_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_user_tags(&account_id, &user_name)
+                .await;
+            Redirect::to(&format!("/console/accounts/{account_id}")).into_response()
+        }
         Err(e) => {
             let nav = html::nav_bar(&identity_label(&session.identity));
             let content = format!(

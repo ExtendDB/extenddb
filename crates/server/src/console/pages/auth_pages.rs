@@ -87,7 +87,8 @@ pub async fn logout(State(state): State<Arc<ConsoleState>>, headers: HeaderMap) 
     if let Some(token) = extract_session_token(&headers) {
         state.sessions.remove(&token).await;
     }
-    let cookie = "extenddb_session=; Path=/console; HttpOnly; SameSite=Strict; Max-Age=0".to_string();
+    let cookie =
+        "extenddb_session=; Path=/console; HttpOnly; SameSite=Strict; Max-Age=0".to_string();
     (
         StatusCode::SEE_OTHER,
         [("location", "/console/login"), ("set-cookie", &cookie)],
@@ -143,9 +144,8 @@ async fn try_admin_login(
     password: &str,
     store: &dyn extenddb_storage::management_store::AdminStore,
 ) -> AdminLoginResult {
-    let result = match store.verify_admin_password(username, password).await {
-        Ok(r) => r,
-        Err(_) => return AdminLoginResult::NotFound,
+    let Ok(result) = store.verify_admin_password(username, password).await else {
+        return AdminLoginResult::NotFound;
     };
     match result {
         Some(true) => AdminLoginResult::Authenticated(CallerIdentity::Admin(username.to_owned())),

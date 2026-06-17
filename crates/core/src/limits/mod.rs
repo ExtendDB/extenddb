@@ -33,7 +33,7 @@ pub struct LimitsConfig {
     #[serde(default = "default_per_account_max_wcu")]
     pub per_account_max_wcu: u64,
     /// Preview extension: allow multi-part (composite) keys on base tables.
-    /// When `false` (default), base tables follow standard DynamoDB rules
+    /// When `false` (default), base tables follow standard `DynamoDB` rules
     /// (1 HASH + optional 1 RANGE). GSIs always allow multi-part keys.
     #[serde(default)]
     pub allow_multipart_table_keys: bool,

@@ -15,7 +15,7 @@ use extenddb_core::types::{
 };
 use extenddb_core::validation::{
     validate_attribute_name_sizes, validate_batch_item_keys, validate_batch_key_only,
-    validate_item_size, validate_key_sizes,
+    validate_item_nesting_depth, validate_item_size, validate_key_sizes,
 };
 
 use crate::OperationContext;
@@ -68,7 +68,7 @@ pub async fn handle_batch_write_item(
     }
 
     // Validate: total operations across all tables <= 25
-    let total_ops: usize = input.request_items.values().map(|r| r.len()).sum();
+    let total_ops: usize = input.request_items.values().map(std::vec::Vec::len).sum();
     if total_ops > MAX_BATCH_WRITE_ITEMS {
         return Err(DynamoDbError::ValidationException(
             "Too many items requested for the BatchWriteItem call".to_owned(),
@@ -123,6 +123,7 @@ pub async fn handle_batch_write_item(
                     &key_info.key_schema,
                     &key_info.attribute_definitions,
                 )?;
+                validate_item_nesting_depth(&put.item)?;
                 validate_item_size(&put.item, ctx.limits.max_item_size_bytes)?;
                 validate_attribute_name_sizes(&put.item, &ctx.limits)?;
                 validate_key_sizes(&put.item, &key_info.key_schema, &ctx.limits)?;

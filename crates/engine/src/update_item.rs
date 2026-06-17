@@ -11,10 +11,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::{
-    ExpressionMaps, PathElement, UpdateAction, parse_update_from, tokenize_for,
-    validate_no_reserved_words,
-};
+use extenddb_core::expression::{ExpressionKind, ExpressionMaps, PathElement, UpdateAction};
 use extenddb_core::types::{
     AttributeValue, Item, ReturnValues, TableKeyInfo, UpdateItemInput, UpdateItemOutput,
     item_size_bytes,
@@ -112,6 +109,23 @@ pub async fn handle_update_item(
         &key_info.attribute_definitions,
     )?;
 
+    let has_update_expr = input
+        .update_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    let has_condition = input
+        .condition_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    let has_expr = has_update_expr || has_condition;
+    extenddb_core::expression::validate_expression_param_usage(
+        input.expression_attribute_names.as_ref(),
+        has_expr,
+        input.expression_attribute_values.as_ref(),
+        has_expr,
+        &[ExpressionKind::Update, ExpressionKind::Condition],
+    )?;
+
     let (condition, maps) = resolve_condition(
         input.condition_expression.as_deref(),
         effective_expr_names.as_ref(),
@@ -121,19 +135,38 @@ pub async fn handle_update_item(
         &ctx.limits,
     )?;
 
-    // Parse the update expression
-    let update_expr = effective_update_expr.as_deref().unwrap_or("");
-    let update_tokens = tokenize_for(
-        update_expr,
-        ctx.limits.max_expression_tokens,
-        "UpdateExpression",
-    )?;
-    if ctx.limits.enforce_reserved_keywords {
-        validate_no_reserved_words(&update_tokens)?;
-    }
-    let actions = parse_update_from(&update_tokens, update_expr)?;
+    // No UpdateExpression and no AttributeUpdates: no-op upsert.
+    // Some("") still errors via parse_update_expr.
+    let actions = if let Some(update_expr) = effective_update_expr.as_deref() {
+        crate::expression_helpers::parse_update_expr(update_expr, &ctx.limits)?
+    } else {
+        Vec::new()
+    };
 
-    if input.expected.is_none() || input.expected.as_ref().is_some_and(|m| m.is_empty()) {
+    // Amazon DynamoDB enforces nesting depth on values that are stored as item
+    // attributes. For UpdateExpression, walk each SET action's RHS to find the
+    // EAV placeholders it references, resolve them against `maps.values`, and
+    // validate those values' depth. Condition-only EAV is left alone.
+    {
+        let mut placeholders: Vec<String> = Vec::new();
+        for action in &actions {
+            if let UpdateAction::Set { value, .. } = action {
+                extenddb_core::expression::collect_value_placeholders(value, &mut placeholders);
+            }
+        }
+        let stored: Vec<&extenddb_core::types::AttributeValue> = placeholders
+            .iter()
+            .filter_map(|name| maps.values.get(name))
+            .collect();
+        extenddb_core::validation::validate_attribute_values_nesting_depth(stored)?;
+    }
+
+    if input.expected.is_none()
+        || input
+            .expected
+            .as_ref()
+            .is_some_and(std::collections::HashMap::is_empty)
+    {
         let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
         extenddb_core::expression::validate_unused_attributes(
             &maps.names,
@@ -152,10 +185,6 @@ pub async fn handle_update_item(
         input.return_values,
         ReturnValues::AllOld | ReturnValues::UpdatedOld
     );
-    let return_new = matches!(
-        input.return_values,
-        ReturnValues::AllNew | ReturnValues::UpdatedNew
-    );
 
     let view_type = stream_capture::stream_view_type(&key_info);
     let stream = view_type.map(|vt| extenddb_storage::StreamCapture {
@@ -164,7 +193,6 @@ pub async fn handle_update_item(
         region: ctx.region.clone(),
     });
     let need_old_for_stream = stream.is_some();
-    let need_new_for_stream = stream.is_some();
 
     let (old_item, new_item) = ctx
         .storage
@@ -173,7 +201,7 @@ pub async fn handle_update_item(
             &input.key,
             &actions,
             return_old || need_old_for_stream,
-            return_new || need_new_for_stream,
+            true, // always fetch new item for WCU calculation
             condition.as_ref(),
             &maps,
             stream.as_ref(),
@@ -197,12 +225,12 @@ pub async fn handle_update_item(
         ReturnValues::None => None,
         ReturnValues::AllOld => old_item,
         ReturnValues::AllNew => new_item,
-        ReturnValues::UpdatedOld => {
-            old_item.map(|item| filter_to_updated_attrs(&item, &actions, &maps))
-        }
-        ReturnValues::UpdatedNew => {
-            new_item.map(|item| filter_to_updated_attrs(&item, &actions, &maps))
-        }
+        ReturnValues::UpdatedOld => old_item
+            .map(|item| filter_to_updated_attrs(&item, &actions, &maps))
+            .filter(|item| !item.is_empty()),
+        ReturnValues::UpdatedNew => new_item
+            .map(|item| filter_to_updated_attrs(&item, &actions, &maps))
+            .filter(|item| !item.is_empty()),
     };
 
     let output = UpdateItemOutput {
@@ -279,17 +307,120 @@ fn filter_to_updated_attrs(item: &Item, actions: &[UpdateAction], maps: &Express
             | UpdateAction::Add { path, .. }
             | UpdateAction::Delete { path, .. } => path,
         };
-        if let Some(PathElement::Attribute(name)) = path.first() {
-            let resolved = name
-                .strip_prefix('#')
-                .and_then(|r| maps.names.get(r).map(String::as_str))
-                .unwrap_or(name.as_str());
-            if let Some(val) = item.get(resolved) {
-                result.insert(resolved.to_owned(), val.clone());
+        if path.is_empty() {
+            continue;
+        }
+        // Resolve the top-level attribute name
+        let top_name = match &path[0] {
+            PathElement::Attribute(name) => {
+                let resolved = name
+                    .strip_prefix('#')
+                    .and_then(|r| maps.names.get(r).map(String::as_str))
+                    .unwrap_or(name.as_str());
+                resolved.to_owned()
+            }
+            _ => continue,
+        };
+
+        // Top-level path (len == 1): return the whole attribute
+        if path.len() == 1 {
+            if let Some(val) = item.get(&top_name) {
+                result.insert(top_name, val.clone());
+            }
+            continue;
+        }
+
+        // Nested path: extract only the leaf value and wrap in path structure
+        let Some(top_val) = item.get(&top_name) else {
+            continue;
+        };
+        if let Some(leaf) = resolve_path_value(top_val, &path[1..], maps) {
+            let wrapped = wrap_leaf_in_path(&path[1..], &leaf, maps);
+            // Merge into existing top-level entry if multiple subpaths target
+            // the same attribute (e.g., SET a.b = :x, a.c = :y).
+            if let Some(existing) = result.get(&top_name) {
+                if let Some(merged) = merge_maps(existing, &wrapped) {
+                    result.insert(top_name, merged);
+                } else {
+                    result.insert(top_name, wrapped);
+                }
+            } else {
+                result.insert(top_name, wrapped);
             }
         }
     }
     result
+}
+
+/// Resolve a value at a nested path within an `AttributeValue`.
+fn resolve_path_value(
+    val: &AttributeValue,
+    path: &[PathElement],
+    maps: &ExpressionMaps,
+) -> Option<AttributeValue> {
+    if path.is_empty() {
+        return Some(val.clone());
+    }
+    match (&path[0], val) {
+        (PathElement::Attribute(name), AttributeValue::M(map)) => {
+            let resolved = name
+                .strip_prefix('#')
+                .and_then(|r| maps.names.get(r).map(String::as_str))
+                .unwrap_or(name.as_str());
+            map.get(resolved)
+                .and_then(|v| resolve_path_value(v, &path[1..], maps))
+        }
+        (PathElement::Index(idx), AttributeValue::L(list)) => list
+            .get(*idx)
+            .and_then(|v| resolve_path_value(v, &path[1..], maps)),
+        _ => None,
+    }
+}
+
+/// Wrap a leaf value in the path structure (building from inside out).
+fn wrap_leaf_in_path(
+    path: &[PathElement],
+    leaf: &AttributeValue,
+    maps: &ExpressionMaps,
+) -> AttributeValue {
+    if path.is_empty() {
+        return leaf.clone();
+    }
+    let inner = wrap_leaf_in_path(&path[1..], leaf, maps);
+    match &path[0] {
+        PathElement::Attribute(name) => {
+            let resolved = name
+                .strip_prefix('#')
+                .and_then(|r| maps.names.get(r).map(String::as_str))
+                .unwrap_or(name.as_str());
+            let mut map = std::collections::BTreeMap::new();
+            map.insert(resolved.to_owned(), inner);
+            AttributeValue::M(map)
+        }
+        PathElement::Index(_) => AttributeValue::L(vec![inner]),
+    }
+}
+
+/// Recursively merge two Map `AttributeValues`. Returns None if either isn't a Map.
+fn merge_maps(a: &AttributeValue, b: &AttributeValue) -> Option<AttributeValue> {
+    match (a, b) {
+        (AttributeValue::M(ma), AttributeValue::M(mb)) => {
+            let mut merged = ma.clone();
+            for (k, v) in mb {
+                if let Some(existing) = merged.get(k) {
+                    if let Some(deep) = merge_maps(existing, v) {
+                        merged.insert(k.clone(), deep);
+                    } else {
+                        merged.insert(k.clone(), v.clone());
+                    }
+                } else {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
+            Some(AttributeValue::M(merged))
+        }
+        _ => None,
+    }
 }
 
 /// Desugared legacy `AttributeUpdates`: (expression, values, names).

@@ -126,7 +126,7 @@ impl extenddb_storage::management_store::AdminStore for PostgresCatalogStore {
     }
 }
 
-/// Verify a bcrypt password on a blocking thread (same logic as server::password).
+/// Verify a bcrypt password on a blocking thread (same logic as `server::password`).
 async fn verify_bcrypt(password: String, hash: String) -> bool {
     tokio::task::spawn_blocking(move || bcrypt::verify(password, &hash).unwrap_or(false))
         .await

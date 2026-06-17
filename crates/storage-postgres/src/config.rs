@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! PostgreSQL connection configuration.
+//! `PostgreSQL` connection configuration.
 
 use serde::Deserialize;
 
@@ -107,5 +107,9 @@ impl extenddb_storage::config::StorageConfig for PostgresStorageConfig {
 
     fn clone_box(&self) -> Box<dyn extenddb_storage::config::StorageConfig> {
         Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }

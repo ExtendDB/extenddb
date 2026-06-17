@@ -136,7 +136,34 @@ pub async fn delete_role(
         .delete_role(&account_id, &role_name)
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // Cascade invalidations: every cached entry keyed by this role
+            // must be dropped. ASIA* session credentials issued for this
+            // role are dropped via `invalidate_principal_credentials`
+            // (their `principal_name` is the role name); session-data
+            // entries are dropped via the role-session predicate.
+            state
+                .auth_cache
+                .invalidate_principal_credentials(&account_id, &role_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_role_policies(&account_id, &role_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_role_boundary(&account_id, &role_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_role_tags(&account_id, &role_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_role_sessions(&account_id, &role_name)
+                .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => op_err_to_response(OpError::from_storage(e)),
     }
 }
@@ -179,6 +206,10 @@ pub async fn tag_role(
         .await
     {
         Ok(()) => {
+            state
+                .auth_cache
+                .invalidate_role_tags(&account_id, &role_name)
+                .await;
             tracing::warn!(
                 target: "extenddb::audit::manage",
                 "tag-role: account={}, role={}, keys=[{}]",
@@ -210,6 +241,10 @@ pub async fn untag_role(
         .await
     {
         Ok(()) => {
+            state
+                .auth_cache
+                .invalidate_role_tags(&account_id, &role_name)
+                .await;
             tracing::warn!(
                 target: "extenddb::audit::manage",
                 "untag-role: account={}, role={}, keys=[{}]",

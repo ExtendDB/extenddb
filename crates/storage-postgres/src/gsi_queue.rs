@@ -5,7 +5,7 @@
 //!
 //! Base table writes commit independently. For GSIs with a non-zero
 //! propagation delay, index updates are enqueued here and applied after a
-//! random delay, simulating real DynamoDB eventual consistency.
+//! random delay, simulating real `DynamoDB` eventual consistency.
 //!
 //! Each queue partition is consumed by a single worker task, guaranteeing
 //! per-key FIFO ordering. Workers are event-driven via `Notify` and sleep
@@ -27,7 +27,7 @@ use crate::data::{
 /// Number of queue partitions. Each partition has one consumer task.
 const NUM_PARTITIONS: usize = 4;
 
-/// PostgreSQL SQLSTATE code for "undefined_table" (relation does not exist).
+/// `PostgreSQL` SQLSTATE code for "`undefined_table`" (relation does not exist).
 const PG_UNDEFINED_TABLE: &str = "42P01";
 
 /// Check if a `StorageError` is caused by an undefined table (SQLSTATE 42P01).
@@ -201,42 +201,42 @@ async fn apply_gsi_update(pool: &PgPool, update: &GsiUpdate) -> Result<(), Stora
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
     // Delete old index row if the old item had index keys.
-    if let Some(ref old) = update.old_item {
-        if item_has_index_keys(old, &update.index_key_schema) {
-            delete_index_row_multi(
-                &mut tx,
-                &idx_table,
-                old,
-                &update.base_key_schema,
-                &update.attr_defs,
-                &base_sks,
-            )
-            .await?;
-        }
+    if let Some(ref old) = update.old_item
+        && item_has_index_keys(old, &update.index_key_schema)
+    {
+        delete_index_row_multi(
+            &mut tx,
+            &idx_table,
+            old,
+            &update.base_key_schema,
+            &update.attr_defs,
+            &base_sks,
+        )
+        .await?;
     }
 
     // Insert new index row if the new item has index keys.
-    if let Some(ref new) = update.new_item {
-        if item_has_index_keys(new, &update.index_key_schema) {
-            let projected = project_item_for_index(
-                new,
-                &update.index_key_schema,
-                &update.base_key_schema,
-                &update.index_projection,
-            );
-            insert_index_row_multi(
-                &mut tx,
-                &idx_table,
-                new,
-                &projected,
-                &update.index_key_schema,
-                &update.base_key_schema,
-                &update.attr_defs,
-                &idx_sks,
-                &base_sks,
-            )
-            .await?;
-        }
+    if let Some(ref new) = update.new_item
+        && item_has_index_keys(new, &update.index_key_schema)
+    {
+        let projected = project_item_for_index(
+            new,
+            &update.index_key_schema,
+            &update.base_key_schema,
+            &update.index_projection,
+        );
+        insert_index_row_multi(
+            &mut tx,
+            &idx_table,
+            new,
+            &projected,
+            &update.index_key_schema,
+            &update.base_key_schema,
+            &update.attr_defs,
+            &idx_sks,
+            &base_sks,
+        )
+        .await?;
     }
 
     tx.commit()

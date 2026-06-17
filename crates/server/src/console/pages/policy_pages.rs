@@ -268,22 +268,21 @@ async fn put_policy(
     }
 
     // Validate JSON.
-    let doc: serde_json::Value = match serde_json::from_str(&form.policy_document) {
-        Ok(v) => v,
-        Err(_) => {
-            let nav = html::nav_bar(&identity_label(&session.identity));
-            let content = format!(
-                "<h1>Add Policy</h1>{}",
-                html::alert_error("Policy document is not valid JSON")
-            );
-            return Html(html::layout_csrf(
-                "New Policy",
-                &nav,
-                &content,
-                &session.csrf_token,
-            ))
-            .into_response();
-        }
+    let doc: serde_json::Value = if let Ok(v) = serde_json::from_str(&form.policy_document) {
+        v
+    } else {
+        let nav = html::nav_bar(&identity_label(&session.identity));
+        let content = format!(
+            "<h1>Add Policy</h1>{}",
+            html::alert_error("Policy document is not valid JSON")
+        );
+        return Html(html::layout_csrf(
+            "New Policy",
+            &nav,
+            &content,
+            &session.csrf_token,
+        ))
+        .into_response();
     };
 
     match state
@@ -297,7 +296,10 @@ async fn put_policy(
         )
         .await
     {
-        Ok(()) => Redirect::to(redirect_url).into_response(),
+        Ok(()) => {
+            invalidate_policy_caches(state, account_id, principal_type, principal_name).await;
+            Redirect::to(redirect_url).into_response()
+        }
         Err(e) => {
             let nav = html::nav_bar(&identity_label(&session.identity));
             let content = format!(
@@ -343,7 +345,10 @@ async fn delete_policy(
         .delete_policy(account_id, principal_type, principal_name, policy_name)
         .await
     {
-        Ok(()) => Redirect::to(redirect_url).into_response(),
+        Ok(()) => {
+            invalidate_policy_caches(state, account_id, principal_type, principal_name).await;
+            Redirect::to(redirect_url).into_response()
+        }
         Err(e) => {
             let nav = html::nav_bar(&identity_label(&session.identity));
             let content = format!(
@@ -358,5 +363,51 @@ async fn delete_policy(
             ))
             .into_response()
         }
+    }
+}
+
+/// Drop the cache entries affected by a policy mutation on the given
+/// principal. Mirrors `management::iam_policy::invalidate_policy_caches`.
+async fn invalidate_policy_caches(
+    state: &Arc<ConsoleState>,
+    account_id: &str,
+    principal_type: &str,
+    principal_name: &str,
+) {
+    match principal_type {
+        "user" => {
+            state
+                .auth_cache
+                .invalidate_user_policies(account_id, principal_name)
+                .await;
+        }
+        "role" => {
+            state
+                .auth_cache
+                .invalidate_role_policies(account_id, principal_name)
+                .await;
+        }
+        "group" => {
+            let members = match state
+                .catalog_store
+                .get_group_detail(account_id, principal_name)
+                .await
+            {
+                Ok(Some(detail)) => detail.members,
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    tracing::warn!(
+                        "console invalidate_policy_caches: get_group_detail failed for \
+                         {principal_name}: {e:?}; members' cached group policies will age out at TTL"
+                    );
+                    Vec::new()
+                }
+            };
+            state
+                .auth_cache
+                .invalidate_users_group_policies(account_id, &members)
+                .await;
+        }
+        _ => {}
     }
 }

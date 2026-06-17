@@ -12,7 +12,7 @@ use crate::serialize_output;
 
 /// Handle `DescribeLimits` — return account-level throughput limits.
 ///
-/// REQ-CTRL-019: DescribeLimits returns configured account and table limits.
+/// REQ-CTRL-019: `DescribeLimits` returns configured account and table limits.
 ///
 /// # Errors
 ///

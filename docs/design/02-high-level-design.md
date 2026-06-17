@@ -434,7 +434,7 @@ There is no in-memory locking (no `Mutex`, `RwLock`, or similar) on the data pat
 | CLI | clap | Standard Rust CLI framework |
 | Config | config + serde | Layered config (file + env + defaults) |
 | Logging | tracing + tracing-subscriber | Structured, async-aware |
-| Metrics | metrics + metrics-exporter-prometheus | Prometheus-compatible |
+| Metrics | in-memory collector | JSON via `/metrics`, DynamoDB CloudWatch-style names |
 | UUID | uuid | Request ID generation |
 | Time | time | Timestamp handling (native sqlx support; chrono 0.4.31+ also fixed its localtime_r unsafety, but time has a leaner API) |
 | Decimal | bigdecimal | Arbitrary-precision decimal arithmetic for DynamoDB's 38-digit number type |

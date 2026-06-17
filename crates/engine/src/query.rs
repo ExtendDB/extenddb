@@ -10,17 +10,17 @@ use serde_json::Value;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::PathElement;
 use extenddb_core::expression::{
-    ExpressionMaps, parse_key_condition, parse_projection, tokenize_for,
+    ExpressionKind, ExpressionMaps, parse_key_condition, tokenize_for,
 };
 use extenddb_core::types::{
-    IndexType, KeyType, QueryInput, QueryOutput, Select, TableKeyInfo, item_size_bytes,
+    IndexType, KeyType, QueryInput, QueryOutput, Select, TableKeyInfo, extract_key, item_size_bytes,
 };
 
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
-use crate::index_helpers::combined_lek_key_schema;
+use crate::index_helpers::{combined_lek_key_schema, validate_query_exclusive_start_key};
 use crate::legacy_filter::{desugar_filter, desugar_key_conditions};
 use crate::read_helpers::apply_post_read;
 use crate::serialize_output;
@@ -62,23 +62,22 @@ pub async fn handle_query(
     };
 
     // ConsistentRead is not supported on GSI queries (tenet 1: fidelity).
-    if input.consistent_read == Some(true) {
-        if let Some(ref idx) = index_info {
-            if idx.index_type == IndexType::Gsi {
-                return Err(DynamoDbError::ValidationException(
-                    "Consistent reads are not supported on global secondary indexes".to_owned(),
-                ));
-            }
-        }
+    if input.consistent_read == Some(true)
+        && let Some(ref idx) = index_info
+        && idx.index_type == IndexType::Gsi
+    {
+        return Err(DynamoDbError::ValidationException(
+            "Consistent reads are not supported on global secondary indexes".to_owned(),
+        ));
     }
 
     // Validate Limit >= 1 (REQ-QUERY-001)
-    if let Some(limit) = input.limit {
-        if limit < 1 {
-            return Err(DynamoDbError::ValidationException(
+    if let Some(limit) = input.limit
+        && limit < 1
+    {
+        return Err(DynamoDbError::ValidationException(
                 "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1".to_owned(),
             ));
-        }
     }
 
     // For index queries, build a key_info that reflects the index's key schema
@@ -89,6 +88,7 @@ pub async fn handle_query(
             account_id: key_info.account_id.clone(),
             table_id: key_info.table_id.clone(),
             key_schema: idx.key_schema.clone(),
+            base_key_schema: key_info.key_schema.clone(),
             attribute_definitions: key_info.attribute_definitions.clone(),
             has_lsi: key_info.has_lsi,
             stream_specification: None, // Queries don't capture stream records
@@ -140,16 +140,47 @@ pub async fn handle_query(
         input.expression_attribute_values.as_ref(),
     );
 
+    // Reject EAN/EAV supplied with no expression that references them. Legacy
+    // KeyConditions does not count as an expression. Query emits no values suffix.
+    let has_kce = input
+        .key_condition_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    let has_filter_expr = input
+        .filter_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    let has_proj_expr = input
+        .projection_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    extenddb_core::expression::validate_expression_param_usage(
+        input.expression_attribute_names.as_ref(),
+        has_kce || has_filter_expr || has_proj_expr,
+        input.expression_attribute_values.as_ref(),
+        has_kce || has_filter_expr,
+        &[],
+    )?;
+
     // Parse KeyConditionExpression or desugar legacy KeyConditions
     let (mut key_condition, legacy_kc_maps) = if let Some(kce_str) =
         input.key_condition_expression.as_deref()
     {
-        let tokens = tokenize_for(
+        let parsed = tokenize_for(
             kce_str,
             ctx.limits.max_expression_tokens,
-            "KeyConditionExpression",
-        )?;
-        (parse_key_condition(&tokens)?, None)
+            ExpressionKind::KeyCondition,
+        )
+        .and_then(|tokens| {
+            if ctx.limits.enforce_reserved_keywords {
+                extenddb_core::expression::validate_no_reserved_words(&tokens)?;
+            }
+            parse_key_condition(&tokens)
+        })
+        .map_err(|e| {
+            crate::expression_helpers::prefix_expression_error(e, ExpressionKind::KeyCondition)
+        })?;
+        (parsed, None)
     } else if let Some(ref kc) = input.key_conditions {
         let key_schema_pairs: Vec<(String, bool)> = query_key_info
             .key_schema
@@ -222,15 +253,15 @@ pub async fn handle_query(
 
     // Parse FilterExpression or desugar legacy QueryFilter
     let (filter, filter_maps) = if let Some(ref qf) = input.query_filter {
-        if !qf.is_empty() {
-            let cond_op = input.conditional_operator.unwrap_or_default();
-            let (expr, fmaps) = desugar_filter(qf, cond_op)?;
-            (Some(expr), Some(fmaps))
-        } else {
+        if qf.is_empty() {
             (
                 parse_optional_filter(input.filter_expression.as_deref(), &ctx.limits)?,
                 None,
             )
+        } else {
+            let cond_op = input.conditional_operator.unwrap_or_default();
+            let (expr, fmaps) = desugar_filter(qf, cond_op)?;
+            (Some(expr), Some(fmaps))
         }
     } else {
         (
@@ -242,7 +273,7 @@ pub async fn handle_query(
     // Validate #name references in filter are defined in ExpressionAttributeNames
     if let Some(ref filter_expr) = filter {
         let names = input.expression_attribute_names.as_ref();
-        validate_name_refs_in_expr(filter_expr, names, "FilterExpression")?;
+        validate_name_refs_in_expr(filter_expr, names, ExpressionKind::Filter)?;
     }
 
     // Parse ProjectionExpression or desugar legacy AttributesToGet
@@ -265,12 +296,10 @@ pub async fn handle_query(
     };
 
     let projection = if let Some(ref proj_str) = effective_projection_str {
-        let proj_tokens = tokenize_for(
+        Some(crate::expression_helpers::parse_projection_expr(
             proj_str,
-            ctx.limits.max_expression_tokens,
-            "ProjectionExpression",
-        )?;
-        Some(parse_projection(&proj_tokens)?)
+            &ctx.limits,
+        )?)
     } else {
         None
     };
@@ -284,10 +313,10 @@ pub async fn handle_query(
         if let Some(ref proj) = projection {
             for path in proj {
                 for el in path {
-                    if let PathElement::Attribute(name) = el {
-                        if let Some(ref_name) = name.strip_prefix('#') {
-                            kc_names.insert(ref_name.to_owned());
-                        }
+                    if let PathElement::Attribute(name) = el
+                        && let Some(ref_name) = name.strip_prefix('#')
+                    {
+                        kc_names.insert(ref_name.to_owned());
                     }
                 }
             }
@@ -303,26 +332,26 @@ pub async fn handle_query(
     }
 
     // Validate Select vs ProjectionExpression and index requirements
-    if let Some(Select::SpecificAttributes) = input.select {
-        if effective_projection_str.is_none() {
-            return Err(DynamoDbError::ValidationException(
+    if let Some(Select::SpecificAttributes) = input.select
+        && effective_projection_str.is_none()
+    {
+        return Err(DynamoDbError::ValidationException(
                 "1 validation error detected: Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES".to_owned(),
             ));
-        }
     }
-    if let Some(Select::AllProjectedAttributes) = input.select {
-        if index_info.is_none() {
-            return Err(DynamoDbError::ValidationException(
-                "ALL_PROJECTED_ATTRIBUTES can be used only when querying an index".to_owned(),
-            ));
-        }
+    if let Some(Select::AllProjectedAttributes) = input.select
+        && index_info.is_none()
+    {
+        return Err(DynamoDbError::ValidationException(
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_owned(),
+        ));
     }
-    if let Some(Select::Count) = input.select {
-        if effective_projection_str.is_some() {
-            return Err(DynamoDbError::ValidationException(
-                "Cannot specify the ProjectionExpression when Select is COUNT".to_owned(),
-            ));
-        }
+    if let Some(Select::Count) = input.select
+        && effective_projection_str.is_some()
+    {
+        return Err(DynamoDbError::ValidationException(
+            "Cannot specify the ProjectionExpression when Select is COUNT".to_owned(),
+        ));
     }
 
     // When Select=ALL_PROJECTED_ATTRIBUTES, capture the index info for post-read filtering.
@@ -353,6 +382,18 @@ pub async fn handle_query(
         ExpressionMaps::new(names, values)
     };
 
+    // Validate begins_with operand types upfront (before any rows are read).
+    if let Some(ref f) = filter {
+        extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
+            |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
+        )?;
+    }
+
+    // Validate ExclusiveStartKey matches the key schema
+    if let Some(ref start_key) = input.exclusive_start_key {
+        validate_query_exclusive_start_key(start_key, &key_info, index_info.as_ref())?;
+    }
+
     // Query storage
     let (raw_items, storage_last_key) = ctx
         .storage
@@ -377,10 +418,19 @@ pub async fn handle_query(
     // For index queries, the LEK includes both the index key and the base table key.
     let lek_key_schema = combined_lek_key_schema(&key_info.key_schema, index_info.as_ref());
 
+    // For index queries, enrich the storage LEK with base table key attributes.
+    let enriched_storage_last_key = if storage_last_key.is_some() && index_info.is_some() {
+        raw_items
+            .last()
+            .map(|item| extract_key(item, &lek_key_schema))
+    } else {
+        storage_last_key
+    };
+
     // Apply FilterExpression, ProjectionExpression, and 1 MB limit
     let result = apply_post_read(
         &raw_items,
-        storage_last_key,
+        enriched_storage_last_key,
         &filter,
         &projection,
         &combined_maps,
@@ -438,23 +488,23 @@ fn resolve_path_attr_name(
 fn validate_name_refs_in_expr(
     expr: &extenddb_core::expression::Expr,
     names: Option<&HashMap<String, String>>,
-    expr_type: &str,
+    expr_type: ExpressionKind,
 ) -> Result<(), DynamoDbError> {
     use extenddb_core::expression::Expr;
     match expr {
         Expr::Path(elements) => {
             for el in elements {
-                if let PathElement::Attribute(name) = el {
-                    if let Some(ref_name) = name.strip_prefix('#') {
-                        let key_with_hash = format!("#{ref_name}");
-                        let defined = names.as_ref().is_some_and(|m| {
-                            m.contains_key(ref_name) || m.contains_key(key_with_hash.as_str())
-                        });
-                        if !defined {
-                            return Err(DynamoDbError::ValidationException(format!(
-                                "Invalid {expr_type}: An expression attribute name used in the document path is not defined; attribute name: #{ref_name}"
-                            )));
-                        }
+                if let PathElement::Attribute(name) = el
+                    && let Some(ref_name) = name.strip_prefix('#')
+                {
+                    let key_with_hash = format!("#{ref_name}");
+                    let defined = names.as_ref().is_some_and(|m| {
+                        m.contains_key(ref_name) || m.contains_key(key_with_hash.as_str())
+                    });
+                    if !defined {
+                        return Err(DynamoDbError::ValidationException(format!(
+                            "Invalid {expr_type}: An expression attribute name used in the document path is not defined; attribute name: #{ref_name}"
+                        )));
                     }
                 }
             }

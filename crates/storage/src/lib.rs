@@ -29,6 +29,27 @@ pub use server_components::{
 
 pub use hooks::{ServerRuntimeHooks, WorkerContext};
 
+/// Pluggable lookup for `TableKeyInfo`.
+///
+/// Allows the engine layer to consult an in-memory cache transparently
+/// instead of calling `StorageEngine::table_key_info` directly. The server
+/// crate provides a SWR-cached implementation; tests and embedded uses can
+/// pass `None` to fall back to direct storage lookups.
+///
+/// Defined here (rather than in `extenddb-engine`) so the cache wrapper in
+/// `extenddb-server` can implement it without creating a circular crate
+/// dependency.
+pub trait TableKeyInfoLookup: Send + Sync {
+    fn lookup<'a>(
+        &'a self,
+        account_id: &'a str,
+        table_name: &'a str,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<extenddb_core::types::TableKeyInfo, error::StorageError>,
+    >;
+}
+
 pub mod util;
 
 use std::sync::Arc;
@@ -205,7 +226,7 @@ pub trait DataEngine: Send + Sync {
 
     /// Update an item by primary key using update actions.
     ///
-    /// UpdateItem is an upsert: if the item doesn't exist, a new item is created
+    /// `UpdateItem` is an upsert: if the item doesn't exist, a new item is created
     /// containing the key attributes plus the SET values.
     ///
     /// If `condition` is `Some`, evaluates the condition against the existing item
@@ -318,7 +339,7 @@ pub trait DataEngine: Send + Sync {
 /// TTL, tag, and table-size management operations.
 ///
 /// Methods that operate on table-scoped resources receive `account_id`.
-/// Tag methods use ARN (which embeds account_id) so they don't need it separately.
+/// Tag methods use ARN (which embeds `account_id`) so they don't need it separately.
 pub trait MetadataEngine: Send + Sync {
     /// Return the TTL configuration for a table.
     fn describe_ttl(
@@ -356,9 +377,7 @@ pub trait MetadataEngine: Send + Sync {
     ) -> BoxFuture<'_, Result<Vec<(String, String)>, StorageError>>;
 
     /// List all tables with TTL enabled across all accounts: `(account_id, table_name, ttl_attribute)`.
-    fn all_tables_with_ttl(
-        &self,
-    ) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>>;
+    fn all_tables_with_ttl(&self) -> BoxFuture<'_, Result<Vec<TtlTableInfo>, StorageError>>;
 
     /// List all tables with TTL enabled AND index ready: `(account_id, table_name, ttl_attribute)`.
     fn all_tables_with_ttl_index_ready(
@@ -408,7 +427,7 @@ pub trait MetadataEngine: Send + Sync {
     fn all_active_tables(&self) -> BoxFuture<'_, Result<Vec<(String, String)>, StorageError>>;
 }
 
-/// DynamoDB Streams record storage and retrieval.
+/// `DynamoDB` Streams record storage and retrieval.
 pub trait StreamEngine: Send + Sync {
     /// Write a stream record atomically (called within the data write transaction).
     fn write_stream_record(
@@ -558,11 +577,11 @@ pub trait BackupEngine: Send + Sync {
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>>;
 }
 
-/// Supertrait combining all DynamoDB operation traits.
+/// Supertrait combining all `DynamoDB` operation traits.
 ///
 /// All storage backends must implement this to provide a complete
 /// DynamoDB-compatible API. This trait has NO additional methods beyond
-/// the trait bounds — backend-specific concerns belong in ServerRuntimeHooks.
+/// the trait bounds — backend-specific concerns belong in `ServerRuntimeHooks`.
 pub trait StorageEngine:
     TableEngine + DataEngine + MetadataEngine + StreamEngine + BackupEngine + WorkerStore + Send + Sync
 {
@@ -598,7 +617,7 @@ pub trait CatalogStore:
     /// Get the cached encryption key (if available).
     ///
     /// Returns None if encryption key is not cached. This is used by
-    /// cmd_serve to construct the auth provider without re-querying
+    /// `cmd_serve` to construct the auth provider without re-querying
     /// the settings table.
     fn cached_encryption_key(&self) -> Option<String>;
 }

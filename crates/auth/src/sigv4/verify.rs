@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! SigV4 signature verification.
+//! `SigV4` signature verification.
 //!
 //! Reconstructs the expected signature from the request and compares it
 //! against the signature in the `Authorization` header using constant-time
@@ -17,14 +17,14 @@ use super::signing_key;
 /// Maximum allowed clock skew between client and server (±15 minutes).
 const MAX_CLOCK_SKEW_SECS: i64 = 15 * 60;
 
-/// Verify a SigV4 signature against the request.
+/// Verify a `SigV4` signature against the request.
 ///
 /// # Arguments
 /// * `parsed` — The parsed `Authorization` header.
 /// * `secret_key` — The plaintext secret access key.
 /// * `method` — HTTP method (e.g. `POST`).
 /// * `uri_path` — URI path (e.g. `/`).
-/// * `query_string` — Query string (empty for DynamoDB).
+/// * `query_string` — Query string (empty for `DynamoDB`).
 /// * `headers` — The full request headers.
 /// * `body` — The request body bytes.
 ///
@@ -64,12 +64,12 @@ pub fn verify_signature(
 
     // Reject UNSIGNED-PAYLOAD: real DynamoDB requires a computed body hash
     // for all API calls. UNSIGNED-PAYLOAD is only valid for S3.
-    if let Some(content_sha) = headers.get("x-amz-content-sha256") {
-        if content_sha.as_bytes() == b"UNSIGNED-PAYLOAD" {
-            return Err(DynamoDbError::InvalidSignatureException(
-                "UNSIGNED-PAYLOAD is not supported for DynamoDB operations.".to_owned(),
-            ));
-        }
+    if let Some(content_sha) = headers.get("x-amz-content-sha256")
+        && content_sha.as_bytes() == b"UNSIGNED-PAYLOAD"
+    {
+        return Err(DynamoDbError::InvalidSignatureException(
+            "UNSIGNED-PAYLOAD is not supported for DynamoDB operations.".to_owned(),
+        ));
     }
 
     // Build canonical request

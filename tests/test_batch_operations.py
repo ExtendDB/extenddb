@@ -14,45 +14,40 @@ import uuid
 import pytest
 from botocore.exceptions import ClientError
 
-from conftest import wait_for_active
-@pytest.fixture()
-def hash_table(dynamodb_client, create_and_cleanup_table, unique_table_name):
-    """Create a hash-only table and wait for ACTIVE."""
-    create_and_cleanup_table(unique_table_name)
-    wait_for_active(dynamodb_client, unique_table_name)
-    return unique_table_name
-@pytest.fixture()
-def hash_range_table(dynamodb_client, create_and_cleanup_table):
-    """Create a hash+range (S,S) table and wait for ACTIVE."""
-    name = f"extenddb-test-{uuid.uuid4().hex[:12]}"
-    create_and_cleanup_table(
-        name,
-        AttributeDefinitions=[
+from conftest import wait_for_active, scoped_table
+@pytest.fixture(scope="class")
+def hash_table(dynamodb_client):
+    """Create a hash-only table for the class, delete on teardown."""
+    with scoped_table(dynamodb_client) as name:
+        yield name
+@pytest.fixture(scope="class")
+def hash_range_table(dynamodb_client):
+    """Create a hash+range (S,S) table for the class, delete on teardown."""
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[
             {"AttributeName": "pk", "AttributeType": "S"},
             {"AttributeName": "sk", "AttributeType": "S"},
         ],
-        KeySchema=[
+        key_schema=[
             {"AttributeName": "pk", "KeyType": "HASH"},
             {"AttributeName": "sk", "KeyType": "RANGE"},
         ],
-    )
-    wait_for_active(dynamodb_client, name)
-    return name
-@pytest.fixture()
-def second_table(dynamodb_client, create_and_cleanup_table):
+    ) as name:
+        yield name
+@pytest.fixture(scope="class")
+def second_table(dynamodb_client):
     """Create a second hash-only table for cross-table batch tests."""
-    name = f"extenddb-test-{uuid.uuid4().hex[:12]}"
-    create_and_cleanup_table(
-        name,
-        AttributeDefinitions=[
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[
             {"AttributeName": "id", "AttributeType": "S"},
         ],
-        KeySchema=[
+        key_schema=[
             {"AttributeName": "id", "KeyType": "HASH"},
         ],
-    )
-    wait_for_active(dynamodb_client, name)
-    return name
+    ) as name:
+        yield name
 # ── BatchGetItem ──────────────────────────────────────────────────────
 class TestBatchGetItem:
     """Tests for the BatchGetItem operation."""
@@ -183,6 +178,30 @@ class TestBatchGetItem:
         # UnprocessedKeys should be empty (or absent)
         unprocessed = resp.get("UnprocessedKeys", {})
         assert len(unprocessed) == 0
+
+    def test_batch_get_unprocessed_keys_always_present(
+        self, dynamodb_client, hash_table
+    ):
+        """BatchGetItem always includes UnprocessedKeys, even when all keys processed.
+
+        Amazon DynamoDB returns ``"UnprocessedKeys": {}`` on the wire when every
+        key is processed; the field is never omitted. A response that drops the
+        field entirely is non-conformant.
+        """
+        dynamodb_client.put_item(
+            TableName=hash_table,
+            Item={"pk": {"S": "present"}},
+        )
+
+        resp = dynamodb_client.batch_get_item(
+            RequestItems={hash_table: {"Keys": [{"pk": {"S": "present"}}]}}
+        )
+
+        assert "UnprocessedKeys" in resp, (
+            "UnprocessedKeys must always be present in the BatchGetItem "
+            "response, even when empty"
+        )
+        assert resp["UnprocessedKeys"] == {}
 # ── BatchWriteItem ────────────────────────────────────────────────────
 class TestBatchWriteItem:
     """Tests for the BatchWriteItem operation."""
@@ -319,6 +338,29 @@ class TestBatchWriteItem:
         unprocessed = resp.get("UnprocessedItems", {})
         assert len(unprocessed) == 0
 
+    def test_batch_write_unprocessed_items_always_present(
+        self, dynamodb_client, hash_table
+    ):
+        """BatchWriteItem always includes UnprocessedItems, even on full success.
+
+        Amazon DynamoDB returns ``"UnprocessedItems": {}`` on the wire when every
+        write succeeds; the field is never omitted. A response that drops the
+        field entirely is non-conformant.
+        """
+        resp = dynamodb_client.batch_write_item(
+            RequestItems={
+                hash_table: [
+                    {"PutRequest": {"Item": {"pk": {"S": "always-present"}}}},
+                ]
+            }
+        )
+
+        assert "UnprocessedItems" in resp, (
+            "UnprocessedItems must always be present in the BatchWriteItem "
+            "response, even when empty"
+        )
+        assert resp["UnprocessedItems"] == {}
+
     def test_batch_write_put_wrong_key_type(self, dynamodb_client, hash_table):
         """BatchWriteItem PutRequest with wrong key type returns ValidationException."""
         with pytest.raises(ClientError) as exc_info:
@@ -380,6 +422,89 @@ class TestBatchWriteItem:
                 }
             )
         assert exc_info.value.response["Error"]["Code"] == "ValidationException"
+
+    def test_batch_write_rejects_empty_key_values(
+        self, dynamodb_client, create_and_cleanup_table
+    ):
+        """BatchWriteItem rejects empty key attribute values for both binary
+        and string types in both PutRequest and DeleteRequest"""
+
+        # Set up a binary-keyed table and a string-keyed table.
+        binary_table = f"extenddb-test-{uuid.uuid4().hex[:12]}"
+        create_and_cleanup_table(
+            binary_table,
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "B"}],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        )
+        wait_for_active(dynamodb_client, binary_table)
+
+        string_table = f"extenddb-test-{uuid.uuid4().hex[:12]}"
+        create_and_cleanup_table(
+            string_table,
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        )
+        wait_for_active(dynamodb_client, string_table)
+
+        # Empty binary in PutRequest — exercises validate_key_sizes.
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.batch_write_item(
+                RequestItems={
+                    binary_table: [
+                        {"PutRequest": {"Item": {"pk": {"B": b""}}}},
+                    ]
+                }
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException", err
+        assert "empty binary value" in err["Message"], err["Message"]
+        assert "Key: pk" in err["Message"], err["Message"]
+
+        # Empty binary in DeleteRequest — exercises validate_key_only via
+        # the validate_batch_key_only wrapper.
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.batch_write_item(
+                RequestItems={
+                    binary_table: [
+                        {"DeleteRequest": {"Key": {"pk": {"B": b""}}}},
+                    ]
+                }
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException", err
+        assert "empty binary value" in err["Message"], err["Message"]
+        assert "Key: pk" in err["Message"], err["Message"]
+
+        # Empty string in PutRequest — same validate_key_sizes path with the
+        # string-typed message variant.
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.batch_write_item(
+                RequestItems={
+                    string_table: [
+                        {"PutRequest": {"Item": {"pk": {"S": ""}}}},
+                    ]
+                }
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException", err
+        assert "empty string value" in err["Message"], err["Message"]
+        assert "Key: pk" in err["Message"], err["Message"]
+
+        # Empty string in DeleteRequest — exercises validate_key_only with the
+        # string-typed message variant. This is a NEW behavior the CR adds:
+        # validate_key_only previously had no empty-key check at all.
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.batch_write_item(
+                RequestItems={
+                    string_table: [
+                        {"DeleteRequest": {"Key": {"pk": {"S": ""}}}},
+                    ]
+                }
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException", err
+        assert "empty string value" in err["Message"], err["Message"]
+        assert "Key: pk" in err["Message"], err["Message"]
 # ── BatchGetItem key validation ───────────────────────────────────────
 class TestBatchGetItemKeyValidation:
     """Tests for BatchGetItem per-key validation (M2 fix)."""

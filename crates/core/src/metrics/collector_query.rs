@@ -30,16 +30,16 @@ impl MetricsCollector {
         let mut results = Vec::new();
         for (key, acc) in map.iter() {
             // Filter by table name if specified.
-            if let Some(ref tn) = params.table_name {
-                if key.table_name.as_deref() != Some(tn.as_str()) {
-                    continue;
-                }
+            if let Some(ref tn) = params.table_name
+                && key.table_name.as_deref() != Some(tn.as_str())
+            {
+                continue;
             }
             // Filter by metric name if specified.
-            if let Some(ref m) = params.metric {
-                if key.metric != *m {
-                    continue;
-                }
+            if let Some(ref m) = params.metric
+                && key.metric != *m
+            {
+                continue;
             }
 
             let Some(snap) = acc.snapshot(window, now) else {
@@ -167,10 +167,10 @@ impl MetricsCollector {
         };
         let mut by_op: HashMap<String, SegmentAccum> = HashMap::new();
         for p in vec.iter() {
-            if let Some(c) = cutoff {
-                if p.timestamp < c {
-                    continue;
-                }
+            if let Some(c) = cutoff
+                && p.timestamp < c
+            {
+                continue;
             }
             let e = by_op.entry(p.operation.clone()).or_default();
             e.0 += p.segments.auth_us;

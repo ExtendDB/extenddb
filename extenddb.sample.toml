@@ -60,6 +60,30 @@
                                 # with provider = "none". Run `extenddb init` to create the
                                 # encryption key and admin user before first start.
 
+[auth.cache]
+# In-memory stale-while-revalidate caches sit between the request hot path
+# and the catalog database. Each request would otherwise issue ~6 catalog
+# queries during auth/authz; caching reduces this to ~0 in steady state.
+#
+# Self-induced changes (admin API mutations) propagate instantly via
+# write-through invalidation. Off-instance changes (multi-node deployments
+# or direct DB writes) take up to `ttl_seconds` to propagate.
+# enabled = true                # Master kill switch. When false, the
+                                # cache wrappers bypass moka entirely
+                                # (no lookup, no insert, no LRU pressure)
+                                # and forward every request to the catalog.
+                                # Use during incident response.
+# ttl_seconds = 60              # Hard TTL — entries older than this trigger
+                                # a fresh, request-blocking load.
+# soft_ttl_seconds = 30         # Stale-but-usable threshold. Older entries
+                                # are returned immediately while a background
+                                # task refreshes them. Set equal to
+                                # ttl_seconds to disable refresh-ahead.
+# negative_ttl_seconds = 5      # Negative-cache TTL for "not found" results.
+                                # Short by design so newly-created entities
+                                # become usable quickly.
+# max_entries = 10000           # Per-cache LRU cap.
+
 # Management web console is served at /console/ on the same port as the
 # DynamoDB API. No separate configuration needed — it uses the same bind
 # address and port as [server]. The console requires auth.provider = "builtin"

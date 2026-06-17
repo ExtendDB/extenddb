@@ -48,15 +48,14 @@ pub async fn run(args: CatalogCheckArgs) -> anyhow::Result<()> {
 
     // Refuse to run while server is up.
     let pid_path = crate::serve_helpers::pid_file_path(&run_dir, port);
-    if let Ok(contents) = std::fs::read_to_string(&pid_path) {
-        if let Ok(pid) = contents.trim().parse::<i32>() {
-            if crate::util::is_process_alive(pid) {
-                anyhow::bail!(
-                    "Server is running (PID {pid}). Stop it with `extenddb stop` before \
+    if let Ok(contents) = std::fs::read_to_string(&pid_path)
+        && let Ok(pid) = contents.trim().parse::<i32>()
+        && crate::util::is_process_alive(pid)
+    {
+        anyhow::bail!(
+            "Server is running (PID {pid}). Stop it with `extenddb stop` before \
                      running catalog-check."
-                );
-            }
-        }
+        );
     }
 
     println!("=== extenddb catalog-check ===");

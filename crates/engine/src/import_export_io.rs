@@ -32,7 +32,7 @@ pub(crate) fn read_items(
     }
 }
 
-/// Read DynamoDB JSON format: one JSON object per line with `{"Item": {...}}` wrapper.
+/// Read `DynamoDB` JSON format: one JSON object per line with `{"Item": {...}}` wrapper.
 fn read_dynamodb_json(reader: impl BufRead, max_items: u64) -> Result<Vec<Item>, DynamoDbError> {
     let mut items = Vec::new();
     for (line_num, line) in reader.lines().enumerate() {
@@ -80,8 +80,7 @@ fn read_csv(
 ) -> Result<Vec<Item>, DynamoDbError> {
     let delimiter = options
         .and_then(|o| o.csv.as_ref())
-        .map(|c| c.delimiter.as_str())
-        .unwrap_or(",");
+        .map_or(",", |c| c.delimiter.as_str());
     let explicit_headers = options
         .and_then(|o| o.csv.as_ref())
         .and_then(|c| c.header_list.as_ref());
@@ -120,10 +119,10 @@ fn read_csv(
         let values = split_csv_line(trimmed, delim_byte);
         let mut item = Item::new();
         for (i, header) in headers.iter().enumerate() {
-            if let Some(val) = values.get(i) {
-                if !val.is_empty() {
-                    item.insert(header.clone(), AttributeValue::S(val.clone()));
-                }
+            if let Some(val) = values.get(i)
+                && !val.is_empty()
+            {
+                item.insert(header.clone(), AttributeValue::S(val.clone()));
             }
         }
         if !item.is_empty() {

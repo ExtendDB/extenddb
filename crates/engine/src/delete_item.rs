@@ -54,6 +54,18 @@ pub async fn handle_delete_item(
         &key_info.attribute_definitions,
     )?;
 
+    let has_condition = input
+        .condition_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    extenddb_core::expression::validate_expression_param_usage(
+        input.expression_attribute_names.as_ref(),
+        has_condition,
+        input.expression_attribute_values.as_ref(),
+        has_condition,
+        &[extenddb_core::expression::ExpressionKind::Condition],
+    )?;
+
     let (condition, maps) = resolve_condition(
         input.condition_expression.as_deref(),
         input.expression_attribute_names.as_ref(),
@@ -63,7 +75,12 @@ pub async fn handle_delete_item(
         &ctx.limits,
     )?;
 
-    if input.expected.is_none() || input.expected.as_ref().is_some_and(|m| m.is_empty()) {
+    if input.expected.is_none()
+        || input
+            .expected
+            .as_ref()
+            .is_some_and(std::collections::HashMap::is_empty)
+    {
         let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
         extenddb_core::expression::validate_unused_attributes(
             &maps.names,

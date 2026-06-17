@@ -4,14 +4,14 @@
 //! Backend factory infrastructure for creating server components.
 //!
 //! This module provides the factory pattern for creating storage backends.
-//! Backends register themselves via the inventory crate, allowing cmd_serve
+//! Backends register themselves via the inventory crate, allowing `cmd_serve`
 //! to remain backend-agnostic.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use extenddb_auth::AuthProvider;
+use extenddb_auth::CredentialStore;
 
 use crate::config::StorageConfig;
 use crate::hooks::ServerRuntimeHooks;
@@ -20,7 +20,7 @@ use crate::{CatalogStore, StorageEngine};
 /// Components needed to run the extenddb server.
 ///
 /// Returned by backend factories. Contains all the trait objects needed
-/// by cmd_serve to start the HTTP server and spawn workers.
+/// by `cmd_serve` to start the HTTP server and spawn workers.
 pub struct ServerComponents {
     /// Storage engine implementing all data/metadata operations
     pub engine: Arc<dyn StorageEngine>,
@@ -28,8 +28,10 @@ pub struct ServerComponents {
     /// Catalog store for management API operations
     pub catalog_store: Arc<dyn CatalogStore>,
 
-    /// Auth provider (wraps credential store internally)
-    pub auth_provider: Arc<dyn AuthProvider>,
+    /// Raw (uncached) credential store. The bin layer wraps this in
+    /// `CachedCredentialStore` using the operator-configured TTL before
+    /// constructing the auth provider.
+    pub credential_store: Arc<dyn CredentialStore>,
 
     /// Optional backend-specific runtime hooks for worker spawning
     pub runtime_hooks: Option<Box<dyn ServerRuntimeHooks>>,
@@ -80,8 +82,8 @@ impl std::error::Error for BackendError {}
 
 /// Factory function type for creating server components.
 ///
-/// Takes a StorageConfig trait object and region string, returns a Future
-/// that resolves to ServerComponents or BackendError.
+/// Takes a `StorageConfig` trait object and region string, returns a Future
+/// that resolves to `ServerComponents` or `BackendError`.
 pub type ServerComponentsFactory =
     fn(
         &dyn StorageConfig,
@@ -90,9 +92,9 @@ pub type ServerComponentsFactory =
 
 /// Registration for backend server components factory.
 ///
-/// Backends submit this via inventory::submit! to register themselves.
+/// Backends submit this via `inventory::submit`! to register themselves.
 pub struct ServerComponentsRegistration {
-    /// Backend name (e.g., "postgres", "cassandra")
+    /// Backend name (e.g., "postgres")
     pub backend: &'static str,
 
     /// Factory function that creates the backend components
@@ -104,7 +106,7 @@ inventory::collect!(ServerComponentsRegistration);
 /// Create server components for the specified backend.
 ///
 /// Searches registered backends via inventory and calls the matching factory.
-/// Returns UnknownBackend error if the backend is not registered.
+/// Returns `UnknownBackend` error if the backend is not registered.
 pub async fn create_server_components(
     backend: &str,
     config: &dyn StorageConfig,

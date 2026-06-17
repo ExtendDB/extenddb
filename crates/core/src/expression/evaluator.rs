@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use crate::error::DynamoDbError;
 use crate::types::AttributeValue;
 
-use super::ast::{CompareOp, Expr};
+use super::ast::{CompareOp, Expr, PathElement};
 use super::resolver::{ExpressionMaps, resolve_path};
 
 /// Evaluate a condition expression against an item.
@@ -53,6 +53,30 @@ pub fn evaluate_condition(
             let val = resolve_to_value(operand, item, maps)?;
             let lo = resolve_to_value(low, item, maps)?;
             let hi = resolve_to_value(high, item, maps)?;
+            // DynamoDB validates bounds when both are literal placeholders
+            if matches!(low.as_ref(), Expr::Placeholder(_))
+                && matches!(high.as_ref(), Expr::Placeholder(_))
+                && let (Some(l), Some(h)) = (lo.as_deref(), hi.as_deref())
+            {
+                let l_type = attribute_type_code(l);
+                let h_type = attribute_type_code(h);
+                if l_type != h_type {
+                    return Err(DynamoDbError::ValidationException(format!(
+                        "Invalid ConditionExpression: The BETWEEN operator requires same data type for lower and upper bounds; lower bound operand: AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
+                        format_attribute_value(l),
+                        format_attribute_value(h)
+                    )));
+                }
+                let lpn = placeholder_numeric(low, maps);
+                let hpn = placeholder_numeric(high, maps);
+                if compare_values(l, h, CompareOp::Gt, lpn, hpn) {
+                    return Err(DynamoDbError::ValidationException(format!(
+                        "Invalid ConditionExpression: The BETWEEN operator requires upper bound to be greater than or equal to lower bound; lower bound operand: AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
+                        format_attribute_value(l),
+                        format_attribute_value(h)
+                    )));
+                }
+            }
             match (&val, &lo, &hi) {
                 (Some(v), Some(l), Some(h)) => {
                     let vpn = placeholder_numeric(operand, maps);
@@ -242,6 +266,15 @@ fn evaluate_function(
             }
             let val = resolve_to_value(&args[0], item, maps)?;
             let prefix = resolve_to_value(&args[1], item, maps)?;
+            // Reject invalid operand types — only S and B are allowed
+            if let Some(p) = prefix.as_deref()
+                && !matches!(&p, AttributeValue::S(_) | AttributeValue::B(_))
+            {
+                let type_code = attribute_type_code(p);
+                return Err(DynamoDbError::ValidationException(format!(
+                    "Invalid ConditionExpression: Incorrect operand type for operator or function; operator or function: begins_with, operand type: {type_code}"
+                )));
+            }
             match (val.as_deref(), prefix.as_deref()) {
                 (Some(AttributeValue::S(s)), Some(AttributeValue::S(p))) => {
                     Ok(s.starts_with(p.as_str()))
@@ -258,6 +291,33 @@ fn evaluate_function(
                     "Invalid ConditionExpression: contains requires exactly two arguments"
                         .to_owned(),
                 ));
+            }
+            if args[0] == args[1] {
+                let operand_str = match &args[0] {
+                    Expr::Path(p) => {
+                        let parts: Vec<String> = p
+                            .iter()
+                            .map(|e| match e {
+                                PathElement::Attribute(a) => {
+                                    if let Some(ref_name) = a.strip_prefix('#') {
+                                        maps.names
+                                            .get(ref_name)
+                                            .cloned()
+                                            .unwrap_or_else(|| a.clone())
+                                    } else {
+                                        a.clone()
+                                    }
+                                }
+                                PathElement::Index(i) => format!("[{i}]"),
+                            })
+                            .collect();
+                        format!("[{}]", parts.join("."))
+                    }
+                    _ => String::new(),
+                };
+                return Err(DynamoDbError::ValidationException(format!(
+                    "Invalid ConditionExpression: The first operand must be distinct from the remaining operands for this operator or function; operator: contains, first operand: {operand_str}"
+                )));
             }
             let val = resolve_to_value(&args[0], item, maps)?;
             let operand = resolve_to_value(&args[1], item, maps)?;
@@ -283,7 +343,7 @@ fn evaluate_function(
 /// Evaluate the `size()` function, returning the size as a number `AttributeValue`.
 ///
 /// Returns `None` if the argument resolves to a missing attribute, matching
-/// DynamoDB's behavior where `size(nonexistent)` causes the enclosing
+/// `DynamoDB`'s behavior where `size(nonexistent)` causes the enclosing
 /// comparison to evaluate to false (the item is skipped).
 fn evaluate_size<'a>(
     args: &'a [Expr],
@@ -301,7 +361,7 @@ fn evaluate_size<'a>(
         return Ok(None);
     };
     let sz = match v.as_ref() {
-        AttributeValue::S(s) => s.len(),
+        AttributeValue::S(s) => s.encode_utf16().count(),
         AttributeValue::B(b) => b.len(),
         AttributeValue::N(n) => n.len(), // ASCII digits are 1 byte each, so len() == UTF-8 byte count
         AttributeValue::L(l) => l.len(),
@@ -330,6 +390,16 @@ fn attribute_type_code(val: &AttributeValue) -> &'static str {
         AttributeValue::SS(_) => "SS",
         AttributeValue::NS(_) => "NS",
         AttributeValue::BS(_) => "BS",
+    }
+}
+
+/// Format an `AttributeValue` for error messages (e.g. `N:5`, `S:hello`).
+fn format_attribute_value(val: &AttributeValue) -> String {
+    match val {
+        AttributeValue::S(s) => format!("S:{s}"),
+        AttributeValue::N(n) => format!("N:{n}"),
+        AttributeValue::B(_) => "B:<binary>".to_owned(),
+        _ => format!("{}:<value>", attribute_type_code(val)),
     }
 }
 

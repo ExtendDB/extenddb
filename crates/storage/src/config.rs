@@ -1,4 +1,4 @@
-// Copyright 2026 DynamoDB Open contributors
+// Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Storage configuration trait and registry for storage backends.
@@ -11,10 +11,7 @@
 pub trait StorageConfig: Send + Sync + std::fmt::Debug {
     /// Backend-specific connection configuration as a string.
     ///
-    /// For PostgreSQL: connection string (postgresql://...)
-    /// For Cassandra: contact points (host1:port,host2:port)
-    /// For MongoDB: connection URI (mongodb://...)
-    /// For Redis: endpoint (host:port)
+    /// For `PostgreSQL`: connection string (postgresql://...)
     fn connection_config(&self) -> &str;
 
     /// Maximum concurrent connections for data operations.
@@ -25,6 +22,13 @@ pub trait StorageConfig: Send + Sync + std::fmt::Debug {
 
     /// Clone this config into a boxed trait object.
     fn clone_box(&self) -> Box<dyn StorageConfig>;
+
+    /// Enable downcasting to specific storage engine config types to allow
+    /// access to engine-specific configuration (e.g. `keyspace_prefix` for
+    /// the Cassandra backend).
+    fn as_any(&self) -> &dyn std::any::Any
+    where
+        Self: 'static;
 }
 
 impl Clone for Box<dyn StorageConfig> {
@@ -59,5 +63,5 @@ pub fn deserialize_storage_config(
             return (reg.deserializer)(table);
         }
     }
-    Err(format!("Unknown backend: {}", backend))
+    Err(format!("Unknown backend: {backend}"))
 }

@@ -8,16 +8,16 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::{ExpressionMaps, parse_projection, tokenize_with_limit};
+use extenddb_core::expression::{ExpressionKind, ExpressionMaps};
 use extenddb_core::types::{
-    IndexType, ScanInput, ScanOutput, Select, TableKeyInfo, item_size_bytes,
+    IndexType, ScanInput, ScanOutput, Select, TableKeyInfo, extract_key, item_size_bytes,
 };
 
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
-use crate::index_helpers::combined_lek_key_schema;
+use crate::index_helpers::{combined_lek_key_schema, validate_scan_exclusive_start_key};
 use crate::legacy_filter::desugar_filter;
 use crate::read_helpers::apply_post_read;
 use crate::serialize_output;
@@ -58,14 +58,13 @@ pub async fn handle_scan(
     };
 
     // ConsistentRead is not supported on GSI scans (tenet 1: fidelity).
-    if input.consistent_read == Some(true) {
-        if let Some(ref idx) = index_info {
-            if idx.index_type == IndexType::Gsi {
-                return Err(DynamoDbError::ValidationException(
-                    "Consistent reads are not supported on global secondary indexes".to_owned(),
-                ));
-            }
-        }
+    if input.consistent_read == Some(true)
+        && let Some(ref idx) = index_info
+        && idx.index_type == IndexType::Gsi
+    {
+        return Err(DynamoDbError::ValidationException(
+            "Consistent reads are not supported on global secondary indexes".to_owned(),
+        ));
     }
 
     // Validate Segment/TotalSegments — DynamoDB returns different messages per direction
@@ -88,10 +87,20 @@ pub async fn handle_scan(
                     "The parameter TotalSegments should be greater than or equal to 1".to_owned(),
                 ));
             }
+            if total > 1_000_000 {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "1 validation error detected: Value '{total}' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"
+                )));
+            }
             if seg < 0 {
-                return Err(DynamoDbError::ValidationException(
-                    "The parameter Segment should be greater than or equal to 0".to_owned(),
-                ));
+                return Err(DynamoDbError::ValidationException(format!(
+                    "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0"
+                )));
+            }
+            if seg > 999_999 {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value less than or equal to 999999"
+                )));
             }
             if seg >= total {
                 return Err(DynamoDbError::ValidationException(format!(
@@ -104,12 +113,12 @@ pub async fn handle_scan(
     }
 
     // Validate Limit >= 1
-    if let Some(limit) = input.limit {
-        if limit < 1 {
-            return Err(DynamoDbError::ValidationException(format!(
-                "1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
-            )));
-        }
+    if let Some(limit) = input.limit
+        && limit < 1
+    {
+        return Err(DynamoDbError::ValidationException(format!(
+            "1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
+        )));
     }
 
     // For index scans, build a key_info that reflects the index's key schema.
@@ -119,6 +128,7 @@ pub async fn handle_scan(
             account_id: key_info.account_id.clone(),
             table_id: key_info.table_id.clone(),
             key_schema: idx.key_schema.clone(),
+            base_key_schema: key_info.key_schema.clone(),
             attribute_definitions: key_info.attribute_definitions.clone(),
             has_lsi: key_info.has_lsi,
             stream_specification: None, // Scans don't capture stream records
@@ -158,17 +168,33 @@ pub async fn handle_scan(
         input.expression_attribute_values.as_ref(),
     );
 
+    let has_filter_expr = input
+        .filter_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    let has_proj_expr = input
+        .projection_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    extenddb_core::expression::validate_expression_param_usage(
+        input.expression_attribute_names.as_ref(),
+        has_proj_expr || has_filter_expr,
+        input.expression_attribute_values.as_ref(),
+        has_filter_expr,
+        &[ExpressionKind::Filter],
+    )?;
+
     // Parse FilterExpression or desugar legacy ScanFilter
     let (filter, filter_maps) = if let Some(ref sf) = input.scan_filter {
-        if !sf.is_empty() {
-            let cond_op = input.conditional_operator.unwrap_or_default();
-            let (expr, fmaps) = desugar_filter(sf, cond_op)?;
-            (Some(expr), Some(fmaps))
-        } else {
+        if sf.is_empty() {
             (
                 parse_optional_filter(input.filter_expression.as_deref(), &ctx.limits)?,
                 None,
             )
+        } else {
+            let cond_op = input.conditional_operator.unwrap_or_default();
+            let (expr, fmaps) = desugar_filter(sf, cond_op)?;
+            (Some(expr), Some(fmaps))
         }
     } else {
         (
@@ -197,8 +223,10 @@ pub async fn handle_scan(
     };
 
     let projection = if let Some(ref proj_str) = effective_projection_str {
-        let proj_tokens = tokenize_with_limit(proj_str, ctx.limits.max_expression_tokens)?;
-        Some(parse_projection(&proj_tokens)?)
+        Some(crate::expression_helpers::parse_projection_expr(
+            proj_str,
+            &ctx.limits,
+        )?)
     } else {
         None
     };
@@ -210,10 +238,10 @@ pub async fn handle_scan(
         if let Some(ref proj) = projection {
             for path in proj {
                 for el in path {
-                    if let extenddb_core::expression::PathElement::Attribute(name) = el {
-                        if let Some(ref_name) = name.strip_prefix('#') {
-                            extra_names.insert(ref_name.to_owned());
-                        }
+                    if let extenddb_core::expression::PathElement::Attribute(name) = el
+                        && let Some(ref_name) = name.strip_prefix('#')
+                    {
+                        extra_names.insert(ref_name.to_owned());
                     }
                 }
             }
@@ -229,19 +257,19 @@ pub async fn handle_scan(
     }
 
     // Validate Select vs ProjectionExpression and index requirements
-    if let Some(Select::AllProjectedAttributes) = input.select {
-        if index_info.is_none() {
-            return Err(DynamoDbError::ValidationException(
-                "ALL_PROJECTED_ATTRIBUTES can be used only when scanning an index".to_owned(),
-            ));
-        }
+    if let Some(Select::AllProjectedAttributes) = input.select
+        && index_info.is_none()
+    {
+        return Err(DynamoDbError::ValidationException(
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_owned(),
+        ));
     }
-    if let Some(Select::Count) = input.select {
-        if effective_projection_str.is_some() {
-            return Err(DynamoDbError::ValidationException(
-                "Cannot specify the ProjectionExpression when Select is COUNT".to_owned(),
-            ));
-        }
+    if let Some(Select::Count) = input.select
+        && effective_projection_str.is_some()
+    {
+        return Err(DynamoDbError::ValidationException(
+            "Cannot specify the ProjectionExpression when Select is COUNT".to_owned(),
+        ));
     }
 
     let index_proj = if matches!(input.select, Some(Select::AllProjectedAttributes)) {
@@ -267,6 +295,18 @@ pub async fn handle_scan(
         ExpressionMaps::new(names, values)
     };
 
+    // Validate ExclusiveStartKey matches the key schema
+    if let Some(ref start_key) = input.exclusive_start_key {
+        validate_scan_exclusive_start_key(start_key, &key_info, index_info.as_ref())?;
+    }
+
+    // Validate begins_with operand types upfront (before any rows are scanned).
+    if let Some(ref f) = filter {
+        extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
+            |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
+        )?;
+    }
+
     // Scan storage
     let (raw_items, storage_last_key) = ctx
         .storage
@@ -289,10 +329,21 @@ pub async fn handle_scan(
     // Determine which key schema to use for LastEvaluatedKey extraction.
     let lek_key_schema = combined_lek_key_schema(&key_info.key_schema, index_info.as_ref());
 
+    // For index scans, the storage layer returns a LEK with only the index key
+    // attributes. Enrich it with the base table key attributes from the last
+    // raw item so the LEK matches DynamoDB's format (all combined keys).
+    let enriched_storage_last_key = if storage_last_key.is_some() && index_info.is_some() {
+        raw_items
+            .last()
+            .map(|item| extract_key(item, &lek_key_schema))
+    } else {
+        storage_last_key
+    };
+
     // Apply FilterExpression, ProjectionExpression, and 1 MB limit
     let result = apply_post_read(
         &raw_items,
-        storage_last_key,
+        enriched_storage_last_key,
         &filter,
         &projection,
         &combined_maps,

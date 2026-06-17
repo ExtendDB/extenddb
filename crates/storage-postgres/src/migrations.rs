@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! PostgreSQL schema migration helpers for catalog and data databases.
+//! `PostgreSQL` schema migration helpers for catalog and data databases.
 
 use extenddb_storage::management_store::{OpError, OpResult};
 use sqlx::PgPool;

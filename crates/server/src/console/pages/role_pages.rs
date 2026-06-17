@@ -210,7 +210,7 @@ pub async fn role_detail(
             r#"<a href="/console/accounts/{eid}/roles/{ern}/policies/new" class="btn btn-primary btn-sm" style="margin-bottom:0.5rem;display:inline-block">Add Policy</a>"#
         );
     }
-    content.push_str(r#"<table><thead><tr><th>Policy Name</th><th></th></tr></thead><tbody>"#);
+    content.push_str(r"<table><thead><tr><th>Policy Name</th><th></th></tr></thead><tbody>");
     for pname in &detail.policies {
         let ep = html::escape(pname);
         let delete_btn = if is_admin(&session.identity) {
@@ -229,7 +229,7 @@ pub async fn role_detail(
 
     // Tags section.
     let _ = write!(content, "<h2>Tags ({})</h2>", detail.tags.len());
-    content.push_str(r#"<table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>"#);
+    content.push_str(r"<table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>");
     for (k, v) in &detail.tags {
         let _ = write!(
             content,
@@ -272,7 +272,32 @@ pub async fn delete_role(
         .delete_role(&account_id, &role_name)
         .await
     {
-        Ok(()) => Redirect::to(&format!("/console/accounts/{account_id}")).into_response(),
+        Ok(()) => {
+            // Mirror management::iam_role::delete_role: cascade invalidate
+            // session credentials, role-level authz, and any cached
+            // session_data entries for this role.
+            state
+                .auth_cache
+                .invalidate_principal_credentials(&account_id, &role_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_role_policies(&account_id, &role_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_role_boundary(&account_id, &role_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_role_tags(&account_id, &role_name)
+                .await;
+            state
+                .auth_cache
+                .invalidate_role_sessions(&account_id, &role_name)
+                .await;
+            Redirect::to(&format!("/console/accounts/{account_id}")).into_response()
+        }
         Err(e) => {
             let nav = html::nav_bar(&identity_label(&session.identity));
             let content = format!(

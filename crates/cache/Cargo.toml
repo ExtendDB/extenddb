@@ -1,0 +1,24 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "extenddb-cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "In-memory stale-while-revalidate cache primitive used by the auth and storage layers."
+
+[features]
+# `test-util` exposes test-only helpers like `SwrCache::run_pending_tasks`
+# to consumers outside this crate. Production code never enables this.
+test-util = []
+
+[dependencies]
+moka = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

@@ -13,7 +13,7 @@ use extenddb_storage::util::{sk_column, sk_column_n};
 use super::{all_sort_key_info, data_table_name, index_table_name};
 use crate::PostgresEngine;
 
-/// Row shape returned by the table-info query: (key_schema, attr_defs, status, table_id, stream_spec, has_lsi).
+/// Row shape returned by the table-info query: (`key_schema`, `attr_defs`, status, `table_id`, `stream_spec`, `has_lsi`).
 type TableInfoRow = (
     serde_json::Value,
     serde_json::Value,
@@ -123,7 +123,7 @@ impl PostgresEngine {
         Ok(())
     }
 
-    /// Create a GSI/LSI data table in PostgreSQL.
+    /// Create a GSI/LSI data table in `PostgreSQL`.
     ///
     /// GSI tables use the same `(pk, sk_*)` structure as base tables but add
     /// `base_pk` and `base_sk_*` columns for uniqueness (GSI keys are not unique).
@@ -295,6 +295,7 @@ impl PostgresEngine {
             table_name: table_name.to_owned(),
             account_id: account_id.to_owned(),
             table_id,
+            base_key_schema: key_schema.clone(),
             key_schema,
             attribute_definitions,
             has_lsi: has_lsi.unwrap_or(false),

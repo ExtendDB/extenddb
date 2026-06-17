@@ -60,9 +60,17 @@ pub struct QueryInput {
     pub filter_expression: Option<String>,
     #[serde(rename = "ProjectionExpression")]
     pub projection_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames")]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ExpressionAttributeValues")]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_values"
+    )]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ScanIndexForward", default = "default_true")]
     pub scan_index_forward: bool,
@@ -122,9 +130,17 @@ pub struct ScanInput {
     pub filter_expression: Option<String>,
     #[serde(rename = "ProjectionExpression")]
     pub projection_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames")]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ExpressionAttributeValues")]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_values"
+    )]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "Limit")]
     pub limit: Option<i64>,

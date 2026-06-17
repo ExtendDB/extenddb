@@ -122,7 +122,7 @@ impl DataEngine for PostgresEngine {
         let key_condition = key_condition.clone();
         let maps = maps.clone();
         let exclusive_start_key = exclusive_start_key.cloned();
-        let index_name = index_name.map(|s| s.to_string());
+        let index_name = index_name.map(std::string::ToString::to_string);
         Box::pin(async move {
             self.query_impl(
                 &key_info,
@@ -148,7 +148,7 @@ impl DataEngine for PostgresEngine {
     ) -> BoxFuture<'_, Result<(Vec<Item>, Option<Item>), StorageError>> {
         let key_info = key_info.clone();
         let exclusive_start_key = exclusive_start_key.cloned();
-        let index_name = index_name.map(|s| s.to_string());
+        let index_name = index_name.map(std::string::ToString::to_string);
         Box::pin(async move {
             self.scan_impl(
                 &key_info,

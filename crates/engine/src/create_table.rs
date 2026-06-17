@@ -26,6 +26,8 @@ pub async fn handle_create_table(
         let msg = e.to_string();
         if msg.contains("validation error detected")
             || msg.contains("parameter values were invalid")
+            || msg.contains("must not be empty")
+            || msg.contains("Syntax error; key")
         {
             DynamoDbError::ValidationException(msg)
         } else if msg.contains("missing field") && msg.contains("TableName") {
@@ -42,11 +44,29 @@ pub async fn handle_create_table(
 
     validate_create_table(&input, &ctx.limits)?;
 
+    let table_name = input.table_name.clone();
     let table_desc = ctx
         .storage
         .create_table(&ctx.account_id, input)
         .await
         .map_err(storage_err_to_dynamo)?;
+
+    // Drop any cached TableKeyInfo (typically a negative-cached "not found"
+    // from a prior describe attempt) so requests against the new table see
+    // it immediately.
+    ctx.auth_cache
+        .invalidate_table_key_info(&ctx.account_id, &table_name)
+        .await;
+
+    // The CreateTable request itself ran through authorize_request, which
+    // populates resource_tags for this ARN. At that point the tags row didn't
+    // exist yet, so the cache holds an empty TagMap. Drop it so subsequent
+    // ABAC evaluations see the tags supplied via CreateTable.Tags.
+    let arn = format!(
+        "arn:aws:dynamodb:{}:{}:table/{}",
+        ctx.region, ctx.account_id, table_name
+    );
+    ctx.auth_cache.invalidate_resource_tags(&arn).await;
 
     let output = CreateTableOutput {
         table_description: table_desc,

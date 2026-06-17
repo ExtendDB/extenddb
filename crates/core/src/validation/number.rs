@@ -7,7 +7,7 @@ const MAX_SIGNIFICANT_DIGITS: usize = 38;
 const MAX_EXPONENT: i32 = 125;
 const MIN_EXPONENT: i32 = -130;
 
-/// Validate and normalize a DynamoDB number string.
+/// Validate and normalize a `DynamoDB` number string.
 pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
     let s = s.trim();
     if s.is_empty() {

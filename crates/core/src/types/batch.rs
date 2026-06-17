@@ -21,7 +21,11 @@ pub struct KeysAndAttributes {
     pub consistent_read: Option<bool>,
     #[serde(rename = "ProjectionExpression")]
     pub projection_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames")]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_expression_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
     /// Legacy projection API. Superseded by `ProjectionExpression`.
     /// Cannot be used together with `ProjectionExpression`.
@@ -44,7 +48,9 @@ pub struct BatchGetItemInput {
 pub struct BatchGetItemOutput {
     #[serde(rename = "Responses")]
     pub responses: HashMap<String, Vec<Item>>,
-    #[serde(rename = "UnprocessedKeys", skip_serializing_if = "HashMap::is_empty")]
+    /// Always serialized, even when empty: Amazon `DynamoDB` returns
+    /// `"UnprocessedKeys": {}` when all keys are processed rather than omitting it.
+    #[serde(rename = "UnprocessedKeys")]
     pub unprocessed_keys: HashMap<String, KeysAndAttributes>,
     /// Per-table consumed capacity (present when requested).
     #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
@@ -112,7 +118,9 @@ pub struct BatchWriteItemInput {
 /// `BatchWriteItem` response body.
 #[derive(Debug, Clone, Serialize)]
 pub struct BatchWriteItemOutput {
-    #[serde(rename = "UnprocessedItems", skip_serializing_if = "HashMap::is_empty")]
+    /// Always serialized, even when empty: Amazon `DynamoDB` returns
+    /// `"UnprocessedItems": {}` on full success rather than omitting the field.
+    #[serde(rename = "UnprocessedItems")]
     pub unprocessed_items: HashMap<String, Vec<WriteRequest>>,
     /// Per-table consumed capacity (present when requested).
     #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]

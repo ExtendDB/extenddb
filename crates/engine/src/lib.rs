@@ -71,7 +71,7 @@ use extenddb_core::limits::LimitsConfig;
 
 /// Check whether an operation name is recognized by the dispatch table.
 ///
-/// Real DynamoDB validates the operation name before checking authentication.
+/// Real `DynamoDB` validates the operation name before checking authentication.
 /// An unknown operation with no auth headers returns `UnknownOperationException`,
 /// not `MissingAuthenticationToken`. The server layer calls this before auth.
 #[must_use]
@@ -141,7 +141,7 @@ pub(crate) fn sanitize_storage_error(e: extenddb_storage::error::StorageError) -
     DynamoDbError::InternalServerError("Internal server error".to_owned())
 }
 
-/// Map a serde deserialization error to the appropriate DynamoDB error type.
+/// Map a serde deserialization error to the appropriate `DynamoDB` error type.
 ///
 /// Enum validation errors (produced by custom Deserialize impls) contain
 /// "validation error detected" and should be returned as `ValidationException`.
@@ -151,6 +151,12 @@ pub(crate) fn deserialize_error(e: serde_json::Error) -> DynamoDbError {
     if msg.contains("validation error detected")
         || msg.contains("may not be empty")
         || msg.contains("contains duplicates")
+        || msg.contains("must not be empty")
+        || msg.contains("contains invalid key")
+        || msg.contains("Syntax error; key")
+        || msg.contains("AttributeValue is empty")
+        || msg.contains("AttributeValue has more than one datatypes set")
+        || msg.contains("parameter values were invalid")
     {
         DynamoDbError::ValidationException(msg)
     } else {
@@ -162,28 +168,26 @@ pub(crate) fn deserialize_error(e: serde_json::Error) -> DynamoDbError {
 
 /// Pre-validate enum fields in a JSON body and return a combined error if multiple are invalid.
 ///
-/// DynamoDB reports all invalid enum fields together rather than stopping at the first.
+/// `DynamoDB` reports all invalid enum fields together rather than stopping at the first.
 /// Each entry is `(json_field_name, api_field_name, valid_values)`.
 pub(crate) fn validate_enum_fields(
     body: &serde_json::Value,
     fields: &[(&str, &str, &[&str])],
 ) -> Result<(), DynamoDbError> {
-    let obj = match body.as_object() {
-        Some(o) => o,
-        None => return Ok(()),
+    let Some(obj) = body.as_object() else {
+        return Ok(());
     };
     let mut errors: Vec<String> = Vec::new();
     for &(json_name, api_name, valid) in fields {
-        if let Some(val) = obj.get(json_name) {
-            if let Some(s) = val.as_str() {
-                if !valid.contains(&s) {
-                    errors.push(format!(
-                        "Value '{s}' at '{api_name}' failed to satisfy constraint: \
+        if let Some(val) = obj.get(json_name)
+            && let Some(s) = val.as_str()
+            && !valid.contains(&s)
+        {
+            errors.push(format!(
+                "Value '{s}' at '{api_name}' failed to satisfy constraint: \
                          Member must satisfy enum value set: [{}]",
-                        valid.join(", ")
-                    ));
-                }
-            }
+                valid.join(", ")
+            ));
         }
     }
     if errors.is_empty() {
@@ -210,7 +214,7 @@ pub struct DispatchMetrics {
     /// Number of items returned to the client.
     pub returned_item_count: u64,
     /// Total bytes of items returned to the client (pre-projection scanned size,
-    /// consistent with how DynamoDB charges capacity on scanned data).
+    /// consistent with how `DynamoDB` charges capacity on scanned data).
     pub returned_bytes: u64,
     /// GSI/LSI name when the operation targets a secondary index.
     /// Used to attribute metrics to the specific index.
@@ -262,6 +266,15 @@ pub struct OperationContext {
     /// Populated for single-table item-level operations; `None` for table-level
     /// and batch/transact operations.
     pub pre_fetched_key_info: Option<extenddb_core::types::TableKeyInfo>,
+    /// Auth/authz cache handles. Used by control-plane and tagging operations
+    /// to issue write-through cache invalidations after the underlying state
+    /// changes (e.g. `TagResource` invalidates the resource-tags cache).
+    pub auth_cache: extenddb_auth::AuthCacheRegistry,
+    /// Optional cached `TableKeyInfo` lookup. When set, batch / transact /
+    /// multi-table engine handlers route through this instead of calling
+    /// `storage.table_key_info` directly. When unset (e.g. unit tests), the
+    /// engine falls back to direct storage lookups.
+    pub table_key_info_lookup: Option<Arc<dyn extenddb_storage::TableKeyInfoLookup>>,
 }
 
 impl OperationContext {
@@ -272,10 +285,14 @@ impl OperationContext {
         &self,
         table_name: &str,
     ) -> Result<extenddb_core::types::TableKeyInfo, extenddb_storage::error::StorageError> {
-        if let Some(ref ki) = self.pre_fetched_key_info {
-            if ki.table_name == table_name && *ki.account_id == *self.account_id {
-                return Ok(ki.clone());
-            }
+        if let Some(ref ki) = self.pre_fetched_key_info
+            && ki.table_name == table_name
+            && *ki.account_id == *self.account_id
+        {
+            return Ok(ki.clone());
+        }
+        if let Some(ref lookup) = self.table_key_info_lookup {
+            return lookup.lookup(&self.account_id, table_name).await;
         }
         self.storage
             .table_key_info(&self.account_id, table_name)

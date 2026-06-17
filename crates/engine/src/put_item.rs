@@ -32,9 +32,15 @@ pub async fn handle_put_item(
     // Validate table name from raw body first (takes priority over enum errors)
     if let Some(table_name) = body.get("TableName").and_then(|v| v.as_str()) {
         extenddb_core::validation::validate_table_name(table_name, &ctx.limits)?;
-    } else if body.get("TableName").is_some_and(|v| v.is_string()) {
+    } else if body
+        .get("TableName")
+        .is_some_and(serde_json::Value::is_string)
+    {
         // empty string — caught by validate_table_name above
-    } else if body.get("TableName").is_none() || body.get("TableName").is_some_and(|v| v.is_null())
+    } else if body.get("TableName").is_none()
+        || body
+            .get("TableName")
+            .is_some_and(serde_json::Value::is_null)
     {
         return Err(DynamoDbError::ValidationException(
             "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null".to_owned()
@@ -66,6 +72,10 @@ pub async fn handle_put_item(
             || msg.contains("contains duplicates")
             || msg.contains("Null attribute value")
             || msg.contains("validation error detected")
+            || msg.contains("must not be empty")
+            || msg.contains("Syntax error; key")
+            || msg.contains("AttributeValue is empty")
+            || msg.contains("AttributeValue has more than one datatypes set")
         {
             DynamoDbError::ValidationException(msg)
         } else {
@@ -75,31 +85,18 @@ pub async fn handle_put_item(
         }
     })?;
 
-    // Reject EAV/EAN without an expression
+    // Reject EAN/EAV supplied without a referencing expression.
     let has_expression = input
         .condition_expression
         .as_ref()
         .is_some_and(|s| !s.is_empty());
-    if !has_expression
-        && input
-            .expression_attribute_values
-            .as_ref()
-            .is_some_and(|m| !m.is_empty())
-    {
-        return Err(DynamoDbError::ValidationException(
-            "ExpressionAttributeValues can only be specified when using expressions: ConditionExpression is null".to_owned(),
-        ));
-    }
-    if !has_expression
-        && input
-            .expression_attribute_names
-            .as_ref()
-            .is_some_and(|m| !m.is_empty())
-    {
-        return Err(DynamoDbError::ValidationException(
-            "ExpressionAttributeNames can only be specified when using expressions: ConditionExpression is null".to_owned(),
-        ));
-    }
+    extenddb_core::expression::validate_expression_param_usage(
+        input.expression_attribute_names.as_ref(),
+        has_expression,
+        input.expression_attribute_values.as_ref(),
+        has_expression,
+        &[extenddb_core::expression::ExpressionKind::Condition],
+    )?;
 
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
 
@@ -124,7 +121,12 @@ pub async fn handle_put_item(
         &ctx.limits,
     )?;
 
-    if input.expected.is_none() || input.expected.as_ref().is_some_and(|m| m.is_empty()) {
+    if input.expected.is_none()
+        || input
+            .expected
+            .as_ref()
+            .is_some_and(std::collections::HashMap::is_empty)
+    {
         let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
         extenddb_core::expression::validate_unused_attributes(
             &maps.names,

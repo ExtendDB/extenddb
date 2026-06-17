@@ -32,6 +32,9 @@ CREATE TABLE IF NOT EXISTS tables (
     status_transition_at TIMESTAMPTZ,
     stream_label TEXT,
     ttl_index_ready BOOLEAN NOT NULL DEFAULT FALSE,
+    table_class TEXT,
+    sse_specification JSONB,
+    on_demand_throughput JSONB,
     PRIMARY KEY (account_id, table_name),
     CONSTRAINT tables_table_id_unique UNIQUE (table_id)
 );

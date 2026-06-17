@@ -5,28 +5,22 @@
 
 use crate::error::StorageError;
 
-/// Returns an ARN for the specified DynamoDB index.
+/// Returns an ARN for the specified `DynamoDB` index.
+#[must_use]
 pub fn index_arn(region: &str, account_id: &str, table_name: &str, index_name: &str) -> String {
-    format!(
-        "arn:aws:dynamodb:{}:{}:table/{}/index/{}",
-        region, account_id, table_name, index_name
-    )
+    format!("arn:aws:dynamodb:{region}:{account_id}:table/{table_name}/index/{index_name}")
 }
 
-/// Returns an ARN for the specified DynamoDB stream.
+/// Returns an ARN for the specified `DynamoDB` stream.
+#[must_use]
 pub fn stream_arn(region: &str, account_id: &str, table_name: &str, stream_label: &str) -> String {
-    format!(
-        "arn:aws:dynamodb:{}:{}:table/{}/stream/{}",
-        region, account_id, table_name, stream_label
-    )
+    format!("arn:aws:dynamodb:{region}:{account_id}:table/{table_name}/stream/{stream_label}")
 }
 
-/// Returns an ARN for the specified DynamoDB table.
+/// Returns an ARN for the specified `DynamoDB` table.
+#[must_use]
 pub fn table_arn(region: &str, account_id: &str, table_name: &str) -> String {
-    format!(
-        "arn:aws:dynamodb:{}:{}:table/{}",
-        region, account_id, table_name
-    )
+    format!("arn:aws:dynamodb:{region}:{account_id}:table/{table_name}")
 }
 
 /// Parse a stream ARN into (`table_name`, `stream_label`).

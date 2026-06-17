@@ -4,6 +4,7 @@
 resolver = "2"
 members = [
     "crates/core",
+    "crates/cache",
     "crates/engine",
     "crates/storage",
     "crates/storage-postgres",
@@ -16,12 +17,13 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Apache-2.0"
 
 [workspace.dependencies]
 # Internal crates
 extenddb-core = { path = "crates/core" }
+extenddb-cache = { path = "crates/cache" }
 extenddb-engine = { path = "crates/engine" }
 extenddb-storage = { path = "crates/storage" }
 extenddb-storage-postgres = { path = "crates/storage-postgres" }
@@ -48,9 +50,13 @@ axum = { version = "0.8", features = ["macros"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["compression-gzip", "cors", "set-header"] }
 hyper = { version = "1" }
+urlencoding = { version = "2.1" }
 
 # Database plugin registry
 inventory = "0.3"
+
+# Caching
+moka = { version = "0.12", features = ["future"] }
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "json", "time", "uuid", "bigdecimal"] }
@@ -82,7 +88,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 syslog-tracing = "0.3"
 metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
 
 # Config
 clap = { version = "4", features = ["derive"] }

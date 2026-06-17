@@ -23,6 +23,7 @@
 /// assert!(!wildcard_match("dynamodb:Get*", "dynamodb:PutItem"));
 /// assert!(wildcard_match("s?s", "sis"));
 /// ```
+#[must_use]
 pub fn wildcard_match(pattern: &str, value: &str) -> bool {
     wildcard_match_impl(pattern.as_bytes(), value.as_bytes(), false)
 }
@@ -40,6 +41,7 @@ pub fn wildcard_match(pattern: &str, value: &str) -> bool {
 /// assert!(wildcard_match_ignore_case("dynamodb:Get*", "dynamodb:getitem"));
 /// assert!(!wildcard_match_ignore_case("dynamodb:Get*", "dynamodb:PutItem"));
 /// ```
+#[must_use]
 pub fn wildcard_match_ignore_case(pattern: &str, value: &str) -> bool {
     wildcard_match_impl(pattern.as_bytes(), value.as_bytes(), true)
 }
@@ -104,6 +106,7 @@ fn wildcard_match_impl(p: &[u8], v: &[u8], ignore_case: bool) -> bool {
 ///     "arn:aws:dynamodb:us-east-1:123456789012:table/Users"
 /// ));
 /// ```
+#[must_use]
 pub fn arn_match(pattern: &str, value: &str) -> bool {
     // "*" as a pattern matches any ARN
     if pattern == "*" {

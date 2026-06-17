@@ -27,6 +27,10 @@ use crate::error::DynamoDbError;
 ///
 /// Returns `ValidationException` for syntax errors.
 pub fn parse_update(tokens: &[Token]) -> Result<Vec<UpdateAction>, DynamoDbError> {
+    parser_common::check_redundant_parens(tokens).map_err(|msg| {
+        DynamoDbError::ValidationException(format!("Invalid UpdateExpression: {msg}"))
+    })?;
+
     let mut pos = 0;
     let mut actions = Vec::new();
 
@@ -70,6 +74,10 @@ pub fn parse_update_from(
     tokens: &[Token],
     source: &str,
 ) -> Result<Vec<UpdateAction>, DynamoDbError> {
+    parser_common::check_redundant_parens(tokens).map_err(|msg| {
+        DynamoDbError::ValidationException(format!("Invalid UpdateExpression: {msg}"))
+    })?;
+
     let mut pos = 0;
     let mut actions = Vec::new();
 
@@ -239,6 +247,17 @@ fn parse_set_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDb
             }
         }
         Token::NameRef(_) => parser_common::parse_path(tokens, pos).map(Expr::Path),
+        Token::LParen => {
+            *pos += 1; // consume '('
+            let expr = parse_value_expr(tokens, pos)?;
+            if *pos >= tokens.len() || tokens[*pos] != Token::RParen {
+                return Err(validation_err(
+                    "Invalid UpdateExpression: expected closing ')'",
+                ));
+            }
+            *pos += 1; // consume ')'
+            Ok(expr)
+        }
         _ => Err(validation_err(
             "Invalid UpdateExpression: expected path, placeholder, or function",
         )),
@@ -512,5 +531,41 @@ mod tests {
         } else {
             panic!("Expected Set action");
         }
+    }
+
+    #[test]
+    fn redundant_parens_rejected() {
+        let err = parse("SET c = ((c - :v))").unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg) if msg.contains("redundant parentheses")),
+            "Expected redundant parens error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn single_parens_accepted() {
+        let actions = parse("SET c = (c - :v)").unwrap();
+        assert!(matches!(&actions[0], UpdateAction::Set { .. }));
+    }
+
+    #[test]
+    fn unmatched_paren_rejected() {
+        // Opening paren with no matching close must be a ValidationException,
+        // not a panic or a silently-accepted expression.
+        let err = parse("SET c = (c - :v").unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg) if msg.contains("closing")),
+            "Expected unmatched-paren error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn unmatched_close_paren_rejected() {
+        // A stray closing paren with no matching open must also be rejected.
+        let err = parse("SET c = c - :v)").unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(_)),
+            "Expected validation error for stray ')', got: {err:?}"
+        );
     }
 }

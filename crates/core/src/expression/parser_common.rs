@@ -81,6 +81,33 @@ pub fn expect_token(
     Ok(())
 }
 
+/// Reject redundant parentheses: a parenthesised group whose
+/// entire content is itself a single parenthesised group, such as `((x))`.
+/// Returns the bare error body so each parser can prefix its own expression type.
+pub fn check_redundant_parens(tokens: &[Token]) -> Result<(), String> {
+    // Single-pass stack: one bool per unmatched '('.
+    // true = the preceding token was also '(' (double-open).
+    // On ')', if popped is true AND the next token is ')', the group is redundant.
+    let mut stack: Vec<bool> = Vec::new();
+
+    for (i, token) in tokens.iter().enumerate() {
+        match token {
+            Token::LParen => {
+                stack.push(i > 0 && tokens[i - 1] == Token::LParen);
+            }
+            Token::RParen => {
+                if let Some(true) = stack.pop()
+                    && tokens.get(i + 1) == Some(&Token::RParen)
+                {
+                    return Err("The expression has redundant parentheses;".to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn validation_err(msg: &str) -> DynamoDbError {
     DynamoDbError::ValidationException(format!("Invalid expression: {msg}"))
 }

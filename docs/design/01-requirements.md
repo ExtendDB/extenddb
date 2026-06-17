@@ -482,7 +482,7 @@ The catalog database stores extenddb metadata: table definitions, indexes, tags,
 - REQ-OBS-002: Per-operation latency metrics (p50, p95, p99)
 - REQ-OBS-003: Per-operation request count and error count metrics
 - REQ-OBS-004: Per-table metrics (request count, consumed capacity)
-- REQ-OBS-005: Prometheus-compatible metrics endpoint (`/metrics`)
+- REQ-OBS-005: JSON metrics endpoint (`/metrics`) using DynamoDB CloudWatch-style metric names and dimensions
 - REQ-OBS-006: Health check endpoint (`/health`) returning 200 when the server is ready
 - REQ-OBS-007: Request ID propagation through all log entries
 

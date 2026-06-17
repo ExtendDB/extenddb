@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! TTL cleanup background worker for PostgreSQL.
+//! TTL cleanup background worker for `PostgreSQL`.
 
 use std::sync::Arc;
 use std::time::Duration;

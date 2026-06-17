@@ -80,6 +80,7 @@ pub trait AuthorizationStore: Send + Sync {
 }
 
 /// Session data returned by [`AuthorizationStore::fetch_session_data`].
+#[derive(Debug, Clone)]
 pub struct SessionData {
     /// The inline session policy document, if any.
     pub session_policy: Option<String>,

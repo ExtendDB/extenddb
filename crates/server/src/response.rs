@@ -34,7 +34,7 @@ pub(crate) fn success_response(body: &Value, request_id: &str) -> Response {
 }
 
 /// REQ-ERR-001: `__type` with prefix. REQ-ERR-002: message field.
-/// REQ-ERR-003: Omit `message` when empty (real DynamoDB behavior, verified 2026-05-04).
+/// REQ-ERR-003: Omit `message` when empty (real `DynamoDB` behavior, verified 2026-05-04).
 pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Response {
     // Fix #14: Use full_error_type() which includes the prefix
     let mut body = serde_json::json!({

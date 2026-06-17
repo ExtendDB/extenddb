@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use extenddb_core::types::{CancellationReason, Item};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum StorageError {
     #[error("Table not found: {0}")]
     TableNotFound(String),

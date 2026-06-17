@@ -4,7 +4,7 @@
 
 ## Introduction
 
-extenddb uses a fully trait-based storage abstraction. The default backend is PostgreSQL, implemented in the `storage-postgres` crate. This document explains the storage architecture, lists every trait a new backend must implement, and provides guidance for adding a new storage backend (e.g., Cassandra, SQLite, FoundationDB).
+extenddb uses a fully trait-based storage abstraction. The default backend is PostgreSQL, implemented in the `storage-postgres` crate. This document explains the storage architecture, lists every trait a new backend must implement, and provides guidance for adding a new storage backend.
 
 As of v0.0.81, the server crate has **no direct PostgreSQL dependencies**. All database access goes through traits defined in the `storage` and `auth` crates. PostgreSQL-specific code lives exclusively in `storage-postgres` and the `bin` crate's wiring layer.
 
@@ -304,9 +304,13 @@ Schema is managed via SQL migration files in `crates/storage-postgres/migrations
 
 ## Adding a New Backend
 
+NOTE: ExtendDB ships with a built-in functional reference backend implementation for PostgreSQL. Future backend
+implementations should be developed and released separately from the ExtendDB project itself, to simplify dependencies
+and maintenance.
+
 ### Step 1: Create a New Crate
 
-Create a new crate (e.g., `storage-cassandra`) in the workspace. It should depend on `extenddb-storage`, `extenddb-auth`, and `extenddb-core`.
+Create a new crate (e.g., `storage-mydbengine`) in your workspace. It should depend on `extenddb-storage`, `extenddb-auth`, and `extenddb-core`.
 
 ### Step 2: Implement the DynamoDB Data Traits
 
@@ -385,33 +389,9 @@ Stream sequence numbers must be monotonically increasing within a shard. Your ba
 
 Account deletion must cascade to all child resources (users, groups, roles, policies, access keys, sessions) atomically. Your backend must provide equivalent cascade logic.
 
-## Hypothetical: Implementing a Cassandra Backend
-
-### What Maps Naturally
-
-- **Item storage** — Cassandra's wide-column model maps well to DynamoDB's key-value items. Partition key → Cassandra partition key, sort key → clustering column, item attributes → a blob/map column.
-- **Query by partition key** — native Cassandra operation.
-- **TTL** — Cassandra has native TTL support per row, though the semantics differ (Cassandra TTL is per-cell, DynamoDB TTL is per-item with a specific attribute).
-- **Horizontal scaling** — Cassandra's distributed nature would provide natural scaling.
-
-### What Requires Design Decisions
-
-- **Condition expressions** — Cassandra has lightweight transactions (LWT) with `IF` clauses, but they are limited compared to DynamoDB's full expression language. You would likely need to read-then-write with application-level locking, or implement condition evaluation in the application layer with Cassandra's compare-and-set.
-- **Transactions** — DynamoDB's `TransactWriteItems` requires ACID across multiple items/tables. Cassandra has no multi-partition transactions. Options: (a) use a transaction coordinator library, (b) implement saga patterns, (c) limit transaction support. This is the hardest problem.
-- **Sort key ordering** — Cassandra clustering columns provide ordering within a partition, which maps well. However, `scan` across all partitions with consistent ordering is not native to Cassandra.
-- **Parallel scan segments** — would need a custom partitioning scheme (e.g., token range splitting).
-- **Stream records** — would need a separate table or Cassandra CDC (Change Data Capture).
-- **Sequence numbers** — monotonically increasing per-shard sequence numbers require coordination. Cassandra counters or a lightweight transaction could work but add latency.
-
-### What Does Not Map
-
-- **Serializable isolation for TransactGetItems** — Cassandra does not provide serializable reads across partitions. You would need to accept weaker consistency or implement a coordination layer.
-- **Atomic multi-table writes** — `TransactWriteItems` can span multiple DynamoDB tables. Cassandra has no cross-table atomicity.
-- **Secondary indexes with consistent propagation** — Cassandra's secondary indexes are local. GSI-like behavior would require materialized views or application-managed denormalization.
-
 ## PostgreSQL-isms in the Default Backend
 
-An honest assessment of where the PostgreSQL implementation makes backend-specific choices. These are implementation details inside `storage-postgres`, not leaks in the trait abstraction:
+The PostgreSQL implementation makes backend-specific choices. These are implementation details inside `storage-postgres`, not leaks in the trait abstraction:
 
 1. **JSONB item storage** — items are stored as JSONB, enabling PostgreSQL-specific query optimizations. The traits pass `Item` = `BTreeMap<String, AttributeValue>` — your backend can use any serialization format.
 

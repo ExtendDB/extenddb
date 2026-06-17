@@ -42,7 +42,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | Partition key size | 1–2,048 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_partition_key_size_bytes`            |
 | Sort key size | 1–1,024 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_sort_key_size_bytes`                 |
 | Attribute name size | 1–64 KB (65,535 bytes) | Enforced | `validate_attribute_name_sizes`, `LimitsConfig::max_attribute_name_bytes`     |
-| Attribute nesting depth | 32 levels | Not enforced | No nesting depth validation                                                   |
+| Attribute nesting depth | 32 levels | Enforced | `validate_item_nesting_depth`, applied on PutItem, UpdateItem, BatchWriteItem.PutRequest, TransactWriteItems.Put, ImportTable |
 | Number of attributes per item | No practical limit | Enforced | ExtendDB has no per-item attribute count limit                                |
 
 ## Secondary Indexes
@@ -149,7 +149,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 |----------|----------|---------|--------------|-----|
 | Throughput | 5 | 0 | 1 | 2 |
 | Tables | 4 | 0 | 0 | 0 |
-| Items | 5 | 0 | 1 | 0 |
+| Items | 6 | 0 | 0 | 0 |
 | Secondary Indexes | 4 | 0 | 2 | 0 |
 | Query/Scan | 2 | 0 | 5 | 0 |
 | Batch Operations | 3 | 0 | 2 | 0 |
@@ -159,24 +159,23 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | Import/Export/Backup | 0 | 0 | 0 | 8 |
 | Global Tables | 0 | 0 | 0 | 2 |
 | Contributor Insights | 0 | 0 | 0 | 1 |
-| **Total** | **28** | **0** | **18** | **14** |
+| **Total** | **29** | **0** | **17** | **14** |
 
 ### Unenforced Limits Requiring Tracking
 
 The following unenforced limits are tracked in `docs/technical-debt.md`:
 
 1. **Provisioned capacity decrease limit** (27/day) — would require per-table decrease counter with hourly replenishment
-2. **Attribute nesting depth** (32 levels) — requires recursive depth check in attribute value validation
-3. **Projected attributes across all indexes** (100) — requires cross-index attribute counting in CreateTable validation
-4. **LSI item collection size** (10 GB) — requires per-partition size tracking in storage layer
-5. **Expression size limits** (4 KB condition/filter/projection, 2 MB names/values) — requires byte-length checks on expression strings
-6. **BatchGetItem response size** (16 MB) — requires aggregate response size tracking
-7. **BatchWriteItem request size** (16 MB) — requires aggregate request size tracking
-8. **Transaction request size** (4 MB) — requires aggregate request size tracking
-9. **GetRecords max per call** (1,000) — requires record count limit in streams
-10. **Shard iterator lifetime** (15 minutes) — requires timestamp tracking on shard iterators
-11. **Tag count per resource** (50) — requires count validation in TagResource
-12. **Tag key/value length** (128/256 chars) — requires length validation in TagResource
+2. **Projected attributes across all indexes** (100) — requires cross-index attribute counting in CreateTable validation
+3. **LSI item collection size** (10 GB) — requires per-partition size tracking in storage layer
+4. **Expression size limits** (4 KB condition/filter/projection, 2 MB names/values) — requires byte-length checks on expression strings
+5. **BatchGetItem response size** (16 MB) — requires aggregate response size tracking
+6. **BatchWriteItem request size** (16 MB) — requires aggregate request size tracking
+7. **Transaction request size** (4 MB) — requires aggregate request size tracking
+8. **GetRecords max per call** (1,000) — requires record count limit in streams
+9. **Shard iterator lifetime** (15 minutes) — requires timestamp tracking on shard iterators
+10. **Tag count per resource** (50) — requires count validation in TagResource
+11. **Tag key/value length** (128/256 chars) — requires length validation in TagResource
 
 ---
 

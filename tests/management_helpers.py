@@ -393,3 +393,24 @@ class ManagementClient:
             auth=self.admin_auth,
             timeout=self.timeout, verify=self.verify,
         )
+
+    # -- Cache (admin break-glass) --
+
+    def invalidate_cache(
+        self,
+        scope: str,
+        selectors: dict | None = None,
+        *,
+        auth=None,
+    ) -> requests.Response:
+        """POST /management/cache/invalidate.
+
+        ``auth`` defaults to admin credentials; pass a tuple to test auth gating.
+        """
+        body = {"scope": scope, "selectors": selectors or {}}
+        return requests.post(
+            f"{self.base_url}/cache/invalidate",
+            json=body,
+            auth=auth or self.admin_auth,
+            timeout=self.timeout, verify=self.verify,
+        )

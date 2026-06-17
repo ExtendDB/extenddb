@@ -6,12 +6,11 @@
 use extenddb_core::limits::LimitsConfig;
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
     pub server: ServerConfig,
-    #[serde(default)]
     pub storage: StorageConfig,
     /// Auth provider configuration. `provider = "builtin"` for `SigV4` with
     /// local credential store. The server refuses to start with `provider = "none"`.
@@ -114,7 +113,7 @@ impl Default for TlsConfig {
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
     /// Storage backend selector (e.g. "postgres").
-    pub _backend: String,
+    pub backend: String,
     /// Backend-specific configuration (trait object).
     config: Box<dyn extenddb_storage::config::StorageConfig>,
 }
@@ -173,17 +172,15 @@ impl<'de> serde::Deserialize<'de> for StorageConfig {
         let config = extenddb_storage::config::deserialize_storage_config(&backend, backend_table)
             .map_err(D::Error::custom)?;
 
-        Ok(StorageConfig {
-            _backend: backend,
-            config,
-        })
+        Ok(StorageConfig { backend, config })
     }
 }
 
+#[cfg(feature = "postgres")]
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            _backend: default_backend(),
+            backend: default_backend(),
             config: Box::new(extenddb_storage_postgres::PostgresStorageConfig::default()),
         }
     }
@@ -197,14 +194,77 @@ pub struct AuthConfig {
     /// authentication enabled.
     #[serde(default = "default_provider")]
     pub provider: String,
+    /// Configuration for the in-memory auth/authz caches. Optional; defaults
+    /// apply when absent.
+    #[serde(default)]
+    pub cache: AuthCacheConfigToml,
 }
 
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             provider: default_provider(),
+            cache: AuthCacheConfigToml::default(),
         }
     }
+}
+
+/// Configuration for the in-memory auth/authz caches (`[auth.cache]` section).
+///
+/// Each `*_seconds` field has a sensible default; operators only need to
+/// override values when they want to deviate from the docs. The configuration
+/// is static — values are read once at startup.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthCacheConfigToml {
+    /// Master switch. When `false`, all caches operate in pass-through mode
+    /// (fall through to the underlying store on every request) — useful as a
+    /// kill switch during incident response.
+    #[serde(default = "default_cache_enabled")]
+    pub enabled: bool,
+    /// Hard TTL: cached values older than this trigger a fresh load.
+    #[serde(default = "default_cache_ttl_seconds")]
+    pub ttl_seconds: u64,
+    /// Soft TTL: cached values older than this trigger a background refresh
+    /// while still returning the cached value to the caller.
+    #[serde(default = "default_cache_soft_ttl_seconds")]
+    pub soft_ttl_seconds: u64,
+    /// TTL applied to negative results (`Ok(None)` from the loader). Typically
+    /// shorter than `ttl_seconds` so newly-created entities become visible
+    /// quickly.
+    #[serde(default = "default_cache_negative_ttl_seconds")]
+    pub negative_ttl_seconds: u64,
+    /// Maximum entries per cache. When exceeded, LRU eviction kicks in.
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: u64,
+}
+
+impl Default for AuthCacheConfigToml {
+    fn default() -> Self {
+        Self {
+            enabled: default_cache_enabled(),
+            ttl_seconds: default_cache_ttl_seconds(),
+            soft_ttl_seconds: default_cache_soft_ttl_seconds(),
+            negative_ttl_seconds: default_cache_negative_ttl_seconds(),
+            max_entries: default_cache_max_entries(),
+        }
+    }
+}
+
+fn default_cache_enabled() -> bool {
+    true
+}
+fn default_cache_ttl_seconds() -> u64 {
+    60
+}
+fn default_cache_soft_ttl_seconds() -> u64 {
+    30
+}
+fn default_cache_negative_ttl_seconds() -> u64 {
+    5
+}
+fn default_cache_max_entries() -> u64 {
+    10_000
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -244,15 +304,15 @@ fn default_run_dir() -> String {
 /// Expand a leading `~` in a path to `$HOME`. Returns the input unchanged
 /// if `$HOME` is unset or the path does not start with `~`.
 pub fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix('~') {
-        if rest.is_empty() || rest.starts_with('/') {
-            if let Ok(home) = std::env::var("HOME") {
-                return format!("{home}{rest}");
-            }
-        }
+    if let Some(rest) = path.strip_prefix('~')
+        && (rest.is_empty() || rest.starts_with('/'))
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return format!("{home}{rest}");
     }
     path.to_owned()
 }
+#[cfg(feature = "postgres")]
 fn default_backend() -> String {
     "postgres".to_owned()
 }
@@ -298,7 +358,7 @@ pub fn load(config_path: &str) -> anyhow::Result<AppConfig> {
 /// Redact password from a connection string for safe logging (REQ-LOG-002).
 ///
 /// Uses the backend-specific operations engine to handle different connection
-/// string formats (`PostgreSQL`, Cassandra, etc.).
+/// string formats (`PostgreSQL`).
 pub fn redact_password(backend: &str, conn: &str) -> String {
     extenddb_storage::operations::redact_connection_string(backend, conn)
         .unwrap_or_else(|_| conn.to_owned())
@@ -351,7 +411,7 @@ fn redact_if_sensitive(key: &str, val: &str) -> String {
 /// sensitive values (connection strings, passwords, keys).
 pub fn build_config_entries(cfg: &AppConfig) -> Vec<(String, String)> {
     let r = redact_if_sensitive;
-    let backend = &cfg.storage._backend;
+    let backend = &cfg.storage.backend;
     let mut entries = vec![
         ("server.bind_addr".into(), cfg.server.bind_addr.clone()),
         ("server.port".into(), cfg.server.port.to_string()),

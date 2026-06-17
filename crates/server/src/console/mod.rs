@@ -5,7 +5,7 @@
 //!
 //! A server-rendered HTML interface for the management API. Provides login,
 //! account/user/group/role CRUD, policy editing, and IAM user self-service.
-//! Mounted at `/console/*` on the same server as the DynamoDB API.
+//! Mounted at `/console/*` on the same server as the `DynamoDB` API.
 //!
 //! Sessions are stored in-memory with random tokens in cookies. No external
 //! dependencies — all HTML is generated with Rust string formatting.
@@ -32,7 +32,7 @@ pub struct ConsoleState {
     pub sessions: SessionStore,
     /// Version string displayed in the console footer (e.g. "0.1.0 · catalog 2.1.0 · abc1234").
     pub version_info: Arc<str>,
-    /// The URL the server is listening on (e.g. "https://127.0.0.1:8000").
+    /// The URL the server is listening on (e.g. "<https://127.0.0.1:8000>").
     /// Displayed in the footer so users know which address the self-signed
     /// certificate is bound to.
     pub listen_url: String,
@@ -44,6 +44,13 @@ pub struct ConsoleState {
     /// Runtime documentation store. `None` if `docs_dir` is not configured or
     /// the directory is missing/invalid.
     pub docs_store: Option<docs_embed::DocsStore>,
+    /// Auth/authz cache registry. Used by mutation handlers to issue
+    /// write-through invalidations after IAM changes — the same hooks the
+    /// management API calls. Also used by the `/console/cache` admin
+    /// break-glass page to drive manual invalidation. Without this,
+    /// console-driven mutations leave stale entries in the cache for up
+    /// to `auth.cache.ttl_seconds`.
+    pub auth_cache: extenddb_auth::AuthCacheRegistry,
 }
 
 /// Build the console router.
@@ -63,6 +70,10 @@ pub fn router() -> Router<Arc<ConsoleState>> {
         .route("/metrics", get(pages::metrics_page))
         // Settings (read-only, admin-only)
         .route("/settings", get(pages::settings_page))
+        // Cache (admin-only break-glass invalidation).
+        // See docs/design/12-auth-authz-cache.md §6.1.
+        .route("/cache", get(pages::cache_page))
+        .route("/cache/invalidate", post(pages::invalidate_cache))
         // Accounts
         .route("/accounts", get(pages::list_accounts))
         .route("/accounts/new", get(pages::new_account_form))

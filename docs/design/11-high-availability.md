@@ -13,7 +13,7 @@ extenddb currently operates as a single-process server backed by a single Postgr
 ### Goals
 
 1. Multiple extenddb instances sharing the same backing database (horizontal frontend scaling).
-2. Pluggable storage layers (PostgreSQL, Cassandra, MongoDB, future backends) with varying native replication capabilities.
+2. Pluggable storage layers with varying native replication capabilities.
 3. A notion of leadership that enables correct strongly-consistent vs. eventually-consistent read semantics.
 4. Deployment models spanning single-node to multi-region.
 5. Staged delivery — each stage is independently useful and testable.
@@ -31,9 +31,9 @@ extenddb currently operates as a single-process server backed by a single Postgr
 | Term | Definition |
 |------|-----------|
 | **Frontend** | A extenddb process that accepts DynamoDB API requests. Stateless except for in-flight request state. |
-| **Catalog** | The backing database (PostgreSQL, Cassandra, etc.) that stores table metadata, items, streams, and auth data. |
+| **Catalog** | The backing database that stores table metadata, items, streams, and auth data. |
 | **Deployment** | One or more frontends sharing a single logical catalog. All frontends in a deployment serve the same set of accounts and tables. |
-| **Replica set** | Multiple catalog nodes providing data redundancy (e.g., PostgreSQL streaming replication, Cassandra ring, MongoDB replica set). |
+| **Replica set** | Multiple catalog nodes providing data redundancy. |
 | **Leader** | The frontend (or catalog node) that handles writes and strongly-consistent reads for a given scope. |
 | **Follower** | A frontend (or catalog node) that handles eventually-consistent reads. |
 
@@ -150,17 +150,24 @@ This is the minimal mechanism needed to honor DynamoDB's consistency model. It w
 
 ## 6. Design Decisions
 
-### D1: No In-Process State (Preserved)
+### D1: No In-Process State on the Data Path (Preserved, with one explicit revision)
 
-The existing "No Caching Rule" is preserved and strengthened. Frontends remain stateless. This is what makes horizontal frontend scaling trivial — any frontend can serve any request because all state lives in the catalog.
+The "No Caching Rule" applies to data-path state: items, query results, throttle buckets, stream cursors, and anything that varies per write. Frontends remain stateless on the data path — any frontend can serve any data request because all data state lives in the catalog.
 
-**Rationale:** Multiple frontends sharing a catalog would have stale caches. The No Caching Rule already anticipated this.
+**Revision (2026-05):** The auth/authz layer now caches IAM data (credentials, parsed policies, principal/resource tags, table key info) in-process for the request hot path. See [`12-auth-authz-cache.md`](12-auth-authz-cache.md) for the full design. This was a deliberate trade-off, not a violation of D1:
+
+- Auth/authz reads on the hot path were ~6 catalog queries per request (now ~0 in steady state). The performance gap had no other fix.
+- IAM data has bounded staleness tolerance: AWS IAM itself documents policy-propagation delays of ~30 s–2 min. ExtendDB exposes the same bound as `auth.cache.ttl_seconds` (default 60 s) and makes it operator-tunable.
+- Self-induced changes (admin API mutations) propagate **instantly** within a single instance via write-through invalidation hooks. Off-instance changes (multi-frontend, or direct DB writes) are bounded by the configured TTL.
+- The kill switch (`auth.cache.enabled = false`) restores the original "no caching" behavior without restart-triggered code changes.
+
+**Rationale (still valid for the data path):** Multiple frontends sharing a catalog would have stale caches. For data, that's intolerable. For IAM, bounded staleness is the same trade-off real AWS IAM exposes. Cross-frontend invalidation fanout for the IAM cache is designed in [Appendix B of `12-auth-authz-cache.md`](12-auth-authz-cache.md#appendix-b--multi-instance-cache-invalidation-deferred) but not yet implemented; deployments running multiple frontends should treat `auth.cache.ttl_seconds` as the worst-case lag for off-instance IAM mutations.
 
 ### D2: Consistency Routing Lives in the Storage Adapter
 
 The storage adapter (e.g., `storage-postgres`) is responsible for routing reads to the appropriate connection based on the consistency requirement. The engine passes a `ConsistencyLevel` parameter; the storage adapter decides which connection to use.
 
-**Rationale:** Different backends implement replication differently. PostgreSQL uses streaming replication with separate read replicas. Cassandra uses tunable consistency per query. The storage adapter is the right place to abstract this.
+**Rationale:** Different backends implement replication differently. The storage adapter is the right place to abstract this.
 
 ### D3: Leadership Is Per-Catalog, Not Per-Frontend
 
@@ -174,7 +181,7 @@ In deployment models 2 and 3, there is no "leader frontend." All frontends are e
 
 ### D4: Heterogeneous Storage Is Illegal
 
-A single deployment must use a single storage backend type. You cannot mix PostgreSQL and Cassandra nodes in one deployment.
+A single deployment must use a single storage backend type. You cannot mix different backend storage types in one deployment.
 
 **Rationale:** Different backends have different data models, consistency semantics, and transaction capabilities. Mixing them would create an untestable matrix of behaviors. Each deployment is homogeneous.
 
@@ -196,19 +203,6 @@ replicas = [
     "postgresql://replica1:5432/extenddb",
     "postgresql://replica2:5432/extenddb",
 ]
-```
-
-For natively-clustered backends:
-
-```toml
-[storage]
-backend = "cassandra"
-
-[storage.cassandra]
-contact_points = ["node1:9042", "node2:9042", "node3:9042"]
-# Consistency mapping is handled by the storage adapter
-strong_consistency = "QUORUM"
-eventual_consistency = "ONE"
 ```
 
 ### D6: Health Checks and Connection Failover
@@ -235,7 +229,7 @@ The `extenddb.toml` configuration accepts `pool_size` per connection target. The
 - Adds enormous complexity (Raft implementation, membership management, log replication).
 - Unnecessary when the catalog already provides durability and consistency.
 - extenddb frontends are stateless by design — adding state contradicts the architecture.
-- Databases like PostgreSQL, Cassandra, and MongoDB already solve this problem at the storage layer.
+- Many databases already solve this problem at the storage layer.
 
 ### A2: Shared-Nothing Architecture (Each Frontend Owns a Partition)
 
@@ -247,14 +241,16 @@ The `extenddb.toml` configuration accepts `pool_size` per connection target. The
 - DynamoDB's API doesn't expose partitioning to clients — any frontend must be able to serve any request.
 - Contradicts the "equally comfortable on a Raspberry Pi" requirement.
 
-### A3: Frontend-Level Read Replicas (Cached Reads)
+### A3: Frontend-Level Read Replicas (Cached Data Reads)
 
-**Approach:** Frontends cache recent reads and serve eventually-consistent reads from cache.
+**Approach:** Frontends cache recent **data** reads (item bodies, query results) and serve eventually-consistent reads from cache.
 
 **Rejected because:**
-- Violates the No Caching Rule.
-- Cache invalidation across frontends is the exact problem the No Caching Rule was designed to avoid.
+- Violates the No Caching Rule for data-path state.
+- Cache invalidation across frontends for arbitrary item writes is the exact problem the No Caching Rule was designed to avoid — every PutItem/UpdateItem would need to fan out to every frontend.
 - PostgreSQL's buffer pool already provides memory-resident access to hot data.
+
+**Note:** A narrow, bounded cache for **IAM data** (credentials, policies, tags) is implemented in [`12-auth-authz-cache.md`](12-auth-authz-cache.md). It applies the trade-off described in D1: bounded staleness on a slow-mutation, high-read-rate dataset, with TTLs that match AWS IAM's documented propagation window. That cache does not extend to data-path reads.
 
 ### A4: Single-Writer with Read Replicas at Frontend Level
 
@@ -277,16 +273,14 @@ Add a `ConsistencyLevel` enum to the storage crate. This enum is **internal to t
 #[non_exhaustive]
 pub enum ConsistencyLevel {
     /// Eventually consistent read. May return stale data.
-    /// Maps to: replica connection (PostgreSQL), ONE/LOCAL_ONE (Cassandra).
     #[default]
     Eventually,
     /// Strongly consistent read. Returns the most recent write.
-    /// Maps to: primary connection (PostgreSQL), QUORUM/LOCAL_QUORUM (Cassandra).
     Strong,
 }
 ```
 
-The `#[non_exhaustive]` attribute allows future extension (e.g., `LocalQuorum` for multi-datacenter Cassandra) without a breaking change.
+The `#[non_exhaustive]` attribute allows future extension without a breaking change.
 
 ### 8.2 Consistency Routing via Trait Parameter (Option A)
 
@@ -445,29 +439,6 @@ This avoids adding yet another trait that every storage backend must implement. 
 - Document load balancer configuration (sticky sessions not required since frontends are stateless).
 - Add instance-id to metrics and logs for multi-frontend debugging.
 
-### Stage 4: Cassandra Storage Backend (Future)
-
-**Deliverable:** A `storage-cassandra` crate implementing the storage traits with native consistency mapping.
-
-**Value:** Enables deployment Model 4. Cassandra's native clustering provides HA without external replication setup.
-
-**Scope:**
-- Implement storage traits against Cassandra.
-- Map `ConsistencyLevel::Strong` → `QUORUM`, `ConsistencyLevel::Eventually` → `ONE`.
-- Cassandra's partition key model maps naturally to DynamoDB's.
-- No separate primary/replica config — Cassandra handles it.
-
-### Stage 5: MongoDB Storage Backend (Future)
-
-**Deliverable:** A `storage-mongodb` crate implementing the storage traits with replica set awareness.
-
-**Value:** Enables deployment Model 4 with MongoDB. MongoDB replica sets provide automatic failover.
-
-**Scope:**
-- Implement storage traits against MongoDB.
-- Map `ConsistencyLevel::Strong` → `readPreference: primary`, `ConsistencyLevel::Eventually` → `readPreference: secondaryPreferred`.
-- MongoDB's document model maps naturally to DynamoDB items.
-
 ## 10. Background Worker Coordination
 
 ### Problem
@@ -537,8 +508,6 @@ Each frontend attempts to acquire the lock on its worker tick interval. If it ge
 - No explicit TTL/lease mechanism is needed for PostgreSQL.
 - A crashed frontend's locks are released when PostgreSQL cleans up the dead connection.
 - The instance registry heartbeat (§13) is for **observability only**, not for lock management.
-
-For Cassandra/MongoDB: lightweight transactions (LWT) or findAndModify with TTL-based expiry (since these backends don't have session-scoped locks).
 
 ## 11. Failure Modes and Recovery
 

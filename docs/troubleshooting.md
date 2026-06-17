@@ -27,6 +27,26 @@ pg_ctl -D ~/pgdata status          # check if running
 pg_ctl -D ~/pgdata -l ~/pgdata/server.log start  # start it
 ```
 
+### `Failed to connect to postgres: Connection error: error with configuration: empty host`
+
+**Cause:** The connection string in `extenddb.toml` has an invalid format, typically from using a Unix socket path with `--pg-host` during `extenddb init` in version tagged 0.1.
+
+**Fix:** Edit `extenddb.toml` and manually percent-encode the Unix socket path in the connection string:
+```toml
+# Before (invalid):
+connection_string = "postgresql://extenddb:***@/var/run/postgresql:5432/extenddb_catalog"
+
+# After (valid):
+connection_string = "postgresql://extenddb:***@%2Fvar%2Frun%2Fpostgresql:5432/extenddb_catalog"
+```
+
+Also update the catalog database:
+```bash
+psql extenddb_catalog -c "UPDATE settings SET value='postgresql://extenddb:***@%2Fvar%2Frun%2Fpostgresql:5432/extenddb' WHERE key='data_database_connection_string';"
+```
+
+**Prevention:** This issue is fixed in versions after 0.1, which automatically encode Unix socket paths correctly.
+
 ### `password authentication failed for user "extenddb"`
 
 **Cause:** The PostgreSQL `extenddb` user doesn't exist or the password doesn't match.

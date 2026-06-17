@@ -21,7 +21,7 @@ import uuid
 import boto3
 import pytest
 from botocore.exceptions import ClientError
-from conftest import wait_for_active, wait_for_deleted
+from conftest import _poll_interval, wait_for_active, wait_for_deleted
 # EXTENDDB_TEST_ENDPOINT is required — devtools/run-tests validates this.
 # Tests will fail with KeyError if the env var is missing.
 @pytest.fixture(scope="module")
@@ -100,6 +100,36 @@ def _drain_all_shards(
             if not resp.get("Records"):
                 break
     return all_records
+
+
+def _wait_for_stream_records(
+    streams_client, stream_arn: str, min_count: int,
+    prefix: str | None = None, timeout: float = 5.0,
+    iterator_type: str = "TRIM_HORIZON",
+    sequence_number: str | None = None,
+) -> list[dict]:
+    """Poll stream until at least min_count records are available.
+
+    If prefix is given, only count records whose pk starts with that prefix.
+    Returns all records found (not just the filtered ones).
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        records = _drain_all_shards(
+            streams_client, stream_arn, iterator_type,
+            sequence_number=sequence_number,
+        )
+        if prefix:
+            matching = [
+                r for r in records
+                if r["dynamodb"]["Keys"]["pk"]["S"].startswith(prefix)
+            ]
+        else:
+            matching = records
+        if len(matching) >= min_count:
+            return records
+        time.sleep(_poll_interval())
+    return records
 class TestListStreams:
     """ListStreams operation tests."""
 
@@ -153,9 +183,8 @@ class TestIteratorAdvancement:
                 TableName=table_name,
                 Item={"pk": {"S": f"adv-{i}"}, "val": {"N": str(i)}},
             )
-        time.sleep(0.5)
 
-        # First pass: drain all records.
+        # First pass: drain all records, polling until we have them.
         desc = streams_client.describe_stream(StreamArn=stream_arn)
         shards = desc["StreamDescription"]["Shards"]
         shard_iters: dict[str, str | None] = {}
@@ -170,7 +199,8 @@ class TestIteratorAdvancement:
             shard_iters[shard["ShardId"]] = it["ShardIterator"]
 
         # Read until we get all records.
-        for _ in range(10):
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
             for sid in list(shard_iters):
                 it = shard_iters[sid]
                 if not it:
@@ -180,7 +210,7 @@ class TestIteratorAdvancement:
                 shard_iters[sid] = resp.get("NextShardIterator")
             if len(first_pass_records) >= n:
                 break
-            time.sleep(0.3)
+            time.sleep(_poll_interval())
 
         assert len(first_pass_records) >= n
 
@@ -226,7 +256,7 @@ class TestIteratorAdvancement:
                 shard_iters[sid] = resp.get("NextShardIterator")
             if not any_records:
                 break
-            time.sleep(0.2)
+            time.sleep(_poll_interval())
 
         # Empty poll — should return 0 records and a valid NextShardIterator.
         for sid, it in shard_iters.items():
@@ -242,15 +272,20 @@ class TestIteratorAdvancement:
             TableName=table_name,
             Item={"pk": {"S": "empty-poll-test"}, "data": {"S": "hello"}},
         )
-        time.sleep(0.5)
 
-        # Poll again — should get exactly the new record.
+        # Poll again until we get the new record.
         new_records: list[dict] = []
-        for sid, it in shard_iters.items():
-            if not it:
-                continue
-            resp = streams_client.get_records(ShardIterator=it, Limit=100)
-            new_records.extend(resp.get("Records", []))
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            for sid, it in shard_iters.items():
+                if not it:
+                    continue
+                resp = streams_client.get_records(ShardIterator=it, Limit=100)
+                new_records.extend(resp.get("Records", []))
+                shard_iters[sid] = resp.get("NextShardIterator")
+            if new_records:
+                break
+            time.sleep(_poll_interval())
 
         assert len(new_records) == 1
         assert new_records[0]["dynamodb"]["Keys"]["pk"]["S"] == "empty-poll-test"
@@ -269,9 +304,10 @@ class TestExactlyOnceDelivery:
                 TableName=table_name,
                 Item={"pk": {"S": pk}, "seq": {"N": str(i)}},
             )
-        time.sleep(1)
 
-        records = _drain_all_shards(streams_client, stream_arn)
+        records = _wait_for_stream_records(
+            streams_client, stream_arn, min_count=n, prefix="exact-"
+        )
         # Filter to only our records (table may have records from other tests).
         our_records = [
             r for r in records
@@ -302,7 +338,11 @@ class TestExactlyOnceDelivery:
                 TableName=table_name,
                 Item={"pk": {"S": pk}, "seq": {"N": str(i)}},
             )
-        time.sleep(1)
+
+        # Wait for records to be available before doing incremental polling.
+        _wait_for_stream_records(
+            streams_client, stream_arn, min_count=n, prefix="incr-"
+        )
 
         desc = streams_client.describe_stream(StreamArn=stream_arn)
         shards = desc["StreamDescription"]["Shards"]
@@ -355,7 +395,11 @@ class TestInOrderDelivery:
                 TableName=table_name,
                 Item={"pk": {"S": f"order-{i}"}, "val": {"N": str(i)}},
             )
-        time.sleep(0.5)
+
+        # Wait for records to be available.
+        _wait_for_stream_records(
+            streams_client, stream_arn, min_count=5, prefix="order-"
+        )
 
         desc = streams_client.describe_stream(StreamArn=stream_arn)
         for shard in desc["StreamDescription"]["Shards"]:
@@ -392,8 +436,9 @@ class TestIteratorTypes:
             TableName=table_name,
             Item={"pk": {"S": "horizon-1"}, "v": {"S": "a"}},
         )
-        time.sleep(0.5)
-        records = _drain_all_shards(streams_client, stream_arn, "TRIM_HORIZON")
+        records = _wait_for_stream_records(
+            streams_client, stream_arn, min_count=1, prefix="horizon-"
+        )
         pks = [r["dynamodb"]["Keys"]["pk"]["S"] for r in records]
         assert "horizon-1" in pks
 
@@ -406,7 +451,10 @@ class TestIteratorTypes:
             TableName=table_name,
             Item={"pk": {"S": "latest-before"}, "v": {"S": "old"}},
         )
-        time.sleep(0.5)
+        # Wait for it to appear in the stream.
+        _wait_for_stream_records(
+            streams_client, stream_arn, min_count=1, prefix="latest-before"
+        )
 
         # Get LATEST iterators.
         desc = streams_client.describe_stream(StreamArn=stream_arn)
@@ -424,13 +472,19 @@ class TestIteratorTypes:
             TableName=table_name,
             Item={"pk": {"S": "latest-after"}, "v": {"S": "new"}},
         )
-        time.sleep(0.5)
 
-        # Read with LATEST iterators — should see "after" but not "before".
+        # Poll with LATEST iterators until we see the "after" item.
         records: list[dict] = []
-        for sid, it in shard_iters.items():
-            resp = streams_client.get_records(ShardIterator=it, Limit=100)
-            records.extend(resp.get("Records", []))
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            for sid, it in shard_iters.items():
+                resp = streams_client.get_records(ShardIterator=it, Limit=100)
+                records.extend(resp.get("Records", []))
+                shard_iters[sid] = resp.get("NextShardIterator", it)
+            pks = [r["dynamodb"]["Keys"]["pk"]["S"] for r in records]
+            if "latest-after" in pks:
+                break
+            time.sleep(_poll_interval())
 
         pks = [r["dynamodb"]["Keys"]["pk"]["S"] for r in records]
         assert "latest-after" in pks
@@ -443,10 +497,11 @@ class TestIteratorTypes:
             TableName=table_name,
             Item={"pk": {"S": "at-seq-test"}, "v": {"S": "x"}},
         )
-        time.sleep(0.5)
 
-        # Find the record's sequence number.
-        records = _drain_all_shards(streams_client, stream_arn, "TRIM_HORIZON")
+        # Wait for the record to appear, then find its sequence number.
+        records = _wait_for_stream_records(
+            streams_client, stream_arn, min_count=1, prefix="at-seq-test"
+        )
         target = [
             r for r in records
             if r["dynamodb"]["Keys"]["pk"]["S"] == "at-seq-test"
@@ -484,12 +539,18 @@ class TestIteratorTypes:
             TableName=table_name,
             Item={"pk": {"S": "after-seq-1"}, "v": {"S": "first"}},
         )
-        time.sleep(0.3)
+        # Wait for first to appear before writing second.
+        _wait_for_stream_records(
+            streams_client, stream_arn, min_count=1, prefix="after-seq-1"
+        )
         dynamodb_client.put_item(
             TableName=table_name,
             Item={"pk": {"S": "after-seq-2"}, "v": {"S": "second"}},
         )
-        time.sleep(0.5)
+        # Wait for both to appear.
+        _wait_for_stream_records(
+            streams_client, stream_arn, min_count=1, prefix="after-seq-2"
+        )
 
         # Get all records to find the first item's sequence number.
         all_records = _drain_all_shards(streams_client, stream_arn, "TRIM_HORIZON")
@@ -534,13 +595,19 @@ class TestMixedWorkload:
             TableName=table_name,
             Key={"pk": {"S": pk}},
         )
-        time.sleep(1)
 
-        records = _drain_all_shards(streams_client, stream_arn, "TRIM_HORIZON")
-        our_records = [
-            r for r in records
-            if r["dynamodb"]["Keys"]["pk"]["S"] == pk
-        ]
+        # Poll until we have all 3 events for this pk.
+        deadline = time.monotonic() + 5.0
+        our_records: list[dict] = []
+        while time.monotonic() < deadline:
+            records = _drain_all_shards(streams_client, stream_arn, "TRIM_HORIZON")
+            our_records = [
+                r for r in records
+                if r["dynamodb"]["Keys"]["pk"]["S"] == pk
+            ]
+            if len(our_records) >= 3:
+                break
+            time.sleep(_poll_interval())
 
         events = [r["eventName"] for r in our_records]
         assert events == ["INSERT", "MODIFY", "REMOVE"], (

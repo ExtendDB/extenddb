@@ -69,8 +69,8 @@ impl PreparedOp {
     /// Approximate item size for transaction size limit enforcement.
     ///
     /// For Put operations, this returns the exact item size. For Update, Delete,
-    /// and ConditionCheck, the full item is not yet available at validation time
-    /// (it will be fetched during execution). DynamoDB's 4MB limit counts the
+    /// and `ConditionCheck`, the full item is not yet available at validation time
+    /// (it will be fetched during execution). `DynamoDB`'s 4MB limit counts the
     /// full item size as it exists or will exist post-mutation.
     ///
     /// To avoid bypassing the limit with updates that produce large items, we
@@ -86,8 +86,7 @@ impl PreparedOp {
                 // Use key size + expression attribute values size as a better
                 // approximation of the data involved in the update.
                 let key_size = extenddb_core::types::item_size_bytes(key);
-                let values_size: usize =
-                    maps.values.values().map(attribute_value_size).sum();
+                let values_size: usize = maps.values.values().map(attribute_value_size).sum();
                 key_size + values_size
             }
         }
@@ -205,24 +204,6 @@ impl PreparedOp {
             Self::ConditionCheck { .. } => return None,
         };
         capacity_helpers::item_metrics(ricm, &key_info.key_schema, item_or_key, key_info.has_lsi)
-    }
-}
-
-/// Parse an optional condition expression string.
-pub(crate) fn parse_optional_condition(
-    expr: Option<&str>,
-    limits: &extenddb_core::limits::LimitsConfig,
-) -> Result<Option<extenddb_core::expression::Expr>, DynamoDbError> {
-    match expr {
-        Some(s) if !s.is_empty() => {
-            let tokens = crate::expression_helpers::tokenize_expression(s, limits)?;
-            let ast = extenddb_core::expression::parse_condition_with_depth_limit(
-                &tokens,
-                limits.max_expression_depth,
-            )?;
-            Ok(Some(ast))
-        }
-        _ => Ok(None),
     }
 }
 

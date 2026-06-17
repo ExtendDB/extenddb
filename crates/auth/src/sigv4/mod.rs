@@ -3,7 +3,7 @@
 
 //! AWS Signature Version 4 verification.
 //!
-//! Implements server-side SigV4 verification: parsing the `Authorization` header,
+//! Implements server-side `SigV4` verification: parsing the `Authorization` header,
 //! reconstructing the canonical request, deriving the signing key, and performing
 //! constant-time signature comparison.
 

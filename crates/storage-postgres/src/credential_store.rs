@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Database-backed credential store for SigV4 authentication.
+//! Database-backed credential store for `SigV4` authentication.
 //!
 //! Implements `extenddb_auth::CredentialStore` by looking up access keys and
 //! session credentials from the catalog database, decrypting secrets with
@@ -57,7 +57,7 @@ fn decrypt_secret(encrypted: &[u8], key_b64: &str, aad: &str) -> Result<String, 
         .map_err(|e| format!("decrypted secret is not valid UTF-8: {e}"))
 }
 
-/// Credential store backed by the catalog PostgreSQL database.
+/// Credential store backed by the catalog `PostgreSQL` database.
 ///
 /// The `encryption_key` is zeroed from memory on drop.
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -72,6 +72,7 @@ impl DbCredentialStore {
     /// Create a new credential store.
     ///
     /// `encryption_key` is the base64-encoded 32-byte key from the `settings` table.
+    #[must_use]
     pub fn new(pool: PgPool, encryption_key: String) -> Self {
         Self {
             pool,
@@ -138,6 +139,7 @@ impl DbCredentialStore {
             is_session: false,
             session_token: None,
             is_active,
+            expires_at: None,
         }))
     }
 
@@ -195,6 +197,7 @@ impl DbCredentialStore {
             is_session: true,
             session_token: Some(session_token),
             is_active: true,
+            expires_at: Some(expires_at),
         }))
     }
 }

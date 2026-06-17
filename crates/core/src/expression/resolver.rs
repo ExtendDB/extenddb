@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::error::DynamoDbError;
 use crate::types::AttributeValue;
 
+use super::ast::Expr;
 use super::ast::PathElement;
 
 /// Resolved expression attribute names and values.
@@ -93,10 +94,10 @@ impl ExpressionMaps {
     /// existing behavior.
     pub fn pre_parse_numerics(&mut self) {
         for (key, value) in &self.values {
-            if let AttributeValue::N(n) = value {
-                if let Ok(d) = n.parse::<bigdecimal::BigDecimal>() {
-                    self.parsed_numerics.insert(key.clone(), d);
-                }
+            if let AttributeValue::N(n) = value
+                && let Ok(d) = n.parse::<bigdecimal::BigDecimal>()
+            {
+                self.parsed_numerics.insert(key.clone(), d);
             }
         }
     }
@@ -199,6 +200,58 @@ pub fn resolve_element_name<'a>(
     }
 }
 
+/// Reject `ExpressionAttributeNames`/`Values` supplied with no expression that
+/// can reference them. Matches Amazon `DynamoDB`:
+///
+/// - names: `ExpressionAttributeNames can only be specified when using expressions`
+///   (no suffix), for every API.
+/// - values: `ExpressionAttributeValues can only be specified when using
+///   expressions: <params> is/are null`, listing the value-capable expression
+///   parameter(s) of the API.
+///
+/// `name_expr_present` is true when any expression that can carry a `#name` is
+/// present (projection, condition, filter, key condition, update).
+/// `value_expr_present` is true when any expression that can carry a `:value` is
+/// present (condition, filter, key condition, update; not projection).
+/// `value_expr_params` is the API's static list of value-capable expression
+/// parameter kinds, used to build the values suffix. An empty list yields no
+/// suffix (matching Query).
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` when a map is supplied with no
+/// referencing expression.
+pub fn validate_expression_param_usage(
+    names: Option<&HashMap<String, String>>,
+    name_expr_present: bool,
+    values: Option<&HashMap<String, AttributeValue>>,
+    value_expr_present: bool,
+    value_expr_params: &[super::ExpressionKind],
+) -> Result<(), DynamoDbError> {
+    if !name_expr_present && names.is_some_and(|m| !m.is_empty()) {
+        return Err(DynamoDbError::ValidationException(
+            "ExpressionAttributeNames can only be specified when using expressions".to_owned(),
+        ));
+    }
+    if !value_expr_present && values.is_some_and(|m| !m.is_empty()) {
+        let base = "ExpressionAttributeValues can only be specified when using expressions";
+        let msg = match value_expr_params {
+            [] => base.to_owned(),
+            [one] => format!("{base}: {one} is null"),
+            many => {
+                let joined = many
+                    .iter()
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                format!("{base}: {joined} are null")
+            }
+        };
+        return Err(DynamoDbError::ValidationException(msg));
+    }
+    Ok(())
+}
+
 /// Validate that all provided ExpressionAttributeNames/Values were used.
 ///
 /// Collects `#name` and `:value` references from the given expressions,
@@ -287,6 +340,46 @@ fn collect_expr_refs(
     }
 }
 
+/// Walk an `Expr` tree and append every `Expr::Placeholder(name)` reference to `out`.
+///
+/// Used by `UpdateItem` depth validation: for each `SET` action's right-hand
+/// side, collect the EAV placeholders referenced (directly or via
+/// `if_not_exists`, `list_append`, arithmetic, etc.). Resolving those names
+/// against the `ExpressionMaps` yields the set of attribute values that will
+/// be stored, so their nesting depth must be validated.
+pub fn collect_value_placeholders(expr: &super::ast::Expr, out: &mut Vec<String>) {
+    use super::ast::Expr;
+    match expr {
+        Expr::Placeholder(name) => out.push(name.clone()),
+        Expr::Path(_) => {}
+        Expr::Compare { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
+            collect_value_placeholders(left, out);
+            collect_value_placeholders(right, out);
+        }
+        Expr::And(l, r) | Expr::Or(l, r) => {
+            collect_value_placeholders(l, out);
+            collect_value_placeholders(r, out);
+        }
+        Expr::Not(inner) => collect_value_placeholders(inner, out),
+        Expr::Function { args, .. } => {
+            for a in args {
+                collect_value_placeholders(a, out);
+            }
+        }
+        Expr::Between { operand, low, high } => {
+            collect_value_placeholders(operand, out);
+            collect_value_placeholders(low, out);
+            collect_value_placeholders(high, out);
+        }
+        Expr::In { operand, list } => {
+            collect_value_placeholders(operand, out);
+            for i in list {
+                collect_value_placeholders(i, out);
+            }
+        }
+    }
+}
+
 fn collect_action_refs(
     action: &super::ast::UpdateAction,
     names: &mut std::collections::HashSet<String>,
@@ -306,10 +399,10 @@ fn collect_action_refs(
 
 fn collect_path_refs(elements: &[PathElement], names: &mut std::collections::HashSet<String>) {
     for el in elements {
-        if let PathElement::Attribute(name) = el {
-            if let Some(ref_name) = name.strip_prefix('#') {
-                names.insert(ref_name.to_owned());
-            }
+        if let PathElement::Attribute(name) = el
+            && let Some(ref_name) = name.strip_prefix('#')
+        {
+            names.insert(ref_name.to_owned());
         }
     }
 }
@@ -318,6 +411,7 @@ fn collect_path_refs(elements: &[PathElement], names: &mut std::collections::Has
 ///
 /// Returns `(used_names, used_values)` sets suitable for passing to
 /// `validate_unused_attributes`.
+#[must_use]
 pub fn collect_key_condition_refs(
     kc: &super::key_condition::KeyCondition,
 ) -> (
@@ -358,4 +452,245 @@ pub fn collect_key_condition_refs(
     }
 
     (names, values)
+}
+
+/// Validate `begins_with` operand types in a parsed expression.
+///
+/// `DynamoDB` rejects `begins_with(path, value)` upfront when `value` is not
+/// a string or binary type. This validation runs before evaluation so that
+/// empty scans/queries still reject invalid operand types.
+///
+/// Returns `Ok(())` if all `begins_with` calls have valid operand types,
+/// or `Err(ValidationException)` with the appropriate error message.
+pub fn validate_begins_with_operands(
+    expr: &Expr,
+    maps: &ExpressionMaps,
+) -> Result<(), DynamoDbError> {
+    match expr {
+        Expr::Function { name, args } if name == "begins_with" => {
+            if args.len() == 2
+                && let Expr::Placeholder(ref placeholder) = args[1]
+                && let Some(val) = maps.values.get(placeholder)
+                && !matches!(val, AttributeValue::S(_) | AttributeValue::B(_))
+            {
+                let type_code = match val {
+                    AttributeValue::N(_) => "N",
+                    AttributeValue::Bool(_) => "BOOL",
+                    AttributeValue::Null => "NULL",
+                    AttributeValue::L(_) => "L",
+                    AttributeValue::M(_) => "M",
+                    AttributeValue::SS(_) => "SS",
+                    AttributeValue::NS(_) => "NS",
+                    AttributeValue::BS(_) => "BS",
+                    _ => "UNKNOWN",
+                };
+                return Err(DynamoDbError::ValidationException(format!(
+                    "Incorrect operand type for operator or function; operator or function: begins_with, operand type: {type_code}"
+                )));
+            }
+            Ok(())
+        }
+        Expr::And(left, right) | Expr::Or(left, right) => {
+            validate_begins_with_operands(left, maps)?;
+            validate_begins_with_operands(right, maps)
+        }
+        Expr::Not(inner) => validate_begins_with_operands(inner, maps),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expression::ast::{ArithOp, Expr, PathElement};
+    use crate::expression::parser::parse_condition;
+    use crate::expression::tokenizer::tokenize;
+    use std::collections::BTreeSet;
+
+    fn parse(input: &str) -> Expr {
+        let tokens = tokenize(input).unwrap();
+        parse_condition(&tokens).unwrap()
+    }
+
+    fn maps_with(key: &str, val: AttributeValue) -> ExpressionMaps {
+        let mut values = HashMap::new();
+        values.insert(key.to_owned(), val);
+        ExpressionMaps::new(HashMap::new(), values)
+    }
+
+    #[test]
+    fn begins_with_rejects_number_upfront() {
+        let expr = parse("begins_with(pk, :n)");
+        let maps = maps_with("n", AttributeValue::N("1".into()));
+        let err = validate_begins_with_operands(&expr, &maps).unwrap_err();
+        assert!(err.to_string().contains("operand type: N"));
+    }
+
+    #[test]
+    fn begins_with_rejects_bool_upfront() {
+        let expr = parse("begins_with(pk, :n)");
+        let maps = maps_with("n", AttributeValue::Bool(true));
+        let err = validate_begins_with_operands(&expr, &maps).unwrap_err();
+        assert!(err.to_string().contains("operand type: BOOL"));
+    }
+
+    #[test]
+    fn begins_with_rejects_null_upfront() {
+        let expr = parse("begins_with(pk, :n)");
+        let maps = maps_with("n", AttributeValue::Null);
+        let err = validate_begins_with_operands(&expr, &maps).unwrap_err();
+        assert!(err.to_string().contains("operand type: NULL"));
+    }
+
+    #[test]
+    fn begins_with_rejects_list_upfront() {
+        let expr = parse("begins_with(pk, :n)");
+        let maps = maps_with("n", AttributeValue::L(vec![]));
+        let err = validate_begins_with_operands(&expr, &maps).unwrap_err();
+        assert!(err.to_string().contains("operand type: L"));
+    }
+
+    #[test]
+    fn begins_with_rejects_map_upfront() {
+        let expr = parse("begins_with(pk, :n)");
+        let maps = maps_with("n", AttributeValue::M(BTreeMap::new()));
+        let err = validate_begins_with_operands(&expr, &maps).unwrap_err();
+        assert!(err.to_string().contains("operand type: M"));
+    }
+
+    #[test]
+    fn begins_with_rejects_string_set_upfront() {
+        let expr = parse("begins_with(pk, :n)");
+        let maps = maps_with("n", AttributeValue::SS(BTreeSet::from(["a".into()])));
+        let err = validate_begins_with_operands(&expr, &maps).unwrap_err();
+        assert!(err.to_string().contains("operand type: SS"));
+    }
+
+    #[test]
+    fn begins_with_rejects_number_set_upfront() {
+        let expr = parse("begins_with(pk, :n)");
+        let maps = maps_with("n", AttributeValue::NS(BTreeSet::from(["1".into()])));
+        let err = validate_begins_with_operands(&expr, &maps).unwrap_err();
+        assert!(err.to_string().contains("operand type: NS"));
+    }
+
+    #[test]
+    fn begins_with_rejects_binary_set_upfront() {
+        let expr = parse("begins_with(pk, :n)");
+        let maps = maps_with("n", AttributeValue::BS(BTreeSet::from([vec![1u8]])));
+        let err = validate_begins_with_operands(&expr, &maps).unwrap_err();
+        assert!(err.to_string().contains("operand type: BS"));
+    }
+
+    #[test]
+    fn begins_with_accepts_string() {
+        let expr = parse("begins_with(pk, :n)");
+        let maps = maps_with("n", AttributeValue::S("hello".into()));
+        assert!(validate_begins_with_operands(&expr, &maps).is_ok());
+    }
+
+    #[test]
+    fn begins_with_accepts_binary() {
+        let expr = parse("begins_with(pk, :n)");
+        let maps = maps_with("n", AttributeValue::B(vec![1, 2, 3]));
+        assert!(validate_begins_with_operands(&expr, &maps).is_ok());
+    }
+
+    #[test]
+    fn begins_with_nested_in_and_rejected() {
+        let expr = parse("pk = :pk AND begins_with(sk, :n)");
+        let mut values = HashMap::new();
+        values.insert("pk".to_owned(), AttributeValue::S("x".into()));
+        values.insert("n".to_owned(), AttributeValue::N("1".into()));
+        let maps = ExpressionMaps::new(HashMap::new(), values);
+        let err = validate_begins_with_operands(&expr, &maps).unwrap_err();
+        assert!(err.to_string().contains("operand type: N"));
+    }
+
+    #[test]
+    fn begins_with_nested_in_or_rejected() {
+        let expr = parse("pk = :pk OR begins_with(sk, :n)");
+        let mut values = HashMap::new();
+        values.insert("pk".to_owned(), AttributeValue::S("x".into()));
+        values.insert("n".to_owned(), AttributeValue::N("1".into()));
+        let maps = ExpressionMaps::new(HashMap::new(), values);
+        let err = validate_begins_with_operands(&expr, &maps).unwrap_err();
+        assert!(err.to_string().contains("operand type: N"));
+    }
+
+    #[test]
+    fn begins_with_nested_in_not_rejected() {
+        let expr = parse("NOT begins_with(pk, :n)");
+        let maps = maps_with("n", AttributeValue::N("1".into()));
+        let err = validate_begins_with_operands(&expr, &maps).unwrap_err();
+        assert!(err.to_string().contains("operand type: N"));
+    }
+
+    fn placeholder(s: &str) -> Expr {
+        Expr::Placeholder(s.to_owned())
+    }
+
+    #[test]
+    fn collect_value_placeholders_finds_direct_reference() {
+        let mut out = Vec::new();
+        collect_value_placeholders(&placeholder(":d"), &mut out);
+        assert_eq!(out, vec![":d".to_owned()]);
+    }
+
+    #[test]
+    fn collect_value_placeholders_walks_function_args() {
+        // SET v = if_not_exists(path, :default)
+        let expr = Expr::Function {
+            name: "if_not_exists".to_owned(),
+            args: vec![
+                Expr::Path(vec![PathElement::Attribute("path".to_owned())]),
+                placeholder(":default"),
+            ],
+        };
+        let mut out = Vec::new();
+        collect_value_placeholders(&expr, &mut out);
+        assert_eq!(out, vec![":default".to_owned()]);
+    }
+
+    #[test]
+    fn collect_value_placeholders_walks_arithmetic() {
+        // SET v = :a + :b
+        let expr = Expr::Arithmetic {
+            left: Box::new(placeholder(":a")),
+            op: ArithOp::Add,
+            right: Box::new(placeholder(":b")),
+        };
+        let mut out = Vec::new();
+        collect_value_placeholders(&expr, &mut out);
+        assert_eq!(out, vec![":a".to_owned(), ":b".to_owned()]);
+    }
+
+    #[test]
+    fn collect_value_placeholders_walks_nested_function() {
+        // SET v = list_append(:base, list_append(:extra, :more))
+        let expr = Expr::Function {
+            name: "list_append".to_owned(),
+            args: vec![
+                placeholder(":base"),
+                Expr::Function {
+                    name: "list_append".to_owned(),
+                    args: vec![placeholder(":extra"), placeholder(":more")],
+                },
+            ],
+        };
+        let mut out = Vec::new();
+        collect_value_placeholders(&expr, &mut out);
+        assert_eq!(
+            out,
+            vec![":base".to_owned(), ":extra".to_owned(), ":more".to_owned()]
+        );
+    }
+
+    #[test]
+    fn collect_value_placeholders_path_only_yields_nothing() {
+        let expr = Expr::Path(vec![PathElement::Attribute("address".to_owned())]);
+        let mut out = Vec::new();
+        collect_value_placeholders(&expr, &mut out);
+        assert!(out.is_empty());
+    }
 }

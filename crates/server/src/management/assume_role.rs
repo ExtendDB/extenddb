@@ -119,14 +119,14 @@ pub async fn assume_role(
     }
 
     // Validate session policy if provided.
-    if let Some(ref sp) = request.session_policy {
-        if sp.get("Version").is_none() || sp.get("Statement").is_none() {
-            return (
-                StatusCode::BAD_REQUEST,
-                "Session policy must contain Version and Statement",
-            )
-                .into_response();
-        }
+    if let Some(ref sp) = request.session_policy
+        && (sp.get("Version").is_none() || sp.get("Statement").is_none())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Session policy must contain Version and Statement",
+        )
+            .into_response();
     }
 
     // Load the role and its trust policy.
@@ -163,6 +163,7 @@ pub async fn assume_role(
 
     generate_and_store_session(
         &*state.catalog_store,
+        &state.auth_cache,
         &account_id,
         &role_name,
         &request,
@@ -174,6 +175,7 @@ pub async fn assume_role(
 /// Generate ASIA* credentials, encrypt, store session, and return the response.
 async fn generate_and_store_session(
     store: &dyn extenddb_storage::CatalogStore,
+    auth_cache: &extenddb_auth::AuthCacheRegistry,
     account_id: &str,
     role_name: &str,
     request: &AssumeRoleRequest,
@@ -228,6 +230,15 @@ async fn generate_and_store_session(
         .await
     {
         Ok(()) => {
+            // Drop any negative-cached entry for this newly-issued access
+            // key (e.g. from a probe before the session existed). Also drop
+            // any cached session-data for this exact (role, session) tuple
+            // — overwriting an existing session via re-assume would
+            // otherwise serve stale policies/tags until TTL.
+            auth_cache.invalidate_credential(&access_key_id).await;
+            auth_cache
+                .invalidate_session(account_id, role_name, &request.session_name)
+                .await;
             tracing::warn!(
                 target: "extenddb::audit::manage",
                 "assume-role: account={}, role={}, session={}, caller={}",

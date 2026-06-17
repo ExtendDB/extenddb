@@ -84,7 +84,7 @@ f.appendChild(i);
     };
     let tls_line = match listen_url {
         Some(url) => format!(
-            r#"Self-signed TLS certificate bound to <strong>{}</strong>"#,
+            r"Self-signed TLS certificate bound to <strong>{}</strong>",
             escape(url),
         ),
         None => String::new(),
@@ -172,6 +172,7 @@ pub fn nav_bar(identity_label: &str) -> String {
 <a href="/console/accounts">Accounts</a>
 <a href="/console/metrics">Metrics</a>
 <a href="/console/settings">Settings</a>
+<a href="/console/cache">Cache</a>
 <span class="spacer"></span>
 <span>{identity}</span>
 <form class="inline" method="post" action="/console/logout">

@@ -65,7 +65,7 @@ inventory::submit! {
         backend: "postgres",
         deserializer: |table| {
             let config: PostgresStorageConfig = table.clone().try_into()
-                .map_err(|e: toml::de::Error| format!("Failed to parse postgres config: {}", e))?;
+                .map_err(|e: toml::de::Error| format!("Failed to parse postgres config: {e}"))?;
             Ok(Box::new(config) as Box<dyn extenddb_storage::config::StorageConfig>)
         },
     }
@@ -118,7 +118,7 @@ pub const CATALOG_VERSION: CatalogVersion = CatalogVersion::new(0, 0, 2);
 
 /// Minimum number of connections allowed per pool.
 ///
-/// Each DynamoDB request triggers an auth/authz query fanout against the
+/// Each `DynamoDB` request triggers an auth/authz query fanout against the
 /// catalog pool. Pools smaller than this floor starve under concurrent load.
 /// Configured values below the floor are clamped at startup with a warning.
 const MIN_POOL_SIZE: u32 = 10;
@@ -140,7 +140,7 @@ pub struct PostgresConfig {
 /// Uses two connection pools: `pool` for catalog metadata (tables, indexes,
 /// settings, accounts, IAM) and `data_pool` for per-DynamoDB-table data
 /// (`_ddb_*` tables, GSI tables). This separation allows the catalog and
-/// data to live in different PostgreSQL databases (Bug 1, P54).
+/// data to live in different `PostgreSQL` databases (Bug 1, P54).
 pub struct PostgresEngine {
     pub(crate) pool: PgPool,
     /// Connection pool for the data database where `_ddb_*` tables live.
@@ -232,6 +232,7 @@ impl PostgresEngine {
     ///
     /// Must be called after construction, before serving requests.
     /// Returns `&Self` for chaining.
+    #[must_use]
     pub fn start_gsi_workers(mut self) -> Self {
         self.gsi_queue = Some(gsi_queue::GsiQueue::spawn(self.data_pool.clone()));
         self
@@ -239,6 +240,7 @@ impl PostgresEngine {
 
     /// Returns a handle to the control plane notify, for use by the
     /// background poller task (F-3).
+    #[must_use]
     pub fn control_plane_notify(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.control_plane_notify)
     }
@@ -322,6 +324,7 @@ impl PostgresEngine {
 
     /// Returns a reference to the data pool for use by background workers
     /// that operate on `_ddb_*` tables (e.g., TTL cleanup, table size refresh).
+    #[must_use]
     pub fn data_pool(&self) -> &PgPool {
         &self.data_pool
     }
@@ -331,13 +334,13 @@ impl PostgresEngine {
 // ServerComponents Factory Registration
 // ============================================================================
 
-use extenddb_auth::BuiltinAuthProvider;
+use extenddb_auth::CredentialStore;
 use extenddb_storage::hooks::{ServerRuntimeHooks, WorkerContext};
 use extenddb_storage::server_components::{
     BackendError, ServerComponents, ServerComponentsRegistration,
 };
 
-/// Backend-specific runtime hooks for PostgreSQL.
+/// Backend-specific runtime hooks for `PostgreSQL`.
 struct PostgresRuntimeHooks {
     engine: Arc<PostgresEngine>,
     control_plane_notify: Arc<tokio::sync::Notify>,
@@ -356,7 +359,7 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
         let catalog_store = ctx.catalog_store.clone();
         tokio::spawn(async move {
             workers::poll_control_plane_transitions(storage_for_poller, cp_notify, catalog_store)
-                .await
+                .await;
         });
 
         // 2. Table size refresh worker
@@ -367,14 +370,14 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
         let storage_for_stream = self.engine.clone();
         let metrics = ctx.metrics.clone();
         tokio::spawn(async move {
-            workers::stream_record_cleanup_worker(storage_for_stream, metrics).await
+            workers::stream_record_cleanup_worker(storage_for_stream, metrics).await;
         });
 
         // 4. Idempotency token cleanup worker
         let storage_for_token = self.engine.clone();
         let metrics = ctx.metrics.clone();
         tokio::spawn(async move {
-            workers::idempotency_token_cleanup_worker(storage_for_token, metrics).await
+            workers::idempotency_token_cleanup_worker(storage_for_token, metrics).await;
         });
 
         // 5. TTL cleanup worker
@@ -387,7 +390,7 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
         let data_pool = self.engine.data_pool().clone();
         let metrics = ctx.metrics.clone();
         tokio::spawn(async move {
-            workers::pool_metrics_worker(catalog_pool, data_pool, metrics).await
+            workers::pool_metrics_worker(catalog_pool, data_pool, metrics).await;
         });
 
         // 7. GSI delay poller
@@ -504,8 +507,8 @@ inventory::submit! {
                 // Create auth provider
                 let enc_key = extenddb_storage::CatalogStore::cached_encryption_key(&*catalog_store)
                     .ok_or(BackendError::MissingEncryptionKey)?;
-                let cred_store = DbCredentialStore::new(catalog_pool.clone(), enc_key);
-                let auth_provider = Arc::new(BuiltinAuthProvider::new(cred_store));
+                let cred_store: Arc<dyn CredentialStore> =
+                    Arc::new(DbCredentialStore::new(catalog_pool.clone(), enc_key));
 
                 // Create runtime hooks
                 let runtime_hooks = Box::new(PostgresRuntimeHooks {
@@ -518,7 +521,7 @@ inventory::submit! {
                 Ok(ServerComponents {
                     engine,
                     catalog_store,
-                    auth_provider,
+                    credential_store: cred_store,
                     runtime_hooks: Some(runtime_hooks),
                 })
             })

@@ -42,6 +42,8 @@ pub fn parse_condition_with_depth_limit(
     tokens: &[Token],
     max_depth: usize,
 ) -> Result<Expr, DynamoDbError> {
+    parser_common::check_redundant_parens(tokens)
+        .map_err(|body| validation_err(&format!("Invalid ConditionExpression: {body}")))?;
     let mut pos = 0;
     let mut depth = 0;
     let expr = parse_or(tokens, &mut pos, &mut depth, max_depth)?;
@@ -462,5 +464,59 @@ mod tests {
         assert!(
             matches!(err, DynamoDbError::ValidationException(msg) if msg.contains("depth exceeded"))
         );
+    }
+
+    #[test]
+    fn redundant_parens_rejected() {
+        let cases = [
+            "((a = :v))",
+            "(((a = :v)))",
+            "((a = :v AND b = :v2))",
+            "((NOT (a = :v)))",
+            "(a = :v) AND ((b = :v2))",
+        ];
+        for expr in cases {
+            let tokens = tokenize(expr).unwrap();
+            let err = parse_condition(&tokens).unwrap_err();
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg) if msg.contains("redundant parentheses")),
+                "Expected redundant parens error for: {expr}, got: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_parens_accepted() {
+        let cases = [
+            "(a = :v)",
+            "(a = :v) AND (b = :v2)",
+            "((a = :v) AND (b = :v2))",
+            "(NOT (a = :v))",
+        ];
+        for expr in cases {
+            let tokens = tokenize(expr).unwrap();
+            assert!(
+                parse_condition(&tokens).is_ok(),
+                "Expected valid parse for: {expr}"
+            );
+        }
+    }
+
+    #[test]
+    fn redundant_parens_use_canonical_message() {
+        for expr in [
+            "((a = :v))",
+            "(((a = :v)))",
+            "((a = :v AND b = :v2))",
+            "((NOT (a = :v)))",
+        ] {
+            let tokens = tokenize(expr).unwrap();
+            let err = parse_condition(&tokens).unwrap_err();
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg)
+                    if msg == "Invalid ConditionExpression: The expression has redundant parentheses;"),
+                "expr {expr}: got {err:?}"
+            );
+        }
     }
 }

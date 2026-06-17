@@ -4,10 +4,15 @@
 //! Authentication and authorization for extenddb.
 //!
 //! Defines the `AuthProvider` trait for pluggable auth backends. Ships with
-//! `BuiltinAuthProvider` (full SigV4 verification with local credential store).
+//! `BuiltinAuthProvider` (full `SigV4` verification with local credential store).
 
+pub mod cache_registry;
+pub mod credential_cache;
 pub mod policy;
 pub mod sigv4;
+
+pub use cache_registry::{AuthCacheRegistry, AuthzCacheInvalidator, TableKeyInfoCacheInvalidator};
+pub use credential_cache::CachedCredentialStore;
 
 use axum::http::HeaderMap;
 use extenddb_core::error::DynamoDbError;
@@ -15,7 +20,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Auth provider trait — pluggable authentication.
 ///
-/// `BuiltinAuthProvider` performs SigV4 verification.
+/// `BuiltinAuthProvider` performs `SigV4` verification.
 /// Fix #11: Accept `&HeaderMap` directly to avoid per-request `HashMap` allocation.
 #[async_trait::async_trait]
 pub trait AuthProvider: Send + Sync {
@@ -69,6 +74,12 @@ pub struct StoredCredential {
     /// storage so the auth layer can produce the correct error response.
     #[zeroize(skip)]
     pub is_active: bool,
+    /// For session credentials: the absolute expiry time. Long-lived AKIA*
+    /// credentials set this to `None`. Auth checks this on every cache hit
+    /// so cached sessions don't outlive their `expires_at` window — the
+    /// storage layer's expiry check only fires on the cache-miss path.
+    #[zeroize(skip)]
+    pub expires_at: Option<time::OffsetDateTime>,
 }
 
 /// Trait for looking up credentials from storage.
@@ -91,10 +102,10 @@ pub trait CredentialStore: Send + Sync {
     ) -> Result<Option<StoredCredential>, DynamoDbError>;
 }
 
-/// SigV4 auth provider with local credential store.
+/// `SigV4` auth provider with local credential store.
 ///
 /// Parses the `Authorization` header, looks up the access key, decrypts the
-/// secret, verifies the SigV4 signature, and validates the request timestamp.
+/// secret, verifies the `SigV4` signature, and validates the request timestamp.
 /// Handles both long-lived (AKIA*) and temporary (ASIA* + X-Amz-Security-Token)
 /// credentials.
 pub struct BuiltinAuthProvider<C: CredentialStore> {
@@ -149,7 +160,10 @@ impl<C: CredentialStore + 'static> AuthProvider for BuiltinAuthProvider<C> {
 
         // For session credentials, verify X-Amz-Security-Token matches the stored token.
         // CB-12: Session expiration is enforced at the credential store layer (fail-closed).
-        // Expired sessions are never returned — the store returns ExpiredTokenException directly.
+        // Expired sessions are never returned — the storage layer returns
+        // ExpiredTokenException on the cache-miss path, and CachedCredentialStore
+        // re-validates `expires_at` on every cache hit before returning so cached
+        // entries cannot survive past their issued lifetime.
         if credential.is_session {
             let token = headers
                 .get("x-amz-security-token")
