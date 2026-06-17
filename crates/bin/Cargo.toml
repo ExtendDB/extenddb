@@ -14,12 +14,14 @@ path = "src/main.rs"
 [features]
 default = ["postgres"]
 postgres = ["extenddb-storage-postgres"]
+s3annotations = ["extenddb-storage-s3annotations"]
 
 [dependencies]
 extenddb-core = { workspace = true }
 extenddb-engine = { workspace = true }
 extenddb-storage = { workspace = true }
 extenddb-storage-postgres = { workspace = true, optional = true }
+extenddb-storage-s3annotations = { workspace = true, optional = true }
 extenddb-auth = { workspace = true }
 extenddb-server = { workspace = true }
 tokio = { workspace = true }

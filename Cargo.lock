@@ -852,6 +852,7 @@ dependencies = [
  "extenddb-server",
  "extenddb-storage",
  "extenddb-storage-postgres",
+ "extenddb-storage-s3annotations",
  "libc",
  "rand 0.9.4",
  "rcgen",
@@ -992,6 +993,20 @@ dependencies = [
  "tracing",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "extenddb-storage-s3annotations"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "extenddb-core",
+ "extenddb-storage",
+ "inventory",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

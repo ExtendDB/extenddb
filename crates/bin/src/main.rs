@@ -25,6 +25,13 @@ mod serve_helpers;
 mod util;
 mod workers;
 
+// The S3 Annotations backend registers itself via `inventory` at link time.
+// Nothing in this binary names the crate by path, so `extern crate` is what
+// forces the linker to include it — and thus its `BackendRegistration` — when
+// the `s3annotations` feature is enabled.
+#[cfg(feature = "s3annotations")]
+extern crate extenddb_storage_s3annotations;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
