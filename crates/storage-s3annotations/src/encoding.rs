@@ -40,7 +40,9 @@ pub const MAX_ANNOTATION_VALUE_BYTES: usize = 1024 * 1024;
 
 /// Maximum number of named annotations attached to a single object: 1,000, per
 /// the S3 Object Annotations limits. Because each item is encoded as one or
-/// more annotations on the sentinel object, this caps items-per-table at 1,000.
+/// more annotations on the sentinel object, a table holds at most 1,000 items —
+/// fewer when any item exceeds [`MAX_ANNOTATION_VALUE_BYTES`] and spills across
+/// multiple annotations.
 pub const MAX_ANNOTATIONS_PER_OBJECT: usize = 1000;
 
 /// Separator between the encoded partition key and encoded sort key within an
