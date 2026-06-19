@@ -8,6 +8,7 @@ members = [
     "crates/engine",
     "crates/storage",
     "crates/storage-postgres",
+    "crates/storage-dynamodb",
     "crates/auth",
     "crates/server",
     "crates/bin",
@@ -26,6 +27,7 @@ extenddb-cache = { path = "crates/cache" }
 extenddb-engine = { path = "crates/engine" }
 extenddb-storage = { path = "crates/storage" }
 extenddb-storage-postgres = { path = "crates/storage-postgres" }
+extenddb-storage-dynamodb = { path = "crates/storage-dynamodb" }
 extenddb-auth = { path = "crates/auth" }
 extenddb-server = { path = "crates/server" }
 
@@ -86,6 +88,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 syslog-tracing = "0.3"
 metrics = "0.24"
+
+# AWS SDK (DynamoDB-at-home backend)
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-dynamodb = "1"
+aws-smithy-runtime-api = "1"
 
 # Config
 clap = { version = "4", features = ["derive"] }
