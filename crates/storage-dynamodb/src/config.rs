@@ -60,6 +60,10 @@ impl extenddb_storage::config::StorageConfig for DynamoStorageConfig {
     fn clone_box(&self) -> Box<dyn extenddb_storage::config::StorageConfig> {
         Box::new(self.clone())
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[cfg(test)]
