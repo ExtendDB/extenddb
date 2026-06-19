@@ -54,10 +54,12 @@ impl DynamoBootstrapper {
                 StorageError::Internal("Missing [storage.dynamodb] section in config".into())
             })?;
 
-        let dynamo_config = DynamoStorageConfig::from_table(dynamo_table)
-            .map_err(|e| StorageError::Internal(format!("Invalid [storage.dynamodb] config: {e}")))?;
+        let dynamo_config = DynamoStorageConfig::from_table(dynamo_table).map_err(|e| {
+            StorageError::Internal(format!("Invalid [storage.dynamodb] config: {e}"))
+        })?;
 
-        let inner = Self::build_inner_bootstrapper(&dynamo_config.catalog_connection_string).await?;
+        let inner =
+            Self::build_inner_bootstrapper(&dynamo_config.catalog_connection_string).await?;
 
         Ok(Self {
             inner,
@@ -71,9 +73,13 @@ impl DynamoBootstrapper {
     /// the connection string encodes the app credentials. This mirrors how the
     /// Postgres bootstrapper handles connection strings that already carry
     /// app-level credentials.
-    async fn build_inner_bootstrapper(catalog_conn: &str) -> Result<PostgresBootstrapper, StorageError> {
-        let parts = extenddb_storage_postgres::parse_connection_string(catalog_conn)
-            .map_err(|e| StorageError::Internal(format!("invalid catalog connection string: {e}")))?;
+    async fn build_inner_bootstrapper(
+        catalog_conn: &str,
+    ) -> Result<PostgresBootstrapper, StorageError> {
+        let parts =
+            extenddb_storage_postgres::parse_connection_string(catalog_conn).map_err(|e| {
+                StorageError::Internal(format!("invalid catalog connection string: {e}"))
+            })?;
 
         // Derive the data_db name: strip the `_catalog` suffix if present.
         let data_db = parts
@@ -136,7 +142,9 @@ impl Bootstrapper for DynamoBootstrapper {
         env_user: Option<&str>,
         env_password: Option<&str>,
     ) -> OpResult<AdminBootstrapResult> {
-        self.inner.bootstrap_admin_user(env_user, env_password).await
+        self.inner
+            .bootstrap_admin_user(env_user, env_password)
+            .await
     }
 
     async fn is_catalog_initialized(&self) -> OpResult<bool> {

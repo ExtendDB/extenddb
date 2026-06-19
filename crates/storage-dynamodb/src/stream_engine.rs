@@ -109,10 +109,7 @@ impl StreamEngine for DynamoEngine {
         })
     }
 
-    fn next_sequence_number(
-        &self,
-        _shard_id: &str,
-    ) -> BoxFuture<'_, Result<String, StorageError>> {
+    fn next_sequence_number(&self, _shard_id: &str) -> BoxFuture<'_, Result<String, StorageError>> {
         // Maps to DynamoDB Streams shard management (sequence numbers are assigned by DynamoDB).
         Box::pin(async {
             Err(StorageError::Internal(

@@ -14,6 +14,7 @@ path = "src/main.rs"
 [features]
 default = ["postgres"]
 postgres = ["extenddb-storage-postgres"]
+dynamodb = ["extenddb-storage-dynamodb"]
 
 [dependencies]
 extenddb-auth = { workspace = true }
@@ -22,6 +23,7 @@ extenddb-core = { workspace = true }
 extenddb-engine = { workspace = true }
 extenddb-storage = { workspace = true }
 extenddb-storage-postgres = { workspace = true, optional = true }
+extenddb-storage-dynamodb = { workspace = true, optional = true }
 extenddb-server = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }

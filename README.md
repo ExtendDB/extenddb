@@ -22,6 +22,7 @@ A DynamoDB-compatible API adapter, ExtendDB speaks the DynamoDB wire protocol �
 - JSON metrics endpoint with DynamoDB CloudWatch-style metric names and dimensions
 - Daemon mode with syslog logging, plus `--foreground` for container and supervisor environments
 - PostgreSQL storage — use standard backup, replication, and HA tools
+- Optional `dynamodb` storage backend — store your data in actual DynamoDB while running ExtendDB yourself (data plane → DynamoDB, catalog → PostgreSQL); see [Differences from DynamoDB](docs/differences-from-dynamodb.md#the-dynamodb-storage-backend-dynamodb-at-home)
 
 ## Quick Start
 
@@ -179,6 +180,7 @@ crates/
   engine/           — operation handlers
   storage/          — storage trait definitions
   storage-postgres/ — PostgreSQL backend
+  storage-dynamodb/ — "DynamoDB at home" backend (data → real DynamoDB, catalog → PostgreSQL)
   auth/             — SigV4 verification, IAM policy engine
   server/           — HTTP server, management API, web console
   bin/              — CLI, config, daemon lifecycle

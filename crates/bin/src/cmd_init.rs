@@ -16,7 +16,7 @@ use crate::init_helpers::{generate_config, generate_tls_cert_if_needed};
 #[derive(Args)]
 #[allow(clippy::doc_markdown)] // Clap help text, not rustdoc
 pub struct InitArgs {
-    /// Storage backend (postgres) (default: postgres)
+    /// Storage backend (postgres, dynamodb) (default: postgres)
     #[arg(long, default_value = "postgres")]
     backend: Option<String>,
 

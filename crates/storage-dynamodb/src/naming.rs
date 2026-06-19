@@ -10,7 +10,9 @@ pub struct Namer {
 
 impl Namer {
     pub fn new(prefix: &str) -> Self {
-        Self { prefix: prefix.to_owned() }
+        Self {
+            prefix: prefix.to_owned(),
+        }
     }
 
     /// `<prefix><account_id>_<table>`
@@ -41,7 +43,10 @@ mod tests {
     #[test]
     fn physical_name_combines_prefix_account_table() {
         let n = Namer::new("athome_");
-        assert_eq!(n.physical("123456789012", "Orders"), "athome_123456789012_Orders");
+        assert_eq!(
+            n.physical("123456789012", "Orders"),
+            "athome_123456789012_Orders"
+        );
     }
 
     #[test]

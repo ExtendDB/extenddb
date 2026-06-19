@@ -36,20 +36,19 @@ impl MetadataEngine for DynamoEngine {
                 .await
                 .map_err(crate::errors::from_sdk_error)?;
 
-            let (time_to_live_status, attribute_name) =
-                match out.time_to_live_description() {
-                    Some(sdk_ttl) => {
-                        let status = match sdk_ttl.time_to_live_status() {
-                            Some(aws_sdk_dynamodb::types::TimeToLiveStatus::Enabled)
-                            | Some(aws_sdk_dynamodb::types::TimeToLiveStatus::Enabling) => {
-                                TimeToLiveStatus::Enabled
-                            }
-                            _ => TimeToLiveStatus::Disabled,
-                        };
-                        (status, sdk_ttl.attribute_name().map(str::to_owned))
-                    }
-                    None => (TimeToLiveStatus::Disabled, None),
-                };
+            let (time_to_live_status, attribute_name) = match out.time_to_live_description() {
+                Some(sdk_ttl) => {
+                    let status = match sdk_ttl.time_to_live_status() {
+                        Some(aws_sdk_dynamodb::types::TimeToLiveStatus::Enabled)
+                        | Some(aws_sdk_dynamodb::types::TimeToLiveStatus::Enabling) => {
+                            TimeToLiveStatus::Enabled
+                        }
+                        _ => TimeToLiveStatus::Disabled,
+                    };
+                    (status, sdk_ttl.attribute_name().map(str::to_owned))
+                }
+                None => (TimeToLiveStatus::Disabled, None),
+            };
             Ok(TimeToLiveDescription {
                 time_to_live_status,
                 attribute_name,
@@ -215,8 +214,7 @@ impl MetadataEngine for DynamoEngine {
                 let out = req.send().await.map_err(crate::errors::from_sdk_error)?;
 
                 for phys in out.table_names() {
-                    if let Some((account_id, table_name)) =
-                        parse_physical_table(phys, table_prefix)
+                    if let Some((account_id, table_name)) = parse_physical_table(phys, table_prefix)
                     {
                         pairs.push((account_id, table_name));
                     }
@@ -316,10 +314,7 @@ impl DynamoEngine {
     /// This is best-effort: if the incoming ARN is a stream or index ARN rather
     /// than a table ARN, parsing will fail and an error will be returned.
     /// The implementation only handles `arn:aws:dynamodb:...:table/<name>`.
-    async fn resolve_table_arn_from_extenddb_arn(
-        &self,
-        arn: &str,
-    ) -> Result<String, StorageError> {
+    async fn resolve_table_arn_from_extenddb_arn(&self, arn: &str) -> Result<String, StorageError> {
         // ARN format: arn:aws:dynamodb:<region>:<account_id>:table/<logical_name>
         // Split on ':' → ["arn", "aws", "dynamodb", "<region>", "<account_id>", "table/<name>"]
         let segments: Vec<&str> = arn.splitn(6, ':').collect();
@@ -330,13 +325,11 @@ impl DynamoEngine {
         }
         let account_id = segments[4];
         let resource = segments[5]; // e.g. "table/MyTable"
-        let logical_table_name = resource
-            .strip_prefix("table/")
-            .ok_or_else(|| {
-                StorageError::Validation(format!(
-                    "Only table ARNs are supported for tag operations (got resource '{resource}')"
-                ))
-            })?;
+        let logical_table_name = resource.strip_prefix("table/").ok_or_else(|| {
+            StorageError::Validation(format!(
+                "Only table ARNs are supported for tag operations (got resource '{resource}')"
+            ))
+        })?;
 
         let physical = self.namer.physical(account_id, logical_table_name);
         let out = self

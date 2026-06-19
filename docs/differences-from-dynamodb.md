@@ -8,10 +8,37 @@ adaptation when switching between ExtendDB and the real service.
 
 | Area | DynamoDB | ExtendDB |
 |------|----------|------|
-| Storage backend | Proprietary distributed storage | PostgreSQL |
+| Storage backend | Proprietary distributed storage | PostgreSQL (default), or the optional `dynamodb` backend (see below) |
 | Global Tables | CreateGlobalTable, replication | Not implemented (returns UnknownOperationException) |
 | DAX (Accelerator) | In-memory caching layer | Not applicable |
 | PartiQL | ExecuteStatement, BatchExecuteStatement | Not implemented (returns UnknownOperationException) |
+
+## The `dynamodb` Storage Backend ("DynamoDB at home")
+
+ExtendDB ships an optional `dynamodb` storage backend (build with
+`--features dynamodb`, select with `[storage] backend = "dynamodb"`). It forwards
+the **data plane** to a real DynamoDB endpoint via the AWS SDK, while the
+**catalog/IAM/auth plane** is delegated to the PostgreSQL backend. Run it yourself,
+point it at DynamoDB, and you are technically self-hosted — the entire point.
+
+| Area | Behavior with `backend = "dynamodb"` |
+|------|--------------------------------------|
+| Data plane (PutItem, GetItem, UpdateItem, DeleteItem, Query, Scan, transactions) | Forwarded to real DynamoDB |
+| Catalog / IAM / settings / metrics / rate-limits | Stored in PostgreSQL (`catalog_connection_string`) |
+| Table namespacing | ExtendDB is multi-tenant; physical DynamoDB tables are named `<table_prefix><account_id>_<table>` (default prefix `athome_`) |
+| TTL | Native DynamoDB TTL (`UpdateTimeToLive`); ExtendDB's TTL worker is a no-op |
+| Tags | Forwarded to DynamoDB `TagResource`/`UntagResource`/`ListTagsOfResource` (table ARNs only) |
+| Idempotency tokens | Forwarded as `ClientRequestToken`; DynamoDB manages its own ~10-minute window |
+| Streams | **Not implemented in v1** — each method errors naming the DynamoDB Streams call it maps to |
+| Backups / PITR | **Not implemented in v1** — each method errors naming the DynamoDB Backup call it maps to |
+| `UpdateItem` returning both old and new | DynamoDB returns only one per call; the backend prefers `ALL_NEW` when both are requested |
+| `update_table` GSI mutations | Not forwarded in v1 (table create/describe/delete and billing changes are) |
+| `index_info_by_table_id` | Not supported (DynamoDB has no TableId→name reverse lookup) |
+| `endpoint_url` | May point at DynamoDB Local — or at **another ExtendDB endpoint**, which is documented as a feature, not a bug (the near-identity encoding makes the stack composable) |
+
+Note that this backend still requires PostgreSQL for the catalog: your data is
+on-prem, but the bureaucracy that proves you're on-prem still needs a real
+database.
 
 ## Authentication and Authorization (AWS IAM/STS auth surface used by DynamoDB)
 

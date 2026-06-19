@@ -24,9 +24,7 @@ pub fn to_sdk(v: &CoreAttributeValue) -> aws_sdk_dynamodb::types::AttributeValue
         CoreAttributeValue::B(bytes) => Sdk::B(Blob::new(bytes.clone())),
         CoreAttributeValue::SS(set) => Sdk::Ss(set.iter().cloned().collect()),
         CoreAttributeValue::NS(set) => Sdk::Ns(set.iter().cloned().collect()),
-        CoreAttributeValue::BS(set) => {
-            Sdk::Bs(set.iter().map(|b| Blob::new(b.clone())).collect())
-        }
+        CoreAttributeValue::BS(set) => Sdk::Bs(set.iter().map(|b| Blob::new(b.clone())).collect()),
         CoreAttributeValue::Bool(b) => Sdk::Bool(*b),
         CoreAttributeValue::Null => Sdk::Null(true),
         CoreAttributeValue::L(list) => Sdk::L(list.iter().map(to_sdk).collect()),
@@ -49,19 +47,20 @@ pub fn from_sdk(v: &aws_sdk_dynamodb::types::AttributeValue) -> CoreAttributeVal
         Sdk::B(blob) => CoreAttributeValue::B(blob.as_ref().to_vec()),
         Sdk::Ss(vec) => CoreAttributeValue::SS(vec.iter().cloned().collect::<BTreeSet<_>>()),
         Sdk::Ns(vec) => CoreAttributeValue::NS(vec.iter().cloned().collect::<BTreeSet<_>>()),
-        Sdk::Bs(blobs) => {
-            CoreAttributeValue::BS(blobs.iter().map(|b| b.as_ref().to_vec()).collect::<BTreeSet<_>>())
-        }
+        Sdk::Bs(blobs) => CoreAttributeValue::BS(
+            blobs
+                .iter()
+                .map(|b| b.as_ref().to_vec())
+                .collect::<BTreeSet<_>>(),
+        ),
         Sdk::Bool(b) => CoreAttributeValue::Bool(*b),
         Sdk::Null(_) => CoreAttributeValue::Null,
         Sdk::L(list) => CoreAttributeValue::L(list.iter().map(from_sdk).collect()),
-        Sdk::M(map) => {
-            CoreAttributeValue::M(
-                map.iter()
-                    .map(|(k, v)| (k.clone(), from_sdk(v)))
-                    .collect::<BTreeMap<_, _>>(),
-            )
-        }
+        Sdk::M(map) => CoreAttributeValue::M(
+            map.iter()
+                .map(|(k, v)| (k.clone(), from_sdk(v)))
+                .collect::<BTreeMap<_, _>>(),
+        ),
         _ => {
             tracing::warn!("encountered unknown SDK AttributeValue variant; mapping to Null");
             CoreAttributeValue::Null
@@ -75,9 +74,7 @@ pub fn item_to_sdk(item: &CoreItem) -> HashMap<String, aws_sdk_dynamodb::types::
 }
 
 /// Convert a DynamoDB SDK item (HashMap) to an ExtendDB `Item`.
-pub fn item_from_sdk(
-    item: HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
-) -> CoreItem {
+pub fn item_from_sdk(item: HashMap<String, aws_sdk_dynamodb::types::AttributeValue>) -> CoreItem {
     item.into_iter().map(|(k, v)| (k, from_sdk(&v))).collect()
 }
 
@@ -120,18 +117,12 @@ mod tests {
 
     #[test]
     fn rt_string_set() {
-        round_trip(Core::SS(BTreeSet::from([
-            "a".to_string(),
-            "b".to_string(),
-        ])));
+        round_trip(Core::SS(BTreeSet::from(["a".to_string(), "b".to_string()])));
     }
 
     #[test]
     fn rt_number_set() {
-        round_trip(Core::NS(BTreeSet::from([
-            "1".to_string(),
-            "2".to_string(),
-        ])));
+        round_trip(Core::NS(BTreeSet::from(["1".to_string(), "2".to_string()])));
     }
 
     #[test]

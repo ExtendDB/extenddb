@@ -9,8 +9,8 @@
 
 use futures::future::BoxFuture;
 
-use extenddb_storage::error::StorageError;
 use extenddb_storage::WorkerStore;
+use extenddb_storage::error::StorageError;
 
 use crate::DynamoEngine;
 

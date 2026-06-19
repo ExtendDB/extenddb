@@ -11,8 +11,8 @@ use futures::future::BoxFuture;
 use extenddb_core::types::{
     BackupDescription, BackupDetails, BackupSummary, ContinuousBackupsDescription, TableDescription,
 };
-use extenddb_storage::error::StorageError;
 use extenddb_storage::BackupEngine;
+use extenddb_storage::error::StorageError;
 
 use crate::DynamoEngine;
 

@@ -15,21 +15,21 @@
 //! the Postgres backend (`extenddb-storage-postgres`), because DynamoDB has
 //! opinions about what a database is and "relational IAM catalog" is not one.
 
+pub(crate) mod backup_engine;
 pub mod bootstrapper;
-pub mod config;
 pub mod client;
+pub mod config;
+pub(crate) mod data_engine;
 pub mod encoding;
-pub mod naming;
-pub mod operations;
 pub(crate) mod errors;
 pub(crate) mod expression;
-pub(crate) mod table_engine;
-pub(crate) mod data_engine;
 pub(crate) mod metadata_engine;
-pub(crate) mod stream_engine;
-pub(crate) mod backup_engine;
-pub(crate) mod worker_store;
+pub mod naming;
+pub mod operations;
 mod server_components;
+pub(crate) mod stream_engine;
+pub(crate) mod table_engine;
+pub(crate) mod worker_store;
 
 /// The DynamoDB-at-home storage engine: forwards the data/table plane to a real
 /// DynamoDB endpoint. Catalog/auth are composed separately (see server_components, later task).

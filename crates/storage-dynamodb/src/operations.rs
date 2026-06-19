@@ -97,8 +97,14 @@ impl OperationsEngine for DynamoOperationsEngine {
     /// `"encryption_key"`.
     fn is_sensitive_key(&self, key: &str) -> bool {
         let lower = key.to_lowercase();
-        ["connection_string", "password", "secret", "token", "encryption_key"]
-            .iter()
-            .any(|pattern| lower.contains(pattern))
+        [
+            "connection_string",
+            "password",
+            "secret",
+            "token",
+            "encryption_key",
+        ]
+        .iter()
+        .any(|pattern| lower.contains(pattern))
     }
 }

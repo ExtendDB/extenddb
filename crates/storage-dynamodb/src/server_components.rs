@@ -11,7 +11,9 @@ use std::sync::Arc;
 use extenddb_auth::BuiltinAuthProvider;
 use extenddb_storage::StorageEngine;
 use extenddb_storage::config::StorageConfig as _;
-use extenddb_storage::server_components::{BackendError, ServerComponents, ServerComponentsRegistration};
+use extenddb_storage::server_components::{
+    BackendError, ServerComponents, ServerComponentsRegistration,
+};
 use extenddb_storage_postgres::{DbCredentialStore, PostgresCatalogStore};
 use sqlx::postgres::PgPoolOptions;
 

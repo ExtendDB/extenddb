@@ -25,6 +25,14 @@ mod serve_helpers;
 mod util;
 mod workers;
 
+// Force-link optional storage backend crates so their `inventory::submit!`
+// registrations are included by the linker. Without an explicit reference, the
+// linker drops the otherwise-unused crate and the backend would not register.
+// (The postgres backend is linked transitively via a direct symbol reference in
+// `config.rs`, so it needs no entry here.)
+#[cfg(feature = "dynamodb")]
+extern crate extenddb_storage_dynamodb;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]

@@ -17,8 +17,8 @@ pub async fn build_client(cfg: &DynamoStorageConfig) -> aws_sdk_dynamodb::Client
     use aws_config::BehaviorVersion;
     use aws_config::Region;
 
-    let mut loader = aws_config::defaults(BehaviorVersion::latest())
-        .region(Region::new(cfg.region.clone()));
+    let mut loader =
+        aws_config::defaults(BehaviorVersion::latest()).region(Region::new(cfg.region.clone()));
 
     if let Some(ep) = &cfg.endpoint_url {
         loader = loader.endpoint_url(ep.clone());

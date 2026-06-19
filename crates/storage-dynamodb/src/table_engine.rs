@@ -13,12 +13,12 @@ use futures::future::BoxFuture;
 use extenddb_core::types::{
     AttributeDefinition, BillingMode, BillingModeSummary, CreateTableInput, DeleteTableInput,
     DescribeTableInput, GsiDescription, IndexInfo, KeySchemaElement, KeyType, ListTablesInput,
-    ListTablesOutput, LsiDescription, ProjectionType, ProvisionedThroughputDescription, Projection,
+    ListTablesOutput, LsiDescription, Projection, ProjectionType, ProvisionedThroughputDescription,
     ScalarAttributeType, StreamSpecification, StreamViewType, TableDescription, TableKeyInfo,
     TableStatus, UpdateTableInput,
 };
-use extenddb_storage::error::StorageError;
 use extenddb_storage::TableEngine;
+use extenddb_storage::error::StorageError;
 
 use crate::DynamoEngine;
 
@@ -159,10 +159,7 @@ impl TableEngine for DynamoEngine {
                 req = req.deletion_protection_enabled(dp);
             }
 
-            let out = req
-                .send()
-                .await
-                .map_err(crate::errors::from_sdk_error)?;
+            let out = req.send().await.map_err(crate::errors::from_sdk_error)?;
 
             match out.table_description() {
                 Some(t) => to_table_description(t, &account_id, &self.namer),
@@ -343,11 +340,8 @@ impl TableEngine for DynamoEngine {
                 .ok_or_else(|| StorageError::TableNotFound(table_name.clone()))?;
 
             // Key schema
-            let key_schema: Vec<KeySchemaElement> = t
-                .key_schema()
-                .iter()
-                .map(map_key_schema_from_sdk)
-                .collect();
+            let key_schema: Vec<KeySchemaElement> =
+                t.key_schema().iter().map(map_key_schema_from_sdk).collect();
 
             // Attribute definitions
             let attribute_definitions: Vec<AttributeDefinition> = t
@@ -417,10 +411,7 @@ impl TableEngine for DynamoEngine {
                         .projection()
                         .map(map_projection_from_sdk)
                         .unwrap_or_else(default_projection);
-                    let index_id = gsi
-                        .index_arn()
-                        .unwrap_or(&index_name)
-                        .to_owned();
+                    let index_id = gsi.index_arn().unwrap_or(&index_name).to_owned();
                     return Ok(IndexInfo {
                         index_name,
                         index_id,
@@ -443,10 +434,7 @@ impl TableEngine for DynamoEngine {
                         .projection()
                         .map(map_projection_from_sdk)
                         .unwrap_or_else(default_projection);
-                    let index_id = lsi
-                        .index_arn()
-                        .unwrap_or(&index_name)
-                        .to_owned();
+                    let index_id = lsi.index_arn().unwrap_or(&index_name).to_owned();
                     return Ok(IndexInfo {
                         index_name,
                         index_id,
@@ -522,9 +510,7 @@ fn build_sdk_projection(proj: &Projection) -> aws_sdk_dynamodb::types::Projectio
 
 // ── Helpers: SDK → core conversions ─────────────────────────────────────────
 
-fn map_key_schema_from_sdk(
-    ks: &aws_sdk_dynamodb::types::KeySchemaElement,
-) -> KeySchemaElement {
+fn map_key_schema_from_sdk(ks: &aws_sdk_dynamodb::types::KeySchemaElement) -> KeySchemaElement {
     KeySchemaElement {
         attribute_name: ks.attribute_name.clone(),
         key_type: match ks.key_type {
@@ -535,9 +521,7 @@ fn map_key_schema_from_sdk(
     }
 }
 
-fn map_attr_def_from_sdk(
-    ad: &aws_sdk_dynamodb::types::AttributeDefinition,
-) -> AttributeDefinition {
+fn map_attr_def_from_sdk(ad: &aws_sdk_dynamodb::types::AttributeDefinition) -> AttributeDefinition {
     AttributeDefinition {
         attribute_name: ad.attribute_name.clone(),
         attribute_type: match ad.attribute_type {
@@ -580,9 +564,7 @@ fn map_stream_spec_from_sdk(
         aws_sdk_dynamodb::types::StreamViewType::KeysOnly => StreamViewType::KeysOnly,
         aws_sdk_dynamodb::types::StreamViewType::NewImage => StreamViewType::NewImage,
         aws_sdk_dynamodb::types::StreamViewType::OldImage => StreamViewType::OldImage,
-        aws_sdk_dynamodb::types::StreamViewType::NewAndOldImages => {
-            StreamViewType::NewAndOldImages
-        }
+        aws_sdk_dynamodb::types::StreamViewType::NewAndOldImages => StreamViewType::NewAndOldImages,
         _ => StreamViewType::KeysOnly, // forward-compat
     });
     StreamSpecification {
@@ -591,9 +573,7 @@ fn map_stream_spec_from_sdk(
     }
 }
 
-fn map_table_status_from_sdk(
-    ts: &aws_sdk_dynamodb::types::TableStatus,
-) -> TableStatus {
+fn map_table_status_from_sdk(ts: &aws_sdk_dynamodb::types::TableStatus) -> TableStatus {
     match ts {
         aws_sdk_dynamodb::types::TableStatus::Active => TableStatus::Active,
         aws_sdk_dynamodb::types::TableStatus::Creating => TableStatus::Creating,
@@ -692,7 +672,11 @@ fn to_table_description(
                 .iter()
                 .map(|gsi| GsiDescription {
                     index_name: gsi.index_name().unwrap_or("").to_owned(),
-                    key_schema: gsi.key_schema().iter().map(map_key_schema_from_sdk).collect(),
+                    key_schema: gsi
+                        .key_schema()
+                        .iter()
+                        .map(map_key_schema_from_sdk)
+                        .collect(),
                     projection: gsi
                         .projection()
                         .map(map_projection_from_sdk)
@@ -732,7 +716,11 @@ fn to_table_description(
                 .iter()
                 .map(|lsi| LsiDescription {
                     index_name: lsi.index_name().unwrap_or("").to_owned(),
-                    key_schema: lsi.key_schema().iter().map(map_key_schema_from_sdk).collect(),
+                    key_schema: lsi
+                        .key_schema()
+                        .iter()
+                        .map(map_key_schema_from_sdk)
+                        .collect(),
                     projection: lsi
                         .projection()
                         .map(map_projection_from_sdk)

@@ -1409,6 +1409,7 @@ dependencies = [
  "extenddb-engine",
  "extenddb-server",
  "extenddb-storage",
+ "extenddb-storage-dynamodb",
  "extenddb-storage-postgres",
  "libc",
  "rcgen",

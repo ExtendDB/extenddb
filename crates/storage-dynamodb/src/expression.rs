@@ -60,7 +60,11 @@ impl Renderer {
     ///
     /// Returns `StorageError::Validation` if a name reference or value placeholder
     /// cannot be resolved from `maps`.
-    pub fn render_condition(&mut self, e: &Expr, maps: &ExpressionMaps) -> Result<String, StorageError> {
+    pub fn render_condition(
+        &mut self,
+        e: &Expr,
+        maps: &ExpressionMaps,
+    ) -> Result<String, StorageError> {
         self.render_expr(e, maps)
     }
 
@@ -168,9 +172,11 @@ impl Renderer {
             Expr::Path(elements) => self.render_path(elements, maps),
 
             Expr::Placeholder(name) => {
-                let core_val = maps
-                    .resolve_value(name)
-                    .map_err(|err: extenddb_core::error::DynamoDbError| StorageError::Validation(err.to_string()))?;
+                let core_val = maps.resolve_value(name).map_err(
+                    |err: extenddb_core::error::DynamoDbError| {
+                        StorageError::Validation(err.to_string())
+                    },
+                )?;
                 let sdk_val = to_sdk(core_val);
                 let token = format!(":v{}", self.v_counter);
                 self.v_counter += 1;
@@ -262,8 +268,11 @@ impl Renderer {
         for element in elements {
             match element {
                 PathElement::Attribute(name) => {
-                    let real_name = resolve_name_ref(name, maps)
-                        .map_err(|err: extenddb_core::error::DynamoDbError| StorageError::Validation(err.to_string()))?;
+                    let real_name = resolve_name_ref(name, maps).map_err(
+                        |err: extenddb_core::error::DynamoDbError| {
+                            StorageError::Validation(err.to_string())
+                        },
+                    )?;
                     let token = format!("#n{}", self.n_counter);
                     self.n_counter += 1;
                     self.names.insert(token.clone(), real_name.into_owned());
@@ -320,13 +329,19 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use extenddb_core::expression::{Expr, CompareOp, ExpressionMaps, PathElement, UpdateAction};
+    use extenddb_core::expression::{CompareOp, Expr, ExpressionMaps, PathElement, UpdateAction};
     use extenddb_core::types::AttributeValue as Av;
     use std::collections::HashMap;
 
     fn maps_with(values: &[(&str, Av)], names: &[(&str, &str)]) -> ExpressionMaps {
-        let v = values.iter().map(|(k, val)| (k.to_string(), val.clone())).collect::<HashMap<_, _>>();
-        let n = names.iter().map(|(k, val)| (k.to_string(), val.to_string())).collect::<HashMap<_, _>>();
+        let v = values
+            .iter()
+            .map(|(k, val)| (k.to_string(), val.clone()))
+            .collect::<HashMap<_, _>>();
+        let n = names
+            .iter()
+            .map(|(k, val)| (k.to_string(), val.to_string()))
+            .collect::<HashMap<_, _>>();
         ExpressionMaps::new(n, v)
     }
 

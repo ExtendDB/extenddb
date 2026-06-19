@@ -13,10 +13,12 @@ use futures::future::BoxFuture;
 use aws_sdk_dynamodb::types::{
     ConditionCheck, Delete, Get, Put, ReturnValue, TransactGetItem, TransactWriteItem, Update,
 };
+use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, UpdateAction};
 use extenddb_core::types::{Item, TableKeyInfo};
-use extenddb_core::expression::{ExpressionMaps, KeyCondition, UpdateAction, Expr};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{DataEngine, ItemPairResult, QueryResult, StreamCapture, TransactGetOp, TransactWriteOp};
+use extenddb_storage::{
+    DataEngine, ItemPairResult, QueryResult, StreamCapture, TransactGetOp, TransactWriteOp,
+};
 
 use crate::DynamoEngine;
 use crate::encoding::{item_from_sdk, item_to_sdk};
@@ -43,7 +45,9 @@ impl DataEngine for DynamoEngine {
         maps: &ExpressionMaps,
         _stream: Option<&StreamCapture>,
     ) -> BoxFuture<'_, Result<Option<Item>, StorageError>> {
-        let physical = self.namer.physical(&key_info.account_id, &key_info.table_name);
+        let physical = self
+            .namer
+            .physical(&key_info.account_id, &key_info.table_name);
         let sdk_item = item_to_sdk(&item);
 
         // Clone the condition and maps so they can cross the async boundary.
@@ -90,7 +94,9 @@ impl DataEngine for DynamoEngine {
         key_info: &TableKeyInfo,
         key: &Item,
     ) -> BoxFuture<'_, Result<Option<Item>, StorageError>> {
-        let physical = self.namer.physical(&key_info.account_id, &key_info.table_name);
+        let physical = self
+            .namer
+            .physical(&key_info.account_id, &key_info.table_name);
         let sdk_key = item_to_sdk(key);
 
         Box::pin(async move {
@@ -118,7 +124,9 @@ impl DataEngine for DynamoEngine {
         maps: &ExpressionMaps,
         _stream: Option<&StreamCapture>,
     ) -> BoxFuture<'_, Result<Option<Item>, StorageError>> {
-        let physical = self.namer.physical(&key_info.account_id, &key_info.table_name);
+        let physical = self
+            .namer
+            .physical(&key_info.account_id, &key_info.table_name);
         let sdk_key = item_to_sdk(key);
         let condition = condition.cloned();
         let maps = maps.clone();
@@ -175,7 +183,9 @@ impl DataEngine for DynamoEngine {
         maps: &ExpressionMaps,
         _stream: Option<&StreamCapture>,
     ) -> BoxFuture<'_, ItemPairResult> {
-        let physical = self.namer.physical(&key_info.account_id, &key_info.table_name);
+        let physical = self
+            .namer
+            .physical(&key_info.account_id, &key_info.table_name);
         let sdk_key = item_to_sdk(key);
         let actions = actions.to_vec();
         let condition = condition.cloned();
@@ -244,7 +254,9 @@ impl DataEngine for DynamoEngine {
         exclusive_start_key: Option<&Item>,
         index_name: Option<&str>,
     ) -> BoxFuture<'_, QueryResult> {
-        let physical = self.namer.physical(&key_info.account_id, &key_info.table_name);
+        let physical = self
+            .namer
+            .physical(&key_info.account_id, &key_info.table_name);
         let key_condition = key_condition.clone();
         let maps = maps.clone();
         let esk = exclusive_start_key.cloned();
@@ -288,9 +300,7 @@ impl DataEngine for DynamoEngine {
                 .map(|m| item_from_sdk(m.clone()))
                 .collect();
 
-            let lek = out
-                .last_evaluated_key()
-                .map(|m| item_from_sdk(m.clone()));
+            let lek = out.last_evaluated_key().map(|m| item_from_sdk(m.clone()));
 
             Ok((items, lek))
         })
@@ -308,7 +318,9 @@ impl DataEngine for DynamoEngine {
         total_segments: Option<i64>,
         index_name: Option<&str>,
     ) -> BoxFuture<'_, QueryResult> {
-        let physical = self.namer.physical(&key_info.account_id, &key_info.table_name);
+        let physical = self
+            .namer
+            .physical(&key_info.account_id, &key_info.table_name);
         let esk = exclusive_start_key.cloned();
         let index_name = index_name.map(|s| s.to_owned());
 
@@ -343,9 +355,7 @@ impl DataEngine for DynamoEngine {
                 .map(|m| item_from_sdk(m.clone()))
                 .collect();
 
-            let lek = out
-                .last_evaluated_key()
-                .map(|m| item_from_sdk(m.clone()));
+            let lek = out.last_evaluated_key().map(|m| item_from_sdk(m.clone()));
 
             Ok((items, lek))
         })
@@ -361,7 +371,9 @@ impl DataEngine for DynamoEngine {
         let items: Result<Vec<TransactGetItem>, StorageError> = ops
             .iter()
             .map(|op| {
-                let physical = self.namer.physical(&op.key_info.account_id, &op.key_info.table_name);
+                let physical = self
+                    .namer
+                    .physical(&op.key_info.account_id, &op.key_info.table_name);
                 let sdk_key = item_to_sdk(op.key);
                 let get = Get::builder()
                     .table_name(physical)
@@ -470,9 +482,7 @@ fn build_transact_write_item(
         } => {
             let physical = namer.physical(&key_info.account_id, &key_info.table_name);
             let sdk_item = item_to_sdk(item);
-            let mut put_b = Put::builder()
-                .table_name(physical)
-                .set_item(Some(sdk_item));
+            let mut put_b = Put::builder().table_name(physical).set_item(Some(sdk_item));
 
             if let Some(cond) = condition {
                 let mut r = Renderer::new();

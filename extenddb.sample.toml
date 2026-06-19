@@ -52,6 +52,13 @@
                                 # DynamoDB request makes concurrent authz queries
                                 # — size this to match expected concurrency.
 
+# [storage.dynamodb]
+# Data plane stores into real DynamoDB; the catalog/IAM plane lives in Postgres.
+# region = "us-east-1"
+# endpoint_url = "http://localhost:8000"   # DynamoDB Local, or another ExtendDB endpoint (recursion is a feature)
+# table_prefix = "athome_"
+# catalog_connection_string = "postgresql://extenddb:extenddb-local-dev@localhost:5432/extenddb_catalog"
+
 [auth]
 # provider = "builtin"          # Auth provider:
                                 #   "builtin" — SigV4 verification with local credential
