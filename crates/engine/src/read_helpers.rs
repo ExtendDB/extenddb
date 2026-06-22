@@ -11,8 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
-    Expr, ExpressionMaps, PathElement, apply_projection, evaluate_condition,
-    validate_unused_attributes,
+    Expr, ExpressionMaps, PathElement, Projection, evaluate_condition, validate_unused_attributes,
 };
 use extenddb_core::types::{
     IndexInfo, Item, KeySchemaElement, Select, extract_key, item_size_bytes,
@@ -26,8 +25,10 @@ use crate::index_helpers::apply_index_projection;
 /// `validate_unused_attributes`, narrowed to read handlers that accept only a
 /// projection (`GetItem`, `BatchGetItem`). `names` is the raw request map with
 /// keys still carrying their `#` prefix. The caller passes this only for a
-/// user-supplied `ProjectionExpression`; desugared `AttributesToGet` uses
-/// synthetic placeholders and is governed by a separate rule.
+/// user-supplied `ProjectionExpression`. Desugared `AttributesToGet` uses
+/// synthetic placeholders, so it is not checked here; duplicate
+/// `AttributesToGet` entries are currently accepted (a divergence from
+/// Amazon DynamoDB, tracked separately).
 ///
 /// # Errors
 ///
@@ -77,7 +78,7 @@ pub fn apply_post_read(
     raw_items: &[Item],
     storage_last_key: Option<Item>,
     filter: &Option<Expr>,
-    projection: &Option<Vec<Vec<PathElement>>>,
+    projection: Option<&Projection>,
     maps: &ExpressionMaps,
     lek_key_schema: &[KeySchemaElement],
     select: Option<&Select>,
@@ -123,8 +124,8 @@ pub fn apply_post_read(
         filtered_count += 1;
 
         if !is_count {
-            let projected = if let Some(paths) = projection {
-                apply_projection(item, paths, maps)?
+            let projected = if let Some(proj) = projection {
+                proj.apply(item)
             } else if let Some(idx) = index_proj {
                 apply_index_projection(item, idx, base_key_schema)
             } else {

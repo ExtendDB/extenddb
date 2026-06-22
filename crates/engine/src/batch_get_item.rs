@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::apply_projection;
+use extenddb_core::expression::Projection;
 use extenddb_core::types::{BatchGetItemInput, BatchGetItemOutput, Item, item_size_bytes};
 use extenddb_core::validation::validate_batch_key_only;
 
@@ -125,7 +125,7 @@ pub async fn handle_batch_get_item(
             (None, HashMap::new())
         };
 
-        let projection = if let Some(ref proj_str) = effective_proj_str {
+        let parsed_projection = if let Some(ref proj_str) = effective_proj_str {
             Some(crate::expression_helpers::parse_projection_expr(
                 proj_str,
                 &ctx.limits,
@@ -133,30 +133,36 @@ pub async fn handle_batch_get_item(
         } else {
             None
         };
-        // Reject ExpressionAttributeNames entries the projection never
+        let maps = if extra_proj_names.is_empty() {
+            build_expression_maps(ka.expression_attribute_names.as_ref(), None)
+        } else {
+            // Merge extra names with any user-provided names.
+            let mut merged = ka.expression_attribute_names.clone().unwrap_or_default();
+            merged.extend(extra_proj_names);
+            build_expression_maps(Some(&merged), None)
+        };
+        // Compile once per table: resolves #names and rejects overlapping
+        // paths. DynamoDB checks overlap before the unused-name check, so this
+        // runs first. Overlap rejection is scoped to a user-supplied expression.
+        let projection = match parsed_projection {
+            Some(ref paths) => Some(Projection::compile(
+                paths,
+                &maps,
+                ka.projection_expression.is_some(),
+            )?),
+            None => None,
+        };
+        // Then reject ExpressionAttributeNames entries the projection never
         // references, matching Amazon DynamoDB. Scoped to a user-supplied
-        // ProjectionExpression; desugared AttributesToGet uses synthetic names.
+        // ProjectionExpression.
         if ka.projection_expression.is_some()
-            && let Some(ref paths) = projection
+            && let Some(ref paths) = parsed_projection
         {
             crate::read_helpers::validate_projection_unused_names(
                 ka.expression_attribute_names.as_ref(),
                 paths,
             )?;
         }
-        let ean = if extra_proj_names.is_empty() {
-            ka.expression_attribute_names.as_ref()
-        } else {
-            // Merge extra names with any user-provided names.
-            None // extra_proj_names used directly below
-        };
-        let maps = if extra_proj_names.is_empty() {
-            build_expression_maps(ean, None)
-        } else {
-            let mut merged = ka.expression_attribute_names.clone().unwrap_or_default();
-            merged.extend(extra_proj_names);
-            build_expression_maps(Some(&merged), None)
-        };
 
         let mut table_items: Vec<Item> = Vec::new();
         let mut seen_keys: HashSet<Vec<u8>> = HashSet::with_capacity(ka.keys.len());
@@ -182,8 +188,8 @@ pub async fn handle_batch_get_item(
                 *per_table_rcu.entry(table_name.clone()).or_default() += item_rcu;
                 total_pre_proj_bytes += size;
                 returned_count += 1;
-                let item = if let Some(ref paths) = projection {
-                    apply_projection(&item, paths, &maps)?
+                let item = if let Some(ref projection) = projection {
+                    projection.apply(&item)
                 } else {
                     item
                 };
