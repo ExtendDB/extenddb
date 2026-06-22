@@ -48,11 +48,11 @@ Relevant facts:
    guard test, and move the version write inside the runner. It stays fully under
    our control, but it keeps reimplementing what sqlx already does and leaves us
    maintaining a migration runner of our own.
-2. **Adopt sqlx:migrate** We would switch to sqlx and seed its `_sqlx_migrations`
+2. **Adopt sqlx, upgrade in place.** We would switch to sqlx and seed its `_sqlx_migrations`
    table to match what each existing catalog already has, so no re-initialization
    is needed. This avoids a breaking change, but getting that seeding exactly
    right for every existing catalog is delicate and error-prone.
-3. **Adopt sqlx:migrate** We switch to sqlx and accept that an existing catalog has to be
+3. **Adopt sqlx, re-initialize.** We switch to sqlx and accept that an existing catalog has to be
    torn down and re-initialized. There is no compatibility shim and no in-place
    upgrade.
 
