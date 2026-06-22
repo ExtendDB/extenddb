@@ -60,6 +60,8 @@ Relevant facts:
 
 Adopt `sqlx::migrate` directly for both the catalog and data database (the re-init
 option): existing catalogs re-initialize, and we do not build a compatibility shim.
+Re-initializing drops the databases, so existing tables and items are lost and must
+be recreated and reloaded after `init`.
 
 ## Rationale
 
@@ -96,11 +98,14 @@ option): existing catalogs re-initialize, and we do not build a compatibility sh
 
 **Version gate and the version write**
 
-- The catalog version gate stays: the server refuses to start when the binary's
-  expected version and the stored `catalog_version` disagree. It is catalog-only;
-  the data database relies on its `_sqlx_migrations` table and has no separate
-  version. The gate is symmetric, so an older binary against a newer catalog also
-  refuses to serve, which is intended.
+- The catalog version gate stays: at startup the server refuses to boot unless its
+  compiled `CATALOG_VERSION` exactly matches the stored `catalog_version` (exact
+  equality, not a range). It is catalog-only; the data database relies on its
+  `_sqlx_migrations` table and has no separate version. The gate is symmetric, so
+  an older binary against a newer catalog also refuses to serve. That is intended:
+  it exists to stop a server running against a schema it was not built for, the
+  exact failure behind this incident, caught at startup instead of at request
+  time.
 - The old runner wrote `catalog_version` inside the migration transaction. sqlx
   knows nothing about our semver, so `init` and `migrate` will write it in a
   separate step after migrations run. This write is not atomic with the migration:
@@ -114,6 +119,20 @@ option): existing catalogs re-initialize, and we do not build a compatibility sh
   count and `CATALOG_VERSION` match expected constants. This is a tripwire (adding
   a migration breaks the count and forces a version bump), not a strict invariant
   tying the version to the migration.
+
+**Upgrade and availability**
+
+- The server binary and the catalog are version-locked, so a schema-bumping
+  upgrade needs every server moved to the matching version together. For a
+  breaking change that is a brief coordinated outage (stop old servers, `migrate`,
+  start new). This is existing behavior, not introduced here.
+- The data wipe above is a one-time cost of adopting sqlx; later migrations are
+  additive and do not lose data.
+- Online / rolling (no-outage) upgrades are out of scope. They need the server
+  decoupled from an exact schema version: expand-contract migrations plus a
+  version-range gate, and per-engine degradation if a server ever fans out to
+  multiple backends. Tracked as separate future work, a postgres-backend decision,
+  not part of this runner change.
 
 **Operational notes**
 
