@@ -15,7 +15,7 @@ export AWS_SECRET_ACCESS_KEY=<secret-access-key>
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
 ```
 
-The sample reads `EXTENDDB_ENDPOINT` (not `AWS_ENDPOINT_URL_DYNAMODB`). `EXTENDDB_ENDPOINT` defaults to `http://localhost:8000` if unset. Replace `<port>` in the example below with the port from your `extenddb.toml` (default 8000). The other three are standard AWS environment variables. `AWS_CA_BUNDLE` is required only when `EXTENDDB_ENDPOINT` uses `https://`, which is the default for a `extenddb serve` started with self-signed TLS.
+The sample reads `EXTENDDB_ENDPOINT` (not `AWS_ENDPOINT_URL_DYNAMODB`). `EXTENDDB_ENDPOINT` defaults to `http://localhost:18443` if unset. Replace `<port>` in the example below with the port from your `extenddb.toml` (default 18443). The other three are standard AWS environment variables. `AWS_CA_BUNDLE` is required only when `EXTENDDB_ENDPOINT` uses `https://`, which is the default for a `extenddb serve` started with self-signed TLS.
 
 ## Run command
 

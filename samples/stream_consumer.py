@@ -8,7 +8,7 @@ Creates a table with streams enabled, then runs two threads:
   - Poller: reads the stream and prints every record it sees
 
 Usage:
-    EXTENDDB_TEST_ENDPOINT=http://localhost:8000 python samples/stream_consumer.py
+    EXTENDDB_TEST_ENDPOINT=http://localhost:18443 python samples/stream_consumer.py
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import uuid
 
 import boto3
 
-ENDPOINT = os.environ.get("EXTENDDB_TEST_ENDPOINT", "http://localhost:8000").strip()
+ENDPOINT = os.environ.get("EXTENDDB_TEST_ENDPOINT", "http://localhost:18443").strip()
 TABLE_NAME = f"stream-demo-{uuid.uuid4().hex[:8]}"
 ITEM_COUNT = 5
 

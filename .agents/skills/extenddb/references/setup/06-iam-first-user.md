@@ -70,7 +70,7 @@ The access key ID starts with `AKIAEXTENDDB` and the secret access key starts wi
 
 ## Verify the access key
 
-Run a minimal signed request to confirm the access key works. Substitute the values captured in the previous step. Use the port configured in `extenddb.toml` (default 8000).
+Run a minimal signed request to confirm the access key works. Substitute the values captured in the previous step. Use the port configured in `extenddb.toml` (default 18443).
 
 ```bash
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem

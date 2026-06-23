@@ -116,7 +116,7 @@ mod tests {
     #[test]
     fn canonical_request_basic() {
         let mut headers = HeaderMap::new();
-        headers.insert("host", "localhost:8000".parse().unwrap());
+        headers.insert("host", "localhost:18443".parse().unwrap());
         headers.insert("x-amz-date", "20260415T120000Z".parse().unwrap());
 
         let creq = canonical_request("POST", "/", "", &headers, "host;x-amz-date", b"{}");
@@ -125,7 +125,7 @@ mod tests {
         assert_eq!(lines[0], "POST");
         assert_eq!(lines[1], "/");
         assert_eq!(lines[2], ""); // empty query string
-        assert_eq!(lines[3], "host:localhost:8000");
+        assert_eq!(lines[3], "host:localhost:18443");
         assert_eq!(lines[4], "x-amz-date:20260415T120000Z");
         assert_eq!(lines[5], ""); // trailing newline from canonical headers
         assert_eq!(lines[6], "host;x-amz-date");
@@ -158,14 +158,14 @@ mod tests {
     #[test]
     fn canonical_request_lowercases_signed_headers() {
         let mut headers = HeaderMap::new();
-        headers.insert("host", "localhost:8000".parse().unwrap());
+        headers.insert("host", "localhost:18443".parse().unwrap());
         headers.insert("x-amz-date", "20260415T120000Z".parse().unwrap());
 
         // Pass mixed-case signed headers — output must be lowercase
         let creq = canonical_request("POST", "/", "", &headers, "Host;X-Amz-Date", b"{}");
 
         let lines: Vec<&str> = creq.split('\n').collect();
-        assert_eq!(lines[3], "host:localhost:8000");
+        assert_eq!(lines[3], "host:localhost:18443");
         assert_eq!(lines[4], "x-amz-date:20260415T120000Z");
         assert_eq!(lines[6], "host;x-amz-date"); // lowercased
     }

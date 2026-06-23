@@ -289,7 +289,7 @@ fn default_bind_addr() -> String {
     "127.0.0.1".to_owned()
 }
 fn default_port() -> u16 {
-    8000
+    18443
 }
 fn default_region() -> String {
     "us-east-1".to_owned()

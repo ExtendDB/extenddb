@@ -37,7 +37,7 @@ cargo build --release
 
 # Use with any AWS SDK (TLS with self-signed cert — trust via AWS_CA_BUNDLE)
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
-aws dynamodb list-tables --endpoint-url https://127.0.0.1:8000 --region us-east-1
+aws dynamodb list-tables --endpoint-url https://127.0.0.1:18443 --region us-east-1
 ```
 
 See [Getting Started](docs/getting-started.md) for the full walkthrough, or use the platform installer scripts:
@@ -118,10 +118,10 @@ Use this with Docker, Kubernetes, `systemd Type=simple`, runit, s6, or any other
 
 ```bash
 # Health check
-curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/health
+curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 
 # JSON metrics (DynamoDB CloudWatch-style)
-curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/metrics
+curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/metrics
 
 # Syslog (Linux)
 journalctl -t extenddb -f
@@ -132,7 +132,7 @@ log stream --predicate 'processImagePath ENDSWITH "extenddb"' --level info
 
 ## Management Console
 
-Web-based administration at `https://127.0.0.1:8000/console/`. Manage accounts, users, groups, roles, policies, and access keys through a browser. Accept the self-signed certificate warning on first visit.
+Web-based administration at `https://127.0.0.1:18443/console/`. Manage accounts, users, groups, roles, policies, and access keys through a browser. Accept the self-signed certificate warning on first visit.
 
 ## CLI Reference
 

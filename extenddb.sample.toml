@@ -24,9 +24,9 @@
 
 [server]
 # bind_addr = "127.0.0.1"      # Network interface to bind (default: localhost only)
-# port = 8000                  # HTTP port
+# port = 18443                 # HTTP port
 # region = "us-east-1"         # AWS region for ARN generation
-# run_dir = "~/.extenddb/run"     # Directory for PID file (~ is expanded to $HOME)
+# run_dir = "~/.extenddb/run"  # Directory for PID file (~ is expanded to $HOME)
 
 [storage]
 # backend = "postgres"         # Storage backend (only "postgres" supported)
@@ -148,7 +148,7 @@
 #
 # [server]
 # bind_addr = "0.0.0.0"
-# port = 8000
+# port = 18443
 #
 # [server.tls]
 # cert_path = "/etc/extenddb/tls/cert.pem"

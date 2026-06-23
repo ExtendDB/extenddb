@@ -450,7 +450,7 @@ All under `/management/*`. Authenticated via HTTP Basic auth (admin users use `a
 
 ## 12. CLI Commands
 
-The CLI is a thin client that calls the management API. All commands require `--config extenddb.toml` to discover the server address, or `--endpoint https://127.0.0.1:8000`.
+The CLI is a thin client that calls the management API. All commands require `--config extenddb.toml` to discover the server address, or `--endpoint https://127.0.0.1:18443`.
 
 ```
 extenddb manage --user <admin|account_id/user_name> --password <pw> <subcommand>

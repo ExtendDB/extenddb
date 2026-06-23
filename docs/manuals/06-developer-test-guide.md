@@ -148,7 +148,7 @@ devtools/run-tests --extenddb --pytest --filter test_put_item
 **Prerequisites for integration tests (pytest, external, comprehensive, rust-integration):**
 
 1. A running extenddb server: `./target/debug/extenddb serve --config extenddb.toml`
-2. `EXTENDDB_TEST_ENDPOINT=https://localhost:8000`
+2. `EXTENDDB_TEST_ENDPOINT=https://localhost:18443`
 3. `EXTENDDB_ADMIN_PASSWORD=<password from extenddb init>`
 
 The `run-tests` script automatically:
@@ -172,13 +172,13 @@ The `run-tests` script automatically:
 
 ### Test Suites
 
-| Suite | Count | Description |
-|-------|-------|-------------|
-| Rust unit tests | 317 | Expression engine, type system, validation, error codes |
-| Pytest (standard) | 180 + 118 skipped | DynamoDB API tests via boto3 |
-| Comprehensive (Python) | 296 | Clean-room gap analysis tests |
-| External (Java) | 346 | Third-party functional test suite |
-| CLI lifecycle | 9 | Binary lifecycle tests (separate, requires `EXTENDDB_TEST_PG_CONNECTION_STRING`) |
+| Suite | Count           | Description |
+|-------|-----------------|-------------|
+| Rust unit tests | 317             | Expression engine, type system, validation, error codes |
+| Pytest (standard) | 573 + 2 skipped | DynamoDB API tests via boto3 |
+| Comprehensive (Python) | 296             | Clean-room gap analysis tests |
+| External (Java) | 346             | Third-party functional test suite |
+| CLI lifecycle | 9               | Binary lifecycle tests (separate, requires `EXTENDDB_TEST_PG_CONNECTION_STRING`) |
 
 ### Python Integration Tests
 

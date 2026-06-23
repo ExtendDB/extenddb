@@ -153,19 +153,19 @@ Stop the server:
 ## 6. Smoke test
 
 ```bash
-curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/health
+curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 # {"status":"healthy"}
 
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
 aws dynamodb list-tables \
-    --endpoint-url https://127.0.0.1:8000 \
+    --endpoint-url https://127.0.0.1:18443 \
     --region us-east-1
 # { "TableNames": [] }
 ```
 
 ## 7. Management console
 
-Open `https://127.0.0.1:8000/console/` in a browser (accept the self-signed
+Open `https://127.0.0.1:18443/console/` in a browser (accept the self-signed
 certificate warning). Log in with the `admin` user and the password printed
 during `init`.
 
@@ -196,7 +196,7 @@ No data is lost; only the catalog schema is updated.
 
 | Symptom                                                | Fix                                                                 |
 |--------------------------------------------------------|---------------------------------------------------------------------|
-| `connection refused` on port 8000                      | Server not running. `./target/release/extenddb serve --config extenddb.toml`|
+| `connection refused` on port 18443                      | Server not running. `./target/release/extenddb serve --config extenddb.toml`|
 | `Catalog version X.Y.Z (binary expects A.B.C)`        | `./target/release/extenddb migrate --config extenddb.toml`                  |
 | `role "postgres" does not exist`                       | Use `--pg-user $(whoami)` if PG runs as your user                   |
 | `FATAL: Peer authentication failed`                    | Edit `pg_hba.conf` to allow `trust` or `md5` for local connections  |

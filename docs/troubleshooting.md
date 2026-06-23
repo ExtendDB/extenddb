@@ -85,12 +85,12 @@ See `docs/local-postgres-setup.md` for full setup instructions.
 
 ### `Failed to bind <addr>: Address already in use`
 
-**Cause:** Another process is already listening on the configured port (default 8000).
+**Cause:** Another process is already listening on the configured port (default 18443).
 
 **Fix:** Check what's using the port and stop it, or use a different port:
 ```bash
-ss -tlnp | grep :8000                    # find what's using the port
-extenddb serve --port 8001 --config extenddb.toml  # use a different port
+ss -tlnp | grep :18443                    # find what's using the port
+extenddb serve --port 19443 --config extenddb.toml  # use a different port
 ```
 
 ### `Failed to load TLS certificates: <error>`
@@ -290,7 +290,7 @@ These errors occur when `auth.provider = "builtin"` is enabled.
 
 **Fix:**
 ```bash
-curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/health
+curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 # Should return: {"status":"healthy"}
 ```
 

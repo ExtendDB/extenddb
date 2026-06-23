@@ -83,7 +83,7 @@ export EXTENDDB_ADMIN_PASSWORD="<password-from-init-output>"
 extenddb daemonizes automatically — no output appears in the terminal. Verify it's running:
 
 ```bash
-curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/health
+curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 # {"status":"healthy"}
 ```
 
@@ -189,8 +189,8 @@ Create `~/.aws/credentials` entries (or export environment variables):
 ```bash
 # Set up the box-office profile for table creation and management
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
-export AWS_ENDPOINT_URL_DYNAMODB=https://127.0.0.1:8000
-export AWS_ENDPOINT_URL_DYNAMODB_STREAMS=https://127.0.0.1:8000
+export AWS_ENDPOINT_URL_DYNAMODB=https://127.0.0.1:18443
+export AWS_ENDPOINT_URL_DYNAMODB_STREAMS=https://127.0.0.1:18443
 export AWS_DEFAULT_REGION=us-east-1
 
 # Use box-office credentials for setup
@@ -440,8 +440,8 @@ print change events as they arrive — including the TTL deletion event.
 
 ```bash
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
-export AWS_ENDPOINT_URL_DYNAMODB=https://127.0.0.1:8000
-export AWS_ENDPOINT_URL_DYNAMODB_STREAMS=https://127.0.0.1:8000
+export AWS_ENDPOINT_URL_DYNAMODB=https://127.0.0.1:18443
+export AWS_ENDPOINT_URL_DYNAMODB_STREAMS=https://127.0.0.1:18443
 export AWS_DEFAULT_REGION=us-east-1
 export AWS_ACCESS_KEY_ID=<box-office-access-key-id>
 export AWS_SECRET_ACCESS_KEY=<box-office-secret-key>
@@ -511,10 +511,10 @@ Verify that extenddb is recording operational metrics:
 
 ```bash
 # Request counts and latencies
-curl -s --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/metrics | python3 -m json.tool
+curl -s --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:**18443**/metrics | python3 -m json.tool
 
 # Management console metrics (open in browser)
-echo "Open: https://127.0.0.1:8000/console/metrics"
+echo "Open: https://127.0.0.1:**18443**/console/metrics"
 ```
 
 You should see non-zero counts for:
@@ -735,7 +735,7 @@ aws dynamodb describe-table --table-name Tickets | jq '{
 ## 23. Final metrics check
 
 ```bash
-curl -s --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/metrics | python3 -c "
+curl -s --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/metrics | python3 -c "
 import json, sys
 m = json.load(sys.stdin)
 print('=== extenddb Metrics Summary ===')

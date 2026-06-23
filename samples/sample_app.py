@@ -19,16 +19,10 @@ auth_mode = builtin. Demonstrates:
  10. Clean exit — full lifecycle from create to teardown
 
 Usage:
-    # Start extenddb with auth_mode = builtin, then:
-    export EXTENDDB_ENDPOINT=http://localhost:8000
+    # Start extenddb, then:
+    export EXTENDDB_ENDPOINT=http://localhost:18443
     export AWS_ACCESS_KEY_ID=<your-access-key>
     export AWS_SECRET_ACCESS_KEY=<your-secret-key>
-    python3 samples/sample_app.py
-
-    # Or with auth_mode = none:
-    export EXTENDDB_ENDPOINT=http://localhost:8000
-    export AWS_ACCESS_KEY_ID=test
-    export AWS_SECRET_ACCESS_KEY=test
     python3 samples/sample_app.py
 """
 
@@ -48,7 +42,7 @@ except ModuleNotFoundError:
 # Configuration
 # ---------------------------------------------------------------------------
 
-ENDPOINT = os.environ.get("EXTENDDB_ENDPOINT", "http://localhost:8000")
+ENDPOINT = os.environ.get("EXTENDDB_ENDPOINT", "http://localhost:18443")
 REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
 # Tables created by this sample — cleaned up at the end.

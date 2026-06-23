@@ -124,7 +124,7 @@ This creates:
 ./target/release/extenddb serve --config extenddb.toml
 ```
 
-The server runs on `https://127.0.0.1:8000` by default (TLS mandatory).
+The server runs on `https://127.0.0.1:18443` by default (TLS mandatory).
 
 ### Stop Server
 
@@ -170,7 +170,7 @@ cargo build --release
 ./target/release/extenddb serve --config extenddb.toml
 
 # 3. Provision test credentials and run tests
-export EXTENDDB_TEST_ENDPOINT=https://127.0.0.1:8000
+export EXTENDDB_TEST_ENDPOINT=https://127.0.0.1:18443
 export EXTENDDB_ADMIN_USER=admin
 export EXTENDDB_ADMIN_PASSWORD=<password-from-init>
 eval $(python3 devtools/provision-test-credentials)
@@ -208,7 +208,7 @@ devtools/run-tests --extenddb --pytest --filter test_put_item
 ```
 
 The script requires:
-- `EXTENDDB_TEST_ENDPOINT` (e.g., `https://127.0.0.1:8000`)
+- `EXTENDDB_TEST_ENDPOINT` (e.g., `https://127.0.0.1:18443`)
 - `EXTENDDB_ADMIN_PASSWORD` (from `extenddb init`)
 - `EXTENDDB_ADMIN_USER` (optional, defaults to `admin`)
 
@@ -219,7 +219,7 @@ The script automatically provisions test credentials, configures runtime setting
 Java tests live in `tests/external/java/` and require Java 17+ and Maven 3.6+.
 
 ```bash
-devtools/run-external-tests --endpoint https://127.0.0.1:8000
+devtools/run-external-tests --endpoint https://127.0.0.1:18443
 ```
 
 ### Coverage
@@ -260,7 +260,7 @@ To use with AWS CLI/SDKs:
 
 ```bash
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
-aws dynamodb list-tables --endpoint-url https://127.0.0.1:8000 --region us-east-1
+aws dynamodb list-tables --endpoint-url https://127.0.0.1:18443 --region us-east-1
 ```
 
 Python tests automatically use `verify=False` when endpoint is HTTPS.
@@ -280,16 +280,16 @@ extenddb manage --user admin --password <pw> create-user --account-id <id> --use
 extenddb manage --user admin --password <pw> create-access-key --account-id <id> --user-name alice
 ```
 
-Or use the web console at `https://127.0.0.1:8000/console/`.
+Or use the web console at `https://127.0.0.1:18443/console/`.
 
 ## Monitoring
 
 ```bash
 # Health check
-curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/health
+curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 
 # JSON metrics (DynamoDB CloudWatch-style)
-curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/metrics
+curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/metrics
 
 # Syslog (Linux)
 journalctl -t extenddb -f
@@ -343,7 +343,7 @@ Expression parsing lives in `crates/core/src/expression/`. This is pure sync Rus
 - Set `RUST_LOG=debug` for verbose logging
 - Use `extenddb settings set log_level debug` for runtime log level changes
 - Check syslog: `journalctl -t extenddb -f` (Linux) or `log stream` (macOS)
-- Health-check endpoint: `curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/health`
+- Health-check endpoint: `curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health`
 
 ## Documentation
 
@@ -434,7 +434,7 @@ Activate when the user asks about installing, configuring, running, or debugging
 
 | Variable | Purpose                                                    |
 |----------|------------------------------------------------------------|
-| `EXTENDDB_TEST_ENDPOINT` | Target endpoint for tests (e.g., `https://127.0.0.1:8000`) |
+| `EXTENDDB_TEST_ENDPOINT` | Target endpoint for tests (e.g., `https://127.0.0.1:18443`) |
 | `EXTENDDB_ADMIN_USER` | Admin username for test credential provisioning (default: `admin`) |
 | `EXTENDDB_ADMIN_PASSWORD` | Admin password for test credential provisioning            |
 | `EXTENDDB_PASSWORD` | Password for `extenddb manage` commands (avoids process listing exposure) |
@@ -466,4 +466,4 @@ See [LICENSE](LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind.
 
-**Last Updated:** 2026-05-18
+**Last Updated:** 2026-06-23

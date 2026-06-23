@@ -29,7 +29,7 @@ from conftest import wait_for_active, wait_for_deleted
 # EXTENDDB_TEST_ENDPOINT is required — devtools/run-tests validates this.
 # Tests will use the default endpoint if the env var is missing.
 
-ENDPOINT = os.environ.get("EXTENDDB_TEST_ENDPOINT", "http://localhost:8000").strip()
+ENDPOINT = os.environ.get("EXTENDDB_TEST_ENDPOINT", "http://localhost:18443").strip()
 def extenddb_request(operation: str, body: dict) -> dict:
     """Send a raw DynamoDB-format request to extenddb with SigV4 authentication."""
     body_bytes = json.dumps(body).encode("utf-8")

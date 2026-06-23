@@ -21,7 +21,7 @@ cargo build --release
 ./target/release/extenddb serve --config extenddb.toml
 
 # 3. Provision test credentials and run tests
-export EXTENDDB_TEST_ENDPOINT=https://127.0.0.1:8000
+export EXTENDDB_TEST_ENDPOINT=https://127.0.0.1:18443
 export EXTENDDB_ADMIN_USER=admin
 export EXTENDDB_ADMIN_PASSWORD=<password-from-init>
 eval $(python3 devtools/provision-test-credentials)
@@ -31,7 +31,7 @@ pytest tests/ -v
 ### Using the test runner script (recommended)
 
 ```bash
-export EXTENDDB_TEST_ENDPOINT=https://127.0.0.1:8000
+export EXTENDDB_TEST_ENDPOINT=https://127.0.0.1:18443
 export EXTENDDB_ADMIN_USER=admin
 export EXTENDDB_ADMIN_PASSWORD=<password-from-init>
 devtools/run-tests --extenddb --all
@@ -51,7 +51,7 @@ pytest tests/ -v
 Auth tests require extenddb running with `auth.provider = "builtin"` (the default):
 
 ```bash
-EXTENDDB_TEST_ENDPOINT=https://127.0.0.1:8000 \
+EXTENDDB_TEST_ENDPOINT=https://127.0.0.1:18443 \
 EXTENDDB_ADMIN_USER=admin \
 EXTENDDB_ADMIN_PASSWORD=<admin-password-from-init> \
 pytest tests/test_auth_integration.py tests/test_auth_error_fidelity.py -v
@@ -64,7 +64,7 @@ as real DynamoDB. They run automatically against real DynamoDB (no env vars need
 Against extenddb, they require auth mode — set `EXTENDDB_ADMIN_USER` to signal this:
 
 ```bash
-EXTENDDB_TEST_ENDPOINT=https://127.0.0.1:8000 \
+EXTENDDB_TEST_ENDPOINT=https://127.0.0.1:18443 \
 EXTENDDB_ADMIN_USER=admin \
 pytest tests/test_auth_error_fidelity.py -v
 ```
@@ -129,12 +129,12 @@ brew install openjdk@17 maven
 
 ```bash
 # Start extenddb first, then:
-devtools/run-external-tests --endpoint https://127.0.0.1:8000
+devtools/run-external-tests --endpoint https://127.0.0.1:18443
 ```
 
 Or manually:
 
 ```bash
 cd tests/external/java
-mvn test -Dextenddb.endpoint=https://localhost:8000 2>&1 | tail -20
+mvn test -Dextenddb.endpoint=https://localhost:18443 2>&1 | tail -20
 ```
