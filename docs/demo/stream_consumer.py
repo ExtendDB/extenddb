@@ -20,7 +20,7 @@ import time
 
 import boto3
 
-ENDPOINT = os.environ.get("AWS_ENDPOINT_URL_DYNAMODB_STREAMS", "https://127.0.0.1:8000")
+ENDPOINT = os.environ.get("AWS_ENDPOINT_URL_DYNAMODB_STREAMS", "https://127.0.0.1:18443")
 TABLE_NAME = "Tickets"
 POLL_INTERVAL = 1  # seconds
 

@@ -27,7 +27,7 @@ from conftest import wait_for_active, wait_for_deleted
 # EXTENDDB_TEST_ENDPOINT is required — devtools/run-tests validates this.
 # Tests will use the default endpoint if the env var is missing.
 
-ENDPOINT = os.environ.get("EXTENDDB_TEST_ENDPOINT", "http://localhost:8000").strip()
+ENDPOINT = os.environ.get("EXTENDDB_TEST_ENDPOINT", "http://localhost:18443").strip()
 EXTENDDB_CONFIG = os.environ.get("EXTENDDB_CONFIG", "extenddb.toml")
 def extenddb_settings_set(key: str, value: str) -> None:
     """Set a extenddb runtime setting via the CLI.

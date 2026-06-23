@@ -113,7 +113,7 @@ backend = "{backend}"
 {docs_line}
 [server]
 bind_addr = "{bind_addr}"
-# port = 8000                    # HTTP port
+# port = 18443                   # HTTPS port
 # region = "us-east-1"           # AWS region for ARN generation
 # run_dir = "{run_dir}"          # Directory for PID file
 # throttling_enabled = false     # Enable provisioned throughput throttling

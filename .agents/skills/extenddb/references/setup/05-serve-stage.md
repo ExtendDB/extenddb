@@ -20,7 +20,7 @@ Wait roughly two seconds after starting, then run:
 ./target/release/extenddb status --config extenddb.toml
 ```
 
-Expected output: listening host, port (default 8000), and PID. Exit code 0.
+Expected output: listening host, port (default 18443), and PID. Exit code 0.
 
 If the exit code is nonzero, the server did not start successfully. Hand off to ``references/troubleshooting/01-symptom-index.md``. Return here when the startup failure is resolved.
 
@@ -72,7 +72,7 @@ The skill presents the command. Per Requirement 14, it does not run `kill`.
 
 Common causes, with pointers to the troubleshooting skill for detail:
 
-- Port 8000 already in use. Consult ``references/troubleshooting/01-symptom-index.md``, symptom "Address already in use."
+- Port 18443 already in use. Consult ``references/troubleshooting/01-symptom-index.md``, symptom "Address already in use."
 - TLS certificate missing or unreadable. Consult ``references/troubleshooting/01-symptom-index.md``, symptom "Failed to load TLS certificates."
 - Config file permissions too open. Consult ``references/troubleshooting/01-symptom-index.md``, symptom "Config file permissions too open."
 - Postgres unreachable. Consult ``references/postgres/01-readiness-checks.md``.

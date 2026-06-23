@@ -49,7 +49,7 @@ jobs:
         run: |
           ./target/release/extenddb serve --config extenddb.toml --foreground &
           for i in $(seq 1 30); do
-            if curl -sk https://127.0.0.1:8000/health | grep -q healthy; then
+            if curl -sk https://127.0.0.1:18443/health | grep -q healthy; then
               echo "Server ready"
               exit 0
             fi
@@ -67,7 +67,7 @@ jobs:
 
       - name: Run integration tests
         env:
-          EXTENDDB_TEST_ENDPOINT: https://127.0.0.1:8000
+          EXTENDDB_TEST_ENDPOINT: https://127.0.0.1:18443
           EXTENDDB_ADMIN_USER: admin
           EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
           EXTENDDB_TEST_PG_ADMIN_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432

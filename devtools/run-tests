@@ -144,7 +144,7 @@ validate_local_target() {
     # EXTENDDB_TEST_ENDPOINT must be set
     if [[ -z "${EXTENDDB_TEST_ENDPOINT:-}" ]]; then
         echo "error: --${prefix_lower} requires EXTENDDB_TEST_ENDPOINT to be set."
-        echo "  export EXTENDDB_TEST_ENDPOINT=https://localhost:8443"
+        echo "  export EXTENDDB_TEST_ENDPOINT=https://localhost:18443"
         exit 1
     fi
 

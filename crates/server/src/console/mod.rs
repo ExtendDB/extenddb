@@ -32,7 +32,7 @@ pub struct ConsoleState {
     pub sessions: SessionStore,
     /// Version string displayed in the console footer (e.g. "0.1.0 · catalog 2.1.0 · abc1234").
     pub version_info: Arc<str>,
-    /// The URL the server is listening on (e.g. "<https://127.0.0.1:8000>").
+    /// The URL the server is listening on (e.g. "<https://127.0.0.1:18443>").
     /// Displayed in the footer so users know which address the self-signed
     /// certificate is bound to.
     pub listen_url: String,

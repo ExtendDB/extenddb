@@ -47,11 +47,6 @@ you whether an RFC, an ADR, or neither is needed.
 
 ## Index
 
-<!-- Add published RFCs here as they land. -->
+<!-- Add accepted RFCs here as they land. -->
 
-| RFC      | Title | Status | Release |
-|:---------|:------|:-------|:--------|
-| [0001]() | | Draft  | |
-| [0002](0002-backend-plug-policy.md) | Backend Plugin Policy | Draft | |
-
-
+_(none yet)_

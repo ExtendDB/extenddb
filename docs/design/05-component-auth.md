@@ -1053,7 +1053,7 @@ Client (with extenddb wrapper)
 
 This is the same pattern used by EKS (`aws-iam-authenticator`) and Vault's AWS auth method. The client generates a pre-signed STS `GetCallerIdentity` request using its own credentials (signed for the `sts` service), and extenddb calls STS with that pre-signed request to validate the caller's identity.
 
-> **Why pre-signed tokens instead of header forwarding?** SigV4 signatures are bound to the service name, host, and request body they were generated for. A request signed for `dynamodb` / `localhost:8000` cannot be replayed against `sts` / `sts.amazonaws.com` — STS will reject the signature because the credential scope, signed host, and body hash all mismatch. Pre-signed URLs solve this: the client signs a separate request specifically for STS, and extenddb uses that to authenticate.
+> **Why pre-signed tokens instead of header forwarding?** SigV4 signatures are bound to the service name, host, and request body they were generated for. A request signed for `dynamodb` / `localhost:18443` cannot be replayed against `sts` / `sts.amazonaws.com` — STS will reject the signature because the credential scope, signed host, and body hash all mismatch. Pre-signed URLs solve this: the client signs a separate request specifically for STS, and extenddb uses that to authenticate.
 
 #### 8.3.2 Authentication: Pre-Signed STS GetCallerIdentity
 
