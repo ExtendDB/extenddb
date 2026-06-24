@@ -153,6 +153,7 @@ pub(crate) fn deserialize_error(e: serde_json::Error) -> DynamoDbError {
         || msg.contains("contains duplicates")
         || msg.contains("must not be empty")
         || msg.contains("contains invalid key")
+        || msg.contains("contains invalid value")
         || msg.contains("Syntax error; key")
         || msg.contains("AttributeValue is empty")
         || msg.contains("AttributeValue has more than one datatypes set")

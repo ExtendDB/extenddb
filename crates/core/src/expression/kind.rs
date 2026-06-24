@@ -31,6 +31,17 @@ impl ExpressionKind {
             Self::Update => "UpdateExpression",
         }
     }
+
+    /// Whether the size-limit error appends `; expression size: N`. Amazon
+    /// `DynamoDB` appends it for `Filter` and `Condition` only.
+    ///
+    /// `Condition` MUST stay in this set: `Filter` size errors are built as
+    /// `Condition` then relabelled by `prefix_expression_error`, inheriting the
+    /// suffix.
+    #[must_use]
+    pub fn size_error_includes_length(self) -> bool {
+        matches!(self, Self::Filter | Self::Condition)
+    }
 }
 
 impl fmt::Display for ExpressionKind {

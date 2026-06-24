@@ -7,9 +7,9 @@ use std::collections::HashMap;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
-    Expr, ExpressionKind, ExpressionMaps, PathElement, Token, UpdateAction,
-    parse_condition_with_depth_limit, parse_projection, parse_update_from, tokenize_for,
-    tokenize_with_limit, validate_no_reserved_words,
+    Expr, ExpressionKind, ExpressionMaps, KeyCondition, PathElement, Token, UpdateAction,
+    parse_condition_with_depth_limit, parse_key_condition, parse_projection, parse_update_from,
+    tokenize_for, tokenize_with_limit, validate_no_reserved_words,
 };
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{AttributeValue, ConditionalOperator, ExpectedAttributeValue};
@@ -55,6 +55,30 @@ pub fn build_expression_maps(
     )
 }
 
+/// Reject an expression over the byte-size limit, measured on the raw text
+/// before `#name` / `:value` substitution (Amazon `DynamoDB`: 4096). The error
+/// carries the per-parameter prefix and, for Filter/Condition, the byte length.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` when `expr` is over the limit.
+pub fn check_expression_size(
+    expr: &str,
+    kind: ExpressionKind,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    if expr.len() > limits.max_expression_length_bytes {
+        let mut msg =
+            format!("Invalid {kind}: Expression size has exceeded the maximum allowed size;");
+        if kind.size_error_includes_length() {
+            use std::fmt::Write as _;
+            let _ = write!(msg, " expression size: {}", expr.len());
+        }
+        return Err(DynamoDbError::ValidationException(msg));
+    }
+    Ok(())
+}
+
 /// Tokenize, reserved-word check, and parse a required `ConditionExpression`.
 ///
 /// Errors carry the `ConditionExpression` prefix, matching Amazon DynamoDB.
@@ -63,6 +87,7 @@ pub fn build_expression_maps(
 ///
 /// Returns `DynamoDbError::ValidationException` for syntax or reserved-word errors.
 pub fn parse_condition_expr(expr: &str, limits: &LimitsConfig) -> Result<Expr, DynamoDbError> {
+    check_expression_size(expr, ExpressionKind::Condition, limits)?;
     tokenize_expression(expr, limits)
         .and_then(|tokens| parse_condition_with_depth_limit(&tokens, limits.max_expression_depth))
         .map_err(|e| prefix_expression_error(e, ExpressionKind::Condition))
@@ -79,6 +104,7 @@ pub fn parse_update_expr(
     update_expr: &str,
     limits: &LimitsConfig,
 ) -> Result<Vec<UpdateAction>, DynamoDbError> {
+    check_expression_size(update_expr, ExpressionKind::Update, limits)?;
     tokenize_for(
         update_expr,
         limits.max_expression_tokens,
@@ -193,6 +219,7 @@ pub fn parse_projection_expr(
     proj_str: &str,
     limits: &LimitsConfig,
 ) -> Result<Vec<Vec<PathElement>>, DynamoDbError> {
+    check_expression_size(proj_str, ExpressionKind::Projection, limits)?;
     let result = tokenize_for(
         proj_str,
         limits.max_expression_tokens,
@@ -205,6 +232,33 @@ pub fn parse_projection_expr(
         parse_projection(&tokens)
     });
     result.map_err(|e| prefix_expression_error(e, ExpressionKind::Projection))
+}
+
+/// Size-check, tokenize, reserved-word check, and parse a `KeyConditionExpression`.
+///
+/// Errors carry the `KeyConditionExpression` prefix, matching Amazon `DynamoDB`.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` for over-size, syntax, or
+/// reserved-word errors.
+pub fn parse_key_condition_expr(
+    expr: &str,
+    limits: &LimitsConfig,
+) -> Result<KeyCondition, DynamoDbError> {
+    check_expression_size(expr, ExpressionKind::KeyCondition, limits)?;
+    tokenize_for(
+        expr,
+        limits.max_expression_tokens,
+        ExpressionKind::KeyCondition,
+    )
+    .and_then(|tokens| {
+        if limits.enforce_reserved_keywords {
+            validate_no_reserved_words(&tokens)?;
+        }
+        parse_key_condition(&tokens)
+    })
+    .map_err(|e| prefix_expression_error(e, ExpressionKind::KeyCondition))
 }
 
 /// Prefix an expression error with the expression type, matching `DynamoDB`'s format.
@@ -289,6 +343,66 @@ mod tests {
         assert!(
             matches!(&err, DynamoDbError::ValidationException(msg)
                 if msg.starts_with("Invalid FilterExpression:")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn filter_over_size_limit_keeps_size_suffix_through_relabel() {
+        // Filter relabels through Condition; the size suffix must survive.
+        let limits = LimitsConfig::default();
+        let path = "a".to_owned() + &"z".repeat(limits.max_expression_length_bytes);
+        let expr = format!("{path} = :v");
+        let err = parse_optional_filter(Some(&expr), &limits).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if *msg == format!(
+                    "Invalid FilterExpression: Expression size has exceeded the \
+                     maximum allowed size; expression size: {}", expr.len())),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn condition_over_size_limit_keeps_size_suffix() {
+        let limits = LimitsConfig::default();
+        let path = "a".to_owned() + &"z".repeat(limits.max_expression_length_bytes);
+        let expr = format!("attribute_not_exists({path})");
+        let err = parse_optional_condition(Some(&expr), &limits).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if *msg == format!(
+                    "Invalid ConditionExpression: Expression size has exceeded the \
+                     maximum allowed size; expression size: {}", expr.len())),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn projection_over_size_limit_omits_size_suffix() {
+        let limits = LimitsConfig::default();
+        let expr = "a".to_owned() + &"z".repeat(limits.max_expression_length_bytes);
+        let err = parse_projection_expr(&expr, &limits).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if msg == "Invalid ProjectionExpression: Expression size has exceeded \
+                           the maximum allowed size;"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn expression_size_limit_is_bytes_not_chars() {
+        // Over the limit in bytes but not in chars: still rejected.
+        let limits = LimitsConfig::default();
+        let half = limits.max_expression_length_bytes / 2;
+        let path = "\u{00e9}".repeat(half + 1); // 'é' = 2 bytes; (half+1)*2 > limit
+        assert!(path.chars().count() <= limits.max_expression_length_bytes);
+        assert!(path.len() > limits.max_expression_length_bytes);
+        let err = parse_projection_expr(&path, &limits).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if msg.contains("Expression size has exceeded the maximum allowed size")),
             "got {err:?}"
         );
     }
