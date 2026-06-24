@@ -21,7 +21,7 @@ tests/
 
 ```bash
 # Ensure extenddb is running with TLS + auth
-export DYNAMODB_ENDPOINT=https://127.0.0.1:8000
+export DYNAMODB_ENDPOINT=https://127.0.0.1:18443
 export AWS_ACCESS_KEY_ID=<test-key>
 export AWS_SECRET_ACCESS_KEY=<test-secret>
 export AWS_DEFAULT_REGION=us-east-1

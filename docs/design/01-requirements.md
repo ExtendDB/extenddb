@@ -574,8 +574,8 @@ extenddb requires credentials for SigV4 authentication. The standard `~/.aws/cre
 
 ```bash
 # Point both services at extenddb
-export AWS_ENDPOINT_URL_DYNAMODB=https://127.0.0.1:8000
-export AWS_ENDPOINT_URL_DYNAMODB_STREAMS=https://127.0.0.1:8000
+export AWS_ENDPOINT_URL_DYNAMODB=https://127.0.0.1:18443
+export AWS_ENDPOINT_URL_DYNAMODB_STREAMS=https://127.0.0.1:18443
 
 # Credentials must match a pair registered in extenddb's credential store
 export AWS_ACCESS_KEY_ID=local-dev-key
@@ -594,9 +594,9 @@ services = extenddb-services
 
 [services extenddb-services]
 dynamodb =
-  endpoint_url = https://127.0.0.1:8000
+  endpoint_url = https://127.0.0.1:18443
 dynamodb_streams =
-  endpoint_url = https://127.0.0.1:8000
+  endpoint_url = https://127.0.0.1:18443
 ```
 
 ```ini
@@ -611,7 +611,7 @@ Usage: `export AWS_PROFILE=extenddb` — then all SDK clients in the process use
 **Alternative — global endpoint override (all AWS services go to one place):**
 
 ```bash
-export AWS_ENDPOINT_URL=https://127.0.0.1:8000
+export AWS_ENDPOINT_URL=https://127.0.0.1:18443
 ```
 
 This sends every AWS SDK call to extenddb. Only useful when the application exclusively uses DynamoDB.

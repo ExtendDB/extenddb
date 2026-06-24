@@ -4,7 +4,7 @@
 
 The AWS CLI talks to extenddb over HTTPS using SigV4. Three values redirect it from real AWS to the extenddb endpoint: the CA bundle (to trust the self-signed cert), the endpoint URL (the extenddb host and port), and the access key pair (for SigV4 signing). A region is also required; any valid region string works, and `us-east-1` is the conventional default.
 
-The default port is 8000 (configured via `port` in `[server]` section of `extenddb.toml`). Replace `<port>` below with the value from your config.
+The default port is 18443 (configured via `port` in `[server]` section of `extenddb.toml`). Replace `<port>` below with the value from your config.
 
 ## 2. Option 1: Environment variables (simplest)
 

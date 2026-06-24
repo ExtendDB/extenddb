@@ -162,14 +162,14 @@ extenddb runs as a daemon (background process) and logs to syslog. On startup it
 
 ```bash
 ./target/release/extenddb serve --config extenddb.toml
-# extenddb 0.0.2 (catalog 0.0.2) listening on 127.0.0.1:8000
+# extenddb 0.0.2 (catalog 0.0.2) listening on 127.0.0.1:18443
 ```
 
 Check status (includes the daemon PID):
 
 ```bash
 ./target/release/extenddb status --config extenddb.toml
-# extenddb is running on port 8000 (pid 12345)
+# extenddb is running on port 18443 (pid 12345)
 ```
 
 Read logs:
@@ -291,9 +291,9 @@ Stop the server:
 
 If `extenddb stop` is unavailable (e.g., older binary), fall back to manual process management:
 
-1. Find the process listening on the extenddb port (default 8000):
+1. Find the process listening on the extenddb port (default 18443):
    ```bash
-   ss -tlnp | grep :8000
+   ss -tlnp | grep :18443
    ```
 2. Kill it:
    ```bash
@@ -312,7 +312,7 @@ export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
 
 ```bash
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
-export AWS_ENDPOINT_URL_DYNAMODB=https://127.0.0.1:8000
+export AWS_ENDPOINT_URL_DYNAMODB=https://127.0.0.1:18443
 export AWS_ACCESS_KEY_ID=<access-key-from-create-access-key>
 export AWS_SECRET_ACCESS_KEY=<secret-key-from-create-access-key>
 export AWS_DEFAULT_REGION=us-east-1
@@ -330,7 +330,7 @@ services = extenddb-services
 
 [services extenddb-services]
 dynamodb =
-  endpoint_url = https://127.0.0.1:8000
+  endpoint_url = https://127.0.0.1:18443
 ```
 
 Add to `~/.aws/credentials`:
@@ -347,7 +347,7 @@ Then: `export AWS_PROFILE=extenddb`
 
 ```bash
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
-aws dynamodb list-tables --endpoint-url https://127.0.0.1:8000
+aws dynamodb list-tables --endpoint-url https://127.0.0.1:18443
 ```
 
 ### Post-init workflow
@@ -573,24 +573,24 @@ import os
 os.environ["AWS_CA_BUNDLE"] = os.path.expanduser("~/.extenddb/tls/cert.pem")
 
 # DynamoDB client — for table/item operations
-dynamodb = boto3.client("dynamodb", endpoint_url="https://127.0.0.1:8000")
+dynamodb = boto3.client("dynamodb", endpoint_url="https://127.0.0.1:18443")
 
 # DynamoDB Streams client — for stream operations
-streams = boto3.client("dynamodbstreams", endpoint_url="https://127.0.0.1:8000")
+streams = boto3.client("dynamodbstreams", endpoint_url="https://127.0.0.1:18443")
 ```
 
 List streams:
 
 ```bash
 aws dynamodbstreams list-streams \
-    --endpoint-url https://127.0.0.1:8000
+    --endpoint-url https://127.0.0.1:18443
 ```
 
 Describe a stream (use the `LatestStreamArn` from `DescribeTable`):
 
 ```bash
 aws dynamodbstreams describe-stream \
-    --endpoint-url https://127.0.0.1:8000 \
+    --endpoint-url https://127.0.0.1:18443 \
     --stream-arn \
       "arn:aws:dynamodb:us-east-1:<account-id>:table/StreamTable/stream/2026-04-08T07:00:00"
 ```
@@ -600,7 +600,7 @@ Get a shard iterator and read records:
 ```bash
 # Get iterator for a shard (use ShardId from DescribeStream)
 aws dynamodbstreams get-shard-iterator \
-    --endpoint-url https://127.0.0.1:8000 \
+    --endpoint-url https://127.0.0.1:18443 \
     --stream-arn \
       "arn:aws:dynamodb:us-east-1:<account-id>:table/StreamTable/stream/2026-04-08T07:00:00" \
     --shard-id "shard-0" \
@@ -608,7 +608,7 @@ aws dynamodbstreams get-shard-iterator \
 
 # Read records using the iterator
 aws dynamodbstreams get-records \
-    --endpoint-url https://127.0.0.1:8000 \
+    --endpoint-url https://127.0.0.1:18443 \
     --shard-iterator "<iterator-from-above>"
 ```
 
@@ -620,8 +620,8 @@ The standard pattern for consuming a DynamoDB stream is a polling loop:
 import time
 import boto3
 
-streams = boto3.client("dynamodbstreams", endpoint_url="https://127.0.0.1:8000")
-dynamodb = boto3.client("dynamodb", endpoint_url="https://127.0.0.1:8000")
+streams = boto3.client("dynamodbstreams", endpoint_url="https://127.0.0.1:18443")
+dynamodb = boto3.client("dynamodb", endpoint_url="https://127.0.0.1:18443")
 
 # Get stream ARN from the table.
 table = dynamodb.describe_table(TableName="StreamTable")
@@ -660,7 +660,7 @@ Stream records are retained for 24 hours. A background worker cleans up expired 
 ### Health check
 
 ```bash
-curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/health
+curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 # {"status":"healthy"}
 ```
 
@@ -1135,7 +1135,7 @@ extenddb includes a built-in web console for managing accounts, users, groups, r
 
 ### Accessing the console
 
-Navigate to `https://127.0.0.1:8000/console/` in your browser (adjust the host and port to match your `extenddb.toml` configuration). Accept the self-signed certificate warning on first visit.
+Navigate to `https://127.0.0.1:18443/console/` in your browser (adjust the host and port to match your `extenddb.toml` configuration). Accept the self-signed certificate warning on first visit.
 
 ### Login
 
@@ -1351,7 +1351,7 @@ A complete Python sample application is included at `samples/sample_app.py`. It 
 
 # Run the sample with the access key from create-access-key output
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
-export EXTENDDB_ENDPOINT=https://127.0.0.1:8000
+export EXTENDDB_ENDPOINT=https://127.0.0.1:18443
 export AWS_ACCESS_KEY_ID=<access-key-id>
 export AWS_SECRET_ACCESS_KEY=<secret-access-key>
 python3 samples/sample_app.py

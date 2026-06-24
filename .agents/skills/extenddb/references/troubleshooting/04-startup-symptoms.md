@@ -13,12 +13,12 @@ Entries are copied verbatim from `docs/troubleshooting.md` per Requirement 10.2.
 Failed to bind <addr>: Address already in use
 ```
 
-**Cause:** Another process is already listening on the configured port (default 8000).
+**Cause:** Another process is already listening on the configured port (default 18443).
 
 **Fix:** Check what's using the port and stop it, or use a different port:
 ```bash
-ss -tlnp | grep :8000                    # find what's using the port
-extenddb serve --port 8001 --config extenddb.toml  # use a different port
+ss -tlnp | grep :18443                    # find what's using the port
+extenddb serve --port 19443 --config extenddb.toml  # use a different port
 ```
 
 **Source:** `docs/troubleshooting.md`, section "`Failed to bind <addr>: Address already in use`", last synced 2026-05-12.

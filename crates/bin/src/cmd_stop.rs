@@ -38,7 +38,7 @@ pub fn run(args: &StopArgs) {
     let port = args
         .port
         .or_else(|| app_config.as_ref().map(|c| c.server.port))
-        .unwrap_or(8000);
+        .unwrap_or(18443);
 
     let pid_file = match &app_config {
         Some(c) => {

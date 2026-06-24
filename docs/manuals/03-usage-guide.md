@@ -14,7 +14,7 @@ Point your SDK at extenddb by setting the endpoint URL. extenddb uses TLS with a
 
 ```bash
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
-export AWS_ENDPOINT_URL_DYNAMODB=https://127.0.0.1:8000
+export AWS_ENDPOINT_URL_DYNAMODB=https://127.0.0.1:18443
 export AWS_ACCESS_KEY_ID=your-access-key
 export AWS_SECRET_ACCESS_KEY=your-secret-key
 export AWS_DEFAULT_REGION=us-east-1
@@ -24,7 +24,7 @@ Or per-command:
 
 ```bash
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
-aws dynamodb list-tables --endpoint-url https://127.0.0.1:8000
+aws dynamodb list-tables --endpoint-url https://127.0.0.1:18443
 ```
 
 ### Python (boto3)
@@ -37,7 +37,7 @@ os.environ["AWS_CA_BUNDLE"] = os.path.expanduser("~/.extenddb/tls/cert.pem")
 
 dynamodb = boto3.client(
     "dynamodb",
-    endpoint_url="https://127.0.0.1:8000",
+    endpoint_url="https://127.0.0.1:18443",
     region_name="us-east-1",
     aws_access_key_id="your-access-key",
     aws_secret_access_key="your-secret-key",
@@ -48,7 +48,7 @@ dynamodb = boto3.client(
 
 ```java
 DynamoDbClient client = DynamoDbClient.builder()
-    .endpointOverride(URI.create("https://127.0.0.1:8000"))
+    .endpointOverride(URI.create("https://127.0.0.1:18443"))
     .region(Region.US_EAST_1)
     .credentialsProvider(StaticCredentialsProvider.create(
         AwsBasicCredentials.create("your-access-key", "your-secret-key")))
@@ -61,7 +61,7 @@ Note: For Java, configure the trust store to include the self-signed cert, or se
 
 ```rust
 let config = aws_config::defaults(BehaviorVersion::latest())
-    .endpoint_url("https://127.0.0.1:8000")
+    .endpoint_url("https://127.0.0.1:18443")
     .region(Region::new("us-east-1"))
     .credentials_provider(Credentials::new("key", "secret", None, None, "extenddb"))
     .load()
@@ -75,7 +75,7 @@ let client = aws_sdk_dynamodb::Client::new(&config);
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 
 const client = new DynamoDBClient({
-    endpoint: "https://127.0.0.1:8000",
+    endpoint: "https://127.0.0.1:18443",
     region: "us-east-1",
     credentials: { accessKeyId: "key", secretAccessKey: "secret" },
 });
@@ -377,23 +377,23 @@ Read stream records:
 
 ```bash
 # List streams
-aws dynamodbstreams list-streams --endpoint-url https://127.0.0.1:8000
+aws dynamodbstreams list-streams --endpoint-url https://127.0.0.1:18443
 
 # Describe stream
 aws dynamodbstreams describe-stream \
-    --endpoint-url https://127.0.0.1:8000 \
+    --endpoint-url https://127.0.0.1:18443 \
     --stream-arn "<stream-arn>"
 
 # Get shard iterator
 aws dynamodbstreams get-shard-iterator \
-    --endpoint-url https://127.0.0.1:8000 \
+    --endpoint-url https://127.0.0.1:18443 \
     --stream-arn "<stream-arn>" \
     --shard-id "shard-0" \
     --shard-iterator-type TRIM_HORIZON
 
 # Read records
 aws dynamodbstreams get-records \
-    --endpoint-url https://127.0.0.1:8000 \
+    --endpoint-url https://127.0.0.1:18443 \
     --shard-iterator "<iterator>"
 ```
 

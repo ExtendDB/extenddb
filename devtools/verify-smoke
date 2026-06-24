@@ -15,7 +15,7 @@
 #   devtools/verify-smoke [--config PATH]
 #
 # Requires:
-#   EXTENDDB_TEST_ENDPOINT  — server URL (e.g. https://localhost:8000)
+#   EXTENDDB_TEST_ENDPOINT  — server URL (e.g. https://localhost:18443)
 #   AWS_ACCESS_KEY_ID       — valid credentials for the target
 #   AWS_SECRET_ACCESS_KEY   — valid credentials for the target
 #   EXTENDDB_ADMIN_PASSWORD — admin password (for manage commands)

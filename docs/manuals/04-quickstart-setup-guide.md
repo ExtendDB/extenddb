@@ -45,7 +45,7 @@ cargo build --release
 
 # 6. Configure AWS CLI (use access key from step 5)
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
-export AWS_ENDPOINT_URL_DYNAMODB=https://127.0.0.1:8000
+export AWS_ENDPOINT_URL_DYNAMODB=https://127.0.0.1:18443
 export AWS_ACCESS_KEY_ID=<access-key-id>
 export AWS_SECRET_ACCESS_KEY=<secret-access-key>
 export AWS_DEFAULT_REGION=us-east-1
@@ -240,7 +240,7 @@ Three options for endpoint configuration, from simplest to most structured:
 
 ```bash
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
-export AWS_ENDPOINT_URL_DYNAMODB=https://127.0.0.1:8000
+export AWS_ENDPOINT_URL_DYNAMODB=https://127.0.0.1:18443
 export AWS_ACCESS_KEY_ID=<access-key-from-create-access-key>
 export AWS_SECRET_ACCESS_KEY=<secret-key-from-create-access-key>
 export AWS_DEFAULT_REGION=us-east-1
@@ -258,7 +258,7 @@ services = extenddb-services
 
 [services extenddb-services]
 dynamodb =
-  endpoint_url = https://127.0.0.1:8000
+  endpoint_url = https://127.0.0.1:18443
 ```
 
 `~/.aws/credentials`:
@@ -275,7 +275,7 @@ Then: `export AWS_PROFILE=extenddb`
 
 ```bash
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
-aws dynamodb list-tables --endpoint-url https://127.0.0.1:8000
+aws dynamodb list-tables --endpoint-url https://127.0.0.1:18443
 ```
 
 ### Setting Up Credentials
@@ -331,7 +331,7 @@ aws dynamodb create-table \
     --key-schema AttributeName=pk,KeyType=HASH \
     --billing-mode PAY_PER_REQUEST \
     --stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES \
-    --endpoint-url https://127.0.0.1:8000
+    --endpoint-url https://127.0.0.1:18443
 ```
 
 6. Wait for the table to become ACTIVE, then insert an item:
@@ -340,7 +340,7 @@ aws dynamodb create-table \
 aws dynamodb put-item \
     --table-name StreamTest \
     --item '{"pk": {"S": "key1"}, "data": {"S": "hello streams"}}' \
-    --endpoint-url https://127.0.0.1:8000
+    --endpoint-url https://127.0.0.1:18443
 ```
 
 7. Read the stream:
@@ -349,29 +349,29 @@ aws dynamodb put-item \
 # List streams
 aws dynamodbstreams list-streams \
     --table-name StreamTest \
-    --endpoint-url https://127.0.0.1:8000
+    --endpoint-url https://127.0.0.1:18443
 
 # Describe the stream (use the StreamArn from above)
 aws dynamodbstreams describe-stream \
     --stream-arn <stream-arn> \
-    --endpoint-url https://127.0.0.1:8000
+    --endpoint-url https://127.0.0.1:18443
 
 # Get a shard iterator (use the ShardId from above)
 aws dynamodbstreams get-shard-iterator \
     --stream-arn <stream-arn> \
     --shard-id <shard-id> \
     --shard-iterator-type TRIM_HORIZON \
-    --endpoint-url https://127.0.0.1:8000
+    --endpoint-url https://127.0.0.1:18443
 
 # Get records (use the ShardIterator from above)
 aws dynamodbstreams get-records \
     --shard-iterator <shard-iterator> \
-    --endpoint-url https://127.0.0.1:8000
+    --endpoint-url https://127.0.0.1:18443
 ```
 
 ### Management Web Console
 
-Navigate to `https://127.0.0.1:8000/console/` in your browser. Log in with admin credentials or IAM user credentials (`account_id/user_name`).
+Navigate to `https://127.0.0.1:18443/console/` in your browser. Log in with admin credentials or IAM user credentials (`account_id/user_name`).
 
 The console provides a GUI for managing accounts, users, groups, roles, policies, and access keys.
 
@@ -402,7 +402,7 @@ This drops both databases after confirmation.
 
 | Symptom | Fix |
 |---------|-----|
-| `connection refused` on port 8000 | Server not running. Start with `extenddb serve --config extenddb.toml` |
+| `connection refused` on port 18443 | Server not running. Start with `extenddb serve --config extenddb.toml` |
 | `CATALOG_VERSION_MISMATCH` | Run `extenddb migrate --config extenddb.toml` |
 | `ResourceNotFoundException` on CreateTable | Table is still in CREATING status. Poll DescribeTable until `TableStatus` is `ACTIVE` |
 | `UnrecognizedClientException` | Invalid access key. Check credentials — verify the access key ID and secret match what was returned by `create-access-key` |
