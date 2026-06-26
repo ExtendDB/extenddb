@@ -59,11 +59,65 @@ Backends released under the ExtendDB organization must adhere to a trait-based c
 
 3. **All-or-nothing per trait.** The trait is the finest-grained unit of conformance. Backends cannot claim partial support for a trait (example: "Streams partially works but records are incomplete" is not allowed). Either the trait is fully implemented and conformant, or it is not implemented.
 
-4. **Maintain semantic correctness.** Where a backend implements an operation, it must match DynamoDB behavior including error responses, pagination, atomicity guarantees, and consistency models.
+4. **Maintain semantic correctness.** Where a backend implements an operation, it must match DynamoDB behavior including error responses, pagination, isolation guarantees, atomicity guarantees, and consistency models.
 
 5. **Clear documentation.** Backends must document in their README which optional traits they implement and which they do not. Conformance test results (per-trait pass rates) must be published and tracked in CI.
 
 This model reduces friction by allowing new backends to launch with a well-defined subset of functionality without requiring support for every ExtendDB feature from day one. As backends mature, they can add optional traits incrementally, but each addition must be complete and correct. This prevents fragmented, partially-working implementations that erode ExtendDB's compatibility guarantee.
+
+#### Conformance expectations and communication
+
+**Compatibility matrices:** Backends must publish a compatibility matrix documenting which DynamoDB operations and features are supported. This matrix should be maintained in the backend's README and updated with each release. Example format:
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Basic CRUD | Supported | PutItem, GetItem, DeleteItem, UpdateItem |
+| Query/Scan | Supported | Filters and projections supported |
+| GSI/LSI | Not supported | Returns `OperationNotSupported` |
+| Transactions | Partial | TransactWriteItems only; read transactions unsupported |
+| Streams | Supported | Full support with configurable retention |
+
+**Error handling for unsupported features:** Backends MUST return explicit errors for unsupported operations rather than silently degrading behavior or returning incorrect results. Acceptable approaches:
+- Return `OperationNotSupported` error for unimplemented operations
+- Return `ValidationException` with clear message for unsupported parameters within implemented operations
+- Document degraded behavior explicitly (e.g., "eventually consistent reads treated as strongly consistent")
+
+Backends MUST NOT silently ignore unsupported features or return partial/incorrect data.
+
+**Capability discovery and enforcement:** To help users understand what a backend supports and to prevent confusing error messages deep in operation execution, ExtendDB should provide a mechanism for backends to declare their capabilities and for the server to check support before dispatching requests.
+
+In a trait-based model, Rust's type system provides some of this enforcement: if a backend doesn't implement `StreamEngine`, stream operations won't compile. However, this doesn't help with partial trait implementations (e.g., a backend that implements `DataEngine` but not all optional parameters within PutItem).
+
+In an operation-based model, explicit capability declaration becomes more important. Backends would declare supported operations in a manifest (TOML, JSON, or Rust code), which the server reads at startup to populate a capability registry. When a request arrives, the server checks the registry before dispatching. If the operation isn't supported, the server returns `OperationNotSupported` immediately without calling the backend.
+
+This approach provides benefits regardless of conformance model:
+- Users can query capabilities programmatically (e.g., `DescribeBackendCapabilities` API)
+- Conformance tests can adapt to backend capabilities without manual configuration
+- Error messages are consistent and occur at request validation rather than deep in execution
+- Backend developers get a single place to document support
+
+Implementation could range from simple (static capability declaration in backend code) to sophisticated (dynamic capability querying, versioned capability schemas). The key principle: make it easy for users to discover what works before trying it.
+
+**Beyond DynamoDB compatibility:** Backends may implement features beyond DynamoDB compatibility (e.g., backend-specific query optimizations, extended data types, native full-text search). These extensions:
+- MUST NOT break DynamoDB compatibility for standard operations
+- MUST NOT fundamentally change the DynamoDB API paradigm
+- MUST be clearly documented as extensions
+- SHOULD be exposed via backend-specific APIs or configuration, not by altering DynamoDB API semantics
+- MUST NOT be required for core DynamoDB functionality to work
+
+The "DynamoDB API paradigm" centers on predictable, consistent performance where developers can reason unambiguously about operation cost. Extensions that introduce unpredictable performance characteristics are prohibited even if they don't technically break API compatibility. Examples:
+
+**Prohibited extensions:**
+- SQL-style joins (unpredictable performance, violates DynamoDB's explicit access pattern design)
+- Automatic GSI selection via query optimizer (hides performance characteristics from developer)
+- Cross-table transactions (changes atomicity guarantees and performance model)
+
+**Acceptable extensions:**
+- Backend-specific full-text search via separate API endpoint (doesn't alter Query/Scan semantics)
+- Extended data types exposed through backend-specific configuration (DynamoDB types still work)
+- Read-your-writes consistency mode as opt-in configuration (doesn't change standard consistency guarantees)
+
+When in doubt, extensions should be backend-specific APIs rather than modifications to DynamoDB operations.
 
 #### Trait classification
 
@@ -83,16 +137,72 @@ ExtendDB's storage abstraction consists of 13 traits covering storage operations
 - `AdminStore` - administrative functions
 - `Bootstrapper` - initialization and bootstrap
 
+**Mandatory authentication/authorization traits:**
+- `AuthorizationStore` - authorization data (policies, users, groups, roles)
+
+ExtendDB requires SigV4 authentication on all DynamoDB API requests. Backends must persist auth primitives (users, groups, roles, policies, access keys) to support this requirement. While these traits don't map directly to DynamoDB APIs, they are infrastructure requirements for a conformant ExtendDB deployment.
+
 **Optional management traits:**
 - `SettingsStore` - settings persistence
 - `MetricsStore` - metrics collection
 - `RateLimitStore` - rate limiting state
-- `AuthorizationStore` - authorization data
 - `BackupEngine` - backup and restore
 
 Note: This classification may be refined as the trait design evolves. Some traits may be split, merged, or reclassified before this policy is finalized.
 
 Conformance test results are published in the backend's README and tracked in CI.
+
+#### Alternate proposal: Operation-based conformance
+
+Trait boundaries and feature boundaries don't always align. If conformance is trait-based ("implement all or nothing of a trait"), backends must implement entire traits even when only a subset of operations is needed. If conformance is operation- or feature-based ("implement these specific operations"), backends stub out unneeded operations but must track conformance at finer granularity.
+
+If we define conformance in terms of a stable set of DynamoDB features rather than traits, a classification more like the following emerges:
+
+**Mandatory DynamoDB operations (control plane):**
+- CreateTable, DeleteTable, DescribeTable, ListTables, UpdateTable
+- TagResource, UntagResource, ListTagsOfResource
+
+**Mandatory DynamoDB operations (data plane):**
+- PutItem, GetItem, DeleteItem, UpdateItem
+- Query, Scan (basic, no index selection)
+- BatchGetItem, BatchWriteItem
+
+**Mandatory infrastructure traits:**
+- `ManagementStore` - core management operations
+- `AdminStore` - administrative functions
+- `AuthorizationStore` - authorization data (policies, users, groups, roles)
+- `Bootstrapper` - initialization and bootstrap
+
+ExtendDB requires SigV4 authentication on all DynamoDB API requests. Backends must implement these infrastructure traits to persist auth primitives, even though they don't map directly to DynamoDB APIs. Unlike optional DynamoDB operations, these infrastructure traits remain mandatory in both conformance models.
+
+**Optional DynamoDB operation classes:**
+- Secondary indexes (GSI, LSI)
+- Transactions (TransactGetItems, TransactWriteItems)
+- Streams (ListStreams, DescribeStream, GetRecords)
+- TTL (UpdateTimeToLive, DescribeTimeToLive)
+- Import/Export (ImportTable, ExportTableToPointInTime)
+- Advanced Query/Scan features (filters, projections, index selection)
+
+Under this model, backends would declare supported operations explicitly (via manifest or code), and the server would maintain a capability registry for runtime enforcement. See "Capability discovery and enforcement" above for implementation considerations that apply to both conformance models.
+
+**Tradeoffs:**
+
+| Aspect | Trait-based | Operation-based |
+|--------|-------------|-----------------|
+| Developer clarity | "Implement these traits" | "Implement these operations" |
+| Granularity | Coarse (whole trait) | Fine (individual operation) |
+| Partial features | Forces full trait implementation | Allows targeted implementation |
+| Maintenance | Trait changes affect all backends | Operation registry must stay stable |
+| Test complexity | Test entire trait or skip it | Test operation-by-operation |
+| Runtime checks | None (compile-time trait bounds) | Capability registry + error handling |
+| Stub implementations | Not required | Required for unimplemented operations |
+
+**Current recommendation:** Start with trait-based conformance for simplicity. The ExtendDB team currently maintains all backends and can absorb the cost of implementing full traits. Revisit operation-based conformance if:
+- External contributors request narrower conformance targets
+- Trait/feature misalignment becomes a blocking issue
+- Backends emerge with fundamentally different capability models (e.g., read-only, control-plane-only)
+
+This alternate proposal is documented for future consideration, not immediate adoption.
 
 ### Contribution process
 
