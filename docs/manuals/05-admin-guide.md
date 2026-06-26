@@ -25,7 +25,7 @@ extenddb always runs as a daemon. On startup it:
 
 ```bash
 ./target/release/extenddb status --config extenddb.toml
-# extenddb is running on port 8000 (pid 12345)
+# extenddb is running on port 18443 (pid 12345)
 ```
 
 ### Stopping
@@ -45,7 +45,7 @@ extenddb handles SIGTERM and SIGINT gracefully — it drains active connections 
 ### Health Check
 
 ```bash
-curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/health
+curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 # {"status":"healthy"}
 ```
 
@@ -60,7 +60,7 @@ These settings require a server restart to take effect.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `bind_addr` | `127.0.0.1` | Network interface to bind |
-| `port` | `8000` | HTTP port |
+| `port` | `18443` | HTTP port |
 | `region` | `us-east-1` | AWS region for ARN generation |
 
 #### [storage]
@@ -452,7 +452,7 @@ Targets: `extenddb::audit::manage` (management ops), `extenddb::audit::settings`
 ### Metrics
 
 ```bash
-curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/metrics
+curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/metrics
 ```
 
 JSON metrics endpoint with DynamoDB CloudWatch-style metric names and dimensions. The response shape is `{ metrics, buckets, segments, source }`. See `docs/design/06-component-server.md` §7.2 for the full schema and metric list.
@@ -460,7 +460,7 @@ JSON metrics endpoint with DynamoDB CloudWatch-style metric names and dimensions
 ### Health Check
 
 ```bash
-curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/health
+curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 # {"status":"healthy"}
 ```
 
@@ -474,7 +474,7 @@ curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/health
 Error: Address already in use (os error 98)
 ```
 
-Another process is using the port. Find it with `ss -tlnp | grep :8000` and stop it, or change the port in `extenddb.toml`.
+Another process is using the port. Find it with `ss -tlnp | grep :18443` and stop it, or change the port in `extenddb.toml`.
 
 **Database connection failed:**
 

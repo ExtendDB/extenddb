@@ -9,9 +9,7 @@ use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::PathElement;
-use extenddb_core::expression::{
-    ExpressionKind, ExpressionMaps, Projection, parse_key_condition, tokenize_for,
-};
+use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
 use extenddb_core::types::{
     IndexType, KeyType, QueryInput, QueryOutput, Select, TableKeyInfo, extract_key, item_size_bytes,
 };
@@ -166,20 +164,7 @@ pub async fn handle_query(
     let (mut key_condition, legacy_kc_maps) = if let Some(kce_str) =
         input.key_condition_expression.as_deref()
     {
-        let parsed = tokenize_for(
-            kce_str,
-            ctx.limits.max_expression_tokens,
-            ExpressionKind::KeyCondition,
-        )
-        .and_then(|tokens| {
-            if ctx.limits.enforce_reserved_keywords {
-                extenddb_core::expression::validate_no_reserved_words(&tokens)?;
-            }
-            parse_key_condition(&tokens)
-        })
-        .map_err(|e| {
-            crate::expression_helpers::prefix_expression_error(e, ExpressionKind::KeyCondition)
-        })?;
+        let parsed = crate::expression_helpers::parse_key_condition_expr(kce_str, &ctx.limits)?;
         (parsed, None)
     } else if let Some(ref kc) = input.key_conditions {
         let key_schema_pairs: Vec<(String, bool)> = query_key_info

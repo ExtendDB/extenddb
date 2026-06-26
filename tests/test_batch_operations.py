@@ -538,3 +538,139 @@ class TestBatchGetItemKeyValidation:
                 }
             )
         assert exc_info.value.response["Error"]["Code"] == "ValidationException"
+
+
+# Expected messages for the BatchGetItem expression / non-expression param mix.
+_MIXED_PARAMS_MSG = (
+    "Can not use both expression and non-expression parameters in the same "
+    "request: Non-expression parameters: {AttributesToGet} Expression "
+    "parameters: {ProjectionExpression}"
+)
+_NAMES_WITHOUT_EXPR_MSG = (
+    "ExpressionAttributeNames can only be specified when using expressions"
+)
+
+
+class TestBatchGetItemExpressionParamMix:
+    """BatchGetItem rejects mixing expression and non-expression parameters.
+
+    Amazon DynamoDB applies the check request-wide: a ProjectionExpression on
+    one table and AttributesToGet on another is a mix, even when each table is
+    internally consistent. ExpressionAttributeNames alone is not a mix trigger;
+    it fails the separate "can only be specified when using expressions" check.
+    """
+
+    def _expect_validation(self, func, expected_message):
+        with pytest.raises(ClientError) as exc_info:
+            func()
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == expected_message
+
+    def test_same_table_proj_and_attrs_rejected(self, dynamodb_client, hash_table):
+        self._expect_validation(
+            lambda: dynamodb_client.batch_get_item(
+                RequestItems={
+                    hash_table: {
+                        "Keys": [{"pk": {"S": "a"}}],
+                        "ProjectionExpression": "pk",
+                        "AttributesToGet": ["pk"],
+                    }
+                }
+            ),
+            _MIXED_PARAMS_MSG,
+        )
+
+    def test_cross_table_proj_and_attrs_rejected(
+        self, dynamodb_client, hash_table, second_table
+    ):
+        self._expect_validation(
+            lambda: dynamodb_client.batch_get_item(
+                RequestItems={
+                    hash_table: {
+                        "Keys": [{"pk": {"S": "a"}}],
+                        "ProjectionExpression": "pk",
+                    },
+                    second_table: {
+                        "Keys": [{"id": {"S": "b"}}],
+                        "AttributesToGet": ["id"],
+                    },
+                }
+            ),
+            _MIXED_PARAMS_MSG,
+        )
+
+    def test_cross_table_proj_with_ean_and_attrs_rejected(
+        self, dynamodb_client, hash_table, second_table
+    ):
+        self._expect_validation(
+            lambda: dynamodb_client.batch_get_item(
+                RequestItems={
+                    hash_table: {
+                        "Keys": [{"pk": {"S": "a"}}],
+                        "ProjectionExpression": "#p",
+                        "ExpressionAttributeNames": {"#p": "pk"},
+                    },
+                    second_table: {
+                        "Keys": [{"id": {"S": "b"}}],
+                        "AttributesToGet": ["id"],
+                    },
+                }
+            ),
+            _MIXED_PARAMS_MSG,
+        )
+
+    def test_cross_table_ean_only_and_attrs_is_names_error(
+        self, dynamodb_client, hash_table, second_table
+    ):
+        self._expect_validation(
+            lambda: dynamodb_client.batch_get_item(
+                RequestItems={
+                    hash_table: {
+                        "Keys": [{"pk": {"S": "a"}}],
+                        "ExpressionAttributeNames": {"#p": "pk"},
+                    },
+                    second_table: {
+                        "Keys": [{"id": {"S": "b"}}],
+                        "AttributesToGet": ["id"],
+                    },
+                }
+            ),
+            _NAMES_WITHOUT_EXPR_MSG,
+        )
+
+    def test_cross_table_both_proj_accepted(
+        self, dynamodb_client, hash_table, second_table
+    ):
+        dynamodb_client.put_item(
+            TableName=hash_table, Item={"pk": {"S": "a"}, "foo": {"S": "x"}}
+        )
+        dynamodb_client.put_item(
+            TableName=second_table, Item={"id": {"S": "b"}, "foo": {"S": "y"}}
+        )
+        resp = dynamodb_client.batch_get_item(
+            RequestItems={
+                hash_table: {"Keys": [{"pk": {"S": "a"}}], "ProjectionExpression": "pk"},
+                second_table: {"Keys": [{"id": {"S": "b"}}], "ProjectionExpression": "id"},
+            }
+        )
+        assert resp["Responses"][hash_table] == [{"pk": {"S": "a"}}]
+        assert resp["Responses"][second_table] == [{"id": {"S": "b"}}]
+
+    def test_cross_table_both_attrs_accepted(
+        self, dynamodb_client, hash_table, second_table
+    ):
+        dynamodb_client.put_item(
+            TableName=hash_table, Item={"pk": {"S": "a"}, "foo": {"S": "x"}}
+        )
+        dynamodb_client.put_item(
+            TableName=second_table, Item={"id": {"S": "b"}, "foo": {"S": "y"}}
+        )
+        resp = dynamodb_client.batch_get_item(
+            RequestItems={
+                hash_table: {"Keys": [{"pk": {"S": "a"}}], "AttributesToGet": ["pk"]},
+                second_table: {"Keys": [{"id": {"S": "b"}}], "AttributesToGet": ["id"]},
+            }
+        )
+        assert resp["Responses"][hash_table] == [{"pk": {"S": "a"}}]
+        assert resp["Responses"][second_table] == [{"id": {"S": "b"}}]

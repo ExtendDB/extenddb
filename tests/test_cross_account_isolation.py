@@ -12,7 +12,7 @@ Prerequisites:
   - `extenddb init` has been run (encryption key + admin user exist)
 
 Run:
-  EXTENDDB_TEST_ENDPOINT=http://localhost:8000 \\
+  EXTENDDB_TEST_ENDPOINT=http://localhost:18443 \\
   EXTENDDB_ADMIN_USER=admin \\
   EXTENDDB_ADMIN_PASSWORD=<password> \\
   pytest tests/test_cross_account_isolation.py -v

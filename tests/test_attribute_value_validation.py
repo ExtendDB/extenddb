@@ -44,7 +44,7 @@ from conftest import scoped_table
 
 # Tests use the EXTENDDB_TEST_ENDPOINT used by the rest of the suite. When the
 # var is unset (e.g., ad-hoc invocation), default to the local extenddb daemon.
-ENDPOINT = os.environ.get("EXTENDDB_TEST_ENDPOINT", "http://localhost:8000").strip()
+ENDPOINT = os.environ.get("EXTENDDB_TEST_ENDPOINT", "http://localhost:18443").strip()
 
 
 # Wire-format AttributeValues that DynamoDB rejects with a

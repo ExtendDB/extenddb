@@ -98,8 +98,8 @@ def _patch_config_port(config_path, port):
     with open(config_path) as f:
         content = f.read()
     # Replace commented port line or add port after bind_addr
-    if "# port = 8000" in content:
-        content = content.replace("# port = 8000", f"port = {port}")
+    if "# port = 18443" in content:
+        content = content.replace("# port = 18443", f"port = {port}")
     elif "port = " not in content:
         content = content.replace(
             'bind_addr = "127.0.0.1"',

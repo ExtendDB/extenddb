@@ -72,6 +72,25 @@ pub async fn handle_batch_get_item(
         }
     }
 
+    // Reject mixing expression and non-expression parameters anywhere in the
+    // request. The check is request-wide: ProjectionExpression on one table and
+    // AttributesToGet on another is still a mix, matching Amazon DynamoDB.
+    let has_projection_expr = input
+        .request_items
+        .values()
+        .any(|ka| ka.projection_expression.is_some());
+    let has_attributes_to_get = input
+        .request_items
+        .values()
+        .any(|ka| ka.attributes_to_get.as_ref().is_some_and(|a| !a.is_empty()));
+    if has_projection_expr && has_attributes_to_get {
+        return Err(DynamoDbError::ValidationException(
+            "Can not use both expression and non-expression parameters in the same request: \
+             Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}"
+                .to_owned(),
+        ));
+    }
+
     let mut responses: HashMap<String, Vec<Item>> = HashMap::new();
     let mut total_rcu: f64 = 0.0;
     let mut total_pre_proj_bytes: usize = 0;
@@ -87,16 +106,6 @@ pub async fn handle_batch_get_item(
 
         // Parse per-table projection. AttributesToGet is desugared into a
         // ProjectionExpression with synthetic name placeholders.
-        if ka.projection_expression.is_some()
-            && ka.attributes_to_get.as_ref().is_some_and(|a| !a.is_empty())
-        {
-            return Err(DynamoDbError::ValidationException(
-                "Can not use both expression and non-expression parameters in the same request: \
-                 Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}"
-                    .to_owned(),
-            ));
-        }
-
         extenddb_core::expression::validate_expression_param_usage(
             ka.expression_attribute_names.as_ref(),
             ka.projection_expression

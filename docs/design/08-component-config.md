@@ -12,7 +12,7 @@ This document covers the configuration system, configurable limits, logging, met
 
 Precedence (highest to lowest):
 1. **CLI flags** — `--config`, `--port`, `--version`, `--validate-config`
-2. **Environment variables** — `EXTENDDB__SERVER__PORT=8000`
+2. **Environment variables** — `EXTENDDB__SERVER__PORT=18443`
 3. **Config file** — TOML format, path specified via `--config` or default `config.toml`
 4. **Defaults** — hardcoded in Rust structs via `Default` trait
 
@@ -89,7 +89,7 @@ fn load_config(cli: &Cli) -> Result<AppConfig, anyhow::Error> {
 
 [server]
 bind_addr = "0.0.0.0"
-port = 8000
+port = 18443
 max_connections = 10000
 request_timeout_secs = 30
 shutdown_drain_secs = 30       # Time to wait for in-flight requests before force-closing
@@ -449,7 +449,7 @@ spec:
       - name: extenddb
         image: extenddb:latest
         ports:
-        - containerPort: 8000
+        - containerPort: 18443
         env:
         - name: EXTENDDB__SERVER__BIND_ADDR
           value: "0.0.0.0"
@@ -466,13 +466,13 @@ spec:
         livenessProbe:
           httpGet:
             path: /health
-            port: 8000
+            port: 18443
           initialDelaySeconds: 5
           periodSeconds: 10
         readinessProbe:
           httpGet:
             path: /health
-            port: 8000
+            port: 18443
           initialDelaySeconds: 3
           periodSeconds: 5
         resources:
@@ -498,7 +498,7 @@ RUN cargo build --release --target x86_64-unknown-linux-musl -p extenddb-bin
 FROM scratch
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/extenddb /extenddb
 COPY config.example.toml /etc/extenddb/config.toml
-EXPOSE 8000
+EXPOSE 18443
 ENTRYPOINT ["/extenddb"]
 CMD ["--config", "/etc/extenddb/config.toml"]
 ```
@@ -513,8 +513,8 @@ The simplest approach — set two service-specific endpoint variables and creden
 
 ```bash
 # Endpoint overrides (both point to the same extenddb instance)
-export AWS_ENDPOINT_URL_DYNAMODB=https://127.0.0.1:8000
-export AWS_ENDPOINT_URL_DYNAMODB_STREAMS=https://127.0.0.1:8000
+export AWS_ENDPOINT_URL_DYNAMODB=https://127.0.0.1:18443
+export AWS_ENDPOINT_URL_DYNAMODB_STREAMS=https://127.0.0.1:18443
 
 # Credentials (must match a pair registered in extenddb's credential store)
 export AWS_ACCESS_KEY_ID=local-dev-key
@@ -527,7 +527,7 @@ This works with every AWS SDK (Python/boto3, Java v2, Rust, Go v2, .NET, Node.js
 **Alternative — single global override** (when the application only uses DynamoDB):
 
 ```bash
-export AWS_ENDPOINT_URL=https://127.0.0.1:8000
+export AWS_ENDPOINT_URL=https://127.0.0.1:18443
 ```
 
 This sends all AWS SDK calls to extenddb. Simpler, but breaks if the application also calls non-DynamoDB services.
@@ -544,9 +544,9 @@ services = extenddb-services
 
 [services extenddb-services]
 dynamodb =
-  endpoint_url = https://127.0.0.1:8000
+  endpoint_url = https://127.0.0.1:18443
 dynamodb_streams =
-  endpoint_url = https://127.0.0.1:8000
+  endpoint_url = https://127.0.0.1:18443
 ```
 
 ```ini
@@ -580,7 +580,7 @@ When called, `DescribeEndpoints` returns the server's own listen address:
 {
     "Endpoints": [
         {
-            "Address": "localhost:8000",
+            "Address": "localhost:18443",
             "CachePeriodInMinutes": 10
         }
     ]

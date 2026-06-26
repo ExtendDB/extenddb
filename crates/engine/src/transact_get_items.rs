@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::{ExpressionKind, Projection, parse_projection, tokenize_for};
+use extenddb_core::expression::Projection;
 use extenddb_core::types::{
     ItemResponse, TransactGetItemsInput, TransactGetItemsOutput, item_size_bytes,
 };
@@ -89,12 +89,8 @@ pub async fn handle_transact_get_items(
     for tgi in &input.transact_items {
         if let Some(ref proj_str) = tgi.get.projection_expression {
             let maps = build_expression_maps(tgi.get.expression_attribute_names.as_ref(), None);
-            let proj_tokens = tokenize_for(
-                proj_str,
-                ctx.limits.max_expression_tokens,
-                ExpressionKind::Projection,
-            )?;
-            let projection = parse_projection(&proj_tokens)?;
+            let projection =
+                crate::expression_helpers::parse_projection_expr(proj_str, &ctx.limits)?;
             let compiled = Projection::compile(&projection, &maps, true)?;
             let mut extra_names = HashSet::new();
             for path in &projection {

@@ -247,7 +247,7 @@ mod tests {
     fn make_headers(date: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert("x-amz-date", date.parse().unwrap());
-        h.insert("host", "localhost:8000".parse().unwrap());
+        h.insert("host", "localhost:18443".parse().unwrap());
         h.insert(
             "content-type",
             "application/x-amz-json-1.0".parse().unwrap(),

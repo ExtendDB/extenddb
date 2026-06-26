@@ -144,7 +144,7 @@ validate_local_target() {
     # EXTENDDB_TEST_ENDPOINT must be set
     if [[ -z "${EXTENDDB_TEST_ENDPOINT:-}" ]]; then
         echo "error: --${prefix_lower} requires EXTENDDB_TEST_ENDPOINT to be set."
-        echo "  export EXTENDDB_TEST_ENDPOINT=https://localhost:8443"
+        echo "  export EXTENDDB_TEST_ENDPOINT=https://localhost:18443"
         exit 1
     fi
 
@@ -344,14 +344,19 @@ if $NEEDS_INTEGRATION && [[ "$TARGET" != "real-dynamodb" ]]; then
         fi
     fi
 
-    # Export PG connection string for CLI lifecycle tests.
+    # Export PG connection string for CLI lifecycle tests (PostgreSQL only).
     # Extract from config, strip the database name to get the base URL.
+    # This is only needed for test_cli_lifecycle.py which is PostgreSQL-specific
+    # and excluded from the main pytest suite.
     if [[ -z "${EXTENDDB_TEST_PG_CONNECTION_STRING:-}" && -f "$CONFIG_FOR_SETTINGS" ]]; then
-        FULL_CONN=$(grep 'connection_string' "$CONFIG_FOR_SETTINGS" | sed -n 's/.*connection_string[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-        if [[ -n "$FULL_CONN" ]]; then
-            # Strip trailing /database_name to get base URL
-            export EXTENDDB_TEST_PG_CONNECTION_STRING="${FULL_CONN%/*}"
-            echo "  ✓ EXTENDDB_TEST_PG_CONNECTION_STRING=${EXTENDDB_TEST_PG_CONNECTION_STRING}"
+        # Only try to extract connection_string for PostgreSQL backend
+        if grep -q '^[[:space:]]*backend[[:space:]]*=[[:space:]]*"postgres"' "$CONFIG_FOR_SETTINGS" 2>/dev/null; then
+            FULL_CONN=$(grep 'connection_string' "$CONFIG_FOR_SETTINGS" | sed -n 's/.*connection_string[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+            if [[ -n "$FULL_CONN" ]]; then
+                # Strip trailing /database_name to get base URL
+                export EXTENDDB_TEST_PG_CONNECTION_STRING="${FULL_CONN%/*}"
+                echo "  ✓ EXTENDDB_TEST_PG_CONNECTION_STRING=${EXTENDDB_TEST_PG_CONNECTION_STRING}"
+            fi
         fi
     fi
     echo ""

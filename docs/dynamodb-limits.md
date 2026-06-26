@@ -62,11 +62,13 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 |-------|---------------|--------|-------|
 | Response size per page | 1 MB (1,048,576 bytes) | Enforced | `read_helpers.rs` enforces 1 MB page limit |
 | `Limit` parameter (max items evaluated) | No maximum | Enforced | Honored in query/scan |
-| Filter expression size | 4 KB | Not enforced | No expression size validation |
-| Projection expression size | 4 KB | Not enforced | No expression size validation |
-| Condition expression size | 4 KB | Not enforced | No expression size validation |
-| Expression attribute names | 2 MB total | Not enforced | No aggregate size validation |
-| Expression attribute values | 2 MB total | Not enforced | No aggregate size validation |
+| Filter expression size | 4 KB | Enforced | `check_expression_size`, `LimitsConfig::max_expression_length_bytes` (raw bytes, pre-substitution) |
+| Projection expression size | 4 KB | Enforced | `check_expression_size`, `LimitsConfig::max_expression_length_bytes` |
+| Condition expression size | 4 KB | Enforced | `check_expression_size`, `LimitsConfig::max_expression_length_bytes` |
+| Update expression size | 4 KB | Enforced | `check_expression_size`, `LimitsConfig::max_expression_length_bytes` |
+| Key condition expression size | 4 KB | Enforced | `check_expression_size`, `LimitsConfig::max_expression_length_bytes` |
+| Expression attribute names | 2 MB total | Not enforced | Per-entry key/value validated (`serde_helpers`); no aggregate size validation |
+| Expression attribute values | 2 MB total | Not enforced | Per-entry key/value validated (`serde_helpers`); no aggregate size validation |
 
 ## Batch Operations
 
@@ -168,7 +170,7 @@ The following unenforced limits are tracked in `docs/technical-debt.md`:
 1. **Provisioned capacity decrease limit** (27/day) — would require per-table decrease counter with hourly replenishment
 2. **Projected attributes across all indexes** (100) — requires cross-index attribute counting in CreateTable validation
 3. **LSI item collection size** (10 GB) — requires per-partition size tracking in storage layer
-4. **Expression size limits** (4 KB condition/filter/projection, 2 MB names/values) — requires byte-length checks on expression strings
+4. **Expression aggregate size limits** (2 MB total expression attribute names/values) — requires aggregate byte-length tracking across all expression parameters. (Per-expression 4 KB limits for condition/filter/projection/update/key-condition are enforced via `check_expression_size`.)
 5. **BatchGetItem response size** (16 MB) — requires aggregate response size tracking
 6. **BatchWriteItem request size** (16 MB) — requires aggregate request size tracking
 7. **Transaction request size** (4 MB) — requires aggregate request size tracking

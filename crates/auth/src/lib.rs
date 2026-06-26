@@ -270,7 +270,7 @@ mod tests {
         );
         headers.insert("authorization", HeaderValue::from_str(&auth).unwrap());
         headers.insert("x-amz-date", HeaderValue::from_str(&date_str).unwrap());
-        headers.insert("host", HeaderValue::from_static("localhost:8000"));
+        headers.insert("host", HeaderValue::from_static("localhost:18443"));
         headers.insert(
             "content-type",
             HeaderValue::from_static("application/x-amz-json-1.0"),

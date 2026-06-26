@@ -12,7 +12,7 @@ Usage:
 Options:
     --config PATH       Path to suite registry (default: external-suites.toml)
     --suite NAME        Run only the named suite (can be repeated)
-    --endpoint URL      extenddb endpoint URL (default: $EXTENDDB_ENDPOINT or http://localhost:8000)
+    --endpoint URL      extenddb endpoint URL (default: $EXTENDDB_ENDPOINT or http://localhost:18443)
     --dry-run           Show what would run without executing
     --report PATH       Write JSON report to PATH
     --verbose           Show full test output (default: summary only)
@@ -448,8 +448,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--endpoint",
-        default=os.environ.get("EXTENDDB_ENDPOINT", "http://localhost:8000"),
-        help="extenddb endpoint URL (default: $EXTENDDB_ENDPOINT or http://localhost:8000)",
+        default=os.environ.get("EXTENDDB_ENDPOINT", "http://localhost:18443"),
+        help="extenddb endpoint URL (default: $EXTENDDB_ENDPOINT or http://localhost:18443)",
     )
     parser.add_argument("--dry-run", action="store_true", help="Show what would run")
     parser.add_argument("--report", help="Write JSON report to PATH")

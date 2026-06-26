@@ -88,7 +88,7 @@ See `docs/dynamodb-limits.md` for the full catalog. The following are the highes
 | # | Limit | DynamoDB Value | Priority | Origin |
 |---|-------|---------------|----------|--------|
 | L-1 | Projected attributes across all indexes | 100 | Medium | P42 |
-| L-2 | Expression size limits (condition/filter/projection) | 4 KB each | Low | P42 |
+| L-2 | Expression aggregate size (attribute names/values, 2 MB total) | 2 MB | Low | P42 |
 | L-3 | Batch/transaction aggregate request size | 4–16 MB | Low | P42 |
 | L-4 | GetRecords max per call | 1,000 records | Low | P42 |
 | L-5 | Shard iterator lifetime | 15 minutes | Medium | P42 |

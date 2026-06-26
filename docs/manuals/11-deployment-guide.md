@@ -95,7 +95,7 @@ COPY --from=builder /src/target/release/extenddb /usr/local/bin/extenddb
 COPY extenddb.toml /etc/extenddb/extenddb.toml
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
-EXPOSE 8000
+EXPOSE 18443
 ENTRYPOINT ["tini", "--"]
 CMD ["/usr/local/bin/entrypoint.sh"]
 ```
@@ -108,7 +108,7 @@ extenddb always daemonizes (there is no foreground mode). In a container, the pa
 extenddb serve --config /etc/extenddb/extenddb.toml
 # Wait on the daemon PID — the PID file location depends on run_dir in extenddb.toml
 # Default: ~/.extenddb/run/extenddb-<port>.pid
-PID_FILE="${HOME}/.extenddb/run/extenddb-8000.pid"
+PID_FILE="${HOME}/.extenddb/run/extenddb-18443.pid"
 if [ -f "$PID_FILE" ]; then
   tail --pid="$(cat "$PID_FILE")" -f /dev/null
 else
@@ -186,7 +186,7 @@ ExecStop=/usr/local/bin/extenddb stop --config /etc/extenddb/extenddb.toml
 # PID file path: {run_dir}/extenddb-{port}.pid
 # Default run_dir is ~/.extenddb/run (~ expands to $HOME of the User= below)
 # Adjust if run_dir or port are overridden in extenddb.toml
-PIDFile=/home/extenddb/.extenddb/run/extenddb-8000.pid
+PIDFile=/home/extenddb/.extenddb/run/extenddb-18443.pid
 User=extenddb
 Group=extenddb
 Restart=on-failure
