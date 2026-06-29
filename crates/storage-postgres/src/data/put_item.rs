@@ -35,6 +35,27 @@ impl PostgresEngine {
 
         // Fetch indexes for GSI/LSI updates (D-4: sync + async split).
         let indexes = fetch_indexes_for_table(&key_info.table_id, &self.pool).await?;
+
+        // Index key attributes present in the item must match their declared
+        // scalar type and be non-empty, matching real DynamoDB. This is up-front
+        // input validation (a top-level ValidationException), so it runs before
+        // any write work.
+        if !indexes.is_empty() {
+            let index_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = indexes
+                .iter()
+                .map(|idx| extenddb_core::validation::IndexKeyRef {
+                    index_name: &idx.index_name,
+                    key_schema: &idx.key_schema,
+                })
+                .collect();
+            extenddb_core::validation::validate_index_keys(
+                &item,
+                &index_refs,
+                &key_info.attribute_definitions,
+            )
+            .map_err(|e| StorageError::Validation(e.to_string()))?;
+        }
+
         let sys_delay = if indexes.is_empty() {
             0
         } else {

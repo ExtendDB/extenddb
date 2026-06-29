@@ -736,6 +736,162 @@ fn validate_no_empty_key_value(
     Ok(())
 }
 
+/// A secondary index's name and key schema, for index-key validation.
+///
+/// Decouples [`validate_index_keys`] from the storage layer's index metadata
+/// type: callers build these refs from whatever index representation they hold.
+pub struct IndexKeyRef<'a> {
+    pub index_name: &'a str,
+    pub key_schema: &'a [KeySchemaElement],
+}
+
+/// The `DynamoDB` type tag for an `AttributeValue`, used in `Actual: <tag>`
+/// error text (e.g. `N`, `L`, `BOOL`).
+fn attribute_value_type_tag(v: &AttributeValue) -> &'static str {
+    match v {
+        AttributeValue::S(_) => "S",
+        AttributeValue::N(_) => "N",
+        AttributeValue::B(_) => "B",
+        AttributeValue::SS(_) => "SS",
+        AttributeValue::NS(_) => "NS",
+        AttributeValue::BS(_) => "BS",
+        AttributeValue::Bool(_) => "BOOL",
+        AttributeValue::Null => "NULL",
+        AttributeValue::L(_) => "L",
+        AttributeValue::M(_) => "M",
+    }
+}
+
+/// The scalar type tag (`S`, `N`, or `B`) for a declared attribute type.
+fn scalar_type_tag(t: ScalarAttributeType) -> &'static str {
+    match t {
+        ScalarAttributeType::S => "S",
+        ScalarAttributeType::N => "N",
+        ScalarAttributeType::B => "B",
+    }
+}
+
+/// Context for a secondary-index empty-key error, selecting the message form.
+#[derive(Debug, Clone, Copy)]
+pub enum SecondaryIndexEmptyContext {
+    /// The value came directly from a written item (PutItem / Put transaction).
+    Item,
+    /// The value was produced by an UpdateExpression (Update transaction).
+    UpdateExpression,
+}
+
+/// Validate that secondary-index key attributes present in `item` match their
+/// declared scalar type.
+///
+/// Indexes are checked in name order, so when an attribute keys more than one
+/// index the alphabetically-first index name is the one reported (matching
+/// observed `DynamoDB` behaviour).
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` on the first index key attribute
+/// whose value type does not match its declared scalar type.
+pub fn validate_index_key_types(
+    item: &Item,
+    indexes: &[IndexKeyRef<'_>],
+    attr_defs: &[AttributeDefinition],
+) -> Result<(), DynamoDbError> {
+    for idx in ordered_indexes(indexes) {
+        for ks in idx.key_schema {
+            let Some(value) = item.get(&ks.attribute_name) else {
+                continue;
+            };
+            let Some(expected) = attr_defs
+                .iter()
+                .find(|ad| ad.attribute_name == ks.attribute_name)
+                .map(|ad| ad.attribute_type)
+            else {
+                continue;
+            };
+            let matches = matches!(
+                (expected, value),
+                (ScalarAttributeType::S, AttributeValue::S(_))
+                    | (ScalarAttributeType::N, AttributeValue::N(_))
+                    | (ScalarAttributeType::B, AttributeValue::B(_))
+            );
+            if !matches {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "One or more parameter values were invalid: Type mismatch for Index Key {} Expected: {} Actual: {} IndexName: {}",
+                    ks.attribute_name,
+                    scalar_type_tag(expected),
+                    attribute_value_type_tag(value),
+                    idx.index_name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate that no secondary-index key attribute in `item` is an empty string
+/// or empty binary value.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` naming the alphabetically-first
+/// index for the first empty index key attribute found. The message form is
+/// selected by `ctx`.
+pub fn validate_index_key_not_empty(
+    item: &Item,
+    indexes: &[IndexKeyRef<'_>],
+    ctx: SecondaryIndexEmptyContext,
+) -> Result<(), DynamoDbError> {
+    for idx in ordered_indexes(indexes) {
+        for ks in idx.key_schema {
+            let Some(value) = item.get(&ks.attribute_name) else {
+                continue;
+            };
+            let empty = matches!(value, AttributeValue::S(s) if s.is_empty())
+                || matches!(value, AttributeValue::B(b) if b.is_empty());
+            if empty {
+                let msg = match ctx {
+                    SecondaryIndexEmptyContext::Item => format!(
+                        "One or more parameter values are not valid. A value specified for a secondary index key is not supported. \
+                         The AttributeValue for a key attribute cannot contain an empty string value. IndexName: {}, IndexKey: {}",
+                        idx.index_name, ks.attribute_name
+                    ),
+                    SecondaryIndexEmptyContext::UpdateExpression =>
+                        "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. \
+                         The AttributeValue for a key attribute cannot contain an empty string value."
+                            .to_owned(),
+                };
+                return Err(DynamoDbError::ValidationException(msg));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate secondary-index key attributes for a written item: scalar type match
+/// first, then non-empty. Convenience wrapper over [`validate_index_key_types`]
+/// and [`validate_index_key_not_empty`] for the PutItem / BatchWriteItem paths,
+/// where both faults are reported as a top-level `ValidationException`.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` on the first offending index key.
+pub fn validate_index_keys(
+    item: &Item,
+    indexes: &[IndexKeyRef<'_>],
+    attr_defs: &[AttributeDefinition],
+) -> Result<(), DynamoDbError> {
+    validate_index_key_types(item, indexes, attr_defs)?;
+    validate_index_key_not_empty(item, indexes, SecondaryIndexEmptyContext::Item)
+}
+
+/// Indexes sorted by name, so the alphabetically-first index that uses a
+/// violating attribute is the one reported.
+fn ordered_indexes<'b, 'a>(indexes: &'b [IndexKeyRef<'a>]) -> Vec<&'b IndexKeyRef<'a>> {
+    let mut ordered: Vec<&IndexKeyRef<'_>> = indexes.iter().collect();
+    ordered.sort_by(|a, b| a.index_name.cmp(b.index_name));
+    ordered
+}
+
 /// Validate partition key and sort key sizes against limits.
 ///
 /// # Errors
@@ -1437,5 +1593,98 @@ mod tests {
                 .contains("Nesting Levels have exceeded supported limits"),
             "unexpected error: {err}"
         );
+    }
+
+    fn idx<'a>(name: &'a str, attr: &'a str) -> (String, Vec<KeySchemaElement>) {
+        (name.to_owned(), vec![make_ks(attr, KeyType::Hash)])
+    }
+
+    #[test]
+    fn index_key_type_mismatch_names_alphabetically_first_index() {
+        // lsi1sk keys both gsi1 and lsi1; declared S but written as N.
+        let owned = [idx("lsi1", "lsi1sk"), idx("gsi1", "lsi1sk")];
+        let refs: Vec<IndexKeyRef<'_>> = owned
+            .iter()
+            .map(|(n, ks)| IndexKeyRef {
+                index_name: n,
+                key_schema: ks,
+            })
+            .collect();
+        let attr_defs = vec![make_ad("lsi1sk", ScalarAttributeType::S)];
+        let mut item = Item::new();
+        item.insert("lsi1sk".to_owned(), AttributeValue::N("5".to_owned()));
+
+        let err = validate_index_key_types(&item, &refs, &attr_defs).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: Type mismatch for Index Key lsi1sk Expected: S Actual: N IndexName: gsi1"
+        );
+    }
+
+    #[test]
+    fn index_key_non_scalar_reports_actual_l() {
+        let owned = [idx("gsi1", "lsi1sk")];
+        let refs: Vec<IndexKeyRef<'_>> = owned
+            .iter()
+            .map(|(n, ks)| IndexKeyRef {
+                index_name: n,
+                key_schema: ks,
+            })
+            .collect();
+        let attr_defs = vec![make_ad("lsi1sk", ScalarAttributeType::S)];
+        let mut item = Item::new();
+        item.insert("lsi1sk".to_owned(), AttributeValue::L(vec![]));
+        let err = validate_index_key_types(&item, &refs, &attr_defs).unwrap_err();
+        assert!(err.to_string().contains("Actual: L"), "got: {err}");
+    }
+
+    #[test]
+    fn index_key_empty_messages_by_context() {
+        let owned = [idx("gsi1", "lsi1sk")];
+        let refs: Vec<IndexKeyRef<'_>> = owned
+            .iter()
+            .map(|(n, ks)| IndexKeyRef {
+                index_name: n,
+                key_schema: ks,
+            })
+            .collect();
+        let mut item = Item::new();
+        item.insert("lsi1sk".to_owned(), AttributeValue::S(String::new()));
+
+        let put_err = validate_index_key_not_empty(&item, &refs, SecondaryIndexEmptyContext::Item)
+            .unwrap_err();
+        assert_eq!(
+            put_err.to_string(),
+            "One or more parameter values are not valid. A value specified for a secondary index key is not supported. \
+             The AttributeValue for a key attribute cannot contain an empty string value. IndexName: gsi1, IndexKey: lsi1sk"
+        );
+
+        let upd_err = validate_index_key_not_empty(
+            &item,
+            &refs,
+            SecondaryIndexEmptyContext::UpdateExpression,
+        )
+        .unwrap_err();
+        assert_eq!(
+            upd_err.to_string(),
+            "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. \
+             The AttributeValue for a key attribute cannot contain an empty string value."
+        );
+    }
+
+    #[test]
+    fn valid_index_key_passes() {
+        let owned = [idx("gsi1", "lsi1sk")];
+        let refs: Vec<IndexKeyRef<'_>> = owned
+            .iter()
+            .map(|(n, ks)| IndexKeyRef {
+                index_name: n,
+                key_schema: ks,
+            })
+            .collect();
+        let attr_defs = vec![make_ad("lsi1sk", ScalarAttributeType::S)];
+        let mut item = Item::new();
+        item.insert("lsi1sk".to_owned(), AttributeValue::S("ok".to_owned()));
+        assert!(validate_index_keys(&item, &refs, &attr_defs).is_ok());
     }
 }
