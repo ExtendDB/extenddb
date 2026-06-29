@@ -7,7 +7,7 @@ use crate::limits::LimitsConfig;
 use crate::types::{
     AttributeDefinition, AttributeValue, BillingMode, CreateTableInput, DeleteItemInput,
     GetItemInput, Item, KeySchemaElement, KeyType, PutItemInput, ReturnValues, ScalarAttributeType,
-    UpdateItemInput, item_size_bytes,
+    Select, UpdateItemInput, item_size_bytes,
 };
 
 /// Validate a table name per Virtual `DynamoDB` rules.
@@ -736,6 +736,55 @@ fn validate_no_empty_key_value(
     Ok(())
 }
 
+/// Validate the `Select` value against `ProjectionExpression` / `AttributesToGet`
+/// presence and `IndexName`. Shared by Query and Scan so both reject the same
+/// invalid combinations with the same messages.
+///
+/// Rules (matching real DynamoDB, in this order):
+/// 1. A `ProjectionExpression` with `ALL_ATTRIBUTES`, `ALL_PROJECTED_ATTRIBUTES`,
+///    or `COUNT` is rejected (reported before the `IndexName` requirement).
+/// 2. `SPECIFIC_ATTRIBUTES` requires a `ProjectionExpression` (or legacy
+///    `AttributesToGet`).
+/// 3. `ALL_PROJECTED_ATTRIBUTES` requires an `IndexName`.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` for any of the above.
+pub fn validate_select_projection(
+    select: Option<Select>,
+    has_projection: bool,
+    has_attributes_to_get: bool,
+    has_index_name: bool,
+) -> Result<(), DynamoDbError> {
+    if has_projection {
+        let incompatible = match select {
+            Some(Select::AllAttributes) => Some("ALL_ATTRIBUTES"),
+            Some(Select::AllProjectedAttributes) => Some("ALL_PROJECTED_ATTRIBUTES"),
+            Some(Select::Count) => Some("only the Count"),
+            _ => None,
+        };
+        if let Some(what) = incompatible {
+            return Err(DynamoDbError::ValidationException(format!(
+                "Cannot specify the ProjectionExpression when choosing to get {what}"
+            )));
+        }
+    }
+    if matches!(select, Some(Select::SpecificAttributes))
+        && !has_projection
+        && !has_attributes_to_get
+    {
+        return Err(DynamoDbError::ValidationException(
+            "1 validation error detected: Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES".to_owned(),
+        ));
+    }
+    if matches!(select, Some(Select::AllProjectedAttributes)) && !has_index_name {
+        return Err(DynamoDbError::ValidationException(
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate partition key and sort key sizes against limits.
 ///
 /// # Errors
@@ -1436,6 +1485,72 @@ mod tests {
             err.to_string()
                 .contains("Nesting Levels have exceeded supported limits"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn select_projection_incompatible_messages() {
+        let cases = [
+            (Select::AllAttributes, "ALL_ATTRIBUTES"),
+            (Select::AllProjectedAttributes, "ALL_PROJECTED_ATTRIBUTES"),
+            (Select::Count, "only the Count"),
+        ];
+        for (select, what) in cases {
+            let err = validate_select_projection(Some(select), true, false, true).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("Cannot specify the ProjectionExpression when choosing to get {what}")
+            );
+        }
+    }
+
+    #[test]
+    fn select_specific_attributes_requires_projection() {
+        // No projection and no AttributesToGet -> rejected.
+        assert!(
+            validate_select_projection(Some(Select::SpecificAttributes), false, false, false)
+                .is_err()
+        );
+        // A projection satisfies it.
+        assert!(
+            validate_select_projection(Some(Select::SpecificAttributes), true, false, false)
+                .is_ok()
+        );
+        // Legacy AttributesToGet satisfies it.
+        assert!(
+            validate_select_projection(Some(Select::SpecificAttributes), false, true, false)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn select_all_projected_requires_index() {
+        let err =
+            validate_select_projection(Some(Select::AllProjectedAttributes), false, false, false)
+                .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
+        );
+        assert!(
+            validate_select_projection(Some(Select::AllProjectedAttributes), false, false, true)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn select_projection_rule_precedes_index_rule() {
+        // ALL_PROJECTED_ATTRIBUTES + ProjectionExpression + no IndexName: the
+        // ProjectionExpression rule is reported, not the IndexName one.
+        let err =
+            validate_select_projection(Some(Select::AllProjectedAttributes), true, false, false)
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("ALL_PROJECTED_ATTRIBUTES")
+                && err
+                    .to_string()
+                    .contains("Cannot specify the ProjectionExpression"),
+            "got: {err}"
         );
     }
 }

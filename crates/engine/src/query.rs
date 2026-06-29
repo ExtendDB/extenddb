@@ -335,28 +335,20 @@ pub async fn handle_query(
         )?;
     }
 
-    // Validate Select vs ProjectionExpression and index requirements
-    if let Some(Select::SpecificAttributes) = input.select
-        && effective_projection_str.is_none()
-    {
-        return Err(DynamoDbError::ValidationException(
-                "1 validation error detected: Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES".to_owned(),
-            ));
-    }
-    if let Some(Select::AllProjectedAttributes) = input.select
-        && index_info.is_none()
-    {
-        return Err(DynamoDbError::ValidationException(
-            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_owned(),
-        ));
-    }
-    if let Some(Select::Count) = input.select
-        && effective_projection_str.is_some()
-    {
-        return Err(DynamoDbError::ValidationException(
-            "Cannot specify the ProjectionExpression when Select is COUNT".to_owned(),
-        ));
-    }
+    // Validate Select vs ProjectionExpression and index requirements (shared
+    // with Scan so both reject the same combinations identically).
+    extenddb_core::validation::validate_select_projection(
+        input.select,
+        input
+            .projection_expression
+            .as_deref()
+            .is_some_and(|s| !s.is_empty()),
+        input
+            .attributes_to_get
+            .as_ref()
+            .is_some_and(|a| !a.is_empty()),
+        input.index_name.is_some(),
+    )?;
 
     // When Select=ALL_PROJECTED_ATTRIBUTES, capture the index info for post-read filtering.
     let index_proj = if matches!(input.select, Some(Select::AllProjectedAttributes)) {
