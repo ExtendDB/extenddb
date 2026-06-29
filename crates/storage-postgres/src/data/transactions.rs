@@ -339,7 +339,7 @@ async fn execute_transact_write_op(
             return_values_on_ccf,
             ..
         } => {
-            validation::validate_key_only(
+            validation::validate_batch_key_only(
                 key,
                 &key_info.key_schema,
                 &key_info.attribute_definitions,
@@ -384,7 +384,7 @@ async fn execute_transact_write_op(
             return_values_on_ccf,
             ..
         } => {
-            validation::validate_key_only(
+            validation::validate_batch_key_only(
                 key,
                 &key_info.key_schema,
                 &key_info.attribute_definitions,
@@ -440,7 +440,7 @@ async fn execute_transact_write_op(
             maps,
             return_values_on_ccf,
         } => {
-            validation::validate_key_only(
+            validation::validate_batch_key_only(
                 key,
                 &key_info.key_schema,
                 &key_info.attribute_definitions,
