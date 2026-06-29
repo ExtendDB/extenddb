@@ -101,6 +101,67 @@ pub fn validate_create_table(
     validate_lsi_count(input, limits)?;
     validate_lsi_requires_range_key(input)?;
     validate_unique_index_names(input)?;
+    validate_index_projections(input)?;
+    validate_stream_specification(input)?;
+    Ok(())
+}
+
+/// Validate that INCLUDE-projection secondary indexes specify `NonKeyAttributes`.
+///
+/// Real `DynamoDB` rejects a GSI or LSI whose `ProjectionType` is `INCLUDE`
+/// without a non-empty `NonKeyAttributes` list.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` for any such index.
+fn validate_index_projections(input: &CreateTableInput) -> Result<(), DynamoDbError> {
+    fn include_without_attrs(projection: &crate::types::Projection) -> bool {
+        matches!(
+            projection.projection_type,
+            crate::types::ProjectionType::Include
+        ) && projection
+            .non_key_attributes
+            .as_ref()
+            .is_none_or(|attrs| attrs.is_empty())
+    }
+    let err = || {
+        DynamoDbError::ValidationException(
+            "One or more parameter values were invalid: ProjectionType is INCLUDE, but NonKeyAttributes is not specified".to_owned(),
+        )
+    };
+    if let Some(gsis) = &input.global_secondary_indexes {
+        for gsi in gsis {
+            if include_without_attrs(&gsi.projection) {
+                return Err(err());
+            }
+        }
+    }
+    if let Some(lsis) = &input.local_secondary_indexes {
+        for lsi in lsis {
+            if include_without_attrs(&lsi.projection) {
+                return Err(err());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate the `StreamSpecification`: a disabled stream must not also specify a
+/// `StreamViewType`.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` when `StreamEnabled` is false
+/// but a `StreamViewType` is present.
+fn validate_stream_specification(input: &CreateTableInput) -> Result<(), DynamoDbError> {
+    if let Some(stream) = &input.stream_specification
+        && !stream.stream_enabled
+        && stream.stream_view_type.is_some()
+    {
+        return Err(DynamoDbError::ValidationException(
+            "One or more parameter values were invalid: Table is being created with a stream disabled, UpdateViewType should not be specified".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -1437,5 +1498,73 @@ mod tests {
                 .contains("Nesting Levels have exceeded supported limits"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn gsi_include_projection_requires_non_key_attributes() {
+        use crate::types::{GsiInput, Projection, ProjectionType};
+        let mut input = base_input(
+            vec![make_ks("pk", KeyType::Hash)],
+            vec![
+                make_ad("pk", ScalarAttributeType::S),
+                make_ad("gsipk", ScalarAttributeType::S),
+            ],
+        );
+        let gsi = |non_key: Option<Vec<String>>| GsiInput {
+            index_name: "gsi_inc".to_owned(),
+            key_schema: vec![make_ks("gsipk", KeyType::Hash)],
+            projection: Projection {
+                projection_type: ProjectionType::Include,
+                non_key_attributes: non_key,
+            },
+            provisioned_throughput: None,
+        };
+
+        input.global_secondary_indexes = Some(vec![gsi(None)]);
+        let err = validate_create_table(&input, &LimitsConfig::default()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: ProjectionType is INCLUDE, but NonKeyAttributes is not specified"
+        );
+
+        // Empty NonKeyAttributes is also rejected.
+        input.global_secondary_indexes = Some(vec![gsi(Some(vec![]))]);
+        assert!(validate_create_table(&input, &LimitsConfig::default()).is_err());
+
+        // A non-empty NonKeyAttributes list is accepted.
+        input.global_secondary_indexes = Some(vec![gsi(Some(vec!["extra".to_owned()]))]);
+        assert!(validate_create_table(&input, &LimitsConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn stream_disabled_with_view_type_is_rejected() {
+        use crate::types::{StreamSpecification, StreamViewType};
+        let mut input = base_input(
+            vec![make_ks("pk", KeyType::Hash)],
+            vec![make_ad("pk", ScalarAttributeType::S)],
+        );
+        input.stream_specification = Some(StreamSpecification {
+            stream_enabled: false,
+            stream_view_type: Some(StreamViewType::NewAndOldImages),
+        });
+        let err = validate_create_table(&input, &LimitsConfig::default()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: Table is being created with a stream disabled, UpdateViewType should not be specified"
+        );
+
+        // Disabled with no view type is fine.
+        input.stream_specification = Some(StreamSpecification {
+            stream_enabled: false,
+            stream_view_type: None,
+        });
+        assert!(validate_create_table(&input, &LimitsConfig::default()).is_ok());
+
+        // Enabled with a view type is fine.
+        input.stream_specification = Some(StreamSpecification {
+            stream_enabled: true,
+            stream_view_type: Some(StreamViewType::NewImage),
+        });
+        assert!(validate_create_table(&input, &LimitsConfig::default()).is_ok());
     }
 }
