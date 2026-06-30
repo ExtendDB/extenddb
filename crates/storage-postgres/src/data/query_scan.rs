@@ -438,8 +438,25 @@ impl PostgresEngine {
                             p1 = param_idx, p2 = param_idx + 1, p3 = param_idx + 2
                         ));
                     }
+                } else if let Some((_, base_sk_type)) = &base_sk_info {
+                    // Hash-only index on a composite-key base table: rows that
+                    // share the same index hash AND base partition key differ
+                    // only by the base sort key, so it must be part of the
+                    // pagination tie-breaker (matching the ORDER BY below).
+                    let base_sk_col = format!("base_{}", sk_column(*base_sk_type));
+                    let base_collate = if *base_sk_type == ScalarAttributeType::S {
+                        " COLLATE \"C\""
+                    } else {
+                        ""
+                    };
+                    conditions.push(format!(
+                        "(pk, base_pk COLLATE \"C\", {base_sk_col}{base_collate}) > (${p1}, ${p2}, ${p3})",
+                        p1 = param_idx,
+                        p2 = param_idx + 1,
+                        p3 = param_idx + 2
+                    ));
                 } else {
-                    // Hash-only index scan
+                    // Hash-only index on a hash-only base table.
                     conditions.push(format!(
                         "(pk, base_pk COLLATE \"C\") > (${p1}, ${p2})",
                         p1 = param_idx,
@@ -497,6 +514,17 @@ impl PostgresEngine {
                         " ORDER BY pk, {sk_col}{collate}, base_pk COLLATE \"C\""
                     );
                 }
+            } else if let Some((_, base_sk_type)) = &base_sk_info {
+                let base_sk_col = format!("base_{}", sk_column(*base_sk_type));
+                let base_collate = if *base_sk_type == ScalarAttributeType::S {
+                    " COLLATE \"C\""
+                } else {
+                    ""
+                };
+                let _ = write!(
+                    sql,
+                    " ORDER BY pk, base_pk COLLATE \"C\", {base_sk_col}{base_collate}"
+                );
             } else {
                 let _ = write!(sql, " ORDER BY pk, base_pk COLLATE \"C\"");
             }

@@ -1347,3 +1347,70 @@ class TestBaseKeySchemaFlow:
         assert len(all_items) == 12
         item_keys = [(i["pk"]["S"], i["sk"]["N"]) for i in all_items]
         assert len(item_keys) == len(set(item_keys))
+
+
+
+@pytest.fixture
+def hash_only_gsi_on_composite_base(dynamodb_client):
+    """Composite-key base table (HASH+RANGE) with a hash-only GSI.
+
+    Multiple items share the same GSI hash AND the same base partition key,
+    differing only by the base sort key — the case where index rows collide on
+    (gsi_hash, base_pk) and pagination must order by the base sort key too.
+    """
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[
+            {"AttributeName": "deviceId", "AttributeType": "S"},
+            {"AttributeName": "ts", "AttributeType": "N"},
+            {"AttributeName": "status", "AttributeType": "S"},
+        ],
+        key_schema=[
+            {"AttributeName": "deviceId", "KeyType": "HASH"},
+            {"AttributeName": "ts", "KeyType": "RANGE"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "StatusGSI",
+                "KeySchema": [{"AttributeName": "status", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            },
+        ],
+    ) as name:
+        for i in range(1, 8):
+            dynamodb_client.put_item(
+                TableName=name,
+                Item={
+                    "deviceId": {"S": "d1"},
+                    "ts": {"N": str(i)},
+                    "status": {"S": "ACTIVE"},
+                },
+            )
+        yield name
+
+
+class TestHashOnlyGsiCompositeBaseScan:
+    """Scanning a hash-only GSI on a composite-key base table must not drop
+    rows that share a (gsi_hash, base_pk) prefix across page boundaries."""
+
+    def test_scan_paginate_returns_all(
+        self, dynamodb_client, hash_only_gsi_on_composite_base
+    ):
+        all_ts = []
+        exclusive_start_key = None
+        while True:
+            kwargs = {
+                "TableName": hash_only_gsi_on_composite_base,
+                "IndexName": "StatusGSI",
+                "Limit": 2,
+            }
+            if exclusive_start_key:
+                kwargs["ExclusiveStartKey"] = exclusive_start_key
+            resp = dynamodb_client.scan(**kwargs)
+            all_ts.extend(item["ts"]["N"] for item in resp["Items"])
+            if "LastEvaluatedKey" not in resp:
+                break
+            exclusive_start_key = resp["LastEvaluatedKey"]
+
+        assert len(all_ts) == 7, f"expected 7 items, got {len(all_ts)}"
+        assert sorted(all_ts, key=int) == [str(i) for i in range(1, 8)]
