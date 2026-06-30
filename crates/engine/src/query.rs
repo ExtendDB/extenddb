@@ -132,6 +132,10 @@ pub async fn handle_query(
         ));
     }
 
+    // An explicitly empty KeyConditionExpression is rejected up front, before
+    // the expression-parameter-usage checks (matching real DynamoDB).
+    reject_empty_key_condition_expression(input.key_condition_expression.as_deref())?;
+
     // Build expression maps from request (used for expression-based parameters)
     let maps = build_expression_maps(
         input.expression_attribute_names.as_ref(),
@@ -335,28 +339,20 @@ pub async fn handle_query(
         )?;
     }
 
-    // Validate Select vs ProjectionExpression and index requirements
-    if let Some(Select::SpecificAttributes) = input.select
-        && effective_projection_str.is_none()
-    {
-        return Err(DynamoDbError::ValidationException(
-                "1 validation error detected: Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES".to_owned(),
-            ));
-    }
-    if let Some(Select::AllProjectedAttributes) = input.select
-        && index_info.is_none()
-    {
-        return Err(DynamoDbError::ValidationException(
-            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_owned(),
-        ));
-    }
-    if let Some(Select::Count) = input.select
-        && effective_projection_str.is_some()
-    {
-        return Err(DynamoDbError::ValidationException(
-            "Cannot specify the ProjectionExpression when Select is COUNT".to_owned(),
-        ));
-    }
+    // Validate Select vs ProjectionExpression and index requirements (shared
+    // with Scan so both reject the same combinations identically).
+    extenddb_core::validation::validate_select_projection(
+        input.select,
+        input
+            .projection_expression
+            .as_deref()
+            .is_some_and(|s| !s.is_empty()),
+        input
+            .attributes_to_get
+            .as_ref()
+            .is_some_and(|a| !a.is_empty()),
+        input.index_name.is_some(),
+    )?;
 
     // When Select=ALL_PROJECTED_ATTRIBUTES, capture the index info for post-read filtering.
     let index_proj = if matches!(input.select, Some(Select::AllProjectedAttributes)) {
@@ -546,5 +542,46 @@ fn validate_name_refs_in_expr(
             validate_name_refs_in_expr(right, names, expr_type)
         }
         Expr::Placeholder(_) => Ok(()),
+    }
+}
+
+/// Reject an explicitly empty `KeyConditionExpression` with DynamoDB's exact
+/// message. An absent expression (`None`) is allowed here; required-ness is
+/// enforced later. Only the empty-string case (`Some("")`) is rejected, and it
+/// is rejected up front — before expression-parameter-usage checks — to match
+/// real DynamoDB's ordering.
+fn reject_empty_key_condition_expression(expr: Option<&str>) -> Result<(), DynamoDbError> {
+    if expr == Some("") {
+        return Err(DynamoDbError::ValidationException(
+            "Invalid KeyConditionExpression: The expression can not be empty;".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod empty_key_condition_tests {
+    use super::reject_empty_key_condition_expression;
+    use extenddb_core::error::DynamoDbError;
+
+    #[test]
+    fn empty_string_is_rejected_with_canonical_message() {
+        match reject_empty_key_condition_expression(Some("")) {
+            Err(DynamoDbError::ValidationException(msg)) => assert_eq!(
+                msg,
+                "Invalid KeyConditionExpression: The expression can not be empty;"
+            ),
+            other => panic!("expected ValidationException, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn absent_expression_is_allowed_here() {
+        assert!(reject_empty_key_condition_expression(None).is_ok());
+    }
+
+    #[test]
+    fn non_empty_expression_is_allowed() {
+        assert!(reject_empty_key_condition_expression(Some("pk = :v")).is_ok());
     }
 }

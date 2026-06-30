@@ -399,3 +399,35 @@ class TestBetweenBoundsValidation:
         err = exc_info.value.response["Error"]
         assert err["Code"] == "ValidationException"
         assert "BETWEEN" in err["Message"]
+
+
+def test_update_item_condition_only_deep_eav_accepted(
+    dynamodb_client, condition_table
+):
+    """A >32-level nested EAV referenced only by the ConditionExpression (never
+    stored by a SET action) is accepted. DynamoDB enforces the nesting limit on
+    values stored as item attributes, not on operands used solely in a
+    ConditionExpression.
+
+    Verified against real DynamoDB (us-east-1, acct 964157134968): a 33-level
+    condition-only EAV is accepted.
+    """
+    # Build a 33-level-deep nested list value (exceeds the 32-level limit).
+    deep = {"S": "x"}
+    for _ in range(33):
+        deep = {"L": [deep]}
+
+    # ':deep = :deep' is always true; the deep value is never stored.
+    dynamodb_client.update_item(
+        TableName=condition_table,
+        Key={"pk": {"S": "p"}, "sk": {"S": "s"}},
+        UpdateExpression="SET v = :new",
+        ConditionExpression=":deep = :deep",
+        ExpressionAttributeValues={":new": {"N": "1"}, ":deep": deep},
+    )
+    got = dynamodb_client.get_item(
+        TableName=condition_table,
+        Key={"pk": {"S": "p"}, "sk": {"S": "s"}},
+        ConsistentRead=True,
+    )
+    assert got["Item"]["v"]["N"] == "1"

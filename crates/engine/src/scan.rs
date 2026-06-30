@@ -250,6 +250,21 @@ pub async fn handle_scan(
         None => None,
     };
 
+    // Validate Select vs ProjectionExpression and index requirements (shared
+    // with Query so both reject the same combinations identically).
+    extenddb_core::validation::validate_select_projection(
+        input.select,
+        input
+            .projection_expression
+            .as_deref()
+            .is_some_and(|s| !s.is_empty()),
+        input
+            .attributes_to_get
+            .as_ref()
+            .is_some_and(|a| !a.is_empty()),
+        input.index_name.is_some(),
+    )?;
+
     // Validate unused expression attributes
     {
         let exprs: Vec<&extenddb_core::expression::Expr> = filter.iter().collect();
