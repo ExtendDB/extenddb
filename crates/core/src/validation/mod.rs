@@ -109,38 +109,50 @@ pub fn validate_create_table(
 /// Validate that INCLUDE-projection secondary indexes specify `NonKeyAttributes`.
 ///
 /// Real `DynamoDB` rejects a GSI or LSI whose `ProjectionType` is `INCLUDE`
-/// without a non-empty `NonKeyAttributes` list.
+/// without a non-empty `NonKeyAttributes` list, and conversely rejects a
+/// `KEYS_ONLY` or `ALL` projection that carries `NonKeyAttributes`.
 ///
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` for any such index.
 fn validate_index_projections(input: &CreateTableInput) -> Result<(), DynamoDbError> {
-    fn include_without_attrs(projection: &crate::types::Projection) -> bool {
-        matches!(
-            projection.projection_type,
-            crate::types::ProjectionType::Include
-        ) && projection
+    use crate::types::{Projection, ProjectionType};
+
+    // Validates a single index projection against real DynamoDB rules:
+    // `INCLUDE` requires a non-empty `NonKeyAttributes`, while `KEYS_ONLY`
+    // and `ALL` must not carry `NonKeyAttributes`.
+    fn check(projection: &Projection) -> Result<(), DynamoDbError> {
+        let has_attrs = projection
             .non_key_attributes
             .as_ref()
-            .is_none_or(|attrs| attrs.is_empty())
+            .is_some_and(|attrs| !attrs.is_empty());
+        let message = match projection.projection_type {
+            ProjectionType::Include if !has_attrs => {
+                Some("ProjectionType is INCLUDE, but NonKeyAttributes is not specified")
+            }
+            ProjectionType::KeysOnly if has_attrs => {
+                Some("ProjectionType is KEYS_ONLY, but NonKeyAttributes is specified")
+            }
+            ProjectionType::All if has_attrs => {
+                Some("ProjectionType is ALL, but NonKeyAttributes is specified")
+            }
+            _ => None,
+        };
+        if let Some(message) = message {
+            return Err(DynamoDbError::ValidationException(format!(
+                "One or more parameter values were invalid: {message}"
+            )));
+        }
+        Ok(())
     }
-    let err = || {
-        DynamoDbError::ValidationException(
-            "One or more parameter values were invalid: ProjectionType is INCLUDE, but NonKeyAttributes is not specified".to_owned(),
-        )
-    };
     if let Some(gsis) = &input.global_secondary_indexes {
         for gsi in gsis {
-            if include_without_attrs(&gsi.projection) {
-                return Err(err());
-            }
+            check(&gsi.projection)?;
         }
     }
     if let Some(lsis) = &input.local_secondary_indexes {
         for lsi in lsis {
-            if include_without_attrs(&lsi.projection) {
-                return Err(err());
-            }
+            check(&lsi.projection)?;
         }
     }
     Ok(())
@@ -1534,6 +1546,105 @@ mod tests {
         // A non-empty NonKeyAttributes list is accepted.
         input.global_secondary_indexes = Some(vec![gsi(Some(vec!["extra".to_owned()]))]);
         assert!(validate_create_table(&input, &LimitsConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn keys_only_and_all_projections_reject_non_key_attributes() {
+        use crate::types::{GsiInput, LsiInput, Projection, ProjectionType};
+
+        // GSI cases: table keyed on `pk`, GSI keyed on `gsipk`.
+        let gsi_input = |ptype: ProjectionType, non_key: Option<Vec<String>>| {
+            let mut input = base_input(
+                vec![make_ks("pk", KeyType::Hash)],
+                vec![
+                    make_ad("pk", ScalarAttributeType::S),
+                    make_ad("gsipk", ScalarAttributeType::S),
+                ],
+            );
+            input.global_secondary_indexes = Some(vec![GsiInput {
+                index_name: "gsi1".to_owned(),
+                key_schema: vec![make_ks("gsipk", KeyType::Hash)],
+                projection: Projection {
+                    projection_type: ptype,
+                    non_key_attributes: non_key,
+                },
+                provisioned_throughput: None,
+            }]);
+            input
+        };
+
+        // LSI case: table keyed on `pk`+`sk`, LSI alternate sort key `lsisk`.
+        let lsi_input = |ptype: ProjectionType, non_key: Option<Vec<String>>| {
+            let mut input = base_input(
+                vec![make_ks("pk", KeyType::Hash), make_ks("sk", KeyType::Range)],
+                vec![
+                    make_ad("pk", ScalarAttributeType::S),
+                    make_ad("sk", ScalarAttributeType::S),
+                    make_ad("lsisk", ScalarAttributeType::S),
+                ],
+            );
+            input.local_secondary_indexes = Some(vec![LsiInput {
+                index_name: "lsi1".to_owned(),
+                key_schema: vec![
+                    make_ks("pk", KeyType::Hash),
+                    make_ks("lsisk", KeyType::Range),
+                ],
+                projection: Projection {
+                    projection_type: ptype,
+                    non_key_attributes: non_key,
+                },
+            }]);
+            input
+        };
+
+        // GSI KEYS_ONLY + NonKeyAttributes -> rejected.
+        let err = validate_create_table(
+            &gsi_input(ProjectionType::KeysOnly, Some(vec!["x".to_owned()])),
+            &LimitsConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: ProjectionType is KEYS_ONLY, but NonKeyAttributes is specified"
+        );
+
+        // GSI ALL + NonKeyAttributes -> rejected.
+        let err = validate_create_table(
+            &gsi_input(ProjectionType::All, Some(vec!["x".to_owned()])),
+            &LimitsConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: ProjectionType is ALL, but NonKeyAttributes is specified"
+        );
+
+        // LSI KEYS_ONLY + NonKeyAttributes -> rejected.
+        let err = validate_create_table(
+            &lsi_input(ProjectionType::KeysOnly, Some(vec!["x".to_owned()])),
+            &LimitsConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: ProjectionType is KEYS_ONLY, but NonKeyAttributes is specified"
+        );
+
+        // KEYS_ONLY / ALL without NonKeyAttributes are accepted.
+        assert!(
+            validate_create_table(
+                &gsi_input(ProjectionType::KeysOnly, None),
+                &LimitsConfig::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_create_table(
+                &gsi_input(ProjectionType::All, Some(vec![])),
+                &LimitsConfig::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
