@@ -1488,6 +1488,78 @@ mod tests {
     }
 
     #[test]
+    fn validate_key_sizes_rejects_oversized_hash_key() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        let big = "a".repeat(limits.max_partition_key_size_bytes + 1);
+        item.insert("pk".to_owned(), AttributeValue::S(big));
+        let err = validate_key_sizes(&item, &[make_ks("pk", KeyType::Hash)], &limits).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Size of hashkey has exceeded the maximum size limit"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_key_sizes_rejects_oversized_range_key() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        let big = "b".repeat(limits.max_sort_key_size_bytes + 1);
+        item.insert("sk".to_owned(), AttributeValue::S(big));
+        let err = validate_key_sizes(&item, &[make_ks("sk", KeyType::Range)], &limits).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Aggregated size of all range keys has exceeded the size limit"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_key_sizes_accepts_key_at_limit() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        item.insert(
+            "pk".to_owned(),
+            AttributeValue::S("a".repeat(limits.max_partition_key_size_bytes)),
+        );
+        assert!(validate_key_sizes(&item, &[make_ks("pk", KeyType::Hash)], &limits).is_ok());
+    }
+
+    #[test]
+    fn validate_key_sizes_hash_message_matches_amazon_dynamodb() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        item.insert(
+            "pk".to_owned(),
+            AttributeValue::S("a".repeat(limits.max_partition_key_size_bytes + 1)),
+        );
+        let err = validate_key_sizes(&item, &[make_ks("pk", KeyType::Hash)], &limits).unwrap_err();
+        // Exact wording, including Amazon DynamoDB's missing space before the size.
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: \
+             Size of hashkey has exceeded the maximum size limit of2048 bytes"
+        );
+    }
+
+    #[test]
+    fn validate_key_sizes_range_message_matches_amazon_dynamodb() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        item.insert(
+            "sk".to_owned(),
+            AttributeValue::S("b".repeat(limits.max_sort_key_size_bytes + 1)),
+        );
+        let err = validate_key_sizes(&item, &[make_ks("sk", KeyType::Range)], &limits).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: \
+             Aggregated size of all range keys has exceeded the size limit of 1024 bytes"
+        );
+    }
+
+    #[test]
     fn validate_key_only_rejects_empty_binary_key() {
         let mut key = Item::new();
         key.insert("pk".to_owned(), AttributeValue::B(Vec::new()));
