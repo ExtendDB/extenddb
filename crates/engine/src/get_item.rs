@@ -36,17 +36,9 @@ pub async fn handle_get_item(
 ) -> Result<DispatchResult, DynamoDbError> {
     let input: GetItemInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
-    let key_info = ctx
-        .table_key_info(&input.table_name)
-        .await
-        .map_err(storage_err_to_dynamo)?;
-
-    extenddb_core::validation::validate_get_item(
-        &input,
-        &ctx.limits,
-        &key_info.key_schema,
-        &key_info.attribute_definitions,
-    )?;
+    // Validate the projection (and EAN usage) before the existence
+    // check, so a missing table returns ValidationException, not
+    // ResourceNotFoundException. Key validation stays after existence.
 
     // Reject ExpressionAttributeNames supplied with no ProjectionExpression
     // (legacy AttributesToGet does not count as an expression).
@@ -61,18 +53,6 @@ pub async fn handle_get_item(
         &[],
     )?;
 
-    let item = ctx
-        .storage
-        .get_item(&key_info, &input.key)
-        .await
-        .map_err(storage_err_to_dynamo)?;
-
-    // Capacity metering: full item size pre-projection, rounded up to 4 KB.
-    let pre_projection_bytes = item.as_ref().map_or(0, item_size_bytes);
-    let strongly_consistent = input.consistent_read == Some(true);
-    let rcu = capacity_helpers::read_capacity_units(pre_projection_bytes, strongly_consistent);
-
-    // Apply projection if requested.
     // M4: Mutual exclusivity — real DynamoDB rejects both at once.
     if input.projection_expression.is_some()
         && input
@@ -115,8 +95,8 @@ pub async fn handle_get_item(
         Some(merged)
     };
 
-    // Parse and validate the projection once, before the item fetch result
-    // matters, so validation runs whether or not the item exists.
+    // Parse and validate the projection once, before existence and before the
+    // item fetch, so validation runs whether or not the table or item exists.
     let projection = match effective_projection {
         Some(ref proj_str) => {
             let parsed = crate::expression_helpers::parse_projection_expr(proj_str, &ctx.limits)?;
@@ -139,6 +119,29 @@ pub async fn handle_get_item(
         }
         None => None,
     };
+
+    let key_info = ctx
+        .table_key_info(&input.table_name)
+        .await
+        .map_err(storage_err_to_dynamo)?;
+
+    extenddb_core::validation::validate_get_item(
+        &input,
+        &ctx.limits,
+        &key_info.key_schema,
+        &key_info.attribute_definitions,
+    )?;
+
+    let item = ctx
+        .storage
+        .get_item(&key_info, &input.key)
+        .await
+        .map_err(storage_err_to_dynamo)?;
+
+    // Capacity metering: full item size pre-projection, rounded up to 4 KB.
+    let pre_projection_bytes = item.as_ref().map_or(0, item_size_bytes);
+    let strongly_consistent = input.consistent_read == Some(true);
+    let rcu = capacity_helpers::read_capacity_units(pre_projection_bytes, strongly_consistent);
 
     let item = match (projection, item) {
         (Some(projection), Some(fetched)) => Some(projection.apply(&fetched)),

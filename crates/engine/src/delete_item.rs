@@ -42,18 +42,9 @@ pub async fn handle_delete_item(
 
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
 
-    let key_info = ctx
-        .table_key_info(&input.table_name)
-        .await
-        .map_err(storage_err_to_dynamo)?;
-
-    extenddb_core::validation::validate_delete_item(
-        &input,
-        &ctx.limits,
-        &key_info.key_schema,
-        &key_info.attribute_definitions,
-    )?;
-
+    // Validate expressions/`Expected` before the existence check,
+    // so a missing table returns ValidationException, not ResourceNotFoundException.
+    // Key validation stays after existence (it needs the table's key schema).
     let has_condition = input
         .condition_expression
         .as_ref()
@@ -91,6 +82,18 @@ pub async fn handle_delete_item(
             &std::collections::HashSet::new(),
         )?;
     }
+
+    let key_info = ctx
+        .table_key_info(&input.table_name)
+        .await
+        .map_err(storage_err_to_dynamo)?;
+
+    extenddb_core::validation::validate_delete_item(
+        &input,
+        &ctx.limits,
+        &key_info.key_schema,
+        &key_info.attribute_definitions,
+    )?;
 
     let return_old = input.return_values == ReturnValues::AllOld;
 

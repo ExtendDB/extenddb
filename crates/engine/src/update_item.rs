@@ -56,10 +56,9 @@ pub async fn handle_update_item(
 
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
 
-    let key_info = ctx
-        .table_key_info(&input.table_name)
-        .await
-        .map_err(storage_err_to_dynamo)?;
+    // Validate Update/Condition expressions (and AttributeUpdates
+    // desugaring) before the existence check; key, item-content nesting, and
+    // the no-key-update checks stay after (post-existence on Amazon DynamoDB).
 
     // Desugar legacy AttributeUpdates into UpdateExpression if present.
     // N.B. The literal `{AttributeUpdates}` / `{UpdateExpression}` in the error message
@@ -102,13 +101,6 @@ pub async fn handle_update_item(
         Some(merged)
     };
 
-    extenddb_core::validation::validate_update_item(
-        &input,
-        &ctx.limits,
-        &key_info.key_schema,
-        &key_info.attribute_definitions,
-    )?;
-
     let has_update_expr = input
         .update_expression
         .as_ref()
@@ -143,24 +135,22 @@ pub async fn handle_update_item(
         Vec::new()
     };
 
-    // Amazon DynamoDB enforces nesting depth on values that are stored as item
-    // attributes. For UpdateExpression, walk each SET action's RHS to find the
-    // EAV placeholders it references, resolve them against `maps.values`, and
-    // validate those values' depth. Condition-only EAV is left alone — real
-    // DynamoDB does not apply the nesting limit to values used solely in a
-    // ConditionExpression (verified against the service).
-    {
-        let mut placeholders: Vec<String> = Vec::new();
-        for action in &actions {
-            if let UpdateAction::Set { value, .. } = action {
-                extenddb_core::expression::collect_value_placeholders(value, &mut placeholders);
+    // Reject an undefined #name before the existence check
+    // (otherwise it is only raised later, during execution).
+    for action in &actions {
+        let path = match action {
+            UpdateAction::Set { path, .. }
+            | UpdateAction::Remove { path }
+            | UpdateAction::Add { path, .. }
+            | UpdateAction::Delete { path, .. } => path,
+        };
+        for el in path {
+            if let PathElement::Attribute(name) = el
+                && let Some(ref_name) = name.strip_prefix('#')
+            {
+                maps.resolve_name(ref_name)?;
             }
         }
-        let stored: Vec<&extenddb_core::types::AttributeValue> = placeholders
-            .iter()
-            .filter_map(|name| maps.values.get(name))
-            .collect();
-        extenddb_core::validation::validate_attribute_values_nesting_depth(stored)?;
     }
 
     if input.expected.is_none()
@@ -178,6 +168,38 @@ pub async fn handle_update_item(
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
         )?;
+    }
+
+    let key_info = ctx
+        .table_key_info(&input.table_name)
+        .await
+        .map_err(storage_err_to_dynamo)?;
+
+    extenddb_core::validation::validate_update_item(
+        &input,
+        &ctx.limits,
+        &key_info.key_schema,
+        &key_info.attribute_definitions,
+    )?;
+
+    // Amazon DynamoDB enforces nesting depth on values that are stored as item
+    // attributes. For UpdateExpression, walk each SET action's RHS to find the
+    // EAV placeholders it references, resolve them against `maps.values`, and
+    // validate those values' depth. Condition-only EAV is left alone: real
+    // DynamoDB does not apply the nesting limit to values used solely in a
+    // ConditionExpression (verified against the service).
+    {
+        let mut placeholders: Vec<String> = Vec::new();
+        for action in &actions {
+            if let UpdateAction::Set { value, .. } = action {
+                extenddb_core::expression::collect_value_placeholders(value, &mut placeholders);
+            }
+        }
+        let stored: Vec<&extenddb_core::types::AttributeValue> = placeholders
+            .iter()
+            .filter_map(|name| maps.values.get(name))
+            .collect();
+        extenddb_core::validation::validate_attribute_values_nesting_depth(stored)?;
     }
 
     // Validate that no update action targets a key attribute (REQ-DATA-003)
