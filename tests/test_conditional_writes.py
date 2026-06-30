@@ -399,3 +399,31 @@ class TestBetweenBoundsValidation:
         err = exc_info.value.response["Error"]
         assert err["Code"] == "ValidationException"
         assert "BETWEEN" in err["Message"]
+
+
+def test_update_item_condition_only_deep_eav_is_validation_error(
+    dynamodb_client, condition_table
+):
+    """A >32-level nested EAV referenced only by the ConditionExpression (never by
+    a SET action) must be rejected up front as a ValidationException — not surface
+    as a ConditionalCheckFailedException.
+
+    Verified against real DynamoDB (us-east-1): nesting limit is enforced on every
+    provided ExpressionAttributeValue before the condition is evaluated.
+    """
+    # Build a 33-level-deep nested list value (exceeds the 32-level limit).
+    deep = {"S": "x"}
+    for _ in range(33):
+        deep = {"L": [deep]}
+
+    with pytest.raises(ClientError) as exc:
+        dynamodb_client.update_item(
+            TableName=condition_table,
+            Key={"pk": {"S": "p"}, "sk": {"S": "s"}},
+            UpdateExpression="SET v = :new",
+            ConditionExpression="c = :deep",
+            ExpressionAttributeValues={":new": {"N": "1"}, ":deep": deep},
+        )
+    err = exc.value.response["Error"]
+    assert err["Code"] == "ValidationException", err
+    assert "Nesting Levels have exceeded supported limits" in err["Message"], err

@@ -132,6 +132,10 @@ pub async fn handle_query(
         ));
     }
 
+    // An explicitly empty KeyConditionExpression is rejected up front, before
+    // the expression-parameter-usage checks (matching real DynamoDB).
+    reject_empty_key_condition_expression(input.key_condition_expression.as_deref())?;
+
     // Build expression maps from request (used for expression-based parameters)
     let maps = build_expression_maps(
         input.expression_attribute_names.as_ref(),
@@ -546,5 +550,46 @@ fn validate_name_refs_in_expr(
             validate_name_refs_in_expr(right, names, expr_type)
         }
         Expr::Placeholder(_) => Ok(()),
+    }
+}
+
+/// Reject an explicitly empty `KeyConditionExpression` with DynamoDB's exact
+/// message. An absent expression (`None`) is allowed here; required-ness is
+/// enforced later. Only the empty-string case (`Some("")`) is rejected, and it
+/// is rejected up front — before expression-parameter-usage checks — to match
+/// real DynamoDB's ordering.
+fn reject_empty_key_condition_expression(expr: Option<&str>) -> Result<(), DynamoDbError> {
+    if expr == Some("") {
+        return Err(DynamoDbError::ValidationException(
+            "Invalid KeyConditionExpression: The expression can not be empty;".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod empty_key_condition_tests {
+    use super::reject_empty_key_condition_expression;
+    use extenddb_core::error::DynamoDbError;
+
+    #[test]
+    fn empty_string_is_rejected_with_canonical_message() {
+        match reject_empty_key_condition_expression(Some("")) {
+            Err(DynamoDbError::ValidationException(msg)) => assert_eq!(
+                msg,
+                "Invalid KeyConditionExpression: The expression can not be empty;"
+            ),
+            other => panic!("expected ValidationException, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn absent_expression_is_allowed_here() {
+        assert!(reject_empty_key_condition_expression(None).is_ok());
+    }
+
+    #[test]
+    fn non_empty_expression_is_allowed() {
+        assert!(reject_empty_key_condition_expression(Some("pk = :v")).is_ok());
     }
 }

@@ -143,21 +143,13 @@ pub async fn handle_update_item(
         Vec::new()
     };
 
-    // Amazon DynamoDB enforces nesting depth on values that are stored as item
-    // attributes. For UpdateExpression, walk each SET action's RHS to find the
-    // EAV placeholders it references, resolve them against `maps.values`, and
-    // validate those values' depth. Condition-only EAV is left alone.
+    // Amazon DynamoDB enforces the 32-level nesting limit on every provided
+    // ExpressionAttributeValue up front — before the condition is evaluated —
+    // not only those stored via a SET action. Validate all of them so a deeply
+    // nested condition-only value is a ValidationException rather than surfacing
+    // as a ConditionalCheckFailedException.
     {
-        let mut placeholders: Vec<String> = Vec::new();
-        for action in &actions {
-            if let UpdateAction::Set { value, .. } = action {
-                extenddb_core::expression::collect_value_placeholders(value, &mut placeholders);
-            }
-        }
-        let stored: Vec<&extenddb_core::types::AttributeValue> = placeholders
-            .iter()
-            .filter_map(|name| maps.values.get(name))
-            .collect();
+        let stored: Vec<&extenddb_core::types::AttributeValue> = maps.values.values().collect();
         extenddb_core::validation::validate_attribute_values_nesting_depth(stored)?;
     }
 
