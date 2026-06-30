@@ -20,7 +20,7 @@ publish = false
 # See https://doc.rust-lang.org/cargo/reference/overriding-dependencies.html#paths-overrides
 [dependencies]
 aws-sdk-dynamodb = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
-aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client", "credentials-process"] }
 aws-credential-types = "1"
 aws-smithy-types = "1"
 aws-smithy-runtime-api = "1"
