@@ -293,11 +293,42 @@ pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbErr
         ));
     }
 
+    // A key condition may only reference a top-level key attribute. Any document
+    // path (`attr.sub` or `attr[i]`) on a key is rejected, matching Amazon
+    // DynamoDB. Runs after the reserved-word check and before key-schema checks.
+    for clause in &clauses {
+        reject_nested_key_path(raw_clause_path(clause))?;
+    }
+
     match clauses.len() {
         1 => classify_single(clauses.remove(0)),
         2 => classify_pair(clauses.remove(0), clauses.remove(0)),
         _ => classify_multi(clauses),
     }
+}
+
+/// The attribute-side path of a raw clause.
+fn raw_clause_path(clause: &RawClause) -> &[PathElement] {
+    match clause {
+        RawClause::Eq(path, _)
+        | RawClause::Compare(path, _, _)
+        | RawClause::Between(path, _, _)
+        | RawClause::BeginsWith(path, _) => path,
+    }
+}
+
+/// Reject any key path that is not a single top-level attribute.
+///
+/// `parse_path` always emits an `Attribute` (or `#name`) as element 0, so a path
+/// can never start with an `Index` or be empty: the length is the real
+/// discriminator. The element check is defensive against future AST changes.
+fn reject_nested_key_path(path: &[PathElement]) -> Result<(), DynamoDbError> {
+    if path.len() == 1 && matches!(path.first(), Some(PathElement::Attribute(_))) {
+        return Ok(());
+    }
+    Err(validation_err(
+        "Invalid KeyConditionExpression: KeyConditionExpressions cannot have conditions on nested attributes",
+    ))
 }
 
 /// A raw parsed clause before we know if it's PK or SK.
