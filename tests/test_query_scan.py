@@ -1414,3 +1414,20 @@ class TestHashOnlyGsiCompositeBaseScan:
 
         assert len(all_ts) == 7, f"expected 7 items, got {len(all_ts)}"
         assert sorted(all_ts, key=int) == [str(i) for i in range(1, 8)]
+
+
+def test_query_empty_key_condition_expression_rejected(dynamodb_client):
+    """Query with an explicitly empty KeyConditionExpression is a ValidationException.
+
+    Verified against real DynamoDB (us-east-1): the exact message is
+    "Invalid KeyConditionExpression: The expression can not be empty;".
+    """
+    with scoped_table(dynamodb_client) as name:
+        with pytest.raises(ClientError) as exc:
+            dynamodb_client.query(TableName=name, KeyConditionExpression="")
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException", err
+        assert (
+            err["Message"]
+            == "Invalid KeyConditionExpression: The expression can not be empty;"
+        ), err

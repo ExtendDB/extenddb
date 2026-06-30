@@ -429,7 +429,8 @@ async fn gsi_hash_only_pagination() {
         })
         .collect();
     ids.sort();
-    let expected: Vec<String> = (1..=10).map(|i| format!("node-{i}")).collect();
+    let mut expected: Vec<String> = (1..=10).map(|i| format!("node-{i}")).collect();
+    expected.sort();
     assert_eq!(ids, expected);
 }
 

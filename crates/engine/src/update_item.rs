@@ -146,7 +146,9 @@ pub async fn handle_update_item(
     // Amazon DynamoDB enforces nesting depth on values that are stored as item
     // attributes. For UpdateExpression, walk each SET action's RHS to find the
     // EAV placeholders it references, resolve them against `maps.values`, and
-    // validate those values' depth. Condition-only EAV is left alone.
+    // validate those values' depth. Condition-only EAV is left alone — real
+    // DynamoDB does not apply the nesting limit to values used solely in a
+    // ConditionExpression (verified against the service).
     {
         let mut placeholders: Vec<String> = Vec::new();
         for action in &actions {

@@ -183,7 +183,8 @@ async fn transact_write_update_with_expression() {
                     Update::builder()
                         .table_name(table)
                         .set_key(Some(upd_key.clone()))
-                        .update_expression("SET counter = counter + :inc")
+                        .update_expression("SET #c = #c + :inc")
+                        .expression_attribute_names("#c", "counter")
                         .expression_attribute_values(":inc", n(5))
                         .build()
                         .unwrap(),

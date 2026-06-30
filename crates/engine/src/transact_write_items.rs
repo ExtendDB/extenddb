@@ -254,6 +254,10 @@ async fn prepare_write_op(
             .table_key_info(&ctx.account_id, &del.table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
+        // Empty or oversize key values are up-front input validation in
+        // DynamoDB (a top-level ValidationException), unlike a key type
+        // mismatch which surfaces as a per-item cancellation reason.
+        validate_key_sizes(&del.key, &key_info.key_schema, &ctx.limits)?;
         let maps = build_expression_maps(
             del.expression_attribute_names.as_ref(),
             del.expression_attribute_values.as_ref(),
@@ -292,6 +296,10 @@ async fn prepare_write_op(
             .table_key_info(&ctx.account_id, &upd.table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
+        // Empty or oversize key values are up-front input validation in
+        // DynamoDB (a top-level ValidationException), unlike a key type
+        // mismatch which surfaces as a per-item cancellation reason.
+        validate_key_sizes(&upd.key, &key_info.key_schema, &ctx.limits)?;
         let maps = build_expression_maps(
             upd.expression_attribute_names.as_ref(),
             upd.expression_attribute_values.as_ref(),
@@ -349,6 +357,10 @@ async fn prepare_write_op(
             .table_key_info(&ctx.account_id, &cc.table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
+        // Empty or oversize key values are up-front input validation in
+        // DynamoDB (a top-level ValidationException), unlike a key type
+        // mismatch which surfaces as a per-item cancellation reason.
+        validate_key_sizes(&cc.key, &key_info.key_schema, &ctx.limits)?;
         let maps = build_expression_maps(
             cc.expression_attribute_names.as_ref(),
             cc.expression_attribute_values.as_ref(),

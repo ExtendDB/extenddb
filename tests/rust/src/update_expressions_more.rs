@@ -149,7 +149,8 @@ async fn set_add_remove_delete_all_four() {
     c.update_item()
         .table_name(table)
         .set_key(Some(key.clone()))
-        .update_expression("SET new_field = :nf ADD counter :inc REMOVE old_field DELETE tags :rem")
+        .update_expression("SET new_field = :nf ADD #c :inc REMOVE old_field DELETE tags :rem")
+        .expression_attribute_names("#c", "counter")
         .expression_attribute_values(":nf", s("hello"))
         .expression_attribute_values(":inc", n(5))
         .expression_attribute_values(":rem", ss(&["x"]))
@@ -197,7 +198,8 @@ async fn set_list_element_by_index() {
     c.update_item()
         .table_name(table)
         .set_key(Some(key.clone()))
-        .update_expression("SET items[1] = :v")
+        .update_expression("SET #i[1] = :v")
+        .expression_attribute_names("#i", "items")
         .expression_attribute_values(":v", s("replaced"))
         .send()
         .await
@@ -241,7 +243,8 @@ async fn remove_list_element_by_index() {
     c.update_item()
         .table_name(table)
         .set_key(Some(key.clone()))
-        .update_expression("REMOVE items[1]")
+        .update_expression("REMOVE #i[1]")
+        .expression_attribute_names("#i", "items")
         .send()
         .await
         .unwrap();

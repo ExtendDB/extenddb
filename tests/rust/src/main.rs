@@ -26,6 +26,8 @@ mod condition_expressions;
 #[cfg(test)]
 mod condition_expressions_more;
 #[cfg(test)]
+mod create_table_validation;
+#[cfg(test)]
 mod data_types;
 #[cfg(test)]
 mod delete_item;
@@ -42,9 +44,13 @@ mod gsi;
 #[cfg(test)]
 mod gsi_more;
 #[cfg(test)]
+mod index_key_validation;
+#[cfg(test)]
 mod lsi;
 #[cfg(test)]
 mod misc_control_plane;
+#[cfg(test)]
+mod number_validation;
 #[cfg(test)]
 mod put_item;
 #[cfg(test)]
@@ -58,6 +64,8 @@ mod raw_http;
 #[cfg(test)]
 mod scan;
 #[cfg(test)]
+mod select_projection_validation;
+#[cfg(test)]
 mod table_operations;
 #[cfg(test)]
 mod table_operations_more;
@@ -65,6 +73,8 @@ mod table_operations_more;
 mod tagging;
 #[cfg(test)]
 mod transact_get_items;
+#[cfg(test)]
+mod transact_key_validation;
 #[cfg(test)]
 mod transact_write_items;
 #[cfg(test)]
