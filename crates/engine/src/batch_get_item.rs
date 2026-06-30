@@ -10,7 +10,7 @@ use serde_json::Value;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::Projection;
 use extenddb_core::types::{BatchGetItemInput, BatchGetItemOutput, Item, item_size_bytes};
-use extenddb_core::validation::validate_batch_key_only;
+use extenddb_core::validation::{validate_batch_key_only, validate_key_sizes};
 
 use crate::OperationContext;
 use crate::capacity_helpers;
@@ -183,6 +183,7 @@ pub async fn handle_batch_get_item(
                 ));
             }
             validate_batch_key_only(key, &key_info.key_schema, &key_info.attribute_definitions)?;
+            validate_key_sizes(key, &key_info.key_schema, &ctx.limits)?;
 
             if let Some(item) = ctx
                 .storage
