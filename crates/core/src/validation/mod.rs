@@ -561,6 +561,7 @@ pub fn validate_get_item(
 ) -> Result<(), DynamoDbError> {
     validate_table_name(&input.table_name, limits)?;
     validate_key_only(&input.key, key_schema, attr_defs)?;
+    validate_key_sizes(&input.key, key_schema, limits)?;
     Ok(())
 }
 
@@ -590,6 +591,7 @@ pub fn validate_delete_item(
     }
 
     validate_key_only(&input.key, key_schema, attr_defs)?;
+    validate_key_sizes(&input.key, key_schema, limits)?;
     Ok(())
 }
 
@@ -609,6 +611,7 @@ pub fn validate_update_item(
 ) -> Result<(), DynamoDbError> {
     validate_table_name(&input.table_name, limits)?;
     validate_key_only(&input.key, key_schema, attr_defs)?;
+    validate_key_sizes(&input.key, key_schema, limits)?;
 
     if let Some(updates) = &input.attribute_updates {
         validate_attribute_values_nesting_depth(updates.values().filter_map(|u| u.value.as_ref()))?;
@@ -1027,15 +1030,24 @@ pub fn validate_key_sizes(
         if let Some(value) = item.get(&ks.attribute_name) {
             validate_no_empty_key_value(&ks.attribute_name, value)?;
             let size = key_value_byte_size(value);
-            let (max_size, key_label) = match ks.key_type {
-                KeyType::Hash => (limits.max_partition_key_size_bytes, "partition key"),
-                KeyType::Range => (limits.max_sort_key_size_bytes, "sort key"),
+            let max_size = match ks.key_type {
+                KeyType::Hash => limits.max_partition_key_size_bytes,
+                KeyType::Range => limits.max_sort_key_size_bytes,
             };
             if size > max_size {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "One or more parameter values are not valid. \
-                     The {key_label} size must be between 1 and {max_size} bytes"
-                )));
+                // Hash and range use different wording, matching Amazon
+                // DynamoDB (the hash variant has no space before the size).
+                let msg = match ks.key_type {
+                    KeyType::Hash => format!(
+                        "One or more parameter values were invalid: \
+                         Size of hashkey has exceeded the maximum size limit of{max_size} bytes"
+                    ),
+                    KeyType::Range => format!(
+                        "One or more parameter values were invalid: \
+                         Aggregated size of all range keys has exceeded the size limit of {max_size} bytes"
+                    ),
+                };
+                return Err(DynamoDbError::ValidationException(msg));
             }
         }
     }
@@ -1043,6 +1055,10 @@ pub fn validate_key_sizes(
 }
 
 /// Get the byte size of a key attribute value.
+///
+/// For `N` keys this uses the digit-string length. Amazon DynamoDB caps a
+/// number at 38 significant digits, so the string length is always far below
+/// the key-size limit and the proxy is exact for the rejection decision.
 fn key_value_byte_size(value: &AttributeValue) -> usize {
     match value {
         AttributeValue::S(s) => s.len(),
