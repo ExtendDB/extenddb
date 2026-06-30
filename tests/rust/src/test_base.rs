@@ -222,6 +222,20 @@ pub async fn tables() -> &'static TestTables {
         .await
 }
 
+// ========== Table creation helpers ==========
+//
+// Tables created during tests are NOT deleted by Rust code. Cleanup is handled
+// by `devtools/run-tests` which bulk-deletes all test tables after the test
+// binary exits (see the "Post-test table cleanup" section in that script).
+//
+// This avoids per-test `wait_for_deleted` polling loops, which on real DynamoDB
+// can take up to 60 seconds per table — a significant overhead when many tests
+// each create their own table. On ExtendDB the tables vanish with the database
+// anyway (CI uses a fresh PostgreSQL container per run).
+//
+// The only tests that issue DeleteTable are those in `table_operations.rs` which
+// specifically verify deletion behavior.
+
 async fn create_table(
     c: &Client,
     name: &str,
@@ -359,8 +373,18 @@ async fn create_table_with_gsi(
 }
 
 /// Poll DescribeTable until ACTIVE (up to 60s).
+///
+/// Uses 100ms polling for local ExtendDB (tables are instantly active)
+/// and 1s polling for real DynamoDB (async table creation).
 pub async fn wait_for_active(c: &Client, name: &str) {
-    for _ in 0..60 {
+    let interval = if is_real_dynamodb() {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_millis(100)
+    };
+    let max_attempts = if is_real_dynamodb() { 60 } else { 100 };
+
+    for _ in 0..max_attempts {
         if let Ok(resp) = c.describe_table().table_name(name).send().await {
             if let Some(table) = resp.table() {
                 if table.table_status() == Some(&TableStatus::Active) {
@@ -368,14 +392,23 @@ pub async fn wait_for_active(c: &Client, name: &str) {
                 }
             }
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(interval).await;
     }
-    panic!("Table {name} did not become ACTIVE within 60s");
+    panic!("Table {name} did not become ACTIVE within timeout");
 }
 
 /// Poll DescribeTable until the table no longer exists (up to 60s).
+///
+/// Uses adaptive polling interval like `wait_for_active`.
 pub async fn wait_for_deleted(c: &Client, name: &str) {
-    for _ in 0..60 {
+    let interval = if is_real_dynamodb() {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_millis(100)
+    };
+    let max_attempts = if is_real_dynamodb() { 60 } else { 100 };
+
+    for _ in 0..max_attempts {
         match c.describe_table().table_name(name).send().await {
             Err(e) => {
                 if err_code(&e) == Some("ResourceNotFoundException") {
@@ -384,9 +417,9 @@ pub async fn wait_for_deleted(c: &Client, name: &str) {
             }
             Ok(_) => {}
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(interval).await;
     }
-    panic!("Table {name} was not deleted within 60s");
+    panic!("Table {name} was not deleted within timeout");
 }
 
 // ========== Item helpers ==========

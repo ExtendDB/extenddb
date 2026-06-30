@@ -173,7 +173,6 @@ async fn scan_with_select_count() {
     assert_eq!(resp.count(), 4);
     assert!(resp.items().is_empty());
 
-    c.delete_table().table_name(&table).send().await.ok();
 }
 
 #[tokio::test]

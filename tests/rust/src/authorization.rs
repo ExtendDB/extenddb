@@ -99,8 +99,6 @@ async fn unknown_access_key_rejected() {
         err_code(&err).is_some(),
         "Expected auth error, got: {err:?}"
     );
-
-    c.delete_table().table_name(&table).send().await.ok();
 }
 
 #[tokio::test]
@@ -165,6 +163,4 @@ async fn valid_credentials_put_and_get() {
         .unwrap();
     let item = resp.item().expect("Item should exist");
     assert_eq!(item.get("data").unwrap().as_s().unwrap(), "auth_test");
-
-    c.delete_table().table_name(&table).send().await.ok();
 }
