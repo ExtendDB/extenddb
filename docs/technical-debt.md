@@ -1,6 +1,6 @@
 # Technical Debt Tracker
 
-Last updated: 2026-05-04 (P112)
+Last updated: 2026-07-02 (#200)
 
 ## Categories
 
@@ -30,6 +30,9 @@ Last updated: 2026-05-04 (P112)
 | F-15 | ~~TTL worker bypasses stream capture — expired item deletions don't generate REMOVE stream records~~ | `bin/cmd_serve.rs:ttl_cleanup_worker` | ~~High~~ | P26 |
 | F-16 | `transact_write_items.rs` passes `None` for `old_item` in stream capture — `OldImage` always `None` for transaction-originated stream records | `engine/transact_write_items.rs` | Medium | P27 |
 | F-17 | `validate_attribute_name_sizes` only checks top-level attribute names — nested map keys not validated | `core/validation/mod.rs` | Low | P30 |
+| F-18 | Table ARN as `TableName`: cross-account not authorized. A foreign-account ARN resolves within the caller's account instead of returning `AccessDeniedException` | `core/validation/table_arn.rs` | Medium | #200 |
+| F-19 | Table ARN as `TableName`: ARN region ignored. A mismatched region is not rejected (matches DynamoDB Local; DynamoDB returns `ValidationException`, "Invalid AWS region") | `core/validation/table_arn.rs` | Low | #200 |
+| F-20 | Table ARN as `TableName` accepted only on data-plane operations. Control-plane ops (e.g. `DescribeTable`) do not resolve an ARN; the bare name is required | `server/request_helpers.rs` | Low | #200 |
 
 ## Cleanup
 

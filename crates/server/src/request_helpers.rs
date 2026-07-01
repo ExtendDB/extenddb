@@ -34,6 +34,161 @@ pub(crate) fn extract_operation(headers: &HeaderMap) -> Result<String, DynamoDbE
         .ok_or_else(|| DynamoDbError::UnknownOperationException(String::new()))
 }
 
+/// Normalize any table ARN supplied in place of a bare table name.
+///
+/// A table ARN is accepted wherever a `TableName` is expected, matching Amazon
+/// DynamoDB and DynamoDB Local. This rewrites the wire request in place so
+/// validation, authorization, throttling, and the storage lookup all operate on
+/// the bare name. It returns the `(bare, original)` pairs for any name that was
+/// an ARN, so the response layer can echo the caller's original ARN back in
+/// `ConsumedCapacity.TableName` and batch response keys, matching Amazon
+/// DynamoDB (which echoes the supplied ARN verbatim).
+pub(crate) fn normalize_table_arns(
+    input: &mut Value,
+    operation: &str,
+) -> Result<Vec<(String, String)>, DynamoDbError> {
+    let mut echo: Vec<(String, String)> = Vec::new();
+    match operation {
+        "GetItem" | "PutItem" | "DeleteItem" | "UpdateItem" | "Query" | "Scan" => {
+            resolve_table_name_field(input, &mut echo)?;
+        }
+        "BatchGetItem" | "BatchWriteItem" => normalize_request_items_keys(input, &mut echo)?,
+        "TransactGetItems" | "TransactWriteItems" => normalize_transact_items(input, &mut echo)?,
+        _ => {}
+    }
+    Ok(echo)
+}
+
+/// Restore the caller's original ARN in the echoed table names of a response.
+///
+/// Swaps the bare name back to the supplied ARN in `ConsumedCapacity.TableName`
+/// (object or per-table array) and in the table-name-keyed response maps for the
+/// operation, so the response mirrors what the caller sent, as Amazon DynamoDB
+/// does. The keyed-map set is operation-scoped: `ItemCollectionMetrics` is a
+/// table-keyed map only for batch-write/transact-write; for single-item writes
+/// it is a field-keyed object and must not be rewritten.
+pub(crate) fn denormalize_table_arns(body: &mut Value, operation: &str, echo: &[(String, String)]) {
+    if echo.is_empty() {
+        return;
+    }
+    let bare_to_original: std::collections::HashMap<&str, &str> =
+        echo.iter().map(|(b, o)| (b.as_str(), o.as_str())).collect();
+
+    if let Some(cc) = body.get_mut("ConsumedCapacity") {
+        match cc {
+            Value::Array(entries) => {
+                for entry in entries {
+                    swap_table_name_field(entry, &bare_to_original);
+                }
+            }
+            other => swap_table_name_field(other, &bare_to_original),
+        }
+    }
+    let table_keyed_maps: &[&str] = match operation {
+        "BatchGetItem" => &["Responses", "UnprocessedKeys"],
+        "BatchWriteItem" => &["UnprocessedItems", "ItemCollectionMetrics"],
+        "TransactWriteItems" => &["ItemCollectionMetrics"],
+        _ => &[],
+    };
+    for key in table_keyed_maps {
+        if let Some(map) = body.get_mut(*key).and_then(Value::as_object_mut) {
+            rename_map_keys(map, &bare_to_original);
+        }
+    }
+}
+
+fn swap_table_name_field(
+    entry: &mut Value,
+    bare_to_original: &std::collections::HashMap<&str, &str>,
+) {
+    if let Some(name) = entry.get("TableName").and_then(Value::as_str)
+        && let Some(original) = bare_to_original.get(name)
+    {
+        entry["TableName"] = Value::String((*original).to_owned());
+    }
+}
+
+fn rename_map_keys(
+    map: &mut serde_json::Map<String, Value>,
+    bare_to_original: &std::collections::HashMap<&str, &str>,
+) {
+    let renames: Vec<(String, String)> = map
+        .keys()
+        .filter_map(|k| {
+            bare_to_original
+                .get(k.as_str())
+                .map(|o| (k.clone(), (*o).to_owned()))
+        })
+        .collect();
+    for (bare, original) in renames {
+        if let Some(value) = map.remove(&bare) {
+            map.insert(original, value);
+        }
+    }
+}
+
+/// Resolve `input["TableName"]` if it is a string ARN, recording the swap.
+fn resolve_table_name_field(
+    input: &mut Value,
+    echo: &mut Vec<(String, String)>,
+) -> Result<(), DynamoDbError> {
+    if let Some(name) = input.get("TableName").and_then(Value::as_str) {
+        let resolved = extenddb_core::validation::resolve_table_arn(name)?;
+        if resolved != name {
+            let pair = (resolved.to_owned(), name.to_owned());
+            input["TableName"] = Value::String(pair.0.clone());
+            echo.push(pair);
+        }
+    }
+    Ok(())
+}
+
+/// Batch operations key `RequestItems` by table name. Rebuild the map with any
+/// ARN keys resolved to bare names, recording each swap for response echo. When
+/// an ARN key and a bare key resolve to the same table, the entries collapse to
+/// one; Amazon DynamoDB likewise collapses duplicate table references rather
+/// than rejecting them.
+fn normalize_request_items_keys(
+    input: &mut Value,
+    echo: &mut Vec<(String, String)>,
+) -> Result<(), DynamoDbError> {
+    let Some(items) = input.get_mut("RequestItems").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    if !items.keys().any(|k| k.starts_with("arn:")) {
+        return Ok(());
+    }
+    let mut rebuilt = serde_json::Map::with_capacity(items.len());
+    for (key, value) in std::mem::take(items) {
+        let resolved = extenddb_core::validation::resolve_table_arn(&key)?;
+        if resolved != key {
+            echo.push((resolved.to_owned(), key.clone()));
+        }
+        rebuilt.insert(resolved.to_owned(), value);
+    }
+    *items = rebuilt;
+    Ok(())
+}
+
+/// Transact operations carry a `TableName` inside each sub-operation object.
+fn normalize_transact_items(
+    input: &mut Value,
+    echo: &mut Vec<(String, String)>,
+) -> Result<(), DynamoDbError> {
+    let Some(items) = input.get_mut("TransactItems").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for item in items {
+        let Some(sub_op) = item.as_object_mut() else {
+            continue;
+        };
+        for value in sub_op.values_mut() {
+            resolve_table_name_field(value, echo)?;
+        }
+    }
+    Ok(())
+}
+
 /// Extract the table name from a `DynamoDB` request body.
 ///
 /// Most operations use `TableName`. Batch and transact operations embed table
@@ -185,6 +340,148 @@ fn build_resource_arn(region: &str, account_id: &str, table_name: Option<&str>) 
     match table_name {
         Some(name) => format!("arn:aws:dynamodb:{region}:{account_id}:table/{name}"),
         None => format!("arn:aws:dynamodb:{region}:{account_id}:table/*"),
+    }
+}
+
+#[cfg(test)]
+mod arn_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn top_level_table_name_arn_is_resolved() {
+        let mut input = json!({
+            "TableName": "arn:aws:dynamodb:us-east-1:123456789012:table/Tbl",
+            "Key": {"pk": {"S": "a"}}
+        });
+        normalize_table_arns(&mut input, "GetItem").unwrap();
+        assert_eq!(input["TableName"], json!("Tbl"));
+    }
+
+    #[test]
+    fn top_level_arn_echo_pair_is_recorded() {
+        let arn = "arn:aws:dynamodb:us-east-1:123456789012:table/Tbl";
+        let mut input = json!({"TableName": arn});
+        let echo = normalize_table_arns(&mut input, "PutItem").unwrap();
+        assert_eq!(echo, vec![("Tbl".to_owned(), arn.to_owned())]);
+    }
+
+    #[test]
+    fn bare_table_name_is_untouched() {
+        let mut input = json!({"TableName": "Tbl"});
+        normalize_table_arns(&mut input, "PutItem").unwrap();
+        assert_eq!(input["TableName"], json!("Tbl"));
+    }
+
+    #[test]
+    fn index_arn_table_name_is_rejected() {
+        let mut input = json!({
+            "TableName": "arn:aws:dynamodb:us-east-1:123456789012:table/Tbl/index/i"
+        });
+        let err = normalize_table_arns(&mut input, "Query").unwrap_err();
+        assert!(matches!(err, DynamoDbError::ValidationException(_)));
+    }
+
+    #[test]
+    fn batch_request_items_keys_are_resolved() {
+        let mut input = json!({
+            "RequestItems": {
+                "arn:aws:dynamodb:us-east-1:123456789012:table/Tbl": {
+                    "Keys": [{"pk": {"S": "a"}}]
+                }
+            }
+        });
+        normalize_table_arns(&mut input, "BatchGetItem").unwrap();
+        let items = input["RequestItems"].as_object().unwrap();
+        assert!(items.contains_key("Tbl"));
+        assert!(!items.keys().any(|k| k.starts_with("arn:")));
+    }
+
+    #[test]
+    fn transact_item_table_names_are_resolved() {
+        let mut input = json!({
+            "TransactItems": [
+                {"Put": {"TableName": "arn:aws:dynamodb:us-east-1:123456789012:table/Tbl",
+                          "Item": {"pk": {"S": "a"}}}},
+                {"Delete": {"TableName": "other", "Key": {"pk": {"S": "b"}}}}
+            ]
+        });
+        normalize_table_arns(&mut input, "TransactWriteItems").unwrap();
+        assert_eq!(input["TransactItems"][0]["Put"]["TableName"], json!("Tbl"));
+        assert_eq!(
+            input["TransactItems"][1]["Delete"]["TableName"],
+            json!("other")
+        );
+    }
+
+    #[test]
+    fn denormalize_restores_arn_in_consumed_capacity_object() {
+        let arn = "arn:aws:dynamodb:us-east-1:123456789012:table/Tbl";
+        let echo = vec![("Tbl".to_owned(), arn.to_owned())];
+        let mut body = json!({"ConsumedCapacity": {"TableName": "Tbl", "CapacityUnits": 0.5}});
+        denormalize_table_arns(&mut body, "GetItem", &echo);
+        assert_eq!(body["ConsumedCapacity"]["TableName"], json!(arn));
+    }
+
+    #[test]
+    fn denormalize_restores_arn_in_consumed_capacity_array() {
+        let arn = "arn:aws:dynamodb:us-east-1:123456789012:table/Tbl";
+        let echo = vec![("Tbl".to_owned(), arn.to_owned())];
+        let mut body = json!({"ConsumedCapacity": [{"TableName": "Tbl", "CapacityUnits": 1.0}]});
+        denormalize_table_arns(&mut body, "BatchGetItem", &echo);
+        assert_eq!(body["ConsumedCapacity"][0]["TableName"], json!(arn));
+    }
+
+    #[test]
+    fn denormalize_restores_arn_in_batch_response_keys() {
+        let arn = "arn:aws:dynamodb:us-east-1:123456789012:table/Tbl";
+        let echo = vec![("Tbl".to_owned(), arn.to_owned())];
+        let mut body = json!({
+            "Responses": {"Tbl": [{"pk": {"S": "a"}}]},
+            "UnprocessedKeys": {}
+        });
+        denormalize_table_arns(&mut body, "BatchGetItem", &echo);
+        let responses = body["Responses"].as_object().unwrap();
+        assert!(responses.contains_key(arn));
+        assert!(!responses.contains_key("Tbl"));
+    }
+
+    #[test]
+    fn denormalize_batch_echo_is_selective_per_table() {
+        // One ARN table and one bare table in the same batch: only the ARN
+        // table's key is rewritten; the bare table's key is left untouched.
+        let arn = "arn:aws:dynamodb:us-east-1:123456789012:table/Tbl";
+        let echo = vec![("Tbl".to_owned(), arn.to_owned())];
+        let mut body = json!({
+            "Responses": {"Tbl": [{"pk": {"S": "a"}}], "Other": [{"pk": {"S": "b"}}]}
+        });
+        denormalize_table_arns(&mut body, "BatchGetItem", &echo);
+        let responses = body["Responses"].as_object().unwrap();
+        assert!(responses.contains_key(arn));
+        assert!(responses.contains_key("Other"));
+        assert!(!responses.contains_key("Tbl"));
+    }
+
+    #[test]
+    fn denormalize_leaves_single_op_item_collection_metrics_untouched() {
+        // For single-item writes ItemCollectionMetrics is field-keyed, not
+        // table-keyed, so its keys must never be rewritten.
+        let arn = "arn:aws:dynamodb:us-east-1:123456789012:table/Tbl";
+        let echo = vec![("Tbl".to_owned(), arn.to_owned())];
+        let mut body = json!({
+            "ItemCollectionMetrics": {"ItemCollectionKey": {}, "SizeEstimateRangeGB": [0.0, 1.0]}
+        });
+        denormalize_table_arns(&mut body, "PutItem", &echo);
+        let icm = body["ItemCollectionMetrics"].as_object().unwrap();
+        assert!(icm.contains_key("ItemCollectionKey"));
+        assert!(icm.contains_key("SizeEstimateRangeGB"));
+    }
+
+    #[test]
+    fn denormalize_is_noop_without_echo() {
+        let mut body = json!({"ConsumedCapacity": {"TableName": "Tbl"}});
+        denormalize_table_arns(&mut body, "GetItem", &[]);
+        assert_eq!(body["ConsumedCapacity"]["TableName"], json!("Tbl"));
     }
 }
 

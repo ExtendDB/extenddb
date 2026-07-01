@@ -1,6 +1,9 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 pub mod number;
+pub mod table_arn;
+
+pub use table_arn::resolve_table_arn;
 
 use crate::error::{DynamoDbError, ErrorMessageKey, error_message};
 use crate::limits::LimitsConfig;
