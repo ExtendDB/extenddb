@@ -245,6 +245,66 @@ impl ConsumedCapacity {
             local_secondary_indexes: None,
         }
     }
+
+    /// Build a write `ConsumedCapacity` whose aggregate total includes the base
+    /// table plus every affected secondary index.
+    ///
+    /// `base_cu` is the base-table write capacity. `gsi`/`lsi` map each affected
+    /// index name to its write capacity. DynamoDB reports the aggregate total as
+    /// `base + Σ(GSI) + Σ(LSI)` (confirmed against BigBird
+    /// `ReturnedIops_v2Tests.verifyConsumedCapacityValues`), and — in `INDEXES`
+    /// mode — the per-table `Table` capacity plus the two per-index maps.
+    ///
+    /// When `breakdown` is true (`INDEXES` mode) the `Table`,
+    /// `GlobalSecondaryIndexes` and `LocalSecondaryIndexes` fields are populated;
+    /// when false (`TOTAL` mode) only the aggregate is returned, but that
+    /// aggregate still reflects the index writes.
+    #[must_use]
+    pub fn write_indexed(
+        table_name: &str,
+        base_cu: f64,
+        gsi: HashMap<String, f64>,
+        lsi: HashMap<String, f64>,
+        breakdown: bool,
+    ) -> Self {
+        let total = base_cu + gsi.values().sum::<f64>() + lsi.values().sum::<f64>();
+        Self {
+            table_name: table_name.to_owned(),
+            capacity_units: total,
+            read_capacity_units: None,
+            write_capacity_units: Some(total),
+            table: breakdown.then(|| Capacity::write_units(base_cu)),
+            global_secondary_indexes: if breakdown { map_or_none(gsi) } else { None },
+            local_secondary_indexes: if breakdown { map_or_none(lsi) } else { None },
+        }
+    }
+}
+
+impl Capacity {
+    /// A write-only `Capacity` with the given units.
+    #[must_use]
+    pub fn write_units(cu: f64) -> Self {
+        Self {
+            capacity_units: cu,
+            read_capacity_units: None,
+            write_capacity_units: Some(cu),
+        }
+    }
+}
+
+/// Convert a per-index units map into `Some(map of Capacity)`, or `None` when
+/// empty so the field is omitted from the response.
+fn map_or_none(units: HashMap<String, f64>) -> Option<HashMap<String, Capacity>> {
+    if units.is_empty() {
+        None
+    } else {
+        Some(
+            units
+                .into_iter()
+                .map(|(name, cu)| (name, Capacity::write_units(cu)))
+                .collect(),
+        )
+    }
 }
 
 impl ItemCollectionMetrics {
