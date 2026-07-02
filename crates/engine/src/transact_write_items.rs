@@ -164,6 +164,11 @@ pub async fn handle_transact_write_items(
         })
         .sum();
 
+    // NOTE: per-index (INDEXES) consumed-capacity breakdown for transactions is
+    // deferred to the storage-layer capacity-reporting follow-up: the engine has
+    // no resulting/old item for Update/Delete sub-ops, but BigBird requires a
+    // non-null GSI breakdown for those ops on GSI tables. Base-table aggregate
+    // only for now.
     let consumed_capacity = capacity_helpers::batch_write_capacity(
         input.return_consumed_capacity,
         per_table_wcu.iter().map(|(t, cu)| (t.as_str(), *cu)),

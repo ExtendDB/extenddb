@@ -1387,6 +1387,103 @@ class TestUpdateItemWCU:
         assert cap["WriteCapacityUnits"] >= 2.0
 
 
+def _gsi(name, key_attr):
+    return {
+        "IndexName": name,
+        "KeySchema": [{"AttributeName": key_attr, "KeyType": "HASH"}],
+        "Projection": {"ProjectionType": "ALL"},
+    }
+
+
+class TestConsumedCapacityIndexes:
+    """Per-index consumed capacity (INDEXES/TOTAL) for single-item writes.
+
+    Complements TestUpdateItemWCU (which uses a non-GSI table and only checks
+    the Table sub-field) by exercising the actual GlobalSecondaryIndexes
+    breakdown and the base + Σ(GSI) aggregate on a table with two GSIs.
+    """
+
+    @pytest.fixture(scope="class")
+    def two_gsi_table(self, dynamodb_client):
+        with scoped_table(
+            dynamodb_client,
+            attribute_definitions=[
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "g1", "AttributeType": "S"},
+                {"AttributeName": "g2", "AttributeType": "S"},
+            ],
+            key_schema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            GlobalSecondaryIndexes=[_gsi("gsi1", "g1"), _gsi("gsi2", "g2")],
+        ) as name:
+            yield name
+
+    def test_put_item_indexes_per_index_breakdown(self, dynamodb_client, two_gsi_table):
+        """PutItem projecting into both GSIs: total = 1 base + 2 GSIs = 3."""
+        resp = dynamodb_client.put_item(
+            TableName=two_gsi_table,
+            Item={"pk": {"S": "a"}, "g1": {"S": "x"}, "g2": {"S": "y"}},
+            ReturnConsumedCapacity="INDEXES",
+        )
+        cc = resp["ConsumedCapacity"]
+        assert cc["CapacityUnits"] == 3.0
+        assert cc["Table"]["CapacityUnits"] == 1.0
+        gsis = cc["GlobalSecondaryIndexes"]
+        assert set(gsis) == {"gsi1", "gsi2"}
+        assert gsis["gsi1"]["CapacityUnits"] == 1.0
+        assert gsis["gsi2"]["CapacityUnits"] == 1.0
+
+    def test_put_item_indexes_sparse(self, dynamodb_client, two_gsi_table):
+        """Item missing g2 projects only into gsi1: total = 1 base + 1 GSI = 2."""
+        resp = dynamodb_client.put_item(
+            TableName=two_gsi_table,
+            Item={"pk": {"S": "b"}, "g1": {"S": "x"}},
+            ReturnConsumedCapacity="INDEXES",
+        )
+        cc = resp["ConsumedCapacity"]
+        assert cc["CapacityUnits"] == 2.0
+        assert set(cc["GlobalSecondaryIndexes"]) == {"gsi1"}
+
+    def test_put_item_total_aggregate_includes_gsis(self, dynamodb_client, two_gsi_table):
+        """TOTAL: aggregate counts base + affected GSIs, but no breakdown maps."""
+        resp = dynamodb_client.put_item(
+            TableName=two_gsi_table,
+            Item={"pk": {"S": "c"}, "g1": {"S": "x"}, "g2": {"S": "y"}},
+            ReturnConsumedCapacity="TOTAL",
+        )
+        cc = resp["ConsumedCapacity"]
+        assert "GlobalSecondaryIndexes" not in cc
+        assert "Table" not in cc
+        assert cc["CapacityUnits"] == 3.0
+
+    def test_delete_item_indexes_per_index_breakdown(self, dynamodb_client, two_gsi_table):
+        """DeleteItem propagates to both GSIs: total = 1 base + 2 GSIs = 3."""
+        dynamodb_client.put_item(
+            TableName=two_gsi_table,
+            Item={"pk": {"S": "d"}, "g1": {"S": "x"}, "g2": {"S": "y"}},
+        )
+        resp = dynamodb_client.delete_item(
+            TableName=two_gsi_table,
+            Key={"pk": {"S": "d"}},
+            ReturnConsumedCapacity="INDEXES",
+        )
+        cc = resp["ConsumedCapacity"]
+        assert cc["CapacityUnits"] == 3.0
+        assert set(cc["GlobalSecondaryIndexes"]) == {"gsi1", "gsi2"}
+
+    def test_update_item_indexes_per_index_breakdown(self, dynamodb_client, two_gsi_table):
+        """UpdateItem resulting in projection into both GSIs: total = 3."""
+        resp = dynamodb_client.update_item(
+            TableName=two_gsi_table,
+            Key={"pk": {"S": "e"}},
+            UpdateExpression="SET g1 = :a, g2 = :b",
+            ExpressionAttributeValues={":a": {"S": "x"}, ":b": {"S": "y"}},
+            ReturnConsumedCapacity="INDEXES",
+        )
+        cc = resp["ConsumedCapacity"]
+        assert cc["CapacityUnits"] == 3.0
+        assert set(cc["GlobalSecondaryIndexes"]) == {"gsi1", "gsi2"}
+
+
 # ---------------------------------------------------------------------------
 # Number sizing uses DynamoDB formula (a787349)
 # ---------------------------------------------------------------------------
