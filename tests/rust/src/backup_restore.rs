@@ -73,7 +73,6 @@ async fn create_backup_happy_case() {
     assert!(!details.backup_arn().is_empty());
     assert_eq!(details.backup_status().as_str(), "AVAILABLE");
 
-    c.delete_table().table_name(&table).send().await.ok();
 }
 
 #[tokio::test]
@@ -108,7 +107,6 @@ async fn describe_backup() {
     let desc = resp.backup_description().unwrap();
     assert_eq!(desc.backup_details().unwrap().backup_arn(), arn.as_str());
 
-    c.delete_table().table_name(&table).send().await.ok();
 }
 
 #[tokio::test]
@@ -135,7 +133,6 @@ async fn list_backups() {
     let resp = c.list_backups().table_name(&table).send().await.unwrap();
     assert!(resp.backup_summaries().len() >= 2);
 
-    c.delete_table().table_name(&table).send().await.ok();
 }
 
 #[tokio::test]
@@ -147,7 +144,6 @@ async fn list_backups_empty() {
     let resp = c.list_backups().table_name(&table).send().await.unwrap();
     assert!(resp.backup_summaries().is_empty());
 
-    c.delete_table().table_name(&table).send().await.ok();
 }
 
 #[tokio::test]
@@ -166,7 +162,6 @@ async fn delete_backup() {
         "DELETED"
     );
 
-    c.delete_table().table_name(&table).send().await.ok();
 }
 
 #[tokio::test]
@@ -209,8 +204,6 @@ async fn restore_table_from_backup() {
     let scan = c.scan().table_name(&restored).send().await.unwrap();
     assert_eq!(scan.count(), 5);
 
-    c.delete_table().table_name(&restored).send().await.ok();
-    c.delete_table().table_name(&table).send().await.ok();
 }
 
 #[tokio::test]
@@ -227,7 +220,6 @@ async fn describe_continuous_backups() {
         .unwrap();
     assert!(resp.continuous_backups_description().is_some());
 
-    c.delete_table().table_name(&table).send().await.ok();
 }
 
 #[tokio::test]
@@ -264,7 +256,6 @@ async fn enable_point_in_time_recovery() {
         "ENABLED"
     );
 
-    c.delete_table().table_name(&table).send().await.ok();
 }
 
 #[tokio::test]
@@ -284,5 +275,4 @@ async fn restore_table_to_point_in_time() {
         .await;
     assert!(err.is_err(), "RestoreTableToPointInTime should return an error (not yet supported)");
 
-    c.delete_table().table_name(&table).send().await.ok();
 }

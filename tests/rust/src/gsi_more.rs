@@ -93,13 +93,6 @@ async fn create_table_with_gsi_keys_only_projection() {
         !result.contains_key("extra"),
         "KEYS_ONLY projection should not include non-key attributes"
     );
-
-    c.delete_table()
-        .table_name(&table_name)
-        .send()
-        .await
-        .unwrap();
-    wait_for_deleted(c, &table_name).await;
 }
 
 #[tokio::test]
@@ -187,13 +180,6 @@ async fn create_table_with_gsi_include_projection() {
         !result.contains_key("excluded_attr"),
         "INCLUDE projection should not include non-projected attributes"
     );
-
-    c.delete_table()
-        .table_name(&table_name)
-        .send()
-        .await
-        .unwrap();
-    wait_for_deleted(c, &table_name).await;
 }
 
 #[tokio::test]

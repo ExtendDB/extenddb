@@ -93,7 +93,6 @@ async fn get_item_consumed_capacity_total() {
     assert_eq!(cap.table_name().unwrap(), table.as_str());
     assert!(cap.capacity_units().unwrap() > 0.0);
 
-    c.delete_table().table_name(&table).send().await.ok();
 }
 
 #[tokio::test]
@@ -116,7 +115,6 @@ async fn put_item_consumed_capacity_total() {
     assert_eq!(cap.table_name().unwrap(), table.as_str());
     assert!(cap.capacity_units().unwrap() > 0.0);
 
-    c.delete_table().table_name(&table).send().await.ok();
 }
 
 #[tokio::test]
@@ -145,7 +143,6 @@ async fn scan_consumed_capacity_total() {
     let cap = resp.consumed_capacity().unwrap();
     assert!(cap.capacity_units().unwrap() > 0.0);
 
-    c.delete_table().table_name(&table).send().await.ok();
 }
 
 #[tokio::test]
@@ -171,7 +168,6 @@ async fn no_consumed_capacity_by_default() {
 
     assert!(resp.consumed_capacity().is_none());
 
-    c.delete_table().table_name(&table).send().await.ok();
 }
 
 #[tokio::test]
@@ -213,7 +209,6 @@ async fn per_partition_write_throttling() {
         "Expected some writes throttled. Succeeded: {succeeded}, Throttled: {throttled}"
     );
 
-    c.delete_table().table_name(&table).send().await.ok();
 }
 
 #[tokio::test]
@@ -255,7 +250,6 @@ async fn provisioned_table_write_throttling() {
         "Expected some writes throttled (1 WCU). Succeeded: {succeeded}, Throttled: {throttled}"
     );
 
-    c.delete_table().table_name(&table).send().await.ok();
 }
 
 #[tokio::test]
@@ -305,5 +299,4 @@ async fn provisioned_table_read_throttling() {
         "Expected some reads throttled (1 RCU). Succeeded: {succeeded}, Throttled: {throttled}"
     );
 
-    c.delete_table().table_name(&table).send().await.ok();
 }
