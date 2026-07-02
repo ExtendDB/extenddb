@@ -251,9 +251,8 @@ impl ConsumedCapacity {
     ///
     /// `base_cu` is the base-table write capacity. `gsi`/`lsi` map each affected
     /// index name to its write capacity. DynamoDB reports the aggregate total as
-    /// `base + Σ(GSI) + Σ(LSI)` (confirmed against BigBird
-    /// `ReturnedIops_v2Tests.verifyConsumedCapacityValues`), and — in `INDEXES`
-    /// mode — the per-table `Table` capacity plus the two per-index maps.
+    /// `base + Σ(GSI) + Σ(LSI)`, and — in `INDEXES` mode — the per-table `Table`
+    /// capacity plus the two per-index maps.
     ///
     /// When `breakdown` is true (`INDEXES` mode) the `Table`,
     /// `GlobalSecondaryIndexes` and `LocalSecondaryIndexes` fields are populated;

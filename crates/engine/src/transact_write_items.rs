@@ -171,8 +171,8 @@ pub async fn handle_transact_write_items(
 
     // NOTE: per-index (INDEXES) consumed-capacity breakdown for transactions is
     // deferred to the storage-layer capacity-reporting follow-up: the engine has
-    // no resulting/old item for Update/Delete sub-ops, but DynamoDB requires a
-    // non-null GSI breakdown for those ops on GSI tables. Base-table aggregate
+    // no resulting/old item for Update/Delete sub-ops, but DynamoDB reports a
+    // per-index breakdown for those ops on GSI tables. Base-table aggregate
     // only for now.
     let consumed_capacity = capacity_helpers::transact_write_capacity(
         input.return_consumed_capacity,
