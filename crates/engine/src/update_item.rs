@@ -255,6 +255,34 @@ pub async fn handle_update_item(
     let new_bytes = new_item.as_ref().map_or(0, item_size_bytes);
     let wcu = capacity_helpers::write_capacity_units(old_bytes.max(new_bytes));
 
+    // Consumed capacity — computed before old/new items are moved below.
+    // INDEXES mode uses the resulting item (new, or old for pure deletes) to
+    // determine sparse index membership, via one describe_table read.
+    let consumed_capacity = if input.return_consumed_capacity
+        != extenddb_core::types::ReturnConsumedCapacity::None
+        && let Some(cc_item) = new_item.as_ref().or(old_item.as_ref())
+    {
+        let desc = ctx
+            .storage
+            .describe_table(
+                &ctx.account_id,
+                extenddb_core::types::DescribeTableInput {
+                    table_name: input.table_name.clone(),
+                },
+            )
+            .await
+            .map_err(storage_err_to_dynamo)?;
+        capacity_helpers::write_capacity_indexed(
+            input.return_consumed_capacity,
+            &input.table_name,
+            wcu,
+            cc_item,
+            &desc,
+        )
+    } else {
+        capacity_helpers::write_capacity(input.return_consumed_capacity, &input.table_name, wcu)
+    };
+
     // Select the appropriate return value.
     // UPDATED_OLD and UPDATED_NEW return only the attributes that were
     // targeted by the update expression (top-level attribute of each action path).
@@ -272,11 +300,7 @@ pub async fn handle_update_item(
 
     let output = UpdateItemOutput {
         attributes,
-        consumed_capacity: capacity_helpers::write_capacity(
-            input.return_consumed_capacity,
-            &input.table_name,
-            wcu,
-        ),
+        consumed_capacity,
         item_collection_metrics: capacity_helpers::item_metrics(
             input.return_item_collection_metrics,
             &key_info.key_schema,

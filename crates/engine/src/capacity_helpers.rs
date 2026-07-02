@@ -10,8 +10,8 @@
 use std::sync::atomic::AtomicU64;
 
 use extenddb_core::types::{
-    ConsumedCapacity, Item, ItemCollectionMetrics, KeySchemaElement, ReturnConsumedCapacity,
-    ReturnItemCollectionMetrics,
+    ConsumedCapacity, Item, ItemCollectionMetrics, KeySchemaElement, Projection, ProjectionType,
+    ReturnConsumedCapacity, ReturnItemCollectionMetrics, TableDescription, item_size_bytes,
 };
 
 /// Global counter for requests that used approximate consumed capacity.
@@ -52,6 +52,133 @@ pub fn write_capacity(
     }
 }
 
+/// Build a write `ConsumedCapacity` with a per-index breakdown for `INDEXES`
+/// mode, or the plain table-level capacity otherwise.
+///
+/// `base_cu` is the base-table write capacity; `item` is the item being written
+/// (used to determine sparse index membership and per-index projected size);
+/// `desc` is the table description (source of GSI/LSI definitions). When the
+/// caller does not request `INDEXES`, `desc` is unused and this behaves exactly
+/// like [`write_capacity`].
+#[must_use]
+pub fn write_capacity_indexed(
+    rcc: ReturnConsumedCapacity,
+    table_name: &str,
+    base_cu: f64,
+    item: &Item,
+    desc: &TableDescription,
+) -> Option<ConsumedCapacity> {
+    match rcc {
+        ReturnConsumedCapacity::None => None,
+        rcc => {
+            CAPACITY_REQUEST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (gsi, lsi) = index_write_units(item, desc);
+            let breakdown = rcc == ReturnConsumedCapacity::Indexes;
+            Some(ConsumedCapacity::write_indexed(
+                table_name, base_cu, gsi, lsi, breakdown,
+            ))
+        }
+    }
+}
+
+/// Compute per-GSI and per-LSI write capacity units contributed by `item`.
+///
+/// Returns `(gsi_units, lsi_units)` keyed by index name. An index is charged
+/// only when the item projects into it — i.e. the item contains every one of
+/// the index's key attributes (sparse-index semantics). Per-index capacity is
+/// `ceil(projected_item_size / 1KB)`, where the projected item contains only
+/// the attributes the index materializes (per its projection type).
+#[must_use]
+pub fn index_write_units(
+    item: &Item,
+    desc: &TableDescription,
+) -> (
+    std::collections::HashMap<String, f64>,
+    std::collections::HashMap<String, f64>,
+) {
+    let base_keys: Vec<&str> = desc
+        .key_schema
+        .iter()
+        .map(|k| k.attribute_name.as_str())
+        .collect();
+
+    let mut gsi = std::collections::HashMap::new();
+    if let Some(gsis) = &desc.global_secondary_indexes {
+        for g in gsis {
+            if let Some(cu) = one_index_write_units(item, &g.key_schema, &base_keys, &g.projection)
+            {
+                gsi.insert(g.index_name.clone(), cu);
+            }
+        }
+    }
+
+    let mut lsi = std::collections::HashMap::new();
+    if let Some(lsis) = &desc.local_secondary_indexes {
+        for l in lsis {
+            if let Some(cu) = one_index_write_units(item, &l.key_schema, &base_keys, &l.projection)
+            {
+                lsi.insert(l.index_name.clone(), cu);
+            }
+        }
+    }
+
+    (gsi, lsi)
+}
+
+/// Write units for a single index, or `None` if the item is not projected into
+/// it (missing an index key attribute — sparse index).
+fn one_index_write_units(
+    item: &Item,
+    index_key_schema: &[KeySchemaElement],
+    base_keys: &[&str],
+    projection: &Projection,
+) -> Option<f64> {
+    for ks in index_key_schema {
+        if !item.contains_key(&ks.attribute_name) {
+            return None;
+        }
+    }
+    let projected = project_index_item(item, index_key_schema, base_keys, projection);
+    Some(write_capacity_units(item_size_bytes(&projected)))
+}
+
+/// Build the subset of `item` that an index materializes, per its projection.
+fn project_index_item(
+    item: &Item,
+    index_key_schema: &[KeySchemaElement],
+    base_keys: &[&str],
+    projection: &Projection,
+) -> Item {
+    match projection.projection_type {
+        // ALL projects the entire item.
+        ProjectionType::All => item.clone(),
+        // KEYS_ONLY and INCLUDE always project index keys + base table keys.
+        ProjectionType::KeysOnly | ProjectionType::Include => {
+            let mut out = Item::new();
+            for ks in index_key_schema {
+                if let Some(v) = item.get(&ks.attribute_name) {
+                    out.insert(ks.attribute_name.clone(), v.clone());
+                }
+            }
+            for k in base_keys {
+                if let Some(v) = item.get(*k) {
+                    out.insert((*k).to_owned(), v.clone());
+                }
+            }
+            if projection.projection_type == ProjectionType::Include
+                && let Some(non_key) = &projection.non_key_attributes
+            {
+                for a in non_key {
+                    if let Some(v) = item.get(a) {
+                        out.insert(a.clone(), v.clone());
+                    }
+                }
+            }
+            out
+        }
+    }
+}
+
 /// Build a `Vec<ConsumedCapacity>` for a batch/transaction read, or `None` if not requested.
 /// One entry per distinct table name with real CU values.
 #[must_use]
@@ -74,7 +201,7 @@ pub fn batch_read_capacity<'a>(
 }
 
 /// Build a `Vec<ConsumedCapacity>` for a batch/transaction write, or `None` if not requested.
-/// One entry per distinct table name with real CU values.
+/// One entry per distinct table name with real CU values (base-table aggregate only).
 #[must_use]
 pub fn batch_write_capacity<'a>(
     rcc: ReturnConsumedCapacity,
