@@ -105,7 +105,8 @@ pub fn index_write_units(
     let mut gsi = std::collections::HashMap::new();
     if let Some(gsis) = &desc.global_secondary_indexes {
         for g in gsis {
-            if let Some(cu) = one_index_write_units(item, &g.key_schema, &base_keys, &g.projection) {
+            if let Some(cu) = one_index_write_units(item, &g.key_schema, &base_keys, &g.projection)
+            {
                 gsi.insert(g.index_name.clone(), cu);
             }
         }
@@ -114,7 +115,8 @@ pub fn index_write_units(
     let mut lsi = std::collections::HashMap::new();
     if let Some(lsis) = &desc.local_secondary_indexes {
         for l in lsis {
-            if let Some(cu) = one_index_write_units(item, &l.key_schema, &base_keys, &l.projection) {
+            if let Some(cu) = one_index_write_units(item, &l.key_schema, &base_keys, &l.projection)
+            {
                 lsi.insert(l.index_name.clone(), cu);
             }
         }
