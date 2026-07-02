@@ -165,15 +165,14 @@ fn project_index_item(
                     out.insert((*k).to_owned(), v.clone());
                 }
             }
-            if projection.projection_type == ProjectionType::Include {
-                if let Some(non_key) = &projection.non_key_attributes {
+            if projection.projection_type == ProjectionType::Include
+                && let Some(non_key) = &projection.non_key_attributes {
                     for a in non_key {
                         if let Some(v) = item.get(a) {
                             out.insert(a.clone(), v.clone());
                         }
                     }
                 }
-            }
             out
         }
     }
