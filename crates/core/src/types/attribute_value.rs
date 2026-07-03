@@ -76,20 +76,49 @@ impl<'de> Visitor<'de> for AttributeValueVisitor {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-        let (key, value): (String, serde_json::Value) = map
-            .next_entry()?
-            .ok_or_else(|| {
-                de::Error::custom(
-                    "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes",
-                )
-            })?;
+        let mut entries: Vec<(String, serde_json::Value)> = Vec::new();
+        while let Some(entry) = map.next_entry::<String, serde_json::Value>()? {
+            entries.push(entry);
+        }
+        if entries.is_empty() {
+            return Err(de::Error::custom(
+                "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes",
+            ));
+        }
+
+        // DynamoDB validates the content of a number field before it reports the
+        // "more than one datatype" error, so an invalid N/NS value is surfaced
+        // even when several type descriptors are present.
+        for (k, v) in &entries {
+            match k.as_str() {
+                "N" => {
+                    if let Some(s) = v.as_str() {
+                        crate::validation::number::validate_and_normalize_number(s)
+                            .map_err(|e| de::Error::custom(e.message()))?;
+                    }
+                }
+                "NS" => {
+                    if let Some(arr) = v.as_array() {
+                        for elem in arr {
+                            if let Some(s) = elem.as_str() {
+                                crate::validation::number::validate_and_normalize_number(s)
+                                    .map_err(|e| de::Error::custom(e.message()))?;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
 
         // REQ-TYPE-001: reject if multiple keys
-        if map.next_key::<String>()?.is_some() {
+        if entries.len() > 1 {
             return Err(de::Error::custom(
                 "Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes",
             ));
         }
+
+        let (key, value) = entries.into_iter().next().expect("entries is non-empty");
 
         match key.as_str() {
             "S" => {
@@ -174,11 +203,7 @@ impl<'de> Visitor<'de> for AttributeValueVisitor {
                     })
                     .collect::<Result<_, _>>()?;
                 if set.len() != arr.len() {
-                    let values: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-                    let repr = values.join(", ");
-                    return Err(de::Error::custom(format!(
-                        "One or more parameter values were invalid: Input collection [{repr}] contains duplicates."
-                    )));
+                    return Err(de::Error::custom("Input collection contains duplicates"));
                 }
                 Ok(AttributeValue::NS(set))
             }
@@ -432,25 +457,27 @@ mod tests {
 
     #[test]
     fn invalid_number_accepted_at_deserialization() {
-        // Invalid numbers are accepted by the deserializer (stored raw)
-        // and rejected later by the validation layer as ValidationException.
-        let json = r#"{"N":"abc"}"#;
-        let val: AttributeValue = serde_json::from_str(json).unwrap();
-        assert_eq!(val, AttributeValue::N("abc".to_owned()));
+        // Invalid numbers are rejected at deserialization with DynamoDB's
+        // number-validation messages.
+        let err = serde_json::from_str::<AttributeValue>(r#"{"N":"abc"}"#).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("The parameter cannot be converted to a numeric value: abc"),
+            "got: {err}"
+        );
 
-        let json = r#"{"N":"1E999"}"#;
-        let val: AttributeValue = serde_json::from_str(json).unwrap();
-        assert_eq!(val, AttributeValue::N("1E999".to_owned()));
+        let err = serde_json::from_str::<AttributeValue>(r#"{"N":"1E999"}"#).unwrap_err();
+        assert!(err.to_string().contains("Number overflow"), "got: {err}");
     }
 
     #[test]
     fn invalid_number_in_ns_accepted() {
-        let json = r#"{"NS":["1","abc"]}"#;
-        let val: AttributeValue = serde_json::from_str(json).unwrap();
-        match val {
-            AttributeValue::NS(set) => assert!(set.contains("abc")),
-            _ => panic!("expected NS"),
-        }
+        let err = serde_json::from_str::<AttributeValue>(r#"{"NS":["1","abc"]}"#).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("The parameter cannot be converted to a numeric value: abc"),
+            "got: {err}"
+        );
     }
 
     #[test]

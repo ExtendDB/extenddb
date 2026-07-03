@@ -89,10 +89,14 @@ where
             // Semantic value-validation errors are wrapped with the field name
             // and the offending key (DynamoDB parity). Wire/type errors (wrong
             // JSON shape for a datatype) pass through as-is.
-            let is_value_validation = msg
-                .starts_with("One or more parameter values were invalid:")
+            let is_value_validation = msg.starts_with("One or more parameter values were invalid:")
                 || msg.contains("Supplied AttributeValue is empty")
-                || msg.contains("Supplied AttributeValue has more than one datatypes set");
+                || msg.contains("Supplied AttributeValue has more than one datatypes set")
+                || msg.contains("cannot be converted to a numeric value")
+                || msg.contains("significant digits in a Number")
+                || msg.starts_with("Number overflow")
+                || msg.starts_with("Number underflow")
+                || msg.contains("Input collection contains duplicates");
             if is_value_validation {
                 de::Error::custom(format!(
                     "{field_name} contains invalid value: {msg} for key {key}"
@@ -364,7 +368,9 @@ mod tests {
         // without the ':' prefix). The key error must win, matching DynamoDB.
         let msg = values_err(r#"{"values":{":b":{"a":""},"b":{"S":"a"}}}"#);
         assert!(
-            msg.contains(r#"ExpressionAttributeValues contains invalid key: Syntax error; key: "b""#),
+            msg.contains(
+                r#"ExpressionAttributeValues contains invalid key: Syntax error; key: "b""#
+            ),
             "{msg}"
         );
     }
@@ -394,6 +400,49 @@ mod tests {
             ),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn values_invalid_number_wrapped_with_key() {
+        // Empty, non-numeric, overflow, underflow, 38-digit, and NS-duplicate
+        // all wrap with the field name and key, matching real DynamoDB.
+        for (av, needle) in [
+            (
+                r#"{"N":""}"#,
+                "The parameter cannot be converted to a numeric value",
+            ),
+            (
+                r#"{"N":"b"}"#,
+                "The parameter cannot be converted to a numeric value: b",
+            ),
+            (
+                r#"{"S":"a","N":""}"#,
+                "The parameter cannot be converted to a numeric value",
+            ),
+            (
+                r#"{"NS":["1","b"]}"#,
+                "The parameter cannot be converted to a numeric value: b",
+            ),
+            (
+                r#"{"NS":["1","1"]}"#,
+                "Input collection contains duplicates",
+            ),
+            (
+                r#"{"N":"1e126"}"#,
+                "Number overflow. Attempting to store a number with magnitude larger",
+            ),
+            (
+                r#"{"N":"1e-131"}"#,
+                "Number underflow. Attempting to store a number with magnitude smaller",
+            ),
+        ] {
+            let msg = values_err(&format!(r#"{{"values":{{":b":{av}}}}}"#));
+            let expected = format!("ExpressionAttributeValues contains invalid value: {needle}");
+            assert!(
+                msg.contains(&expected) && msg.contains("for key :b"),
+                "av={av} got: {msg}"
+            );
+        }
     }
 
     #[test]
