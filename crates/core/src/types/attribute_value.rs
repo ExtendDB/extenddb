@@ -253,9 +253,9 @@ impl<'de> Visitor<'de> for AttributeValueVisitor {
                     .collect::<Result<_, A::Error>>()?;
                 Ok(AttributeValue::M(map))
             }
-            other => Err(de::Error::custom(format!(
-                "unknown AttributeValue type descriptor: {other}"
-            ))),
+            _other => Err(de::Error::custom(
+                "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes",
+            )),
         }
     }
 }
@@ -418,9 +418,16 @@ mod tests {
 
     #[test]
     fn unknown_type_descriptor_rejected() {
+        // An unrecognized type descriptor means no supported datatype is
+        // present; DynamoDB reports this as an empty AttributeValue.
         let json = r#"{"X":"hello"}"#;
         let err = serde_json::from_str::<AttributeValue>(json).unwrap_err();
-        assert!(err.to_string().contains("unknown"));
+        assert!(
+            err.to_string().contains(
+                "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes"
+            ),
+            "got: {err}"
+        );
     }
 
     #[test]

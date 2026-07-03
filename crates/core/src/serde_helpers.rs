@@ -89,7 +89,11 @@ where
             // Semantic value-validation errors are wrapped with the field name
             // and the offending key (DynamoDB parity). Wire/type errors (wrong
             // JSON shape for a datatype) pass through as-is.
-            if msg.starts_with("One or more parameter values were invalid:") {
+            let is_value_validation = msg
+                .starts_with("One or more parameter values were invalid:")
+                || msg.contains("Supplied AttributeValue is empty")
+                || msg.contains("Supplied AttributeValue has more than one datatypes set");
+            if is_value_validation {
                 de::Error::custom(format!(
                     "{field_name} contains invalid value: {msg} for key {key}"
                 ))
@@ -361,6 +365,33 @@ mod tests {
         let msg = values_err(r#"{"values":{":b":{"a":""},"b":{"S":"a"}}}"#);
         assert!(
             msg.contains(r#"ExpressionAttributeValues contains invalid key: Syntax error; key: "b""#),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn values_unsupported_datatype_wrapped_with_key() {
+        // An unrecognized datatype tag is reported as an empty AttributeValue,
+        // wrapped with the field name and key.
+        let msg = values_err(r#"{"values":{":b":{"a":""}}}"#);
+        assert!(
+            msg.contains(
+                "ExpressionAttributeValues contains invalid value: Supplied AttributeValue \
+                 is empty, must contain exactly one of the supported datatypes for key :b"
+            ),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn values_multiple_datatypes_wrapped_with_key() {
+        let msg = values_err(r#"{"values":{":b":{"S":"a","N":"1"}}}"#);
+        assert!(
+            msg.contains(
+                "ExpressionAttributeValues contains invalid value: Supplied AttributeValue \
+                 has more than one datatypes set, must contain exactly one of the supported \
+                 datatypes for key :b"
+            ),
             "{msg}"
         );
     }
