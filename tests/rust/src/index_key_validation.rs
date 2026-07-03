@@ -78,3 +78,86 @@ async fn put_item_accepts_valid_index_key() {
         .await
         .expect("valid index key must be accepted");
 }
+
+#[tokio::test]
+async fn put_item_rejects_empty_binary_index_key_reports_binary() {
+    use aws_sdk_dynamodb::types::{
+        AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, KeySchemaElement,
+        KeyType, Projection, ProjectionType, ScalarAttributeType,
+    };
+    let c = client();
+    let name = format!("BinGsiEmpty{}", ts());
+    c.create_table()
+        .table_name(&name)
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("gb")
+                .attribute_type(ScalarAttributeType::B)
+                .build()
+                .unwrap(),
+        )
+        .global_secondary_indexes(
+            GlobalSecondaryIndex::builder()
+                .index_name("gsib")
+                .key_schema(
+                    KeySchemaElement::builder()
+                        .attribute_name("gb")
+                        .key_type(KeyType::Hash)
+                        .build()
+                        .unwrap(),
+                )
+                .projection(
+                    Projection::builder()
+                        .projection_type(ProjectionType::All)
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+    wait_for_active(c, &name).await;
+
+    // Empty BINARY value on the GSI key must be reported as an "empty binary
+    // value" (matching real DynamoDB), not "empty string value".
+    let mut item: HashMap<String, AttributeValue> = HashMap::new();
+    item.insert("pk".into(), s("a"));
+    item.insert(
+        "gb".into(),
+        AttributeValue::B(aws_smithy_types::Blob::new(Vec::<u8>::new())),
+    );
+    let err = c
+        .put_item()
+        .table_name(&name)
+        .set_item(Some(item))
+        .send()
+        .await
+        .expect_err("empty binary index key must be rejected");
+    assert_eq!(
+        err_code(&err),
+        Some("ValidationException"),
+        "{}",
+        err_msg(&err)
+    );
+    let m = err_msg(&err);
+    assert!(
+        m.contains("empty binary value"),
+        "expected type-correct 'empty binary value' message, got: {m}"
+    );
+}
