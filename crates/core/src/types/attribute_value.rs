@@ -210,7 +210,7 @@ impl<'de> Visitor<'de> for AttributeValueVisitor {
                     let values: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
                     let repr = values.join(", ");
                     return Err(de::Error::custom(format!(
-                        "One or more parameter values were invalid: Input collection [{repr}] contains duplicates."
+                        "One or more parameter values were invalid: Input collection [{repr}]of type BS contains duplicates."
                     )));
                 }
                 Ok(AttributeValue::BS(set))
@@ -222,10 +222,7 @@ impl<'de> Visitor<'de> for AttributeValueVisitor {
                 Ok(AttributeValue::Bool(b))
             }
             "NULL" => {
-                let n = value
-                    .as_bool()
-                    .ok_or_else(|| de::Error::custom("NULL value must be a boolean"))?;
-                if !n {
+                if value.as_bool() != Some(true) {
                     return Err(de::Error::custom(
                         "One or more parameter values were invalid: Null attribute value types must have the value of true",
                     ));
