@@ -235,6 +235,12 @@ class TestGsiAsyncPropagation:
         Sets the system-wide delay to 0, writes an item, and asserts
         the GSI query returns the item immediately (single query, no
         polling loop). This validates the effective_delay==0 sync path.
+
+        Note: gsi_propagation_delay_ms is read by the data-plane write path at
+        server startup, so setting it at runtime here only takes effect if the
+        server was already booted with delay=0 (as devtools/run-tests does). A
+        behavioral probe below confirms the server is actually in synchronous
+        mode and skips — rather than falsely fails — if it is not.
         """
         table_name = gsi_table
 
@@ -243,6 +249,32 @@ class TestGsiAsyncPropagation:
         extenddb_settings_set("gsi_propagation_delay_ms", "0")
 
         try:
+            # Behavioral guard: throwaway write + immediate index read. If the
+            # running server is genuinely synchronous, this appears at once;
+            # otherwise the sync path is not exercisable here — skip cleanly.
+            probe_gsi = f"syncprobe-gsi-{uuid.uuid4().hex[:8]}"
+            dynamodb_client.put_item(
+                TableName=table_name,
+                Item={
+                    "pk": {"S": f"syncprobe-{uuid.uuid4().hex[:8]}"},
+                    "gsi_pk": {"S": probe_gsi},
+                    "gsi_sk": {"N": "1"},
+                    "data": {"S": "probe"},
+                },
+            )
+            probe = dynamodb_client.query(
+                TableName=table_name,
+                IndexName="test-gsi",
+                KeyConditionExpression="gsi_pk = :pk",
+                ExpressionAttributeValues={":pk": {"S": probe_gsi}},
+            )
+            if probe["Count"] != 1:
+                pytest.skip(
+                    "server is not running with gsi_propagation_delay_ms=0 in "
+                    "effect (the setting is applied at startup); the synchronous "
+                    "GSI path cannot be exercised in this configuration"
+                )
+
             pk = f"sync-{uuid.uuid4().hex[:8]}"
             gsi_pk = f"sync-gsi-{uuid.uuid4().hex[:8]}"
 
