@@ -148,6 +148,12 @@ pub async fn handle_put_item(
         )?;
     }
 
+    // Item-size limit is validated before the existence check so a genuinely
+    // oversized item to a missing table returns ValidationException (matching
+    // Amazon DynamoDB), not ResourceNotFoundException. Key/attribute-definition
+    // checks stay after existence — they need the table's key schema.
+    extenddb_core::validation::validate_item_size(&input.item, ctx.limits.max_item_size_bytes)?;
+
     let key_info = ctx
         .table_key_info(&input.table_name)
         .await

@@ -98,6 +98,18 @@ pub async fn handle_batch_write_item(
         }
     }
 
+    // Item-size limit is validated across the whole request before any table
+    // existence check, so an oversized item to a missing table returns
+    // ValidationException (matching Amazon DynamoDB), not
+    // ResourceNotFoundException. Key-schema-dependent checks stay post-existence.
+    for reqs in input.request_items.values() {
+        for wr in reqs {
+            if let Some(put) = &wr.put_request {
+                validate_item_size(&put.item, ctx.limits.max_item_size_bytes)?;
+            }
+        }
+    }
+
     let empty_maps = ExpressionMaps::default();
     let mut all_icm: HashMap<String, Vec<extenddb_core::types::ItemCollectionMetrics>> =
         HashMap::new();
@@ -124,7 +136,6 @@ pub async fn handle_batch_write_item(
                     &key_info.attribute_definitions,
                 )?;
                 validate_item_nesting_depth(&put.item)?;
-                validate_item_size(&put.item, ctx.limits.max_item_size_bytes)?;
                 validate_attribute_name_sizes(&put.item, &ctx.limits)?;
                 validate_key_sizes(&put.item, &key_info.key_schema, &ctx.limits)?;
 
