@@ -277,8 +277,15 @@ impl PostgresEngine {
         let (ks_json, ad_json, status, table_id, stream_spec_json, has_lsi) =
             row.ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
 
-        if status != "ACTIVE" {
-            return Err(StorageError::TableNotActive(table_name.to_owned()));
+        match status.as_str() {
+            "ACTIVE" => {}
+            // A table that is still being created, or is being deleted, is not
+            // usable for data-plane operations; DynamoDB reports it as not found
+            // (not as in-use). UPDATING keeps the not-active classification.
+            "CREATING" | "DELETING" => {
+                return Err(StorageError::TableNotFound(table_name.to_owned()));
+            }
+            _ => return Err(StorageError::TableNotActive(table_name.to_owned())),
         }
 
         let key_schema: Vec<KeySchemaElement> =
@@ -327,8 +334,15 @@ impl PostgresEngine {
         let (table_id, status) =
             row.ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
 
-        if status != "ACTIVE" {
-            return Err(StorageError::TableNotActive(table_name.to_owned()));
+        match status.as_str() {
+            "ACTIVE" => {}
+            // A table that is still being created, or is being deleted, is not
+            // usable for data-plane operations; DynamoDB reports it as not found
+            // (not as in-use). UPDATING keeps the not-active classification.
+            "CREATING" | "DELETING" => {
+                return Err(StorageError::TableNotFound(table_name.to_owned()));
+            }
+            _ => return Err(StorageError::TableNotActive(table_name.to_owned())),
         }
 
         self.fetch_index_info_by_table_id(&table_id, index_name)
