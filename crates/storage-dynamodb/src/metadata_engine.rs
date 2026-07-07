@@ -180,10 +180,10 @@ impl MetadataEngine for DynamoEngine {
                 let out = req.send().await.map_err(crate::errors::from_sdk_error)?;
 
                 for phys in out.table_names() {
-                    if phys.starts_with(&prefix) {
-                        if let Ok(logical) = self.namer.logical(&account_id, phys) {
-                            table_names.push(logical);
-                        }
+                    if phys.starts_with(&prefix)
+                        && let Ok(logical) = self.namer.logical(&account_id, phys)
+                    {
+                        table_names.push(logical);
                     }
                 }
 

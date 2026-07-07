@@ -138,7 +138,9 @@ impl StorageConfig {
     }
 
     /// Get a reference to the underlying trait object for factory calls.
-    pub fn as_trait(&self) -> &dyn extenddb_storage::config::StorageConfig {
+    /// The `+ 'static` (true of the owned `Box` contents) lets factories
+    /// downcast via `StorageConfig::as_any`.
+    pub fn as_trait(&self) -> &(dyn extenddb_storage::config::StorageConfig + 'static) {
         &*self.config
     }
 }

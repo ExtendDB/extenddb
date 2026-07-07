@@ -86,7 +86,9 @@ impl std::error::Error for BackendError {}
 /// that resolves to `ServerComponents` or `BackendError`.
 pub type ServerComponentsFactory =
     fn(
-        &dyn StorageConfig,
+        // `+ 'static` so factories can downcast via `StorageConfig::as_any`;
+        // configs are always owned `Box<dyn StorageConfig>` data.
+        &(dyn StorageConfig + 'static),
         &str,
     ) -> Pin<Box<dyn Future<Output = Result<ServerComponents, BackendError>> + Send>>;
 
@@ -109,7 +111,7 @@ inventory::collect!(ServerComponentsRegistration);
 /// Returns `UnknownBackend` error if the backend is not registered.
 pub async fn create_server_components(
     backend: &str,
-    config: &dyn StorageConfig,
+    config: &(dyn StorageConfig + 'static),
     region: &str,
 ) -> Result<ServerComponents, BackendError> {
     for reg in inventory::iter::<ServerComponentsRegistration> {

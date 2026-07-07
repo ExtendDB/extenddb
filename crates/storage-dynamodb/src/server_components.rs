@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use extenddb_auth::BuiltinAuthProvider;
+use extenddb_auth::CredentialStore;
 use extenddb_storage::StorageEngine;
 use extenddb_storage::config::StorageConfig as _;
 use extenddb_storage::server_components::{
@@ -61,18 +61,20 @@ inventory::submit! {
                     None => return Err(BackendError::MissingEncryptionKey),
                 }) as Arc<dyn extenddb_storage::CatalogStore>;
 
-                // 4. Auth provider (reuse Postgres credential store)
+                // 4. Credential store (reuse Postgres implementation); the bin
+                //    layer wraps it in CachedCredentialStore and builds the
+                //    auth provider.
                 let enc_key =
                     extenddb_storage::CatalogStore::cached_encryption_key(&*catalog_store)
                         .ok_or(BackendError::MissingEncryptionKey)?;
-                let cred_store = DbCredentialStore::new(catalog_pool.clone(), enc_key);
-                let auth_provider = Arc::new(BuiltinAuthProvider::new(cred_store));
+                let cred_store: Arc<dyn CredentialStore> =
+                    Arc::new(DbCredentialStore::new(catalog_pool.clone(), enc_key));
 
                 // 5. No background workers needed: DynamoDB drives TTL/streams/control-plane itself.
                 Ok(ServerComponents {
                     engine,
                     catalog_store,
-                    auth_provider,
+                    credential_store: cred_store,
                     runtime_hooks: None,
                 })
             })

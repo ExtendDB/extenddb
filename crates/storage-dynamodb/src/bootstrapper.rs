@@ -179,6 +179,26 @@ impl Bootstrapper for DynamoBootstrapper {
         self.inner.catalog_connection_url()
     }
 
+    fn generate_backend_config_section(&self) -> String {
+        let endpoint_line = match &self.dynamo_config.endpoint_url {
+            Some(url) => format!("endpoint_url = \"{url}\"\n"),
+            None => {
+                "# endpoint_url = \"http://localhost:8000\"  # DynamoDB Local, or another ExtendDB endpoint\n"
+                    .to_string()
+            }
+        };
+        format!(
+            r#"[storage.dynamodb]
+region = "{}"
+{}table_prefix = "{}"
+catalog_connection_string = "{}""#,
+            self.dynamo_config.region,
+            endpoint_line,
+            self.dynamo_config.table_prefix,
+            self.inner.catalog_connection_url(),
+        )
+    }
+
     // ── DynamoDB data no-ops ─────────────────────────────────────────────
 
     /// DynamoDB has no `CREATE DATABASE` equivalent.

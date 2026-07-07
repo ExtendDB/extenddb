@@ -13,9 +13,9 @@ use futures::future::BoxFuture;
 use extenddb_core::types::{
     AttributeDefinition, BillingMode, BillingModeSummary, CreateTableInput, DeleteTableInput,
     DescribeTableInput, GsiDescription, IndexInfo, KeySchemaElement, KeyType, ListTablesInput,
-    ListTablesOutput, LsiDescription, Projection, ProjectionType, ProvisionedThroughputDescription,
-    ScalarAttributeType, StreamSpecification, StreamViewType, TableDescription, TableKeyInfo,
-    TableStatus, UpdateTableInput,
+    ListTablesOutput, LsiDescription, OnDemandThroughput, Projection, ProjectionType,
+    ProvisionedThroughputDescription, ScalarAttributeType, StreamSpecification, StreamViewType,
+    TableDescription, TableKeyInfo, TableStatus, UpdateTableInput,
 };
 use extenddb_storage::TableEngine;
 use extenddb_storage::error::StorageError;
@@ -76,15 +76,15 @@ impl TableEngine for DynamoEngine {
             req = req.billing_mode(map_billing_mode_to_sdk(&billing_mode));
 
             // Provisioned throughput (only set when billing mode is Provisioned)
-            if matches!(billing_mode, BillingMode::Provisioned) {
-                if let Some(pt) = &input.provisioned_throughput {
-                    let sdk_pt = aws_sdk_dynamodb::types::ProvisionedThroughput::builder()
-                        .read_capacity_units(pt.read_capacity_units)
-                        .write_capacity_units(pt.write_capacity_units)
-                        .build()
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    req = req.provisioned_throughput(sdk_pt);
-                }
+            if matches!(billing_mode, BillingMode::Provisioned)
+                && let Some(pt) = &input.provisioned_throughput
+            {
+                let sdk_pt = aws_sdk_dynamodb::types::ProvisionedThroughput::builder()
+                    .read_capacity_units(pt.read_capacity_units)
+                    .write_capacity_units(pt.write_capacity_units)
+                    .build()
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                req = req.provisioned_throughput(sdk_pt);
             }
 
             // GSIs
@@ -368,6 +368,8 @@ impl TableEngine for DynamoEngine {
                 table_name,
                 account_id,
                 table_id,
+                // Base-table lookup: the base schema IS the key schema.
+                base_key_schema: key_schema.clone(),
                 key_schema,
                 attribute_definitions,
                 has_lsi,
@@ -760,5 +762,9 @@ fn to_table_description(
         deletion_protection_enabled,
         sse_description: None, // Not mapped in v1
         table_class_summary: None,
+        on_demand_throughput: t.on_demand_throughput().map(|odt| OnDemandThroughput {
+            max_read_request_units: odt.max_read_request_units(),
+            max_write_request_units: odt.max_write_request_units(),
+        }),
     })
 }

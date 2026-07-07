@@ -122,6 +122,7 @@ fn create_pk_sk_table(logical_name: &str) -> CreateTableInput {
         tags: None,
         deletion_protection_enabled: None,
         table_class: None,
+        on_demand_throughput: None,
     }
 }
 
