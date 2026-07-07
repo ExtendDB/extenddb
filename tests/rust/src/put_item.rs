@@ -447,3 +447,58 @@ async fn put_item_without_gsi_key_attributes() {
         .unwrap();
     check_item(c, &t.simple_key_string_gsi, &item).await;
 }
+
+/// A data-plane operation against a table still in `CREATING` returns
+/// `ResourceNotFoundException` (not `ResourceInUseException`), matching
+/// DynamoDB — a table being created is not yet usable and reports as not found.
+///
+/// Gated to the local server: it relies on the control-plane delay that holds a
+/// freshly-created table in `CREATING`; real DynamoDB creation timing differs.
+#[tokio::test]
+async fn put_item_on_creating_table_returns_not_found() {
+    if is_real_dynamodb() {
+        return;
+    }
+    use aws_sdk_dynamodb::types::{
+        AttributeDefinition, BillingMode, KeySchemaElement, KeyType, ScalarAttributeType,
+    };
+    let c = client();
+    let table = format!("CreatingInflux_{}", ts());
+    c.create_table()
+        .table_name(&table)
+        .billing_mode(BillingMode::PayPerRequest)
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name(HASH_KEY_S)
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name(HASH_KEY_S)
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    // Do NOT wait for ACTIVE — the table is still CREATING here.
+    let err = c
+        .put_item()
+        .table_name(&table)
+        .item(HASH_KEY_S, s("k1"))
+        .send()
+        .await
+        .expect_err("PutItem against a CREATING table must fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("ResourceNotFoundException") || msg.contains("Requested resource not found"),
+        "expected ResourceNotFoundException for a CREATING table, got: {msg}"
+    );
+
+    wait_for_active(c, &table).await;
+    c.delete_table().table_name(&table).send().await.ok();
+}
