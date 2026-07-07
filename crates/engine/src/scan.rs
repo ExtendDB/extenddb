@@ -289,6 +289,8 @@ pub async fn handle_scan(
             base_key_schema: key_info.key_schema.clone(),
             attribute_definitions: key_info.attribute_definitions.clone(),
             has_lsi: key_info.has_lsi,
+            global_secondary_indexes: key_info.global_secondary_indexes.clone(),
+            local_secondary_indexes: key_info.local_secondary_indexes.clone(),
             stream_specification: None, // Scans don't capture stream records
         }
     } else {

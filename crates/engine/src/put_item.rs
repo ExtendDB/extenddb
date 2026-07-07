@@ -167,31 +167,16 @@ pub async fn handle_put_item(
     let wcu = capacity_helpers::write_capacity_units(item_bytes);
 
     // Consumed capacity is computed before `input.item` is moved into storage.
-    // INDEXES mode additionally needs the item and index metadata to build the
-    // per-index breakdown, which requires one describe_table catalog read (only
-    // taken when INDEXES is requested).
-    let consumed_capacity =
-        if input.return_consumed_capacity != extenddb_core::types::ReturnConsumedCapacity::None {
-            let desc = ctx
-                .storage
-                .describe_table(
-                    &ctx.account_id,
-                    extenddb_core::types::DescribeTableInput {
-                        table_name: input.table_name.clone(),
-                    },
-                )
-                .await
-                .map_err(storage_err_to_dynamo)?;
-            capacity_helpers::write_capacity_indexed(
-                input.return_consumed_capacity,
-                &input.table_name,
-                wcu,
-                &input.item,
-                &desc,
-            )
-        } else {
-            capacity_helpers::write_capacity(input.return_consumed_capacity, &input.table_name, wcu)
-        };
+    // Consumed capacity, computed before `input.item` is moved into storage.
+    // Per-index (INDEXES) breakdown uses the index metadata already carried on
+    // the (cached) `TableKeyInfo`, so no extra catalog round-trip is needed.
+    let consumed_capacity = capacity_helpers::write_capacity_indexed(
+        input.return_consumed_capacity,
+        &input.table_name,
+        wcu,
+        &input.item,
+        &key_info,
+    );
 
     // Extract item collection metrics before item is moved into storage.
     let icm = capacity_helpers::item_metrics(

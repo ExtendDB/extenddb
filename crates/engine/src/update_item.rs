@@ -255,32 +255,21 @@ pub async fn handle_update_item(
     let new_bytes = new_item.as_ref().map_or(0, item_size_bytes);
     let wcu = capacity_helpers::write_capacity_units(old_bytes.max(new_bytes));
 
-    // Consumed capacity — computed before old/new items are moved below.
-    // INDEXES mode uses the resulting item (new, or old for pure deletes) to
-    // determine sparse index membership, via one describe_table read.
-    let consumed_capacity = if input.return_consumed_capacity
-        != extenddb_core::types::ReturnConsumedCapacity::None
-        && let Some(cc_item) = new_item.as_ref().or(old_item.as_ref())
-    {
-        let desc = ctx
-            .storage
-            .describe_table(
-                &ctx.account_id,
-                extenddb_core::types::DescribeTableInput {
-                    table_name: input.table_name.clone(),
-                },
-            )
-            .await
-            .map_err(storage_err_to_dynamo)?;
-        capacity_helpers::write_capacity_indexed(
+    // Consumed capacity — computed before old/new items are moved below. The
+    // per-index breakdown uses the resulting item (new, or old for pure deletes)
+    // for sparse index membership; index metadata comes from the (cached)
+    // `TableKeyInfo`, so no extra catalog round-trip is needed.
+    let consumed_capacity = match new_item.as_ref().or(old_item.as_ref()) {
+        Some(cc_item) => capacity_helpers::write_capacity_indexed(
             input.return_consumed_capacity,
             &input.table_name,
             wcu,
             cc_item,
-            &desc,
-        )
-    } else {
-        capacity_helpers::write_capacity(input.return_consumed_capacity, &input.table_name, wcu)
+            &key_info,
+        ),
+        None => {
+            capacity_helpers::write_capacity(input.return_consumed_capacity, &input.table_name, wcu)
+        }
     };
 
     // Select the appropriate return value.
