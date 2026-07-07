@@ -1488,6 +1488,77 @@ class TestConsumedCapacityIndexes:
         assert cc["CapacityUnits"] == 3.0
         assert set(cc["GlobalSecondaryIndexes"]) == {"gsi1", "gsi2"}
 
+    def test_keys_only_gsi_charges_projected_size(self, dynamodb_client):
+        """A KEYS_ONLY GSI is charged on the projected (keys-only) size, not the
+        full base item.
+
+        The base item carries a ~2 KB non-key attribute (2 WCU), but the
+        KEYS_ONLY GSI projects only the key attributes, so it costs 1 WCU. Total
+        is base(2) + gsi(1) = 3 — proving per-index size uses the projection, not
+        the whole item.
+        """
+        with scoped_table(
+            dynamodb_client,
+            attribute_definitions=[
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "g1", "AttributeType": "S"},
+            ],
+            key_schema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "gsi_ko",
+                    "KeySchema": [{"AttributeName": "g1", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "KEYS_ONLY"},
+                }
+            ],
+        ) as table:
+            resp = dynamodb_client.put_item(
+                TableName=table,
+                Item={"pk": {"S": "a"}, "g1": {"S": "gv"}, "big": {"S": "x" * 2000}},
+                ReturnConsumedCapacity="INDEXES",
+            )
+            cc = resp["ConsumedCapacity"]
+            assert cc["Table"]["CapacityUnits"] == 2.0  # ~2 KB base item
+            assert cc["GlobalSecondaryIndexes"]["gsi_ko"]["CapacityUnits"] == 1.0  # keys only
+            assert cc["CapacityUnits"] == 3.0
+
+    def test_lsi_write_reports_local_secondary_index_breakdown(self, dynamodb_client):
+        """An LSI is reported under LocalSecondaryIndexes and added to the total.
+
+        Base (pk, sk) + LSI on (pk, ls). Small item → base 1 + lsi 1 = 2.
+        """
+        with scoped_table(
+            dynamodb_client,
+            attribute_definitions=[
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+                {"AttributeName": "ls", "AttributeType": "S"},
+            ],
+            key_schema=[
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"},
+            ],
+            LocalSecondaryIndexes=[
+                {
+                    "IndexName": "lsi1",
+                    "KeySchema": [
+                        {"AttributeName": "pk", "KeyType": "HASH"},
+                        {"AttributeName": "ls", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+            ],
+        ) as table:
+            resp = dynamodb_client.put_item(
+                TableName=table,
+                Item={"pk": {"S": "a"}, "sk": {"S": "s1"}, "ls": {"S": "l1"}},
+                ReturnConsumedCapacity="INDEXES",
+            )
+            cc = resp["ConsumedCapacity"]
+            assert cc["LocalSecondaryIndexes"]["lsi1"]["CapacityUnits"] == 1.0
+            assert cc["Table"]["CapacityUnits"] == 1.0
+            assert cc["CapacityUnits"] == 2.0  # base + LSI
+
 
 # ---------------------------------------------------------------------------
 # Number sizing uses DynamoDB formula (a787349)

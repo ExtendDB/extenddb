@@ -11,7 +11,7 @@ use std::sync::atomic::AtomicU64;
 
 use extenddb_core::types::{
     ConsumedCapacity, Item, ItemCollectionMetrics, KeySchemaElement, Projection, ProjectionType,
-    ReturnConsumedCapacity, ReturnItemCollectionMetrics, TableDescription, item_size_bytes,
+    ReturnConsumedCapacity, ReturnItemCollectionMetrics, TableKeyInfo, item_size_bytes,
 };
 
 /// Global counter for requests that used approximate consumed capacity.
@@ -58,21 +58,21 @@ pub fn write_capacity(
 /// `base_cu` is the base-table write capacity; `item` is the item being written
 /// (used to determine sparse index membership and per-index projected size);
 /// `desc` is the table description (source of GSI/LSI definitions). When the
-/// caller does not request `INDEXES`, `desc` is unused and this behaves exactly
-/// like [`write_capacity`].
+/// caller does not request `INDEXES`, `key_info` is unused and this behaves
+/// exactly like [`write_capacity`].
 #[must_use]
 pub fn write_capacity_indexed(
     rcc: ReturnConsumedCapacity,
     table_name: &str,
     base_cu: f64,
     item: &Item,
-    desc: &TableDescription,
+    key_info: &TableKeyInfo,
 ) -> Option<ConsumedCapacity> {
     match rcc {
         ReturnConsumedCapacity::None => None,
         rcc => {
             CAPACITY_REQUEST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let (gsi, lsi) = index_write_units(item, desc);
+            let (gsi, lsi) = index_write_units(item, key_info);
             let breakdown = rcc == ReturnConsumedCapacity::Indexes;
             Some(ConsumedCapacity::write_indexed(
                 table_name, base_cu, gsi, lsi, breakdown,
@@ -88,37 +88,34 @@ pub fn write_capacity_indexed(
 /// the index's key attributes (sparse-index semantics). Per-index capacity is
 /// `ceil(projected_item_size / 1KB)`, where the projected item contains only
 /// the attributes the index materializes (per its projection type).
+///
+/// Index metadata is read from the (cached) `TableKeyInfo`, so no extra catalog
+/// round-trip is needed.
 #[must_use]
 pub fn index_write_units(
     item: &Item,
-    desc: &TableDescription,
+    key_info: &TableKeyInfo,
 ) -> (
     std::collections::HashMap<String, f64>,
     std::collections::HashMap<String, f64>,
 ) {
-    let base_keys: Vec<&str> = desc
-        .key_schema
+    let base_keys: Vec<&str> = key_info
+        .base_key_schema
         .iter()
         .map(|k| k.attribute_name.as_str())
         .collect();
 
     let mut gsi = std::collections::HashMap::new();
-    if let Some(gsis) = &desc.global_secondary_indexes {
-        for g in gsis {
-            if let Some(cu) = one_index_write_units(item, &g.key_schema, &base_keys, &g.projection)
-            {
-                gsi.insert(g.index_name.clone(), cu);
-            }
+    for g in &key_info.global_secondary_indexes {
+        if let Some(cu) = one_index_write_units(item, &g.key_schema, &base_keys, &g.projection) {
+            gsi.insert(g.index_name.clone(), cu);
         }
     }
 
     let mut lsi = std::collections::HashMap::new();
-    if let Some(lsis) = &desc.local_secondary_indexes {
-        for l in lsis {
-            if let Some(cu) = one_index_write_units(item, &l.key_schema, &base_keys, &l.projection)
-            {
-                lsi.insert(l.index_name.clone(), cu);
-            }
+    for l in &key_info.local_secondary_indexes {
+        if let Some(cu) = one_index_write_units(item, &l.key_schema, &base_keys, &l.projection) {
+            lsi.insert(l.index_name.clone(), cu);
         }
     }
 

@@ -153,31 +153,20 @@ pub async fn handle_delete_item(
     );
 
     // Consumed capacity — INDEXES mode uses the deleted (old) item to determine
-    // which indexes the delete propagated to, via one describe_table read. If
+    // which indexes the delete propagated to. Index metadata comes from the
+    // (cached) `TableKeyInfo`, so no extra catalog round-trip is needed. If
     // nothing was deleted, only base-table capacity is reported.
-    let consumed_capacity = if input.return_consumed_capacity
-        != extenddb_core::types::ReturnConsumedCapacity::None
-        && let Some(cc_item) = old_item.as_ref()
-    {
-        let desc = ctx
-            .storage
-            .describe_table(
-                &ctx.account_id,
-                extenddb_core::types::DescribeTableInput {
-                    table_name: input.table_name.clone(),
-                },
-            )
-            .await
-            .map_err(storage_err_to_dynamo)?;
-        capacity_helpers::write_capacity_indexed(
+    let consumed_capacity = match old_item.as_ref() {
+        Some(cc_item) => capacity_helpers::write_capacity_indexed(
             input.return_consumed_capacity,
             &input.table_name,
             wcu,
             cc_item,
-            &desc,
-        )
-    } else {
-        capacity_helpers::write_capacity(input.return_consumed_capacity, &input.table_name, wcu)
+            &key_info,
+        ),
+        None => {
+            capacity_helpers::write_capacity(input.return_consumed_capacity, &input.table_name, wcu)
+        }
     };
 
     let output = DeleteItemOutput {

@@ -13,14 +13,13 @@ use extenddb_storage::util::{sk_column, sk_column_n};
 use super::{all_sort_key_info, data_table_name, index_table_name};
 use crate::PostgresEngine;
 
-/// Row shape returned by the table-info query: (`key_schema`, `attr_defs`, status, `table_id`, `stream_spec`, `has_lsi`).
+/// Row shape returned by the table-info query: (`key_schema`, `attr_defs`, status, `table_id`, `stream_spec`).
 type TableInfoRow = (
     serde_json::Value,
     serde_json::Value,
     String,
     String,
     Option<serde_json::Value>,
-    Option<bool>,
 );
 
 impl PostgresEngine {
@@ -263,8 +262,7 @@ impl PostgresEngine {
     ) -> Result<TableKeyInfo, StorageError> {
         let row: Option<TableInfoRow> = sqlx::query_as(
             "SELECT key_schema, attribute_definitions, table_status, table_id, \
-             stream_specification, \
-             EXISTS(SELECT 1 FROM indexes WHERE table_id = tables.table_id AND index_type = 'LSI') AS has_lsi \
+             stream_specification \
              FROM tables \
              WHERE account_id = $1 AND table_name = $2",
         )
@@ -274,7 +272,7 @@ impl PostgresEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let (ks_json, ad_json, status, table_id, stream_spec_json, has_lsi) =
+        let (ks_json, ad_json, status, table_id, stream_spec_json) =
             row.ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
 
         match status.as_str() {
@@ -298,6 +296,14 @@ impl PostgresEngine {
             .transpose()
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+        // Fetch all secondary indexes once and carry their metadata on the
+        // (cached) TableKeyInfo. This lets per-index consumed-capacity accounting
+        // avoid a separate describe_table round-trip on every write, and also
+        // supplies `has_lsi`.
+        let (global_secondary_indexes, local_secondary_indexes) =
+            self.fetch_all_index_info(&table_id).await?;
+        let has_lsi = !local_secondary_indexes.is_empty();
+
         Ok(TableKeyInfo {
             table_name: table_name.to_owned(),
             account_id: account_id.to_owned(),
@@ -305,9 +311,58 @@ impl PostgresEngine {
             base_key_schema: key_schema.clone(),
             key_schema,
             attribute_definitions,
-            has_lsi: has_lsi.unwrap_or(false),
+            has_lsi,
+            global_secondary_indexes,
+            local_secondary_indexes,
             stream_specification,
         })
+    }
+
+    /// Fetch every secondary index defined on a table, split into
+    /// `(global_secondary_indexes, local_secondary_indexes)`.
+    async fn fetch_all_index_info(
+        &self,
+        table_id: &str,
+    ) -> Result<(Vec<IndexInfo>, Vec<IndexInfo>), StorageError> {
+        let rows: Vec<(String, String, String, serde_json::Value, serde_json::Value)> =
+            sqlx::query_as(
+                "SELECT index_name, index_type, index_id, key_schema, projection \
+                 FROM indexes WHERE table_id = $1",
+            )
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        let mut gsis = Vec::new();
+        let mut lsis = Vec::new();
+        for (index_name, idx_type_str, index_id, ks_json, proj_json) in rows {
+            let index_type = match idx_type_str.as_str() {
+                "GSI" => IndexType::Gsi,
+                "LSI" => IndexType::Lsi,
+                other => {
+                    return Err(StorageError::Internal(format!(
+                        "unknown index type in database: {other}"
+                    )));
+                }
+            };
+            let key_schema: Vec<KeySchemaElement> = serde_json::from_value(ks_json)
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let projection: Projection = serde_json::from_value(proj_json)
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let info = IndexInfo {
+                index_name,
+                index_id,
+                index_type,
+                key_schema,
+                projection,
+            };
+            match index_type {
+                IndexType::Gsi => gsis.push(info),
+                IndexType::Lsi => lsis.push(info),
+            }
+        }
+        Ok((gsis, lsis))
     }
 
     /// Fetch metadata for a secondary index from the catalog.
