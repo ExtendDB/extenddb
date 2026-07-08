@@ -209,6 +209,11 @@ impl Bootstrapper for PostgresBootstrapper {
         migrations::run_data_migrations(&pool).await
     }
 
+    async fn pending_data_migrations(&self) -> OpResult<Vec<String>> {
+        let pool = self.app_pool(&self.config.data_db).await?;
+        migrations::pending_data_migrations(&pool).await
+    }
+
     async fn record_data_connection(&self) -> OpResult<()> {
         let pool = self.app_pool(&self.config.catalog_db).await?;
         let data_conn = self.app_connection_url(&self.config.data_db);

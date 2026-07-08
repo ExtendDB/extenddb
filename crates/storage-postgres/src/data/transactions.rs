@@ -11,12 +11,9 @@ use extenddb_core::types::{
 };
 use extenddb_core::validation;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::pk_to_text;
 use extenddb_storage::{TransactGetOp, TransactWriteOp};
 
-use super::index::{
-    IndexMeta, enqueue_async_indexes, fetch_indexes_for_table, pk_hash, sync_indexes,
-};
+use super::index::{IndexMeta, enqueue_async_indexes, fetch_indexes_for_table, sync_indexes};
 use super::tx_helpers::{
     check_idempotency_token_in_tx, delete_item_in_tx, fetch_item_for_update, fetch_item_in_tx,
     upsert_item_in_tx, write_stream_record_in_tx,
@@ -170,49 +167,41 @@ impl PostgresEngine {
             }
         }
 
+        // Persist async GSI work inside the transaction.
+        let mut needs_notify = false;
+        for (op, (old_item, new_item)) in ops.iter().zip(op_items.iter()) {
+            // ConditionCheck (and any op that touched no item) — no index changes.
+            if old_item.is_none() && new_item.is_none() {
+                continue;
+            }
+            let indexes = &table_indexes[transact_op_table_name(op)];
+            let key_info = match op {
+                TransactWriteOp::Put { key_info, .. }
+                | TransactWriteOp::Delete { key_info, .. }
+                | TransactWriteOp::Update { key_info, .. }
+                | TransactWriteOp::ConditionCheck { key_info, .. } => key_info,
+            };
+            // One row per async index, each honoring its own propagation delay.
+            let n = enqueue_async_indexes(
+                &mut tx,
+                key_info,
+                indexes,
+                old_item.as_ref(),
+                new_item.as_ref(),
+                sys_delay,
+            )
+            .await?;
+            if n > 0 {
+                needs_notify = true;
+            }
+        }
+
         tx.commit()
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // D-4: Enqueue async GSI updates after commit using the old/new items
-        // collected during transaction execution (M-3 fix).
-        if let Some(ref q) = self.gsi_queue {
-            for (op, (old_item, new_item)) in ops.iter().zip(op_items.iter()) {
-                let indexes = &table_indexes[transact_op_table_name(op)];
-                if indexes.is_empty() {
-                    continue;
-                }
-                let key_info = match op {
-                    TransactWriteOp::Put { key_info, .. }
-                    | TransactWriteOp::Delete { key_info, .. }
-                    | TransactWriteOp::Update { key_info, .. }
-                    | TransactWriteOp::ConditionCheck { key_info, .. } => key_info,
-                };
-                let pk_name = &key_info.key_schema[0].attribute_name;
-                // Derive pk_text from whichever item is available.
-                let pk_item = new_item.as_ref().or(old_item.as_ref());
-                let Some(pk_item) = pk_item else { continue }; // ConditionCheck — no index changes
-                let Some(pk_value) = pk_item.get(pk_name) else {
-                    continue;
-                };
-                let Ok(pk_text) = pk_to_text(pk_value) else {
-                    continue;
-                };
-                enqueue_async_indexes(
-                    q,
-                    pk_hash(&pk_text),
-                    &key_info.account_id,
-                    &key_info.table_name,
-                    &key_info.table_id,
-                    &key_info.key_schema,
-                    &key_info.attribute_definitions,
-                    indexes,
-                    old_item.as_ref(),
-                    new_item.as_ref(),
-                    sys_delay,
-                )
-                .await;
-            }
+        if needs_notify && let Some(ref q) = self.gsi_queue {
+            q.notify_workers();
         }
 
         Ok(())
@@ -353,7 +342,6 @@ async fn execute_transact_write_op(
             if !indexes.is_empty() {
                 sync_indexes(
                     tx,
-                    &key_info.table_id,
                     &key_info.key_schema,
                     &key_info.attribute_definitions,
                     indexes,
@@ -397,7 +385,6 @@ async fn execute_transact_write_op(
             if !indexes.is_empty() {
                 sync_indexes(
                     tx,
-                    &key_info.table_id,
                     &key_info.key_schema,
                     &key_info.attribute_definitions,
                     indexes,
@@ -469,7 +456,6 @@ async fn execute_transact_write_op(
             if !indexes.is_empty() {
                 sync_indexes(
                     tx,
-                    &key_info.table_id,
                     &key_info.key_schema,
                     &key_info.attribute_definitions,
                     indexes,

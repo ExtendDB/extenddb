@@ -188,3 +188,6 @@ def scoped_table(
             client.delete_table(TableName=name)
         except client.exceptions.ResourceNotFoundException:
             pass  # Already deleted by the test itself.
+
+# Shared CLI/lifecycle fixture (used by lifecycle + GSI-queue integration tests).
+from lifecycle_helpers import cli_env  # noqa: F401

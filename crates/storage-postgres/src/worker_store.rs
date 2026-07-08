@@ -128,6 +128,16 @@ impl PostgresEngine {
                 Self::drop_index_data_table(&mut data_tx, idx_id).await?;
             }
             Self::drop_data_table(&mut data_tx, table_id).await?;
+
+            // Drop any still-pending GSI propagation rows for this table in the
+            // same transaction that drops the tables, so workers don't waste a
+            // claim→deserialize→attempt→skip cycle on now-orphaned rows.
+            sqlx::query("DELETE FROM gsi_pending WHERE table_id = $1")
+                .bind(table_id)
+                .execute(&mut *data_tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+
             data_tx
                 .commit()
                 .await
