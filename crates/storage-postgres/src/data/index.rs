@@ -9,17 +9,30 @@
 
 use extenddb_core::types::{
     AttributeDefinition, Item, KeySchemaElement, Projection, ProjectionType, ScalarAttributeType,
+    TableKeyInfo,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::SortKeyValue;
 use extenddb_storage::util::{composite_pk_to_text, parse_sk, sk_column, sk_column_n};
 
 use super::{all_sort_key_info, index_table_name};
+use crate::gsi_queue::{GsiApplyContext, GsiIndexDef, enqueue_gsi_pending};
+
+/// Map a `sqlx` error to `StorageError`, preserving the SQLSTATE code in the
+/// message. The async GSI worker keys off the code (e.g. `42P01`,
+/// undefined_table) to tell a dropped-index race apart from a real failure;
+/// `sqlx`'s `Display` only carries the human text, so the code must be kept.
+fn db_error(e: sqlx::Error) -> StorageError {
+    match e.as_database_error().and_then(|d| d.code()) {
+        Some(code) => StorageError::Internal(format!("SQLSTATE {code}: {e}")),
+        None => StorageError::Internal(e.to_string()),
+    }
+}
 
 /// Metadata for a single index, used during write-path GSI/LSI sync.
 pub(crate) struct IndexMeta {
-    pub(super) index_name: String,
     pub(super) index_id: String,
+    pub(super) index_name: String,
     pub(super) index_type: String,
     pub(super) key_schema: Vec<KeySchemaElement>,
     pub(super) projection: Projection,
@@ -34,7 +47,7 @@ pub(crate) async fn fetch_indexes_for_table(
     pool: &sqlx::PgPool,
 ) -> Result<Vec<IndexMeta>, StorageError> {
     let rows: Vec<(String, String, String, serde_json::Value, serde_json::Value, Option<i32>)> = sqlx::query_as(
-        "SELECT index_name, index_id, index_type, key_schema, projection, propagation_delay_ms FROM indexes WHERE table_id = $1",
+        "SELECT index_id, index_name, index_type, key_schema, projection, propagation_delay_ms FROM indexes WHERE table_id = $1",
     )
     .bind(table_id)
     .fetch_all(pool)
@@ -42,14 +55,14 @@ pub(crate) async fn fetch_indexes_for_table(
     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
     rows.into_iter()
-        .map(|(name, id, idx_type, ks_json, proj_json, delay)| {
+        .map(|(id, index_name, idx_type, ks_json, proj_json, delay)| {
             let key_schema: Vec<KeySchemaElement> = serde_json::from_value(ks_json)
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             let projection: Projection = serde_json::from_value(proj_json)
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             Ok(IndexMeta {
-                index_name: name,
                 index_id: id,
+                index_name,
                 index_type: idx_type,
                 key_schema,
                 projection,
@@ -124,11 +137,10 @@ pub(super) fn effective_delay(idx: &IndexMeta, system_default: u64) -> u64 {
 ///
 /// Called within the same PG transaction as the base table write.
 /// Only processes indexes where `effective_delay == 0`. Async indexes are
-/// handled by `enqueue_async_indexes` after the transaction commits.
+/// handled by the persistent `gsi_pending` queue after the transaction commits.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn sync_indexes(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    _table_id: &str,
     base_key_schema: &[KeySchemaElement],
     attr_defs: &[AttributeDefinition],
     indexes: &[IndexMeta],
@@ -148,8 +160,7 @@ pub(crate) async fn sync_indexes(
         if let Some(old) = old_item
             && item_has_index_keys(old, &idx.key_schema)
         {
-            delete_index_row_multi(tx, &idx_table, old, base_key_schema, attr_defs, &base_sks)
-                .await?;
+            delete_index_row_multi(tx, &idx_table, old, base_key_schema, &base_sks).await?;
         }
 
         // Insert new index row if the new item has index keys
@@ -165,7 +176,6 @@ pub(crate) async fn sync_indexes(
                 &projected,
                 &idx.key_schema,
                 base_key_schema,
-                attr_defs,
                 &idx_sks,
                 &base_sks,
             )
@@ -175,56 +185,50 @@ pub(crate) async fn sync_indexes(
     Ok(())
 }
 
-/// Enqueue async GSI updates for indexes with non-zero propagation delay.
+/// Enqueue async GSI propagation for a write, **one `gsi_pending` row per
+/// async index**.
 ///
-/// Called after the base table transaction commits. The queue workers apply
-/// the index updates after a random delay within the configured range.
-#[allow(clippy::too_many_arguments)]
+/// For every GSI (LSIs are always synchronous) whose effective propagation
+/// delay is non-zero, a self-describing row is inserted carrying that single
+/// index's definition and its own effective delay (see [`enqueue_gsi_pending`],
+/// which applies per-index jitter and the partition-monotonic `ready_at`
+/// clamp). Splitting per index — rather than bundling every index into one row
+/// with one `ready_at` — is what lets each GSI honor its own
+/// `propagation_delay_ms` and propagate independently.
+///
+/// Returns the number of rows enqueued, so callers can skip waking the workers
+/// when nothing was queued. Must be called inside the base write's transaction
+/// so the pending rows commit atomically with the item mutation.
 pub(crate) async fn enqueue_async_indexes(
-    gsi_queue: &crate::gsi_queue::GsiQueue,
-    pk_hash: u64,
-    account_id: &str,
-    table_name: &str,
-    table_id: &str,
-    base_key_schema: &[KeySchemaElement],
-    attr_defs: &[AttributeDefinition],
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    key_info: &TableKeyInfo,
     indexes: &[IndexMeta],
     old_item: Option<&Item>,
     new_item: Option<&Item>,
     system_default_delay: u64,
-) {
+) -> Result<usize, StorageError> {
+    let mut enqueued = 0usize;
     for idx in indexes {
+        if idx.index_type == "LSI" {
+            continue; // LSIs are always synchronous.
+        }
         let delay = effective_delay(idx, system_default_delay);
         if delay == 0 {
-            continue; // Sync — already handled in transaction.
+            continue; // Synchronous GSI — handled in-transaction by sync_indexes.
         }
-        if idx.index_type == "LSI" {
-            continue; // LSIs are always synchronous — already handled in transaction.
-        }
-        gsi_queue
-            .enqueue(
-                pk_hash,
-                account_id,
-                table_name,
-                table_id,
-                base_key_schema,
-                attr_defs,
-                &idx.index_name,
-                &idx.index_id,
-                &idx.key_schema,
-                &idx.projection,
-                old_item,
-                new_item,
-                delay,
-            )
-            .await;
+        let context = GsiApplyContext {
+            base_key_schema: key_info.key_schema.clone(),
+            attribute_definitions: key_info.attribute_definitions.clone(),
+            index: GsiIndexDef {
+                index_id: idx.index_id.clone(),
+                key_schema: idx.key_schema.clone(),
+                projection: idx.projection.clone(),
+            },
+        };
+        enqueue_gsi_pending(tx, &key_info.table_id, old_item, new_item, delay, &context).await?;
+        enqueued += 1;
     }
-}
-
-/// Compute a hash of the partition key text for queue partitioning.
-/// Uses crc32 for stability across Rust versions (`DefaultHasher` is not stable).
-pub(crate) fn pk_hash(pk_text: &str) -> u64 {
-    u64::from(crc32fast::hash(pk_text.as_bytes()))
+    Ok(enqueued)
 }
 
 /// Delete a row from an index table using base table key columns.
@@ -233,7 +237,6 @@ pub(crate) async fn delete_index_row_multi(
     idx_table: &str,
     item: &Item,
     base_ks: &[KeySchemaElement],
-    _attr_defs: &[AttributeDefinition],
     base_sks: &[(&str, ScalarAttributeType)],
 ) -> Result<(), StorageError> {
     let base_pk_text = composite_pk_to_text(item, base_ks)?;
@@ -266,10 +269,7 @@ pub(crate) async fn delete_index_row_multi(
         }
     }
 
-    query
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+    query.execute(&mut **tx).await.map_err(db_error)?;
     Ok(())
 }
 
@@ -282,7 +282,6 @@ pub(crate) async fn insert_index_row_multi(
     projected: &Item,
     index_ks: &[KeySchemaElement],
     base_ks: &[KeySchemaElement],
-    _attr_defs: &[AttributeDefinition],
     idx_sks: &[(&str, ScalarAttributeType)],
     base_sks: &[(&str, ScalarAttributeType)],
 ) -> Result<(), StorageError> {
@@ -347,9 +346,6 @@ pub(crate) async fn insert_index_row_multi(
     // Bind item_data
     query = query.bind(item_json);
 
-    query
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+    query.execute(&mut **tx).await.map_err(db_error)?;
     Ok(())
 }
