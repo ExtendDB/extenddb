@@ -258,7 +258,7 @@ async fn serve_inner(
     //
     // The EnvFilter encodes both levels: `{app_level},sqlx={sqlx_level}`.
     // The poll_log_level worker reloads the filter when either setting changes.
-    let filter_str = format!("{},sqlx=warn", &app_config.logging.level);
+    let filter_str = format!("{},sqlx=warn", app_config.logging.level);
     // CB-29: Always use the config file log level, never RUST_LOG. The runtime
     // settings poller handles dynamic level changes. RUST_LOG silently
     // overriding the config is an operational surprise.
