@@ -7,7 +7,7 @@
 use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, UpdateAction};
 use extenddb_core::types::{Item, TableKeyInfo};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{DataEngine, StreamCapture, TransactGetOp, TransactWriteOp};
+use extenddb_storage::{DataEngine, IdempotencyKey, StreamCapture, TransactGetOp, TransactWriteOp};
 use futures::future::BoxFuture;
 
 use crate::PostgresEngine;
@@ -184,7 +184,7 @@ impl DataEngine for PostgresEngine {
     fn transact_write_items(
         &self,
         ops: &[TransactWriteOp<'_>],
-        token: Option<(&str, &str)>,
+        idempotency: Option<IdempotencyKey<'_>>,
     ) -> BoxFuture<'_, Result<(), StorageError>> {
         // Clone ops to owned data - unavoidable due to lifetime constraints
         let owned_ops: Vec<_> = ops
@@ -264,7 +264,13 @@ impl DataEngine for PostgresEngine {
                 ),
             })
             .collect();
-        let token = token.map(|(a, b)| (a.to_string(), b.to_string()));
+        let idempotency = idempotency.map(|k| {
+            (
+                k.account_id.to_string(),
+                k.token.to_string(),
+                k.fingerprint.to_string(),
+            )
+        });
 
         Box::pin(async move {
             // Reconstruct borrowed ops from owned data
@@ -322,7 +328,13 @@ impl DataEngine for PostgresEngine {
                 .collect();
             self.transact_write_items_impl(
                 &borrowed_ops,
-                token.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
+                idempotency
+                    .as_ref()
+                    .map(|(account_id, token, fingerprint)| IdempotencyKey {
+                        account_id,
+                        token,
+                        fingerprint,
+                    }),
             )
             .await
         })
