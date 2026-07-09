@@ -52,7 +52,7 @@ pub async fn run(args: MigrateArgs) -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
-    // Show current version.
+    // Show current catalog version.
     println!("--- Checking current catalog version...");
     let current = bootstrap
         .read_catalog_version()
@@ -62,25 +62,59 @@ pub async fn run(args: MigrateArgs) -> anyhow::Result<()> {
     println!("  Current version: {current_display}");
 
     let expected = bootstrap.expected_catalog_version();
-    if current.as_deref() == Some(expected.as_str()) {
+    let catalog_pending = current.as_deref() != Some(expected.as_str());
+
+    // Data migrations are tracked in the data database's own ledger, separate
+    // from and independent of the catalog version, so they must be checked (and
+    // applied) on their own — a release that only changes the data schema does
+    // not bump the catalog version.
+    println!("--- Checking data migrations...");
+    let data_pending = bootstrap
+        .pending_data_migrations()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    if data_pending.is_empty() {
+        println!("  Data migrations up to date.");
+    } else {
+        println!("  Pending: {}", data_pending.join(", "));
+    }
+
+    if !catalog_pending && data_pending.is_empty() {
         println!();
-        println!("Catalog is up to date (version {expected}). No migrations needed.");
+        println!("Everything is up to date (catalog version {expected}). No migrations needed.");
         return Ok(());
     }
 
     if !args.yes {
+        let mut what = Vec::new();
+        if catalog_pending {
+            what.push(format!("catalog {current_display} -> {expected}"));
+        }
+        if !data_pending.is_empty() {
+            what.push(format!("data migrations [{}]", data_pending.join(", ")));
+        }
         anyhow::bail!(
-            "--yes is required to apply migrations. \
-             Current version: {current_display}, target version: {expected}."
+            "--yes is required to apply migrations. Pending: {}.",
+            what.join("; ")
         );
     }
 
+    if catalog_pending {
+        bootstrap
+            .run_catalog_migrations()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    }
+
+    // Always run data migrations: the data-database ledger is idempotent
+    // (already-applied migrations are skipped) and independent of the catalog
+    // version, so an upgrade that only touched the data schema is still applied.
     bootstrap
-        .run_catalog_migrations()
+        .run_data_migrations()
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
-    // Read new version.
+    // Read new catalog version.
     let new = bootstrap
         .read_catalog_version()
         .await

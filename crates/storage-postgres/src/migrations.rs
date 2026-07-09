@@ -31,28 +31,65 @@ pub(crate) async fn run_catalog_migrations(pool: &PgPool) -> OpResult<()> {
     Ok(())
 }
 
-/// Run data database migrations.
+/// Embedded data-database migration files, applied in order. Tracked in the
+/// data database's own `schema_history` table (a separate database from the
+/// catalog), so `extenddb migrate` applies exactly the pending migrations.
+pub(crate) const DATA_MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "001_data_schema.sql",
+        include_str!("../../storage-postgres/data_migrations/001_data_schema.sql"),
+    ),
+    (
+        "002_gsi_pending.sql",
+        include_str!("../../storage-postgres/data_migrations/002_gsi_pending.sql"),
+    ),
+];
+
+/// Run data database migrations, skipping already-applied ones.
+///
+/// Mirrors [`run_catalog_migrations`]: each migration is recorded in
+/// `schema_history` and skipped on later runs. The data database has its own
+/// ledger because it is a separate database from the catalog.
 pub(crate) async fn run_data_migrations(pool: &PgPool) -> OpResult<()> {
-    let sql = include_str!("../../storage-postgres/data_migrations/001_data_schema.sql");
+    println!("--- Running data migrations...");
 
-    println!("--- Initializing data database schema...");
-    let initialized: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM information_schema.tables \
-         WHERE table_name = 'stream_shards' AND table_schema = 'public')",
+    // Ensure the data database has a migration ledger before tracking. (The
+    // catalog ledger lives in a different database and cannot be reused here.)
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS schema_history (\
+             filename TEXT PRIMARY KEY, \
+             applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\
+         )",
     )
-    .fetch_one(pool)
+    .execute(pool)
     .await
-    .map_err(|e| OpError::Internal(format!("Check data schema: {e}")))?;
+    .map_err(|e| OpError::Internal(format!("Create data schema_history: {e}")))?;
 
-    if initialized {
-        println!("    Data schema already initialized.");
-    } else {
+    // Adopt a pre-tracking deployment: if 001 was applied by an earlier version
+    // (its tables exist) but isn't recorded, record it WITHOUT re-running it.
+    // Re-running 001 would execute `setval('stream_seq', ...)` again and could
+    // regress the stream sequence on a live database, producing duplicate
+    // sequence numbers.
+    if !is_migration_applied(pool, "001_data_schema.sql").await?
+        && table_exists(pool, "stream_shards").await?
+    {
+        println!("    Adopting existing 001_data_schema.sql (pre-tracking deployment).");
+        record_migration(pool, "001_data_schema.sql").await?;
+    }
+
+    for (filename, sql) in DATA_MIGRATIONS {
+        if is_migration_applied(pool, filename).await? {
+            println!("    {filename} — already applied, skipping.");
+            continue;
+        }
+        println!("    Applying {filename}...");
         sqlx::raw_sql(sql)
             .execute(pool)
             .await
-            .map_err(|e| OpError::Internal(format!("Data migration failed: {e}")))?;
-        println!("    Data schema initialized.");
+            .map_err(|e| OpError::Internal(format!("Data migration {filename} failed: {e}")))?;
+        record_migration(pool, filename).await?;
     }
+    println!("    Data migrations applied.");
     Ok(())
 }
 
@@ -67,6 +104,33 @@ pub(crate) async fn table_exists(pool: &PgPool, name: &str) -> OpResult<bool> {
     .await
     .map_err(|e| OpError::Internal(format!("Check table exists: {e}")))?;
     Ok(exists)
+}
+
+/// Filenames of [`DATA_MIGRATIONS`] not yet applied to this data database.
+///
+/// Mirrors the apply logic in [`run_data_migrations`] without executing
+/// anything, so callers (e.g. `extenddb migrate`) can report and gate on
+/// pending work. A pre-tracking baseline (`001_data_schema.sql` whose tables
+/// already exist but isn't recorded) is treated as already applied: it will be
+/// adopted — recorded without re-running — not applied, so it is not reported
+/// as pending.
+pub(crate) async fn pending_data_migrations(pool: &PgPool) -> OpResult<Vec<String>> {
+    let has_history = table_exists(pool, "schema_history").await?;
+    // Pre-tracking deployment: 001 ran under an earlier version (its tables
+    // exist) but was never recorded. It is adopted, not re-run.
+    let adopts_baseline = !has_history && table_exists(pool, "stream_shards").await?;
+
+    let mut pending = Vec::new();
+    for (filename, _sql) in DATA_MIGRATIONS {
+        if is_migration_applied(pool, filename).await? {
+            continue;
+        }
+        if *filename == "001_data_schema.sql" && adopts_baseline {
+            continue;
+        }
+        pending.push((*filename).to_owned());
+    }
+    Ok(pending)
 }
 
 /// Check if a migration has already been applied.

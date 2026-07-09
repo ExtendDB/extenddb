@@ -66,6 +66,15 @@ pub trait Bootstrapper: Send + Sync {
     /// Run data schema migrations (stream tables, sequences, etc.).
     async fn run_data_migrations(&self) -> OpResult<()>;
 
+    /// Filenames of data-database migrations that have not yet been applied.
+    ///
+    /// Excludes a pre-tracking baseline migration that already exists and will
+    /// be adopted (recorded without re-running) rather than applied. Data
+    /// migrations are tracked in the data database's own ledger, independent of
+    /// the catalog version, so `migrate` uses this to report accurately and to
+    /// decide whether confirmation is required — without running anything.
+    async fn pending_data_migrations(&self) -> OpResult<Vec<String>>;
+
     /// Record the data database connection string in the catalog.
     async fn record_data_connection(&self) -> OpResult<()>;
 

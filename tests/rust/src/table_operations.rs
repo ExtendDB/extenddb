@@ -368,14 +368,27 @@ async fn describe_table_key_schema() {
 async fn list_tables_basic() {
     let c = client();
     let t = tables().await;
-    let result = c.list_tables().send().await.unwrap();
 
-    let names = result.table_names();
-    assert!(
-        names.contains(&t.simple_key_string),
-        "Should contain {}",
-        t.simple_key_string
-    );
+    // ListTables returns at most 100 names per page; the suite can create more
+    // than that, so paginate until we find the shared table or exhaust pages.
+    let mut found = false;
+    let mut start: Option<String> = None;
+    loop {
+        let mut req = c.list_tables();
+        if let Some(s) = &start {
+            req = req.exclusive_start_table_name(s);
+        }
+        let resp = req.send().await.unwrap();
+        if resp.table_names().contains(&t.simple_key_string) {
+            found = true;
+            break;
+        }
+        match resp.last_evaluated_table_name() {
+            Some(n) => start = Some(n.to_string()),
+            None => break,
+        }
+    }
+    assert!(found, "Should contain {}", t.simple_key_string);
 }
 
 #[tokio::test]

@@ -380,14 +380,48 @@ async fn seed_gsi_items(table: &str, count: usize) {
     }
 }
 
+/// Poll the hash-only `StatusGSI` until it reflects at least `expected` ACTIVE
+/// items, tolerating asynchronous GSI propagation. Bounded so it can't hang.
+/// Replaces fixed sleeps, which race the index-apply queue under load.
+async fn wait_for_gsi_items(table: &str, expected: usize) {
+    let c = client();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let mut count = 0usize;
+        let mut esk: Option<HashMap<String, AttributeValue>> = None;
+        loop {
+            let mut req = c
+                .query()
+                .table_name(table)
+                .index_name("StatusGSI")
+                .key_condition_expression("nodeStatus = :s")
+                .expression_attribute_values(":s", s("ACTIVE"))
+                .limit(100);
+            if let Some(ref lek) = esk {
+                req = req.set_exclusive_start_key(Some(lek.clone()));
+            }
+            let resp = req.send().await.unwrap();
+            count += resp.items().len();
+            match resp.last_evaluated_key() {
+                Some(lek) => esk = Some(lek.to_owned()),
+                None => break,
+            }
+        }
+        if count >= expected || std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 #[tokio::test]
 async fn gsi_hash_only_pagination() {
     let table = format!("GSIHashPag_{}", ts());
     create_hash_only_gsi_table(&table).await;
     seed_gsi_items(&table, 10).await;
 
-    // Allow GSI propagation
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Wait for asynchronous GSI propagation (bounded poll, not a fixed sleep).
+    wait_for_gsi_items(&table, 10).await;
 
     let c = client();
     let mut all_items: Vec<HashMap<String, AttributeValue>> = Vec::new();
@@ -429,7 +463,8 @@ async fn gsi_hash_only_pagination() {
         })
         .collect();
     ids.sort();
-    let expected: Vec<String> = (1..=10).map(|i| format!("node-{i}")).collect();
+    let mut expected: Vec<String> = (1..=10).map(|i| format!("node-{i}")).collect();
+    expected.sort();
     assert_eq!(ids, expected);
 }
 
@@ -439,7 +474,7 @@ async fn gsi_hash_only_page_two_returns_items() {
     create_hash_only_gsi_table(&table).await;
     seed_gsi_items(&table, 10).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    wait_for_gsi_items(&table, 10).await;
 
     let c = client();
 
@@ -485,7 +520,7 @@ async fn gsi_hash_only_no_duplicates() {
     create_hash_only_gsi_table(&table).await;
     seed_gsi_items(&table, 10).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    wait_for_gsi_items(&table, 10).await;
 
     let c = client();
     let mut all_ids: Vec<String> = Vec::new();

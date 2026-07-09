@@ -1,262 +1,35 @@
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""CLI lifecycle tests for extenddb.
+"""CLI lifecycle tests for extenddb (init -> serve -> status -> stop -> destroy).
 
-These tests exercise the full extenddb CLI lifecycle:
-  extenddb init → extenddb serve → extenddb status → extenddb stop → extenddb destroy
-
-They require:
-  - A built extenddb binary (cargo build)
-  - A running PostgreSQL instance
-  - EXTENDDB_TEST_PG_CONNECTION_STRING env var pointing to a PostgreSQL server
-    (e.g., "postgresql://postgres:postgres@localhost:5432")
-
-Each test creates an isolated catalog database, config, and TLS certs to
-avoid interfering with other tests or a running extenddb instance.
-
-These tests are NOT run via the standard pytest suite (which tests the
-DynamoDB API). They are a separate test category for CLI behavior.
+Shared lifecycle helpers and the `cli_env` fixture live in `lifecycle_helpers.py`; the
+fixture is re-exported via `conftest.py` for auto-discovery. These require a
+PostgreSQL instance (EXTENDDB_TEST_PG_CONNECTION_STRING) and a built binary, and
+are excluded from the backend-agnostic pytest suite.
 """
 
-from __future__ import annotations
-
-import json
 import os
-import shutil
-import subprocess
-import tempfile
 import time
 import uuid
 
 import pytest
 
-# The extenddb binary path — built by cargo
-EXTENDDB_BINARY = os.environ.get(
-    "EXTENDDB_BINARY",
-    os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "target",
-        "release",
-        "extenddb",
-    ),
+from lifecycle_helpers import (
+    PG_ADMIN_CONN,
+    PG_ADMIN_PASS,
+    PG_ADMIN_USER,
+    PG_CONN,
+    _drop_database,
+    _fail_if_no_binary,
+    _fail_if_no_pg,
+    _find_free_port,
+    _init_args,
+    _patch_config_port,
+    _pg_args,
+    _run_extenddb,
+    _wait_for_server,
 )
-
-# PostgreSQL connection string for creating test databases.
-PG_CONN = os.environ.get("EXTENDDB_TEST_PG_CONNECTION_STRING", "")
-
-# Admin connection for privileged ops (CREATE/DROP DATABASE, CREATE ROLE).
-# PG_CONN is the unprivileged app role; falls back to it for local superuser setups.
-PG_ADMIN_CONN = os.environ.get("EXTENDDB_TEST_PG_ADMIN_CONNECTION_STRING", "") or PG_CONN
-
-
-def _parse_pg_credentials(conn):
-    """Extract user and password from a connection string (postgresql://user:pass@host:port)."""
-    if not conn:
-        return None, None
-    from urllib.parse import urlparse
-    parsed = urlparse(conn)
-    return parsed.username, parsed.password
-
-
-PG_USER, PG_PASS = _parse_pg_credentials(PG_CONN)
-PG_ADMIN_USER, PG_ADMIN_PASS = _parse_pg_credentials(PG_ADMIN_CONN)
-
-
-def _fail_if_no_pg():
-    """Fail test if PostgreSQL is not available."""
-    if not PG_CONN:
-        pytest.fail(
-            "MISCONFIGURED: EXTENDDB_TEST_PG_CONNECTION_STRING not set. "
-            "CLI lifecycle tests require a PostgreSQL connection string."
-        )
-
-
-def _fail_if_no_binary():
-    """Fail test if extenddb binary is not built."""
-    if not os.path.isfile(EXTENDDB_BINARY):
-        pytest.fail(
-            f"MISCONFIGURED: extenddb binary not found at {EXTENDDB_BINARY}. "
-            "Build with: cargo build --release"
-        )
-
-
-def _pg_args():
-    """Return --pg-user and --pg-pass args for commands that connect as the
-    PostgreSQL admin (catalog database and application-role creation)."""
-    args = []
-    if PG_ADMIN_USER:
-        args.extend(["--pg-user", PG_ADMIN_USER])
-    if PG_ADMIN_PASS:
-        args.extend(["--pg-pass", PG_ADMIN_PASS])
-    return args
-
-
-def _patch_config_port(config_path, port):
-    """Patch the generated config to use a specific port."""
-    with open(config_path) as f:
-        content = f.read()
-    # Replace commented port line or add port after bind_addr
-    if "# port = 18443" in content:
-        content = content.replace("# port = 18443", f"port = {port}")
-    elif "port = " not in content:
-        content = content.replace(
-            'bind_addr = "127.0.0.1"',
-            f'bind_addr = "127.0.0.1"\nport = {port}',
-        )
-    with open(config_path, "w") as f:
-        f.write(content)
-
-
-def _init_args(cli_env):
-    """Return CLI args for extenddb init including all connection details."""
-    args = list(_pg_args())
-    args.extend(["--pg-host", cli_env["pg_host"]])
-    args.extend(["--pg-port", cli_env["pg_port"]])
-    args.extend(["--catalog-db", cli_env["db_name"]])
-    if PG_USER:
-        args.extend(["--extenddb-user", PG_USER])
-    if PG_PASS:
-        args.extend(["--extenddb-pass", PG_PASS])
-    return args
-
-
-def _run_extenddb(*args, config=None, timeout=30, check=True, env_override=None):
-    """Run a extenddb CLI command and return the CompletedProcess.
-
-    Never passes stdin — extenddb commands must be fully non-interactive.
-    Use env_override to pass EXTENDDB_ADMIN_PASSWORD etc.
-    """
-    cmd = [EXTENDDB_BINARY]
-    cmd.extend(args)
-    if config:
-        cmd.extend(["--config", config])
-    env = None
-    if env_override:
-        env = os.environ.copy()
-        env.update(env_override)
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=check,
-        stdin=subprocess.DEVNULL,
-        env=env,
-    )
-
-
-@pytest.fixture()
-def cli_env(tmp_path):
-    """Create an isolated environment for CLI lifecycle testing.
-
-    Yields a dict with:
-      - db_name: unique PostgreSQL database name (catalog)
-      - config_path: path to the generated extenddb.toml
-      - run_dir: directory for PID files
-      - port: unique port for this test instance
-      - binary: path to the extenddb binary
-      - tls_dir: directory containing TLS certs (from ~/.extenddb/tls)
-    """
-    _fail_if_no_pg()
-    _fail_if_no_binary()
-
-    db_name = f"extenddb_test_{uuid.uuid4().hex[:8]}_catalog"
-    port = _find_free_port()
-    run_dir = str(tmp_path / "run")
-    os.makedirs(run_dir, exist_ok=True)
-
-    config_path = str(tmp_path / "extenddb.toml")
-
-    # Parse PG connection details from PG_CONN
-    from urllib.parse import urlparse
-    parsed = urlparse(PG_CONN)
-    pg_host = parsed.hostname or "localhost"
-    pg_port = str(parsed.port or 5432)
-
-    env = {
-        "db_name": db_name,
-        "config_path": config_path,
-        "run_dir": run_dir,
-        "tls_dir": os.path.expanduser("~/.extenddb/tls"),
-        "port": port,
-        "binary": EXTENDDB_BINARY,
-        "conn_string": f"{PG_CONN}/{db_name}",
-        "pg_host": pg_host,
-        "pg_port": pg_port,
-    }
-
-    yield env
-
-    # Cleanup: stop server if running, destroy, drop database
-    try:
-        _run_extenddb("stop", config=config_path, check=False, timeout=10)
-    except Exception:
-        pass
-    try:
-        _run_extenddb("destroy", "--yes", *_pg_args(), config=config_path, check=False, timeout=10)
-    except Exception:
-        pass
-    _drop_database(db_name)
-    # Also drop the data database (catalog name minus _catalog suffix)
-    if db_name.endswith("_catalog"):
-        _drop_database(db_name[:-len("_catalog")])
-
-
-def _find_free_port():
-    """Find a free TCP port."""
-    import socket
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def _drop_database(db_name):
-    """Drop a PostgreSQL test database."""
-    import psycopg2
-
-    try:
-        conn = psycopg2.connect(PG_ADMIN_CONN + "/postgres")
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            # Terminate existing connections
-            cur.execute(
-                f"""
-                SELECT pg_terminate_backend(pid)
-                FROM pg_stat_activity
-                WHERE datname = '{db_name}' AND pid <> pg_backend_pid()
-                """
-            )
-            cur.execute(f'DROP DATABASE IF EXISTS "{db_name}"')
-        conn.close()
-    except Exception:
-        pass  # Best-effort cleanup
-
-
-def _wait_for_server(port, timeout=15):
-    """Wait for the server to become healthy."""
-    import urllib3
-
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    import urllib.request
-    import ssl
-
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            req = urllib.request.Request(f"https://127.0.0.1:{port}/health")
-            urllib.request.urlopen(req, context=ctx, timeout=2)
-            return True
-        except Exception:
-            time.sleep(0.5)
-    return False
-
 
 class TestCliLifecycle:
     """Test the full extenddb CLI lifecycle."""
@@ -279,6 +52,114 @@ class TestCliLifecycle:
         # TLS certs should exist
         assert os.path.isfile(os.path.join(cli_env["tls_dir"], "cert.pem"))
         assert os.path.isfile(os.path.join(cli_env["tls_dir"], "key.pem"))
+
+    def test_data_migrations_tracked(self, cli_env):
+        """init records every data migration in the data DB's schema_history.
+
+        Validates the data-migration registry: migrations are tracked (so
+        `extenddb migrate` knows what is pending and never re-runs an applied
+        one), and the GSI-pending migration is among them.
+        """
+        import psycopg2
+
+        result = _run_extenddb(
+            "init", *_init_args(cli_env),
+            config=cli_env["config_path"],
+            env_override={"EXTENDDB_ADMIN_PASSWORD": "TestPass1!"},
+        )
+        assert result.returncode == 0
+
+        # The data database is the catalog name without the "_catalog" suffix.
+        data_db = cli_env["db_name"][: -len("_catalog")]
+        conn = psycopg2.connect(PG_ADMIN_CONN + "/" + data_db)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT filename FROM schema_history ORDER BY filename")
+                tracked = {row[0] for row in cur.fetchall()}
+        finally:
+            conn.close()
+
+        assert "001_data_schema.sql" in tracked, tracked
+        assert "002_gsi_pending.sql" in tracked, tracked
+
+    def test_migrate_applies_pending_data_migration(self, cli_env):
+        """`extenddb migrate` applies a pending *data* migration on an existing
+        deployment — not just catalog migrations.
+
+        Regression: data migrations live in the data database's own
+        `schema_history`, independent of the catalog version. `migrate`
+        previously only ran catalog migrations and returned "up to date" when
+        the catalog version matched, so a release that only added a data
+        migration (e.g. `002_gsi_pending.sql`) was never applied on upgrade —
+        the `gsi_pending` table was missing and every async-GSI write failed.
+
+        Simulates a pre-002 deployment by dropping `gsi_pending` and its
+        ledger row, then asserts `migrate` re-applies it (and refuses without
+        `--yes`).
+        """
+        import psycopg2
+
+        result = _run_extenddb(
+            "init", *_init_args(cli_env),
+            config=cli_env["config_path"],
+            env_override={"EXTENDDB_ADMIN_PASSWORD": "TestPass1!"},
+        )
+        assert result.returncode == 0
+
+        data_db = cli_env["db_name"][: -len("_catalog")]
+
+        def _data_conn():
+            return psycopg2.connect(PG_ADMIN_CONN + "/" + data_db)
+
+        # Simulate a deployment created before 002 existed.
+        conn = _data_conn()
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute("DROP TABLE IF EXISTS gsi_pending")
+                cur.execute(
+                    "DELETE FROM schema_history WHERE filename = '002_gsi_pending.sql'"
+                )
+                cur.execute("SELECT to_regclass('public.gsi_pending') IS NOT NULL")
+                assert cur.fetchone()[0] is False
+        finally:
+            conn.close()
+
+        # Without --yes, migrate must refuse while a data migration is pending.
+        refused = _run_extenddb(
+            "migrate", *_pg_args(),
+            config=cli_env["config_path"],
+            check=False,
+        )
+        assert refused.returncode != 0, refused.stdout + refused.stderr
+
+        # With --yes, migrate applies the pending data migration.
+        applied = _run_extenddb(
+            "migrate", "--yes", *_pg_args(),
+            config=cli_env["config_path"],
+            check=False,
+        )
+        assert applied.returncode == 0, applied.stdout + applied.stderr
+
+        conn = _data_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT to_regclass('public.gsi_pending') IS NOT NULL")
+                assert cur.fetchone()[0] is True
+                cur.execute(
+                    "SELECT EXISTS(SELECT 1 FROM schema_history "
+                    "WHERE filename = '002_gsi_pending.sql')"
+                )
+                assert cur.fetchone()[0] is True
+                # The 002 schema must carry the per-index queue columns.
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'gsi_pending'"
+                )
+                cols = {row[0] for row in cur.fetchall()}
+                assert {"worker_partition", "ready_at", "index_context"} <= cols, cols
+        finally:
+            conn.close()
 
     def test_init_serve_status_stop(self, cli_env):
         """Full lifecycle: init → serve → status → stop."""

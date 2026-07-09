@@ -9,7 +9,10 @@ const MIN_EXPONENT: i32 = -130;
 
 /// Validate and normalize a `DynamoDB` number string.
 pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
-    let s = s.trim();
+    // DynamoDB does not trim: leading or trailing whitespace makes the number
+    // malformed rather than acceptable (e.g. " 5" and "5 " are rejected). A
+    // genuinely empty string is reported with a distinct message from a
+    // malformed-but-non-empty one.
     if s.is_empty() {
         return Err(number_err());
     }
@@ -20,12 +23,19 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
     };
 
     let (mantissa_str, explicit_exp) = match rest.split_once(['e', 'E']) {
-        Some((m, e)) => (m, e.parse::<i32>().map_err(|_| number_err())?),
+        Some((m, e)) => (m, e.parse::<i32>().map_err(|_| numeric_value_err(s))?),
         None => (rest, 0),
     };
 
     if mantissa_str.is_empty() || !mantissa_str.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        return Err(number_err());
+        return Err(numeric_value_err(s));
+    }
+
+    // The mantissa must contain at least one digit. A bare "." (also "+.",
+    // ".e5") passes the character check above since '.' is allowed, but has no
+    // digits and is not a valid number.
+    if !mantissa_str.bytes().any(|b| b.is_ascii_digit()) {
+        return Err(numeric_value_err(s));
     }
 
     // Split into integer and fractional parts
@@ -37,7 +47,7 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
     if !int_part.chars().all(|c| c.is_ascii_digit())
         || !frac_part.chars().all(|c| c.is_ascii_digit())
     {
-        return Err(number_err());
+        return Err(numeric_value_err(s));
     }
 
     // Combine into a single digit string and track where the decimal point is.
@@ -140,6 +150,15 @@ fn number_err() -> DynamoDbError {
     )
 }
 
+/// Error for a non-empty but malformed number string. Mirrors real DynamoDB,
+/// which reports `The parameter cannot be converted to a numeric value: <input>`
+/// for syntactically invalid numbers, distinct from the empty-value message.
+fn numeric_value_err(s: &str) -> DynamoDbError {
+    DynamoDbError::ValidationException(format!(
+        "The parameter cannot be converted to a numeric value: {s}"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +249,38 @@ mod tests {
     #[test]
     fn negative_decimal() {
         assert_eq!(validate_and_normalize_number("-0.5").unwrap(), "-0.5");
+    }
+
+    #[test]
+    fn rejects_surrounding_whitespace() {
+        // DynamoDB does not trim; whitespace makes the value malformed.
+        assert!(validate_and_normalize_number(" 5").is_err());
+        assert!(validate_and_normalize_number("5 ").is_err());
+        assert!(validate_and_normalize_number("1 5").is_err());
+    }
+
+    #[test]
+    fn rejects_bare_dot() {
+        assert!(validate_and_normalize_number(".").is_err());
+        assert!(validate_and_normalize_number("+.").is_err());
+    }
+
+    #[test]
+    fn malformed_uses_numeric_value_message() {
+        for bad in [
+            "+e2", "1+2", "1.2.3", "0x5", "NaN", "Infinity", "1_000", "1e",
+        ] {
+            let err = validate_and_normalize_number(bad).unwrap_err();
+            assert!(
+                err.to_string().contains("numeric value"),
+                "expected numeric-value message for {bad:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_uses_empty_value_message() {
+        let err = validate_and_normalize_number("").unwrap_err();
+        assert!(err.to_string().contains("Supplied AttributeValue is empty"));
     }
 }

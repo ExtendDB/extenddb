@@ -26,7 +26,8 @@ async fn set_arithmetic_decrement() {
     c.update_item()
         .table_name(table)
         .set_key(Some(key.clone()))
-        .update_expression("SET counter = counter - :dec")
+        .update_expression("SET #c = #c - :dec")
+        .expression_attribute_names("#c", "counter")
         .expression_attribute_values(":dec", n(3))
         .send()
         .await

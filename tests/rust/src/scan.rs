@@ -244,3 +244,83 @@ async fn scan_with_multiple_filters() {
     // Even items with idx > 10: items 12, 14, 16, 18
     assert_eq!(resp.count(), 4);
 }
+
+/// Scan filter `contains` over a Binary (B) attribute performs a contiguous
+/// byte-substring match, matching DynamoDB. Regression for the previously
+/// missing (B, B) arm which returned no matches for any binary operand.
+#[tokio::test]
+async fn scan_filter_contains_binary() {
+    use aws_sdk_dynamodb::types::{
+        AttributeDefinition, BillingMode, KeySchemaElement, KeyType, ScalarAttributeType,
+    };
+    let c = client();
+    let table = format!("ScanBinContains_{}", ts());
+    c.create_table()
+        .table_name(&table)
+        .billing_mode(BillingMode::PayPerRequest)
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name(HASH_KEY_S)
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name(HASH_KEY_S)
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    wait_for_active(c, &table).await;
+
+    // i1 = b"hello", i2 = b"world"
+    for (k, v) in [("i1", "hello"), ("i2", "world")] {
+        let mut item = std::collections::HashMap::new();
+        item.insert(HASH_KEY_S.into(), s(k));
+        item.insert("blob".into(), b(v));
+        c.put_item()
+            .table_name(&table)
+            .set_item(Some(item))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // contains(blob, b"ell") -> only i1 ("hello" contains "ell")
+    let resp = c
+        .scan()
+        .table_name(&table)
+        .filter_expression("contains(#b, :sub)")
+        .expression_attribute_names("#b", "blob")
+        .expression_attribute_values(":sub", b("ell"))
+        .send()
+        .await
+        .unwrap();
+    let keys: Vec<&str> = resp
+        .items()
+        .iter()
+        .map(|i| i.get(HASH_KEY_S).unwrap().as_s().unwrap().as_str())
+        .collect();
+    assert_eq!(keys, vec!["i1"], "CONTAINS b\"ell\" should match only i1");
+
+    // NOT_CONTAINS(blob, b"ell") -> only i2
+    let resp = c
+        .scan()
+        .table_name(&table)
+        .filter_expression("NOT contains(#b, :sub)")
+        .expression_attribute_names("#b", "blob")
+        .expression_attribute_values(":sub", b("ell"))
+        .send()
+        .await
+        .unwrap();
+    let keys: Vec<&str> = resp
+        .items()
+        .iter()
+        .map(|i| i.get(HASH_KEY_S).unwrap().as_s().unwrap().as_str())
+        .collect();
+    assert_eq!(keys, vec!["i2"], "NOT contains b\"ell\" should match only i2");
+}

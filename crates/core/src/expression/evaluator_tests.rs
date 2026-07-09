@@ -172,6 +172,30 @@ fn contains_string_substring() {
 }
 
 #[test]
+fn contains_binary_substring() {
+    // Binary CONTAINS is a contiguous byte-substring check, mirroring String.
+    let mut item = BTreeMap::new();
+    item.insert("blob".into(), AttributeValue::B(b"hello".to_vec()));
+
+    let check = |sub: &[u8]| {
+        let mut values = HashMap::new();
+        values.insert("s".into(), AttributeValue::B(sub.to_vec()));
+        eval("contains(blob, :s)", &item, HashMap::new(), values).unwrap()
+    };
+
+    assert!(check(b"ell"), "contiguous substring should match");
+    assert!(check(b"lo"), "suffix should match");
+    assert!(check(b"hello"), "full value should match");
+    assert!(check(b""), "empty operand matches any binary");
+    assert!(!check(b"hlo"), "non-contiguous bytes must not match");
+    assert!(!check(b"xyz"), "absent bytes must not match");
+    assert!(
+        !check(b"hellox"),
+        "operand longer than value must not match"
+    );
+}
+
+#[test]
 fn contains_duplicate_operand_rejected() {
     let item = simple_item();
     let result = eval(

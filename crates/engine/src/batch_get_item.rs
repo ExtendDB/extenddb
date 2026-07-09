@@ -10,7 +10,7 @@ use serde_json::Value;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::Projection;
 use extenddb_core::types::{BatchGetItemInput, BatchGetItemOutput, Item, item_size_bytes};
-use extenddb_core::validation::validate_batch_key_only;
+use extenddb_core::validation::{validate_batch_key_only, validate_key_sizes};
 
 use crate::OperationContext;
 use crate::capacity_helpers;
@@ -91,21 +91,11 @@ pub async fn handle_batch_get_item(
         ));
     }
 
-    let mut responses: HashMap<String, Vec<Item>> = HashMap::new();
-    let mut total_rcu: f64 = 0.0;
-    let mut total_pre_proj_bytes: usize = 0;
-    let mut returned_count: u64 = 0;
-    let mut per_table_rcu: HashMap<String, f64> = HashMap::new();
-
+    // Validate every table's projection and duplicate keys before
+    // any existence lookup (Amazon DynamoDB validates the whole request first).
+    // Compiled projections are reused below; per-key schema check stays in the loop.
+    let mut table_projections: HashMap<String, Option<Projection>> = HashMap::new();
     for (table_name, ka) in &input.request_items {
-        let key_info = ctx
-            .storage
-            .table_key_info(&ctx.account_id, table_name)
-            .await
-            .map_err(storage_err_to_dynamo)?;
-
-        // Parse per-table projection. AttributesToGet is desugared into a
-        // ProjectionExpression with synthetic name placeholders.
         extenddb_core::expression::validate_expression_param_usage(
             ka.expression_attribute_names.as_ref(),
             ka.projection_expression
@@ -173,16 +163,38 @@ pub async fn handle_batch_get_item(
             )?;
         }
 
-        let mut table_items: Vec<Item> = Vec::new();
+        // Reject duplicate keys (pre-existence on Amazon DynamoDB).
         let mut seen_keys: HashSet<Vec<u8>> = HashSet::with_capacity(ka.keys.len());
         for key in &ka.keys {
-            let key_bytes = serialize_key_for_dedup(key);
-            if !seen_keys.insert(key_bytes) {
+            if !seen_keys.insert(serialize_key_for_dedup(key)) {
                 return Err(DynamoDbError::ValidationException(
                     "Provided list of item keys contains duplicates".to_owned(),
                 ));
             }
+        }
+
+        table_projections.insert(table_name.clone(), projection);
+    }
+
+    let mut responses: HashMap<String, Vec<Item>> = HashMap::new();
+    let mut total_rcu: f64 = 0.0;
+    let mut total_pre_proj_bytes: usize = 0;
+    let mut returned_count: u64 = 0;
+    let mut per_table_rcu: HashMap<String, f64> = HashMap::new();
+
+    for (table_name, ka) in &input.request_items {
+        let key_info = ctx
+            .storage
+            .table_key_info(&ctx.account_id, table_name)
+            .await
+            .map_err(storage_err_to_dynamo)?;
+
+        let projection = table_projections.get(table_name).and_then(Option::as_ref);
+
+        let mut table_items: Vec<Item> = Vec::new();
+        for key in &ka.keys {
             validate_batch_key_only(key, &key_info.key_schema, &key_info.attribute_definitions)?;
+            validate_key_sizes(key, &key_info.key_schema, &ctx.limits)?;
 
             if let Some(item) = ctx
                 .storage
@@ -197,7 +209,7 @@ pub async fn handle_batch_get_item(
                 *per_table_rcu.entry(table_name.clone()).or_default() += item_rcu;
                 total_pre_proj_bytes += size;
                 returned_count += 1;
-                let item = if let Some(ref projection) = projection {
+                let item = if let Some(projection) = projection {
                     projection.apply(&item)
                 } else {
                     item

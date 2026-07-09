@@ -412,6 +412,11 @@ fn format_attribute_value(val: &AttributeValue) -> String {
 fn contains_check(container: &AttributeValue, operand: &AttributeValue) -> bool {
     match (container, operand) {
         (AttributeValue::S(s), AttributeValue::S(sub)) => s.contains(sub.as_str()),
+        (AttributeValue::B(bytes), AttributeValue::B(sub)) => {
+            sub.is_empty()
+                || (sub.len() <= bytes.len()
+                    && bytes.windows(sub.len()).any(|w| w == sub.as_slice()))
+        }
         (AttributeValue::SS(set), AttributeValue::S(val))
         | (AttributeValue::NS(set), AttributeValue::N(val)) => set.contains(val),
         (AttributeValue::BS(set), AttributeValue::B(val)) => set.contains(val),

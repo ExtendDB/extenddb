@@ -293,11 +293,42 @@ pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbErr
         ));
     }
 
+    // A key condition may only reference a top-level key attribute. Any document
+    // path (`attr.sub` or `attr[i]`) on a key is rejected, matching Amazon
+    // DynamoDB. Runs after the reserved-word check and before key-schema checks.
+    for clause in &clauses {
+        reject_nested_key_path(raw_clause_path(clause))?;
+    }
+
     match clauses.len() {
         1 => classify_single(clauses.remove(0)),
         2 => classify_pair(clauses.remove(0), clauses.remove(0)),
         _ => classify_multi(clauses),
     }
+}
+
+/// The attribute-side path of a raw clause.
+fn raw_clause_path(clause: &RawClause) -> &[PathElement] {
+    match clause {
+        RawClause::Eq(path, _)
+        | RawClause::Compare(path, _, _)
+        | RawClause::Between(path, _, _)
+        | RawClause::BeginsWith(path, _) => path,
+    }
+}
+
+/// Reject any key path that is not a single top-level attribute.
+///
+/// `parse_path` always emits an `Attribute` (or `#name`) as element 0, so a path
+/// can never start with an `Index` or be empty: the length is the real
+/// discriminator. The element check is defensive against future AST changes.
+fn reject_nested_key_path(path: &[PathElement]) -> Result<(), DynamoDbError> {
+    if path.len() == 1 && matches!(path.first(), Some(PathElement::Attribute(_))) {
+        return Ok(());
+    }
+    Err(validation_err(
+        "Invalid KeyConditionExpression: KeyConditionExpressions cannot have conditions on nested attributes",
+    ))
 }
 
 /// A raw parsed clause before we know if it's PK or SK.
@@ -882,5 +913,82 @@ mod tests {
             kc.extra_sk_conditions[0].0,
             vec![PathElement::Attribute("sk2".to_owned())]
         );
+    }
+
+    const NESTED_KEY_ERR: &str = "Invalid KeyConditionExpression: KeyConditionExpressions cannot have conditions on nested attributes";
+
+    #[test]
+    fn nested_dot_path_on_key_rejected() {
+        for expr in [
+            "pk.foo = :v",
+            "pk = :p AND sk.foo = :v",
+            "begins_with(sk.foo, :v)",
+            "foo.bar = :v",
+        ] {
+            let tokens = tokenize(expr).unwrap();
+            let err = parse_key_condition(&tokens).unwrap_err();
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg) if msg == NESTED_KEY_ERR),
+                "expr {expr}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_path_in_all_clause_shapes_rejected() {
+        // Exercises every `raw_clause_path` arm (Compare/Between/BeginsWith) and a
+        // 3-clause multi-part shape with a nested middle clause. Multi-part keys
+        // are an ExtendDB extension real DynamoDB cannot express, hence a
+        // parser-level test. The reject loop runs before classification, so a
+        // nested clause in any position is rejected up front.
+        for expr in [
+            "pk.foo > :v",                            // single non-eq (Compare arm)
+            "pk = :p AND sk.foo BETWEEN :a AND :b",   // Between arm
+            "pk = :p AND begins_with(sk[0], :v)",     // BeginsWith arm, index
+            "pk = :p AND :v < sk.foo",                // reversed value-first
+            "pk1 = :v1 AND pk2.x = :v2 AND sk = :v3", // multi-part, nested middle
+        ] {
+            let tokens = tokenize(expr).unwrap();
+            let err = parse_key_condition(&tokens).unwrap_err();
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg) if msg == NESTED_KEY_ERR),
+                "expr {expr}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn index_path_on_key_rejected() {
+        for expr in ["pk[0] = :v", "pk = :p AND sk[0] = :v"] {
+            let tokens = tokenize(expr).unwrap();
+            let err = parse_key_condition(&tokens).unwrap_err();
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg) if msg == NESTED_KEY_ERR),
+                "expr {expr}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_path_via_name_placeholder_rejected() {
+        // The check is structural (path length), so it fires before #name
+        // resolution.
+        let tokens = tokenize("#d.foo = :v").unwrap();
+        let err = parse_key_condition(&tokens).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg) if msg == NESTED_KEY_ERR),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn top_level_key_paths_accepted() {
+        for expr in ["pk = :v", "pk = :p AND sk = :s", "#pk = :p AND #sk = :s"] {
+            let tokens = tokenize(expr).unwrap();
+            assert!(
+                parse_key_condition(&tokens).is_ok(),
+                "expr {expr} should parse"
+            );
+        }
     }
 }

@@ -123,7 +123,6 @@ impl PostgresEngine {
                     &projected,
                     index_key_schema,
                     base_key_schema,
-                    attr_defs,
                     &idx_sks,
                     &base_sks,
                 )

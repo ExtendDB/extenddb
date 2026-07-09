@@ -38,104 +38,8 @@ pub async fn handle_scan(
 ) -> Result<DispatchResult, DynamoDbError> {
     let input: ScanInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
-    // P118: Fetch key_info first so we can use table_id for index lookup.
-    let key_info = ctx
-        .table_key_info(&input.table_name)
-        .await
-        .map_err(storage_err_to_dynamo)?;
-
-    // GSI/LSI: resolve index metadata if scanning a secondary index.
-    // Uses table_id from pre-fetched key_info to skip redundant table lookup (P118 #4).
-    let index_info = if let Some(ref idx_name) = input.index_name {
-        Some(
-            ctx.storage
-                .index_info_by_table_id(&key_info.table_id, idx_name)
-                .await
-                .map_err(storage_err_to_dynamo)?,
-        )
-    } else {
-        None
-    };
-
-    // ConsistentRead is not supported on GSI scans (tenet 1: fidelity).
-    if input.consistent_read == Some(true)
-        && let Some(ref idx) = index_info
-        && idx.index_type == IndexType::Gsi
-    {
-        return Err(DynamoDbError::ValidationException(
-            "Consistent reads are not supported on global secondary indexes".to_owned(),
-        ));
-    }
-
-    // Validate Segment/TotalSegments — DynamoDB returns different messages per direction
-    match (input.segment, input.total_segments) {
-        (Some(_), None) => {
-            return Err(DynamoDbError::ValidationException(
-                "The TotalSegments parameter is required but was not present in the request when Segment parameter is present"
-                    .to_owned(),
-            ));
-        }
-        (None, Some(_)) => {
-            return Err(DynamoDbError::ValidationException(
-                "The Segment parameter is required but was not present in the request when parameter TotalSegments is present"
-                    .to_owned(),
-            ));
-        }
-        (Some(seg), Some(total)) => {
-            if total < 1 {
-                return Err(DynamoDbError::ValidationException(
-                    "The parameter TotalSegments should be greater than or equal to 1".to_owned(),
-                ));
-            }
-            if total > 1_000_000 {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "1 validation error detected: Value '{total}' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"
-                )));
-            }
-            if seg < 0 {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0"
-                )));
-            }
-            if seg > 999_999 {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value less than or equal to 999999"
-                )));
-            }
-            if seg >= total {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "The Segment parameter is zero-based and must be less than parameter TotalSegments: \
-                     Segment: {seg} is not less than TotalSegments: {total}"
-                )));
-            }
-        }
-        (None, None) => {}
-    }
-
-    // Validate Limit >= 1
-    if let Some(limit) = input.limit
-        && limit < 1
-    {
-        return Err(DynamoDbError::ValidationException(format!(
-            "1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
-        )));
-    }
-
-    // For index scans, build a key_info that reflects the index's key schema.
-    let scan_key_info = if let Some(ref idx) = index_info {
-        TableKeyInfo {
-            table_name: key_info.table_name.clone(),
-            account_id: key_info.account_id.clone(),
-            table_id: key_info.table_id.clone(),
-            key_schema: idx.key_schema.clone(),
-            base_key_schema: key_info.key_schema.clone(),
-            attribute_definitions: key_info.attribute_definitions.clone(),
-            has_lsi: key_info.has_lsi,
-            stream_specification: None, // Scans don't capture stream records
-        }
-    } else {
-        key_info.clone()
-    };
+    // Validate Filter/Projection expressions before the existence
+    // check; index resolution, Segment/Limit/Select and key checks stay after.
 
     // --- Legacy vs expression mutual exclusivity checks ---
     let has_fe = input.filter_expression.is_some();
@@ -250,6 +154,21 @@ pub async fn handle_scan(
         None => None,
     };
 
+    // Validate Select vs ProjectionExpression and index requirements (shared
+    // with Query so both reject the same combinations identically).
+    extenddb_core::validation::validate_select_projection(
+        input.select,
+        input
+            .projection_expression
+            .as_deref()
+            .is_some_and(|s| !s.is_empty()),
+        input
+            .attributes_to_get
+            .as_ref()
+            .is_some_and(|a| !a.is_empty()),
+        input.index_name.is_some(),
+    )?;
+
     // Validate unused expression attributes
     {
         let exprs: Vec<&extenddb_core::expression::Expr> = filter.iter().collect();
@@ -274,6 +193,105 @@ pub async fn handle_scan(
             &std::collections::HashSet::new(),
         )?;
     }
+
+    // P118: Fetch key_info first so we can use table_id for index lookup.
+    let key_info = ctx
+        .table_key_info(&input.table_name)
+        .await
+        .map_err(storage_err_to_dynamo)?;
+
+    // GSI/LSI: resolve index metadata if scanning a secondary index.
+    // Uses table_id from pre-fetched key_info to skip redundant table lookup (P118 #4).
+    let index_info = if let Some(ref idx_name) = input.index_name {
+        Some(
+            ctx.storage
+                .index_info_by_table_id(&key_info.table_id, idx_name)
+                .await
+                .map_err(storage_err_to_dynamo)?,
+        )
+    } else {
+        None
+    };
+
+    // ConsistentRead is not supported on GSI scans (tenet 1: fidelity).
+    if input.consistent_read == Some(true)
+        && let Some(ref idx) = index_info
+        && idx.index_type == IndexType::Gsi
+    {
+        return Err(DynamoDbError::ValidationException(
+            "Consistent reads are not supported on global secondary indexes".to_owned(),
+        ));
+    }
+
+    // Validate Segment/TotalSegments — DynamoDB returns different messages per direction
+    match (input.segment, input.total_segments) {
+        (Some(_), None) => {
+            return Err(DynamoDbError::ValidationException(
+                "The TotalSegments parameter is required but was not present in the request when Segment parameter is present"
+                    .to_owned(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(DynamoDbError::ValidationException(
+                "The Segment parameter is required but was not present in the request when parameter TotalSegments is present"
+                    .to_owned(),
+            ));
+        }
+        (Some(seg), Some(total)) => {
+            if total < 1 {
+                return Err(DynamoDbError::ValidationException(
+                    "The parameter TotalSegments should be greater than or equal to 1".to_owned(),
+                ));
+            }
+            if total > 1_000_000 {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "1 validation error detected: Value '{total}' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"
+                )));
+            }
+            if seg < 0 {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0"
+                )));
+            }
+            if seg > 999_999 {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value less than or equal to 999999"
+                )));
+            }
+            if seg >= total {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "The Segment parameter is zero-based and must be less than parameter TotalSegments: \
+                     Segment: {seg} is not less than TotalSegments: {total}"
+                )));
+            }
+        }
+        (None, None) => {}
+    }
+
+    // Validate Limit >= 1
+    if let Some(limit) = input.limit
+        && limit < 1
+    {
+        return Err(DynamoDbError::ValidationException(format!(
+            "1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
+        )));
+    }
+
+    // For index scans, build a key_info that reflects the index's key schema.
+    let scan_key_info = if let Some(ref idx) = index_info {
+        TableKeyInfo {
+            table_name: key_info.table_name.clone(),
+            account_id: key_info.account_id.clone(),
+            table_id: key_info.table_id.clone(),
+            key_schema: idx.key_schema.clone(),
+            base_key_schema: key_info.key_schema.clone(),
+            attribute_definitions: key_info.attribute_definitions.clone(),
+            has_lsi: key_info.has_lsi,
+            stream_specification: None, // Scans don't capture stream records
+        }
+    } else {
+        key_info.clone()
+    };
 
     // Validate Select vs ProjectionExpression and index requirements
     if let Some(Select::AllProjectedAttributes) = input.select

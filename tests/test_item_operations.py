@@ -965,6 +965,161 @@ class TestEmptyKeyRejection:
 
 
 # ---------------------------------------------------------------------------
+# Primary-key size limit (hash > 2048 bytes, range > 1024 bytes)
+# ---------------------------------------------------------------------------
+
+_HASH_MAX = 2048
+_RANGE_MAX = 1024
+_HASH_TOO_BIG = "a" * (_HASH_MAX + 1)
+_HASH_AT_LIMIT = "a" * _HASH_MAX
+_RANGE_TOO_BIG = "b" * (_RANGE_MAX + 1)
+_RANGE_AT_LIMIT = "b" * _RANGE_MAX
+_HASH_MSG = "Size of hashkey has exceeded the maximum size limit"
+_RANGE_MSG = "Aggregated size of all range keys has exceeded the size limit"
+
+
+class TestPrimaryKeySizeRejection:
+    """DynamoDB rejects key values over the limit (hash 2048 B, range 1024 B).
+
+    Enforced on every key-bearing single-item / batch API. Boundary controls
+    pin that exactly-at-limit keys are accepted, and an oversized key against a
+    missing table stays ResourceNotFound (key-size is post-existence).
+    """
+
+    @pytest.fixture(scope="class")
+    def binary_hash_table(self, dynamodb_client):
+        with scoped_table(
+            dynamodb_client,
+            attribute_definitions=[{"AttributeName": "pk", "AttributeType": "B"}],
+            key_schema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        ) as name:
+            yield name
+
+    def test_get_item_rejects_oversized_hash_key(self, dynamodb_client, hash_range_table):
+        with pytest.raises(ClientError) as exc:
+            dynamodb_client.get_item(
+                TableName=hash_range_table,
+                Key={"pk": {"S": _HASH_TOO_BIG}, "sk": {"S": "s"}},
+            )
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException", err["Message"]
+        assert _HASH_MSG in err["Message"], err["Message"]
+
+    def test_get_item_rejects_oversized_range_key(self, dynamodb_client, hash_range_table):
+        with pytest.raises(ClientError) as exc:
+            dynamodb_client.get_item(
+                TableName=hash_range_table,
+                Key={"pk": {"S": "h"}, "sk": {"S": _RANGE_TOO_BIG}},
+            )
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException", err["Message"]
+        assert _RANGE_MSG in err["Message"], err["Message"]
+
+    def test_batch_get_item_rejects_oversized_hash_key(self, dynamodb_client, hash_range_table):
+        with pytest.raises(ClientError) as exc:
+            dynamodb_client.batch_get_item(
+                RequestItems={
+                    hash_range_table: {"Keys": [{"pk": {"S": _HASH_TOO_BIG}, "sk": {"S": "s"}}]}
+                }
+            )
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException", err["Message"]
+        assert _HASH_MSG in err["Message"], err["Message"]
+
+    def test_batch_get_item_rejects_oversized_range_key(self, dynamodb_client, hash_range_table):
+        with pytest.raises(ClientError) as exc:
+            dynamodb_client.batch_get_item(
+                RequestItems={
+                    hash_range_table: {"Keys": [{"pk": {"S": "h"}, "sk": {"S": _RANGE_TOO_BIG}}]}
+                }
+            )
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException", err["Message"]
+        assert _RANGE_MSG in err["Message"], err["Message"]
+
+    def test_delete_item_rejects_oversized_hash_key(self, dynamodb_client, hash_range_table):
+        with pytest.raises(ClientError) as exc:
+            dynamodb_client.delete_item(
+                TableName=hash_range_table,
+                Key={"pk": {"S": _HASH_TOO_BIG}, "sk": {"S": "s"}},
+            )
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException", err["Message"]
+        assert _HASH_MSG in err["Message"], err["Message"]
+
+    def test_update_item_rejects_oversized_range_key(self, dynamodb_client, hash_range_table):
+        with pytest.raises(ClientError) as exc:
+            dynamodb_client.update_item(
+                TableName=hash_range_table,
+                Key={"pk": {"S": "h"}, "sk": {"S": _RANGE_TOO_BIG}},
+                UpdateExpression="SET x = :v",
+                ExpressionAttributeValues={":v": {"S": "1"}},
+            )
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException", err["Message"]
+        assert _RANGE_MSG in err["Message"], err["Message"]
+
+    def test_put_item_rejects_oversized_hash_key(self, dynamodb_client, hash_range_table):
+        """Write path shares the validator; lock its wording too."""
+        with pytest.raises(ClientError) as exc:
+            dynamodb_client.put_item(
+                TableName=hash_range_table,
+                Item={"pk": {"S": _HASH_TOO_BIG}, "sk": {"S": "s"}},
+            )
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException", err["Message"]
+        assert _HASH_MSG in err["Message"], err["Message"]
+
+    def test_get_item_rejects_oversized_hash_key_hash_only(self, dynamodb_client, hash_table):
+        with pytest.raises(ClientError) as exc:
+            dynamodb_client.get_item(
+                TableName=hash_table, Key={"pk": {"S": _HASH_TOO_BIG}},
+            )
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException", err["Message"]
+        assert _HASH_MSG in err["Message"], err["Message"]
+
+    def test_get_item_rejects_oversized_binary_hash_key(self, dynamodb_client, binary_hash_table):
+        """Binary key limit is on the decoded byte length, not the base64 form."""
+        with pytest.raises(ClientError) as exc:
+            dynamodb_client.get_item(
+                TableName=binary_hash_table, Key={"pk": {"B": b"a" * (_HASH_MAX + 1)}},
+            )
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException", err["Message"]
+        assert _HASH_MSG in err["Message"], err["Message"]
+
+    def test_get_item_accepts_binary_hash_key_at_limit(self, dynamodb_client, binary_hash_table):
+        resp = dynamodb_client.get_item(
+            TableName=binary_hash_table, Key={"pk": {"B": b"a" * _HASH_MAX}},
+        )
+        assert "Item" not in resp
+
+    def test_get_item_accepts_hash_key_at_limit(self, dynamodb_client, hash_range_table):
+        resp = dynamodb_client.get_item(
+            TableName=hash_range_table,
+            Key={"pk": {"S": _HASH_AT_LIMIT}, "sk": {"S": "s"}},
+        )
+        assert "Item" not in resp
+
+    def test_get_item_accepts_range_key_at_limit(self, dynamodb_client, hash_range_table):
+        resp = dynamodb_client.get_item(
+            TableName=hash_range_table,
+            Key={"pk": {"S": "h"}, "sk": {"S": _RANGE_AT_LIMIT}},
+        )
+        assert "Item" not in resp
+
+    def test_oversized_key_on_missing_table_is_resource_not_found(self, dynamodb_client):
+        """Key-size is post-existence: a missing table wins with ResourceNotFound."""
+        with pytest.raises(ClientError) as exc:
+            dynamodb_client.get_item(
+                TableName="extenddb-test-does-not-exist-keysize",
+                Key={"pk": {"S": _HASH_TOO_BIG}, "sk": {"S": "s"}},
+            )
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+# ---------------------------------------------------------------------------
 # Duplicate values in NS and BS sets (c40478c)
 # ---------------------------------------------------------------------------
 

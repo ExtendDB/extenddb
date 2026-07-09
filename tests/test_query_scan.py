@@ -489,6 +489,87 @@ class TestQueryValidation:
             in err["Message"]
         )
 
+    # A document path (dot or index) on a key attribute in a
+    # KeyConditionExpression is rejected, matching Amazon DynamoDB.
+    _KCE_NESTED_MSG = "cannot have conditions on nested attributes"
+
+    @pytest.mark.parametrize(
+        "kce,values,names",
+        [
+            ("pk.foo = :v", {":v": {"N": "1"}}, None),
+            ("pk[0] = :v", {":v": {"N": "1"}}, None),
+            ("pk = :pk AND sk.foo = :v", {":pk": {"S": "user-1"}, ":v": {"N": "1"}}, None),
+            ("pk = :pk AND sk[0] = :v", {":pk": {"S": "user-1"}, ":v": {"N": "1"}}, None),
+            (
+                "pk = :pk AND begins_with(sk.foo, :v)",
+                {":pk": {"S": "user-1"}, ":v": {"S": "x"}},
+                None,
+            ),
+            (
+                "pk = :pk AND sk.foo BETWEEN :v AND :v2",
+                {":pk": {"S": "user-1"}, ":v": {"N": "1"}, ":v2": {"N": "9"}},
+                None,
+            ),
+            ("pk = :pk AND :v < sk.foo", {":pk": {"S": "user-1"}, ":v": {"N": "1"}}, None),
+            ("pk.foo > :v", {":v": {"N": "1"}}, None),
+            ("foo.bar = :v", {":v": {"N": "1"}}, None),
+            ("#d.foo = :v", {":v": {"N": "1"}}, {"#d": "pk"}),
+        ],
+    )
+    def test_query_kce_nested_key_path_rejected(
+        self, dynamodb_client, query_table, kce, values, names
+    ):
+        """Nested access on a key attribute in a KCE is a ValidationException."""
+        kwargs = {
+            "TableName": query_table,
+            "KeyConditionExpression": kce,
+            "ExpressionAttributeValues": values,
+        }
+        if names is not None:
+            kwargs["ExpressionAttributeNames"] = names
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.query(**kwargs)
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert self._KCE_NESTED_MSG in err["Message"]
+
+    def test_query_kce_reserved_keyword_beats_nested(self, dynamodb_client, query_table):
+        """A reserved word on the key is reported as reserved, not as nested."""
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.query(
+                TableName=query_table,
+                KeyConditionExpression="data.foo = :v",
+                ExpressionAttributeValues={":v": {"N": "1"}},
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert "reserved keyword" in err["Message"]
+        assert self._KCE_NESTED_MSG not in err["Message"]
+
+    def test_query_kce_top_level_non_key_is_schema_missed(
+        self, dynamodb_client, query_table
+    ):
+        """A top-level non-key attribute is a missed-key-schema error, not nested."""
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.query(
+                TableName=query_table,
+                KeyConditionExpression="foo = :v",
+                ExpressionAttributeValues={":v": {"N": "1"}},
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert "missed key schema element" in err["Message"]
+        assert self._KCE_NESTED_MSG not in err["Message"]
+
+    def test_query_kce_top_level_key_paths_accepted(self, dynamodb_client, query_table):
+        """Valid top-level key paths still succeed."""
+        resp = dynamodb_client.query(
+            TableName=query_table,
+            KeyConditionExpression="pk = :pk AND sk = :sk",
+            ExpressionAttributeValues={":pk": {"S": "user-1"}, ":sk": {"N": "5"}},
+        )
+        assert resp["Count"] == 1
+
 
 class TestScanValidation:
     """Scan validation edge cases from recent fixes."""
@@ -1347,3 +1428,87 @@ class TestBaseKeySchemaFlow:
         assert len(all_items) == 12
         item_keys = [(i["pk"]["S"], i["sk"]["N"]) for i in all_items]
         assert len(item_keys) == len(set(item_keys))
+
+
+
+@pytest.fixture
+def hash_only_gsi_on_composite_base(dynamodb_client):
+    """Composite-key base table (HASH+RANGE) with a hash-only GSI.
+
+    Multiple items share the same GSI hash AND the same base partition key,
+    differing only by the base sort key — the case where index rows collide on
+    (gsi_hash, base_pk) and pagination must order by the base sort key too.
+    """
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[
+            {"AttributeName": "deviceId", "AttributeType": "S"},
+            {"AttributeName": "ts", "AttributeType": "N"},
+            {"AttributeName": "status", "AttributeType": "S"},
+        ],
+        key_schema=[
+            {"AttributeName": "deviceId", "KeyType": "HASH"},
+            {"AttributeName": "ts", "KeyType": "RANGE"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "StatusGSI",
+                "KeySchema": [{"AttributeName": "status", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            },
+        ],
+    ) as name:
+        for i in range(1, 8):
+            dynamodb_client.put_item(
+                TableName=name,
+                Item={
+                    "deviceId": {"S": "d1"},
+                    "ts": {"N": str(i)},
+                    "status": {"S": "ACTIVE"},
+                },
+            )
+        yield name
+
+
+class TestHashOnlyGsiCompositeBaseScan:
+    """Scanning a hash-only GSI on a composite-key base table must not drop
+    rows that share a (gsi_hash, base_pk) prefix across page boundaries."""
+
+    def test_scan_paginate_returns_all(
+        self, dynamodb_client, hash_only_gsi_on_composite_base
+    ):
+        all_ts = []
+        exclusive_start_key = None
+        while True:
+            kwargs = {
+                "TableName": hash_only_gsi_on_composite_base,
+                "IndexName": "StatusGSI",
+                "Limit": 2,
+            }
+            if exclusive_start_key:
+                kwargs["ExclusiveStartKey"] = exclusive_start_key
+            resp = dynamodb_client.scan(**kwargs)
+            all_ts.extend(item["ts"]["N"] for item in resp["Items"])
+            if "LastEvaluatedKey" not in resp:
+                break
+            exclusive_start_key = resp["LastEvaluatedKey"]
+
+        assert len(all_ts) == 7, f"expected 7 items, got {len(all_ts)}"
+        assert sorted(all_ts, key=int) == [str(i) for i in range(1, 8)]
+
+
+def test_query_empty_key_condition_expression_rejected(dynamodb_client):
+    """Query with an explicitly empty KeyConditionExpression is a ValidationException.
+
+    Verified against real DynamoDB (us-east-1): the exact message is
+    "Invalid KeyConditionExpression: The expression can not be empty;".
+    """
+    with scoped_table(dynamodb_client) as name:
+        with pytest.raises(ClientError) as exc:
+            dynamodb_client.query(TableName=name, KeyConditionExpression="")
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException", err
+        assert (
+            err["Message"]
+            == "Invalid KeyConditionExpression: The expression can not be empty;"
+        ), err

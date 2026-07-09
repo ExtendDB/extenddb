@@ -25,6 +25,16 @@ where
     ProvideErrorMetadata::code(err)
 }
 
+/// Extract the DynamoDB error message from an `SdkError` (empty string if none).
+pub fn err_msg<E, R>(err: &aws_smithy_runtime_api::client::result::SdkError<E, R>) -> String
+where
+    E: ProvideErrorMetadata,
+{
+    ProvideErrorMetadata::message(err)
+        .unwrap_or_default()
+        .to_string()
+}
+
 // ========== AttributeValue constructors ==========
 
 pub fn s(val: &str) -> AttributeValue {

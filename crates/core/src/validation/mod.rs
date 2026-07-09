@@ -7,7 +7,7 @@ use crate::limits::LimitsConfig;
 use crate::types::{
     AttributeDefinition, AttributeValue, BillingMode, CreateTableInput, DeleteItemInput,
     GetItemInput, Item, KeySchemaElement, KeyType, PutItemInput, ReturnValues, ScalarAttributeType,
-    UpdateItemInput, item_size_bytes,
+    Select, UpdateItemInput, item_size_bytes,
 };
 
 /// Validate a table name per Virtual `DynamoDB` rules.
@@ -101,6 +101,79 @@ pub fn validate_create_table(
     validate_lsi_count(input, limits)?;
     validate_lsi_requires_range_key(input)?;
     validate_unique_index_names(input)?;
+    validate_index_projections(input)?;
+    validate_stream_specification(input)?;
+    Ok(())
+}
+
+/// Validate that INCLUDE-projection secondary indexes specify `NonKeyAttributes`.
+///
+/// Real `DynamoDB` rejects a GSI or LSI whose `ProjectionType` is `INCLUDE`
+/// without a non-empty `NonKeyAttributes` list, and conversely rejects a
+/// `KEYS_ONLY` or `ALL` projection that carries `NonKeyAttributes`.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` for any such index.
+fn validate_index_projections(input: &CreateTableInput) -> Result<(), DynamoDbError> {
+    use crate::types::{Projection, ProjectionType};
+
+    // Validates a single index projection against real DynamoDB rules:
+    // `INCLUDE` requires a non-empty `NonKeyAttributes`, while `KEYS_ONLY`
+    // and `ALL` must not carry `NonKeyAttributes`.
+    fn check(projection: &Projection) -> Result<(), DynamoDbError> {
+        let has_attrs = projection
+            .non_key_attributes
+            .as_ref()
+            .is_some_and(|attrs| !attrs.is_empty());
+        let message = match projection.projection_type {
+            ProjectionType::Include if !has_attrs => {
+                Some("ProjectionType is INCLUDE, but NonKeyAttributes is not specified")
+            }
+            ProjectionType::KeysOnly if has_attrs => {
+                Some("ProjectionType is KEYS_ONLY, but NonKeyAttributes is specified")
+            }
+            ProjectionType::All if has_attrs => {
+                Some("ProjectionType is ALL, but NonKeyAttributes is specified")
+            }
+            _ => None,
+        };
+        if let Some(message) = message {
+            return Err(DynamoDbError::ValidationException(format!(
+                "One or more parameter values were invalid: {message}"
+            )));
+        }
+        Ok(())
+    }
+    if let Some(gsis) = &input.global_secondary_indexes {
+        for gsi in gsis {
+            check(&gsi.projection)?;
+        }
+    }
+    if let Some(lsis) = &input.local_secondary_indexes {
+        for lsi in lsis {
+            check(&lsi.projection)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate the `StreamSpecification`: a disabled stream must not also specify a
+/// `StreamViewType`.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` when `StreamEnabled` is false
+/// but a `StreamViewType` is present.
+fn validate_stream_specification(input: &CreateTableInput) -> Result<(), DynamoDbError> {
+    if let Some(stream) = &input.stream_specification
+        && !stream.stream_enabled
+        && stream.stream_view_type.is_some()
+    {
+        return Err(DynamoDbError::ValidationException(
+            "One or more parameter values were invalid: Table is being created with a stream disabled, UpdateViewType should not be specified".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -488,6 +561,7 @@ pub fn validate_get_item(
 ) -> Result<(), DynamoDbError> {
     validate_table_name(&input.table_name, limits)?;
     validate_key_only(&input.key, key_schema, attr_defs)?;
+    validate_key_sizes(&input.key, key_schema, limits)?;
     Ok(())
 }
 
@@ -517,6 +591,7 @@ pub fn validate_delete_item(
     }
 
     validate_key_only(&input.key, key_schema, attr_defs)?;
+    validate_key_sizes(&input.key, key_schema, limits)?;
     Ok(())
 }
 
@@ -536,6 +611,7 @@ pub fn validate_update_item(
 ) -> Result<(), DynamoDbError> {
     validate_table_name(&input.table_name, limits)?;
     validate_key_only(&input.key, key_schema, attr_defs)?;
+    validate_key_sizes(&input.key, key_schema, limits)?;
 
     if let Some(updates) = &input.attribute_updates {
         validate_attribute_values_nesting_depth(updates.values().filter_map(|u| u.value.as_ref()))?;
@@ -661,9 +737,7 @@ pub fn validate_batch_item_keys(
 /// message.
 fn remap_key_type_mismatch(err: DynamoDbError) -> DynamoDbError {
     match &err {
-        DynamoDbError::ValidationException(msg)
-            if msg.contains("Type mismatch for key attribute") =>
-        {
+        DynamoDbError::ValidationException(msg) if msg.contains("Type mismatch for key ") => {
             DynamoDbError::ValidationException(
                 "The provided key element does not match the schema".to_owned(),
             )
@@ -700,8 +774,9 @@ fn validate_key_attribute_type(
             ScalarAttributeType::N => "N",
             ScalarAttributeType::B => "B",
         };
+        let actual_tag = attribute_value_type_tag(value);
         return Err(DynamoDbError::ValidationException(format!(
-            "One or more parameter values were invalid: Type mismatch for key attribute {attr_name}: expected: {type_char}"
+            "One or more parameter values were invalid: Type mismatch for key {attr_name} expected: {type_char} actual: {actual_tag}"
         )));
     }
 
@@ -736,6 +811,211 @@ fn validate_no_empty_key_value(
     Ok(())
 }
 
+/// A secondary index's name and key schema, for index-key validation.
+///
+/// Decouples [`validate_index_keys`] from the storage layer's index metadata
+/// type: callers build these refs from whatever index representation they hold.
+pub struct IndexKeyRef<'a> {
+    pub index_name: &'a str,
+    pub key_schema: &'a [KeySchemaElement],
+}
+
+/// The `DynamoDB` type tag for an `AttributeValue`, used in `Actual: <tag>`
+/// error text (e.g. `N`, `L`, `BOOL`).
+fn attribute_value_type_tag(v: &AttributeValue) -> &'static str {
+    match v {
+        AttributeValue::S(_) => "S",
+        AttributeValue::N(_) => "N",
+        AttributeValue::B(_) => "B",
+        AttributeValue::SS(_) => "SS",
+        AttributeValue::NS(_) => "NS",
+        AttributeValue::BS(_) => "BS",
+        AttributeValue::Bool(_) => "BOOL",
+        AttributeValue::Null => "NULL",
+        AttributeValue::L(_) => "L",
+        AttributeValue::M(_) => "M",
+    }
+}
+
+/// The scalar type tag (`S`, `N`, or `B`) for a declared attribute type.
+fn scalar_type_tag(t: ScalarAttributeType) -> &'static str {
+    match t {
+        ScalarAttributeType::S => "S",
+        ScalarAttributeType::N => "N",
+        ScalarAttributeType::B => "B",
+    }
+}
+
+/// Context for a secondary-index empty-key error, selecting the message form.
+#[derive(Debug, Clone, Copy)]
+pub enum SecondaryIndexEmptyContext {
+    /// The value came directly from a written item (PutItem / Put transaction).
+    Item,
+    /// The value was produced by an UpdateExpression (Update transaction).
+    UpdateExpression,
+}
+
+/// Validate that secondary-index key attributes present in `item` match their
+/// declared scalar type.
+///
+/// Indexes are checked in name order, so when an attribute keys more than one
+/// index the alphabetically-first index name is the one reported (matching
+/// observed `DynamoDB` behaviour).
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` on the first index key attribute
+/// whose value type does not match its declared scalar type.
+pub fn validate_index_key_types(
+    item: &Item,
+    indexes: &[IndexKeyRef<'_>],
+    attr_defs: &[AttributeDefinition],
+) -> Result<(), DynamoDbError> {
+    for idx in ordered_indexes(indexes) {
+        for ks in idx.key_schema {
+            let Some(value) = item.get(&ks.attribute_name) else {
+                continue;
+            };
+            let Some(expected) = attr_defs
+                .iter()
+                .find(|ad| ad.attribute_name == ks.attribute_name)
+                .map(|ad| ad.attribute_type)
+            else {
+                continue;
+            };
+            let matches = matches!(
+                (expected, value),
+                (ScalarAttributeType::S, AttributeValue::S(_))
+                    | (ScalarAttributeType::N, AttributeValue::N(_))
+                    | (ScalarAttributeType::B, AttributeValue::B(_))
+            );
+            if !matches {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "One or more parameter values were invalid: Type mismatch for Index Key {} Expected: {} Actual: {} IndexName: {}",
+                    ks.attribute_name,
+                    scalar_type_tag(expected),
+                    attribute_value_type_tag(value),
+                    idx.index_name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate that no secondary-index key attribute in `item` is an empty string
+/// or empty binary value.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` naming the alphabetically-first
+/// index for the first empty index key attribute found. The message form is
+/// selected by `ctx`.
+pub fn validate_index_key_not_empty(
+    item: &Item,
+    indexes: &[IndexKeyRef<'_>],
+    ctx: SecondaryIndexEmptyContext,
+) -> Result<(), DynamoDbError> {
+    for idx in ordered_indexes(indexes) {
+        for ks in idx.key_schema {
+            let Some(value) = item.get(&ks.attribute_name) else {
+                continue;
+            };
+            let empty = matches!(value, AttributeValue::S(s) if s.is_empty())
+                || matches!(value, AttributeValue::B(b) if b.is_empty());
+            if empty {
+                let msg = match ctx {
+                    SecondaryIndexEmptyContext::Item => format!(
+                        "One or more parameter values are not valid. A value specified for a secondary index key is not supported. \
+                         The AttributeValue for a key attribute cannot contain an empty string value. IndexName: {}, IndexKey: {}",
+                        idx.index_name, ks.attribute_name
+                    ),
+                    SecondaryIndexEmptyContext::UpdateExpression =>
+                        "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. \
+                         The AttributeValue for a key attribute cannot contain an empty string value."
+                            .to_owned(),
+                };
+                return Err(DynamoDbError::ValidationException(msg));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate secondary-index key attributes for a written item: scalar type match
+/// first, then non-empty. Convenience wrapper over [`validate_index_key_types`]
+/// and [`validate_index_key_not_empty`] for the PutItem / BatchWriteItem paths,
+/// where both faults are reported as a top-level `ValidationException`.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` on the first offending index key.
+pub fn validate_index_keys(
+    item: &Item,
+    indexes: &[IndexKeyRef<'_>],
+    attr_defs: &[AttributeDefinition],
+) -> Result<(), DynamoDbError> {
+    validate_index_key_types(item, indexes, attr_defs)?;
+    validate_index_key_not_empty(item, indexes, SecondaryIndexEmptyContext::Item)
+}
+
+/// Indexes sorted by name, so the alphabetically-first index that uses a
+/// violating attribute is the one reported.
+fn ordered_indexes<'b, 'a>(indexes: &'b [IndexKeyRef<'a>]) -> Vec<&'b IndexKeyRef<'a>> {
+    let mut ordered: Vec<&IndexKeyRef<'_>> = indexes.iter().collect();
+    ordered.sort_by(|a, b| a.index_name.cmp(b.index_name));
+    ordered
+}
+
+/// Validate the `Select` value against `ProjectionExpression` / `AttributesToGet`
+/// presence and `IndexName`. Shared by Query and Scan so both reject the same
+/// invalid combinations with the same messages.
+///
+/// Rules (matching real DynamoDB, in this order):
+/// 1. A `ProjectionExpression` with `ALL_ATTRIBUTES`, `ALL_PROJECTED_ATTRIBUTES`,
+///    or `COUNT` is rejected (reported before the `IndexName` requirement).
+/// 2. `SPECIFIC_ATTRIBUTES` requires a `ProjectionExpression` (or legacy
+///    `AttributesToGet`).
+/// 3. `ALL_PROJECTED_ATTRIBUTES` requires an `IndexName`.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` for any of the above.
+pub fn validate_select_projection(
+    select: Option<Select>,
+    has_projection: bool,
+    has_attributes_to_get: bool,
+    has_index_name: bool,
+) -> Result<(), DynamoDbError> {
+    if has_projection {
+        let incompatible = match select {
+            Some(Select::AllAttributes) => Some("ALL_ATTRIBUTES"),
+            Some(Select::AllProjectedAttributes) => Some("ALL_PROJECTED_ATTRIBUTES"),
+            Some(Select::Count) => Some("only the Count"),
+            _ => None,
+        };
+        if let Some(what) = incompatible {
+            return Err(DynamoDbError::ValidationException(format!(
+                "Cannot specify the ProjectionExpression when choosing to get {what}"
+            )));
+        }
+    }
+    if matches!(select, Some(Select::SpecificAttributes))
+        && !has_projection
+        && !has_attributes_to_get
+    {
+        return Err(DynamoDbError::ValidationException(
+            "Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES".to_owned(),
+        ));
+    }
+    if matches!(select, Some(Select::AllProjectedAttributes)) && !has_index_name {
+        return Err(DynamoDbError::ValidationException(
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate partition key and sort key sizes against limits.
 ///
 /// # Errors
@@ -750,15 +1030,24 @@ pub fn validate_key_sizes(
         if let Some(value) = item.get(&ks.attribute_name) {
             validate_no_empty_key_value(&ks.attribute_name, value)?;
             let size = key_value_byte_size(value);
-            let (max_size, key_label) = match ks.key_type {
-                KeyType::Hash => (limits.max_partition_key_size_bytes, "partition key"),
-                KeyType::Range => (limits.max_sort_key_size_bytes, "sort key"),
+            let max_size = match ks.key_type {
+                KeyType::Hash => limits.max_partition_key_size_bytes,
+                KeyType::Range => limits.max_sort_key_size_bytes,
             };
             if size > max_size {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "One or more parameter values are not valid. \
-                     The {key_label} size must be between 1 and {max_size} bytes"
-                )));
+                // Hash and range use different wording, matching Amazon
+                // DynamoDB (the hash variant has no space before the size).
+                let msg = match ks.key_type {
+                    KeyType::Hash => format!(
+                        "One or more parameter values were invalid: \
+                         Size of hashkey has exceeded the maximum size limit of{max_size} bytes"
+                    ),
+                    KeyType::Range => format!(
+                        "One or more parameter values were invalid: \
+                         Aggregated size of all range keys has exceeded the size limit of {max_size} bytes"
+                    ),
+                };
+                return Err(DynamoDbError::ValidationException(msg));
             }
         }
     }
@@ -766,6 +1055,10 @@ pub fn validate_key_sizes(
 }
 
 /// Get the byte size of a key attribute value.
+///
+/// For `N` keys this uses the digit-string length. Amazon DynamoDB caps a
+/// number at 38 significant digits, so the string length is always far below
+/// the key-size limit and the proxy is exact for the rejection decision.
 fn key_value_byte_size(value: &AttributeValue) -> usize {
     match value {
         AttributeValue::S(s) => s.len(),
@@ -1195,6 +1488,78 @@ mod tests {
     }
 
     #[test]
+    fn validate_key_sizes_rejects_oversized_hash_key() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        let big = "a".repeat(limits.max_partition_key_size_bytes + 1);
+        item.insert("pk".to_owned(), AttributeValue::S(big));
+        let err = validate_key_sizes(&item, &[make_ks("pk", KeyType::Hash)], &limits).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Size of hashkey has exceeded the maximum size limit"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_key_sizes_rejects_oversized_range_key() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        let big = "b".repeat(limits.max_sort_key_size_bytes + 1);
+        item.insert("sk".to_owned(), AttributeValue::S(big));
+        let err = validate_key_sizes(&item, &[make_ks("sk", KeyType::Range)], &limits).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Aggregated size of all range keys has exceeded the size limit"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_key_sizes_accepts_key_at_limit() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        item.insert(
+            "pk".to_owned(),
+            AttributeValue::S("a".repeat(limits.max_partition_key_size_bytes)),
+        );
+        assert!(validate_key_sizes(&item, &[make_ks("pk", KeyType::Hash)], &limits).is_ok());
+    }
+
+    #[test]
+    fn validate_key_sizes_hash_message_matches_amazon_dynamodb() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        item.insert(
+            "pk".to_owned(),
+            AttributeValue::S("a".repeat(limits.max_partition_key_size_bytes + 1)),
+        );
+        let err = validate_key_sizes(&item, &[make_ks("pk", KeyType::Hash)], &limits).unwrap_err();
+        // Exact wording, including Amazon DynamoDB's missing space before the size.
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: \
+             Size of hashkey has exceeded the maximum size limit of2048 bytes"
+        );
+    }
+
+    #[test]
+    fn validate_key_sizes_range_message_matches_amazon_dynamodb() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        item.insert(
+            "sk".to_owned(),
+            AttributeValue::S("b".repeat(limits.max_sort_key_size_bytes + 1)),
+        );
+        let err = validate_key_sizes(&item, &[make_ks("sk", KeyType::Range)], &limits).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: \
+             Aggregated size of all range keys has exceeded the size limit of 1024 bytes"
+        );
+    }
+
+    #[test]
     fn validate_key_only_rejects_empty_binary_key() {
         let mut key = Item::new();
         key.insert("pk".to_owned(), AttributeValue::B(Vec::new()));
@@ -1437,5 +1802,331 @@ mod tests {
                 .contains("Nesting Levels have exceeded supported limits"),
             "unexpected error: {err}"
         );
+    }
+
+    fn idx<'a>(name: &'a str, attr: &'a str) -> (String, Vec<KeySchemaElement>) {
+        (name.to_owned(), vec![make_ks(attr, KeyType::Hash)])
+    }
+
+    #[test]
+    fn index_key_type_mismatch_names_alphabetically_first_index() {
+        // lsi1sk keys both gsi1 and lsi1; declared S but written as N.
+        let owned = [idx("lsi1", "lsi1sk"), idx("gsi1", "lsi1sk")];
+        let refs: Vec<IndexKeyRef<'_>> = owned
+            .iter()
+            .map(|(n, ks)| IndexKeyRef {
+                index_name: n,
+                key_schema: ks,
+            })
+            .collect();
+        let attr_defs = vec![make_ad("lsi1sk", ScalarAttributeType::S)];
+        let mut item = Item::new();
+        item.insert("lsi1sk".to_owned(), AttributeValue::N("5".to_owned()));
+
+        let err = validate_index_key_types(&item, &refs, &attr_defs).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: Type mismatch for Index Key lsi1sk Expected: S Actual: N IndexName: gsi1"
+        );
+    }
+
+    #[test]
+    fn select_projection_incompatible_messages() {
+        let cases = [
+            (Select::AllAttributes, "ALL_ATTRIBUTES"),
+            (Select::AllProjectedAttributes, "ALL_PROJECTED_ATTRIBUTES"),
+            (Select::Count, "only the Count"),
+        ];
+        for (select, what) in cases {
+            let err = validate_select_projection(Some(select), true, false, true).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("Cannot specify the ProjectionExpression when choosing to get {what}")
+            );
+        }
+    }
+
+    #[test]
+    fn select_specific_attributes_requires_projection() {
+        // No projection and no AttributesToGet -> rejected.
+        assert!(
+            validate_select_projection(Some(Select::SpecificAttributes), false, false, false)
+                .is_err()
+        );
+        // A projection satisfies it.
+        assert!(
+            validate_select_projection(Some(Select::SpecificAttributes), true, false, false)
+                .is_ok()
+        );
+        // Legacy AttributesToGet satisfies it.
+        assert!(
+            validate_select_projection(Some(Select::SpecificAttributes), false, true, false)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn select_all_projected_requires_index() {
+        let err =
+            validate_select_projection(Some(Select::AllProjectedAttributes), false, false, false)
+                .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
+        );
+        assert!(
+            validate_select_projection(Some(Select::AllProjectedAttributes), false, false, true)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn index_key_non_scalar_reports_actual_l() {
+        let owned = [idx("gsi1", "lsi1sk")];
+        let refs: Vec<IndexKeyRef<'_>> = owned
+            .iter()
+            .map(|(n, ks)| IndexKeyRef {
+                index_name: n,
+                key_schema: ks,
+            })
+            .collect();
+        let attr_defs = vec![make_ad("lsi1sk", ScalarAttributeType::S)];
+        let mut item = Item::new();
+        item.insert("lsi1sk".to_owned(), AttributeValue::L(vec![]));
+        let err = validate_index_key_types(&item, &refs, &attr_defs).unwrap_err();
+        assert!(err.to_string().contains("Actual: L"), "got: {err}");
+    }
+
+    #[test]
+    fn index_key_empty_messages_by_context() {
+        let owned = [idx("gsi1", "lsi1sk")];
+        let refs: Vec<IndexKeyRef<'_>> = owned
+            .iter()
+            .map(|(n, ks)| IndexKeyRef {
+                index_name: n,
+                key_schema: ks,
+            })
+            .collect();
+        let mut item = Item::new();
+        item.insert("lsi1sk".to_owned(), AttributeValue::S(String::new()));
+
+        let put_err = validate_index_key_not_empty(&item, &refs, SecondaryIndexEmptyContext::Item)
+            .unwrap_err();
+        assert_eq!(
+            put_err.to_string(),
+            "One or more parameter values are not valid. A value specified for a secondary index key is not supported. \
+             The AttributeValue for a key attribute cannot contain an empty string value. IndexName: gsi1, IndexKey: lsi1sk"
+        );
+
+        let upd_err = validate_index_key_not_empty(
+            &item,
+            &refs,
+            SecondaryIndexEmptyContext::UpdateExpression,
+        )
+        .unwrap_err();
+        assert_eq!(
+            upd_err.to_string(),
+            "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. \
+             The AttributeValue for a key attribute cannot contain an empty string value."
+        );
+    }
+
+    #[test]
+    fn valid_index_key_passes() {
+        let owned = [idx("gsi1", "lsi1sk")];
+        let refs: Vec<IndexKeyRef<'_>> = owned
+            .iter()
+            .map(|(n, ks)| IndexKeyRef {
+                index_name: n,
+                key_schema: ks,
+            })
+            .collect();
+        let attr_defs = vec![make_ad("lsi1sk", ScalarAttributeType::S)];
+        let mut item = Item::new();
+        item.insert("lsi1sk".to_owned(), AttributeValue::S("ok".to_owned()));
+        assert!(validate_index_keys(&item, &refs, &attr_defs).is_ok());
+    }
+
+    #[test]
+    fn select_projection_rule_precedes_index_rule() {
+        // ALL_PROJECTED_ATTRIBUTES + ProjectionExpression + no IndexName: the
+        // ProjectionExpression rule is reported, not the IndexName one.
+        let err =
+            validate_select_projection(Some(Select::AllProjectedAttributes), true, false, false)
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("ALL_PROJECTED_ATTRIBUTES")
+                && err
+                    .to_string()
+                    .contains("Cannot specify the ProjectionExpression"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn gsi_include_projection_requires_non_key_attributes() {
+        use crate::types::{GsiInput, Projection, ProjectionType};
+        let mut input = base_input(
+            vec![make_ks("pk", KeyType::Hash)],
+            vec![
+                make_ad("pk", ScalarAttributeType::S),
+                make_ad("gsipk", ScalarAttributeType::S),
+            ],
+        );
+        let gsi = |non_key: Option<Vec<String>>| GsiInput {
+            index_name: "gsi_inc".to_owned(),
+            key_schema: vec![make_ks("gsipk", KeyType::Hash)],
+            projection: Projection {
+                projection_type: ProjectionType::Include,
+                non_key_attributes: non_key,
+            },
+            provisioned_throughput: None,
+        };
+
+        input.global_secondary_indexes = Some(vec![gsi(None)]);
+        let err = validate_create_table(&input, &LimitsConfig::default()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: ProjectionType is INCLUDE, but NonKeyAttributes is not specified"
+        );
+
+        // Empty NonKeyAttributes is also rejected.
+        input.global_secondary_indexes = Some(vec![gsi(Some(vec![]))]);
+        assert!(validate_create_table(&input, &LimitsConfig::default()).is_err());
+
+        // A non-empty NonKeyAttributes list is accepted.
+        input.global_secondary_indexes = Some(vec![gsi(Some(vec!["extra".to_owned()]))]);
+        assert!(validate_create_table(&input, &LimitsConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn keys_only_and_all_projections_reject_non_key_attributes() {
+        use crate::types::{GsiInput, LsiInput, Projection, ProjectionType};
+
+        // GSI cases: table keyed on `pk`, GSI keyed on `gsipk`.
+        let gsi_input = |ptype: ProjectionType, non_key: Option<Vec<String>>| {
+            let mut input = base_input(
+                vec![make_ks("pk", KeyType::Hash)],
+                vec![
+                    make_ad("pk", ScalarAttributeType::S),
+                    make_ad("gsipk", ScalarAttributeType::S),
+                ],
+            );
+            input.global_secondary_indexes = Some(vec![GsiInput {
+                index_name: "gsi1".to_owned(),
+                key_schema: vec![make_ks("gsipk", KeyType::Hash)],
+                projection: Projection {
+                    projection_type: ptype,
+                    non_key_attributes: non_key,
+                },
+                provisioned_throughput: None,
+            }]);
+            input
+        };
+
+        // LSI case: table keyed on `pk`+`sk`, LSI alternate sort key `lsisk`.
+        let lsi_input = |ptype: ProjectionType, non_key: Option<Vec<String>>| {
+            let mut input = base_input(
+                vec![make_ks("pk", KeyType::Hash), make_ks("sk", KeyType::Range)],
+                vec![
+                    make_ad("pk", ScalarAttributeType::S),
+                    make_ad("sk", ScalarAttributeType::S),
+                    make_ad("lsisk", ScalarAttributeType::S),
+                ],
+            );
+            input.local_secondary_indexes = Some(vec![LsiInput {
+                index_name: "lsi1".to_owned(),
+                key_schema: vec![
+                    make_ks("pk", KeyType::Hash),
+                    make_ks("lsisk", KeyType::Range),
+                ],
+                projection: Projection {
+                    projection_type: ptype,
+                    non_key_attributes: non_key,
+                },
+            }]);
+            input
+        };
+
+        // GSI KEYS_ONLY + NonKeyAttributes -> rejected.
+        let err = validate_create_table(
+            &gsi_input(ProjectionType::KeysOnly, Some(vec!["x".to_owned()])),
+            &LimitsConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: ProjectionType is KEYS_ONLY, but NonKeyAttributes is specified"
+        );
+
+        // GSI ALL + NonKeyAttributes -> rejected.
+        let err = validate_create_table(
+            &gsi_input(ProjectionType::All, Some(vec!["x".to_owned()])),
+            &LimitsConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: ProjectionType is ALL, but NonKeyAttributes is specified"
+        );
+
+        // LSI KEYS_ONLY + NonKeyAttributes -> rejected.
+        let err = validate_create_table(
+            &lsi_input(ProjectionType::KeysOnly, Some(vec!["x".to_owned()])),
+            &LimitsConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: ProjectionType is KEYS_ONLY, but NonKeyAttributes is specified"
+        );
+
+        // KEYS_ONLY / ALL without NonKeyAttributes are accepted.
+        assert!(
+            validate_create_table(
+                &gsi_input(ProjectionType::KeysOnly, None),
+                &LimitsConfig::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_create_table(
+                &gsi_input(ProjectionType::All, Some(vec![])),
+                &LimitsConfig::default()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn stream_disabled_with_view_type_is_rejected() {
+        use crate::types::{StreamSpecification, StreamViewType};
+        let mut input = base_input(
+            vec![make_ks("pk", KeyType::Hash)],
+            vec![make_ad("pk", ScalarAttributeType::S)],
+        );
+        input.stream_specification = Some(StreamSpecification {
+            stream_enabled: false,
+            stream_view_type: Some(StreamViewType::NewAndOldImages),
+        });
+        let err = validate_create_table(&input, &LimitsConfig::default()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: Table is being created with a stream disabled, UpdateViewType should not be specified"
+        );
+
+        // Disabled with no view type is fine.
+        input.stream_specification = Some(StreamSpecification {
+            stream_enabled: false,
+            stream_view_type: None,
+        });
+        assert!(validate_create_table(&input, &LimitsConfig::default()).is_ok());
+
+        // Enabled with a view type is fine.
+        input.stream_specification = Some(StreamSpecification {
+            stream_enabled: true,
+            stream_view_type: Some(StreamViewType::NewImage),
+        });
+        assert!(validate_create_table(&input, &LimitsConfig::default()).is_ok());
     }
 }

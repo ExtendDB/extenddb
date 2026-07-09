@@ -9,7 +9,7 @@ use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{composite_pk_to_text, parse_sk, pk_to_text, sk_column, sk_info};
 
-use super::index::{enqueue_async_indexes, fetch_indexes_for_table, pk_hash, sync_indexes};
+use super::index::{enqueue_async_indexes, fetch_indexes_for_table, sync_indexes};
 use super::query::check_condition;
 use super::tx_helpers::write_stream_record_in_tx;
 use super::{data_table_name, json_to_item};
@@ -35,6 +35,27 @@ impl PostgresEngine {
 
         // Fetch indexes for GSI/LSI updates (D-4: sync + async split).
         let indexes = fetch_indexes_for_table(&key_info.table_id, &self.pool).await?;
+
+        // Index key attributes present in the item must match their declared
+        // scalar type and be non-empty, matching real DynamoDB. This is up-front
+        // input validation (a top-level ValidationException), so it runs before
+        // any write work.
+        if !indexes.is_empty() {
+            let index_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = indexes
+                .iter()
+                .map(|idx| extenddb_core::validation::IndexKeyRef {
+                    index_name: &idx.index_name,
+                    key_schema: &idx.key_schema,
+                })
+                .collect();
+            extenddb_core::validation::validate_index_keys(
+                &item,
+                &index_refs,
+                &key_info.attribute_definitions,
+            )
+            .map_err(|e| StorageError::Validation(e.to_string()))?;
+        }
+
         let sys_delay = if indexes.is_empty() {
             0
         } else {
@@ -119,7 +140,6 @@ impl PostgresEngine {
                         .transpose()?;
                     sync_indexes(
                         &mut tx,
-                        &key_info.table_id,
                         &key_info.key_schema,
                         &key_info.attribute_definitions,
                         &indexes,
@@ -146,26 +166,26 @@ impl PostgresEngine {
                     )
                     .await?;
                 }
+                // Persist async GSI work inside the same transaction — one row
+                // per async index, each honoring its own propagation delay.
+                let async_enqueued = enqueue_async_indexes(
+                    &mut tx,
+                    key_info,
+                    &indexes,
+                    old_item_for_idx.as_ref(),
+                    Some(&item),
+                    sys_delay,
+                )
+                .await?;
+
                 tx.commit()
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-                // Enqueue async GSI updates after commit (D-4).
-                if let Some(ref q) = self.gsi_queue {
-                    enqueue_async_indexes(
-                        q,
-                        pk_hash(pk_text.as_str()),
-                        &key_info.account_id,
-                        &key_info.table_name,
-                        &key_info.table_id,
-                        &key_info.key_schema,
-                        &key_info.attribute_definitions,
-                        &indexes,
-                        old_item_for_idx.as_ref(),
-                        Some(&item),
-                        sys_delay,
-                    )
-                    .await;
+                if async_enqueued > 0
+                    && let Some(ref q) = self.gsi_queue
+                {
+                    q.notify_workers();
                 }
 
                 if return_old {
@@ -264,7 +284,6 @@ impl PostgresEngine {
                         .transpose()?;
                     sync_indexes(
                         &mut tx,
-                        &key_info.table_id,
                         &key_info.key_schema,
                         &key_info.attribute_definitions,
                         &indexes,
@@ -291,26 +310,26 @@ impl PostgresEngine {
                     )
                     .await?;
                 }
+                // Persist async GSI work inside the same transaction — one row
+                // per async index, each honoring its own propagation delay.
+                let async_enqueued = enqueue_async_indexes(
+                    &mut tx,
+                    key_info,
+                    &indexes,
+                    old_item_for_idx.as_ref(),
+                    Some(&item),
+                    sys_delay,
+                )
+                .await?;
+
                 tx.commit()
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-                // Enqueue async GSI updates after commit (D-4).
-                if let Some(ref q) = self.gsi_queue {
-                    enqueue_async_indexes(
-                        q,
-                        pk_hash(pk_text.as_str()),
-                        &key_info.account_id,
-                        &key_info.table_name,
-                        &key_info.table_id,
-                        &key_info.key_schema,
-                        &key_info.attribute_definitions,
-                        &indexes,
-                        old_item_for_idx.as_ref(),
-                        Some(&item),
-                        sys_delay,
-                    )
-                    .await;
+                if async_enqueued > 0
+                    && let Some(ref q) = self.gsi_queue
+                {
+                    q.notify_workers();
                 }
 
                 if return_old {

@@ -10,7 +10,7 @@ use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{parse_sk, pk_to_text, sk_column, sk_info};
 
-use super::index::{enqueue_async_indexes, fetch_indexes_for_table, pk_hash, sync_indexes};
+use super::index::{enqueue_async_indexes, fetch_indexes_for_table, sync_indexes};
 use super::query::check_condition;
 use super::tx_helpers::write_stream_record_in_tx;
 use super::{data_table_name, json_to_item};
@@ -202,7 +202,6 @@ impl PostgresEngine {
         if !indexes.is_empty() {
             sync_indexes(
                 &mut tx,
-                &key_info.table_id,
                 &key_info.key_schema,
                 &key_info.attribute_definitions,
                 &indexes,
@@ -224,26 +223,26 @@ impl PostgresEngine {
             )
             .await?;
         }
+        // Persist async GSI work inside the same transaction — one row per
+        // async index, each honoring its own propagation delay.
+        let async_enqueued = enqueue_async_indexes(
+            &mut tx,
+            key_info,
+            &indexes,
+            pre_mutation_item.as_ref(),
+            Some(&item),
+            sys_delay,
+        )
+        .await?;
+
         tx.commit()
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // Enqueue async GSI updates after commit (D-4).
-        if let Some(ref q) = self.gsi_queue {
-            enqueue_async_indexes(
-                q,
-                pk_hash(pk_text.as_ref()),
-                &key_info.account_id,
-                &key_info.table_name,
-                &key_info.table_id,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-                &indexes,
-                pre_mutation_item.as_ref(),
-                Some(&item),
-                sys_delay,
-            )
-            .await;
+        if async_enqueued > 0
+            && let Some(ref q) = self.gsi_queue
+        {
+            q.notify_workers();
         }
 
         Ok((old_item, new_item))
