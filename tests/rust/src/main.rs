@@ -95,6 +95,10 @@ mod update_item;
 mod update_item_edge;
 #[cfg(test)]
 mod update_item_more;
+#[cfg(test)]
+mod update_item_number_validation;
+#[cfg(test)]
+mod update_table_billing_validation;
 
 fn main() {
     eprintln!("Run with `cargo test` to execute integration tests.");
