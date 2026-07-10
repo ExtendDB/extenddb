@@ -40,6 +40,40 @@ impl PostgresEngine {
             return Err(StorageError::TableNotActive(input.table_name.clone()));
         }
 
+        // Reject ProvisionedThroughput when the effective billing mode is
+        // PAY_PER_REQUEST. The effective mode is the requested billing_mode when
+        // the request changes it, otherwise the table's current mode. Real
+        // DynamoDB returns "Neither ReadCapacityUnits nor WriteCapacityUnits can
+        // be specified when BillingMode is PAY_PER_REQUEST". This is checked
+        // here, under the FOR UPDATE row lock, because it depends on the table's
+        // current billing mode (a stateless engine-layer check would race with a
+        // concurrent billing-mode change). The engine layer already rejects the
+        // explicit `BillingMode=PAY_PER_REQUEST + ProvisionedThroughput` combo;
+        // this additionally covers the omitted-BillingMode case on a table that
+        // is already PAY_PER_REQUEST.
+        if input.provisioned_throughput.is_some() {
+            let effective_ppr = match input.billing_mode {
+                Some(BillingMode::PayPerRequest) => true,
+                Some(BillingMode::Provisioned) => false,
+                None => {
+                    let current_bm: Option<Option<String>> = sqlx::query_scalar(
+                        "SELECT billing_mode FROM tables WHERE account_id = $1 AND table_name = $2",
+                    )
+                    .bind(account_id)
+                    .bind(&input.table_name)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    current_bm.flatten().as_deref() == Some("PAY_PER_REQUEST")
+                }
+            };
+            if effective_ppr {
+                return Err(StorageError::Validation(
+                    "One or more parameter values were invalid: Neither ReadCapacityUnits nor WriteCapacityUnits can be specified when BillingMode is PAY_PER_REQUEST".to_owned(),
+                ));
+            }
+        }
+
         // No-op rejection: setting same billing mode to PROVISIONED with same
         // throughput values is rejected by DynamoDB. This check runs under the
         // FOR UPDATE lock to eliminate the TOCTOU race that existed when the
