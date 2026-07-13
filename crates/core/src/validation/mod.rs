@@ -1026,6 +1026,7 @@ pub fn validate_select_projection(
     has_projection: bool,
     has_attributes_to_get: bool,
     has_index_name: bool,
+    is_query: bool,
 ) -> Result<(), DynamoDbError> {
     if has_projection {
         let incompatible = match select {
@@ -1035,10 +1036,16 @@ pub fn validate_select_projection(
             _ => None,
         };
         if let Some(what) = incompatible {
-            return Err(DynamoDbError::ValidationException(format!(
-                "1 validation error detected: \
-                 Cannot specify the ProjectionExpression when choosing to get {what}"
-            )));
+            // Real DynamoDB prepends "1 validation error detected: " to this
+            // rejection for Query, but NOT for Scan.
+            let body =
+                format!("Cannot specify the ProjectionExpression when choosing to get {what}");
+            let msg = if is_query {
+                format!("1 validation error detected: {body}")
+            } else {
+                body
+            };
+            return Err(DynamoDbError::ValidationException(msg));
         }
     }
     if matches!(select, Some(Select::SpecificAttributes))
@@ -2151,14 +2158,17 @@ mod tests {
             (Select::Count, "only the Count"),
         ];
         for (select, what) in cases {
-            let err = validate_select_projection(Some(select), true, false, true).unwrap_err();
+            let body =
+                format!("Cannot specify the ProjectionExpression when choosing to get {what}");
+            // Query prepends the "1 validation error detected: " prefix.
+            let q = validate_select_projection(Some(select), true, false, true, true).unwrap_err();
             assert_eq!(
-                err.to_string(),
-                format!(
-                    "1 validation error detected: \
-                     Cannot specify the ProjectionExpression when choosing to get {what}"
-                )
+                q.to_string(),
+                format!("1 validation error detected: {body}")
             );
+            // Scan does NOT prepend the prefix (matches real DynamoDB).
+            let s = validate_select_projection(Some(select), true, false, true, false).unwrap_err();
+            assert_eq!(s.to_string(), body);
         }
     }
 
@@ -2166,33 +2176,44 @@ mod tests {
     fn select_specific_attributes_requires_projection() {
         // No projection and no AttributesToGet -> rejected.
         assert!(
-            validate_select_projection(Some(Select::SpecificAttributes), false, false, false)
+            validate_select_projection(Some(Select::SpecificAttributes), false, false, false, true)
                 .is_err()
         );
         // A projection satisfies it.
         assert!(
-            validate_select_projection(Some(Select::SpecificAttributes), true, false, false)
+            validate_select_projection(Some(Select::SpecificAttributes), true, false, false, true)
                 .is_ok()
         );
         // Legacy AttributesToGet satisfies it.
         assert!(
-            validate_select_projection(Some(Select::SpecificAttributes), false, true, false)
+            validate_select_projection(Some(Select::SpecificAttributes), false, true, false, true)
                 .is_ok()
         );
     }
 
     #[test]
     fn select_all_projected_requires_index() {
-        let err =
-            validate_select_projection(Some(Select::AllProjectedAttributes), false, false, false)
-                .unwrap_err();
+        let err = validate_select_projection(
+            Some(Select::AllProjectedAttributes),
+            false,
+            false,
+            false,
+            true,
+        )
+        .unwrap_err();
         assert_eq!(
             err.to_string(),
             "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
         );
         assert!(
-            validate_select_projection(Some(Select::AllProjectedAttributes), false, false, true)
-                .is_ok()
+            validate_select_projection(
+                Some(Select::AllProjectedAttributes),
+                false,
+                false,
+                true,
+                true
+            )
+            .is_ok()
         );
     }
 
@@ -2267,9 +2288,14 @@ mod tests {
     fn select_projection_rule_precedes_index_rule() {
         // ALL_PROJECTED_ATTRIBUTES + ProjectionExpression + no IndexName: the
         // ProjectionExpression rule is reported, not the IndexName one.
-        let err =
-            validate_select_projection(Some(Select::AllProjectedAttributes), true, false, false)
-                .unwrap_err();
+        let err = validate_select_projection(
+            Some(Select::AllProjectedAttributes),
+            true,
+            false,
+            false,
+            true,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("ALL_PROJECTED_ATTRIBUTES")
                 && err

@@ -170,6 +170,7 @@ pub async fn handle_scan(
             .as_ref()
             .is_some_and(|a| !a.is_empty()),
         input.index_name.is_some(),
+        false, // Scan: no "1 validation error detected: " prefix
     )?;
 
     // Validate unused expression attributes

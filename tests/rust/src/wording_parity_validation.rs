@@ -82,6 +82,27 @@ async fn query_count_with_projection_has_validation_prefix() {
 }
 
 #[tokio::test]
+async fn scan_count_with_projection_no_prefix() {
+    // Scan (unlike Query) does NOT carry the "1 validation error detected: "
+    // prefix on this rejection — matches real DynamoDB.
+    let c = client();
+    let t = tables().await;
+    let err = c
+        .scan()
+        .table_name(&t.simple_key_string)
+        .select(Select::Count)
+        .projection_expression("#h")
+        .expression_attribute_names("#h", HASH_KEY_S)
+        .send()
+        .await
+        .expect_err("COUNT with ProjectionExpression is rejected");
+    assert_eq!(
+        err_msg(&err),
+        "Cannot specify the ProjectionExpression when choosing to get only the Count"
+    );
+}
+
+#[tokio::test]
 async fn scan_all_attributes_on_non_all_gsi_rejected() {
     let c = client();
     let name = format!("WordingGsi_{}", ts());
