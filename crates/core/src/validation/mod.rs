@@ -1036,7 +1036,8 @@ pub fn validate_select_projection(
         };
         if let Some(what) = incompatible {
             return Err(DynamoDbError::ValidationException(format!(
-                "Cannot specify the ProjectionExpression when choosing to get {what}"
+                "1 validation error detected: \
+                 Cannot specify the ProjectionExpression when choosing to get {what}"
             )));
         }
     }
@@ -2153,7 +2154,10 @@ mod tests {
             let err = validate_select_projection(Some(select), true, false, true).unwrap_err();
             assert_eq!(
                 err.to_string(),
-                format!("Cannot specify the ProjectionExpression when choosing to get {what}")
+                format!(
+                    "1 validation error detected: \
+                     Cannot specify the ProjectionExpression when choosing to get {what}"
+                )
             );
         }
     }

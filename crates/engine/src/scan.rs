@@ -10,7 +10,8 @@ use serde_json::Value;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
 use extenddb_core::types::{
-    IndexType, ScanInput, ScanOutput, Select, TableKeyInfo, extract_key, item_size_bytes,
+    IndexType, ProjectionType, ScanInput, ScanOutput, Select, TableKeyInfo, extract_key,
+    item_size_bytes,
 };
 
 use crate::OperationContext;
@@ -223,6 +224,19 @@ pub async fn handle_scan(
         return Err(DynamoDbError::ValidationException(
             "Consistent reads are not supported on global secondary indexes".to_owned(),
         ));
+    }
+
+    // Select=ALL_ATTRIBUTES requires an ALL-projection GSI. Matches real DynamoDB.
+    if matches!(input.select, Some(Select::AllAttributes))
+        && let Some(ref idx) = index_info
+        && idx.index_type == IndexType::Gsi
+        && idx.projection.projection_type != ProjectionType::All
+    {
+        return Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: Select type ALL_ATTRIBUTES is not \
+             supported for global secondary index {} because its projection type is not ALL",
+            idx.index_name
+        )));
     }
 
     // Validate Segment/TotalSegments — DynamoDB returns different messages per direction

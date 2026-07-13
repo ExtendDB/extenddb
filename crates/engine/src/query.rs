@@ -11,7 +11,8 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::PathElement;
 use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
 use extenddb_core::types::{
-    IndexType, KeyType, QueryInput, QueryOutput, Select, TableKeyInfo, extract_key, item_size_bytes,
+    IndexType, KeyType, ProjectionType, QueryInput, QueryOutput, Select, TableKeyInfo, extract_key,
+    item_size_bytes,
 };
 
 use crate::OperationContext;
@@ -67,6 +68,20 @@ pub async fn handle_query(
         return Err(DynamoDbError::ValidationException(
             "Consistent reads are not supported on global secondary indexes".to_owned(),
         ));
+    }
+
+    // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (a GSI that does not
+    // project all attributes cannot serve ALL_ATTRIBUTES). Matches real DynamoDB.
+    if matches!(input.select, Some(Select::AllAttributes))
+        && let Some(ref idx) = index_info
+        && idx.index_type == IndexType::Gsi
+        && idx.projection.projection_type != ProjectionType::All
+    {
+        return Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: Select type ALL_ATTRIBUTES is not \
+             supported for global secondary index {} because its projection type is not ALL",
+            idx.index_name
+        )));
     }
 
     // Validate Limit >= 1 (REQ-QUERY-001)
