@@ -94,6 +94,52 @@ pub fn batch_write_capacity<'a>(
     }
 }
 
+/// Build a `Vec<ConsumedCapacity>` for `TransactGetItems`, or `None` if not requested.
+///
+/// Transactions differ from single-item/batch reads: real DynamoDB emits the
+/// granular `ReadCapacityUnits` sub-field, so this uses `ConsumedCapacity::transact_read`.
+#[must_use]
+pub fn transact_read_capacity<'a>(
+    rcc: ReturnConsumedCapacity,
+    table_cus: impl Iterator<Item = (&'a str, f64)>,
+) -> Option<Vec<ConsumedCapacity>> {
+    match rcc {
+        ReturnConsumedCapacity::None => None,
+        rcc => {
+            CAPACITY_REQUEST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let indexes = rcc == ReturnConsumedCapacity::Indexes;
+            Some(
+                table_cus
+                    .map(|(t, cu)| ConsumedCapacity::transact_read(t, cu, indexes))
+                    .collect(),
+            )
+        }
+    }
+}
+
+/// Build a `Vec<ConsumedCapacity>` for `TransactWriteItems`, or `None` if not requested.
+///
+/// Transactions differ from single-item/batch writes: real DynamoDB emits the
+/// granular `WriteCapacityUnits` sub-field, so this uses `ConsumedCapacity::transact_write`.
+#[must_use]
+pub fn transact_write_capacity<'a>(
+    rcc: ReturnConsumedCapacity,
+    table_cus: impl Iterator<Item = (&'a str, f64)>,
+) -> Option<Vec<ConsumedCapacity>> {
+    match rcc {
+        ReturnConsumedCapacity::None => None,
+        rcc => {
+            CAPACITY_REQUEST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let indexes = rcc == ReturnConsumedCapacity::Indexes;
+            Some(
+                table_cus
+                    .map(|(t, cu)| ConsumedCapacity::transact_write(t, cu, indexes))
+                    .collect(),
+            )
+        }
+    }
+}
+
 /// Compute read capacity units for a single item: `ceil(item_size / 4096)`.
 ///
 /// `strongly_consistent`: if `true`, returns full RCU; if `false` (eventually

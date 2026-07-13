@@ -164,7 +164,7 @@ pub async fn handle_transact_write_items(
         })
         .sum();
 
-    let consumed_capacity = capacity_helpers::batch_write_capacity(
+    let consumed_capacity = capacity_helpers::transact_write_capacity(
         input.return_consumed_capacity,
         per_table_wcu.iter().map(|(t, cu)| (t.as_str(), *cu)),
     );

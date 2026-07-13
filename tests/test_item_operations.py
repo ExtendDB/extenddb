@@ -1345,10 +1345,11 @@ class TestUpdateItemWCU:
         )
         cap = resp["ConsumedCapacity"]
         assert cap["CapacityUnits"] >= 1.0
-        assert cap["WriteCapacityUnits"] >= 1.0
+        # Real DynamoDB reports write cost via CapacityUnits only — no granular sub-field.
+        assert "WriteCapacityUnits" not in cap
 
-    def test_update_item_indexes_capacity_has_wcu_in_table(self, dynamodb_client, wcu_table):
-        """INDEXES-level capacity includes WriteCapacityUnits in Table breakdown."""
+    def test_update_item_indexes_capacity_only_capacity_units(self, dynamodb_client, wcu_table):
+        """INDEXES-level capacity reports only CapacityUnits in the Table breakdown (matches real DynamoDB — no granular RCU/WCU)."""
         dynamodb_client.put_item(
             TableName=wcu_table,
             Item={"pk": {"S": "wcu-idx"}, "v": {"N": "1"}},
@@ -1361,11 +1362,14 @@ class TestUpdateItemWCU:
             ReturnConsumedCapacity="INDEXES",
         )
         cap = resp["ConsumedCapacity"]
-        assert cap["WriteCapacityUnits"] >= 1.0
+        assert cap["CapacityUnits"] >= 1.0
+        # Real DynamoDB emits only CapacityUnits for UpdateItem — no granular RCU/WCU.
+        assert "WriteCapacityUnits" not in cap
+        assert "ReadCapacityUnits" not in cap
         table_cap = cap.get("Table", {})
-        assert table_cap.get("WriteCapacityUnits") >= 1.0
-        # ReadCapacityUnits should not be present for writes
-        assert table_cap.get("ReadCapacityUnits") is None
+        assert table_cap.get("CapacityUnits") >= 1.0
+        assert "WriteCapacityUnits" not in table_cap
+        assert "ReadCapacityUnits" not in table_cap
 
     def test_update_item_wcu_reflects_new_item_size(self, dynamodb_client, wcu_table):
         """UpdateItem WCU is based on the larger of old/new item (new item here)."""
@@ -1383,8 +1387,9 @@ class TestUpdateItemWCU:
             ReturnConsumedCapacity="TOTAL",
         )
         cap = resp["ConsumedCapacity"]
-        # New item is ~1.5KB → rounds up to 2 WCU
-        assert cap["WriteCapacityUnits"] >= 2.0
+        # New item is ~1.5KB → rounds up to 2 WCU, reported via CapacityUnits (no granular field).
+        assert cap["CapacityUnits"] >= 2.0
+        assert "WriteCapacityUnits" not in cap
 
 
 # ---------------------------------------------------------------------------
