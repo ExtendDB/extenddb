@@ -193,6 +193,58 @@ impl ConsumedCapacity {
             local_secondary_indexes: None,
         }
     }
+
+    /// Build a `ConsumedCapacity` for a transaction read (`TransactGetItems`).
+    ///
+    /// Unlike single-item and batch reads, real DynamoDB includes the granular
+    /// `ReadCapacityUnits` sub-field for transactions — both at the top level
+    /// and inside the nested `Table` breakdown at INDEXES granularity.
+    #[must_use]
+    pub fn transact_read(table_name: &str, cu: f64, indexes: bool) -> Self {
+        Self {
+            table_name: table_name.to_owned(),
+            capacity_units: cu,
+            read_capacity_units: Some(cu),
+            write_capacity_units: None,
+            table: if indexes {
+                Some(Capacity {
+                    capacity_units: cu,
+                    read_capacity_units: Some(cu),
+                    write_capacity_units: None,
+                })
+            } else {
+                None
+            },
+            global_secondary_indexes: None,
+            local_secondary_indexes: None,
+        }
+    }
+
+    /// Build a `ConsumedCapacity` for a transaction write (`TransactWriteItems`).
+    ///
+    /// Unlike single-item and batch writes, real DynamoDB includes the granular
+    /// `WriteCapacityUnits` sub-field for transactions — both at the top level
+    /// and inside the nested `Table` breakdown at INDEXES granularity.
+    #[must_use]
+    pub fn transact_write(table_name: &str, cu: f64, indexes: bool) -> Self {
+        Self {
+            table_name: table_name.to_owned(),
+            capacity_units: cu,
+            read_capacity_units: None,
+            write_capacity_units: Some(cu),
+            table: if indexes {
+                Some(Capacity {
+                    capacity_units: cu,
+                    read_capacity_units: None,
+                    write_capacity_units: Some(cu),
+                })
+            } else {
+                None
+            },
+            global_secondary_indexes: None,
+            local_secondary_indexes: None,
+        }
+    }
 }
 
 impl ItemCollectionMetrics {
