@@ -78,6 +78,49 @@ async fn put_item_consumed_capacity_has_no_granular_fields() {
 }
 
 #[tokio::test]
+async fn delete_item_consumed_capacity_has_no_granular_fields() {
+    let c = client();
+    let t = tables().await;
+    let resp = c
+        .delete_item()
+        .table_name(&t.simple_key_string)
+        .set_key(Some(key(&format!("ccd_{}", ts()))))
+        .return_consumed_capacity(ReturnConsumedCapacity::Total)
+        .send()
+        .await
+        .unwrap();
+    let cc = resp.consumed_capacity().expect("ConsumedCapacity");
+    assert!(cc.capacity_units().is_some());
+    assert!(
+        cc.write_capacity_units().is_none() && cc.read_capacity_units().is_none(),
+        "DeleteItem TOTAL must emit only CapacityUnits"
+    );
+}
+
+#[tokio::test]
+async fn update_item_consumed_capacity_has_no_granular_fields() {
+    let c = client();
+    let t = tables().await;
+    let resp = c
+        .update_item()
+        .table_name(&t.simple_key_string)
+        .set_key(Some(key(&format!("ccu_{}", ts()))))
+        .update_expression("SET #d = :v")
+        .expression_attribute_names("#d", "data")
+        .expression_attribute_values(":v", s("x"))
+        .return_consumed_capacity(ReturnConsumedCapacity::Total)
+        .send()
+        .await
+        .unwrap();
+    let cc = resp.consumed_capacity().expect("ConsumedCapacity");
+    assert!(cc.capacity_units().is_some());
+    assert!(
+        cc.write_capacity_units().is_none() && cc.read_capacity_units().is_none(),
+        "UpdateItem TOTAL must emit only CapacityUnits"
+    );
+}
+
+#[tokio::test]
 async fn batch_get_consumed_capacity_has_no_granular_fields() {
     let c = client();
     let t = tables().await;
