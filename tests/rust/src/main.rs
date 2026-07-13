@@ -111,6 +111,8 @@ mod update_item_more;
 mod update_item_number_validation;
 #[cfg(test)]
 mod update_table_billing_validation;
+#[cfg(test)]
+mod wording_parity_validation;
 
 fn main() {
     eprintln!("Run with `cargo test` to execute integration tests.");

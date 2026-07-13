@@ -51,7 +51,6 @@ pub async fn handle_put_item(
     crate::validate_enum_fields(
         &body,
         &[
-            ("ReturnValues", "returnValues", &["NONE", "ALL_OLD"]),
             (
                 "ReturnConsumedCapacity",
                 "returnConsumedCapacity",
@@ -64,6 +63,7 @@ pub async fn handle_put_item(
             ),
         ],
     )?;
+    crate::validate_put_delete_return_values(&body)?;
 
     let input: PutItemInput = serde_json::from_value(body).map_err(|e| {
         let msg = e.to_string();

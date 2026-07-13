@@ -29,15 +29,13 @@ pub async fn handle_delete_item(
 ) -> Result<DispatchResult, DynamoDbError> {
     crate::validate_enum_fields(
         &body,
-        &[
-            ("ReturnValues", "returnValues", &["NONE", "ALL_OLD"]),
-            (
-                "ReturnConsumedCapacity",
-                "returnConsumedCapacity",
-                &["INDEXES", "TOTAL", "NONE"],
-            ),
-        ],
+        &[(
+            "ReturnConsumedCapacity",
+            "returnConsumedCapacity",
+            &["INDEXES", "TOTAL", "NONE"],
+        )],
     )?;
+    crate::validate_put_delete_return_values(&body)?;
     let input: DeleteItemInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
