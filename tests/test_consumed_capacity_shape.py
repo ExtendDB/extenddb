@@ -47,6 +47,27 @@ def test_put_item_consumed_capacity_shape(dynamodb_client, table, granularity):
     _assert_only_capacity_units(resp["ConsumedCapacity"])
 
 
+@pytest.mark.parametrize("granularity", ["TOTAL", "INDEXES"])
+def test_delete_item_consumed_capacity_shape(dynamodb_client, table, granularity):
+    resp = dynamodb_client.delete_item(
+        TableName=table, Key={"pk": {"S": "kd"}}, ReturnConsumedCapacity=granularity
+    )
+    _assert_only_capacity_units(resp["ConsumedCapacity"])
+
+
+@pytest.mark.parametrize("granularity", ["TOTAL", "INDEXES"])
+def test_update_item_consumed_capacity_shape(dynamodb_client, table, granularity):
+    resp = dynamodb_client.update_item(
+        TableName=table,
+        Key={"pk": {"S": "ku"}},
+        UpdateExpression="SET #d = :v",
+        ExpressionAttributeNames={"#d": "data"},
+        ExpressionAttributeValues={":v": {"S": "x"}},
+        ReturnConsumedCapacity=granularity,
+    )
+    _assert_only_capacity_units(resp["ConsumedCapacity"])
+
+
 def test_batch_get_consumed_capacity_shape(dynamodb_client, table):
     dynamodb_client.put_item(TableName=table, Item={"pk": {"S": "b1"}})
     resp = dynamodb_client.batch_get_item(
