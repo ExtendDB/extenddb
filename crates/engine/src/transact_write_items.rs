@@ -21,7 +21,7 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{TransactWriteItem, TransactWriteItemsInput, TransactWriteItemsOutput};
 use extenddb_core::validation::{
     validate_attribute_name_sizes, validate_attribute_values_nesting_depth,
-    validate_item_nesting_depth, validate_item_size, validate_key_sizes,
+    validate_item_nesting_depth, validate_item_size, validate_key_not_empty,
 };
 
 /// Maximum number of items in a single `TransactWriteItems` request.
@@ -113,6 +113,31 @@ pub async fn handle_transact_write_items(
         return Err(DynamoDbError::ValidationException(
             "Transaction item size has exceeded the 4 MB limit".to_owned(),
         ));
+    }
+
+    // Reject oversized primary keys as a per-item cancellation, matching real
+    // DynamoDB: an oversized hash/range key in any sub-op returns
+    // TransactionCanceledException with a ValidationError cancellation reason
+    // for the offending item (an EMPTY key value, by contrast, is a top-level
+    // ValidationException and is handled in prepare_write_op).
+    {
+        let mut reasons: Vec<extenddb_core::types::CancellationReason> =
+            Vec::with_capacity(prepared.len());
+        let mut any_oversized = false;
+        for op in &prepared {
+            match op.oversized_key_reason(&ctx.limits) {
+                Some(reason) => {
+                    any_oversized = true;
+                    reasons.push(reason);
+                }
+                None => reasons.push(extenddb_core::types::CancellationReason::none()),
+            }
+        }
+        if any_oversized {
+            return Err(storage_err_to_dynamo(
+                extenddb_storage::error::StorageError::TransactionCanceled(reasons),
+            ));
+        }
     }
 
     // Build storage operations
@@ -223,7 +248,7 @@ async fn prepare_write_op(
         validate_item_nesting_depth(&put.item)?;
         validate_item_size(&put.item, ctx.limits.max_item_size_bytes)?;
         validate_attribute_name_sizes(&put.item, &ctx.limits)?;
-        validate_key_sizes(&put.item, &key_info.key_schema, &ctx.limits)?;
+        validate_key_not_empty(&put.item, &key_info.key_schema)?;
         let maps = build_expression_maps(
             put.expression_attribute_names.as_ref(),
             put.expression_attribute_values.as_ref(),
@@ -277,7 +302,7 @@ async fn prepare_write_op(
         // Empty or oversize key values are up-front input validation in
         // DynamoDB (a top-level ValidationException), unlike a key type
         // mismatch which surfaces as a per-item cancellation reason.
-        validate_key_sizes(&del.key, &key_info.key_schema, &ctx.limits)?;
+        validate_key_not_empty(&del.key, &key_info.key_schema)?;
         let maps = build_expression_maps(
             del.expression_attribute_names.as_ref(),
             del.expression_attribute_values.as_ref(),
@@ -329,7 +354,7 @@ async fn prepare_write_op(
         // Empty or oversize key values are up-front input validation in
         // DynamoDB (a top-level ValidationException), unlike a key type
         // mismatch which surfaces as a per-item cancellation reason.
-        validate_key_sizes(&upd.key, &key_info.key_schema, &ctx.limits)?;
+        validate_key_not_empty(&upd.key, &key_info.key_schema)?;
         let maps = build_expression_maps(
             upd.expression_attribute_names.as_ref(),
             upd.expression_attribute_values.as_ref(),
@@ -400,7 +425,7 @@ async fn prepare_write_op(
         // Empty or oversize key values are up-front input validation in
         // DynamoDB (a top-level ValidationException), unlike a key type
         // mismatch which surfaces as a per-item cancellation reason.
-        validate_key_sizes(&cc.key, &key_info.key_schema, &ctx.limits)?;
+        validate_key_not_empty(&cc.key, &key_info.key_schema)?;
         let maps = build_expression_maps(
             cc.expression_attribute_names.as_ref(),
             cc.expression_attribute_values.as_ref(),

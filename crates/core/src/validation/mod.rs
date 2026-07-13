@@ -1132,27 +1132,82 @@ pub fn validate_key_sizes(
     for ks in key_schema {
         if let Some(value) = item.get(&ks.attribute_name) {
             validate_no_empty_key_value(&ks.attribute_name, value)?;
-            let size = key_value_byte_size(value);
-            let max_size = match ks.key_type {
-                KeyType::Hash => limits.max_partition_key_size_bytes,
-                KeyType::Range => limits.max_sort_key_size_bytes,
-            };
-            if size > max_size {
-                // Hash and range use different wording, matching Amazon
-                // DynamoDB (the hash variant has no space before the size).
-                let msg = match ks.key_type {
-                    KeyType::Hash => format!(
-                        "One or more parameter values were invalid: \
-                         Size of hashkey has exceeded the maximum size limit of{max_size} bytes"
-                    ),
-                    KeyType::Range => format!(
-                        "One or more parameter values were invalid: \
-                         Aggregated size of all range keys has exceeded the size limit of {max_size} bytes"
-                    ),
-                };
-                return Err(DynamoDbError::ValidationException(msg));
-            }
+            check_key_size(ks, value, limits)?;
         }
+    }
+    Ok(())
+}
+
+/// Validate only the byte-size limit of primary-key values (no empty-value
+/// check).
+///
+/// Used by the transaction path, which surfaces an oversized key as a per-item
+/// `TransactionCanceledException` / `ValidationError` cancellation reason, while
+/// an empty key value remains a top-level `ValidationException` — matching real
+/// `DynamoDB`.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` if a key value exceeds its size limit.
+pub fn validate_key_size_limits(
+    item: &Item,
+    key_schema: &[KeySchemaElement],
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    for ks in key_schema {
+        if let Some(value) = item.get(&ks.attribute_name) {
+            check_key_size(ks, value, limits)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate only that primary-key values are non-empty (no size check).
+///
+/// The transaction path uses this to keep the empty-key rejection as a
+/// top-level `ValidationException` (real `DynamoDB` behavior) while the size
+/// limit is enforced separately as a per-item cancellation reason.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` if a key value is empty.
+pub fn validate_key_not_empty(
+    item: &Item,
+    key_schema: &[KeySchemaElement],
+) -> Result<(), DynamoDbError> {
+    for ks in key_schema {
+        if let Some(value) = item.get(&ks.attribute_name) {
+            validate_no_empty_key_value(&ks.attribute_name, value)?;
+        }
+    }
+    Ok(())
+}
+
+/// Check a single primary-key value against its size limit. Hash and range use
+/// different wording, matching Amazon `DynamoDB` (the hash variant has no space
+/// before the size).
+fn check_key_size(
+    ks: &KeySchemaElement,
+    value: &AttributeValue,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    let size = key_value_byte_size(value);
+    let max_size = match ks.key_type {
+        KeyType::Hash => limits.max_partition_key_size_bytes,
+        KeyType::Range => limits.max_sort_key_size_bytes,
+    };
+    if size > max_size {
+        let msg = match ks.key_type {
+            KeyType::Hash => format!(
+                "One or more parameter values were invalid: \
+                 Size of hashkey has exceeded the maximum size limit of{max_size} bytes"
+            ),
+            KeyType::Range => format!(
+                "One or more parameter values were invalid: \
+                 Aggregated size of all range keys has exceeded the size limit of {max_size} bytes"
+            ),
+        };
+        return Err(DynamoDbError::ValidationException(msg));
     }
     Ok(())
 }
@@ -1627,6 +1682,70 @@ mod tests {
             AttributeValue::S("a".repeat(limits.max_partition_key_size_bytes)),
         );
         assert!(validate_key_sizes(&item, &[make_ks("pk", KeyType::Hash)], &limits).is_ok());
+    }
+
+    #[test]
+    fn validate_key_size_limits_rejects_oversized_but_ignores_empty() {
+        // Size-only helper: oversized hash key rejected with the exact message,
+        // but an empty key value is NOT rejected here (that stays a separate,
+        // top-level check for the transaction path).
+        let limits = LimitsConfig::default();
+        let mut big = Item::new();
+        big.insert(
+            "pk".to_owned(),
+            AttributeValue::S("a".repeat(limits.max_partition_key_size_bytes + 1)),
+        );
+        let err =
+            validate_key_size_limits(&big, &[make_ks("pk", KeyType::Hash)], &limits).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: \
+             Size of hashkey has exceeded the maximum size limit of2048 bytes"
+        );
+
+        let mut empty = Item::new();
+        empty.insert("pk".to_owned(), AttributeValue::S(String::new()));
+        assert!(
+            validate_key_size_limits(&empty, &[make_ks("pk", KeyType::Hash)], &limits).is_ok(),
+            "size-only check must ignore empty key values"
+        );
+    }
+
+    #[test]
+    fn validate_key_size_limits_range_message_matches_amazon_dynamodb() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        item.insert(
+            "sk".to_owned(),
+            AttributeValue::S("b".repeat(limits.max_sort_key_size_bytes + 1)),
+        );
+        let err =
+            validate_key_size_limits(&item, &[make_ks("sk", KeyType::Range)], &limits).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: \
+             Aggregated size of all range keys has exceeded the size limit of 1024 bytes"
+        );
+    }
+
+    #[test]
+    fn validate_key_not_empty_rejects_empty_but_ignores_oversized() {
+        // Empty-only helper: rejects an empty key value, but a merely-oversized
+        // (non-empty) key passes (size is enforced separately).
+        let limits = LimitsConfig::default();
+        let mut empty = Item::new();
+        empty.insert("pk".to_owned(), AttributeValue::S(String::new()));
+        assert!(validate_key_not_empty(&empty, &[make_ks("pk", KeyType::Hash)]).is_err());
+
+        let mut big = Item::new();
+        big.insert(
+            "pk".to_owned(),
+            AttributeValue::S("a".repeat(limits.max_partition_key_size_bytes + 1)),
+        );
+        assert!(
+            validate_key_not_empty(&big, &[make_ks("pk", KeyType::Hash)]).is_ok(),
+            "empty-only check must ignore oversized (non-empty) key values"
+        );
     }
 
     #[test]

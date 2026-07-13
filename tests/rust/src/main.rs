@@ -90,6 +90,8 @@ mod transact_write_items;
 #[cfg(test)]
 mod transact_write_items_more;
 #[cfg(test)]
+mod transaction_key_size_validation;
+#[cfg(test)]
 mod transaction_validation;
 #[cfg(test)]
 mod ttl;
