@@ -365,6 +365,7 @@ pub async fn handle_query(
             .as_ref()
             .is_some_and(|a| !a.is_empty()),
         input.index_name.is_some(),
+        true, // Query: real DynamoDB prepends "1 validation error detected: "
     )?;
 
     // When Select=ALL_PROJECTED_ATTRIBUTES, capture the index info for post-read filtering.

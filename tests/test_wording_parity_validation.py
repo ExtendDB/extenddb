@@ -86,6 +86,17 @@ def test_query_count_with_projection_prefix(dynamodb_client, table):
     )
 
 
+def test_scan_count_with_projection_no_prefix(dynamodb_client, table):
+    # Scan (unlike Query) has NO "1 validation error detected: " prefix here.
+    with pytest.raises(ClientError) as ei:
+        dynamodb_client.scan(
+            TableName=table, Select="COUNT", ProjectionExpression="pk"
+        )
+    assert ei.value.response["Error"]["Message"] == (
+        "Cannot specify the ProjectionExpression when choosing to get only the Count"
+    )
+
+
 def test_scan_all_attributes_on_non_all_gsi(dynamodb_client, gsi_table):
     with pytest.raises(ClientError) as ei:
         dynamodb_client.scan(
