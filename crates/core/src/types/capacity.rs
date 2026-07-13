@@ -156,12 +156,12 @@ impl ConsumedCapacity {
         Self {
             table_name: table_name.to_owned(),
             capacity_units: cu,
-            read_capacity_units: Some(cu),
+            read_capacity_units: None,
             write_capacity_units: None,
             table: if indexes {
                 Some(Capacity {
                     capacity_units: cu,
-                    read_capacity_units: Some(cu),
+                    read_capacity_units: None,
                     write_capacity_units: None,
                 })
             } else {
@@ -179,12 +179,12 @@ impl ConsumedCapacity {
             table_name: table_name.to_owned(),
             capacity_units: cu,
             read_capacity_units: None,
-            write_capacity_units: Some(cu),
+            write_capacity_units: None,
             table: if indexes {
                 Some(Capacity {
                     capacity_units: cu,
                     read_capacity_units: None,
-                    write_capacity_units: Some(cu),
+                    write_capacity_units: None,
                 })
             } else {
                 None

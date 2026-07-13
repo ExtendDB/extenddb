@@ -26,6 +26,8 @@ mod condition_expressions;
 #[cfg(test)]
 mod condition_expressions_more;
 #[cfg(test)]
+mod consumed_capacity_shape;
+#[cfg(test)]
 mod create_table_validation;
 #[cfg(test)]
 mod data_types;
