@@ -2192,4 +2192,81 @@ mod tests {
         });
         assert!(validate_create_table(&input, &LimitsConfig::default()).is_ok());
     }
+
+    #[test]
+    fn test_expression_param_mixing_lists_present_params_in_order() {
+        let err = validate_no_expression_param_mixing(
+            &[
+                ("AttributesToGet", true),
+                ("ScanFilter", true),
+                ("ConditionalOperator", true),
+            ],
+            &[("ProjectionExpression", true), ("FilterExpression", true)],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Can not use both expression and non-expression parameters in the same request: \
+             Non-expression parameters: {AttributesToGet, ScanFilter, ConditionalOperator} \
+             Expression parameters: {ProjectionExpression, FilterExpression}"
+        );
+    }
+
+    #[test]
+    fn test_expression_param_mixing_skips_absent_params() {
+        let err = validate_no_expression_param_mixing(
+            &[("ScanFilter", false), ("ConditionalOperator", true)],
+            &[("ProjectionExpression", false), ("FilterExpression", true)],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Can not use both expression and non-expression parameters in the same request: \
+             Non-expression parameters: {ConditionalOperator} \
+             Expression parameters: {FilterExpression}"
+        );
+    }
+
+    #[test]
+    fn test_expression_param_mixing_allows_one_side_only() {
+        assert!(
+            validate_no_expression_param_mixing(
+                &[("ScanFilter", true), ("ConditionalOperator", true)],
+                &[("FilterExpression", false)],
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_no_expression_param_mixing(
+                &[("ScanFilter", false)],
+                &[("FilterExpression", true), ("ProjectionExpression", true)],
+            )
+            .is_ok()
+        );
+        assert!(validate_no_expression_param_mixing(&[], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_conditional_operator_requires_conditions() {
+        let err = validate_conditional_operator_usage(true, 0).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ConditionalOperator cannot be used without Filter or Expected"
+        );
+
+        let err = validate_conditional_operator_usage(true, 1).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ConditionalOperator can only be used when Filter or Expected has two or more elements"
+        );
+
+        assert!(validate_conditional_operator_usage(true, 2).is_ok());
+        assert!(validate_conditional_operator_usage(true, 5).is_ok());
+    }
+
+    #[test]
+    fn test_conditional_operator_absent_is_ok() {
+        assert!(validate_conditional_operator_usage(false, 0).is_ok());
+        assert!(validate_conditional_operator_usage(false, 1).is_ok());
+    }
 }
