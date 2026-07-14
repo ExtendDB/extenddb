@@ -85,17 +85,36 @@ pub async fn handle_put_item(
         }
     })?;
 
-    // Reject EAN/EAV supplied without a referencing expression.
+    // Reject mixing legacy and expression parameters, then EAN/EAV supplied
+    // without a referencing expression.
     let has_expression = input
         .condition_expression
         .as_ref()
         .is_some_and(|s| !s.is_empty());
+    let has_expected = input.expected.as_ref().is_some_and(|m| !m.is_empty());
+    let has_cond_op = input.conditional_operator.is_some();
+    extenddb_core::validation::validate_no_expression_param_mixing(
+        &[
+            ("Expected", has_expected),
+            ("ConditionalOperator", has_cond_op),
+        ],
+        &[("ConditionExpression", has_expression)],
+    )?;
     extenddb_core::expression::validate_expression_param_usage(
         input.expression_attribute_names.as_ref(),
         has_expression,
         input.expression_attribute_values.as_ref(),
         has_expression,
         &[extenddb_core::expression::ExpressionKind::Condition],
+    )?;
+
+    // ConditionalOperator requires an Expected with two or more conditions.
+    extenddb_core::validation::validate_conditional_operator_usage(
+        has_cond_op,
+        input
+            .expected
+            .as_ref()
+            .map_or(0, std::collections::HashMap::len),
     )?;
 
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;

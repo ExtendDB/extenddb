@@ -96,41 +96,33 @@ pub async fn handle_query(
     };
 
     // --- Legacy vs expression mutual exclusivity checks ---
-    let has_kce = input.key_condition_expression.is_some();
+    let kce_present = input.key_condition_expression.is_some();
     let has_kc = input.key_conditions.as_ref().is_some_and(|m| !m.is_empty());
-
-    if has_kce && has_kc {
-        return Err(DynamoDbError::ValidationException(
-            "Can not use both expression and non-expression parameters in the same request: \
-             Non-expression parameters: {KeyConditions} Expression parameters: {KeyConditionExpression}"
-                .to_owned(),
-        ));
-    }
-
     let has_fe = input.filter_expression.is_some();
     let has_qf = input.query_filter.as_ref().is_some_and(|m| !m.is_empty());
-
-    if has_fe && has_qf {
-        return Err(DynamoDbError::ValidationException(
-            "Can not use both expression and non-expression parameters in the same request: \
-             Non-expression parameters: {QueryFilter} Expression parameters: {FilterExpression}"
-                .to_owned(),
-        ));
-    }
-
     let has_pe = input.projection_expression.is_some();
     let has_atg = input
         .attributes_to_get
         .as_ref()
         .is_some_and(|a| !a.is_empty());
+    let has_cond_op = input.conditional_operator.is_some();
 
-    if has_pe && has_atg {
-        return Err(DynamoDbError::ValidationException(
-            "Can not use both expression and non-expression parameters in the same request: \
-             Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}"
-                .to_owned(),
-        ));
-    }
+    // KeyConditions legitimately combines with FilterExpression and
+    // ProjectionExpression, so it joins the mixing check only when
+    // KeyConditionExpression is also present.
+    extenddb_core::validation::validate_no_expression_param_mixing(
+        &[
+            ("AttributesToGet", has_atg),
+            ("QueryFilter", has_qf),
+            ("ConditionalOperator", has_cond_op),
+            ("KeyConditions", has_kc && kce_present),
+        ],
+        &[
+            ("ProjectionExpression", has_pe),
+            ("FilterExpression", has_fe),
+            ("KeyConditionExpression", kce_present),
+        ],
+    )?;
 
     // An explicitly empty KeyConditionExpression is rejected up front, before
     // the expression-parameter-usage checks (matching real DynamoDB).
@@ -162,6 +154,12 @@ pub async fn handle_query(
         input.expression_attribute_values.as_ref(),
         has_kce || has_filter_expr,
         &[],
+    )?;
+
+    // ConditionalOperator requires a QueryFilter with two or more conditions.
+    extenddb_core::validation::validate_conditional_operator_usage(
+        has_cond_op,
+        input.query_filter.as_ref().map_or(0, HashMap::len),
     )?;
 
     // Parse KeyConditionExpression or desugar legacy KeyConditions

@@ -44,28 +44,24 @@ pub async fn handle_scan(
     // --- Legacy vs expression mutual exclusivity checks ---
     let has_fe = input.filter_expression.is_some();
     let has_sf = input.scan_filter.as_ref().is_some_and(|m| !m.is_empty());
-
-    if has_fe && has_sf {
-        return Err(DynamoDbError::ValidationException(
-            "Can not use both expression and non-expression parameters in the same request: \
-             Non-expression parameters: {ScanFilter} Expression parameters: {FilterExpression}"
-                .to_owned(),
-        ));
-    }
-
     let has_pe = input.projection_expression.is_some();
     let has_atg = input
         .attributes_to_get
         .as_ref()
         .is_some_and(|a| !a.is_empty());
+    let has_cond_op = input.conditional_operator.is_some();
 
-    if has_pe && has_atg {
-        return Err(DynamoDbError::ValidationException(
-            "Can not use both expression and non-expression parameters in the same request: \
-             Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}"
-                .to_owned(),
-        ));
-    }
+    extenddb_core::validation::validate_no_expression_param_mixing(
+        &[
+            ("AttributesToGet", has_atg),
+            ("ScanFilter", has_sf),
+            ("ConditionalOperator", has_cond_op),
+        ],
+        &[
+            ("ProjectionExpression", has_pe),
+            ("FilterExpression", has_fe),
+        ],
+    )?;
 
     let maps = build_expression_maps(
         input.expression_attribute_names.as_ref(),
@@ -86,6 +82,12 @@ pub async fn handle_scan(
         input.expression_attribute_values.as_ref(),
         has_filter_expr,
         &[ExpressionKind::Filter],
+    )?;
+
+    // ConditionalOperator requires a ScanFilter with two or more conditions.
+    extenddb_core::validation::validate_conditional_operator_usage(
+        has_cond_op,
+        input.scan_filter.as_ref().map_or(0, HashMap::len),
     )?;
 
     // Parse FilterExpression or desugar legacy ScanFilter
