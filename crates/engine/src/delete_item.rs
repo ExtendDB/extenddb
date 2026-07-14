@@ -49,12 +49,30 @@ pub async fn handle_delete_item(
         .condition_expression
         .as_ref()
         .is_some_and(|s| !s.is_empty());
+    let has_expected = input.expected.as_ref().is_some_and(|m| !m.is_empty());
+    let has_cond_op = input.conditional_operator.is_some();
+    extenddb_core::validation::validate_no_expression_param_mixing(
+        &[
+            ("Expected", has_expected),
+            ("ConditionalOperator", has_cond_op),
+        ],
+        &[("ConditionExpression", has_condition)],
+    )?;
     extenddb_core::expression::validate_expression_param_usage(
         input.expression_attribute_names.as_ref(),
         has_condition,
         input.expression_attribute_values.as_ref(),
         has_condition,
         &[extenddb_core::expression::ExpressionKind::Condition],
+    )?;
+
+    // ConditionalOperator requires an Expected with two or more conditions.
+    extenddb_core::validation::validate_conditional_operator_usage(
+        has_cond_op,
+        input
+            .expected
+            .as_ref()
+            .map_or(0, std::collections::HashMap::len),
     )?;
 
     let (condition, maps) = resolve_condition(

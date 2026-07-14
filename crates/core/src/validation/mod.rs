@@ -1056,6 +1056,69 @@ pub fn validate_select_projection(
     Ok(())
 }
 
+/// Reject requests that mix legacy (non-expression) and expression parameters.
+///
+/// Each slice lists the API's parameters as `(name, present)` pairs in the
+/// canonical order Amazon DynamoDB reports them. If at least one parameter is
+/// present on each side, the error message lists every present parameter.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` when both sides are non-empty.
+pub fn validate_no_expression_param_mixing(
+    non_expression: &[(&str, bool)],
+    expression: &[(&str, bool)],
+) -> Result<(), DynamoDbError> {
+    // Happy path allocates nothing; the name lists are built only on error.
+    let any_present = |params: &[(&str, bool)]| params.iter().any(|(_, p)| *p);
+    if !any_present(non_expression) || !any_present(expression) {
+        return Ok(());
+    }
+    fn present_names(params: &[(&str, bool)]) -> String {
+        params
+            .iter()
+            .filter(|(_, p)| *p)
+            .map(|(n, _)| *n)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+    Err(DynamoDbError::ValidationException(format!(
+        "Can not use both expression and non-expression parameters in the same request: \
+         Non-expression parameters: {{{}}} Expression parameters: {{{}}}",
+        present_names(non_expression),
+        present_names(expression)
+    )))
+}
+
+/// Validate `ConditionalOperator` accompanies a legacy Filter/Expected with
+/// two or more conditions, matching Amazon DynamoDB.
+///
+/// `condition_count` is the number of entries in the request's legacy
+/// `ScanFilter`/`QueryFilter`/`Expected` map (0 when absent or empty).
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` when `ConditionalOperator` is
+/// present with fewer than two legacy conditions.
+pub fn validate_conditional_operator_usage(
+    conditional_operator_present: bool,
+    condition_count: usize,
+) -> Result<(), DynamoDbError> {
+    if !conditional_operator_present {
+        return Ok(());
+    }
+    match condition_count {
+        0 => Err(DynamoDbError::ValidationException(
+            "ConditionalOperator cannot be used without Filter or Expected".to_owned(),
+        )),
+        1 => Err(DynamoDbError::ValidationException(
+            "ConditionalOperator can only be used when Filter or Expected has two or more elements"
+                .to_owned(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Validate partition key and sort key sizes against limits.
 ///
 /// # Errors
