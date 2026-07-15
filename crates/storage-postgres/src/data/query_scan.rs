@@ -277,8 +277,14 @@ impl PostgresEngine {
         // The enum variant determines exactly which values are bound and in what order,
         // preventing bind-order divergence between SQL generation and execution.
         let pagination_binds = if let Some(start_key) = exclusive_start_key {
-            if let Some((ref base_sk_name, base_sk_type)) = base_sk_info {
-                // Index with base SK tie-breaker (SQL has $N for base_sk)
+            if sk_info_val.is_some()
+                && let Some((ref base_sk_name, base_sk_type)) = base_sk_info
+            {
+                // Index that has its own SK, with a base-table SK tie-breaker.
+                // The index SK is bound separately (see execute_query_sql); here
+                // we bind only the base SK. (SQL has $N for base_sk.)
+                // A hash-only index falls through to the BasePkAndSk arm below,
+                // because its SQL binds base_pk AND base_sk, not base_sk alone.
                 if let Some(base_sk_val) = start_key.get(base_sk_name.as_str()) {
                     let sk = parse_sk(base_sk_val, base_sk_type)?;
                     PaginationBinds::BaseSkOnly { sk }
