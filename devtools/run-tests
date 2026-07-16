@@ -310,24 +310,26 @@ if $NEEDS_INTEGRATION && [[ "$TARGET" != "real-dynamodb" ]]; then
         fi
     fi
 
-    # Import/export paths
+    # Import/export paths. The Python tests write fixtures via tempfile, which
+    # honours $TMPDIR — on macOS that is under /var/folders, not /tmp. Allow
+    # whatever tempfile will use so exported/imported file paths validate on
+    # every platform (Linux leaves TMPDIR unset, so this is /tmp there).
+    TMP_ALLOWED="${TMPDIR:-/tmp}"; TMP_ALLOWED="${TMP_ALLOWED%/}"
     if [[ -f "$CONFIG_FOR_SETTINGS" ]]; then
         NEED_RESTART=false
-        if ! grep -qE '^\[import\]' "$CONFIG_FOR_SETTINGS" || \
-           ! grep -A1 '^\[import\]' "$CONFIG_FOR_SETTINGS" | grep -q '/tmp'; then
+        if ! grep -A1 '^\[import\]' "$CONFIG_FOR_SETTINGS" 2>/dev/null | grep -qF "$TMP_ALLOWED"; then
             sed '/^# \[import\]/d; /^# paths = \[\].*import/d' "$CONFIG_FOR_SETTINGS" > "$CONFIG_FOR_SETTINGS.tmp" \
                 && mv "$CONFIG_FOR_SETTINGS.tmp" "$CONFIG_FOR_SETTINGS"
-            printf '\n[import]\npaths = ["/tmp"]\n' >> "$CONFIG_FOR_SETTINGS"
+            printf '\n[import]\npaths = ["%s"]\n' "$TMP_ALLOWED" >> "$CONFIG_FOR_SETTINGS"
             NEED_RESTART=true
-            echo "  ✓ [import] paths configured for /tmp"
+            echo "  ✓ [import] paths configured for $TMP_ALLOWED"
         fi
-        if ! grep -qE '^\[export\]' "$CONFIG_FOR_SETTINGS" || \
-           ! grep -A1 '^\[export\]' "$CONFIG_FOR_SETTINGS" | grep -q '/tmp'; then
+        if ! grep -A1 '^\[export\]' "$CONFIG_FOR_SETTINGS" 2>/dev/null | grep -qF "$TMP_ALLOWED"; then
             sed '/^# \[export\]/d; /^# paths = \[\].*export/d' "$CONFIG_FOR_SETTINGS" > "$CONFIG_FOR_SETTINGS.tmp" \
                 && mv "$CONFIG_FOR_SETTINGS.tmp" "$CONFIG_FOR_SETTINGS"
-            printf '\n[export]\npaths = ["/tmp"]\n' >> "$CONFIG_FOR_SETTINGS"
+            printf '\n[export]\npaths = ["%s"]\n' "$TMP_ALLOWED" >> "$CONFIG_FOR_SETTINGS"
             NEED_RESTART=true
-            echo "  ✓ [export] paths configured for /tmp"
+            echo "  ✓ [export] paths configured for $TMP_ALLOWED"
         fi
         if $NEED_RESTART && [[ -x "$BINARY" ]]; then
             echo "  Restarting server to pick up import/export config..."

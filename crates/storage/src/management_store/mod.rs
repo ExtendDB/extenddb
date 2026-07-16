@@ -157,6 +157,12 @@ pub trait ManagementStore: Send + Sync {
     /// List all accounts as `(account_id, account_name)`.
     fn list_all_accounts(&self) -> BoxFuture<'_, OpResult<Vec<(String, String)>>>;
 
+    /// Return the deployment's canonical default account id, recorded at
+    /// bootstrap. Callers must use this rather than inferring the default from
+    /// `list_all_accounts` ordering. Returns `None` if not recorded (catalog
+    /// not bootstrapped by a version that records it).
+    fn default_account_id(&self) -> BoxFuture<'_, OpResult<Option<String>>>;
+
     /// List all accounts with `created_at` as `(account_id, account_name, created_at)`.
     fn list_all_accounts_full(
         &self,

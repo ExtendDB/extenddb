@@ -16,8 +16,9 @@ use extenddb_config as config;
 #[derive(Args)]
 #[allow(clippy::doc_markdown)] // Clap help text, not rustdoc
 pub struct InitArgs {
-    /// Storage backend (postgres) (default: postgres)
-    #[arg(long, default_value = "postgres")]
+    /// Storage backend. Optional: the binary's compiled-in backend is used;
+    /// when given, it is validated against that backend.
+    #[arg(long)]
     backend: Option<String>,
 
     /// Data database name (default: extenddb)
@@ -114,15 +115,32 @@ fn discover_docs_dir() -> Option<String> {
 
 /// Returns exit code: 0 = success, 255 = existing config preserved.
 pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
-    // Determine backend: CLI flag > config file > default
-    let backend = if let Some(ref b) = args.backend {
-        b.clone()
-    } else if Path::new(&args.config).exists() {
+    // The installed backend is authoritative — there is exactly one compiled
+    // into this binary. An explicit --backend (or a config file's backend key)
+    // is validated against it rather than driving dispatch, so a mismatch is a
+    // clear startup error instead of a mis-generated config.
+    let backend = extenddb_storage::backend_name()
+        .ok_or_else(|| anyhow::anyhow!("no storage backend installed"))?
+        .to_owned();
+    if let Some(ref requested) = args.backend
+        && *requested != backend
+    {
+        anyhow::bail!(
+            "this binary is built with the '{backend}' backend; \
+             --backend {requested} requires the extenddb-{requested} binary"
+        );
+    }
+    if args.backend.is_none() && Path::new(&args.config).exists() {
         let app_config = config::load(&args.config)?;
-        app_config.storage.backend
-    } else {
-        "postgres".to_owned()
-    };
+        if app_config.storage.backend != backend {
+            anyhow::bail!(
+                "config file '{}' selects backend '{}', but this binary is built \
+                 with the '{backend}' backend",
+                args.config,
+                app_config.storage.backend,
+            );
+        }
+    }
 
     println!("=== extenddb init (backend: {backend}) ===");
 
@@ -254,7 +272,6 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
     }
 
     // Generate or update extenddb.toml.
-    let backend = args.backend.as_deref().unwrap_or("postgres");
     let config_path = &args.config;
 
     if Path::new(config_path).exists() {
@@ -262,7 +279,7 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
     }
     generate_config(
         config_path,
-        backend,
+        &backend,
         bootstrapper.as_ref(),
         &bind_addr,
         docs_dir.as_deref(),

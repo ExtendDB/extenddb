@@ -1,0 +1,37 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "extenddb-storage-sqlite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# Compile the in-memory (`:memory:`) database in as the default storage path,
+# yielding a zero-config, ephemeral, bootstrap-on-serve deployment (no `init`,
+# no file on disk). Without this feature the backend is file-backed and the path
+# must be configured as usual.
+memory = []
+
+[dependencies]
+extenddb-core = { workspace = true }
+extenddb-storage = { workspace = true }
+extenddb-auth = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true, features = ["sqlite"] }
+tokio = { workspace = true, features = ["sync"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+time = { workspace = true }
+base64 = { workspace = true }
+bcrypt = { workspace = true }
+aes-gcm = { workspace = true }
+rand = { workspace = true }
+bigdecimal = { workspace = true }
+crc32fast = { workspace = true }
+zeroize = { workspace = true }

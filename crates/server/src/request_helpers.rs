@@ -108,6 +108,14 @@ pub(crate) async fn authorize_request(
         _ => None,
     };
 
+    // Developer mode opens authorization for the authenticated caller. SigV4
+    // verification already ran upstream, so the request is authenticated; only
+    // the IAM policy decision is skipped. key_info is still returned so the
+    // engine layer can reuse it.
+    if state.dev_mode {
+        return Ok(key_info);
+    }
+
     let pk_attr = key_info
         .as_ref()
         .map(|ki| ki.key_schema[0].attribute_name.clone());
