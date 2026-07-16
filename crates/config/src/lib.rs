@@ -355,6 +355,18 @@ fn default_log_format() -> String {
     "pretty".to_owned()
 }
 
+/// Effective TLS state for a loaded config.
+///
+/// A `dev-mode` build always serves plain HTTP on loopback regardless of the
+/// configured `server.tls.enabled` (which defaults to `true`). This is the
+/// single source of truth so the server (`cmd_serve`) and the `manage` client
+/// agree on the scheme; reading `config.server.tls.enabled` directly is a bug
+/// in dev-mode builds.
+#[must_use]
+pub fn is_tls_enabled(config: &AppConfig) -> bool {
+    config.server.tls.enabled && !cfg!(feature = "dev-mode")
+}
+
 /// Load `AppConfig` from a config file (optional) and environment variables.
 ///
 /// # Errors

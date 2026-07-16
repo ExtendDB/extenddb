@@ -272,29 +272,45 @@ impl Bootstrapper for PostgresBootstrapper {
 
     async fn bootstrap_default_account(&self) -> OpResult<()> {
         let pool = self.app_pool(&self.config.catalog_db).await?;
-        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM accounts)")
-            .fetch_one(&pool)
-            .await
-            .map_err(|e| OpError::Internal(format!("Check accounts: {e}")))?;
-
-        if exists {
-            println!("--- Default account already exists, skipping.");
-            return Ok(());
-        }
-
-        let account_id = generate_account_id();
-        println!("--- Creating default account '{account_id}'...");
+        // Reuse the existing account when already bootstrapped, otherwise create
+        // the single default account. Either way, record its id as the canonical
+        // default account so callers never infer it from list ordering. The
+        // settings write is idempotent, so it also backfills the marker for
+        // catalogs bootstrapped before it existed.
+        let account_id: String =
+            match sqlx::query_scalar("SELECT account_id FROM accounts ORDER BY account_id LIMIT 1")
+                .fetch_optional(&pool)
+                .await
+                .map_err(|e| OpError::Internal(format!("Check accounts: {e}")))?
+            {
+                Some(id) => {
+                    println!("--- Default account already exists, skipping.");
+                    id
+                }
+                None => {
+                    let id = generate_account_id();
+                    println!("--- Creating default account '{id}'...");
+                    sqlx::query(
+                        "INSERT INTO accounts (account_id, account_name) VALUES ($1, $2) \
+                     ON CONFLICT (account_id) DO NOTHING",
+                    )
+                    .bind(&id)
+                    .bind("default")
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| OpError::Internal(format!("Create account: {e}")))?;
+                    println!("    Account ID: {id}");
+                    id
+                }
+            };
         sqlx::query(
-            "INSERT INTO accounts (account_id, account_name) VALUES ($1, $2) \
-             ON CONFLICT (account_id) DO NOTHING",
+            "INSERT INTO settings (key, value) VALUES ('default_account_id', $1) \
+             ON CONFLICT (key) DO NOTHING",
         )
         .bind(&account_id)
-        .bind("default")
         .execute(&pool)
         .await
-        .map_err(|e| OpError::Internal(format!("Create account: {e}")))?;
-
-        println!("    Account ID: {account_id}");
+        .map_err(|e| OpError::Internal(format!("Record default account id: {e}")))?;
         Ok(())
     }
 

@@ -38,12 +38,13 @@ pub fn resolve_endpoint(
             return Ok((rest.to_owned(), false, None));
         }
         let app_config = config::load(config_path)?;
-        let cert = if app_config.server.tls.enabled {
+        let use_tls = config::is_tls_enabled(&app_config);
+        let cert = if use_tls {
             Some(config::expand_tilde(&app_config.server.tls.cert_path))
         } else {
             None
         };
-        return Ok((ep.to_owned(), app_config.server.tls.enabled, cert));
+        return Ok((ep.to_owned(), use_tls, cert));
     }
     if !std::path::Path::new(config_path).exists() {
         anyhow::bail!(
@@ -57,16 +58,13 @@ pub fn resolve_endpoint(
     } else {
         &app_config.server.bind_addr
     };
-    let cert = if app_config.server.tls.enabled {
+    let use_tls = config::is_tls_enabled(&app_config);
+    let cert = if use_tls {
         Some(config::expand_tilde(&app_config.server.tls.cert_path))
     } else {
         None
     };
-    Ok((
-        format!("{addr}:{}", app_config.server.port),
-        app_config.server.tls.enabled,
-        cert,
-    ))
+    Ok((format!("{addr}:{}", app_config.server.port), use_tls, cert))
 }
 
 /// Resolve the password from: CLI arg or `EXTENDDB_PASSWORD` env var.

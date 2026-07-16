@@ -7,6 +7,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Developer mode: plain HTTP on loopback, open authorization (SigV4 still
+# enforced), seeded dev credential. A build-time profile for local/CI only;
+# the thin bin enforces that it is paired with a dev/CI backend.
+dev-mode = ["extenddb-config/dev-mode"]
+
 [dependencies]
 extenddb-auth = { workspace = true }
 extenddb-cache = { workspace = true }
