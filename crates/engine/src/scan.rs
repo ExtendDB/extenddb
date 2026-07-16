@@ -344,6 +344,9 @@ pub async fn handle_scan(
         extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
             |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
         )?;
+        extenddb_core::expression::validate_ordering_operand_types(f, &combined_maps).map_err(
+            |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
+        )?;
     }
 
     // Scan storage

@@ -12,8 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::error::DynamoDbError;
 use crate::types::AttributeValue;
 
-use super::ast::Expr;
-use super::ast::PathElement;
+use super::ast::{CompareOp, Expr, PathElement};
 
 /// Resolved expression attribute names and values.
 ///
@@ -473,17 +472,7 @@ pub fn validate_begins_with_operands(
                 && let Some(val) = maps.values.get(placeholder)
                 && !matches!(val, AttributeValue::S(_) | AttributeValue::B(_))
             {
-                let type_code = match val {
-                    AttributeValue::N(_) => "N",
-                    AttributeValue::Bool(_) => "BOOL",
-                    AttributeValue::Null => "NULL",
-                    AttributeValue::L(_) => "L",
-                    AttributeValue::M(_) => "M",
-                    AttributeValue::SS(_) => "SS",
-                    AttributeValue::NS(_) => "NS",
-                    AttributeValue::BS(_) => "BS",
-                    _ => "UNKNOWN",
-                };
+                let type_code = attribute_type_code(val);
                 return Err(DynamoDbError::ValidationException(format!(
                     "Incorrect operand type for operator or function; operator or function: begins_with, operand type: {type_code}"
                 )));
@@ -497,6 +486,97 @@ pub fn validate_begins_with_operands(
         Expr::Not(inner) => validate_begins_with_operands(inner, maps),
         _ => Ok(()),
     }
+}
+
+/// Return the DynamoDB type code for an AttributeValue (S, N, B, BOOL, NULL,
+/// L, M, SS, NS, BS). Used in operand-type validation messages.
+pub(crate) fn attribute_type_code(val: &AttributeValue) -> &'static str {
+    match val {
+        AttributeValue::S(_) => "S",
+        AttributeValue::N(_) => "N",
+        AttributeValue::B(_) => "B",
+        AttributeValue::Bool(_) => "BOOL",
+        AttributeValue::Null => "NULL",
+        AttributeValue::L(_) => "L",
+        AttributeValue::M(_) => "M",
+        AttributeValue::SS(_) => "SS",
+        AttributeValue::NS(_) => "NS",
+        AttributeValue::BS(_) => "BS",
+    }
+}
+
+/// Reject ordering comparisons (`<`, `<=`, `>`, `>=`) and `BETWEEN` whose
+/// literal (expression-attribute-value) operand is a non-orderable type. Only
+/// S, N and B are orderable in Amazon DynamoDB. A document path is not checked
+/// here: at runtime a path that resolves to a non-orderable type makes the
+/// comparison evaluate to false. Runs over the whole tree before evaluation so
+/// short-circuited branches and empty scans still reject. Equality (`=`) and
+/// inequality (`<>`) accept every type and are left alone.
+///
+/// The message carries no expression-kind prefix; the caller adds
+/// `Invalid ConditionExpression:` / `Invalid FilterExpression:`.
+///
+/// # Errors
+///
+/// Returns `ValidationException` when an ordering operand is a non-orderable literal.
+pub fn validate_ordering_operand_types(
+    expr: &Expr,
+    maps: &ExpressionMaps,
+) -> Result<(), DynamoDbError> {
+    match expr {
+        Expr::Compare { left, op, right } => {
+            if let Some(symbol) = ordering_op_symbol(*op) {
+                reject_non_orderable_literal(left, maps, symbol)?;
+                reject_non_orderable_literal(right, maps, symbol)?;
+            }
+            Ok(())
+        }
+        Expr::Between { operand, low, high } => {
+            reject_non_orderable_literal(operand, maps, "BETWEEN")?;
+            reject_non_orderable_literal(low, maps, "BETWEEN")?;
+            reject_non_orderable_literal(high, maps, "BETWEEN")
+        }
+        Expr::And(left, right) | Expr::Or(left, right) => {
+            validate_ordering_operand_types(left, maps)?;
+            validate_ordering_operand_types(right, maps)
+        }
+        Expr::Not(inner) => validate_ordering_operand_types(inner, maps),
+        _ => Ok(()),
+    }
+}
+
+/// The DynamoDB symbol for an ordering operator, or `None` for equality and
+/// inequality (which accept every operand type).
+fn ordering_op_symbol(op: CompareOp) -> Option<&'static str> {
+    match op {
+        CompareOp::Lt => Some("<"),
+        CompareOp::Le => Some("<="),
+        CompareOp::Gt => Some(">"),
+        CompareOp::Ge => Some(">="),
+        CompareOp::Eq | CompareOp::Ne => None,
+    }
+}
+
+/// Reject a literal (`:value`) operand whose resolved type is not orderable.
+/// Non-literal operands (document paths, function results) are left to runtime.
+fn reject_non_orderable_literal(
+    operand: &Expr,
+    maps: &ExpressionMaps,
+    op_label: &str,
+) -> Result<(), DynamoDbError> {
+    if let Expr::Placeholder(placeholder) = operand
+        && let Some(val) = maps.values.get(placeholder)
+        && !matches!(
+            val,
+            AttributeValue::S(_) | AttributeValue::N(_) | AttributeValue::B(_)
+        )
+    {
+        let type_code = attribute_type_code(val);
+        return Err(DynamoDbError::ValidationException(format!(
+            "Incorrect operand type for operator or function; operator or function: {op_label}, operand type: {type_code}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
