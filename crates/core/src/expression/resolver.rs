@@ -706,6 +706,81 @@ mod tests {
         assert!(err.to_string().contains("operand type: N"));
     }
 
+    #[test]
+    fn ordering_rejects_non_orderable_literal_with_operator_symbol() {
+        for (op, sym) in [("<", "<"), ("<=", "<="), (">", ">"), (">=", ">=")] {
+            let expr = parse(&format!("n {op} :v"));
+            let maps = maps_with("v", AttributeValue::Bool(true));
+            let err = validate_ordering_operand_types(&expr, &maps).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("operator or function: {sym}")),
+                "{msg}"
+            );
+            assert!(msg.contains("operand type: BOOL"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn ordering_reports_each_non_orderable_type_code() {
+        for (val, code) in [
+            (AttributeValue::Null, "NULL"),
+            (AttributeValue::L(vec![]), "L"),
+            (AttributeValue::M(BTreeMap::new()), "M"),
+            (AttributeValue::SS(BTreeSet::from(["a".to_owned()])), "SS"),
+        ] {
+            let expr = parse("n > :v");
+            let maps = maps_with("v", val);
+            let err = validate_ordering_operand_types(&expr, &maps).unwrap_err();
+            assert!(err.to_string().contains(&format!("operand type: {code}")));
+        }
+    }
+
+    #[test]
+    fn equality_ops_accept_non_orderable_literal() {
+        for op in ["=", "<>"] {
+            let expr = parse(&format!("n {op} :v"));
+            let maps = maps_with("v", AttributeValue::Bool(true));
+            assert!(validate_ordering_operand_types(&expr, &maps).is_ok());
+        }
+    }
+
+    #[test]
+    fn between_rejects_non_orderable_literal_bounds() {
+        let expr = parse("n BETWEEN :a AND :b");
+        let mut values = HashMap::new();
+        values.insert("a".to_owned(), AttributeValue::Bool(true));
+        values.insert("b".to_owned(), AttributeValue::Bool(false));
+        let maps = ExpressionMaps::new(HashMap::new(), values);
+        let err = validate_ordering_operand_types(&expr, &maps).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("operator or function: BETWEEN"), "{msg}");
+        assert!(msg.contains("operand type: BOOL"), "{msg}");
+    }
+
+    #[test]
+    fn ordering_ignores_non_orderable_document_path() {
+        // Both operands are document paths: not validated (evaluates false at runtime).
+        let expr = parse("flag > other");
+        let maps = ExpressionMaps::new(HashMap::new(), HashMap::new());
+        assert!(validate_ordering_operand_types(&expr, &maps).is_ok());
+    }
+
+    #[test]
+    fn ordering_validated_across_short_circuit_branches() {
+        // The bad compare is rejected even behind a short-circuiting AND/OR or NOT.
+        for expr_str in [
+            "attribute_exists(x) AND n > :v",
+            "attribute_not_exists(x) OR n > :v",
+            "NOT (n > :v)",
+        ] {
+            let expr = parse(expr_str);
+            let maps = maps_with("v", AttributeValue::Bool(true));
+            let err = validate_ordering_operand_types(&expr, &maps).unwrap_err();
+            assert!(err.to_string().contains("Incorrect operand type"));
+        }
+    }
+
     fn placeholder(s: &str) -> Expr {
         Expr::Placeholder(s.to_owned())
     }
