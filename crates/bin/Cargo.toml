@@ -11,8 +11,21 @@ license.workspace = true
 name = "extenddb"
 path = "src/main.rs"
 
+[features]
+default = ["postgres"]
+postgres = ["extenddb-storage-postgres"]
+sqlite = ["extenddb-storage-sqlite"]
+# Build the SQLite backend in its zero-config, ephemeral in-memory mode.
+sqlite-memory = ["sqlite", "extenddb-storage-sqlite/memory"]
+# Developer mode: plain HTTP on loopback, open authorization (SigV4 still
+# enforced), seeded dev credential. A build-time profile for local/CI only; it
+# requires a dev backend (`sqlite`/`sqlite-memory`) and fails to build with a
+# production backend like `postgres` (enforced at compile time in `main.rs`).
+dev-mode = ["extenddb-app/dev-mode"]
+
 [dependencies]
 extenddb-app = { workspace = true }
 extenddb-storage = { workspace = true }
-extenddb-storage-postgres = { workspace = true }
+extenddb-storage-postgres = { workspace = true, optional = true }
+extenddb-storage-sqlite = { workspace = true, optional = true }
 anyhow = { workspace = true }

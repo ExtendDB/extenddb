@@ -9,6 +9,7 @@ members = [
     "crates/storage",
     "crates/config",
     "crates/storage-postgres",
+    "crates/storage-sqlite",
     "crates/auth",
     "crates/server",
     "crates/app",
@@ -29,6 +30,7 @@ extenddb-engine = { path = "crates/engine" }
 extenddb-storage = { path = "crates/storage" }
 extenddb-config = { path = "crates/config" }
 extenddb-storage-postgres = { path = "crates/storage-postgres" }
+extenddb-storage-sqlite = { path = "crates/storage-sqlite" }
 extenddb-auth = { path = "crates/auth" }
 extenddb-server = { path = "crates/server" }
 extenddb-app = { path = "crates/app" }

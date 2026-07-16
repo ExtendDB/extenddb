@@ -10,3 +10,7 @@ pdfs/
 docs/rendered/
 discussions/
 .DS_Store
+extenddb.sqlite
+extenddb.sqlite-shm
+extenddb.sqlite-wal
+extenddb.toml.bak

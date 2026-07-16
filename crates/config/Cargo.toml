@@ -7,6 +7,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Developer mode: `is_tls_enabled` reports plain HTTP regardless of the
+# configured TLS state. Enabled only through the app crate's `dev-mode` feature.
+dev-mode = []
+
 [dependencies]
 extenddb-core = { workspace = true }
 extenddb-storage = { workspace = true }

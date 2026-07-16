@@ -64,8 +64,9 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     // Load config early so bind address is known before fork.
     let app_config = config::load(&args.config)?;
 
-    // D5: TLS is mandatory. Reject explicit opt-out.
-    if !app_config.server.tls.enabled {
+    // D5: TLS is mandatory — except in a dev-mode build, which deliberately
+    // serves plain HTTP on loopback for frictionless local/CI use.
+    if !cfg!(feature = "dev-mode") && !app_config.server.tls.enabled {
         anyhow::bail!("TLS is mandatory. Remove `tls.enabled = false` from your config file.");
     }
 
@@ -88,6 +89,24 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     let catalog_version = extenddb_storage::operations::catalog_version()?;
 
     let port = args.port.unwrap_or(app_config.server.port);
+
+    // Dev mode serves plain HTTP with relaxed authorization; confine it to
+    // loopback so it can never be exposed off-host.
+    if cfg!(feature = "dev-mode") {
+        let host = app_config.server.bind_addr.trim();
+        let loopback = host == "localhost"
+            || host
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false);
+        if !loopback {
+            anyhow::bail!(
+                "dev-mode builds may only bind to loopback (127.0.0.1, ::1, localhost); \
+                 got server.bind_addr = '{host}'"
+            );
+        }
+    }
+
     let bind_addr = format!("{}:{}", app_config.server.bind_addr, port);
 
     // Bind in sync context — errors go to stderr before daemonizing.
@@ -122,6 +141,15 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         println!("{banner_line1}");
         println!("{banner_line2}");
     }
+    if cfg!(feature = "dev-mode") {
+        let msg = "  DEVELOPER MODE: plain HTTP on loopback, authorization open \
+                   (SigV4 still enforced). Not for production.";
+        if args.foreground {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    }
 
     // D-3: A PID file lets `extenddb status` and `extenddb stop` find the
     // process. Daemon mode always writes one. Foreground mode writes one only on
@@ -147,6 +175,12 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         let pid_file = pid_file
             .as_ref()
             .expect("daemon mode always has a PID file path");
+        // The listening socket bound successfully above, which proves no live
+        // server owns this port. Any existing PID file is therefore stale (a
+        // prior run that crashed or was killed without cleanup). Remove it
+        // before daemonizing so startup verification reads the new daemon's
+        // PID rather than a dead one from a previous run.
+        let _ = std::fs::remove_file(pid_file);
         let daemon = Daemonize::new().pid_file(pid_file);
         match daemon.execute() {
             daemonize::Outcome::Parent(Ok(_)) => {
@@ -181,13 +215,13 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         .enable_all()
         .build()?
         .block_on(extenddb_server::serve(
-            ServeParams::new(app_config, std_listener, pid_file, build).with_log_target(
-                if args.foreground {
+            ServeParams::new(app_config, std_listener, pid_file, build)
+                .with_log_target(if args.foreground {
                     LogTarget::Stderr
                 } else {
                     LogTarget::Syslog
-                },
-            ),
+                })
+                .with_dev_mode(cfg!(feature = "dev-mode")),
         ))
 }
 
