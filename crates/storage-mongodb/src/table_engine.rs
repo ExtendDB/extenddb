@@ -455,7 +455,7 @@ impl MongoEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        self.gsi_cache.remove(&desc.table_id);
+        self.gsi_cache_invalidate(&desc.table_id);
 
         // Delete the table metadata
         tables_coll
@@ -650,7 +650,7 @@ impl MongoEngine {
                             }
                         })?;
 
-                    self.gsi_cache.insert(desc.table_id.clone(), true);
+                    self.gsi_cache_set(&desc.table_id, true);
                 }
 
                 if let Some(delete) = &update.delete {
@@ -667,7 +667,7 @@ impl MongoEngine {
                     }
 
                     // Invalidate cache — may still have other GSIs
-                    self.gsi_cache.remove(&desc.table_id);
+                    self.gsi_cache_invalidate(&desc.table_id);
                 }
             }
         }
