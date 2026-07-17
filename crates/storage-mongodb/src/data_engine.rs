@@ -2130,18 +2130,14 @@ fn sk_to_bson(
 ) -> Result<bson::Bson, StorageError> {
     match (sk_type, av) {
         (ScalarAttributeType::S, AttributeValue::S(s)) => Ok(bson::Bson::String(s.clone())),
-        (ScalarAttributeType::N, AttributeValue::N(n)) => match n.parse::<bson::Decimal128>() {
-            Ok(d) => Ok(bson::Bson::Decimal128(d)),
-            Err(_) => {
-                if let Ok(f) = n.parse::<f64>() {
-                    Ok(bson::Bson::Double(f))
-                } else {
-                    Err(StorageError::Internal(format!(
-                        "cannot parse numeric sort key: {n}"
-                    )))
-                }
-            }
-        },
+        (ScalarAttributeType::N, AttributeValue::N(n)) => n
+            .parse::<bson::Decimal128>()
+            .map(bson::Bson::Decimal128)
+            .map_err(|_| {
+                StorageError::Validation(format!(
+                    "Numeric sort key value '{n}' exceeds supported precision (Decimal128, 34 significant digits)"
+                ))
+            }),
         (ScalarAttributeType::B, AttributeValue::B(b)) => Ok(bson::Bson::Binary(bson::Binary {
             subtype: bson::spec::BinarySubtype::Generic,
             bytes: b.clone(),

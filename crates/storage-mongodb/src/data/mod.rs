@@ -60,22 +60,18 @@ pub fn item_to_document(
             }
             ScalarAttributeType::N => {
                 if let AttributeValue::N(n) = sk_value {
-                    // Store as Decimal128 for proper numeric ordering
-                    match n.parse::<bson::Decimal128>() {
-                        Ok(d) => {
-                            doc.insert("sk_n", d);
-                        }
-                        Err(_) => {
-                            // Fallback: try parsing as f64
-                            if let Ok(f) = n.parse::<f64>() {
-                                doc.insert("sk_n", f);
-                            } else {
-                                return Err(StorageError::Internal(format!(
-                                    "Cannot convert sort key '{n}' to numeric BSON type"
-                                )));
-                            }
-                        }
-                    }
+                    // Store as Decimal128 for correct numeric ordering.
+                    // Values that exceed Decimal128's 34 significant digits (or
+                    // any parse failure) are rejected rather than downcasting to
+                    // f64, which would silently lose precision and can produce
+                    // incorrect ordering. DynamoDB supports up to 38 digits; this
+                    // limitation is documented in docs/differences-from-dynamodb.md.
+                    let d = n.parse::<bson::Decimal128>().map_err(|_| {
+                        StorageError::Validation(format!(
+                            "Numeric sort key value '{n}' exceeds supported precision (Decimal128, 34 significant digits)"
+                        ))
+                    })?;
+                    doc.insert("sk_n", d);
                 }
             }
             ScalarAttributeType::B => {
@@ -151,16 +147,12 @@ pub fn pk_filter(
             }
             ScalarAttributeType::N => {
                 if let AttributeValue::N(n) = sk_value {
-                    match n.parse::<bson::Decimal128>() {
-                        Ok(d) => {
-                            filter.insert("sk_n", d);
-                        }
-                        Err(_) => {
-                            if let Ok(f) = n.parse::<f64>() {
-                                filter.insert("sk_n", f);
-                            }
-                        }
-                    }
+                    let d = n.parse::<bson::Decimal128>().map_err(|_| {
+                        StorageError::Validation(format!(
+                            "Numeric key value '{n}' exceeds supported precision (Decimal128, 34 significant digits)"
+                        ))
+                    })?;
+                    filter.insert("sk_n", d);
                 }
             }
             ScalarAttributeType::B => {
@@ -190,4 +182,80 @@ pub fn sk_field_name(
         ScalarAttributeType::N => "sk_n",
         ScalarAttributeType::B => "sk_b",
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schema_pk_str_sk_num() -> (Vec<KeySchemaElement>, Vec<AttributeDefinition>) {
+        (
+            vec![
+                KeySchemaElement {
+                    attribute_name: "pk".to_owned(),
+                    key_type: KeyType::Hash,
+                },
+                KeySchemaElement {
+                    attribute_name: "sk".to_owned(),
+                    key_type: KeyType::Range,
+                },
+            ],
+            vec![
+                AttributeDefinition {
+                    attribute_name: "pk".to_owned(),
+                    attribute_type: ScalarAttributeType::S,
+                },
+                AttributeDefinition {
+                    attribute_name: "sk".to_owned(),
+                    attribute_type: ScalarAttributeType::N,
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn item_to_document_rejects_numeric_sort_key_exceeding_decimal128() {
+        let (schema, attrs) = schema_pk_str_sk_num();
+        // 35 significant digits — exceeds Decimal128's 34-digit precision.
+        let over_precision = "1".to_owned() + &"2".repeat(34);
+        assert_eq!(over_precision.chars().filter(|c| c.is_ascii_digit()).count(), 35);
+
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S("x".to_owned()));
+        item.insert("sk".to_owned(), AttributeValue::N(over_precision.clone()));
+
+        let err = item_to_document(&item, &schema, &attrs).unwrap_err();
+        match err {
+            StorageError::Validation(msg) => {
+                assert!(msg.contains(&over_precision));
+                assert!(msg.contains("Decimal128"));
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn item_to_document_accepts_numeric_sort_key_at_decimal128_boundary() {
+        let (schema, attrs) = schema_pk_str_sk_num();
+        // 34 significant digits — at the Decimal128 boundary.
+        let at_boundary = "1".repeat(34);
+
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S("x".to_owned()));
+        item.insert("sk".to_owned(), AttributeValue::N(at_boundary));
+
+        assert!(item_to_document(&item, &schema, &attrs).is_ok());
+    }
+
+    #[test]
+    fn pk_filter_rejects_numeric_sort_key_exceeding_decimal128() {
+        let (schema, attrs) = schema_pk_str_sk_num();
+        let over_precision = "1".to_owned() + &"2".repeat(34);
+        let mut key = Item::new();
+        key.insert("pk".to_owned(), AttributeValue::S("x".to_owned()));
+        key.insert("sk".to_owned(), AttributeValue::N(over_precision));
+
+        let err = pk_filter(&key, &schema, &attrs).unwrap_err();
+        assert!(matches!(err, StorageError::Validation(_)));
+    }
 }
