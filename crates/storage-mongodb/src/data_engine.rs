@@ -905,25 +905,23 @@ impl MongoEngine {
 
         // Post-fetch filtering for binary begins_with (BSON Binary comparison
         // sorts by length first, making $gte/$lt unreliable for prefix matching).
-        if let Some(ref sk_cond) = key_condition.sk_condition {
-            if let SortKeyCondition::BeginsWith { prefix, .. } = sk_cond {
-                let prefix_av = resolve_key_expr(prefix, maps)?;
-                if let AttributeValue::B(ref prefix_bytes) = prefix_av {
-                    if let Some((sk_name, _)) =
-                        sk_info(&effective_key_schema, &key_info.attribute_definitions)
-                    {
-                        items.retain(|item| {
-                            item.get(sk_name)
-                                .and_then(|v| {
-                                    if let AttributeValue::B(b) = v {
-                                        Some(b.starts_with(prefix_bytes))
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or(false)
-                        });
-                    }
+        if let Some(SortKeyCondition::BeginsWith { prefix, .. }) = &key_condition.sk_condition {
+            let prefix_av = resolve_key_expr(prefix, maps)?;
+            if let AttributeValue::B(ref prefix_bytes) = prefix_av {
+                if let Some((sk_name, _)) =
+                    sk_info(&effective_key_schema, &key_info.attribute_definitions)
+                {
+                    items.retain(|item| {
+                        item.get(sk_name)
+                            .and_then(|v| {
+                                if let AttributeValue::B(b) = v {
+                                    Some(b.starts_with(prefix_bytes))
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(false)
+                    });
                 }
             }
         }
