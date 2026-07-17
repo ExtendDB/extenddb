@@ -52,8 +52,7 @@ impl BackupEngine for MongoEngine {
             let tables_coll = self.catalog_db.collection::<Document>("tables");
             let table_doc = tables_coll
                 .find_one(doc! {
-                    "account_id": &account_id,
-                    "table_name": &table_name,
+                    "_id": { "account_id": &account_id, "table_name": &table_name },
                     "table_status": "ACTIVE",
                 })
                 .await
@@ -458,7 +457,7 @@ impl BackupEngine for MongoEngine {
             let tables_coll = self.catalog_db.collection::<Document>("tables");
             tables_coll
                 .update_one(
-                    doc! { "account_id": &account_id, "table_name": &target_table_name },
+                    doc! { "_id": { "account_id": &account_id, "table_name": &target_table_name } },
                     doc! { "$set": { "item_count": item_count, "table_status": "ACTIVE" } },
                 )
                 .await
@@ -478,7 +477,7 @@ impl BackupEngine for MongoEngine {
         Box::pin(async move {
             let tables_coll = self.catalog_db.collection::<Document>("tables");
             let exists = tables_coll
-                .find_one(doc! { "account_id": &account_id, "table_name": &table_name })
+                .find_one(doc! { "_id": { "account_id": &account_id, "table_name": &table_name } })
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -529,7 +528,7 @@ impl BackupEngine for MongoEngine {
         Box::pin(async move {
             let tables_coll = self.catalog_db.collection::<Document>("tables");
             let exists = tables_coll
-                .find_one(doc! { "account_id": &account_id, "table_name": &table_name })
+                .find_one(doc! { "_id": { "account_id": &account_id, "table_name": &table_name } })
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
