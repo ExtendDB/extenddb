@@ -34,6 +34,7 @@ use proptest::sample::select;
 use extenddb_core::expression::{CompareOp, Expr, ExpressionMaps, PathElement, evaluate_condition};
 use extenddb_core::types::AttributeValue;
 use extenddb_storage_mongodb::condition::condition_to_filter;
+use extenddb_storage_mongodb::pushdown::{Pushable, is_pushable};
 
 use common::eval_filter;
 
@@ -115,19 +116,15 @@ fn arb_placeholder_ref(idx: usize) -> Expr {
 /// The placeholders are numbered per-expression starting at :v0. When
 /// composing with AND/OR (below), we renumber to keep them globally unique.
 ///
-/// Binary (`.B`) operands are currently excluded: the compiler emits raw
-/// BSON `Binary` filters for `.B` comparisons, but `item_to_document`
-/// (in production) stores `.B` fields as base64-encoded strings via the
-/// AttributeValue JSON serializer. The two formats never match — a
-/// pre-existing bug in the compiler / storage-layer contract. A5 step 3
-/// will either fix the compiler to emit string filters (matching storage)
-/// or fix the storage to emit BSON binary (matching the compiler), and
-/// re-enable `.B` comparisons in this harness.
+/// `.B` operands are re-enabled here as of A5 step 3, which fixed
+/// `av_to_bson` in `condition.rs` to emit the base64 string form that
+/// matches how storage writes `.B` fields.
 #[allow(clippy::redundant_closure)]
 fn arb_leaf_expr() -> impl Strategy<Value = (Expr, Vec<AttributeValue>)> {
     // We union several leaf shapes. Each yields (Expr, values-list).
     let name = || arb_name_expr();
     let str_val = || arb_short_str().prop_map(AttributeValue::S);
+    let bytes_val = || arb_short_bytes().prop_map(AttributeValue::B);
 
     prop_oneof![
         // attribute_exists(name)
@@ -218,6 +215,33 @@ fn arb_leaf_expr() -> impl Strategy<Value = (Expr, Vec<AttributeValue>)> {
             },
             vec![v],
         )),
+        // name = :v  (B) — base64-string equality equals underlying-byte
+        // equality, so pushdown is correct for `.B` under `=`.
+        (name(), bytes_val()).prop_map(|(n, v)| (
+            Expr::Compare {
+                left: Box::new(n),
+                op: CompareOp::Eq,
+                right: Box::new(arb_placeholder_ref(0)),
+            },
+            vec![v],
+        )),
+        // name <> :v  (B) — same, complement of equality.
+        (name(), bytes_val()).prop_map(|(n, v)| (
+            Expr::Compare {
+                left: Box::new(n),
+                op: CompareOp::Ne,
+                right: Box::new(arb_placeholder_ref(0)),
+            },
+            vec![v],
+        )),
+        // Note: `<`/`<=`/`>`/`>=` on `.B` is NOT in the pushable subset.
+        // The compiler emits a base64 string comparison, but DDB
+        // compares binary values bytewise. Base64 preserves byte
+        // ordering only for equal-length inputs; different-length
+        // inputs can invert the order (e.g. bytes [255] > bytes [0, 0]
+        // bytewise, but "/w==" < "AAA=" lexicographically). Step 3's
+        // analyzer marks binary ordering as NotPushable and falls
+        // back to session-scoped in-Rust evaluation.
     ]
 }
 
@@ -244,10 +268,10 @@ fn arb_composed_expr() -> impl Strategy<Value = (Expr, Vec<AttributeValue>)> {
 fn renumber_placeholders(expr: Expr, offset: usize) -> Expr {
     match expr {
         Expr::Placeholder(name) => {
-            if let Some(idx_str) = name.strip_prefix(":v") {
-                if let Ok(idx) = idx_str.parse::<usize>() {
-                    return Expr::Placeholder(format!(":v{}", idx + offset));
-                }
+            if let Some(idx_str) = name.strip_prefix(":v")
+                && let Ok(idx) = idx_str.parse::<usize>()
+            {
+                return Expr::Placeholder(format!(":v{}", idx + offset));
             }
             Expr::Placeholder(name)
         }
@@ -369,6 +393,53 @@ proptest! {
             "parity mismatch:\n  expr:  {:?}\n  item:  {:?}\n  filter: {:?}\n  ddb:   {}\n  mongo: {}",
             expr,
             item,
+            filter,
+            ddb_result,
+            mongo_result,
+        );
+    }
+
+    /// The analyzer's soundness contract: for every expression it marks
+    /// `Pushable::Yes`, the compiled filter must agree with the DDB
+    /// evaluator on the generated item.
+    ///
+    /// This is a stricter check than the first property because the
+    /// analyzer whitelists a specific subset — if it marks Yes on an
+    /// expression whose compiled filter drifts from DDB, that's an
+    /// analyzer bug (whitelist too generous). The generator draws from
+    /// the same pushable grammar as the first property so most cases
+    /// hit the analyzer's Yes branch; when generation drifts into
+    /// non-pushable AST shapes (e.g., unhandled operand-type interactions
+    /// in composed expressions), the analyzer says No and the test
+    /// short-circuits without a comparison.
+    #[test]
+    fn analyzer_yes_implies_filter_parity(
+        item in arb_item(),
+        expr_pair in arb_expr(),
+    ) {
+        let (expr, values_vec) = expr_pair;
+        let mut values = HashMap::new();
+        for (idx, v) in values_vec.iter().enumerate() {
+            values.insert(format!(":v{idx}"), v.clone());
+        }
+        let maps = ExpressionMaps::new(HashMap::new(), values);
+
+        if !matches!(is_pushable(&expr, &maps), Pushable::Yes) {
+            return Ok(());
+        }
+
+        let filter = condition_to_filter(&expr, &maps).expect(
+            "analyzer said Yes but compiler failed — analyzer/compiler drift",
+        );
+        let bson_doc = item_to_bson_doc(&item);
+        let mongo_result = eval_filter(&filter, &bson_doc);
+        let ddb_result = evaluate_condition(&expr, &item, &maps).unwrap_or(false);
+
+        prop_assert_eq!(
+            ddb_result,
+            mongo_result,
+            "analyzer said Pushable::Yes but results diverged:\n  expr: {:?}\n  filter: {:?}\n  ddb: {}, mongo: {}",
+            expr,
             filter,
             ddb_result,
             mongo_result,

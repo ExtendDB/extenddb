@@ -29,6 +29,7 @@ use crate::condition::condition_to_filter;
 use crate::data::{
     data_collection_name, document_to_item, item_to_document, pk_filter, sk_field_name,
 };
+use crate::pushdown::{Pushable, is_pushable};
 
 use extenddb_core::types::{AttributeDefinition, Projection, ProjectionType};
 
@@ -488,6 +489,20 @@ impl MongoEngine {
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
     ) -> Result<Option<Item>, StorageError> {
+        // Pushdown fast path: conditional delete on a no-stream / no-GSI
+        // table with a pushable condition. Collapses read-then-check-then-
+        // write inside a session to a single `find_one_and_delete` with
+        // the merged filter. See `crates/storage-mongodb/src/pushdown.rs`.
+        if let Some(cond) = condition
+            && stream.is_none()
+            && self.gsi_cache_get_fresh(&key_info.table_id) == Some(false)
+            && matches!(is_pushable(cond, maps), Pushable::Yes)
+        {
+            return self
+                .delete_item_pushdown(key_info, key, return_old, cond, maps)
+                .await;
+        }
+
         let coll_name = data_collection_name(&key_info.table_id);
         let coll = self.data_db.collection::<Document>(&coll_name);
 
@@ -593,6 +608,27 @@ impl MongoEngine {
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
     ) -> Result<(Option<Item>, Option<Item>), StorageError> {
+        // Pushdown fast path (A5): conditional update on a no-stream /
+        // no-GSI table with a pushable condition. Skips the session/
+        // transaction overhead. See `crates/storage-mongodb/src/pushdown.rs`.
+        if let Some(cond) = condition
+            && stream.is_none()
+            && self.gsi_cache_get_fresh(&key_info.table_id) == Some(false)
+            && matches!(is_pushable(cond, maps), Pushable::Yes)
+        {
+            match self
+                .update_item_pushdown(key_info, key, actions, return_old, return_new, cond, maps)
+                .await
+            {
+                Ok(pair) => return Ok(pair),
+                Err(StorageError::Internal(msg)) if msg.contains("raced by concurrent writer") => {
+                    // Fall through to session-scoped path which
+                    // has a proper retry loop.
+                }
+                Err(other) => return Err(other),
+            }
+        }
+
         let coll_name = data_collection_name(&key_info.table_id);
         let coll = self.data_db.collection::<Document>(&coll_name);
 
@@ -1897,6 +1933,204 @@ impl MongoEngine {
                 Ok(())
             }
         }
+    }
+
+    // ── Pushdown fast path (A5) ──────────────────────────────────────
+    //
+    // Callers must pre-check the guard conditions:
+    //   - condition is Some(cond)
+    //   - stream.is_none()
+    //   - gsi_cache_get_fresh(table_id) == Some(false)
+    //   - is_pushable(cond, maps) == Pushable::Yes
+    //
+    // Under those guards, the write's atomicity is provided by MongoDB's
+    // single-document find_one_and_* operators — no session needed, no
+    // GSI sync, no stream record. The compiled filter merges with the
+    // key filter so the operator matches only when both apply. On null
+    // return, we follow up with a `find_one` against the key alone to
+    // distinguish "key doesn't exist" from "condition failed".
+
+    async fn delete_item_pushdown(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        return_old: bool,
+        condition: &Expr,
+        maps: &ExpressionMaps,
+    ) -> Result<Option<Item>, StorageError> {
+        let coll_name = data_collection_name(&key_info.table_id);
+        let coll = self.data_db.collection::<Document>(&coll_name);
+
+        let key_filter = pk_filter(key, &key_info.key_schema, &key_info.attribute_definitions)?;
+        let cond_filter = condition_to_filter(condition, maps)?;
+
+        // Merge key filter and condition filter under an $and so the
+        // delete only fires when both match.
+        let merged = doc! { "$and": [key_filter.clone(), cond_filter] };
+
+        let old_doc = coll
+            .find_one_and_delete(merged)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        if let Some(doc) = old_doc {
+            let old_item = document_to_item(&doc)?;
+            return Ok(if return_old { Some(old_item) } else { None });
+        }
+
+        // Null return: either the key doesn't exist or the condition
+        // failed. Disambiguate with a follow-up find_one on the key.
+        let existing = coll
+            .find_one(key_filter)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        match existing {
+            Some(doc) => {
+                let existing_item = document_to_item(&doc)?;
+                Err(StorageError::ConditionFailed(Some(existing_item)))
+            }
+            None => {
+                // Key genuinely doesn't exist. Evaluate the condition
+                // against an empty item to match DDB semantics — some
+                // conditions (attribute_not_exists) evaluate to true
+                // even when the item is missing, in which case the
+                // delete is a no-op success rather than a condition
+                // failure.
+                let empty = std::collections::BTreeMap::new();
+                let passed = expression::evaluate_condition(condition, &empty, maps)
+                    .map_err(|e| StorageError::Validation(e.to_string()))?;
+                if passed {
+                    Ok(None)
+                } else {
+                    Err(StorageError::ConditionFailed(None))
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn update_item_pushdown(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        actions: &[UpdateAction],
+        return_old: bool,
+        return_new: bool,
+        condition: &Expr,
+        maps: &ExpressionMaps,
+    ) -> Result<(Option<Item>, Option<Item>), StorageError> {
+        let coll_name = data_collection_name(&key_info.table_id);
+        let coll = self.data_db.collection::<Document>(&coll_name);
+
+        let key_filter = pk_filter(key, &key_info.key_schema, &key_info.attribute_definitions)?;
+        let cond_filter = condition_to_filter(condition, maps)?;
+        let merged = doc! { "$and": [key_filter.clone(), cond_filter] };
+
+        // Load the item first so we can apply the update in Rust and
+        // then replace it. This is a two-round-trip pushdown rather than
+        // a single-RT one because DDB update expressions have richer
+        // semantics than MongoDB's atomic update operators can express
+        // in general (e.g. list_append, if_not_exists, arithmetic on
+        // decimal strings). The win over the session-scoped fallback is
+        // that we skip the session start/commit round trips.
+        let existing_doc = coll
+            .find_one(merged.clone())
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        let Some(existing) = existing_doc else {
+            // No document matched the key+condition filter. Disambiguate.
+            let by_key = coll
+                .find_one(key_filter.clone())
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            return match by_key {
+                Some(doc) => {
+                    let existing_item = document_to_item(&doc)?;
+                    Err(StorageError::ConditionFailed(Some(existing_item)))
+                }
+                None => {
+                    // Key didn't exist. Evaluate condition against
+                    // empty item (for attribute_not_exists-style
+                    // guards that permit upsert).
+                    let empty = std::collections::BTreeMap::new();
+                    let passed = expression::evaluate_condition(condition, &empty, maps)
+                        .map_err(|e| StorageError::Validation(e.to_string()))?;
+                    if !passed {
+                        return Err(StorageError::ConditionFailed(None));
+                    }
+                    // Condition allows the upsert. Build the new item
+                    // from `key` + apply update actions.
+                    let mut new_item = key.clone();
+                    expression::apply_update(actions, &mut new_item, maps)
+                        .map_err(|e| StorageError::Validation(e.to_string()))?;
+                    let new_doc = item_to_document(
+                        &new_item,
+                        &key_info.key_schema,
+                        &key_info.attribute_definitions,
+                    )?;
+                    let opts = mongodb::options::ReplaceOptions::builder()
+                        .upsert(true)
+                        .build();
+                    coll.replace_one(key_filter, new_doc)
+                        .with_options(opts)
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    Ok((None, if return_new { Some(new_item) } else { None }))
+                }
+            };
+        };
+
+        let existing_item = document_to_item(&existing)?;
+        let mut new_item = existing_item.clone();
+        expression::apply_update(actions, &mut new_item, maps)
+            .map_err(|e| StorageError::Validation(e.to_string()))?;
+
+        let new_doc = item_to_document(
+            &new_item,
+            &key_info.key_schema,
+            &key_info.attribute_definitions,
+        )?;
+
+        // Bump the OCC version. The session-scoped path uses a versioned
+        // filter to catch concurrent modifications; the pushdown path
+        // does the same by merging the current version into the replace
+        // filter. If a concurrent writer bumps _v between our find_one
+        // and our replace_one, the replace matches nothing and we fall
+        // back to a retry.
+        let current_version = existing.get_i64("_v").unwrap_or(0);
+        let mut new_doc_versioned = new_doc;
+        new_doc_versioned.insert("_v", current_version + 1);
+
+        let mut versioned_filter = key_filter.clone();
+        if current_version == 0 {
+            versioned_filter.insert("_v", doc! { "$not": { "$gt": 0_i64 } });
+        } else {
+            versioned_filter.insert("_v", current_version);
+        }
+
+        let result = coll
+            .replace_one(versioned_filter, new_doc_versioned)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        if result.matched_count == 0 {
+            // Concurrent update raced us. Fall back to the session-scoped
+            // path which has a retry loop. This is rare — return an
+            // Internal error the trait implementer can catch and retry.
+            return Err(StorageError::Internal(
+                "pushdown update raced by concurrent writer; retry via session-scoped path"
+                    .to_owned(),
+            ));
+        }
+
+        let old_out = if return_old {
+            Some(existing_item)
+        } else {
+            None
+        };
+        let new_out = if return_new { Some(new_item) } else { None };
+        Ok((old_out, new_out))
     }
 }
 

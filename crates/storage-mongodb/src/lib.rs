@@ -22,6 +22,7 @@ mod data_engine;
 mod management_store;
 mod metadata_engine;
 mod operations;
+pub mod pushdown;
 mod stream_engine;
 mod table_engine;
 mod ttl_worker;
