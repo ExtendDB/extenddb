@@ -65,6 +65,16 @@ fn eval_clause(key: &str, val: &Bson, doc: &Document) -> bool {
 fn eval_predicate(pred: &Bson, field: &FieldValue<'_>) -> bool {
     match pred {
         Bson::Document(pred_doc) => {
+            // Disambiguate: MongoDB treats a document as an operator
+            // document when at least one of its keys starts with `$`;
+            // otherwise it's a literal document for equality match. This
+            // is the same rule the driver uses. The compiler relies on
+            // literal-match for `contains(L_field, :s)` which emits a
+            // predicate like `{S: "value"}` — no `$` keys.
+            let is_operator_doc = pred_doc.keys().any(|k| k.starts_with('$'));
+            if !is_operator_doc {
+                return eq_or_array_match(field, pred);
+            }
             // Operator document: every operator must match. MongoDB's
             // behavior with multiple operator keys in one doc is that they
             // are ANDed together.
