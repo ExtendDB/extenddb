@@ -277,6 +277,14 @@ impl MongoEngine {
             }
         }
 
+        if !matches!(options.tls, Some(mongodb::options::Tls::Enabled(_))) {
+            tracing::warn!(
+                "MongoDB connection is not using TLS; credentials and data will \
+                 traverse the network in cleartext. Enable TLS with `?tls=true` \
+                 in the connection string, or use a `mongodb+srv://` URI."
+            );
+        }
+
         let client = mongodb::Client::with_options(options)
             .map_err(|e| StorageError::Connection(e.to_string()))?;
 
