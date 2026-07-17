@@ -439,17 +439,26 @@ impl StreamEngine for MongoEngine {
         })
     }
 
-    fn next_sequence_number(&self, _shard_id: &str) -> BoxFuture<'_, Result<String, StorageError>> {
+    fn next_sequence_number(&self, shard_id: &str) -> BoxFuture<'_, Result<String, StorageError>> {
+        let shard_id = shard_id.to_owned();
         Box::pin(async move {
-            // Use atomic findAndModify on a sequence counter document
+            // Per-shard atomic counter. DynamoDB Streams' contract is that
+            // sequence numbers are strictly monotonic *within a shard* and
+            // independent *across shards*. A single global counter would
+            // couple the sequence spaces of unrelated shards — a writer
+            // pushing records into shard B would advance the counter shard A
+            // reads back, producing non-contiguous sequence numbers on
+            // shard A's GetRecords pages. Keying the counter document by
+            // shard_id preserves the per-shard monotonicity guarantee.
             let counters_coll = self.data_db.collection::<Document>("counters");
             let opts = mongodb::options::FindOneAndUpdateOptions::builder()
                 .upsert(true)
                 .return_document(mongodb::options::ReturnDocument::After)
                 .build();
+            let counter_id = format!("stream_seq:{shard_id}");
             let doc = counters_coll
                 .find_one_and_update(
-                    doc! { "_id": "stream_seq" },
+                    doc! { "_id": counter_id },
                     doc! { "$inc": { "value": 1_i64 } },
                 )
                 .with_options(opts)
