@@ -1459,7 +1459,7 @@ impl MongoEngine {
                 "sequence_number": &record.dynamodb.sequence_number,
                 "shard_id": &shard_id,
                 "table_id": table_id,
-                "event_name": format!("{:?}", record.event_name),
+                "event_name": crate::stream_engine::event_name_ddb_str(record.event_name),
                 "record_data": record_bson,
                 "created_at": mongodb::bson::DateTime::now(),
             })
