@@ -4,12 +4,17 @@
 //! Credential store implementation for `MongoDB`.
 
 use mongodb::bson::{Document, doc};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use extenddb_auth::{CredentialStore, StoredCredential};
 use extenddb_core::error::DynamoDbError;
 
 /// `MongoDB` credential store for authentication.
+///
+/// The `encryption_key` is zeroed from memory on drop.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct MongoCredentialStore {
+    #[zeroize(skip)]
     client: mongodb::Client,
     encryption_key: String,
 }
