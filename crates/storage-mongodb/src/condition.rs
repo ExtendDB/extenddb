@@ -53,19 +53,27 @@ fn resolve_path_to_field(
 
 /// Convert an `AttributeValue` to a BSON value for filter comparisons.
 ///
-/// `DynamoDB` stores typed values like `{"S": "hello"}`, so when comparing
-/// `item_data.foo.S` we need the raw string value, not the wrapped form.
+/// The value must match how `data/mod.rs::item_to_document` stores the
+/// value inside `item_data`, otherwise the compiled filter will not
+/// match real stored items. Storage serializes each attribute value via
+/// the `AttributeValue` `Serialize` impl (JSON-shape) and then converts
+/// to BSON — so:
 ///
-/// Numbers are kept as strings to match the storage format in `item_data`
-/// (DynamoDB numbers are 38-digit decimals stored as their string representation).
+/// - `S(s)` → JSON string → BSON string
+/// - `N(n)` → JSON string (numbers are wire-encoded as strings) → BSON string
+/// - `B(b)` → JSON string (base64) → BSON string
+/// - `Bool(b)` → BSON boolean
+/// - `Null` → JSON true (the `{"NULL": true}` tag) → BSON boolean true
+///
+/// Emitting raw BSON `Binary` for `.B` here (as an earlier version did)
+/// produced a filter that never matched real stored items because
+/// storage writes the base64 string form.
 fn av_to_bson(av: &AttributeValue) -> Bson {
+    use base64::Engine;
     match av {
         AttributeValue::S(s) => Bson::String(s.clone()),
         AttributeValue::N(n) => Bson::String(n.clone()),
-        AttributeValue::B(b) => Bson::Binary(bson::Binary {
-            subtype: bson::spec::BinarySubtype::Generic,
-            bytes: b.clone(),
-        }),
+        AttributeValue::B(b) => Bson::String(base64::engine::general_purpose::STANDARD.encode(b)),
         AttributeValue::Bool(b) => Bson::Boolean(*b),
         AttributeValue::Null => Bson::Boolean(true), // NULL type stores {"NULL": true}
         _ => Bson::Null,                             // Sets and complex types handled differently
@@ -316,12 +324,16 @@ fn compile_function(
                         { &list_field: &list_elem },
                     ] })
                 }
-                AttributeValue::B(b) => {
-                    // Binary membership in BS or L
+                AttributeValue::B(_) => {
+                    // Binary membership in BS or L. Storage serializes B
+                    // as base64 strings inside item_data (matches wire
+                    // format via the JSON serializer), so both the field
+                    // predicate and the list-element predicate use the
+                    // base64 form.
                     let bs_field = format!("{field}.BS");
                     let list_field = format!("{field}.L");
                     let bson_val = av_to_bson(&val);
-                    let list_elem = doc! { "B": bson::Binary { subtype: bson::spec::BinarySubtype::Generic, bytes: b.clone() } };
+                    let list_elem = doc! { "B": bson_val.clone() };
                     Ok(doc! { "$or": [
                         { &bs_field: &bson_val },
                         { &list_field: &list_elem },
