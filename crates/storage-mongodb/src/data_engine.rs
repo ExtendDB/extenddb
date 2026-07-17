@@ -11,8 +11,9 @@ use extenddb_core::expression::{
     self, Expr, ExpressionMaps, KeyCondition, PathElement, SortKeyCondition, UpdateAction,
 };
 use extenddb_core::types::{
-    AttributeValue, Item, KeySchemaElement, KeyType, ScalarAttributeType, StreamEventName,
-    StreamRecord, StreamRecordData, TableKeyInfo, extract_key, item_size_bytes,
+    AttributeValue, Item, KeySchemaElement, KeyType, ReturnValuesOnConditionCheckFailure,
+    ScalarAttributeType, StreamEventName, StreamRecord, StreamRecordData, TableKeyInfo,
+    extract_key, item_size_bytes,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
@@ -1654,6 +1655,7 @@ impl MongoEngine {
                 item,
                 condition,
                 maps,
+                return_values_on_ccf,
                 ..
             } => {
                 validation::validate_item_keys(
@@ -1679,11 +1681,12 @@ impl MongoEngine {
 
                 if let Some(cond) = condition {
                     let existing_item = if let Some(doc) = existing_doc.as_ref() {
-                        document_to_item(doc).map_err(TransactOpError::Storage)?
+                        Some(document_to_item(doc).map_err(TransactOpError::Storage)?)
                     } else {
-                        Item::new()
+                        None
                     };
-                    let passed = expression::evaluate_condition(cond, &existing_item, maps)
+                    let for_eval = existing_item.clone().unwrap_or_default();
+                    let passed = expression::evaluate_condition(cond, &for_eval, maps)
                         .map_err(|e| {
                             TransactOpError::Cancel(CancellationReason::validation_error(
                                 e.to_string(),
@@ -1691,7 +1694,10 @@ impl MongoEngine {
                         })?;
                     if !passed {
                         return Err(TransactOpError::Cancel(
-                            CancellationReason::condition_check_failed_with_item(None),
+                            CancellationReason::condition_check_failed_with_item(ccf_return_item(
+                                *return_values_on_ccf,
+                                existing_item.as_ref(),
+                            )),
                         ));
                     }
                 }
@@ -1716,6 +1722,7 @@ impl MongoEngine {
                 key,
                 condition,
                 maps,
+                return_values_on_ccf,
                 ..
             } => {
                 validation::validate_key_only(
@@ -1743,11 +1750,12 @@ impl MongoEngine {
                         })?;
 
                     let existing_item = if let Some(doc) = existing_doc.as_ref() {
-                        document_to_item(doc).map_err(TransactOpError::Storage)?
+                        Some(document_to_item(doc).map_err(TransactOpError::Storage)?)
                     } else {
-                        Item::new()
+                        None
                     };
-                    let passed = expression::evaluate_condition(cond, &existing_item, maps)
+                    let for_eval = existing_item.clone().unwrap_or_default();
+                    let passed = expression::evaluate_condition(cond, &for_eval, maps)
                         .map_err(|e| {
                             TransactOpError::Cancel(CancellationReason::validation_error(
                                 e.to_string(),
@@ -1755,7 +1763,10 @@ impl MongoEngine {
                         })?;
                     if !passed {
                         return Err(TransactOpError::Cancel(
-                            CancellationReason::condition_check_failed_with_item(None),
+                            CancellationReason::condition_check_failed_with_item(ccf_return_item(
+                                *return_values_on_ccf,
+                                existing_item.as_ref(),
+                            )),
                         ));
                     }
                 }
@@ -1773,6 +1784,7 @@ impl MongoEngine {
                 actions,
                 condition,
                 maps,
+                return_values_on_ccf,
                 ..
             } => {
                 validation::validate_key_only(
@@ -1796,18 +1808,17 @@ impl MongoEngine {
                     .await
                     .map_err(|e| TransactOpError::Storage(StorageError::Internal(e.to_string())))?;
 
-                let mut item = if let Some(doc) = existing_doc.as_ref() {
-                    document_to_item(doc).map_err(TransactOpError::Storage)?
+                let existing_item = if let Some(doc) = existing_doc.as_ref() {
+                    Some(document_to_item(doc).map_err(TransactOpError::Storage)?)
                 } else {
-                    key.clone()
+                    None
                 };
 
+                let mut item = existing_item.clone().unwrap_or_else(|| key.clone());
+
                 if let Some(cond) = condition {
-                    let condition_item = if existing_doc.is_some() {
-                        &item
-                    } else {
-                        &std::collections::BTreeMap::new()
-                    };
+                    let empty = std::collections::BTreeMap::new();
+                    let condition_item = if existing_item.is_some() { &item } else { &empty };
                     let passed = expression::evaluate_condition(cond, condition_item, maps)
                         .map_err(|e| {
                             TransactOpError::Cancel(CancellationReason::validation_error(
@@ -1816,7 +1827,10 @@ impl MongoEngine {
                         })?;
                     if !passed {
                         return Err(TransactOpError::Cancel(
-                            CancellationReason::condition_check_failed_with_item(None),
+                            CancellationReason::condition_check_failed_with_item(ccf_return_item(
+                                *return_values_on_ccf,
+                                existing_item.as_ref(),
+                            )),
                         ));
                     }
                 }
@@ -1845,7 +1859,7 @@ impl MongoEngine {
                 key,
                 condition,
                 maps,
-                ..
+                return_values_on_ccf,
             } => {
                 validation::validate_key_only(
                     key,
@@ -1869,18 +1883,22 @@ impl MongoEngine {
                     .map_err(|e| TransactOpError::Storage(StorageError::Internal(e.to_string())))?;
 
                 let existing_item = if let Some(doc) = existing_doc.as_ref() {
-                    document_to_item(doc).map_err(TransactOpError::Storage)?
+                    Some(document_to_item(doc).map_err(TransactOpError::Storage)?)
                 } else {
-                    Item::new()
+                    None
                 };
 
-                let passed = expression::evaluate_condition(condition, &existing_item, maps)
+                let for_eval = existing_item.clone().unwrap_or_default();
+                let passed = expression::evaluate_condition(condition, &for_eval, maps)
                     .map_err(|e| {
                         TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
                     })?;
                 if !passed {
                     return Err(TransactOpError::Cancel(
-                        CancellationReason::condition_check_failed_with_item(None),
+                        CancellationReason::condition_check_failed_with_item(ccf_return_item(
+                            *return_values_on_ccf,
+                            existing_item.as_ref(),
+                        )),
                     ));
                 }
 
@@ -1897,6 +1915,23 @@ enum TransactOpError {
     Storage(StorageError),
 }
 
+/// Choose the `Item` value to include in a `CancellationReason` when a
+/// condition check fails inside `TransactWriteItems`.
+///
+/// Per DynamoDB's contract, the pre-existing item is returned only when the
+/// caller requested `ReturnValuesOnConditionCheckFailure = ALL_OLD` AND the
+/// item existed at the time of the check. In all other cases the field is
+/// omitted (returned as `None`).
+fn ccf_return_item(
+    rv: ReturnValuesOnConditionCheckFailure,
+    existing: Option<&Item>,
+) -> Option<Item> {
+    match rv {
+        ReturnValuesOnConditionCheckFailure::AllOld => existing.cloned(),
+        ReturnValuesOnConditionCheckFailure::None => None,
+    }
+}
+
 /// Owned version of `TransactWriteOp` to allow moving into async blocks.
 enum OwnedTransactWriteOp {
     Put {
@@ -1904,12 +1939,14 @@ enum OwnedTransactWriteOp {
         item: Item,
         condition: Option<Expr>,
         maps: ExpressionMaps,
+        return_values_on_ccf: ReturnValuesOnConditionCheckFailure,
     },
     Delete {
         key_info: TableKeyInfo,
         key: Item,
         condition: Option<Expr>,
         maps: ExpressionMaps,
+        return_values_on_ccf: ReturnValuesOnConditionCheckFailure,
     },
     Update {
         key_info: TableKeyInfo,
@@ -1917,12 +1954,14 @@ enum OwnedTransactWriteOp {
         actions: Vec<UpdateAction>,
         condition: Option<Expr>,
         maps: ExpressionMaps,
+        return_values_on_ccf: ReturnValuesOnConditionCheckFailure,
     },
     ConditionCheck {
         key_info: TableKeyInfo,
         key: Item,
         condition: Expr,
         maps: ExpressionMaps,
+        return_values_on_ccf: ReturnValuesOnConditionCheckFailure,
     },
 }
 
@@ -1933,24 +1972,28 @@ fn clone_transact_write_op(op: &TransactWriteOp<'_>) -> OwnedTransactWriteOp {
             item,
             condition,
             maps,
+            return_values_on_ccf,
             ..
         } => OwnedTransactWriteOp::Put {
             key_info: (*key_info).clone(),
             item: (*item).clone(),
             condition: condition.cloned(),
             maps: (*maps).clone(),
+            return_values_on_ccf: *return_values_on_ccf,
         },
         TransactWriteOp::Delete {
             key_info,
             key,
             condition,
             maps,
+            return_values_on_ccf,
             ..
         } => OwnedTransactWriteOp::Delete {
             key_info: (*key_info).clone(),
             key: (*key).clone(),
             condition: condition.cloned(),
             maps: (*maps).clone(),
+            return_values_on_ccf: *return_values_on_ccf,
         },
         TransactWriteOp::Update {
             key_info,
@@ -1958,6 +2001,7 @@ fn clone_transact_write_op(op: &TransactWriteOp<'_>) -> OwnedTransactWriteOp {
             actions,
             condition,
             maps,
+            return_values_on_ccf,
             ..
         } => OwnedTransactWriteOp::Update {
             key_info: (*key_info).clone(),
@@ -1965,18 +2009,20 @@ fn clone_transact_write_op(op: &TransactWriteOp<'_>) -> OwnedTransactWriteOp {
             actions: actions.to_vec(),
             condition: condition.cloned(),
             maps: (*maps).clone(),
+            return_values_on_ccf: *return_values_on_ccf,
         },
         TransactWriteOp::ConditionCheck {
             key_info,
             key,
             condition,
             maps,
-            ..
+            return_values_on_ccf,
         } => OwnedTransactWriteOp::ConditionCheck {
             key_info: (*key_info).clone(),
             key: (*key).clone(),
             condition: (*condition).clone(),
             maps: (*maps).clone(),
+            return_values_on_ccf: *return_values_on_ccf,
         },
     }
 }
@@ -2219,6 +2265,29 @@ mod tests {
             &AttributeValue::N("42".into()),
             &AttributeValue::N("42".into())
         ));
+    }
+
+    #[test]
+    fn ccf_return_item_all_old_with_existing() {
+        let mut item = Item::new();
+        item.insert("a".to_string(), AttributeValue::S("1".to_string()));
+        let returned =
+            ccf_return_item(ReturnValuesOnConditionCheckFailure::AllOld, Some(&item));
+        assert_eq!(returned, Some(item));
+    }
+
+    #[test]
+    fn ccf_return_item_all_old_without_existing() {
+        let returned = ccf_return_item(ReturnValuesOnConditionCheckFailure::AllOld, None);
+        assert_eq!(returned, None);
+    }
+
+    #[test]
+    fn ccf_return_item_none_never_returns() {
+        let mut item = Item::new();
+        item.insert("a".to_string(), AttributeValue::S("1".to_string()));
+        let returned = ccf_return_item(ReturnValuesOnConditionCheckFailure::None, Some(&item));
+        assert_eq!(returned, None);
     }
 
     #[test]
