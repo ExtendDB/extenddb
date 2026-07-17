@@ -54,3 +54,8 @@ crc32fast.workspace = true
 
 # In-process GSI existence cache
 dashmap.workspace = true
+
+[dev-dependencies]
+# Property-based testing for the filter-pushdown parity harness
+# (crates/storage-mongodb/tests/pushdown_parity.rs).
+proptest = "1"
