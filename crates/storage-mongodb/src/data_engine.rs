@@ -1184,10 +1184,10 @@ impl MongoEngine {
     ) -> Result<(), StorageError> {
         use futures::TryStreamExt;
 
-        // Fast path: skip catalog query if we know this table has no GSIs
-        if let Some(entry) = self.gsi_cache.get(&key_info.table_id)
-            && !*entry
-        {
+        // Fast path: skip catalog query if we know this table has no GSIs.
+        // The cache entry is valid for GSI_CACHE_TTL, giving eventual
+        // convergence when a GSI is added on another ExtendDB instance.
+        if let Some(false) = self.gsi_cache_get_fresh(&key_info.table_id) {
             return Ok(());
         }
 
@@ -1255,7 +1255,7 @@ impl MongoEngine {
             }
         }
 
-        self.gsi_cache.insert(key_info.table_id.clone(), found_any);
+        self.gsi_cache_set(&key_info.table_id, found_any);
         Ok(())
     }
 
@@ -1268,9 +1268,7 @@ impl MongoEngine {
     ) -> Result<(), StorageError> {
         use futures::TryStreamExt;
 
-        if let Some(entry) = self.gsi_cache.get(&key_info.table_id)
-            && !*entry
-        {
+        if let Some(false) = self.gsi_cache_get_fresh(&key_info.table_id) {
             return Ok(());
         }
 
@@ -1339,7 +1337,7 @@ impl MongoEngine {
             }
         }
 
-        self.gsi_cache.insert(key_info.table_id.clone(), found_any);
+        self.gsi_cache_set(&key_info.table_id, found_any);
         Ok(())
     }
 

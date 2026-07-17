@@ -215,6 +215,16 @@ inventory::submit! {
 // MongoEngine
 // ============================================================================
 
+/// TTL for entries in [`MongoEngine::gsi_cache`].
+///
+/// The GSI cache is per-process. When multiple ExtendDB instances share a
+/// catalog, an admin creating or dropping a GSI on instance A does not
+/// invalidate instance B's cache. Bounding cache entries by wall-clock age
+/// gives eventual convergence at a small cost (one catalog `find` per table
+/// per TTL window), which is far cheaper than the cost of silently skipping
+/// index updates on tables where GSIs were added out-of-band.
+const GSI_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// `MongoDB` storage backend.
 pub struct MongoEngine {
     client: mongodb::Client,
@@ -222,9 +232,12 @@ pub struct MongoEngine {
     data_db: mongodb::Database,
     region: String,
     max_connections: u32,
-    /// Cache of `table_id` -> `has_gsi`. Avoids catalog queries on every write
-    /// for tables with no GSIs.
-    gsi_cache: dashmap::DashMap<String, bool>,
+    /// Cache of `table_id` -> (`has_gsi`, insertion time). Avoids catalog
+    /// queries on every write for tables with no GSIs. Entries older than
+    /// [`GSI_CACHE_TTL`] are treated as misses and re-read from the catalog,
+    /// so GSI additions/removals on other ExtendDB instances converge within
+    /// the TTL window.
+    gsi_cache: dashmap::DashMap<String, (bool, std::time::Instant)>,
 }
 
 impl MongoEngine {
@@ -252,6 +265,32 @@ impl MongoEngine {
             max_connections,
             gsi_cache: dashmap::DashMap::new(),
         })
+    }
+
+    /// Look up a fresh GSI-cache entry for `table_id`.
+    ///
+    /// Returns `Some(has_gsi)` when a cache entry exists and is younger than
+    /// [`GSI_CACHE_TTL`], `None` otherwise (either no entry or expired).
+    /// Callers that get `None` must fall back to reading the catalog.
+    pub(crate) fn gsi_cache_get_fresh(&self, table_id: &str) -> Option<bool> {
+        let entry = self.gsi_cache.get(table_id)?;
+        let (has_gsi, inserted) = *entry;
+        if inserted.elapsed() <= GSI_CACHE_TTL {
+            Some(has_gsi)
+        } else {
+            None
+        }
+    }
+
+    /// Record a fresh GSI-cache observation for `table_id`.
+    pub(crate) fn gsi_cache_set(&self, table_id: &str, has_gsi: bool) {
+        self.gsi_cache
+            .insert(table_id.to_owned(), (has_gsi, std::time::Instant::now()));
+    }
+
+    /// Remove a GSI-cache entry (e.g., on GSI drop or table delete).
+    pub(crate) fn gsi_cache_invalidate(&self, table_id: &str) {
+        self.gsi_cache.remove(table_id);
     }
 
     /// Validate `account_id` against injection attacks.
