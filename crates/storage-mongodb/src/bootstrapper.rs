@@ -391,10 +391,11 @@ impl Bootstrapper for MongoBootstrapper {
             .await
             .map_err(|e| OpError::Internal(format!("record_data_connection: {e}")))?;
 
+        let redacted = redact_connection_string(&self.connection_string);
         settings
             .update_one(
                 doc! { "_id": "data_connection_string" },
-                doc! { "$set": { "value": &self.connection_string } },
+                doc! { "$set": { "value": &redacted } },
             )
             .upsert(true)
             .await
@@ -624,5 +625,81 @@ connection_string = "{}"
 # max_catalog_connections = 20   # Max concurrent connections for catalog/management operations (default 20)"#,
             self.connection_string
         )
+    }
+}
+
+/// Replace `user:password` userinfo with `user:<redacted>` in a MongoDB URI.
+///
+/// Returns the original string unchanged if no `@` separator is present or if
+/// the userinfo section contains no `:` (username-only, no password).
+fn redact_connection_string(uri: &str) -> String {
+    let Some(scheme_end) = uri.find("://") else {
+        return uri.to_string();
+    };
+    let after_scheme = scheme_end + 3;
+    let Some(at_offset) = uri[after_scheme..].find('@') else {
+        return uri.to_string();
+    };
+    let at_idx = after_scheme + at_offset;
+    let userinfo = &uri[after_scheme..at_idx];
+    let Some(colon_offset) = userinfo.find(':') else {
+        return uri.to_string();
+    };
+    let user = &userinfo[..colon_offset];
+    format!(
+        "{}{}:<redacted>{}",
+        &uri[..after_scheme],
+        user,
+        &uri[at_idx..]
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_connection_string;
+
+    #[test]
+    fn redact_userinfo_with_password() {
+        assert_eq!(
+            redact_connection_string("mongodb://alice:secret@host:27017/?replicaSet=rs0"),
+            "mongodb://alice:<redacted>@host:27017/?replicaSet=rs0"
+        );
+    }
+
+    #[test]
+    fn redact_srv_scheme() {
+        assert_eq!(
+            redact_connection_string("mongodb+srv://alice:p%40ss@cluster.example.com/?tls=true"),
+            "mongodb+srv://alice:<redacted>@cluster.example.com/?tls=true"
+        );
+    }
+
+    #[test]
+    fn no_userinfo_untouched() {
+        assert_eq!(
+            redact_connection_string("mongodb://localhost:27017/?replicaSet=rs0"),
+            "mongodb://localhost:27017/?replicaSet=rs0"
+        );
+    }
+
+    #[test]
+    fn user_only_untouched() {
+        assert_eq!(
+            redact_connection_string("mongodb://alice@host:27017/"),
+            "mongodb://alice@host:27017/"
+        );
+    }
+
+    #[test]
+    fn at_in_query_is_not_userinfo() {
+        assert_eq!(
+            redact_connection_string("mongodb://host:27017/?authSource=admin"),
+            "mongodb://host:27017/?authSource=admin"
+        );
+    }
+
+    #[test]
+    fn no_scheme_untouched() {
+        assert_eq!(redact_connection_string("not a uri"), "not a uri");
     }
 }
