@@ -2020,6 +2020,11 @@ fn build_sk_filter(
             let sk_type = infer_sk_type_from_field(sk_field);
             let low_av = resolve_key_expr(low, maps)?;
             let high_av = resolve_key_expr(high, maps)?;
+            if sk_between_low_gt_high(&low_av, &high_av) {
+                return Err(StorageError::Validation(
+                    "Invalid KeyConditionExpression: The BETWEEN operator requires upper bound to be greater than or equal to lower bound".to_owned(),
+                ));
+            }
             let low_bson = sk_to_bson(&low_av, sk_type)?;
             let high_bson = sk_to_bson(&high_av, sk_type)?;
             Ok(doc! { sk_field: { "$gte": low_bson, "$lte": high_bson } })
@@ -2048,6 +2053,31 @@ fn build_sk_filter(
 }
 
 /// Convert an `AttributeValue` sort key to the appropriate BSON type.
+/// Return true when a sort-key BETWEEN's low bound is strictly greater than its high bound.
+///
+/// DynamoDB rejects this at the wire layer with a ValidationException; the storage
+/// backend must reject it too, since the engine layer only validates BETWEEN for
+/// filter/condition expressions, not for KeyConditionExpression's sort-key path.
+///
+/// The comparison is done in the source AttributeValue domain so it happens before
+/// any Decimal128/f64 conversion that could mask ordering. Strings are compared
+/// lexicographically (matching DynamoDB), numbers via f64 (adequate for ordering —
+/// values exceeding Decimal128 range are rejected downstream in `sk_to_bson`), and
+/// binary bytewise.
+fn sk_between_low_gt_high(low: &AttributeValue, high: &AttributeValue) -> bool {
+    match (low, high) {
+        (AttributeValue::S(l), AttributeValue::S(h)) => l > h,
+        (AttributeValue::N(l), AttributeValue::N(h)) => {
+            match (l.parse::<f64>(), h.parse::<f64>()) {
+                (Ok(lf), Ok(hf)) => lf > hf,
+                _ => false, // downstream sk_to_bson will surface the parse error
+            }
+        }
+        (AttributeValue::B(l), AttributeValue::B(h)) => l > h,
+        _ => false, // type mismatch — downstream sk_to_bson will surface it
+    }
+}
+
 fn sk_to_bson(
     av: &AttributeValue,
     sk_type: ScalarAttributeType,
@@ -2152,5 +2182,54 @@ fn project_item(
             }
             projected
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn between_low_gt_high_string() {
+        assert!(sk_between_low_gt_high(
+            &AttributeValue::S("z".into()),
+            &AttributeValue::S("a".into())
+        ));
+        assert!(!sk_between_low_gt_high(
+            &AttributeValue::S("a".into()),
+            &AttributeValue::S("z".into())
+        ));
+        assert!(!sk_between_low_gt_high(
+            &AttributeValue::S("m".into()),
+            &AttributeValue::S("m".into())
+        ));
+    }
+
+    #[test]
+    fn between_low_gt_high_number() {
+        assert!(sk_between_low_gt_high(
+            &AttributeValue::N("100".into()),
+            &AttributeValue::N("50".into())
+        ));
+        assert!(!sk_between_low_gt_high(
+            &AttributeValue::N("50".into()),
+            &AttributeValue::N("100".into())
+        ));
+        assert!(!sk_between_low_gt_high(
+            &AttributeValue::N("42".into()),
+            &AttributeValue::N("42".into())
+        ));
+    }
+
+    #[test]
+    fn between_low_gt_high_binary() {
+        assert!(sk_between_low_gt_high(
+            &AttributeValue::B(vec![0xff]),
+            &AttributeValue::B(vec![0x00])
+        ));
+        assert!(!sk_between_low_gt_high(
+            &AttributeValue::B(vec![0x00]),
+            &AttributeValue::B(vec![0xff])
+        ));
     }
 }
