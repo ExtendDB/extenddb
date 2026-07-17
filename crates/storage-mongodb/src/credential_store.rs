@@ -57,7 +57,10 @@ impl MongoCredentialStore {
         };
         let account_id = key_doc.get_str("account_id").unwrap_or_default().to_owned();
         let user_name = key_doc.get_str("user_name").unwrap_or_default().to_owned();
-        let is_active = key_doc.get_bool("is_active").unwrap_or(true);
+        // Fail closed: treat a missing or malformed is_active as inactive so
+        // a corrupted or partially written access-key record cannot silently
+        // authenticate.
+        let is_active = key_doc.get_bool("is_active").unwrap_or(false);
 
         let secret_key =
             decrypt_secret(&encrypted, &self.encryption_key, access_key_id).map_err(|e| {
