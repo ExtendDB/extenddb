@@ -17,8 +17,8 @@ use mongodb::bson::{self, Document, doc};
 use mongodb::options::FindOptions;
 
 use extenddb_core::types::{
-    DescribeStreamInput, SequenceNumberRange, Shard, StreamDescription, StreamRecord, StreamStatus,
-    StreamSummary, StreamViewType,
+    DescribeStreamInput, SequenceNumberRange, Shard, StreamDescription, StreamEventName,
+    StreamRecord, StreamStatus, StreamSummary, StreamViewType,
 };
 use extenddb_storage::StreamEngine;
 use extenddb_storage::error::StorageError;
@@ -28,6 +28,18 @@ use extenddb_storage::{StreamListResult, StreamRecordsResult};
 use crate::MongoEngine;
 
 const SHARDS_PER_STREAM: u32 = 4;
+
+/// Map a `StreamEventName` to its DynamoDB wire-format string.
+///
+/// DynamoDB Streams records use uppercase event names (`INSERT`, `MODIFY`, `REMOVE`).
+/// The enum's `Debug` output is Rust-cased (`Insert`, ...) so we must not use that.
+pub(crate) fn event_name_ddb_str(name: StreamEventName) -> &'static str {
+    match name {
+        StreamEventName::Insert => "INSERT",
+        StreamEventName::Modify => "MODIFY",
+        StreamEventName::Remove => "REMOVE",
+    }
+}
 
 impl MongoEngine {
     /// Initialize stream shards for a table. Only creates shard documents;
@@ -90,7 +102,7 @@ impl StreamEngine for MongoEngine {
                     "sequence_number": &record.dynamodb.sequence_number,
                     "shard_id": &shard_id,
                     "table_id": table_id,
-                    "event_name": format!("{:?}", record.event_name),
+                    "event_name": event_name_ddb_str(record.event_name),
                     "record_data": record_bson,
                     "created_at": BsonDateTime::now(),
                 })
@@ -522,5 +534,17 @@ impl StreamEngine for MongoEngine {
                     .map(std::borrow::ToOwned::to_owned)
             }))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_name_maps_to_ddb_wire_format() {
+        assert_eq!(event_name_ddb_str(StreamEventName::Insert), "INSERT");
+        assert_eq!(event_name_ddb_str(StreamEventName::Modify), "MODIFY");
+        assert_eq!(event_name_ddb_str(StreamEventName::Remove), "REMOVE");
     }
 }
