@@ -170,7 +170,7 @@ pub async fn handle_scan(
             .as_ref()
             .is_some_and(|a| !a.is_empty()),
         input.index_name.is_some(),
-        false, // Scan: no "1 validation error detected: " prefix
+        extenddb_core::validation::IS_SCAN,
     )?;
 
     // Validate unused expression attributes
@@ -227,17 +227,14 @@ pub async fn handle_scan(
         ));
     }
 
-    // Select=ALL_ATTRIBUTES requires an ALL-projection GSI. Matches real DynamoDB.
-    if matches!(input.select, Some(Select::AllAttributes))
-        && let Some(ref idx) = index_info
-        && idx.index_type == IndexType::Gsi
-        && idx.projection.projection_type != ProjectionType::All
-    {
-        return Err(DynamoDbError::ValidationException(format!(
-            "One or more parameter values were invalid: Select type ALL_ATTRIBUTES is not \
-             supported for global secondary index {} because its projection type is not ALL",
-            idx.index_name
-        )));
+    // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (shared with Query).
+    if let Some(ref idx) = index_info {
+        extenddb_core::validation::validate_all_attributes_index_support(
+            input.select,
+            idx.index_type == IndexType::Gsi,
+            idx.projection.projection_type == ProjectionType::All,
+            &idx.index_name,
+        )?;
     }
 
     // Validate Segment/TotalSegments — DynamoDB returns different messages per direction
