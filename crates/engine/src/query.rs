@@ -70,18 +70,14 @@ pub async fn handle_query(
         ));
     }
 
-    // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (a GSI that does not
-    // project all attributes cannot serve ALL_ATTRIBUTES). Matches real DynamoDB.
-    if matches!(input.select, Some(Select::AllAttributes))
-        && let Some(ref idx) = index_info
-        && idx.index_type == IndexType::Gsi
-        && idx.projection.projection_type != ProjectionType::All
-    {
-        return Err(DynamoDbError::ValidationException(format!(
-            "One or more parameter values were invalid: Select type ALL_ATTRIBUTES is not \
-             supported for global secondary index {} because its projection type is not ALL",
-            idx.index_name
-        )));
+    // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (shared with Scan).
+    if let Some(ref idx) = index_info {
+        extenddb_core::validation::validate_all_attributes_index_support(
+            input.select,
+            idx.index_type == IndexType::Gsi,
+            idx.projection.projection_type == ProjectionType::All,
+            &idx.index_name,
+        )?;
     }
 
     // Validate Limit >= 1 (REQ-QUERY-001)
@@ -365,7 +361,7 @@ pub async fn handle_query(
             .as_ref()
             .is_some_and(|a| !a.is_empty()),
         input.index_name.is_some(),
-        true, // Query: real DynamoDB prepends "1 validation error detected: "
+        extenddb_core::validation::IS_QUERY,
     )?;
 
     // When Select=ALL_PROJECTED_ATTRIBUTES, capture the index info for post-read filtering.

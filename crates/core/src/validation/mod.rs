@@ -1007,6 +1007,12 @@ fn ordered_indexes<'b, 'a>(indexes: &'b [IndexKeyRef<'a>]) -> Vec<&'b IndexKeyRe
     ordered
 }
 
+/// Readable flags for the `is_query` parameter of [`validate_select_projection`].
+/// Real DynamoDB prepends `1 validation error detected: ` to some rejections for
+/// Query but not for Scan, so callers pass one of these instead of a bare bool.
+pub const IS_QUERY: bool = true;
+pub const IS_SCAN: bool = false;
+
 /// Validate the `Select` value against `ProjectionExpression` / `AttributesToGet`
 /// presence and `IndexName`. Shared by Query and Scan so both reject the same
 /// invalid combinations with the same messages.
@@ -1125,6 +1131,29 @@ pub fn validate_conditional_operator_usage(
         )),
         _ => Ok(()),
     }
+}
+
+/// Reject `Select=ALL_ATTRIBUTES` against a global secondary index whose
+/// projection type is not `ALL` (such an index cannot serve every attribute).
+/// Shared by Query and Scan so both reject with the identical message; a no-op
+/// unless a GSI is targeted with `Select=ALL_ATTRIBUTES`.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` when the combination is invalid.
+pub fn validate_all_attributes_index_support(
+    select: Option<Select>,
+    is_gsi: bool,
+    projection_is_all: bool,
+    index_name: &str,
+) -> Result<(), DynamoDbError> {
+    if matches!(select, Some(Select::AllAttributes)) && is_gsi && !projection_is_all {
+        return Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: Select type ALL_ATTRIBUTES is not \
+             supported for global secondary index {index_name} because its projection type is not ALL"
+        )));
+    }
+    Ok(())
 }
 
 /// Validate partition key and sort key sizes against limits.
@@ -2161,13 +2190,15 @@ mod tests {
             let body =
                 format!("Cannot specify the ProjectionExpression when choosing to get {what}");
             // Query prepends the "1 validation error detected: " prefix.
-            let q = validate_select_projection(Some(select), true, false, true, true).unwrap_err();
+            let q =
+                validate_select_projection(Some(select), true, false, true, IS_QUERY).unwrap_err();
             assert_eq!(
                 q.to_string(),
                 format!("1 validation error detected: {body}")
             );
             // Scan does NOT prepend the prefix (matches real DynamoDB).
-            let s = validate_select_projection(Some(select), true, false, true, false).unwrap_err();
+            let s =
+                validate_select_projection(Some(select), true, false, true, IS_SCAN).unwrap_err();
             assert_eq!(s.to_string(), body);
         }
     }
@@ -2176,18 +2207,36 @@ mod tests {
     fn select_specific_attributes_requires_projection() {
         // No projection and no AttributesToGet -> rejected.
         assert!(
-            validate_select_projection(Some(Select::SpecificAttributes), false, false, false, true)
-                .is_err()
+            validate_select_projection(
+                Some(Select::SpecificAttributes),
+                false,
+                false,
+                false,
+                IS_QUERY
+            )
+            .is_err()
         );
         // A projection satisfies it.
         assert!(
-            validate_select_projection(Some(Select::SpecificAttributes), true, false, false, true)
-                .is_ok()
+            validate_select_projection(
+                Some(Select::SpecificAttributes),
+                true,
+                false,
+                false,
+                IS_QUERY
+            )
+            .is_ok()
         );
         // Legacy AttributesToGet satisfies it.
         assert!(
-            validate_select_projection(Some(Select::SpecificAttributes), false, true, false, true)
-                .is_ok()
+            validate_select_projection(
+                Some(Select::SpecificAttributes),
+                false,
+                true,
+                false,
+                IS_QUERY
+            )
+            .is_ok()
         );
     }
 
@@ -2198,7 +2247,7 @@ mod tests {
             false,
             false,
             false,
-            true,
+            IS_QUERY,
         )
         .unwrap_err();
         assert_eq!(
@@ -2211,7 +2260,7 @@ mod tests {
                 false,
                 false,
                 true,
-                true
+                IS_QUERY
             )
             .is_ok()
         );
@@ -2293,7 +2342,7 @@ mod tests {
             true,
             false,
             false,
-            true,
+            IS_QUERY,
         )
         .unwrap_err();
         assert!(
