@@ -218,7 +218,13 @@ mod tests {
         let (schema, attrs) = schema_pk_str_sk_num();
         // 35 significant digits — exceeds Decimal128's 34-digit precision.
         let over_precision = "1".to_owned() + &"2".repeat(34);
-        assert_eq!(over_precision.chars().filter(|c| c.is_ascii_digit()).count(), 35);
+        assert_eq!(
+            over_precision
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .count(),
+            35
+        );
 
         let mut item = Item::new();
         item.insert("pk".to_owned(), AttributeValue::S("x".to_owned()));

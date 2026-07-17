@@ -1686,8 +1686,8 @@ impl MongoEngine {
                         None
                     };
                     let for_eval = existing_item.clone().unwrap_or_default();
-                    let passed = expression::evaluate_condition(cond, &for_eval, maps)
-                        .map_err(|e| {
+                    let passed =
+                        expression::evaluate_condition(cond, &for_eval, maps).map_err(|e| {
                             TransactOpError::Cancel(CancellationReason::validation_error(
                                 e.to_string(),
                             ))
@@ -1755,8 +1755,8 @@ impl MongoEngine {
                         None
                     };
                     let for_eval = existing_item.clone().unwrap_or_default();
-                    let passed = expression::evaluate_condition(cond, &for_eval, maps)
-                        .map_err(|e| {
+                    let passed =
+                        expression::evaluate_condition(cond, &for_eval, maps).map_err(|e| {
                             TransactOpError::Cancel(CancellationReason::validation_error(
                                 e.to_string(),
                             ))
@@ -1818,7 +1818,11 @@ impl MongoEngine {
 
                 if let Some(cond) = condition {
                     let empty = std::collections::BTreeMap::new();
-                    let condition_item = if existing_item.is_some() { &item } else { &empty };
+                    let condition_item = if existing_item.is_some() {
+                        &item
+                    } else {
+                        &empty
+                    };
                     let passed = expression::evaluate_condition(cond, condition_item, maps)
                         .map_err(|e| {
                             TransactOpError::Cancel(CancellationReason::validation_error(
@@ -1889,8 +1893,8 @@ impl MongoEngine {
                 };
 
                 let for_eval = existing_item.clone().unwrap_or_default();
-                let passed = expression::evaluate_condition(condition, &for_eval, maps)
-                    .map_err(|e| {
+                let passed =
+                    expression::evaluate_condition(condition, &for_eval, maps).map_err(|e| {
                         TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
                     })?;
                 if !passed {
@@ -2267,8 +2271,7 @@ mod tests {
     fn ccf_return_item_all_old_with_existing() {
         let mut item = Item::new();
         item.insert("a".to_string(), AttributeValue::S("1".to_string()));
-        let returned =
-            ccf_return_item(ReturnValuesOnConditionCheckFailure::AllOld, Some(&item));
+        let returned = ccf_return_item(ReturnValuesOnConditionCheckFailure::AllOld, Some(&item));
         assert_eq!(returned, Some(item));
     }
 
