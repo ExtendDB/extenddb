@@ -8,10 +8,11 @@ adaptation when switching between ExtendDB and the real service.
 
 | Area | DynamoDB | ExtendDB |
 |------|----------|------|
-| Storage backend | Proprietary distributed storage | PostgreSQL |
+| Storage backend | Proprietary distributed storage | PostgreSQL (default) or MongoDB (feature flag) |
 | Global Tables | CreateGlobalTable, replication | Not implemented (returns UnknownOperationException) |
 | DAX (Accelerator) | In-memory caching layer | Not applicable |
 | PartiQL | ExecuteStatement, BatchExecuteStatement | Not implemented (returns UnknownOperationException) |
+| Numeric precision on partition/sort keys (MongoDB backend only) | 38 significant digits | 34 significant digits (BSON Decimal128). Values that exceed this precision are rejected at write and query time with a ValidationException rather than silently downcast. PostgreSQL backend supports the full 38 digits. |
 
 ## Authentication and Authorization (AWS IAM/STS auth surface used by DynamoDB)
 
