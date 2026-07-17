@@ -3,10 +3,16 @@
 
 //! `BackupEngine` implementation for `MongoDB`.
 //!
-//! Backups are stored as documents in a `backups` collection (metadata) and
-//! a `backup_items` collection (snapshotted items). Uses `$out`-style cloning
-//! approach: read all items from the data collection and bulk-insert into
-//! the backup items collection tagged with `backup_arn`.
+//! Backups are stored as one MongoDB collection per backup, plus a `backups`
+//! metadata collection in the catalog. `CreateBackup` uses MongoDB's
+//! server-side aggregation `$out` stage to clone the source data collection
+//! into `_backup_<backup_id>` in the data database — no per-item traffic
+//! between the driver and the server. `RestoreTableFromBackup` uses the same
+//! stage in reverse. `DeleteBackup` drops the collection.
+//!
+//! Backup metadata carries a `backup_id` UUID; the collection name is derived
+//! from that id so the `backup_arn` (which contains slashes and colons) never
+//! appears in a collection name.
 
 use futures::TryStreamExt;
 use futures::future::BoxFuture;
@@ -28,6 +34,15 @@ fn epoch_millis() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+/// Return the MongoDB collection name that holds items for a given backup.
+///
+/// The collection lives in the data database. The name is derived from the
+/// backup's UUID so it is safe for MongoDB (no colons, slashes, or dots) and
+/// bounded in length regardless of how long the source `backup_arn` is.
+fn backup_collection_name(backup_id: &str) -> String {
+    format!("_backup_{backup_id}")
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -87,53 +102,45 @@ impl BackupEngine for MongoEngine {
                 region = self.region,
                 ts = epoch_millis()
             );
+            let backup_id = uuid::Uuid::new_v4().to_string();
 
-            // Snapshot items from the data collection
-            let coll_name = data_collection_name(&table_id);
-            let data_coll = self.data_db.collection::<Document>(&coll_name);
+            // Snapshot items from the data collection using a server-side
+            // `$out` aggregation. Items are copied directly between
+            // collections in MongoDB — no per-item traffic to the driver.
+            let src_coll_name = data_collection_name(&table_id);
+            let dst_coll_name = backup_collection_name(&backup_id);
+            let data_coll = self.data_db.collection::<Document>(&src_coll_name);
 
-            let mut cursor = data_coll
-                .find(doc! {})
+            let pipeline = vec![doc! { "$out": &dst_coll_name }];
+            let out_cursor = data_coll
+                .aggregate(pipeline)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            // `$out` writes to the target collection and returns an empty
+            // cursor; consume it to ensure the stage has fully completed
+            // before we count.
+            let _drained: Vec<Document> = out_cursor
+                .try_collect()
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            let backup_items_coll = self.catalog_db.collection::<Document>("backup_items");
-            let mut actual_count: i64 = 0;
-
-            while let Some(item_doc) = cursor
-                .try_next()
+            let dst_coll = self.data_db.collection::<Document>(&dst_coll_name);
+            let actual_count = dst_coll
+                .count_documents(doc! {})
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?
-            {
-                let mut backup_doc = Document::new();
-                backup_doc.insert("backup_arn", &backup_arn);
-                backup_doc.insert(
-                    "item_data",
-                    item_doc
-                        .get("item_data")
-                        .cloned()
-                        .unwrap_or(mongodb::bson::Bson::Null),
-                );
-                backup_doc.insert("pk", item_doc.get_str("pk").unwrap_or_default());
-                if let Ok(sk) = item_doc.get_str("sk_s") {
-                    backup_doc.insert("sk", sk);
-                } else if let Some(sk_n) = item_doc.get("sk_n") {
-                    backup_doc.insert("sk_n", sk_n.clone());
-                }
-
-                backup_items_coll
-                    .insert_one(backup_doc)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                actual_count += 1;
-            }
+                as i64;
 
             let created_at = now_epoch_secs();
 
-            // Store backup metadata
+            // Store backup metadata. `backup_id` is what maps to the
+            // physical collection; `backup_arn` remains the caller-visible
+            // handle and stays the `_id` for compatibility with existing
+            // describe/list callers.
             let backups_coll = self.catalog_db.collection::<Document>("backups");
             let backup_meta = doc! {
                 "_id": &backup_arn,
+                "backup_id": &backup_id,
                 "backup_name": &backup_name,
                 "backup_status": "AVAILABLE",
                 "backup_type": "USER",
@@ -314,15 +321,28 @@ impl BackupEngine for MongoEngine {
         Box::pin(async move {
             let desc = self.describe_backup(&backup_arn).await?;
 
-            // Delete backup items
-            let backup_items_coll = self.catalog_db.collection::<Document>("backup_items");
-            backup_items_coll
-                .delete_many(doc! { "backup_arn": &backup_arn })
+            // Look up the physical collection name from metadata.
+            let backups_coll = self.catalog_db.collection::<Document>("backups");
+            let meta = backups_coll
+                .find_one(doc! { "_id": &backup_arn })
                 .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                .map_err(|e| StorageError::Internal(e.to_string()))?
+                .ok_or_else(|| {
+                    StorageError::Validation(format!("Backup not found: {backup_arn}"))
+                })?;
+
+            // Drop the backup collection. If backup_id is absent (e.g., a
+            // pre-`$out` backup on an old catalog) we skip — nothing to drop
+            // at the collection level in that case.
+            if let Ok(backup_id) = meta.get_str("backup_id") {
+                let coll_name = backup_collection_name(backup_id);
+                let coll = self.data_db.collection::<Document>(&coll_name);
+                coll.drop()
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+            }
 
             // Mark backup as deleted
-            let backups_coll = self.catalog_db.collection::<Document>("backups");
             backups_coll
                 .update_one(
                     doc! { "_id": &backup_arn },
@@ -409,49 +429,36 @@ impl BackupEngine for MongoEngine {
 
             let desc = self.create_table(&account_id, create_input).await?;
 
-            // Restore items from backup
-            let backup_items_coll = self.catalog_db.collection::<Document>("backup_items");
-            let mut cursor = backup_items_coll
-                .find(doc! { "backup_arn": &backup_arn })
+            // Restore items from the backup collection using server-side `$out`.
+            // The backup collection was written by `create_backup` in the same
+            // document shape as the source data collection, so this is a
+            // direct clone — no per-item transformation needed.
+            let backup_id = backup_doc
+                .get_str("backup_id")
+                .map_err(|_| {
+                    StorageError::Internal("backup metadata missing backup_id".to_string())
+                })?
+                .to_owned();
+            let src_coll_name = backup_collection_name(&backup_id);
+            let src_coll = self.data_db.collection::<Document>(&src_coll_name);
+            let new_coll_name = data_collection_name(&desc.table_id);
+
+            let pipeline = vec![doc! { "$out": &new_coll_name }];
+            let out_cursor = src_coll
+                .aggregate(pipeline)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let _drained: Vec<Document> = out_cursor
+                .try_collect()
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            let new_coll_name = data_collection_name(&desc.table_id);
             let new_data_coll = self.data_db.collection::<Document>(&new_coll_name);
-
-            let mut item_count: i64 = 0;
-            while let Some(backup_item) = cursor
-                .try_next()
+            let item_count = new_data_coll
+                .count_documents(doc! {})
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?
-            {
-                // Re-insert using the original document structure
-                let mut restore_doc = Document::new();
-                if let Some(pk) = backup_item.get("pk") {
-                    restore_doc.insert("pk", pk.clone());
-                }
-                if let Some(item_data) = backup_item.get("item_data") {
-                    restore_doc.insert("item_data", item_data.clone());
-                }
-                if let Ok(sk) = backup_item.get_str("sk") {
-                    restore_doc.insert("sk_s", sk);
-                    let pk_str = backup_item.get_str("pk").unwrap_or_default();
-                    restore_doc.insert("_id", format!("{pk_str}#{sk}"));
-                } else if let Some(sk_n) = backup_item.get("sk_n") {
-                    restore_doc.insert("sk_n", sk_n.clone());
-                    let pk_str = backup_item.get_str("pk").unwrap_or_default();
-                    restore_doc.insert("_id", format!("{pk_str}#{sk_n}"));
-                } else {
-                    let pk_str = backup_item.get_str("pk").unwrap_or_default();
-                    restore_doc.insert("_id", pk_str);
-                }
-
-                new_data_coll
-                    .insert_one(restore_doc)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                item_count += 1;
-            }
+                as i64;
 
             // Update item count and mark table ACTIVE
             let tables_coll = self.catalog_db.collection::<Document>("tables");
