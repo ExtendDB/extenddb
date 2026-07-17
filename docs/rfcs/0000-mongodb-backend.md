@@ -48,25 +48,25 @@ This RFC does not propose:
 The backend lives at `crates/storage-mongodb/` in the main ExtendDB repository, following the mono-repo structure prescribed by RFC-0002. It is selected at build time via a `mongodb` Cargo feature flag on the `extenddb` binary crate.
 
 
-Feature flag definition: `crates/bin/Cargo.toml` — `[features]` section defines `mongodb = ["extenddb-storage-mongodb"]` with the crate as an optional dependency. The `postgres` feature remains the default. An `all-backends` convenience flag is planned as part of gap resolution.
+Feature flag definition: `crates/bin/Cargo.toml` — `[features]` section defines `mongodb = ["extenddb-storage-mongodb"]` with the crate as an optional dependency. The `postgres` feature remains the default. Both features can be enabled together to compile a binary supporting both backends.
 
 ### Plugin registration
 
-The backend registers itself with ExtendDB's `inventory`-based plugin system without modifying the server, engine, or auth layers. Four `inventory::submit!` calls in `lib.rs` register the backend for: bootstrapping (`extenddb init`), config parsing, settings store access, and server component construction (`extenddb serve`).
+The backend registers itself with ExtendDB's `inventory`-based plugin system without modifying the server, engine, or auth layers. Five `inventory::submit!` calls in `lib.rs` register the backend for: bootstrapping (`extenddb init`), config parsing, settings store access, diagnostics store access, and server component construction (`extenddb serve`).
 
 
-All four registration blocks: `crates/storage-mongodb/src/lib.rs`. The `ServerComponentsRegistration` block is the critical one — it is the factory function called when `extenddb serve --backend mongodb` is run. No changes were required in `crates/server/`, `crates/engine/`, or `crates/auth/`.
+All five registration blocks: `crates/storage-mongodb/src/lib.rs`. The `ServerComponentsRegistration` block is the critical one — it is the factory function called when `extenddb serve --backend mongodb` is run. No changes were required in `crates/server/`, `crates/engine/`, or `crates/auth/`.
 
 ### Database layout
 
 The backend uses two MongoDB databases:
 
-**`extenddb_catalog`** — metadata and management. Created on `extenddb init`. Contains 17 collections covering table definitions, index metadata, IAM users, groups, roles, access keys, policies, permissions boundaries, settings, metrics, login attempts, backups, and schema migration history.
+**`extenddb_catalog`** — metadata and management. Created on `extenddb init`. Contains 18 collections covering: table definitions (`tables`), index metadata, accounts, tags, admin users, IAM users, groups, group memberships, roles, access keys, IAM sessions, policies, permissions boundaries, session data, settings, metrics, login attempts, continuous backup metadata, and schema migration history. `iam_group_members` and `backup_items` are used by the runtime but auto-created on first insert rather than during migrations.
 
-**`extenddb_data`** — item data. One MongoDB collection per DynamoDB table, named `_ddb_{table_id}`. One additional collection per GSI/LSI, named the same way with the index's ID. Two shared collections: `stream_records` and `stream_shards` for DynamoDB Streams, `idempotency_tokens` for transaction deduplication, and `counters` for sequence number generation.
+**`extenddb_data`** — item data. One MongoDB collection per DynamoDB table, named `_ddb_{table_id}`. One additional collection per GSI/LSI, named the same way with the index's ID. Shared collections: `stream_records` and `stream_shards` for DynamoDB Streams, `idempotency_tokens` for transaction deduplication, and `counters` for sequence number generation.
 
 
-Catalog collection creation and index setup: `crates/storage-mongodb/src/bootstrapper.rs` — `run_catalog_migrations()` creates all 17 catalog collections and their MongoDB indexes. Data database setup: `create_data_db()` in the same file creates `idempotency_tokens` with a 10-minute TTL index. Collection naming convention: `crates/storage-mongodb/src/data/mod.rs` — `data_collection_name()` and `index_collection_name()`.
+Catalog collection creation and index setup: `crates/storage-mongodb/src/bootstrapper.rs` — `run_catalog_migrations()` creates the migration-managed catalog collections and their MongoDB indexes; `schema_history` is created separately by `create_catalog_db()` in the same file. Data database setup: `create_data_db()` creates `idempotency_tokens` with a 10-minute TTL index. Collection naming convention: `crates/storage-mongodb/src/data/mod.rs` — `data_collection_name()` and `index_collection_name()`.
 
 ### Document structure for DynamoDB items
 
@@ -83,21 +83,23 @@ Each DynamoDB item is stored as a MongoDB document with the following structure:
 }
 ```
 
-The `_id` field enables O(1) point lookups. The `pk` field is indexed separately to support partition scans (Query operations). Sort keys are stored in typed fields (`sk_s`, `sk_n`, `sk_b`) so MongoDB can apply native range comparisons with correct ordering — notably, numeric sort keys use MongoDB's `Decimal128` type rather than strings to ensure correct numeric ordering. The full item is stored in `item_data` using DynamoDB's own type-tagged format (`{"S": "hello"}`, `{"N": "42"}`, etc.), preserving all type information without lossy conversion.
+The `_id` field enables O(1) point lookups. The `pk` field is indexed separately to support partition scans (Query operations). Sort keys are stored in typed fields (`sk_s`, `sk_n`, `sk_b`) so MongoDB can apply native range comparisons with correct ordering — notably, numeric sort keys use MongoDB's `Decimal128` type rather than strings to ensure correct numeric ordering. Values that exceed Decimal128's 34-significant-digit precision are rejected at write and query time with a ValidationException, rather than downcast; DynamoDB itself supports up to 38 significant digits. This is documented as a backend-specific behavioral difference (see `docs/differences-from-dynamodb.md`). The full item is stored in `item_data` using DynamoDB's own type-tagged format (`{"S": "hello"}`, `{"N": "42"}`, etc.), preserving type information for non-key attributes.
 
-String sort key collections are created with `{ locale: "simple", strength: 3 }` collation, ensuring byte-for-byte ordering that matches DynamoDB's behavior rather than locale-aware Unicode ordering.
+String sort key collections are created with `{ locale: "simple" }` collation, ensuring byte-for-byte ordering that matches DynamoDB's behavior rather than locale-aware Unicode ordering.
 
 
 Document conversion functions: `crates/storage-mongodb/src/data/mod.rs` — `item_to_document()` (DynamoDB Item → BSON document) and `document_to_item()` (BSON document → DynamoDB Item). Sort key type handling including `Decimal128`: same file, `item_to_document()` `ScalarAttributeType::N` branch. Collation: `crates/storage-mongodb/src/table_engine.rs` — `CreateTable` implementation, index creation with `Collation` options.
 
-### Condition expression pushdown
+### Condition expression evaluation
 
-Condition expressions (`ConditionExpression` on PutItem, DeleteItem, UpdateItem) are compiled into MongoDB filter documents and executed server-side as part of atomic `findOneAndReplace` and `findOneAndDelete` operations. This means a conditional write is a single round-trip to MongoDB — no separate fetch, no application-level check, no race window between the check and the write.
+Condition expressions (`ConditionExpression` on PutItem, DeleteItem, UpdateItem) are evaluated inside a MongoDB client session that also wraps the write. Within the session, the backend reads the current item, evaluates the condition in Rust against the loaded item, and issues the write — the read and write share the session's transactional atomicity, so a concurrent writer's changes are either visible to the condition or cause the write to observe its version guard (see Write conflict handling). This delivers DynamoDB's atomicity contract for conditional writes and matches the `ReturnValuesOnConditionCheckFailure = ALL_OLD` semantics naturally (the read result is available for the response).
 
-The compiler handles: `attribute_exists`, `attribute_not_exists`, `attribute_type`, `begins_with`, `contains`, `size`, `BETWEEN`, `IN`, `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`. Because items are stored with DynamoDB type tags, compiled paths include the type suffix: `item_data.fieldName.S` for strings, `.N` for numbers.
+The condition compiler exists as scaffolding for a follow-up optimization: it translates DynamoDB expressions into MongoDB filter documents that could be pushed into `findOneAndReplace` / `findOneAndDelete` for a single-round-trip conditional write. The compiler handles: `attribute_exists`, `attribute_not_exists`, `attribute_type`, `begins_with`, `contains`, `BETWEEN`, `IN`, `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`. Because items are stored with DynamoDB type tags, compiled paths include the type suffix: `item_data.fieldName.S` for strings, `.N` for numbers. The compiler is not on the load-bearing correctness path today; the session-scoped read-then-write is.
+
+**Alternative considered — filter pushdown as the primary path.** Compiling filters into `findOneAndReplace` / `findOneAndDelete` would reduce a conditional write to a single round-trip. It is planned as a follow-up optimization once the compiler is exercised through the integration test suite. The current design was chosen because it gives us the loaded item for `ReturnValuesOnConditionCheckFailure` responses without a follow-up read, and because the compiler's behavior on edge-case expressions (multi-valued `size()`, `NOT` on missing paths, mixed-type set membership) is easier to validate incrementally under the session-scoped path.
 
 
-Condition compiler: `crates/storage-mongodb/src/condition.rs` — `condition_to_filter()` is the entry point. Each DynamoDB function and operator has a corresponding compilation case. Unit tests in the same file demonstrate each compiled output. Usage in write operations: `crates/storage-mongodb/src/data_engine.rs` — `put_item_impl()`, `delete_item_impl()`, `update_item_impl()` each pass the compiled filter to MongoDB's `findOneAndReplace`/`findOneAndDelete`/`findOneAndUpdate`.
+Session-scoped condition path: `crates/storage-mongodb/src/data_engine.rs` — `put_item_impl()`, `delete_item_impl()`, `update_item_impl()`, and the four `OwnedTransactWriteOp` arms in `execute_write_op_in_session()` each do read → `expression::evaluate_condition` → write, all with the session bound to each driver call. Condition compiler (scaffolding for the future pushdown path): `crates/storage-mongodb/src/condition.rs` — `condition_to_filter()` is the entry point. Unit tests in the same file demonstrate each compiled output.
 
 ### Query and Scan
 
@@ -125,9 +127,9 @@ Transaction implementation: `crates/storage-mongodb/src/data_engine.rs` — `tra
 
 ### Write conflict handling
 
-**UpdateItem** uses optimistic concurrency. A `_v` version counter is stored on each document. The write path reads the current `_v`, applies the update expression in memory, sets `_v = current_version + 1`, then executes `replaceOne` filtered on both the primary key and the expected `_v`. If `matched_count == 0`, a concurrent writer incremented the version first. The operation retries with jittered exponential backoff (100 µs base, up to 50 attempts). Exhausted retries propagate the error to the caller.
+**UpdateItem** uses optimistic concurrency. A `_v` version counter is stored on each document. The write path reads the current `_v`, applies the update expression in memory, sets `_v = current_version + 1`, then executes `replaceOne` filtered on both the primary key and the expected `_v`. If `matched_count == 0`, a concurrent writer incremented the version first. The operation retries with jittered exponential backoff (50 µs base, up to 50 attempts). Exhausted retries propagate the error to the caller.
 
-**PutItem and DeleteItem** use condition pushdown (see Condition expression pushdown). When `ReturnValuesOnConditionCheckFailure` is requested and the condition fails, a follow-up `find_one` fetches the existing item for the response. This matches DynamoDB's own best-effort semantics for the returned item on condition failure.
+**PutItem and DeleteItem** run their conditional read, condition evaluation, and write within a single MongoDB client session (see Condition expression evaluation). The item loaded to evaluate the condition is reused directly for the `ReturnValuesOnConditionCheckFailure = ALL_OLD` response — no follow-up read is issued. When no condition is present, the write is a straight `findOneAndReplace` / `findOneAndDelete`.
 
 **TransactWriteItems** runs all operations inside a single MongoDB ACID transaction with snapshot read concern and majority write concern. Transaction failures are not retried — the error propagates as `TransactionCanceled`.
 
@@ -167,10 +169,12 @@ Encryption key generation and storage: `crates/storage-mongodb/src/bootstrapper.
 
 ### Backup
 
-`CreateBackup` uses MongoDB's server-side `$out` aggregation stage to copy a table's collection to a backup collection (`_backup_{backup_id}_{table_id}`) without transferring data through the application. `RestoreTableFromBackup` reads the backup collection and reconstructs the table. `DeleteBackup` drops the backup collection.
+`CreateBackup` iterates the source table's collection and inserts each item into a shared `backup_items` collection in the `extenddb_catalog` database, tagged with the `backup_arn`. Backup metadata (arn, table, timestamps, status) is stored in `extenddb_catalog.backups`. `RestoreTableFromBackup` reads `backup_items` filtered by `backup_arn` and reconstructs the table. `DeleteBackup` removes the entries for that arn from the shared collection and marks the metadata row deleted.
+
+**Alternative considered — server-side `$out` aggregation.** MongoDB's `$out` stage would copy a collection server-side without transferring data through the application. It was not adopted here because backup metadata (retention policies, tags, cross-collection references, account-scoped ARN lookups) does not compose with `$out`'s single-collection-target model, and because a shared `backup_items` collection avoids proliferating per-backup collection names in the WiredTiger file namespace at typical scale. A future revision could switch to `$out` for the copy phase while keeping the shared metadata schema.
 
 
-Backup implementation: `crates/storage-mongodb/src/backup_engine.rs`.
+Backup implementation: `crates/storage-mongodb/src/backup_engine.rs`. `backup_items` collection layout and `backup_arn` indexing are documented in the module header.
 
 ### Operational requirements
 
@@ -212,6 +216,7 @@ Configuration struct: `crates/storage-mongodb/src/config.rs`. Sample configurati
 | `crates/storage-mongodb/` | New crate — full backend implementation |
 | `crates/bin/Cargo.toml` | Added `mongodb` optional feature flag |
 | `crates/bin/src/main.rs` | Added `#[cfg(feature = "mongodb")] extern crate` |
+| `crates/bin/src/cmd_serve.rs` | Generalized the supported-backend gate from a hard-coded `"postgres"` check to a compile-time-conditional list built from the enabled feature flags (accepts `"mongodb"` when the feature is on) |
 | `Cargo.toml` (workspace) | Added crate to members, added `mongodb`, `bson`, `dashmap` workspace dependencies |
 
 No changes to `crates/engine/`, `crates/server/`, `crates/storage/` (trait definitions), `crates/auth/`, or `crates/core/`.
@@ -223,22 +228,22 @@ Full diff: `mongodb-forks/extenddb` branch `extenddb-on-mongo` compared to `main
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Conditional writes (PutItem, DeleteItem) | Filter pushdown into `findOneAndReplace` / `findOneAndDelete` | Single-document atomicity; no transaction overhead on the hot path |
-| UpdateItem write conflict | Optimistic concurrency with `_v` version field + jittered backoff | Avoids transactions for single-item updates while preventing lost updates |
-| GSI updates | Synchronous inline with `DashMap` cache | No Change Stream recovery complexity; GSI reads are strongly consistent |
-| DynamoDB Streams | Inline writes to `stream_records` collection | Behavioral parity with PostgreSQL backend; explicit control over sequence numbers, shard assignment, and retention |
+| Conditional writes (PutItem, DeleteItem) | Read + evaluate + write within one MongoDB client session | Atomicity for the DynamoDB contract; loaded item is reused for `ReturnValuesOnConditionCheckFailure = ALL_OLD` without a follow-up read. Filter pushdown is planned as an optimization (see Condition expression evaluation). |
+| UpdateItem write conflict | Optimistic concurrency with `_v` version field + jittered backoff | Avoids multi-document transactions for single-item updates while preventing lost updates |
+| GSI updates | Synchronous inline within the base write's session, with `DashMap` cache short-circuit for tables with no GSIs | No Change Stream recovery complexity; GSI reads are strongly consistent |
+| DynamoDB Streams | Inline writes to `stream_records` collection within the base write's session | Behavioral parity with PostgreSQL backend; explicit control over sequence numbers, shard assignment, and retention |
 | Stream shards | 4 per table, CRC32 hash assignment | Predictable consumer parallelism; no catalog lookup at shard assignment time |
-| Sort key numbers | Native BSON `Decimal128` | Correct ordering by value; no string-encoding tricks |
-| Backups | Server-side `$out` aggregation stage | No client-side data transfer; no document size limitations |
+| Sort key numbers | Native BSON `Decimal128` | Correct ordering by value; no string-encoding tricks. Values exceeding Decimal128 precision (34 digits) are rejected — see `docs/differences-from-dynamodb.md`. |
+| Backups | Per-item inserts to shared `backup_items` collection keyed by `backup_arn` | Composes cleanly with backup metadata (tags, retention, ARN-scoped restore/delete); avoids collection-name proliferation. Server-side `$out` documented as a future optimization. |
 | Parallel scan | Application-side `crc32(pk) % segments` filter | Avoids per-document write overhead of a pre-bucketed segment field |
 
 ### Performance characteristics
 
-**Single-item writes (hot path).** Transaction-free. A PutItem with a condition expression is a single `findOneAndReplace` with a filter — one network round-trip, one WiredTiger document write. No locking, no multi-phase commit.
+**Single-item writes.** A conditional PutItem, DeleteItem, or UpdateItem is executed within a MongoDB client session that covers the condition read, the write, and any dependent writes (stream record insert, GSI collection updates). This adds one session start/commit pair over a raw driver call — ~sub-millisecond on a local replica set. The session wrap is what gives DynamoDB's atomicity contract on conditional writes; it is not overhead in the DynamoDB-compatibility sense, it is the compatibility. A sessionless fast path for the narrow case of tables with no streams and no GSIs is planned as a follow-up optimization.
 
-**GSI write overhead.** For tables with no GSIs, the `gsi_cache` short-circuits to zero overhead — no catalog query, no additional I/O. For tables with GSIs, one catalog query fetches index definitions (cached for subsequent writes on the same table), plus one upsert or delete per index collection per write.
+**GSI write overhead.** For tables with no GSIs, the `gsi_cache` short-circuits to zero overhead — no catalog query, no additional I/O. For tables with GSIs, one catalog query fetches index definitions (cached for subsequent writes on the same table), plus one upsert or delete per index collection per write, all within the same session as the base write.
 
-**Stream write overhead.** When streams are enabled, each write adds one atomic `findOneAndUpdate` counter increment and one document insert into `stream_records`.
+**Stream write overhead.** When streams are enabled, each write adds one atomic `findOneAndUpdate` counter increment and one document insert into `stream_records`, both within the base write's session.
 
 **Query and Scan.** Direct index lookups on `{ pk, sk_* }`. Performance characteristics match any indexed MongoDB query. Parallel scans scan the full collection once per segment (see Query and Scan).
 
