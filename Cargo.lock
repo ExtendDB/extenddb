@@ -863,6 +863,16 @@ name = "extenddb"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "extenddb-app",
+ "extenddb-storage",
+ "extenddb-storage-postgres",
+]
+
+[[package]]
+name = "extenddb-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "base64 0.22.1",
  "clap",
  "daemonize",
@@ -873,7 +883,6 @@ dependencies = [
  "extenddb-engine",
  "extenddb-server",
  "extenddb-storage",
- "extenddb-storage-postgres",
  "libc",
  "rcgen",
  "rustls",
