@@ -35,7 +35,7 @@ pub struct ServeArgs {
 /// Bind the listening socket, daemonize, then start the tokio runtime.
 /// Binding before forking ensures port conflicts are reported to stderr
 /// before the parent process exits (D-4).
-pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
+pub fn run(args: &ServeArgs, git_hash: &'static str) -> anyhow::Result<()> {
     // P50: Check config file permissions before loading. The config file may
     // contain the encryption key (via `extenddb init`). Reject if more permissive
     // than 0600 (owner read/write only).
@@ -179,7 +179,7 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
             port,
             run_dir,
             args.foreground,
-            env!("EXTENDDB_GIT_HASH"),
+            git_hash,
         ))
 }
 

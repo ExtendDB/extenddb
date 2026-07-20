@@ -11,6 +11,7 @@ members = [
     "crates/storage-postgres",
     "crates/auth",
     "crates/server",
+    "crates/app",
     "crates/bin",
 ]
 
@@ -30,6 +31,7 @@ extenddb-config = { path = "crates/config" }
 extenddb-storage-postgres = { path = "crates/storage-postgres" }
 extenddb-auth = { path = "crates/auth" }
 extenddb-server = { path = "crates/server" }
+extenddb-app = { path = "crates/app" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
