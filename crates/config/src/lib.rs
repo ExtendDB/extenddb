@@ -1,7 +1,16 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared configuration types for the extenddb binary.
+//! Configuration types and loading for ExtendDB.
+//!
+//! Owns [`AppConfig`] and its subsections, config-file loading, redaction
+//! helpers, and runtime-path helpers (PID file). This crate is
+//! backend-agnostic: it depends only on the `extenddb-storage` trait surface
+//! (never on a concrete backend), so both `extenddb-server` (for `serve`) and
+//! the CLI/app layer can depend on it without pulling in a backend or forming
+//! a dependency cycle.
+
+use std::path::PathBuf;
 
 use extenddb_core::limits::LimitsConfig;
 use serde::Deserialize;
@@ -153,11 +162,18 @@ impl<'de> serde::Deserialize<'de> for StorageConfig {
         // Deserialize into a raw TOML value first
         let value: toml::Value = toml::Value::deserialize(deserializer)?;
 
-        // Extract the backend field
+        // Extract the backend field. This crate is backend-agnostic and does
+        // not default to any backend: the operator must select one explicitly,
+        // and the thin bin registers it before config is loaded.
         let backend = value
             .get("backend")
             .and_then(|v| v.as_str())
-            .unwrap_or("postgres")
+            .ok_or_else(|| {
+                D::Error::custom(
+                    "[storage] section is missing the required `backend` key \
+                     (e.g. backend = \"postgres\")",
+                )
+            })?
             .to_string();
 
         // Get the backend-specific table (e.g., [storage.postgres])
@@ -173,16 +189,6 @@ impl<'de> serde::Deserialize<'de> for StorageConfig {
             .map_err(D::Error::custom)?;
 
         Ok(StorageConfig { backend, config })
-    }
-}
-
-#[cfg(feature = "postgres")]
-impl Default for StorageConfig {
-    fn default() -> Self {
-        Self {
-            backend: default_backend(),
-            config: Box::new(extenddb_storage_postgres::PostgresStorageConfig::default()),
-        }
     }
 }
 
@@ -303,6 +309,7 @@ fn default_run_dir() -> String {
 
 /// Expand a leading `~` in a path to `$HOME`. Returns the input unchanged
 /// if `$HOME` is unset or the path does not start with `~`.
+#[must_use]
 pub fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix('~')
         && (rest.is_empty() || rest.starts_with('/'))
@@ -312,10 +319,7 @@ pub fn expand_tilde(path: &str) -> String {
     }
     path.to_owned()
 }
-#[cfg(feature = "postgres")]
-fn default_backend() -> String {
-    "postgres".to_owned()
-}
+
 fn default_tls_enabled() -> bool {
     true
 }
@@ -359,12 +363,14 @@ pub fn load(config_path: &str) -> anyhow::Result<AppConfig> {
 ///
 /// Uses the backend-specific operations engine to handle different connection
 /// string formats (`PostgreSQL`).
+#[must_use]
 pub fn redact_password(backend: &str, conn: &str) -> String {
     extenddb_storage::operations::redact_connection_string(backend, conn)
         .unwrap_or_else(|_| conn.to_owned())
 }
 
 /// Return the current OS username, falling back to given default username: e.g. `"postgres"`.
+#[must_use]
 pub fn whoami(default: &str) -> String {
     std::env::var("USER").unwrap_or_else(|_| default.to_owned())
 }
@@ -381,6 +387,21 @@ pub fn whoami(default: &str) -> String {
 pub fn validate_identifier(backend: &str, name: &str, label: &str) -> anyhow::Result<()> {
     extenddb_storage::operations::validate_identifier(backend, name, label)
         .map_err(|e| anyhow::anyhow!("{e:?}"))
+}
+
+/// PID file path for a given port and run directory.
+///
+/// Used by `serve` (write) and `status`/`stop` (read).
+#[must_use]
+pub fn pid_file_path(run_dir: &str, port: u16) -> PathBuf {
+    PathBuf::from(format!("{run_dir}/extenddb-{port}.pid"))
+}
+
+/// PID file path using the default run directory. Used by `status` when
+/// no config file is loaded.
+#[must_use]
+pub fn pid_file_path_default(port: u16) -> PathBuf {
+    pid_file_path(&ServerConfig::default().run_dir, port)
 }
 
 /// Keys whose values must be redacted in configuration displays.
@@ -409,6 +430,7 @@ fn redact_if_sensitive(key: &str, val: &str) -> String {
 ///
 /// Extracts key-value pairs from the parsed `AppConfig` and pre-redacts
 /// sensitive values (connection strings, passwords, keys).
+#[must_use]
 pub fn build_config_entries(cfg: &AppConfig) -> Vec<(String, String)> {
     let r = redact_if_sensitive;
     let backend = &cfg.storage.backend;
@@ -518,5 +540,13 @@ mod tests {
     fn expand_tilde_not_home_prefix() {
         // ~user should NOT be expanded (we only handle ~/...)
         assert_eq!(expand_tilde("~user/foo"), "~user/foo");
+    }
+
+    #[test]
+    fn pid_file_path_formats_port() {
+        assert_eq!(
+            pid_file_path("/run/extenddb", 18443),
+            PathBuf::from("/run/extenddb/extenddb-18443.pid")
+        );
     }
 }

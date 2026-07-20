@@ -10,8 +10,8 @@ use std::path::Path;
 
 use clap::Args;
 
-use crate::config;
 use crate::init_helpers::{generate_config, generate_tls_cert_if_needed};
+use extenddb_config as config;
 
 #[derive(Args)]
 #[allow(clippy::doc_markdown)] // Clap help text, not rustdoc

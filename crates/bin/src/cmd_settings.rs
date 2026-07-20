@@ -11,7 +11,7 @@ use clap::{Args, Subcommand};
 
 use extenddb_storage::management_store::SettingsStore;
 
-use crate::config;
+use extenddb_config as config;
 
 // Re-use validation constants from the ops layer.
 use extenddb_server::management::ops_settings::{KNOWN_KEYS, READONLY_KEYS};

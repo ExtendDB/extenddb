@@ -17,7 +17,6 @@ mod cmd_settings;
 mod cmd_status;
 mod cmd_stop;
 mod cmd_verify;
-mod config;
 mod init_helpers;
 mod manage_http;
 mod manage_types;

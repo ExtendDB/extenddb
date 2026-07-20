@@ -21,12 +21,12 @@ extenddb-cache = { workspace = true }
 extenddb-core = { workspace = true }
 extenddb-engine = { workspace = true }
 extenddb-storage = { workspace = true }
+extenddb-config = { workspace = true }
 extenddb-storage-postgres = { workspace = true, optional = true }
 extenddb-server = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
-config = { workspace = true }
 daemonize = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

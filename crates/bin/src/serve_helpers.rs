@@ -6,8 +6,6 @@
 
 use std::path::PathBuf;
 
-use crate::config;
-
 /// P57 Bug 7: Best-effort raw syslog write for fatal errors. Used when the
 /// tracing subscriber may not be initialized (e.g., errors during early
 /// startup before syslog tracing is configured).
@@ -81,19 +79,6 @@ pub fn verify_daemon_started(pid_file: &PathBuf, bind_addr: &str) -> anyhow::Res
 
     println!("extenddb server started (pid {pid}, {bind_addr})");
     Ok(())
-}
-
-/// PID file path for a given port and run directory.
-/// Used by `serve` (write) and `status` (read).
-pub fn pid_file_path(run_dir: &str, port: u16) -> PathBuf {
-    PathBuf::from(format!("{run_dir}/extenddb-{port}.pid"))
-}
-
-/// PID file path using the default run directory. Used by `status` when
-/// no config file is loaded.
-pub fn pid_file_path_default(port: u16) -> PathBuf {
-    let run_dir = config::ServerConfig::default().run_dir;
-    pid_file_path(&run_dir, port)
 }
 
 /// Check that the config file has permissions no more permissive than `0600`.

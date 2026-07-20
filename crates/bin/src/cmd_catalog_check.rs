@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use clap::Args;
 use sqlx::postgres::PgPoolOptions;
 
-use crate::config;
+use extenddb_config as config;
 
 #[derive(Args)]
 pub struct CatalogCheckArgs {
@@ -47,7 +47,7 @@ pub async fn run(args: CatalogCheckArgs) -> anyhow::Result<()> {
     let run_dir = config::expand_tilde(&app_config.server.run_dir);
 
     // Refuse to run while server is up.
-    let pid_path = crate::serve_helpers::pid_file_path(&run_dir, port);
+    let pid_path = extenddb_config::pid_file_path(&run_dir, port);
     if let Ok(contents) = std::fs::read_to_string(&pid_path)
         && let Ok(pid) = contents.trim().parse::<i32>()
         && crate::util::is_process_alive(pid)
