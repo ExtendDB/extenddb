@@ -45,25 +45,13 @@ pub struct ConnectionParts {
     pub database: String,
 }
 
-/// Registration entry for backend operations.
-pub struct OperationsEngineRegistration {
-    pub name: &'static str,
-    pub operations: &'static dyn OperationsEngine,
-}
-
-inventory::collect!(OperationsEngineRegistration);
-
 /// Get the operations engine for a backend by name.
 pub fn get_operations_engine(backend: &str) -> Result<&'static dyn OperationsEngine, StorageError> {
-    for reg in inventory::iter::<OperationsEngineRegistration> {
-        if reg.name == backend {
-            return Ok(reg.operations);
-        }
+    if let Some(ops) = crate::registry::try_registry().and_then(|r| r.operations.get(backend)) {
+        return Ok(*ops);
     }
 
-    let available: Vec<&str> = inventory::iter::<OperationsEngineRegistration>()
-        .map(|r| r.name)
-        .collect();
+    let available = list_operations_backends();
 
     Err(StorageError::Internal(format!(
         "Unknown backend: {backend}. Available backends: {}",
@@ -74,9 +62,9 @@ pub fn get_operations_engine(backend: &str) -> Result<&'static dyn OperationsEng
 /// List all registered backend names.
 #[must_use]
 pub fn list_operations_backends() -> Vec<&'static str> {
-    inventory::iter::<OperationsEngineRegistration>()
-        .map(|r| r.name)
-        .collect()
+    crate::registry::try_registry()
+        .map(|r| r.operations.keys().copied().collect())
+        .unwrap_or_default()
 }
 
 // Convenience functions that delegate to the operations engine

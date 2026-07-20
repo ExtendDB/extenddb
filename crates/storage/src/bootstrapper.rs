@@ -145,35 +145,23 @@ pub type BootstrapperFactory =
         Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<Box<dyn Bootstrapper>, StorageError>> + Send>>;
 
-/// Backend bootstrapper registration entry.
-///
-/// Backend crates submit instances of this struct using `inventory::submit!`
-/// to register their bootstrappers at compile time.
-pub struct BackendRegistration {
-    pub name: &'static str,
-    pub factory: BootstrapperFactory,
-}
-
-inventory::collect!(BackendRegistration);
-
 /// Create a bootstrapper for the given backend.
 ///
-/// Looks up the backend in the compile-time registry and calls its bootstrapper factory.
+/// Looks up the backend in the installed [`BackendRegistry`](crate::registry)
+/// and calls its bootstrapper factory.
 pub async fn create_bootstrapper(
     backend: &str,
     config_path: &str,
     cli_args: &[String],
 ) -> Result<Box<dyn Bootstrapper>, StorageError> {
-    for registration in inventory::iter::<BackendRegistration> {
-        if registration.name == backend {
-            tracing::info!("Found registered backend: {}", backend);
-            return (registration.factory)(config_path.to_string(), cli_args.to_vec()).await;
-        }
+    if let Some(factory) =
+        crate::registry::try_registry().and_then(|r| r.bootstrappers.get(backend))
+    {
+        tracing::info!("Found registered backend: {}", backend);
+        return factory(config_path.to_string(), cli_args.to_vec()).await;
     }
 
-    let available: Vec<&str> = inventory::iter::<BackendRegistration>()
-        .map(|r| r.name)
-        .collect();
+    let available = list_backends();
 
     tracing::error!(
         "Unknown backend: {}. Available: {}",
@@ -190,9 +178,9 @@ pub async fn create_bootstrapper(
 /// List all registered backends.
 #[must_use]
 pub fn list_backends() -> Vec<&'static str> {
-    inventory::iter::<BackendRegistration>()
-        .map(|r| r.name)
-        .collect()
+    crate::registry::try_registry()
+        .map(|r| r.bootstrappers.keys().copied().collect())
+        .unwrap_or_default()
 }
 
 /// Helper functions for bootstrapper implementations.

@@ -65,6 +65,15 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Wire the available backend(s) into the process registry before any
+    // subcommand runs. This is the single place backends are selected — the
+    // compiler checks it, and adding a backend is a plain `register` call
+    // rather than a link-time side effect.
+    let mut registry = extenddb_storage::BackendRegistry::new();
+    #[cfg(feature = "postgres")]
+    extenddb_storage_postgres::register(&mut registry);
+    extenddb_storage::set_registry(registry)?;
+
     let cli = Cli::parse();
 
     if cli.version {

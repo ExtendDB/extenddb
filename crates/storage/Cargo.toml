@@ -16,7 +16,6 @@ bigdecimal = { workspace = true }
 extenddb-auth = { workspace = true }
 extenddb-core = { workspace = true }
 futures = { workspace = true }
-inventory = { workspace = true }
 rand = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -42,26 +42,17 @@ impl Clone for Box<dyn StorageConfig> {
 /// Takes a TOML table and returns a boxed `StorageConfig` trait object.
 pub type StorageConfigDeserializer = fn(&toml::Table) -> Result<Box<dyn StorageConfig>, String>;
 
-/// Registration entry for a storage config deserializer.
-pub struct StorageConfigRegistration {
-    pub backend: &'static str,
-    pub deserializer: StorageConfigDeserializer,
-}
-
-inventory::collect!(StorageConfigRegistration);
-
 /// Deserialize a storage configuration from a TOML table.
 ///
-/// Looks up the registered deserializer for the given backend name
-/// and invokes it with the provided TOML table.
+/// Looks up the registered deserializer for the given backend name in the
+/// installed [`BackendRegistry`](crate::registry) and invokes it with the
+/// provided TOML table.
 pub fn deserialize_storage_config(
     backend: &str,
     table: &toml::Table,
 ) -> Result<Box<dyn StorageConfig>, String> {
-    for reg in inventory::iter::<StorageConfigRegistration> {
-        if reg.backend == backend {
-            return (reg.deserializer)(table);
-        }
+    match crate::registry::try_registry().and_then(|r| r.storage_configs.get(backend)) {
+        Some(deserializer) => deserializer(table),
+        None => Err(format!("Unknown backend: {backend}")),
     }
-    Err(format!("Unknown backend: {backend}"))
 }

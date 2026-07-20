@@ -38,69 +38,66 @@ pub use config::PostgresStorageConfig;
 pub use config::parse_connection_string;
 pub use credential_store::DbCredentialStore;
 
-// Auto-register the Postgres backend at compile time
-inventory::submit! {
-    extenddb_storage::bootstrapper::BackendRegistration {
-        name: "postgres",
-        factory: |config_path, cli_args| {
-            Box::pin(async move {
-                let store = PostgresBootstrapper::from_config(&config_path, &cli_args).await?;
-                Ok(Box::new(store) as Box<dyn extenddb_storage::bootstrapper::Bootstrapper>)
-            })
-        }
-    }
-}
+/// Register the `PostgreSQL` backend into a [`BackendRegistry`].
+///
+/// A thin `main` calls this before installing the registry:
+///
+/// ```ignore
+/// let mut registry = extenddb_storage::BackendRegistry::new();
+/// extenddb_storage_postgres::register(&mut registry);
+/// extenddb_storage::set_registry(registry).expect("registry already set");
+/// ```
+pub fn register(reg: &mut extenddb_storage::BackendRegistry) {
+    reg.register_bootstrapper("postgres", |config_path, cli_args| {
+        Box::pin(async move {
+            let store = PostgresBootstrapper::from_config(&config_path, &cli_args).await?;
+            Ok(Box::new(store) as Box<dyn extenddb_storage::bootstrapper::Bootstrapper>)
+        })
+    });
 
-// Auto-register PostgreSQL operations engine
-inventory::submit! {
-    extenddb_storage::operations::OperationsEngineRegistration {
-        name: "postgres",
-        operations: &operations::PostgresOperationsEngine,
-    }
-}
+    reg.register_operations("postgres", &operations::PostgresOperationsEngine);
 
-// Auto-register PostgreSQL config deserializer
-inventory::submit! {
-    extenddb_storage::config::StorageConfigRegistration {
-        backend: "postgres",
-        deserializer: |table| {
-            let config: PostgresStorageConfig = table.clone().try_into()
-                .map_err(|e: toml::de::Error| format!("Failed to parse postgres config: {e}"))?;
-            Ok(Box::new(config) as Box<dyn extenddb_storage::config::StorageConfig>)
-        },
-    }
-}
+    reg.register_storage_config("postgres", |table| {
+        let config: PostgresStorageConfig = table
+            .clone()
+            .try_into()
+            .map_err(|e: toml::de::Error| format!("Failed to parse postgres config: {e}"))?;
+        Ok(Box::new(config) as Box<dyn extenddb_storage::config::StorageConfig>)
+    });
 
-// Auto-register PostgreSQL settings store factory
-inventory::submit! {
-    extenddb_storage::settings_store::SettingsStoreRegistration {
-        backend: "postgres",
-        factory: |connection_string| {
-            let connection_string = connection_string.to_string();
-            Box::pin(async move {
-                let pool = sqlx::PgPool::connect(&connection_string)
-                    .await
-                    .map_err(|e| extenddb_storage::settings_store::SettingsStoreError::ConnectionFailed(e.to_string()))?;
-                Ok(Box::new(PostgresCatalogStore::new(pool)) as Box<dyn extenddb_storage::management_store::SettingsStore>)
-            })
-        },
-    }
-}
+    reg.register_settings_store("postgres", |connection_string| {
+        let connection_string = connection_string.to_string();
+        Box::pin(async move {
+            let pool = sqlx::PgPool::connect(&connection_string)
+                .await
+                .map_err(|e| {
+                    extenddb_storage::settings_store::SettingsStoreError::ConnectionFailed(
+                        e.to_string(),
+                    )
+                })?;
+            Ok(Box::new(PostgresCatalogStore::new(pool))
+                as Box<
+                    dyn extenddb_storage::management_store::SettingsStore,
+                >)
+        })
+    });
 
-// Auto-register PostgreSQL diagnostics store factory
-inventory::submit! {
-    extenddb_storage::diagnostics_store::DiagnosticsStoreRegistration {
-        backend: "postgres",
-        factory: |connection_string| {
-            let connection_string = connection_string.to_string();
-            Box::pin(async move {
-                let pool = sqlx::PgPool::connect(&connection_string)
-                    .await
-                    .map_err(|e| extenddb_storage::diagnostics_store::DiagnosticsStoreError::ConnectionFailed(e.to_string()))?;
-                Ok(Box::new(PostgresCatalogStore::new(pool)) as Box<dyn extenddb_storage::diagnostics::DiagnosticsStore>)
-            })
-        },
-    }
+    reg.register_diagnostics_store("postgres", |connection_string| {
+        let connection_string = connection_string.to_string();
+        Box::pin(async move {
+            let pool = sqlx::PgPool::connect(&connection_string)
+                .await
+                .map_err(|e| {
+                    extenddb_storage::diagnostics_store::DiagnosticsStoreError::ConnectionFailed(
+                        e.to_string(),
+                    )
+                })?;
+            Ok(Box::new(PostgresCatalogStore::new(pool))
+                as Box<dyn extenddb_storage::diagnostics::DiagnosticsStore>)
+        })
+    });
+
+    reg.register_server_components("postgres", server_components_factory);
 }
 
 use std::sync::Arc;
@@ -336,9 +333,7 @@ impl PostgresEngine {
 
 use extenddb_auth::CredentialStore;
 use extenddb_storage::hooks::{ServerRuntimeHooks, WorkerContext};
-use extenddb_storage::server_components::{
-    BackendError, ServerComponents, ServerComponentsRegistration,
-};
+use extenddb_storage::server_components::{BackendError, ServerComponents};
 
 /// Backend-specific runtime hooks for `PostgreSQL`.
 struct PostgresRuntimeHooks {
@@ -406,125 +401,129 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
     }
 }
 
-// Register the PostgreSQL backend factory
-inventory::submit! {
-    ServerComponentsRegistration {
-        backend: "postgres",
-        factory: |config, region| {
-            let connection_string = config.connection_config().to_string();
-            let max_connections = config.max_connections();
-            let max_catalog_connections = config.max_catalog_connections();
-            let region = region.to_string();
-            Box::pin(async move {
-                // Build PostgresConfig from extracted values
-                let pg_config = PostgresConfig {
-                    connection_string: connection_string.clone(),
-                    pool_size: max_connections,
-                    max_item_size_bytes: 400_000,
-                };
+/// Build server components for the Postgres backend (registered in [`register`]).
+fn server_components_factory(
+    config: &dyn extenddb_storage::config::StorageConfig,
+    region: &str,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<ServerComponents, BackendError>> + Send>,
+> {
+    let connection_string = config.connection_config().to_string();
+    let max_connections = config.max_connections();
+    let max_catalog_connections = config.max_catalog_connections();
+    let region = region.to_string();
+    Box::pin(async move {
+        // Build PostgresConfig from extracted values
+        let pg_config = PostgresConfig {
+            connection_string: connection_string.clone(),
+            pool_size: max_connections,
+            max_item_size_bytes: 400_000,
+        };
 
-                // Create PostgresEngine
-                let engine = PostgresEngine::new(&pg_config, &region)
-                    .await
-                    .map_err(|e| BackendError::ConnectionFailed {
-                        backend: "postgres".to_string(),
-                        details: e.to_string(),
-                    })?;
+        // Create PostgresEngine
+        let engine = PostgresEngine::new(&pg_config, &region)
+            .await
+            .map_err(|e| BackendError::ConnectionFailed {
+                backend: "postgres".to_string(),
+                details: e.to_string(),
+            })?;
 
-                // Check catalog version
-                engine.check_catalog_version().await.map_err(|e| match e {
-                    StorageError::CatalogVersionMismatch { expected, found } => {
-                        BackendError::CatalogVersionMismatch { expected, found }
-                    }
-                    _ => BackendError::InitializationFailed(e.to_string()),
+        // Check catalog version
+        engine.check_catalog_version().await.map_err(|e| match e {
+            StorageError::CatalogVersionMismatch { expected, found } => {
+                BackendError::CatalogVersionMismatch { expected, found }
+            }
+            _ => BackendError::InitializationFailed(e.to_string()),
+        })?;
+
+        // Recover control plane transitions (ignore errors)
+        match engine.process_control_plane_transitions().await {
+            Ok(ref t) if t.is_empty() => {}
+            Ok(transitions) => {
+                for (name, transition) in &transitions {
+                    tracing::info!("Recovered table '{name}': {transition}");
+                }
+            }
+            Err(e) => tracing::error!("Failed to recover control plane transitions: {e}"),
+        }
+
+        // Start GSI workers
+        let engine = engine.start_gsi_workers();
+
+        // Get data database name for logging (before wrapping in Arc)
+        let data_db_name = engine
+            .get_data_database_info()
+            .await
+            .unwrap_or_else(|_| "(query failed)".to_owned());
+
+        // Get references to fields we need before wrapping
+        let control_plane_notify = engine.control_plane_notify.clone();
+        let gsi_default_delay_ms = engine.gsi_default_delay_ms.clone();
+
+        // Wrap engine in Arc
+        let engine = Arc::new(engine);
+
+        // Create catalog store. Honors storage.postgres.catalog_pool_size,
+        // defaulting to pool_size when unset. Clamped to the same minimum
+        // as the engine pool.
+        let catalog_pool_size = if max_catalog_connections < MIN_POOL_SIZE {
+            tracing::warn!(
+                "storage.postgres.catalog_pool_size = {} is below the minimum of {}; clamping to {}",
+                max_catalog_connections,
+                MIN_POOL_SIZE,
+                MIN_POOL_SIZE
+            );
+            MIN_POOL_SIZE
+        } else {
+            max_catalog_connections
+        };
+        let catalog_pool = PgPoolOptions::new()
+            .max_connections(catalog_pool_size)
+            .min_connections(catalog_pool_size.min(2))
+            .test_before_acquire(false)
+            .max_lifetime(std::time::Duration::from_secs(1800))
+            .connect(&connection_string)
+            .await
+            .map_err(|e| BackendError::ConnectionFailed {
+                backend: "postgres".to_string(),
+                details: format!("Failed to create catalog pool: {e}"),
+            })?;
+
+        // Load encryption key
+        let enc_key: Option<String> =
+            sqlx::query_scalar("SELECT value FROM settings WHERE key = 'encryption_key'")
+                .fetch_optional(&catalog_pool)
+                .await
+                .map_err(|e| {
+                    BackendError::InitializationFailed(format!(
+                        "Failed to fetch encryption key: {e}"
+                    ))
                 })?;
 
-                // Recover control plane transitions (ignore errors)
-                match engine.process_control_plane_transitions().await {
-                    Ok(ref t) if t.is_empty() => {}
-                    Ok(transitions) => {
-                        for (name, transition) in &transitions {
-                            tracing::info!("Recovered table '{name}': {transition}");
-                        }
-                    }
-                    Err(e) => tracing::error!("Failed to recover control plane transitions: {e}"),
-                }
+        let catalog_store = Arc::new(match enc_key {
+            Some(k) => PostgresCatalogStore::with_encryption_key(catalog_pool.clone(), k),
+            None => return Err(BackendError::MissingEncryptionKey),
+        }) as Arc<dyn extenddb_storage::CatalogStore>;
 
-                // Start GSI workers
-                let engine = engine.start_gsi_workers();
+        // Create auth provider
+        let enc_key = extenddb_storage::CatalogStore::cached_encryption_key(&*catalog_store)
+            .ok_or(BackendError::MissingEncryptionKey)?;
+        let cred_store: Arc<dyn CredentialStore> =
+            Arc::new(DbCredentialStore::new(catalog_pool.clone(), enc_key));
 
-                // Get data database name for logging (before wrapping in Arc)
-                let data_db_name = engine
-                    .get_data_database_info()
-                    .await
-                    .unwrap_or_else(|_| "(query failed)".to_owned());
+        // Create runtime hooks
+        let runtime_hooks = Box::new(PostgresRuntimeHooks {
+            engine: engine.clone(),
+            control_plane_notify,
+            gsi_default_delay_ms,
+            data_db_name,
+        });
 
-                // Get references to fields we need before wrapping
-                let control_plane_notify = engine.control_plane_notify.clone();
-                let gsi_default_delay_ms = engine.gsi_default_delay_ms.clone();
-
-                // Wrap engine in Arc
-                let engine = Arc::new(engine);
-
-                // Create catalog store. Honors storage.postgres.catalog_pool_size,
-                // defaulting to pool_size when unset. Clamped to the same minimum
-                // as the engine pool.
-                let catalog_pool_size = if max_catalog_connections < MIN_POOL_SIZE {
-                    tracing::warn!(
-                        "storage.postgres.catalog_pool_size = {} is below the minimum of {}; clamping to {}",
-                        max_catalog_connections,
-                        MIN_POOL_SIZE,
-                        MIN_POOL_SIZE
-                    );
-                    MIN_POOL_SIZE
-                } else {
-                    max_catalog_connections
-                };
-                let catalog_pool = PgPoolOptions::new()
-                    .max_connections(catalog_pool_size)
-                    .min_connections(catalog_pool_size.min(2))
-                    .test_before_acquire(false)
-                    .max_lifetime(std::time::Duration::from_secs(1800))
-                    .connect(&connection_string)
-                    .await
-                    .map_err(|e| BackendError::ConnectionFailed {
-                        backend: "postgres".to_string(),
-                        details: format!("Failed to create catalog pool: {e}"),
-                    })?;
-
-                // Load encryption key
-                let enc_key: Option<String> =
-                    sqlx::query_scalar("SELECT value FROM settings WHERE key = 'encryption_key'")
-                        .fetch_optional(&catalog_pool)
-                        .await
-                        .map_err(|e| BackendError::InitializationFailed(format!("Failed to fetch encryption key: {e}")))?;
-
-                let catalog_store = Arc::new(match enc_key {
-                    Some(k) => PostgresCatalogStore::with_encryption_key(catalog_pool.clone(), k),
-                    None => return Err(BackendError::MissingEncryptionKey),
-                }) as Arc<dyn extenddb_storage::CatalogStore>;
-
-                // Create auth provider
-                let enc_key = extenddb_storage::CatalogStore::cached_encryption_key(&*catalog_store)
-                    .ok_or(BackendError::MissingEncryptionKey)?;
-                let cred_store: Arc<dyn CredentialStore> =
-                    Arc::new(DbCredentialStore::new(catalog_pool.clone(), enc_key));
-
-                // Create runtime hooks
-                let runtime_hooks = Box::new(PostgresRuntimeHooks {
-                    engine: engine.clone(),
-                    control_plane_notify,
-                    gsi_default_delay_ms,
-                    data_db_name,
-                });
-
-                Ok(ServerComponents {
-                    engine,
-                    catalog_store,
-                    credential_store: cred_store,
-                    runtime_hooks: Some(runtime_hooks),
-                })
-            })
-        },
-    }
+        Ok(ServerComponents {
+            engine,
+            catalog_store,
+            credential_store: cred_store,
+            runtime_hooks: Some(runtime_hooks),
+        })
+    })
 }
