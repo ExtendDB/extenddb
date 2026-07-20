@@ -22,7 +22,6 @@ mod manage_http;
 mod manage_types;
 mod serve_helpers;
 mod util;
-mod workers;
 
 use clap::{Parser, Subcommand};
 

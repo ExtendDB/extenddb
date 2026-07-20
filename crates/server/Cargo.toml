@@ -10,6 +10,7 @@ license.workspace = true
 [dependencies]
 extenddb-cache = { workspace = true }
 extenddb-core = { workspace = true }
+extenddb-config = { workspace = true }
 extenddb-engine = { workspace = true }
 extenddb-storage = { workspace = true }
 extenddb-auth = { workspace = true }
@@ -34,6 +35,9 @@ aes-gcm = { workspace = true }
 rand = { workspace = true }
 axum-server = { workspace = true }
 rustls = { workspace = true }
+tracing-subscriber = { workspace = true }
+syslog-tracing = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 extenddb-cache = { workspace = true, features = ["test-util"] }
