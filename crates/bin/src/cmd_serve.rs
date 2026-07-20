@@ -15,11 +15,10 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
 };
 
-use crate::config;
-use crate::serve_helpers::{
-    check_config_permissions, log_to_syslog_raw, pid_file_path, verify_daemon_started,
-};
+use crate::serve_helpers::{check_config_permissions, log_to_syslog_raw, verify_daemon_started};
 use crate::workers;
+use extenddb_config as config;
+use extenddb_config::pid_file_path;
 
 #[derive(Args, Default)]
 pub struct ServeArgs {
@@ -596,8 +595,8 @@ async fn serve_inner(
     }
 
     let tls_config = if tls_enabled {
-        let cert_path = crate::config::expand_tilde(&app_config.server.tls.cert_path);
-        let key_path = crate::config::expand_tilde(&app_config.server.tls.key_path);
+        let cert_path = extenddb_config::expand_tilde(&app_config.server.tls.cert_path);
+        let key_path = extenddb_config::expand_tilde(&app_config.server.tls.key_path);
         Some(extenddb_server::ServerTlsConfig {
             cert_path: std::path::PathBuf::from(cert_path),
             key_path: std::path::PathBuf::from(key_path),

@@ -13,7 +13,7 @@
 
 use clap::Args;
 
-use crate::config;
+use extenddb_config as config;
 
 #[derive(Args)]
 pub struct VerifyArgs {

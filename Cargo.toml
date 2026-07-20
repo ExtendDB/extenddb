@@ -7,6 +7,7 @@ members = [
     "crates/cache",
     "crates/engine",
     "crates/storage",
+    "crates/config",
     "crates/storage-postgres",
     "crates/auth",
     "crates/server",
@@ -25,6 +26,7 @@ extenddb-core = { path = "crates/core" }
 extenddb-cache = { path = "crates/cache" }
 extenddb-engine = { path = "crates/engine" }
 extenddb-storage = { path = "crates/storage" }
+extenddb-config = { path = "crates/config" }
 extenddb-storage-postgres = { path = "crates/storage-postgres" }
 extenddb-auth = { path = "crates/auth" }
 extenddb-server = { path = "crates/server" }

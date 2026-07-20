@@ -5,7 +5,7 @@
 
 /// Generate a self-signed TLS certificate and key if they don't already exist.
 pub fn generate_tls_cert_if_needed(bind_addr: &str) -> anyhow::Result<()> {
-    let tls_dir = crate::config::expand_tilde("~/.extenddb/tls");
+    let tls_dir = extenddb_config::expand_tilde("~/.extenddb/tls");
     let cert_path = format!("{tls_dir}/cert.pem");
     let key_path = format!("{tls_dir}/key.pem");
 
@@ -76,9 +76,9 @@ pub(crate) fn generate_config(
     let timestamp = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "unknown".to_owned());
-    let tls_cert = crate::config::expand_tilde("~/.extenddb/tls/cert.pem");
-    let tls_key = crate::config::expand_tilde("~/.extenddb/tls/key.pem");
-    let run_dir = crate::config::expand_tilde("~/.extenddb/run");
+    let tls_cert = extenddb_config::expand_tilde("~/.extenddb/tls/cert.pem");
+    let tls_key = extenddb_config::expand_tilde("~/.extenddb/tls/key.pem");
+    let run_dir = extenddb_config::expand_tilde("~/.extenddb/run");
 
     // Compute docs_dir line before the template so it lands in the top-level
     // TOML section (before any [section] header).

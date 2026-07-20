@@ -865,10 +865,10 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "clap",
- "config",
  "daemonize",
  "extenddb-auth",
  "extenddb-cache",
+ "extenddb-config",
  "extenddb-core",
  "extenddb-engine",
  "extenddb-server",
@@ -917,6 +917,19 @@ dependencies = [
  "moka",
  "serde",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "extenddb-config"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "config",
+ "extenddb-core",
+ "extenddb-storage",
+ "serde",
+ "toml",
  "tracing",
 ]
 

@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use clap::Args;
 
-use crate::config;
 use crate::util::is_process_alive;
+use extenddb_config as config;
 
 /// Maximum time to wait for the process to exit after SIGTERM.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -41,10 +41,8 @@ pub fn run(args: &StopArgs) {
         .unwrap_or(18443);
 
     let pid_file = match &app_config {
-        Some(c) => {
-            crate::serve_helpers::pid_file_path(&config::expand_tilde(&c.server.run_dir), port)
-        }
-        None => crate::serve_helpers::pid_file_path_default(port),
+        Some(c) => extenddb_config::pid_file_path(&config::expand_tilde(&c.server.run_dir), port),
+        None => extenddb_config::pid_file_path_default(port),
     };
 
     let pid_str = match std::fs::read_to_string(&pid_file) {

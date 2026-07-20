@@ -7,7 +7,7 @@
 
 use clap::Args;
 
-use crate::config;
+use extenddb_config as config;
 
 #[derive(Args)]
 #[allow(clippy::doc_markdown)] // Clap help text, not rustdoc
