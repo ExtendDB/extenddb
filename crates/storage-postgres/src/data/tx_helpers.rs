@@ -333,19 +333,22 @@ pub(super) async fn write_stream_record_in_tx(
 
 /// Check an idempotency token within an existing transaction.
 ///
-/// Returns `Ok(())` for new tokens (inserted), `Err(IdempotentReplay)` for
-/// matching replays, `Err(IdempotentMismatch)` for fingerprint conflicts.
+/// The token is scoped to `account_id`: the same token value from different
+/// accounts is stored and matched independently. Returns `Ok(())` for new
+/// tokens (inserted), `Err(IdempotentReplay)` for matching replays,
+/// `Err(IdempotentMismatch)` for fingerprint conflicts.
 pub(super) async fn check_idempotency_token_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: &str,
     token: &str,
     fingerprint: &str,
 ) -> Result<(), StorageError> {
     let row: Option<(String, bool)> = sqlx::query_as(
         r"WITH ins AS (
-            INSERT INTO idempotency_tokens (token, fingerprint)
-            VALUES ($1, $2)
-            ON CONFLICT (token) DO UPDATE
-                SET fingerprint = $2, created_at = NOW()
+            INSERT INTO idempotency_tokens (account_id, token, fingerprint)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (account_id, token) DO UPDATE
+                SET fingerprint = $3, created_at = NOW()
                 WHERE idempotency_tokens.created_at <= NOW() - INTERVAL '10 minutes'
             RETURNING fingerprint, TRUE AS inserted
           )
@@ -353,11 +356,13 @@ pub(super) async fn check_idempotency_token_in_tx(
           UNION ALL
           SELECT fingerprint, FALSE AS inserted
           FROM idempotency_tokens
-          WHERE token = $1
+          WHERE account_id = $1
+            AND token = $2
             AND created_at > NOW() - INTERVAL '10 minutes'
             AND NOT EXISTS (SELECT 1 FROM ins)
           LIMIT 1",
     )
+    .bind(account_id)
     .bind(token)
     .bind(fingerprint)
     .fetch_optional(&mut **tx)

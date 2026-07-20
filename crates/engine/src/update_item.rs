@@ -60,25 +60,40 @@ pub async fn handle_update_item(
     // desugaring) before the existence check; key, item-content nesting, and
     // the no-key-update checks stay after (post-existence on Amazon DynamoDB).
 
+    let has_update_expr = input
+        .update_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    let has_condition = input
+        .condition_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    let has_expected = input.expected.as_ref().is_some_and(|m| !m.is_empty());
+    let has_cond_op = input.conditional_operator.is_some();
+
+    extenddb_core::validation::validate_no_expression_param_mixing(
+        &[
+            ("AttributeUpdates", input.attribute_updates.is_some()),
+            ("Expected", has_expected),
+            ("ConditionalOperator", has_cond_op),
+        ],
+        &[
+            ("UpdateExpression", input.update_expression.is_some()),
+            ("ConditionExpression", has_condition),
+        ],
+    )?;
+
     // Desugar legacy AttributeUpdates into UpdateExpression if present.
-    // N.B. The literal `{AttributeUpdates}` / `{UpdateExpression}` in the error message
-    // matches real DynamoDB's format — they are not Rust format placeholders.
-    let (effective_update_expr, extra_expr_values, extra_expr_names) = if let Some(attr_updates) =
-        &input.attribute_updates
-    {
-        if input.update_expression.is_some() {
-            return Err(DynamoDbError::ValidationException(
-                "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributeUpdates} Expression parameters: {UpdateExpression}".to_owned(),
-            ));
-        }
-        desugar_attribute_updates(attr_updates)?
-    } else {
-        (
-            input.update_expression.clone(),
-            HashMap::new(),
-            HashMap::new(),
-        )
-    };
+    let (effective_update_expr, extra_expr_values, extra_expr_names) =
+        if let Some(attr_updates) = &input.attribute_updates {
+            desugar_attribute_updates(attr_updates)?
+        } else {
+            (
+                input.update_expression.clone(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+        };
 
     // Merge extra expression values from desugaring with any existing ones.
     let effective_expr_values = if extra_expr_values.is_empty() {
@@ -101,14 +116,6 @@ pub async fn handle_update_item(
         Some(merged)
     };
 
-    let has_update_expr = input
-        .update_expression
-        .as_ref()
-        .is_some_and(|s| !s.is_empty());
-    let has_condition = input
-        .condition_expression
-        .as_ref()
-        .is_some_and(|s| !s.is_empty());
     let has_expr = has_update_expr || has_condition;
     extenddb_core::expression::validate_expression_param_usage(
         input.expression_attribute_names.as_ref(),
@@ -116,6 +123,12 @@ pub async fn handle_update_item(
         input.expression_attribute_values.as_ref(),
         has_expr,
         &[ExpressionKind::Update, ExpressionKind::Condition],
+    )?;
+
+    // ConditionalOperator requires an Expected with two or more conditions.
+    extenddb_core::validation::validate_conditional_operator_usage(
+        has_cond_op,
+        input.expected.as_ref().map_or(0, HashMap::len),
     )?;
 
     let (condition, maps) = resolve_condition(

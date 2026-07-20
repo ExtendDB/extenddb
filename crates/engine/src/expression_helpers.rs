@@ -172,13 +172,10 @@ pub fn resolve_condition(
     let has_condition = condition_expression.is_some_and(|s| !s.is_empty());
     let has_expected = expected.is_some_and(|m| !m.is_empty());
 
-    if has_condition && has_expected {
-        return Err(DynamoDbError::ValidationException(
-            "Can not use both expression and non-expression parameters in the same request: \
-             Non-expression parameters: {Expected} Expression parameters: {ConditionExpression}"
-                .to_owned(),
-        ));
-    }
+    extenddb_core::validation::validate_no_expression_param_mixing(
+        &[("Expected", has_expected)],
+        &[("ConditionExpression", has_condition)],
+    )?;
 
     if let Some(exp) = expected.filter(|m| !m.is_empty()) {
         let (expr, mut maps) = desugar_expected(exp, conditional_operator.unwrap_or_default())?;

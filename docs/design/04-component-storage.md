@@ -739,27 +739,32 @@ arithmetic assigns each partition key to exactly one segment, ensuring:
 
 ## 9. Idempotency Token Storage
 
-`TransactWriteItems` supports `ClientRequestToken` for idempotency. Tokens are stored in a dedicated table:
+`TransactWriteItems` supports `ClientRequestToken` for idempotency. Tokens are stored in a dedicated table, scoped per account:
 
 ```sql
-CREATE TABLE _dynamodb_idempotency_tokens (
-    client_request_token TEXT PRIMARY KEY,
-    response JSONB NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+CREATE TABLE idempotency_tokens (
+    account_id  TEXT NOT NULL,
+    token       TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (account_id, token)
 );
-CREATE INDEX ON _dynamodb_idempotency_tokens(created_at);
+CREATE INDEX ON idempotency_tokens(created_at);
 ```
 
 **Flow:**
-1. Before executing a transaction, check if the token exists
-2. If found: return the stored response (idempotent replay)
-3. If not found: execute the transaction, store the token + response
-   atomically in the same PostgreSQL transaction
+1. Before executing a transaction, look up `(account_id, token)`
+2. If found with a matching fingerprint: treat as an idempotent replay and
+   return success without re-applying the writes
+3. If not found: execute the transaction and store `(account_id, token,
+   fingerprint)` atomically in the same PostgreSQL transaction
 4. Background cleanup: delete tokens older than 10 minutes (matching
    DynamoDB's idempotency window)
 
-If a request arrives with the same token but different parameters, return
-`IdempotentParameterMismatchException`.
+The token is scoped to `account_id`: a `ClientRequestToken` is unique per
+account in DynamoDB, so the same token value from two accounts never collides.
+If a request arrives with the same `(account_id, token)` but a different
+fingerprint, return `IdempotentParameterMismatchException`.
 
 ## 10. Backend Plugin Architecture
 

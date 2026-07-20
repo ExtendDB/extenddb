@@ -613,10 +613,50 @@ pub fn validate_update_item(
     validate_key_only(&input.key, key_schema, attr_defs)?;
     validate_key_sizes(&input.key, key_schema, limits)?;
 
-    if let Some(updates) = &input.attribute_updates {
-        validate_attribute_values_nesting_depth(updates.values().filter_map(|u| u.value.as_ref()))?;
+    // Validate number values supplied via ExpressionAttributeValues. Unlike a
+    // PutItem item (validated by validate_item_numbers), these are checked here
+    // because the AttributeValue deserializer intentionally stores malformed
+    // numbers raw and defers rejection to the validation layer. Real DynamoDB
+    // wraps the error as:
+    //   "ExpressionAttributeValues contains invalid value: <inner> for key <k>"
+    if let Some(values) = &input.expression_attribute_values {
+        validate_expression_attribute_value_numbers(values)?;
     }
 
+    if let Some(updates) = &input.attribute_updates {
+        validate_attribute_values_nesting_depth(updates.values().filter_map(|u| u.value.as_ref()))?;
+        // Legacy AttributeUpdates values carry the bare numeric-value message,
+        // matching real DynamoDB (no ExpressionAttributeValues wrapper).
+        for update in updates.values() {
+            if let Some(v) = &update.value {
+                validate_attribute_number(v)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate number values provided via `ExpressionAttributeValues`, matching the
+/// service's wrapped message: `ExpressionAttributeValues contains invalid value:
+/// <inner> for key <placeholder>`. Keys are visited in sorted order so the
+/// reported placeholder is deterministic when several values are invalid.
+fn validate_expression_attribute_value_numbers(
+    values: &std::collections::HashMap<String, AttributeValue>,
+) -> Result<(), DynamoDbError> {
+    let mut keys: Vec<&String> = values.keys().collect();
+    keys.sort();
+    for key in keys {
+        match validate_attribute_number(&values[key]) {
+            Ok(()) => {}
+            Err(DynamoDbError::ValidationException(inner)) => {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "ExpressionAttributeValues contains invalid value: {inner} for key {key}"
+                )));
+            }
+            Err(other) => return Err(other),
+        }
+    }
     Ok(())
 }
 
@@ -1014,6 +1054,69 @@ pub fn validate_select_projection(
         ));
     }
     Ok(())
+}
+
+/// Reject requests that mix legacy (non-expression) and expression parameters.
+///
+/// Each slice lists the API's parameters as `(name, present)` pairs in the
+/// canonical order Amazon DynamoDB reports them. If at least one parameter is
+/// present on each side, the error message lists every present parameter.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` when both sides are non-empty.
+pub fn validate_no_expression_param_mixing(
+    non_expression: &[(&str, bool)],
+    expression: &[(&str, bool)],
+) -> Result<(), DynamoDbError> {
+    // Happy path allocates nothing; the name lists are built only on error.
+    let any_present = |params: &[(&str, bool)]| params.iter().any(|(_, p)| *p);
+    if !any_present(non_expression) || !any_present(expression) {
+        return Ok(());
+    }
+    fn present_names(params: &[(&str, bool)]) -> String {
+        params
+            .iter()
+            .filter(|(_, p)| *p)
+            .map(|(n, _)| *n)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+    Err(DynamoDbError::ValidationException(format!(
+        "Can not use both expression and non-expression parameters in the same request: \
+         Non-expression parameters: {{{}}} Expression parameters: {{{}}}",
+        present_names(non_expression),
+        present_names(expression)
+    )))
+}
+
+/// Validate `ConditionalOperator` accompanies a legacy Filter/Expected with
+/// two or more conditions, matching Amazon DynamoDB.
+///
+/// `condition_count` is the number of entries in the request's legacy
+/// `ScanFilter`/`QueryFilter`/`Expected` map (0 when absent or empty).
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` when `ConditionalOperator` is
+/// present with fewer than two legacy conditions.
+pub fn validate_conditional_operator_usage(
+    conditional_operator_present: bool,
+    condition_count: usize,
+) -> Result<(), DynamoDbError> {
+    if !conditional_operator_present {
+        return Ok(());
+    }
+    match condition_count {
+        0 => Err(DynamoDbError::ValidationException(
+            "ConditionalOperator cannot be used without Filter or Expected".to_owned(),
+        )),
+        1 => Err(DynamoDbError::ValidationException(
+            "ConditionalOperator can only be used when Filter or Expected has two or more elements"
+                .to_owned(),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Validate partition key and sort key sizes against limits.
@@ -1660,6 +1763,96 @@ mod tests {
         assert!(validate_update_item(&input, &limits, &key_schema, &attr_defs).is_ok());
     }
 
+    fn eav_update_input(key: &str, value: AttributeValue) -> UpdateItemInput {
+        let mut input = update_input_no_directives();
+        input.update_expression = Some(format!("SET bad = {key}"));
+        let mut m = std::collections::HashMap::new();
+        m.insert(key.to_owned(), value);
+        input.expression_attribute_values = Some(m);
+        input
+    }
+
+    #[test]
+    fn update_item_rejects_malformed_number_in_eav() {
+        // The AttributeValue deserializer stores malformed numbers raw and
+        // defers rejection here. Matches real DynamoDB's wrapped message.
+        let limits = LimitsConfig::default();
+        let key_schema = vec![make_ks("pk", KeyType::Hash)];
+        let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
+        let input = eav_update_input(":v", AttributeValue::N("12e".to_owned()));
+        let err = validate_update_item(&input, &limits, &key_schema, &attr_defs).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ExpressionAttributeValues contains invalid value: \
+             The parameter cannot be converted to a numeric value: 12e for key :v"
+        );
+    }
+
+    #[test]
+    fn update_item_rejects_number_overflow_in_eav() {
+        let limits = LimitsConfig::default();
+        let key_schema = vec![make_ks("pk", KeyType::Hash)];
+        let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
+        let big = format!("1{}", "0".repeat(200));
+        let input = eav_update_input(":v", AttributeValue::N(big));
+        let err = validate_update_item(&input, &limits, &key_schema, &attr_defs).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ExpressionAttributeValues contains invalid value: \
+             Number overflow. Attempting to store a number with magnitude larger than \
+             supported range for key :v"
+        );
+    }
+
+    #[test]
+    fn update_item_rejects_invalid_number_set_member_in_eav() {
+        let limits = LimitsConfig::default();
+        let key_schema = vec![make_ks("pk", KeyType::Hash)];
+        let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
+        let ns: std::collections::BTreeSet<String> =
+            ["1".to_owned(), "abc".to_owned()].into_iter().collect();
+        let input = eav_update_input(":v", AttributeValue::NS(ns));
+        let err = validate_update_item(&input, &limits, &key_schema, &attr_defs).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ExpressionAttributeValues contains invalid value: \
+             The parameter cannot be converted to a numeric value: abc for key :v"
+        );
+    }
+
+    #[test]
+    fn update_item_accepts_valid_number_in_eav() {
+        let limits = LimitsConfig::default();
+        let key_schema = vec![make_ks("pk", KeyType::Hash)];
+        let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
+        let input = eav_update_input(":v", AttributeValue::N("42".to_owned()));
+        assert!(validate_update_item(&input, &limits, &key_schema, &attr_defs).is_ok());
+    }
+
+    #[test]
+    fn update_item_rejects_bad_number_in_attribute_updates() {
+        // Legacy AttributeUpdates path: bare numeric-value message, no
+        // ExpressionAttributeValues wrapper (matches real DynamoDB).
+        let limits = LimitsConfig::default();
+        let key_schema = vec![make_ks("pk", KeyType::Hash)];
+        let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
+        let mut input = update_input_no_directives();
+        let mut updates = std::collections::HashMap::new();
+        updates.insert(
+            "bad".to_owned(),
+            crate::types::AttributeValueUpdate {
+                value: Some(AttributeValue::N("not_a_num".to_owned())),
+                action: "PUT".to_owned(),
+            },
+        );
+        input.attribute_updates = Some(updates);
+        let err = validate_update_item(&input, &limits, &key_schema, &attr_defs).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "The parameter cannot be converted to a numeric value: not_a_num"
+        );
+    }
+
     fn nested_map(depth: usize) -> AttributeValue {
         let mut leaf = AttributeValue::S("leaf".to_owned());
         for _ in 0..depth {
@@ -2128,5 +2321,82 @@ mod tests {
             stream_view_type: Some(StreamViewType::NewImage),
         });
         assert!(validate_create_table(&input, &LimitsConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn test_expression_param_mixing_lists_present_params_in_order() {
+        let err = validate_no_expression_param_mixing(
+            &[
+                ("AttributesToGet", true),
+                ("ScanFilter", true),
+                ("ConditionalOperator", true),
+            ],
+            &[("ProjectionExpression", true), ("FilterExpression", true)],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Can not use both expression and non-expression parameters in the same request: \
+             Non-expression parameters: {AttributesToGet, ScanFilter, ConditionalOperator} \
+             Expression parameters: {ProjectionExpression, FilterExpression}"
+        );
+    }
+
+    #[test]
+    fn test_expression_param_mixing_skips_absent_params() {
+        let err = validate_no_expression_param_mixing(
+            &[("ScanFilter", false), ("ConditionalOperator", true)],
+            &[("ProjectionExpression", false), ("FilterExpression", true)],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Can not use both expression and non-expression parameters in the same request: \
+             Non-expression parameters: {ConditionalOperator} \
+             Expression parameters: {FilterExpression}"
+        );
+    }
+
+    #[test]
+    fn test_expression_param_mixing_allows_one_side_only() {
+        assert!(
+            validate_no_expression_param_mixing(
+                &[("ScanFilter", true), ("ConditionalOperator", true)],
+                &[("FilterExpression", false)],
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_no_expression_param_mixing(
+                &[("ScanFilter", false)],
+                &[("FilterExpression", true), ("ProjectionExpression", true)],
+            )
+            .is_ok()
+        );
+        assert!(validate_no_expression_param_mixing(&[], &[]).is_ok());
+    }
+
+    #[test]
+    fn test_conditional_operator_requires_conditions() {
+        let err = validate_conditional_operator_usage(true, 0).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ConditionalOperator cannot be used without Filter or Expected"
+        );
+
+        let err = validate_conditional_operator_usage(true, 1).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ConditionalOperator can only be used when Filter or Expected has two or more elements"
+        );
+
+        assert!(validate_conditional_operator_usage(true, 2).is_ok());
+        assert!(validate_conditional_operator_usage(true, 5).is_ok());
+    }
+
+    #[test]
+    fn test_conditional_operator_absent_is_ok() {
+        assert!(validate_conditional_operator_usage(false, 0).is_ok());
+        assert!(validate_conditional_operator_usage(false, 1).is_ok());
     }
 }

@@ -127,12 +127,17 @@ pub async fn handle_transact_write_items(
         validate_client_request_token(token)?;
     }
 
-    let token_pair = input
-        .client_request_token
-        .as_deref()
-        .map(|t| (t, fingerprint.as_str()));
+    let idempotency =
+        input
+            .client_request_token
+            .as_deref()
+            .map(|t| extenddb_storage::IdempotencyKey {
+                account_id: ctx.account_id.as_ref(),
+                token: t,
+                fingerprint: fingerprint.as_str(),
+            });
 
-    match ctx.storage.transact_write_items(&ops, token_pair).await {
+    match ctx.storage.transact_write_items(&ops, idempotency).await {
         Ok(()) => {}
         Err(extenddb_storage::error::StorageError::IdempotentReplay) => {
             let output = TransactWriteItemsOutput {
@@ -164,7 +169,7 @@ pub async fn handle_transact_write_items(
         })
         .sum();
 
-    let consumed_capacity = capacity_helpers::batch_write_capacity(
+    let consumed_capacity = capacity_helpers::transact_write_capacity(
         input.return_consumed_capacity,
         per_table_wcu.iter().map(|(t, cu)| (t.as_str(), *cu)),
     );

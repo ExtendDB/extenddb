@@ -230,3 +230,141 @@ async fn query_gsi_composite_key_table() {
 
     assert_eq!(resp.count(), 3);
 }
+
+/// Regression: a hash-only GSI on a composite-key base table. Many items share
+/// the GSI hash and the base partition key, differing only by the base sort
+/// key, so a continuation must carry the base sort key to disambiguate.
+///
+/// Previously the pagination resume bound the base sort key without the base
+/// partition key, diverging from the generated SQL (which binds both), causing
+/// a parameter/bind-count mismatch and a 500 on the second page. This walks
+/// every item across pages and asserts each is returned exactly once.
+#[tokio::test]
+async fn hash_only_gsi_pagination_on_composite_base_table() {
+    use aws_sdk_dynamodb::types::{AttributeValue, BillingMode};
+    use std::collections::{BTreeSet, HashMap};
+    use std::time::Duration;
+
+    let c = client();
+    let table = format!("HashOnlyGsiPage_{}", ts());
+    let gh = format!("gho_{}", ts());
+
+    let gsi = GlobalSecondaryIndex::builder()
+        .index_name("gho")
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("gh")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .projection(
+            Projection::builder()
+                .projection_type(ProjectionType::All)
+                .build(),
+        )
+        .build()
+        .unwrap();
+
+    c.create_table()
+        .table_name(&table)
+        .billing_mode(BillingMode::PayPerRequest)
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("sk")
+                .key_type(KeyType::Range)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("sk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("gh")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .global_secondary_indexes(gsi)
+        .send()
+        .await
+        .unwrap();
+    wait_for_active(c, &table).await;
+
+    let count = 5;
+    for i in 0..count {
+        let mut item = HashMap::new();
+        item.insert("pk".to_string(), s("p"));
+        item.insert("sk".to_string(), s(&format!("s{i}")));
+        item.insert("gh".to_string(), s(&gh));
+        c.put_item()
+            .table_name(&table)
+            .set_item(Some(item))
+            .send()
+            .await
+            .unwrap();
+    }
+    // GSI is eventually consistent — allow projection to settle.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut total = 0usize;
+    let mut pages = 0usize;
+    let mut esk: Option<HashMap<String, AttributeValue>> = None;
+
+    loop {
+        let mut req = c
+            .query()
+            .table_name(&table)
+            .index_name("gho")
+            .key_condition_expression("#gh = :gh")
+            .expression_attribute_names("#gh", "gh")
+            .expression_attribute_values(":gh", s(&gh))
+            .limit(2);
+        if let Some(ref lek) = esk {
+            req = req.set_exclusive_start_key(Some(lek.clone()));
+        }
+
+        let resp = req.send().await.unwrap();
+        for it in resp.items() {
+            if let Some(AttributeValue::S(sk)) = it.get("sk") {
+                seen.insert(sk.clone());
+                total += 1;
+            }
+        }
+        pages += 1;
+        match resp.last_evaluated_key() {
+            Some(lek) => esk = Some(lek.to_owned()),
+            None => break,
+        }
+        assert!(pages < 10, "pagination did not terminate");
+    }
+
+    assert_eq!(seen.len(), count, "every item must be seen exactly once");
+    assert_eq!(
+        total, count,
+        "no item may be returned twice across a page boundary"
+    );
+    assert!(pages > 1, "Limit 2 over 5 items must force real pagination");
+
+    let _ = c.delete_table().table_name(&table).send().await;
+}

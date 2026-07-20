@@ -43,6 +43,10 @@ pub(crate) const DATA_MIGRATIONS: &[(&str, &str)] = &[
         "002_gsi_pending.sql",
         include_str!("../../storage-postgres/data_migrations/002_gsi_pending.sql"),
     ),
+    (
+        "003_idempotency_account_scope.sql",
+        include_str!("../../storage-postgres/data_migrations/003_idempotency_account_scope.sql"),
+    ),
 ];
 
 /// Run data database migrations, skipping already-applied ones.

@@ -172,7 +172,7 @@ pub async fn handle_transact_get_items(
         })
         .collect();
 
-    let consumed_capacity = capacity_helpers::batch_read_capacity(
+    let consumed_capacity = capacity_helpers::transact_read_capacity(
         input.return_consumed_capacity,
         per_table_rcu.iter().map(|(t, cu)| (t.as_str(), *cu)),
     );

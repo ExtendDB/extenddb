@@ -92,7 +92,7 @@ Item CRUD, query, scan, and transaction operations:
 Key design decisions:
 - **Condition expressions** are evaluated inside the storage transaction. The engine parses and compiles expressions; the storage layer receives an AST (`Expr`) and evaluates it against the existing item within the same transaction that performs the write. This is critical for correctness — condition checks and writes must be atomic.
 - **Stream capture** is passed as `Option<&StreamCapture>`. When present, the stream record must be written in the same transaction as the data write.
-- **Idempotency tokens** for `TransactWriteItems` must be checked and stored atomically with the writes.
+- **Idempotency tokens** for `TransactWriteItems` must be checked and stored atomically with the writes, and must be scoped per account: a `ClientRequestToken` is unique per account in DynamoDB, not globally, so the store must key on `(account_id, token)`. Keying on the token alone lets the same token value from two accounts collide (one account's transaction wrongly replayed or rejected against another's).
 - **Items** are `BTreeMap<String, AttributeValue>`. A new backend must handle the full `AttributeValue` type (S, N, B, SS, NS, BS, L, M, BOOL, NULL).
 - **Query** must support forward/reverse sort order, exclusive start key pagination, and routing to secondary index storage.
 - **Parallel scan** uses `segment` and `total_segments` to partition the keyspace.

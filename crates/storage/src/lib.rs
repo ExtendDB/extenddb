@@ -20,7 +20,7 @@ pub mod server_components;
 pub mod settings_store;
 pub mod transact;
 
-pub use transact::{TransactGetOp, TransactWriteOp};
+pub use transact::{IdempotencyKey, TransactGetOp, TransactWriteOp};
 
 pub use server_components::{
     BackendError, ServerComponents, ServerComponentsFactory, ServerComponentsRegistration,
@@ -313,8 +313,10 @@ pub trait DataEngine: Send + Sync {
     /// When `stream` is `Some`, stream records for each write operation are
     /// inserted in the same transaction as the data writes.
     ///
-    /// When `token` is `Some`, the idempotency token is checked and stored
-    /// in the same transaction as the writes, guaranteeing atomicity.
+    /// When `idempotency` is `Some`, the token is checked and stored in the
+    /// same transaction as the writes, guaranteeing atomicity. The token is
+    /// scoped to its account, so the same token value from different accounts
+    /// never collides.
     ///
     /// # Errors
     ///
@@ -322,11 +324,10 @@ pub trait DataEngine: Send + Sync {
     /// Returns [`StorageError::Internal`] on transaction or query failure.
     /// Returns [`StorageError::IdempotentReplay`] if the token matches a previous request.
     /// Returns [`StorageError::IdempotentMismatch`] if the token exists with different ops.
-    #[allow(clippy::too_many_arguments)]
     fn transact_write_items(
         &self,
         ops: &[TransactWriteOp<'_>],
-        token: Option<(&str, &str)>,
+        idempotency: Option<IdempotencyKey<'_>>,
     ) -> BoxFuture<'_, Result<(), StorageError>>;
 
     /// Delete idempotency tokens older than the given age in seconds.
