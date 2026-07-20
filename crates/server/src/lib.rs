@@ -18,7 +18,11 @@ mod metrics_endpoint;
 pub mod rate_limit;
 mod request_helpers;
 mod response;
+mod serve;
 mod throttle_helpers;
+mod workers;
+
+pub use serve::serve;
 
 use std::path::PathBuf;
 use std::sync::Arc;

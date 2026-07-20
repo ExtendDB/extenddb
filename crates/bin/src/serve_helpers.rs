@@ -6,24 +6,6 @@
 
 use std::path::PathBuf;
 
-/// P57 Bug 7: Best-effort raw syslog write for fatal errors. Used when the
-/// tracing subscriber may not be initialized (e.g., errors during early
-/// startup before syslog tracing is configured).
-pub fn log_to_syslog_raw(msg: &str) {
-    // SAFETY: openlog/syslog are POSIX-standard C functions. The ident
-    // string is a static C string literal with 'static lifetime.
-    unsafe {
-        libc::openlog(
-            c"extenddb".as_ptr(),
-            libc::LOG_PID | libc::LOG_NDELAY,
-            libc::LOG_DAEMON,
-        );
-        if let Ok(cmsg) = std::ffi::CString::new(msg.to_owned()) {
-            libc::syslog(libc::LOG_CRIT, c"%s".as_ptr(), cmsg.as_ptr());
-        }
-    }
-}
-
 /// Platform-appropriate hint for viewing syslog output.
 fn syslog_hint() -> &'static str {
     if cfg!(target_os = "macos") {
