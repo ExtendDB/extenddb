@@ -33,23 +33,13 @@ impl std::error::Error for SettingsStoreError {}
 pub type SettingsStoreFactory =
     fn(&str) -> BoxFuture<'static, Result<Box<dyn SettingsStore>, SettingsStoreError>>;
 
-/// Registration entry for a settings store factory.
-pub struct SettingsStoreRegistration {
-    pub backend: &'static str,
-    pub factory: SettingsStoreFactory,
-}
-
-inventory::collect!(SettingsStoreRegistration);
-
 /// Create a settings store for the given backend and connection string.
 pub async fn create_settings_store(
     backend: &str,
     connection_string: &str,
 ) -> Result<Box<dyn SettingsStore>, SettingsStoreError> {
-    for registration in inventory::iter::<SettingsStoreRegistration> {
-        if registration.backend == backend {
-            return (registration.factory)(connection_string).await;
-        }
+    match crate::registry::try_registry().and_then(|r| r.settings_stores.get(backend)) {
+        Some(factory) => factory(connection_string).await,
+        None => Err(SettingsStoreError::BackendNotFound(backend.to_string())),
     }
-    Err(SettingsStoreError::BackendNotFound(backend.to_string()))
 }

@@ -33,23 +33,13 @@ impl std::error::Error for DiagnosticsStoreError {}
 pub type DiagnosticsStoreFactory =
     fn(&str) -> BoxFuture<'static, Result<Box<dyn DiagnosticsStore>, DiagnosticsStoreError>>;
 
-/// Registration entry for a diagnostics store factory.
-pub struct DiagnosticsStoreRegistration {
-    pub backend: &'static str,
-    pub factory: DiagnosticsStoreFactory,
-}
-
-inventory::collect!(DiagnosticsStoreRegistration);
-
 /// Create a diagnostics store for the given backend and connection string.
 pub async fn create_diagnostics_store(
     backend: &str,
     connection_string: &str,
 ) -> Result<Box<dyn DiagnosticsStore>, DiagnosticsStoreError> {
-    for registration in inventory::iter::<DiagnosticsStoreRegistration> {
-        if registration.backend == backend {
-            return (registration.factory)(connection_string).await;
-        }
+    match crate::registry::try_registry().and_then(|r| r.diagnostics_stores.get(backend)) {
+        Some(factory) => factory(connection_string).await,
+        None => Err(DiagnosticsStoreError::BackendNotFound(backend.to_string())),
     }
-    Err(DiagnosticsStoreError::BackendNotFound(backend.to_string()))
 }

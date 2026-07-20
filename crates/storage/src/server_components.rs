@@ -90,32 +90,18 @@ pub type ServerComponentsFactory =
         &str,
     ) -> Pin<Box<dyn Future<Output = Result<ServerComponents, BackendError>> + Send>>;
 
-/// Registration for backend server components factory.
-///
-/// Backends submit this via `inventory::submit`! to register themselves.
-pub struct ServerComponentsRegistration {
-    /// Backend name (e.g., "postgres")
-    pub backend: &'static str,
-
-    /// Factory function that creates the backend components
-    pub factory: ServerComponentsFactory,
-}
-
-inventory::collect!(ServerComponentsRegistration);
-
 /// Create server components for the specified backend.
 ///
-/// Searches registered backends via inventory and calls the matching factory.
-/// Returns `UnknownBackend` error if the backend is not registered.
+/// Looks up the backend in the installed [`BackendRegistry`](crate::registry)
+/// and calls the matching factory. Returns `UnknownBackend` if the backend is
+/// not registered.
 pub async fn create_server_components(
     backend: &str,
     config: &dyn StorageConfig,
     region: &str,
 ) -> Result<ServerComponents, BackendError> {
-    for reg in inventory::iter::<ServerComponentsRegistration> {
-        if reg.backend == backend {
-            return (reg.factory)(config, region).await;
-        }
+    match crate::registry::try_registry().and_then(|r| r.server_components.get(backend)) {
+        Some(factory) => factory(config, region).await,
+        None => Err(BackendError::UnknownBackend(backend.to_string())),
     }
-    Err(BackendError::UnknownBackend(backend.to_string()))
 }
