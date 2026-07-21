@@ -97,6 +97,22 @@ impl BackupEngine for MongoEngine {
             let table_size = table_doc.get_i64("table_size_bytes").unwrap_or(0);
             let item_count = table_doc.get_i64("item_count").unwrap_or(0);
 
+            // Preserve TableClass / SSESpecification / OnDemandThroughput so
+            // RestoreTableFromBackup can recreate the table with the same
+            // configuration.
+            let table_class_bson = table_doc
+                .get("table_class")
+                .cloned()
+                .unwrap_or(mongodb::bson::Bson::Null);
+            let sse_spec_bson = table_doc
+                .get("sse_specification")
+                .cloned()
+                .unwrap_or(mongodb::bson::Bson::Null);
+            let on_demand_bson = table_doc
+                .get("on_demand_throughput")
+                .cloned()
+                .unwrap_or(mongodb::bson::Bson::Null);
+
             let backup_arn = format!(
                 "arn:aws:dynamodb:{region}:{account_id}:table/{table_name}/backup/{ts}",
                 region = self.region,
@@ -155,6 +171,9 @@ impl BackupEngine for MongoEngine {
                 "billing_mode": &billing_mode,
                 "created_at": mongodb::bson::DateTime::now(),
                 "table_creation_date_time": created_at,
+                "table_class": table_class_bson,
+                "sse_specification": sse_spec_bson,
+                "on_demand_throughput": on_demand_bson,
             };
 
             backups_coll
@@ -408,6 +427,26 @@ impl BackupEngine for MongoEngine {
                 Some(extenddb_core::types::BillingMode::Provisioned)
             };
 
+            // Preserve the source table's TableClass / SSESpecification /
+            // OnDemandThroughput settings when recreating.
+            let table_class = backup_doc.get_str("table_class").ok().map(str::to_owned);
+            let sse_specification: Option<serde_json::Value> =
+                backup_doc.get("sse_specification").and_then(|b| {
+                    if matches!(b, mongodb::bson::Bson::Null) {
+                        None
+                    } else {
+                        bson::from_bson(b.clone()).ok()
+                    }
+                });
+            let on_demand_throughput: Option<extenddb_core::types::OnDemandThroughput> =
+                backup_doc.get("on_demand_throughput").and_then(|b| {
+                    if matches!(b, mongodb::bson::Bson::Null) {
+                        None
+                    } else {
+                        bson::from_bson(b.clone()).ok()
+                    }
+                });
+
             let create_input = extenddb_core::types::CreateTableInput {
                 table_name: target_table_name.clone(),
                 key_schema,
@@ -422,9 +461,9 @@ impl BackupEngine for MongoEngine {
                 stream_specification: None,
                 tags: None,
                 deletion_protection_enabled: None,
-                sse_specification: None,
-                table_class: None,
-                on_demand_throughput: None,
+                sse_specification,
+                table_class,
+                on_demand_throughput,
             };
 
             let desc = self.create_table(&account_id, create_input).await?;
