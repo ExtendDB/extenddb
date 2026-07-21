@@ -104,13 +104,11 @@ fn insert_typed_sk(
             doc.insert(field, d);
         }
         (ScalarAttributeType::B, AttributeValue::B(b)) => {
-            doc.insert(
-                field,
-                bson::Binary {
-                    subtype: bson::spec::BinarySubtype::Generic,
-                    bytes: b.clone(),
-                },
-            );
+            // Store as hex string, not BSON Binary. See `binary_sk_to_hex`
+            // for the rationale — MongoDB's Binary sort order diverges
+            // from DDB's unsigned-lex byte order for unequal-length
+            // values (D-M5 / RFC-0003 §1.4).
+            doc.insert(field, binary_sk_to_hex(b));
         }
         _ => {
             // Mismatched types are silently skipped — matches the existing
@@ -287,6 +285,27 @@ fn sk_to_text(value: &AttributeValue) -> Result<String, StorageError> {
     }
 }
 
+/// Encode a byte slice as a lowercase hex string.
+///
+/// Used to store binary sort keys as strings in the typed
+/// `sk_b`/`base_sk_b` fields. Lexicographic comparison of hex-encoded
+/// strings preserves DynamoDB's unsigned-lex byte order — MongoDB's
+/// native BSON Binary comparison is length-first-then-content, which
+/// diverges from DDB for values of different lengths (e.g., DDB says
+/// `[0x01,0xFF] < [0x02]`; BSON Binary reverses that). Hex strings
+/// also make `begins_with` implementable as a plain string range
+/// filter instead of a full-partition post-fetch scan. RFC-0003 §1.4.
+#[must_use]
+pub fn binary_sk_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
 /// Build a primary key filter for `MongoDB` queries.
 pub fn pk_filter(
     key: &Item,
@@ -318,13 +337,9 @@ pub fn pk_filter(
             }
             ScalarAttributeType::B => {
                 if let AttributeValue::B(b) = sk_value {
-                    filter.insert(
-                        "sk_b",
-                        bson::Binary {
-                            subtype: bson::spec::BinarySubtype::Generic,
-                            bytes: b.clone(),
-                        },
-                    );
+                    // Hex-encoded string, matching how insert_typed_sk
+                    // writes sk_b — see D-M5.
+                    filter.insert("sk_b", binary_sk_to_hex(b));
                 }
             }
         }
@@ -595,5 +610,32 @@ mod tests {
         );
         assert_eq!(doc.get_str("base_pk").unwrap(), "cust1");
         assert_eq!(doc.get_str("base_sk_s").unwrap(), "order1");
+    }
+
+    #[test]
+    fn binary_sk_to_hex_preserves_ddb_byte_order() {
+        // DynamoDB compares binary sort keys as unsigned lex bytes.
+        // The stored hex-string form must preserve that ordering under
+        // MongoDB's default lexicographic string comparison — verify
+        // both same-length and cross-length cases.
+        let a = binary_sk_to_hex(&[0x01, 0xff]);
+        let b = binary_sk_to_hex(&[0x02]);
+        // DDB: [0x01, 0xff] < [0x02]. Hex: "01ff" < "02".
+        assert!(a < b, "{a} < {b}");
+
+        // Shorter-prefix rule: [0x01] < [0x01, 0x00] in DDB.
+        let a = binary_sk_to_hex(&[0x01]);
+        let b = binary_sk_to_hex(&[0x01, 0x00]);
+        assert!(a < b);
+
+        // Same first byte, longer runner in DDB.
+        let a = binary_sk_to_hex(&[0x01, 0x00, 0x00]);
+        let b = binary_sk_to_hex(&[0x02]);
+        assert!(a < b);
+
+        // Empty is the smallest.
+        let empty = binary_sk_to_hex(&[]);
+        let single = binary_sk_to_hex(&[0x00]);
+        assert!(empty < single);
     }
 }

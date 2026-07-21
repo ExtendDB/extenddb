@@ -27,8 +27,8 @@ use extenddb_storage::{
 use crate::MongoEngine;
 use crate::condition::condition_to_filter;
 use crate::data::{
-    composite_id, data_collection_name, document_to_item, index_document, index_entry_filter,
-    item_to_document, pk_filter, sk_field_name, sk_suffix,
+    binary_sk_to_hex, composite_id, data_collection_name, document_to_item, index_document,
+    index_entry_filter, item_to_document, pk_filter, sk_field_name, sk_suffix,
 };
 use crate::pushdown::{Pushable, is_pushable};
 
@@ -1091,27 +1091,12 @@ impl MongoEngine {
             .map(document_to_item)
             .collect::<Result<Vec<_>, _>>()?;
 
-        // Post-fetch filtering for binary begins_with (BSON Binary comparison
-        // sorts by length first, making $gte/$lt unreliable for prefix matching).
-        if let Some(SortKeyCondition::BeginsWith { prefix, .. }) = &key_condition.sk_condition {
-            let prefix_av = resolve_key_expr(prefix, maps)?;
-            if let AttributeValue::B(ref prefix_bytes) = prefix_av
-                && let Some((sk_name, _)) =
-                    sk_info(&effective_key_schema, &key_info.attribute_definitions)
-            {
-                items.retain(|item| {
-                    item.get(sk_name)
-                        .and_then(|v| {
-                            if let AttributeValue::B(b) = v {
-                                Some(b.starts_with(prefix_bytes))
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or(false)
-                });
-            }
-        }
+        // Binary begins_with used to require a post-fetch pass because
+        // BSON Binary comparison is length-first and $gte/$lt-on-Binary
+        // dropped matches whenever the prefix was shorter than the stored
+        // value. Since D-M5 stores binary sort keys as hex strings, the
+        // $gte/$lt filter emitted by build_sk_filter is now authoritative
+        // and no post-fetch filtering is needed. RFC-0003 §1.4.
 
         // Handle pagination. For an index query, LEK carries both the
         // index-key components and the base-key components so the next
@@ -3141,12 +3126,16 @@ fn build_sk_filter(
                     let upper = increment_string(p);
                     Ok(doc! { sk_field: { "$gte": p.as_str(), "$lt": &upper } })
                 }
-                AttributeValue::B(ref _b) => {
-                    // BSON Binary comparison sorts by length first, then by content.
-                    // This means $gte/$lt range queries don't work for prefix matching
-                    // when the prefix is shorter than the stored values. Return an empty
-                    // filter here and let the caller do post-fetch prefix filtering.
-                    Ok(Document::new())
+                AttributeValue::B(ref b) => {
+                    // Binary sort keys are stored as hex strings (D-M5),
+                    // so begins_with is a plain lexicographic range:
+                    // `sk_b >= hex(prefix) AND sk_b < increment(hex(prefix))`.
+                    // The exclusive upper bound is the next hex prefix,
+                    // computed by incrementing the raw bytes and encoding
+                    // again — carries are handled by `increment_bytes`.
+                    let lo = binary_sk_to_hex(b);
+                    let hi = binary_sk_to_hex(&increment_bytes(b));
+                    Ok(doc! { sk_field: { "$gte": lo, "$lt": hi } })
                 }
                 _ => Err(StorageError::Validation(
                     "begins_with requires string or binary sort key".to_string(),
@@ -3196,10 +3185,12 @@ fn sk_to_bson(
                     "Numeric sort key value '{n}' exceeds supported precision (Decimal128, 34 significant digits)"
                 ))
             }),
-        (ScalarAttributeType::B, AttributeValue::B(b)) => Ok(bson::Bson::Binary(bson::Binary {
-            subtype: bson::spec::BinarySubtype::Generic,
-            bytes: b.clone(),
-        })),
+        // Binary sort keys are stored as hex-encoded strings; see
+        // `binary_sk_to_hex` and the D-M5 rationale. Query/BETWEEN
+        // filters must project to the same encoding.
+        (ScalarAttributeType::B, AttributeValue::B(b)) => {
+            Ok(bson::Bson::String(binary_sk_to_hex(b)))
+        }
         _ => Err(StorageError::Internal("sort key type mismatch".to_string())),
     }
 }
