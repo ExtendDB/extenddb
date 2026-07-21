@@ -685,11 +685,38 @@ impl MongoEngine {
                 let table_id = table_doc
                     .get_str("table_id")
                     .map_err(|_| StorageError::Internal("missing table_id".to_string()))?;
-                let label = time::OffsetDateTime::now_utc()
-                    .format(&time::format_description::well_known::Iso8601::DEFAULT)
-                    .unwrap_or_else(|_| "unknown".to_string());
-                update_doc.insert("stream_label", &label);
-                self.init_stream_shards(table_id).await?;
+
+                // Idempotent re-enable: if shards already exist for this
+                // table, reuse them and preserve the existing
+                // stream_label. Otherwise a repeat UpdateTable would
+                // insert duplicate shards (DescribeStream would then
+                // report N × k) and rotate stream_label, invalidating
+                // stream ARNs previously handed out to consumers.
+                let shards_coll = self.data_db.collection::<Document>("stream_shards");
+                let existing_shard = shards_coll
+                    .find_one(doc! { "table_id": table_id })
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                if existing_shard.is_none() {
+                    let label = time::OffsetDateTime::now_utc()
+                        .format(&time::format_description::well_known::Iso8601::DEFAULT)
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    update_doc.insert("stream_label", &label);
+                    self.init_stream_shards(table_id).await?;
+                } else if table_doc
+                    .get_str("stream_label")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .is_none()
+                {
+                    // Shards exist but the label was cleared by a
+                    // previous disable — restore a fresh label so the
+                    // ARN resolves again.
+                    let label = time::OffsetDateTime::now_utc()
+                        .format(&time::format_description::well_known::Iso8601::DEFAULT)
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    update_doc.insert("stream_label", &label);
+                }
             }
         }
 
