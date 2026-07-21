@@ -178,7 +178,7 @@ fn parse_iso8601_basic(s: &str) -> Option<i64> {
 /// The early return on length mismatch leaks timing information about whether
 /// lengths match. Callers must ensure both inputs have equal length (e.g.,
 /// hex-encoded signatures are always 64 bytes).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
