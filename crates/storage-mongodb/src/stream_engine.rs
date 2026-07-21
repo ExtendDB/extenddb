@@ -84,6 +84,102 @@ impl MongoEngine {
         Ok(())
     }
 
+    /// Draw the next sequence number for a shard *inside* the given
+    /// transaction session.
+    ///
+    /// Sequence assignment must participate in the same transaction as the
+    /// stream-record insert, otherwise a fast writer B can obtain seq=6
+    /// and commit before a slow writer A (which obtained seq=5) commits.
+    /// A consumer polling at `after_sequence_number=cursor` between B's
+    /// commit and A's commit sees seq=6 and advances past it; when A
+    /// finally commits, seq=5 lands behind the cursor and is never
+    /// returned. RFC-0003 §5.1 (atomicity with data writes) and §5.2
+    /// (per-shard ordering).
+    ///
+    /// Placing the counter increment inside the session also serializes
+    /// concurrent writers on the same shard: two writes racing to
+    /// $inc the same counter under snapshot isolation will conflict at
+    /// commit time, so the loser retries — the transaction retry loop
+    /// upstream in the caller (see D-C3 followup) handles this.
+    pub(crate) async fn next_sequence_number_in_session(
+        &self,
+        shard_id: &str,
+        session: &mut mongodb::ClientSession,
+    ) -> Result<String, StorageError> {
+        let counters_coll = self.data_db.collection::<Document>("counters");
+        let opts = mongodb::options::FindOneAndUpdateOptions::builder()
+            .upsert(true)
+            .return_document(mongodb::options::ReturnDocument::After)
+            .build();
+        let counter_id = format!("stream_seq:{shard_id}");
+        let doc = counters_coll
+            .find_one_and_update(
+                doc! { "_id": counter_id },
+                doc! { "$inc": { "value": 1_i64 } },
+            )
+            .with_options(opts)
+            .session(&mut *session)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .ok_or_else(|| {
+                StorageError::Internal("Failed to generate sequence number".to_owned())
+            })?;
+
+        let seq_val = doc.get_i64("value").unwrap_or(1);
+        Ok(format!("{seq_val:021}"))
+    }
+
+    /// Resolve the shard_id for a given (account, table, partition-key)
+    /// *inside* the given transaction session. Pairs with
+    /// `next_sequence_number_in_session` so the shard set the write is
+    /// routed to is read at the same snapshot as the sequence draw.
+    pub(crate) async fn assign_shard_in_session(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        partition_key: &str,
+        session: &mut mongodb::ClientSession,
+    ) -> Result<String, StorageError> {
+        let tables_coll = self.catalog_db.collection::<Document>("tables");
+        let table_doc = tables_coll
+            .find_one(doc! { "_id": { "account_id": account_id, "table_name": table_name } })
+            .session(&mut *session)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .ok_or_else(|| StorageError::Internal(format!("Table {table_name} not found")))?;
+        let table_id = table_doc.get_str("table_id").unwrap_or_default();
+
+        let shards_coll = self.data_db.collection::<Document>("stream_shards");
+        let opts = FindOptions::builder().sort(doc! { "shard_id": 1 }).build();
+        let mut cursor = shards_coll
+            .find(doc! { "table_id": table_id })
+            .with_options(opts)
+            .session(&mut *session)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let shard_docs: Vec<Document> = cursor
+            .stream(&mut *session)
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        if shard_docs.is_empty() {
+            return Err(StorageError::Internal(format!(
+                "No stream shards for table {table_name}"
+            )));
+        }
+
+        let shard_ids: Vec<&str> = shard_docs
+            .iter()
+            .filter_map(|d| d.get_str("shard_id").ok())
+            .collect();
+
+        let hash = crc32fast::hash(partition_key.as_bytes());
+        #[allow(clippy::cast_possible_truncation)]
+        let idx = (hash as usize) % shard_ids.len();
+        Ok(shard_ids[idx].to_owned())
+    }
+
     /// Delete every stream_shards document for a given table_id, and every
     /// stream_records document written to any of its shards. Invoked from
     /// `delete_table_impl` so that a table recreated with the same name

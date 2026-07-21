@@ -238,99 +238,6 @@ impl DataEngine for MongoEngine {
 }
 
 impl MongoEngine {
-    async fn write_stream_inline(
-        &self,
-        key_info: &TableKeyInfo,
-        capture: &StreamCapture,
-        old_item: Option<&Item>,
-        new_item: Option<&Item>,
-    ) -> Result<(), StorageError> {
-        use extenddb_core::types::StreamViewType;
-
-        let source_item = new_item.or(old_item);
-        let Some(source) = source_item else {
-            return Ok(());
-        };
-
-        let event = match (old_item, new_item) {
-            (None, Some(_)) => StreamEventName::Insert,
-            (Some(_), Some(_)) => StreamEventName::Modify,
-            (Some(_), None) => StreamEventName::Remove,
-            (None, None) => return Ok(()),
-        };
-
-        let keys: std::collections::BTreeMap<String, AttributeValue> = key_info
-            .key_schema
-            .iter()
-            .filter_map(|ks| {
-                source
-                    .get(&ks.attribute_name)
-                    .map(|v| (ks.attribute_name.clone(), v.clone()))
-            })
-            .collect();
-
-        let new_image = match capture.view_type {
-            StreamViewType::NewImage | StreamViewType::NewAndOldImages => new_item.cloned(),
-            _ => None,
-        };
-        let old_image = match capture.view_type {
-            StreamViewType::OldImage | StreamViewType::NewAndOldImages => old_item.cloned(),
-            _ => None,
-        };
-
-        let size = source_item.map_or(0, |i| i64::try_from(item_size_bytes(i)).unwrap_or(i64::MAX));
-
-        let pk_name = &key_info.key_schema[0].attribute_name;
-        let pk_str = source
-            .get(pk_name)
-            .map(|v| match v {
-                AttributeValue::S(s) => s.clone(),
-                AttributeValue::N(n) => n.clone(),
-                AttributeValue::B(b) => {
-                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b)
-                }
-                _ => String::new(),
-            })
-            .unwrap_or_default();
-
-        let shard_id = self
-            .assign_shard(&key_info.account_id, &key_info.table_name, &pk_str)
-            .await?;
-        let seq = self.next_sequence_number(&shard_id).await?;
-
-        let record = StreamRecord {
-            event_id: uuid::Uuid::new_v4().to_string(),
-            event_name: event,
-            event_version: "1.1".to_owned(),
-            event_source: "aws:dynamodb".to_owned(),
-            aws_region: capture.region.to_string(),
-            dynamodb: StreamRecordData {
-                approximate_creation_date_time: i64::try_from(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                )
-                .unwrap_or(i64::MAX),
-                keys,
-                new_image,
-                old_image,
-                sequence_number: seq,
-                size_bytes: size,
-                stream_view_type: capture.view_type,
-            },
-            user_identity: capture.user_identity.clone(),
-        };
-
-        self.write_stream_record(
-            &key_info.account_id,
-            &record,
-            &shard_id,
-            &key_info.table_name,
-        )
-        .await
-    }
-
     async fn put_item_impl(
         &self,
         key_info: &TableKeyInfo,
@@ -1434,10 +1341,22 @@ impl MongoEngine {
             })
             .unwrap_or_default();
 
+        // Both shard resolution and sequence-number assignment run inside
+        // the same session as the data write. This is what makes stream
+        // ordering safe under contention — see
+        // stream_engine::next_sequence_number_in_session for the full
+        // rationale.
         let shard_id = self
-            .assign_shard(&key_info.account_id, &key_info.table_name, &pk_str)
+            .assign_shard_in_session(
+                &key_info.account_id,
+                &key_info.table_name,
+                &pk_str,
+                &mut *session,
+            )
             .await?;
-        let seq = self.next_sequence_number(&shard_id).await?;
+        let seq = self
+            .next_sequence_number_in_session(&shard_id, &mut *session)
+            .await?;
 
         let record = StreamRecord {
             event_id: uuid::Uuid::new_v4().to_string(),
@@ -1468,16 +1387,11 @@ impl MongoEngine {
         let record_bson =
             bson::to_bson(&record_json).map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let tables_coll = self.catalog_db.collection::<Document>("tables");
-        let table_doc = tables_coll
-            .find_one(doc! { "_id": { "account_id": &key_info.account_id, "table_name": &key_info.table_name } })
-            .session(&mut *session)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?
-            .ok_or_else(|| {
-                StorageError::Internal(format!("Table {} not found in catalog", key_info.table_name))
-            })?;
-        let table_id = table_doc.get_str("table_id").unwrap_or_default();
+        // key_info already carries table_id — no need to re-read the catalog
+        // just to resolve it, and re-reading inside the session against the
+        // tables collection would join to the counter/records write set
+        // needlessly.
+        let table_id = &key_info.table_id;
 
         let records_coll = self.data_db.collection::<Document>("stream_records");
         records_coll
