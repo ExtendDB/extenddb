@@ -27,8 +27,8 @@ use extenddb_storage::{
 use crate::MongoEngine;
 use crate::condition::condition_to_filter;
 use crate::data::{
-    composite_id, data_collection_name, document_to_item, item_to_document, pk_filter,
-    sk_field_name,
+    composite_id, data_collection_name, document_to_item, index_document, index_entry_filter,
+    item_to_document, pk_filter, sk_field_name, sk_suffix,
 };
 use crate::pushdown::{Pushable, is_pushable};
 
@@ -787,27 +787,113 @@ impl MongoEngine {
             }
         }
 
-        // Apply exclusive_start_key pagination
-        if let Some(start_key) = exclusive_start_key
-            && let Some(sk_f) = sk_field
-        {
-            // Get the sort key value from the start key
-            if let Some((sk_name, sk_type)) =
-                sk_info(&effective_key_schema, &key_info.attribute_definitions)
-                && let Some(sk_val) = start_key.get(sk_name)
+        // Apply exclusive_start_key pagination.
+        //
+        // For a base-table query the cursor is a single sort-key comparison:
+        // base-table items are uniquely keyed by (pk, sk), so `sk > cursor`
+        // is unambiguous.
+        //
+        // For an index query the cursor is a compound tuple over
+        // (index_sk?, base_pk, base_sk?). Index-key values are non-unique —
+        // duplicates fall through to the base-key tie-breaker. Express as
+        // a lexicographic `$or` of the shape
+        //     (a > A) OR (a == A AND b > B) OR (a == A AND b == B AND c > C)
+        // (with `<` when reverse). RFC-0003 §2.6.
+        let is_index = index_name.is_some();
+        if let Some(start_key) = exclusive_start_key {
+            let cmp_gt = if forward { "$gt" } else { "$lt" };
+            if is_index {
+                let idx_sk_pair =
+                    match sk_info(&effective_key_schema, &key_info.attribute_definitions) {
+                        Some((sk_name, sk_type)) => start_key
+                            .get(sk_name)
+                            .map(|v| sk_to_bson(v, sk_type))
+                            .transpose()?
+                            .map(|b| (sk_field.expect("sk_field present when sk_info is Some"), b)),
+                        None => None,
+                    };
+                let base_pk_bson: Option<bson::Bson> = {
+                    // Build the base_pk text the same way the write path
+                    // does — composite_pk_to_text on the base key schema.
+                    // If the start_key is malformed we skip pagination
+                    // (result is a query that may return duplicates).
+                    let text = composite_pk_to_text(start_key, &key_info.base_key_schema).ok();
+                    text.map(bson::Bson::String)
+                };
+                let base_sk_pair =
+                    match sk_info(&key_info.base_key_schema, &key_info.attribute_definitions) {
+                        Some((sk_name, sk_type)) => start_key
+                            .get(sk_name)
+                            .map(|v| sk_to_bson(v, sk_type))
+                            .transpose()?
+                            .map(|b| (format!("base_sk_{}", sk_suffix(sk_type)), b)),
+                        None => None,
+                    };
+
+                let mut or_clauses: Vec<Document> = Vec::new();
+                if let Some((sk_f, sk_bson)) = idx_sk_pair.clone() {
+                    or_clauses.push(doc! { sk_f: { cmp_gt: sk_bson } });
+                }
+                if let Some(bp) = base_pk_bson.clone() {
+                    let mut clause = Document::new();
+                    if let Some((sk_f, sk_bson)) = idx_sk_pair.clone() {
+                        clause.insert(sk_f, sk_bson);
+                    }
+                    clause.insert("base_pk", doc! { cmp_gt: bp });
+                    or_clauses.push(clause);
+                }
+                if let (Some(bp), Some((base_sk_f, base_sk_bson))) =
+                    (base_pk_bson, base_sk_pair.clone())
+                {
+                    let mut clause = Document::new();
+                    if let Some((sk_f, sk_bson)) = idx_sk_pair {
+                        clause.insert(sk_f, sk_bson);
+                    }
+                    clause.insert("base_pk", bp);
+                    clause.insert(base_sk_f, doc! { cmp_gt: base_sk_bson });
+                    or_clauses.push(clause);
+                }
+
+                if !or_clauses.is_empty() {
+                    // Merge with any existing $or (unlikely — sk_condition
+                    // uses ranged operators, not $or) by wrapping in $and.
+                    if filter.contains_key("$or") {
+                        let existing = filter.remove("$or").unwrap();
+                        filter.insert(
+                            "$and",
+                            bson::bson!([{ "$or": existing }, { "$or": or_clauses }]),
+                        );
+                    } else {
+                        filter.insert("$or", or_clauses);
+                    }
+                }
+            } else if let (Some(sk_f), Some((sk_name, sk_type))) = (
+                sk_field,
+                sk_info(&effective_key_schema, &key_info.attribute_definitions),
+            ) && let Some(sk_val) = start_key.get(sk_name)
             {
                 let sk_bson = sk_to_bson(sk_val, sk_type)?;
-                if forward {
-                    filter.insert(sk_f, doc! { "$gt": sk_bson });
-                } else {
-                    filter.insert(sk_f, doc! { "$lt": sk_bson });
-                }
+                filter.insert(sk_f, doc! { cmp_gt: sk_bson });
             }
         }
 
-        // Build sort direction
+        // Build sort direction. For indexes the sort tuple is
+        // (index_sk?, base_pk, base_sk?) so pagination lands deterministic
+        // within a group of items sharing index keys.
         let sort_direction = if forward { 1 } else { -1 };
-        let sort_doc = if let Some(sk_f) = sk_field {
+        let sort_doc = if is_index {
+            let mut sd = Document::new();
+            if let Some(sk_f) = sk_field {
+                sd.insert(sk_f, sort_direction);
+            }
+            sd.insert("base_pk", sort_direction);
+            if let Some((_, sk_type)) =
+                sk_info(&key_info.base_key_schema, &key_info.attribute_definitions)
+            {
+                sd.insert(format!("base_sk_{}", sk_suffix(sk_type)), sort_direction);
+            }
+            sd
+        } else if let Some(sk_f) = sk_field {
             doc! { sk_f: sort_direction }
         } else {
             doc! { "pk": sort_direction }
@@ -870,15 +956,27 @@ impl MongoEngine {
             }
         }
 
-        // Handle pagination
+        // Handle pagination. For an index query, LEK carries both the
+        // index-key components and the base-key components so the next
+        // page's ExclusiveStartKey can resolve the compound cursor.
+        // RFC-0003 §7.2.
         let last_evaluated_key = if let Some(l) = limit {
             #[allow(clippy::cast_sign_loss)]
             let l_usize = l as usize;
             if items.len() > l_usize {
                 items.truncate(l_usize);
-                items
-                    .last()
-                    .map(|item| extract_key(item, &key_info.key_schema))
+                items.last().map(|item| {
+                    if is_index {
+                        let mut key = extract_key(item, &effective_key_schema);
+                        let base_key = extract_key(item, &key_info.base_key_schema);
+                        for (k, v) in base_key {
+                            key.entry(k).or_insert(v);
+                        }
+                        key
+                    } else {
+                        extract_key(item, &key_info.key_schema)
+                    }
+                })
             } else {
                 None
             }
@@ -900,39 +998,118 @@ impl MongoEngine {
     ) -> Result<(Vec<Item>, Option<Item>), StorageError> {
         use futures::TryStreamExt;
 
-        let coll_name = if let Some(idx_name) = index_name {
+        // The effective key schema for the collection under scan: index
+        // schema for index scans (where the collection's _id encodes index
+        // keys), base schema for base-table scans.
+        let (coll_name, effective_key_schema) = if let Some(idx_name) = index_name {
             let idx_info = self
                 .index_info_by_table_id_impl(&key_info.table_id, idx_name)
                 .await?;
-            data_collection_name(&idx_info.index_id)
+            (
+                data_collection_name(&idx_info.index_id),
+                idx_info.key_schema.clone(),
+            )
         } else {
-            data_collection_name(&key_info.table_id)
+            (
+                data_collection_name(&key_info.table_id),
+                key_info.key_schema.clone(),
+            )
         };
         let coll = self.data_db.collection::<Document>(&coll_name);
 
+        let is_index = index_name.is_some();
         let mut filter = Document::new();
 
-        // Apply exclusive_start_key for pagination (using _id for scan ordering)
+        // Apply exclusive_start_key for pagination. Base tables use _id
+        // ordering (netstring-encoded); index scans use a compound cursor
+        // over (pk, sk?, base_pk, base_sk?) so items with duplicate index
+        // keys don't confuse pagination. RFC-0003 §7.2, §2.6.
         if let Some(start_key) = exclusive_start_key {
-            let start_pk = composite_pk_to_text(start_key, &key_info.key_schema)?;
-            if let Some((sk_name, sk_type)) =
-                sk_info(&key_info.key_schema, &key_info.attribute_definitions)
-            {
-                if let Some(sk_val) = start_key.get(sk_name) {
-                    let sk_text = match sk_val {
-                        AttributeValue::S(s) => s.clone(),
-                        AttributeValue::N(n) => n.clone(),
-                        AttributeValue::B(b) => {
-                            use base64::Engine;
-                            base64::engine::general_purpose::STANDARD.encode(b)
-                        }
-                        _ => return Err(StorageError::Internal("invalid sk type".to_string())),
+            if is_index {
+                let idx_pk_bson: Option<bson::Bson> =
+                    composite_pk_to_text(start_key, &effective_key_schema)
+                        .ok()
+                        .map(bson::Bson::String);
+                let idx_sk_pair =
+                    match sk_info(&effective_key_schema, &key_info.attribute_definitions) {
+                        Some((sk_name, sk_type)) => start_key
+                            .get(sk_name)
+                            .map(|v| sk_to_bson(v, sk_type))
+                            .transpose()?
+                            .map(|b| (format!("sk_{}", sk_suffix(sk_type)), b)),
+                        None => None,
                     };
-                    let start_id = composite_id(&start_pk, &sk_text);
-                    filter.insert("_id", doc! { "$gt": start_id });
+                let base_pk_bson: Option<bson::Bson> =
+                    composite_pk_to_text(start_key, &key_info.base_key_schema)
+                        .ok()
+                        .map(bson::Bson::String);
+                let base_sk_pair =
+                    match sk_info(&key_info.base_key_schema, &key_info.attribute_definitions) {
+                        Some((sk_name, sk_type)) => start_key
+                            .get(sk_name)
+                            .map(|v| sk_to_bson(v, sk_type))
+                            .transpose()?
+                            .map(|b| (format!("base_sk_{}", sk_suffix(sk_type)), b)),
+                        None => None,
+                    };
+
+                let mut or_clauses: Vec<Document> = Vec::new();
+                if let Some(ip) = idx_pk_bson.clone() {
+                    or_clauses.push(doc! { "pk": { "$gt": ip } });
+                }
+                if let (Some(ip), Some((sk_f, sk_bson))) =
+                    (idx_pk_bson.clone(), idx_sk_pair.clone())
+                {
+                    or_clauses.push(doc! {
+                        "pk": ip,
+                        sk_f: { "$gt": sk_bson },
+                    });
+                }
+                if let (Some(ip), Some(bp)) = (idx_pk_bson.clone(), base_pk_bson.clone()) {
+                    let mut clause = doc! { "pk": ip };
+                    if let Some((sk_f, sk_bson)) = idx_sk_pair.clone() {
+                        clause.insert(sk_f, sk_bson);
+                    }
+                    clause.insert("base_pk", doc! { "$gt": bp });
+                    or_clauses.push(clause);
+                }
+                if let (Some(ip), Some(bp), Some((base_sk_f, base_sk_bson))) =
+                    (idx_pk_bson, base_pk_bson, base_sk_pair)
+                {
+                    let mut clause = doc! { "pk": ip };
+                    if let Some((sk_f, sk_bson)) = idx_sk_pair {
+                        clause.insert(sk_f, sk_bson);
+                    }
+                    clause.insert("base_pk", bp);
+                    clause.insert(base_sk_f, doc! { "$gt": base_sk_bson });
+                    or_clauses.push(clause);
+                }
+
+                if !or_clauses.is_empty() {
+                    filter.insert("$or", or_clauses);
                 }
             } else {
-                filter.insert("_id", doc! { "$gt": &start_pk });
+                // Base-table scan: unique (pk, sk) means _id > cursor.
+                let start_pk = composite_pk_to_text(start_key, &effective_key_schema)?;
+                if let Some((sk_name, _)) =
+                    sk_info(&effective_key_schema, &key_info.attribute_definitions)
+                {
+                    if let Some(sk_val) = start_key.get(sk_name) {
+                        let sk_text = match sk_val {
+                            AttributeValue::S(s) => s.clone(),
+                            AttributeValue::N(n) => n.clone(),
+                            AttributeValue::B(b) => {
+                                use base64::Engine;
+                                base64::engine::general_purpose::STANDARD.encode(b)
+                            }
+                            _ => return Err(StorageError::Internal("invalid sk type".to_string())),
+                        };
+                        let start_id = composite_id(&start_pk, &sk_text);
+                        filter.insert("_id", doc! { "$gt": start_id });
+                    }
+                } else {
+                    filter.insert("_id", doc! { "$gt": &start_pk });
+                }
             }
         }
 
@@ -950,8 +1127,29 @@ impl MongoEngine {
             }
         });
 
+        // Sort key. Index scans sort by (pk, sk?, base_pk, base_sk?) so
+        // pagination is well-defined across items sharing index keys.
+        // Base-table scans sort by _id (unique).
+        let sort_doc = if is_index {
+            let mut sd = doc! { "pk": 1 };
+            if let Some((_, sk_type)) =
+                sk_info(&effective_key_schema, &key_info.attribute_definitions)
+            {
+                sd.insert(format!("sk_{}", sk_suffix(sk_type)), 1);
+            }
+            sd.insert("base_pk", 1);
+            if let Some((_, sk_type)) =
+                sk_info(&key_info.base_key_schema, &key_info.attribute_definitions)
+            {
+                sd.insert(format!("base_sk_{}", sk_suffix(sk_type)), 1);
+            }
+            sd
+        } else {
+            doc! { "_id": 1 }
+        };
+
         let opts = mongodb::options::FindOptions::builder()
-            .sort(doc! { "_id": 1 })
+            .sort(sort_doc)
             .limit(fetch_limit)
             .build();
 
@@ -994,15 +1192,25 @@ impl MongoEngine {
             }
         }
 
-        // Handle pagination
+        // Handle pagination. For index scans, LEK includes both the
+        // index-key and base-key components. RFC-0003 §7.2.
         let last_evaluated_key = if let Some(l) = limit {
             #[allow(clippy::cast_sign_loss)]
             let l_usize = l as usize;
             if items.len() > l_usize {
                 items.truncate(l_usize);
-                items
-                    .last()
-                    .map(|item| extract_key(item, &key_info.key_schema))
+                items.last().map(|item| {
+                    if is_index {
+                        let mut key = extract_key(item, &effective_key_schema);
+                        let base_key = extract_key(item, &key_info.base_key_schema);
+                        for (k, v) in base_key {
+                            key.entry(k).or_insert(v);
+                        }
+                        key
+                    } else {
+                        extract_key(item, &key_info.key_schema)
+                    }
+                })
             } else {
                 None
             }
@@ -1170,11 +1378,21 @@ impl MongoEngine {
             let idx_coll_name = data_collection_name(&index_id);
             let idx_coll = self.data_db.collection::<Document>(&idx_coll_name);
 
-            // Delete old index entry
+            // Delete old index entry. The filter must match on both the
+            // index-key AND the base-key components, because GSIs allow
+            // duplicate index-key values across base items. See D-C1 /
+            // RFC-0003 §2.1.
             if let Some(old) = old_item
                 && item_has_index_keys(old, &idx_key_schema)
             {
-                let old_filter = pk_filter(old, &idx_key_schema, &key_info.attribute_definitions)?;
+                let projected_old =
+                    project_item(old, &idx_key_schema, &key_info.key_schema, &projection);
+                let old_filter = index_entry_filter(
+                    &projected_old,
+                    &idx_key_schema,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                )?;
                 let _ = idx_coll.delete_one(old_filter).await;
             }
 
@@ -1184,10 +1402,18 @@ impl MongoEngine {
             {
                 let projected =
                     project_item(new, &idx_key_schema, &key_info.key_schema, &projection);
-                let idx_doc =
-                    item_to_document(&projected, &idx_key_schema, &key_info.attribute_definitions)?;
-                let filter =
-                    pk_filter(&projected, &idx_key_schema, &key_info.attribute_definitions)?;
+                let idx_doc = index_document(
+                    &projected,
+                    &idx_key_schema,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                )?;
+                let filter = index_entry_filter(
+                    &projected,
+                    &idx_key_schema,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                )?;
                 let opts = mongodb::options::ReplaceOptions::builder()
                     .upsert(true)
                     .build();
@@ -1256,7 +1482,14 @@ impl MongoEngine {
             if let Some(old) = old_item
                 && item_has_index_keys(old, &idx_key_schema)
             {
-                let old_filter = pk_filter(old, &idx_key_schema, &key_info.attribute_definitions)?;
+                let projected_old =
+                    project_item(old, &idx_key_schema, &key_info.key_schema, &projection);
+                let old_filter = index_entry_filter(
+                    &projected_old,
+                    &idx_key_schema,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                )?;
                 let _ = idx_coll.delete_one(old_filter).session(&mut *session).await;
             }
 
@@ -1265,10 +1498,18 @@ impl MongoEngine {
             {
                 let projected =
                     project_item(new, &idx_key_schema, &key_info.key_schema, &projection);
-                let idx_doc =
-                    item_to_document(&projected, &idx_key_schema, &key_info.attribute_definitions)?;
-                let filter =
-                    pk_filter(&projected, &idx_key_schema, &key_info.attribute_definitions)?;
+                let idx_doc = index_document(
+                    &projected,
+                    &idx_key_schema,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                )?;
+                let filter = index_entry_filter(
+                    &projected,
+                    &idx_key_schema,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                )?;
                 let opts = mongodb::options::ReplaceOptions::builder()
                     .upsert(true)
                     .build();
