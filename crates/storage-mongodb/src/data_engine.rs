@@ -1780,8 +1780,13 @@ impl MongoEngine {
                 return Err(StorageError::IdempotentMismatch);
             }
 
-            // Store the token
-            idem_coll
+            // Store the token. A unique index on (account_id, token)
+            // catches the case where a concurrent request under snapshot
+            // isolation didn't see our pre-check but raced us to the
+            // insert. On E11000, abort our txn and resolve the winner
+            // by re-reading outside the session — same replay/mismatch
+            // logic as the pre-check path.
+            let insert_res = idem_coll
                 .insert_one(doc! {
                     "account_id": key.account_id,
                     "token": key.token,
@@ -1789,8 +1794,29 @@ impl MongoEngine {
                     "created_at": mongodb::bson::DateTime::now(),
                 })
                 .session(&mut session)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                .await;
+            if let Err(e) = insert_res {
+                let is_dup = matches!(
+                    *e.kind,
+                    mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
+                        mongodb::error::WriteError { code: 11000, .. }
+                    ))
+                );
+                if is_dup {
+                    let _ = session.abort_transaction().await;
+                    let winner = idem_coll
+                        .find_one(doc! { "account_id": key.account_id, "token": key.token })
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    return Err(
+                        match winner.as_ref().and_then(|d| d.get_str("fingerprint").ok()) {
+                            Some(fp) if fp == key.fingerprint => StorageError::IdempotentReplay,
+                            _ => StorageError::IdempotentMismatch,
+                        },
+                    );
+                }
+                return Err(StorageError::Internal(e.to_string()));
+            }
         }
 
         let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());
