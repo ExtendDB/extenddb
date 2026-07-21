@@ -41,17 +41,35 @@ pub(crate) fn event_name_ddb_str(name: StreamEventName) -> &'static str {
     }
 }
 
+/// Build the mongo `stream_shards.shard_id` for a given table_id + shard index.
+///
+/// **Security invariant (RFC-0003 §5.3, §8.2):** shard_id must incorporate
+/// the table's globally-unique `table_id` (a UUID), not the caller-visible
+/// `table_name`. Table names are only unique per-account, so two accounts
+/// creating "orders" tables would generate colliding shard_ids under a
+/// name-derived scheme, letting one account's `GetRecords(shard_id)` read
+/// the other's stream records. `table_id` is a per-table-instance UUID that
+/// resets on `DeleteTable + CreateTable` — the recreated table gets fresh
+/// shard_ids, so leftover stream records from the deleted table never
+/// resurface either.
+///
+/// UUIDs are not guessable, so an attacker cannot synthesize a shard_id
+/// belonging to another tenant without first observing it (which itself
+/// requires an authenticated path scoped to that tenant's account).
+pub(crate) fn build_shard_id(table_id: &str, shard_index: u32) -> String {
+    format!("shardId-{table_id}-{shard_index:012}")
+}
+
 impl MongoEngine {
     /// Initialize stream shards for a table. Only creates shard documents;
     /// the caller is responsible for setting `stream_label` on the table doc.
-    pub(crate) async fn init_stream_shards(
-        &self,
-        table_name: &str,
-        table_id: &str,
-    ) -> Result<(), StorageError> {
+    ///
+    /// Uses the table's UUID (`table_id`), not `table_name`, in the shard_id
+    /// — see `build_shard_id` for the security rationale.
+    pub(crate) async fn init_stream_shards(&self, table_id: &str) -> Result<(), StorageError> {
         let shards_coll = self.data_db.collection::<Document>("stream_shards");
         for i in 0..SHARDS_PER_STREAM {
-            let shard_id = format!("shardId-{table_name}-{i:012}");
+            let shard_id = build_shard_id(table_id, i);
             let start_seq = format!("{:021}", 0);
             shards_coll
                 .insert_one(doc! {
@@ -63,6 +81,61 @@ impl MongoEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
         }
+        Ok(())
+    }
+
+    /// Delete every stream_shards document for a given table_id, and every
+    /// stream_records document written to any of its shards. Invoked from
+    /// `delete_table_impl` so that a table recreated with the same name
+    /// (which will get a fresh table_id) cannot inherit the deleted table's
+    /// stream history.
+    pub(crate) async fn cleanup_stream_state_for_table(
+        &self,
+        table_id: &str,
+    ) -> Result<(), StorageError> {
+        let shards_coll = self.data_db.collection::<Document>("stream_shards");
+        let records_coll = self.data_db.collection::<Document>("stream_records");
+
+        // Collect shard_ids for this table so we can delete their records.
+        // Records don't carry table_id directly — they're addressed by shard_id.
+        let cursor = shards_coll
+            .find(doc! { "table_id": table_id })
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let shard_docs: Vec<Document> = cursor
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let shard_ids: Vec<String> = shard_docs
+            .iter()
+            .filter_map(|d| d.get_str("shard_id").ok().map(str::to_owned))
+            .collect();
+
+        if !shard_ids.is_empty() {
+            records_coll
+                .delete_many(doc! { "shard_id": { "$in": &shard_ids } })
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
+
+        shards_coll
+            .delete_many(doc! { "table_id": table_id })
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        // Sequence-number counters are keyed as "stream_seq:<shard_id>".
+        let counters_coll = self.data_db.collection::<Document>("counters");
+        let counter_ids: Vec<String> = shard_ids
+            .iter()
+            .map(|sid| format!("stream_seq:{sid}"))
+            .collect();
+        if !counter_ids.is_empty() {
+            counters_coll
+                .delete_many(doc! { "_id": { "$in": &counter_ids } })
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
+
         Ok(())
     }
 }
@@ -555,5 +628,42 @@ mod tests {
         assert_eq!(event_name_ddb_str(StreamEventName::Insert), "INSERT");
         assert_eq!(event_name_ddb_str(StreamEventName::Modify), "MODIFY");
         assert_eq!(event_name_ddb_str(StreamEventName::Remove), "REMOVE");
+    }
+
+    #[test]
+    fn shard_id_embeds_table_id_not_table_name() {
+        let table_id = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(
+            build_shard_id(table_id, 0),
+            "shardId-550e8400-e29b-41d4-a716-446655440000-000000000000"
+        );
+        assert_eq!(
+            build_shard_id(table_id, 3),
+            "shardId-550e8400-e29b-41d4-a716-446655440000-000000000003"
+        );
+    }
+
+    #[test]
+    fn shard_ids_for_different_table_ids_do_not_collide() {
+        // Regression test for RFC-0003 §5.3 (account and table isolation).
+        // Two tables with the same shard index (0) must have different
+        // shard_ids so a caller in one tenant cannot address the other's
+        // shard.
+        let table_a = "550e8400-e29b-41d4-a716-446655440000";
+        let table_b = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        assert_ne!(build_shard_id(table_a, 0), build_shard_id(table_b, 0));
+    }
+
+    #[test]
+    fn shard_id_format_is_stable_across_shards_of_same_table() {
+        // Same table_id, different shard index → deterministic ordering.
+        let table_id = "550e8400-e29b-41d4-a716-446655440000";
+        let s0 = build_shard_id(table_id, 0);
+        let s1 = build_shard_id(table_id, 1);
+        let s2 = build_shard_id(table_id, 2);
+        let s3 = build_shard_id(table_id, 3);
+        assert!(s0 < s1);
+        assert!(s1 < s2);
+        assert!(s2 < s3);
     }
 }

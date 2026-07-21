@@ -254,10 +254,11 @@ impl MongoEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
         }
 
-        // Initialize stream shards if streaming is enabled
+        // Initialize stream shards if streaming is enabled. shard_id is
+        // derived from table_id (UUID), never table_name — see
+        // stream_engine::build_shard_id for the security rationale.
         if stream_label_opt.is_some() {
-            self.init_stream_shards(&input.table_name, &table_id)
-                .await?;
+            self.init_stream_shards(&table_id).await?;
         }
 
         // Handle GSI creation
@@ -504,6 +505,12 @@ impl MongoEngine {
 
         self.gsi_cache_invalidate(&desc.table_id);
 
+        // Delete stream_shards, stream_records, and their sequence counters
+        // for this table. Prevents a table recreated with the same name
+        // (which will get a fresh table_id) from inheriting the deleted
+        // table's stream history. RFC-0003 §8.2 (table-name reuse).
+        self.cleanup_stream_state_for_table(&desc.table_id).await?;
+
         // Delete the table metadata
         tables_coll
             .delete_one(
@@ -682,7 +689,7 @@ impl MongoEngine {
                     .format(&time::format_description::well_known::Iso8601::DEFAULT)
                     .unwrap_or_else(|_| "unknown".to_string());
                 update_doc.insert("stream_label", &label);
-                self.init_stream_shards(&input.table_name, table_id).await?;
+                self.init_stream_shards(table_id).await?;
             }
         }
 
