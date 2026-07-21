@@ -88,8 +88,9 @@ impl Bootstrapper for MongoBootstrapper {
             .await
             .map_err(|e| OpError::Internal(format!("Failed to create data db: {e}")))?;
 
-        // Create TTL index on idempotency_tokens.created_at (10 min expiry)
         let coll = db.collection::<Document>("idempotency_tokens");
+
+        // Create TTL index on idempotency_tokens.created_at (10 min expiry)
         let ttl_index = IndexModel::builder()
             .keys(doc! { "created_at": 1 })
             .options(
@@ -101,6 +102,22 @@ impl Bootstrapper for MongoBootstrapper {
         coll.create_index(ttl_index)
             .await
             .map_err(|e| OpError::Internal(format!("Failed to create TTL index: {e}")))?;
+
+        // Unique compound index on (account_id, token). Without this,
+        // two concurrent TransactWriteItems calls with the same token
+        // both do a snapshot read that misses the other's uncommitted
+        // insert, and both commit — the operation executes twice.
+        // With the unique index in place, the second inserter fails
+        // E11000 and the write path converts that into a retryable
+        // error, giving the client the read-check path on retry.
+        coll.create_index(
+            IndexModel::builder()
+                .keys(doc! { "account_id": 1, "token": 1 })
+                .options(IndexOptions::builder().unique(true).build())
+                .build(),
+        )
+        .await
+        .map_err(|e| OpError::Internal(format!("idempotency_tokens unique index: {e}")))?;
 
         // stream_shards: unique index on shard_id so a subsequent init/
         // recreate can never insert a duplicate shard document under the
