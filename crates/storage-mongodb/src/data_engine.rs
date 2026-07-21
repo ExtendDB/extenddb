@@ -1360,9 +1360,6 @@ impl MongoEngine {
         }
 
         let mut update = Document::new();
-        if !inc_doc.is_empty() {
-            update.insert("$inc", inc_doc);
-        }
         if !set_doc.is_empty() {
             update.insert("$set", set_doc);
         }
@@ -1370,9 +1367,17 @@ impl MongoEngine {
             update.insert("$unset", unset_doc);
         }
 
-        if update.is_empty() {
+        if update.is_empty() && inc_doc.is_empty() {
             return None;
         }
+
+        // Bump `_v` on every native fast-path write. Without this a
+        // fast-path commit leaves `_v` at its previous value, and a
+        // slow-path update running concurrently against that same
+        // stale value can pass its versioned-filter guard and
+        // overwrite the fast-path write (lost update, RFC-0003 §4.4).
+        inc_doc.insert("_v", 1_i64);
+        update.insert("$inc", inc_doc);
 
         Some(update)
     }
