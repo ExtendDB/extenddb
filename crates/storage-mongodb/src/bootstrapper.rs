@@ -137,6 +137,29 @@ impl Bootstrapper for MongoBootstrapper {
             .await
             .map_err(|e| OpError::Internal(format!("stream_shards shard_id index: {e}")))?;
 
+        // stream_records: TTL index enforcing DDB's 24-hour retention.
+        // The `expireAfterSeconds` is the delta from the field value,
+        // not a hard cutoff, so a MongoDB background thread will
+        // delete records ~1 minute after created_at + 24h. The
+        // TTL cleanup worker in `ttl_worker.rs` provides a defense-
+        // in-depth deletion path but the primary enforcement is here.
+        db.create_collection("stream_records")
+            .await
+            .map_err(|e| OpError::Internal(format!("Failed to create stream_records: {e}")))?;
+        db.collection::<Document>("stream_records")
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! { "created_at": 1 })
+                    .options(
+                        IndexOptions::builder()
+                            .expire_after(std::time::Duration::from_secs(24 * 3600))
+                            .build(),
+                    )
+                    .build(),
+            )
+            .await
+            .map_err(|e| OpError::Internal(format!("stream_records TTL index: {e}")))?;
+
         Ok(())
     }
 

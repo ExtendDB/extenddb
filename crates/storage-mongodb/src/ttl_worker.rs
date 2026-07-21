@@ -9,12 +9,14 @@ use std::time::Duration;
 use extenddb_core::metrics::MetricsCollector;
 use extenddb_core::types::UserIdentity;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{DataEngine, MetadataEngine, TableEngine};
+use extenddb_storage::{DataEngine, MetadataEngine, StreamEngine, TableEngine};
 
 use crate::MongoEngine;
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(60);
 const BATCH_SIZE: usize = 100;
+const STREAM_RETENTION_HOURS: i64 = 24;
+const STREAM_CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
 
 pub(crate) async fn ttl_cleanup_worker(storage: Arc<MongoEngine>, metrics: Arc<MetricsCollector>) {
     let region_arc: Arc<str> = Arc::from(storage.region.as_str());
@@ -23,6 +25,22 @@ pub(crate) async fn ttl_cleanup_worker(storage: Arc<MongoEngine>, metrics: Arc<M
         tokio::time::sleep(SCAN_INTERVAL).await;
         retry_pending_indexes(&storage).await;
         sweep_expired_items(&storage, &metrics, &region_arc).await;
+    }
+}
+
+/// Defense-in-depth stream-record deletion. A MongoDB TTL index on
+/// `stream_records.created_at` already deletes records ~1 minute after
+/// created_at + 24h; this loop covers the case where that index is
+/// missing (init predates the schema change) or lagging.
+pub(crate) async fn stream_record_cleanup_worker(storage: Arc<MongoEngine>) {
+    loop {
+        tokio::time::sleep(STREAM_CLEANUP_INTERVAL).await;
+        match StreamEngine::cleanup_expired_stream_records(&*storage, STREAM_RETENTION_HOURS).await
+        {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("Stream cleanup worker: deleted {n} expired record(s)"),
+            Err(e) => tracing::warn!("Stream cleanup worker: delete failed: {e}"),
+        }
     }
 }
 

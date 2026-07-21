@@ -139,7 +139,11 @@ impl ServerRuntimeHooks for MongoRuntimeHooks {
         let storage_for_ttl = self.engine.clone();
         let metrics = ctx.metrics.clone();
         tokio::spawn(async move { ttl_worker::ttl_cleanup_worker(storage_for_ttl, metrics).await });
-        tracing::info!("MongoDB backend: TTL cleanup worker spawned");
+        let storage_for_stream = self.engine.clone();
+        tokio::spawn(async move {
+            ttl_worker::stream_record_cleanup_worker(storage_for_stream).await;
+        });
+        tracing::info!("MongoDB backend: TTL and stream cleanup workers spawned");
     }
 
     fn backend_info(&self) -> Option<String> {
