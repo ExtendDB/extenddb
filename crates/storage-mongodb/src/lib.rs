@@ -143,7 +143,11 @@ impl ServerRuntimeHooks for MongoRuntimeHooks {
         tokio::spawn(async move {
             ttl_worker::stream_record_cleanup_worker(storage_for_stream).await;
         });
-        tracing::info!("MongoDB backend: TTL and stream cleanup workers spawned");
+        let storage_for_backfill = self.engine.clone();
+        tokio::spawn(async move {
+            ttl_worker::gsi_backfill_worker(storage_for_backfill).await;
+        });
+        tracing::info!("MongoDB backend: TTL, stream cleanup, and GSI backfill workers spawned");
     }
 
     fn backend_info(&self) -> Option<String> {
@@ -233,7 +237,7 @@ const GSI_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 /// `MongoDB` storage backend.
 pub struct MongoEngine {
     client: mongodb::Client,
-    catalog_db: mongodb::Database,
+    pub(crate) catalog_db: mongodb::Database,
     data_db: mongodb::Database,
     region: String,
     max_connections: u32,

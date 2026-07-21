@@ -751,13 +751,20 @@ impl MongoEngine {
                         .transpose()
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+                    // Enter CREATING; the background gsi_backfill_worker
+                    // in ttl_worker.rs discovers this row, backfills the
+                    // base table, and flips the status to ACTIVE. Matches
+                    // DDB's async UpdateTable contract (§2.4 in RFC-0003).
+                    // Live writes during the backfill window sync through
+                    // sync_indexes (upserts) so the eventual state is
+                    // convergent regardless of interleaving.
                     let index_doc = doc! {
                         "_id": { "table_id": &desc.table_id, "index_name": &create.index_name },
                         "index_id": &index_id,
                         "index_type": "GSI",
                         "key_schema": key_schema_bson,
                         "projection": projection_bson,
-                        "index_status": "ACTIVE",
+                        "index_status": "CREATING",
                         "provisioned_throughput": pt_bson.unwrap_or(bson::Bson::Null),
                     };
 
@@ -813,9 +820,50 @@ impl MongoEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?
             .ok_or_else(|| StorageError::TableNotFound(table_name.to_string()))?;
 
+        self.table_key_info_from_doc(&table_doc, true).await
+    }
+
+    /// Load `TableKeyInfo` by `table_id`. The tables catalog has a
+    /// unique index on `table_id`, so this is a single-doc lookup.
+    /// Used by the GSI backfill worker, which discovers work items
+    /// keyed by `table_id`. Skips the ACTIVE-status guard so a table
+    /// that is temporarily in a transient state (CREATING, UPDATING)
+    /// can still be backfilled — backfill is decoupled from data-plane
+    /// availability.
+    pub(crate) async fn table_key_info_by_table_id_impl(
+        &self,
+        table_id: &str,
+    ) -> Result<TableKeyInfo, StorageError> {
+        let tables_coll = self.catalog_db.collection::<Document>("tables");
+        let table_doc = tables_coll
+            .find_one(doc! { "table_id": table_id })
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .ok_or_else(|| StorageError::TableNotFound(table_id.to_string()))?;
+
+        self.table_key_info_from_doc(&table_doc, false).await
+    }
+
+    async fn table_key_info_from_doc(
+        &self,
+        table_doc: &Document,
+        require_active: bool,
+    ) -> Result<TableKeyInfo, StorageError> {
+        let id_doc = table_doc
+            .get_document("_id")
+            .map_err(|_| StorageError::Internal("missing _id".to_string()))?;
+        let table_name = id_doc
+            .get_str("table_name")
+            .map_err(|_| StorageError::Internal("missing _id.table_name".to_string()))?
+            .to_string();
+        let account_id = id_doc
+            .get_str("account_id")
+            .map_err(|_| StorageError::Internal("missing _id.account_id".to_string()))?
+            .to_string();
+
         let status = table_doc.get_str("table_status").unwrap_or("ACTIVE");
-        if status != "ACTIVE" {
-            return Err(StorageError::TableNotActive(table_name.to_string()));
+        if require_active && status != "ACTIVE" {
+            return Err(StorageError::TableNotActive(table_name));
         }
 
         let table_id = table_doc
@@ -846,7 +894,6 @@ impl MongoEngine {
             }
         });
 
-        // Check for LSIs
         let indexes_coll = self.catalog_db.collection::<Document>("indexes");
         let has_lsi = indexes_coll
             .count_documents(doc! { "_id.table_id": &table_id, "index_type": "LSI" })
@@ -855,8 +902,8 @@ impl MongoEngine {
             > 0;
 
         Ok(TableKeyInfo {
-            table_name: table_name.to_string(),
-            account_id: account_id.to_string(),
+            table_name,
+            account_id,
             table_id,
             base_key_schema: key_schema.clone(),
             key_schema,

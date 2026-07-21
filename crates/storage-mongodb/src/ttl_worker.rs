@@ -6,10 +6,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bson::{Document, doc};
 use extenddb_core::metrics::MetricsCollector;
-use extenddb_core::types::UserIdentity;
+use extenddb_core::types::{KeySchemaElement, Projection, ProjectionType, UserIdentity};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{DataEngine, MetadataEngine, StreamEngine, TableEngine};
+use futures::TryStreamExt;
 
 use crate::MongoEngine;
 
@@ -17,6 +19,8 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(60);
 const BATCH_SIZE: usize = 100;
 const STREAM_RETENTION_HOURS: i64 = 24;
 const STREAM_CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
+const GSI_BACKFILL_INTERVAL: Duration = Duration::from_secs(5);
+const GSI_BACKFILL_BATCH: i64 = 500;
 
 pub(crate) async fn ttl_cleanup_worker(storage: Arc<MongoEngine>, metrics: Arc<MetricsCollector>) {
     let region_arc: Arc<str> = Arc::from(storage.region.as_str());
@@ -40,6 +44,138 @@ pub(crate) async fn stream_record_cleanup_worker(storage: Arc<MongoEngine>) {
             Ok(0) => {}
             Ok(n) => tracing::info!("Stream cleanup worker: deleted {n} expired record(s)"),
             Err(e) => tracing::warn!("Stream cleanup worker: delete failed: {e}"),
+        }
+    }
+}
+
+/// Background worker that turns CREATING GSIs into ACTIVE ones.
+///
+/// UpdateTable's GSI-create path leaves the index in `index_status:
+/// "CREATING"` after inserting the catalog document. This worker
+/// discovers each such row, iterates the base collection with a
+/// persistent cursor, upserts projected items into the index
+/// collection, and — once the base is fully scanned — flips the
+/// index to `ACTIVE`. Restart-safe: the cursor is persisted after
+/// every batch so a mid-backfill crash resumes where it left off.
+///
+/// Live writes during the backfill window continue to route through
+/// `sync_indexes` / `sync_indexes_in_session`, which write to
+/// CREATING indexes too (indexes catalog membership, not status, is
+/// what gates the write path). All writes are upserts on the same
+/// `_id` shape, so a base item touched by both the backfill and a
+/// concurrent write converges regardless of interleaving —
+/// RFC-0003 §2.4.
+pub(crate) async fn gsi_backfill_worker(storage: Arc<MongoEngine>) {
+    loop {
+        tokio::time::sleep(GSI_BACKFILL_INTERVAL).await;
+
+        let indexes_coll = storage.catalog_db.collection::<Document>("indexes");
+        let cursor = match indexes_coll
+            .find(doc! { "index_status": "CREATING", "index_type": "GSI" })
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("GSI backfill worker: list failed: {e}");
+                continue;
+            }
+        };
+        let jobs: Vec<Document> = match cursor.try_collect().await {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!("GSI backfill worker: collect failed: {e}");
+                continue;
+            }
+        };
+
+        for job in jobs {
+            if let Err(e) = run_gsi_backfill_job(&storage, &job).await {
+                tracing::warn!(
+                    "GSI backfill worker: job failed for index_id={}: {e}",
+                    job.get_str("index_id").unwrap_or("?"),
+                );
+            }
+        }
+    }
+}
+
+async fn run_gsi_backfill_job(storage: &MongoEngine, job: &Document) -> Result<(), StorageError> {
+    let index_id = job
+        .get_str("index_id")
+        .map_err(|_| StorageError::Internal("missing index_id".to_owned()))?
+        .to_owned();
+    let id_doc = job
+        .get_document("_id")
+        .map_err(|_| StorageError::Internal("missing _id".to_owned()))?;
+    let table_id = id_doc
+        .get_str("table_id")
+        .map_err(|_| StorageError::Internal("missing _id.table_id".to_owned()))?
+        .to_owned();
+
+    let key_info = storage.table_key_info_by_table_id_impl(&table_id).await?;
+
+    let idx_key_schema_bson = job
+        .get("key_schema")
+        .ok_or_else(|| StorageError::Internal("missing key_schema".to_owned()))?;
+    let idx_key_schema: Vec<KeySchemaElement> = bson::from_bson(idx_key_schema_bson.clone())
+        .map_err(|e| StorageError::Internal(format!("key_schema parse: {e}")))?;
+
+    let projection: Projection = job
+        .get("projection")
+        .and_then(|p| bson::from_bson(p.clone()).ok())
+        .unwrap_or(Projection {
+            projection_type: ProjectionType::All,
+            non_key_attributes: None,
+        });
+
+    let mut cursor = job.get("backfill_cursor").cloned();
+    let indexes_coll = storage.catalog_db.collection::<Document>("indexes");
+
+    loop {
+        let progress = storage
+            .backfill_gsi_batch(
+                &key_info,
+                &index_id,
+                &idx_key_schema,
+                &projection,
+                cursor.as_ref(),
+                GSI_BACKFILL_BATCH,
+            )
+            .await?;
+
+        if progress.done {
+            // Full-scan complete. Flip to ACTIVE and drop the cursor.
+            indexes_coll
+                .update_one(
+                    doc! { "index_id": &index_id, "index_status": "CREATING" },
+                    doc! {
+                        "$set": { "index_status": "ACTIVE" },
+                        "$unset": { "backfill_cursor": "" },
+                    },
+                )
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            tracing::info!(
+                "GSI backfill worker: index_id={index_id} ACTIVE (last batch scanned {} docs)",
+                progress.scanned,
+            );
+            return Ok(());
+        }
+
+        if let Some(ref last_id) = progress.last_id {
+            indexes_coll
+                .update_one(
+                    doc! { "index_id": &index_id },
+                    doc! { "$set": { "backfill_cursor": last_id.clone() } },
+                )
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            cursor = Some(last_id.clone());
+        } else {
+            // Empty batch but not done — treat as done to avoid an
+            // infinite loop. Shouldn't happen in practice since
+            // backfill_gsi_batch marks done when scanned < batch_size.
+            return Ok(());
         }
     }
 }

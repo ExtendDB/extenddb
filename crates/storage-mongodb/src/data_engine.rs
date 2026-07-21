@@ -2612,6 +2612,107 @@ impl MongoEngine {
         let new_out = if return_new { Some(new_item) } else { None };
         Ok((old_out, new_out))
     }
+
+    // ── GSI Backfill ──────────────────────────────────────────────
+    //
+    // Called by the gsi_backfill_worker in ttl_worker.rs. Reads one
+    // batch of base-table items past the given cursor and upserts
+    // matching index rows. Returns the new cursor and whether more
+    // items remain to scan. The worker persists the cursor between
+    // batches so a mid-backfill server restart resumes from where it
+    // left off — see the CREATING → ACTIVE state machine in
+    // update_table_impl / spawn_workers.
+
+    pub(crate) async fn backfill_gsi_batch(
+        &self,
+        key_info: &TableKeyInfo,
+        index_id: &str,
+        idx_key_schema: &[KeySchemaElement],
+        projection: &Projection,
+        cursor: Option<&bson::Bson>,
+        batch_size: i64,
+    ) -> Result<GsiBackfillProgress, StorageError> {
+        use futures::TryStreamExt;
+
+        let base_coll_name = data_collection_name(&key_info.table_id);
+        let base_coll = self.data_db.collection::<Document>(&base_coll_name);
+        let idx_coll_name = data_collection_name(index_id);
+        let idx_coll = self.data_db.collection::<Document>(&idx_coll_name);
+
+        let mut filter = Document::new();
+        if let Some(c) = cursor {
+            filter.insert("_id", doc! { "$gt": c.clone() });
+        }
+
+        let opts = mongodb::options::FindOptions::builder()
+            .sort(doc! { "_id": 1 })
+            .limit(batch_size)
+            .build();
+
+        let base_cursor = base_coll
+            .find(filter)
+            .with_options(opts)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        let docs: Vec<Document> = base_cursor
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        let scanned = docs.len();
+        let last_id = docs.last().and_then(|d| d.get("_id").cloned());
+
+        for doc in docs {
+            let item = document_to_item(&doc)?;
+            if !item_has_index_keys(&item, idx_key_schema) {
+                continue;
+            }
+
+            let projected = project_item(&item, idx_key_schema, &key_info.key_schema, projection);
+            let idx_doc = index_document(
+                &projected,
+                idx_key_schema,
+                &key_info.key_schema,
+                &key_info.attribute_definitions,
+            )?;
+            let filter = index_entry_filter(
+                &projected,
+                idx_key_schema,
+                &key_info.key_schema,
+                &key_info.attribute_definitions,
+            )?;
+            let opts = mongodb::options::ReplaceOptions::builder()
+                .upsert(true)
+                .build();
+            idx_coll
+                .replace_one(filter, idx_doc)
+                .with_options(opts)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
+
+        // A short-read (fewer docs than the batch size) means we've
+        // reached the end of the base collection. Upstream flips the
+        // index to ACTIVE when that happens.
+        Ok(GsiBackfillProgress {
+            scanned,
+            last_id,
+            done: (scanned as i64) < batch_size,
+        })
+    }
+}
+
+/// Progress from one `backfill_gsi_batch` invocation.
+pub(crate) struct GsiBackfillProgress {
+    /// Number of base-collection documents read in this batch (before
+    /// filtering out those missing index-key attributes).
+    pub scanned: usize,
+    /// The `_id` of the last document scanned; the next batch resumes
+    /// with `_id > last_id`. `None` when the batch was empty.
+    pub last_id: Option<bson::Bson>,
+    /// Whether the base collection has been fully scanned.
+    pub done: bool,
 }
 
 // ── Contention / retry helpers ──────────────────────────────────────────
