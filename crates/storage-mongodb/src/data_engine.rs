@@ -543,10 +543,18 @@ impl MongoEngine {
         let key_filter = pk_filter(key, &key_info.key_schema, &key_info.attribute_definitions)?;
 
         // Fast path: use native MongoDB atomic operators when possible.
-        // This avoids transactions and retries for simple unconditional updates.
+        // This avoids transactions and retries for simple unconditional
+        // updates. Gated on the table having no GSIs — the fast path
+        // does not read the pre-image, so it has no way to compute the
+        // GSI-key delta and would leave stale index entries when an
+        // indexed attribute is $set to a new value or $unset (RFC-0003
+        // §2.2). The GSI cache lets us avoid a catalog query in the
+        // common (no-GSI) case; when the cache is stale-or-unknown
+        // we fall through to the slow path which is authoritative.
         if condition.is_none()
             && !return_old
             && stream.is_none()
+            && self.gsi_cache_get_fresh(&key_info.table_id) == Some(false)
             && let Some(mongo_update) = self.try_build_native_update(actions, maps)
         {
             let opts = mongodb::options::FindOneAndUpdateOptions::builder()
@@ -564,12 +572,6 @@ impl MongoEngine {
             } else {
                 None
             };
-
-            // Sync GSI (non-transactional but data write is atomic)
-            if let Some(ref doc) = result_doc {
-                let item = document_to_item(doc)?;
-                self.sync_indexes(key_info, None, Some(&item)).await?;
-            }
 
             return Ok((None, new_item));
         }
@@ -631,14 +633,27 @@ impl MongoEngine {
                 }
             }
 
-            let need_old = return_old || stream.is_some();
-            // Only surface a pre-image when the item actually existed.
+            // The pre-image is required for two independent reasons:
+            // (a) surfacing it to the caller (ReturnValues=ALL_OLD or
+            // stream capture) and (b) computing the GSI-key delta so
+            // stale index rows can be deleted when the update changes
+            // a GSI-key attribute (§2.2 in RFC-0003).
+            //
+            // Historically we only tracked (a). That left the fast
+            // path — no ReturnValues + no stream — running
+            // sync_indexes_in_session with old_item=None, so the
+            // "delete old entry" branch never fired and updates that
+            // moved an item between GSI-key values left the old entry
+            // orphaned. Always compute the pre-image on the slow path
+            // — we already read `existing_doc` for the version guard,
+            // so the additional cost is a clone.
+            //
             // When existing_doc is None, `existing_item` is a fabricated
-            // key-only stub used to seed apply_update — feeding it to
-            // stream/ReturnValues would emit MODIFY with a phantom
-            // OldImage instead of INSERT (§5.4 in RFC-0003).
-            let old_item = if need_old && existing_doc.is_some() {
-                Some(existing_item.clone())
+            // key-only stub used only to seed apply_update; the stream
+            // path must not see it (else INSERT looks like MODIFY, §5.4).
+            let pre_image = existing_doc.as_ref().map(|_| existing_item.clone());
+            let old_item_for_stream = if return_old || stream.is_some() {
+                pre_image.clone()
             } else {
                 None
             };
@@ -686,10 +701,12 @@ impl MongoEngine {
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
             }
 
-            // Sync GSI collections within the transaction
+            // Sync GSI collections within the transaction — pass the
+            // true pre-image so index rows for moved GSI-key values
+            // can be deleted, not just the caller-visible old_item.
             self.sync_indexes_in_session(
                 key_info,
-                old_item.as_ref(),
+                pre_image.as_ref(),
                 Some(&new_item),
                 &mut session,
             )
@@ -700,7 +717,7 @@ impl MongoEngine {
                 self.write_stream_inline_in_session(
                     key_info,
                     capture,
-                    old_item.as_ref(),
+                    old_item_for_stream.as_ref(),
                     Some(&new_item),
                     &mut session,
                 )
@@ -712,7 +729,7 @@ impl MongoEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            let old_item_result = if return_old { old_item } else { None };
+            let old_item_result = if return_old { old_item_for_stream } else { None };
             let new_item_result = if return_new { Some(new_item) } else { None };
             return Ok((old_item_result, new_item_result));
         }
