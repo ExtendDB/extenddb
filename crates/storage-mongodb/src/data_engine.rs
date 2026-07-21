@@ -27,7 +27,8 @@ use extenddb_storage::{
 use crate::MongoEngine;
 use crate::condition::condition_to_filter;
 use crate::data::{
-    data_collection_name, document_to_item, item_to_document, pk_filter, sk_field_name,
+    composite_id, data_collection_name, document_to_item, item_to_document, pk_filter,
+    sk_field_name,
 };
 use crate::pushdown::{Pushable, is_pushable};
 
@@ -1020,7 +1021,7 @@ impl MongoEngine {
                         }
                         _ => return Err(StorageError::Internal("invalid sk type".to_string())),
                     };
-                    let start_id = format!("{start_pk}#{sk_text}");
+                    let start_id = composite_id(&start_pk, &sk_text);
                     filter.insert("_id", doc! { "$gt": start_id });
                 }
             } else {

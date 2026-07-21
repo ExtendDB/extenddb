@@ -13,11 +13,25 @@ use extenddb_core::types::{
     AttributeDefinition, AttributeValue, Item, KeySchemaElement, KeyType, ScalarAttributeType,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{composite_pk_to_text, pk_to_text, sk_info};
+use extenddb_storage::util::{
+    composite_pk_to_text, encode_netstring_composite, pk_to_text, sk_info,
+};
 
 /// Returns the `MongoDB` collection name for a `DynamoDB` table.
 pub fn data_collection_name(table_id: &str) -> String {
     format!("_ddb_{table_id}")
+}
+
+/// Build the mongo document `_id` for a composite (partition + sort) key.
+///
+/// Uses netstring encoding — `<len>:<part>,<len>:<part>,` — so the boundary
+/// between `pk` and `sk` is unambiguous regardless of the contents of
+/// either. A naive `"{pk}#{sk}"` scheme collides when `pk` or `sk` contains
+/// the delimiter (e.g., `pk="a#b", sk="c"` and `pk="a", sk="b#c"` both
+/// produce `"a#b#c"`).
+#[must_use]
+pub fn composite_id(pk_text: &str, sk_text: &str) -> String {
+    encode_netstring_composite(&[pk_text.to_owned(), sk_text.to_owned()])
 }
 
 /// Returns the `MongoDB` collection name for a secondary index.
@@ -48,7 +62,9 @@ pub fn item_to_document(
             .get(sk_name)
             .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?;
         let sk_text = sk_to_text(sk_value)?;
-        doc.insert("_id", format!("{pk_text}#{sk_text}"));
+        // Netstring-encoded composite _id — see composite_id() for why the
+        // naive "{pk}#{sk}" form is collision-prone.
+        doc.insert("_id", composite_id(&pk_text, &sk_text));
         doc.insert("pk", pk_text);
 
         // Insert the typed sort key field
@@ -263,5 +279,43 @@ mod tests {
 
         let err = pk_filter(&key, &schema, &attrs).unwrap_err();
         assert!(matches!(err, StorageError::Validation(_)));
+    }
+
+    #[test]
+    fn composite_id_disambiguates_delimiter_in_pk_or_sk() {
+        // Two items whose naive "{pk}#{sk}" strings would collide must
+        // produce distinct netstring-encoded _ids.
+        let a = composite_id("a#b", "c");
+        let b = composite_id("a", "b#c");
+        assert_ne!(
+            a, b,
+            "composite _id must not collide on delimiter-containing keys"
+        );
+    }
+
+    #[test]
+    fn composite_id_stable_on_normal_inputs() {
+        // Reasonable inputs still round-trip through netstring cleanly.
+        assert_eq!(
+            composite_id("user1", "2024-01-01"),
+            "5:user1,10:2024-01-01,"
+        );
+        assert_eq!(composite_id("", "sk"), "0:,2:sk,");
+        assert_eq!(composite_id("pk", ""), "2:pk,0:,");
+    }
+
+    #[test]
+    fn composite_id_is_written_by_item_to_document() {
+        let (schema, attrs) = schema_pk_str_sk_num();
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S("user1".to_owned()));
+        item.insert("sk".to_owned(), AttributeValue::N("42".to_owned()));
+
+        let doc = item_to_document(&item, &schema, &attrs).unwrap();
+        let id = doc.get_str("_id").unwrap();
+        assert!(
+            id.starts_with("5:user1,"),
+            "expected netstring-encoded _id, got {id:?}"
+        );
     }
 }
