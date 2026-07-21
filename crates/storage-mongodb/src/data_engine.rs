@@ -1681,7 +1681,7 @@ impl MongoEngine {
                 condition,
                 maps,
                 return_values_on_ccf,
-                ..
+                stream,
             } => {
                 validation::validate_item_keys(
                     item,
@@ -1698,18 +1698,24 @@ impl MongoEngine {
                     pk_filter(item, &key_info.key_schema, &key_info.attribute_definitions)
                         .map_err(TransactOpError::Storage)?;
 
+                // Always fetch the pre-image. Needed to (a) evaluate any
+                // condition against it, (b) let sync_indexes_in_session delete
+                // stale index entries when this write changes or removes a
+                // GSI key attribute, and (c) supply OldImage to any attached
+                // stream capture.
                 let existing_doc = coll
                     .find_one(key_filter.clone())
                     .session(&mut *session)
                     .await
                     .map_err(|e| TransactOpError::Storage(StorageError::Internal(e.to_string())))?;
 
+                let existing_item = if let Some(doc) = existing_doc.as_ref() {
+                    Some(document_to_item(doc).map_err(TransactOpError::Storage)?)
+                } else {
+                    None
+                };
+
                 if let Some(cond) = condition {
-                    let existing_item = if let Some(doc) = existing_doc.as_ref() {
-                        Some(document_to_item(doc).map_err(TransactOpError::Storage)?)
-                    } else {
-                        None
-                    };
                     let for_eval = existing_item.clone().unwrap_or_default();
                     let passed =
                         expression::evaluate_condition(cond, &for_eval, maps).map_err(|e| {
@@ -1740,6 +1746,31 @@ impl MongoEngine {
                     .await
                     .map_err(|e| TransactOpError::Storage(StorageError::Internal(e.to_string())))?;
 
+                // Propagate to secondary indexes and the stream within the
+                // same transaction session — otherwise a transactional write
+                // to a streams-enabled or GSI-bearing table would commit
+                // the base row while silently dropping its dependent side
+                // effects.
+                self.sync_indexes_in_session(
+                    key_info,
+                    existing_item.as_ref(),
+                    Some(item),
+                    &mut *session,
+                )
+                .await
+                .map_err(TransactOpError::Storage)?;
+                if let Some(capture) = stream {
+                    self.write_stream_inline_in_session(
+                        key_info,
+                        capture,
+                        existing_item.as_ref(),
+                        Some(item),
+                        &mut *session,
+                    )
+                    .await
+                    .map_err(TransactOpError::Storage)?;
+                }
+
                 Ok(())
             }
             OwnedTransactWriteOp::Delete {
@@ -1748,7 +1779,7 @@ impl MongoEngine {
                 condition,
                 maps,
                 return_values_on_ccf,
-                ..
+                stream,
             } => {
                 validation::validate_key_only(
                     key,
@@ -1765,20 +1796,22 @@ impl MongoEngine {
                     pk_filter(key, &key_info.key_schema, &key_info.attribute_definitions)
                         .map_err(TransactOpError::Storage)?;
 
-                if let Some(cond) = condition {
-                    let existing_doc = coll
-                        .find_one(key_filter.clone())
-                        .session(&mut *session)
-                        .await
-                        .map_err(|e| {
-                            TransactOpError::Storage(StorageError::Internal(e.to_string()))
-                        })?;
+                // Always fetch the pre-image. Needed for condition evaluation,
+                // stale-index deletion in sync_indexes_in_session, and OldImage
+                // capture for any attached stream.
+                let existing_doc = coll
+                    .find_one(key_filter.clone())
+                    .session(&mut *session)
+                    .await
+                    .map_err(|e| TransactOpError::Storage(StorageError::Internal(e.to_string())))?;
 
-                    let existing_item = if let Some(doc) = existing_doc.as_ref() {
-                        Some(document_to_item(doc).map_err(TransactOpError::Storage)?)
-                    } else {
-                        None
-                    };
+                let existing_item = if let Some(doc) = existing_doc.as_ref() {
+                    Some(document_to_item(doc).map_err(TransactOpError::Storage)?)
+                } else {
+                    None
+                };
+
+                if let Some(cond) = condition {
                     let for_eval = existing_item.clone().unwrap_or_default();
                     let passed =
                         expression::evaluate_condition(cond, &for_eval, maps).map_err(|e| {
@@ -1801,6 +1834,28 @@ impl MongoEngine {
                     .await
                     .map_err(|e| TransactOpError::Storage(StorageError::Internal(e.to_string())))?;
 
+                // Propagate to secondary indexes and the stream within the
+                // same transaction session.
+                self.sync_indexes_in_session(key_info, existing_item.as_ref(), None, &mut *session)
+                    .await
+                    .map_err(TransactOpError::Storage)?;
+                if let Some(capture) = stream {
+                    // DDB semantics: a delete on a non-existent key is a
+                    // no-op, and no stream record is emitted. Guard on
+                    // existing_item.is_some() to match.
+                    if existing_item.is_some() {
+                        self.write_stream_inline_in_session(
+                            key_info,
+                            capture,
+                            existing_item.as_ref(),
+                            None,
+                            &mut *session,
+                        )
+                        .await
+                        .map_err(TransactOpError::Storage)?;
+                    }
+                }
+
                 Ok(())
             }
             OwnedTransactWriteOp::Update {
@@ -1810,7 +1865,7 @@ impl MongoEngine {
                 condition,
                 maps,
                 return_values_on_ccf,
-                ..
+                stream,
             } => {
                 validation::validate_key_only(
                     key,
@@ -1838,6 +1893,7 @@ impl MongoEngine {
                 } else {
                     None
                 };
+                let is_creating = existing_item.is_none();
 
                 let mut item = existing_item.clone().unwrap_or_else(|| key.clone());
 
@@ -1880,6 +1936,36 @@ impl MongoEngine {
                     .session(&mut *session)
                     .await
                     .map_err(|e| TransactOpError::Storage(StorageError::Internal(e.to_string())))?;
+
+                // Propagate to secondary indexes and the stream within the
+                // same transaction session. When the update creates the
+                // item (previously did not exist), pass None as the old
+                // image so the stream layer produces an INSERT record, not
+                // a MODIFY with a synthesized key-only OldImage.
+                self.sync_indexes_in_session(
+                    key_info,
+                    existing_item.as_ref(),
+                    Some(&item),
+                    &mut *session,
+                )
+                .await
+                .map_err(TransactOpError::Storage)?;
+                if let Some(capture) = stream {
+                    let old_for_stream = if is_creating {
+                        None
+                    } else {
+                        existing_item.as_ref()
+                    };
+                    self.write_stream_inline_in_session(
+                        key_info,
+                        capture,
+                        old_for_stream,
+                        Some(&item),
+                        &mut *session,
+                    )
+                    .await
+                    .map_err(TransactOpError::Storage)?;
+                }
 
                 Ok(())
             }
@@ -2167,6 +2253,7 @@ enum OwnedTransactWriteOp {
         condition: Option<Expr>,
         maps: ExpressionMaps,
         return_values_on_ccf: ReturnValuesOnConditionCheckFailure,
+        stream: Option<StreamCapture>,
     },
     Delete {
         key_info: TableKeyInfo,
@@ -2174,6 +2261,7 @@ enum OwnedTransactWriteOp {
         condition: Option<Expr>,
         maps: ExpressionMaps,
         return_values_on_ccf: ReturnValuesOnConditionCheckFailure,
+        stream: Option<StreamCapture>,
     },
     Update {
         key_info: TableKeyInfo,
@@ -2182,6 +2270,7 @@ enum OwnedTransactWriteOp {
         condition: Option<Expr>,
         maps: ExpressionMaps,
         return_values_on_ccf: ReturnValuesOnConditionCheckFailure,
+        stream: Option<StreamCapture>,
     },
     ConditionCheck {
         key_info: TableKeyInfo,
@@ -2200,13 +2289,14 @@ fn clone_transact_write_op(op: &TransactWriteOp<'_>) -> OwnedTransactWriteOp {
             condition,
             maps,
             return_values_on_ccf,
-            ..
+            stream,
         } => OwnedTransactWriteOp::Put {
             key_info: (*key_info).clone(),
             item: (*item).clone(),
             condition: condition.cloned(),
             maps: (*maps).clone(),
             return_values_on_ccf: *return_values_on_ccf,
+            stream: stream.clone(),
         },
         TransactWriteOp::Delete {
             key_info,
@@ -2214,13 +2304,14 @@ fn clone_transact_write_op(op: &TransactWriteOp<'_>) -> OwnedTransactWriteOp {
             condition,
             maps,
             return_values_on_ccf,
-            ..
+            stream,
         } => OwnedTransactWriteOp::Delete {
             key_info: (*key_info).clone(),
             key: (*key).clone(),
             condition: condition.cloned(),
             maps: (*maps).clone(),
             return_values_on_ccf: *return_values_on_ccf,
+            stream: stream.clone(),
         },
         TransactWriteOp::Update {
             key_info,
@@ -2229,7 +2320,7 @@ fn clone_transact_write_op(op: &TransactWriteOp<'_>) -> OwnedTransactWriteOp {
             condition,
             maps,
             return_values_on_ccf,
-            ..
+            stream,
         } => OwnedTransactWriteOp::Update {
             key_info: (*key_info).clone(),
             key: (*key).clone(),
@@ -2237,6 +2328,7 @@ fn clone_transact_write_op(op: &TransactWriteOp<'_>) -> OwnedTransactWriteOp {
             condition: condition.cloned(),
             maps: (*maps).clone(),
             return_values_on_ccf: *return_values_on_ccf,
+            stream: stream.clone(),
         },
         TransactWriteOp::ConditionCheck {
             key_info,
