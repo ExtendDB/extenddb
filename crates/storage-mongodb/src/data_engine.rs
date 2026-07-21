@@ -600,32 +600,34 @@ impl MongoEngine {
 
         // Fast path: use native MongoDB atomic operators when possible.
         // This avoids transactions and retries for simple unconditional updates.
-        if condition.is_none() && !return_old && stream.is_none() {
-            if let Some(mongo_update) = self.try_build_native_update(actions, maps) {
-                let opts = mongodb::options::FindOneAndUpdateOptions::builder()
-                    .upsert(true)
-                    .return_document(ReturnDocument::After)
-                    .build();
-                let result_doc = coll
-                    .find_one_and_update(key_filter, mongo_update)
-                    .with_options(opts)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+        if condition.is_none()
+            && !return_old
+            && stream.is_none()
+            && let Some(mongo_update) = self.try_build_native_update(actions, maps)
+        {
+            let opts = mongodb::options::FindOneAndUpdateOptions::builder()
+                .upsert(true)
+                .return_document(ReturnDocument::After)
+                .build();
+            let result_doc = coll
+                .find_one_and_update(key_filter, mongo_update)
+                .with_options(opts)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-                let new_item = if return_new {
-                    result_doc.as_ref().map(document_to_item).transpose()?
-                } else {
-                    None
-                };
+            let new_item = if return_new {
+                result_doc.as_ref().map(document_to_item).transpose()?
+            } else {
+                None
+            };
 
-                // Sync GSI (non-transactional but data write is atomic)
-                if let Some(ref doc) = result_doc {
-                    let item = document_to_item(doc)?;
-                    self.sync_indexes(key_info, None, Some(&item)).await?;
-                }
-
-                return Ok((None, new_item));
+            // Sync GSI (non-transactional but data write is atomic)
+            if let Some(ref doc) = result_doc {
+                let item = document_to_item(doc)?;
+                self.sync_indexes(key_info, None, Some(&item)).await?;
             }
+
+            return Ok((None, new_item));
         }
 
         let mut session = self
@@ -832,30 +834,29 @@ impl MongoEngine {
         let sk_field = sk_field_name(&effective_key_schema, &key_info.attribute_definitions);
 
         // Apply sort key condition
-        if let Some(ref sk_cond) = key_condition.sk_condition {
-            if let Some(sk_f) = sk_field {
-                let sk_filter = build_sk_filter(sk_cond, sk_f, maps)?;
-                for (k, v) in sk_filter {
-                    filter.insert(k, v);
-                }
+        if let Some(ref sk_cond) = key_condition.sk_condition
+            && let Some(sk_f) = sk_field
+        {
+            let sk_filter = build_sk_filter(sk_cond, sk_f, maps)?;
+            for (k, v) in sk_filter {
+                filter.insert(k, v);
             }
         }
 
         // Apply exclusive_start_key pagination
-        if let Some(start_key) = exclusive_start_key {
-            if let Some(sk_f) = sk_field {
-                // Get the sort key value from the start key
-                if let Some((sk_name, sk_type)) =
-                    sk_info(&effective_key_schema, &key_info.attribute_definitions)
-                {
-                    if let Some(sk_val) = start_key.get(sk_name) {
-                        let sk_bson = sk_to_bson(sk_val, sk_type)?;
-                        if forward {
-                            filter.insert(sk_f, doc! { "$gt": sk_bson });
-                        } else {
-                            filter.insert(sk_f, doc! { "$lt": sk_bson });
-                        }
-                    }
+        if let Some(start_key) = exclusive_start_key
+            && let Some(sk_f) = sk_field
+        {
+            // Get the sort key value from the start key
+            if let Some((sk_name, sk_type)) =
+                sk_info(&effective_key_schema, &key_info.attribute_definitions)
+                && let Some(sk_val) = start_key.get(sk_name)
+            {
+                let sk_bson = sk_to_bson(sk_val, sk_type)?;
+                if forward {
+                    filter.insert(sk_f, doc! { "$gt": sk_bson });
+                } else {
+                    filter.insert(sk_f, doc! { "$lt": sk_bson });
                 }
             }
         }
@@ -907,22 +908,21 @@ impl MongoEngine {
         // sorts by length first, making $gte/$lt unreliable for prefix matching).
         if let Some(SortKeyCondition::BeginsWith { prefix, .. }) = &key_condition.sk_condition {
             let prefix_av = resolve_key_expr(prefix, maps)?;
-            if let AttributeValue::B(ref prefix_bytes) = prefix_av {
-                if let Some((sk_name, _)) =
+            if let AttributeValue::B(ref prefix_bytes) = prefix_av
+                && let Some((sk_name, _)) =
                     sk_info(&effective_key_schema, &key_info.attribute_definitions)
-                {
-                    items.retain(|item| {
-                        item.get(sk_name)
-                            .and_then(|v| {
-                                if let AttributeValue::B(b) = v {
-                                    Some(b.starts_with(prefix_bytes))
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(false)
-                    });
-                }
+            {
+                items.retain(|item| {
+                    item.get(sk_name)
+                        .and_then(|v| {
+                            if let AttributeValue::B(b) = v {
+                                Some(b.starts_with(prefix_bytes))
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(false)
+                });
             }
         }
 
@@ -1185,10 +1185,10 @@ impl MongoEngine {
         use futures::TryStreamExt;
 
         // Fast path: skip catalog query if we know this table has no GSIs
-        if let Some(entry) = self.gsi_cache.get(&key_info.table_id) {
-            if !*entry {
-                return Ok(());
-            }
+        if let Some(entry) = self.gsi_cache.get(&key_info.table_id)
+            && !*entry
+        {
+            return Ok(());
         }
 
         let indexes_coll = self.catalog_db.collection::<Document>("indexes");
@@ -1227,35 +1227,31 @@ impl MongoEngine {
             let idx_coll = self.data_db.collection::<Document>(&idx_coll_name);
 
             // Delete old index entry
-            if let Some(old) = old_item {
-                if item_has_index_keys(old, &idx_key_schema) {
-                    let old_filter =
-                        pk_filter(old, &idx_key_schema, &key_info.attribute_definitions)?;
-                    let _ = idx_coll.delete_one(old_filter).await;
-                }
+            if let Some(old) = old_item
+                && item_has_index_keys(old, &idx_key_schema)
+            {
+                let old_filter = pk_filter(old, &idx_key_schema, &key_info.attribute_definitions)?;
+                let _ = idx_coll.delete_one(old_filter).await;
             }
 
             // Insert new index entry
-            if let Some(new) = new_item {
-                if item_has_index_keys(new, &idx_key_schema) {
-                    let projected =
-                        project_item(new, &idx_key_schema, &key_info.key_schema, &projection);
-                    let idx_doc = item_to_document(
-                        &projected,
-                        &idx_key_schema,
-                        &key_info.attribute_definitions,
-                    )?;
-                    let filter =
-                        pk_filter(&projected, &idx_key_schema, &key_info.attribute_definitions)?;
-                    let opts = mongodb::options::ReplaceOptions::builder()
-                        .upsert(true)
-                        .build();
-                    idx_coll
-                        .replace_one(filter, idx_doc)
-                        .with_options(opts)
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                }
+            if let Some(new) = new_item
+                && item_has_index_keys(new, &idx_key_schema)
+            {
+                let projected =
+                    project_item(new, &idx_key_schema, &key_info.key_schema, &projection);
+                let idx_doc =
+                    item_to_document(&projected, &idx_key_schema, &key_info.attribute_definitions)?;
+                let filter =
+                    pk_filter(&projected, &idx_key_schema, &key_info.attribute_definitions)?;
+                let opts = mongodb::options::ReplaceOptions::builder()
+                    .upsert(true)
+                    .build();
+                idx_coll
+                    .replace_one(filter, idx_doc)
+                    .with_options(opts)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
             }
         }
 
@@ -1272,10 +1268,10 @@ impl MongoEngine {
     ) -> Result<(), StorageError> {
         use futures::TryStreamExt;
 
-        if let Some(entry) = self.gsi_cache.get(&key_info.table_id) {
-            if !*entry {
-                return Ok(());
-            }
+        if let Some(entry) = self.gsi_cache.get(&key_info.table_id)
+            && !*entry
+        {
+            return Ok(());
         }
 
         let indexes_coll = self.catalog_db.collection::<Document>("indexes");
@@ -1315,35 +1311,31 @@ impl MongoEngine {
             let idx_coll_name = data_collection_name(&index_id);
             let idx_coll = self.data_db.collection::<Document>(&idx_coll_name);
 
-            if let Some(old) = old_item {
-                if item_has_index_keys(old, &idx_key_schema) {
-                    let old_filter =
-                        pk_filter(old, &idx_key_schema, &key_info.attribute_definitions)?;
-                    let _ = idx_coll.delete_one(old_filter).session(&mut *session).await;
-                }
+            if let Some(old) = old_item
+                && item_has_index_keys(old, &idx_key_schema)
+            {
+                let old_filter = pk_filter(old, &idx_key_schema, &key_info.attribute_definitions)?;
+                let _ = idx_coll.delete_one(old_filter).session(&mut *session).await;
             }
 
-            if let Some(new) = new_item {
-                if item_has_index_keys(new, &idx_key_schema) {
-                    let projected =
-                        project_item(new, &idx_key_schema, &key_info.key_schema, &projection);
-                    let idx_doc = item_to_document(
-                        &projected,
-                        &idx_key_schema,
-                        &key_info.attribute_definitions,
-                    )?;
-                    let filter =
-                        pk_filter(&projected, &idx_key_schema, &key_info.attribute_definitions)?;
-                    let opts = mongodb::options::ReplaceOptions::builder()
-                        .upsert(true)
-                        .build();
-                    idx_coll
-                        .replace_one(filter, idx_doc)
-                        .with_options(opts)
-                        .session(&mut *session)
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                }
+            if let Some(new) = new_item
+                && item_has_index_keys(new, &idx_key_schema)
+            {
+                let projected =
+                    project_item(new, &idx_key_schema, &key_info.key_schema, &projection);
+                let idx_doc =
+                    item_to_document(&projected, &idx_key_schema, &key_info.attribute_definitions)?;
+                let filter =
+                    pk_filter(&projected, &idx_key_schema, &key_info.attribute_definitions)?;
+                let opts = mongodb::options::ReplaceOptions::builder()
+                    .upsert(true)
+                    .build();
+                idx_coll
+                    .replace_one(filter, idx_doc)
+                    .with_options(opts)
+                    .session(&mut *session)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
             }
         }
 
