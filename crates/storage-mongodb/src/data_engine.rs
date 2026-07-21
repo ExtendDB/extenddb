@@ -247,6 +247,12 @@ impl MongoEngine {
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
     ) -> Result<Option<Item>, StorageError> {
+        // Up-front index-key validation — must run before any write
+        // work so the caller sees a top-level ValidationException on
+        // wrong-type or empty index-key attributes (D-M10, RFC-0003
+        // §2.3).
+        self.validate_index_keys_for_item(key_info, &item).await?;
+
         let coll_name = data_collection_name(&key_info.table_id);
         let coll = self.data_db.collection::<Document>(&coll_name);
 
@@ -713,6 +719,14 @@ impl MongoEngine {
                 let mut new_item = existing_item;
                 expression::apply_update(actions, &mut new_item, maps)
                     .map_err(|e| TxErr::Fatal(StorageError::Validation(e.to_string())))?;
+
+                // Reject wrong-type or empty index-key attributes on
+                // the resulting item — D-M10, RFC-0003 §2.3. Same
+                // shape as put_item's up-front check, but the
+                // post-update item is what actually gets written.
+                self.validate_index_keys_for_item(key_info, &new_item)
+                    .await
+                    .map_err(TxErr::Fatal)?;
 
                 let mut new_doc = item_to_document(
                     &new_item,
@@ -1476,6 +1490,83 @@ impl MongoEngine {
 
     // ── GSI Sync ──────────────────────────────────────────────────────
 
+    /// Fetch (index_name, key_schema) for every index on the table.
+    /// Used by up-front input validation so PutItem / UpdateItem
+    /// rejects wrong-type or empty index-key attributes with a
+    /// top-level ValidationException before doing any write work
+    /// (D-M10, matches postgres put_item.rs).
+    async fn fetch_index_key_schemas(
+        &self,
+        table_id: &str,
+    ) -> Result<Vec<(String, Vec<KeySchemaElement>)>, StorageError> {
+        use futures::TryStreamExt;
+
+        if let Some(false) = self.gsi_cache_get_fresh(table_id) {
+            return Ok(Vec::new());
+        }
+
+        let indexes_coll = self.catalog_db.collection::<Document>("indexes");
+        let mut cursor = indexes_coll
+            .find(doc! { "_id.table_id": table_id })
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        let mut out = Vec::new();
+        while let Some(idx_doc) = cursor
+            .try_next()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?
+        {
+            let index_name = match idx_doc
+                .get_document("_id")
+                .and_then(|d| d.get_str("index_name"))
+            {
+                Ok(n) => n.to_string(),
+                Err(_) => continue,
+            };
+            let key_schema: Vec<KeySchemaElement> = match idx_doc.get("key_schema") {
+                Some(ks) => bson::from_bson(ks.clone()).unwrap_or_default(),
+                None => continue,
+            };
+            out.push((index_name, key_schema));
+        }
+        Ok(out)
+    }
+
+    /// Reject an item whose secondary-index key attributes have the
+    /// wrong scalar type or are empty. Called by put/update before
+    /// the transaction is opened — matches postgres semantics of
+    /// surfacing this as a top-level ValidationException rather than
+    /// letting sync_indexes silently drop the malformed index doc
+    /// (`data/mod.rs::index_document` skips typed sk fields on type
+    /// mismatch, leaving the row un-locatable for subsequent
+    /// deletes). RFC-0003 §2.3.
+    async fn validate_index_keys_for_item(
+        &self,
+        key_info: &TableKeyInfo,
+        item: &Item,
+    ) -> Result<(), StorageError> {
+        let idx_pairs = self.fetch_index_key_schemas(&key_info.table_id).await?;
+        if idx_pairs.is_empty() {
+            return Ok(());
+        }
+        let refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = idx_pairs
+            .iter()
+            .map(
+                |(name, ks)| extenddb_core::validation::IndexKeyRef {
+                    index_name: name.as_str(),
+                    key_schema: ks.as_slice(),
+                },
+            )
+            .collect();
+        extenddb_core::validation::validate_index_keys(
+            item,
+            &refs,
+            &key_info.attribute_definitions,
+        )
+        .map_err(|e| StorageError::Validation(e.to_string()))
+    }
+
     async fn sync_indexes(
         &self,
         key_info: &TableKeyInfo,
@@ -2085,6 +2176,34 @@ impl MongoEngine {
                     TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
                 })?;
 
+                // Index-key type/empty faults inside a transaction
+                // surface as per-item cancellation reasons (matches
+                // postgres data/transactions.rs). D-M10.
+                let idx_pairs = self
+                    .fetch_index_key_schemas(&key_info.table_id)
+                    .await
+                    .map_err(TransactOpError::Storage)?;
+                if !idx_pairs.is_empty() {
+                    let idx_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> =
+                        idx_pairs
+                            .iter()
+                            .map(|(n, ks)| extenddb_core::validation::IndexKeyRef {
+                                index_name: n.as_str(),
+                                key_schema: ks.as_slice(),
+                            })
+                            .collect();
+                    extenddb_core::validation::validate_index_keys(
+                        item,
+                        &idx_refs,
+                        &key_info.attribute_definitions,
+                    )
+                    .map_err(|e| {
+                        TransactOpError::Cancel(CancellationReason::validation_error(
+                            e.to_string(),
+                        ))
+                    })?;
+                }
+
                 let coll_name = data_collection_name(&key_info.table_id);
                 let coll = self.data_db.collection::<Document>(&coll_name);
                 let key_filter =
@@ -2316,6 +2435,34 @@ impl MongoEngine {
                 expression::apply_update(actions, &mut item, maps).map_err(|e| {
                     TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
                 })?;
+
+                // Validate index-key types/emptiness on the post-update
+                // item; a violation here surfaces as a per-item
+                // cancellation reason. D-M10, RFC-0003 §2.3.
+                let idx_pairs = self
+                    .fetch_index_key_schemas(&key_info.table_id)
+                    .await
+                    .map_err(TransactOpError::Storage)?;
+                if !idx_pairs.is_empty() {
+                    let idx_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> =
+                        idx_pairs
+                            .iter()
+                            .map(|(n, ks)| extenddb_core::validation::IndexKeyRef {
+                                index_name: n.as_str(),
+                                key_schema: ks.as_slice(),
+                            })
+                            .collect();
+                    extenddb_core::validation::validate_index_keys(
+                        &item,
+                        &idx_refs,
+                        &key_info.attribute_definitions,
+                    )
+                    .map_err(|e| {
+                        TransactOpError::Cancel(CancellationReason::validation_error(
+                            e.to_string(),
+                        ))
+                    })?;
+                }
 
                 let new_doc =
                     item_to_document(&item, &key_info.key_schema, &key_info.attribute_definitions)
