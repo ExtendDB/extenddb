@@ -250,8 +250,6 @@ impl MongoEngine {
         let coll_name = data_collection_name(&key_info.table_id);
         let coll = self.data_db.collection::<Document>(&coll_name);
 
-        let new_doc =
-            item_to_document(&item, &key_info.key_schema, &key_info.attribute_definitions)?;
         let key_filter = pk_filter(&item, &key_info.key_schema, &key_info.attribute_definitions)?;
 
         let mut session = self
@@ -269,106 +267,137 @@ impl MongoEngine {
             )
             .build();
 
-        session
-            .start_transaction()
-            .with_options(tx_options)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-        let old_item: Option<Item>;
-        let return_val: Option<Item>;
-
-        if let Some(cond) = condition {
-            let existing_doc = coll
-                .find_one(key_filter.clone())
-                .session(&mut session)
+        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+            let new_doc =
+                item_to_document(&item, &key_info.key_schema, &key_info.attribute_definitions)?;
+            session
+                .start_transaction()
+                .with_options(tx_options.clone())
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            if let Some(ref existing) = existing_doc {
-                let existing_item = document_to_item(existing)?;
-                let passed = expression::evaluate_condition(cond, &existing_item, maps)
-                    .map_err(|e| StorageError::Validation(e.to_string()))?;
-                if !passed {
-                    let _ = session.abort_transaction().await;
-                    return Err(StorageError::ConditionFailed(Some(existing_item)));
-                }
-                let opts = FindOneAndReplaceOptions::builder()
-                    .return_document(ReturnDocument::Before)
-                    .build();
-                let old_doc = coll
-                    .find_one_and_replace(key_filter, new_doc)
-                    .with_options(opts)
-                    .session(&mut session)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let attempt_res: Result<Option<Item>, TxErr> = async {
+                let old_item: Option<Item>;
 
-                old_item = old_doc.as_ref().map(document_to_item).transpose()?;
-                return_val = if return_old { old_item.clone() } else { None };
-            } else {
-                let empty = std::collections::BTreeMap::new();
-                let passed = expression::evaluate_condition(cond, &empty, maps)
-                    .map_err(|e| StorageError::Validation(e.to_string()))?;
-                if !passed {
-                    let _ = session.abort_transaction().await;
-                    return Err(StorageError::ConditionFailed(None));
-                }
-                let result = coll.insert_one(new_doc).session(&mut session).await;
-                if let Err(e) = result {
-                    if e.to_string().contains("E11000") {
-                        let _ = session.abort_transaction().await;
-                        let winner = coll
-                            .find_one(key_filter)
+                if let Some(cond) = condition {
+                    let existing_doc = coll
+                        .find_one(key_filter.clone())
+                        .session(&mut session)
+                        .await
+                        .map_err(TxErr::from)?;
+
+                    if let Some(ref existing) = existing_doc {
+                        let existing_item = document_to_item(existing)?;
+                        let passed = expression::evaluate_condition(cond, &existing_item, maps)
+                            .map_err(|e| TxErr::Fatal(StorageError::Validation(e.to_string())))?;
+                        if !passed {
+                            return Err(TxErr::Fatal(StorageError::ConditionFailed(Some(
+                                existing_item,
+                            ))));
+                        }
+                        let opts = FindOneAndReplaceOptions::builder()
+                            .return_document(ReturnDocument::Before)
+                            .build();
+                        let old_doc = coll
+                            .find_one_and_replace(key_filter.clone(), new_doc)
+                            .with_options(opts)
+                            .session(&mut session)
                             .await
-                            .map_err(|e2| StorageError::Internal(e2.to_string()))?
-                            .map(|d| document_to_item(&d))
-                            .transpose()?;
-                        return Err(StorageError::ConditionFailed(winner));
+                            .map_err(TxErr::from)?;
+                        old_item = old_doc.as_ref().map(document_to_item).transpose()?;
+                    } else {
+                        let empty = std::collections::BTreeMap::new();
+                        let passed = expression::evaluate_condition(cond, &empty, maps)
+                            .map_err(|e| TxErr::Fatal(StorageError::Validation(e.to_string())))?;
+                        if !passed {
+                            return Err(TxErr::Fatal(StorageError::ConditionFailed(None)));
+                        }
+                        // Conditional insert: a concurrent inserter
+                        // manifests either as E11000 (unique-index
+                        // race) or as WriteConflict (snapshot-isolation
+                        // race). Both are the runtime signature of a
+                        // failed condition. Map dup-key to CCF with
+                        // the winner's image; let WriteConflict fall
+                        // through TxErr::Transient and retry — the
+                        // retry will re-read and see the winner.
+                        if let Err(e) = coll.insert_one(new_doc).session(&mut session).await {
+                            if is_duplicate_key(&e) {
+                                let _ = session.abort_transaction().await;
+                                let winner = coll
+                                    .find_one(key_filter.clone())
+                                    .await
+                                    .map_err(|e2| {
+                                        TxErr::Fatal(StorageError::Internal(e2.to_string()))
+                                    })?
+                                    .map(|d| document_to_item(&d))
+                                    .transpose()?;
+                                return Err(TxErr::Fatal(StorageError::ConditionFailed(winner)));
+                            }
+                            return Err(TxErr::from(e));
+                        }
+                        old_item = None;
                     }
-                    let _ = session.abort_transaction().await;
-                    return Err(StorageError::Internal(e.to_string()));
+                } else {
+                    let opts = FindOneAndReplaceOptions::builder()
+                        .upsert(true)
+                        .return_document(ReturnDocument::Before)
+                        .build();
+                    let old_doc = coll
+                        .find_one_and_replace(key_filter.clone(), new_doc)
+                        .with_options(opts)
+                        .session(&mut session)
+                        .await
+                        .map_err(TxErr::from)?;
+                    old_item = old_doc.as_ref().map(document_to_item).transpose()?;
                 }
-                old_item = None;
-                return_val = None;
+
+                self.sync_indexes_in_session(
+                    key_info,
+                    old_item.as_ref(),
+                    Some(&item),
+                    &mut session,
+                )
+                .await?;
+
+                if let Some(capture) = stream {
+                    self.write_stream_inline_in_session(
+                        key_info,
+                        capture,
+                        old_item.as_ref(),
+                        Some(&item),
+                        &mut session,
+                    )
+                    .await?;
+                }
+
+                Ok(if return_old { old_item } else { None })
             }
-        } else {
-            let opts = FindOneAndReplaceOptions::builder()
-                .upsert(true)
-                .return_document(ReturnDocument::Before)
-                .build();
-            let old_doc = coll
-                .find_one_and_replace(key_filter, new_doc)
-                .with_options(opts)
-                .session(&mut session)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            .await;
 
-            old_item = old_doc.as_ref().map(document_to_item).transpose()?;
-            return_val = if return_old { old_item.clone() } else { None };
+            match attempt_res {
+                Ok(return_val) => match session.commit_transaction().await {
+                    Ok(()) => return Ok(return_val),
+                    Err(e) if is_transient_write_conflict(&e) => {
+                        backoff_sleep(attempt).await;
+                        continue;
+                    }
+                    Err(e) => return Err(StorageError::Internal(e.to_string())),
+                },
+                Err(TxErr::Transient) => {
+                    let _ = session.abort_transaction().await;
+                    backoff_sleep(attempt).await;
+                    continue;
+                }
+                Err(TxErr::Fatal(e)) => {
+                    let _ = session.abort_transaction().await;
+                    return Err(e);
+                }
+            }
         }
 
-        // Sync GSI collections within the transaction
-        self.sync_indexes_in_session(key_info, old_item.as_ref(), Some(&item), &mut session)
-            .await?;
-
-        // Write stream record within the transaction
-        if let Some(capture) = stream {
-            self.write_stream_inline_in_session(
-                key_info,
-                capture,
-                old_item.as_ref(),
-                Some(&item),
-                &mut session,
-            )
-            .await?;
-        }
-
-        session
-            .commit_transaction()
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-        Ok(return_val)
+        Err(StorageError::Internal(
+            "PutItem: too many concurrent write conflicts, giving up".to_owned(),
+        ))
     }
 
     async fn get_item_impl(
@@ -431,77 +460,104 @@ impl MongoEngine {
             )
             .build();
 
-        session
-            .start_transaction()
-            .with_options(tx_options)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-        let deleted_item: Option<Item>;
-
-        if let Some(cond) = condition {
-            let existing_doc = coll
-                .find_one(key_filter.clone())
-                .session(&mut session)
+        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+            session
+                .start_transaction()
+                .with_options(tx_options.clone())
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            if let Some(ref existing) = existing_doc {
-                let existing_item = document_to_item(existing)?;
-                let passed = expression::evaluate_condition(cond, &existing_item, maps)
-                    .map_err(|e| StorageError::Validation(e.to_string()))?;
-                if !passed {
-                    let _ = session.abort_transaction().await;
-                    return Err(StorageError::ConditionFailed(Some(existing_item)));
+            let attempt_res: Result<Option<Item>, TxErr> = async {
+                let deleted_item: Option<Item>;
+
+                if let Some(cond) = condition {
+                    let existing_doc = coll
+                        .find_one(key_filter.clone())
+                        .session(&mut session)
+                        .await
+                        .map_err(TxErr::from)?;
+
+                    if let Some(ref existing) = existing_doc {
+                        let existing_item = document_to_item(existing)?;
+                        let passed = expression::evaluate_condition(cond, &existing_item, maps)
+                            .map_err(|e| TxErr::Fatal(StorageError::Validation(e.to_string())))?;
+                        if !passed {
+                            return Err(TxErr::Fatal(StorageError::ConditionFailed(Some(
+                                existing_item,
+                            ))));
+                        }
+                        coll.delete_one(key_filter.clone())
+                            .session(&mut session)
+                            .await
+                            .map_err(TxErr::from)?;
+                        deleted_item = Some(existing_item);
+                    } else {
+                        let empty = std::collections::BTreeMap::new();
+                        let passed = expression::evaluate_condition(cond, &empty, maps)
+                            .map_err(|e| TxErr::Fatal(StorageError::Validation(e.to_string())))?;
+                        if !passed {
+                            return Err(TxErr::Fatal(StorageError::ConditionFailed(None)));
+                        }
+                        deleted_item = None;
+                    }
+                } else {
+                    let old_doc = coll
+                        .find_one_and_delete(key_filter.clone())
+                        .session(&mut session)
+                        .await
+                        .map_err(TxErr::from)?;
+                    deleted_item = old_doc.as_ref().map(document_to_item).transpose()?;
                 }
-                coll.delete_one(key_filter)
-                    .session(&mut session)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                deleted_item = Some(existing_item);
-            } else {
-                let empty = std::collections::BTreeMap::new();
-                let passed = expression::evaluate_condition(cond, &empty, maps)
-                    .map_err(|e| StorageError::Validation(e.to_string()))?;
-                if !passed {
-                    let _ = session.abort_transaction().await;
-                    return Err(StorageError::ConditionFailed(None));
+
+                if deleted_item.is_some() {
+                    self.sync_indexes_in_session(
+                        key_info,
+                        deleted_item.as_ref(),
+                        None,
+                        &mut session,
+                    )
+                    .await?;
                 }
-                deleted_item = None;
+
+                if let Some(capture) = stream {
+                    self.write_stream_inline_in_session(
+                        key_info,
+                        capture,
+                        deleted_item.as_ref(),
+                        None,
+                        &mut session,
+                    )
+                    .await?;
+                }
+
+                Ok(if return_old { deleted_item } else { None })
             }
-        } else {
-            let old_doc = coll
-                .find_one_and_delete(key_filter)
-                .session(&mut session)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            deleted_item = old_doc.as_ref().map(document_to_item).transpose()?;
+            .await;
+
+            match attempt_res {
+                Ok(return_val) => match session.commit_transaction().await {
+                    Ok(()) => return Ok(return_val),
+                    Err(e) if is_transient_write_conflict(&e) => {
+                        backoff_sleep(attempt).await;
+                        continue;
+                    }
+                    Err(e) => return Err(StorageError::Internal(e.to_string())),
+                },
+                Err(TxErr::Transient) => {
+                    let _ = session.abort_transaction().await;
+                    backoff_sleep(attempt).await;
+                    continue;
+                }
+                Err(TxErr::Fatal(e)) => {
+                    let _ = session.abort_transaction().await;
+                    return Err(e);
+                }
+            }
         }
 
-        // Sync GSI collections within the transaction
-        if deleted_item.is_some() {
-            self.sync_indexes_in_session(key_info, deleted_item.as_ref(), None, &mut session)
-                .await?;
-        }
-
-        // Write stream record within the transaction
-        if let Some(capture) = stream {
-            self.write_stream_inline_in_session(
-                key_info,
-                capture,
-                deleted_item.as_ref(),
-                None,
-                &mut session,
-            )
-            .await?;
-        }
-
-        session
-            .commit_transaction()
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-        Ok(if return_old { deleted_item } else { None })
+        Err(StorageError::Internal(
+            "DeleteItem: too many concurrent write conflicts, giving up".to_owned(),
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -591,151 +647,170 @@ impl MongoEngine {
             )
             .build();
 
-        for _attempt in 0..50 {
+        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
             session
                 .start_transaction()
                 .with_options(tx_options.clone())
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            let existing_doc = coll
-                .find_one(key_filter.clone())
-                .session(&mut session)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            // Sentinel returned by the attempt body to signal "the
+            // OCC version guard didn't match; retry from a fresh
+            // read." Distinct from TxErr::Transient because it isn't
+            // a mongo-side conflict — the whole snapshot succeeded,
+            // we just lost the CAS race.
+            struct StaleVersion;
+            #[allow(clippy::large_enum_variant)]
+            enum AttemptOk {
+                Committed(Option<Item>, Option<Item>),
+                Stale,
+            }
 
-            let current_version = existing_doc
-                .as_ref()
-                .and_then(|d| d.get_i64("_v").ok())
-                .unwrap_or(0);
+            let attempt_res: Result<AttemptOk, TxErr> = async {
+                let existing_doc = coll
+                    .find_one(key_filter.clone())
+                    .session(&mut session)
+                    .await
+                    .map_err(TxErr::from)?;
 
-            let existing_item = if let Some(doc) = existing_doc.as_ref() {
-                document_to_item(doc)?
-            } else {
-                key.clone()
-            };
+                let current_version = existing_doc
+                    .as_ref()
+                    .and_then(|d| d.get_i64("_v").ok())
+                    .unwrap_or(0);
 
-            if let Some(cond) = condition {
-                let eval_item = if existing_doc.is_some() {
-                    &existing_item
+                let existing_item = if let Some(doc) = existing_doc.as_ref() {
+                    document_to_item(doc)?
                 } else {
-                    &std::collections::BTreeMap::new()
+                    key.clone()
                 };
-                let passed = expression::evaluate_condition(cond, eval_item, maps)
-                    .map_err(|e| StorageError::Validation(e.to_string()))?;
-                if !passed {
-                    let _ = session.abort_transaction().await;
-                    return Err(StorageError::ConditionFailed(if existing_doc.is_some() {
-                        Some(existing_item.clone())
+
+                if let Some(cond) = condition {
+                    let eval_item = if existing_doc.is_some() {
+                        &existing_item
                     } else {
-                        None
-                    }));
+                        &std::collections::BTreeMap::new()
+                    };
+                    let passed = expression::evaluate_condition(cond, eval_item, maps)
+                        .map_err(|e| TxErr::Fatal(StorageError::Validation(e.to_string())))?;
+                    if !passed {
+                        return Err(TxErr::Fatal(StorageError::ConditionFailed(
+                            if existing_doc.is_some() {
+                                Some(existing_item.clone())
+                            } else {
+                                None
+                            },
+                        )));
+                    }
                 }
-            }
 
-            // The pre-image is required for two independent reasons:
-            // (a) surfacing it to the caller (ReturnValues=ALL_OLD or
-            // stream capture) and (b) computing the GSI-key delta so
-            // stale index rows can be deleted when the update changes
-            // a GSI-key attribute (§2.2 in RFC-0003).
-            //
-            // Historically we only tracked (a). That left the fast
-            // path — no ReturnValues + no stream — running
-            // sync_indexes_in_session with old_item=None, so the
-            // "delete old entry" branch never fired and updates that
-            // moved an item between GSI-key values left the old entry
-            // orphaned. Always compute the pre-image on the slow path
-            // — we already read `existing_doc` for the version guard,
-            // so the additional cost is a clone.
-            //
-            // When existing_doc is None, `existing_item` is a fabricated
-            // key-only stub used only to seed apply_update; the stream
-            // path must not see it (else INSERT looks like MODIFY, §5.4).
-            let pre_image = existing_doc.as_ref().map(|_| existing_item.clone());
-            let old_item_for_stream = if return_old || stream.is_some() {
-                pre_image.clone()
-            } else {
-                None
-            };
-
-            let mut new_item = existing_item;
-            expression::apply_update(actions, &mut new_item, maps)
-                .map_err(|e| StorageError::Validation(e.to_string()))?;
-
-            let mut new_doc = item_to_document(
-                &new_item,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )?;
-            let new_version = current_version + 1;
-            new_doc.insert("_v", new_version);
-
-            if existing_doc.is_some() {
-                let mut versioned_filter = key_filter.clone();
-                if current_version == 0 {
-                    versioned_filter.insert("_v", doc! { "$not": { "$gt": 0_i64 } });
+                let pre_image = existing_doc.as_ref().map(|_| existing_item.clone());
+                let old_item_for_stream = if return_old || stream.is_some() {
+                    pre_image.clone()
                 } else {
-                    versioned_filter.insert("_v", current_version);
+                    None
+                };
+
+                let mut new_item = existing_item;
+                expression::apply_update(actions, &mut new_item, maps)
+                    .map_err(|e| TxErr::Fatal(StorageError::Validation(e.to_string())))?;
+
+                let mut new_doc = item_to_document(
+                    &new_item,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                )?;
+                let new_version = current_version + 1;
+                new_doc.insert("_v", new_version);
+
+                if existing_doc.is_some() {
+                    let mut versioned_filter = key_filter.clone();
+                    if current_version == 0 {
+                        versioned_filter.insert("_v", doc! { "$not": { "$gt": 0_i64 } });
+                    } else {
+                        versioned_filter.insert("_v", current_version);
+                    }
+                    let result = coll
+                        .replace_one(versioned_filter, new_doc)
+                        .session(&mut session)
+                        .await
+                        .map_err(TxErr::from)?;
+
+                    if result.matched_count == 0 {
+                        // OCC CAS lost: someone else bumped _v after
+                        // our find_one. Not a mongo conflict — the
+                        // snapshot txn succeeded, we just have a
+                        // stale read. Signal retry.
+                        let _ = StaleVersion;
+                        return Ok(AttemptOk::Stale);
+                    }
+                } else {
+                    let opts = mongodb::options::ReplaceOptions::builder()
+                        .upsert(true)
+                        .build();
+                    coll.replace_one(key_filter.clone(), new_doc)
+                        .with_options(opts)
+                        .session(&mut session)
+                        .await
+                        .map_err(TxErr::from)?;
                 }
-                let result = coll
-                    .replace_one(versioned_filter, new_doc)
-                    .session(&mut session)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-                if result.matched_count == 0 {
-                    let _ = session.abort_transaction().await;
-                    let base_us = 50u64.saturating_mul(1u64 << _attempt.min(8));
-                    let jitter = rand::random_range(0..=base_us);
-                    tokio::time::sleep(std::time::Duration::from_micros(jitter)).await;
-                    continue;
-                }
-            } else {
-                let opts = mongodb::options::ReplaceOptions::builder()
-                    .upsert(true)
-                    .build();
-                coll.replace_one(key_filter.clone(), new_doc)
-                    .with_options(opts)
-                    .session(&mut session)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-            }
-
-            // Sync GSI collections within the transaction — pass the
-            // true pre-image so index rows for moved GSI-key values
-            // can be deleted, not just the caller-visible old_item.
-            self.sync_indexes_in_session(
-                key_info,
-                pre_image.as_ref(),
-                Some(&new_item),
-                &mut session,
-            )
-            .await?;
-
-            // Write stream record within the transaction
-            if let Some(capture) = stream {
-                self.write_stream_inline_in_session(
+                self.sync_indexes_in_session(
                     key_info,
-                    capture,
-                    old_item_for_stream.as_ref(),
+                    pre_image.as_ref(),
                     Some(&new_item),
                     &mut session,
                 )
                 .await?;
+
+                if let Some(capture) = stream {
+                    self.write_stream_inline_in_session(
+                        key_info,
+                        capture,
+                        old_item_for_stream.as_ref(),
+                        Some(&new_item),
+                        &mut session,
+                    )
+                    .await?;
+                }
+
+                let old_item_result = if return_old {
+                    old_item_for_stream
+                } else {
+                    None
+                };
+                let new_item_result = if return_new { Some(new_item) } else { None };
+                Ok(AttemptOk::Committed(old_item_result, new_item_result))
             }
+            .await;
 
-            session
-                .commit_transaction()
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            let old_item_result = if return_old { old_item_for_stream } else { None };
-            let new_item_result = if return_new { Some(new_item) } else { None };
-            return Ok((old_item_result, new_item_result));
+            match attempt_res {
+                Ok(AttemptOk::Committed(old, new)) => match session.commit_transaction().await {
+                    Ok(()) => return Ok((old, new)),
+                    Err(e) if is_transient_write_conflict(&e) => {
+                        backoff_sleep(attempt).await;
+                        continue;
+                    }
+                    Err(e) => return Err(StorageError::Internal(e.to_string())),
+                },
+                Ok(AttemptOk::Stale) => {
+                    let _ = session.abort_transaction().await;
+                    backoff_sleep(attempt).await;
+                    continue;
+                }
+                Err(TxErr::Transient) => {
+                    let _ = session.abort_transaction().await;
+                    backoff_sleep(attempt).await;
+                    continue;
+                }
+                Err(TxErr::Fatal(e)) => {
+                    let _ = session.abort_transaction().await;
+                    return Err(e);
+                }
+            }
         }
 
         Err(StorageError::Internal(
-            "UpdateItem: too many version conflicts, giving up".to_owned(),
+            "UpdateItem: too many concurrent write conflicts, giving up".to_owned(),
         ))
     }
 
@@ -1798,7 +1873,6 @@ impl MongoEngine {
         idempotency: Option<IdempotencyKey<'_>>,
     ) -> Result<(), StorageError> {
         use extenddb_core::types::CancellationReason;
-        use extenddb_core::validation;
 
         // Start a MongoDB multi-document transaction
         let mut session = self
@@ -1816,108 +1890,173 @@ impl MongoEngine {
             )
             .build();
 
-        session
-            .start_transaction()
-            .with_options(tx_options)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        // Outcome of one attempt at running the whole idempotency check
+        // + op fan-out + commit. `Retry` means MongoDB aborted the txn
+        // as a transient conflict; the caller should re-run from the top.
+        enum AttemptOutcome {
+            Committed,
+            CanceledReasons(Vec<CancellationReason>),
+            Retry,
+        }
 
-        // Check idempotency token, scoped to the caller's account so that
-        // identical tokens from different accounts never collide.
-        if let Some(key) = idempotency {
-            let idem_coll = self.data_db.collection::<Document>("idempotency_tokens");
-            let existing = idem_coll
-                .find_one(doc! { "account_id": key.account_id, "token": key.token })
-                .session(&mut session)
+        // Rehydrate the `IdempotencyKey` per attempt from owned strings.
+        // The input struct holds `&str`s, so it cannot be moved across
+        // loop iterations. This keeps the retry loop lifetime-clean
+        // without asking upstream to change the trait signature.
+        let idem_owned = idempotency.map(|k| {
+            (
+                k.account_id.to_owned(),
+                k.token.to_owned(),
+                k.fingerprint.to_owned(),
+            )
+        });
+
+        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+            let idempotency = idem_owned.as_ref().map(|(a, t, f)| IdempotencyKey {
+                account_id: a.as_str(),
+                token: t.as_str(),
+                fingerprint: f.as_str(),
+            });
+            session
+                .start_transaction()
+                .with_options(tx_options.clone())
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            if let Some(existing_doc) = existing {
-                let stored_fp = existing_doc.get_str("fingerprint").unwrap_or_default();
-                if stored_fp == key.fingerprint {
-                    session
-                        .abort_transaction()
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    return Err(StorageError::IdempotentReplay);
-                }
-                session
-                    .abort_transaction()
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                return Err(StorageError::IdempotentMismatch);
-            }
-
-            // Store the token. A unique index on (account_id, token)
-            // catches the case where a concurrent request under snapshot
-            // isolation didn't see our pre-check but raced us to the
-            // insert. On E11000, abort our txn and resolve the winner
-            // by re-reading outside the session — same replay/mismatch
-            // logic as the pre-check path.
-            let insert_res = idem_coll
-                .insert_one(doc! {
-                    "account_id": key.account_id,
-                    "token": key.token,
-                    "fingerprint": key.fingerprint,
-                    "created_at": mongodb::bson::DateTime::now(),
-                })
-                .session(&mut session)
-                .await;
-            if let Err(e) = insert_res {
-                let is_dup = matches!(
-                    *e.kind,
-                    mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
-                        mongodb::error::WriteError { code: 11000, .. }
-                    ))
-                );
-                if is_dup {
-                    let _ = session.abort_transaction().await;
-                    let winner = idem_coll
+            let outcome: Result<AttemptOutcome, StorageError> = async {
+                // Check idempotency token, scoped to the caller's account
+                // so that identical tokens from different accounts never
+                // collide.
+                if let Some(key) = idempotency {
+                    let idem_coll = self.data_db.collection::<Document>("idempotency_tokens");
+                    let existing = match idem_coll
                         .find_one(doc! { "account_id": key.account_id, "token": key.token })
+                        .session(&mut session)
                         .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    return Err(
-                        match winner.as_ref().and_then(|d| d.get_str("fingerprint").ok()) {
-                            Some(fp) if fp == key.fingerprint => StorageError::IdempotentReplay,
-                            _ => StorageError::IdempotentMismatch,
-                        },
-                    );
+                    {
+                        Ok(v) => v,
+                        Err(e) if is_transient_write_conflict(&e) => {
+                            return Ok(AttemptOutcome::Retry);
+                        }
+                        Err(e) => return Err(StorageError::Internal(e.to_string())),
+                    };
+
+                    if let Some(existing_doc) = existing {
+                        let stored_fp = existing_doc.get_str("fingerprint").unwrap_or_default();
+                        return Err(if stored_fp == key.fingerprint {
+                            StorageError::IdempotentReplay
+                        } else {
+                            StorageError::IdempotentMismatch
+                        });
+                    }
+
+                    // Store the token. A unique index on (account_id, token)
+                    // catches the case where a concurrent request under
+                    // snapshot isolation didn't see our pre-check but raced
+                    // us to the insert. On E11000, resolve the winner by
+                    // re-reading outside the session — same replay/mismatch
+                    // logic as the pre-check path.
+                    let insert_res = idem_coll
+                        .insert_one(doc! {
+                            "account_id": key.account_id,
+                            "token": key.token,
+                            "fingerprint": key.fingerprint,
+                            "created_at": mongodb::bson::DateTime::now(),
+                        })
+                        .session(&mut session)
+                        .await;
+                    if let Err(e) = insert_res {
+                        if is_duplicate_key(&e) {
+                            let winner = idem_coll
+                                .find_one(doc! {
+                                    "account_id": key.account_id,
+                                    "token": key.token,
+                                })
+                                .await
+                                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                            return Err(
+                                match winner.as_ref().and_then(|d| d.get_str("fingerprint").ok()) {
+                                    Some(fp) if fp == key.fingerprint => {
+                                        StorageError::IdempotentReplay
+                                    }
+                                    _ => StorageError::IdempotentMismatch,
+                                },
+                            );
+                        }
+                        if is_transient_write_conflict(&e) {
+                            return Ok(AttemptOutcome::Retry);
+                        }
+                        return Err(StorageError::Internal(e.to_string()));
+                    }
                 }
-                return Err(StorageError::Internal(e.to_string()));
+
+                let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());
+                let mut any_failed = false;
+
+                for op in ops {
+                    match self
+                        .execute_transact_write_op_in_session(op, &mut session)
+                        .await
+                    {
+                        Ok(()) => reasons.push(CancellationReason::none()),
+                        Err(TransactOpError::Cancel(r)) => {
+                            any_failed = true;
+                            reasons.push(r);
+                        }
+                        Err(TransactOpError::Transient) => {
+                            return Ok(AttemptOutcome::Retry);
+                        }
+                        Err(TransactOpError::Storage(e)) => return Err(e),
+                    }
+                }
+
+                if any_failed {
+                    return Ok(AttemptOutcome::CanceledReasons(reasons));
+                }
+                Ok(AttemptOutcome::Committed)
             }
-        }
+            .await;
 
-        let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());
-        let mut any_failed = false;
-
-        for op in ops {
-            let reason = self
-                .execute_transact_write_op_in_session(op, &mut session)
-                .await;
-            match reason {
-                Ok(()) => reasons.push(CancellationReason::none()),
-                Err(TransactOpError::Cancel(r)) => {
-                    any_failed = true;
-                    reasons.push(r);
+            match outcome {
+                Ok(AttemptOutcome::Committed) => match session.commit_transaction().await {
+                    Ok(()) => return Ok(()),
+                    Err(e) if is_transient_write_conflict(&e) => {
+                        backoff_sleep(attempt).await;
+                        continue;
+                    }
+                    Err(e) => return Err(StorageError::Internal(e.to_string())),
+                },
+                Ok(AttemptOutcome::CanceledReasons(reasons)) => {
+                    let _ = session.abort_transaction().await;
+                    return Err(StorageError::TransactionCanceled(reasons));
                 }
-                Err(TransactOpError::Storage(e)) => {
+                Ok(AttemptOutcome::Retry) => {
+                    let _ = session.abort_transaction().await;
+                    backoff_sleep(attempt).await;
+                    continue;
+                }
+                Err(e) => {
                     let _ = session.abort_transaction().await;
                     return Err(e);
                 }
             }
         }
 
-        if any_failed {
-            let _ = session.abort_transaction().await;
-            return Err(StorageError::TransactionCanceled(reasons));
-        }
-
-        session
-            .commit_transaction()
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-        Ok(())
+        // Exhausted retries under sustained contention. Surface as a
+        // canceled transaction with a synthetic per-op TransactionConflict
+        // reason so wire consumers see the DDB-canonical error string
+        // instead of a bare HTTP 500. The engine maps StorageError::
+        // TransactionCanceled to TransactionCanceledException; the
+        // reason codes are echoed back in the message.
+        let reasons = ops
+            .iter()
+            .map(|_| CancellationReason {
+                code: "TransactionConflict".to_owned(),
+                message: Some("Transaction is ongoing for the item".to_owned()),
+                item: None,
+            })
+            .collect();
+        Err(StorageError::TransactionCanceled(reasons))
     }
 
     async fn execute_transact_write_op_in_session(
@@ -1961,7 +2100,7 @@ impl MongoEngine {
                     .find_one(key_filter.clone())
                     .session(&mut *session)
                     .await
-                    .map_err(|e| TransactOpError::Storage(StorageError::Internal(e.to_string())))?;
+                    .map_err(TransactOpError::from)?;
 
                 let existing_item = if let Some(doc) = existing_doc.as_ref() {
                     Some(document_to_item(doc).map_err(TransactOpError::Storage)?)
@@ -1998,7 +2137,7 @@ impl MongoEngine {
                     .with_options(opts)
                     .session(&mut *session)
                     .await
-                    .map_err(|e| TransactOpError::Storage(StorageError::Internal(e.to_string())))?;
+                    .map_err(TransactOpError::from)?;
 
                 // Propagate to secondary indexes and the stream within the
                 // same transaction session — otherwise a transactional write
@@ -2057,7 +2196,7 @@ impl MongoEngine {
                     .find_one(key_filter.clone())
                     .session(&mut *session)
                     .await
-                    .map_err(|e| TransactOpError::Storage(StorageError::Internal(e.to_string())))?;
+                    .map_err(TransactOpError::from)?;
 
                 let existing_item = if let Some(doc) = existing_doc.as_ref() {
                     Some(document_to_item(doc).map_err(TransactOpError::Storage)?)
@@ -2086,7 +2225,7 @@ impl MongoEngine {
                 coll.delete_one(key_filter)
                     .session(&mut *session)
                     .await
-                    .map_err(|e| TransactOpError::Storage(StorageError::Internal(e.to_string())))?;
+                    .map_err(TransactOpError::from)?;
 
                 // Propagate to secondary indexes and the stream within the
                 // same transaction session.
@@ -2140,7 +2279,7 @@ impl MongoEngine {
                     .find_one(key_filter.clone())
                     .session(&mut *session)
                     .await
-                    .map_err(|e| TransactOpError::Storage(StorageError::Internal(e.to_string())))?;
+                    .map_err(TransactOpError::from)?;
 
                 let existing_item = if let Some(doc) = existing_doc.as_ref() {
                     Some(document_to_item(doc).map_err(TransactOpError::Storage)?)
@@ -2189,7 +2328,7 @@ impl MongoEngine {
                     .with_options(opts)
                     .session(&mut *session)
                     .await
-                    .map_err(|e| TransactOpError::Storage(StorageError::Internal(e.to_string())))?;
+                    .map_err(TransactOpError::from)?;
 
                 // Propagate to secondary indexes and the stream within the
                 // same transaction session. When the update creates the
@@ -2249,7 +2388,7 @@ impl MongoEngine {
                     .find_one(key_filter)
                     .session(&mut *session)
                     .await
-                    .map_err(|e| TransactOpError::Storage(StorageError::Internal(e.to_string())))?;
+                    .map_err(TransactOpError::from)?;
 
                 let existing_item = if let Some(doc) = existing_doc.as_ref() {
                     Some(document_to_item(doc).map_err(TransactOpError::Storage)?)
@@ -2475,11 +2614,109 @@ impl MongoEngine {
     }
 }
 
+// ── Contention / retry helpers ──────────────────────────────────────────
+
+/// Maximum number of times to retry a write that MongoDB aborted as a
+/// transient conflict. Small enough that we don't lock a partition on
+/// sustained hot-key contention; large enough to absorb ordinary
+/// snapshot-isolation aborts. Matches the OCC retry ceiling elsewhere
+/// in this file.
+const TRANSIENT_RETRY_ATTEMPTS: u32 = 50;
+
+/// Error signal used inside per-attempt transaction bodies. Lets the
+/// body use `?` for control flow while distinguishing "retry this
+/// whole transaction" from "return this error to the caller."
+enum TxErr {
+    Transient,
+    Fatal(StorageError),
+}
+
+impl From<mongodb::error::Error> for TxErr {
+    fn from(e: mongodb::error::Error) -> Self {
+        if is_transient_write_conflict(&e) {
+            TxErr::Transient
+        } else {
+            TxErr::Fatal(StorageError::Internal(e.to_string()))
+        }
+    }
+}
+
+impl From<StorageError> for TxErr {
+    fn from(e: StorageError) -> Self {
+        TxErr::Fatal(e)
+    }
+}
+
+/// Detect the family of errors MongoDB uses to signal "your write lost
+/// to another concurrent writer under snapshot isolation; retry."
+///
+/// The transient-transaction label is set on any error that a
+/// `withTransaction` client would automatically retry. In addition to
+/// abstract labels the raw `WriteConflict` (code 112) still shows up
+/// when a same-document collision surfaces on the write itself rather
+/// than at commit — check that too. RFC-0003 §4.1 / §4.3.
+fn is_transient_write_conflict(e: &mongodb::error::Error) -> bool {
+    if e.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR)
+        || e.contains_label(mongodb::error::UNKNOWN_TRANSACTION_COMMIT_RESULT)
+    {
+        return true;
+    }
+    matches!(*e.kind, mongodb::error::ErrorKind::Command(ref c) if c.code == 112)
+        || matches!(
+            *e.kind,
+            mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
+                mongodb::error::WriteError { code: 112, .. }
+            ))
+        )
+}
+
+/// Detect a duplicate-key error (E11000, code 11000). Used at
+/// conditional-insert sites — a duplicate is the manifestation of a
+/// conditional-put race, so it must be surfaced as
+/// `ConditionalCheckFailedException` rather than a 500.
+fn is_duplicate_key(e: &mongodb::error::Error) -> bool {
+    matches!(
+        *e.kind,
+        mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
+            mongodb::error::WriteError { code: 11000, .. }
+        ))
+    )
+}
+
+/// Exponential-backoff sleep with random jitter. Used inside the OCC
+/// / WriteConflict retry loops so competing writers don't lock-step
+/// re-retry into the same conflict window.
+async fn backoff_sleep(attempt: u32) {
+    let base_us = 50u64.saturating_mul(1u64 << attempt.min(8));
+    let jitter = rand::random_range(0..=base_us);
+    tokio::time::sleep(std::time::Duration::from_micros(jitter)).await;
+}
+
 // ── Transaction helper types ──────────────────────────────────────────
 
 enum TransactOpError {
     Cancel(extenddb_core::types::CancellationReason),
     Storage(StorageError),
+    /// MongoDB aborted the transaction as a transient conflict —
+    /// the whole transact_write_items txn should be retried from
+    /// the top.
+    Transient,
+}
+
+impl From<mongodb::error::Error> for TransactOpError {
+    fn from(e: mongodb::error::Error) -> Self {
+        if is_transient_write_conflict(&e) {
+            TransactOpError::Transient
+        } else {
+            TransactOpError::Storage(StorageError::Internal(e.to_string()))
+        }
+    }
+}
+
+impl From<StorageError> for TransactOpError {
+    fn from(e: StorageError) -> Self {
+        TransactOpError::Storage(e)
+    }
 }
 
 /// Choose the `Item` value to include in a `CancellationReason` when a
