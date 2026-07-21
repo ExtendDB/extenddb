@@ -878,7 +878,53 @@ impl MongoEngine {
             ) && let Some(sk_val) = start_key.get(sk_name)
             {
                 let sk_bson = sk_to_bson(sk_val, sk_type)?;
-                filter.insert(sk_f, doc! { cmp_gt: sk_bson });
+                // Merge the resume bound into any existing sort-key
+                // predicate rather than replacing it. Naive
+                // `filter.insert(sk_f, {$gt: cursor})` drops the
+                // caller's original range/prefix/eq bound and returns
+                // items outside it on page 2+ (RFC-0003 §7.2).
+                let cursor_bound = doc! { cmp_gt: sk_bson };
+                match filter.remove(sk_f) {
+                    None => {
+                        filter.insert(sk_f, cursor_bound);
+                    }
+                    Some(bson::Bson::Document(mut existing)) => {
+                        // Existing predicate already uses operators
+                        // ($gte/$lte/$lt/...); merge ours into the
+                        // same operator map. If the caller and the
+                        // cursor share an operator (both $gt on a
+                        // forward page whose caller filtered $gt),
+                        // overwriting with the cursor is correct —
+                        // the cursor's bound is always strictly
+                        // beyond the caller's for that direction.
+                        for (k, v) in cursor_bound {
+                            existing.insert(k, v);
+                        }
+                        filter.insert(sk_f, existing);
+                    }
+                    Some(scalar) => {
+                        // Caller's predicate was an equality
+                        // (`sk = X`). Combine with the resume bound
+                        // under $and — a scalar sk_f binding can't
+                        // hold a $gt sibling.
+                        let clauses = bson::bson!([
+                            { sk_f: scalar },
+                            { sk_f: cursor_bound },
+                        ]);
+                        if let Some(existing_and) = filter.remove("$and") {
+                            let mut combined = match existing_and {
+                                bson::Bson::Array(a) => a,
+                                other => vec![other],
+                            };
+                            if let bson::Bson::Array(new) = clauses {
+                                combined.extend(new);
+                            }
+                            filter.insert("$and", combined);
+                        } else {
+                            filter.insert("$and", clauses);
+                        }
+                    }
+                }
             }
         }
 
