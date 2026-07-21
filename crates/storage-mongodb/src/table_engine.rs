@@ -11,8 +11,8 @@ use mongodb::options::{Collation, CollationStrength, IndexOptions};
 use extenddb_core::types::{
     BillingMode, BillingModeSummary, CreateTableInput, DeleteTableInput, DescribeTableInput,
     GsiDescription, IndexInfo, IndexType, KeyType, ListTablesInput, ListTablesOutput,
-    LsiDescription, ProvisionedThroughputDescription, ScalarAttributeType, TableDescription,
-    TableKeyInfo, TableStatus, UpdateTableInput,
+    LsiDescription, OnDemandThroughput, ProvisionedThroughputDescription, ScalarAttributeType,
+    SseDescription, SseType, TableDescription, TableKeyInfo, TableStatus, UpdateTableInput,
 };
 use extenddb_storage::TableEngine;
 use extenddb_storage::error::StorageError;
@@ -164,6 +164,23 @@ impl MongoEngine {
             .as_ref()
             .map_or(bson::Bson::Null, |l| bson::Bson::String(l.clone()));
 
+        // Persist TableClass / SSESpecification / OnDemandThroughput on the
+        // catalog doc so DescribeTable can return TableClassSummary,
+        // SSEDescription, and OnDemandThroughput respectively. Mirrors the
+        // postgres backend at storage-postgres/src/create_table.rs:100-102.
+        let table_class_bson = input
+            .table_class
+            .as_deref()
+            .map_or(bson::Bson::Null, |tc| bson::Bson::String(tc.to_owned()));
+        let sse_spec_bson = input.sse_specification.as_ref().map_or_else(
+            || bson::Bson::Null,
+            |v| bson::to_bson(v).unwrap_or(bson::Bson::Null),
+        );
+        let on_demand_bson = input.on_demand_throughput.as_ref().map_or_else(
+            || bson::Bson::Null,
+            |v| bson::to_bson(v).unwrap_or(bson::Bson::Null),
+        );
+
         let table_doc = doc! {
             "_id": { "account_id": account_id, "table_name": &input.table_name },
             "key_schema": key_schema_bson,
@@ -180,6 +197,9 @@ impl MongoEngine {
             "deletion_protection_enabled": deletion_protection,
             "ttl_attribute": bson::Bson::Null,
             "stream_label": stream_label_bson,
+            "table_class": table_class_bson,
+            "sse_specification": sse_spec_bson,
+            "on_demand_throughput": on_demand_bson,
         };
 
         let tables_coll = self.catalog_db.collection::<Document>("tables");
@@ -389,6 +409,33 @@ impl MongoEngine {
             }
         }
 
+        // Derive the SSEDescription from the SSESpecification, mirroring the
+        // postgres backend (table_helpers.rs:329-346). The specification's
+        // `Enabled: true` becomes a KMS-status ENABLED description with a
+        // synthesized ARN. Anything else omits the field.
+        let sse_description = input.sse_specification.as_ref().and_then(|spec| {
+            let enabled = spec
+                .get("Enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if enabled {
+                Some(SseDescription {
+                    status: "ENABLED".to_owned(),
+                    sse_type: Some(SseType::KMS),
+                    kms_master_key_arn: Some(format!(
+                        "arn:aws:kms:{}:{}:key/default",
+                        self.region, account_id
+                    )),
+                })
+            } else {
+                None
+            }
+        });
+        let table_class_summary = input
+            .table_class
+            .as_deref()
+            .map(|tc| serde_json::json!({ "TableClass": tc }));
+
         Ok(TableDescription {
             table_name: input.table_name,
             key_schema: input.key_schema,
@@ -407,9 +454,9 @@ impl MongoEngine {
             latest_stream_arn: stream_arn_opt,
             latest_stream_label: stream_label_opt,
             deletion_protection_enabled: deletion_protection,
-            sse_description: None,
-            table_class_summary: None,
-            on_demand_throughput: None,
+            sse_description,
+            table_class_summary,
+            on_demand_throughput: input.on_demand_throughput,
         })
     }
 
@@ -608,6 +655,15 @@ impl MongoEngine {
 
         if let Some(dp) = input.deletion_protection_enabled {
             update_doc.insert("deletion_protection_enabled", dp);
+        }
+
+        if let Some(tc) = &input.table_class {
+            update_doc.insert("table_class", tc);
+        }
+
+        if let Some(odt) = &input.on_demand_throughput {
+            let odt_bson = bson::to_bson(odt).map_err(|e| StorageError::Internal(e.to_string()))?;
+            update_doc.insert("on_demand_throughput", odt_bson);
         }
 
         if let Some(ss) = &input.stream_specification {
@@ -1045,6 +1101,36 @@ impl MongoEngine {
             .as_ref()
             .map(|label| stream_arn(&self.region, account_id, &table_name, label));
 
+        // TableClass / SSEDescription / OnDemandThroughput — read back the
+        // fields persisted at CreateTable time. Same shape as postgres'
+        // table_helpers.rs:329-353.
+        let table_class_summary = doc
+            .get_str("table_class")
+            .ok()
+            .map(|tc| serde_json::json!({ "TableClass": tc }));
+        let sse_description = doc.get("sse_specification").and_then(|b| {
+            let spec: serde_json::Value = bson::from_bson(b.clone()).ok()?;
+            let enabled = spec
+                .get("Enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if enabled {
+                Some(SseDescription {
+                    status: "ENABLED".to_owned(),
+                    sse_type: Some(SseType::KMS),
+                    kms_master_key_arn: Some(format!(
+                        "arn:aws:kms:{}:{}:key/default",
+                        self.region, account_id
+                    )),
+                })
+            } else {
+                None
+            }
+        });
+        let on_demand_throughput: Option<OnDemandThroughput> = doc
+            .get("on_demand_throughput")
+            .and_then(|b| bson::from_bson(b.clone()).ok());
+
         Ok(TableDescription {
             table_name,
             key_schema,
@@ -1063,9 +1149,9 @@ impl MongoEngine {
             latest_stream_arn: stream_arn_opt,
             latest_stream_label: stream_label,
             deletion_protection_enabled: deletion_protection,
-            sse_description: None,
-            table_class_summary: None,
-            on_demand_throughput: None,
+            sse_description,
+            table_class_summary,
+            on_demand_throughput,
         })
     }
 }
