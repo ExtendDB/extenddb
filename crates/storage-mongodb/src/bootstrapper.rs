@@ -102,6 +102,24 @@ impl Bootstrapper for MongoBootstrapper {
             .await
             .map_err(|e| OpError::Internal(format!("Failed to create TTL index: {e}")))?;
 
+        // stream_shards: unique index on shard_id so a subsequent init/
+        // recreate can never insert a duplicate shard document under the
+        // same shard_id. Combined with `table_id`-derived shard_ids
+        // (see stream_engine::build_shard_id) this rules out cross-tenant
+        // shard collisions structurally.
+        db.create_collection("stream_shards")
+            .await
+            .map_err(|e| OpError::Internal(format!("Failed to create stream_shards: {e}")))?;
+        db.collection::<Document>("stream_shards")
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! { "shard_id": 1 })
+                    .options(IndexOptions::builder().unique(true).build())
+                    .build(),
+            )
+            .await
+            .map_err(|e| OpError::Internal(format!("stream_shards shard_id index: {e}")))?;
+
         Ok(())
     }
 
