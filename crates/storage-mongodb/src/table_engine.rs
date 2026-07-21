@@ -557,6 +557,39 @@ impl MongoEngine {
 
         let tables_coll = self.catalog_db.collection::<Document>("tables");
 
+        // Reject ProvisionedThroughput when the effective billing mode is
+        // PAY_PER_REQUEST. The effective mode is the requested billing_mode
+        // when the request changes it, otherwise the table's current mode.
+        // Real DynamoDB returns "Neither ReadCapacityUnits nor WriteCapacityUnits
+        // can be specified when BillingMode is PAY_PER_REQUEST". Postgres does
+        // this same check under a FOR UPDATE row lock in update_table.rs; mongo
+        // reads the current billing_mode via find_one and relies on the fact
+        // that any concurrent billing-mode change would then be rejected by its
+        // own no-op check (not yet implemented — see R-8 followup).
+        if input.provisioned_throughput.is_some() {
+            let effective_ppr = match input.billing_mode {
+                Some(BillingMode::PayPerRequest) => true,
+                Some(BillingMode::Provisioned) => false,
+                None => {
+                    let table_doc = tables_coll
+                        .find_one(doc! {
+                            "_id": { "account_id": account_id, "table_name": &input.table_name },
+                        })
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    table_doc
+                        .and_then(|d| d.get_str("billing_mode").ok().map(str::to_owned))
+                        .as_deref()
+                        == Some("PAY_PER_REQUEST")
+                }
+            };
+            if effective_ppr {
+                return Err(StorageError::Validation(
+                    "One or more parameter values were invalid: Neither ReadCapacityUnits nor WriteCapacityUnits can be specified when BillingMode is PAY_PER_REQUEST".to_owned(),
+                ));
+            }
+        }
+
         // Build update document
         let mut update_doc = Document::new();
 
