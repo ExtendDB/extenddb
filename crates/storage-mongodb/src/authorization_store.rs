@@ -240,22 +240,22 @@ impl AuthorizationStore for MongoCatalogStore {
             });
 
             let mut session_tags = Vec::new();
-            if let Some(tags_bson) = session_doc.get("session_tags") {
-                if let Ok(tags_val) = bson::from_bson::<serde_json::Value>(tags_bson.clone()) {
-                    if let Some(arr) = tags_val.as_array() {
-                        for tag in arr {
-                            if let (Some(k), Some(v)) = (
-                                tag.get("Key").and_then(|k| k.as_str()),
-                                tag.get("Value").and_then(|v| v.as_str()),
-                            ) {
-                                session_tags.push((k.to_owned(), v.to_owned()));
-                            }
+            if let Some(tags_bson) = session_doc.get("session_tags")
+                && let Ok(tags_val) = bson::from_bson::<serde_json::Value>(tags_bson.clone())
+            {
+                if let Some(arr) = tags_val.as_array() {
+                    for tag in arr {
+                        if let (Some(k), Some(v)) = (
+                            tag.get("Key").and_then(|k| k.as_str()),
+                            tag.get("Value").and_then(|v| v.as_str()),
+                        ) {
+                            session_tags.push((k.to_owned(), v.to_owned()));
                         }
-                    } else if let Some(obj) = tags_val.as_object() {
-                        for (k, v) in obj {
-                            if let Some(v_str) = v.as_str() {
-                                session_tags.push((k.clone(), v_str.to_owned()));
-                            }
+                    }
+                } else if let Some(obj) = tags_val.as_object() {
+                    for (k, v) in obj {
+                        if let Some(v_str) = v.as_str() {
+                            session_tags.push((k.clone(), v_str.to_owned()));
                         }
                     }
                 }

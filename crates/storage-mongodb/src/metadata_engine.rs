@@ -421,17 +421,15 @@ impl MetadataEngine for MongoEngine {
                     break;
                 }
                 // Parse the TTL value and check if expired
-                if let Ok(item_data) = doc.get_document("item_data") {
-                    if let Ok(ttl_obj) = item_data.get_document(&ttl_attribute) {
-                        if let Ok(n_str) = ttl_obj.get_str("N") {
-                            if let Ok(ttl_val) = n_str.parse::<i64>() {
-                                if ttl_val >= 1 && ttl_val <= now_epoch {
-                                    let item = document_to_item(&doc)?;
-                                    items.push(item);
-                                }
-                            }
-                        }
-                    }
+                if let Ok(item_data) = doc.get_document("item_data")
+                    && let Ok(ttl_obj) = item_data.get_document(&ttl_attribute)
+                    && let Ok(n_str) = ttl_obj.get_str("N")
+                    && let Ok(ttl_val) = n_str.parse::<i64>()
+                    && ttl_val >= 1
+                    && ttl_val <= now_epoch
+                {
+                    let item = document_to_item(&doc)?;
+                    items.push(item);
                 }
             }
             Ok(items)
