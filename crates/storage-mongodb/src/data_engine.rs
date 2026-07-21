@@ -632,7 +632,12 @@ impl MongoEngine {
             }
 
             let need_old = return_old || stream.is_some();
-            let old_item = if need_old {
+            // Only surface a pre-image when the item actually existed.
+            // When existing_doc is None, `existing_item` is a fabricated
+            // key-only stub used to seed apply_update — feeding it to
+            // stream/ReturnValues would emit MODIFY with a phantom
+            // OldImage instead of INSERT (§5.4 in RFC-0003).
+            let old_item = if need_old && existing_doc.is_some() {
                 Some(existing_item.clone())
             } else {
                 None
