@@ -1613,7 +1613,19 @@ impl MongoEngine {
                     &key_info.key_schema,
                     &key_info.attribute_definitions,
                 )?;
-                let _ = idx_coll.delete_one(old_filter).session(&mut *session).await;
+                // Propagate the error rather than swallowing it — RFC-0003
+                // §2.2 requires deleting the old entry when a write changes
+                // or removes a GSI key attribute, and RFC-0003 §9.1 forbids
+                // silent side-effect drops. A transient error here would
+                // leave the stale index row live under the old GSI-key
+                // value even though the base item no longer has it, and
+                // subsequent queries would return the stale projection
+                // forever.
+                idx_coll
+                    .delete_one(old_filter)
+                    .session(&mut *session)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
             }
 
             if let Some(new) = new_item
