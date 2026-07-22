@@ -1255,20 +1255,6 @@ impl MongoEngine {
             }
         }
 
-        // Parallel scan segment filtering
-        // segment/total_segments use CRC32 hash of pk modulo total_segments
-        let apply_segment_filter = segment.is_some() && total_segments.is_some();
-
-        // Apply limit
-        let fetch_limit = limit.map(|l| {
-            let extra = l + 1;
-            if apply_segment_filter {
-                extra * total_segments.unwrap_or(1)
-            } else {
-                extra
-            }
-        });
-
         // Sort key. Index scans sort by (pk, sk?, base_pk, base_sk?) so
         // pagination is well-defined across items sharing index keys.
         // Base-table scans sort by _id (unique).
@@ -1290,27 +1276,45 @@ impl MongoEngine {
             doc! { "_id": 1 }
         };
 
+        // Lazy cursor iteration. The segment filter (CRC32 hash of pk
+        // mod total_segments) is applied per-item after fetching, so
+        // any hard server-side limit interacts badly with skew: with
+        // a modest hot-key concentration, a whole `(limit+1) *
+        // total_segments` window can land in one segment and leave
+        // the others empty, terminating the scan early with the
+        // remaining items silently dropped. RFC-0003 §7.3.
+        //
+        // Instead, stream the cursor and stop when either
+        //   (a) we have `limit + 1` in-segment items (so we know we
+        //       need a LEK for the next page), or
+        //   (b) the cursor is exhausted.
+        // mongo batches under the hood (~101 docs per network trip),
+        // so this is efficient without a hard limit — we consume at
+        // most one extra network batch beyond what we return.
         let opts = mongodb::options::FindOptions::builder()
             .sort(sort_doc)
-            .limit(fetch_limit)
             .build();
 
-        let cursor = coll
+        let mut cursor = coll
             .find(filter)
             .with_options(opts)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let docs: Vec<Document> = cursor
-            .try_collect()
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
         let mut items: Vec<Item> = Vec::new();
-        for doc in &docs {
-            let item = document_to_item(doc)?;
+        let target = limit.map(|l| {
+            #[allow(clippy::cast_sign_loss)]
+            let l = l as usize;
+            l + 1
+        });
 
-            // Apply segment filter if needed
+        while let Some(doc) = cursor
+            .try_next()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?
+        {
+            let item = document_to_item(&doc)?;
+
             if let (Some(seg), Some(total)) = (segment, total_segments) {
                 let pk_text = composite_pk_to_text(&item, &key_info.key_schema)?;
                 let hash = crc32fast::hash(pk_text.as_bytes());
@@ -1325,12 +1329,10 @@ impl MongoEngine {
 
             items.push(item);
 
-            // Check if we have enough items
-            if let Some(l) = limit {
-                #[allow(clippy::cast_sign_loss)]
-                if items.len() > l as usize {
-                    break;
-                }
+            if let Some(t) = target
+                && items.len() >= t
+            {
+                break;
             }
         }
 
