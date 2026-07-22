@@ -4,10 +4,7 @@
 //! `MongoDB` storage backend for extenddb.
 //!
 //! Implements the storage traits from `extenddb-storage` using `MongoDB`
-//! as the backing store. Phase 1 covers `TableEngine`, `DataEngine`,
-//! Bootstrapper, and `StorageConfig` with condition filter pushdown.
-
-#![allow(unused)]
+//! as the backing store.
 
 mod admin_store;
 mod authorization_store;
@@ -36,7 +33,6 @@ pub use credential_store::MongoCredentialStore;
 use std::sync::Arc;
 
 use extenddb_storage::error::StorageError;
-use futures::future::BoxFuture;
 
 // ============================================================================
 // OperationsEngineRegistration
@@ -122,7 +118,6 @@ inventory::submit! {
 // ServerComponentsRegistration
 // ============================================================================
 
-use extenddb_auth::BuiltinAuthProvider;
 use extenddb_storage::hooks::{ServerRuntimeHooks, WorkerContext};
 use extenddb_storage::server_components::{
     BackendError, ServerComponents, ServerComponentsRegistration,
@@ -240,7 +235,6 @@ pub struct MongoEngine {
     pub(crate) catalog_db: mongodb::Database,
     data_db: mongodb::Database,
     region: String,
-    max_connections: u32,
     /// Cache of `table_id` -> (`has_gsi`, insertion time). Avoids catalog
     /// queries on every write for tables with no GSIs. Entries older than
     /// [`GSI_CACHE_TTL`] are treated as misses and re-read from the catalog,
@@ -294,7 +288,6 @@ impl MongoEngine {
             catalog_db,
             data_db,
             region: region.to_owned(),
-            max_connections,
             gsi_cache: dashmap::DashMap::new(),
         })
     }

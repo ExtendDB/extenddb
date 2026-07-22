@@ -6,11 +6,11 @@
 use bson::{Document, doc};
 use futures::future::BoxFuture;
 use mongodb::IndexModel;
-use mongodb::options::{Collation, CollationStrength, IndexOptions};
+use mongodb::options::{Collation, IndexOptions};
 
 use extenddb_core::types::{
     AttributeDefinition, BillingMode, BillingModeSummary, CreateTableInput, DeleteTableInput,
-    DescribeTableInput, GsiDescription, IndexInfo, IndexType, KeySchemaElement, KeyType,
+    DescribeTableInput, GsiDescription, IndexInfo, IndexType, KeySchemaElement,
     ListTablesInput, ListTablesOutput, LsiDescription, OnDemandThroughput,
     ProvisionedThroughputDescription, ScalarAttributeType, SseDescription, SseType,
     TableDescription, TableKeyInfo, TableStatus, UpdateTableInput,

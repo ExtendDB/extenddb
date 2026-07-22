@@ -6,7 +6,6 @@
 use futures::TryStreamExt;
 use futures::future::BoxFuture;
 use mongodb::bson::{self, Document, doc};
-use mongodb::options::FindOptions;
 
 use extenddb_storage::authorization_store::{AuthorizationStore, SessionData};
 use extenddb_storage::management_store::{OpError, OpResult};
