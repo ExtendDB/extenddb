@@ -237,47 +237,28 @@ impl MongoEngine {
 }
 
 impl StreamEngine for MongoEngine {
+    /// Superseded by `MongoEngine::write_stream_inline_in_session` which
+    /// writes the stream record inside the same session as the data
+    /// write (D-C2 / RFC-0003 §3.2). The trait method has no callers
+    /// in the mongo backend after that change — it lives on only
+    /// because the `StreamEngine` trait still declares it. If invoked
+    /// externally, it would race against concurrent data writes: this
+    /// path does not enroll in any transaction and can commit a stream
+    /// record whose base-table write later rolls back. Return an
+    /// explicit error rather than performing a subtly-wrong write.
     fn write_stream_record(
         &self,
-        account_id: &str,
-        record: &StreamRecord,
-        shard_id: &str,
-        table_name: &str,
+        _account_id: &str,
+        _record: &StreamRecord,
+        _shard_id: &str,
+        _table_name: &str,
     ) -> BoxFuture<'_, Result<(), StorageError>> {
-        let account_id = account_id.to_owned();
-        let record = record.clone();
-        let shard_id = shard_id.to_owned();
-        let table_name = table_name.to_owned();
         Box::pin(async move {
-            let record_json =
-                serde_json::to_value(&record).map_err(|e| StorageError::Internal(e.to_string()))?;
-            let record_bson =
-                bson::to_bson(&record_json).map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            // Look up table_id
-            let tables_coll = self.catalog_db.collection::<Document>("tables");
-            let table_doc = tables_coll
-                .find_one(doc! { "_id": { "account_id": &account_id, "table_name": &table_name } })
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?
-                .ok_or_else(|| {
-                    StorageError::Internal(format!("Table {table_name} not found in catalog"))
-                })?;
-            let table_id = table_doc.get_str("table_id").unwrap_or_default();
-
-            let records_coll = self.data_db.collection::<Document>("stream_records");
-            records_coll
-                .insert_one(doc! {
-                    "sequence_number": &record.dynamodb.sequence_number,
-                    "shard_id": &shard_id,
-                    "table_id": table_id,
-                    "event_name": event_name_ddb_str(record.event_name),
-                    "record_data": record_bson,
-                    "created_at": BsonDateTime::now(),
-                })
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            Ok(())
+            Err(StorageError::Internal(
+                "MongoDB backend: non-transactional write_stream_record is unused; \
+                 the data-plane path always routes through the in-session variant"
+                    .to_owned(),
+            ))
         })
     }
 
