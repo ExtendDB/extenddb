@@ -9,10 +9,11 @@ use mongodb::IndexModel;
 use mongodb::options::{Collation, CollationStrength, IndexOptions};
 
 use extenddb_core::types::{
-    BillingMode, BillingModeSummary, CreateTableInput, DeleteTableInput, DescribeTableInput,
-    GsiDescription, IndexInfo, IndexType, KeyType, ListTablesInput, ListTablesOutput,
-    LsiDescription, OnDemandThroughput, ProvisionedThroughputDescription, ScalarAttributeType,
-    SseDescription, SseType, TableDescription, TableKeyInfo, TableStatus, UpdateTableInput,
+    AttributeDefinition, BillingMode, BillingModeSummary, CreateTableInput, DeleteTableInput,
+    DescribeTableInput, GsiDescription, IndexInfo, IndexType, KeySchemaElement, KeyType,
+    ListTablesInput, ListTablesOutput, LsiDescription, OnDemandThroughput,
+    ProvisionedThroughputDescription, ScalarAttributeType, SseDescription, SseType,
+    TableDescription, TableKeyInfo, TableStatus, UpdateTableInput,
 };
 use extenddb_storage::TableEngine;
 use extenddb_storage::error::StorageError;
@@ -297,6 +298,14 @@ impl MongoEngine {
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+                self.create_index_data_collection(
+                    &index_id,
+                    &gsi.key_schema,
+                    &input.key_schema,
+                    &input.attribute_definitions,
+                )
+                .await?;
+
                 descs.push(GsiDescription {
                     index_name: gsi.index_name.clone(),
                     key_schema: gsi.key_schema.clone(),
@@ -349,6 +358,14 @@ impl MongoEngine {
                     .insert_one(index_doc)
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+                self.create_index_data_collection(
+                    &index_id,
+                    &lsi.key_schema,
+                    &input.key_schema,
+                    &input.attribute_definitions,
+                )
+                .await?;
 
                 descs.push(LsiDescription {
                     index_name: lsi.index_name.clone(),
@@ -779,6 +796,19 @@ impl MongoEngine {
                                 StorageError::Internal(e.to_string())
                             }
                         })?;
+
+                    // Pre-create the mongo collection + query indexes
+                    // before the backfill worker starts writing — the
+                    // worker's upserts would work on an un-indexed
+                    // collection but subsequent GetItem/Query traffic
+                    // on the CREATING index would run coll-scans. D-m7.
+                    self.create_index_data_collection(
+                        &index_id,
+                        &create.key_schema,
+                        &desc.key_schema,
+                        &desc.attribute_definitions,
+                    )
+                    .await?;
 
                     self.gsi_cache_set(&desc.table_id, true);
                 }
@@ -1234,5 +1264,68 @@ impl MongoEngine {
             table_class_summary,
             on_demand_throughput,
         })
+    }
+
+    /// Create the mongo collection for a GSI/LSI and add the indexes
+    /// its query path relies on. Every read against the index goes
+    /// through `find` predicates on `(pk, sk_*, base_pk, base_sk_*)`
+    /// with sorts on the same fields — without indexes those queries
+    /// devolve to a collection scan per read. Called from
+    /// `create_table_impl` (initial GSI/LSI) and the UpdateTable GSI-
+    /// create path (D-m7).
+    pub(crate) async fn create_index_data_collection(
+        &self,
+        index_id: &str,
+        index_key_schema: &[KeySchemaElement],
+        base_key_schema: &[KeySchemaElement],
+        attribute_definitions: &[AttributeDefinition],
+    ) -> Result<(), StorageError> {
+        let coll_name = data_collection_name(index_id);
+        // create_collection is idempotent on recent MongoDB; a duplicate
+        // means we retried through a crash after the first success. Log
+        // + continue rather than surfacing an error to the caller.
+        if let Err(e) = self.data_db.create_collection(&coll_name).await {
+            tracing::debug!("index collection {coll_name} pre-exists or race: {e}");
+        }
+        let coll = self.data_db.collection::<Document>(&coll_name);
+
+        // Sort/paginate key: (pk, sk?, base_pk, base_sk?). Same tuple
+        // that scan_impl / query_impl sort by post-D-C1. Not unique —
+        // GSI keys are non-unique across base items; index docs are
+        // disambiguated by base-key components in the _id.
+        let idx_sk_field = sk_info(index_key_schema, attribute_definitions).map(|(_, t)| match t {
+            ScalarAttributeType::S => ("sk_s", true),
+            ScalarAttributeType::N => ("sk_n", false),
+            ScalarAttributeType::B => ("sk_b", false),
+        });
+        let base_sk_field = sk_info(base_key_schema, attribute_definitions).map(|(_, t)| match t {
+            ScalarAttributeType::S => "base_sk_s",
+            ScalarAttributeType::N => "base_sk_n",
+            ScalarAttributeType::B => "base_sk_b",
+        });
+
+        let mut keys = doc! { "pk": 1 };
+        if let Some((sk_f, _)) = idx_sk_field {
+            keys.insert(sk_f, 1);
+        }
+        keys.insert("base_pk", 1);
+        if let Some(base_sk_f) = base_sk_field {
+            keys.insert(base_sk_f, 1);
+        }
+
+        // String sort keys need the `simple` collation so range
+        // comparisons behave as byte-wise, matching the query path.
+        let uses_string_sort = matches!(idx_sk_field, Some((_, true)))
+            || matches!(base_sk_field, Some("base_sk_s"));
+        let mut opts = IndexOptions::builder().build();
+        if uses_string_sort {
+            opts.collation = Some(Collation::builder().locale("simple".to_string()).build());
+        }
+
+        coll.create_index(IndexModel::builder().keys(keys).options(opts).build())
+            .await
+            .map_err(|e| StorageError::Internal(format!("index-coll index: {e}")))?;
+
+        Ok(())
     }
 }
