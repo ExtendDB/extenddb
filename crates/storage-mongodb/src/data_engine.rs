@@ -2019,6 +2019,21 @@ impl MongoEngine {
                         Err(e) => return Err(StorageError::Internal(e.to_string())),
                     };
 
+                    // Filter out rows older than the DDB spec's 10-minute
+                    // dedup window. Even with the TTL index set to 540s,
+                    // MongoDB's TTL monitor runs on a ~60s cadence so a
+                    // just-expired row can linger briefly. Treating a stale
+                    // row as "not present" makes the read strictly correct
+                    // regardless of monitor timing. See D-m4.
+                    let existing = existing.filter(|doc| {
+                        doc.get_datetime("created_at").is_ok_and(|dt| {
+                            let age_ms = mongodb::bson::DateTime::now()
+                                .timestamp_millis()
+                                .saturating_sub(dt.timestamp_millis());
+                            age_ms < 600_000
+                        })
+                    });
+
                     if let Some(existing_doc) = existing {
                         let stored_fp = existing_doc.get_str("fingerprint").unwrap_or_default();
                         return Err(if stored_fp == key.fingerprint {
@@ -2052,6 +2067,25 @@ impl MongoEngine {
                                 })
                                 .await
                                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+                            // Same 10-min age filter as the pre-check —
+                            // don't let a barely-expired row masquerade
+                            // as a live token. D-m4.
+                            let winner = winner.filter(|d| {
+                                d.get_datetime("created_at").is_ok_and(|dt| {
+                                    let age_ms = mongodb::bson::DateTime::now()
+                                        .timestamp_millis()
+                                        .saturating_sub(dt.timestamp_millis());
+                                    age_ms < 600_000
+                                })
+                            });
+                            // If the winner aged out between our insert
+                            // and this follow-up read, the row will be
+                            // TTL'd shortly and the request is not a
+                            // real dup — retry so the next attempt
+                            // inserts fresh.
+                            if winner.is_none() {
+                                return Ok(AttemptOutcome::Retry);
+                            }
                             return Err(
                                 match winner.as_ref().and_then(|d| d.get_str("fingerprint").ok()) {
                                     Some(fp) if fp == key.fingerprint => {
