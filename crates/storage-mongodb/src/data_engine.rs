@@ -9,6 +9,7 @@ use mongodb::options::{FindOneAndReplaceOptions, ReturnDocument};
 
 use extenddb_core::expression::{
     self, Expr, ExpressionMaps, KeyCondition, PathElement, SortKeyCondition, UpdateAction,
+    resolve_name_ref,
 };
 use extenddb_core::types::{
     AttributeValue, Item, KeySchemaElement, ReturnValuesOnConditionCheckFailure,
@@ -258,6 +259,36 @@ impl MongoEngine {
 
         let key_filter = pk_filter(&item, &key_info.key_schema, &key_info.attribute_definitions)?;
 
+        // Sessionless fast path for unconditional PutItem on a plain
+        // table (no cond, no stream, no GSI). DDB's contract is
+        // last-writer-wins with no client-visible conflict error
+        // (RFC-0003 §4.1). Wrapping this in a snapshot transaction
+        // would convert same-key contention into WriteConflict
+        // aborts that eventually surface as `Internal` — a wire-
+        // visible error DDB never emits. Rely on WiredTiger's
+        // single-document atomicity instead. Two concurrent writes
+        // serialize at the storage engine level; one wins the last-
+        // writer-wins race and the other's version is overwritten.
+        // No txn, no retry loop, no possible 500 from contention.
+        if condition.is_none()
+            && stream.is_none()
+            && self.gsi_cache_get_fresh(&key_info.table_id) == Some(false)
+        {
+            let new_doc =
+                item_to_document(&item, &key_info.key_schema, &key_info.attribute_definitions)?;
+            let opts = FindOneAndReplaceOptions::builder()
+                .upsert(true)
+                .return_document(ReturnDocument::Before)
+                .build();
+            let old_doc = coll
+                .find_one_and_replace(key_filter, new_doc)
+                .with_options(opts)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let old_item = old_doc.as_ref().map(document_to_item).transpose()?;
+            return Ok(if return_old { old_item } else { None });
+        }
+
         let mut session = self
             .client
             .start_session()
@@ -401,7 +432,10 @@ impl MongoEngine {
             }
         }
 
-        Err(StorageError::Internal(
+        // Retry ceiling exhausted. RFC-0003 §4.3 requires
+        // `TransactionConflictException` when a single-item write can't
+        // serialize against concurrent activity — never a bare 500.
+        Err(StorageError::TransactionConflict(
             "PutItem: too many concurrent write conflicts, giving up".to_owned(),
         ))
     }
@@ -450,6 +484,22 @@ impl MongoEngine {
         let coll = self.data_db.collection::<Document>(&coll_name);
 
         let key_filter = pk_filter(key, &key_info.key_schema, &key_info.attribute_definitions)?;
+
+        // Sessionless fast path for unconditional DeleteItem on a plain
+        // table (no cond, no stream, no GSI). Same rationale as
+        // put_item_impl — DDB never surfaces contention on unconditional
+        // single-item deletes. RFC-0003 §4.1.
+        if condition.is_none()
+            && stream.is_none()
+            && self.gsi_cache_get_fresh(&key_info.table_id) == Some(false)
+        {
+            let old_doc = coll
+                .find_one_and_delete(key_filter)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let deleted_item = old_doc.as_ref().map(document_to_item).transpose()?;
+            return Ok(if return_old { deleted_item } else { None });
+        }
 
         let mut session = self
             .client
@@ -561,7 +611,7 @@ impl MongoEngine {
             }
         }
 
-        Err(StorageError::Internal(
+        Err(StorageError::TransactionConflict(
             "DeleteItem: too many concurrent write conflicts, giving up".to_owned(),
         ))
     }
@@ -619,23 +669,65 @@ impl MongoEngine {
             && self.gsi_cache_get_fresh(&key_info.table_id) == Some(false)
             && let Some(mongo_update) = self.try_build_native_update(actions, maps)
         {
-            let opts = mongodb::options::FindOneAndUpdateOptions::builder()
-                .upsert(true)
-                .return_document(ReturnDocument::After)
-                .build();
-            let result_doc = coll
-                .find_one_and_update(key_filter, mongo_update)
-                .with_options(opts)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            let new_item = if return_new {
-                result_doc.as_ref().map(document_to_item).transpose()?
-            } else {
-                None
+            let (fast_filter, took_fast) = match mongo_update {
+                NativeUpdate::Doc(d) => {
+                    let opts = mongodb::options::FindOneAndUpdateOptions::builder()
+                        .upsert(true)
+                        .return_document(ReturnDocument::After)
+                        .build();
+                    let result = coll
+                        .find_one_and_update(key_filter.clone(), d)
+                        .with_options(opts)
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    (Some(result), true)
+                }
+                NativeUpdate::Pipeline {
+                    type_guard,
+                    pipeline,
+                } => {
+                    // Compose the key filter with the type guard. If
+                    // the doc exists but fails the guard, findAndModify
+                    // returns None and we fall through to the slow
+                    // path (which raises ValidationException).
+                    // Upsert is disabled here because a missing-doc
+                    // "no match" is indistinguishable from a
+                    // type-mismatch "no match"; the slow path handles
+                    // both correctly.
+                    let combined_filter = if let Some(guard) = type_guard {
+                        doc! { "$and": [key_filter.clone(), guard] }
+                    } else {
+                        key_filter.clone()
+                    };
+                    let opts = mongodb::options::FindOneAndUpdateOptions::builder()
+                        .upsert(false)
+                        .return_document(ReturnDocument::After)
+                        .build();
+                    let result = coll
+                        .find_one_and_update(combined_filter, pipeline)
+                        .with_options(opts)
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    if result.is_none() {
+                        // Either the doc doesn't exist yet (need to
+                        // upsert with proper type handling) or the
+                        // guard rejected it. Fall through.
+                        (None, false)
+                    } else {
+                        (Some(result), true)
+                    }
+                }
             };
 
-            return Ok((None, new_item));
+            if took_fast {
+                let result_doc = fast_filter.and_then(|d| d);
+                let new_item = if return_new {
+                    result_doc.as_ref().map(document_to_item).transpose()?
+                } else {
+                    None
+                };
+                return Ok((None, new_item));
+            }
         }
 
         let mut session = self
@@ -823,7 +915,7 @@ impl MongoEngine {
             }
         }
 
-        Err(StorageError::Internal(
+        Err(StorageError::TransactionConflict(
             "UpdateItem: too many concurrent write conflicts, giving up".to_owned(),
         ))
     }
@@ -1367,14 +1459,35 @@ impl MongoEngine {
 
     // ── Native MongoDB Update (fast path) ─────────────────────────────
 
+    /// Try to express the update as a native MongoDB atomic update.
+    ///
+    /// Returns:
+    /// - `Some(NativeUpdate::Doc(...))` for a plain operator update
+    ///   (`$set`/`$unset`/`$inc`), served by
+    ///   `find_one_and_update(filter, doc)`.
+    /// - `Some(NativeUpdate::Pipeline(...))` for numeric `ADD`, which
+    ///   requires an aggregation-pipeline update (`$set` with computed
+    ///   expressions) to convert the string-stored `.N` value to a
+    ///   `Decimal128`, add the delta, and convert back — all
+    ///   server-side.
+    /// - `None` on anything else — set-typed `ADD`, `DELETE`,
+    ///   `list_append`, `if_not_exists`, arithmetic, multi-component
+    ///   paths. Those fall through to the session-scoped
+    ///   read-modify-write path.
+    ///
+    /// The pipeline form is what makes RFC-0003 §4.4 achievable
+    /// without a numeric shadow field: 50+ concurrent
+    /// `UpdateItem ADD counter :one` calls all apply cumulatively
+    /// because mongo serializes doc-scoped write locks around the
+    /// pipeline's read + compute + write, no OCC retry needed.
     fn try_build_native_update(
         &self,
         actions: &[UpdateAction],
         maps: &ExpressionMaps,
-    ) -> Option<Document> {
-        let mut inc_doc = Document::new();
+    ) -> Option<NativeUpdate> {
         let mut set_doc = Document::new();
         let mut unset_doc = Document::new();
+        let mut num_adds: Vec<(String, String)> = Vec::new();
 
         for action in actions {
             match action {
@@ -1382,50 +1495,45 @@ impl MongoEngine {
                     if path.len() != 1 {
                         return None;
                     }
-                    let attr_name = match &path[0] {
+                    let raw_name = match &path[0] {
                         PathElement::Attribute(name) => name,
                         _ => return None,
                     };
+                    let attr_name = resolve_name_ref(raw_name, maps).ok()?.into_owned();
                     let val = match value {
                         Expr::Placeholder(name) => maps.resolve_value(name).ok()?,
                         _ => return None,
                     };
                     match val {
                         AttributeValue::N(n) => {
-                            let field = format!("item_data.{attr_name}.N");
-                            // Store numeric increment as string (matching our storage format)
-                            // Use $inc on a helper field and reconcile, OR use a different approach.
-                            // Actually: item_data stores N as string. We can't $inc a string.
-                            // We need a numeric shadow field for $inc to work.
-                            // For now, only optimize if we can parse as i64.
-                            if let Ok(i) = n.parse::<i64>() {
-                                // Use $inc on a numeric shadow field, then $set the string representation.
-                                // Actually this won't work atomically in one update...
-                                // The simplest correct approach: use $inc on item_data.attr.N
-                                // BUT item_data.attr.N is stored as a string, not a number.
-                                // MongoDB $inc doesn't work on strings.
-                                // FALLBACK: we cannot use the native fast path for numeric ADD
-                                // unless we change the storage format. Give up.
-                                let _ = (field, i);
+                            // Validate the delta parses as Decimal128
+                            // up-front so a bad number fails fast
+                            // rather than mid-pipeline on mongo.
+                            if n.parse::<bson::Decimal128>().is_err() {
                                 return None;
                             }
-                            return None;
+                            num_adds.push((attr_name, n.clone()));
                         }
                         AttributeValue::SS(_) | AttributeValue::NS(_) | AttributeValue::BS(_) => {
-                            // Set ADD — could use $addToSet but storage format is complex
+                            // Set ADD — $addToSet would work in theory
+                            // but our .SS/.NS/.BS storage keeps the
+                            // values inside item_data.<attr>.SS as an
+                            // array. Not urgent enough to expand yet.
                             return None;
                         }
                         _ => return None,
                     }
                 }
+                UpdateAction::Delete { .. } => return None,
                 UpdateAction::Set { path, value } => {
                     if path.len() != 1 {
                         return None;
                     }
-                    let attr_name = match &path[0] {
+                    let raw_name = match &path[0] {
                         PathElement::Attribute(name) => name,
                         _ => return None,
                     };
+                    let attr_name = resolve_name_ref(raw_name, maps).ok()?;
                     let val = match value {
                         Expr::Placeholder(name) => maps.resolve_value(name).ok()?,
                         _ => return None, // complex expressions (if_not_exists, list_append, arithmetic)
@@ -1439,17 +1547,82 @@ impl MongoEngine {
                     if path.len() != 1 {
                         return None;
                     }
-                    let attr_name = match &path[0] {
+                    let raw_name = match &path[0] {
                         PathElement::Attribute(name) => name,
                         _ => return None,
                     };
+                    let attr_name = resolve_name_ref(raw_name, maps).ok()?;
                     let field = format!("item_data.{attr_name}");
                     unset_doc.insert(field, 1);
                 }
-                UpdateAction::Delete { .. } => {
-                    return None;
-                }
             }
+        }
+
+        if set_doc.is_empty() && unset_doc.is_empty() && num_adds.is_empty() {
+            return None;
+        }
+
+        if !num_adds.is_empty() {
+            // Aggregation-pipeline stage. `$set` accepts computed
+            // expressions here (unlike an operator update's `$set`).
+            // Each numeric ADD is `<field> = toString(toDecimal(field
+            // or 0) + delta)`; `$unset` is expressed as `<field> =
+            // "$$REMOVE"`; SET actions are literal assignments. `_v`
+            // is bumped in the same stage.
+            let mut stage: Document = Document::new();
+            for (k, v) in &set_doc {
+                stage.insert(k, v.clone());
+            }
+            for k in unset_doc.keys() {
+                stage.insert(k, "$$REMOVE");
+            }
+            // Guard: the fast path never reads the pre-image, so we
+            // can't detect an existing non-numeric attribute (e.g.
+            // ADD to a string). Require every ADD target to be
+            // absent or already hold `.N` — else return no match and
+            // let the caller fall back to the slow path, which reads
+            // the pre-image and returns a proper ValidationException.
+            let mut guard_clauses: Vec<Document> = Vec::with_capacity(num_adds.len());
+            for (attr, delta_s) in &num_adds {
+                let field = format!("item_data.{attr}.N");
+                let field_ref = format!("${field}");
+                let attr_path = format!("item_data.{attr}");
+                let delta_dec = delta_s
+                    .parse::<bson::Decimal128>()
+                    .expect("validated above");
+                stage.insert(
+                    &field,
+                    doc! {
+                        "$toString": {
+                            "$add": [
+                                { "$toDecimal": { "$ifNull": [ &field_ref, "0" ] } },
+                                { "$toDecimal": bson::Bson::Decimal128(delta_dec) },
+                            ]
+                        }
+                    },
+                );
+                guard_clauses.push(doc! {
+                    "$or": [
+                        { &attr_path: { "$exists": false } },
+                        { &field: { "$exists": true } },
+                    ]
+                });
+            }
+            stage.insert(
+                "_v",
+                doc! { "$add": [ { "$ifNull": [ "$_v", 0_i64 ] }, 1_i64 ] },
+            );
+            let type_guard = if guard_clauses.is_empty() {
+                None
+            } else if guard_clauses.len() == 1 {
+                Some(guard_clauses.into_iter().next().unwrap())
+            } else {
+                Some(doc! { "$and": guard_clauses })
+            };
+            return Some(NativeUpdate::Pipeline {
+                type_guard,
+                pipeline: vec![doc! { "$set": stage }],
+            });
         }
 
         let mut update = Document::new();
@@ -1460,19 +1633,16 @@ impl MongoEngine {
             update.insert("$unset", unset_doc);
         }
 
-        if update.is_empty() && inc_doc.is_empty() {
-            return None;
-        }
-
         // Bump `_v` on every native fast-path write. Without this a
         // fast-path commit leaves `_v` at its previous value, and a
         // slow-path update running concurrently against that same
         // stale value can pass its versioned-filter guard and
         // overwrite the fast-path write (lost update, RFC-0003 §4.4).
+        let mut inc_doc = Document::new();
         inc_doc.insert("_v", 1_i64);
         update.insert("$inc", inc_doc);
 
-        Some(update)
+        Some(NativeUpdate::Doc(update))
     }
 
     // ── GSI Sync ──────────────────────────────────────────────────────
@@ -2800,6 +2970,26 @@ pub(crate) struct GsiBackfillProgress {
 /// snapshot-isolation aborts. Matches the OCC retry ceiling elsewhere
 /// in this file.
 const TRANSIENT_RETRY_ATTEMPTS: u32 = 50;
+
+/// Return type of `try_build_native_update`. Distinguishes an
+/// operator-document update (`{$set, $unset, $inc}`) from an
+/// aggregation-pipeline update (needed for numeric ADD, which
+/// converts a string-stored `.N` value to Decimal128, applies the
+/// delta, and converts back).
+///
+/// `Pipeline` carries an optional `type_guard` filter — for numeric
+/// ADD we require the target attribute to be absent or already an
+/// `.N` so we don't clobber a string with a number. When the guard
+/// rejects the match, `find_one_and_update` returns `None`, and the
+/// caller falls back to the slow (session-scoped) path which reads
+/// the pre-image and surfaces a proper `ValidationException`.
+enum NativeUpdate {
+    Doc(Document),
+    Pipeline {
+        type_guard: Option<Document>,
+        pipeline: Vec<Document>,
+    },
+}
 
 /// Error signal used inside per-attempt transaction bodies. Lets the
 /// body use `?` for control flow while distinguishing "retry this
