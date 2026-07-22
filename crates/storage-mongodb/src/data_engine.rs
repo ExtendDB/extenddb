@@ -3158,9 +3158,22 @@ fn build_sk_filter(
             let prefix_av = resolve_key_expr(prefix, maps)?;
             match prefix_av {
                 AttributeValue::S(ref p) => {
-                    // For begins_with on string sort keys: sk_s >= prefix AND sk_s < prefix + max_char
-                    let upper = increment_string(p);
-                    Ok(doc! { sk_field: { "$gte": p.as_str(), "$lt": &upper } })
+                    // `sk BEGINS_WITH P` matches every X where P is a
+                    // prefix of X. Emit that as `sk >= P AND sk < P'`,
+                    // where P' is the least string strictly greater
+                    // than any P-starting string.
+                    //
+                    // `next_string_prefix` finds P' by incrementing
+                    // the last non-`char::MAX` code point. If P is
+                    // entirely `char::MAX`, no such P' exists — return
+                    // just the lower-bound filter and let mongo match
+                    // every string ≥ P (which is what DDB does).
+                    match next_string_prefix(p) {
+                        Some(upper) => Ok(doc! {
+                            sk_field: { "$gte": p.as_str(), "$lt": upper }
+                        }),
+                        None => Ok(doc! { sk_field: { "$gte": p.as_str() } }),
+                    }
                 }
                 AttributeValue::B(ref b) => {
                     // Binary sort keys are stored as hex strings (D-M5),
@@ -3242,12 +3255,44 @@ fn infer_sk_type_from_field(field: &str) -> ScalarAttributeType {
     }
 }
 
-/// Increment a string to get the exclusive upper bound for `begins_with`.
-fn increment_string(s: &str) -> String {
-    // Append the maximum Unicode code point
-    let mut result = s.to_string();
-    result.push(char::MAX);
-    result
+/// Compute the least string strictly greater than every string
+/// beginning with `s`, used as the exclusive upper bound for
+/// `sk BEGINS_WITH s`.
+///
+/// Strategy: find the rightmost char in `s` that isn't `char::MAX`,
+/// increment it, and truncate everything to its right. If every char
+/// is `char::MAX` (an unlikely-but-real edge case), no upper bound
+/// exists — return `None` so the caller can drop the `$lt` clause.
+///
+/// The previous implementation appended `char::MAX` to `s` and used
+/// `$lt`, which excluded any stored string equal to `s + char::MAX`
+/// (or extending past it) — those still begin with `s` and DDB
+/// matches them. D-m12.
+fn next_string_prefix(s: &str) -> Option<String> {
+    let chars: Vec<char> = s.chars().collect();
+    // Walk from the right, find the first char we can bump.
+    for i in (0..chars.len()).rev() {
+        if chars[i] < char::MAX {
+            let mut out = String::with_capacity(s.len());
+            for c in &chars[..i] {
+                out.push(*c);
+            }
+            // char::from_u32 handles the surrogate gap by skipping
+            // to the next valid scalar. u32 → char via char::from_u32
+            // returns None on the surrogate range D800..=DFFF, so
+            // walk past it.
+            let mut next = u32::from(chars[i]) + 1;
+            let bumped = loop {
+                if let Some(c) = char::from_u32(next) {
+                    break c;
+                }
+                next += 1;
+            };
+            out.push(bumped);
+            return Some(out);
+        }
+    }
+    None
 }
 
 /// Increment bytes to get the exclusive upper bound for `begins_with` on binary.
@@ -3368,6 +3413,25 @@ mod tests {
         item.insert("a".to_string(), AttributeValue::S("1".to_string()));
         let returned = ccf_return_item(ReturnValuesOnConditionCheckFailure::None, Some(&item));
         assert_eq!(returned, None);
+    }
+
+    #[test]
+    fn next_string_prefix_ascii() {
+        // Basic ASCII: "abc" -> "abd" as the exclusive upper bound.
+        assert_eq!(next_string_prefix("abc").as_deref(), Some("abd"));
+
+        // Trailing char::MAX skips back to a bumpable char.
+        // E.g. "abZ\u{10FFFF}" -> "ab["
+        let s: String = ['a', 'b', 'Z', char::MAX].iter().collect();
+        let expected: String = ['a', 'b', '['].iter().collect();
+        assert_eq!(next_string_prefix(&s).as_deref(), Some(expected.as_str()));
+
+        // All-char::MAX -> None (no bound; caller drops $lt clause).
+        let s: String = std::iter::repeat_n(char::MAX, 3).collect();
+        assert!(next_string_prefix(&s).is_none());
+
+        // Empty string is also unbounded (no chars to bump).
+        assert!(next_string_prefix("").is_none());
     }
 
     #[test]
