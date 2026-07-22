@@ -132,6 +132,13 @@ pub(crate) fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) ->
             tracing::error!("Unexpected idempotency error in generic error handler");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
         }
+        StorageError::TransactionConflict(msg) => {
+            // Single-item write raced an in-flight TransactWriteItems on
+            // the same item and the backend couldn't serialize them
+            // through internal retries. RFC-0003 §4.3 requires
+            // TransactionConflictException here — never InternalServerError.
+            DynamoDbError::TransactionConflictException(msg)
+        }
         StorageError::Internal(msg) => {
             // Log the raw message for debugging but do not expose storage
             // backend details (e.g. PostgreSQL error text) to the client.
