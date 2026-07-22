@@ -260,6 +260,29 @@ impl MongoEngine {
             .map_err(|e| StorageError::Connection(e.to_string()))?;
         options.max_pool_size = Some(max_connections);
 
+        // Reject non-primary read preferences. DynamoDB's `ConsistentRead=true`
+        // requires linearizable reads; MongoDB's Primary read concern is the
+        // only mode that provides that. A connection string like
+        // `mongodb://.../?readPreference=secondaryPreferred` would silently
+        // route reads to a secondary and return stale data — a fidelity
+        // violation the caller has no way to detect.
+        if let Some(sel) = options.selection_criteria.as_ref() {
+            use mongodb::options::{ReadPreference, SelectionCriteria};
+            let is_non_primary = match sel {
+                SelectionCriteria::ReadPreference(rp) => !matches!(rp, ReadPreference::Primary),
+                _ => false,
+            };
+            if is_non_primary {
+                return Err(StorageError::Connection(
+                    "MongoDB connection string must use readPreference=primary. \
+                     Non-primary read preferences (secondary, secondaryPreferred, \
+                     nearest, primaryPreferred) route reads to replicas and \
+                     silently break ConsistentRead=true."
+                        .to_owned(),
+                ));
+            }
+        }
+
         let client = mongodb::Client::with_options(options)
             .map_err(|e| StorageError::Connection(e.to_string()))?;
 
