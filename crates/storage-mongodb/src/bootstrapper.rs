@@ -153,7 +153,8 @@ impl Bootstrapper for MongoBootstrapper {
         db.create_collection("stream_records")
             .await
             .map_err(|e| OpError::Internal(format!("Failed to create stream_records: {e}")))?;
-        db.collection::<Document>("stream_records")
+        let stream_records = db.collection::<Document>("stream_records");
+        stream_records
             .create_index(
                 IndexModel::builder()
                     .keys(doc! { "created_at": 1 })
@@ -166,6 +167,21 @@ impl Bootstrapper for MongoBootstrapper {
             )
             .await
             .map_err(|e| OpError::Internal(format!("stream_records TTL index: {e}")))?;
+
+        // Query-side index on (shard_id, sequence_number). GetRecords
+        // filters by shard_id and paginates by sequence_number > cursor
+        // with an ascending sort — the only way this can be efficient
+        // is if the index prefix matches. Without it, GetRecords does a
+        // full collection scan every time consumer polls, and cost
+        // grows linearly in the retained record count. D-m6.
+        stream_records
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! { "shard_id": 1, "sequence_number": 1 })
+                    .build(),
+            )
+            .await
+            .map_err(|e| OpError::Internal(format!("stream_records shard index: {e}")))?;
 
         Ok(())
     }
