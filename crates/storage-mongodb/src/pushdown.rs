@@ -86,12 +86,33 @@ fn walk(expr: &Expr, maps: &ExpressionMaps) -> Pushable {
                 if args.len() != 2 {
                     return Pushable::No("attribute_type arity");
                 }
-                // The type argument must resolve to a String (the type
-                // tag: "S", "N", "B", "BOOL", "NULL", "L", "M", "SS",
-                // "NS", "BS"). Anything else is a parse-time error but
-                // we defensively check.
-                if !arg_resolves_to_scalar_type(&args[1], maps, AttrKind::S) {
-                    return Pushable::No("attribute_type non-string tag");
+                // The type argument must resolve to a String whose
+                // value is exactly one of the DDB type tags. The
+                // compiler in condition.rs inserts the tag verbatim
+                // into the mongo field path via
+                // `format!("{field}.{type_name}")`; without this
+                // whitelist a placeholder like `":t": {"S": "$ne"}`
+                // would produce a filter clause with a `$`-prefixed
+                // "field" that mongo would interpret as an operator.
+                // Keeping the whitelist in the analyzer means the
+                // compiler is only ever reached with a known-safe
+                // tag. RFC-0003 §6.1 / §8 (D-M6).
+                let Expr::Placeholder(name) = &args[1] else {
+                    return Pushable::No("attribute_type tag not a placeholder");
+                };
+                let Ok(val) = maps.resolve_value(name) else {
+                    return Pushable::No("attribute_type tag unresolvable");
+                };
+                match val {
+                    AttributeValue::S(tag) => {
+                        const VALID: &[&str] = &[
+                            "S", "N", "B", "BOOL", "NULL", "L", "M", "SS", "NS", "BS",
+                        ];
+                        if !VALID.contains(&tag.as_str()) {
+                            return Pushable::No("attribute_type tag not a DDB type name");
+                        }
+                    }
+                    _ => return Pushable::No("attribute_type non-string tag"),
                 }
                 Pushable::Yes
             }
@@ -384,6 +405,86 @@ mod tests {
         ]);
         // BETWEEN is currently non-pushable pending analyzer coverage;
         // this test locks in that decision.
+        assert!(!is_pushable(&expr, &maps).is_yes());
+    }
+
+    // ── D-M6 exclusion tests ────────────────────────────────────────
+    //
+    // The condition compiler in `condition.rs` has latent correctness
+    // bugs on numeric operands, set/list/map equality, mixed-type IN
+    // lists, and unvalidated attribute_type tags. The A5 analyzer is
+    // supposed to keep every one of those input shapes out of the
+    // pushdown path. These tests lock in that boundary so a future
+    // widening of the compiler doesn't accidentally admit a buggy
+    // shape without the analyzer being updated.
+
+    #[test]
+    fn numeric_compare_is_not_pushable() {
+        // Numeric operands would compile to BSON string comparisons —
+        // the analyzer must reject.
+        let maps = maps_with(&[(":n", AttributeValue::N("42".into()))]);
+        let expr = Expr::Compare {
+            left: Box::new(path("a")),
+            op: CompareOp::Lt,
+            right: Box::new(Expr::Placeholder(":n".into())),
+        };
+        assert!(!is_pushable(&expr, &maps).is_yes());
+    }
+
+    #[test]
+    fn in_is_not_pushable() {
+        // IN with mixed-type list uses the first literal's type for
+        // all entries — analyzer must reject entirely.
+        let maps = maps_with(&[
+            (":a", AttributeValue::S("x".into())),
+            (":b", AttributeValue::N("1".into())),
+        ]);
+        let expr = Expr::In {
+            operand: Box::new(path("a")),
+            list: vec![
+                Expr::Placeholder(":a".into()),
+                Expr::Placeholder(":b".into()),
+            ],
+        };
+        assert!(!is_pushable(&expr, &maps).is_yes());
+    }
+
+    #[test]
+    fn set_equality_is_not_pushable() {
+        // Eq/Ne on SS/NS/BS compiles to Bson::Null in the compiler.
+        // Analyzer classifies as `un-inferrable operand kind` and
+        // must reject.
+        let ss: std::collections::BTreeSet<String> =
+            ["a".to_owned(), "b".to_owned()].into_iter().collect();
+        let maps = maps_with(&[(":s", AttributeValue::SS(ss))]);
+        let expr = Expr::Compare {
+            left: Box::new(path("tags")),
+            op: CompareOp::Eq,
+            right: Box::new(Expr::Placeholder(":s".into())),
+        };
+        assert!(!is_pushable(&expr, &maps).is_yes());
+    }
+
+    #[test]
+    fn attribute_type_valid_tag_is_pushable() {
+        // "S" is a valid DDB type tag — analyzer admits.
+        let expr = Expr::Function {
+            name: "attribute_type".to_owned(),
+            args: vec![path("a"), Expr::Placeholder(":t".into())],
+        };
+        let maps = maps_with(&[(":t", AttributeValue::S("S".into()))]);
+        assert!(is_pushable(&expr, &maps).is_yes());
+    }
+
+    #[test]
+    fn attribute_type_invalid_tag_is_not_pushable() {
+        // An arbitrary string as the tag is refused so the compiler
+        // never assembles `field.$evil` mongo path fragments.
+        let expr = Expr::Function {
+            name: "attribute_type".to_owned(),
+            args: vec![path("a"), Expr::Placeholder(":t".into())],
+        };
+        let maps = maps_with(&[(":t", AttributeValue::S("$ne".into()))]);
         assert!(!is_pushable(&expr, &maps).is_yes());
     }
 }
