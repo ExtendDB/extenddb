@@ -95,7 +95,7 @@ impl BackupEngine for MongoEngine {
                 .unwrap_or("PAY_PER_REQUEST")
                 .to_owned();
             let table_size = table_doc.get_i64("table_size_bytes").unwrap_or(0);
-            let item_count = table_doc.get_i64("item_count").unwrap_or(0);
+            let _item_count = table_doc.get_i64("item_count").unwrap_or(0);
 
             // Preserve TableClass / SSESpecification / OnDemandThroughput so
             // RestoreTableFromBackup can recreate the table with the same

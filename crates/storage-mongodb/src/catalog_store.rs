@@ -39,10 +39,6 @@ impl MongoCatalogStore {
         &self.catalog_db
     }
 
-    /// Get a reference to the `MongoDB` client.
-    pub(crate) fn client(&self) -> &mongodb::Client {
-        &self.client
-    }
 }
 
 // Implement CatalogStore supertrait

@@ -5,13 +5,13 @@
 
 use bson::{Document, doc};
 use futures::future::BoxFuture;
-use mongodb::options::{FindOneAndDeleteOptions, FindOneAndReplaceOptions, ReturnDocument};
+use mongodb::options::{FindOneAndReplaceOptions, ReturnDocument};
 
 use extenddb_core::expression::{
     self, Expr, ExpressionMaps, KeyCondition, PathElement, SortKeyCondition, UpdateAction,
 };
 use extenddb_core::types::{
-    AttributeValue, Item, KeySchemaElement, KeyType, ReturnValuesOnConditionCheckFailure,
+    AttributeValue, Item, KeySchemaElement, ReturnValuesOnConditionCheckFailure,
     ScalarAttributeType, StreamEventName, StreamRecord, StreamRecordData, TableKeyInfo,
     extract_key, item_size_bytes,
 };
@@ -20,7 +20,7 @@ use extenddb_storage::util::{
     composite_pk_to_text, encode_netstring_composite, pk_to_text, sk_info,
 };
 use extenddb_storage::{
-    DataEngine, IdempotencyKey, ItemPairResult, QueryResult, StreamCapture, StreamEngine,
+    DataEngine, IdempotencyKey, ItemPairResult, QueryResult, StreamCapture,
     TransactGetOp, TransactWriteOp,
 };
 
@@ -32,7 +32,7 @@ use crate::data::{
 };
 use crate::pushdown::{Pushable, is_pushable};
 
-use extenddb_core::types::{AttributeDefinition, Projection, ProjectionType};
+use extenddb_core::types::{Projection, ProjectionType};
 
 impl DataEngine for MongoEngine {
     fn put_item(
@@ -1554,107 +1554,6 @@ impl MongoEngine {
         .map_err(|e| StorageError::Validation(e.to_string()))
     }
 
-    async fn sync_indexes(
-        &self,
-        key_info: &TableKeyInfo,
-        old_item: Option<&Item>,
-        new_item: Option<&Item>,
-    ) -> Result<(), StorageError> {
-        use futures::TryStreamExt;
-
-        // Fast path: skip catalog query if we know this table has no GSIs.
-        // The cache entry is valid for GSI_CACHE_TTL, giving eventual
-        // convergence when a GSI is added on another ExtendDB instance.
-        if let Some(false) = self.gsi_cache_get_fresh(&key_info.table_id) {
-            return Ok(());
-        }
-
-        let indexes_coll = self.catalog_db.collection::<Document>("indexes");
-        let mut cursor = indexes_coll
-            .find(doc! { "_id.table_id": &key_info.table_id })
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-        let mut found_any = false;
-        while let Some(idx_doc) = cursor
-            .try_next()
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?
-        {
-            found_any = true;
-            let index_id = match idx_doc.get_str("index_id") {
-                Ok(id) => id.to_string(),
-                Err(_) => continue,
-            };
-            let idx_key_schema: Vec<KeySchemaElement> = match idx_doc.get("key_schema") {
-                Some(ks) => bson::from_bson(ks.clone()).unwrap_or_default(),
-                None => continue,
-            };
-            let projection: Projection = match idx_doc.get("projection") {
-                Some(p) => bson::from_bson(p.clone()).unwrap_or(Projection {
-                    projection_type: ProjectionType::All,
-                    non_key_attributes: None,
-                }),
-                None => Projection {
-                    projection_type: ProjectionType::All,
-                    non_key_attributes: None,
-                },
-            };
-
-            let idx_coll_name = data_collection_name(&index_id);
-            let idx_coll = self.data_db.collection::<Document>(&idx_coll_name);
-
-            // Delete old index entry. The filter must match on both the
-            // index-key AND the base-key components, because GSIs allow
-            // duplicate index-key values across base items. See D-C1 /
-            // RFC-0003 §2.1.
-            if let Some(old) = old_item
-                && item_has_index_keys(old, &idx_key_schema)
-            {
-                let projected_old =
-                    project_item(old, &idx_key_schema, &key_info.key_schema, &projection);
-                let old_filter = index_entry_filter(
-                    &projected_old,
-                    &idx_key_schema,
-                    &key_info.key_schema,
-                    &key_info.attribute_definitions,
-                )?;
-                let _ = idx_coll.delete_one(old_filter).await;
-            }
-
-            // Insert new index entry
-            if let Some(new) = new_item
-                && item_has_index_keys(new, &idx_key_schema)
-            {
-                let projected =
-                    project_item(new, &idx_key_schema, &key_info.key_schema, &projection);
-                let idx_doc = index_document(
-                    &projected,
-                    &idx_key_schema,
-                    &key_info.key_schema,
-                    &key_info.attribute_definitions,
-                )?;
-                let filter = index_entry_filter(
-                    &projected,
-                    &idx_key_schema,
-                    &key_info.key_schema,
-                    &key_info.attribute_definitions,
-                )?;
-                let opts = mongodb::options::ReplaceOptions::builder()
-                    .upsert(true)
-                    .build();
-                idx_coll
-                    .replace_one(filter, idx_doc)
-                    .with_options(opts)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-            }
-        }
-
-        self.gsi_cache_set(&key_info.table_id, found_any);
-        Ok(())
-    }
-
     async fn sync_indexes_in_session(
         &self,
         key_info: &TableKeyInfo,
@@ -1662,8 +1561,6 @@ impl MongoEngine {
         new_item: Option<&Item>,
         session: &mut mongodb::ClientSession,
     ) -> Result<(), StorageError> {
-        use futures::TryStreamExt;
-
         if let Some(false) = self.gsi_cache_get_fresh(&key_info.table_id) {
             return Ok(());
         }

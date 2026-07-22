@@ -5,16 +5,17 @@
 //!
 //! Contains document conversion, collection naming, and key extraction utilities.
 
-use std::collections::BTreeMap;
 
-use bson::{Bson, Document, doc};
+use bson::{Document, doc};
 
 use extenddb_core::types::{
-    AttributeDefinition, AttributeValue, Item, KeySchemaElement, KeyType, ScalarAttributeType,
+    AttributeDefinition, AttributeValue, Item, KeySchemaElement, ScalarAttributeType,
 };
+#[cfg(test)]
+use extenddb_core::types::KeyType;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
-    composite_pk_to_text, encode_netstring_composite, pk_to_text, sk_info,
+    composite_pk_to_text, encode_netstring_composite, sk_info,
 };
 
 /// Returns the `MongoDB` collection name for a `DynamoDB` table.
@@ -32,11 +33,6 @@ pub fn data_collection_name(table_id: &str) -> String {
 #[must_use]
 pub fn composite_id(pk_text: &str, sk_text: &str) -> String {
     encode_netstring_composite(&[pk_text.to_owned(), sk_text.to_owned()])
-}
-
-/// Returns the `MongoDB` collection name for a secondary index.
-pub fn index_collection_name(index_id: &str) -> String {
-    format!("_ddb_{index_id}")
 }
 
 /// Convert a `DynamoDB` Item to a `MongoDB` BSON document for storage.

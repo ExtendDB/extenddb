@@ -62,7 +62,7 @@ The backend uses two MongoDB databases:
 
 **`extenddb_data`** — item data. One MongoDB collection per DynamoDB table, named `_ddb_{table_id}`. One additional collection per GSI/LSI, named `_ddb_{index_id}`. Shared collections: `stream_records` and `stream_shards` for DynamoDB Streams, `counters` for per-shard sequence-number counters, `idempotency_tokens` for transaction deduplication, and one `_backup_{backup_id}` collection per user-created backup.
 
-Catalog collection creation and index setup: `crates/storage-mongodb/src/bootstrapper.rs` — `run_catalog_migrations()`. Data-database setup (`idempotency_tokens`, `stream_shards`, `stream_records` and their indexes): `create_data_db()` in the same file. Collection naming: `data/mod.rs` — `data_collection_name()` and `index_collection_name()`.
+Catalog collection creation and index setup: `crates/storage-mongodb/src/bootstrapper.rs` — `run_catalog_migrations()`. Data-database setup (`idempotency_tokens`, `stream_shards`, `stream_records` and their indexes): `create_data_db()` in the same file. Collection naming: `data/mod.rs` — `data_collection_name()`, shared between base-table and index collections.
 
 ### Document structure for DynamoDB items
 
