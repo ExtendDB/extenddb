@@ -170,7 +170,9 @@ TTL index creation: `metadata_engine.rs` — `create_ttl_index`. Background work
 
 ### Control plane state transitions
 
-Table creation and deletion are asynchronous at the DynamoDB API level — `CreateTable` returns `CREATING` status, `DeleteTable` returns `DELETING`. A background `WorkerStore` implementation (`worker_store.rs`) polls the `tables` catalog collection for entries whose `status_transition_at` timestamp has passed and completes the transition: flipping CREATING → ACTIVE, or for DELETING → dropping the data collection, dropping every associated index collection, cleaning up stream shards + records + counters, and removing catalog entries and tags.
+Table creation and deletion run inline. `CreateTable` writes the catalog row and creates the data collection with its indexes before returning; the returned `TableDescription` carries `TableStatus: ACTIVE`. `DeleteTable` removes the catalog row, drops the data + index collections, deletes tags, and cleans up stream shards / records / counters via `cleanup_stream_state_for_table` (`table_engine.rs`), all before returning. MongoDB's create/drop is fast enough that there is no need to defer either operation to a background worker.
+
+GSI creation on `UpdateTable` is the one control-plane operation that does need asynchronous work — a background worker drains index rows in `CREATING` state, backfills the base collection, and flips the row to `ACTIVE`. See the Global and Local Secondary Indexes section for the state machine.
 
 ### Authentication and authorization
 
