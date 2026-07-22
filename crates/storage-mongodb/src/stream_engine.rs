@@ -71,15 +71,35 @@ impl MongoEngine {
         for i in 0..SHARDS_PER_STREAM {
             let shard_id = build_shard_id(table_id, i);
             let start_seq = format!("{:021}", 0);
-            shards_coll
+            let insert_res = shards_coll
                 .insert_one(doc! {
                     "shard_id": &shard_id,
                     "table_id": table_id,
                     "starting_sequence_number": &start_seq,
                     "created_at": BsonDateTime::now(),
                 })
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                .await;
+            if let Err(e) = insert_res {
+                // Treat a duplicate `shard_id` as idempotent no-op: two
+                // concurrent `UpdateTable(stream_enabled=true)` calls
+                // can both observe "no shards yet" under snapshot
+                // isolation and both reach this insert; the unique
+                // index on `stream_shards.shard_id` (`bootstrapper.rs`)
+                // means one of them lands E11000. RFC-0003 §10.3
+                // requires repeated `UpdateTable` calls with the same
+                // specification to not corrupt state — swallowing
+                // this E11000 makes the redundant call a no-op rather
+                // than a wire-visible 500.
+                let is_dup = matches!(
+                    *e.kind,
+                    mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
+                        mongodb::error::WriteError { code: 11000, .. }
+                    ))
+                );
+                if !is_dup {
+                    return Err(StorageError::Internal(e.to_string()));
+                }
+            }
         }
         Ok(())
     }
