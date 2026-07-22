@@ -90,12 +90,19 @@ impl Bootstrapper for MongoBootstrapper {
 
         let coll = db.collection::<Document>("idempotency_tokens");
 
-        // Create TTL index on idempotency_tokens.created_at (10 min expiry)
+        // DDB spec: `ClientRequestToken` dedups retries within a 10-minute
+        // window. MongoDB's TTL monitor runs on a ~60s cadence, so an
+        // `expireAfterSeconds = 600` index deletes rows anywhere from
+        // 10:00 to ~11:00 minutes after `created_at` — retention drifts
+        // above the spec. Shrink to 540s (9 min) so worst-case retention
+        // is ≤10 min. The data-plane read path also filters on `created_at`
+        // to enforce the boundary strictly, independent of TTL monitor
+        // cadence (see `transact_write_items_impl`).
         let ttl_index = IndexModel::builder()
             .keys(doc! { "created_at": 1 })
             .options(
                 IndexOptions::builder()
-                    .expire_after(std::time::Duration::from_secs(600))
+                    .expire_after(std::time::Duration::from_secs(540))
                     .build(),
             )
             .build();
