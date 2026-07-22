@@ -22,6 +22,27 @@ use extenddb_storage::util::{index_arn, sk_info, stream_arn, table_arn};
 use crate::MongoEngine;
 use crate::data::data_collection_name;
 
+/// Format a timestamp as a DynamoDB-style stream label:
+/// `YYYY-MM-DDThh:mm:ss` (second precision, no timezone).
+///
+/// Matches the postgres backend's
+/// `to_char(NOW(), 'YYYY-MM-DD"T"HH24:MI:SS')` output byte-for-byte
+/// so a stream ARN issued by one backend is parseable by tooling that
+/// only ever saw the other. The `time` crate's `Iso8601::DEFAULT`
+/// emits nanoseconds with a trailing `Z` — pushing that through AWS-
+/// SDK parsers or postgres-shaped tests failed unpredictably. D-m8.
+fn format_stream_label(now: time::OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
+    )
+}
+
 impl TableEngine for MongoEngine {
     fn create_table(
         &self,
@@ -155,8 +176,7 @@ impl MongoEngine {
             .is_some_and(|ss| ss.stream_enabled)
         {
             Some(
-                now.format(&time::format_description::well_known::Iso8601::DEFAULT)
-                    .unwrap_or_else(|_| "unknown".to_string()),
+                format_stream_label(now),
             )
         } else {
             None
@@ -715,9 +735,7 @@ impl MongoEngine {
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
                 if existing_shard.is_none() {
-                    let label = time::OffsetDateTime::now_utc()
-                        .format(&time::format_description::well_known::Iso8601::DEFAULT)
-                        .unwrap_or_else(|_| "unknown".to_string());
+                    let label = format_stream_label(time::OffsetDateTime::now_utc());
                     update_doc.insert("stream_label", &label);
                     self.init_stream_shards(table_id).await?;
                 } else if table_doc
@@ -729,9 +747,7 @@ impl MongoEngine {
                     // Shards exist but the label was cleared by a
                     // previous disable — restore a fresh label so the
                     // ARN resolves again.
-                    let label = time::OffsetDateTime::now_utc()
-                        .format(&time::format_description::well_known::Iso8601::DEFAULT)
-                        .unwrap_or_else(|_| "unknown".to_string());
+                    let label = format_stream_label(time::OffsetDateTime::now_utc());
                     update_doc.insert("stream_label", &label);
                 }
             }
