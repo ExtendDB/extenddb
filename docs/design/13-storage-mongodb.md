@@ -833,7 +833,7 @@ crates/storage-mongodb/
     ├── credential_store.rs     # Access-key lookup + AES-GCM decryption
     ├── catalog_store.rs        # SettingsStore / DiagnosticsStore glue
     ├── admin_store.rs          # Admin operations (currently thin)
-    └── worker_store.rs         # Control-plane state transitions (CREATING/DELETING)
+    └── worker_store.rs         # WorkerStore trait shim (no-op; supertrait requirement)
 ```
 
 ## 7. `MongoEngine` Struct
@@ -993,8 +993,12 @@ The backend implements every trait in `extenddb-storage`:
 - `Bootstrapper` — init, destroy, migrate, verify. Creates the
   catalog and data databases, seeds encryption key and admin user,
   applies index schema.
-- `WorkerStore` — CREATING → ACTIVE / DELETING → dropped transitions,
-  polled every scan interval.
+- `WorkerStore` — trait method is a no-op. `create_table_impl`
+  writes `TableStatus: ACTIVE` inline and `delete_table_impl` runs
+  the collection/tag/stream cleanup inline, so there is never a
+  transient state waiting for a background worker. Kept in the
+  impl surface only because `OperationsEngine` requires
+  `WorkerStore` as a supertrait.
 - `ManagementStore`, `AdminStore`, `SettingsStore`, `MetricsStore`,
   `RateLimitStore` — the catalog trait surface.
 - `AuthorizationStore` — user/group/role/permissions-boundary/session
