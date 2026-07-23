@@ -16,6 +16,7 @@ use extenddb_storage::error::StorageError;
 
 use super::index::{enqueue_async_indexes, fetch_indexes_for_table, sync_indexes};
 use super::query::check_condition;
+use super::transactions::index_key_refs;
 use super::tx_helpers::{fetch_item_in_tx, upsert_item_in_tx, write_stream_record_in_tx};
 use crate::store::SqliteEngine;
 
@@ -63,6 +64,21 @@ impl SqliteEngine {
             .map_err(|e| StorageError::Validation(e.to_string()))?;
         validation::validate_item_size(&item, self.max_item_size_bytes)
             .map_err(|e| StorageError::Validation(e.to_string()))?;
+        // Secondary-index key validation on the post-update item, matching the
+        // TransactWriteItems update path: a wrong-typed index key attribute or
+        // an index key set to an empty value is a ValidationException up front,
+        // rather than silently producing a malformed / unmatchable index row.
+        if !indexes.is_empty() {
+            let idx_refs = index_key_refs(&indexes);
+            validation::validate_index_key_types(&item, &idx_refs, &key_info.attribute_definitions)
+                .map_err(|e| StorageError::Validation(e.to_string()))?;
+            validation::validate_index_key_not_empty(
+                &item,
+                &idx_refs,
+                validation::SecondaryIndexEmptyContext::UpdateExpression,
+            )
+            .map_err(|e| StorageError::Validation(e.to_string()))?;
+        }
 
         upsert_item_in_tx(&mut tx, key_info, &item).await?;
 

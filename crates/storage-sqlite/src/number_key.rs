@@ -41,6 +41,11 @@ const NEG_TERMINATOR: char = ':';
 
 /// Encode a `BigDecimal` into an order-preserving ASCII string such that, for
 /// all `a`, `b`: `a.cmp(b) == encode(a).cmp(&encode(b))`.
+///
+/// Precondition: `value` is a finite decimal within DynamoDB's supported numeric
+/// range. `BigDecimal` cannot represent NaN or ±Infinity, and the protocol /
+/// validation layer rejects non-numeric, NaN, and Infinity inputs before they
+/// reach this encoder, so those cases are not handled here.
 pub(crate) fn encode_orderable_number(value: &BigDecimal) -> String {
     if value.is_zero() {
         return "1".to_owned();

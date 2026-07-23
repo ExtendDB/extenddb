@@ -49,20 +49,27 @@ pub struct ServeArgs {
 /// Binding before forking ensures port conflicts are reported to stderr
 /// before the parent process exits (D-4).
 pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
-    // P50: Check config file permissions before loading. The config file may
-    // contain the encryption key (via `extenddb init`). Reject if more permissive
-    // than 0600 (owner read/write only).
-    if !std::path::Path::new(&args.config).exists() {
+    // Load config early so bind address is known before fork. A dev-mode
+    // build serves with built-in defaults when no config file exists
+    // (zero-config local/CI use: loopback, in-memory storage, seeded dev
+    // credential — a drop-in for DynamoDB Local). Production builds require
+    // an `init`-generated config.
+    let config_exists = std::path::Path::new(&args.config).exists();
+    let app_config = if config_exists {
+        // P50: Check config file permissions before loading. The config file
+        // may contain the encryption key (via `extenddb init`). Reject if more
+        // permissive than 0600 (owner read/write only).
+        check_config_permissions(&args.config)?;
+        config::load(&args.config)?
+    } else if cfg!(feature = "dev-mode") {
+        config::load_builtin_defaults()?
+    } else {
         anyhow::bail!(
             "Config file '{}' not found. Run 'extenddb init' to create one, \
              or use --config <path> to specify a different location.",
             args.config,
         );
-    }
-    check_config_permissions(&args.config)?;
-
-    // Load config early so bind address is known before fork.
-    let app_config = config::load(&args.config)?;
+    };
 
     // D5: TLS is mandatory — except in a dev-mode build, which deliberately
     // serves plain HTTP on loopback for frictionless local/CI use.
@@ -142,8 +149,11 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         println!("{banner_line2}");
     }
     if cfg!(feature = "dev-mode") {
-        let msg = "  DEVELOPER MODE: plain HTTP on loopback, authorization open \
-                   (SigV4 still enforced). Not for production.";
+        let msg = format!(
+            "  DEVELOPER MODE: plain HTTP on loopback, authorization open \
+             (SigV4 still enforced). Serving storage: {}. Not for production.",
+            config::redact_password(app_config.storage.connection_config()),
+        );
         if args.foreground {
             eprintln!("{msg}");
         } else {

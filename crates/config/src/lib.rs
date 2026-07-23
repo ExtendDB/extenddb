@@ -381,6 +381,37 @@ pub fn load(config_path: &str) -> anyhow::Result<AppConfig> {
     Ok(config.try_deserialize()?)
 }
 
+/// Load `AppConfig` entirely from built-in defaults and environment variables,
+/// with no config file.
+///
+/// Supports zero-config `serve` in dev-mode builds: the installed backend's
+/// `[storage.<name>]` section is synthesized empty, so every storage field
+/// takes its default (for the SQLite dev build that is the in-memory path).
+/// Server defaults are loopback + port 18443, satisfying the dev-mode
+/// loopback guard. `EXTENDDB__*` environment overrides still apply on top.
+///
+/// A backend whose storage config has required fields fails deserialization
+/// here with that field named, which is correct: such a backend cannot run
+/// without a config file.
+///
+/// # Errors
+///
+/// Returns an error if no backend is installed, or if environment variable
+/// values cannot be deserialized.
+pub fn load_builtin_defaults() -> anyhow::Result<AppConfig> {
+    let backend = extenddb_storage::backend_name()
+        .ok_or_else(|| anyhow::anyhow!("no storage backend installed"))?;
+    let storage_section = format!("[storage.{backend}]\n");
+    let config = config::Config::builder()
+        .add_source(config::File::from_str(
+            &storage_section,
+            config::FileFormat::Toml,
+        ))
+        .add_source(config::Environment::with_prefix("EXTENDDB").separator("__"))
+        .build()?;
+    Ok(config.try_deserialize()?)
+}
+
 /// Redact password from a connection string for safe logging (REQ-LOG-002).
 ///
 /// Uses the backend-specific operations engine to handle different connection

@@ -104,6 +104,34 @@ To bind the server to a specific address (e.g., for remote access), pass `--bind
 
 This generates a certificate with SANs: `localhost`, `127.0.0.1`, and `10.0.1.5`.
 
+### SQLite backend (developer mode)
+
+For local development and CI, extenddb can run against a SQLite backend instead
+of PostgreSQL. Select it at init time with `--backend sqlite`:
+
+```bash
+./target/release/extenddb init --backend sqlite
+```
+
+This writes a config with a `[storage.sqlite]` section where the database
+location is configured (default `extenddb.sqlite`):
+
+```toml
+[storage.sqlite]
+path = "extenddb.sqlite"   # or ":memory:" for an ephemeral in-memory database
+```
+
+At serve time the path can be overridden with `--sqlite-path`. The resolution
+order is: the `--sqlite-path` flag, then `[storage.sqlite].path` in the config,
+then the default `extenddb.sqlite`:
+
+```bash
+./target/release/extenddb serve --config extenddb.toml --sqlite-path /data/extenddb.sqlite
+```
+
+Use `:memory:` (in the config or via `--sqlite-path`) for an ephemeral database
+that is discarded on shutdown.
+
 ### Generating a self-signed certificate manually
 
 `extenddb init` auto-generates a self-signed TLS certificate at `~/.extenddb/tls/`. If you need a certificate with different SANs (e.g., binding to `0.0.0.0` and connecting via a specific hostname), generate one manually with `openssl`:

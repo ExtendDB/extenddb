@@ -264,10 +264,15 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         .try_init()
         .map_err(|e| anyhow::anyhow!("Failed to initialize tracing: {e}"))?;
 
-    // Create server components via factory pattern
+    // Create server components via factory pattern. Dev mode asks the backend
+    // to bootstrap an uninitialized catalog at serve time (zero-config use).
+    let mut component_options =
+        extenddb_storage::server_components::ServerComponentsOptions::default();
+    component_options.bootstrap_if_uninitialized = dev_mode;
     let components = extenddb_storage::create_server_components(
         app_config.storage.as_trait(),
         &app_config.server.region,
+        component_options,
     )
     .await?;
 
@@ -284,7 +289,8 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         let dev_access_key = seed_dev_credential(catalog_store.as_ref()).await?;
         tracing::warn!(
             "DEVELOPER MODE active — plain HTTP, authorization open (SigV4 still \
-             enforced), loopback only. Signing credential: {dev_access_key}"
+             enforced), loopback only. Storage: {}. Signing credential: {dev_access_key}",
+            config::redact_password(app_config.storage.connection_config()),
         );
     }
 

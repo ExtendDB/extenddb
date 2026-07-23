@@ -156,6 +156,22 @@ class _Deployment:
         _patch_port(self.config, self.port)
         # Set the system GSI delay before serving (read at startup).
         self._run("settings", "set", "gsi_propagation_delay_ms", str(gsi_delay_ms))
+        # Assert the delay is persisted as expected BEFORE the server starts.
+        # These tests run isolated, file-backed servers with their own database,
+        # so the main devtools/run-tests setting of gsi_propagation_delay_ms=0 on
+        # the shared server cannot race or clobber this value. The read-back pins
+        # that invariant rather than relying on it implicitly.
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = 'gsi_propagation_delay_ms'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None and row[0] == str(gsi_delay_ms), (
+            f"expected gsi_propagation_delay_ms={gsi_delay_ms} persisted at startup, "
+            f"got {row!r}"
+        )
 
     def start(self) -> None:
         self.proc = subprocess.Popen(
@@ -174,16 +190,31 @@ class _Deployment:
         self.proc = None
 
     def stop(self) -> None:
-        if self.proc is not None:
-            try:
-                self._run("stop", check=False)
-            except Exception:
-                pass
-            try:
-                self.proc.send_signal(signal.SIGKILL)
-                self.proc.wait(timeout=10)
-            except Exception:
-                pass
+        if self.proc is None:
+            return
+        # Graceful shutdown is the only acceptable path in normal teardown.
+        # `extenddb stop` drains the queue and exits; we wait for that exit and
+        # escalate to a hard signal ONLY if it fails to exit within the timeout,
+        # and even then loudly (a warning) rather than silently.
+        try:
+            self._run("stop", check=False)
+        except Exception:
+            # The stop command itself timed out/failed; fall through and observe
+            # the process directly before deciding whether to escalate.
+            pass
+        try:
+            self.proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            import warnings
+
+            warnings.warn(
+                f"`extenddb stop` did not exit within 30s (pid {self.proc.pid}); "
+                "escalating to SIGKILL as a last resort.",
+                stacklevel=2,
+            )
+            self.proc.send_signal(signal.SIGKILL)
+            self.proc.wait(timeout=10)
+        finally:
             self.proc = None
 
     def _provision(self) -> dict:
