@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Orchestrated mongo integration-test runner.
+#
+# Starts a mongo:7 single-node replica set in Docker, initializes and
+# serves extenddb against it, then delegates the test workload to
+# `devtools/run-tests --backend mongodb`. Tears everything down on exit.
+#
+# Usage:
+#   devtools/run-mongodb-tests [OPTIONS] [-- RUN_TESTS_ARGS ...]
+#
+# Options:
+#   --port PORT        HTTPS port extenddb should bind (default: 18443)
+#   --mongo-port PORT  Host port to publish mongo on (default: 27021)
+#   --output DIR       Directory for logs and generated config
+#                      (default: /tmp/run-mongodb-tests-<ts>)
+#   --keep             Do not tear down the mongo container / server
+#                      on exit (useful for post-run inspection)
+#   -h, --help         Show this help
+#
+# Arguments after `--` are passed to `devtools/run-tests` verbatim.
+# Default suite is `--pytest --comprehensive --parallel`.
+#
+# Examples:
+#   devtools/run-mongodb-tests
+#   devtools/run-mongodb-tests -- --pytest --filter test_put_item
+#   devtools/run-mongodb-tests --keep -- --pytest --filter test_rfc0003
+#
+# Prerequisites:
+#   - Docker running
+#   - `cargo build --release --features mongodb` already done
+#   - Python venv activated with pytest installed
+#   - `~/.extenddb/tls/` populated (from a prior `extenddb init`)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_DIR"
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+BIND_PORT=18443
+MONGO_PORT=27021
+OUTPUT_DIR=""
+KEEP=false
+RUN_TESTS_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --port)       BIND_PORT="$2"; shift 2 ;;
+        --mongo-port) MONGO_PORT="$2"; shift 2 ;;
+        --output)     OUTPUT_DIR="$2"; shift 2 ;;
+        --keep)       KEEP=true; shift ;;
+        --)           shift; RUN_TESTS_ARGS=("$@"); break ;;
+        -h|--help)    sed -n '5,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)            echo "error: unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+if [[ ${#RUN_TESTS_ARGS[@]} -eq 0 ]]; then
+    RUN_TESTS_ARGS=(--pytest --comprehensive --parallel)
+fi
+
+if [[ -z "$OUTPUT_DIR" ]]; then
+    OUTPUT_DIR="/tmp/run-mongodb-tests-$(date +%Y%m%d-%H%M%S)"
+fi
+mkdir -p "$OUTPUT_DIR"
+
+CONFIG="$OUTPUT_DIR/extenddb.toml"
+SERVER_LOG="$OUTPUT_DIR/server.log"
+SERVER_PID_FILE="$OUTPUT_DIR/server.pid"
+CONTAINER_NAME="extenddb-runtests-mongo"
+BINARY="./target/release/extenddb"
+
+if [[ ! -x "$BINARY" ]]; then
+    echo "error: $BINARY not found. Build first: cargo build --release --features mongodb" >&2
+    exit 1
+fi
+
+# Canonicalized `/tmp` — resolves through the macOS `/tmp -> /private/tmp`
+# symlink so the server's import/export path check (which rejects symlink
+# components) accepts it. Portable across Linux and macOS.
+TMP_CANON=$(realpath /tmp)
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+
+cleanup() {
+    if $KEEP; then
+        echo ""
+        echo "=== --keep set; leaving mongo + extenddb running ==="
+        echo "  server pid file:      $SERVER_PID_FILE"
+        echo "  server log:           $SERVER_LOG"
+        echo "  mongo container:      $CONTAINER_NAME (port $MONGO_PORT)"
+        echo "  tear down manually:   kill \$(cat $SERVER_PID_FILE); docker rm -f $CONTAINER_NAME"
+        return
+    fi
+    echo ""
+    echo "=== Cleanup ==="
+    if [[ -f "$SERVER_PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$SERVER_PID_FILE")
+        if kill "$pid" 2>/dev/null; then
+            echo "  stopped extenddb server (pid $pid)"
+        fi
+        rm -f "$SERVER_PID_FILE"
+    fi
+    if docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1; then
+        echo "  removed docker container $CONTAINER_NAME"
+    fi
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Start mongo replica set
+# ---------------------------------------------------------------------------
+
+echo "=== Starting MongoDB 7 replica set on host port $MONGO_PORT ==="
+docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+docker run -d --name "$CONTAINER_NAME" -p "$MONGO_PORT:27017" mongo:7 \
+    mongod --replSet rs0 --bind_ip_all --wiredTigerCacheSizeGB 1 >/dev/null
+
+# Wait for mongod to accept pings
+for i in $(seq 1 30); do
+    if docker exec "$CONTAINER_NAME" mongosh --quiet --eval "db.runCommand({ping:1}).ok" 2>/dev/null \
+        | grep -q '^1$'; then
+        echo "  mongod responsive after ${i}s"
+        break
+    fi
+    sleep 1
+done
+
+# Initiate replica set (idempotent — rs.initiate() errors are non-fatal)
+docker exec "$CONTAINER_NAME" mongosh --quiet --eval \
+    'rs.initiate({_id: "rs0", members: [{_id: 0, host: "localhost:27017"}]})' >/dev/null 2>&1 || true
+
+# Wait for PRIMARY election
+for i in $(seq 1 30); do
+    state=$(docker exec "$CONTAINER_NAME" mongosh --quiet --eval 'rs.status().members[0].stateStr' 2>/dev/null | tail -1)
+    if [[ "$state" == "PRIMARY" ]]; then
+        echo "  replica set PRIMARY after ${i}s"
+        break
+    fi
+    sleep 1
+done
+
+# ---------------------------------------------------------------------------
+# Initialize extenddb
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== Initializing extenddb ==="
+
+# `init --backend mongodb` reads the connection string from the config
+# file, so write a minimal stub for it first.
+cat > "$CONFIG" <<TOML
+[storage]
+backend = "mongodb"
+
+[storage.mongodb]
+connection_string = "mongodb://localhost:$MONGO_PORT/?replicaSet=rs0&directConnection=true"
+TOML
+
+ADMIN_PASSWORD=$(openssl rand -base64 16)
+EXTENDDB_ADMIN_PASSWORD="$ADMIN_PASSWORD" "$BINARY" init \
+    --backend mongodb --config "$CONFIG" --overwrite 2>&1 | tail -3
+
+# `init` regenerates the config with default port 18443 and no
+# `[import]` / `[export]` sections. Rewrite with the port + defaults the
+# integration suite needs. This overwrite falls away once `extenddb init`
+# grows flags for these knobs.
+cat > "$CONFIG" <<TOML
+[server]
+bind_addr = "127.0.0.1"
+port = $BIND_PORT
+region = "us-east-1"
+
+[server.tls]
+cert_path = "$HOME/.extenddb/tls/cert.pem"
+key_path = "$HOME/.extenddb/tls/key.pem"
+
+[storage]
+backend = "mongodb"
+
+[storage.mongodb]
+connection_string = "mongodb://localhost:$MONGO_PORT/?replicaSet=rs0&directConnection=true"
+
+[auth]
+provider = "builtin"
+
+[import]
+paths = ["$TMP_CANON"]
+
+[export]
+paths = ["$TMP_CANON"]
+
+[logging]
+level = "info"
+format = "pretty"
+TOML
+
+# ---------------------------------------------------------------------------
+# Start extenddb server
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== Starting extenddb server on 127.0.0.1:$BIND_PORT ==="
+nohup "$BINARY" serve --foreground --config "$CONFIG" >"$SERVER_LOG" 2>&1 &
+echo "$!" > "$SERVER_PID_FILE"
+
+for i in $(seq 1 30); do
+    if curl -sk "https://127.0.0.1:$BIND_PORT/health" >/dev/null 2>&1; then
+        echo "  server healthy after ${i}s"
+        break
+    fi
+    sleep 1
+done
+
+if ! curl -sk "https://127.0.0.1:$BIND_PORT/health" >/dev/null 2>&1; then
+    echo "error: extenddb server did not become healthy" >&2
+    tail -30 "$SERVER_LOG" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Delegate to run-tests
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== Running test suite via devtools/run-tests --backend mongodb ==="
+echo "  passthrough args: ${RUN_TESTS_ARGS[*]}"
+echo ""
+
+export EXTENDDB_TEST_ENDPOINT="https://127.0.0.1:$BIND_PORT"
+export EXTENDDB_ADMIN_USER=admin
+export EXTENDDB_ADMIN_PASSWORD="$ADMIN_PASSWORD"
+
+# Some tests read EXTENDDB_CONFIG to invoke `extenddb settings` against
+# the running instance. Without this, they fall back to `./extenddb.toml`
+# in the repo root, which is a stale dev config that points at a
+# postgres instance that isn't running — the CLI hangs on the doomed
+# connection and pytest times its subprocess out.
+export EXTENDDB_CONFIG="$CONFIG"
+
+# import/export tests use tempfile.NamedTemporaryFile(), which honors
+# $TMPDIR. On macOS $TMPDIR defaults to /var/folders/…/T, which isn't
+# inside the server's configured [import]/[export] paths. Point TMPDIR
+# at the canonical `/tmp` (matches the paths written above) so the
+# tempfiles land in an allowed location on both Linux and macOS.
+export TMPDIR="$TMP_CANON"
+
+RC=0
+devtools/run-tests --extenddb --backend mongodb --config "$CONFIG" "${RUN_TESTS_ARGS[@]}" || RC=$?
+
+exit $RC
