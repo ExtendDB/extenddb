@@ -228,7 +228,7 @@ enum TxnOpError {
 
 /// Build [`validation::IndexKeyRef`] views over the table's indexes for
 /// secondary-index key validation.
-fn index_key_refs(indexes: &[IndexMeta]) -> Vec<validation::IndexKeyRef<'_>> {
+pub(crate) fn index_key_refs(indexes: &[IndexMeta]) -> Vec<validation::IndexKeyRef<'_>> {
     indexes
         .iter()
         .map(|idx| validation::IndexKeyRef {

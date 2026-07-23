@@ -110,6 +110,8 @@ pub(crate) async fn stream_record_cleanup_worker(
                 if n > 0 {
                     tracing::info!("Stream cleanup worker: deleted {n} expired record(s)");
                 }
+                // Elapsed microseconds fit exactly in f64's 53-bit mantissa for
+                // the latency ranges recorded here (telemetry, not exact math).
                 #[allow(clippy::cast_precision_loss)]
                 metrics.record_worker_success(
                     QuerySource::StreamCleanup,
@@ -138,6 +140,8 @@ pub(crate) async fn idempotency_token_cleanup_worker(
                 if n > 0 {
                     tracing::info!("Idempotency cleanup worker: deleted {n} expired token(s)");
                 }
+                // Elapsed microseconds fit exactly in f64's 53-bit mantissa for
+                // the latency ranges recorded here (telemetry, not exact math).
                 #[allow(clippy::cast_precision_loss)]
                 metrics.record_worker_success(
                     QuerySource::IdempotencyCleanup,
@@ -287,6 +291,8 @@ async fn sweep_expired_items(
                     deleted += 1;
                     metrics.record_ttl_deletion(table_name);
                     if let Some(s) = staleness {
+                        // Staleness seconds are small and well within f64's
+                        // exact-integer range; used only for telemetry.
                         #[allow(clippy::cast_precision_loss)]
                         metrics.record_ttl_staleness(table_name, s as f64);
                     }

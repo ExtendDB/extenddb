@@ -57,3 +57,53 @@ fn main() -> anyhow::Result<()> {
         build_time: env!("EXTENDDB_BUILD_TIME"),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    /// Install this binary's backend once for the test process.
+    fn install_backend() {
+        #[cfg(feature = "postgres")]
+        let _ = extenddb_storage::set_backend(extenddb_storage_postgres::backend());
+        #[cfg(feature = "sqlite")]
+        let _ = extenddb_storage::set_backend(extenddb_storage_sqlite::backend());
+    }
+
+    /// Zero-config serve contract: with the SQLite backend installed,
+    /// built-in defaults deserialize with no config file, bind to loopback
+    /// (so the dev-mode loopback guard passes), and select the backend's
+    /// default storage path.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn builtin_defaults_load_for_sqlite_and_bind_loopback() {
+        install_backend();
+        let cfg = extenddb_config::load_builtin_defaults()
+            .expect("sqlite storage config has no required fields");
+        assert_eq!(cfg.server.bind_addr, "127.0.0.1");
+        assert_eq!(cfg.server.port, 18443);
+        // The sqlite config absolutizes a relative file path against the
+        // working directory, so match on the invariant part of each default.
+        let path = cfg.storage.connection_config();
+        if cfg!(feature = "sqlite-memory") {
+            assert_eq!(path, ":memory:");
+        } else {
+            assert!(
+                path.ends_with("extenddb.sqlite"),
+                "default file path should be extenddb.sqlite, got: {path}"
+            );
+        }
+    }
+
+    /// `load_builtin_defaults` is only reachable from dev-mode builds (a
+    /// postgres + dev-mode binary is a compile error), but its defaults must
+    /// never relax the production posture regardless of backend: loopback
+    /// bind and TLS enabled.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn builtin_defaults_keep_loopback_and_tls_for_postgres() {
+        install_backend();
+        let cfg = extenddb_config::load_builtin_defaults()
+            .expect("postgres storage config defaults to a local dev connection");
+        assert_eq!(cfg.server.bind_addr, "127.0.0.1");
+        assert!(cfg.server.tls.enabled);
+    }
+}
