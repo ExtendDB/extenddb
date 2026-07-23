@@ -194,7 +194,7 @@ Backup implementation: `backup_engine.rs`.
 
 ### Operational requirements
 
-**Minimum MongoDB version: 6.0.** Required for multi-document ACID transactions and snapshot reads. The MongoDB Rust driver 3.x is technically compatible with earlier server versions; this backend targets 6.0 as the minimum supported.
+**Minimum MongoDB version: 7.0.** Required for multi-document ACID transactions and snapshot reads. The MongoDB Rust driver 3.x is technically compatible with earlier server versions; this backend targets 7.0 as the minimum supported.
 
 **Replica set required.** MongoDB must be configured as a replica set before running `extenddb init`. A standalone node does not support multi-document transactions. A single-node replica set is sufficient for development and CI; production deployments should use a 3-node replica set for high availability.
 
@@ -273,7 +273,7 @@ Testing is organized in three layers.
 
 **End-to-end tests** run the existing ExtendDB pytest suite (`tests/`) unchanged against a MongoDB-backed ExtendDB server. The pytest suite speaks the DynamoDB wire protocol and has no backend awareness — a passing run against MongoDB is equivalent to a passing run against PostgreSQL. This is the conformance test baseline required by RFC-0002.
 
-CI spins up a single-node MongoDB 6.0 replica set, builds ExtendDB with `--features mongodb`, runs `cargo test -p extenddb-storage-mongodb`, then runs `devtools/run-tests --extenddb --pytest` and `devtools/run-tests --extenddb --external` against the MongoDB-backed server.
+CI spins up a single-node MongoDB 7.0 replica set, builds ExtendDB with `--features mongodb`, runs `cargo test -p extenddb-storage-mongodb`, then runs `devtools/run-tests --extenddb --pytest` and `devtools/run-tests --extenddb --external` against the MongoDB-backed server.
 
 ## Drawbacks
 
