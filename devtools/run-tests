@@ -13,6 +13,7 @@
 #   devtools/run-tests --extenddb --rust --release
 #   devtools/run-tests --extenddb --filter PATTERN --pytest
 #   devtools/run-tests --extenddb --catalog-check --config PATH
+#   devtools/run-tests --extenddb --pytest --backend mongodb
 #
 # Target flag (exactly one required, mutually exclusive):
 #   --extenddb            targeting a local extenddb instance
@@ -28,6 +29,10 @@
 #   --catalog-check   post-test catalog integrity check
 #
 # Options:
+#   --backend NAME    storage backend the running server uses:
+#                       postgres (default) or mongodb.
+#                       Gates postgres-only paths (pg connection-string
+#                       extraction, test_cli_lifecycle.py).
 #   --release         use release build for Rust tests
 #   --filter PATTERN  pass to cargo test / pytest -k
 #   --parallel[=N]    run pytest in parallel (default: 1/3 of CPU cores)
@@ -67,6 +72,7 @@ RELEASE=false
 FILTER=""
 CONFIG_PATH=""
 PARALLEL=""
+BACKEND="postgres"
 
 usage() {
     cat <<'EOF'
@@ -86,6 +92,8 @@ Suites (at least one required):
   --catalog-check   post-test catalog integrity check
 
 Options:
+  --backend NAME    storage backend the running server uses:
+                      postgres (default) or mongodb.
   --release         release build for Rust tests
   --filter PATTERN  filter for cargo test / pytest -k
   --parallel[=N]    run pytest in parallel (default: 1/3 of CPU cores)
@@ -112,6 +120,7 @@ while [[ $# -gt 0 ]]; do
         --filter)         FILTER="$2"; shift 2 ;;
         --catalog-check)  RUN_CATALOG_CHECK=true; shift ;;
         --config)         CONFIG_PATH="$2"; shift 2 ;;
+        --backend)        BACKEND="$2"; shift 2 ;;
         --parallel)
             # --parallel (no argument) or --parallel=N
             PARALLEL="auto"; shift
@@ -123,6 +132,15 @@ while [[ $# -gt 0 ]]; do
         *)                echo "error: unknown option: $1"; usage ;;
     esac
 done
+
+# --- Validate: backend name ---
+case "$BACKEND" in
+    postgres|mongodb) ;;
+    *)
+        echo "error: --backend must be 'postgres' or 'mongodb' (got: $BACKEND)"
+        exit 1
+        ;;
+esac
 
 # --- Validate: target flag required ---
 if [[ -z "$TARGET" ]]; then
@@ -212,6 +230,7 @@ if [[ "$TARGET" == "real-dynamodb" ]]; then
     echo "  EXTENDDB_TEST_ENDPOINT = (not set — using AWS SDK defaults)"
     echo "  AWS_ACCESS_KEY_ID  = ${AWS_ACCESS_KEY_ID:-(from ~/.aws)}"
 else
+    echo "  backend            = $BACKEND"
     echo "  EXTENDDB_TEST_ENDPOINT = ${EXTENDDB_TEST_ENDPOINT:-}"
     echo "  AWS_ACCESS_KEY_ID  = ${AWS_ACCESS_KEY_ID:-(will be provisioned)}"
 fi
@@ -360,18 +379,17 @@ if $NEEDS_INTEGRATION && [[ "$TARGET" != "real-dynamodb" ]]; then
     fi
 
     # Export PG connection string for CLI lifecycle tests (PostgreSQL only).
-    # Extract from config, strip the database name to get the base URL.
-    # This is only needed for test_cli_lifecycle.py which is PostgreSQL-specific
-    # and excluded from the main pytest suite.
-    if [[ -z "${EXTENDDB_TEST_PG_CONNECTION_STRING:-}" && -f "$CONFIG_FOR_SETTINGS" ]]; then
-        # Only try to extract connection_string for PostgreSQL backend
-        if grep -q '^[[:space:]]*backend[[:space:]]*=[[:space:]]*"postgres"' "$CONFIG_FOR_SETTINGS" 2>/dev/null; then
-            FULL_CONN=$(grep 'connection_string' "$CONFIG_FOR_SETTINGS" | sed -n 's/.*connection_string[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-            if [[ -n "$FULL_CONN" ]]; then
-                # Strip trailing /database_name to get base URL
-                export EXTENDDB_TEST_PG_CONNECTION_STRING="${FULL_CONN%/*}"
-                echo "  ✓ EXTENDDB_TEST_PG_CONNECTION_STRING=${EXTENDDB_TEST_PG_CONNECTION_STRING}"
-            fi
+    # test_cli_lifecycle.py is PostgreSQL-specific and excluded from the
+    # main pytest suite; it opens its own extenddb instances via the
+    # connection string. Skipped on the mongo backend.
+    if [[ "$BACKEND" == "postgres" \
+        && -z "${EXTENDDB_TEST_PG_CONNECTION_STRING:-}" \
+        && -f "$CONFIG_FOR_SETTINGS" ]]; then
+        FULL_CONN=$(grep 'connection_string' "$CONFIG_FOR_SETTINGS" | sed -n 's/.*connection_string[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        if [[ -n "$FULL_CONN" ]]; then
+            # Strip trailing /database_name to get base URL
+            export EXTENDDB_TEST_PG_CONNECTION_STRING="${FULL_CONN%/*}"
+            echo "  ✓ EXTENDDB_TEST_PG_CONNECTION_STRING=${EXTENDDB_TEST_PG_CONNECTION_STRING}"
         fi
     fi
     echo ""
@@ -528,8 +546,11 @@ if $RUN_COMPREHENSIVE; then
     echo ""
 fi
 
-# --- CLI lifecycle tests (run last — they start/stop their own servers) ---
-if $RUN_PYTEST && [[ "$TARGET" != "real-dynamodb" && -n "${EXTENDDB_TEST_PG_CONNECTION_STRING:-}" ]]; then
+# --- CLI lifecycle tests (postgres-only; run last — they start/stop their own servers) ---
+if $RUN_PYTEST \
+    && [[ "$TARGET" != "real-dynamodb" \
+        && "$BACKEND" == "postgres" \
+        && -n "${EXTENDDB_TEST_PG_CONNECTION_STRING:-}" ]]; then
     CLI_OUTFILE="discussions/test-cli-${HASH}.txt"
     echo "=== CLI lifecycle tests → ${CLI_OUTFILE} ==="
     CLI_ARGS=(python3 -m pytest tests/test_cli_lifecycle.py tests/test_cli_container_readiness.py tests/test_cli_migrate_concurrency.py -v)
