@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- MongoDB 6.0+ (for multi-document transactions)
+- MongoDB 7.0+ (for multi-document transactions)
 - A replica set configuration (required even for single-node deployments)
 
 ## Installation

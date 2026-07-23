@@ -31,7 +31,7 @@ software on your behalf. After the script completes, continue from
 
 - **Storage backend** (one of):
   - PostgreSQL 14+ running locally (see `docs/local-postgres-setup.md`)
-  - MongoDB 6.0+ with replica set (see `docs/local-mongodb-setup.md`)
+  - MongoDB 7.0+ with replica set (see `docs/local-mongodb-setup.md`)
 - Rust toolchain (1.88+)
 - AWS CLI v2 (for testing)
 - Python 3.10+ with virtual environment (see [Python Environment Setup](../README.md#python-environment-setup) in the README)

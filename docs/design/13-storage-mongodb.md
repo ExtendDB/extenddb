@@ -1026,7 +1026,7 @@ The backend implements every trait in `extenddb-storage`:
   (`mongod --replSet rs0`), full trait coverage.
 - **Existing pytest suite:** Passes unchanged (backend-agnostic wire
   protocol tests).
-- **CI:** GitHub Actions job with MongoDB 6.0 replica set, runs
+- **CI:** GitHub Actions job with MongoDB 7.0 replica set, runs
   `cargo test -p extenddb-storage-mongodb` then `devtools/run-tests
   --extenddb --pytest --external`.
 
