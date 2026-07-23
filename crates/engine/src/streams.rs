@@ -173,19 +173,18 @@ pub async fn handle_get_records(
     let input: GetRecordsInput = serde_json::from_value(body)
         .map_err(|e| DynamoDbError::SerializationException(e.to_string()))?;
 
-    let decoded = base64::Engine::decode(
+    let token = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
         &input.shard_iterator,
     )
-    .map_err(|_| DynamoDbError::ValidationException("Invalid shard iterator".to_owned()))?;
-    let token = String::from_utf8(decoded).map_err(|_| {
-        DynamoDbError::ValidationException("Invalid shard iterator encoding".to_owned())
-    })?;
+    .ok()
+    .and_then(|d| String::from_utf8(d).ok())
+    .ok_or_else(|| DynamoDbError::ValidationException("Invalid ShardIterator".to_owned()))?;
 
     let parts: Vec<&str> = token.splitn(4, '|').collect();
     if parts.len() < 2 {
         return Err(DynamoDbError::ValidationException(
-            "Invalid shard iterator format".to_owned(),
+            "Invalid ShardIterator".to_owned(),
         ));
     }
 
@@ -227,7 +226,7 @@ pub async fn handle_get_records(
 
     let (records, last_seq) = ctx
         .storage
-        .get_stream_records(shard_id, after_sequence.as_deref(), limit)
+        .get_stream_records(&ctx.account_id, shard_id, after_sequence.as_deref(), limit)
         .await
         .map_err(storage_to_dynamo)?;
 

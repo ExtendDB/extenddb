@@ -440,8 +440,14 @@ pub trait StreamEngine: Send + Sync {
     ) -> BoxFuture<'_, Result<(), StorageError>>;
 
     /// Read stream records from a shard starting after a sequence number.
+    ///
+    /// `account_id` is the authenticated caller's account. Implementations MUST
+    /// return records only for shards whose backing table belongs to that
+    /// account; a shard whose table belongs to a different account must yield no
+    /// records, so a shard iterator only reads its owning account's stream data.
     fn get_stream_records(
         &self,
+        account_id: &str,
         shard_id: &str,
         after_sequence: Option<&str>,
         limit: i64,

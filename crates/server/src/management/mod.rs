@@ -12,7 +12,7 @@ mod account;
 pub(crate) use account::generate_account_id;
 mod admin;
 mod assume_role;
-mod auth;
+pub(crate) mod auth;
 pub mod cache_invalidate;
 mod cache_metrics;
 pub(crate) mod crypto;

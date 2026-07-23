@@ -30,7 +30,7 @@ pub use docs_page::{docs_page, docs_pdf, docs_view};
 pub use group_pages::{
     add_group_member, create_group, delete_group, group_detail, new_group_form, remove_group_member,
 };
-pub use metrics_pages::metrics_page;
+pub use metrics_pages::{metrics_data, metrics_page};
 pub use policy_pages::{
     delete_group_policy, delete_role_policy, delete_user_policy, new_group_policy_form,
     new_role_policy_form, new_user_policy_form, put_group_policy, put_role_policy, put_user_policy,
