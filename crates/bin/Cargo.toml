@@ -29,3 +29,4 @@ extenddb-storage = { workspace = true }
 extenddb-storage-postgres = { workspace = true, optional = true }
 extenddb-storage-sqlite = { workspace = true, optional = true }
 anyhow = { workspace = true }
+extenddb-config = { workspace = true }

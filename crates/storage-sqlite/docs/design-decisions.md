@@ -117,7 +117,12 @@ only) — identical to Postgres, no change needed.
   `schema.rs`. SQL logic is ported from PR #109 and corrected/retargeted.
 - **Single file, single logical DB.** Catalog and data tables co-locate (SQLite
   has no multi-database server). The dual-pool Postgres split collapses to one
-  store; `data_database_name` is recorded for diagnostics parity only.
+  logical store; `data_database_name` is recorded for diagnostics parity only.
+  Connection *pools* are not collapsed for file-backed databases: the serve path
+  opens two pools — the engine pool (all data reads/writes, serialized by
+  `write_lock`) and a separate catalog pool (catalog + credential stores) so
+  catalog reads don't contend with the data write lock. Only `:memory:` uses a
+  single pinned connection (see D4).
 - **Schema** is one authoritative migration mirroring Postgres `001_schema.sql`
   semantics: accounts, tables, indexes, tags, settings (seeded `catalog_version`
   = the compiled `CATALOG_VERSION`), stream_shards/records, seq_counters,

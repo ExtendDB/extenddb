@@ -161,6 +161,7 @@ const MAX_ITEM_SIZE_BYTES: usize = 400_000;
 fn sqlite_server_components_factory(
     config: &dyn extenddb_storage::config::StorageConfig,
     region: &str,
+    options: extenddb_storage::server_components::ServerComponentsOptions,
 ) -> futures::future::BoxFuture<'static, Result<ServerComponents, BackendError>> {
     let db_path = config.connection_config().to_owned();
     let pool_size = config.max_connections();
@@ -176,10 +177,15 @@ fn sqlite_server_components_factory(
         // In-memory databases do not persist across the `init` process, so the
         // catalog must be bootstrapped here, at serve time, on the engine's own
         // shared connection (a second pool would open a separate empty DB).
+        // A dev-mode build extends the same bootstrap to an uninitialized FILE
+        // database (`bootstrap_if_uninitialized`), so zero-config dev serve
+        // works with a persistent path too; every bootstrap step is guarded
+        // (IF NOT EXISTS / INSERT OR IGNORE), so re-running on an initialized
+        // file is a no-op. Production builds keep the explicit-`init` contract.
         let in_memory = db_path == ":memory:"
             || db_path.starts_with("file::memory:")
             || db_path.contains("mode=memory");
-        if in_memory {
+        if in_memory || options.bootstrap_if_uninitialized {
             let admin_user = std::env::var("EXTENDDB_ADMIN_USER").ok();
             let admin_password = std::env::var("EXTENDDB_ADMIN_PASSWORD").ok();
             if let Some(password) = engine
@@ -188,10 +194,12 @@ fn sqlite_server_components_factory(
                 .map_err(|e| BackendError::InitializationFailed(e.to_string()))?
             {
                 let user = admin_user.as_deref().unwrap_or("admin");
-                println!(
-                    "\n  In-memory backend: ephemeral admin credentials (lost on restart)\n  \
-                     Username: {user}\n  Password: {password}\n"
-                );
+                let durability = if in_memory {
+                    "In-memory backend: ephemeral admin credentials (lost on restart)"
+                } else {
+                    "Bootstrapped file backend: admin credentials (stored in the database)"
+                };
+                println!("\n  {durability}\n  Username: {user}\n  Password: {password}\n");
             }
         }
 

@@ -9,8 +9,8 @@
 //! columns are addressed by the index sort key and `base_*` columns provide
 //! tie-breakers. SQLite differences: positional `?` placeholders, no `COLLATE`
 //! (the default BINARY collation already matches DynamoDB byte order, and `N`
-//! keys are stored as the order-preserving TEXT encoding per D2), `char()`
-//! instead of `chr()`, and `rowid % total_segments` for parallel scan.
+//! keys are stored as the order-preserving TEXT encoding per D2), and
+//! `rowid % total_segments` for parallel scan.
 
 use std::fmt::Write;
 
