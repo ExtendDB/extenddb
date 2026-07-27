@@ -75,6 +75,9 @@ time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
 rustls-pemfile = "2"
+# Already a hard (transitive) dependency of rustls; used directly to check
+# whether an existing certificate covers a requested `init --tls-san` name.
+rustls-webpki = "0.103"
 rcgen = "0.14"
 
 # Process management

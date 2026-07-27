@@ -4,11 +4,13 @@
 //! extenddb binary — entry point for the Virtual `DynamoDB` server.
 //!
 //! Provides subcommands for server operation and lifecycle management:
-//! `serve`, `init`, `destroy`, `verify`, `migrate`, `status`, `stop`, `settings`.
+//! `serve`, `init`, `destroy`, `verify`, `migrate`, `status`, `stop`, `settings`,
+//! `healthcheck`.
 //! Running with no subcommand prints version information.
 
 mod cmd_catalog_check;
 mod cmd_destroy;
+mod cmd_healthcheck;
 mod cmd_init;
 mod cmd_manage;
 mod cmd_migrate;
@@ -60,6 +62,8 @@ enum Command {
     Manage(cmd_manage::ManageArgs),
     /// Check catalog and data database integrity
     CatalogCheck(cmd_catalog_check::CatalogCheckArgs),
+    /// Probe the local /health endpoint over HTTPS (exit 0 healthy, 1 not)
+    Healthcheck(cmd_healthcheck::HealthcheckArgs),
     /// Print version, catalog version, git commit, and build timestamp
     Version,
 }
@@ -95,6 +99,13 @@ fn main() -> anyhow::Result<()> {
         Command::Settings(args) => run_interactive(cmd_settings::run(args)),
         Command::Manage(args) => run_interactive(cmd_manage::run(args)),
         Command::CatalogCheck(args) => run_interactive(cmd_catalog_check::run(args)),
+        Command::Healthcheck(args) => match cmd_healthcheck::run(&args) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("healthcheck failed: {e}");
+                std::process::exit(1);
+            }
+        },
         Command::Version => {
             print_version();
             Ok(())

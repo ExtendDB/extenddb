@@ -878,6 +878,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pemfile",
+ "rustls-webpki",
  "serde",
  "serde_json",
  "sqlx",

@@ -112,7 +112,30 @@ By default `extenddb serve` daemonizes itself, which doesn't play well with cont
 extenddb serve --config extenddb.toml --foreground
 ```
 
-Use this with Docker, Kubernetes, `systemd Type=simple`, runit, s6, or any other supervisor that captures stdout/stderr. `extenddb status` and `extenddb stop` continue to work as in daemon mode, since the PID file is still written.
+Use this with Docker, Kubernetes, `systemd Type=simple`, runit, s6, or any other supervisor that captures stdout/stderr.
+
+In `--foreground` mode extenddb writes no PID file and never creates `run_dir`, so the container can run with a read-only root filesystem. Two consequences:
+
+- `extenddb status` still works (it probes the port) but reports the PID as unknown.
+- `extenddb stop` cannot signal the process — there is no PID file to read. Stop it through your supervisor, which delivers `SIGTERM` and triggers the same graceful shutdown.
+
+For a container `HEALTHCHECK`, use the `healthcheck` subcommand rather than `curl`; it needs no shell or extra binaries, so it works on a `distroless`/`scratch` image and accepts the self-signed certificate:
+
+```bash
+extenddb healthcheck --config extenddb.toml            # exit 0 healthy, 1 not
+extenddb healthcheck --endpoint https://127.0.0.1:18443 # explicit target
+```
+
+This is a liveness check, which is what a container `HEALTHCHECK` wants: `/health` does not query the storage backend, so it reports healthy even if PostgreSQL becomes unreachable after startup. That is deliberate, since a liveness probe that failed on a database outage would restart every replica at once. A backend that is unreachable at startup does stop the server from listening, so that case is caught. There is no separate readiness endpoint yet.
+
+To make the generated self-signed certificate valid for the name clients actually use — an in-cluster service DNS name, for example — pass `--tls-san` to `init` (repeatable):
+
+```bash
+extenddb init --catalog-db extenddb_catalog \
+  --tls-san extenddb.default.svc.cluster.local --tls-san extenddb.example.com
+```
+
+`init` never regenerates an existing certificate, so if one is already present it verifies that it already covers every requested `--tls-san` and fails with an explicit error if it does not, rather than silently dropping the name.
 
 ## Monitoring
 
@@ -142,6 +165,7 @@ extenddb serve --config extenddb.toml --foreground  # Start in foreground
 extenddb init --catalog-db NAME            # Initialize deployment
 extenddb stop --config extenddb.toml           # Graceful shutdown
 extenddb status --config extenddb.toml         # Check if running
+extenddb healthcheck --config extenddb.toml    # Probe /health (exit 0 healthy, 1 not)
 extenddb verify --config extenddb.toml         # Validate deployment
 extenddb migrate --config extenddb.toml        # Apply schema migrations
 extenddb destroy --config extenddb.toml        # Tear down deployment

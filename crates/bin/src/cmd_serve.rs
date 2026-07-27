@@ -121,11 +121,10 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         println!("{banner_line2}");
     }
 
-    // D-3: Write PID file so `extenddb status` can report the daemon PID.
+    // In daemon mode a PID file lets `extenddb status` and `extenddb stop` find
+    // the process. In --foreground mode we write no PID file and skip the run
+    // directory entirely, so the container can use a read-only root filesystem.
     let run_dir = config::expand_tilde(&app_config.server.run_dir);
-    std::fs::create_dir_all(&run_dir)
-        .map_err(|e| anyhow::anyhow!("Failed to create run directory {run_dir}: {e}"))?;
-    let pid_file = pid_file_path(&run_dir, port);
 
     // P57 Bug 7 fix: Use execute() instead of start() so the parent can
     // verify the daemon child is healthy before exiting. start() exits the
@@ -133,9 +132,10 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
     //
     // When --foreground is set, skip daemonization entirely so the process
     // can be supervised by Docker, Kubernetes, systemd Type=simple, etc.
-    // The PID file is still written below by `start_server`, and graceful
-    // shutdown on SIGINT/SIGTERM still works.
     if !args.foreground {
+        std::fs::create_dir_all(&run_dir)
+            .map_err(|e| anyhow::anyhow!("Failed to create run directory {run_dir}: {e}"))?;
+        let pid_file = pid_file_path(&run_dir, port);
         let daemon = Daemonize::new().pid_file(&pid_file);
         match daemon.execute() {
             daemonize::Outcome::Parent(Ok(_)) => {
@@ -200,14 +200,21 @@ async fn serve(
     run_dir: String,
     foreground: bool,
 ) -> anyhow::Result<()> {
-    // CB-27: Clean up PID file if serve() fails before reaching the HTTP
-    // server (e.g., Postgres connection failure). The PID file was already
-    // written by Daemonize in run().
-    let pid_path = pid_file_path(&run_dir, port);
+    // CB-27: Clean up the PID file if serve() fails before reaching the HTTP
+    // server, for example on a Postgres connection failure. Daemonize already
+    // wrote it in run(). In foreground mode there is no PID file, and removing
+    // one would mean deleting a file this process never wrote.
+    let pid_path = if foreground {
+        None
+    } else {
+        Some(pid_file_path(&run_dir, port))
+    };
     let backend = app_config.storage.backend.clone();
     let result = serve_inner(app_config, std_listener, port, run_dir, backend, foreground).await;
     if let Err(ref e) = result {
-        let _ = std::fs::remove_file(&pid_path);
+        if let Some(ref path) = pid_path {
+            let _ = std::fs::remove_file(path);
+        }
         // P57 Bug 7: Log fatal errors to syslog. After daemonize, stderr is
         // /dev/null so anyhow's error display is lost. Use tracing if
         // available, fall back to raw syslog if tracing isn't initialized yet.
@@ -236,16 +243,10 @@ async fn serve_inner(
     let catalog_version = extenddb_storage::operations::catalog_version(&backend)
         .unwrap_or_else(|_| "unknown".to_string());
 
-    // In foreground mode, daemonize was skipped so the PID file was never
-    // written. Write it now so `extenddb status`/`stop` and `start_server`'s
-    // graceful shutdown cleanup still work. The grandchild PID written by
-    // daemonize matches `std::process::id()` post-fork, so this stays
-    // consistent with daemon mode.
-    if foreground {
-        let pid_file = pid_file_path(&run_dir, port);
-        std::fs::write(&pid_file, format!("{}\n", std::process::id()))
-            .map_err(|e| anyhow::anyhow!("Failed to write PID file {}: {e}", pid_file.display()))?;
-    }
+    // In foreground mode we deliberately write no PID file. The container
+    // runtime or systemd tracks the process directly, and skipping the file lets
+    // the container run with a read-only root filesystem. In daemon mode the
+    // `daemonize` crate already wrote it in `run()`.
 
     // Init logging (REQ-LOG-003, REQ-LOG-006) — syslog in daemon mode, stderr
     // in foreground mode so a container/process supervisor can capture logs.
@@ -606,13 +607,15 @@ async fn serve_inner(
         None
     };
 
-    extenddb_server::start_server(
-        listener,
-        state,
-        Some(pid_file_path(&run_dir, port)),
-        tls_config,
-    )
-    .await?;
+    // In daemon mode, hand start_server the PID file so it can clean it up on
+    // shutdown. In foreground mode there is nothing to clean up.
+    let shutdown_pid_file = if foreground {
+        None
+    } else {
+        Some(pid_file_path(&run_dir, port))
+    };
+
+    extenddb_server::start_server(listener, state, shutdown_pid_file, tls_config).await?;
 
     Ok(())
 }
