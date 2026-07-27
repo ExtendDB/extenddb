@@ -12,6 +12,8 @@ mod test_base;
 #[cfg(test)]
 mod authorization;
 #[cfg(test)]
+mod backup_arn_scoping;
+#[cfg(test)]
 mod backup_restore;
 #[cfg(test)]
 mod batch_get_item;

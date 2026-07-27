@@ -15,12 +15,25 @@ use futures::future::BoxFuture;
 use crate::PostgresEngine;
 use crate::data::data_table_name;
 
-/// Current epoch milliseconds for unique ARN generation.
+/// Current epoch milliseconds, used as the leading component of a backup id.
 fn epoch_millis() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+/// Build the trailing `backup/<id>` component of a backup ARN.
+///
+/// `DynamoDB` formats this as `<epoch_millis>-<8 hex chars>` (for example
+/// `01489602797149-73d8d5bc`). The random component is part of the identifier,
+/// not decoration: a timestamp alone makes a backup id derivable by anyone who
+/// knows roughly when the backup ran, so the id is only a usable handle for a
+/// caller that was given it.
+fn backup_id() -> String {
+    use rand::Rng;
+    let suffix: u32 = rand::rng().random();
+    format!("{ts}-{suffix:08x}", ts = epoch_millis())
 }
 
 /// Convert a `PostgreSQL` `TIMESTAMPTZ` to epoch seconds as `f64`.
@@ -75,9 +88,9 @@ impl BackupEngine for PostgresEngine {
             ) = row;
 
             let backup_arn = format!(
-                "arn:aws:dynamodb:{region}:{account_id}:table/{table_name}/backup/{ts}",
+                "arn:aws:dynamodb:{region}:{account_id}:table/{table_name}/backup/{id}",
                 region = self.region,
-                ts = epoch_millis()
+                id = backup_id()
             );
 
             // Snapshot items from the data table.
@@ -179,8 +192,10 @@ impl BackupEngine for PostgresEngine {
 
     fn describe_backup(
         &self,
+        account_id: &str,
         backup_arn: &str,
     ) -> BoxFuture<'_, Result<BackupDescription, StorageError>> {
+        let account_id = account_id.to_string();
         let backup_arn = backup_arn.to_string();
         Box::pin(async move {
             let row: (
@@ -205,10 +220,11 @@ impl BackupEngine for PostgresEngine {
                  COALESCE(t.creation_date_time, b.created_at) \
                  FROM backups b \
                  LEFT JOIN tables t ON t.table_id = b.table_id \
-                 WHERE b.backup_arn = $1",
+                 WHERE b.backup_arn = $1 AND b.account_id = $3",
             )
             .bind(&backup_arn)
             .bind(&self.region)
+            .bind(&account_id)
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?
@@ -329,23 +345,38 @@ impl BackupEngine for PostgresEngine {
 
     fn delete_backup(
         &self,
+        account_id: &str,
         backup_arn: &str,
     ) -> BoxFuture<'_, Result<BackupDescription, StorageError>> {
+        let account_id = account_id.to_string();
         let backup_arn = backup_arn.to_string();
         Box::pin(async move {
-            let desc = self.describe_backup(&backup_arn).await?;
+            // Resolves account-scoped, so a backup owned by another account is
+            // reported missing here and the writes below never run.
+            let desc = self.describe_backup(&account_id, &backup_arn).await?;
 
-            sqlx::query("DELETE FROM backup_items WHERE backup_arn = $1")
-                .bind(&backup_arn)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
+            // The account predicate is repeated on both writes rather than
+            // relying on the lookup above, so the statements are correct on
+            // their own terms.
+            sqlx::query(
+                "DELETE FROM backup_items WHERE backup_arn = $1 AND EXISTS (\
+                 SELECT 1 FROM backups b WHERE b.backup_arn = $1 AND b.account_id = $2)",
+            )
+            .bind(&backup_arn)
+            .bind(&account_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
 
-            sqlx::query("UPDATE backups SET backup_status = 'DELETED' WHERE backup_arn = $1")
-                .bind(&backup_arn)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
+            sqlx::query(
+                "UPDATE backups SET backup_status = 'DELETED' \
+                 WHERE backup_arn = $1 AND account_id = $2",
+            )
+            .bind(&backup_arn)
+            .bind(&account_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
 
             Ok(BackupDescription {
                 backup_details: BackupDetails {
@@ -376,9 +407,11 @@ impl BackupEngine for PostgresEngine {
             ) = sqlx::query_as(
                 "SELECT table_name, key_schema, attribute_definitions, billing_mode, \
                  provisioned_throughput \
-                 FROM backups WHERE backup_arn = $1 AND backup_status = 'AVAILABLE'",
+                 FROM backups \
+                 WHERE backup_arn = $1 AND account_id = $2 AND backup_status = 'AVAILABLE'",
             )
             .bind(&backup_arn)
+            .bind(&account_id)
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?
@@ -620,7 +653,7 @@ impl BackupEngine for PostgresEngine {
             let desc = self
                 .restore_table_from_backup(&account_id, &target_table_name, &backup.backup_arn)
                 .await?;
-            let _ = self.delete_backup(&backup.backup_arn).await;
+            let _ = self.delete_backup(&account_id, &backup.backup_arn).await;
             Ok(desc)
         })
     }
