@@ -590,6 +590,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "reqwest",
+ "serde_json",
  "tokio",
  "uuid",
 ]

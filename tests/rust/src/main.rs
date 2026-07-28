@@ -20,6 +20,8 @@ mod batch_get_item;
 #[cfg(test)]
 mod batch_write_item;
 #[cfg(test)]
+mod batch_transact_authz;
+#[cfg(test)]
 mod binary_sort_key;
 #[cfg(test)]
 mod capacity_throttling;
