@@ -55,7 +55,6 @@ hyper = { version = "1" }
 urlencoding = { version = "2.1" }
 
 # Database plugin registry
-inventory = "0.3"
 
 # Caching
 moka = { version = "0.12", features = ["future"] }
