@@ -20,8 +20,8 @@ use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_credential_types::Credentials;
 use aws_sdk_dynamodb::config::Region;
 use aws_sdk_dynamodb::types::{
-    AttributeDefinition, BillingMode, KeySchemaElement, KeyType, KeysAndAttributes, Put,
-    PutRequest, ScalarAttributeType, TransactGetItem, TransactWriteItem, WriteRequest,
+    AttributeDefinition, BillingMode, ConditionCheck, KeySchemaElement, KeyType, KeysAndAttributes,
+    Put, PutRequest, ScalarAttributeType, TransactGetItem, TransactWriteItem, WriteRequest,
 };
 use aws_sdk_dynamodb::Client;
 use aws_smithy_http_client::tls;
@@ -395,4 +395,69 @@ async fn putitem_deny_blocks_transact_write_put() {
         .await
         .unwrap_err();
     assert!(is_denied(err_code(&err)), "got {err:?}");
+}
+
+// --- D: ConditionCheck authorizes as the exact IAM action -----------------
+// These pin the ConditionCheck sub-op to `dynamodb:ConditionCheckItem` (per the
+// AWS IAM Service Authorization Reference / "Using IAM with DynamoDB
+// transactions": "For the ConditionCheck action, you can use the
+// dynamodb:ConditionCheckItem permission"). The all-or-nothing tests above use
+// `dynamodb:*`, which matches any action string, so they cannot pin the exact
+// name; these two do.
+
+#[tokio::test]
+async fn conditioncheckitem_deny_blocks_transact_write_condition_check() {
+    if skip_no_admin() {
+        return;
+    }
+    let (_allowed, secret, secret_arn) = tables().await;
+    // ConditionCheck decomposes to dynamodb:ConditionCheckItem, so a deny on
+    // that exact action must block the transaction.
+    let u = user_with_policy(deny_policy("dynamodb:ConditionCheckItem", &secret_arn)).await;
+    let err = u
+        .transact_write_items()
+        .transact_items(
+            TransactWriteItem::builder()
+                .condition_check(
+                    ConditionCheck::builder()
+                        .table_name(&secret)
+                        .set_key(Some(key("s1")))
+                        .condition_expression("attribute_exists(pk)")
+                        .build()
+                        .unwrap(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap_err();
+    assert!(is_denied(err_code(&err)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn conditioncheck_action_string_does_not_block_transact_write() {
+    if skip_no_admin() {
+        return;
+    }
+    let (_allowed, secret, secret_arn) = tables().await;
+    // `dynamodb:ConditionCheck` is NOT a real IAM action (the sub-op authorizes
+    // as `dynamodb:ConditionCheckItem`). A deny on the wrong string must NOT
+    // block the operation, proving we authorize under the correct action.
+    let u = user_with_policy(deny_policy("dynamodb:ConditionCheck", &secret_arn)).await;
+    u.transact_write_items()
+        .transact_items(
+            TransactWriteItem::builder()
+                .condition_check(
+                    ConditionCheck::builder()
+                        .table_name(&secret)
+                        .set_key(Some(key("s1")))
+                        .condition_expression("attribute_exists(pk)")
+                        .build()
+                        .unwrap(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .expect("a deny on the non-existent dynamodb:ConditionCheck action must not block ConditionCheck");
 }
