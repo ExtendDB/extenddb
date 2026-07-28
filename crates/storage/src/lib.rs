@@ -440,8 +440,14 @@ pub trait StreamEngine: Send + Sync {
     ) -> BoxFuture<'_, Result<(), StorageError>>;
 
     /// Read stream records from a shard starting after a sequence number.
+    ///
+    /// `account_id` is the authenticated caller's account. Implementations MUST
+    /// return records only for shards whose backing table belongs to that
+    /// account; a shard whose table belongs to a different account must yield no
+    /// records, so a shard iterator only reads its owning account's stream data.
     fn get_stream_records(
         &self,
+        account_id: &str,
         shard_id: &str,
         after_sequence: Option<&str>,
         limit: i64,
@@ -524,9 +530,15 @@ pub trait BackupEngine: Send + Sync {
         backup_name: &str,
     ) -> BoxFuture<'_, Result<extenddb_core::types::BackupDetails, StorageError>>;
 
-    /// Describe a backup by ARN.
+    /// Describe a backup by ARN, scoped to the owning account.
+    ///
+    /// Backups belong to an account, so implementations must match on both
+    /// `account_id` and `backup_arn` and report a missing backup when the ARN
+    /// belongs to another account — consistent with `list_backups`, which is
+    /// already account-scoped.
     fn describe_backup(
         &self,
+        account_id: &str,
         backup_arn: &str,
     ) -> BoxFuture<'_, Result<extenddb_core::types::BackupDescription, StorageError>>;
 
@@ -537,13 +549,21 @@ pub trait BackupEngine: Send + Sync {
         table_name: Option<&str>,
     ) -> BoxFuture<'_, Result<Vec<extenddb_core::types::BackupSummary>, StorageError>>;
 
-    /// Delete a backup by ARN.
+    /// Delete a backup by ARN, scoped to the owning account.
+    ///
+    /// Same scoping requirement as `describe_backup`: an ARN owned by another
+    /// account must be reported as missing rather than deleted.
     fn delete_backup(
         &self,
+        account_id: &str,
         backup_arn: &str,
     ) -> BoxFuture<'_, Result<extenddb_core::types::BackupDescription, StorageError>>;
 
     /// Restore a table from a backup.
+    ///
+    /// `account_id` is the caller's account: it owns the new table *and* scopes
+    /// the source backup lookup, since a backup can only be restored by the
+    /// account that owns it.
     fn restore_table_from_backup(
         &self,
         account_id: &str,

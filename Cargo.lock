@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -891,7 +891,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-auth"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -911,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-cache"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "futures",
  "moka",
@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-core"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "bigdecimal",
@@ -935,7 +935,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-engine"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "crc32fast",
@@ -954,7 +954,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-server"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -1009,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-postgres"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
