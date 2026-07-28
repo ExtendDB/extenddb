@@ -220,7 +220,7 @@ impl BackupEngine for PostgresEngine {
                  COALESCE(t.creation_date_time, b.created_at) \
                  FROM backups b \
                  LEFT JOIN tables t ON t.table_id = b.table_id \
-                 WHERE b.backup_arn = $1 AND b.account_id = $3",
+                 WHERE b.backup_arn = $1 AND b.account_id = $3 AND b.backup_status != 'DELETED'",
             )
             .bind(&backup_arn)
             .bind(&self.region)
