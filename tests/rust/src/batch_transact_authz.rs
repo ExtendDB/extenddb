@@ -203,8 +203,26 @@ async fn tables() -> (String, String, String) {
 
 // --- A: Deny dynamodb:* on the secret table -------------------------------
 
+/// Skip when admin creds are unavailable, matching the Python auth suite
+/// (`test_abac.py`, `test_auth_integration.py`). `devtools/run-tests --extenddb
+/// --rust-integration` sets `EXTENDDB_ADMIN_PASSWORD`, so CI still runs these
+/// for real; a bare `cargo test` without it skips rather than hard-failing.
+fn skip_no_admin() -> bool {
+    if std::env::var("EXTENDDB_ADMIN_PASSWORD").is_err() {
+        eprintln!(
+            "SKIP: EXTENDDB_ADMIN_PASSWORD not set; run via \
+             devtools/run-tests --extenddb --rust-integration"
+        );
+        return true;
+    }
+    false
+}
+
 #[tokio::test]
 async fn batch_get_including_denied_table_is_denied() {
+    if skip_no_admin() {
+        return;
+    }
     let (allowed, secret, secret_arn) = tables().await;
     let u = user_with_policy(deny_policy("dynamodb:*", &secret_arn)).await;
     let err = u
@@ -228,6 +246,9 @@ async fn batch_get_including_denied_table_is_denied() {
 
 #[tokio::test]
 async fn batch_write_including_denied_table_is_denied() {
+    if skip_no_admin() {
+        return;
+    }
     let (_allowed, secret, secret_arn) = tables().await;
     let u = user_with_policy(deny_policy("dynamodb:*", &secret_arn)).await;
     let err = u
@@ -246,6 +267,9 @@ async fn batch_write_including_denied_table_is_denied() {
 
 #[tokio::test]
 async fn transact_get_including_denied_table_is_denied() {
+    if skip_no_admin() {
+        return;
+    }
     let (_allowed, secret, secret_arn) = tables().await;
     let u = user_with_policy(deny_policy("dynamodb:*", &secret_arn)).await;
     let err = u
@@ -269,6 +293,9 @@ async fn transact_get_including_denied_table_is_denied() {
 
 #[tokio::test]
 async fn transact_write_including_denied_table_is_denied() {
+    if skip_no_admin() {
+        return;
+    }
     let (_allowed, secret, secret_arn) = tables().await;
     let u = user_with_policy(deny_policy("dynamodb:*", &secret_arn)).await;
     let err = u
@@ -291,6 +318,9 @@ async fn transact_write_including_denied_table_is_denied() {
 
 #[tokio::test]
 async fn getitem_deny_does_not_block_batch_get() {
+    if skip_no_admin() {
+        return;
+    }
     let (_allowed, secret, secret_arn) = tables().await;
     let u = user_with_policy(deny_policy("dynamodb:GetItem", &secret_arn)).await;
     // BatchGetItem is its own action; a GetItem deny does not apply.
@@ -303,6 +333,9 @@ async fn getitem_deny_does_not_block_batch_get() {
 
 #[tokio::test]
 async fn getitem_deny_blocks_transact_get() {
+    if skip_no_admin() {
+        return;
+    }
     let (_allowed, secret, secret_arn) = tables().await;
     let u = user_with_policy(deny_policy("dynamodb:GetItem", &secret_arn)).await;
     // TransactGetItems decomposes to GetItem, so the deny applies.
@@ -327,6 +360,9 @@ async fn getitem_deny_blocks_transact_get() {
 
 #[tokio::test]
 async fn putitem_deny_does_not_block_batch_write() {
+    if skip_no_admin() {
+        return;
+    }
     let (_allowed, secret, secret_arn) = tables().await;
     let u = user_with_policy(deny_policy("dynamodb:PutItem", &secret_arn)).await;
     u.batch_write_item()
@@ -343,6 +379,9 @@ async fn putitem_deny_does_not_block_batch_write() {
 
 #[tokio::test]
 async fn putitem_deny_blocks_transact_write_put() {
+    if skip_no_admin() {
+        return;
+    }
     let (_allowed, secret, secret_arn) = tables().await;
     let u = user_with_policy(deny_policy("dynamodb:PutItem", &secret_arn)).await;
     let err = u
