@@ -8,17 +8,19 @@ use serde_json::{Value, json};
 
 use crate::{OperationContext, serialize_output};
 
-/// Resolve the `BackupArn` field, rejecting ARNs that name a different account.
+/// Resolve the `BackupArn` field, denying ARNs that name a different account.
 ///
 /// A backup ARN embeds the owning account:
-/// `arn:aws:dynamodb:<region>:<account>:table/<table>/backup/<id>`. Backups are
-/// account-scoped resources, so an ARN belonging to another account is treated
-/// as absent rather than as a permission error — the same response a caller gets
-/// for an ARN that was never issued, and consistent with `ListBackups`, which
-/// only ever returns the caller's own backups.
+/// `arn:aws:dynamodb:<region>:<account>:table/<table>/backup/<id>`. DynamoDB
+/// authorizes on the ARN's account before resolving the backup, so an ARN whose
+/// account differs from the caller's is rejected with `AccessDeniedException`
+/// (verified against the service) — not reported as absent. A caller can
+/// therefore distinguish "my backup does not exist" (`BackupNotFoundException`,
+/// from the backend) from "that ARN belongs to another account"
+/// (`AccessDeniedException`, here), matching DynamoDB.
 ///
-/// Backends also filter on `account_id`; this check keeps the rule in the engine
-/// so it holds for every backend rather than depending on each one to repeat it.
+/// Keeping this check in the engine means it holds for every backend; backends
+/// additionally filter on `account_id` so a mismatch can never resolve.
 fn backup_arn_field(body: &Value, account_id: &str) -> Result<String, DynamoDbError> {
     let backup_arn = body
         .get("BackupArn")
@@ -31,13 +33,15 @@ fn backup_arn_field(body: &Value, account_id: &str) -> Result<String, DynamoDbEr
             )
         })?;
 
-    // Field 4 of a colon-delimited ARN is the account id. A malformed ARN has no
-    // account to match, so it falls through as not found too.
+    // Field 4 of a colon-delimited ARN is the account id. An ARN naming another
+    // account — or one malformed enough to have no account in that position — is
+    // denied before the backend resolves it, matching DynamoDB's authorize-first
+    // behavior.
     let arn_account = backup_arn.split(':').nth(4);
     if arn_account != Some(account_id) {
-        return Err(DynamoDbError::ResourceNotFoundException(format!(
-            "Backup not found: {backup_arn}"
-        )));
+        return Err(DynamoDbError::AccessDeniedException(
+            "Access is denied".to_owned(),
+        ));
     }
 
     Ok(backup_arn.to_owned())
@@ -245,9 +249,11 @@ fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> DynamoDbEr
             DynamoDbError::ResourceInUseException(msg)
         }
         extenddb_storage::error::StorageError::Validation(msg) => {
-            // Backup-not-found errors come through as Validation.
+            // A missing (or deleted) backup surfaces from the backend as a
+            // Validation error carrying "Backup not found"; DynamoDB reports
+            // this as BackupNotFoundException, not ResourceNotFoundException.
             if msg.contains("Backup not found") {
-                DynamoDbError::ResourceNotFoundException(msg)
+                DynamoDbError::BackupNotFoundException(msg)
             } else {
                 DynamoDbError::ValidationException(msg)
             }
@@ -278,17 +284,17 @@ mod tests {
     }
 
     #[test]
-    fn other_account_arn_is_reported_missing() {
+    fn other_account_arn_is_denied() {
         let body = json!({ "BackupArn": arn("999999999999") });
         let err = backup_arn_field(&body, ACCOUNT).unwrap_err();
         assert!(
-            matches!(err, DynamoDbError::ResourceNotFoundException(_)),
-            "expected ResourceNotFoundException, got {err:?}"
+            matches!(err, DynamoDbError::AccessDeniedException(_)),
+            "expected AccessDeniedException, got {err:?}"
         );
     }
 
     #[test]
-    fn malformed_arn_is_reported_missing() {
+    fn malformed_arn_is_denied() {
         for candidate in [
             "not-an-arn",
             "arn:aws:dynamodb",
@@ -302,8 +308,8 @@ mod tests {
             let body = json!({ "BackupArn": candidate });
             let err = backup_arn_field(&body, ACCOUNT).unwrap_err();
             assert!(
-                matches!(err, DynamoDbError::ResourceNotFoundException(_)),
-                "expected ResourceNotFoundException for {candidate:?}, got {err:?}"
+                matches!(err, DynamoDbError::AccessDeniedException(_)),
+                "expected AccessDeniedException for {candidate:?}, got {err:?}"
             );
         }
     }

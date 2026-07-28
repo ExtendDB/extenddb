@@ -56,7 +56,7 @@ async fn make_table(name: &str) {
 }
 
 #[tokio::test]
-async fn describe_backup_with_another_accounts_arn_reports_not_found() {
+async fn describe_backup_with_another_accounts_arn_is_denied() {
     let c = client();
     let err = c
         .describe_backup()
@@ -67,13 +67,13 @@ async fn describe_backup_with_another_accounts_arn_reports_not_found() {
 
     assert_eq!(
         err_code(&err),
-        Some("ResourceNotFoundException"),
-        "expected the ARN to resolve as absent, got: {err:?}"
+        Some("AccessDeniedException"),
+        "a foreign-account ARN must be denied, got: {err:?}"
     );
 }
 
 #[tokio::test]
-async fn delete_backup_with_another_accounts_arn_reports_not_found() {
+async fn delete_backup_with_another_accounts_arn_is_denied() {
     let c = client();
     let err = c
         .delete_backup()
@@ -84,13 +84,13 @@ async fn delete_backup_with_another_accounts_arn_reports_not_found() {
 
     assert_eq!(
         err_code(&err),
-        Some("ResourceNotFoundException"),
-        "expected the ARN to resolve as absent, got: {err:?}"
+        Some("AccessDeniedException"),
+        "a foreign-account ARN must be denied, got: {err:?}"
     );
 }
 
 #[tokio::test]
-async fn restore_from_another_accounts_backup_arn_reports_not_found() {
+async fn restore_from_another_accounts_backup_arn_is_denied() {
     let c = client();
     let target = format!("BackupScopeRestore_{}", ts());
 
@@ -104,15 +104,15 @@ async fn restore_from_another_accounts_backup_arn_reports_not_found() {
 
     assert_eq!(
         err_code(&err),
-        Some("ResourceNotFoundException"),
-        "expected the ARN to resolve as absent, got: {err:?}"
+        Some("AccessDeniedException"),
+        "a foreign-account ARN must be denied, got: {err:?}"
     );
 
     // The target table must not have been created as a side effect.
     let describe = c.describe_table().table_name(&target).send().await;
     assert!(
         describe.is_err(),
-        "restore from an unresolvable backup ARN created table {target}"
+        "restore from a denied backup ARN created table {target}"
     );
 }
 
@@ -149,8 +149,71 @@ async fn describe_backup_with_own_arn_still_resolves() {
     c.delete_table().table_name(&table).send().await.ok();
 }
 
-/// The backup id carries a random component after the timestamp, so two backups
-/// taken in the same millisecond still get distinct ARNs.
+/// A backup ARN in the caller's own account that does not exist is reported as
+/// `BackupNotFoundException` (not `ResourceNotFoundException`), matching
+/// DynamoDB. The ARN is derived from a real backup so account/region/table
+/// match the caller; only the backup id is swapped for one never issued.
+#[tokio::test]
+async fn describe_backup_with_own_nonexistent_arn_is_backup_not_found() {
+    let c = client();
+    let table = format!("BackupScopeMiss_{}", ts());
+    make_table(&table).await;
+
+    let create = c
+        .create_backup()
+        .table_name(&table)
+        .backup_name("scope-miss")
+        .send()
+        .await
+        .unwrap();
+    let real = create.backup_details().unwrap().backup_arn().to_string();
+    // Same account/region/table prefix, a backup id that was never issued.
+    let missing = format!("{}/00000000000000-deadbeef", real.rsplit_once('/').unwrap().0);
+
+    let err = c
+        .describe_backup()
+        .backup_arn(&missing)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err_code(&err),
+        Some("BackupNotFoundException"),
+        "own-account missing backup must be BackupNotFoundException, got: {err:?}"
+    );
+
+    c.delete_backup().backup_arn(&real).send().await.ok();
+    c.delete_table().table_name(&table).send().await.ok();
+}
+
+/// After a backup is deleted, DescribeBackup on its ARN reports
+/// `BackupNotFoundException` — a deleted backup reads as absent.
+#[tokio::test]
+async fn describe_backup_after_delete_is_backup_not_found() {
+    let c = client();
+    let table = format!("BackupScopeDel_{}", ts());
+    make_table(&table).await;
+
+    let create = c
+        .create_backup()
+        .table_name(&table)
+        .backup_name("scope-del")
+        .send()
+        .await
+        .unwrap();
+    let arn = create.backup_details().unwrap().backup_arn().to_string();
+
+    c.delete_backup().backup_arn(&arn).send().await.unwrap();
+
+    let err = c.describe_backup().backup_arn(&arn).send().await.unwrap_err();
+    assert_eq!(
+        err_code(&err),
+        Some("BackupNotFoundException"),
+        "a deleted backup must read as BackupNotFoundException, got: {err:?}"
+    );
+
+    c.delete_table().table_name(&table).send().await.ok();
+}
 #[tokio::test]
 async fn backup_ids_are_not_derived_from_the_timestamp_alone() {
     let c = client();
