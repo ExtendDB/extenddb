@@ -405,7 +405,7 @@ pub fn pid_file_path_default(port: u16) -> PathBuf {
 }
 
 mod display;
-pub use display::build_config_entries;
+pub use display::{build_config_entries, should_redact};
 
 #[cfg(test)]
 mod tests {

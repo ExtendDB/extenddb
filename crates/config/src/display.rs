@@ -6,8 +6,9 @@ use crate::AppConfig;
 
 /// Keys whose values must be redacted in configuration displays.
 ///
-/// Canonical list — keep in sync with `REDACTED_KEYS` in
-/// `crates/server/src/console/pages/settings_pages.rs`.
+/// The single source of truth for redaction patterns. Consumers (including the
+/// console settings page) call [`should_redact`] rather than keeping their own
+/// copy of this list.
 const REDACTED_CONFIG_KEYS: &[&str] = &[
     "connection_string",
     "encryption_key",
@@ -16,10 +17,20 @@ const REDACTED_CONFIG_KEYS: &[&str] = &[
     "token",
 ];
 
+/// Return `true` if a configuration or settings key's value must be redacted
+/// before it is displayed.
+///
+/// Matching is case-insensitive and substring-based, so `DATA_DB_PASSWORD` and
+/// `storage.connection_string` both redact.
+#[must_use]
+pub fn should_redact(key: &str) -> bool {
+    let lower = key.to_lowercase();
+    REDACTED_CONFIG_KEYS.iter().any(|p| lower.contains(p))
+}
+
 /// Return `"••••••••"` if `key` matches a redaction pattern, else `val`.
 fn redact_if_sensitive(key: &str, val: &str) -> String {
-    let lower = key.to_lowercase();
-    if REDACTED_CONFIG_KEYS.iter().any(|p| lower.contains(p)) {
+    if should_redact(key) {
         "••••••••".to_owned()
     } else {
         val.to_owned()
