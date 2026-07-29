@@ -36,8 +36,10 @@ pub async fn run(args: MigrateArgs) -> anyhow::Result<()> {
             args.config,
         );
     }
-    let app_config = config::load(&args.config)?;
-    let backend = &app_config.storage.backend;
+    // Load the config for validation only: migrate drives the bootstrapper from
+    // the config path directly, but a malformed config should fail here rather
+    // than midway through a migration.
+    config::load(&args.config)?;
 
     println!("=== extenddb migrate ===");
     println!("Config:           {}", args.config);
@@ -47,10 +49,9 @@ pub async fn run(args: MigrateArgs) -> anyhow::Result<()> {
     let cli_args: Vec<String> = std::env::args().collect();
 
     // Create bootstrapper via registry
-    let bootstrap =
-        extenddb_storage::bootstrapper::create_bootstrapper(backend, &args.config, &cli_args)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let bootstrap = extenddb_storage::bootstrapper::create_bootstrapper(&args.config, &cli_args)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
     // Show current catalog version.
     println!("--- Checking current catalog version...");

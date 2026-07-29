@@ -6,14 +6,12 @@
 //! Owns the command-line interface (`serve`, `init`, `destroy`, `verify`,
 //! `migrate`, `status`, `stop`, `settings`, `manage`, `catalog-check`) and the
 //! subcommand dispatch. It is backend-agnostic: a backend's thin `main`
-//! registers its backend into the [`BackendRegistry`](extenddb_storage::registry),
-//! installs it, and then calls [`run`]:
+//! installs its backend with
+//! [`set_backend`](extenddb_storage::set_backend) and then calls [`run`]:
 //!
 //! ```ignore
 //! fn main() -> anyhow::Result<()> {
-//!     let mut registry = extenddb_storage::BackendRegistry::new();
-//!     my_backend::register(&mut registry);
-//!     extenddb_storage::set_registry(registry).expect("registry already set");
+//!     extenddb_storage::set_backend(my_backend::backend())?;
 //!     extenddb_app::run(extenddb_app::BuildInfo {
 //!         version: env!("CARGO_PKG_VERSION"),
 //!         git_hash: env!("MY_GIT_HASH"),
@@ -86,8 +84,8 @@ enum Command {
 
 /// Parse the command line and dispatch the selected subcommand.
 ///
-/// The backend registry must already be installed via
-/// [`extenddb_storage::set_registry`] before this is called.
+/// The backend must already be installed via
+/// [`extenddb_storage::set_backend`] before this is called.
 ///
 /// # Errors
 ///
@@ -134,16 +132,14 @@ pub fn run(build: BuildInfo) -> anyhow::Result<()> {
 fn print_version(build: BuildInfo) {
     println!("extenddb {}", build.version);
 
-    // Report catalog version(s) for all registered backend(s)
-    let backends = extenddb_storage::operations::list_operations_backends();
-    if backends.is_empty() {
-        println!("catalog unknown (no backends registered)");
-    } else {
-        for backend in backends {
-            let version = extenddb_storage::operations::catalog_version(backend)
-                .unwrap_or_else(|_| "unknown".to_string());
-            println!("catalog {version} ({backend})");
-        }
+    // One backend is compiled into this binary; report its catalog version.
+    match (
+        extenddb_storage::backend_name(),
+        extenddb_storage::operations::catalog_version(),
+    ) {
+        (Some(backend), Ok(version)) => println!("catalog {version} ({backend})"),
+        (Some(backend), Err(_)) => println!("catalog unknown ({backend})"),
+        (None, _) => println!("catalog unknown (no backend installed)"),
     }
 
     println!("commit {}", build.git_hash);

@@ -145,42 +145,19 @@ pub type BootstrapperFactory =
         Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<Box<dyn Bootstrapper>, StorageError>> + Send>>;
 
-/// Create a bootstrapper for the given backend.
+/// Create a bootstrapper using the installed backend.
 ///
-/// Looks up the backend in the installed [`BackendRegistry`](crate::registry)
-/// and calls its bootstrapper factory.
+/// Calls the bootstrapper factory of the [`Backend`](crate::Backend) installed
+/// via [`set_backend`](crate::set_backend).
 pub async fn create_bootstrapper(
-    backend: &str,
     config_path: &str,
     cli_args: &[String],
 ) -> Result<Box<dyn Bootstrapper>, StorageError> {
-    if let Some(factory) =
-        crate::registry::try_registry().and_then(|r| r.bootstrappers.get(backend))
-    {
-        tracing::info!("Found registered backend: {}", backend);
-        return factory(config_path.to_string(), cli_args.to_vec()).await;
-    }
-
-    let available = list_backends();
-
-    tracing::error!(
-        "Unknown backend: {}. Available: {}",
-        backend,
-        available.join(", ")
-    );
-
-    Err(StorageError::Internal(format!(
-        "Unknown backend: {backend}. Available backends: {}",
-        available.join(", ")
-    )))
-}
-
-/// List all registered backends.
-#[must_use]
-pub fn list_backends() -> Vec<&'static str> {
-    crate::registry::try_registry()
-        .map(|r| r.bootstrappers.keys().copied().collect())
-        .unwrap_or_default()
+    let backend = crate::backend::try_backend().ok_or_else(|| {
+        StorageError::Internal("no storage backend installed (set_backend was not called)".into())
+    })?;
+    tracing::info!("Using compiled-in backend: {}", backend.name);
+    (backend.bootstrapper)(config_path.to_string(), cli_args.to_vec()).await
 }
 
 /// Helper functions for bootstrapper implementations.

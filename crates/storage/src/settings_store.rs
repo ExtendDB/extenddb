@@ -9,17 +9,18 @@ use futures::future::BoxFuture;
 /// Error type for settings store creation.
 #[derive(Debug)]
 pub enum SettingsStoreError {
-    BackendNotFound(String),
+    /// No storage backend has been installed (set_backend was not called).
+    BackendNotInstalled,
     ConnectionFailed(String),
 }
 
 impl std::fmt::Display for SettingsStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BackendNotFound(backend) => {
+            Self::BackendNotInstalled => {
                 write!(
                     f,
-                    "No settings store factory registered for backend '{backend}'"
+                    "no storage backend installed (set_backend was not called)"
                 )
             }
             Self::ConnectionFailed(msg) => write!(f, "Failed to connect: {msg}"),
@@ -33,13 +34,10 @@ impl std::error::Error for SettingsStoreError {}
 pub type SettingsStoreFactory =
     fn(&str) -> BoxFuture<'static, Result<Box<dyn SettingsStore>, SettingsStoreError>>;
 
-/// Create a settings store for the given backend and connection string.
+/// Create a settings store for the installed backend.
 pub async fn create_settings_store(
-    backend: &str,
     connection_string: &str,
 ) -> Result<Box<dyn SettingsStore>, SettingsStoreError> {
-    match crate::registry::try_registry().and_then(|r| r.settings_stores.get(backend)) {
-        Some(factory) => factory(connection_string).await,
-        None => Err(SettingsStoreError::BackendNotFound(backend.to_string())),
-    }
+    let backend = crate::backend::try_backend().ok_or(SettingsStoreError::BackendNotInstalled)?;
+    (backend.settings_store)(connection_string).await
 }

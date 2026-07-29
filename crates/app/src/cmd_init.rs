@@ -140,10 +140,9 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
     let cli_args: Vec<String> = std::env::args().collect();
 
     // Create bootstrapper via registry (no hardcoded match!)
-    let bootstrapper =
-        extenddb_storage::bootstrapper::create_bootstrapper(&backend, &args.config, &cli_args)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let bootstrapper = extenddb_storage::bootstrapper::create_bootstrapper(&args.config, &cli_args)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
     // Ensure application user exists.
     bootstrapper
