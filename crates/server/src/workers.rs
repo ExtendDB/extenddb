@@ -270,3 +270,165 @@ pub(crate) async fn login_attempt_cleanup_worker(
         store.cleanup_old_attempts(MAX_AGE_SECONDS).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{login_attempt_cleanup_worker, metrics_flush_worker};
+    use extenddb_core::metrics::MetricsCollector;
+    use extenddb_storage::CancellationToken;
+    use extenddb_storage::management_store::{MetricsRow, MetricsStore, OpResult, RateLimitStore};
+    use futures::future::BoxFuture;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Records every row handed to `insert_metrics` so a test can assert what
+    /// the flush worker persisted.
+    #[derive(Default)]
+    struct RecordingMetricsStore {
+        inserted: Mutex<Vec<MetricsRow>>,
+    }
+
+    impl RecordingMetricsStore {
+        fn inserted_count(&self) -> usize {
+            self.inserted.lock().expect("lock poisoned").len()
+        }
+    }
+
+    impl MetricsStore for RecordingMetricsStore {
+        fn insert_metrics(&self, rows: &[MetricsRow]) -> BoxFuture<'_, OpResult<()>> {
+            self.inserted
+                .lock()
+                .expect("lock poisoned")
+                .extend_from_slice(rows);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn query_metrics(
+            &self,
+            _start: time::OffsetDateTime,
+            _end: time::OffsetDateTime,
+            _table_name: Option<&str>,
+            _metric: Option<&str>,
+        ) -> BoxFuture<'_, OpResult<Vec<MetricsRow>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn prune_metrics(&self, _retention: Duration) -> BoxFuture<'_, OpResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Counts cleanup sweeps so a test can assert the worker did not run one.
+    #[derive(Default)]
+    struct CountingRateLimitStore {
+        sweeps: Mutex<usize>,
+    }
+
+    impl RateLimitStore for CountingRateLimitStore {
+        fn count_principal_failures(
+            &self,
+            _principal: &str,
+            _window_seconds: i64,
+        ) -> BoxFuture<'_, OpResult<i64>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn count_ip_failures(
+            &self,
+            _source_ip: &str,
+            _window_seconds: i64,
+        ) -> BoxFuture<'_, OpResult<i64>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn record_failed_login(
+            &self,
+            _principal: &str,
+            _source_ip: Option<&str>,
+        ) -> BoxFuture<'_, ()> {
+            Box::pin(async {})
+        }
+
+        fn cleanup_old_attempts(&self, _max_age_seconds: i64) -> BoxFuture<'_, ()> {
+            *self.sweeps.lock().expect("lock poisoned") += 1;
+            Box::pin(async {})
+        }
+    }
+
+    /// A worker must keep running while the token is live. Without this the
+    /// cancellation test below would also pass for a worker that returns
+    /// immediately and never does any work at all.
+    #[tokio::test]
+    async fn worker_keeps_running_until_cancelled() {
+        let store = Arc::new(CountingRateLimitStore::default());
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(login_attempt_cleanup_worker(store.clone(), token.clone()));
+
+        // The cleanup interval is an hour, so the worker must still be sleeping.
+        let outcome = tokio::time::timeout(Duration::from_millis(200), handle).await;
+        assert!(
+            outcome.is_err(),
+            "worker returned before it was cancelled — its loop is not waiting on the interval"
+        );
+        assert_eq!(
+            *store.sweeps.lock().expect("lock poisoned"),
+            0,
+            "worker swept before its first interval elapsed"
+        );
+        token.cancel();
+    }
+
+    /// Cancelling the token must stop the worker at its next tick rather than
+    /// leaving it to be dropped when the runtime shuts down.
+    #[tokio::test]
+    async fn cancellation_stops_a_sleeping_worker() {
+        let store = Arc::new(CountingRateLimitStore::default());
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(login_attempt_cleanup_worker(store, token.clone()));
+
+        token.cancel();
+
+        // The worker is mid-`sleep` on an hour-long interval; it may only return
+        // promptly because it also selects on the token.
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("worker did not return within 2s of cancellation")
+            .expect("worker panicked");
+    }
+
+    /// On shutdown the flush worker must persist the partial bucket it is
+    /// holding. The flush interval is 60s, so a row appearing at all proves it
+    /// came from the cancellation path and not from a periodic tick.
+    #[tokio::test]
+    async fn cancellation_flushes_the_final_partial_bucket() {
+        let metrics = Arc::new(MetricsCollector::new());
+        let store = Arc::new(RecordingMetricsStore::default());
+        let token = CancellationToken::new();
+
+        // Buffer a data point younger than one flush interval — a steady-state
+        // flush would deliberately leave this to accumulate.
+        metrics.record_latency(Some("test-table"), "PutItem", 1_234.0);
+
+        let handle = tokio::spawn(metrics_flush_worker(metrics, store.clone(), token.clone()));
+
+        // Nothing may be written before shutdown begins.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            store.inserted_count(),
+            0,
+            "worker flushed before its first interval elapsed"
+        );
+
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("flush worker did not return within 2s of cancellation")
+            .expect("flush worker panicked");
+
+        assert!(
+            store.inserted_count() > 0,
+            "final flush lost the in-flight bucket: nothing was persisted on shutdown"
+        );
+    }
+}
