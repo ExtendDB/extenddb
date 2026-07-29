@@ -10,11 +10,20 @@ use serde::Deserialize;
 pub struct PostgresStorageConfig {
     #[serde(default = "default_connection_string")]
     pub connection_string: String,
-    #[serde(default = "default_pool_size")]
+    // string_coerce: environment-variable overrides
+    // (EXTENDDB__STORAGE__POSTGRES__POOL_SIZE=10) arrive as strings; accept
+    // both forms (issue #222).
+    #[serde(
+        default = "default_pool_size",
+        deserialize_with = "extenddb_storage::config::string_coerce::u32"
+    )]
     pub pool_size: u32,
     /// Maximum connections for the management/catalog pool (authz, IAM, console).
     /// Defaults to `pool_size` if not set.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "extenddb_storage::config::string_coerce::opt_u32"
+    )]
     pub catalog_pool_size: Option<u32>,
 }
 
@@ -111,5 +120,36 @@ impl extenddb_storage::config::StorageConfig for PostgresStorageConfig {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod env_override_tests {
+    use super::PostgresStorageConfig;
+
+    /// Issue #222: `EXTENDDB__STORAGE__POSTGRES__CATALOG_POOL_SIZE=10` reaches
+    /// this deserializer as the string "10". The typed fields must accept it.
+    #[test]
+    fn string_valued_numeric_fields_deserialize() {
+        let cfg: PostgresStorageConfig = toml::from_str(
+            r#"connection_string = "postgresql://u:p@localhost:5432/db"
+pool_size = "25"
+catalog_pool_size = "10""#,
+        )
+        .expect("string-valued numeric fields must deserialize");
+        assert_eq!(cfg.pool_size, 25);
+        assert_eq!(cfg.catalog_pool_size, Some(10));
+    }
+
+    #[test]
+    fn native_numeric_fields_still_deserialize() {
+        let cfg: PostgresStorageConfig = toml::from_str(
+            r#"connection_string = "postgresql://u:p@localhost:5432/db"
+pool_size = 25
+catalog_pool_size = 10"#,
+        )
+        .expect("native numeric fields must deserialize");
+        assert_eq!(cfg.pool_size, 25);
+        assert_eq!(cfg.catalog_pool_size, Some(10));
     }
 }
