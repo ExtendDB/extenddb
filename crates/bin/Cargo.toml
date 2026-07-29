@@ -11,12 +11,8 @@ license.workspace = true
 name = "extenddb"
 path = "src/main.rs"
 
-[features]
-default = ["postgres"]
-postgres = ["extenddb-storage-postgres"]
-
 [dependencies]
 extenddb-app = { workspace = true }
 extenddb-storage = { workspace = true }
-extenddb-storage-postgres = { workspace = true, optional = true }
+extenddb-storage-postgres = { workspace = true }
 anyhow = { workspace = true }
