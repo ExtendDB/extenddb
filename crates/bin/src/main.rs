@@ -17,6 +17,9 @@ fn main() -> anyhow::Result<()> {
     extenddb_storage::set_registry(registry)?;
 
     extenddb_app::run(extenddb_app::BuildInfo {
+        // Read from the bin crate so the reported version is the deployed
+        // artifact's, not a library crate's.
+        version: env!("CARGO_PKG_VERSION"),
         git_hash: env!("EXTENDDB_GIT_HASH"),
         build_time: env!("EXTENDDB_BUILD_TIME"),
     })

@@ -11,6 +11,7 @@ use daemonize::Daemonize;
 use crate::serve_helpers::{check_config_permissions, verify_daemon_started};
 use extenddb_config as config;
 use extenddb_config::pid_file_path;
+use extenddb_server::{BuildInfo, LogTarget, ServeParams};
 
 #[derive(Args, Default)]
 pub struct ServeArgs {
@@ -35,7 +36,7 @@ pub struct ServeArgs {
 /// Bind the listening socket, daemonize, then start the tokio runtime.
 /// Binding before forking ensures port conflicts are reported to stderr
 /// before the parent process exits (D-4).
-pub fn run(args: &ServeArgs, git_hash: &'static str) -> anyhow::Result<()> {
+pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     // P50: Check config file permissions before loading. The config file may
     // contain the encryption key (via `extenddb init`). Reject if more permissive
     // than 0600 (owner read/write only).
@@ -95,9 +96,7 @@ pub fn run(args: &ServeArgs, git_hash: &'static str) -> anyhow::Result<()> {
     // capture noisier than necessary.
     let banner_line1 = format!(
         "extenddb {} (catalog {}) starting on {}",
-        env!("CARGO_PKG_VERSION"),
-        catalog_version,
-        bind_addr,
+        build.version, catalog_version, bind_addr,
     );
     let banner_line2 = format!(
         "  storage: {} ({})",
@@ -149,24 +148,11 @@ pub fn run(args: &ServeArgs, git_hash: &'static str) -> anyhow::Result<()> {
 
         // P57 Bug 3 fix: After daemonize, stderr is /dev/null. Install a panic
         // hook that writes to syslog so panics are visible. Without this, the
-        // child process silently disappears on panic.
+        // child process silently disappears on panic. Reuses the server crate's
+        // raw syslog writer so there is one implementation of it — tracing is
+        // unusable here because the subscriber is only set up inside `serve`.
         std::panic::set_hook(Box::new(|info| {
-            // Best-effort syslog write. We can't use tracing here because the
-            // subscriber may not be initialized yet (it's set up in serve_inner).
-            let msg = format!("extenddb panic: {info}");
-            // SAFETY: openlog/syslog are POSIX-standard C functions. The ident
-            // string is a static C string literal with 'static lifetime.
-            unsafe {
-                libc::openlog(
-                    c"extenddb".as_ptr(),
-                    libc::LOG_PID | libc::LOG_NDELAY,
-                    libc::LOG_DAEMON,
-                );
-                // Use CString to ensure null-termination for the format arg.
-                if let Ok(cmsg) = std::ffi::CString::new(msg) {
-                    libc::syslog(libc::LOG_CRIT, c"%s".as_ptr(), cmsg.as_ptr());
-                }
-            }
+            extenddb_server::log_to_syslog_raw(&format!("extenddb panic: {info}"));
         }));
     }
 
@@ -174,12 +160,13 @@ pub fn run(args: &ServeArgs, git_hash: &'static str) -> anyhow::Result<()> {
         .enable_all()
         .build()?
         .block_on(extenddb_server::serve(
-            app_config,
-            std_listener,
-            port,
-            run_dir,
-            args.foreground,
-            git_hash,
+            ServeParams::new(app_config, std_listener, run_dir, build).with_log_target(
+                if args.foreground {
+                    LogTarget::Stderr
+                } else {
+                    LogTarget::Syslog
+                },
+            ),
         ))
 }
 

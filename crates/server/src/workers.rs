@@ -8,34 +8,39 @@
 //! TTL cleanup, table size refresh, stream record expiry, idempotency token
 //! cleanup, capacity warning, and metrics pruning.
 //!
+//! Every worker takes a [`CancellationToken`] and stops at its next tick after
+//! the token is cancelled, so `serve` can drain them on shutdown instead of
+//! relying on the runtime dropping mid-flight tasks. `metrics_flush_worker`
+//! performs a final full flush on cancellation so the last partial bucket is
+//! persisted rather than discarded.
+//!
 //! Workers are generic over storage traits so they are decoupled from the
 //! concrete `PostgresEngine` / `PostgresCatalogStore` types.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use extenddb_core::throttle::ThrottleManager;
 use extenddb_storage::management_store::{MetricsStore, RateLimitStore, SettingsStore};
+use extenddb_storage::{CancellationToken, sleep_or_shutdown as tick};
 use tracing_subscriber::{EnvFilter, reload};
 
 /// Poll the `log_level` and `sqlx_log_level` settings from the database
 /// and reload the tracing filter when either changes (D-22, D-3).
 /// The combined filter is `{log_level},sqlx={sqlx_log_level}`.
 /// Falls back to `config_level` when `log_level` is absent from the DB.
-/// Runs until the process exits.
+/// Runs until `token` is cancelled.
 pub(crate) async fn poll_log_level(
     store: Arc<dyn SettingsStore>,
     handle: reload::Handle<EnvFilter, tracing_subscriber::Registry>,
     config_level: String,
+    token: CancellationToken,
 ) {
-    use std::time::Duration;
-
     const POLL_INTERVAL: Duration = Duration::from_secs(30);
     let mut current_level = config_level;
     let mut current_sqlx_level = String::from("warn");
 
-    loop {
-        tokio::time::sleep(POLL_INTERVAL).await;
-
+    while tick(&token, POLL_INTERVAL).await {
         let (log_result, sqlx_result) = tokio::join!(
             store.get_setting("log_level"),
             store.get_setting("sqlx_log_level"),
@@ -99,15 +104,12 @@ pub(crate) async fn poll_throttling_enabled(
     store: Arc<dyn SettingsStore>,
     throttle: Arc<ThrottleManager>,
     config_enabled: bool,
+    token: CancellationToken,
 ) {
-    use std::time::Duration;
-
     const POLL_INTERVAL: Duration = Duration::from_secs(30);
     let mut current = config_enabled;
 
-    loop {
-        tokio::time::sleep(POLL_INTERVAL).await;
-
+    while tick(&token, POLL_INTERVAL).await {
         let new_enabled = match store.get_setting("throttling_enabled").await {
             Ok(Some(v)) => v == "true",
             Ok(None) => config_enabled,
@@ -134,15 +136,12 @@ pub(crate) async fn poll_throttling_enabled(
 /// Phase 11a: `ConsumedCapacity` returns plausible stubs, not real values.
 /// This worker reads and resets the counter on a fixed interval and emits
 /// a single log line summarizing usage since the last tick.
-pub(crate) async fn capacity_warning_worker() {
+pub(crate) async fn capacity_warning_worker(token: CancellationToken) {
     use extenddb_engine::capacity_helpers::CAPACITY_REQUEST_COUNT;
-    use std::time::Duration;
 
     const WARNING_INTERVAL: Duration = Duration::from_secs(3600);
 
-    loop {
-        tokio::time::sleep(WARNING_INTERVAL).await;
-
+    while tick(&token, WARNING_INTERVAL).await {
         let count = CAPACITY_REQUEST_COUNT.swap(0, std::sync::atomic::Ordering::Relaxed);
         if count > 0 {
             tracing::warn!(
@@ -154,12 +153,14 @@ pub(crate) async fn capacity_warning_worker() {
 }
 
 /// Periodically prune metrics data points older than 1 day.
-pub(crate) async fn metrics_prune_worker(metrics: Arc<extenddb_core::metrics::MetricsCollector>) {
+pub(crate) async fn metrics_prune_worker(
+    metrics: Arc<extenddb_core::metrics::MetricsCollector>,
+    token: CancellationToken,
+) {
     use extenddb_core::metrics::QuerySource;
 
-    const PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
-    loop {
-        tokio::time::sleep(PRUNE_INTERVAL).await;
+    const PRUNE_INTERVAL: Duration = Duration::from_secs(300);
+    while tick(&token, PRUNE_INTERVAL).await {
         let cycle_start = std::time::Instant::now();
         metrics.prune();
         #[allow(clippy::cast_precision_loss)]
@@ -173,19 +174,31 @@ pub(crate) async fn metrics_prune_worker(metrics: Arc<extenddb_core::metrics::Me
 /// Drains data points older than 60 seconds, aggregates them into 1-minute
 /// buckets, and upserts via the `MetricsStore` trait. Also prunes DB rows
 /// older than 24 hours.
+///
+/// On cancellation the worker performs one final flush that drains *all*
+/// buffered points (not just those older than one interval) so shutdown does
+/// not discard the in-flight bucket.
 pub(crate) async fn metrics_flush_worker(
     metrics: Arc<extenddb_core::metrics::MetricsCollector>,
     store: Arc<dyn MetricsStore>,
+    token: CancellationToken,
 ) {
     use extenddb_core::metrics::QuerySource;
     use extenddb_storage::management_store::MetricsRow;
 
-    const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-    const RETENTION: std::time::Duration = std::time::Duration::from_secs(86400);
+    const FLUSH_INTERVAL: Duration = Duration::from_secs(60);
+    const RETENTION: Duration = Duration::from_secs(86400);
     loop {
-        tokio::time::sleep(FLUSH_INTERVAL).await;
+        let running = tick(&token, FLUSH_INTERVAL).await;
+        // Final flush drains everything; steady-state flushes leave points
+        // younger than one interval to accumulate into a complete bucket.
+        let drain_age = if running {
+            FLUSH_INTERVAL
+        } else {
+            Duration::ZERO
+        };
         let cycle_start = std::time::Instant::now();
-        let buckets = metrics.drain(FLUSH_INTERVAL);
+        let buckets = metrics.drain(drain_age);
         if !buckets.is_empty() {
             let rows: Vec<MetricsRow> = buckets
                 .iter()
@@ -238,19 +251,22 @@ pub(crate) async fn metrics_flush_worker(
             let cycle_us = cycle_start.elapsed().as_micros() as f64;
             metrics.record_worker_success(QuerySource::MetricsFlush, cycle_us);
         }
+        if !running {
+            break;
+        }
     }
 }
 
 /// Background worker that deletes old login attempt records.
-pub(crate) async fn login_attempt_cleanup_worker(store: Arc<dyn RateLimitStore>) {
-    use std::time::Duration;
-
+pub(crate) async fn login_attempt_cleanup_worker(
+    store: Arc<dyn RateLimitStore>,
+    token: CancellationToken,
+) {
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
     // Keep records for 24 hours for audit purposes.
     const MAX_AGE_SECONDS: i64 = 86400;
 
-    loop {
-        tokio::time::sleep(CLEANUP_INTERVAL).await;
+    while tick(&token, CLEANUP_INTERVAL).await {
         store.cleanup_old_attempts(MAX_AGE_SECONDS).await;
     }
 }

@@ -22,7 +22,7 @@ mod serve;
 mod throttle_helpers;
 mod workers;
 
-pub use serve::serve;
+pub use serve::{BuildInfo, LogTarget, ServeParams, log_to_syslog_raw, serve};
 
 use std::path::PathBuf;
 use std::sync::Arc;

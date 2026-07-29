@@ -345,55 +345,83 @@ struct PostgresRuntimeHooks {
 
 #[async_trait::async_trait]
 impl ServerRuntimeHooks for PostgresRuntimeHooks {
-    async fn spawn_workers(&self, ctx: &WorkerContext) {
-        // Backend-specific workers that need PostgreSQL internals
+    async fn spawn_workers(&self, ctx: &WorkerContext) -> Vec<tokio::task::JoinHandle<()>> {
+        // Backend-specific workers that need PostgreSQL internals. Each takes
+        // the shutdown token and returns at its next tick after cancellation;
+        // the handles are returned so `serve` can drain them.
 
         // 1. Control plane transitions poller
         let storage_for_poller = self.engine.clone();
         let cp_notify = self.control_plane_notify.clone();
         let catalog_store = ctx.catalog_store.clone();
-        tokio::spawn(async move {
-            workers::poll_control_plane_transitions(storage_for_poller, cp_notify, catalog_store)
-                .await;
+        let token = ctx.shutdown.clone();
+        let control_plane = tokio::spawn(async move {
+            workers::poll_control_plane_transitions(
+                storage_for_poller,
+                cp_notify,
+                catalog_store,
+                token,
+            )
+            .await;
         });
 
         // 2. Table size refresh worker
         let storage_for_size = self.engine.clone();
-        tokio::spawn(async move { workers::table_size_refresh_worker(storage_for_size).await });
+        let token = ctx.shutdown.clone();
+        let table_size = tokio::spawn(async move {
+            workers::table_size_refresh_worker(storage_for_size, token).await
+        });
 
         // 3. Stream record cleanup worker
         let storage_for_stream = self.engine.clone();
         let metrics = ctx.metrics.clone();
-        tokio::spawn(async move {
-            workers::stream_record_cleanup_worker(storage_for_stream, metrics).await;
+        let token = ctx.shutdown.clone();
+        let stream_cleanup = tokio::spawn(async move {
+            workers::stream_record_cleanup_worker(storage_for_stream, metrics, token).await;
         });
 
         // 4. Idempotency token cleanup worker
         let storage_for_token = self.engine.clone();
         let metrics = ctx.metrics.clone();
-        tokio::spawn(async move {
-            workers::idempotency_token_cleanup_worker(storage_for_token, metrics).await;
+        let token = ctx.shutdown.clone();
+        let idempotency_cleanup = tokio::spawn(async move {
+            workers::idempotency_token_cleanup_worker(storage_for_token, metrics, token).await;
         });
 
         // 5. TTL cleanup worker
         let storage_for_ttl = self.engine.clone();
         let metrics = ctx.metrics.clone();
-        tokio::spawn(async move { ttl_worker::ttl_cleanup_worker(storage_for_ttl, metrics).await });
+        let token = ctx.shutdown.clone();
+        let ttl = tokio::spawn(async move {
+            ttl_worker::ttl_cleanup_worker(storage_for_ttl, metrics, token).await;
+        });
 
         // 6. Pool metrics worker - needs both catalog and data pools
         let catalog_pool = self.engine.pool.clone();
         let data_pool = self.engine.data_pool().clone();
         let metrics = ctx.metrics.clone();
-        tokio::spawn(async move {
-            workers::pool_metrics_worker(catalog_pool, data_pool, metrics).await;
+        let token = ctx.shutdown.clone();
+        let pool_metrics = tokio::spawn(async move {
+            workers::pool_metrics_worker(catalog_pool, data_pool, metrics, token).await;
         });
 
         // 7. GSI delay poller
         let catalog_store_for_gsi = ctx.catalog_store.clone();
         let gsi_delay = self.gsi_default_delay_ms.clone();
-        tokio::spawn(
-            async move { workers::poll_gsi_delay(catalog_store_for_gsi, gsi_delay).await },
-        );
+        let token = ctx.shutdown.clone();
+        let gsi_poller = tokio::spawn(async move {
+            workers::poll_gsi_delay(catalog_store_for_gsi, gsi_delay, token).await;
+        });
+
+        vec![
+            control_plane,
+            table_size,
+            stream_cleanup,
+            idempotency_cleanup,
+            ttl,
+            pool_metrics,
+            gsi_poller,
+        ]
     }
 
     fn backend_info(&self) -> Option<String> {

@@ -21,7 +21,7 @@ pub mod server_components;
 pub mod settings_store;
 pub mod transact;
 
-pub use registry::{BackendRegistry, set_registry};
+pub use registry::{BackendRegistry, RegistryError, set_registry};
 
 pub use transact::{IdempotencyKey, TransactGetOp, TransactWriteOp};
 
@@ -29,7 +29,7 @@ pub use server_components::{
     BackendError, ServerComponents, ServerComponentsFactory, create_server_components,
 };
 
-pub use hooks::{ServerRuntimeHooks, WorkerContext};
+pub use hooks::{CancellationToken, ServerRuntimeHooks, WorkerContext, sleep_or_shutdown};
 
 /// Pluggable lookup for `TableKeyInfo`.
 ///
