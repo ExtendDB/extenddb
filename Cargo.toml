@@ -44,6 +44,7 @@ anyhow = "1"
 
 # Async
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7" }
 async-trait = "0.1"
 futures = "0.3"
 
@@ -53,8 +54,6 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["compression-gzip", "cors", "set-header"] }
 hyper = { version = "1" }
 urlencoding = { version = "2.1" }
-
-# Database plugin registry
 
 # Caching
 moka = { version = "0.12", features = ["future"] }

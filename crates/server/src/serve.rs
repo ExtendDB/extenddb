@@ -13,9 +13,11 @@
 
 use std::net::TcpListener;
 use std::sync::Arc;
+use std::time::Duration;
 
 use extenddb_config as config;
 use extenddb_config::pid_file_path;
+use extenddb_storage::CancellationToken;
 use syslog_tracing::{Facility, Options, Syslog};
 use tracing_subscriber::{
     EnvFilter, Layer, fmt, fmt::writer::BoxMakeWriter, layer::SubscriberExt, reload,
@@ -25,54 +27,134 @@ use tracing_subscriber::{
 use crate::AppState;
 use crate::workers;
 
-/// Run the ExtendDB server on a pre-bound listener until shutdown.
+/// Build provenance of the deployed binary.
 ///
-/// `std_listener` must already be bound (the caller binds before daemonizing so
-/// port conflicts surface on stderr before the parent exits). `git_hash` is the
-/// build provenance of the deployed binary (the thin bin supplies it, e.g.
-/// `env!("EXTENDDB_GIT_HASH")`) and is surfaced in the console version string.
+/// The library crates cannot read the bin's `build.rs` environment variables or
+/// its package version, so the thin `main` passes them in. Surfaced by
+/// `extenddb version`, the startup banner, and the console version string.
+///
+/// All fields are `&'static str` because every value originates from a compile
+/// time `env!` and is baked into the binary. Declaring the true lifetime up
+/// front means the values can later be stored beyond the call (in a struct, a
+/// metrics label, a spawned task) without a breaking signature change.
+#[derive(Debug, Clone, Copy)]
+pub struct BuildInfo {
+    /// Package version of the deployed binary (e.g. `env!("CARGO_PKG_VERSION")`
+    /// from the bin crate — not from a library crate, whose version may drift).
+    pub version: &'static str,
+    /// Short git commit hash of the build (e.g. `env!("EXTENDDB_GIT_HASH")`).
+    pub git_hash: &'static str,
+    /// Build timestamp (e.g. `env!("EXTENDDB_BUILD_TIME")`).
+    pub build_time: &'static str,
+}
+
+/// Where the server writes its log output.
+///
+/// This is the library's whole view of the deployment model: it decides where
+/// logs go and nothing else. Whether the process daemonized, runs under a
+/// container, or is supervised by systemd is the caller's concern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogTarget {
+    /// Write logs to the POSIX syslog. Used by the daemonized deployment, where
+    /// stderr is `/dev/null` after the double fork.
+    Syslog,
+    /// Write logs to stderr, for a container or process supervisor that
+    /// captures the process's own streams.
+    Stderr,
+}
+
+impl LogTarget {
+    /// Short label for the startup banner.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Syslog => "syslog",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+/// Everything [`serve`] needs to run a server.
+///
+/// Marked `#[non_exhaustive]`, so construct it with [`ServeParams::new`] and the
+/// `with_*` methods rather than a struct literal — new fields can then be added
+/// without breaking third-party backends.
+#[non_exhaustive]
+pub struct ServeParams {
+    /// Parsed application configuration.
+    pub app_config: config::AppConfig,
+    /// Already-bound listening socket. The caller binds before daemonizing so
+    /// port conflicts surface on stderr before the parent exits. The listening
+    /// port is read from this socket, so it cannot disagree with it.
+    pub listener: TcpListener,
+    /// Directory holding the PID file.
+    pub run_dir: String,
+    /// Where log output is written.
+    pub log_target: LogTarget,
+    /// Build provenance of the deployed binary.
+    pub build: BuildInfo,
+}
+
+impl ServeParams {
+    /// Create parameters that log to syslog (the daemon default).
+    #[must_use]
+    pub fn new(
+        app_config: config::AppConfig,
+        listener: TcpListener,
+        run_dir: String,
+        build: BuildInfo,
+    ) -> Self {
+        Self {
+            app_config,
+            listener,
+            run_dir,
+            log_target: LogTarget::Syslog,
+            build,
+        }
+    }
+
+    /// Send log output to `target` instead of the syslog default.
+    #[must_use]
+    pub fn with_log_target(mut self, target: LogTarget) -> Self {
+        self.log_target = target;
+        self
+    }
+}
+
+/// Run the ExtendDB server on the pre-bound listener in `params` until shutdown.
+///
 /// On any error before the HTTP server starts, the PID file is removed and a
-/// fatal message is logged to syslog (daemon) or stderr (foreground).
+/// fatal message is written to the configured [`LogTarget`].
 ///
 /// # Errors
 ///
 /// Returns an error if logging init, backend component creation, cache
 /// configuration, path resolution, or the HTTP server fails.
-pub async fn serve(
-    app_config: config::AppConfig,
-    std_listener: TcpListener,
-    port: u16,
-    run_dir: String,
-    foreground: bool,
-    git_hash: &str,
-) -> anyhow::Result<()> {
+pub async fn serve(params: ServeParams) -> anyhow::Result<()> {
+    // The listener is the single source of truth for the port: it is already
+    // bound, so reading it back cannot disagree with the caller's intent (and
+    // resolves port 0 to the kernel-assigned port).
+    let port = params
+        .listener
+        .local_addr()
+        .map_err(|e| anyhow::anyhow!("Failed to read listener address: {e}"))?
+        .port();
+
     // CB-27: Clean up PID file if serve fails before reaching the HTTP server
     // (e.g., backend connection failure). The PID file was already written by
     // the daemonize step in the caller.
-    let pid_path = pid_file_path(&run_dir, port);
-    let backend = app_config.storage.backend.clone();
-    let result = serve_inner(
-        app_config,
-        std_listener,
-        port,
-        run_dir,
-        backend,
-        foreground,
-        git_hash,
-    )
-    .await;
+    let pid_path = pid_file_path(&params.run_dir, port);
+    let log_target = params.log_target;
+    let result = serve_inner(params, port).await;
     if let Err(ref e) = result {
         let _ = std::fs::remove_file(&pid_path);
-        // P57 Bug 7: Log fatal errors to syslog. After daemonize, stderr is
-        // /dev/null so anyhow's error display is lost. Use tracing if
-        // available, fall back to raw syslog if tracing isn't initialized yet.
-        // In foreground mode, also echo to stderr since the supervisor
-        // captures stderr rather than syslog.
+        // P57 Bug 7: Log fatal errors where the operator will see them. After
+        // daemonize, stderr is /dev/null so anyhow's error display is lost. Use
+        // tracing if available, fall back to the raw writer if tracing isn't
+        // initialized yet.
         tracing::error!("extenddb fatal: {e:#}");
-        if foreground {
-            eprintln!("extenddb fatal: {e:#}");
-        } else {
-            log_to_syslog_raw(&format!("extenddb fatal: {e:#}"));
+        match log_target {
+            LogTarget::Stderr => eprintln!("extenddb fatal: {e:#}"),
+            LogTarget::Syslog => log_to_syslog_raw(&format!("extenddb fatal: {e:#}")),
         }
     }
     result
@@ -80,31 +162,30 @@ pub async fn serve(
 
 /// Inner serve function — separated so [`serve`] can clean up the PID file on
 /// any error path.
-async fn serve_inner(
-    app_config: config::AppConfig,
-    std_listener: TcpListener,
-    port: u16,
-    run_dir: String,
-    backend: String,
-    foreground: bool,
-    git_hash: &str,
-) -> anyhow::Result<()> {
+async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
+    let ServeParams {
+        app_config,
+        listener: std_listener,
+        run_dir,
+        log_target,
+        build,
+    } = params;
+    let backend = app_config.storage.backend.clone();
     let catalog_version = extenddb_storage::operations::catalog_version(&backend)
         .unwrap_or_else(|_| "unknown".to_string());
 
-    // In foreground mode, daemonize was skipped so the PID file was never
-    // written. Write it now so `extenddb status`/`stop` and `start_server`'s
-    // graceful shutdown cleanup still work. The grandchild PID written by
-    // daemonize matches `std::process::id()` post-fork, so this stays
-    // consistent with daemon mode.
-    if foreground {
-        let pid_file = pid_file_path(&run_dir, port);
-        std::fs::write(&pid_file, format!("{}\n", std::process::id()))
-            .map_err(|e| anyhow::anyhow!("Failed to write PID file {}: {e}", pid_file.display()))?;
-    }
+    // Write the PID file so `extenddb status`/`stop` and `start_server`'s
+    // graceful shutdown cleanup work in every deployment. When the caller
+    // daemonized, the grandchild PID that `daemonize` wrote is the same value
+    // as `std::process::id()` post-fork, so this is a consistent rewrite rather
+    // than a conflicting one.
+    let pid_file = pid_file_path(&run_dir, port);
+    std::fs::write(&pid_file, format!("{}\n", std::process::id()))
+        .map_err(|e| anyhow::anyhow!("Failed to write PID file {}: {e}", pid_file.display()))?;
 
-    // Init logging (REQ-LOG-003, REQ-LOG-006) — syslog in daemon mode, stderr
-    // in foreground mode so a container/process supervisor can capture logs.
+    // Init logging (REQ-LOG-003, REQ-LOG-006) — the caller chose the target via
+    // [`LogTarget`]; a supervised/container deployment picks stderr so the
+    // supervisor can capture logs.
     // D-3: sqlx messages are controlled by an independent `sqlx_log_level`
     // runtime setting (default: warn). Both extenddb and sqlx messages use the
     // `extenddb` syslog identifier (POSIX syslog supports only one identity per
@@ -121,23 +202,24 @@ async fn serve_inner(
     let filter = EnvFilter::new(&filter_str);
     let (filter_layer, reload_handle) = reload::Layer::new(filter);
 
-    // Pick the writer first (foreground → stderr, daemon → syslog), then the
-    // format (text vs json). syslog supplies its own timestamps, so we strip
-    // them with `.without_time()` only on the syslog path.
-    let (writer, with_time): (BoxMakeWriter, bool) = if foreground {
-        (BoxMakeWriter::new(std::io::stderr), true)
-    } else {
-        let syslog = Syslog::new(
-            c"extenddb",
-            Options::LOG_PID | Options::LOG_NDELAY,
-            Facility::Daemon,
-        )
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Failed to initialize syslog — another syslog logger may already be active"
+    // Pick the writer first (stderr vs syslog), then the format (text vs json).
+    // syslog supplies its own timestamps, so we strip them with
+    // `.without_time()` only on the syslog path.
+    let (writer, with_time): (BoxMakeWriter, bool) = match log_target {
+        LogTarget::Stderr => (BoxMakeWriter::new(std::io::stderr), true),
+        LogTarget::Syslog => {
+            let syslog = Syslog::new(
+                c"extenddb",
+                Options::LOG_PID | Options::LOG_NDELAY,
+                Facility::Daemon,
             )
-        })?;
-        (BoxMakeWriter::new(syslog), false)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Failed to initialize syslog — another syslog logger may already be active"
+                )
+            })?;
+            (BoxMakeWriter::new(syslog), false)
+        }
     };
 
     let fmt_layer = match (with_time, app_config.logging.format == "json") {
@@ -261,10 +343,9 @@ async fn serve_inner(
 
     // REQ-LOG-001: Startup banner with effective configuration.
     // REQ-LOG-002: Connection strings redact passwords.
-    let log_output = if foreground { "stderr" } else { "syslog" };
     tracing::info!(
         "extenddb {} (catalog {}) starting — bind={}:{}, region={}, auth={}, catalog_db={}, data_db={}, log_output={}, log_level={}",
-        env!("CARGO_PKG_VERSION"),
+        build.version,
         catalog_version,
         app_config.server.bind_addr,
         port,
@@ -272,7 +353,7 @@ async fn serve_inner(
         app_config.auth.provider,
         config::redact_password(&backend, app_config.storage.connection_config()),
         data_db_info,
-        log_output,
+        log_target.label(),
         app_config.logging.level,
     );
 
@@ -395,9 +476,7 @@ async fn serve_inner(
         version_info: Arc::from(
             format!(
                 "{} · catalog {} · {}",
-                env!("CARGO_PKG_VERSION"),
-                catalog_version,
-                git_hash,
+                build.version, catalog_version, build.git_hash,
             )
             .as_str(),
         ),
@@ -413,28 +492,44 @@ async fn serve_inner(
         docs_store,
     };
 
-    // D-22: Spawn background task to poll log_level from settings table.
-    tokio::spawn(workers::poll_log_level(
-        catalog_store.clone(),
-        reload_handle.clone(),
-        app_config.logging.level.clone(),
-    ));
-    // Poll throttling_enabled runtime setting.
-    tokio::spawn(workers::poll_throttling_enabled(
-        catalog_store.clone(),
-        throttle,
-        config_throttling,
-    ));
-    // Spawn background tasks for metrics pruning and flushing.
-    tokio::spawn(workers::metrics_prune_worker(metrics.clone()));
-    tokio::spawn(workers::metrics_flush_worker(
-        metrics.clone(),
-        catalog_store.clone(),
-    ));
-    // Spawn background task to clean up old login attempt records.
-    tokio::spawn(workers::login_attempt_cleanup_worker(catalog_store.clone()));
-    // Phase 11a: Spawn background task to warn about approximate consumed capacity.
-    tokio::spawn(workers::capacity_warning_worker());
+    // Workers run until `shutdown` is cancelled, which happens after the HTTP
+    // server stops accepting. Handles are collected so shutdown can drain them
+    // (the metrics flush worker persists its final bucket on the way out)
+    // instead of leaving the work to a runtime drop.
+    let shutdown = CancellationToken::new();
+    let mut worker_handles = vec![
+        // D-22: Poll log_level from the settings table.
+        tokio::spawn(workers::poll_log_level(
+            catalog_store.clone(),
+            reload_handle.clone(),
+            app_config.logging.level.clone(),
+            shutdown.clone(),
+        )),
+        // Poll the throttling_enabled runtime setting.
+        tokio::spawn(workers::poll_throttling_enabled(
+            catalog_store.clone(),
+            throttle,
+            config_throttling,
+            shutdown.clone(),
+        )),
+        // Metrics pruning and flushing.
+        tokio::spawn(workers::metrics_prune_worker(
+            metrics.clone(),
+            shutdown.clone(),
+        )),
+        tokio::spawn(workers::metrics_flush_worker(
+            metrics.clone(),
+            catalog_store.clone(),
+            shutdown.clone(),
+        )),
+        // Clean up old login attempt records.
+        tokio::spawn(workers::login_attempt_cleanup_worker(
+            catalog_store.clone(),
+            shutdown.clone(),
+        )),
+        // Phase 11a: Warn about approximate consumed capacity.
+        tokio::spawn(workers::capacity_warning_worker(shutdown.clone())),
+    ];
 
     // Spawn backend-specific workers via runtime hooks
     if let Some(hooks) = runtime_hooks {
@@ -443,8 +538,9 @@ async fn serve_inner(
             catalog_store: catalog_store.clone(),
             reload_handle: reload_handle.clone(),
             config_log_level: app_config.logging.level.clone(),
+            shutdown: shutdown.clone(),
         };
-        hooks.spawn_workers(&worker_ctx).await;
+        worker_handles.extend(hooks.spawn_workers(&worker_ctx).await);
     }
 
     let tls_config = if tls_enabled {
@@ -458,21 +554,57 @@ async fn serve_inner(
         None
     };
 
-    crate::start_server(
+    let server_result = crate::start_server(
         listener,
         state,
         Some(pid_file_path(&run_dir, port)),
         tls_config,
     )
-    .await?;
+    .await;
+
+    // The HTTP server has stopped accepting; drain the workers so in-flight
+    // cycles finish and the metrics flush worker writes its final bucket.
+    drain_workers(&shutdown, worker_handles).await;
+
+    server_result?;
 
     Ok(())
 }
 
-/// P57 Bug 7: Best-effort raw syslog write for fatal errors. Used when the
-/// tracing subscriber may not be initialized (e.g., errors during early
-/// startup before syslog tracing is configured).
-fn log_to_syslog_raw(msg: &str) {
+/// Cancel the shutdown token and wait for every worker to return.
+///
+/// Bounded by `DRAIN_TIMEOUT` so a worker stuck inside a backend call cannot
+/// hold the process open; a timeout is logged and the remaining tasks are
+/// dropped, which is the pre-drain behavior.
+async fn drain_workers(shutdown: &CancellationToken, handles: Vec<tokio::task::JoinHandle<()>>) {
+    const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+    shutdown.cancel();
+    let count = handles.len();
+    let drain = futures::future::join_all(handles);
+    match tokio::time::timeout(DRAIN_TIMEOUT, drain).await {
+        Ok(results) => {
+            let panicked = results.iter().filter(|r| r.is_err()).count();
+            if panicked > 0 {
+                tracing::warn!("{panicked} of {count} background worker(s) ended abnormally");
+            } else {
+                tracing::info!("{count} background worker(s) drained");
+            }
+        }
+        Err(_) => tracing::warn!(
+            "Background workers did not drain within {}s; shutting down anyway",
+            DRAIN_TIMEOUT.as_secs()
+        ),
+    }
+}
+
+/// P57 Bug 7: Best-effort raw syslog write for fatal errors and panics.
+///
+/// Used when the tracing subscriber may not be initialized — during early
+/// startup before syslog tracing is configured, and from the caller's panic
+/// hook after daemonizing (stderr is `/dev/null` there, so a panic would
+/// otherwise be invisible).
+pub fn log_to_syslog_raw(msg: &str) {
     // SAFETY: openlog/syslog are POSIX-standard C functions. The ident
     // string is a static C string literal with 'static lifetime.
     unsafe {

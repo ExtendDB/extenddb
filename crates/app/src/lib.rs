@@ -15,6 +15,7 @@
 //!     my_backend::register(&mut registry);
 //!     extenddb_storage::set_registry(registry).expect("registry already set");
 //!     extenddb_app::run(extenddb_app::BuildInfo {
+//!         version: env!("CARGO_PKG_VERSION"),
 //!         git_hash: env!("MY_GIT_HASH"),
 //!         build_time: env!("MY_BUILD_TIME"),
 //!     })
@@ -41,16 +42,10 @@ use clap::{Parser, Subcommand};
 
 /// Build provenance supplied by the deployed binary.
 ///
-/// The library cannot read the bin's `build.rs` environment variables, so the
-/// thin `main` passes them in. Surfaced by `extenddb version` and the console
-/// version string.
-#[derive(Debug, Clone, Copy)]
-pub struct BuildInfo {
-    /// Short git commit hash of the build (e.g. `env!("EXTENDDB_GIT_HASH")`).
-    pub git_hash: &'static str,
-    /// Build timestamp (e.g. `env!("EXTENDDB_BUILD_TIME")`).
-    pub build_time: &'static str,
-}
+/// Defined by `extenddb-server` (which consumes it for the startup banner and
+/// console version string) and re-exported here so a thin `main` only needs the
+/// `extenddb-app` dependency.
+pub use extenddb_server::BuildInfo;
 
 #[derive(Parser)]
 #[command(name = "extenddb", about = "ExtendDB — DynamoDB-compatible API server")]
@@ -106,7 +101,7 @@ pub fn run(build: BuildInfo) -> anyhow::Result<()> {
     }
 
     match cli.command.unwrap_or(Command::Version) {
-        Command::Serve(args) => cmd_serve::run(&args, build.git_hash),
+        Command::Serve(args) => cmd_serve::run(&args, build),
         Command::Init(args) => {
             let code = run_interactive(cmd_init::run(args))?;
             if code != 0 {
@@ -137,7 +132,7 @@ pub fn run(build: BuildInfo) -> anyhow::Result<()> {
 
 /// Print version, catalog version, git commit hash, and build timestamp.
 fn print_version(build: BuildInfo) {
-    println!("extenddb {}", env!("CARGO_PKG_VERSION"));
+    println!("extenddb {}", build.version);
 
     // Report catalog version(s) for all registered backend(s)
     let backends = extenddb_storage::operations::list_operations_backends();
