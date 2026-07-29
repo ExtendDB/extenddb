@@ -961,22 +961,23 @@ pub fn validate_index_key_not_empty(
             let Some(value) = item.get(&ks.attribute_name) else {
                 continue;
             };
-            let empty = matches!(value, AttributeValue::S(s) if s.is_empty())
-                || matches!(value, AttributeValue::B(b) if b.is_empty());
-            if empty {
-                let msg = match ctx {
-                    SecondaryIndexEmptyContext::Item => format!(
-                        "One or more parameter values are not valid. A value specified for a secondary index key is not supported. \
-                         The AttributeValue for a key attribute cannot contain an empty string value. IndexName: {}, IndexKey: {}",
-                        idx.index_name, ks.attribute_name
-                    ),
-                    SecondaryIndexEmptyContext::UpdateExpression =>
-                        "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. \
-                         The AttributeValue for a key attribute cannot contain an empty string value."
-                            .to_owned(),
-                };
-                return Err(DynamoDbError::ValidationException(msg));
-            }
+            let kind = match value {
+                AttributeValue::S(s) if s.is_empty() => "string",
+                AttributeValue::B(b) if b.is_empty() => "binary",
+                _ => continue,
+            };
+            let msg = match ctx {
+                SecondaryIndexEmptyContext::Item => format!(
+                    "One or more parameter values are not valid. A value specified for a secondary index key is not supported. \
+                     The AttributeValue for a key attribute cannot contain an empty {kind} value. IndexName: {}, IndexKey: {}",
+                    idx.index_name, ks.attribute_name
+                ),
+                SecondaryIndexEmptyContext::UpdateExpression => format!(
+                    "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. \
+                     The AttributeValue for a key attribute cannot contain an empty {kind} value."
+                ),
+            };
+            return Err(DynamoDbError::ValidationException(msg));
         }
     }
     Ok(())
@@ -2121,6 +2122,43 @@ mod tests {
             upd_err.to_string(),
             "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. \
              The AttributeValue for a key attribute cannot contain an empty string value."
+        );
+    }
+
+    #[test]
+    fn index_key_empty_messages_name_the_offending_value_type() {
+        let owned = [idx("gsi1", "lsi1sk")];
+        let refs: Vec<IndexKeyRef<'_>> = owned
+            .iter()
+            .map(|(n, ks)| IndexKeyRef {
+                index_name: n,
+                key_schema: ks,
+            })
+            .collect();
+
+        // An empty binary index key must be reported as a binary value, not a
+        // string value: DynamoDB names the type of the offending attribute.
+        let mut item = Item::new();
+        item.insert("lsi1sk".to_owned(), AttributeValue::B(Vec::new()));
+
+        let put_err = validate_index_key_not_empty(&item, &refs, SecondaryIndexEmptyContext::Item)
+            .unwrap_err();
+        assert_eq!(
+            put_err.to_string(),
+            "One or more parameter values are not valid. A value specified for a secondary index key is not supported. \
+             The AttributeValue for a key attribute cannot contain an empty binary value. IndexName: gsi1, IndexKey: lsi1sk"
+        );
+
+        let upd_err = validate_index_key_not_empty(
+            &item,
+            &refs,
+            SecondaryIndexEmptyContext::UpdateExpression,
+        )
+        .unwrap_err();
+        assert_eq!(
+            upd_err.to_string(),
+            "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. \
+             The AttributeValue for a key attribute cannot contain an empty binary value."
         );
     }
 

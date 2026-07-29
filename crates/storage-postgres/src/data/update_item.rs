@@ -121,6 +121,19 @@ impl PostgresEngine {
         validation::validate_item_size(&item, self.max_item_size_bytes)
             .map_err(|e| StorageError::Validation(e.to_string()))?;
 
+        // Secondary-index key validation on the post-update item, matching the
+        // transactional Update path: an update expression must not set an index
+        // key to a mismatched type or an empty string/binary value.
+        let idx_refs = super::transactions::index_key_refs(&indexes);
+        validation::validate_index_key_types(&item, &idx_refs, &key_info.attribute_definitions)
+            .map_err(|e| StorageError::Validation(e.to_string()))?;
+        validation::validate_index_key_not_empty(
+            &item,
+            &idx_refs,
+            validation::SecondaryIndexEmptyContext::UpdateExpression,
+        )
+        .map_err(|e| StorageError::Validation(e.to_string()))?;
+
         let new_item = if return_new { Some(item.clone()) } else { None };
 
         // Write the updated item back

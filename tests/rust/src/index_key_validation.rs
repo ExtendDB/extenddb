@@ -78,3 +78,77 @@ async fn put_item_accepts_valid_index_key() {
         .await
         .expect("valid index key must be accepted");
 }
+
+/// An update expression that sets a secondary-index key to an empty value must
+/// be rejected, the same as writing that value with PutItem. Before this was
+/// enforced, UpdateItem accepted the write and stored an unindexable key.
+#[tokio::test]
+async fn update_item_rejects_setting_an_index_key_to_an_empty_value() {
+    let c = client();
+    let t = tables().await;
+    let key_value = format!("idxupde_{}", ts());
+
+    // Seed a row with a valid index key so the update targets an existing item.
+    let mut item: HashMap<String, _> = HashMap::new();
+    item.insert(HASH_KEY_S.into(), s(&key_value));
+    item.insert(GSI_HASH_KEY.into(), s("h"));
+    item.insert(GSI_RANGE_KEY.into(), s("r"));
+    c.put_item()
+        .table_name(&t.simple_key_string_gsi)
+        .set_item(Some(item))
+        .send()
+        .await
+        .expect("seed item must be accepted");
+
+    let err = c
+        .update_item()
+        .table_name(&t.simple_key_string_gsi)
+        .key(HASH_KEY_S, s(&key_value))
+        .update_expression("SET #g = :empty")
+        .expression_attribute_names("#g", GSI_HASH_KEY)
+        .expression_attribute_values(":empty", s(""))
+        .send()
+        .await
+        .expect_err("setting an index key to an empty value must be rejected");
+    assert_eq!(
+        err_code(&err),
+        Some("ValidationException"),
+        "{}",
+        err_msg(&err)
+    );
+    let m = err_msg(&err);
+    assert!(
+        m.contains("update expression attempted to update a secondary index key"),
+        "expected the update-expression index-key message, got: {m}"
+    );
+}
+
+/// Control for the rejection above: a normal update that leaves the index key
+/// valid must still succeed.
+#[tokio::test]
+async fn update_item_accepts_setting_an_index_key_to_a_valid_value() {
+    let c = client();
+    let t = tables().await;
+    let key_value = format!("idxupdok_{}", ts());
+
+    let mut item: HashMap<String, _> = HashMap::new();
+    item.insert(HASH_KEY_S.into(), s(&key_value));
+    item.insert(GSI_HASH_KEY.into(), s("h"));
+    item.insert(GSI_RANGE_KEY.into(), s("r"));
+    c.put_item()
+        .table_name(&t.simple_key_string_gsi)
+        .set_item(Some(item))
+        .send()
+        .await
+        .expect("seed item must be accepted");
+
+    c.update_item()
+        .table_name(&t.simple_key_string_gsi)
+        .key(HASH_KEY_S, s(&key_value))
+        .update_expression("SET #g = :v")
+        .expression_attribute_names("#g", GSI_HASH_KEY)
+        .expression_attribute_values(":v", s("h2"))
+        .send()
+        .await
+        .expect("a valid index-key update must be accepted");
+}
