@@ -268,9 +268,9 @@ impl PostgresEngine {
         // Apply GSI updates (create/delete).
         let mut created_index_ids: Vec<String> = Vec::new();
         let mut deleted_index_ids: Vec<String> = Vec::new();
-        // The merged attribute definitions persisted by this UpdateTable, carried
-        // out of the catalog transaction so the post-commit index DDL builds its
-        // columns from the same set the catalog now holds.
+        // The merged and pruned attribute definitions persisted by this
+        // UpdateTable, carried out of the catalog transaction so the post-commit
+        // index DDL builds its columns from the same set the catalog now holds.
         let mut merged_attr_defs_for_ddl: Option<Vec<AttributeDefinition>> = None;
         if let Some(updates) = &input.global_secondary_index_updates {
             for update in updates {
@@ -349,32 +349,83 @@ impl PostgresEngine {
                 }
             }
 
-            // Merge the request's attribute definitions into the stored set.
+            // Recompute attribute_definitions for the post-update table.
             //
-            // The request carries only the attributes it needs (a created index's
-            // key attributes), so replacing the column would drop the base
-            // table's own pk/sk definitions and silently degrade keyed reads to a
-            // partition-only lookup (issue #259). The existing set was read under
-            // the FOR UPDATE lock above, so the read-modify-write is atomic with
-            // respect to a concurrent UpdateTable.
-            let merged_attr_defs = if let Some(new_attr_defs) = &input.attribute_definitions {
-                let existing: Vec<AttributeDefinition> = serde_json::from_value(ad_json.clone())
+            // DynamoDB treats the request's AttributeDefinitions as neither a
+            // replacement for the stored set nor a pure addition to it. The
+            // effective set is the stored definitions merged with the request's,
+            // then pruned to the attributes still referenced by the table key
+            // schema or by an index that survives this update:
+            //
+            //   * replacing rather than merging would drop the base table's own
+            //     pk/sk definitions and silently degrade keyed reads to a
+            //     partition-only lookup (issue #259);
+            //   * a definition no key and no surviving index references is
+            //     dropped, so supplying an unused definition alongside a GSI add
+            //     is a no-op rather than a stored row;
+            //   * definitions referenced only by a deleted index are dropped;
+            //   * redeclaring an existing attribute keeps the STORED type, so a
+            //     conflicting redeclaration cannot silently retype a live index
+            //     key;
+            //   * sequential adds accumulate, because the stored set is the base
+            //     of the merge.
+            //
+            // This runs whether or not the request carried AttributeDefinitions,
+            // because a GSI deletion prunes definitions without the request
+            // naming any. The index rows were created and deleted above in this
+            // same transaction, so `indexes` already holds exactly the surviving
+            // set; the stored definitions were read under the FOR UPDATE lock, so
+            // the read-modify-write is atomic against a concurrent UpdateTable.
+            let stored_attr_defs: Vec<AttributeDefinition> =
+                serde_json::from_value(ad_json.clone())
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
-                let merged = merge_attribute_definitions(&existing, new_attr_defs);
-                let merged_json = serde_json::to_value(&merged)
+            let table_key_schema: Vec<KeySchemaElement> =
+                serde_json::from_value(ks_json.clone())
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
-                sqlx::query("UPDATE tables SET attribute_definitions = $1 WHERE account_id = $2 AND table_name = $3")
-                    .bind(&merged_json)
-                    .bind(account_id)
-                    .bind(&input.table_name)
-                    .execute(&mut *tx)
+
+            let surviving_index_key_schemas: Vec<(serde_json::Value,)> =
+                sqlx::query_as("SELECT key_schema FROM indexes WHERE table_id = $1")
+                    .bind(&table_id)
+                    .fetch_all(&mut *tx)
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
-                Some(merged)
-            } else {
-                None
-            };
-            merged_attr_defs_for_ddl = merged_attr_defs;
+
+            let mut referenced: std::collections::BTreeSet<String> = table_key_schema
+                .into_iter()
+                .map(|ks| ks.attribute_name)
+                .collect();
+            for (ks_value,) in surviving_index_key_schemas {
+                let ks: Vec<KeySchemaElement> = serde_json::from_value(ks_value)
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                referenced.extend(ks.into_iter().map(|k| k.attribute_name));
+            }
+
+            // merge_attribute_definitions keeps the stored definition when both
+            // sides name the same attribute, which is what preserves the stored
+            // type on a conflicting redeclaration.
+            let effective: Vec<AttributeDefinition> = merge_attribute_definitions(
+                &stored_attr_defs,
+                input.attribute_definitions.as_deref().unwrap_or(&[]),
+            )
+            .into_iter()
+            .filter(|def| referenced.contains(&def.attribute_name))
+            .collect();
+
+            if effective != stored_attr_defs {
+                let effective_json = serde_json::to_value(&effective)
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                sqlx::query(
+                    "UPDATE tables SET attribute_definitions = $1 \
+                     WHERE account_id = $2 AND table_name = $3",
+                )
+                .bind(&effective_json)
+                .bind(account_id)
+                .bind(&input.table_name)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            }
+            merged_attr_defs_for_ddl = Some(effective);
         }
 
         tx.commit()
@@ -387,9 +438,11 @@ impl PostgresEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             let base_attr_defs: Vec<AttributeDefinition> = serde_json::from_value(ad_json.clone())
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
-            // Build index columns from the merged set, not the request's subset: a
-            // new index may key on an attribute the base table already defined, and
-            // the request is not required to re-declare it.
+            // Build index columns from the merged and pruned set rather than the
+            // request's subset: a new index may key on an attribute the base
+            // table already defined and the request need not re-declare it, and
+            // on a conflicting redeclaration the stored type is the one the data
+            // table must be built from.
             let effective_attr_defs = merged_attr_defs_for_ddl
                 .as_deref()
                 .unwrap_or(&base_attr_defs);
