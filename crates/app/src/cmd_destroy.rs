@@ -49,7 +49,7 @@ pub async fn run(args: DestroyArgs) -> anyhow::Result<()> {
 
     // Create bootstrap store for catalog queries and database teardown.
     let bootstrap =
-        extenddb_storage::bootstrapper::create_bootstrapper(backend, &args.config, &cli_args).await;
+        extenddb_storage::bootstrapper::create_bootstrapper(&args.config, &cli_args).await;
 
     let mut data_db = String::new();
 
@@ -96,16 +96,15 @@ pub async fn run(args: DestroyArgs) -> anyhow::Result<()> {
     // connects to the `postgres` database, so we can reuse it.
     if !data_db.is_empty() {
         // Defense-in-depth: validate even though this came from the catalog.
-        config::validate_identifier(backend, &data_db, "data database name")?;
+        config::validate_identifier(&data_db, "data database name")?;
     }
 
     // Reconnect as admin for DDL operations (the catalog pool must be dropped
     // before we can DROP DATABASE).
     drop(bootstrap);
-    let bootstrap =
-        extenddb_storage::bootstrapper::create_bootstrapper(backend, &args.config, &cli_args)
-            .await
-            .map_err(|e| anyhow::anyhow!("Cannot connect as admin: {e:?}"))?;
+    let bootstrap = extenddb_storage::bootstrapper::create_bootstrapper(&args.config, &cli_args)
+        .await
+        .map_err(|e| anyhow::anyhow!("Cannot connect as admin: {e:?}"))?;
 
     bootstrap
         .drop_databases(&data_db)

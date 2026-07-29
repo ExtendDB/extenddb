@@ -38,66 +38,62 @@ pub use config::PostgresStorageConfig;
 pub use config::parse_connection_string;
 pub use credential_store::DbCredentialStore;
 
-/// Register the `PostgreSQL` backend into a [`BackendRegistry`].
+/// The `PostgreSQL` storage backend.
 ///
-/// A thin `main` calls this before installing the registry:
+/// A thin `main` installs it before dispatching any subcommand:
 ///
 /// ```ignore
-/// let mut registry = extenddb_storage::BackendRegistry::new();
-/// extenddb_storage_postgres::register(&mut registry);
-/// extenddb_storage::set_registry(registry).expect("registry already set");
+/// extenddb_storage::set_backend(extenddb_storage_postgres::backend())?;
 /// ```
-pub fn register(reg: &mut extenddb_storage::BackendRegistry) {
-    reg.register_bootstrapper("postgres", |config_path, cli_args| {
-        Box::pin(async move {
-            let store = PostgresBootstrapper::from_config(&config_path, &cli_args).await?;
-            Ok(Box::new(store) as Box<dyn extenddb_storage::bootstrapper::Bootstrapper>)
-        })
-    });
-
-    reg.register_operations("postgres", &operations::PostgresOperationsEngine);
-
-    reg.register_storage_config("postgres", |table| {
-        let config: PostgresStorageConfig = table
-            .clone()
-            .try_into()
-            .map_err(|e: toml::de::Error| format!("Failed to parse postgres config: {e}"))?;
-        Ok(Box::new(config) as Box<dyn extenddb_storage::config::StorageConfig>)
-    });
-
-    reg.register_settings_store("postgres", |connection_string| {
-        let connection_string = connection_string.to_string();
-        Box::pin(async move {
-            let pool = sqlx::PgPool::connect(&connection_string)
-                .await
-                .map_err(|e| {
-                    extenddb_storage::settings_store::SettingsStoreError::ConnectionFailed(
-                        e.to_string(),
-                    )
-                })?;
-            Ok(Box::new(PostgresCatalogStore::new(pool))
-                as Box<
-                    dyn extenddb_storage::management_store::SettingsStore,
-                >)
-        })
-    });
-
-    reg.register_diagnostics_store("postgres", |connection_string| {
-        let connection_string = connection_string.to_string();
-        Box::pin(async move {
-            let pool = sqlx::PgPool::connect(&connection_string)
-                .await
-                .map_err(|e| {
-                    extenddb_storage::diagnostics_store::DiagnosticsStoreError::ConnectionFailed(
-                        e.to_string(),
-                    )
-                })?;
-            Ok(Box::new(PostgresCatalogStore::new(pool))
-                as Box<dyn extenddb_storage::diagnostics::DiagnosticsStore>)
-        })
-    });
-
-    reg.register_server_components("postgres", server_components_factory);
+pub fn backend() -> extenddb_storage::Backend {
+    extenddb_storage::Backend {
+        name: "postgres",
+        bootstrapper: |config_path, cli_args| {
+            Box::pin(async move {
+                let store = PostgresBootstrapper::from_config(&config_path, &cli_args).await?;
+                Ok(Box::new(store) as Box<dyn extenddb_storage::bootstrapper::Bootstrapper>)
+            })
+        },
+        operations: &operations::PostgresOperationsEngine,
+        storage_config: |table| {
+            let config: PostgresStorageConfig = table
+                .clone()
+                .try_into()
+                .map_err(|e: toml::de::Error| format!("Failed to parse postgres config: {e}"))?;
+            Ok(Box::new(config) as Box<dyn extenddb_storage::config::StorageConfig>)
+        },
+        settings_store: |connection_string| {
+            let connection_string = connection_string.to_string();
+            Box::pin(async move {
+                let pool = sqlx::PgPool::connect(&connection_string)
+                    .await
+                    .map_err(|e| {
+                        extenddb_storage::settings_store::SettingsStoreError::ConnectionFailed(
+                            e.to_string(),
+                        )
+                    })?;
+                Ok(Box::new(PostgresCatalogStore::new(pool))
+                    as Box<
+                        dyn extenddb_storage::management_store::SettingsStore,
+                    >)
+            })
+        },
+        diagnostics_store: |connection_string| {
+            let connection_string = connection_string.to_string();
+            Box::pin(async move {
+                let pool = sqlx::PgPool::connect(&connection_string)
+                    .await
+                    .map_err(|e| {
+                        extenddb_storage::diagnostics_store::DiagnosticsStoreError::ConnectionFailed(
+                            e.to_string(),
+                        )
+                    })?;
+                Ok(Box::new(PostgresCatalogStore::new(pool))
+                    as Box<dyn extenddb_storage::diagnostics::DiagnosticsStore>)
+            })
+        },
+        server_components: server_components_factory,
+    }
 }
 
 use std::sync::Arc;

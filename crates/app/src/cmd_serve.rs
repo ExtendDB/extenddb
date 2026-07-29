@@ -73,7 +73,7 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
 
     // Validate backend is supported and get catalog version (fail fast before binding port)
     let backend = &app_config.storage.backend;
-    let catalog_version = extenddb_storage::operations::catalog_version(backend)?;
+    let catalog_version = extenddb_storage::operations::catalog_version()?;
 
     let port = args.port.unwrap_or(app_config.server.port);
     let bind_addr = format!("{}:{}", app_config.server.bind_addr, port);
@@ -101,7 +101,7 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     let banner_line2 = format!(
         "  storage: {} ({})",
         backend,
-        config::redact_password(backend, app_config.storage.connection_config()),
+        config::redact_password(app_config.storage.connection_config()),
     );
     if args.foreground {
         eprintln!("{banner_line1}");

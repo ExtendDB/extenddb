@@ -162,33 +162,43 @@ impl<'de> serde::Deserialize<'de> for StorageConfig {
         // Deserialize into a raw TOML value first
         let value: toml::Value = toml::Value::deserialize(deserializer)?;
 
-        // Extract the backend field. This crate is backend-agnostic and does
-        // not default to any backend: the operator must select one explicitly,
-        // and the thin bin registers it before config is loaded.
-        let backend = value
-            .get("backend")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                D::Error::custom(
-                    "[storage] section is missing the required `backend` key \
-                     (e.g. backend = \"postgres\")",
-                )
-            })?
-            .to_string();
+        // The installed backend is authoritative: it supplies the name used to
+        // locate its `[storage.<name>]` section. The file's `backend` key is
+        // therefore optional, and when present it is validated against the
+        // compiled-in backend rather than used to choose one. A binary contains
+        // exactly one backend, so a mismatch is an operator error worth naming
+        // instead of silently ignoring.
+        let backend = extenddb_storage::backend_name().ok_or_else(|| {
+            D::Error::custom("no storage backend installed (set_backend was not called)")
+        })?;
+
+        if let Some(requested) = value.get("backend").and_then(|v| v.as_str())
+            && requested != backend
+        {
+            return Err(D::Error::custom(format!(
+                "[storage] backend = \"{requested}\" does not match this binary's \
+                 compiled-in backend \"{backend}\". This binary can only serve \
+                 \"{backend}\"; either remove the key or install the \
+                 extenddb-{requested} binary."
+            )));
+        }
 
         // Get the backend-specific table (e.g., [storage.postgres])
         let backend_table: &toml::Table = value
-            .get(&backend)
+            .get(backend)
             .and_then(|v| v.as_table())
             .ok_or_else(|| {
                 D::Error::custom(format!("Missing [storage.{backend}] section in config"))
             })?;
 
-        // Use the registry to deserialize the backend config
-        let config = extenddb_storage::config::deserialize_storage_config(&backend, backend_table)
+        // Hand the section to the installed backend's deserializer.
+        let config = extenddb_storage::config::deserialize_storage_config(backend_table)
             .map_err(D::Error::custom)?;
 
-        Ok(StorageConfig { backend, config })
+        Ok(StorageConfig {
+            backend: backend.to_owned(),
+            config,
+        })
     }
 }
 
@@ -364,9 +374,8 @@ pub fn load(config_path: &str) -> anyhow::Result<AppConfig> {
 /// Uses the backend-specific operations engine to handle different connection
 /// string formats (`PostgreSQL`).
 #[must_use]
-pub fn redact_password(backend: &str, conn: &str) -> String {
-    extenddb_storage::operations::redact_connection_string(backend, conn)
-        .unwrap_or_else(|_| conn.to_owned())
+pub fn redact_password(conn: &str) -> String {
+    extenddb_storage::operations::redact_connection_string(conn).unwrap_or_else(|_| conn.to_owned())
 }
 
 /// Return the current OS username, falling back to given default username: e.g. `"postgres"`.
@@ -384,8 +393,8 @@ pub fn whoami(default: &str) -> String {
 /// # Errors
 ///
 /// Returns an error describing the invalid character found.
-pub fn validate_identifier(backend: &str, name: &str, label: &str) -> anyhow::Result<()> {
-    extenddb_storage::operations::validate_identifier(backend, name, label)
+pub fn validate_identifier(name: &str, label: &str) -> anyhow::Result<()> {
+    extenddb_storage::operations::validate_identifier(name, label)
         .map_err(|e| anyhow::anyhow!("{e:?}"))
 }
 

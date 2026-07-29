@@ -44,15 +44,11 @@ pub type StorageConfigDeserializer = fn(&toml::Table) -> Result<Box<dyn StorageC
 
 /// Deserialize a storage configuration from a TOML table.
 ///
-/// Looks up the registered deserializer for the given backend name in the
-/// installed [`BackendRegistry`](crate::registry) and invokes it with the
-/// provided TOML table.
-pub fn deserialize_storage_config(
-    backend: &str,
-    table: &toml::Table,
-) -> Result<Box<dyn StorageConfig>, String> {
-    match crate::registry::try_registry().and_then(|r| r.storage_configs.get(backend)) {
-        Some(deserializer) => deserializer(table),
-        None => Err(format!("Unknown backend: {backend}")),
-    }
+/// Uses the deserializer of the [`Backend`](crate::Backend) installed via
+/// [`set_backend`](crate::set_backend), invoking it with the provided TOML
+/// table.
+pub fn deserialize_storage_config(table: &toml::Table) -> Result<Box<dyn StorageConfig>, String> {
+    let backend = crate::backend::try_backend()
+        .ok_or_else(|| "no storage backend installed (set_backend was not called)".to_owned())?;
+    (backend.storage_config)(table)
 }

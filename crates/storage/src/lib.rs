@@ -8,6 +8,7 @@
 //! methods receive `account_id` from the authenticated identity.
 
 pub mod authorization_store;
+pub mod backend;
 pub mod bootstrapper;
 pub mod config;
 pub mod diagnostics;
@@ -16,12 +17,11 @@ pub mod error;
 pub mod hooks;
 pub mod management_store;
 pub mod operations;
-pub mod registry;
 pub mod server_components;
 pub mod settings_store;
 pub mod transact;
 
-pub use registry::{BackendRegistry, RegistryError, set_registry};
+pub use backend::{Backend, BackendAlreadySet, backend_name, set_backend, try_backend};
 
 pub use transact::{IdempotencyKey, TransactGetOp, TransactWriteOp};
 

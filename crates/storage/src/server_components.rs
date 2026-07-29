@@ -40,8 +40,8 @@ pub struct ServerComponents {
 /// Errors that can occur during backend initialization.
 #[derive(Debug)]
 pub enum BackendError {
-    /// Backend name not registered
-    UnknownBackend(String),
+    /// No storage backend has been installed (set_backend was not called).
+    BackendNotInstalled,
 
     /// Failed to connect to backend database
     ConnectionFailed { backend: String, details: String },
@@ -59,8 +59,11 @@ pub enum BackendError {
 impl std::fmt::Display for BackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnknownBackend(b) => {
-                write!(f, "Unknown backend '{b}'. Available backends: postgres")
+            Self::BackendNotInstalled => {
+                write!(
+                    f,
+                    "no storage backend installed (set_backend was not called)"
+                )
             }
             Self::ConnectionFailed { backend, details } => {
                 write!(f, "Failed to connect to {backend}: {details}")
@@ -90,18 +93,15 @@ pub type ServerComponentsFactory =
         &str,
     ) -> Pin<Box<dyn Future<Output = Result<ServerComponents, BackendError>> + Send>>;
 
-/// Create server components for the specified backend.
+/// Create server components using the installed backend.
 ///
-/// Looks up the backend in the installed [`BackendRegistry`](crate::registry)
-/// and calls the matching factory. Returns `UnknownBackend` if the backend is
-/// not registered.
+/// Calls the factory of the [`Backend`](crate::Backend) installed via
+/// [`set_backend`](crate::set_backend). Returns `BackendNotInstalled` if no
+/// backend has been installed.
 pub async fn create_server_components(
-    backend: &str,
     config: &dyn StorageConfig,
     region: &str,
 ) -> Result<ServerComponents, BackendError> {
-    match crate::registry::try_registry().and_then(|r| r.server_components.get(backend)) {
-        Some(factory) => factory(config, region).await,
-        None => Err(BackendError::UnknownBackend(backend.to_string())),
-    }
+    let backend = crate::backend::try_backend().ok_or(BackendError::BackendNotInstalled)?;
+    (backend.server_components)(config, region).await
 }

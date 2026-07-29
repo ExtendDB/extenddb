@@ -4,11 +4,11 @@
 //! The `serve` library entrypoint.
 //!
 //! A backend's thin `main` loads config, binds the listening socket, and then
-//! calls [`serve`] to run the server. All backend selection happens through the
-//! installed [`BackendRegistry`](extenddb_storage::registry): `serve` assembles
-//! server components from the registry, wires the auth/authz/table-key caches
-//! and [`AppState`](crate::AppState), spawns the generic + backend workers, and
-//! serves until shutdown. Daemonization, PID-file creation, and CLI argument
+//! calls [`serve`] to run the server. There is no backend selection: `serve`
+//! assembles server components from the single backend installed via
+//! [`set_backend`](extenddb_storage::set_backend), wires the auth/authz/table-key
+//! caches and [`AppState`](crate::AppState), spawns the generic + backend workers,
+//! and serves until shutdown. Daemonization, PID-file creation, and CLI argument
 //! handling stay in the app/CLI layer that calls this function.
 
 use std::net::TcpListener;
@@ -170,9 +170,8 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         log_target,
         build,
     } = params;
-    let backend = app_config.storage.backend.clone();
-    let catalog_version = extenddb_storage::operations::catalog_version(&backend)
-        .unwrap_or_else(|_| "unknown".to_string());
+    let catalog_version =
+        extenddb_storage::operations::catalog_version().unwrap_or_else(|_| "unknown".to_string());
 
     // Write the PID file so `extenddb status`/`stop` and `start_server`'s
     // graceful shutdown cleanup work in every deployment. When the caller
@@ -241,7 +240,6 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
 
     // Create server components via factory pattern
     let components = extenddb_storage::create_server_components(
-        &backend,
         app_config.storage.as_trait(),
         &app_config.server.region,
     )
@@ -351,7 +349,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         port,
         app_config.server.region,
         app_config.auth.provider,
-        config::redact_password(&backend, app_config.storage.connection_config()),
+        config::redact_password(app_config.storage.connection_config()),
         data_db_info,
         log_target.label(),
         app_config.logging.level,

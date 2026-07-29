@@ -31,13 +31,11 @@ pub async fn run(args: VerifyArgs) -> anyhow::Result<()> {
         );
     }
     let app_config = config::load(&args.config)?;
-    let backend = &app_config.storage.backend;
-    let expected_version = extenddb_storage::operations::catalog_version(backend)
-        .unwrap_or_else(|_| "unknown".to_string());
+    let expected_version =
+        extenddb_storage::operations::catalog_version().unwrap_or_else(|_| "unknown".to_string());
 
     // Parse connection string to get database name for display
     let parts = extenddb_storage::operations::parse_connection_string(
-        backend,
         app_config.storage.connection_config(),
     )
     .map_err(|e| anyhow::anyhow!("Failed to parse connection string: {e}"))?;
@@ -52,7 +50,6 @@ pub async fn run(args: VerifyArgs) -> anyhow::Result<()> {
     // Create settings and diagnostics store
     println!("--- Checking catalog connection...");
     let store = match extenddb_storage::settings_store::create_settings_store(
-        backend,
         app_config.storage.connection_config(),
     )
     .await
@@ -93,7 +90,6 @@ pub async fn run(args: VerifyArgs) -> anyhow::Result<()> {
 
     // Create diagnostics store (reuse for data DB test and table/index counts)
     let diag_store = extenddb_storage::diagnostics_store::create_diagnostics_store(
-        backend,
         app_config.storage.connection_config(),
     )
     .await

@@ -45,51 +45,44 @@ pub struct ConnectionParts {
     pub database: String,
 }
 
-/// Get the operations engine for a backend by name.
-pub fn get_operations_engine(backend: &str) -> Result<&'static dyn OperationsEngine, StorageError> {
-    if let Some(ops) = crate::registry::try_registry().and_then(|r| r.operations.get(backend)) {
-        return Ok(*ops);
-    }
-
-    let available = list_operations_backends();
-
-    Err(StorageError::Internal(format!(
-        "Unknown backend: {backend}. Available backends: {}",
-        available.join(", ")
-    )))
-}
-
-/// List all registered backend names.
-#[must_use]
-pub fn list_operations_backends() -> Vec<&'static str> {
-    crate::registry::try_registry()
-        .map(|r| r.operations.keys().copied().collect())
-        .unwrap_or_default()
+/// Get the operations engine of the installed backend.
+///
+/// # Errors
+///
+/// Returns an error if no backend has been installed.
+pub fn get_operations_engine() -> Result<&'static dyn OperationsEngine, StorageError> {
+    crate::backend::try_backend()
+        .map(|b| b.operations)
+        .ok_or_else(|| {
+            StorageError::Internal(
+                "no storage backend installed (set_backend was not called)".into(),
+            )
+        })
 }
 
 // Convenience functions that delegate to the operations engine
 
 /// Get the catalog version for a backend.
-pub fn catalog_version(backend: &str) -> Result<String, StorageError> {
-    get_operations_engine(backend).map(OperationsEngine::catalog_version)
+pub fn catalog_version() -> Result<String, StorageError> {
+    get_operations_engine().map(OperationsEngine::catalog_version)
 }
 
 /// Redact sensitive information from a connection string.
-pub fn redact_connection_string(backend: &str, s: &str) -> Result<String, StorageError> {
-    get_operations_engine(backend).map(|ops| ops.redact_connection_string(s))
+pub fn redact_connection_string(s: &str) -> Result<String, StorageError> {
+    get_operations_engine().map(|ops| ops.redact_connection_string(s))
 }
 
 /// Parse a connection string into components.
-pub fn parse_connection_string(backend: &str, s: &str) -> Result<ConnectionParts, StorageError> {
-    get_operations_engine(backend)?.parse_connection_string(s)
+pub fn parse_connection_string(s: &str) -> Result<ConnectionParts, StorageError> {
+    get_operations_engine()?.parse_connection_string(s)
 }
 
 /// Validate an identifier for DDL safety.
-pub fn validate_identifier(backend: &str, name: &str, label: &str) -> Result<(), StorageError> {
-    get_operations_engine(backend)?.validate_identifier(name, label)
+pub fn validate_identifier(name: &str, label: &str) -> Result<(), StorageError> {
+    get_operations_engine()?.validate_identifier(name, label)
 }
 
 /// Check if a configuration key contains sensitive data.
-pub fn is_sensitive_key(backend: &str, key: &str) -> Result<bool, StorageError> {
-    get_operations_engine(backend).map(|ops| ops.is_sensitive_key(key))
+pub fn is_sensitive_key(key: &str) -> Result<bool, StorageError> {
+    get_operations_engine().map(|ops| ops.is_sensitive_key(key))
 }
