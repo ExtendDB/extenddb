@@ -16,23 +16,11 @@ use axum::response::{Html, IntoResponse, Response};
 
 use crate::console::ConsoleState;
 use crate::console::html;
+// Redaction patterns live in `extenddb-config` so the console and the static
+// config display cannot drift apart.
+use extenddb_config::should_redact;
 
 use super::{identity_label, is_admin, require_session};
-
-/// Keys whose values must be redacted in the settings display.
-const REDACTED_KEYS: &[&str] = &[
-    "connection_string",
-    "encryption_key",
-    "password",
-    "secret",
-    "token",
-];
-
-/// Check if a settings key should have its value redacted.
-fn should_redact(key: &str) -> bool {
-    let lower = key.to_lowercase();
-    REDACTED_KEYS.iter().any(|&pattern| lower.contains(pattern))
-}
 
 /// Known runtime settings with their default values.
 /// These are the settings that can be changed via `extenddb settings set`.
