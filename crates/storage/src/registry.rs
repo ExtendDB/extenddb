@@ -56,6 +56,10 @@ pub struct BackendRegistry {
     pub(crate) settings_stores: HashMap<&'static str, SettingsStoreFactory>,
     pub(crate) diagnostics_stores: HashMap<&'static str, DiagnosticsStoreFactory>,
     pub(crate) server_components: HashMap<&'static str, ServerComponentsFactory>,
+    /// Registrations that displaced an existing entry for the same
+    /// `(slot, backend name)` pair. Reported by [`set_registry`] so a wiring
+    /// mistake fails startup instead of silently electing the last writer.
+    duplicates: Vec<String>,
 }
 
 impl BackendRegistry {
@@ -67,7 +71,9 @@ impl BackendRegistry {
 
     /// Register a backend bootstrapper factory.
     pub fn register_bootstrapper(&mut self, name: &'static str, factory: BootstrapperFactory) {
-        self.bootstrappers.insert(name, factory);
+        if self.bootstrappers.insert(name, factory).is_some() {
+            self.record_duplicate("bootstrapper", name);
+        }
     }
 
     /// Register a backend storage-config deserializer.
@@ -76,7 +82,9 @@ impl BackendRegistry {
         backend: &'static str,
         deserializer: StorageConfigDeserializer,
     ) {
-        self.storage_configs.insert(backend, deserializer);
+        if self.storage_configs.insert(backend, deserializer).is_some() {
+            self.record_duplicate("storage config", backend);
+        }
     }
 
     /// Register a backend operations engine.
@@ -85,7 +93,9 @@ impl BackendRegistry {
         name: &'static str,
         operations: &'static dyn OperationsEngine,
     ) {
-        self.operations.insert(name, operations);
+        if self.operations.insert(name, operations).is_some() {
+            self.record_duplicate("operations engine", name);
+        }
     }
 
     /// Register a backend settings-store factory.
@@ -94,7 +104,9 @@ impl BackendRegistry {
         backend: &'static str,
         factory: SettingsStoreFactory,
     ) {
-        self.settings_stores.insert(backend, factory);
+        if self.settings_stores.insert(backend, factory).is_some() {
+            self.record_duplicate("settings store", backend);
+        }
     }
 
     /// Register a backend diagnostics-store factory.
@@ -103,7 +115,9 @@ impl BackendRegistry {
         backend: &'static str,
         factory: DiagnosticsStoreFactory,
     ) {
-        self.diagnostics_stores.insert(backend, factory);
+        if self.diagnostics_stores.insert(backend, factory).is_some() {
+            self.record_duplicate("diagnostics store", backend);
+        }
     }
 
     /// Register a backend server-components factory.
@@ -112,23 +126,44 @@ impl BackendRegistry {
         backend: &'static str,
         factory: ServerComponentsFactory,
     ) {
-        self.server_components.insert(backend, factory);
+        if self.server_components.insert(backend, factory).is_some() {
+            self.record_duplicate("server components", backend);
+        }
+    }
+
+    fn record_duplicate(&mut self, slot: &str, backend: &str) {
+        self.duplicates
+            .push(format!("{slot} for backend '{backend}'"));
     }
 }
 
 static REGISTRY: OnceLock<BackendRegistry> = OnceLock::new();
 
-/// Error returned by [`set_registry`] when a registry was already installed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RegistryAlreadySet;
+/// Error returned by [`set_registry`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryError {
+    /// A registry was already installed in this process.
+    AlreadySet,
+    /// Two backends claimed the same registry slot. Each entry names the slot
+    /// and the backend name that was registered twice.
+    DuplicateRegistrations(Vec<String>),
+}
 
-impl std::fmt::Display for RegistryAlreadySet {
+impl std::fmt::Display for RegistryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "backend registry already installed")
+        match self {
+            Self::AlreadySet => write!(f, "backend registry already installed"),
+            Self::DuplicateRegistrations(dupes) => write!(
+                f,
+                "duplicate backend registration(s): {}. Two backends registered \
+                 the same name; rename one or register only one of them.",
+                dupes.join(", ")
+            ),
+        }
     }
 }
 
-impl std::error::Error for RegistryAlreadySet {}
+impl std::error::Error for RegistryError {}
 
 /// Install the process-wide backend registry.
 ///
@@ -136,10 +171,18 @@ impl std::error::Error for RegistryAlreadySet {}
 ///
 /// # Errors
 ///
-/// Returns [`RegistryAlreadySet`] if a registry was already installed; the
-/// first installed registry wins and the argument is dropped.
-pub fn set_registry(registry: BackendRegistry) -> Result<(), RegistryAlreadySet> {
-    REGISTRY.set(registry).map_err(|_| RegistryAlreadySet)
+/// Returns [`RegistryError::DuplicateRegistrations`] if two backends claimed
+/// the same registry slot — silently keeping the last writer would make the
+/// effective backend depend on registration order. Returns
+/// [`RegistryError::AlreadySet`] if a registry was already installed; the first
+/// installed registry wins and the argument is dropped.
+pub fn set_registry(registry: BackendRegistry) -> Result<(), RegistryError> {
+    if !registry.duplicates.is_empty() {
+        return Err(RegistryError::DuplicateRegistrations(registry.duplicates));
+    }
+    REGISTRY
+        .set(registry)
+        .map_err(|_| RegistryError::AlreadySet)
 }
 
 /// Borrow the installed registry, if one has been installed.
@@ -150,4 +193,46 @@ pub fn set_registry(registry: BackendRegistry) -> Result<(), RegistryAlreadySet>
 #[must_use]
 pub fn try_registry() -> Option<&'static BackendRegistry> {
     REGISTRY.get()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BackendRegistry, RegistryError, set_registry};
+    use crate::config::StorageConfig;
+
+    /// Minimal deserializer used only to occupy a registry slot.
+    fn stub_deserializer(_: &toml::Table) -> Result<Box<dyn StorageConfig>, String> {
+        Err("stub".to_owned())
+    }
+
+    #[test]
+    fn distinct_backends_do_not_report_duplicates() {
+        let mut registry = BackendRegistry::new();
+        registry.register_storage_config("alpha", stub_deserializer);
+        registry.register_storage_config("beta", stub_deserializer);
+        assert_eq!(registry.duplicates, Vec::<String>::new());
+    }
+
+    #[test]
+    fn duplicate_registration_fails_set_registry() {
+        // Two backends claiming the same name must not silently elect the last
+        // writer — the effective backend would then depend on the order of
+        // `register` calls in `main`.
+        let mut registry = BackendRegistry::new();
+        registry.register_storage_config("postgres", stub_deserializer);
+        registry.register_storage_config("postgres", stub_deserializer);
+
+        let err = set_registry(registry).expect_err("duplicate registration must be rejected");
+        match err {
+            RegistryError::DuplicateRegistrations(dupes) => {
+                assert_eq!(dupes.len(), 1);
+                assert!(
+                    dupes[0].contains("storage config") && dupes[0].contains("postgres"),
+                    "error should name the slot and backend, got: {}",
+                    dupes[0]
+                );
+            }
+            other => panic!("expected DuplicateRegistrations, got {other:?}"),
+        }
+    }
 }
