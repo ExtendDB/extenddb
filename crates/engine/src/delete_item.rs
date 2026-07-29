@@ -161,7 +161,9 @@ pub async fn handle_delete_item(
             input.return_consumed_capacity,
             &input.table_name,
             wcu,
-            cc_item,
+            Some(cc_item),
+            None,
+            false,
             &key_info,
         ),
         None => {

@@ -271,8 +271,8 @@ impl ConsumedCapacity {
             table_name: table_name.to_owned(),
             capacity_units: total,
             read_capacity_units: None,
-            write_capacity_units: Some(total),
-            table: breakdown.then(|| Capacity::write_units(base_cu)),
+            write_capacity_units: None,
+            table: breakdown.then(|| Capacity::units(base_cu)),
             global_secondary_indexes: if breakdown { map_or_none(gsi) } else { None },
             local_secondary_indexes: if breakdown { map_or_none(lsi) } else { None },
         }
@@ -280,13 +280,13 @@ impl ConsumedCapacity {
 }
 
 impl Capacity {
-    /// A write-only `Capacity` with the given units.
+    /// Capacity for a single-item write, which reports only `CapacityUnits`.
     #[must_use]
-    pub fn write_units(cu: f64) -> Self {
+    fn units(cu: f64) -> Self {
         Self {
             capacity_units: cu,
             read_capacity_units: None,
-            write_capacity_units: Some(cu),
+            write_capacity_units: None,
         }
     }
 }
@@ -300,7 +300,7 @@ fn map_or_none(units: HashMap<String, f64>) -> Option<HashMap<String, Capacity>>
         Some(
             units
                 .into_iter()
-                .map(|(name, cu)| (name, Capacity::write_units(cu)))
+                .map(|(name, cu)| (name, Capacity::units(cu)))
                 .collect(),
         )
     }
@@ -314,5 +314,37 @@ impl ItemCollectionMetrics {
             item_collection_key: HashMap::from([(pk_name.to_owned(), pk_value.clone())]),
             size_estimate_range_gb: [0.0, 1.0],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indexed_write_omits_granular_write_capacity_units() {
+        let capacity = ConsumedCapacity::write_indexed(
+            "table",
+            1.0,
+            HashMap::from([("gsi".to_owned(), 1.0)]),
+            HashMap::from([("lsi".to_owned(), 1.0)]),
+            true,
+        );
+        let Ok(value) = serde_json::to_value(capacity) else {
+            panic!("indexed capacity should serialize");
+        };
+
+        assert!(value.get("WriteCapacityUnits").is_none());
+        assert!(value["Table"].get("WriteCapacityUnits").is_none());
+        assert!(
+            value["GlobalSecondaryIndexes"]["gsi"]
+                .get("WriteCapacityUnits")
+                .is_none()
+        );
+        assert!(
+            value["LocalSecondaryIndexes"]["lsi"]
+                .get("WriteCapacityUnits")
+                .is_none()
+        );
     }
 }

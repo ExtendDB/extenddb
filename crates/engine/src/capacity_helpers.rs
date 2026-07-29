@@ -55,24 +55,26 @@ pub fn write_capacity(
 /// Build a write `ConsumedCapacity` with a per-index breakdown for `INDEXES`
 /// mode, or the plain table-level capacity otherwise.
 ///
-/// `base_cu` is the base-table write capacity; `item` is the item being written
-/// (used to determine sparse index membership and per-index projected size);
-/// `desc` is the table description (source of GSI/LSI definitions). When the
-/// caller does not request `INDEXES`, `key_info` is unused and this behaves
-/// exactly like [`write_capacity`].
+/// `base_cu` is the base-table write capacity. `old_item` and `new_item`
+/// describe the index transition: inserts provide only the new item, deletes
+/// only the old item, and replacements/updates provide both. Index metadata
+/// comes from the cached `TableKeyInfo`.
 #[must_use]
 pub fn write_capacity_indexed(
     rcc: ReturnConsumedCapacity,
     table_name: &str,
     base_cu: f64,
-    item: &Item,
+    old_item: Option<&Item>,
+    new_item: Option<&Item>,
+    charge_unchanged_projection: bool,
     key_info: &TableKeyInfo,
 ) -> Option<ConsumedCapacity> {
     match rcc {
         ReturnConsumedCapacity::None => None,
         rcc => {
             CAPACITY_REQUEST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let (gsi, lsi) = index_write_units(item, key_info);
+            let (gsi, lsi) =
+                index_write_units(old_item, new_item, charge_unchanged_projection, key_info);
             let breakdown = rcc == ReturnConsumedCapacity::Indexes;
             Some(ConsumedCapacity::write_indexed(
                 table_name, base_cu, gsi, lsi, breakdown,
@@ -81,19 +83,21 @@ pub fn write_capacity_indexed(
     }
 }
 
-/// Compute per-GSI and per-LSI write capacity units contributed by `item`.
+/// Compute per-GSI and per-LSI write capacity units for an item transition.
 ///
-/// Returns `(gsi_units, lsi_units)` keyed by index name. An index is charged
-/// only when the item projects into it — i.e. the item contains every one of
-/// the index's key attributes (sparse-index semantics). Per-index capacity is
-/// `ceil(projected_item_size / 1KB)`, where the projected item contains only
-/// the attributes the index materializes (per its projection type).
+/// Returns `(gsi_units, lsi_units)` keyed by index name. Sparse-index inserts
+/// and deletes are charged from the projection that exists. When both versions
+/// project into an index, a changed key is a delete plus an insert. With an
+/// unchanged key, updates skip identical projected entries while PutItem
+/// replacements still charge the index write.
 ///
-/// Index metadata is read from the (cached) `TableKeyInfo`, so no extra catalog
+/// Index metadata is read from the cached `TableKeyInfo`, so no extra catalog
 /// round-trip is needed.
 #[must_use]
 pub fn index_write_units(
-    item: &Item,
+    old_item: Option<&Item>,
+    new_item: Option<&Item>,
+    charge_unchanged_projection: bool,
     key_info: &TableKeyInfo,
 ) -> (
     std::collections::HashMap<String, f64>,
@@ -106,37 +110,97 @@ pub fn index_write_units(
         .collect();
 
     let mut gsi = std::collections::HashMap::new();
-    for g in &key_info.global_secondary_indexes {
-        if let Some(cu) = one_index_write_units(item, &g.key_schema, &base_keys, &g.projection) {
-            gsi.insert(g.index_name.clone(), cu);
+    for index in &key_info.global_secondary_indexes {
+        if let Some(cu) = one_index_write_units(
+            old_item,
+            new_item,
+            charge_unchanged_projection,
+            &index.key_schema,
+            &base_keys,
+            &index.projection,
+        ) {
+            gsi.insert(index.index_name.clone(), cu);
         }
     }
 
     let mut lsi = std::collections::HashMap::new();
-    for l in &key_info.local_secondary_indexes {
-        if let Some(cu) = one_index_write_units(item, &l.key_schema, &base_keys, &l.projection) {
-            lsi.insert(l.index_name.clone(), cu);
+    for index in &key_info.local_secondary_indexes {
+        if let Some(cu) = one_index_write_units(
+            old_item,
+            new_item,
+            charge_unchanged_projection,
+            &index.key_schema,
+            &base_keys,
+            &index.projection,
+        ) {
+            lsi.insert(index.index_name.clone(), cu);
         }
     }
 
     (gsi, lsi)
 }
 
-/// Write units for a single index, or `None` if the item is not projected into
-/// it (missing an index key attribute — sparse index).
+/// Write units for one index transition, or `None` when neither item projects
+/// into the sparse index.
 fn one_index_write_units(
-    item: &Item,
+    old_item: Option<&Item>,
+    new_item: Option<&Item>,
+    charge_unchanged_projection: bool,
     index_key_schema: &[KeySchemaElement],
     base_keys: &[&str],
     projection: &Projection,
 ) -> Option<f64> {
-    for ks in index_key_schema {
-        if !item.contains_key(&ks.attribute_name) {
-            return None;
+    let old_projection = old_item
+        .and_then(|item| sparse_index_projection(item, index_key_schema, base_keys, projection));
+    let new_projection = new_item
+        .and_then(|item| sparse_index_projection(item, index_key_schema, base_keys, projection));
+
+    match (old_projection, new_projection) {
+        (None, None) => None,
+        (Some(projected), None) | (None, Some(projected)) => {
+            Some(write_capacity_units(item_size_bytes(&projected)))
+        }
+        (Some(old_projected), Some(new_projected)) => {
+            let same_key = old_item.zip(new_item).is_some_and(|(old, new)| {
+                index_key_schema
+                    .iter()
+                    .all(|key| old.get(&key.attribute_name) == new.get(&key.attribute_name))
+            });
+            if same_key && !charge_unchanged_projection && old_projected == new_projected {
+                return None;
+            }
+
+            let old_cu = write_capacity_units(item_size_bytes(&old_projected));
+            let new_cu = write_capacity_units(item_size_bytes(&new_projected));
+            Some(if same_key {
+                old_cu.max(new_cu)
+            } else {
+                old_cu + new_cu
+            })
         }
     }
-    let projected = project_index_item(item, index_key_schema, base_keys, projection);
-    Some(write_capacity_units(item_size_bytes(&projected)))
+}
+
+/// Project an item into one index, or return `None` when the item is not a
+/// member of the sparse index.
+fn sparse_index_projection(
+    item: &Item,
+    index_key_schema: &[KeySchemaElement],
+    base_keys: &[&str],
+    projection: &Projection,
+) -> Option<Item> {
+    if index_key_schema
+        .iter()
+        .any(|key| !item.contains_key(&key.attribute_name))
+    {
+        return None;
+    }
+    Some(project_index_item(
+        item,
+        index_key_schema,
+        base_keys,
+        projection,
+    ))
 }
 
 /// Build the subset of `item` that an index materializes, per its projection.
@@ -312,4 +376,93 @@ pub fn item_metrics(
         .find(|ks| ks.key_type == extenddb_core::types::KeyType::Hash)?;
     let pk_value = item_or_key.get(&pk.attribute_name)?;
     Some(ItemCollectionMetrics::stub(&pk.attribute_name, pk_value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use extenddb_core::types::{AttributeValue, KeyType};
+
+    fn key(name: &str) -> KeySchemaElement {
+        KeySchemaElement {
+            attribute_name: name.to_owned(),
+            key_type: KeyType::Hash,
+        }
+    }
+
+    fn item(pk: &str, index_key: Option<&str>) -> Item {
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S(pk.to_owned()));
+        if let Some(value) = index_key {
+            item.insert("gsi_pk".to_owned(), AttributeValue::S(value.to_owned()));
+        }
+        item
+    }
+
+    fn keys_only() -> Projection {
+        Projection {
+            projection_type: ProjectionType::KeysOnly,
+            non_key_attributes: None,
+        }
+    }
+
+    #[test]
+    fn charges_deleted_sparse_index_projection() {
+        let old = item("item", Some("old"));
+        let new = item("item", None);
+        let units = one_index_write_units(
+            Some(&old),
+            Some(&new),
+            false,
+            &[key("gsi_pk")],
+            &["pk"],
+            &keys_only(),
+        );
+        assert_eq!(units, Some(1.0));
+    }
+
+    #[test]
+    fn changing_index_key_charges_delete_and_insert() {
+        let old = item("item", Some("old"));
+        let new = item("item", Some("new"));
+        let units = one_index_write_units(
+            Some(&old),
+            Some(&new),
+            false,
+            &[key("gsi_pk")],
+            &["pk"],
+            &keys_only(),
+        );
+        assert_eq!(units, Some(2.0));
+    }
+
+    #[test]
+    fn update_skips_unchanged_projection_but_replacement_charges_it() {
+        let mut old = item("item", Some("index"));
+        old.insert("other".to_owned(), AttributeValue::S("old".to_owned()));
+        let mut new = item("item", Some("index"));
+        new.insert("other".to_owned(), AttributeValue::S("new".to_owned()));
+        let key_schema = [key("gsi_pk")];
+        let projection = keys_only();
+
+        let update_units = one_index_write_units(
+            Some(&old),
+            Some(&new),
+            false,
+            &key_schema,
+            &["pk"],
+            &projection,
+        );
+        assert_eq!(update_units, None);
+
+        let replacement_units = one_index_write_units(
+            Some(&old),
+            Some(&new),
+            true,
+            &key_schema,
+            &["pk"],
+            &projection,
+        );
+        assert_eq!(replacement_units, Some(1.0));
+    }
 }
