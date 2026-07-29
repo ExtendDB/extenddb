@@ -230,6 +230,8 @@ pub async fn handle_update_item(
         region: ctx.region.clone(),
     });
     let need_old_for_stream = stream.is_some();
+    let need_old_for_capacity =
+        input.return_consumed_capacity != extenddb_core::types::ReturnConsumedCapacity::None;
 
     let (old_item, new_item) = ctx
         .storage
@@ -237,7 +239,7 @@ pub async fn handle_update_item(
             &key_info,
             &input.key,
             &actions,
-            return_old || need_old_for_stream,
+            return_old || need_old_for_stream || need_old_for_capacity,
             true, // always fetch new item for WCU calculation
             condition.as_ref(),
             &maps,
@@ -255,22 +257,19 @@ pub async fn handle_update_item(
     let new_bytes = new_item.as_ref().map_or(0, item_size_bytes);
     let wcu = capacity_helpers::write_capacity_units(old_bytes.max(new_bytes));
 
-    // Consumed capacity — computed before old/new items are moved below. The
-    // per-index breakdown uses the resulting item (new, or old for pure deletes)
-    // for sparse index membership; index metadata comes from the (cached)
-    // `TableKeyInfo`, so no extra catalog round-trip is needed.
-    let consumed_capacity = match new_item.as_ref().or(old_item.as_ref()) {
-        Some(cc_item) => capacity_helpers::write_capacity_indexed(
-            input.return_consumed_capacity,
-            &input.table_name,
-            wcu,
-            cc_item,
-            &key_info,
-        ),
-        None => {
-            capacity_helpers::write_capacity(input.return_consumed_capacity, &input.table_name, wcu)
-        }
-    };
+    // Index capacity follows the old-to-new transition, so removing a sparse
+    // index key charges the deleted projection and changing an index key charges
+    // both the old deletion and new insertion. Metadata comes from cached
+    // `TableKeyInfo`; no describe-table round-trip is needed.
+    let consumed_capacity = capacity_helpers::write_capacity_indexed(
+        input.return_consumed_capacity,
+        &input.table_name,
+        wcu,
+        old_item.as_ref(),
+        new_item.as_ref(),
+        false,
+        &key_info,
+    );
 
     // Select the appropriate return value.
     // UPDATED_OLD and UPDATED_NEW return only the attributes that were

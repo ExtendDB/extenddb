@@ -93,7 +93,11 @@ impl PostgresEngine {
             None
         };
 
-        let old_item = if return_old { Some(item.clone()) } else { None };
+        let old_item = if return_old && old_json.is_some() {
+            Some(item.clone())
+        } else {
+            None
+        };
 
         // Evaluate condition against the existing item (empty if non-existent).
         // DynamoDB treats a non-existent item as having no attributes at all.

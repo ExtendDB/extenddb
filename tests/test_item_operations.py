@@ -1448,6 +1448,82 @@ class TestConsumedCapacityIndexes:
         assert cc["CapacityUnits"] == 2.0
         assert set(cc["GlobalSecondaryIndexes"]) == {"gsi1"}
 
+    def test_index_breakdown_omits_granular_write_units(
+        self, dynamodb_client, two_gsi_table
+    ):
+        """Single-item writes expose CapacityUnits only, including index entries."""
+        resp = dynamodb_client.put_item(
+            TableName=two_gsi_table,
+            Item={"pk": {"S": "shape"}, "g1": {"S": "x"}, "g2": {"S": "y"}},
+            ReturnConsumedCapacity="INDEXES",
+        )
+        cc = resp["ConsumedCapacity"]
+        assert "WriteCapacityUnits" not in cc
+        for capacity in [cc["Table"], *cc["GlobalSecondaryIndexes"].values()]:
+            assert "WriteCapacityUnits" not in capacity
+            assert "ReadCapacityUnits" not in capacity
+
+    def test_put_item_overwrite_charges_deleted_sparse_index(
+        self, dynamodb_client, two_gsi_table
+    ):
+        """Overwriting an indexed item charges an old index entry that is removed."""
+        dynamodb_client.put_item(
+            TableName=two_gsi_table,
+            Item={"pk": {"S": "overwrite"}, "g1": {"S": "x"}, "g2": {"S": "y"}},
+        )
+        resp = dynamodb_client.put_item(
+            TableName=two_gsi_table,
+            Item={"pk": {"S": "overwrite"}, "g1": {"S": "x"}},
+            ReturnConsumedCapacity="INDEXES",
+        )
+        cc = resp["ConsumedCapacity"]
+        assert cc["GlobalSecondaryIndexes"]["gsi2"]["CapacityUnits"] == 1.0
+        assert cc["CapacityUnits"] == 3.0  # base + retained gsi1 + deleted gsi2
+
+    def test_update_item_charges_deleted_sparse_index(
+        self, dynamodb_client, two_gsi_table
+    ):
+        """Removing an index key still charges deletion of the old projection."""
+        dynamodb_client.put_item(
+            TableName=two_gsi_table,
+            Item={"pk": {"S": "remove-index"}, "g1": {"S": "x"}, "g2": {"S": "y"}},
+        )
+        resp = dynamodb_client.update_item(
+            TableName=two_gsi_table,
+            Key={"pk": {"S": "remove-index"}},
+            UpdateExpression="REMOVE g2",
+            ReturnConsumedCapacity="INDEXES",
+        )
+        cc = resp["ConsumedCapacity"]
+        assert cc["GlobalSecondaryIndexes"]["gsi2"]["CapacityUnits"] == 1.0
+        assert cc["CapacityUnits"] >= 2.0  # base + deleted gsi2
+
+    def test_update_upsert_charges_new_index_on_base_key(self, dynamodb_client):
+        """A missing item has no old GSI entry even when the GSI reuses its base key."""
+        with scoped_table(
+            dynamodb_client,
+            attribute_definitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            key_schema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "gsi_pk",
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "KEYS_ONLY"},
+                }
+            ],
+        ) as table:
+            resp = dynamodb_client.update_item(
+                TableName=table,
+                Key={"pk": {"S": "upsert"}},
+                UpdateExpression="SET #attr = :value",
+                ExpressionAttributeNames={"#attr": "other"},
+                ExpressionAttributeValues={":value": {"S": "created"}},
+                ReturnConsumedCapacity="INDEXES",
+            )
+            cc = resp["ConsumedCapacity"]
+            assert cc["GlobalSecondaryIndexes"]["gsi_pk"]["CapacityUnits"] == 1.0
+            assert cc["CapacityUnits"] == 2.0  # base insert + GSI insert
+
     def test_put_item_total_aggregate_includes_gsis(self, dynamodb_client, two_gsi_table):
         """TOTAL: aggregate counts base + affected GSIs, but no breakdown maps."""
         resp = dynamodb_client.put_item(
@@ -1521,6 +1597,17 @@ class TestConsumedCapacityIndexes:
             assert cc["Table"]["CapacityUnits"] == 2.0  # ~2 KB base item
             assert cc["GlobalSecondaryIndexes"]["gsi_ko"]["CapacityUnits"] == 1.0  # keys only
             assert cc["CapacityUnits"] == 3.0
+
+            update = dynamodb_client.update_item(
+                TableName=table,
+                Key={"pk": {"S": "a"}},
+                UpdateExpression="SET big = :value",
+                ExpressionAttributeValues={":value": {"S": "y" * 2000}},
+                ReturnConsumedCapacity="INDEXES",
+            )
+            update_cc = update["ConsumedCapacity"]
+            assert "GlobalSecondaryIndexes" not in update_cc
+            assert update_cc["CapacityUnits"] == update_cc["Table"]["CapacityUnits"]
 
     def test_lsi_write_reports_local_secondary_index_breakdown(self, dynamodb_client):
         """An LSI is reported under LocalSecondaryIndexes and added to the total.
