@@ -60,6 +60,12 @@ pub struct InitArgs {
     #[arg(long)]
     bind_addr: Option<String>,
 
+    /// Additional Subject Alternative Name for the self-signed certificate,
+    /// repeatable. Added to the default localhost/127.0.0.1/bind-addr list so
+    /// the cert is also valid for names like an in-cluster service DNS name.
+    #[arg(long = "tls-san")]
+    tls_san: Vec<String>,
+
     /// Overwrite existing config file (default: --no-overwrite, exit 255 if exists)
     #[arg(long, overrides_with = "no_overwrite")]
     overwrite: bool,
@@ -138,6 +144,16 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
 
     // Collect CLI args for backend-specific parsing
     let cli_args: Vec<String> = std::env::args().collect();
+
+    // Extract bind_addr from CLI args
+    let bind_addr =
+        extract_arg(&cli_args, "--bind-addr").unwrap_or_else(|| "127.0.0.1".to_string());
+
+    // Generate the self-signed TLS certificate if it isn't already present,
+    // covering the bind address plus any --tls-san values so it matches the URLs
+    // clients use. This runs before any database work so that an unusable
+    // --tls-san fails before we create users or databases.
+    generate_tls_cert_if_needed(&bind_addr, &args.tls_san)?;
 
     // Create bootstrapper via registry (no hardcoded match!)
     let bootstrapper = extenddb_storage::bootstrapper::create_bootstrapper(&args.config, &cli_args)
@@ -232,14 +248,6 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
             admin_result.username, password,
         );
     }
-
-    // Extract bind_addr from CLI args
-    let bind_addr =
-        extract_arg(&cli_args, "--bind-addr").unwrap_or_else(|| "127.0.0.1".to_string());
-
-    // Generate self-signed TLS certificate if not already present.
-    // Include the server bind address as a SAN so the cert matches the URL.
-    generate_tls_cert_if_needed(&bind_addr)?;
 
     // AI-1: Discover rendered docs directory for the config file.
     let docs_dir = discover_docs_dir();

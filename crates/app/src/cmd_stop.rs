@@ -48,12 +48,24 @@ pub fn run(args: &StopArgs) {
     let pid_str = match std::fs::read_to_string(&pid_file) {
         Ok(s) => s.trim().to_owned(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
-                "No extenddb server is running on port {port} (PID file {} not found).\n\
-                 Start one with: extenddb serve --config {}",
-                pid_file.display(),
-                args.config,
-            );
+            // `serve --foreground` writes no PID file, so a missing file does
+            // not mean nothing is running. Probe the port before saying so.
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                eprintln!(
+                    "A server is listening on port {port} but wrote no PID file ({}).\n\
+                     It was most likely started with `extenddb serve --foreground`, which \
+                     leaves process supervision to the container runtime, systemd, or your \
+                     shell. Stop it there (or send it SIGTERM directly).",
+                    pid_file.display(),
+                );
+            } else {
+                eprintln!(
+                    "No extenddb server is running on port {port} (PID file {} not found).\n\
+                     Start one with: extenddb serve --config {}",
+                    pid_file.display(),
+                    args.config,
+                );
+            }
             std::process::exit(1);
         }
         Err(e) => {

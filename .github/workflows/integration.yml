@@ -47,7 +47,9 @@ jobs:
 
       - name: Start ExtendDB
         run: |
-          ./target/release/extenddb serve --config extenddb.toml --foreground &
+          # --write-pid-file so devtools/run-tests can restart the server with
+          # 'extenddb stop' when it needs to apply a config change.
+          ./target/release/extenddb serve --config extenddb.toml --foreground --write-pid-file &
           for i in $(seq 1 30); do
             if curl -sk https://127.0.0.1:18443/health | grep -q healthy; then
               echo "Server ready"
@@ -114,7 +116,9 @@ jobs:
 
       - name: Start ExtendDB
         run: |
-          ./target/release/extenddb serve --config extenddb.toml --foreground &
+          # --write-pid-file so devtools/run-tests can restart the server with
+          # 'extenddb stop' when it needs to apply a config change.
+          ./target/release/extenddb serve --config extenddb.toml --foreground --write-pid-file &
           for i in $(seq 1 30); do
             if curl -sk https://127.0.0.1:18443/health | grep -q healthy; then
               echo "Server ready"
