@@ -966,12 +966,29 @@ impl MongoEngine {
             }
         });
 
+        // Load all secondary indexes so per-index consumed capacity can be
+        // computed from the cached TableKeyInfo without an extra describe_table
+        // round-trip per write (matches the fields upstream added).
+        use futures::TryStreamExt;
         let indexes_coll = self.catalog_db.collection::<Document>("indexes");
-        let has_lsi = indexes_coll
-            .count_documents(doc! { "_id.table_id": &table_id, "index_type": "LSI" })
+        let mut idx_cursor = indexes_coll
+            .find(doc! { "_id.table_id": &table_id })
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let mut global_secondary_indexes = Vec::new();
+        let mut local_secondary_indexes = Vec::new();
+        while let Some(idx_doc) = idx_cursor
+            .try_next()
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?
-            > 0;
+        {
+            let info = index_info_from_doc(&idx_doc)?;
+            match info.index_type {
+                IndexType::Gsi => global_secondary_indexes.push(info),
+                IndexType::Lsi => local_secondary_indexes.push(info),
+            }
+        }
+        let has_lsi = !local_secondary_indexes.is_empty();
 
         Ok(TableKeyInfo {
             table_name,
@@ -981,6 +998,8 @@ impl MongoEngine {
             key_schema,
             attribute_definitions,
             has_lsi,
+            global_secondary_indexes,
+            local_secondary_indexes,
             stream_specification,
         })
     }
@@ -1370,4 +1389,47 @@ impl MongoEngine {
 
         Ok(())
     }
+}
+
+/// Build an `IndexInfo` from an `indexes` catalog document whose `_id` is
+/// `{ table_id, index_name }`. Used to populate the GSI/LSI lists carried on
+/// `TableKeyInfo` for per-index consumed-capacity computation.
+fn index_info_from_doc(index_doc: &Document) -> Result<IndexInfo, StorageError> {
+    let index_name = index_doc
+        .get_document("_id")
+        .ok()
+        .and_then(|id| id.get_str("index_name").ok())
+        .ok_or_else(|| StorageError::Internal("missing _id.index_name".to_string()))?
+        .to_string();
+    let index_id = index_doc
+        .get_str("index_id")
+        .map_err(|_| StorageError::Internal("missing index_id".to_string()))?
+        .to_string();
+    let index_type = match index_doc.get_str("index_type") {
+        Ok("GSI") => IndexType::Gsi,
+        Ok("LSI") => IndexType::Lsi,
+        other => {
+            return Err(StorageError::Internal(format!(
+                "unknown index type: {other:?}"
+            )));
+        }
+    };
+    let key_schema_bson = index_doc
+        .get("key_schema")
+        .ok_or_else(|| StorageError::Internal("missing key_schema in index".to_string()))?;
+    let key_schema: Vec<extenddb_core::types::KeySchemaElement> =
+        bson::from_bson(key_schema_bson.clone())
+            .map_err(|e| StorageError::Internal(format!("index key_schema parse: {e}")))?;
+    let projection_bson = index_doc
+        .get("projection")
+        .ok_or_else(|| StorageError::Internal("missing projection in index".to_string()))?;
+    let projection: extenddb_core::types::Projection = bson::from_bson(projection_bson.clone())
+        .map_err(|e| StorageError::Internal(format!("index projection parse: {e}")))?;
+    Ok(IndexInfo {
+        index_name,
+        index_id,
+        index_type,
+        key_schema,
+        projection,
+    })
 }
