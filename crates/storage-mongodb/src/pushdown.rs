@@ -176,8 +176,16 @@ fn walk(expr: &Expr, maps: &ExpressionMaps) -> Pushable {
                 | (AttrKind::Bool | AttrKind::Null, AttrKind::Field, _) => {
                     Pushable::No("ordering on BOOL / NULL operand")
                 }
-                // Field vs. Field: the compiler emits $expr; pushable.
-                (AttrKind::Field, AttrKind::Field, _) => Pushable::Yes,
+                // Field vs. Field: NOT pushable. A plain field's type is
+                // unknown at compile time (its AttrKind is just `Field`), so
+                // the emitted $expr compares the raw tagged subdocuments —
+                // e.g. two Number fields, stored string-encoded, compare
+                // lexically ("42" < "9"), giving the wrong answer in both
+                // directions. Fall back to the in-Rust evaluator, consistent
+                // with the N/B literal exclusions above.
+                (AttrKind::Field, AttrKind::Field, _) => {
+                    Pushable::No("Field vs Field — operand types unknown at compile time")
+                }
                 // Two literals — pushable but degenerate.
                 _ => Pushable::No("Compare with unusual operand kinds"),
             }
@@ -307,6 +315,32 @@ mod tests {
         };
         let maps = maps_with(&[(":n", AttributeValue::N("42".into()))]);
         assert!(!is_pushable(&expr, &maps).is_yes());
+    }
+
+    #[test]
+    fn field_vs_field_is_not_pushable() {
+        // Both operands are plain fields whose runtime types are unknown at
+        // compile time. Pushing $expr would compare tagged subdocuments
+        // (lexical for Numbers), so this must fall back to the in-Rust
+        // evaluator — for every comparator, not just ordering ones.
+        for op in [
+            CompareOp::Eq,
+            CompareOp::Ne,
+            CompareOp::Lt,
+            CompareOp::Le,
+            CompareOp::Gt,
+            CompareOp::Ge,
+        ] {
+            let expr = Expr::Compare {
+                left: Box::new(path("counter_a")),
+                op,
+                right: Box::new(path("counter_b")),
+            };
+            assert!(
+                !is_pushable(&expr, &maps_with(&[])).is_yes(),
+                "Field vs Field must not be pushable for {op:?}"
+            );
+        }
     }
 
     #[test]
