@@ -9,6 +9,7 @@
 //! their crate, and ships their own `extenddb-<backend>` image — with no edits to
 //! any ExtendDB core crate.
 //!
+<<<<<<< HEAD
 //! In-tree backends are selected by mutually exclusive Cargo features
 //! (`postgres` is the default; `sqlite`/`sqlite-memory` build the dev/CI
 //! backend). Exactly one must be enabled: [`set_backend`] installs one backend
@@ -39,12 +40,24 @@ compile_error!(
      not be built with a production backend like `postgres` (build with \
      `--no-default-features --features sqlite-memory,dev-mode`)"
 );
+=======
+//! This fork's bin compiles the PostgreSQL backend by default and the MongoDB
+//! backend under `--features mongodb`, selecting the one to install at compile
+//! time so a single bin serves both while the reviewer's per-backend model is
+//! adopted.
+>>>>>>> b05f594 (chore(mongodb): adopt set_backend registration and adapt to post-#218 main)
 
 fn main() -> anyhow::Result<()> {
     // Install the compiled-in backend before dispatch. The compiler checks this
     // call; there is no link-time auto-registration and no name to resolve, so a
     // missing or mistyped backend cannot become a runtime error.
+<<<<<<< HEAD
     #[cfg(feature = "postgres")]
+=======
+    #[cfg(feature = "mongodb")]
+    extenddb_storage::set_backend(extenddb_storage_mongodb::backend())?;
+    #[cfg(not(feature = "mongodb"))]
+>>>>>>> b05f594 (chore(mongodb): adopt set_backend registration and adapt to post-#218 main)
     extenddb_storage::set_backend(extenddb_storage_postgres::backend())?;
     #[cfg(feature = "sqlite")]
     extenddb_storage::set_backend(extenddb_storage_sqlite::backend())?;

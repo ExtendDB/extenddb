@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [features]
 default = ["postgres"]
+<<<<<<< HEAD
 postgres = ["extenddb-storage-postgres"]
 sqlite = ["extenddb-storage-sqlite"]
 # Build the SQLite backend in its zero-config, ephemeral in-memory mode.
@@ -22,11 +23,19 @@ sqlite-memory = ["sqlite", "extenddb-storage-sqlite/memory"]
 # requires a dev backend (`sqlite`/`sqlite-memory`) and fails to build with a
 # production backend like `postgres` (enforced at compile time in `main.rs`).
 dev-mode = ["extenddb-app/dev-mode"]
+=======
+postgres = ["dep:extenddb-storage-postgres"]
+mongodb = ["dep:extenddb-storage-mongodb"]
+>>>>>>> b05f594 (chore(mongodb): adopt set_backend registration and adapt to post-#218 main)
 
 [dependencies]
 extenddb-app = { workspace = true }
 extenddb-storage = { workspace = true }
 extenddb-storage-postgres = { workspace = true, optional = true }
+<<<<<<< HEAD
 extenddb-storage-sqlite = { workspace = true, optional = true }
+=======
+extenddb-storage-mongodb = { workspace = true, optional = true }
+>>>>>>> b05f594 (chore(mongodb): adopt set_backend registration and adapt to post-#218 main)
 anyhow = { workspace = true }
 extenddb-config = { workspace = true }
