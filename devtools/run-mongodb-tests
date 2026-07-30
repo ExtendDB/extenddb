@@ -73,7 +73,6 @@ mkdir -p "$OUTPUT_DIR"
 
 CONFIG="$OUTPUT_DIR/extenddb.toml"
 SERVER_LOG="$OUTPUT_DIR/server.log"
-SERVER_PID_FILE="$OUTPUT_DIR/server.pid"
 CONTAINER_NAME="extenddb-runtests-mongo"
 BINARY="./target/release/extenddb"
 
@@ -95,21 +94,15 @@ cleanup() {
     if $KEEP; then
         echo ""
         echo "=== --keep set; leaving mongo + extenddb running ==="
-        echo "  server pid file:      $SERVER_PID_FILE"
-        echo "  server log:           $SERVER_LOG"
+        echo "  server log (startup): $SERVER_LOG"
         echo "  mongo container:      $CONTAINER_NAME (port $MONGO_PORT)"
-        echo "  tear down manually:   kill \$(cat $SERVER_PID_FILE); docker rm -f $CONTAINER_NAME"
+        echo "  tear down manually:   $BINARY stop --config $CONFIG; docker rm -f $CONTAINER_NAME"
         return
     fi
     echo ""
     echo "=== Cleanup ==="
-    if [[ -f "$SERVER_PID_FILE" ]]; then
-        local pid
-        pid=$(cat "$SERVER_PID_FILE")
-        if kill "$pid" 2>/dev/null; then
-            echo "  stopped extenddb server (pid $pid)"
-        fi
-        rm -f "$SERVER_PID_FILE"
+    if [[ -f "$CONFIG" ]] && "$BINARY" stop --config "$CONFIG" >/dev/null 2>&1; then
+        echo "  stopped extenddb server"
     fi
     if docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1; then
         echo "  removed docker container $CONTAINER_NAME"
@@ -180,6 +173,7 @@ cat > "$CONFIG" <<TOML
 bind_addr = "127.0.0.1"
 port = $BIND_PORT
 region = "us-east-1"
+run_dir = "$OUTPUT_DIR"
 
 [server.tls]
 cert_path = "$HOME/.extenddb/tls/cert.pem"
@@ -211,8 +205,11 @@ TOML
 
 echo ""
 echo "=== Starting extenddb server on 127.0.0.1:$BIND_PORT ==="
-nohup "$BINARY" serve --foreground --config "$CONFIG" >"$SERVER_LOG" 2>&1 &
-echo "$!" > "$SERVER_PID_FILE"
+# `extenddb serve` daemonizes itself (forks to background, writes its own
+# PID file under the config's run_dir, then returns), so no `&` is needed.
+# Startup banner and any pre-daemonize errors are captured to SERVER_LOG;
+# runtime logs go to syslog.
+"$BINARY" serve --config "$CONFIG" >"$SERVER_LOG" 2>&1
 
 for i in $(seq 1 30); do
     if curl -sk "https://127.0.0.1:$BIND_PORT/health" >/dev/null 2>&1; then
