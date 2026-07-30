@@ -15,8 +15,9 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::path::PathBuf;
+
 use extenddb_config as config;
-use extenddb_config::pid_file_path;
 use extenddb_storage::CancellationToken;
 use syslog_tracing::{Facility, Options, Syslog};
 use tracing_subscriber::{
@@ -86,8 +87,14 @@ pub struct ServeParams {
     /// port conflicts surface on stderr before the parent exits. The listening
     /// port is read from this socket, so it cannot disagree with it.
     pub listener: TcpListener,
-    /// Directory holding the PID file.
-    pub run_dir: String,
+    /// Where to write the PID file, or `None` to write none.
+    ///
+    /// `None` suits a supervised deployment: the supervisor owns the process,
+    /// and skipping the file means no writable run directory is needed, so the
+    /// root filesystem can be read-only. `extenddb status` and `extenddb stop`
+    /// locate the file by convention, so a caller that wants them to work should
+    /// pass the conventional path from `extenddb_config::pid_file_path`.
+    pub pid_file: Option<PathBuf>,
     /// Where log output is written.
     pub log_target: LogTarget,
     /// Build provenance of the deployed binary.
@@ -100,13 +107,13 @@ impl ServeParams {
     pub fn new(
         app_config: config::AppConfig,
         listener: TcpListener,
-        run_dir: String,
+        pid_file: Option<PathBuf>,
         build: BuildInfo,
     ) -> Self {
         Self {
             app_config,
             listener,
-            run_dir,
+            pid_file,
             log_target: LogTarget::Syslog,
             build,
         }
@@ -142,11 +149,13 @@ pub async fn serve(params: ServeParams) -> anyhow::Result<()> {
     // CB-27: Clean up PID file if serve fails before reaching the HTTP server
     // (e.g., backend connection failure). The PID file was already written by
     // the daemonize step in the caller.
-    let pid_path = pid_file_path(&params.run_dir, port);
+    let pid_path = params.pid_file.clone();
     let log_target = params.log_target;
     let result = serve_inner(params, port).await;
     if let Err(ref e) = result {
-        let _ = std::fs::remove_file(&pid_path);
+        if let Some(ref path) = pid_path {
+            let _ = std::fs::remove_file(path);
+        }
         // P57 Bug 7: Log fatal errors where the operator will see them. After
         // daemonize, stderr is /dev/null so anyhow's error display is lost. Use
         // tracing if available, fall back to the raw writer if tracing isn't
@@ -166,21 +175,23 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     let ServeParams {
         app_config,
         listener: std_listener,
-        run_dir,
+        pid_file,
         log_target,
         build,
     } = params;
     let catalog_version =
         extenddb_storage::operations::catalog_version().unwrap_or_else(|_| "unknown".to_string());
 
-    // Write the PID file so `extenddb status`/`stop` and `start_server`'s
-    // graceful shutdown cleanup work in every deployment. When the caller
-    // daemonized, the grandchild PID that `daemonize` wrote is the same value
-    // as `std::process::id()` post-fork, so this is a consistent rewrite rather
-    // than a conflicting one.
-    let pid_file = pid_file_path(&run_dir, port);
-    std::fs::write(&pid_file, format!("{}\n", std::process::id()))
-        .map_err(|e| anyhow::anyhow!("Failed to write PID file {}: {e}", pid_file.display()))?;
+    // Write the PID file, when the caller asked for one, so `extenddb status`,
+    // `extenddb stop`, and `start_server`'s graceful shutdown cleanup work. When
+    // the caller daemonized, the grandchild PID that `daemonize` wrote is the
+    // same value as `std::process::id()` post-fork, so this is a consistent
+    // rewrite rather than a conflicting one. A supervised deployment passes
+    // `None` and needs no writable run directory at all.
+    if let Some(ref path) = pid_file {
+        std::fs::write(path, format!("{}\n", std::process::id()))
+            .map_err(|e| anyhow::anyhow!("Failed to write PID file {}: {e}", path.display()))?;
+    }
 
     // Init logging (REQ-LOG-003, REQ-LOG-006) — the caller chose the target via
     // [`LogTarget`]; a supervised/container deployment picks stderr so the
@@ -552,13 +563,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         None
     };
 
-    let server_result = crate::start_server(
-        listener,
-        state,
-        Some(pid_file_path(&run_dir, port)),
-        tls_config,
-    )
-    .await;
+    let server_result = crate::start_server(listener, state, pid_file, tls_config).await;
 
     // The HTTP server has stopped accepting; drain the workers so in-flight
     // cycles finish and the metrics flush worker writes its final bucket.

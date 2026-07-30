@@ -4,12 +4,34 @@
 //! Helpers for `extenddb init`: TLS certificate generation and config file creation.
 
 /// Generate a self-signed TLS certificate and key if they don't already exist.
-pub fn generate_tls_cert_if_needed(bind_addr: &str) -> anyhow::Result<()> {
+///
+/// `extra_sans` are additional Subject Alternative Names, such as an in-cluster
+/// service DNS name. They are appended to the default list of `localhost`,
+/// `127.0.0.1`, and the bind address so the certificate is valid for the names
+/// clients use.
+///
+/// An existing certificate is never regenerated, because rotating the key pair
+/// under a live deployment would be a surprise. That means `--tls-san` cannot
+/// take effect on a later run, so instead of exiting successfully having dropped
+/// the requested names, we check that the existing certificate already covers
+/// them and fail with an actionable error if it does not.
+pub fn generate_tls_cert_if_needed(bind_addr: &str, extra_sans: &[String]) -> anyhow::Result<()> {
     let tls_dir = extenddb_config::expand_tilde("~/.extenddb/tls");
     let cert_path = format!("{tls_dir}/cert.pem");
     let key_path = format!("{tls_dir}/key.pem");
 
+    // Requested SANs, trimmed, with blanks and duplicates removed.
+    let requested = normalize_sans(extra_sans);
+
+    // Validate every requested name before either path uses it, so a name we
+    // could not verify later is rejected on the first run rather than only on
+    // the next one.
+    for san in &requested {
+        coverage_probe(san)?;
+    }
+
     if std::path::Path::new(&cert_path).exists() && std::path::Path::new(&key_path).exists() {
+        ensure_cert_covers_sans(&cert_path, &key_path, &requested)?;
         println!("--- TLS certificate already exists, skipping generation.");
         return Ok(());
     }
@@ -23,6 +45,12 @@ pub fn generate_tls_cert_if_needed(bind_addr: &str) -> anyhow::Result<()> {
     let mut sans: Vec<String> = vec!["localhost".to_owned(), "127.0.0.1".to_owned()];
     if bind_addr != "localhost" && bind_addr != "127.0.0.1" && bind_addr != "0.0.0.0" {
         sans.push(bind_addr.to_owned());
+    }
+    // Append the `--tls-san` values the defaults don't already cover.
+    for san in &requested {
+        if !sans.iter().any(|s| s.eq_ignore_ascii_case(san)) {
+            sans.push(san.clone());
+        }
     }
 
     let sans_display = sans.join(", ");
@@ -59,6 +87,109 @@ pub fn generate_tls_cert_if_needed(bind_addr: &str) -> anyhow::Result<()> {
     println!("    SANs: {sans_display}");
 
     Ok(())
+}
+
+/// Trim `--tls-san` values, drop blanks, and remove duplicates.
+///
+/// DNS names are case-insensitive, so `Foo.example.com` and `foo.example.com`
+/// are the same name and only the first spelling given is kept.
+fn normalize_sans(sans: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for san in sans {
+        let san = san.trim();
+        if !san.is_empty() && !out.iter().any(|s: &String| s.eq_ignore_ascii_case(san)) {
+            out.push(san.to_owned());
+        }
+    }
+    out
+}
+
+/// Label substituted for the `*` when testing whether a certificate covers a
+/// wildcard SAN. Any single label works; this one is chosen to be implausible
+/// as a real hostname.
+const WILDCARD_PROBE_LABEL: &str = "extenddb-tls-san-probe";
+
+/// The server name used to test whether a certificate covers `san`.
+///
+/// A wildcard such as `*.svc.cluster.local` is a legitimate certificate entry
+/// but not a legitimate server name, so it cannot be verified directly. Verify a
+/// synthetic single-label substitution instead: a certificate is valid for
+/// `<label>.svc.cluster.local` only if it carries the wildcard (or that exact
+/// name), which is what we want to know. Wildcards match exactly one leftmost
+/// label, so one substitution is enough.
+///
+/// Doubles as validation: callers run every requested `--tls-san` through this
+/// before generating a certificate, so a name that could never be verified is
+/// rejected up front instead of on the next run.
+fn coverage_probe(san: &str) -> anyhow::Result<rustls::pki_types::ServerName<'static>> {
+    let probe = match san.strip_prefix("*.") {
+        Some(rest) if rest.is_empty() || rest.contains('*') => {
+            anyhow::bail!(
+                "Invalid --tls-san value '{san}': a wildcard must be a single leading \
+                 label followed by a domain, as in '*.svc.cluster.local'"
+            )
+        }
+        Some(rest) => format!("{WILDCARD_PROBE_LABEL}.{rest}"),
+        None if san.contains('*') => anyhow::bail!(
+            "Invalid --tls-san value '{san}': a wildcard is only valid as the leftmost \
+             label, as in '*.svc.cluster.local'"
+        ),
+        None => san.to_owned(),
+    };
+    rustls::pki_types::ServerName::try_from(probe).map_err(|e| {
+        anyhow::anyhow!("Invalid --tls-san value '{san}' (not a DNS name or IP address): {e}")
+    })
+}
+
+/// Fail unless the certificate at `cert_path` is already valid for every
+/// requested SAN.
+///
+/// Since `init` never regenerates an existing certificate, this check is all
+/// that stands between a mistyped or newly added `--tls-san` and clients failing
+/// hostname verification at runtime against a name `init` appeared to accept.
+fn ensure_cert_covers_sans(
+    cert_path: &str,
+    key_path: &str,
+    requested: &[String],
+) -> anyhow::Result<()> {
+    if requested.is_empty() {
+        return Ok(());
+    }
+
+    let pem = std::fs::read(cert_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read existing certificate {cert_path}: {e}"))?;
+    let der = rustls_pemfile::certs(&mut pem.as_slice())
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No certificate found in {cert_path}"))?
+        .map_err(|e| anyhow::anyhow!("Failed to parse certificate {cert_path}: {e}"))?;
+    let cert = rustls::server::ParsedCertificate::try_from(&der)
+        .map_err(|e| anyhow::anyhow!("Failed to parse certificate {cert_path}: {e}"))?;
+
+    let mut missing = Vec::new();
+    for san in requested {
+        let name = coverage_probe(san)?;
+        if rustls::client::verify_server_name(&cert, &name).is_err() {
+            missing.push(san.clone());
+        }
+    }
+
+    if missing.is_empty() {
+        println!(
+            "    Existing certificate already covers --tls-san: {}",
+            requested.join(", ")
+        );
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "The existing TLS certificate {cert_path} is not valid for the requested \
+         --tls-san value(s): {}. init does not regenerate an existing certificate, \
+         so these names would be silently dropped and clients using them would fail \
+         TLS hostname verification. Either delete {cert_path} and {key_path} and \
+         re-run init to generate a certificate covering them, or mount a certificate \
+         that already covers them.",
+        missing.join(", "),
+    )
 }
 
 /// Generate a comprehensive config file with all settings.

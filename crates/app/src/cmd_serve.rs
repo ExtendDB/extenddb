@@ -31,6 +31,18 @@ pub struct ServeArgs {
     /// them.
     #[arg(long, alias = "no-daemon")]
     foreground: bool,
+
+    /// Write a PID file in --foreground mode.
+    ///
+    /// Foreground mode normally writes none, because the supervisor owns the
+    /// process and a read-only root filesystem then needs no run directory.
+    /// Pass this when you want `extenddb status` and `extenddb stop` to work
+    /// against a foreground server, for example when running it from a shell.
+    /// It goes to the same `run_dir` path daemon mode uses, so `stop` and
+    /// `status` find it with no extra arguments. Ignored in daemon mode, which
+    /// always writes one.
+    #[arg(long)]
+    write_pid_file: bool,
 }
 
 /// Bind the listening socket, daemonize, then start the tokio runtime.
@@ -111,11 +123,18 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         println!("{banner_line2}");
     }
 
-    // D-3: Write PID file so `extenddb status` can report the daemon PID.
+    // D-3: A PID file lets `extenddb status` and `extenddb stop` find the
+    // process. Daemon mode always writes one. Foreground mode writes one only on
+    // request, so by default it needs no run directory at all and the container
+    // can use a read-only root filesystem.
     let run_dir = config::expand_tilde(&app_config.server.run_dir);
-    std::fs::create_dir_all(&run_dir)
-        .map_err(|e| anyhow::anyhow!("Failed to create run directory {run_dir}: {e}"))?;
-    let pid_file = pid_file_path(&run_dir, port);
+    let pid_file = if args.foreground && !args.write_pid_file {
+        None
+    } else {
+        std::fs::create_dir_all(&run_dir)
+            .map_err(|e| anyhow::anyhow!("Failed to create run directory {run_dir}: {e}"))?;
+        Some(pid_file_path(&run_dir, port))
+    };
 
     // P57 Bug 7 fix: Use execute() instead of start() so the parent can
     // verify the daemon child is healthy before exiting. start() exits the
@@ -123,17 +142,19 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     //
     // When --foreground is set, skip daemonization entirely so the process
     // can be supervised by Docker, Kubernetes, systemd Type=simple, etc.
-    // The PID file is still written below by `start_server`, and graceful
-    // shutdown on SIGINT/SIGTERM still works.
+    // Graceful shutdown on SIGINT/SIGTERM still works.
     if !args.foreground {
-        let daemon = Daemonize::new().pid_file(&pid_file);
+        let pid_file = pid_file
+            .as_ref()
+            .expect("daemon mode always has a PID file path");
+        let daemon = Daemonize::new().pid_file(pid_file);
         match daemon.execute() {
             daemonize::Outcome::Parent(Ok(_)) => {
                 // Parent process: wait for the PID file to appear (written by
                 // the grandchild after the double-fork), then verify the daemon
                 // is still alive. This catches crashes during early startup
                 // (bad config, missing tables, TLS cert errors).
-                return verify_daemon_started(&pid_file, &bind_addr);
+                return verify_daemon_started(pid_file, &bind_addr);
             }
             daemonize::Outcome::Parent(Err(e)) => {
                 return Err(anyhow::anyhow!("Failed to daemonize: {e}"));
@@ -160,7 +181,7 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         .enable_all()
         .build()?
         .block_on(extenddb_server::serve(
-            ServeParams::new(app_config, std_listener, run_dir, build).with_log_target(
+            ServeParams::new(app_config, std_listener, pid_file, build).with_log_target(
                 if args.foreground {
                     LogTarget::Stderr
                 } else {
