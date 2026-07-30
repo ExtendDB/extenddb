@@ -10,7 +10,7 @@ use bson::{Document, doc};
 use extenddb_core::metrics::MetricsCollector;
 use extenddb_core::types::{KeySchemaElement, Projection, ProjectionType, UserIdentity};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{DataEngine, MetadataEngine, StreamEngine, TableEngine};
+use extenddb_storage::{DataEngine, MetadataEngine, StreamEngine, TableEngine, WorkerStore};
 use futures::TryStreamExt;
 
 use crate::MongoEngine;
@@ -21,6 +21,10 @@ const STREAM_RETENTION_HOURS: i64 = 24;
 const STREAM_CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
 const GSI_BACKFILL_INTERVAL: Duration = Duration::from_secs(5);
 const GSI_BACKFILL_BATCH: i64 = 500;
+/// How often to flip due `CREATING` tables to `ACTIVE`. Short enough that the
+/// window closes promptly after `control_plane_delay_seconds` (default 0.25s)
+/// without busy-spinning.
+const CONTROL_PLANE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub(crate) async fn ttl_cleanup_worker(storage: Arc<MongoEngine>, metrics: Arc<MetricsCollector>) {
     let region_arc: Arc<str> = Arc::from(storage.region.as_str());
@@ -359,4 +363,22 @@ fn build_ttl_condition(
     );
 
     (condition_expr, ExpressionMaps::new(names, values))
+}
+
+/// Background poller that flips tables out of the transient `CREATING` state
+/// once their scheduled `status_transition_at` has passed. See
+/// [`crate::worker_store`] for how rows enter `CREATING`.
+pub(crate) async fn control_plane_worker(storage: Arc<MongoEngine>) {
+    loop {
+        tokio::time::sleep(CONTROL_PLANE_POLL_INTERVAL).await;
+        match WorkerStore::process_control_plane_transitions(&*storage).await {
+            Ok(t) if t.is_empty() => {}
+            Ok(transitions) => {
+                for (name, transition) in &transitions {
+                    tracing::info!("Table '{name}': {transition}");
+                }
+            }
+            Err(e) => tracing::warn!("Control-plane transition poll failed: {e}"),
+        }
+    }
 }

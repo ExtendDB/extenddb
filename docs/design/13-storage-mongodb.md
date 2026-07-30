@@ -833,7 +833,7 @@ crates/storage-mongodb/
     ├── credential_store.rs     # Access-key lookup + AES-GCM decryption
     ├── catalog_store.rs        # SettingsStore / DiagnosticsStore glue
     ├── admin_store.rs          # Admin operations (currently thin)
-    └── worker_store.rs         # WorkerStore trait shim (no-op; supertrait requirement)
+    └── worker_store.rs         # WorkerStore: CREATING -> ACTIVE table transitions
 ```
 
 ## 7. `MongoEngine` Struct
@@ -993,12 +993,12 @@ The backend implements every trait in `extenddb-storage`:
 - `Bootstrapper` — init, destroy, migrate, verify. Creates the
   catalog and data databases, seeds encryption key and admin user,
   applies index schema.
-- `WorkerStore` — trait method is a no-op. `create_table_impl`
-  writes `TableStatus: ACTIVE` inline and `delete_table_impl` runs
-  the collection/tag/stream cleanup inline, so there is never a
-  transient state waiting for a background worker. Kept in the
-  impl surface only because `OperationsEngine` requires
-  `WorkerStore` as a supertrait.
+- `WorkerStore` — `process_control_plane_transitions` flips tables
+  from `CREATING` to `ACTIVE` once their `status_transition_at`
+  passes. `create_table_impl` (and restore) write `CREATING` with a
+  scheduled transition when `control_plane_delay_seconds` > 0, or
+  `ACTIVE` directly when it is 0. `delete_table_impl` remains inline
+  (no `DELETING` transient state).
 - `ManagementStore`, `AdminStore`, `SettingsStore`, `MetricsStore`,
   `RateLimitStore` — the catalog trait surface.
 - `AuthorizationStore` — user/group/role/permissions-boundary/session
@@ -1013,6 +1013,8 @@ The backend implements every trait in `extenddb-storage`:
   24 h retention TTL index.
 - `gsi_backfill_worker` — drain `indexes` rows in `CREATING` state,
   scan the base collection with a persistent cursor, flip to ACTIVE.
+- `control_plane_worker` — flip `tables` rows from `CREATING` to
+  `ACTIVE` once their scheduled `status_transition_at` passes.
 
 ## 13. Testing Strategy
 

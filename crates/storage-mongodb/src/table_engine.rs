@@ -202,6 +202,23 @@ impl MongoEngine {
             |v| bson::to_bson(v).unwrap_or(bson::Bson::Null),
         );
 
+        // Enter CREATING with a scheduled transition to ACTIVE, unless
+        // control_plane_delay_seconds is 0 (then go straight to ACTIVE). The
+        // background control_plane_worker flips CREATING -> ACTIVE once the
+        // transition time passes; during the window data-plane ops on the
+        // table return ResourceNotFound, matching DynamoDB and the postgres
+        // backend.
+        let delay_secs = self.control_plane_delay_seconds().await;
+        let (table_status, status_transition_at): (&str, bson::Bson) = if delay_secs <= 0.0 {
+            ("ACTIVE", bson::Bson::Null)
+        } else {
+            let at = bson::DateTime::now().timestamp_millis() + (delay_secs * 1000.0) as i64;
+            (
+                "CREATING",
+                bson::Bson::DateTime(bson::DateTime::from_millis(at)),
+            )
+        };
+
         let table_doc = doc! {
             "_id": { "account_id": account_id, "table_name": &input.table_name },
             "key_schema": key_schema_bson,
@@ -209,7 +226,8 @@ impl MongoEngine {
             "billing_mode": billing_str,
             "provisioned_throughput": pt_bson.unwrap_or(bson::Bson::Null),
             "stream_specification": stream_bson.unwrap_or(bson::Bson::Null),
-            "table_status": "ACTIVE",
+            "table_status": table_status,
+            "status_transition_at": status_transition_at,
             "creation_date_time": bson::DateTime::from_millis((creation_epoch * 1000.0) as i64),
             "table_size_bytes": 0_i64,
             "item_count": 0_i64,
@@ -478,7 +496,11 @@ impl MongoEngine {
             table_name: input.table_name,
             key_schema: input.key_schema,
             attribute_definitions: input.attribute_definitions,
-            table_status: TableStatus::Active,
+            table_status: if table_status == "CREATING" {
+                TableStatus::Creating
+            } else {
+                TableStatus::Active
+            },
             creation_date_time: creation_epoch,
             table_size_bytes: 0,
             item_count: 0,
@@ -909,7 +931,11 @@ impl MongoEngine {
 
         let status = table_doc.get_str("table_status").unwrap_or("ACTIVE");
         if require_active && status != "ACTIVE" {
-            return Err(StorageError::TableNotActive(table_name));
+            // This guard gates data-plane key-schema resolution. DynamoDB
+            // returns ResourceNotFoundException (not ResourceInUse) for a
+            // data-plane op against a table that is not yet ACTIVE, matching
+            // the postgres backend; TableNotActive would map to ResourceInUse.
+            return Err(StorageError::TableNotFound(table_name));
         }
 
         let table_id = table_doc

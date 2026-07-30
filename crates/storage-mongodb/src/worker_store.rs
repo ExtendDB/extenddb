@@ -3,41 +3,105 @@
 
 //! `WorkerStore` implementation for `MongoDB`.
 //!
-//! The MongoDB backend does not use transient control-plane states
-//! (`CREATING`, `DELETING`) for tables: `create_table_impl` writes the
-//! catalog row with `table_status: "ACTIVE"` synchronously and
-//! `delete_table_impl` removes the row + collections in one call, so
-//! there is never a table document waiting for a background transition.
-//! Both paths run inline in the request handler because MongoDB's
-//! collection create/drop is fast enough not to warrant asynchronous
-//! promotion, and the alternative would require a background worker
-//! whose only job is to catch up work the API call could have done
-//! synchronously anyway.
+//! Processes table control-plane transitions (`CREATING` → `ACTIVE`) as a
+//! background job. `create_table_impl` and the restore path write the catalog
+//! row as `CREATING` with a `status_transition_at` timestamp when
+//! `control_plane_delay_seconds` > 0 (matching the Postgres backend and real
+//! DynamoDB, which report `CREATING` before a table becomes usable); this
+//! worker flips such rows to `ACTIVE` once their transition time has passed.
+//! When `control_plane_delay_seconds` is 0 the create/restore paths write
+//! `ACTIVE` directly and this worker has nothing to do.
 //!
-//! GSI create is the one control-plane operation that does need
-//! async work — its background portion lives in
-//! [`ttl_worker::gsi_backfill_worker`] rather than here because it
-//! operates on the `indexes` catalog collection with a `CREATING`
-//! index-status, not on the `tables` collection.
-//!
-//! The trait method returns an empty list so `WorkerStore` is
-//! satisfied for the [`OperationsEngine`] supertrait bound without
-//! introducing a background job that would only ever be a no-op.
+//! `DeleteTable` remains inline (the catalog row and collections are removed in
+//! the request handler), so there is no `DELETING` transient state to reconcile
+//! here. GSI create is handled separately by
+//! [`ttl_worker::gsi_backfill_worker`] on the `indexes` catalog collection.
 //!
 //! [`ttl_worker::gsi_backfill_worker`]: crate::ttl_worker::gsi_backfill_worker
-//! [`OperationsEngine`]: extenddb_storage::OperationsEngine
 
+use futures::TryStreamExt;
 use futures::future::BoxFuture;
+use mongodb::bson::{Document, doc};
 
 use extenddb_storage::WorkerStore;
 use extenddb_storage::error::StorageError;
 
 use crate::MongoEngine;
 
+/// Default control-plane delay (seconds) when the setting is absent or
+/// unparseable. Matches the Postgres backend default.
+const DEFAULT_CONTROL_PLANE_DELAY_SECS: f64 = 0.25;
+
+impl MongoEngine {
+    /// Read `control_plane_delay_seconds` from the settings collection,
+    /// falling back to the default. A value <= 0 means "no CREATING window"
+    /// (create/restore write `ACTIVE` synchronously).
+    pub(crate) async fn control_plane_delay_seconds(&self) -> f64 {
+        let coll = self.catalog_db.collection::<Document>("settings");
+        coll.find_one(doc! { "_id": "control_plane_delay_seconds" })
+            .await
+            .ok()
+            .flatten()
+            .and_then(|d| d.get_str("value").ok().map(str::to_owned))
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v >= 0.0)
+            .unwrap_or(DEFAULT_CONTROL_PLANE_DELAY_SECS)
+    }
+}
+
 impl WorkerStore for MongoEngine {
     fn process_control_plane_transitions(
         &self,
     ) -> BoxFuture<'_, Result<Vec<(String, &'static str)>, StorageError>> {
-        Box::pin(async move { Ok(Vec::new()) })
+        Box::pin(async move {
+            let mut transitions = Vec::new();
+            let tables_coll = self.catalog_db.collection::<Document>("tables");
+            let now = mongodb::bson::DateTime::now();
+
+            // CREATING → ACTIVE: tables whose scheduled transition time has
+            // passed. Each row is updated by its own compound `_id` (the mongo
+            // catalog stores account_id/table_name inside `_id`, not at the top
+            // level — the previous impl filtered on flat fields and matched
+            // nothing).
+            let filter = doc! {
+                "table_status": "CREATING",
+                "status_transition_at": { "$lte": now },
+            };
+            let mut cursor = tables_coll
+                .find(filter)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+            while let Some(table_doc) = cursor
+                .try_next()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?
+            {
+                let Some(id) = table_doc.get("_id").cloned() else {
+                    continue;
+                };
+                let table_name = table_doc
+                    .get_document("_id")
+                    .ok()
+                    .and_then(|d| d.get_str("table_name").ok())
+                    .unwrap_or_default()
+                    .to_owned();
+
+                tables_coll
+                    .update_one(
+                        doc! { "_id": id, "table_status": "CREATING" },
+                        doc! {
+                            "$set": { "table_status": "ACTIVE" },
+                            "$unset": { "status_transition_at": "" },
+                        },
+                    )
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+                transitions.push((table_name, "CREATING → active"));
+            }
+
+            Ok(transitions)
+        })
     }
 }
