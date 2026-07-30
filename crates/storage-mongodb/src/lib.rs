@@ -35,93 +35,11 @@ use std::sync::Arc;
 use extenddb_storage::error::StorageError;
 
 // ============================================================================
-// OperationsEngineRegistration
-// ============================================================================
-
-inventory::submit! {
-    extenddb_storage::operations::OperationsEngineRegistration {
-        name: "mongodb",
-        operations: &operations::MongoOperationsEngine,
-    }
-}
-
-// ============================================================================
-// BackendRegistration
-// ============================================================================
-
-inventory::submit! {
-    extenddb_storage::bootstrapper::BackendRegistration {
-        name: "mongodb",
-        factory: |config_path, cli_args| {
-            Box::pin(async move {
-                let store = MongoBootstrapper::from_config(&config_path, &cli_args).await?;
-                Ok(Box::new(store) as Box<dyn extenddb_storage::bootstrapper::Bootstrapper>)
-            })
-        }
-    }
-}
-
-// ============================================================================
-// StorageConfigRegistration
-// ============================================================================
-
-inventory::submit! {
-    extenddb_storage::config::StorageConfigRegistration {
-        backend: "mongodb",
-        deserializer: |table| {
-            let config: MongoStorageConfig = table.clone().try_into()
-                .map_err(|e: toml::de::Error| format!("Failed to parse mongodb config: {e}"))?;
-            Ok(Box::new(config) as Box<dyn extenddb_storage::config::StorageConfig>)
-        },
-    }
-}
-
-// ============================================================================
-// SettingsStoreRegistration
-// ============================================================================
-
-inventory::submit! {
-    extenddb_storage::settings_store::SettingsStoreRegistration {
-        backend: "mongodb",
-        factory: |connection_string| {
-            let connection_string = connection_string.to_string();
-            Box::pin(async move {
-                let client = mongodb::Client::with_uri_str(&connection_string)
-                    .await
-                    .map_err(|e| extenddb_storage::settings_store::SettingsStoreError::ConnectionFailed(e.to_string()))?;
-                Ok(Box::new(MongoCatalogStore::new(client)) as Box<dyn extenddb_storage::management_store::SettingsStore>)
-            })
-        },
-    }
-}
-
-// ============================================================================
-// DiagnosticsStoreRegistration
-// ============================================================================
-
-inventory::submit! {
-    extenddb_storage::diagnostics_store::DiagnosticsStoreRegistration {
-        backend: "mongodb",
-        factory: |connection_string| {
-            let connection_string = connection_string.to_string();
-            Box::pin(async move {
-                let client = mongodb::Client::with_uri_str(&connection_string)
-                    .await
-                    .map_err(|e| extenddb_storage::diagnostics_store::DiagnosticsStoreError::ConnectionFailed(e.to_string()))?;
-                Ok(Box::new(MongoCatalogStore::new(client)) as Box<dyn extenddb_storage::diagnostics::DiagnosticsStore>)
-            })
-        },
-    }
-}
-
-// ============================================================================
-// ServerComponentsRegistration
+// Backend registration
 // ============================================================================
 
 use extenddb_storage::hooks::{ServerRuntimeHooks, WorkerContext};
-use extenddb_storage::server_components::{
-    BackendError, ServerComponents, ServerComponentsRegistration,
-};
+use extenddb_storage::server_components::{BackendError, ServerComponents};
 
 /// Backend-specific runtime hooks for `MongoDB`.
 struct MongoRuntimeHooks {
@@ -130,25 +48,28 @@ struct MongoRuntimeHooks {
 
 #[async_trait::async_trait]
 impl ServerRuntimeHooks for MongoRuntimeHooks {
-    async fn spawn_workers(&self, ctx: &WorkerContext) {
+    async fn spawn_workers(&self, ctx: &WorkerContext) -> Vec<tokio::task::JoinHandle<()>> {
         let storage_for_ttl = self.engine.clone();
         let metrics = ctx.metrics.clone();
-        tokio::spawn(async move { ttl_worker::ttl_cleanup_worker(storage_for_ttl, metrics).await });
+        let ttl = tokio::spawn(async move {
+            ttl_worker::ttl_cleanup_worker(storage_for_ttl, metrics).await;
+        });
         let storage_for_stream = self.engine.clone();
-        tokio::spawn(async move {
+        let stream = tokio::spawn(async move {
             ttl_worker::stream_record_cleanup_worker(storage_for_stream).await;
         });
         let storage_for_backfill = self.engine.clone();
-        tokio::spawn(async move {
+        let backfill = tokio::spawn(async move {
             ttl_worker::gsi_backfill_worker(storage_for_backfill).await;
         });
         let storage_for_control_plane = self.engine.clone();
-        tokio::spawn(async move {
+        let control_plane = tokio::spawn(async move {
             ttl_worker::control_plane_worker(storage_for_control_plane).await;
         });
         tracing::info!(
             "MongoDB backend: TTL, stream cleanup, GSI backfill, and control-plane workers spawned"
         );
+        vec![ttl, stream, backfill, control_plane]
     }
 
     fn backend_info(&self) -> Option<String> {
@@ -156,68 +77,123 @@ impl ServerRuntimeHooks for MongoRuntimeHooks {
     }
 }
 
-inventory::submit! {
-    ServerComponentsRegistration {
-        backend: "mongodb",
-        factory: |config, region| {
-            let connection_string = config.connection_config().to_string();
-            let max_connections = config.max_connections();
-            let region = region.to_string();
+/// Build the assembled server components for the mongo backend (`serve`).
+fn server_components_factory(
+    config: &dyn extenddb_storage::config::StorageConfig,
+    region: &str,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<ServerComponents, BackendError>> + Send>,
+> {
+    let connection_string = config.connection_config().to_string();
+    let max_connections = config.max_connections();
+    let region = region.to_string();
+    Box::pin(async move {
+        // Create MongoEngine
+        let engine = MongoEngine::new(&connection_string, &region, max_connections)
+            .await
+            .map_err(|e| BackendError::ConnectionFailed {
+                backend: "mongodb".to_string(),
+                details: e.to_string(),
+            })?;
+
+        let engine = Arc::new(engine);
+
+        // Create catalog store
+        let catalog_client = mongodb::Client::with_uri_str(&connection_string)
+            .await
+            .map_err(|e| BackendError::ConnectionFailed {
+                backend: "mongodb".to_string(),
+                details: format!("Failed to create catalog client: {e}"),
+            })?;
+
+        // Load encryption key from settings collection
+        let catalog_db = catalog_client.database("extenddb_catalog");
+        let settings_coll = catalog_db.collection::<mongodb::bson::Document>("settings");
+        let enc_key = settings_coll
+            .find_one(mongodb::bson::doc! { "_id": "encryption_key" })
+            .await
+            .map_err(|e| BackendError::InitializationFailed(format!("Load encryption key: {e}")))?
+            .and_then(|d| d.get_str("value").ok().map(std::borrow::ToOwned::to_owned))
+            .unwrap_or_default();
+
+        let catalog_store = Arc::new(MongoCatalogStore::with_encryption_key(
+            catalog_client,
+            enc_key.clone(),
+        )) as Arc<dyn extenddb_storage::CatalogStore>;
+
+        // Create credential store. The bin layer wraps this in
+        // CachedCredentialStore using the operator-configured TTL
+        // before constructing the auth provider.
+        let auth_client = mongodb::Client::with_uri_str(&connection_string)
+            .await
+            .map_err(|e| BackendError::InitializationFailed(format!("Auth client: {e}")))?;
+        let cred_store: Arc<dyn extenddb_auth::CredentialStore> =
+            Arc::new(MongoCredentialStore::new(auth_client, enc_key));
+
+        // Create runtime hooks
+        let runtime_hooks = Box::new(MongoRuntimeHooks {
+            engine: engine.clone(),
+        });
+
+        Ok(ServerComponents {
+            engine,
+            catalog_store,
+            credential_store: cred_store,
+            runtime_hooks: Some(runtime_hooks),
+        })
+    })
+}
+
+/// The MongoDB storage backend. A thin bin installs it via
+/// `extenddb_storage::set_backend(extenddb_storage_mongodb::backend())`.
+pub fn backend() -> extenddb_storage::Backend {
+    extenddb_storage::Backend {
+        name: "mongodb",
+        bootstrapper: |config_path, cli_args| {
             Box::pin(async move {
-                // Create MongoEngine
-                let engine = MongoEngine::new(&connection_string, &region, max_connections)
-                    .await
-                    .map_err(|e| BackendError::ConnectionFailed {
-                        backend: "mongodb".to_string(),
-                        details: e.to_string(),
-                    })?;
-
-                let engine = Arc::new(engine);
-
-                // Create catalog store
-                let catalog_client = mongodb::Client::with_uri_str(&connection_string)
-                    .await
-                    .map_err(|e| BackendError::ConnectionFailed {
-                        backend: "mongodb".to_string(),
-                        details: format!("Failed to create catalog client: {e}"),
-                    })?;
-
-                // Load encryption key from settings collection
-                let catalog_db = catalog_client.database("extenddb_catalog");
-                let settings_coll = catalog_db.collection::<mongodb::bson::Document>("settings");
-                let enc_key = settings_coll
-                    .find_one(mongodb::bson::doc! { "_id": "encryption_key" })
-                    .await
-                    .map_err(|e| BackendError::InitializationFailed(format!("Load encryption key: {e}")))?
-                    .and_then(|d| d.get_str("value").ok().map(std::borrow::ToOwned::to_owned))
-                    .unwrap_or_default();
-
-                let catalog_store = Arc::new(
-                    MongoCatalogStore::with_encryption_key(catalog_client, enc_key.clone())
-                ) as Arc<dyn extenddb_storage::CatalogStore>;
-
-                // Create credential store. The bin layer wraps this in
-                // CachedCredentialStore using the operator-configured TTL
-                // before constructing the auth provider.
-                let auth_client = mongodb::Client::with_uri_str(&connection_string)
-                    .await
-                    .map_err(|e| BackendError::InitializationFailed(format!("Auth client: {e}")))?;
-                let cred_store: Arc<dyn extenddb_auth::CredentialStore> =
-                    Arc::new(MongoCredentialStore::new(auth_client, enc_key));
-
-                // Create runtime hooks
-                let runtime_hooks = Box::new(MongoRuntimeHooks {
-                    engine: engine.clone(),
-                });
-
-                Ok(ServerComponents {
-                    engine,
-                    catalog_store,
-                    credential_store: cred_store,
-                    runtime_hooks: Some(runtime_hooks),
-                })
+                let store = MongoBootstrapper::from_config(&config_path, &cli_args).await?;
+                Ok(Box::new(store) as Box<dyn extenddb_storage::bootstrapper::Bootstrapper>)
             })
         },
+        storage_config: |table| {
+            let config: MongoStorageConfig = table
+                .clone()
+                .try_into()
+                .map_err(|e: toml::de::Error| format!("Failed to parse mongodb config: {e}"))?;
+            Ok(Box::new(config) as Box<dyn extenddb_storage::config::StorageConfig>)
+        },
+        operations: &operations::MongoOperationsEngine,
+        settings_store: |connection_string| {
+            let connection_string = connection_string.to_string();
+            Box::pin(async move {
+                let client = mongodb::Client::with_uri_str(&connection_string)
+                    .await
+                    .map_err(|e| {
+                        extenddb_storage::settings_store::SettingsStoreError::ConnectionFailed(
+                            e.to_string(),
+                        )
+                    })?;
+                Ok(Box::new(MongoCatalogStore::new(client))
+                    as Box<
+                        dyn extenddb_storage::management_store::SettingsStore,
+                    >)
+            })
+        },
+        diagnostics_store: |connection_string| {
+            let connection_string = connection_string.to_string();
+            Box::pin(async move {
+                let client = mongodb::Client::with_uri_str(&connection_string)
+                    .await
+                    .map_err(|e| {
+                        extenddb_storage::diagnostics_store::DiagnosticsStoreError::ConnectionFailed(
+                            e.to_string(),
+                        )
+                    })?;
+                Ok(Box::new(MongoCatalogStore::new(client))
+                    as Box<dyn extenddb_storage::diagnostics::DiagnosticsStore>)
+            })
+        },
+        server_components: server_components_factory,
     }
 }
 

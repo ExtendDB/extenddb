@@ -29,9 +29,6 @@ tokio.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 
-# Backend registry
-inventory.workspace = true
-
 # MongoDB driver
 mongodb.workspace = true
 

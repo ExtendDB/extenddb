@@ -113,8 +113,16 @@ impl BackupEngine for MongoEngine {
                 .cloned()
                 .unwrap_or(mongodb::bson::Bson::Null);
 
+            // The trailing backup-id component is a timestamp plus an 8-hex-char
+            // random suffix, so a backup ARN (which is a capability) is not
+            // guessable from the creation time alone. Matches the postgres
+            // backend.
+            let arn_suffix: u32 = {
+                use rand::Rng;
+                rand::rng().random()
+            };
             let backup_arn = format!(
-                "arn:aws:dynamodb:{region}:{account_id}:table/{table_name}/backup/{ts}",
+                "arn:aws:dynamodb:{region}:{account_id}:table/{table_name}/backup/{ts}-{arn_suffix:08x}",
                 region = self.region,
                 ts = epoch_millis()
             );
@@ -194,13 +202,23 @@ impl BackupEngine for MongoEngine {
 
     fn describe_backup(
         &self,
+        account_id: &str,
         backup_arn: &str,
     ) -> BoxFuture<'_, Result<BackupDescription, StorageError>> {
+        let account_id = account_id.to_string();
         let backup_arn = backup_arn.to_string();
         Box::pin(async move {
             let backups_coll = self.catalog_db.collection::<Document>("backups");
+            // Scope the lookup to the calling account so a backup ARN cannot be
+            // read cross-account, and exclude DELETED backups so a deleted
+            // backup reads as BackupNotFoundException. Matches the postgres
+            // backend.
             let backup_doc = backups_coll
-                .find_one(doc! { "_id": &backup_arn })
+                .find_one(doc! {
+                    "_id": &backup_arn,
+                    "account_id": &account_id,
+                    "backup_status": { "$ne": "DELETED" },
+                })
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?
                 .ok_or_else(|| {
@@ -334,16 +352,18 @@ impl BackupEngine for MongoEngine {
 
     fn delete_backup(
         &self,
+        account_id: &str,
         backup_arn: &str,
     ) -> BoxFuture<'_, Result<BackupDescription, StorageError>> {
+        let account_id = account_id.to_string();
         let backup_arn = backup_arn.to_string();
         Box::pin(async move {
-            let desc = self.describe_backup(&backup_arn).await?;
+            let desc = self.describe_backup(&account_id, &backup_arn).await?;
 
-            // Look up the physical collection name from metadata.
+            // Look up the physical collection name from metadata (account-scoped).
             let backups_coll = self.catalog_db.collection::<Document>("backups");
             let meta = backups_coll
-                .find_one(doc! { "_id": &backup_arn })
+                .find_one(doc! { "_id": &backup_arn, "account_id": &account_id })
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?
                 .ok_or_else(|| {
@@ -361,10 +381,10 @@ impl BackupEngine for MongoEngine {
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
             }
 
-            // Mark backup as deleted
+            // Mark backup as deleted (account-scoped)
             backups_coll
                 .update_one(
-                    doc! { "_id": &backup_arn },
+                    doc! { "_id": &backup_arn, "account_id": &account_id },
                     doc! { "$set": { "backup_status": "DELETED" } },
                 )
                 .await
@@ -623,7 +643,7 @@ impl BackupEngine for MongoEngine {
             let desc = self
                 .restore_table_from_backup(&account_id, &target_table_name, &backup.backup_arn)
                 .await?;
-            let _ = self.delete_backup(&backup.backup_arn).await;
+            let _ = self.delete_backup(&account_id, &backup.backup_arn).await;
             Ok(desc)
         })
     }
