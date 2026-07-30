@@ -59,13 +59,17 @@ pub struct ConnParts {
 /// Handles the standard `postgresql://user:pass@host:port/db` format.
 ///
 /// Percent-decodes every component, mirroring the encoding applied by
-/// `extenddb init` when it writes the connection string (and by libpq/sqlx when
-/// they read one). Without the decode, a Unix socket host such as
-/// `/run/postgresql` — written as `%2Frun%2Fpostgresql` — is treated as a DNS
-/// hostname and fails resolution, so a config that `serve` accepts is rejected
-/// by `migrate` and `verify` (issue #223). Decoding is lenient: a literal `%`
-/// that does not form a valid escape passes through unchanged, matching libpq,
-/// so hand-written configs are unaffected.
+/// `extenddb init` when it writes the connection string (and the decoding
+/// sqlx applies when it reads one on the `serve` path). Without the decode, a
+/// Unix socket host such as `/run/postgresql` — written as
+/// `%2Frun%2Fpostgresql` — is treated as a DNS hostname and fails resolution,
+/// so a config that `serve` accepts is rejected by `migrate` and `verify`
+/// (issue #223). Decoding is lenient: a literal `%` that does not form a
+/// valid escape passes through unchanged. This matches sqlx's parser (libpq
+/// is stricter and rejects malformed escapes); since sqlx is the parser the
+/// `serve` path uses, a strict parser here would recreate the #223 split in
+/// the other direction — a hand-written config with a raw `%` in a password
+/// would work under `serve` but fail under `migrate` and `verify`.
 ///
 /// # Errors
 ///
@@ -218,13 +222,34 @@ mod tests {
 
     /// A hand-written config with a literal `%` not forming a valid escape
     /// must keep working: the decoder is lenient and passes malformed escapes
-    /// through unchanged (matching libpq), so pre-existing configs with raw
-    /// `%` in a password are not broken by the decode step.
+    /// through unchanged, matching sqlx's parser on the `serve` path (libpq is
+    /// stricter, but sqlx is what the rest of the product uses), so
+    /// pre-existing configs with raw `%` in a password are not broken by the
+    /// decode step.
     #[test]
     fn passes_through_a_literal_percent_that_is_not_an_escape() {
         let parts = parse_connection_string("postgresql://extenddb:se%ZZcret@localhost:5432/db")
             .expect("literal % must not break parsing");
         assert_eq!(parts.password, "se%ZZcret");
+    }
+
+    /// `%20` decodes to a space in any component.
+    #[test]
+    fn decodes_a_percent_encoded_space() {
+        let parts = parse_connection_string("postgresql://app%20user:secret@localhost:5432/db")
+            .expect("encoded space must parse");
+        assert_eq!(parts.user, "app user");
+    }
+
+    /// A literal `+` stays a `+`. Plus-as-space is form encoding
+    /// (application/x-www-form-urlencoded), not URI percent-encoding; neither
+    /// libpq nor `urlencoding::encode` treats `+` as a space in connection
+    /// URIs, so a password containing `+` must survive unchanged.
+    #[test]
+    fn keeps_a_literal_plus_as_a_plus() {
+        let parts = parse_connection_string("postgresql://extenddb:a+b@localhost:5432/db")
+            .expect("literal plus must parse");
+        assert_eq!(parts.password, "a+b");
     }
 
     #[test]
