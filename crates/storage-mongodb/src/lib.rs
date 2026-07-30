@@ -142,7 +142,13 @@ impl ServerRuntimeHooks for MongoRuntimeHooks {
         tokio::spawn(async move {
             ttl_worker::gsi_backfill_worker(storage_for_backfill).await;
         });
-        tracing::info!("MongoDB backend: TTL, stream cleanup, and GSI backfill workers spawned");
+        let storage_for_control_plane = self.engine.clone();
+        tokio::spawn(async move {
+            ttl_worker::control_plane_worker(storage_for_control_plane).await;
+        });
+        tracing::info!(
+            "MongoDB backend: TTL, stream cleanup, GSI backfill, and control-plane workers spawned"
+        );
     }
 
     fn backend_info(&self) -> Option<String> {

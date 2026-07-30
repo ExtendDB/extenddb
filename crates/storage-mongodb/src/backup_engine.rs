@@ -499,12 +499,18 @@ impl BackupEngine for MongoEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?
                 as i64;
 
-            // Update item count and mark table ACTIVE
+            // Update the item count. The table was created via `create_table`,
+            // so it is already in CREATING (with a scheduled transition) when
+            // control_plane_delay_seconds > 0, or ACTIVE when it is 0; the
+            // control_plane_worker flips CREATING -> ACTIVE once the window
+            // passes. The data was just copied above, so it is in place before
+            // the table becomes ACTIVE. `desc` (returned to the caller) already
+            // carries the CREATING status from create_table, matching DynamoDB.
             let tables_coll = self.catalog_db.collection::<Document>("tables");
             tables_coll
                 .update_one(
                     doc! { "_id": { "account_id": &account_id, "table_name": &target_table_name } },
-                    doc! { "$set": { "item_count": item_count, "table_status": "ACTIVE" } },
+                    doc! { "$set": { "item_count": item_count } },
                 )
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
