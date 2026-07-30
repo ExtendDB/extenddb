@@ -284,13 +284,57 @@ impl StreamEngine for MongoEngine {
 
     fn get_stream_records(
         &self,
+        account_id: &str,
         shard_id: &str,
         after_sequence: Option<&str>,
         limit: i64,
     ) -> BoxFuture<'_, StreamRecordsResult> {
+        let account_id = account_id.to_owned();
         let shard_id = shard_id.to_owned();
         let after_sequence = after_sequence.map(std::borrow::ToOwned::to_owned);
         Box::pin(async move {
+            // Ownership guard: only return records if the shard's backing table
+            // belongs to the calling account. `stream_shards`/`stream_records`
+            // live in the data database while the `tables` catalog (which
+            // carries account_id inside its compound `_id`) lives in the catalog
+            // database, so ownership is resolved in two steps across the two
+            // databases: shard_id -> table_id (data db), then table_id +
+            // account_id (catalog db). Mirrors the postgres backend.
+            let shards_coll = self.data_db.collection::<Document>("stream_shards");
+            let shard_doc = shards_coll
+                .find_one(doc! { "shard_id": &shard_id })
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let owned = match shard_doc.as_ref().and_then(|d| d.get_str("table_id").ok()) {
+                // Look the table up by its globally-unique `table_id` (a
+                // top-level field), then compare the owning account_id read out
+                // of the compound `_id` subdocument in Rust. account_id lives
+                // only inside the embedded `_id` doc; resolving ownership in
+                // Rust after a single table_id lookup keeps the check explicit
+                // and avoids depending on query-time behaviour of a partial
+                // `_id.account_id` path.
+                Some(table_id) => self
+                    .catalog_db
+                    .collection::<Document>("tables")
+                    .find_one(doc! { "table_id": table_id })
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?
+                    .as_ref()
+                    .and_then(|t| t.get_document("_id").ok())
+                    .and_then(|id| id.get_str("account_id").ok())
+                    .is_some_and(|owner| owner == account_id),
+                None => false,
+            };
+            // A shard iterator that resolves to a shard the caller does not own
+            // (catalog step fails) or one that does not exist (data step fails)
+            // is rejected identically. Real DynamoDB returns
+            // `ValidationException: Invalid ShardIterator` for a GetRecords
+            // iterator it did not issue, and does not distinguish "exists but not
+            // yours" from "does not exist" — so neither do we.
+            if !owned {
+                return Err(StorageError::Validation("Invalid ShardIterator".to_owned()));
+            }
+
             let records_coll = self.data_db.collection::<Document>("stream_records");
 
             let filter = if let Some(ref after) = after_sequence {
