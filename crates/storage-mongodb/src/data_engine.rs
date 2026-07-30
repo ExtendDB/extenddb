@@ -3275,15 +3275,25 @@ fn build_sk_filter(
                     }
                 }
                 AttributeValue::B(ref b) => {
-                    // Binary sort keys are stored as hex strings (D-M5),
-                    // so begins_with is a plain lexicographic range:
-                    // `sk_b >= hex(prefix) AND sk_b < increment(hex(prefix))`.
-                    // The exclusive upper bound is the next hex prefix,
-                    // computed by incrementing the raw bytes and encoding
-                    // again — carries are handled by `increment_bytes`.
+                    // Binary sort keys are stored as lowercase hex strings
+                    // (D-M5), so `sk BEGINS_WITH B` is a string-prefix range
+                    // over the hex encoding, exactly like the S case above:
+                    // `sk_b >= hex(B) AND sk_b < next_string_prefix(hex(B))`.
+                    //
+                    // The exclusive upper bound must be the next prefix in
+                    // hex-STRING space (increment the last hex character), not
+                    // hex(increment_bytes(B)). Incrementing the raw bytes then
+                    // re-encoding widens the range and admits unrelated keys —
+                    // e.g. begins_with(0x2F,0xFF) -> ["2fff", hex(0x30,0x00) =
+                    // "3000"), which wrongly matches the stored key 0x30
+                    // ("30"). next_string_prefix("2fff") = "2ffg" excludes it.
+                    // When the prefix is empty, there is no upper bound and we
+                    // match every key >= "" (all of them), matching DDB.
                     let lo = binary_sk_to_hex(b);
-                    let hi = binary_sk_to_hex(&increment_bytes(b));
-                    Ok(doc! { sk_field: { "$gte": lo, "$lt": hi } })
+                    match next_string_prefix(&lo) {
+                        Some(upper) => Ok(doc! { sk_field: { "$gte": lo, "$lt": upper } }),
+                        None => Ok(doc! { sk_field: { "$gte": lo } }),
+                    }
                 }
                 _ => Err(StorageError::Validation(
                     "begins_with requires string or binary sort key".to_string(),
@@ -3392,24 +3402,6 @@ fn next_string_prefix(s: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// Increment bytes to get the exclusive upper bound for `begins_with` on binary.
-fn increment_bytes(b: &[u8]) -> Vec<u8> {
-    let mut result = b.to_vec();
-    // Increment the last byte, with carry
-    let mut i = result.len();
-    while i > 0 {
-        i -= 1;
-        if result[i] < 255 {
-            result[i] += 1;
-            return result;
-        }
-        result[i] = 0;
-    }
-    // All bytes were 0xFF; prepend a 0x01 byte (makes it longer)
-    result.insert(0, 1);
-    result
 }
 
 fn item_has_index_keys(item: &Item, idx_key_schema: &[KeySchemaElement]) -> bool {
@@ -3543,5 +3535,43 @@ mod tests {
             &AttributeValue::B(vec![0x00]),
             &AttributeValue::B(vec![0xff])
         ));
+    }
+
+    fn binary_begins_with_bounds(prefix: Vec<u8>) -> (String, Option<String>) {
+        let mut values = std::collections::HashMap::new();
+        values.insert(":p".to_string(), AttributeValue::B(prefix));
+        let maps = ExpressionMaps::new(std::collections::HashMap::new(), values);
+        let cond = SortKeyCondition::BeginsWith {
+            path: vec![PathElement::Attribute("sk".to_string())],
+            prefix: Expr::Placeholder(":p".to_string()),
+        };
+        let doc = build_sk_filter(&cond, "sk_b", &maps).unwrap();
+        let inner = doc.get_document("sk_b").unwrap();
+        let lo = inner.get_str("$gte").unwrap().to_string();
+        let hi = inner.get_str("$lt").ok().map(str::to_string);
+        (lo, hi)
+    }
+
+    #[test]
+    fn binary_begins_with_uses_hex_space_prefix() {
+        // Upper bound is the next prefix in hex-STRING space, not
+        // hex(increment_bytes(prefix)).
+
+        // begins_with(0x2F,0xFF): lo="2fff", hi must be "2ffg" (not "3000").
+        // The old code produced "3000", which wrongly admitted stored key
+        // 0x30 ("30") since "2fff" <= "30" < "3000". With "2ffg", "30" is
+        // excluded because "30" > "2ffg".
+        let (lo, hi) = binary_begins_with_bounds(vec![0x2f, 0xff]);
+        assert_eq!(lo, "2fff");
+        assert_eq!(hi.as_deref(), Some("2ffg"));
+        assert!("30" >= hi.as_deref().unwrap(), "0x30 must be excluded");
+
+        // begins_with(0xFF): lo="ff", hi must be "fg". The old code produced
+        // "00" (0xFF+1 wrapped then prepended 0x01 -> "01ff"? either way an
+        // empty/incorrect range), dropping every match.
+        let (lo, hi) = binary_begins_with_bounds(vec![0xff]);
+        assert_eq!(lo, "ff");
+        assert_eq!(hi.as_deref(), Some("fg"));
+        assert!("ffab" < hi.as_deref().unwrap(), "0xFFAB must be included");
     }
 }
