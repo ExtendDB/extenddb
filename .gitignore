@@ -14,3 +14,4 @@ extenddb.sqlite
 extenddb.sqlite-shm
 extenddb.sqlite-wal
 extenddb.toml.bak
+/target-*

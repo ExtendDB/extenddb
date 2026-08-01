@@ -69,7 +69,7 @@ and, by a compile-time guard, **can never be built with the Postgres backend**.
 
 ```bash
 # Zero-config ephemeral server (in-memory, plain HTTP, dev credential)
-cargo build -p extenddb --no-default-features --features sqlite-memory,dev-mode
+cargo build -p extenddb --no-default-features --features dev-mode
 extenddb serve --config extenddb.toml   # bootstraps on serve; no init
 ```
 

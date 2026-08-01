@@ -211,6 +211,14 @@ pub async fn start_server(
 
     let local_addr = listener.local_addr()?;
 
+    #[cfg(not(feature = "tls"))]
+    if tls.is_some() {
+        // Reachable only if a caller sets TlsConfig in a no-tls build; the
+        // config layer treats dev-mode builds as plain HTTP, so this is a
+        // programming error surfaced clearly rather than a silent downgrade.
+        anyhow::bail!("this build has no TLS support (dev-mode profile)");
+    }
+    #[cfg(feature = "tls")]
     if let Some(tls_cfg) = tls {
         // P57 Bug 2 fix: rustls 0.23 requires an explicit CryptoProvider.
         // Install aws-lc-rs as the default before creating any TLS config.
@@ -253,7 +261,13 @@ pub async fn start_server(
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await?;
-    } else {
+        // Shutdown path for HTTPS — clean up the PID file after drain, same
+        // as the plain-HTTP path below.
+        cleanup_pid_file(pid_file.as_deref());
+        return Ok(());
+    }
+
+    {
         tracing::info!("extenddb listening on {local_addr}");
         axum::serve(
             listener,
@@ -303,10 +317,12 @@ fn cleanup_pid_file(pid_file: Option<&std::path::Path>) {
 /// verb, a 301 redirect to `https://` is written and the connection is
 /// rejected with an IO error (which `axum_server` handles by dropping it).
 #[derive(Clone)]
+#[cfg(feature = "tls")]
 struct HttpsRedirectAcceptor {
     addr: std::net::SocketAddr,
 }
 
+#[cfg(feature = "tls")]
 impl<S: Send + 'static> axum_server::accept::Accept<tokio::net::TcpStream, S>
     for HttpsRedirectAcceptor
 {

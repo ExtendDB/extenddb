@@ -7,6 +7,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["tls"]
+# HTTPS serving via axum-server/rustls. Disabled only in dev-mode builds,
+# which serve plain HTTP on loopback.
+tls = ["dep:axum-server", "dep:rustls"]
+
 [dependencies]
 extenddb-cache = { workspace = true }
 extenddb-core = { workspace = true }
@@ -33,8 +39,8 @@ base64 = { workspace = true }
 time = { workspace = true }
 aes-gcm = { workspace = true }
 rand = { workspace = true }
-axum-server = { workspace = true }
-rustls = { workspace = true }
+axum-server = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true }
 syslog-tracing = { workspace = true }
 libc = { workspace = true }

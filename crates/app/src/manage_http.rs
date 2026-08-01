@@ -8,6 +8,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+#[cfg(feature = "tls")]
 use std::sync::Arc;
 
 use base64::Engine;
@@ -112,10 +113,22 @@ fn http_request(
     );
 
     if use_tls {
-        let cp = cert_path.ok_or_else(|| {
-            anyhow::anyhow!("TLS enabled but no cert path resolved — check config")
-        })?;
-        http_request_tls(host_port, &request, &body_bytes, cp)
+        #[cfg(not(feature = "tls"))]
+        {
+            let _ = cert_path;
+            anyhow::bail!(
+                "this build has no TLS support (dev-mode profile); \
+                 the manage endpoint resolved to HTTPS — use a plain-HTTP \
+                 dev server or a TLS-enabled binary"
+            );
+        }
+        #[cfg(feature = "tls")]
+        {
+            let cp = cert_path.ok_or_else(|| {
+                anyhow::anyhow!("TLS enabled but no cert path resolved — check config")
+            })?;
+            http_request_tls(host_port, &request, &body_bytes, cp)
+        }
     } else {
         http_request_plain(host_port, &request, &body_bytes)
     }
@@ -135,6 +148,7 @@ fn http_request_plain(
     read_http_response(&mut stream)
 }
 
+#[cfg(feature = "tls")]
 fn http_request_tls(
     host_port: &str,
     request: &str,

@@ -20,6 +20,7 @@
 //! }
 //! ```
 
+#[cfg(feature = "postgres-diagnostics")]
 mod cmd_catalog_check;
 mod cmd_destroy;
 mod cmd_init;
@@ -77,6 +78,7 @@ enum Command {
     /// Manage admin users and accounts via the management API
     Manage(cmd_manage::ManageArgs),
     /// Check catalog and data database integrity
+    #[cfg(feature = "postgres-diagnostics")]
     CatalogCheck(cmd_catalog_check::CatalogCheckArgs),
     /// Print version, catalog version, git commit, and build timestamp
     Version,
@@ -120,6 +122,7 @@ pub fn run(build: BuildInfo) -> anyhow::Result<()> {
         }
         Command::Settings(args) => run_interactive(cmd_settings::run(args)),
         Command::Manage(args) => run_interactive(cmd_manage::run(args)),
+        #[cfg(feature = "postgres-diagnostics")]
         Command::CatalogCheck(args) => run_interactive(cmd_catalog_check::run(args)),
         Command::Version => {
             print_version(build);

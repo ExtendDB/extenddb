@@ -15,29 +15,31 @@
 //! per process, so a build with both would be ambiguous and is rejected at
 //! compile time.
 
-// Exactly one backend feature must be enabled.
-#[cfg(all(feature = "postgres", feature = "sqlite"))]
+// Exactly one backend must be selected. `dev-mode` is the self-contained
+// SQLite dev profile, so it counts as the SQLite backend.
+#[cfg(all(feature = "postgres", any(feature = "sqlite", feature = "dev-mode")))]
 compile_error!(
-    "the `postgres` and `sqlite` features are mutually exclusive: a thin bin \
-     installs exactly one backend (build the SQLite binary with \
-     `--no-default-features --features sqlite`)"
+    "the `postgres` and `sqlite`/`dev-mode` features are mutually exclusive: a \
+     thin bin installs exactly one backend (build the SQLite binary with \
+     `--no-default-features --features sqlite`, or the dev binary with \
+     `--no-default-features --features dev-mode`)"
 );
-#[cfg(not(any(feature = "postgres", feature = "sqlite")))]
-compile_error!("no backend selected: enable the `postgres` (default) or `sqlite` feature");
+#[cfg(not(any(feature = "postgres", feature = "sqlite", feature = "dev-mode")))]
+compile_error!(
+    "no backend selected: enable the `postgres` (default), `sqlite`, or `dev-mode` feature"
+);
 
 // Developer mode relaxes the security posture (plain HTTP on loopback, open
-// authorization). It is a dev/CI-only profile and must be built only with a
-// dev/CI-suitable backend. Rather than denying each production backend by name
-// (every backend is a production backend unless proven otherwise, so a deny-list
-// would have to grow with each new one), require a known dev backend: dev-mode
-// compiles only when `sqlite` is enabled. `sqlite-memory` enables `sqlite`, so it
-// is covered too; postgres — or any future production backend — fails the build,
-// so there is no path by which a production deployment can serve in dev mode.
-#[cfg(all(feature = "dev-mode", not(feature = "sqlite")))]
+// authorization) and deliberately omits the TLS stack from the build. The
+// production features carry `tls`, so combining them with `dev-mode` is a
+// production/dev mismatch worth failing loudly: there must be no path by
+// which a production deployment serves in dev mode, and no dev binary that
+// silently carries the full TLS stack.
+#[cfg(all(feature = "dev-mode", feature = "tls"))]
 compile_error!(
-    "the `dev-mode` feature requires a dev/CI backend such as `sqlite`; it must \
-     not be built with a production backend like `postgres` (build with \
-     `--no-default-features --features sqlite-memory,dev-mode`)"
+    "`dev-mode` is a self-contained dev profile without the TLS stack; do not \
+     combine it with `sqlite`/`sqlite-memory`/`tls` (build with \
+     `--no-default-features --features dev-mode`)"
 );
 
 fn main() -> anyhow::Result<()> {
@@ -46,7 +48,7 @@ fn main() -> anyhow::Result<()> {
     // missing or mistyped backend cannot become a runtime error.
     #[cfg(feature = "postgres")]
     extenddb_storage::set_backend(extenddb_storage_postgres::backend())?;
-    #[cfg(feature = "sqlite")]
+    #[cfg(any(feature = "sqlite", feature = "dev-mode"))]
     extenddb_storage::set_backend(extenddb_storage_sqlite::backend())?;
 
     extenddb_app::run(extenddb_app::BuildInfo {
@@ -64,7 +66,7 @@ mod tests {
     fn install_backend() {
         #[cfg(feature = "postgres")]
         let _ = extenddb_storage::set_backend(extenddb_storage_postgres::backend());
-        #[cfg(feature = "sqlite")]
+        #[cfg(any(feature = "sqlite", feature = "dev-mode"))]
         let _ = extenddb_storage::set_backend(extenddb_storage_sqlite::backend());
     }
 
@@ -72,7 +74,7 @@ mod tests {
     /// built-in defaults deserialize with no config file, bind to loopback
     /// (so the dev-mode loopback guard passes), and select the backend's
     /// default storage path.
-    #[cfg(feature = "sqlite")]
+    #[cfg(any(feature = "sqlite", feature = "dev-mode"))]
     #[test]
     fn builtin_defaults_load_for_sqlite_and_bind_loopback() {
         install_backend();
@@ -83,7 +85,7 @@ mod tests {
         // The sqlite config absolutizes a relative file path against the
         // working directory, so match on the invariant part of each default.
         let path = cfg.storage.connection_config();
-        if cfg!(feature = "sqlite-memory") {
+        if cfg!(any(feature = "sqlite-memory", feature = "dev-mode")) {
             assert_eq!(path, ":memory:");
         } else {
             assert!(

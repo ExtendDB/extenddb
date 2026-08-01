@@ -13,20 +13,30 @@ path = "src/main.rs"
 
 [features]
 default = ["postgres"]
-postgres = ["extenddb-storage-postgres"]
-sqlite = ["extenddb-storage-sqlite"]
+postgres = ["dep:extenddb-storage-postgres", "tls", "postgres-diagnostics"]
+sqlite = ["dep:extenddb-storage-sqlite", "tls"]
 # Build the SQLite backend in its zero-config, ephemeral in-memory mode.
 sqlite-memory = ["sqlite", "extenddb-storage-sqlite/memory"]
-# Developer mode: plain HTTP on loopback, open authorization (SigV4 still
-# enforced), seeded dev credential. A build-time profile for local/CI only; it
-# requires a dev backend (`sqlite`/`sqlite-memory`) and fails to build with a
-# production backend like `postgres` (enforced at compile time in `main.rs`).
-dev-mode = ["extenddb-app/dev-mode"]
+# HTTPS support (cert generation at init, HTTPS serving and manage client).
+# Production backends require it; only dev-mode builds omit it.
+tls = ["extenddb-app/tls"]
+# The `catalog-check` diagnostic (raw PostgreSQL queries).
+postgres-diagnostics = ["extenddb-app/postgres-diagnostics"]
+# Developer mode: the complete dev profile — SQLite backend defaulting to
+# in-memory, plain HTTP on loopback, open authorization (SigV4 still
+# enforced), seeded dev credential, no TLS stack compiled in. Build with
+# `--no-default-features --features dev-mode`. Compile guards in `main.rs`
+# reject combining it with a production backend.
+dev-mode = [
+    "dep:extenddb-storage-sqlite",
+    "extenddb-storage-sqlite/memory",
+    "extenddb-app/dev-mode",
+]
 
 [dependencies]
 extenddb-app = { workspace = true }
+extenddb-config = { workspace = true }
 extenddb-storage = { workspace = true }
 extenddb-storage-postgres = { workspace = true, optional = true }
 extenddb-storage-sqlite = { workspace = true, optional = true }
 anyhow = { workspace = true }
-extenddb-config = { workspace = true }

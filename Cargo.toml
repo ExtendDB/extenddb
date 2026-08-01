@@ -33,7 +33,7 @@ extenddb-storage-postgres = { path = "crates/storage-postgres" }
 extenddb-storage-sqlite = { path = "crates/storage-sqlite" }
 extenddb-auth = { path = "crates/auth" }
 extenddb-server = { path = "crates/server" }
-extenddb-app = { path = "crates/app" }
+extenddb-app = { path = "crates/app", default-features = false }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -61,7 +61,10 @@ urlencoding = { version = "2.1" }
 moka = { version = "0.12", features = ["future"] }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "json", "time", "uuid", "bigdecimal"] }
+# Minimal base: backend crates add their own driver features (postgres adds
+# "postgres" + "runtime-tokio-rustls"; sqlite adds "sqlite"), so a
+# sqlite-only binary does not compile the PostgreSQL driver and its TLS stack.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "derive", "json", "time", "uuid", "bigdecimal"] }
 
 # Crypto & checksums
 crc32fast = "1"
@@ -97,3 +100,13 @@ config = "0.14"
 
 # Security
 zeroize = { version = "1.8", features = ["derive"] }
+
+# Size-optimized profile for shipped dev binaries (containers, launchers).
+# Not used for tests or the normal release builds.
+[profile.dist]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

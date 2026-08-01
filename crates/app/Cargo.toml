@@ -8,6 +8,13 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
+default = ["tls", "postgres-diagnostics"]
+# HTTPS support: self-signed cert generation at init and the HTTPS manage
+# client. Disabled only in dev-mode builds (plain HTTP on loopback).
+tls = ["dep:rcgen", "dep:rustls", "dep:rustls-pemfile", "extenddb-server/tls"]
+# The `catalog-check` diagnostic runs raw PostgreSQL queries; gating it keeps
+# the PostgreSQL driver out of sqlite-only binaries.
+postgres-diagnostics = ["dep:sqlx"]
 # Developer mode: plain HTTP on loopback, open authorization (SigV4 still
 # enforced), seeded dev credential. A build-time profile for local/CI only;
 # the thin bin enforces that it is paired with a dev/CI backend.
@@ -27,13 +34,13 @@ clap = { workspace = true }
 daemonize = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sqlx = { workspace = true }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls"], optional = true }
 time = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 base64 = { workspace = true }
 libc = { workspace = true }
-rcgen = { workspace = true }
-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
+rcgen = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }

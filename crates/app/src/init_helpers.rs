@@ -4,6 +4,13 @@
 //! Helpers for `extenddb init`: TLS certificate generation and config file creation.
 
 /// Generate a self-signed TLS certificate and key if they don't already exist.
+#[cfg(not(feature = "tls"))]
+pub fn generate_tls_cert_if_needed(_bind_addr: &str) -> anyhow::Result<()> {
+    // Dev-mode builds serve plain HTTP and never read the cert paths.
+    Ok(())
+}
+
+#[cfg(feature = "tls")]
 pub fn generate_tls_cert_if_needed(bind_addr: &str) -> anyhow::Result<()> {
     let tls_dir = extenddb_config::expand_tilde("~/.extenddb/tls");
     let cert_path = format!("{tls_dir}/cert.pem");
