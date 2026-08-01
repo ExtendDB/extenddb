@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "extenddb"
+version = "0.1.0"
+description = "Launcher for the ExtendDB dev server: a DynamoDB-compatible database for local development and CI. Spawns the extenddb dev binary (in-memory by default) and hands back an endpoint plus credentials any AWS SDK accepts."
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+
+[project.scripts]
+extenddb = "extenddb_launcher.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,21 @@
+{
+  "name": "extenddb",
+  "version": "0.1.0",
+  "description": "Launcher for the ExtendDB dev server: a DynamoDB-compatible database for local development and CI. Spawns the extenddb dev binary (in-memory by default) and hands back an endpoint plus credentials any AWS SDK accepts.",
+  "license": "Apache-2.0",
+  "type": "commonjs",
+  "main": "index.js",
+  "bin": {
+    "extenddb": "bin/extenddb-launcher.js"
+  },
+  "files": [
+    "index.js",
+    "bin/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node test/launcher.test.js"
+  }
+}
