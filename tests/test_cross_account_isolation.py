@@ -353,3 +353,220 @@ class TestConsoleIsolation:
         assert resp.status_code == 200
         assert self.bob_acct in resp.text
         assert self.alice_acct not in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Stream record account scoping
+# ---------------------------------------------------------------------------
+import base64
+import time
+
+
+def _make_streams_client(endpoint_url: str, access_key: str, secret_key: str,
+                         region: str) -> Any:
+    kwargs: dict = dict(
+        service_name="dynamodbstreams",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region,
+        config=BotoConfig(retries={"max_attempts": 0}),
+    )
+    if endpoint_url.startswith("https://"):
+        kwargs["verify"] = False
+    return boto3.client(**kwargs)
+
+
+def _stream_arn(ddb: Any, table: str) -> str:
+    return ddb.describe_table(TableName=table)["Table"]["LatestStreamArn"]
+
+
+@pytest.fixture(scope="module")
+def stream_accounts(auth_env, mgmt, region):
+    """Two accounts, each with a DynamoDB and a DynamoDB Streams client."""
+    endpoint = auth_env[0]
+    accts: dict[str, dict] = {}
+    for name, passwd in (("accta", "AcctaPass123!"), ("acctb", "AcctbPass456!")):
+        acct_id = f"{uuid.uuid4().int % 10**12:012d}"
+        assert mgmt.create_account(acct_id, f"{name}-acct-{acct_id}").status_code == 201
+        assert mgmt.create_user(acct_id, name, passwd).status_code == 201
+        creds = mgmt.create_access_key(acct_id, name).json()
+        assert mgmt.put_user_policy(acct_id, name, "full",
+                                    _full_access_policy()).status_code == 204
+        ak, sk = creds["access_key_id"], creds["secret_access_key"]
+        accts[name] = {
+            "acct": acct_id,
+            "ddb": _make_dynamodb_client(endpoint, ak, sk, region),
+            "streams": _make_streams_client(endpoint, ak, sk, region),
+        }
+    yield accts
+    for name in ("accta", "acctb"):
+        mgmt.delete_user(accts[name]["acct"], name)
+        mgmt.delete_account(accts[name]["acct"])
+
+
+class TestStreamAccountScoping:
+    """GetRecords returns only the records of the shard's owning account."""
+
+    def test_shard_iterator_only_returns_owning_account_records(self, stream_accounts):
+        owner = stream_accounts["accta"]
+        other = stream_accounts["acctb"]
+        table = f"accta-stream-{uuid.uuid4().hex[:8]}"
+
+        owner["ddb"].create_table(
+            TableName=table,
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            BillingMode="PAY_PER_REQUEST",
+            StreamSpecification={"StreamEnabled": True,
+                                 "StreamViewType": "NEW_AND_OLD_IMAGES"},
+        )
+        wait_for_active(owner["ddb"], table)
+        owner["ddb"].put_item(
+            TableName=table,
+            Item={"pk": {"S": "item1"}, "data": {"S": "owner-value"}},
+        )
+
+        arn = _stream_arn(owner["ddb"], table)
+        shards = owner["streams"].describe_stream(StreamArn=arn)[
+            "StreamDescription"]["Shards"]
+
+        def drain(client: Any, shard_id: str) -> list:
+            it = client.get_shard_iterator(
+                StreamArn=arn, ShardId=shard_id, ShardIteratorType="TRIM_HORIZON",
+            )["ShardIterator"]
+            recs: list = []
+            for _ in range(10):
+                resp = client.get_records(ShardIterator=it, Limit=100)
+                recs.extend(resp["Records"])
+                it = resp.get("NextShardIterator")
+                if recs or not it:
+                    break
+                time.sleep(0.5)
+            return recs
+
+        # Positive control: the owner finds its record in whichever shard holds
+        # it (the item's key hashes to one of the stream's shards).
+        drained = {sh["ShardId"]: drain(owner["streams"], sh["ShardId"]) for sh in shards}
+        target_shard = next(
+            (
+                sid
+                for sid, recs in drained.items()
+                if any(
+                    r["dynamodb"].get("NewImage", {}).get("data", {}).get("S")
+                    == "owner-value"
+                    for r in recs
+                )
+            ),
+            None,
+        )
+        assert target_shard is not None, (
+            "owner should be able to read its own stream records; drained counts="
+            + str({sid: len(recs) for sid, recs in drained.items()})
+            + " sample="
+            + str(drained)[:600]
+        )
+
+        # Construct a shard-iterator token for the shard holding account A's
+        # record and call GetRecords with account B's own credentials. The
+        # token is "<shard_id>|AFTER_SEQUENCE_NUMBER|<seq>|<ts>" in plain base64.
+        other_iterator = base64.b64encode(
+            f"{target_shard}|AFTER_SEQUENCE_NUMBER||{int(time.time())}".encode()
+        ).decode()
+        # Real DynamoDB rejects a GetRecords iterator it did not issue with
+        # ValidationException("Invalid ShardIterator") -- and does not
+        # distinguish "exists but not yours" from "does not exist", so the
+        # response cannot be used to probe another account's shard existence.
+        with pytest.raises(ClientError) as exc:
+            other["streams"].get_records(ShardIterator=other_iterator, Limit=100)
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException", (
+            "a shard iterator for another account's shard must be rejected as "
+            f"ValidationException, got {err}"
+        )
+        assert err["Message"] == "Invalid ShardIterator", (
+            "expected DynamoDB-verbatim 'Invalid ShardIterator', got "
+            f"{err['Message']!r}"
+        )
+
+    def test_metrics_endpoint_requires_admin_auth(self, auth_env):
+        endpoint, admin_user, admin_pass = auth_env
+
+        # An unauthenticated request is rejected outright. Deterministic --
+        # no dependency on the async metrics flush.
+        r = requests.get(f"{endpoint}/metrics", verify=False, timeout=10)
+        assert r.status_code == 401, (
+            f"unauthenticated /metrics returned {r.status_code}, "
+            "expected 401 (must require admin auth)"
+        )
+
+        # With admin Basic auth the endpoint is reachable and returns a metrics
+        # document. (Per-table dimension *retention* is covered deterministically
+        # by the aggregate_rows Rust unit test, not by polling the 60s flush.)
+        r = requests.get(
+            f"{endpoint}/metrics",
+            auth=(admin_user, admin_pass),
+            verify=False,
+            timeout=10,
+        )
+        assert r.status_code == 200, (
+            f"admin /metrics returned {r.status_code}, expected 200"
+        )
+        body = r.json()
+        assert isinstance(body, dict) and ("metrics" in body or "buckets" in body), (
+            "admin /metrics should return a MetricsResponse JSON body"
+        )
+
+
+    def test_console_metrics_data_requires_session(self, auth_env):
+        endpoint, admin_user, admin_pass = auth_env
+
+        # 1. Without a console session, the data route must not serve
+        #    metrics -- it redirects to the console login.
+        r = requests.get(
+            f"{endpoint}/console/metrics-data?window=Last5Minutes",
+            verify=False,
+            timeout=10,
+            allow_redirects=False,
+        )
+        assert r.status_code in (302, 303), (
+            f"unauthenticated /console/metrics-data returned {r.status_code}, "
+            "expected a redirect to login"
+        )
+        assert "/console/login" in r.headers.get("Location", ""), (
+            "unauthenticated /console/metrics-data should redirect to console login"
+        )
+
+        # 2. With a valid console session, the route returns metrics JSON
+        #    (per-table dimensions), gated by the session cookie rather than
+        #    admin Basic auth.
+        s = requests.Session()
+        # The harness sets REQUESTS_CA_BUNDLE/SSL_CERT_FILE, which overrides
+        # session.verify; disable env trust and pass verify=False per request so
+        # the self-signed dev cert is accepted (same as the direct calls above).
+        s.trust_env = False
+        s.verify = False
+        login = s.post(
+            f"{endpoint}/console/login",
+            data={"username": admin_user, "password": admin_pass},
+            timeout=10,
+            allow_redirects=False,
+            verify=False,
+        )
+        assert login.status_code in (302, 303), (
+            f"console login failed: {login.status_code}"
+        )
+        r = s.get(
+            f"{endpoint}/console/metrics-data?window=Last5Minutes",
+            timeout=10,
+            verify=False,
+        )
+        assert r.status_code == 200, (
+            f"authenticated /console/metrics-data returned {r.status_code}, "
+            "expected 200"
+        )
+        body = r.json()
+        assert isinstance(body, dict) and ("metrics" in body or "buckets" in body), (
+            "authenticated /console/metrics-data should return a MetricsResponse "
+            "JSON body"
+        )

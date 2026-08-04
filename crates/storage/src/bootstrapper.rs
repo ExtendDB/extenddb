@@ -145,54 +145,19 @@ pub type BootstrapperFactory =
         Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<Box<dyn Bootstrapper>, StorageError>> + Send>>;
 
-/// Backend bootstrapper registration entry.
+/// Create a bootstrapper using the installed backend.
 ///
-/// Backend crates submit instances of this struct using `inventory::submit!`
-/// to register their bootstrappers at compile time.
-pub struct BackendRegistration {
-    pub name: &'static str,
-    pub factory: BootstrapperFactory,
-}
-
-inventory::collect!(BackendRegistration);
-
-/// Create a bootstrapper for the given backend.
-///
-/// Looks up the backend in the compile-time registry and calls its bootstrapper factory.
+/// Calls the bootstrapper factory of the [`Backend`](crate::Backend) installed
+/// via [`set_backend`](crate::set_backend).
 pub async fn create_bootstrapper(
-    backend: &str,
     config_path: &str,
     cli_args: &[String],
 ) -> Result<Box<dyn Bootstrapper>, StorageError> {
-    for registration in inventory::iter::<BackendRegistration> {
-        if registration.name == backend {
-            tracing::info!("Found registered backend: {}", backend);
-            return (registration.factory)(config_path.to_string(), cli_args.to_vec()).await;
-        }
-    }
-
-    let available: Vec<&str> = inventory::iter::<BackendRegistration>()
-        .map(|r| r.name)
-        .collect();
-
-    tracing::error!(
-        "Unknown backend: {}. Available: {}",
-        backend,
-        available.join(", ")
-    );
-
-    Err(StorageError::Internal(format!(
-        "Unknown backend: {backend}. Available backends: {}",
-        available.join(", ")
-    )))
-}
-
-/// List all registered backends.
-#[must_use]
-pub fn list_backends() -> Vec<&'static str> {
-    inventory::iter::<BackendRegistration>()
-        .map(|r| r.name)
-        .collect()
+    let backend = crate::backend::try_backend().ok_or_else(|| {
+        StorageError::Internal("no storage backend installed (set_backend was not called)".into())
+    })?;
+    tracing::info!("Using compiled-in backend: {}", backend.name);
+    (backend.bootstrapper)(config_path.to_string(), cli_args.to_vec()).await
 }
 
 /// Helper functions for bootstrapper implementations.

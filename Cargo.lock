@@ -860,20 +860,29 @@ dependencies = [
 
 [[package]]
 name = "extenddb"
-version = "0.1.0"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "extenddb-app",
+ "extenddb-storage",
+ "extenddb-storage-postgres",
+]
+
+[[package]]
+name = "extenddb-app"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "clap",
- "config",
  "daemonize",
  "extenddb-auth",
  "extenddb-cache",
+ "extenddb-config",
  "extenddb-core",
  "extenddb-engine",
  "extenddb-server",
  "extenddb-storage",
- "extenddb-storage-postgres",
  "libc",
  "rcgen",
  "rustls",
@@ -881,7 +890,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
- "syslog-tracing",
  "time",
  "tokio",
  "toml",
@@ -891,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-auth"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -911,7 +919,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-cache"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "futures",
  "moka",
@@ -921,8 +929,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "extenddb-config"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "config",
+ "extenddb-core",
+ "extenddb-storage",
+ "serde",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "extenddb-core"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "bigdecimal",
@@ -935,7 +956,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-engine"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "crc32fast",
@@ -954,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-server"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -966,27 +987,31 @@ dependencies = [
  "crc32fast",
  "extenddb-auth",
  "extenddb-cache",
+ "extenddb-config",
  "extenddb-core",
  "extenddb-engine",
  "extenddb-storage",
  "futures",
  "hyper",
+ "libc",
  "metrics",
  "rand 0.9.4",
  "rustls",
  "serde",
  "serde_json",
+ "syslog-tracing",
  "time",
  "tokio",
  "tower",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
 [[package]]
 name = "extenddb-storage"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -996,12 +1021,13 @@ dependencies = [
  "extenddb-auth",
  "extenddb-core",
  "futures",
- "inventory",
  "rand 0.9.4",
+ "serde",
  "serde_json",
  "thiserror",
  "time",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -1009,7 +1035,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-postgres"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1021,7 +1047,6 @@ dependencies = [
  "extenddb-core",
  "extenddb-storage",
  "futures",
- "inventory",
  "rand 0.9.4",
  "serde",
  "serde_json",
@@ -1566,15 +1591,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
  "generic-array",
-]
-
-[[package]]
-name = "inventory"
-version = "0.3.24"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4f0c30c76f2f4ccee3fe55a2435f691ca00c0e4bd87abe4f4a851b1d4dac39b"
-dependencies = [
- "rustversion",
 ]
 
 [[package]]

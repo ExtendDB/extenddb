@@ -122,13 +122,18 @@ pub async fn handle_delete_item(
         region: ctx.region.clone(),
     });
     let need_old_for_stream = stream.is_some();
+    // Consumed capacity — when requested, the total includes base + affected
+    // GSIs; INDEXES additionally returns the per-index breakdown. The deleted
+    // (old) item is needed to determine which indexes the delete propagated to.
+    let need_old_for_capacity =
+        input.return_consumed_capacity != extenddb_core::types::ReturnConsumedCapacity::None;
 
     let old_item = ctx
         .storage
         .delete_item(
             &key_info,
             &input.key,
-            return_old || need_old_for_stream,
+            return_old || need_old_for_stream || need_old_for_capacity,
             condition.as_ref(),
             &maps,
             stream.as_ref(),
@@ -147,13 +152,28 @@ pub async fn handle_delete_item(
             .map_or_else(|| item_size_bytes(&input.key), item_size_bytes),
     );
 
-    let output = DeleteItemOutput {
-        attributes: if return_old { old_item } else { None },
-        consumed_capacity: capacity_helpers::write_capacity(
+    // Consumed capacity — INDEXES mode uses the deleted (old) item to determine
+    // which indexes the delete propagated to. Index metadata comes from the
+    // (cached) `TableKeyInfo`, so no extra catalog round-trip is needed. If
+    // nothing was deleted, only base-table capacity is reported.
+    let consumed_capacity = match old_item.as_ref() {
+        Some(cc_item) => capacity_helpers::write_capacity_indexed(
             input.return_consumed_capacity,
             &input.table_name,
             wcu,
+            Some(cc_item),
+            None,
+            false,
+            &key_info,
         ),
+        None => {
+            capacity_helpers::write_capacity(input.return_consumed_capacity, &input.table_name, wcu)
+        }
+    };
+
+    let output = DeleteItemOutput {
+        attributes: if return_old { old_item } else { None },
+        consumed_capacity,
         item_collection_metrics: capacity_helpers::item_metrics(
             input.return_item_collection_metrics,
             &key_info.key_schema,

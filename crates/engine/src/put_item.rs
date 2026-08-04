@@ -161,10 +161,16 @@ pub async fn handle_put_item(
     )?;
 
     let return_old = input.return_values == ReturnValues::AllOld;
+    let capacity_requested =
+        input.return_consumed_capacity != extenddb_core::types::ReturnConsumedCapacity::None;
+    let needs_index_capacity = capacity_requested
+        && (!key_info.global_secondary_indexes.is_empty()
+            || !key_info.local_secondary_indexes.is_empty());
 
-    // Capacity metering: full item size, rounded up to 1 KB.
-    let item_bytes = item_size_bytes(&input.item);
-    let wcu = capacity_helpers::write_capacity_units(item_bytes);
+    // Preserve the new item only when per-index accounting needs to compare it
+    // with the replaced item after storage takes ownership.
+    let new_item_for_capacity = needs_index_capacity.then(|| input.item.clone());
+    let new_item_bytes = item_size_bytes(&input.item);
 
     // Extract item collection metrics before item is moved into storage.
     let icm = capacity_helpers::item_metrics(
@@ -182,16 +188,18 @@ pub async fn handle_put_item(
         user_identity: None,
         region: ctx.region.clone(),
     });
-    // When streams are enabled, always request old item so the storage layer
-    // can determine Insert vs Modify and build old images.
+    // Capacity uses the larger old/new base item and must include index entries
+    // deleted by an overwrite, so request the old item whenever capacity is
+    // requested. Indexed writes already read it inside the storage transaction.
     let need_old_for_stream = stream.is_some();
+    let need_old_for_capacity = capacity_requested;
 
     let old_item = ctx
         .storage
         .put_item(
             &key_info,
             input.item,
-            return_old || need_old_for_stream,
+            return_old || need_old_for_stream || need_old_for_capacity,
             condition.as_ref(),
             &maps,
             stream.as_ref(),
@@ -203,13 +211,26 @@ pub async fn handle_put_item(
 
     // Stream records are now captured atomically within the storage transaction.
 
-    let output = PutItemOutput {
-        attributes: if return_old { old_item } else { None },
-        consumed_capacity: capacity_helpers::write_capacity(
+    let old_item_bytes = old_item.as_ref().map_or(0, item_size_bytes);
+    let wcu = capacity_helpers::write_capacity_units(new_item_bytes.max(old_item_bytes));
+    let consumed_capacity = match new_item_for_capacity.as_ref() {
+        Some(new_item) => capacity_helpers::write_capacity_indexed(
             input.return_consumed_capacity,
             &input.table_name,
             wcu,
+            old_item.as_ref(),
+            Some(new_item),
+            true,
+            &key_info,
         ),
+        None => {
+            capacity_helpers::write_capacity(input.return_consumed_capacity, &input.table_name, wcu)
+        }
+    };
+
+    let output = PutItemOutput {
+        attributes: if return_old { old_item } else { None },
+        consumed_capacity,
         item_collection_metrics: icm,
     };
     let body = serialize_output(&output)?;

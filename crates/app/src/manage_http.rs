@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use base64::Engine;
 
-use crate::config;
 use crate::manage_types::{CacheAction, CacheInvalidateScope, ManageCommand};
+use extenddb_config as config;
 
 /// Resolve the management API endpoint from CLI args or config file.
 ///

@@ -87,6 +87,14 @@ pub struct TableKeyInfo {
     /// Whether the table has at least one local secondary index.
     /// Used to decide whether `ItemCollectionMetrics` should be returned.
     pub has_lsi: bool,
+    /// Global secondary indexes defined on the table (name, key schema, and
+    /// projection). Populated from the catalog and carried on the cached
+    /// `TableKeyInfo` so per-index consumed capacity can be computed without an
+    /// extra `describe_table` round-trip per write.
+    pub global_secondary_indexes: Vec<IndexInfo>,
+    /// Local secondary indexes defined on the table (name, key schema, and
+    /// projection). Same rationale as `global_secondary_indexes`.
+    pub local_secondary_indexes: Vec<IndexInfo>,
     /// Stream specification for the table, if streams are configured.
     /// Cached here to avoid an extra `describe_table` call per write operation.
     pub stream_specification: Option<super::StreamSpecification>,
@@ -260,6 +268,8 @@ mod tests {
             base_key_schema: schema.clone(),
             attribute_definitions: vec![],
             has_lsi: false,
+            global_secondary_indexes: vec![],
+            local_secondary_indexes: vec![],
             stream_specification: None,
         };
         assert_eq!(info.key_schema, info.base_key_schema);
@@ -277,6 +287,8 @@ mod tests {
             base_key_schema: base_schema.clone(),
             attribute_definitions: vec![],
             has_lsi: false,
+            global_secondary_indexes: vec![],
+            local_secondary_indexes: vec![],
             stream_specification: None,
         };
         assert_eq!(info.key_schema, index_schema);

@@ -11,7 +11,7 @@ use std::net::TcpStream;
 
 use clap::Args;
 
-use crate::config;
+use extenddb_config as config;
 
 #[derive(Args)]
 pub struct StatusArgs {
@@ -43,8 +43,8 @@ pub fn run(args: &StatusArgs) {
         // Validate the PID is alive to avoid reporting stale PIDs after unclean shutdown.
         // Try config-based run_dir first, fall back to default.
         let pid_file = config::load(&args.config).map_or_else(
-            |_| crate::serve_helpers::pid_file_path_default(port),
-            |c| crate::serve_helpers::pid_file_path(&config::expand_tilde(&c.server.run_dir), port),
+            |_| extenddb_config::pid_file_path_default(port),
+            |c| extenddb_config::pid_file_path(&config::expand_tilde(&c.server.run_dir), port),
         );
         let pid_label = std::fs::read_to_string(&pid_file)
             .ok()

@@ -11,7 +11,7 @@ use clap::{Args, Subcommand};
 
 use extenddb_storage::management_store::SettingsStore;
 
-use crate::config;
+use extenddb_config as config;
 
 // Re-use validation constants from the ops layer.
 use extenddb_server::management::ops_settings::{KNOWN_KEYS, READONLY_KEYS};
@@ -46,9 +46,7 @@ pub async fn run(args: SettingsArgs) -> anyhow::Result<()> {
         );
     }
     let app_config = config::load(&args.config)?;
-    let backend = &app_config.storage.backend;
     let store = extenddb_storage::settings_store::create_settings_store(
-        backend,
         app_config.storage.connection_config(),
     )
     .await

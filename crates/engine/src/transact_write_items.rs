@@ -169,6 +169,11 @@ pub async fn handle_transact_write_items(
         })
         .sum();
 
+    // NOTE: per-index (INDEXES) consumed-capacity breakdown for transactions is
+    // deferred to the storage-layer capacity-reporting follow-up: the engine has
+    // no resulting/old item for Update/Delete sub-ops, but DynamoDB reports a
+    // per-index breakdown for those ops on GSI tables. Base-table aggregate
+    // only for now.
     let consumed_capacity = capacity_helpers::transact_write_capacity(
         input.return_consumed_capacity,
         per_table_wcu.iter().map(|(t, cu)| (t.as_str(), *cu)),
@@ -224,6 +229,16 @@ async fn prepare_write_op(
             put.expression_attribute_values.as_ref(),
         );
         let condition = parse_optional_condition(put.condition_expression.as_deref(), &ctx.limits)?;
+        if let Some(ref expr) = condition {
+            extenddb_core::expression::validate_ordering_operand_types(expr, &maps).map_err(
+                |e| {
+                    crate::expression_helpers::prefix_expression_error(
+                        e,
+                        extenddb_core::expression::ExpressionKind::Condition,
+                    )
+                },
+            )?;
+        }
         // Transactions accept names/values with no expression (unlike single-item
         // APIs); only check for unused refs when a condition is present.
         if condition.is_some() {
@@ -268,6 +283,16 @@ async fn prepare_write_op(
             del.expression_attribute_values.as_ref(),
         );
         let condition = parse_optional_condition(del.condition_expression.as_deref(), &ctx.limits)?;
+        if let Some(ref expr) = condition {
+            extenddb_core::expression::validate_ordering_operand_types(expr, &maps).map_err(
+                |e| {
+                    crate::expression_helpers::prefix_expression_error(
+                        e,
+                        extenddb_core::expression::ExpressionKind::Condition,
+                    )
+                },
+            )?;
+        }
         if condition.is_some() {
             let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
             extenddb_core::expression::validate_unused_attributes(
@@ -328,6 +353,16 @@ async fn prepare_write_op(
             validate_attribute_values_nesting_depth(stored)?;
         }
         let condition = parse_optional_condition(upd.condition_expression.as_deref(), &ctx.limits)?;
+        if let Some(ref expr) = condition {
+            extenddb_core::expression::validate_ordering_operand_types(expr, &maps).map_err(
+                |e| {
+                    crate::expression_helpers::prefix_expression_error(
+                        e,
+                        extenddb_core::expression::ExpressionKind::Condition,
+                    )
+                },
+            )?;
+        }
         {
             let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
             extenddb_core::expression::validate_unused_attributes(
@@ -372,6 +407,14 @@ async fn prepare_write_op(
         );
         let condition =
             crate::expression_helpers::parse_condition_expr(&cc.condition_expression, &ctx.limits)?;
+        extenddb_core::expression::validate_ordering_operand_types(&condition, &maps).map_err(
+            |e| {
+                crate::expression_helpers::prefix_expression_error(
+                    e,
+                    extenddb_core::expression::ExpressionKind::Condition,
+                )
+            },
+        )?;
         {
             let exprs: Vec<&extenddb_core::expression::Expr> = vec![&condition];
             extenddb_core::expression::validate_unused_attributes(

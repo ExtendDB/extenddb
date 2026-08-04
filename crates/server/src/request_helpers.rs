@@ -62,6 +62,32 @@ pub(crate) async fn authorize_request(
     operation: &str,
     account_id: &str,
 ) -> Result<Option<extenddb_core::types::TableKeyInfo>, DynamoDbError> {
+    // Batch and transaction operations address multiple tables in nested request
+    // structures with no top-level TableName. DynamoDB authorizes each of them
+    // per table, against that table's specific ARN, using the IAM action the
+    // operation maps to (BatchGetItem/BatchWriteItem are their own actions;
+    // TransactGetItems decomposes to GetItem; TransactWriteItems decomposes to
+    // the per-sub-op action). Authorizing the whole request against a single
+    // `table/*` wildcard — as the generic path below does — lets an explicit
+    // Deny on one table be bypassed. Evaluate every (action, table) pair and
+    // reject the entire request if any is denied (all-or-nothing), matching
+    // DynamoDB. Verified against the AWS IAM Service Authorization Reference.
+    if let Some(targets) = batch_transact_authz_targets(operation, input) {
+        for (action_op, table) in targets {
+            let resource_arn = build_resource_arn(&state.region, account_id, Some(&table));
+            authorization::check_authorization(
+                state.authz_cache.as_ref(),
+                identity,
+                &action_op,
+                &resource_arn,
+                false,
+                extenddb_auth::policy::context::RequestParams::default(),
+            )
+            .await?;
+        }
+        return Ok(None);
+    }
+
     let table_name = extract_table_name(input);
     let resource_arn = build_resource_arn(&state.region, account_id, table_name.as_deref());
 
@@ -175,6 +201,69 @@ pub(crate) fn extract_attributes(input: &Value) -> Option<Vec<String>> {
         })
         .collect();
     if names.is_empty() { None } else { Some(names) }
+}
+
+/// IAM `(action, table)` pairs to authorize for a batch/transact operation.
+///
+/// Returns `None` for non-batch/transact operations (the caller uses the
+/// single-table path). Actions follow the AWS IAM Service Authorization
+/// Reference: `BatchGetItem`/`BatchWriteItem` authorize under their own action
+/// per table; `TransactGetItems` authorizes as `GetItem` per item's table;
+/// `TransactWriteItems` authorizes per sub-op (`Put`→`PutItem`,
+/// `Delete`→`DeleteItem`, `Update`→`UpdateItem`, `ConditionCheck`→
+/// `ConditionCheckItem`). Pairs are de-duplicated. Table names are the bare
+/// operation-string form (no `dynamodb:` prefix), matching `check_authorization`
+/// which prepends `dynamodb:`.
+fn batch_transact_authz_targets(operation: &str, input: &Value) -> Option<Vec<(String, String)>> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut push = |action: &str, table: &str| {
+        let pair = (action.to_owned(), table.to_owned());
+        if !out.contains(&pair) {
+            out.push(pair);
+        }
+    };
+    match operation {
+        "BatchGetItem" | "BatchWriteItem" => {
+            // RequestItems is a map keyed by table name.
+            let items = input.get("RequestItems")?.as_object()?;
+            for table in items.keys() {
+                push(operation, table);
+            }
+        }
+        "TransactGetItems" => {
+            let items = input.get("TransactItems")?.as_array()?;
+            for entry in items {
+                if let Some(t) = entry
+                    .get("Get")
+                    .and_then(|g| g.get("TableName"))
+                    .and_then(Value::as_str)
+                {
+                    push("GetItem", t);
+                }
+            }
+        }
+        "TransactWriteItems" => {
+            let items = input.get("TransactItems")?.as_array()?;
+            for entry in items {
+                for (sub, action) in [
+                    ("Put", "PutItem"),
+                    ("Delete", "DeleteItem"),
+                    ("Update", "UpdateItem"),
+                    ("ConditionCheck", "ConditionCheckItem"),
+                ] {
+                    if let Some(t) = entry
+                        .get(sub)
+                        .and_then(|s| s.get("TableName"))
+                        .and_then(Value::as_str)
+                    {
+                        push(action, t);
+                    }
+                }
+            }
+        }
+        _ => return None,
+    }
+    Some(out)
 }
 
 /// Build a `DynamoDB` table ARN for authorization.

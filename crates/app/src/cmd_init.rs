@@ -10,8 +10,8 @@ use std::path::Path;
 
 use clap::Args;
 
-use crate::config;
 use crate::init_helpers::{generate_config, generate_tls_cert_if_needed};
+use extenddb_config as config;
 
 #[derive(Args)]
 #[allow(clippy::doc_markdown)] // Clap help text, not rustdoc
@@ -140,10 +140,9 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
     let cli_args: Vec<String> = std::env::args().collect();
 
     // Create bootstrapper via registry (no hardcoded match!)
-    let bootstrapper =
-        extenddb_storage::bootstrapper::create_bootstrapper(&backend, &args.config, &cli_args)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let bootstrapper = extenddb_storage::bootstrapper::create_bootstrapper(&args.config, &cli_args)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
     // Ensure application user exists.
     bootstrapper
