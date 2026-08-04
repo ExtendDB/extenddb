@@ -10,10 +10,10 @@ use mongodb::options::{Collation, IndexOptions};
 
 use extenddb_core::types::{
     AttributeDefinition, BillingMode, BillingModeSummary, CreateTableInput, DeleteTableInput,
-    DescribeTableInput, GsiDescription, IndexInfo, IndexType, KeySchemaElement,
-    ListTablesInput, ListTablesOutput, LsiDescription, OnDemandThroughput,
-    ProvisionedThroughputDescription, ScalarAttributeType, SseDescription, SseType,
-    TableDescription, TableKeyInfo, TableStatus, UpdateTableInput,
+    DescribeTableInput, GsiDescription, IndexInfo, IndexType, KeySchemaElement, ListTablesInput,
+    ListTablesOutput, LsiDescription, OnDemandThroughput, ProvisionedThroughputDescription,
+    ScalarAttributeType, SseDescription, SseType, TableDescription, TableKeyInfo, TableStatus,
+    UpdateTableInput,
 };
 use extenddb_storage::TableEngine;
 use extenddb_storage::error::StorageError;
@@ -175,9 +175,7 @@ impl MongoEngine {
             .as_ref()
             .is_some_and(|ss| ss.stream_enabled)
         {
-            Some(
-                format_stream_label(now),
-            )
+            Some(format_stream_label(now))
         } else {
             None
         };
@@ -1376,8 +1374,8 @@ impl MongoEngine {
 
         // String sort keys need the `simple` collation so range
         // comparisons behave as byte-wise, matching the query path.
-        let uses_string_sort = matches!(idx_sk_field, Some((_, true)))
-            || matches!(base_sk_field, Some("base_sk_s"));
+        let uses_string_sort =
+            matches!(idx_sk_field, Some((_, true))) || matches!(base_sk_field, Some("base_sk_s"));
         let mut opts = IndexOptions::builder().build();
         if uses_string_sort {
             opts.collation = Some(Collation::builder().locale("simple".to_string()).build());

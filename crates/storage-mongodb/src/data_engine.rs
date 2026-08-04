@@ -21,8 +21,8 @@ use extenddb_storage::util::{
     composite_pk_to_text, encode_netstring_composite, pk_to_text, sk_info,
 };
 use extenddb_storage::{
-    DataEngine, IdempotencyKey, ItemPairResult, QueryResult, StreamCapture,
-    TransactGetOp, TransactWriteOp,
+    DataEngine, IdempotencyKey, ItemPairResult, QueryResult, StreamCapture, TransactGetOp,
+    TransactWriteOp,
 };
 
 use crate::MongoEngine;
@@ -1709,19 +1709,13 @@ impl MongoEngine {
         }
         let refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = idx_pairs
             .iter()
-            .map(
-                |(name, ks)| extenddb_core::validation::IndexKeyRef {
-                    index_name: name.as_str(),
-                    key_schema: ks.as_slice(),
-                },
-            )
+            .map(|(name, ks)| extenddb_core::validation::IndexKeyRef {
+                index_name: name.as_str(),
+                key_schema: ks.as_slice(),
+            })
             .collect();
-        extenddb_core::validation::validate_index_keys(
-            item,
-            &refs,
-            &key_info.attribute_definitions,
-        )
-        .map_err(|e| StorageError::Validation(e.to_string()))
+        extenddb_core::validation::validate_index_keys(item, &refs, &key_info.attribute_definitions)
+            .map_err(|e| StorageError::Validation(e.to_string()))
     }
 
     async fn sync_indexes_in_session(
@@ -2284,23 +2278,20 @@ impl MongoEngine {
                     .await
                     .map_err(TransactOpError::Storage)?;
                 if !idx_pairs.is_empty() {
-                    let idx_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> =
-                        idx_pairs
-                            .iter()
-                            .map(|(n, ks)| extenddb_core::validation::IndexKeyRef {
-                                index_name: n.as_str(),
-                                key_schema: ks.as_slice(),
-                            })
-                            .collect();
+                    let idx_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = idx_pairs
+                        .iter()
+                        .map(|(n, ks)| extenddb_core::validation::IndexKeyRef {
+                            index_name: n.as_str(),
+                            key_schema: ks.as_slice(),
+                        })
+                        .collect();
                     extenddb_core::validation::validate_index_keys(
                         item,
                         &idx_refs,
                         &key_info.attribute_definitions,
                     )
                     .map_err(|e| {
-                        TransactOpError::Cancel(CancellationReason::validation_error(
-                            e.to_string(),
-                        ))
+                        TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
                     })?;
                 }
 
@@ -2544,23 +2535,20 @@ impl MongoEngine {
                     .await
                     .map_err(TransactOpError::Storage)?;
                 if !idx_pairs.is_empty() {
-                    let idx_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> =
-                        idx_pairs
-                            .iter()
-                            .map(|(n, ks)| extenddb_core::validation::IndexKeyRef {
-                                index_name: n.as_str(),
-                                key_schema: ks.as_slice(),
-                            })
-                            .collect();
+                    let idx_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = idx_pairs
+                        .iter()
+                        .map(|(n, ks)| extenddb_core::validation::IndexKeyRef {
+                            index_name: n.as_str(),
+                            key_schema: ks.as_slice(),
+                        })
+                        .collect();
                     extenddb_core::validation::validate_index_keys(
                         &item,
                         &idx_refs,
                         &key_info.attribute_definitions,
                     )
                     .map_err(|e| {
-                        TransactOpError::Cancel(CancellationReason::validation_error(
-                            e.to_string(),
-                        ))
+                        TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
                     })?;
                 }
 
