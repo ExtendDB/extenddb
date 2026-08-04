@@ -3,10 +3,26 @@
 
 //! A restored table must not report ACTIVE before its data copy completes.
 //!
-//! DynamoDB's contract: when `DescribeTable` on a restore target first
-//! returns ACTIVE, the restored data is fully present. A restore that flips
-//! ACTIVE on a control-plane timer decoupled from the copy exposes an empty
-//! or partial table to a client that waits-for-ACTIVE.
+//! DynamoDB's contract: when `DescribeTable` on a restore target first returns
+//! ACTIVE, the restored data is fully present. A restore that flips ACTIVE on a
+//! control-plane timer decoupled from the copy exposes an empty or partial
+//! table to a client that waits-for-ACTIVE.
+//!
+//! This is a race detector, deliberately. `RestoreTableFromBackup` in this
+//! backend blocks until the copy completes, so the ACTIVE-before-data window is
+//! only observable from a second client, and whether it is observed depends on
+//! whether the copy or the transition timer wins. Two consequences worth
+//! knowing before reading a result:
+//!
+//! - It cannot fail when the ordering is correct. If ACTIVE is only set after
+//!   the copy drains, the observed count is always complete.
+//! - A PASS is not proof the ordering is correct. On an idle server the `$out`
+//!   copy can finish inside the transition window, and the race is simply not
+//!   observed. Failures are meaningful; passes are weak evidence.
+//!
+//! The dataset is sized so the copy takes longer than the transition window on
+//! a loaded server. On very fast or idle hardware, raising `ITEMS` widens the
+//! window.
 
 use crate::test_base::*;
 use aws_sdk_dynamodb::types::{
@@ -15,6 +31,10 @@ use aws_sdk_dynamodb::types::{
 };
 
 const ITEMS: usize = 40000;
+
+/// Bound on the observer's wait for first ACTIVE, so a failed restore fails the
+/// test rather than hanging it. 10ms per attempt, so this is a 60s ceiling.
+const OBSERVER_MAX_ATTEMPTS: usize = 6000;
 
 #[tokio::test]
 async fn restored_table_has_all_items_when_first_active() {
@@ -89,43 +109,73 @@ async fn restored_table_has_all_items_when_first_active() {
     }
 
     let dst = format!("RestoreRaceDst_{}", ts());
-    // This backend's RestoreTableFromBackup blocks until the copy completes
-    // (real DynamoDB returns immediately), so the ACTIVE-before-data window
-    // is only observable by a CONCURRENT client. Race an observer task
-    // against the in-flight restore: the moment it sees ACTIVE, it counts.
+    // Race an observer against the in-flight restore: the moment it sees
+    // ACTIVE, it counts. Returns None if ACTIVE never arrives within the
+    // bound, which means the restore itself failed.
     let observer = {
         let c2 = client().clone();
         let dst2 = dst.clone();
         tokio::spawn(async move {
-            // Wait for the table to exist, then for first ACTIVE.
-            loop {
-                match c2.describe_table().table_name(&dst2).send().await {
-                    Ok(out) => {
-                        let st = out.table().unwrap().table_status().unwrap().clone();
-                        if st.as_str() == "ACTIVE" {
-                            break;
-                        }
+            let mut saw_active = false;
+            for _ in 0..OBSERVER_MAX_ATTEMPTS {
+                if let Ok(out) = c2.describe_table().table_name(&dst2).send().await {
+                    let status = out
+                        .table()
+                        .and_then(|t| t.table_status())
+                        .map(|s| s.as_str().to_owned());
+                    if status.as_deref() == Some("ACTIVE") {
+                        saw_active = true;
+                        break;
                     }
-                    Err(_) => {}
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            if !saw_active {
+                return None;
             }
             // First ACTIVE observation: count items immediately.
             let mut count = 0usize;
             let mut start_key = None;
             loop {
-                let mut req = c2.scan().table_name(&dst2).select(Select::Count);
-                if let Some(k) = start_key.take() {
-                    req = req.set_exclusive_start_key(Some(k));
-                }
-                let resp = req.send().await.unwrap();
+                // Retry transient scan errors instead of swallowing them. A
+                // page that errors must NOT be treated as "no more items": that
+                // truncates the count and misreports a transient scan blip as
+                // missing data. Clone (don't take) the cursor so a retry
+                // re-scans the same page; if a page still fails after the retry
+                // budget, fail the test loudly rather than under-counting.
+                let resp = {
+                    let mut got = None;
+                    let mut last_err = None;
+                    for _ in 0..10 {
+                        let mut req = c2.scan().table_name(&dst2).select(Select::Count);
+                        if let Some(k) = start_key.clone() {
+                            req = req.set_exclusive_start_key(Some(k));
+                        }
+                        match req.send().await {
+                            Ok(r) => {
+                                got = Some(r);
+                                break;
+                            }
+                            Err(e) => {
+                                last_err = Some(e);
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            }
+                        }
+                    }
+                    got.unwrap_or_else(|| {
+                        panic!(
+                            "observer scan failed during item count (transient scan \
+                             error, not missing data): {last_err:?}"
+                        )
+                    })
+                };
                 count += resp.count() as usize;
                 match resp.last_evaluated_key() {
                     Some(k) if !k.is_empty() => start_key = Some(k.clone()),
                     _ => break,
                 }
             }
-            count
+            Some(count)
         })
     };
 
@@ -138,14 +188,18 @@ async fn restored_table_has_all_items_when_first_active() {
 
     // The concurrent observer counted at first-ACTIVE while the restore call
     // above was still in flight (or just after, if the copy was fast).
-    let count = observer.await.unwrap();
+    let observed = observer.await.unwrap();
 
     c.delete_table().table_name(&src).send().await.ok();
     c.delete_table().table_name(&dst).send().await.ok();
 
+    let count = observed.expect(
+        "restore target never reported ACTIVE within the observer bound, \
+         so the restore itself did not complete",
+    );
     assert_eq!(
         count, ITEMS,
-        "restored table reported ACTIVE with {count}/{ITEMS} items present — \
+        "restored table reported ACTIVE with {count}/{ITEMS} items present. \
          ACTIVE must imply the restore copy is complete"
     );
 }

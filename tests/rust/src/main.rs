@@ -73,6 +73,8 @@ mod query_more;
 #[cfg(test)]
 mod raw_http;
 #[cfg(test)]
+mod restore_active_completeness;
+#[cfg(test)]
 mod scan;
 #[cfg(test)]
 mod select_projection_validation;
