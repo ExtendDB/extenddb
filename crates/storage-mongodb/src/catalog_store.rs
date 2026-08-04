@@ -38,7 +38,6 @@ impl MongoCatalogStore {
     pub(crate) fn catalog_db(&self) -> &mongodb::Database {
         &self.catalog_db
     }
-
 }
 
 // Implement CatalogStore supertrait

@@ -105,9 +105,8 @@ fn walk(expr: &Expr, maps: &ExpressionMaps) -> Pushable {
                 };
                 match val {
                     AttributeValue::S(tag) => {
-                        const VALID: &[&str] = &[
-                            "S", "N", "B", "BOOL", "NULL", "L", "M", "SS", "NS", "BS",
-                        ];
+                        const VALID: &[&str] =
+                            &["S", "N", "B", "BOOL", "NULL", "L", "M", "SS", "NS", "BS"];
                         if !VALID.contains(&tag.as_str()) {
                             return Pushable::No("attribute_type tag not a DDB type name");
                         }

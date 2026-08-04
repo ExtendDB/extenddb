@@ -5,18 +5,15 @@
 //!
 //! Contains document conversion, collection naming, and key extraction utilities.
 
-
 use bson::{Document, doc};
 
+#[cfg(test)]
+use extenddb_core::types::KeyType;
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, Item, KeySchemaElement, ScalarAttributeType,
 };
-#[cfg(test)]
-use extenddb_core::types::KeyType;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{
-    composite_pk_to_text, encode_netstring_composite, sk_info,
-};
+use extenddb_storage::util::{composite_pk_to_text, encode_netstring_composite, sk_info};
 
 /// Returns the `MongoDB` collection name for a `DynamoDB` table.
 pub fn data_collection_name(table_id: &str) -> String {
