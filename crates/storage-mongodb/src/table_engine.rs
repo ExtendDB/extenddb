@@ -50,7 +50,7 @@ impl TableEngine for MongoEngine {
         input: CreateTableInput,
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
         let account_id = account_id.to_string();
-        Box::pin(async move { self.create_table_impl(&account_id, input).await })
+        Box::pin(async move { self.create_table_impl(&account_id, input, false).await })
     }
 
     fn delete_table(
@@ -132,10 +132,16 @@ impl TableEngine for MongoEngine {
 }
 
 impl MongoEngine {
-    async fn create_table_impl(
+    /// Create a table. When `defer_active` is set (the restore path), the row
+    /// is written `CREATING` with **no** scheduled transition, so the
+    /// background worker will not flip it to `ACTIVE`; the caller schedules the
+    /// transition only after it has finished populating the table. Normal
+    /// `CreateTable` passes `false` and gets the usual timed transition.
+    pub(crate) async fn create_table_impl(
         &self,
         account_id: &str,
         input: CreateTableInput,
+        defer_active: bool,
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
 
@@ -207,7 +213,13 @@ impl MongoEngine {
         // table return ResourceNotFound, matching DynamoDB and the postgres
         // backend.
         let delay_secs = self.control_plane_delay_seconds().await;
-        let (table_status, status_transition_at): (&str, bson::Bson) = if delay_secs <= 0.0 {
+        let (table_status, status_transition_at): (&str, bson::Bson) = if defer_active {
+            // Restore path: enter CREATING with no scheduled transition. The
+            // caller flips the table to ACTIVE (or schedules the transition)
+            // only after the data copy completes, so ACTIVE never precedes a
+            // populated table.
+            ("CREATING", bson::Bson::Null)
+        } else if delay_secs <= 0.0 {
             ("ACTIVE", bson::Bson::Null)
         } else {
             let at = bson::DateTime::now().timestamp_millis() + (delay_secs * 1000.0) as i64;

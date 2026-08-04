@@ -23,7 +23,6 @@ use extenddb_core::types::{
     KeySchemaElement, PointInTimeRecoveryDescription, SourceTableDetails, TableDescription,
 };
 use extenddb_storage::BackupEngine;
-use extenddb_storage::TableEngine;
 use extenddb_storage::error::StorageError;
 
 use crate::MongoEngine;
@@ -486,7 +485,12 @@ impl BackupEngine for MongoEngine {
                 on_demand_throughput,
             };
 
-            let desc = self.create_table(&account_id, create_input).await?;
+            // Create the table with the ACTIVE transition deferred: it enters
+            // CREATING with no scheduled flip, so the table cannot become
+            // ACTIVE until we schedule it below, after the data copy completes.
+            let desc = self
+                .create_table_impl(&account_id, create_input, true)
+                .await?;
 
             // Restore items from the backup collection using server-side `$out`.
             // The backup collection was written by `create_backup` in the same
@@ -519,18 +523,26 @@ impl BackupEngine for MongoEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?
                 as i64;
 
-            // Update the item count. The table was created via `create_table`,
-            // so it is already in CREATING (with a scheduled transition) when
-            // control_plane_delay_seconds > 0, or ACTIVE when it is 0; the
-            // control_plane_worker flips CREATING -> ACTIVE once the window
-            // passes. The data was just copied above, so it is in place before
-            // the table becomes ACTIVE. `desc` (returned to the caller) already
-            // carries the CREATING status from create_table, matching DynamoDB.
+            // Now that the data is fully copied, record the item count and
+            // release the table from CREATING. The table was created with the
+            // transition deferred (no scheduled flip), so this is the first
+            // point at which it can become ACTIVE — which is exactly the
+            // ordering we want: ACTIVE now implies the copy is complete.
+            //
+            // No control-plane delay is applied: unlike CreateTable (whose real
+            // work is instant and needs a synthetic delay to make CREATING
+            // observable), the copy is itself the CREATING window. `desc`
+            // (returned to the caller) carries CREATING from create_table_impl,
+            // matching DynamoDB, which reports CREATING while a restore runs.
+            let status_update = doc! {
+                "$set": { "item_count": item_count, "table_status": "ACTIVE" },
+                "$unset": { "status_transition_at": "" },
+            };
             let tables_coll = self.catalog_db.collection::<Document>("tables");
             tables_coll
                 .update_one(
                     doc! { "_id": { "account_id": &account_id, "table_name": &target_table_name } },
-                    doc! { "$set": { "item_count": item_count } },
+                    status_update,
                 )
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
