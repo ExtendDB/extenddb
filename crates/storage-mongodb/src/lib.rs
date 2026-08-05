@@ -99,14 +99,17 @@ fn server_components_factory(
         let engine = Arc::new(engine);
 
         // Create catalog store
-        let catalog_client = mongodb::Client::with_uri_str(&connection_string)
+        let catalog_client = connect_guarded(&connection_string, None, false)
             .await
             .map_err(|e| BackendError::ConnectionFailed {
                 backend: "mongodb".to_string(),
                 details: format!("Failed to create catalog client: {e}"),
             })?;
 
-        // Load encryption key from settings collection
+        // Load encryption key from settings collection. A missing key must be
+        // a hard failure: an empty key would base64-decode to zero bytes and
+        // panic in aes_gcm (`Key::from_slice` requires 32 bytes). Refuse to
+        // start instead, matching the postgres backend.
         let catalog_db = catalog_client.database("extenddb_catalog");
         let settings_coll = catalog_db.collection::<mongodb::bson::Document>("settings");
         let enc_key = settings_coll
@@ -114,7 +117,7 @@ fn server_components_factory(
             .await
             .map_err(|e| BackendError::InitializationFailed(format!("Load encryption key: {e}")))?
             .and_then(|d| d.get_str("value").ok().map(std::borrow::ToOwned::to_owned))
-            .unwrap_or_default();
+            .ok_or(BackendError::MissingEncryptionKey)?;
 
         let catalog_store = Arc::new(MongoCatalogStore::with_encryption_key(
             catalog_client,
@@ -124,7 +127,7 @@ fn server_components_factory(
         // Create credential store. The bin layer wraps this in
         // CachedCredentialStore using the operator-configured TTL
         // before constructing the auth provider.
-        let auth_client = mongodb::Client::with_uri_str(&connection_string)
+        let auth_client = connect_guarded(&connection_string, None, false)
             .await
             .map_err(|e| BackendError::InitializationFailed(format!("Auth client: {e}")))?;
         let cred_store: Arc<dyn extenddb_auth::CredentialStore> =
@@ -166,7 +169,7 @@ pub fn backend() -> extenddb_storage::Backend {
         settings_store: |connection_string| {
             let connection_string = connection_string.to_string();
             Box::pin(async move {
-                let client = mongodb::Client::with_uri_str(&connection_string)
+                let client = connect_guarded(&connection_string, None, false)
                     .await
                     .map_err(|e| {
                         extenddb_storage::settings_store::SettingsStoreError::ConnectionFailed(
@@ -182,7 +185,7 @@ pub fn backend() -> extenddb_storage::Backend {
         diagnostics_store: |connection_string| {
             let connection_string = connection_string.to_string();
             Box::pin(async move {
-                let client = mongodb::Client::with_uri_str(&connection_string)
+                let client = connect_guarded(&connection_string, None, false)
                     .await
                     .map_err(|e| {
                         extenddb_storage::diagnostics_store::DiagnosticsStoreError::ConnectionFailed(
@@ -225,50 +228,66 @@ pub struct MongoEngine {
     gsi_cache: dashmap::DashMap<String, (bool, std::time::Instant)>,
 }
 
+/// Build a MongoDB client from a connection string, applying the shared
+/// connection guards so every client in the backend is protected, not just the
+/// data client: reject non-primary read preferences (they route reads to
+/// replicas and silently break `ConsistentRead=true`).
+///
+/// `max_pool_size` is applied when provided (the data client sizes its pool;
+/// catalog/auth/bootstrapper clients pass `None`).
+///
+/// `warn_on_no_tls` gates the no-TLS warning to the long-running server data
+/// client only. Short-lived CLI/management clients (settings, catalog checks,
+/// bootstrapper) pass `false`: they all share the same connection string, so a
+/// single warning at server startup is enough, and emitting it on every CLI
+/// invocation both spams logs and pollutes command stdout that tooling parses.
+pub(crate) async fn connect_guarded(
+    connection_string: &str,
+    max_pool_size: Option<u32>,
+    warn_on_no_tls: bool,
+) -> Result<mongodb::Client, StorageError> {
+    let mut options = mongodb::options::ClientOptions::parse(connection_string)
+        .await
+        .map_err(|e| StorageError::Connection(e.to_string()))?;
+    if let Some(n) = max_pool_size {
+        options.max_pool_size = Some(n);
+    }
+
+    if let Some(sel) = options.selection_criteria.as_ref() {
+        use mongodb::options::{ReadPreference, SelectionCriteria};
+        let is_non_primary = match sel {
+            SelectionCriteria::ReadPreference(rp) => !matches!(rp, ReadPreference::Primary),
+            _ => false,
+        };
+        if is_non_primary {
+            return Err(StorageError::Connection(
+                "MongoDB connection string must use readPreference=primary. \
+                 Non-primary read preferences (secondary, secondaryPreferred, \
+                 nearest, primaryPreferred) route reads to replicas and \
+                 silently break ConsistentRead=true."
+                    .to_owned(),
+            ));
+        }
+    }
+
+    if warn_on_no_tls && !matches!(options.tls, Some(mongodb::options::Tls::Enabled(_))) {
+        tracing::warn!(
+            "MongoDB connection is not using TLS; credentials and data will \
+             traverse the network in cleartext. Enable TLS with `?tls=true` \
+             in the connection string, or use a `mongodb+srv://` URI."
+        );
+    }
+
+    mongodb::Client::with_options(options).map_err(|e| StorageError::Connection(e.to_string()))
+}
+
 impl MongoEngine {
     pub async fn new(
         connection_string: &str,
         region: &str,
         max_connections: u32,
     ) -> Result<Self, StorageError> {
-        let mut options = mongodb::options::ClientOptions::parse(connection_string)
-            .await
-            .map_err(|e| StorageError::Connection(e.to_string()))?;
-        options.max_pool_size = Some(max_connections);
-
-        // Reject non-primary read preferences. DynamoDB's `ConsistentRead=true`
-        // requires linearizable reads; MongoDB's Primary read concern is the
-        // only mode that provides that. A connection string like
-        // `mongodb://.../?readPreference=secondaryPreferred` would silently
-        // route reads to a secondary and return stale data — a fidelity
-        // violation the caller has no way to detect.
-        if let Some(sel) = options.selection_criteria.as_ref() {
-            use mongodb::options::{ReadPreference, SelectionCriteria};
-            let is_non_primary = match sel {
-                SelectionCriteria::ReadPreference(rp) => !matches!(rp, ReadPreference::Primary),
-                _ => false,
-            };
-            if is_non_primary {
-                return Err(StorageError::Connection(
-                    "MongoDB connection string must use readPreference=primary. \
-                     Non-primary read preferences (secondary, secondaryPreferred, \
-                     nearest, primaryPreferred) route reads to replicas and \
-                     silently break ConsistentRead=true."
-                        .to_owned(),
-                ));
-            }
-        }
-
-        if !matches!(options.tls, Some(mongodb::options::Tls::Enabled(_))) {
-            tracing::warn!(
-                "MongoDB connection is not using TLS; credentials and data will \
-                 traverse the network in cleartext. Enable TLS with `?tls=true` \
-                 in the connection string, or use a `mongodb+srv://` URI."
-            );
-        }
-
-        let client = mongodb::Client::with_options(options)
-            .map_err(|e| StorageError::Connection(e.to_string()))?;
+        let client = connect_guarded(connection_string, Some(max_connections), true).await?;
 
         let catalog_db = client.database("extenddb_catalog");
         let data_db = client.database("extenddb_data");

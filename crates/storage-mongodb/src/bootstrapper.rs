@@ -40,9 +40,9 @@ impl MongoBootstrapper {
             .unwrap_or("mongodb://localhost:27017")
             .to_string();
 
-        let client = mongodb::Client::with_uri_str(&connection_string)
-            .await
-            .map_err(|e| StorageError::Connection(e.to_string()))?;
+        // Route through the shared guard so init/destroy/migrate also reject
+        // non-primary read preferences and warn on missing TLS.
+        let client = crate::connect_guarded(&connection_string, None, false).await?;
 
         Ok(Self {
             client,
