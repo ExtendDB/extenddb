@@ -11,7 +11,7 @@ traits (`ManagementStore`, `AdminStore`, `SettingsStore`, `MetricsStore`,
 **Driver:** `mongodb` (official Rust driver, async, multi-document ACID
 transactions on replica sets).
 
-**Minimum MongoDB version:** 6.0 (multi-document transactions, snapshot reads).
+**Minimum MongoDB version:** 7.0 (multi-document transactions, snapshot reads).
 
 **Read preference:** `primary` only. `MongoEngine::new` rejects connection strings
 that request `secondary`, `secondaryPreferred`, `primaryPreferred`, or `nearest` —
@@ -1024,17 +1024,22 @@ The backend implements every trait in `extenddb-storage`:
 - **Property tests:** `tests/pushdown_parity.rs` — random items and
   expressions checked for agreement between the compiled BSON filter
   and `evaluate_condition`.
-- **Integration tests:** Single-node replica set in Docker
-  (`mongod --replSet rs0`), full trait coverage.
+- **Integration tests:** The dual-target `tests/rust/` SDK suite (the
+  same AWS-SDK wire tests the PostgreSQL backend runs) executed against a
+  MongoDB-backed server on a single-node replica set in Docker
+  (`mongod --replSet rs0`), via `devtools/run-mongodb-tests -- --rust
+  --rust-integration`.
 - **Existing pytest suite:** Passes unchanged (backend-agnostic wire
-  protocol tests).
-- **CI:** GitHub Actions job with MongoDB 7.0 replica set, runs
-  `cargo test -p extenddb-storage-mongodb` then `devtools/run-tests
-  --extenddb --pytest --external`.
+  protocol tests), via `devtools/run-mongodb-tests -- --pytest
+  --comprehensive --parallel`.
+- **CI:** `.github/workflows/integration-mongodb.yml` runs the pytest and
+  rust-integration suites as two parallel jobs, each building with
+  `--features mongodb` and delegating to `devtools/run-mongodb-tests`,
+  which bootstraps a single-node MongoDB 7.0 replica set.
 
 ## 14. Deployment Requirements
 
-- MongoDB **6.0+** in **replica set** mode. Standalone nodes reject
+- MongoDB **7.0+** in **replica set** mode. Standalone nodes reject
   multi-document transactions.
 - **`readPreference=primary`** on the connection string. Non-primary
   is rejected at engine startup.
