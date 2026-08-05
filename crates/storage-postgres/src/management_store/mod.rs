@@ -38,6 +38,10 @@ impl extenddb_storage::management_store::ManagementStore for PostgresCatalogStor
         Box::pin(async move { self.list_all_accounts_impl().await })
     }
 
+    fn default_account_id(&self) -> BoxFuture<'_, OpResult<Option<String>>> {
+        Box::pin(async move { self.default_account_id_impl().await })
+    }
+
     fn list_all_accounts_full(
         &self,
     ) -> BoxFuture<'_, OpResult<Vec<(String, String, time::OffsetDateTime)>>> {

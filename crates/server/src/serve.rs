@@ -15,8 +15,9 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::path::PathBuf;
+
 use extenddb_config as config;
-use extenddb_config::pid_file_path;
 use extenddb_storage::CancellationToken;
 use syslog_tracing::{Facility, Options, Syslog};
 use tracing_subscriber::{
@@ -86,12 +87,23 @@ pub struct ServeParams {
     /// port conflicts surface on stderr before the parent exits. The listening
     /// port is read from this socket, so it cannot disagree with it.
     pub listener: TcpListener,
-    /// Directory holding the PID file.
-    pub run_dir: String,
+    /// Where to write the PID file, or `None` to write none.
+    ///
+    /// `None` suits a supervised deployment: the supervisor owns the process,
+    /// and skipping the file means no writable run directory is needed, so the
+    /// root filesystem can be read-only. `extenddb status` and `extenddb stop`
+    /// locate the file by convention, so a caller that wants them to work should
+    /// pass the conventional path from `extenddb_config::pid_file_path`.
+    pub pid_file: Option<PathBuf>,
     /// Where log output is written.
     pub log_target: LogTarget,
     /// Build provenance of the deployed binary.
     pub build: BuildInfo,
+    /// Developer mode: serve plain HTTP, open authorization for authenticated
+    /// callers (SigV4 still verified), and seed the well-known dev credential.
+    /// Only a `dev-mode` build of the app crate ever sets this, and it enforces
+    /// the loopback-only bind before handing over the listener.
+    pub dev_mode: bool,
 }
 
 impl ServeParams {
@@ -100,15 +112,16 @@ impl ServeParams {
     pub fn new(
         app_config: config::AppConfig,
         listener: TcpListener,
-        run_dir: String,
+        pid_file: Option<PathBuf>,
         build: BuildInfo,
     ) -> Self {
         Self {
             app_config,
             listener,
-            run_dir,
+            pid_file,
             log_target: LogTarget::Syslog,
             build,
+            dev_mode: false,
         }
     }
 
@@ -116,6 +129,14 @@ impl ServeParams {
     #[must_use]
     pub fn with_log_target(mut self, target: LogTarget) -> Self {
         self.log_target = target;
+        self
+    }
+
+    /// Enable developer mode (plain HTTP, open authorization, seeded dev
+    /// credential). The caller is responsible for the loopback-only bind.
+    #[must_use]
+    pub fn with_dev_mode(mut self, dev_mode: bool) -> Self {
+        self.dev_mode = dev_mode;
         self
     }
 }
@@ -142,11 +163,13 @@ pub async fn serve(params: ServeParams) -> anyhow::Result<()> {
     // CB-27: Clean up PID file if serve fails before reaching the HTTP server
     // (e.g., backend connection failure). The PID file was already written by
     // the daemonize step in the caller.
-    let pid_path = pid_file_path(&params.run_dir, port);
+    let pid_path = params.pid_file.clone();
     let log_target = params.log_target;
     let result = serve_inner(params, port).await;
     if let Err(ref e) = result {
-        let _ = std::fs::remove_file(&pid_path);
+        if let Some(ref path) = pid_path {
+            let _ = std::fs::remove_file(path);
+        }
         // P57 Bug 7: Log fatal errors where the operator will see them. After
         // daemonize, stderr is /dev/null so anyhow's error display is lost. Use
         // tracing if available, fall back to the raw writer if tracing isn't
@@ -166,21 +189,24 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     let ServeParams {
         app_config,
         listener: std_listener,
-        run_dir,
+        pid_file,
         log_target,
         build,
+        dev_mode,
     } = params;
     let catalog_version =
         extenddb_storage::operations::catalog_version().unwrap_or_else(|_| "unknown".to_string());
 
-    // Write the PID file so `extenddb status`/`stop` and `start_server`'s
-    // graceful shutdown cleanup work in every deployment. When the caller
-    // daemonized, the grandchild PID that `daemonize` wrote is the same value
-    // as `std::process::id()` post-fork, so this is a consistent rewrite rather
-    // than a conflicting one.
-    let pid_file = pid_file_path(&run_dir, port);
-    std::fs::write(&pid_file, format!("{}\n", std::process::id()))
-        .map_err(|e| anyhow::anyhow!("Failed to write PID file {}: {e}", pid_file.display()))?;
+    // Write the PID file, when the caller asked for one, so `extenddb status`,
+    // `extenddb stop`, and `start_server`'s graceful shutdown cleanup work. When
+    // the caller daemonized, the grandchild PID that `daemonize` wrote is the
+    // same value as `std::process::id()` post-fork, so this is a consistent
+    // rewrite rather than a conflicting one. A supervised deployment passes
+    // `None` and needs no writable run directory at all.
+    if let Some(ref path) = pid_file {
+        std::fs::write(path, format!("{}\n", std::process::id()))
+            .map_err(|e| anyhow::anyhow!("Failed to write PID file {}: {e}", path.display()))?;
+    }
 
     // Init logging (REQ-LOG-003, REQ-LOG-006) — the caller chose the target via
     // [`LogTarget`]; a supervised/container deployment picks stderr so the
@@ -238,10 +264,15 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         .try_init()
         .map_err(|e| anyhow::anyhow!("Failed to initialize tracing: {e}"))?;
 
-    // Create server components via factory pattern
+    // Create server components via factory pattern. Dev mode asks the backend
+    // to bootstrap an uninitialized catalog at serve time (zero-config use).
+    let mut component_options =
+        extenddb_storage::server_components::ServerComponentsOptions::default();
+    component_options.bootstrap_if_uninitialized = dev_mode;
     let components = extenddb_storage::create_server_components(
         app_config.storage.as_trait(),
         &app_config.server.region,
+        component_options,
     )
     .await?;
 
@@ -249,6 +280,19 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     let catalog_store = components.catalog_store;
     let cred_store = components.credential_store;
     let runtime_hooks = components.runtime_hooks;
+
+    // Dev mode: adopt the credential the SDK will sign with (from the standard
+    // AWS_* env) and verify against it. Seeded here so it works for both
+    // file-backed and bootstrap-on-serve (in-memory) deployments. SigV4
+    // verification is unchanged; only the IAM policy decision is opened.
+    if dev_mode {
+        let dev_access_key = seed_dev_credential(catalog_store.as_ref()).await?;
+        tracing::warn!(
+            "DEVELOPER MODE active — plain HTTP, authorization open (SigV4 still \
+             enforced), loopback only. Storage: {}. Signing credential: {dev_access_key}",
+            config::redact_password(app_config.storage.connection_config()),
+        );
+    }
 
     // Build SwrCacheConfig values from the [auth.cache] TOML section.
     let cache_cfg = &app_config.auth.cache;
@@ -361,7 +405,9 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     // P120e: Create metrics collector early so workers can record health.
     let metrics = Arc::new(extenddb_core::metrics::MetricsCollector::new());
 
-    let tls_enabled = app_config.server.tls.enabled;
+    // Dev mode serves plain HTTP regardless of the configured TLS state; the
+    // app crate's `config::is_tls_enabled` applies the same rule for clients.
+    let tls_enabled = app_config.server.tls.enabled && !dev_mode;
 
     // P53: Resolve import and export path lists. Supports both the new
     // [import]/[export] sections and the deprecated import_export_root.
@@ -480,6 +526,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         ),
         metrics: metrics.clone(),
         tls_enabled,
+        dev_mode,
         import_paths,
         export_paths,
         throttle: throttle.clone(),
@@ -552,13 +599,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         None
     };
 
-    let server_result = crate::start_server(
-        listener,
-        state,
-        Some(pid_file_path(&run_dir, port)),
-        tls_config,
-    )
-    .await;
+    let server_result = crate::start_server(listener, state, pid_file, tls_config).await;
 
     // The HTTP server has stopped accepting; drain the workers so in-flight
     // cycles finish and the metrics flush worker writes its final bucket.
@@ -615,4 +656,78 @@ pub fn log_to_syslog_raw(msg: &str) {
             libc::syslog(libc::LOG_CRIT, c"%s".as_ptr(), cmsg.as_ptr());
         }
     }
+}
+
+/// Seed (or refresh) the developer-mode credential and return its access key id.
+///
+/// Dev mode verifies SigV4 exactly like production, so the server must know the
+/// credential the SDK signs with. To stay a drop-in for local development:
+///
+///  * If `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` are set in the server's
+///    environment, the server **adopts and verifies against them**. In the
+///    common CI case the SDK and the co-located server read the same env, so
+///    the user changes nothing but the endpoint URL.
+///  * Otherwise it seeds AWS's documented example credential as a well-known
+///    default the user can point any SDK at.
+///
+/// This mirrors the admin-credential pattern (env-or-default), differing only in
+/// that the default is well-known rather than randomly generated, because an SDK
+/// must know the credential up front (it cannot read a printed banner). Seeding
+/// goes through the generic management surface, so it is backend-agnostic.
+async fn seed_dev_credential(
+    catalog_store: &dyn extenddb_storage::CatalogStore,
+) -> anyhow::Result<String> {
+    use extenddb_storage::management_store::OpError;
+
+    // AWS's documented example credential (recognised everywhere and allowlisted
+    // by secret scanners): the zero-config default users point their SDK at.
+    const DEFAULT_ACCESS_KEY_ID: &str = "AKIAIOSFODNN7EXAMPLE";
+    const DEFAULT_SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+
+    let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_ACCESS_KEY_ID.to_owned());
+    let secret = std::env::var("AWS_SECRET_ACCESS_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_SECRET.to_owned());
+
+    // The access-key prefix is a credential-type discriminator across the auth
+    // layer: `AKIA*` = long-lived IAM user keys, `ASIA*` = temporary role
+    // session credentials (they carry `is_session`, are subject to
+    // ExpiredTokenException, and are invalidated with their role). The dev
+    // credential is a long-lived key on a *user*, so require the AKIA shape; an
+    // ASIA-shaped key here would be a user credential the rest of the system
+    // treats as a role session credential (e.g. user-delete invalidation
+    // matches `AKIA*`, not `ASIA*`).
+    if !access_key_id.starts_with("AKIA") {
+        anyhow::bail!(
+            "dev credential AWS_ACCESS_KEY_ID must be AKIA-shaped (got '{access_key_id}'); \
+             use e.g. AKIAIOSFODNN7EXAMPLE, or unset it to use the default."
+        );
+    }
+
+    // Attach the dev user to the deployment's recorded default account (set at
+    // bootstrap) rather than inferring it from account-list ordering.
+    let account_id = catalog_store
+        .default_account_id()
+        .await
+        .map_err(|e| anyhow::anyhow!("dev mode: failed to read default account: {e:?}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("dev mode: no default account recorded (catalog not bootstrapped)")
+        })?;
+
+    match catalog_store.create_user(&account_id, "dev", None).await {
+        Ok(()) | Err(OpError::AlreadyExists(_)) => {}
+        Err(e) => anyhow::bail!("dev mode: failed to create dev user: {e:?}"),
+    }
+    match catalog_store
+        .import_access_key(&account_id, "dev", &access_key_id, &secret)
+        .await
+    {
+        Ok(()) | Err(OpError::AlreadyExists(_)) => {}
+        Err(e) => anyhow::bail!("dev mode: failed to import dev credential: {e:?}"),
+    }
+    Ok(access_key_id)
 }

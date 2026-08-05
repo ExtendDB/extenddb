@@ -29,7 +29,15 @@
 # run_dir = "~/.extenddb/run"  # Directory for PID file (~ is expanded to $HOME)
 
 [storage]
-# backend = "postgres"         # Storage backend (only "postgres" supported)
+# backend = "postgres"         # Storage backend: "postgres" (default) or "sqlite".
+
+# --- SQLite backend (developer mode) ---
+# Select with `extenddb init --backend sqlite`. The database path can be given
+# at serve time (`extenddb serve --sqlite-path <path>`) or here. Resolution order:
+#   --sqlite-path flag  ->  [storage.sqlite].path  ->  default "extenddb.sqlite".
+# Use ":memory:" for an ephemeral in-memory database (data lost on shutdown).
+# [storage.sqlite]
+# path = "extenddb.sqlite"
 
 [storage.postgres]
 # Connection string points to the CATALOG database.

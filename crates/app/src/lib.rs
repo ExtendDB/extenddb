@@ -4,7 +4,8 @@
 //! ExtendDB application/CLI library.
 //!
 //! Owns the command-line interface (`serve`, `init`, `destroy`, `verify`,
-//! `migrate`, `status`, `stop`, `settings`, `manage`, `catalog-check`) and the
+//! `migrate`, `status`, `stop`, `settings`, `manage`, `catalog-check`,
+//! `healthcheck`) and the
 //! subcommand dispatch. It is backend-agnostic: a backend's thin `main`
 //! installs its backend with
 //! [`set_backend`](extenddb_storage::set_backend) and then calls [`run`]:
@@ -22,6 +23,7 @@
 
 mod cmd_catalog_check;
 mod cmd_destroy;
+mod cmd_healthcheck;
 mod cmd_init;
 mod cmd_manage;
 mod cmd_migrate;
@@ -78,6 +80,8 @@ enum Command {
     Manage(cmd_manage::ManageArgs),
     /// Check catalog and data database integrity
     CatalogCheck(cmd_catalog_check::CatalogCheckArgs),
+    /// Probe the local /health endpoint over HTTPS (exit 0 healthy, 1 not)
+    Healthcheck(cmd_healthcheck::HealthcheckArgs),
     /// Print version, catalog version, git commit, and build timestamp
     Version,
 }
@@ -121,6 +125,13 @@ pub fn run(build: BuildInfo) -> anyhow::Result<()> {
         Command::Settings(args) => run_interactive(cmd_settings::run(args)),
         Command::Manage(args) => run_interactive(cmd_manage::run(args)),
         Command::CatalogCheck(args) => run_interactive(cmd_catalog_check::run(args)),
+        Command::Healthcheck(args) => match cmd_healthcheck::run(&args) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("healthcheck failed: {e}");
+                std::process::exit(1);
+            }
+        },
         Command::Version => {
             print_version(build);
             Ok(())

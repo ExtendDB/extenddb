@@ -28,6 +28,8 @@ mod capacity_throttling;
 #[cfg(test)]
 mod composite_keys;
 #[cfg(test)]
+mod concurrency;
+#[cfg(test)]
 mod condition_expressions;
 #[cfg(test)]
 mod condition_expressions_more;

@@ -355,6 +355,18 @@ fn default_log_format() -> String {
     "pretty".to_owned()
 }
 
+/// Effective TLS state for a loaded config.
+///
+/// A `dev-mode` build always serves plain HTTP on loopback regardless of the
+/// configured `server.tls.enabled` (which defaults to `true`). This is the
+/// single source of truth so the server (`cmd_serve`) and the `manage` client
+/// agree on the scheme; reading `config.server.tls.enabled` directly is a bug
+/// in dev-mode builds.
+#[must_use]
+pub fn is_tls_enabled(config: &AppConfig) -> bool {
+    config.server.tls.enabled && !cfg!(feature = "dev-mode")
+}
+
 /// Load `AppConfig` from a config file (optional) and environment variables.
 ///
 /// # Errors
@@ -364,6 +376,37 @@ fn default_log_format() -> String {
 pub fn load(config_path: &str) -> anyhow::Result<AppConfig> {
     let config = config::Config::builder()
         .add_source(config::File::with_name(config_path).required(false))
+        .add_source(config::Environment::with_prefix("EXTENDDB").separator("__"))
+        .build()?;
+    Ok(config.try_deserialize()?)
+}
+
+/// Load `AppConfig` entirely from built-in defaults and environment variables,
+/// with no config file.
+///
+/// Supports zero-config `serve` in dev-mode builds: the installed backend's
+/// `[storage.<name>]` section is synthesized empty, so every storage field
+/// takes its default (for the SQLite dev build that is the in-memory path).
+/// Server defaults are loopback + port 18443, satisfying the dev-mode
+/// loopback guard. `EXTENDDB__*` environment overrides still apply on top.
+///
+/// A backend whose storage config has required fields fails deserialization
+/// here with that field named, which is correct: such a backend cannot run
+/// without a config file.
+///
+/// # Errors
+///
+/// Returns an error if no backend is installed, or if environment variable
+/// values cannot be deserialized.
+pub fn load_builtin_defaults() -> anyhow::Result<AppConfig> {
+    let backend = extenddb_storage::backend_name()
+        .ok_or_else(|| anyhow::anyhow!("no storage backend installed"))?;
+    let storage_section = format!("[storage.{backend}]\n");
+    let config = config::Config::builder()
+        .add_source(config::File::from_str(
+            &storage_section,
+            config::FileFormat::Toml,
+        ))
         .add_source(config::Environment::with_prefix("EXTENDDB").separator("__"))
         .build()?;
     Ok(config.try_deserialize()?)

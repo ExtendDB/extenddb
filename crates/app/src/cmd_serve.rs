@@ -31,29 +31,49 @@ pub struct ServeArgs {
     /// them.
     #[arg(long, alias = "no-daemon")]
     foreground: bool,
+
+    /// Write a PID file in --foreground mode.
+    ///
+    /// Foreground mode normally writes none, because the supervisor owns the
+    /// process and a read-only root filesystem then needs no run directory.
+    /// Pass this when you want `extenddb status` and `extenddb stop` to work
+    /// against a foreground server, for example when running it from a shell.
+    /// It goes to the same `run_dir` path daemon mode uses, so `stop` and
+    /// `status` find it with no extra arguments. Ignored in daemon mode, which
+    /// always writes one.
+    #[arg(long)]
+    write_pid_file: bool,
 }
 
 /// Bind the listening socket, daemonize, then start the tokio runtime.
 /// Binding before forking ensures port conflicts are reported to stderr
 /// before the parent process exits (D-4).
 pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
-    // P50: Check config file permissions before loading. The config file may
-    // contain the encryption key (via `extenddb init`). Reject if more permissive
-    // than 0600 (owner read/write only).
-    if !std::path::Path::new(&args.config).exists() {
+    // Load config early so bind address is known before fork. A dev-mode
+    // build serves with built-in defaults when no config file exists
+    // (zero-config local/CI use: loopback, in-memory storage, seeded dev
+    // credential — a drop-in for DynamoDB Local). Production builds require
+    // an `init`-generated config.
+    let config_exists = std::path::Path::new(&args.config).exists();
+    let app_config = if config_exists {
+        // P50: Check config file permissions before loading. The config file
+        // may contain the encryption key (via `extenddb init`). Reject if more
+        // permissive than 0600 (owner read/write only).
+        check_config_permissions(&args.config)?;
+        config::load(&args.config)?
+    } else if cfg!(feature = "dev-mode") {
+        config::load_builtin_defaults()?
+    } else {
         anyhow::bail!(
             "Config file '{}' not found. Run 'extenddb init' to create one, \
              or use --config <path> to specify a different location.",
             args.config,
         );
-    }
-    check_config_permissions(&args.config)?;
+    };
 
-    // Load config early so bind address is known before fork.
-    let app_config = config::load(&args.config)?;
-
-    // D5: TLS is mandatory. Reject explicit opt-out.
-    if !app_config.server.tls.enabled {
+    // D5: TLS is mandatory — except in a dev-mode build, which deliberately
+    // serves plain HTTP on loopback for frictionless local/CI use.
+    if !cfg!(feature = "dev-mode") && !app_config.server.tls.enabled {
         anyhow::bail!("TLS is mandatory. Remove `tls.enabled = false` from your config file.");
     }
 
@@ -76,6 +96,24 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     let catalog_version = extenddb_storage::operations::catalog_version()?;
 
     let port = args.port.unwrap_or(app_config.server.port);
+
+    // Dev mode serves plain HTTP with relaxed authorization; confine it to
+    // loopback so it can never be exposed off-host.
+    if cfg!(feature = "dev-mode") {
+        let host = app_config.server.bind_addr.trim();
+        let loopback = host == "localhost"
+            || host
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false);
+        if !loopback {
+            anyhow::bail!(
+                "dev-mode builds may only bind to loopback (127.0.0.1, ::1, localhost); \
+                 got server.bind_addr = '{host}'"
+            );
+        }
+    }
+
     let bind_addr = format!("{}:{}", app_config.server.bind_addr, port);
 
     // Bind in sync context — errors go to stderr before daemonizing.
@@ -110,12 +148,31 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         println!("{banner_line1}");
         println!("{banner_line2}");
     }
+    if cfg!(feature = "dev-mode") {
+        let msg = format!(
+            "  DEVELOPER MODE: plain HTTP on loopback, authorization open \
+             (SigV4 still enforced). Serving storage: {}. Not for production.",
+            config::redact_password(app_config.storage.connection_config()),
+        );
+        if args.foreground {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    }
 
-    // D-3: Write PID file so `extenddb status` can report the daemon PID.
+    // D-3: A PID file lets `extenddb status` and `extenddb stop` find the
+    // process. Daemon mode always writes one. Foreground mode writes one only on
+    // request, so by default it needs no run directory at all and the container
+    // can use a read-only root filesystem.
     let run_dir = config::expand_tilde(&app_config.server.run_dir);
-    std::fs::create_dir_all(&run_dir)
-        .map_err(|e| anyhow::anyhow!("Failed to create run directory {run_dir}: {e}"))?;
-    let pid_file = pid_file_path(&run_dir, port);
+    let pid_file = if args.foreground && !args.write_pid_file {
+        None
+    } else {
+        std::fs::create_dir_all(&run_dir)
+            .map_err(|e| anyhow::anyhow!("Failed to create run directory {run_dir}: {e}"))?;
+        Some(pid_file_path(&run_dir, port))
+    };
 
     // P57 Bug 7 fix: Use execute() instead of start() so the parent can
     // verify the daemon child is healthy before exiting. start() exits the
@@ -123,17 +180,25 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     //
     // When --foreground is set, skip daemonization entirely so the process
     // can be supervised by Docker, Kubernetes, systemd Type=simple, etc.
-    // The PID file is still written below by `start_server`, and graceful
-    // shutdown on SIGINT/SIGTERM still works.
+    // Graceful shutdown on SIGINT/SIGTERM still works.
     if !args.foreground {
-        let daemon = Daemonize::new().pid_file(&pid_file);
+        let pid_file = pid_file
+            .as_ref()
+            .expect("daemon mode always has a PID file path");
+        // The listening socket bound successfully above, which proves no live
+        // server owns this port. Any existing PID file is therefore stale (a
+        // prior run that crashed or was killed without cleanup). Remove it
+        // before daemonizing so startup verification reads the new daemon's
+        // PID rather than a dead one from a previous run.
+        let _ = std::fs::remove_file(pid_file);
+        let daemon = Daemonize::new().pid_file(pid_file);
         match daemon.execute() {
             daemonize::Outcome::Parent(Ok(_)) => {
                 // Parent process: wait for the PID file to appear (written by
                 // the grandchild after the double-fork), then verify the daemon
                 // is still alive. This catches crashes during early startup
                 // (bad config, missing tables, TLS cert errors).
-                return verify_daemon_started(&pid_file, &bind_addr);
+                return verify_daemon_started(pid_file, &bind_addr);
             }
             daemonize::Outcome::Parent(Err(e)) => {
                 return Err(anyhow::anyhow!("Failed to daemonize: {e}"));
@@ -160,13 +225,13 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         .enable_all()
         .build()?
         .block_on(extenddb_server::serve(
-            ServeParams::new(app_config, std_listener, run_dir, build).with_log_target(
-                if args.foreground {
+            ServeParams::new(app_config, std_listener, pid_file, build)
+                .with_log_target(if args.foreground {
                     LogTarget::Stderr
                 } else {
                     LogTarget::Syslog
-                },
-            ),
+                })
+                .with_dev_mode(cfg!(feature = "dev-mode")),
         ))
 }
 

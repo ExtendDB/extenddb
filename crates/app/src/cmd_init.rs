@@ -16,8 +16,9 @@ use extenddb_config as config;
 #[derive(Args)]
 #[allow(clippy::doc_markdown)] // Clap help text, not rustdoc
 pub struct InitArgs {
-    /// Storage backend (postgres) (default: postgres)
-    #[arg(long, default_value = "postgres")]
+    /// Storage backend. Optional: the binary's compiled-in backend is used;
+    /// when given, it is validated against that backend.
+    #[arg(long)]
     backend: Option<String>,
 
     /// Data database name (default: extenddb)
@@ -59,6 +60,12 @@ pub struct InitArgs {
     /// Server bind address (included as a SAN in the self-signed certificate)
     #[arg(long)]
     bind_addr: Option<String>,
+
+    /// Additional Subject Alternative Name for the self-signed certificate,
+    /// repeatable. Added to the default localhost/127.0.0.1/bind-addr list so
+    /// the cert is also valid for names like an in-cluster service DNS name.
+    #[arg(long = "tls-san")]
+    tls_san: Vec<String>,
 
     /// Overwrite existing config file (default: --no-overwrite, exit 255 if exists)
     #[arg(long, overrides_with = "no_overwrite")]
@@ -114,15 +121,32 @@ fn discover_docs_dir() -> Option<String> {
 
 /// Returns exit code: 0 = success, 255 = existing config preserved.
 pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
-    // Determine backend: CLI flag > config file > default
-    let backend = if let Some(ref b) = args.backend {
-        b.clone()
-    } else if Path::new(&args.config).exists() {
+    // The installed backend is authoritative — there is exactly one compiled
+    // into this binary. An explicit --backend (or a config file's backend key)
+    // is validated against it rather than driving dispatch, so a mismatch is a
+    // clear startup error instead of a mis-generated config.
+    let backend = extenddb_storage::backend_name()
+        .ok_or_else(|| anyhow::anyhow!("no storage backend installed"))?
+        .to_owned();
+    if let Some(ref requested) = args.backend
+        && *requested != backend
+    {
+        anyhow::bail!(
+            "this binary is built with the '{backend}' backend; \
+             --backend {requested} requires the extenddb-{requested} binary"
+        );
+    }
+    if args.backend.is_none() && Path::new(&args.config).exists() {
         let app_config = config::load(&args.config)?;
-        app_config.storage.backend
-    } else {
-        "postgres".to_owned()
-    };
+        if app_config.storage.backend != backend {
+            anyhow::bail!(
+                "config file '{}' selects backend '{}', but this binary is built \
+                 with the '{backend}' backend",
+                args.config,
+                app_config.storage.backend,
+            );
+        }
+    }
 
     println!("=== extenddb init (backend: {backend}) ===");
 
@@ -138,6 +162,16 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
 
     // Collect CLI args for backend-specific parsing
     let cli_args: Vec<String> = std::env::args().collect();
+
+    // Extract bind_addr from CLI args
+    let bind_addr =
+        extract_arg(&cli_args, "--bind-addr").unwrap_or_else(|| "127.0.0.1".to_string());
+
+    // Generate the self-signed TLS certificate if it isn't already present,
+    // covering the bind address plus any --tls-san values so it matches the URLs
+    // clients use. This runs before any database work so that an unusable
+    // --tls-san fails before we create users or databases.
+    generate_tls_cert_if_needed(&bind_addr, &args.tls_san)?;
 
     // Create bootstrapper via registry (no hardcoded match!)
     let bootstrapper = extenddb_storage::bootstrapper::create_bootstrapper(&args.config, &cli_args)
@@ -233,14 +267,6 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
         );
     }
 
-    // Extract bind_addr from CLI args
-    let bind_addr =
-        extract_arg(&cli_args, "--bind-addr").unwrap_or_else(|| "127.0.0.1".to_string());
-
-    // Generate self-signed TLS certificate if not already present.
-    // Include the server bind address as a SAN so the cert matches the URL.
-    generate_tls_cert_if_needed(&bind_addr)?;
-
     // AI-1: Discover rendered docs directory for the config file.
     let docs_dir = discover_docs_dir();
     if let Some(ref d) = docs_dir {
@@ -254,7 +280,6 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
     }
 
     // Generate or update extenddb.toml.
-    let backend = args.backend.as_deref().unwrap_or("postgres");
     let config_path = &args.config;
 
     if Path::new(config_path).exists() {
@@ -262,7 +287,7 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
     }
     generate_config(
         config_path,
-        backend,
+        &backend,
         bootstrapper.as_ref(),
         &bind_addr,
         docs_dir.as_deref(),

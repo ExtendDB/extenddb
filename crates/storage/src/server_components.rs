@@ -83,14 +83,27 @@ impl std::fmt::Display for BackendError {
 
 impl std::error::Error for BackendError {}
 
+/// Options for server-component creation, beyond the storage config itself.
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct ServerComponentsOptions {
+    /// Bootstrap the catalog at serve time when it is not initialized,
+    /// instead of failing with `InitializationFailed`. Set by dev-mode builds
+    /// so `serve` works with no prior `init` (zero-config local/CI use).
+    /// Backends whose bootstrap requires operator input ignore this and fail
+    /// as usual; backends with a self-contained bootstrap (SQLite) honor it.
+    pub bootstrap_if_uninitialized: bool,
+}
+
 /// Factory function type for creating server components.
 ///
-/// Takes a `StorageConfig` trait object and region string, returns a Future
-/// that resolves to `ServerComponents` or `BackendError`.
+/// Takes a `StorageConfig` trait object, region string, and options; returns
+/// a Future that resolves to `ServerComponents` or `BackendError`.
 pub type ServerComponentsFactory =
     fn(
         &dyn StorageConfig,
         &str,
+        ServerComponentsOptions,
     ) -> Pin<Box<dyn Future<Output = Result<ServerComponents, BackendError>> + Send>>;
 
 /// Create server components using the installed backend.
@@ -101,7 +114,8 @@ pub type ServerComponentsFactory =
 pub async fn create_server_components(
     config: &dyn StorageConfig,
     region: &str,
+    options: ServerComponentsOptions,
 ) -> Result<ServerComponents, BackendError> {
     let backend = crate::backend::try_backend().ok_or(BackendError::BackendNotInstalled)?;
-    (backend.server_components)(config, region).await
+    (backend.server_components)(config, region, options).await
 }
