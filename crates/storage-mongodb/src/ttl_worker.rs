@@ -176,9 +176,16 @@ async fn run_gsi_backfill_job(storage: &MongoEngine, job: &Document) -> Result<(
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             cursor = Some(last_id.clone());
         } else {
-            // Empty batch but not done — treat as done to avoid an
-            // infinite loop. Shouldn't happen in practice since
-            // backfill_gsi_batch marks done when scanned < batch_size.
+            // Empty batch but the scan did not report completion. This
+            // shouldn't happen — backfill_gsi_batch marks `done` whenever it
+            // scans fewer than batch_size docs — so surface it rather than
+            // silently returning: the index stays CREATING and this worker
+            // will re-pick it up on the next interval, so a persistent
+            // occurrence means a GSI is stuck in CREATING.
+            tracing::warn!(
+                "GSI backfill worker: index_id={index_id} returned an empty, \
+                 non-final batch; index remains CREATING and will be retried",
+            );
             return Ok(());
         }
     }
