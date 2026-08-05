@@ -3,10 +3,15 @@
 
 //! Configuration for `MongoDB` storage backend.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// `MongoDB` storage backend configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Deliberately does **not** derive `Serialize`: `connection_string` may carry
+/// `user:pass@` credentials, and a `Serialize` impl would let them leave the
+/// process on any serialize path. Matches the postgres backend, which derives
+/// only `Debug, Clone, Deserialize`.
+#[derive(Debug, Clone, Deserialize)]
 pub struct MongoStorageConfig {
     /// `MongoDB` connection string (mongodb://...)
     pub connection_string: String,
