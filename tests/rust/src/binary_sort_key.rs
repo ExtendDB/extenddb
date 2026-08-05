@@ -212,11 +212,19 @@ async fn query_binary_sort_key_begins_with_all_ff_prefix() {
     create_binary_sk_table(c, &table).await;
 
     let pk = "p";
-    // A 0xFF-prefixed key is the largest possible under unsigned byte order.
-    // begins_with([0xFF]) exercises the upper-bound edge: a naive "increment
-    // the last prefix byte" range end overflows past 0xFF and must instead
-    // extend to the end of the partition. The 0xFE key must be excluded.
-    seed(c, &table, pk, &[&[0xFE], &[0xFF, 0x00], &[0xFF, 0xFF]]).await;
+    // A *multi-byte* all-0xFF prefix exercises the upper-bound edge where every
+    // prefix byte is 0xFF: a naive "increment the last byte, carrying" range
+    // end overflows past the whole prefix, so the range must have no exclusive
+    // upper bound and extend to the end of the partition. That range must still
+    // include longer keys that begin with [0xFF,0xFF] (e.g. [0xFF,0xFF,0x00])
+    // while excluding [0xFF,0x00], which shares only the first 0xFF byte.
+    seed(
+        c,
+        &table,
+        pk,
+        &[&[0xFF, 0x00], &[0xFF, 0xFF], &[0xFF, 0xFF, 0x00]],
+    )
+    .await;
 
     let resp = c
         .query()
@@ -225,14 +233,15 @@ async fn query_binary_sort_key_begins_with_all_ff_prefix() {
         .expression_attribute_names("#h", "pk")
         .expression_attribute_names("#r", "sk")
         .expression_attribute_values(":hv", s(pk))
-        .expression_attribute_values(":pfx", bb(&[0xFF]))
+        .expression_attribute_values(":pfx", bb(&[0xFF, 0xFF]))
         .send()
         .await
         .unwrap();
     assert_eq!(
         sk_bytes(resp.items()),
-        vec![vec![0xFF, 0x00], vec![0xFF, 0xFF]],
-        "begins_with([0xFF]) must select all 0xFF-prefixed keys and exclude 0xFE"
+        vec![vec![0xFF, 0xFF], vec![0xFF, 0xFF, 0x00]],
+        "begins_with([0xFF,0xFF]) must match keys prefixed by 0xFF 0xFF \
+         (including longer ones) and exclude [0xFF,0x00]"
     );
 
     let _ = c.delete_table().table_name(&table).send().await;
