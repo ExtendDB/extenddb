@@ -3300,9 +3300,16 @@ fn build_sk_filter(
 ///
 /// The comparison is done in the source AttributeValue domain so it happens before
 /// any Decimal128/f64 conversion that could mask ordering. Strings are compared
-/// lexicographically (matching DynamoDB), numbers via f64 (adequate for ordering —
-/// values exceeding Decimal128 range are rejected downstream in `sk_to_bson`), and
-/// binary bytewise.
+/// lexicographically (matching DynamoDB) and binary bytewise.
+///
+/// Numbers are compared via `f64`. f64→nearest rounding is monotonic, so this can
+/// never make a valid `low <= high` range look inverted (no false ValidationException):
+/// if `low <= high` then `low as f64 <= high as f64`. The only imprecision is the
+/// reverse — a genuinely inverted range whose bounds differ only beyond f64's ~15–17
+/// significant digits (DynamoDB numbers carry up to 38) rounds to equal and slips
+/// past this guard. In that pathological case the `$gte low > $lte high` query simply
+/// returns an empty result instead of the ValidationException DynamoDB would raise.
+/// This bounded divergence is documented in `docs/differences-from-dynamodb.md`.
 fn sk_between_low_gt_high(low: &AttributeValue, high: &AttributeValue) -> bool {
     match (low, high) {
         (AttributeValue::S(l), AttributeValue::S(h)) => l > h,
