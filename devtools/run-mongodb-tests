@@ -66,14 +66,18 @@ if [[ ${#RUN_TESTS_ARGS[@]} -eq 0 ]]; then
     RUN_TESTS_ARGS=(--pytest --comprehensive --parallel)
 fi
 
+# Derive the output dir and container name from the mongo port (plus PID for
+# the dir) so concurrent runs on different ports do not collide: a shared
+# container name + a shared `docker rm -f` at startup would let one run tear
+# down another run's mongo and overwrite its logs.
 if [[ -z "$OUTPUT_DIR" ]]; then
-    OUTPUT_DIR="/tmp/run-mongodb-tests-$(date +%Y%m%d-%H%M%S)"
+    OUTPUT_DIR="/tmp/run-mongodb-tests-${MONGO_PORT}-$(date +%Y%m%d-%H%M%S)-$$"
 fi
 mkdir -p "$OUTPUT_DIR"
 
 CONFIG="$OUTPUT_DIR/extenddb.toml"
 SERVER_LOG="$OUTPUT_DIR/server.log"
-CONTAINER_NAME="extenddb-runtests-mongo"
+CONTAINER_NAME="extenddb-runtests-mongo-${MONGO_PORT}"
 BINARY="./target/release/extenddb"
 
 if [[ ! -x "$BINARY" ]]; then
