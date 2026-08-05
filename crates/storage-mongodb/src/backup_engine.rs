@@ -411,7 +411,14 @@ impl BackupEngine for MongoEngine {
         Box::pin(async move {
             let backups_coll = self.catalog_db.collection::<Document>("backups");
             let backup_doc = backups_coll
-                .find_one(doc! { "_id": &backup_arn, "backup_status": "AVAILABLE" })
+                // Scope to the calling account (defence-in-depth: the engine
+                // layer already enforces ARN ownership, and describe/delete are
+                // account-scoped at the storage layer too).
+                .find_one(doc! {
+                    "_id": &backup_arn,
+                    "account_id": &account_id,
+                    "backup_status": "AVAILABLE",
+                })
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?
                 .ok_or_else(|| {
