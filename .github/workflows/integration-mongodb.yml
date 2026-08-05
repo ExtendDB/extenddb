@@ -1,0 +1,67 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+name: MongoDB Integration Tests
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# The MongoDB backend needs a replica set (single-node --replSet + rs.initiate()
+# + wait-for-PRIMARY) for transactions and streams, which GitHub `services:`
+# cannot express. `devtools/run-mongodb-tests` performs that bootstrap, then
+# init/serve/provision extenddb and delegates the workload to
+# `run-tests --backend mongodb`, tearing everything down on exit. Both jobs
+# reuse it so CI runs the exact path developers run locally (no drift), while
+# splitting pytest and rust into parallel jobs the way integration.yml does.
+jobs:
+  mongodb-pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Build release (mongodb backend)
+        run: cargo build --release --features mongodb
+      - name: Run MongoDB pytest suite
+        run: devtools/run-mongodb-tests -- --pytest --comprehensive --parallel
+
+  mongodb-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Build release (mongodb backend)
+        run: cargo build --release --features mongodb
+      - name: Run MongoDB rust integration suite
+        run: devtools/run-mongodb-tests -- --rust --rust-integration
+
+  mongodb-integration:
+    runs-on: ubuntu-latest
+    needs: [mongodb-pytest, mongodb-rust]
+    if: always()
+    steps:
+      - run: |
+          if [ "${{ needs.mongodb-pytest.result }}" != "success" ] || \
+             [ "${{ needs.mongodb-rust.result }}" != "success" ]; then
+            exit 1
+          fi
