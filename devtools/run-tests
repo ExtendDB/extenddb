@@ -443,7 +443,7 @@ if $RUN_PYTEST; then
     fi
     echo "  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}"
     # CLI lifecycle tests manage their own server; exclude from main suite
-    PYTEST_ARGS=(python3 -m pytest tests/ -v --ignore=tests/python --ignore=tests/test_cli_lifecycle.py --ignore=tests/test_cli_container_readiness.py --ignore=tests/test_gsi_async_queue.py)
+    PYTEST_ARGS=(python3 -m pytest tests/ -v --ignore=tests/python --ignore=tests/test_cli_lifecycle.py --ignore=tests/test_cli_container_readiness.py --ignore=tests/test_cli_migrate_concurrency.py --ignore=tests/test_gsi_async_queue.py)
     # Parallel execution (--parallel): distribute by file so module/class-scoped
     # fixtures stay within a single worker.
     if [[ -n "$PARALLEL" ]] && python3 -c "import xdist" 2>/dev/null; then
@@ -532,7 +532,7 @@ fi
 if $RUN_PYTEST && [[ "$TARGET" != "real-dynamodb" && -n "${EXTENDDB_TEST_PG_CONNECTION_STRING:-}" ]]; then
     CLI_OUTFILE="discussions/test-cli-${HASH}.txt"
     echo "=== CLI lifecycle tests → ${CLI_OUTFILE} ==="
-    CLI_ARGS=(python3 -m pytest tests/test_cli_lifecycle.py tests/test_cli_container_readiness.py -v)
+    CLI_ARGS=(python3 -m pytest tests/test_cli_lifecycle.py tests/test_cli_container_readiness.py tests/test_cli_migrate_concurrency.py -v)
     if [[ -n "$FILTER" ]]; then
         CLI_ARGS+=(-k "$FILTER")
     fi

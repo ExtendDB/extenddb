@@ -66,6 +66,28 @@ pub trait Bootstrapper: Send + Sync {
     /// Run data schema migrations (stream tables, sequences, etc.).
     async fn run_data_migrations(&self) -> OpResult<()>;
 
+    /// Acquire a cross-process lock so that concurrent `migrate` runs, such as
+    /// several replicas starting at once, don't race each other applying schema
+    /// changes. Blocks until the lock is available.
+    ///
+    /// The default is a no-op, which means a backend that does not override this
+    /// gets no serialization at all. Implement it if concurrent bootstrap is a
+    /// supported deployment for your backend.
+    ///
+    /// Implementations need not be re-entrant, and callers must not acquire
+    /// twice without releasing. Every acquire must be paired with
+    /// [`Bootstrapper::release_migration_lock`], and the backend must also
+    /// release the lock if the process dies without doing so.
+    async fn acquire_migration_lock(&self) -> OpResult<()> {
+        Ok(())
+    }
+
+    /// Release the lock taken by [`Bootstrapper::acquire_migration_lock`], and
+    /// do nothing if no lock is held. Defaults to a no-op.
+    async fn release_migration_lock(&self) -> OpResult<()> {
+        Ok(())
+    }
+
     /// Filenames of data-database migrations that have not yet been applied.
     ///
     /// Excludes a pre-tracking baseline migration that already exists and will
@@ -463,5 +485,107 @@ pub mod helpers {
             // Should return first occurrence
             assert_eq!(extract_arg(&args, "--host"), Some("first".to_string()));
         }
+    }
+}
+
+/// Compile-time and behaviour guard for out-of-tree backends.
+///
+/// `MinimalBootstrapper` implements only the methods the trait requires. If a
+/// new required method is added, or a defaulted one loses its default, this
+/// stops compiling, which is the same breakage an out-of-tree backend crate
+/// would hit. It also pins object safety by boxing as `dyn Bootstrapper`, and
+/// checks that the defaulted migration-lock methods are usable no-ops.
+#[cfg(test)]
+mod out_of_tree_compat_tests {
+    use super::*;
+    use crate::management_store::OpResult;
+
+    struct MinimalBootstrapper;
+
+    #[async_trait]
+    impl Bootstrapper for MinimalBootstrapper {
+        async fn ensure_app_user(&self) -> OpResult<()> {
+            Ok(())
+        }
+        async fn grant_app_role_to_admin(&self) -> OpResult<()> {
+            Ok(())
+        }
+        async fn create_catalog_db(&self) -> OpResult<()> {
+            Ok(())
+        }
+        async fn create_data_db(&self) -> OpResult<()> {
+            Ok(())
+        }
+        async fn run_catalog_migrations(&self) -> OpResult<()> {
+            Ok(())
+        }
+        async fn run_data_migrations(&self) -> OpResult<()> {
+            Ok(())
+        }
+        async fn pending_data_migrations(&self) -> OpResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn record_data_connection(&self) -> OpResult<()> {
+            Ok(())
+        }
+        async fn bootstrap_encryption_key(&self) -> OpResult<()> {
+            Ok(())
+        }
+        async fn bootstrap_default_account(&self) -> OpResult<()> {
+            Ok(())
+        }
+        async fn bootstrap_admin_user(
+            &self,
+            env_user: Option<&str>,
+            _env_password: Option<&str>,
+        ) -> OpResult<AdminBootstrapResult> {
+            Ok(AdminBootstrapResult {
+                username: env_user.unwrap_or("admin").to_owned(),
+                generated_password: None,
+                already_existed: false,
+                from_env: false,
+            })
+        }
+        async fn is_catalog_initialized(&self) -> OpResult<bool> {
+            Ok(true)
+        }
+        async fn list_table_names(&self) -> OpResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn get_data_db_name(&self) -> OpResult<Option<String>> {
+            Ok(None)
+        }
+        async fn drop_databases(&self, _data_db: &str) -> OpResult<()> {
+            Ok(())
+        }
+        async fn read_catalog_version(&self) -> OpResult<Option<String>> {
+            Ok(None)
+        }
+        fn expected_catalog_version(&self) -> String {
+            "0.0.0".to_owned()
+        }
+        fn catalog_database_name(&self) -> String {
+            "minimal".to_owned()
+        }
+        fn endpoint_info(&self) -> String {
+            "in-memory".to_owned()
+        }
+        fn catalog_connection_url(&self) -> String {
+            "minimal://".to_owned()
+        }
+        fn generate_backend_config_section(&self) -> String {
+            String::new()
+        }
+    }
+
+    /// A backend that does not implement the migration lock still works, and
+    /// the defaults are no-ops rather than errors.
+    #[tokio::test]
+    async fn migration_lock_defaults_to_a_usable_no_op() {
+        let bootstrapper: Box<dyn Bootstrapper> = Box::new(MinimalBootstrapper);
+        assert!(bootstrapper.acquire_migration_lock().await.is_ok());
+        assert!(bootstrapper.release_migration_lock().await.is_ok());
+        // Releasing without acquiring must also be harmless.
+        assert!(bootstrapper.release_migration_lock().await.is_ok());
     }
 }

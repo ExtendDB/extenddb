@@ -203,32 +203,21 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
-    // Check if catalog is already initialized.
-    let initialized = bootstrapper
-        .is_catalog_initialized()
+    // Take the same lock `migrate` uses around the schema work below, so an
+    // init cannot race a migrate running on another replica and fail on a
+    // duplicate pg_type entry from concurrent `CREATE TABLE IF NOT EXISTS`.
+    // Two concurrent inits cannot get this far: the second aborts earlier, at
+    // `create_catalog_db`, because the database already exists. The catalog
+    // database does exist by this point, so the lock connection can be opened.
+    bootstrapper
+        .acquire_migration_lock()
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-
-    if initialized {
-        println!("--- Catalog already initialized. Use 'extenddb migrate' for pending migrations.");
-    } else {
-        bootstrapper
-            .run_catalog_migrations()
-            .await
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let migration_result = run_init_migrations(bootstrapper.as_ref()).await;
+    if let Err(e) = bootstrapper.release_migration_lock().await {
+        tracing::warn!("Failed to release migration lock: {e:?}");
     }
-
-    // Record data database connection in catalog.
-    bootstrapper
-        .record_data_connection()
-        .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-
-    // Initialize data database schema.
-    bootstrapper
-        .run_data_migrations()
-        .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    migration_result?;
 
     bootstrapper
         .bootstrap_encryption_key()
@@ -298,6 +287,41 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
     );
 
     Ok(0)
+}
+
+/// Apply the catalog and data schema while the migration lock is held. Split out
+/// of `run` so that the lock is released on every path, including errors.
+async fn run_init_migrations(
+    bootstrapper: &dyn extenddb_storage::bootstrapper::Bootstrapper,
+) -> anyhow::Result<()> {
+    // Check if catalog is already initialized.
+    let initialized = bootstrapper
+        .is_catalog_initialized()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
+    if initialized {
+        println!("--- Catalog already initialized. Use 'extenddb migrate' for pending migrations.");
+    } else {
+        bootstrapper
+            .run_catalog_migrations()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    }
+
+    // Record data database connection in catalog.
+    bootstrapper
+        .record_data_connection()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
+    // Initialize data database schema.
+    bootstrapper
+        .run_data_migrations()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
+    Ok(())
 }
 
 /// Extract a CLI argument value by flag name.
