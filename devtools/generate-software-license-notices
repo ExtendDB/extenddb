@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+
+set -euo pipefail
+exec < /dev/null
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_DIR"
+
+EXPECTED_VERSION="0.9.0"
+MODE="generate"
+if [[ ${1:-} == "--check" ]]; then
+    MODE="check"
+    shift
+fi
+if [[ $# -ne 0 ]]; then
+    echo "usage: devtools/generate-software-license-notices [--check]" >&2
+    exit 2
+fi
+
+if ! cargo about --version >/dev/null 2>&1; then
+    echo "error: cargo-about $EXPECTED_VERSION is required" >&2
+    echo "install with: cargo install --locked --version $EXPECTED_VERSION --features cli cargo-about" >&2
+    exit 1
+fi
+
+ACTUAL_VERSION=$(cargo about --version | awk '{print $2}')
+if [[ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]]; then
+    echo "error: cargo-about $EXPECTED_VERSION required; found $ACTUAL_VERSION" >&2
+    exit 1
+fi
+
+OUTPUT="SOFTWARE-LICENSE-NOTICES.html"
+TEMP=$(mktemp "${TMPDIR:-/tmp}/extenddb-notices.XXXXXX")
+trap 'rm -f "$TEMP"' EXIT
+
+cargo about generate \
+    --manifest-path crates/bin/Cargo.toml \
+    --no-default-features \
+    --features postgres \
+    --locked \
+    --fail \
+    about.hbs \
+    --output-file "$TEMP"
+
+if [[ "$MODE" == "check" ]]; then
+    if ! cmp -s "$TEMP" "$OUTPUT"; then
+        echo "error: $OUTPUT is stale" >&2
+        echo "run: devtools/generate-software-license-notices" >&2
+        exit 1
+    fi
+    echo "$OUTPUT is current"
+else
+    mv "$TEMP" "$OUTPUT"
+    chmod 0644 "$OUTPUT"
+    trap - EXIT
+    echo "generated $OUTPUT"
+fi

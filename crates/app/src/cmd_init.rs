@@ -42,6 +42,7 @@ pub struct InitArgs {
     pg_user: Option<String>,
 
     /// PostgreSQL admin password (required for remote/Aurora connections).
+    /// Prefer `EXTENDDB_PG_PASSWORD` to keep the value out of process arguments.
     #[arg(long)]
     pg_pass: Option<String>,
 
@@ -49,7 +50,8 @@ pub struct InitArgs {
     #[arg(long)]
     extenddb_user: Option<String>,
 
-    /// extenddb application password
+    /// extenddb application password.
+    /// Prefer `EXTENDDB_APP_PASSWORD` to keep the value out of process arguments.
     #[arg(long)]
     extenddb_pass: Option<String>,
 
@@ -160,8 +162,21 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
         return Ok(255);
     }
 
-    // Collect CLI args for backend-specific parsing
-    let cli_args: Vec<String> = std::env::args().collect();
+    // Collect CLI args for backend-specific parsing. Environment-sourced
+    // secrets are appended only to this in-process copy, not OS-visible argv.
+    let mut cli_args: Vec<String> = std::env::args().collect();
+    crate::util::append_secret_arg(
+        &mut cli_args,
+        "--pg-pass",
+        std::env::var_os("EXTENDDB_PG_PASSWORD"),
+        "EXTENDDB_PG_PASSWORD",
+    )?;
+    crate::util::append_secret_arg(
+        &mut cli_args,
+        "--extenddb-pass",
+        std::env::var_os("EXTENDDB_APP_PASSWORD"),
+        "EXTENDDB_APP_PASSWORD",
+    )?;
 
     // Extract bind_addr from CLI args
     let bind_addr =
