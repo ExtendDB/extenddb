@@ -19,7 +19,8 @@ pub struct MigrateArgs {
     #[arg(long)]
     pg_user: Option<String>,
 
-    /// `PostgreSQL` admin password
+    /// `PostgreSQL` admin password.
+    /// Prefer `EXTENDDB_PG_PASSWORD` to keep the value out of process arguments.
     #[arg(long)]
     pg_pass: Option<String>,
 
@@ -45,8 +46,15 @@ pub async fn run(args: MigrateArgs) -> anyhow::Result<()> {
     println!("Config:           {}", args.config);
     println!();
 
-    // Collect CLI args for backend-specific parsing
-    let cli_args: Vec<String> = std::env::args().collect();
+    // Collect CLI args for backend-specific parsing. The environment-sourced
+    // secret is appended only to this in-process copy, not OS-visible argv.
+    let mut cli_args: Vec<String> = std::env::args().collect();
+    crate::util::append_secret_arg(
+        &mut cli_args,
+        "--pg-pass",
+        std::env::var_os("EXTENDDB_PG_PASSWORD"),
+        "EXTENDDB_PG_PASSWORD",
+    )?;
 
     // Create bootstrapper via registry
     let bootstrap = extenddb_storage::bootstrapper::create_bootstrapper(&args.config, &cli_args)

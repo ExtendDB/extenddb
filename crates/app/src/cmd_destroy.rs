@@ -20,7 +20,8 @@ pub struct DestroyArgs {
     #[arg(long, default_value_t = config::whoami("postgres"))]
     pg_user: String,
 
-    /// PostgreSQL admin password
+    /// PostgreSQL admin password.
+    /// Prefer `EXTENDDB_PG_PASSWORD` to keep the value out of process arguments.
     #[arg(long)]
     pg_pass: Option<String>,
 
@@ -40,8 +41,15 @@ pub async fn run(args: DestroyArgs) -> anyhow::Result<()> {
     let app_config = config::load(&args.config)?;
     let backend = &app_config.storage.backend;
 
-    // Collect CLI args for backend-specific parsing
-    let cli_args: Vec<String> = std::env::args().collect();
+    // Collect CLI args for backend-specific parsing. The environment-sourced
+    // secret is appended only to this in-process copy, not OS-visible argv.
+    let mut cli_args: Vec<String> = std::env::args().collect();
+    crate::util::append_secret_arg(
+        &mut cli_args,
+        "--pg-pass",
+        std::env::var_os("EXTENDDB_PG_PASSWORD"),
+        "EXTENDDB_PG_PASSWORD",
+    )?;
 
     println!("=== extenddb destroy ===");
     println!("Config:           {}", args.config);
