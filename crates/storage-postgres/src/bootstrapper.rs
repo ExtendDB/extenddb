@@ -7,6 +7,8 @@
 //! teardown using PostgreSQL-specific DDL. Connection pools are created
 //! lazily as needed during the bootstrap sequence.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use extenddb_storage::bootstrapper::{
     AdminBootstrapResult, BootstrapConfig, Bootstrapper,
@@ -18,10 +20,27 @@ use extenddb_storage::bootstrapper::{
 use extenddb_storage::management_store::{OpError, OpResult};
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, OnceCell};
 
 use crate::CATALOG_VERSION;
 use crate::migrations;
+
+/// ExtendDB's advisory-lock namespace. PostgreSQL's two-argument form,
+/// `pg_advisory_xact_lock(classid, objid)`, lets ExtendDB reserve one stable
+/// `classid` by convention and assign a distinct `objid` to each internal lock.
+/// Other applications in the same database must avoid choosing the same keys.
+///
+/// The value itself is arbitrary. It only has to stay stable across releases and
+/// differ from any other namespace we add later.
+const ADVISORY_LOCK_NAMESPACE: i32 = 0x0045_4442; // 'E', 'D', 'B'
+/// `objid` for the schema-migration lock, which serializes concurrent `migrate`
+/// runs (for example several replicas starting at once).
+const MIGRATION_LOCK_OBJID: i32 = 1;
+
+/// Maximum time to wait for another migrator. Normal contention should clear
+/// well within this window; expiry indicates a peer that is likely wedged and
+/// needs operator attention rather than an indefinitely stuck init Job.
+const MIGRATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Utilities for bootstrapping a `PostgreSQL` backend store.
 ///
@@ -32,6 +51,9 @@ use crate::migrations;
 pub struct PostgresBootstrapper {
     config: BootstrapConfig,
     admin_pool: OnceCell<PgPool>,
+    /// Dedicated connection whose open transaction holds the migration advisory
+    /// lock. `None` when no migration lock is held.
+    lock_conn: Mutex<Option<sqlx::PgConnection>>,
 }
 
 impl PostgresBootstrapper {
@@ -42,6 +64,7 @@ impl PostgresBootstrapper {
         Self {
             config,
             admin_pool: OnceCell::new(),
+            lock_conn: Mutex::new(None),
         }
     }
 
@@ -207,6 +230,136 @@ impl Bootstrapper for PostgresBootstrapper {
     async fn run_data_migrations(&self) -> OpResult<()> {
         let pool = self.app_pool(&self.config.data_db).await?;
         migrations::run_data_migrations(&pool).await
+    }
+
+    async fn acquire_migration_lock(&self) -> OpResult<()> {
+        use std::io::Write as _;
+
+        use sqlx::Connection;
+
+        // This is not re-entrant. A second call would open a second transaction
+        // and block on the lock the first one holds, deadlocking against itself.
+        let mut held = self.lock_conn.lock().await;
+        if held.is_some() {
+            return Err(OpError::Internal(
+                "Migration lock is already held by this process".to_owned(),
+            ));
+        }
+
+        // Keep an explicit transaction open on a dedicated catalog connection
+        // for the whole migration. Transaction-level advisory locks are released
+        // automatically when that transaction ends or the connection dies.
+        //
+        // The explicit transaction is important for transaction-pooling proxies:
+        // they must retain one PostgreSQL backend until COMMIT/ROLLBACK, so the
+        // lock cannot silently move between backends as separate autocommit
+        // statements can. RDS Proxy also supports this path without session
+        // pinning. The migration statements can use separate connections because
+        // advisory locks coordinate globally within the catalog database.
+        //
+        // Advisory locks are scoped to a database, so migrators only serialize
+        // if they share this catalog database. ExtendDB replicas normally do,
+        // because they use the same catalog connection string.
+        let mut conn =
+            sqlx::PgConnection::connect_with(&self.app_connect_opts(&self.config.catalog_db))
+                .await
+                .map_err(|e| {
+                    OpError::Internal(format!("Cannot connect to take migration lock: {e}"))
+                })?;
+        sqlx::query("BEGIN")
+            .execute(&mut conn)
+            .await
+            .map_err(|e| OpError::Internal(format!("Cannot begin migration lock: {e}")))?;
+
+        // Equivalent to SET LOCAL lock_timeout, but parameterized so the Rust
+        // duration remains the single source of truth. This applies only to the
+        // dedicated transaction and is discarded by rollback on release.
+        let lock_timeout = format!("{}ms", MIGRATION_LOCK_TIMEOUT.as_millis());
+        let _: String = sqlx::query_scalar("SELECT set_config('lock_timeout', $1, true)")
+            .bind(&lock_timeout)
+            .fetch_one(&mut conn)
+            .await
+            .map_err(|e| {
+                OpError::Internal(format!("Cannot configure migration lock timeout: {e}"))
+            })?;
+
+        // Try first so that a migrator which has to wait can say so, rather
+        // than sitting silent for as long as the other migration takes.
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1, $2)")
+            .bind(ADVISORY_LOCK_NAMESPACE)
+            .bind(MIGRATION_LOCK_OBJID)
+            .fetch_one(&mut conn)
+            .await
+            .map_err(|e| OpError::Internal(format!("Cannot acquire migration lock: {e}")))?;
+        if !acquired {
+            println!("--- Another migrator holds the migration lock; waiting for it to finish...");
+            std::io::stdout()
+                .flush()
+                .map_err(|e| OpError::Internal(format!("Cannot report migration wait: {e}")))?;
+            sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+                .bind(ADVISORY_LOCK_NAMESPACE)
+                .bind(MIGRATION_LOCK_OBJID)
+                .execute(&mut conn)
+                .await
+                .map_err(|e| {
+                    if let sqlx::Error::Database(db_err) = &e
+                        && db_err.code().as_deref() == Some("55P03")
+                    {
+                        return OpError::Internal(format!(
+                            "Timed out after {}s waiting for the migration advisory lock; \
+                             another migrator may be wedged. Check the holder's logs or \
+                             terminate it before retrying: {e}",
+                            MIGRATION_LOCK_TIMEOUT.as_secs(),
+                        ));
+                    }
+                    OpError::Internal(format!("Cannot acquire migration lock: {e}"))
+                })?;
+            println!("--- Migration lock acquired.");
+            std::io::stdout()
+                .flush()
+                .map_err(|e| OpError::Internal(format!("Cannot report migration lock: {e}")))?;
+        }
+
+        // Guard against a key or lock-mode mismatch in the acquisition queries.
+        // `objsubid = 2` distinguishes the two-i32 advisory-lock keyspace from
+        // the one-i64 form, and `granted` excludes a merely waiting request.
+        let held_by_this_transaction: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_locks \
+             WHERE locktype = 'advisory' AND classid = $1 AND objid = $2 \
+               AND objsubid = 2 AND mode = 'ExclusiveLock' AND granted \
+               AND pid = pg_backend_pid())",
+        )
+        .bind(ADVISORY_LOCK_NAMESPACE)
+        .bind(MIGRATION_LOCK_OBJID)
+        .fetch_one(&mut conn)
+        .await
+        .map_err(|e| OpError::Internal(format!("Cannot verify migration lock: {e}")))?;
+        if !held_by_this_transaction {
+            return Err(OpError::Internal(
+                "PostgreSQL did not report the migration transaction's advisory lock after \
+                 acquisition; refusing to run migrations without verified serialization"
+                    .to_owned(),
+            ));
+        }
+
+        *held = Some(conn);
+        Ok(())
+    }
+
+    async fn release_migration_lock(&self) -> OpResult<()> {
+        use sqlx::Connection;
+
+        let Some(mut conn) = self.lock_conn.lock().await.take() else {
+            return Ok(());
+        };
+        // This transaction contains only the advisory lock, so rollback is the
+        // safest release: it cannot accidentally commit future work added to the
+        // dedicated connection. Closing is a backstop if rollback fails.
+        let release = sqlx::query("ROLLBACK").execute(&mut conn).await;
+        let _ = conn.close().await;
+        release
+            .map(|_| ())
+            .map_err(|e| OpError::Internal(format!("Cannot release migration lock: {e}")))
     }
 
     async fn pending_data_migrations(&self) -> OpResult<Vec<String>> {
