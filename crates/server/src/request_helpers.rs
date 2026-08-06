@@ -62,34 +62,7 @@ pub(crate) async fn authorize_request(
     operation: &str,
     account_id: &str,
 ) -> Result<Option<extenddb_core::types::TableKeyInfo>, DynamoDbError> {
-    // Batch and transaction operations address multiple tables in nested request
-    // structures with no top-level TableName. DynamoDB authorizes each of them
-    // per table, against that table's specific ARN, using the IAM action the
-    // operation maps to (BatchGetItem/BatchWriteItem are their own actions;
-    // TransactGetItems decomposes to GetItem; TransactWriteItems decomposes to
-    // the per-sub-op action). Authorizing the whole request against a single
-    // `table/*` wildcard — as the generic path below does — lets an explicit
-    // Deny on one table be bypassed. Evaluate every (action, table) pair and
-    // reject the entire request if any is denied (all-or-nothing), matching
-    // DynamoDB. Verified against the AWS IAM Service Authorization Reference.
-    if let Some(targets) = batch_transact_authz_targets(operation, input) {
-        for (action_op, table) in targets {
-            let resource_arn = build_resource_arn(&state.region, account_id, Some(&table));
-            authorization::check_authorization(
-                state.authz_cache.as_ref(),
-                identity,
-                &action_op,
-                &resource_arn,
-                false,
-                extenddb_auth::policy::context::RequestParams::default(),
-            )
-            .await?;
-        }
-        return Ok(None);
-    }
-
     let table_name = extract_table_name(input);
-    let resource_arn = build_resource_arn(&state.region, account_id, table_name.as_deref());
 
     // P118: Fetch table_key_info for item-level operations via the SWR cache.
     // The result is used for LeadingKeys extraction here AND returned to the
@@ -112,9 +85,44 @@ pub(crate) async fn authorize_request(
     // verification already ran upstream, so the request is authenticated; only
     // the IAM policy decision is skipped. key_info is still returned so the
     // engine layer can reuse it.
+    //
+    // This check is deliberately positioned ahead of EVERY authorization branch
+    // below, not merely the generic one. It previously sat after the batch and
+    // transaction branch, which returns early, so those four operations were
+    // still evaluated against IAM and denied in a dev-mode build while single
+    // item operations passed. Any future operation-specific branch must be added
+    // below this point, or it will reintroduce that defect.
     if state.dev_mode {
         return Ok(key_info);
     }
+
+    // Batch and transaction operations address multiple tables in nested request
+    // structures with no top-level TableName. DynamoDB authorizes each of them
+    // per table, against that table's specific ARN, using the IAM action the
+    // operation maps to (BatchGetItem/BatchWriteItem are their own actions;
+    // TransactGetItems decomposes to GetItem; TransactWriteItems decomposes to
+    // the per-sub-op action). Authorizing the whole request against a single
+    // `table/*` wildcard, as the generic path below does, lets an explicit
+    // Deny on one table be bypassed. Evaluate every (action, table) pair and
+    // reject the entire request if any is denied (all-or-nothing), matching
+    // DynamoDB. Verified against the AWS IAM Service Authorization Reference.
+    if let Some(targets) = batch_transact_authz_targets(operation, input) {
+        for (action_op, table) in targets {
+            let resource_arn = build_resource_arn(&state.region, account_id, Some(&table));
+            authorization::check_authorization(
+                state.authz_cache.as_ref(),
+                identity,
+                &action_op,
+                &resource_arn,
+                false,
+                extenddb_auth::policy::context::RequestParams::default(),
+            )
+            .await?;
+        }
+        return Ok(None);
+    }
+
+    let resource_arn = build_resource_arn(&state.region, account_id, table_name.as_deref());
 
     let pk_attr = key_info
         .as_ref()

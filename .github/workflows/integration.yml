@@ -126,6 +126,58 @@ jobs:
           EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
         run: devtools/run-tests --extenddb --pytest --comprehensive --parallel --filter "not import_export"
 
+  run-integration-dev-mode:
+    # dev-mode was shipped with no CI coverage at all, which is how the batch and
+    # transaction authorization regression reached main: the build compiled, so
+    # a feature-matrix check passed, while nothing ever issued a request against
+    # a dev-mode server. This job starts one and exercises the data plane.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build release (dev mode, in-memory SQLite)
+        run: cargo build --release -p extenddb --no-default-features --features sqlite-memory,dev-mode
+
+      - name: Start ExtendDB in dev mode
+        run: |
+          # No config file on purpose: dev mode falls back to built-in defaults,
+          # which is the zero-config path a user gets, and the one the profile
+          # documents as a DynamoDB Local replacement.
+          ./target/release/extenddb serve --foreground --port 18444 --config /nonexistent.toml &
+          for i in $(seq 1 30); do
+            if curl -s http://127.0.0.1:18444/health | grep -q healthy; then
+              echo "Server ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server failed to start"
+          exit 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run dev-mode authorization tests
+        env:
+          EXTENDDB_TEST_ENDPOINT: http://127.0.0.1:18444
+          EXTENDDB_TEST_DEV_MODE: "1"
+          AWS_DEFAULT_REGION: us-east-1
+          # The seeded zero-config dev credential. AWS's documented example key,
+          # which grants nothing anywhere; it exists so SigV4 has a key to verify.
+          AWS_ACCESS_KEY_ID: AKIAIOSFODNN7EXAMPLE
+          AWS_SECRET_ACCESS_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+        run: python3 -m pytest tests/test_dev_mode_authorization.py -v
+
   run-rust-integration:
     runs-on: ubuntu-latest
     services:
@@ -213,12 +265,19 @@ jobs:
 
   integration:
     runs-on: ubuntu-latest
-    needs: [run-integration, run-integration-sqlite, run-rust-integration]
+    needs:
+      [
+        run-integration,
+        run-integration-sqlite,
+        run-integration-dev-mode,
+        run-rust-integration,
+      ]
     if: always()
     steps:
       - run: |
           if [ "${{ needs.run-integration.result }}" != "success" ] || \
              [ "${{ needs.run-integration-sqlite.result }}" != "success" ] || \
+             [ "${{ needs.run-integration-dev-mode.result }}" != "success" ] || \
              [ "${{ needs.run-rust-integration.result }}" != "success" ]; then
             exit 1
           fi
