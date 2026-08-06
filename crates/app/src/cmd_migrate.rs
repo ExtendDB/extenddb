@@ -53,6 +53,25 @@ pub async fn run(args: MigrateArgs) -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
+    // Serialize concurrent migrators, such as several replicas starting at
+    // once, so they don't race each other applying schema changes.
+    bootstrap
+        .acquire_migration_lock()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let result = apply_migrations(bootstrap.as_ref(), &args).await;
+    if let Err(e) = bootstrap.release_migration_lock().await {
+        tracing::warn!("Failed to release migration lock: {e:?}");
+    }
+    result
+}
+
+/// Run the version checks and apply pending migrations while the migration lock
+/// is held. Split out of `run` so that the lock is always released afterwards.
+async fn apply_migrations(
+    bootstrap: &dyn extenddb_storage::bootstrapper::Bootstrapper,
+    args: &MigrateArgs,
+) -> anyhow::Result<()> {
     // Show current catalog version.
     println!("--- Checking current catalog version...");
     let current = bootstrap
