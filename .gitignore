@@ -14,3 +14,8 @@ extenddb.sqlite
 extenddb.sqlite-shm
 extenddb.sqlite-wal
 extenddb.toml.bak
+
+# Local container environment files
+.env
+.env.*
+!.env.example
