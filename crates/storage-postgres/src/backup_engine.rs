@@ -8,7 +8,6 @@ use extenddb_core::types::{
     PointInTimeRecoveryDescription, SourceTableDetails, TableDescription,
 };
 use extenddb_storage::BackupEngine;
-use extenddb_storage::TableEngine;
 use extenddb_storage::error::StorageError;
 use futures::future::BoxFuture;
 
@@ -451,15 +450,19 @@ impl BackupEngine for PostgresEngine {
                 on_demand_throughput: None,
             };
 
-            let desc = self.create_table(&account_id, create_input).await?;
+            // Create the table with the ACTIVE transition deferred: it enters
+            // CREATING with no scheduled flip, so the control-plane worker
+            // cannot mark it ACTIVE while the item copy below is still
+            // running. The explicit ACTIVE update after the copy is the only
+            // way this table leaves CREATING, so ACTIVE implies the restored
+            // data is fully present.
+            let desc = self
+                .create_table_impl(&account_id, create_input, true)
+                .await?;
 
             let new_table_id = &desc.table_id;
             let ddb_table = data_table_name(new_table_id);
             let ddb_table_unquoted = ddb_table.trim_matches('"');
-
-            // Do NOT force ACTIVE — let the control plane handle the transition
-            // (steering rule D-2: tests run with control_plane_delay_seconds > 0).
-            // The table starts in CREATING and transitions to ACTIVE after the delay.
 
             let has_sk: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM information_schema.columns \
@@ -513,10 +516,10 @@ impl BackupEngine for PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
 
-            // Mark the restored table ACTIVE immediately — the data is fully
-            // populated and the table is ready to serve requests. This matches
-            // real DynamoDB behavior where restored tables become ACTIVE once
-            // the restore completes (the CREATING status is transient).
+            // Mark the restored table ACTIVE now that the copy has fully
+            // drained. The table was created with the transition deferred, so
+            // this is the first point it can become ACTIVE, by ordering rather
+            // than by timing.
             sqlx::query(
                 "UPDATE tables SET table_status = 'ACTIVE', status_transition_at = NULL \
              WHERE account_id = $1 AND table_name = $2",
