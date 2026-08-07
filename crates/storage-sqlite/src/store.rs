@@ -18,12 +18,12 @@
 //! invalidated by another pool committing) rather than surfacing it as a 500.
 //! Reads run concurrently from the pool against WAL snapshots and take no lock.
 
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use extenddb_storage::error::StorageError;
-use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::SqlitePool;
+use sqlx::sqlite::SqlitePoolOptions;
 use tokio::sync::Mutex;
 
 use crate::schema::CATALOG_VERSION;
