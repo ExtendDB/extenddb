@@ -10,9 +10,9 @@
 
 use extenddb_core::expression::{Expr, ExpressionMaps};
 use extenddb_core::types::{Item, TableKeyInfo};
-use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{pk_to_text, sk_column, sk_info};
+use extenddb_storage::StreamCapture;
 
 use super::index::{enqueue_async_indexes, fetch_indexes_for_table, sync_indexes};
 use super::query::check_condition;
@@ -56,7 +56,7 @@ impl SqliteEngine {
             .map_err(|e| StorageError::Validation(e.to_string()))?;
         }
 
-        let system_delay = self.gsi_default_delay();
+        let system_delay = self.gsi_default_delay().await;
         let need_old = condition.is_some() || return_old || !indexes.is_empty() || stream.is_some();
 
         let mut tx = self

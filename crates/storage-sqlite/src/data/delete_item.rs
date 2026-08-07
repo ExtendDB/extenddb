@@ -5,8 +5,8 @@
 
 use extenddb_core::expression::{Expr, ExpressionMaps};
 use extenddb_core::types::{Item, TableKeyInfo};
-use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
+use extenddb_storage::StreamCapture;
 
 use super::index::{enqueue_async_indexes, fetch_indexes_for_table, sync_indexes};
 use super::query::check_condition;
@@ -27,7 +27,7 @@ impl SqliteEngine {
         // Read the index set after acquiring the write lock so a concurrently
         // added GSI (UpdateTable holds the same lock) is not missed.
         let indexes = fetch_indexes_for_table(&key_info.table_id, &self.pool).await?;
-        let system_delay = self.gsi_default_delay();
+        let system_delay = self.gsi_default_delay().await;
 
         let mut tx = self
             .pool
