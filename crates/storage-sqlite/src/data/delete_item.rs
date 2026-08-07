@@ -5,8 +5,8 @@
 
 use extenddb_core::expression::{Expr, ExpressionMaps};
 use extenddb_core::types::{Item, TableKeyInfo};
-use extenddb_storage::error::StorageError;
 use extenddb_storage::StreamCapture;
+use extenddb_storage::error::StorageError;
 
 use super::index::{enqueue_async_indexes, fetch_indexes_for_table, sync_indexes};
 use super::query::check_condition;

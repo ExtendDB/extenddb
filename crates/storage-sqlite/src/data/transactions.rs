@@ -15,7 +15,7 @@ use extenddb_core::validation;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{IdempotencyKey, TransactGetOp, TransactWriteOp};
 
-use super::index::{enqueue_async_indexes, fetch_indexes_for_table, sync_indexes, IndexMeta};
+use super::index::{IndexMeta, enqueue_async_indexes, fetch_indexes_for_table, sync_indexes};
 use super::tx_helpers::{
     check_idempotency_token_in_tx, delete_item_in_tx, fetch_item_for_update, fetch_item_in_tx,
     upsert_item_in_tx, write_stream_record_in_tx,
