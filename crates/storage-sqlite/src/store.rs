@@ -18,12 +18,12 @@
 //! invalidated by another pool committing) rather than surfacing it as a 500.
 //! Reads run concurrently from the pool against WAL snapshots and take no lock.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 
 use extenddb_storage::error::StorageError;
-use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 
 use crate::schema::CATALOG_VERSION;
@@ -232,10 +232,30 @@ impl SqliteEngine {
         Ok(if from_env { None } else { Some(password) })
     }
 
-    /// Current cached GSI propagation delay (ms); `0` means synchronous.
-    pub(crate) fn gsi_default_delay(&self) -> u64 {
-        self.gsi_default_delay_ms
-            .load(std::sync::atomic::Ordering::Relaxed)
+    /// Current GSI propagation delay (ms); `0` means synchronous.
+    ///
+    /// Reads the `gsi_propagation_delay_ms` setting live from the catalog so
+    /// out-of-process changes (`extenddb settings set`) take effect on the
+    /// next write, not up to 30 s later when the poll worker refreshes the
+    /// cache. SQLite is a local file, so this is an indexed point lookup with
+    /// negligible cost next to the write it precedes. On a read error the
+    /// cached value (still refreshed by the poll worker) is the fallback; on
+    /// success the cache is re-warmed so fallback reads stay fresh.
+    pub(crate) async fn gsi_default_delay(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        let live: Result<Option<(String,)>, _> =
+            sqlx::query_as("SELECT value FROM settings WHERE key = 'gsi_propagation_delay_ms'")
+                .fetch_optional(&self.pool)
+                .await;
+        match live {
+            Ok(row) => {
+                // Missing row means the default, matching poll_gsi_delay.
+                let ms = row.and_then(|(v,)| v.parse::<u64>().ok()).unwrap_or(10);
+                self.gsi_default_delay_ms.store(ms, Ordering::Relaxed);
+                ms
+            }
+            Err(_) => self.gsi_default_delay_ms.load(Ordering::Relaxed),
+        }
     }
 
     /// Handle to the GSI propagation notifier, woken after an enqueue.
