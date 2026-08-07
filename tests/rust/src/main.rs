@@ -7,6 +7,7 @@
 //! Requires a running extenddb instance with `EXTENDDB_TEST_ENDPOINT` and credentials set.
 
 mod helpers;
+mod restore_active_completeness;
 mod test_base;
 
 #[cfg(test)]
@@ -18,9 +19,9 @@ mod backup_restore;
 #[cfg(test)]
 mod batch_get_item;
 #[cfg(test)]
-mod batch_write_item;
-#[cfg(test)]
 mod batch_transact_authz;
+#[cfg(test)]
+mod batch_write_item;
 #[cfg(test)]
 mod binary_sort_key;
 #[cfg(test)]
