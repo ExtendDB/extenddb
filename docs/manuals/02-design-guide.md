@@ -138,7 +138,7 @@ For UpdateItem, the `new_image` is not known until after `apply_update` runs ins
 
 ### Shard Model
 
-Each stream has a fixed set of shards (currently 4 shards per stream). Shard IDs are deterministic (`shardId-<table>-000000000000` through `shardId-<table>-000000000003`). Sequence numbers are monotonically increasing integers.
+Each stream has a fixed set of shards (currently 4 shards per stream). Shard IDs are deterministic (`shardId-<table>-0000000000000000` through `shardId-<table>-0000000000000003`), zero-padded to 16 digits so every shard ID meets the AWS SDKs' 28-character minimum for `ShardId`, regardless of table name length. Sequence numbers are monotonically increasing integers.
 
 ### Iterator Types
 
