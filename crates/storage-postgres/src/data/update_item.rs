@@ -50,8 +50,7 @@ impl PostgresEngine {
         let sys_delay = if indexes.is_empty() {
             0
         } else {
-            self.gsi_default_delay_ms
-                .load(std::sync::atomic::Ordering::Relaxed)
+            self.gsi_default_delay().await
         };
 
         // Fetch existing item

@@ -33,11 +33,15 @@ impl SqliteEngine {
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
     ) -> Result<(Option<Item>, Option<Item>), StorageError> {
+        // Read the propagation delay BEFORE taking the write lock. It is a
+        // runtime setting, not an invariant of this write, so it does not need
+        // to be read under the lock, and the lock serialises every write in the
+        // process: work done inside it is the backend's throughput bottleneck.
+        let system_delay = self.gsi_default_delay().await;
         let _writer = self.write_lock.lock().await;
         // Read the index set after acquiring the write lock so a concurrently
         // added GSI (UpdateTable holds the same lock) is not missed.
         let indexes = fetch_indexes_for_table(&key_info.table_id, &self.pool).await?;
-        let system_delay = self.gsi_default_delay().await;
 
         let mut tx = self
             .pool

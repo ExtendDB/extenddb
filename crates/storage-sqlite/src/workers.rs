@@ -540,7 +540,9 @@ pub(crate) async fn poll_gsi_delay<S: SettingsStore + ?Sized>(
                     gsi_default.store(ms, Ordering::Relaxed);
                 }
             }
-            Ok(None) => gsi_default.store(10, Ordering::Relaxed),
+            Ok(None) => {
+                gsi_default.store(crate::DEFAULT_GSI_PROPAGATION_DELAY_MS, Ordering::Relaxed)
+            }
             Err(e) => tracing::debug!("poll_gsi_delay: {e:?}"),
         }
     }

@@ -33,6 +33,11 @@ impl SqliteEngine {
         // Read the index set only after acquiring the write lock, so a GSI added
         // by a concurrent UpdateTable (which holds the same lock) cannot be missed
         // and left unmaintained by this write.
+        // Read the propagation delay BEFORE taking the write lock. It is a
+        // runtime setting, not an invariant of this write, so it does not need
+        // to be read under the lock, and the lock serialises every write in the
+        // process: work done inside it is the backend's throughput bottleneck.
+        let system_delay = self.gsi_default_delay().await;
         let _writer = self.write_lock.lock().await;
         let indexes = fetch_indexes_for_table(&key_info.table_id, &self.pool).await?;
 
@@ -56,7 +61,6 @@ impl SqliteEngine {
             .map_err(|e| StorageError::Validation(e.to_string()))?;
         }
 
-        let system_delay = self.gsi_default_delay().await;
         let need_old = condition.is_some() || return_old || !indexes.is_empty() || stream.is_some();
 
         let mut tx = self
