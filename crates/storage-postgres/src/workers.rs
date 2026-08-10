@@ -183,7 +183,10 @@ pub(crate) async fn poll_gsi_delay<S: SettingsStore + ?Sized>(
             }
             Ok(None) => {
                 // Setting removed - revert to default
-                gsi_delay.store(10, std::sync::atomic::Ordering::Relaxed);
+                gsi_delay.store(
+                    crate::DEFAULT_GSI_PROPAGATION_DELAY_MS,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
             Err(e) => {
                 tracing::debug!("Failed to query gsi_propagation_delay_ms: {e:?}");

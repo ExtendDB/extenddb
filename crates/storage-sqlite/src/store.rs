@@ -237,7 +237,7 @@ impl SqliteEngine {
     /// Reads the `gsi_propagation_delay_ms` setting live from the catalog so
     /// out-of-process changes (`extenddb settings set`) take effect on the
     /// next write, not up to 30 s later when the poll worker refreshes the
-    /// cache. SQLite is a local file, so this is an indexed point lookup with
+    /// cache. `SQLite` is a local file, so this is an indexed point lookup with
     /// negligible cost next to the write it precedes. On a read error the
     /// cached value (still refreshed by the poll worker) is the fallback; on
     /// success the cache is re-warmed so fallback reads stay fresh.
@@ -250,11 +250,16 @@ impl SqliteEngine {
         match live {
             Ok(row) => {
                 // Missing row means the default, matching poll_gsi_delay.
-                let ms = row.and_then(|(v,)| v.parse::<u64>().ok()).unwrap_or(10);
+                let ms = row
+                    .and_then(|(v,)| v.parse::<u64>().ok())
+                    .unwrap_or(crate::DEFAULT_GSI_PROPAGATION_DELAY_MS);
                 self.gsi_default_delay_ms.store(ms, Ordering::Relaxed);
                 ms
             }
-            Err(_) => self.gsi_default_delay_ms.load(Ordering::Relaxed),
+            Err(e) => {
+                tracing::debug!("gsi_default_delay: live read failed, using cache: {e:?}");
+                self.gsi_default_delay_ms.load(Ordering::Relaxed)
+            }
         }
     }
 

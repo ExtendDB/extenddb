@@ -68,6 +68,11 @@ impl SqliteEngine {
         ops: &[TransactWriteOp<'_>],
         idempotency: Option<IdempotencyKey<'_>>,
     ) -> Result<(), StorageError> {
+        // Read the propagation delay BEFORE taking the write lock. It is a
+        // runtime setting, not an invariant of this write, so it does not need
+        // to be read under the lock, and the lock serialises every write in the
+        // process: work done inside it is the backend's throughput bottleneck.
+        let system_delay = self.gsi_default_delay().await;
         let _writer = self.write_lock.lock().await;
         // Fetch index metadata per distinct table AFTER acquiring the write lock,
         // so a GSI added by a concurrent UpdateTable (same lock) is not missed and
@@ -81,7 +86,6 @@ impl SqliteEngine {
             }
         }
 
-        let system_delay = self.gsi_default_delay().await;
         let mut tx = self
             .pool
             .begin_with("BEGIN IMMEDIATE")

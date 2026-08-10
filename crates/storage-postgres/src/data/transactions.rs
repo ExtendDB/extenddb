@@ -83,10 +83,9 @@ impl PostgresEngine {
             }
         }
 
-        // D-4: Read system default delay from cache (P119).
-        let sys_delay = self
-            .gsi_default_delay_ms
-            .load(std::sync::atomic::Ordering::Relaxed);
+        // D-4: Read the system default delay live (P119), so a runtime change
+        // applies to this transaction rather than up to 30 s later.
+        let sys_delay = self.gsi_default_delay().await;
 
         let mut tx = self
             .data_pool

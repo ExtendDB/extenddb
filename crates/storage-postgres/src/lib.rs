@@ -134,6 +134,12 @@ pub struct PostgresConfig {
 /// settings, accounts, IAM) and `data_pool` for per-DynamoDB-table data
 /// (`_ddb_*` tables, GSI tables). This separation allows the catalog and
 /// data to live in different `PostgreSQL` databases (Bug 1, P54).
+/// Default GSI propagation delay (milliseconds) when the
+/// `gsi_propagation_delay_ms` setting is absent. Mirrors the value seeded by
+/// the catalog schema, and is the single definition used by both the live read
+/// on the write path and the background refresh worker.
+pub(crate) const DEFAULT_GSI_PROPAGATION_DELAY_MS: u64 = 10;
+
 pub struct PostgresEngine {
     pub(crate) pool: PgPool,
     /// Connection pool for the data database where `_ddb_*` tables live.
@@ -145,8 +151,10 @@ pub struct PostgresEngine {
     pub(crate) control_plane_notify: Arc<tokio::sync::Notify>,
     /// D-4: Async GSI update queue. `None` until `start_gsi_workers()` is called.
     pub(crate) gsi_queue: Option<Arc<gsi_queue::GsiQueue>>,
-    /// P119: Cached GSI default propagation delay (milliseconds). Updated by
-    /// background poller every 30s. Avoids per-request DB query on write path.
+    /// P119: Cached GSI default propagation delay (milliseconds). Refreshed by
+    /// the background poller every 30s and re-warmed by `gsi_default_delay`.
+    /// This is only a fallback for when the live read fails; the write path
+    /// reads the setting live so a runtime change applies to the next write.
     pub gsi_default_delay_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -208,7 +216,7 @@ impl PostgresEngine {
         .ok()
         .flatten()
         .and_then(|(v,)| v.parse::<u64>().ok())
-        .unwrap_or(10);
+        .unwrap_or(DEFAULT_GSI_PROPAGATION_DELAY_MS);
 
         Ok(Self {
             pool,
@@ -226,6 +234,39 @@ impl PostgresEngine {
     /// Must be called after construction, before serving requests.
     /// Returns `&Self` for chaining.
     #[must_use]
+    /// Current GSI propagation delay (ms); `0` means synchronous.
+    ///
+    /// Reads the `gsi_propagation_delay_ms` setting live from the catalog so an
+    /// out-of-process change (`extenddb settings set`) applies to the next write
+    /// rather than up to 30 s later when the poll worker refreshes the cache.
+    /// Callers skip this entirely for tables with no secondary indexes, so a
+    /// table that cannot propagate pays nothing.
+    ///
+    /// On a read error the cached value is used and the error is logged, so a
+    /// degraded catalog serves a stale delay loudly rather than silently. On
+    /// success the cache is re-warmed, keeping the fallback fresh.
+    pub(crate) async fn gsi_default_delay(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        let live = sqlx::query_as::<_, (String,)>(
+            "SELECT value FROM settings WHERE key = 'gsi_propagation_delay_ms'",
+        )
+        .fetch_optional(&self.pool)
+        .await;
+        match live {
+            Ok(row) => {
+                let ms = row
+                    .and_then(|(v,)| v.parse::<u64>().ok())
+                    .unwrap_or(DEFAULT_GSI_PROPAGATION_DELAY_MS);
+                self.gsi_default_delay_ms.store(ms, Ordering::Relaxed);
+                ms
+            }
+            Err(e) => {
+                tracing::debug!("gsi_default_delay: live read failed, using cache: {e:?}");
+                self.gsi_default_delay_ms.load(Ordering::Relaxed)
+            }
+        }
+    }
+
     pub fn start_gsi_workers(mut self) -> Self {
         self.gsi_queue = Some(gsi_queue::GsiQueue::spawn(self.data_pool.clone()));
         self

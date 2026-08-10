@@ -45,6 +45,12 @@ mod update_table;
 mod worker;
 mod workers;
 
+/// Default GSI propagation delay (milliseconds) when the
+/// `gsi_propagation_delay_ms` setting is absent. Mirrors the value seeded by
+/// the catalog schema, and is the single definition used by both the live read
+/// on the write path and the background refresh worker.
+pub(crate) const DEFAULT_GSI_PROPAGATION_DELAY_MS: u64 = 10;
+
 pub use bootstrapper::SqliteBootstrapper;
 pub use catalog_store::SqliteCatalogStore;
 pub use config::SqliteConfig;
