@@ -238,3 +238,115 @@ async fn only_one_racing_conditional_create_wins() {
         );
     }
 }
+
+/// Concurrent writers to the SAME attribute serialize into a linear history.
+///
+/// "All succeed" is necessary but not sufficient: six writers each doing
+/// `SET v = :their-value` on one new key could all return 200 while updates were
+/// applied on stale bases and silently lost. This test proves a total order
+/// exists, which is the actual contract (DynamoDB serializes writes per item;
+/// which writer ends up last is scheduling-dependent, but the history is linear).
+///
+/// The proof uses `ReturnValues: ALL_OLD`. Each writer observes the committed
+/// item it replaced, so a clean serialization of N writers over one new key must
+/// produce:
+///   * exactly one writer that observed no previous item (it created the key),
+///   * every other writer observing some OTHER writer's value, each observed at
+///     most once (two writers seeing the same old value means one applied to a
+///     stale base and the earlier write was lost),
+///   * a final value equal to the one written value nobody observed as old.
+/// Together these force the observations into one chain:
+///   none -> w_a -> w_b -> ... -> final.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_same_attribute_updates_serialize_into_a_linear_history() {
+    let c = client();
+    let table = format!("SameAttrChain_{}", ts());
+    make_simple_table(c, &table).await;
+
+    const WRITERS: usize = 6;
+    // Several trials: the race window is small, so one trial can miss it.
+    for trial in 0..5 {
+        let key = format!("chain-key-{trial}");
+        let mut handles = Vec::new();
+        for i in 0..WRITERS {
+            let c = c.clone();
+            let table = table.clone();
+            let key = key.clone();
+            handles.push(tokio::spawn(async move {
+                c.update_item()
+                    .table_name(&table)
+                    .key("pk", s(&key))
+                    .update_expression("SET v = :v")
+                    .expression_attribute_values(":v", s(&format!("writer-{i}")))
+                    .return_values(aws_sdk_dynamodb::types::ReturnValue::AllOld)
+                    .send()
+                    .await
+                    .map(|out| {
+                        out.attributes
+                            .and_then(|a| a.get("v").and_then(|v| v.as_s().ok().cloned()))
+                    })
+                    .map_err(|e| format!("{:?}", e.into_service_error()))
+            }));
+        }
+
+        let mut observed_old: Vec<Option<String>> = Vec::new();
+        for h in handles {
+            let r = h.await.expect("task panicked");
+            observed_old.push(r.unwrap_or_else(|e| {
+                panic!("trial {trial}: a same-attribute UpdateItem failed: {e}")
+            }));
+        }
+
+        // Exactly one writer created the key (observed no prior item).
+        let creators = observed_old.iter().filter(|o| o.is_none()).count();
+        assert_eq!(
+            creators, 1,
+            "trial {trial}: exactly one writer must observe an absent item; {creators} did. \
+             More than one means a write was applied as a fresh create over an existing \
+             committed value, losing it. Observed: {observed_old:?}"
+        );
+
+        // No two writers observed the same predecessor.
+        let mut seen = std::collections::HashSet::new();
+        for old in observed_old.iter().flatten() {
+            assert!(
+                seen.insert(old.clone()),
+                "trial {trial}: two writers observed the same old value '{old}', so one of \
+                 them applied to a stale base and the write between them was lost. \
+                 Observed: {observed_old:?}"
+            );
+        }
+
+        // The final value is the one written value that nobody observed as old.
+        let final_v = c
+            .get_item()
+            .table_name(&table)
+            .key("pk", s(&key))
+            .consistent_read(true)
+            .send()
+            .await
+            .expect("get_item")
+            .item
+            .and_then(|i| i.get("v").and_then(|v| v.as_s().ok().cloned()))
+            .expect("item must hold v after successful updates");
+        assert!(
+            final_v.starts_with("writer-"),
+            "trial {trial}: final value '{final_v}' is not any writer's value"
+        );
+        assert!(
+            !seen.contains(&final_v),
+            "trial {trial}: final value '{final_v}' was also observed as someone's old \
+             value, so the history has a fork rather than a single chain. \
+             Observed: {observed_old:?}"
+        );
+        // Chain accounting: 1 creator + (N-1) observed predecessors + 1 final tail
+        // must cover all N written values exactly once.
+        assert_eq!(
+            seen.len() + 1,
+            WRITERS,
+            "trial {trial}: {} distinct predecessors + final tail != {WRITERS} writers; \
+             a value vanished from the history. Observed: {observed_old:?}, final: {final_v}",
+            seen.len()
+        );
+    }
+}
