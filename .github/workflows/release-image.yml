@@ -1,0 +1,169 @@
+# Publishes the ExtendDB PostgreSQL container image to Docker Hub on a version tag.
+#
+# Order is deliberate: gate -> build -> test -> log in -> push.
+#   * No registry credential exists in the job until the artifact has passed the
+#     smoke test, so the freshly built image never runs alongside the token.
+#   * The image that is pushed is the exact image that was tested. `docker push`
+#     uploads the local image by ID, so there is no rebuild between test and ship.
+#
+# One-time setup, already in place:
+#   Environment `dockerhub` (Settings -> Environments)
+#     Deployment branches and tags: Selected, rule `tag: v*`. A workflow pushed on
+#       any other ref cannot read the token at all, which is the protection that
+#       repository-level secrets cannot provide.
+#     Required reviewers: the release must be approved before the push.
+#     Secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN (Docker Hub PAT, Read/Write).
+#
+# When a second backend image exists, this file becomes `on: workflow_call` with
+# inputs for the image repository, Dockerfile and build args, and one thin caller
+# per backend triggers on `v*`. Deliberately not a matrix: a matrix asks for one
+# approval per job and a partial failure publishes one backend under a version tag
+# and not the other. Separate callers fail and re-run independently.
+
+name: release-image
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Existing version tag to publish, e.g. v0.1.4'
+        required: true
+
+# Nothing is committed, so the job needs no write scope on the repo.
+permissions:
+  contents: read
+
+# Two releases must never race to move `:latest`. The group names the image, so a
+# future second backend does not serialise behind this one for no reason.
+concurrency:
+  group: release-image-extenddb-postgres
+  cancel-in-progress: false
+
+env:
+  IMAGE_REPO: extenddb/extenddb-postgres
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60          # a hung Rust build must not burn the 6h default
+    environment: dockerhub
+
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0         # the ancestry gate below needs history
+
+      - name: Gate - the tag must identify released code
+        id: meta
+        run: |
+          set -euo pipefail
+          REF_NAME='${{ github.event.inputs.ref || github.ref_name }}'
+          VERSION="${REF_NAME#v}"
+
+          # 1. The tag and the workspace version must agree. Without this, main can
+          #    sit at one version while the newest tag claims another.
+          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          if [[ "$VERSION" != "$CARGO_VERSION" ]]; then
+            echo "::error::tag $REF_NAME implies $VERSION but Cargo.toml says $CARGO_VERSION"
+            exit 1
+          fi
+
+          # 2. The tagged commit must be on main. Without this, a tag pushed on an
+          #    unmerged branch would publish unreviewed code to a public namespace.
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::$REF_NAME is not an ancestor of origin/main"
+            exit 1
+          fi
+
+          echo "version=$VERSION"                          >> "$GITHUB_OUTPUT"
+          echo "vcs_ref=$(git rev-parse --short=12 HEAD)"   >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"  >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE_REPO}:${VERSION}"             >> "$GITHUB_OUTPUT"
+
+      - name: Gate - licence notices must match Cargo.lock
+        # A stale SOFTWARE-LICENSE-NOTICES.html matters far more in a distributed
+        # image than in source. The script pins cargo-about itself and refuses to
+        # run against any other version, so the install must match exactly.
+        run: |
+          set -euo pipefail
+          cargo install --locked --version 0.9.0 --features cli cargo-about
+          ./devtools/generate-software-license-notices --check
+
+      - name: Set up Buildx
+        # Also supplies a current buildx. The build needs >= 0.17; an older one
+        # fails with "compose build requires buildx 0.17.0 or later".
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+
+      - name: Build the image locally, not pushed
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        with:
+          context: .
+          load: true             # into the local store, so it can be tested first
+          push: false
+          tags: |
+            ${{ steps.meta.outputs.image }}
+            ${{ env.IMAGE_REPO }}:latest
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            VCS_REF=${{ steps.meta.outputs.vcs_ref }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the built image
+        # EXTENDDB_IMAGE puts ci/smoke-test-container.sh into prebuilt mode: it
+        # reads VERSION / VCS_REF / BUILD_DATE back off the image labels, runs
+        # `compose up --no-build`, and asserts every container is running this
+        # exact image ID. The script requires docker, aws and python3 on PATH and
+        # fails with a clear message naming any that is missing.
+        env:
+          EXTENDDB_IMAGE: ${{ steps.meta.outputs.image }}
+        run: ./ci/smoke-test-container.sh
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push the tested image
+        run: |
+          set -euo pipefail
+          docker push '${{ steps.meta.outputs.image }}'
+          docker push '${{ env.IMAGE_REPO }}:latest'
+          DIGEST=$(docker image inspect '${{ steps.meta.outputs.image }}' \
+                     --format '{{index .RepoDigests 0}}')
+          {
+            echo "### Published"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| image | \`${{ steps.meta.outputs.image }}\` |"
+            echo "| digest | \`${DIGEST}\` |"
+            echo "| commit | \`${{ steps.meta.outputs.vcs_ref }}\` |"
+            echo "| built | \`${{ steps.meta.outputs.build_date }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+# Two deliberate omissions, and what closing them would cost.
+#
+# 1. No provenance or SBOM attestations. Those come from the registry/OCI exporter,
+#    not the local docker exporter that `load: true` requires. Having both
+#    attestations and "what shipped is what was tested" means a different shape:
+#    push to a staging tag with provenance and sbom enabled, smoke test the pulled
+#    digest (prebuilt mode works on a pulled image), then promote that same digest
+#    with `docker buildx imagetools create`, which copies the manifest without
+#    rebuilding. Correct, but it needs a staging tag or a staging repository.
+#
+# 2. Single architecture. `load: true` cannot load a multi-platform manifest, so
+#    this builds the runner's amd64 only. Adding arm64 would publish an image that
+#    was never executed, since an amd64 runner cannot run it without qemu. Worth
+#    doing only together with the digest-promotion shape above.
+#
+# Neither the smoke test nor the licence check runs on pull requests. This gates
+# releases, not merges; a PR-triggered job would stop both regressing in between.
