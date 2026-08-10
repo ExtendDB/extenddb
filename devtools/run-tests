@@ -135,9 +135,9 @@ done
 
 # --- Validate: backend name ---
 case "$BACKEND" in
-    postgres|mongodb) ;;
+    postgres|sqlite|mongodb) ;;
     *)
-        echo "error: --backend must be 'postgres' or 'mongodb' (got: $BACKEND)"
+        echo "error: --backend must be 'postgres', 'sqlite' or 'mongodb' (got: $BACKEND)"
         exit 1
         ;;
 esac
@@ -385,7 +385,7 @@ if $NEEDS_INTEGRATION && [[ "$TARGET" != "real-dynamodb" ]]; then
     if [[ "$BACKEND" == "postgres" \
         && -z "${EXTENDDB_TEST_PG_CONNECTION_STRING:-}" \
         && -f "$CONFIG_FOR_SETTINGS" ]]; then
-        FULL_CONN=$(grep 'connection_string' "$CONFIG_FOR_SETTINGS" | sed -n 's/.*connection_string[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        FULL_CONN=$(grep 'connection_string' "$CONFIG_FOR_SETTINGS" 2>/dev/null | sed -n 's/.*connection_string[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 || true)
         if [[ -n "$FULL_CONN" ]]; then
             # Strip trailing /database_name to get base URL
             export EXTENDDB_TEST_PG_CONNECTION_STRING="${FULL_CONN%/*}"
