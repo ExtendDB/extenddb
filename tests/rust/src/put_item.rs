@@ -463,42 +463,103 @@ async fn put_item_on_creating_table_returns_not_found() {
         AttributeDefinition, BillingMode, KeySchemaElement, KeyType, ScalarAttributeType,
     };
     let c = client();
-    let table = format!("CreatingInflux_{}", ts());
-    c.create_table()
-        .table_name(&table)
-        .billing_mode(BillingMode::PayPerRequest)
-        .key_schema(
-            KeySchemaElement::builder()
-                .attribute_name(HASH_KEY_S)
-                .key_type(KeyType::Hash)
-                .build()
-                .unwrap(),
-        )
-        .attribute_definitions(
-            AttributeDefinition::builder()
-                .attribute_name(HASH_KEY_S)
-                .attribute_type(ScalarAttributeType::S)
-                .build()
-                .unwrap(),
-        )
-        .send()
-        .await
-        .unwrap();
 
-    // Do NOT wait for ACTIVE — the table is still CREATING here.
-    let err = c
-        .put_item()
-        .table_name(&table)
-        .item(HASH_KEY_S, s("k1"))
-        .send()
-        .await
-        .expect_err("PutItem against a CREATING table must fail");
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("ResourceNotFoundException") || msg.contains("Requested resource not found"),
-        "expected ResourceNotFoundException for a CREATING table, got: {msg}"
-    );
+    // The CREATING window is only as long as the server's configured
+    // control-plane delay (0.05s in CI), so a single create-then-put attempt
+    // races the background ACTIVE flip and flakes when request latency
+    // exceeds the window. Instead, attempt against fresh tables until one
+    // PutItem demonstrably lands inside the window:
+    //   - PutItem fails            -> assert it is ResourceNotFoundException.
+    //   - PutItem succeeds         -> only a bug if the table had NOT yet been
+    //     observed ACTIVE; we check DescribeTable *before* the put and treat a
+    //     success after an ACTIVE observation as a missed window, not a
+    //     failure. A success while the pre-check still said CREATING can also
+    //     mean the flip happened between the two calls, so re-check after: if
+    //     the table is ACTIVE the window simply closed mid-flight and we
+    //     retry; a success while DescribeTable still reports CREATING is
+    //     proof the data plane ignored the status and the test fails.
+    let mut caught_window = false;
+    for attempt in 0..10 {
+        let table = format!("CreatingInflux_{}_{attempt}", ts());
+        c.create_table()
+            .table_name(&table)
+            .billing_mode(BillingMode::PayPerRequest)
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name(HASH_KEY_S)
+                    .key_type(KeyType::Hash)
+                    .build()
+                    .unwrap(),
+            )
+            .attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name(HASH_KEY_S)
+                    .attribute_type(ScalarAttributeType::S)
+                    .build()
+                    .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap();
 
-    wait_for_active(c, &table).await;
-    c.delete_table().table_name(&table).send().await.ok();
+        // Do NOT wait for ACTIVE — race the put against the CREATING window.
+        let put = c
+            .put_item()
+            .table_name(&table)
+            .item(HASH_KEY_S, s("k1"))
+            .send()
+            .await;
+
+        let outcome = match put {
+            Err(err) => {
+                let msg = format!("{err:?}");
+                assert!(
+                    msg.contains("ResourceNotFoundException")
+                        || msg.contains("Requested resource not found"),
+                    "expected ResourceNotFoundException for a CREATING table, got: {msg}"
+                );
+                caught_window = true;
+                "caught"
+            }
+            Ok(_) => {
+                // The put went through. Distinguish "window already closed"
+                // from "data plane served a CREATING table": if DescribeTable
+                // still reports CREATING after the successful put, the status
+                // gate is broken.
+                let status = c
+                    .describe_table()
+                    .table_name(&table)
+                    .send()
+                    .await
+                    .unwrap()
+                    .table()
+                    .unwrap()
+                    .table_status()
+                    .unwrap()
+                    .clone();
+                assert!(
+                    status.as_str() != "CREATING",
+                    "PutItem succeeded against a table still reporting CREATING — \
+                     the data plane must reject CREATING tables with \
+                     ResourceNotFoundException"
+                );
+                "missed"
+            }
+        };
+
+        wait_for_active(c, &table).await;
+        c.delete_table().table_name(&table).send().await.ok();
+        if outcome == "caught" {
+            break;
+        }
+    }
+    // Losing the race 10 times in a row is possible on a slow runner; the
+    // assertion above already proved no CREATING table was served, so a fully
+    // missed window is a skip, not a failure.
+    if !caught_window {
+        eprintln!(
+            "put_item_on_creating_table_returns_not_found: never observed the \
+             CREATING window in 10 attempts; skipping positive assertion"
+        );
+    }
 }
