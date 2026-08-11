@@ -43,11 +43,14 @@ software on your behalf. After the script completes, continue from
 cargo build --release
 
 # MongoDB backend
-cargo build --release --features mongodb
-
-# Both backends
-cargo build --release --features postgres,mongodb
+# (backends are mutually exclusive; disable the default postgres feature)
+cargo build --release --no-default-features --features mongodb
 ```
+
+Each build produces a single-backend binary. The `postgres`, `mongodb`, and
+`sqlite` features are mutually exclusive — a build enabling more than one is
+rejected at compile time — so to run two backends, build one binary per
+backend.
 
 The binary is at `target/release/extenddb`.
 

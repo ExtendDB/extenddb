@@ -7,7 +7,6 @@
 //! Requires a running extenddb instance with `EXTENDDB_TEST_ENDPOINT` and credentials set.
 
 mod helpers;
-mod restore_active_completeness;
 mod test_base;
 
 #[cfg(test)]

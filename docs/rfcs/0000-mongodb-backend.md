@@ -273,7 +273,7 @@ Testing is organized in three layers.
 
 **End-to-end tests** run the existing ExtendDB pytest suite (`tests/`) unchanged against a MongoDB-backed ExtendDB server. The pytest suite speaks the DynamoDB wire protocol and has no backend awareness — a passing run against MongoDB is equivalent to a passing run against PostgreSQL. This is the conformance test baseline required by RFC-0002.
 
-CI (`.github/workflows/integration-mongodb.yml`) runs the pytest and rust-integration suites as two parallel jobs. Each builds ExtendDB with `--features mongodb` and delegates to `devtools/run-mongodb-tests`, which bootstraps a single-node MongoDB 7.0 replica set (`rs.initiate` + wait-for-PRIMARY — a step GitHub `services:` cannot express), serves ExtendDB against it, provisions credentials, and runs the suite via `devtools/run-tests --backend mongodb`. Backend-crate unit and property tests run in the standard `cargo test` workflow.
+CI (`.github/workflows/integration-mongodb.yml`) runs the pytest and rust-integration suites as two parallel jobs. Each builds ExtendDB with `--no-default-features --features mongodb` (the backend features are mutually exclusive, so the default `postgres` feature must be disabled) and delegates to `devtools/run-mongodb-tests`, which bootstraps a single-node MongoDB 7.0 replica set (`rs.initiate` + wait-for-PRIMARY — a step GitHub `services:` cannot express), serves ExtendDB against it, provisions credentials, and runs the suite via `devtools/run-tests --backend mongodb`. Backend-crate unit and property tests run in the standard `cargo test` workflow.
 
 ## Drawbacks
 

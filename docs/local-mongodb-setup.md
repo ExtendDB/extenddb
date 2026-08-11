@@ -92,16 +92,16 @@ mongodb://localhost:27018/?replicaSet=rs0&directConnection=true
 
 ## Building with MongoDB Support
 
-The MongoDB backend is behind a feature flag:
+The MongoDB backend is behind a feature flag. Backends are mutually exclusive
+(a build enabling more than one is rejected at compile time), so disable the
+default `postgres` feature:
 
 ```bash
-cargo build --release --features mongodb
+cargo build --release --no-default-features --features mongodb
 ```
 
-To build with both backends:
-```bash
-cargo build --release --features postgres,mongodb
-```
+The binary is single-backend; to run PostgreSQL and MongoDB side by side, build
+one binary per backend.
 
 ## Initializing ExtendDB with MongoDB
 
