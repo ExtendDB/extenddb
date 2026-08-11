@@ -81,6 +81,10 @@ impl ServerRuntimeHooks for MongoRuntimeHooks {
 fn server_components_factory(
     config: &dyn extenddb_storage::config::StorageConfig,
     region: &str,
+    // MongoDB bootstrap needs operator input (databases, admin credentials), so
+    // `bootstrap_if_uninitialized` is not honored here: an uninitialized catalog
+    // fails with the explicit-`init` guidance, matching the PostgreSQL backend.
+    _options: extenddb_storage::server_components::ServerComponentsOptions,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ServerComponents, BackendError>> + Send>,
 > {

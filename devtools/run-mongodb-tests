@@ -30,7 +30,7 @@
 #
 # Prerequisites:
 #   - Docker running
-#   - `cargo build --release --features mongodb` already done
+#   - `cargo build --release --no-default-features --features mongodb` already done
 #   - Python venv activated with pytest installed
 #   - `~/.extenddb/tls/` populated (from a prior `extenddb init`)
 
@@ -81,7 +81,7 @@ CONTAINER_NAME="extenddb-runtests-mongo-${MONGO_PORT}"
 BINARY="./target/release/extenddb"
 
 if [[ ! -x "$BINARY" ]]; then
-    echo "error: $BINARY not found. Build first: cargo build --release --features mongodb" >&2
+    echo "error: $BINARY not found. Build first: cargo build --release --no-default-features --features mongodb" >&2
     exit 1
 fi
 

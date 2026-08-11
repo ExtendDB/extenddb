@@ -33,7 +33,7 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
       - name: Build release (mongodb backend)
-        run: cargo build --release --features mongodb
+        run: cargo build --release --no-default-features --features mongodb
       - name: Run MongoDB pytest suite
         run: devtools/run-mongodb-tests -- --pytest --comprehensive --parallel
 
@@ -51,7 +51,7 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
       - name: Build release (mongodb backend)
-        run: cargo build --release --features mongodb
+        run: cargo build --release --no-default-features --features mongodb
       - name: Run MongoDB rust integration suite
         run: devtools/run-mongodb-tests -- --rust --rust-integration
 

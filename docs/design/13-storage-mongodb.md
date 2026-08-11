@@ -1034,7 +1034,8 @@ The backend implements every trait in `extenddb-storage`:
   --comprehensive --parallel`.
 - **CI:** `.github/workflows/integration-mongodb.yml` runs the pytest and
   rust-integration suites as two parallel jobs, each building with
-  `--features mongodb` and delegating to `devtools/run-mongodb-tests`,
+  `--no-default-features --features mongodb` and delegating to
+  `devtools/run-mongodb-tests`,
   which bootstraps a single-node MongoDB 7.0 replica set.
 
 ## 14. Deployment Requirements

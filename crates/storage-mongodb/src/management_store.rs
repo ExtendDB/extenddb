@@ -36,6 +36,20 @@ fn now_bson() -> BsonDateTime {
 // ── ManagementStore ─────────────────────────────────────────────────────
 
 impl ManagementStore for MongoCatalogStore {
+    fn default_account_id(&self) -> BoxFuture<'_, OpResult<Option<String>>> {
+        Box::pin(async move {
+            let coll = self.catalog_db().collection::<Document>("settings");
+            let doc = coll
+                .find_one(doc! { "_id": "default_account_id" })
+                .await
+                .map_err(|e| {
+                    tracing::error!("default_account_id: {e}");
+                    OpError::Internal("Database error".to_owned())
+                })?;
+            Ok(doc.and_then(|d| d.get_str("value").ok().map(std::borrow::ToOwned::to_owned)))
+        })
+    }
+
     fn create_account(&self, account_id: &str, account_name: &str) -> BoxFuture<'_, OpResult<()>> {
         let account_id = account_id.to_owned();
         let account_name = account_name.to_owned();

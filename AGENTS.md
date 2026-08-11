@@ -96,12 +96,13 @@ extenddb (bin)
 # PostgreSQL backend (default)
 cargo build --release
 
-# MongoDB backend
-cargo build --release --features mongodb
-
-# Both backends
-cargo build --release --features postgres,mongodb
+# MongoDB backend (backends are mutually exclusive — disable default postgres)
+cargo build --release --no-default-features --features mongodb
 ```
+
+Backends are selected by mutually exclusive Cargo features (`postgres`,
+`mongodb`, `sqlite`); a build enabling more than one is rejected at compile
+time. Each binary serves exactly one backend.
 
 Binary: `target/release/extenddb`
 
