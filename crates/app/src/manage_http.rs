@@ -11,6 +11,7 @@ use std::net::TcpStream;
 use std::sync::Arc;
 
 use base64::Engine;
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 
 use crate::manage_types::{CacheAction, CacheInvalidateScope, ManageCommand};
 use extenddb_config as config;
@@ -148,7 +149,7 @@ fn http_request_tls(
         .map_err(|e| anyhow::anyhow!("Cannot read TLS cert {cert_path}: {e}"))?;
 
     let mut root_store = rustls::RootCertStore::empty();
-    let certs = rustls_pemfile::certs(&mut &cert_pem[..])
+    let certs = CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("Failed to parse PEM certs from {cert_path}: {e}"))?;
     for cert in &certs {
