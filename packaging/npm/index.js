@@ -152,7 +152,21 @@ async function start(options = {}) {
 
   const endpoint = `http://127.0.0.1:${port}`;
   const spawned = new Promise((_, reject) => {
-    child.on("error", reject);
+    child.on("error", (err) => {
+      if (err.code === "ENOENT") {
+        reject(
+          new Error(
+            `could not find the extenddb dev binary (tried the "binary" option, ` +
+              `EXTENDDB_BINARY, the @extenddb/${process.platform}-${process.arch} ` +
+              `platform package, then PATH). If your platform has no prebuilt ` +
+              `package, build one with: cargo build --release --no-default-features ` +
+              `--features sqlite,dev-mode -p extenddb, then set EXTENDDB_BINARY to it.`
+          )
+        );
+        return;
+      }
+      reject(err);
+    });
     child.on("exit", (code) =>
       reject(new Error(`extenddb exited during startup (code ${code}): ${stderrTail}`))
     );

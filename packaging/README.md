@@ -69,3 +69,45 @@ EXTENDDB_BINARY=/path/to/extenddb node test/launcher.test.js
 It proves the contract's load-bearing clauses: file mode is the default and
 persists across two server lifetimes, memory mode creates no files and is
 genuinely ephemeral, and contradictory options are refused.
+
+## Releasing
+
+The launcher versions independently of the server, under its own tag
+namespace: `npm-vMAJOR.MINOR.PATCH`. The version in `npm/package.json` is the
+source of truth; the tag must match it, and the publish workflow refuses
+anything else.
+
+The binary every platform package ships is the slim dev-mode build:
+
+```
+cargo build --release --locked --no-default-features --features sqlite,dev-mode -p extenddb
+```
+
+Flow (mirrors the container release: candidate first, promotion is a
+deliberate second step):
+
+1. Land the release state on `main` with the right version in
+   `npm/package.json`, then tag that commit `npm-vX.Y.Z` and push the tag.
+2. Dispatch the `npm-publish` workflow from `main` with the tag as input.
+   The gate validates shape, existence, ancestry against `main`, and the
+   version match. Five native runners build, smoke test, and run the full
+   launcher suite against their own binary. Only after all five pass does the
+   reviewer-gated `npm` environment release the token, and everything is
+   published with `--provenance` under the `candidate` dist-tag. Nothing
+   reaches `latest`.
+3. Verify the candidate from a clean machine:
+   `npm install extenddb@candidate` and run a smoke script in both storage
+   modes.
+4. Promote, one dist-tag move per package:
+
+   ```
+   npm dist-tag add extenddb@X.Y.Z latest
+   npm dist-tag add @extenddb/linux-x64@X.Y.Z latest        # and the other four
+   ```
+
+One-time registry and repo setup, in order: create the npm org `extenddb`
+(both the unscoped name and the scope were unclaimed as of 2026-08-12); create
+a granular automation token scoped to the `extenddb` package and `@extenddb`
+scope with publish permission only; create the GitHub environment `npm` with
+deployment branch rule `main`, required reviewers, and the token as
+`NPM_TOKEN`.
