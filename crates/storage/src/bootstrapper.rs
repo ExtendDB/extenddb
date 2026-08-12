@@ -235,6 +235,10 @@ pub mod helpers {
     }
 
     /// Check that a CLI arg, if provided, matches the config value.
+    ///
+    /// The error message includes both values, so this must only be used for
+    /// non-sensitive settings (hosts, ports, usernames). For secrets, use
+    /// [`check_conflict_redacted`].
     pub fn check_conflict<T: PartialEq + std::fmt::Display>(
         cli_val: Option<&T>,
         config_val: &T,
@@ -245,6 +249,25 @@ pub mod helpers {
         {
             return Err(crate::error::StorageError::Internal(format!(
                 "{flag} value '{v}' conflicts with config file value '{config_val}'"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Like [`check_conflict`], but the error message never contains either
+    /// value. Use for passwords and other secrets: the message lands on
+    /// stderr, and in a container stderr is the log stream, which is commonly
+    /// shipped to aggregators.
+    pub fn check_conflict_redacted<T: PartialEq>(
+        cli_val: Option<&T>,
+        config_val: &T,
+        flag: &str,
+    ) -> Result<(), crate::error::StorageError> {
+        if let Some(v) = cli_val
+            && v != config_val
+        {
+            return Err(crate::error::StorageError::Internal(format!(
+                "{flag} conflicts with the value in the config file (values redacted)"
             )));
         }
         Ok(())
@@ -430,6 +453,28 @@ pub mod helpers {
             let different_port: u16 = 9042;
             let result = check_conflict(Some(&different_port), &config_port, "--port");
             assert!(result.is_err(), "Should error when numeric values differ");
+        }
+
+        #[test]
+        fn test_check_conflict_redacted_never_leaks_either_value() {
+            let cli_secret = "hunter2-cli".to_string();
+            let config_secret = "hunter2-config".to_string();
+            let result =
+                check_conflict_redacted(Some(&cli_secret), &config_secret, "--extenddb-pass");
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("--extenddb-pass"), "flag must be named: {err}");
+            assert!(!err.contains("hunter2-cli"), "CLI secret leaked: {err}");
+            assert!(
+                !err.contains("hunter2-config"),
+                "config secret leaked: {err}"
+            );
+        }
+
+        #[test]
+        fn test_check_conflict_redacted_ok_paths() {
+            let same = "s3cret".to_string();
+            assert!(check_conflict_redacted(Some(&same), &same, "--extenddb-pass").is_ok());
+            assert!(check_conflict_redacted(None, &same, "--extenddb-pass").is_ok());
         }
 
         #[test]
