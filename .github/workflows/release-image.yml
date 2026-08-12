@@ -1,62 +1,83 @@
-# Publishes the ExtendDB PostgreSQL container image to Docker Hub on a version tag,
-# for linux/amd64 and linux/arm64.
+# Publishes an immutable, commit-addressed CANDIDATE of the ExtendDB PostgreSQL
+# container image to Docker Hub, for linux/amd64 and linux/arm64.
+#
+# This workflow deliberately stops at the candidate. It never creates the
+# version tag or `latest`: promotion, registry mirroring, verification, and
+# signing are maintainer steps recorded in the release runbook. That keeps the
+# blast radius of any workflow defect to a tag no user consumes.
 #
 # Shape, and why:
 #
-#   gate      Runs once. Cheap checks that do not need a build, so a bad tag fails
-#             in seconds rather than after two image builds.
+#   gate      Runs once. Cheap checks that do not need a build, so a bad input
+#             fails in seconds rather than after two image builds. The release
+#             tag arrives as a dispatch input, is validated as strict semver,
+#             resolved to a full commit SHA, and that SHA must be contained in
+#             origin/main and agree with the workspace version.
 #
-#   build     One job per architecture, each on its NATIVE runner. No emulation, so
-#             the arm64 image is genuinely executed rather than published untested.
-#             Each job builds with `load: true`, smoke tests the result, then saves
-#             the image as a workflow artifact. `docker save`/`load` preserves the
-#             image ID, so the artifact is bit-for-bit what was tested.
-#             These jobs hold NO registry credentials.
+#   build     One job per architecture, each on its NATIVE runner. No emulation,
+#             so the arm64 image is genuinely executed rather than published
+#             untested. Each job builds with `load: true`, smoke tests the
+#             result, then saves the image as a workflow artifact. `docker
+#             save`/`load` preserves the image ID, so the artifact is
+#             bit-for-bit what was tested. These jobs hold NO registry
+#             credentials.
 #
-#   publish   Runs once, after both architectures pass. This is the only job with
-#             Docker Hub credentials, so the token never exists in a job that is
-#             executing a freshly built image, and never exists at all unless both
-#             architectures passed. It pushes the two per-arch images and combines
-#             them into one manifest list per tag.
+#   publish   Runs once, after both architectures pass. This is the only job
+#             with Docker Hub credentials, so the token never exists in a job
+#             that is executing a freshly built image, and never exists at all
+#             unless both architectures passed. It pushes ONLY the
+#             commit-addressed candidate tags:
 #
-# One-time setup, already in place:
-#   Environment `dockerhub` (Settings -> Environments)
-#     Deployment branches and tags: Selected, rule `tag: v*`. A workflow pushed on
-#       any other ref cannot read the token at all, which is the protection that
-#       repository-level secrets cannot provide.
-#     Required reviewers: the release must be approved before the push. Because the
-#       environment is referenced by one job only, this is a single approval.
-#     Secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN (Docker Hub PAT, Read/Write).
+#               sha-<full-commit>-amd64
+#               sha-<full-commit>-arm64
+#               sha-<full-commit>          (multi-arch manifest list)
 #
-# When a second backend image exists, this becomes `on: workflow_call` with inputs
-# for the image repository, Dockerfile and build args, plus one thin caller per
-# backend triggering on `v*`. Deliberately not a matrix across backends: a partial
-# failure would publish one backend under a version tag and not the other.
+# Trigger: manual workflow_dispatch only. There is intentionally no
+# `push: tags:` trigger: a tag-triggered run executes the workflow definition
+# from the tagged revision, which may be older than the reviewed workflow on
+# protected main. Dispatching from main runs the current definition against an
+# existing, validated tag.
+#
+# One-time setup (Settings -> Environments -> dockerhub):
+#   Deployment branches: Selected, rule `branch: main` (migrated from the old
+#     `tag: v*` rule when the tag trigger was removed). A dispatch from any
+#     other ref cannot read the token at all.
+#   Required reviewers: the candidate push must be approved before it happens.
+#   Secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN (Docker Hub PAT, Read/Write).
+#
+# When a second backend image exists, this becomes `on: workflow_call` with
+# inputs for the image repository, Dockerfile and build args, plus one thin
+# caller per backend. Deliberately not a matrix across backends: a partial
+# failure would publish one backend's candidate and not the other under the
+# same release.
 
 name: release-image
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
-      ref:
-        description: 'Existing version tag to publish, e.g. v0.1.4'
+      tag:
+        description: 'Existing version tag to build a candidate for, e.g. v0.1.3'
         required: true
 
 # Nothing is committed, so no write scope on the repo is needed.
 permissions:
   contents: read
 
-# Two releases must never race to move `:latest`. The group names the image, so a
-# future second backend does not serialise behind this one for no reason.
+# Two releases must never race. The group names the image, so a future second
+# backend does not serialise behind this one for no reason.
 concurrency:
   group: release-image-extenddb-postgres
   cancel-in-progress: false
 
 env:
   IMAGE_REPO: extenddb/extenddb-postgres
+  # Pinned AWS CLI for runners that lack it (the smoke test needs `aws`).
+  # Checksums are for awscli-exe-linux-<arch>-2.31.6.zip, recorded when the pin
+  # was reviewed; bump the version and both checksums together.
+  AWSCLI_VERSION: 2.31.6
+  AWSCLI_SHA256_X86_64: 45fdcc3003056b3e85c23776636e74208dc2fc16f26278acdbe8eafe3d4e752b
+  AWSCLI_SHA256_AARCH64: 517dec4ce83fabe7ace6164bb6189cdb686ef816332ccf83e81999e3fb57cad5
 
 jobs:
   gate:
@@ -64,46 +85,73 @@ jobs:
     timeout-minutes: 20
     outputs:
       version: ${{ steps.meta.outputs.version }}
-      vcs_ref: ${{ steps.meta.outputs.vcs_ref }}
+      sha: ${{ steps.meta.outputs.sha }}
       build_date: ${{ steps.meta.outputs.build_date }}
     steps:
-      - name: Check out the tagged commit
+      - name: Check out main (the reviewed workflow's own ref)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
-          ref: ${{ github.event.inputs.ref || github.ref }}
-          fetch-depth: 0         # the ancestry gate below needs history
+          fetch-depth: 0         # tag resolution and the ancestry gate need history
 
       - name: Gate - the tag must identify released code
         id: meta
+        env:
+          # Dispatch inputs are untrusted; they reach the shell only through the
+          # environment, never by interpolation into the script source.
+          RAW_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          REF_NAME='${{ github.event.inputs.ref || github.ref_name }}'
-          VERSION="${REF_NAME#v}"
 
-          # 1. The tag and the workspace version must agree. Without this, main can
-          #    sit at one version while the newest tag claims another.
-          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          if [[ "$VERSION" != "$CARGO_VERSION" ]]; then
-            echo "::error::tag $REF_NAME implies $VERSION but Cargo.toml says $CARGO_VERSION"
+          # 1. Strict shape first: anything else cannot be a release tag and
+          #    must not reach git commands as a ref expression.
+          if [[ ! "$RAW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::input '$RAW_TAG' is not a strict semantic version tag (vMAJOR.MINOR.PATCH)"
             exit 1
           fi
+          VERSION="${RAW_TAG#v}"
 
-          # 2. The tagged commit must be on main, so a tag pushed on an unmerged
-          #    branch cannot publish unreviewed code to a public namespace.
+          # 2. The tag must already exist; this workflow never creates tags.
+          git fetch --no-tags origin "refs/tags/${RAW_TAG}:refs/tags/${RAW_TAG}" \
+            || { echo "::error::tag ${RAW_TAG} does not exist on origin"; exit 1; }
+          SHA=$(git rev-list -n 1 "refs/tags/${RAW_TAG}")
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::could not resolve ${RAW_TAG} to a full commit SHA"; exit 1; }
+
+          # 3. The tagged commit must be on main, so a tag pushed on an
+          #    unmerged branch cannot publish unreviewed code publicly.
           git fetch --no-tags origin main
-          if ! git merge-base --is-ancestor HEAD origin/main; then
-            echo "::error::$REF_NAME is not an ancestor of origin/main"
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "::error::${RAW_TAG} (${SHA}) is not contained in origin/main"
             exit 1
           fi
 
-          echo "version=$VERSION"                          >> "$GITHUB_OUTPUT"
-          echo "vcs_ref=$(git rev-parse --short=12 HEAD)"   >> "$GITHUB_OUTPUT"
-          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"  >> "$GITHUB_OUTPUT"
+          # 4. The tag and the workspace version at that commit must agree.
+          CARGO_VERSION=$(git show "${SHA}:Cargo.toml" | grep -m1 '^version' | sed 's/.*"\(.*\)".*/\1/')
+          if [[ "$VERSION" != "$CARGO_VERSION" ]]; then
+            echo "::error::tag ${RAW_TAG} implies ${VERSION} but Cargo.toml at ${SHA} says ${CARGO_VERSION}"
+            exit 1
+          fi
+
+          # 5. Deterministic metadata: the build date is the tagged commit's
+          #    own timestamp, so re-running the same release reproduces the
+          #    same image config instead of minting a new digest per run.
+          BUILD_DATE=$(TZ=UTC git show -s --date=format-local:'%Y-%m-%dT%H:%M:%SZ' --format=%cd "$SHA")
+
+          {
+            echo "version=$VERSION"
+            echo "sha=$SHA"
+            echo "build_date=$BUILD_DATE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out the tagged commit for the licence gate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ steps.meta.outputs.sha }}
 
       - name: Gate - licence notices must match Cargo.lock
-        # A stale SOFTWARE-LICENSE-NOTICES.html matters far more in a distributed
-        # image than in source. The script pins cargo-about itself and refuses to
-        # run against any other version, so the install must match exactly.
+        # A stale SOFTWARE-LICENSE-NOTICES.html matters far more in a
+        # distributed image than in source. The script pins cargo-about itself
+        # and refuses to run against any other version.
         run: |
           set -euo pipefail
           cargo install --locked --version 0.9.0 --features cli cargo-about
@@ -111,8 +159,8 @@ jobs:
 
   build:
     needs: gate
-    # If one architecture fails, cancel the other: nothing is published either way,
-    # so there is no point paying for the rest of the matrix.
+    # If one architecture fails, cancel the other: nothing is published either
+    # way, so there is no point paying for the rest of the matrix.
     strategy:
       fail-fast: true
       matrix:
@@ -129,21 +177,24 @@ jobs:
       - name: Check out the tagged commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
-          ref: ${{ github.event.inputs.ref || github.ref }}
+          ref: ${{ needs.gate.outputs.sha }}
 
       - name: Ensure smoke-test prerequisites
-        # ci/smoke-test-container.sh requires docker, aws and python3. The AWS CLI
-        # is not guaranteed on every runner image, and the arm64 images are newer
-        # than the x64 ones, so install it if absent rather than assuming.
+        # ci/smoke-test-container.sh requires docker, aws and python3. The AWS
+        # CLI is not guaranteed on every runner image. Install is pinned to an
+        # exact version and verified against a recorded checksum: never execute
+        # a mutable unverified download.
         run: |
           set -euo pipefail
           if ! command -v aws >/dev/null 2>&1; then
             case "$(uname -m)" in
-              x86_64)  PKG=awscli-exe-linux-x86_64.zip ;;
-              aarch64) PKG=awscli-exe-linux-aarch64.zip ;;
+              x86_64)  EXPECTED="$AWSCLI_SHA256_X86_64";  PKG="awscli-exe-linux-x86_64-${AWSCLI_VERSION}.zip" ;;
+              aarch64) EXPECTED="$AWSCLI_SHA256_AARCH64"; PKG="awscli-exe-linux-aarch64-${AWSCLI_VERSION}.zip" ;;
               *) echo "::error::unsupported architecture $(uname -m)"; exit 1 ;;
             esac
             curl -fsSL "https://awscli.amazonaws.com/${PKG}" -o /tmp/awscli.zip
+            echo "${EXPECTED}  /tmp/awscli.zip" | sha256sum -c - \
+              || { echo "::error::AWS CLI download failed checksum verification"; exit 1; }
             unzip -q /tmp/awscli.zip -d /tmp
             sudo /tmp/aws/install
           fi
@@ -155,28 +206,28 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
 
-      - name: Build the image for ${{ matrix.platform }}, not pushed
+      - name: Build the candidate image for ${{ matrix.platform }}, not pushed
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
         with:
           context: .
           platforms: ${{ matrix.platform }}
           load: true             # into the local store, so it can be tested first
           push: false
-          tags: ${{ env.IMAGE_REPO }}:${{ needs.gate.outputs.version }}-${{ matrix.arch }}
+          tags: ${{ env.IMAGE_REPO }}:sha-${{ needs.gate.outputs.sha }}-${{ matrix.arch }}
           build-args: |
             VERSION=${{ needs.gate.outputs.version }}
-            VCS_REF=${{ needs.gate.outputs.vcs_ref }}
+            VCS_REF=${{ needs.gate.outputs.sha }}
             BUILD_DATE=${{ needs.gate.outputs.build_date }}
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
 
       - name: Confirm the image really is ${{ matrix.arch }}
-        # Cheap guard against a silent platform fallback: a mislabelled image would
-        # otherwise be published and only fail on a user's machine.
+        # Cheap guard against a silent platform fallback: a mislabelled image
+        # would otherwise be published and only fail on a user's machine.
         run: |
           set -euo pipefail
           ACTUAL=$(docker image inspect \
-            '${{ env.IMAGE_REPO }}:${{ needs.gate.outputs.version }}-${{ matrix.arch }}' \
+            '${{ env.IMAGE_REPO }}:sha-${{ needs.gate.outputs.sha }}-${{ matrix.arch }}' \
             --format '{{.Architecture}}')
           [[ "$ACTUAL" == "${{ matrix.arch }}" ]] \
             || { echo "::error::expected ${{ matrix.arch }}, image reports $ACTUAL"; exit 1; }
@@ -187,7 +238,7 @@ jobs:
         # `compose up --no-build`, and asserts every container is running this
         # exact image ID.
         env:
-          EXTENDDB_IMAGE: ${{ env.IMAGE_REPO }}:${{ needs.gate.outputs.version }}-${{ matrix.arch }}
+          EXTENDDB_IMAGE: ${{ env.IMAGE_REPO }}:sha-${{ needs.gate.outputs.sha }}-${{ matrix.arch }}
         run: ./ci/smoke-test-container.sh
 
       - name: Save the tested image as an artifact
@@ -195,7 +246,7 @@ jobs:
         # what passed the smoke test above.
         run: |
           set -euo pipefail
-          docker save '${{ env.IMAGE_REPO }}:${{ needs.gate.outputs.version }}-${{ matrix.arch }}' \
+          docker save '${{ env.IMAGE_REPO }}:sha-${{ needs.gate.outputs.sha }}-${{ matrix.arch }}' \
             | gzip > "image-${{ matrix.arch }}.tar.gz"
           ls -lh "image-${{ matrix.arch }}.tar.gz"
 
@@ -207,8 +258,8 @@ jobs:
           retention-days: 1
           compression-level: 0   # already gzipped
 
-  publish:
-    needs: build
+  publish-candidate:
+    needs: [gate, build]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: dockerhub       # the single approval gate, and the only job with secrets
@@ -235,60 +286,76 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Push per-architecture images and combine into manifest lists
+      - name: Push the commit-addressed candidate only
         id: push
+        env:
+          SHA: ${{ needs.gate.outputs.sha }}
         run: |
           set -euo pipefail
-          V='${{ needs.gate.outputs.version }}'
           REPO='${{ env.IMAGE_REPO }}'
+          CANDIDATE="sha-${SHA}"
 
-          # The per-arch tags are pushed first because a manifest list can only
-          # reference images that already exist in the registry. They stay visible
-          # on Docker Hub, which is the conventional cost of this pattern; the tags
-          # users consume, :VERSION and :latest, are proper multi-arch lists.
-          docker push "${REPO}:${V}-amd64"
-          docker push "${REPO}:${V}-arm64"
+          # Refuse to overwrite: a candidate tag for this commit must not
+          # already exist pointing at anything else. Idempotent re-runs of the
+          # identical artifact are the only permitted repeat.
+          if docker buildx imagetools inspect "${REPO}:${CANDIDATE}" >/dev/null 2>&1; then
+            echo "::error::candidate ${REPO}:${CANDIDATE} already exists; refusing to overwrite. Verify and promote the existing candidate, or investigate."
+            exit 1
+          fi
 
-          for TAG in "${V}" latest; do
-            docker buildx imagetools create -t "${REPO}:${TAG}" \
-              "${REPO}:${V}-amd64" "${REPO}:${V}-arm64"
-          done
+          # Per-arch tags first: a manifest list can only reference images that
+          # already exist in the registry.
+          docker push "${REPO}:${CANDIDATE}-amd64"
+          docker push "${REPO}:${CANDIDATE}-arm64"
 
-          DIGEST=$(docker buildx imagetools inspect "${REPO}:${V}" \
+          docker buildx imagetools create -t "${REPO}:${CANDIDATE}" \
+            "${REPO}:${CANDIDATE}-amd64" "${REPO}:${CANDIDATE}-arm64"
+
+          DIGEST=$(docker buildx imagetools inspect "${REPO}:${CANDIDATE}" \
                      --format '{{.Manifest.Digest}}')
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "candidate=${CANDIDATE}" >> "$GITHUB_OUTPUT"
 
-      - name: Verify both architectures are in the published manifest
+      - name: Verify both architectures are in the published candidate
         run: |
           set -euo pipefail
           OUT=$(docker buildx imagetools inspect \
-                  '${{ env.IMAGE_REPO }}:${{ needs.gate.outputs.version }}')
+                  '${{ env.IMAGE_REPO }}:${{ steps.push.outputs.candidate }}')
           echo "$OUT"
           echo "$OUT" | grep -q 'linux/amd64' || { echo "::error::amd64 missing"; exit 1; }
           echo "$OUT" | grep -q 'linux/arm64' || { echo "::error::arm64 missing"; exit 1; }
 
-      - name: Summarise
+      - name: Summarise for the release checklist
         run: |
           {
-            echo "### Published"
+            echo "### Candidate published (NOT promoted)"
             echo ""
             echo "| field | value |"
             echo "|---|---|"
-            echo "| image | \`${{ env.IMAGE_REPO }}:${{ needs.gate.outputs.version }}\` |"
-            echo "| digest | \`${{ steps.push.outputs.digest }}\` |"
+            echo "| candidate | \`${{ env.IMAGE_REPO }}:${{ steps.push.outputs.candidate }}\` |"
+            echo "| index digest | \`${{ steps.push.outputs.digest }}\` |"
             echo "| platforms | linux/amd64, linux/arm64 |"
-            echo "| commit | \`${{ needs.gate.outputs.vcs_ref }}\` |"
-            echo "| built | \`${{ needs.gate.outputs.build_date }}\` |"
+            echo "| version (from tag) | \`${{ needs.gate.outputs.version }}\` |"
+            echo "| commit | \`${{ needs.gate.outputs.sha }}\` |"
+            echo "| build date (commit-derived) | \`${{ needs.gate.outputs.build_date }}\` |"
+            echo ""
+            echo "Next steps are manual, per the release runbook: record this digest,"
+            echo "pull and smoke test anonymously by digest on both architectures,"
+            echo "mirror the exact artifact to the other registries, sign, then"
+            echo "promote the digest to the version tag and \`latest\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
-# One deliberate omission, and what closing it would cost.
+# Deliberate omissions, and what closing them would cost.
+#
+# No version tag or `latest`: promotion is a manual, recorded runbook step for
+# the initial releases. Automating it (with existing-tag protection and latest
+# ordering) is the Track 2 follow-up.
 #
 # No provenance or SBOM attestations. Those are produced by the registry/OCI
-# exporter, while `load: true` requires the local docker exporter, and `load` is
-# what makes it possible to smoke test the image before any credential exists in
-# the job. Adding attestations means pushing before testing, or pushing to a
-# staging repository and promoting the digest afterwards. Both are worse trades
-# than losing the attestation for now, so this is a considered follow-up.
+# exporter, while `load: true` requires the local docker exporter, and `load`
+# is what makes it possible to smoke test the image before any credential
+# exists in the job. A staging-repository push-then-promote flow would enable
+# them; considered follow-up.
 #
-# Neither the smoke test nor the licence check runs on pull requests. This gates
-# releases, not merges; a PR-triggered job would stop both regressing in between.
+# Neither the smoke test nor the licence check runs on pull requests. This
+# gates releases, not merges.
