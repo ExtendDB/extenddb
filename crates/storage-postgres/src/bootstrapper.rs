@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use extenddb_storage::bootstrapper::{
     AdminBootstrapResult, BootstrapConfig, Bootstrapper,
     helpers::{
-        check_conflict, extract_arg, generate_account_id, generate_encryption_key,
-        generate_random_password, hash_password_async,
+        check_conflict, check_conflict_redacted, extract_arg, generate_account_id,
+        generate_encryption_key, generate_random_password, hash_password_async,
     },
 };
 use extenddb_storage::management_store::{OpError, OpResult};
@@ -688,7 +688,7 @@ impl PostgresBootstrapper {
             check_conflict(pg_host.as_ref(), &parts.host, "--pg-host")?;
             check_conflict(pg_port.as_ref(), &parts.port, "--pg-port")?;
             check_conflict(extenddb_user.as_ref(), &parts.user, "--extenddb-user")?;
-            check_conflict(extenddb_pass.as_ref(), &parts.password, "--extenddb-pass")?;
+            check_conflict_redacted(extenddb_pass.as_ref(), &parts.password, "--extenddb-pass")?;
 
             if let Some(ref cli_catalog) = catalog_db
                 && cli_catalog != &parts.database
