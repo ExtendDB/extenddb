@@ -1,0 +1,144 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Minimal GHCR candidate mirror.
+#
+# Copies ONE already-verified, commit-addressed candidate from Docker Hub to
+# GHCR, byte-for-byte, and nothing else: no builds, no Docker Hub publication,
+# no ECR, no version tags, no `latest`, no signing. Promotion and signing are
+# manual, recorded runbook steps.
+#
+# Why this exists at all: GHCR's only acceptable credential is the
+# workflow-scoped GITHUB_TOKEN, which exists only inside an Actions run, so
+# the GHCR copy cannot be a manual push (and a PAT is not an option). Every
+# run is human-gated by the protected `ghcr` environment: reviewer approval,
+# main-only, no stored secrets.
+#
+# The digest input is the contract with the manual verification that precedes
+# this job: the operator supplies the digest they verified, and this job
+# refuses to mirror anything else, even if the Docker Hub tag has moved since.
+
+name: ghcr-mirror
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_tag:
+        description: 'Verified Docker Hub candidate tag, e.g. sha-<full 40-char commit>'
+        required: true
+      expected_digest:
+        description: 'The verified multi-arch index digest, e.g. sha256:<64 hex>'
+        required: true
+
+# Copying between registries needs no repository content at all.
+permissions:
+  contents: read
+
+# Two mirror runs must never race on the same destination.
+concurrency:
+  group: ghcr-mirror-extenddb-postgres
+  cancel-in-progress: false
+
+env:
+  SRC_REPO: docker.io/extenddb/extenddb-postgres
+  DST_REPO: ghcr.io/extenddb/extenddb-postgres
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ghcr          # required reviewers, prevent self-review, main only
+    steps:
+      - name: Gate - validate inputs strictly
+        env:
+          # Dispatch inputs are untrusted; they reach the shell only through
+          # the environment, never by interpolation into script source.
+          RAW_TAG: ${{ inputs.candidate_tag }}
+          RAW_DIGEST: ${{ inputs.expected_digest }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RAW_TAG" =~ ^sha-[0-9a-f]{40}$ ]]; then
+            echo "::error::candidate_tag '$RAW_TAG' is not a commit-addressed candidate tag (sha-<40 hex>)"
+            exit 1
+          fi
+          if [[ ! "$RAW_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::expected_digest is not a sha256:<64 hex> digest"
+            exit 1
+          fi
+          {
+            echo "TAG=$RAW_TAG"
+            echo "DIGEST=$RAW_DIGEST"
+          } >> "$GITHUB_ENV"
+
+      - name: Gate - skopeo present (preinstalled on ubuntu-latest)
+        run: |
+          set -euo pipefail
+          command -v skopeo >/dev/null || sudo apt-get install -y --no-install-recommends skopeo
+          skopeo --version
+
+      - name: Gate - the source tag must still resolve to the verified digest
+        run: |
+          set -euo pipefail
+          SRC_DIGEST=$(skopeo inspect --format '{{.Digest}}' "docker://${SRC_REPO}:${TAG}")
+          if [[ "$SRC_DIGEST" != "$DIGEST" ]]; then
+            echo "::error::${SRC_REPO}:${TAG} now resolves to ${SRC_DIGEST}, not the verified ${DIGEST}; refusing to mirror an unverified artifact"
+            exit 1
+          fi
+
+      - name: Gate - refuse to overwrite an existing destination tag
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin <<< "$GHCR_TOKEN"
+          if DST_DIGEST=$(skopeo inspect --format '{{.Digest}}' "docker://${DST_REPO}:${TAG}" 2>/dev/null); then
+            if [[ "$DST_DIGEST" == "$DIGEST" ]]; then
+              echo "already-mirrored=true" >> "$GITHUB_ENV"
+              echo "::notice::${DST_REPO}:${TAG} already exists with the exact verified digest; nothing to do"
+            else
+              echo "::error::${DST_REPO}:${TAG} already exists with different digest ${DST_DIGEST}; refusing to overwrite"
+              exit 1
+            fi
+          fi
+
+      - name: Mirror the exact artifact (no rebuild, digests preserved)
+        if: env.already-mirrored != 'true'
+        run: |
+          set -euo pipefail
+          # --all copies every platform image; --preserve-digests fails rather
+          # than rewrite any manifest, so the GHCR copy is byte-identical.
+          skopeo copy --all --preserve-digests \
+            "docker://${SRC_REPO}:${TAG}" \
+            "docker://${DST_REPO}:${TAG}"
+
+      - name: Verify the published copy
+        run: |
+          set -euo pipefail
+          DST_DIGEST=$(skopeo inspect --format '{{.Digest}}' "docker://${DST_REPO}:${TAG}")
+          if [[ "$DST_DIGEST" != "$DIGEST" ]]; then
+            echo "::error::published ${DST_REPO}:${TAG} digest ${DST_DIGEST} does not match verified ${DIGEST}"
+            exit 1
+          fi
+          RAW=$(skopeo inspect --raw "docker://${DST_REPO}:${TAG}")
+          echo "$RAW" | grep -q '"architecture": *"amd64"' || { echo "::error::amd64 missing from mirrored index"; exit 1; }
+          echo "$RAW" | grep -q '"architecture": *"arm64"' || { echo "::error::arm64 missing from mirrored index"; exit 1; }
+
+      - name: Log out
+        if: always()
+        run: skopeo logout ghcr.io || true
+
+      - name: Summarise for the release checklist
+        run: |
+          {
+            echo "### GHCR candidate mirrored (NOT promoted, NOT signed)"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| source | \`${SRC_REPO}:${TAG}\` |"
+            echo "| destination | \`${DST_REPO}:${TAG}\` |"
+            echo "| digest | \`${DIGEST}\` |"
+            echo ""
+            echo "Next manual steps: anonymous pull + native smoke tests on both"
+            echo "architectures, first-push package settings (visibility), signing,"
+            echo "then promotion per the release runbook."
+          } >> "$GITHUB_STEP_SUMMARY"
