@@ -20,16 +20,19 @@
 #[cfg(any(
     all(feature = "postgres", feature = "sqlite"),
     all(feature = "postgres", feature = "mongodb"),
+    all(feature = "postgres", feature = "bigtable"),
     all(feature = "sqlite", feature = "mongodb"),
+    all(feature = "sqlite", feature = "bigtable"),
+    all(feature = "mongodb", feature = "bigtable"),
 ))]
 compile_error!(
-    "the `postgres`, `mongodb`, and `sqlite` features are mutually exclusive: a \
-     thin bin installs exactly one backend (e.g. build the MongoDB binary with \
-     `--no-default-features --features mongodb`)"
+    "the `postgres`, `mongodb`, `sqlite`, and `bigtable` features are mutually exclusive: a \
+     thin bin installs exactly one backend (e.g. build the Bigtable binary with \
+     `--no-default-features --features bigtable`)"
 );
-#[cfg(not(any(feature = "postgres", feature = "mongodb", feature = "sqlite")))]
+#[cfg(not(any(feature = "postgres", feature = "mongodb", feature = "sqlite", feature = "bigtable")))]
 compile_error!(
-    "no backend selected: enable the `postgres` (default), `mongodb`, or `sqlite` feature"
+    "no backend selected: enable the `postgres` (default), `mongodb`, `sqlite`, or `bigtable` feature"
 );
 
 // Developer mode relaxes the security posture (plain HTTP on loopback, open
@@ -38,12 +41,12 @@ compile_error!(
 // (every backend is a production backend unless proven otherwise, so a deny-list
 // would have to grow with each new one), require a known dev backend: dev-mode
 // compiles only when `sqlite` is enabled. `sqlite-memory` enables `sqlite`, so it
-// is covered too; postgres, mongodb — or any future production backend — fail the
+// is covered too; postgres, mongodb, bigtable — or any future production backend — fail the
 // build, so there is no path by which a production deployment can serve in dev mode.
 #[cfg(all(feature = "dev-mode", not(feature = "sqlite")))]
 compile_error!(
     "the `dev-mode` feature requires a dev/CI backend such as `sqlite`; it must \
-     not be built with a production backend like `postgres` or `mongodb` (build \
+     not be built with a production backend like `postgres`, `mongodb`, or `bigtable` (build \
      with `--no-default-features --features sqlite-memory,dev-mode`)"
 );
 
@@ -57,6 +60,8 @@ fn main() -> anyhow::Result<()> {
     extenddb_storage::set_backend(extenddb_storage_sqlite::backend())?;
     #[cfg(feature = "mongodb")]
     extenddb_storage::set_backend(extenddb_storage_mongodb::backend())?;
+    #[cfg(feature = "bigtable")]
+    extenddb_storage::set_backend(extenddb_storage_bigtable::backend())?;
 
     extenddb_app::run(extenddb_app::BuildInfo {
         // Read from the bin crate so the reported version is the deployed
@@ -77,6 +82,8 @@ mod tests {
         let _ = extenddb_storage::set_backend(extenddb_storage_sqlite::backend());
         #[cfg(feature = "mongodb")]
         let _ = extenddb_storage::set_backend(extenddb_storage_mongodb::backend());
+        #[cfg(feature = "bigtable")]
+        let _ = extenddb_storage::set_backend(extenddb_storage_bigtable::backend());
     }
 
     /// Zero-config serve contract: with the SQLite backend installed,

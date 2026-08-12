@@ -29,16 +29,11 @@
 # run_dir = "~/.extenddb/run"  # Directory for PID file (~ is expanded to $HOME)
 
 [storage]
-# backend = "postgres"         # Storage backend: "postgres" (default), "mongodb", or "sqlite".
+# backend = "postgres"         # Storage backend: "postgres" (default) or "bigtable"
 
-# --- SQLite backend (developer mode) ---
-# Select with `extenddb init --backend sqlite`. The database path can be given
-# at serve time (`extenddb serve --sqlite-path <path>`) or here. Resolution order:
-#   --sqlite-path flag  ->  [storage.sqlite].path  ->  default "extenddb.sqlite".
-# Use ":memory:" for an ephemeral in-memory database (data lost on shutdown).
-# [storage.sqlite]
-# path = "extenddb.sqlite"
-
+# -----------------------------------------------------------------------------
+# Storage Backend: PostgreSQL
+# -----------------------------------------------------------------------------
 [storage.postgres]
 # Connection string points to the CATALOG database.
 # The catalog stores table metadata and the data database connection info.
@@ -60,10 +55,22 @@
                                 # DynamoDB request makes concurrent authz queries
                                 # — size this to match expected concurrency.
 
-[storage.mongodb]
-# MongoDB connection string. Requires a replica set (even single-node).
-# connection_string = "mongodb://localhost:27017/?replicaSet=rs0"
-# max_pool_size = 20           # Maximum concurrent connections to MongoDB.
+# -----------------------------------------------------------------------------
+# Storage Backend: Google Cloud Bigtable (gated behind --features bigtable)
+# -----------------------------------------------------------------------------
+[storage.bigtable]
+# project_id = "my-gcp-project"          # GCP Project ID (or any string when using emulator)
+# instance_id = "my-bigtable-instance"   # Bigtable Instance ID for catalog & metadata
+# data_instance_id = "my-data-instance"  # Optional instance ID for data tables (defaults to instance_id)
+# credentials_path = "/path/to/sa.json"  # Optional path to service account JSON key (falls back to ADC)
+# emulator_host = "localhost:8086"       # Set to point clients to Bigtable emulator
+# pool_size = 20                         # Max concurrent connections on the data path (default: 20)
+# catalog_pool_size = 20                 # Max concurrent connections on the catalog path (defaults to pool_size)
+# sweeper_cadence_secs = 30              # 2PC recovery sweeper scan interval in seconds (default: 30)
+# intent_timeout_secs = 60               # Unresolved 2PC lock timeout in seconds (default: 60)
+# ttl_scan_cadence_secs = 60             # TTL index sweep interval in seconds (default: 60)
+# gsi_reconcile_cadence_secs = 300       # GSI shadow table reconciler interval in seconds (default: 300)
+# dev_mode = false                       # Local dev-mode auth bypass (DO NOT enable in production)
 
 [auth]
 # provider = "builtin"          # Auth provider:

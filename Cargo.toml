@@ -11,6 +11,7 @@ members = [
     "crates/storage-postgres",
     "crates/storage-mongodb",
     "crates/storage-sqlite",
+    "crates/storage-bigtable",
     "crates/auth",
     "crates/server",
     "crates/app",
@@ -33,6 +34,7 @@ extenddb-config = { path = "crates/config" }
 extenddb-storage-postgres = { path = "crates/storage-postgres" }
 extenddb-storage-mongodb = { path = "crates/storage-mongodb" }
 extenddb-storage-sqlite = { path = "crates/storage-sqlite" }
+extenddb-storage-bigtable = { path = "crates/storage-bigtable" }
 extenddb-auth = { path = "crates/auth" }
 extenddb-server = { path = "crates/server" }
 extenddb-app = { path = "crates/app" }
@@ -102,3 +104,14 @@ config = "0.14"
 
 # Security
 zeroize = { version = "1.8", features = ["derive"] }
+
+# BigTable
+bigtable_rs = "0.3"
+googleapis_tonic_google_bigtable_v2 = { package = "googleapis-tonic-google-bigtable-v2", version = "0.36" }
+googleapis_tonic_google_bigtable_admin_v2 = { package = "googleapis-tonic-google-bigtable-admin-v2", version = "0.44" }
+tonic = { version = "0.14", features = ["tls-native-roots"] }
+prost = "0.14"
+prost-types = "0.14"
+hyper-util = "0.1"
+gcp_auth = "0.12"
+
