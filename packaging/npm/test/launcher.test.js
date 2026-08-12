@@ -31,9 +31,6 @@ if (!process.env.EXTENDDB_BINARY) {
 
 function health(endpoint) {
   const http = require("node:http");
-  // The aws-sdk is deliberately not a dev dependency, so data-plane assertions
-  // live in the SDK-level suites; this file's subject is process behavior and
-  // storage resolution, for which the health endpoint suffices.
   return new Promise((resolve, reject) => {
     const req = http.get(`${endpoint}/health`, (res) => {
       res.resume();
@@ -41,6 +38,90 @@ function health(endpoint) {
     });
     req.on("error", reject);
   });
+}
+
+// A minimal SigV4-signed DynamoDB call in plain node, so persistence can be
+// proven with real data-plane writes and reads without making an AWS SDK a
+// dev dependency of the package.
+function ddb(eb, action, body) {
+  const crypto = require("node:crypto");
+  const http = require("node:http");
+
+  const region = "us-east-1";
+  const service = "dynamodb";
+  const payload = JSON.stringify(body);
+  const now = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+  const date = now.slice(0, 8);
+  const { hostname, port } = new URL(eb.endpoint);
+  const host = `${hostname}:${port}`;
+
+  const hash = (d) => crypto.createHash("sha256").update(d).digest("hex");
+  const hmac = (k, d) => crypto.createHmac("sha256", k).update(d).digest();
+
+  const target = `DynamoDB_20120810.${action}`;
+  const canonicalHeaders =
+    `host:${host}\nx-amz-date:${now}\nx-amz-target:${target}\n`;
+  const signedHeaders = "host;x-amz-date;x-amz-target";
+  const canonicalRequest =
+    `POST\n/\n\n${canonicalHeaders}\n${signedHeaders}\n${hash(payload)}`;
+  const scope = `${date}/${region}/${service}/aws4_request`;
+  const stringToSign =
+    `AWS4-HMAC-SHA256\n${now}\n${scope}\n${hash(canonicalRequest)}`;
+  const kSigning = hmac(
+    hmac(hmac(hmac(`AWS4${eb.credentials.secretAccessKey}`, date), region), service),
+    "aws4_request"
+  );
+  const signature = crypto.createHmac("sha256", kSigning).update(stringToSign).digest("hex");
+
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        hostname,
+        port,
+        method: "POST",
+        path: "/",
+        headers: {
+          "content-type": "application/x-amz-json-1.0",
+          "x-amz-date": now,
+          "x-amz-target": target,
+          authorization:
+            `AWS4-HMAC-SHA256 Credential=${eb.credentials.accessKeyId}/${scope}, ` +
+            `SignedHeaders=${signedHeaders}, Signature=${signature}`,
+        },
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (d) => (data += d));
+        res.on("end", () => {
+          if (res.statusCode !== 200) {
+            reject(new Error(`${action} -> ${res.statusCode}: ${data}`));
+          } else {
+            resolve(JSON.parse(data || "{}"));
+          }
+        });
+      }
+    );
+    req.on("error", reject);
+    req.end(payload);
+  });
+}
+
+// The table used by the persistence scenarios. Tables surface a CREATING
+// state briefly even on SQLite, so wait for ACTIVE before writing.
+async function createProbeTable(eb) {
+  await ddb(eb, "CreateTable", {
+    TableName: "launcher-persist",
+    AttributeDefinitions: [{ AttributeName: "pk", AttributeType: "S" }],
+    KeySchema: [{ AttributeName: "pk", KeyType: "HASH" }],
+    BillingMode: "PAY_PER_REQUEST",
+  });
+  const deadline = Date.now() + 15000;
+  for (;;) {
+    const d = await ddb(eb, "DescribeTable", { TableName: "launcher-persist" });
+    if (d.Table && d.Table.TableStatus === "ACTIVE") return;
+    if (Date.now() > deadline) throw new Error("launcher-persist never became ACTIVE");
+    await new Promise((r) => setTimeout(r, 200));
+  }
 }
 
 async function main() {
@@ -64,31 +145,61 @@ async function main() {
     await eb.stop();
   }
 
-  // 2. File mode persists across two server lifetimes on the same path.
+  // 2. File mode persists across two server lifetimes on the same path: an
+  //    item written by the first server must be readable by the second. This
+  //    is the load-bearing assertion; file existence or size alone would pass
+  //    for a server that recreated its schema fresh on every boot.
   {
     const first = await start({ binary: process.env.EXTENDDB_BINARY, dbPath });
-    assert.strictEqual(await health(first.endpoint), 200);
+    await createProbeTable(first);
+    await ddb(first, "PutItem", {
+      TableName: "launcher-persist",
+      Item: { pk: { S: "survivor" }, note: { S: "written by lifetime one" } },
+    });
     await first.stop();
-    const sizeAfterFirst = fs.statSync(dbPath).size;
-    assert.ok(sizeAfterFirst > 0, "database file must be non-empty after first run");
 
     const second = await start({ binary: process.env.EXTENDDB_BINARY, dbPath });
-    assert.strictEqual(await health(second.endpoint), 200);
+    const got = await ddb(second, "GetItem", {
+      TableName: "launcher-persist",
+      Key: { pk: { S: "survivor" } },
+    });
+    assert.ok(got.Item, "the item written in lifetime one must survive into lifetime two");
+    assert.strictEqual(got.Item.note.S, "written by lifetime one");
     await second.stop();
   }
 
-  // 3. Memory mode: nothing lands in the default data dir.
+  // 3. Memory mode: nothing lands in the default data dir, and data written
+  //    to one memory-mode server is GONE after a restart. The loss assertion
+  //    is the discriminating half: if memory mode silently fell back to a
+  //    file, it would fail.
   {
     const memScratch = fs.mkdtempSync(path.join(os.tmpdir(), "extenddb-mem-test-"));
     process.chdir(memScratch);
     const eb = await start({ binary: process.env.EXTENDDB_BINARY, memory: true });
     assert.strictEqual(await health(eb.endpoint), 200);
     assert.strictEqual(eb.storage, ":memory: (ephemeral)");
+    await createProbeTable(eb);
+    await ddb(eb, "PutItem", {
+      TableName: "launcher-persist",
+      Item: { pk: { S: "ephemeral" } },
+    });
     assert.ok(
       !fs.existsSync(path.join(memScratch, ".extenddb")),
       "memory mode must not create the data directory"
     );
     await eb.stop();
+
+    const again = await start({ binary: process.env.EXTENDDB_BINARY, memory: true });
+    await assert.rejects(
+      () =>
+        ddb(again, "GetItem", {
+          TableName: "launcher-persist",
+          Key: { pk: { S: "ephemeral" } },
+        }),
+      /ResourceNotFoundException/,
+      "a restarted memory-mode server must not know the previous server's table"
+    );
+    await again.stop();
   }
 
   // 4. Contradictory options are refused loudly.

@@ -8,8 +8,15 @@
     "url": "git+https://github.com/ExtendDB/extenddb.git",
     "directory": "packaging/npm/platform/win32-x64"
   },
-  "os": ["win32"],
-  "cpu": ["x64"],
-  "files": ["extenddb.exe"],
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "extenddb.exe",
+    "NOTICE"
+  ],
   "preferUnplugged": true
 }

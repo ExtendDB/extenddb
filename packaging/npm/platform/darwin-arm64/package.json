@@ -8,8 +8,15 @@
     "url": "git+https://github.com/ExtendDB/extenddb.git",
     "directory": "packaging/npm/platform/darwin-arm64"
   },
-  "os": ["darwin"],
-  "cpu": ["arm64"],
-  "files": ["extenddb"],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "extenddb",
+    "NOTICE"
+  ],
   "preferUnplugged": true
 }

@@ -111,3 +111,16 @@ a granular automation token scoped to the `extenddb` package and `@extenddb`
 scope with publish permission only; create the GitHub environment `npm` with
 deployment branch rule `main`, required reviewers, and the token as
 `NPM_TOKEN`.
+
+## Known limits
+
+- A hard-killed caller (SIGKILL, OOM) cannot run its exit handler, so the
+  spawned server survives it, holding its port and storage. `stop()` and
+  normal process exit shut it down; after a hard kill, kill the `extenddb`
+  process yourself.
+- The prebuilt Linux binaries are glibc builds. On musl systems (Alpine,
+  `node:alpine`) they fail to execute even though the file exists; build a
+  musl binary and point `EXTENDDB_BINARY` at it.
+- Two servers cannot share one database file: a second `start()` on the same
+  path fails at startup with a lock error. Use distinct `dbPath`s or memory
+  mode for parallel test workers.

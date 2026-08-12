@@ -8,8 +8,15 @@
     "url": "git+https://github.com/ExtendDB/extenddb.git",
     "directory": "packaging/npm/platform/linux-x64"
   },
-  "os": ["linux"],
-  "cpu": ["x64"],
-  "files": ["extenddb"],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "extenddb",
+    "NOTICE"
+  ],
   "preferUnplugged": true
 }

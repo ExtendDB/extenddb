@@ -15,7 +15,8 @@
   },
   "files": [
     "index.js",
-    "bin/"
+    "bin/",
+    "NOTICE"
   ],
   "engines": {
     "node": ">=18"

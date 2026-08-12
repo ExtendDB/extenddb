@@ -156,10 +156,12 @@ async function start(options = {}) {
       if (err.code === "ENOENT") {
         reject(
           new Error(
-            `could not find the extenddb dev binary (tried the "binary" option, ` +
-              `EXTENDDB_BINARY, the @extenddb/${process.platform}-${process.arch} ` +
-              `platform package, then PATH). If your platform has no prebuilt ` +
-              `package, build one with: cargo build --release --no-default-features ` +
+            `could not find or execute the extenddb dev binary (tried the "binary" ` +
+              `option, EXTENDDB_BINARY, the @extenddb/${process.platform}-${process.arch} ` +
+              `platform package, then PATH). Note: on musl systems such as Alpine ` +
+              `(node:alpine), the prebuilt glibc binary fails with this same error even ` +
+              `when the file exists. If your platform has no working prebuilt package, ` +
+              `build one with: cargo build --release --no-default-features ` +
               `--features sqlite,dev-mode -p extenddb, then set EXTENDDB_BINARY to it.`
           )
         );

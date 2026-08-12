@@ -31,9 +31,24 @@ async function main() {
   const opts = {};
   for (let i = 1; i < args.length; i += 1) {
     if (args[i] === "--memory") opts.memory = true;
-    else if (args[i] === "--db") opts.dbPath = args[(i += 1)];
-    else if (args[i] === "--port") opts.port = Number(args[(i += 1)]);
-    else {
+    else if (args[i] === "--db") {
+      const v = args[(i += 1)];
+      if (v === undefined || v.startsWith("--")) {
+        console.error("error: --db requires a path");
+        usage();
+        process.exit(1);
+      }
+      opts.dbPath = v;
+    } else if (args[i] === "--port") {
+      const v = args[(i += 1)];
+      const n = Number(v);
+      if (v === undefined || !Number.isInteger(n) || n < 1 || n > 65535) {
+        console.error(`error: --port requires an integer between 1 and 65535, got ${v}`);
+        usage();
+        process.exit(1);
+      }
+      opts.port = n;
+    } else {
       usage();
       process.exit(1);
     }

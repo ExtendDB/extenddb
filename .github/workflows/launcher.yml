@@ -11,6 +11,13 @@ on:
       - 'packaging/**'
       - '.github/workflows/npm-publish.yml'
       - '.github/workflows/launcher.yml'
+      # The launcher's contract is implemented by the server (dev-mode serve,
+      # /health, EXTENDDB__ env overrides, seeded credentials), so server
+      # changes must run this gate too; otherwise a contract break surfaces
+      # only at release time.
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
 
 permissions:
   contents: read

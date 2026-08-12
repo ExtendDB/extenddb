@@ -221,14 +221,29 @@ jobs:
           VERSION: ${{ needs.gate.outputs.version }}
         run: |
           set -euo pipefail
-          for pkg in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
+
+          # The platform list is derived from the launcher's
+          # optionalDependencies, the single source of truth, so the publish
+          # loop cannot drift from what the launcher wires up. The build
+          # matrix is asserted against the same list below: a platform in the
+          # dependencies but missing from the matrix has no artifact and
+          # fails here, loudly, before anything is published.
+          PLATFORMS=$(jq -r '.optionalDependencies | keys[] | ltrimstr("@extenddb/")' packaging/npm/package.json)
+
+          for pkg in $PLATFORMS; do
             dir="packaging/npm/platform/${pkg}"
             bin="extenddb"; [[ "$pkg" == win32-* ]] && bin="extenddb.exe"
 
+            [[ -d "$dir" ]] || { echo "::error::no template for ${pkg} (optionalDependencies/platform drift)"; exit 1; }
+            [[ -f "artifacts/bin-${pkg}/${bin}" ]] || { echo "::error::no built artifact for ${pkg} (optionalDependencies/build-matrix drift)"; exit 1; }
+
             # Stage the binary at the package root, where the launcher's
-            # require.resolve contract expects it.
+            # require.resolve contract expects it, plus the licence files
+            # Apache-2.0 section 4 requires in every distribution. npm
+            # includes LICENSE and NOTICE regardless of the files whitelist.
             cp "artifacts/bin-${pkg}/${bin}" "${dir}/${bin}"
             chmod +x "${dir}/${bin}"
+            cp LICENSE NOTICE "${dir}/"
 
             jq --arg v "$VERSION" '.version = $v' "${dir}/package.json" > "${dir}/package.json.tmp"
             mv "${dir}/package.json.tmp" "${dir}/package.json"
@@ -243,6 +258,7 @@ jobs:
           VERSION: ${{ needs.gate.outputs.version }}
         run: |
           set -euo pipefail
+          cp LICENSE NOTICE packaging/npm/
           cd packaging/npm
 
           # The launcher and its platform packages are one release: pin the
