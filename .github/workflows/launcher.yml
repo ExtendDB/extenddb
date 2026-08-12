@@ -1,0 +1,38 @@
+# Gates changes to the npm launcher: builds the slim dev-mode binary and runs
+# the launcher test suite against it, the same suite the release workflow
+# later runs on every platform's native runner. PR-time coverage is Linux
+# only; the release workflow is where all five platforms are proven.
+
+name: launcher
+
+on:
+  pull_request:
+    paths:
+      - 'packaging/**'
+      - '.github/workflows/npm-publish.yml'
+      - '.github/workflows/launcher.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  launcher-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      - uses: dtolnay/rust-toolchain@1.97.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the slim dev-mode binary
+        run: cargo build --release --locked --no-default-features --features sqlite,dev-mode -p extenddb
+
+      - name: Run the launcher test suite
+        env:
+          EXTENDDB_BINARY: ${{ github.workspace }}/target/release/extenddb
+        run: |
+          set -euo pipefail
+          cd packaging/npm
+          node test/launcher.test.js
