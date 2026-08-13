@@ -17,7 +17,9 @@ use extenddb_core::types::{
 };
 use extenddb_storage::TableEngine;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{index_arn, sk_info, stream_arn, table_arn};
+use extenddb_storage::util::{
+    index_arn, merge_attribute_definitions, sk_info, stream_arn, table_arn,
+};
 
 use crate::MongoEngine;
 use crate::data::data_collection_name;
@@ -797,6 +799,33 @@ impl MongoEngine {
 
         // Handle GSI updates
         if let Some(gsi_updates) = &input.global_secondary_index_updates {
+            // Persist the request's attribute definitions, merged into the stored
+            // set. This backend previously never wrote them at all, so a created
+            // index's key attributes were missing from the catalog and `sk_info`
+            // resolved the index's own sort key to `None`, making it behave as
+            // hash-only. Merging (rather than replacing) is what keeps the base
+            // table's pk/sk definitions intact, which is issue #259 on the SQL
+            // backends. Read-modify-write without a transaction, matching the rest
+            // of this method; the catalog row is only written by UpdateTable.
+            let merged_attr_defs = if let Some(new_attr_defs) = &input.attribute_definitions {
+                let current = self
+                    .describe_table_impl(account_id, &input.table_name)
+                    .await?;
+                let merged =
+                    merge_attribute_definitions(&current.attribute_definitions, new_attr_defs);
+                let merged_bson =
+                    bson::to_bson(&merged).map_err(|e| StorageError::Internal(e.to_string()))?;
+                tables_coll
+                    .update_one(
+                        doc! { "_id": { "account_id": account_id, "table_name": &input.table_name } },
+                        doc! { "$set": { "attribute_definitions": merged_bson } },
+                    )
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                Some(merged)
+            } else {
+                None
+            };
             for update in gsi_updates {
                 if let Some(create) = &update.create {
                     // Fetch table_id
@@ -854,7 +883,9 @@ impl MongoEngine {
                         &index_id,
                         &create.key_schema,
                         &desc.key_schema,
-                        &desc.attribute_definitions,
+                        merged_attr_defs
+                            .as_deref()
+                            .unwrap_or(&desc.attribute_definitions),
                     )
                     .await?;
 
@@ -1000,7 +1031,7 @@ impl MongoEngine {
         }
         let has_lsi = !local_secondary_indexes.is_empty();
 
-        Ok(TableKeyInfo {
+        let key_info = TableKeyInfo {
             table_name,
             account_id,
             table_id,
@@ -1011,7 +1042,14 @@ impl MongoEngine {
             global_secondary_indexes,
             local_secondary_indexes,
             stream_specification,
-        })
+        };
+        // Catalog metadata that cannot describe its own sort key would make the
+        // keyed read paths fall back to a partition-only lookup and return the
+        // wrong item, so refuse it here rather than serve a wrong answer (#259).
+        key_info
+            .validate_sort_key_definitions()
+            .map_err(StorageError::Internal)?;
+        Ok(key_info)
     }
 
     async fn index_info_impl(

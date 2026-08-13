@@ -54,6 +54,8 @@ mod gsi;
 #[cfg(test)]
 mod gsi_more;
 #[cfg(test)]
+mod gsi_update_table_attr_defs;
+#[cfg(test)]
 mod index_key_validation;
 #[cfg(test)]
 mod lsi;
