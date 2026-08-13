@@ -230,7 +230,7 @@ impl SqliteEngine {
             self.fetch_all_index_info(&table_id).await?;
         let has_lsi = !local_secondary_indexes.is_empty();
 
-        Ok(TableKeyInfo {
+        let key_info = TableKeyInfo {
             table_name: table_name.to_owned(),
             account_id: account_id.to_owned(),
             table_id,
@@ -241,7 +241,14 @@ impl SqliteEngine {
             global_secondary_indexes,
             local_secondary_indexes,
             stream_specification,
-        })
+        };
+        // Catalog metadata that cannot describe its own sort key would make the
+        // keyed read paths fall back to a partition-only lookup and return the
+        // wrong item, so refuse it here rather than serve a wrong answer (#259).
+        key_info
+            .validate_sort_key_definitions()
+            .map_err(StorageError::Internal)?;
+        Ok(key_info)
     }
 
     /// Fetch every secondary index defined on a table, split into
