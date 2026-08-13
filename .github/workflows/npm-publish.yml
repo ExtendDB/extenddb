@@ -43,10 +43,23 @@
 #   Deployment branches: Selected, rule `branch: main`. A dispatch from any
 #     other ref cannot read the token at all.
 #   Required reviewers: the candidate publish must be approved before it runs.
-#   Secrets: NPM_TOKEN (granular automation token limited to the extenddb
-#     package and @extenddb scope, publish permission only).
-# Plus, once on the registry: create the npm org `extenddb`; both the
-# unscoped name and the scope were verified unclaimed when this was written.
+#   Secrets: none. Authentication is npm trusted publishing (OIDC), so there
+#     is no token to store, leak, or rotate. The environment gate is still
+#     load-bearing: npm matches the environment name as part of the trust
+#     relationship, so a run outside `npm` cannot mint a publish credential.
+#
+# Plus, once on the registry, per package (all six: @extenddb/dev and the five
+# @extenddb/<os>-<arch>): Settings -> Trusted Publisher -> GitHub Actions, with
+#   Organization or user: ExtendDB
+#   Repository:           extenddb
+#   Workflow filename:    npm-publish.yml
+#   Environment:          npm
+# Every field is matched exactly, the workflow filename included, so renaming
+# this file breaks publishing until the six entries are updated.
+#
+# npm requires a package to exist before a trusted publisher can be configured,
+# so all six were first published as 0.0.0 placeholders under the `placeholder`
+# dist-tag from a maintainer machine.
 
 name: npm-publish
 
@@ -58,7 +71,8 @@ on:
         required: true
 
 # Nothing is committed, so no write scope on the repo is needed. The publish
-# job adds id-token for provenance at job level.
+# job adds id-token at job level, which is what both authenticates to npm
+# (trusted publishing) and attests provenance.
 permissions:
   contents: read
 
@@ -193,11 +207,15 @@ jobs:
     needs: [gate, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # The protected environment holds NPM_TOKEN and requires reviewer approval.
+    # The protected environment requires reviewer approval, and its name is
+    # part of the npm trusted-publisher match, so it gates credential minting
+    # rather than merely gating a stored secret.
     environment: npm
     permissions:
       contents: read
-      id-token: write            # npm --provenance binds the package to this run
+      id-token: write            # mints the OIDC token npm exchanges for a
+                                 # short-lived publish credential; also what
+                                 # --provenance is attested from
     steps:
       - name: Check out the tagged commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -210,6 +228,15 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
+      # Trusted publishing needs npm >= 11.5.1 for the OIDC exchange, and the
+      # Node 22 image bundles npm 10. Without this the publish falls back to
+      # looking for a token and fails with ENEEDAUTH.
+      - name: Upgrade npm to a trusted-publishing capable version
+        run: |
+          set -euo pipefail
+          npm install -g npm@11
+          npm --version
+
       - name: Download the built binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
@@ -217,7 +244,6 @@ jobs:
 
       - name: Publish the five platform packages (candidate dist-tag)
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ needs.gate.outputs.version }}
         run: |
           set -euo pipefail
@@ -254,7 +280,6 @@ jobs:
 
       - name: Publish the launcher package (candidate dist-tag)
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ needs.gate.outputs.version }}
         run: |
           set -euo pipefail
