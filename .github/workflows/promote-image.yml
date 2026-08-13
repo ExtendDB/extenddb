@@ -27,6 +27,13 @@
 # anything but the digest the tester verified, even if the candidate tag has
 # moved since. It also refuses to overwrite an existing version tag, so a
 # released version is immutable through this path.
+#
+# `latest` may only move forwards. Promoting a back-line hotfix once a newer
+# line has shipped is legitimate, but making it `latest` would silently
+# downgrade every user who does not pin, so the version tag is promoted either
+# way while `latest` is guarded: it moves only when the promoted version is the
+# highest released one, and `move_latest` is the explicit escape hatch for a
+# hotfix that must not become `latest`.
 
 name: promote-image
 
@@ -42,6 +49,10 @@ on:
       expected_digest:
         description: 'The verified multi-arch index digest, e.g. sha256:<64 hex>'
         required: true
+      move_latest:
+        description: 'Move `latest` to this digest. Uncheck for a back-line hotfix that must not become latest.'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -74,6 +85,7 @@ jobs:
           RAW_VERSION: ${{ inputs.version }}
           RAW_TAG: ${{ inputs.candidate_tag }}
           RAW_DIGEST: ${{ inputs.expected_digest }}
+          RAW_MOVE_LATEST: ${{ inputs.move_latest }}
         run: |
           set -euo pipefail
           if [[ ! "$RAW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -88,10 +100,17 @@ jobs:
             echo "::error::expected_digest is not a sha256:<64 hex> digest"
             exit 1
           fi
+          # A boolean input arrives as the literal string true/false. Anything
+          # else means the dispatch payload was not what this workflow models.
+          if [[ "$RAW_MOVE_LATEST" != "true" && "$RAW_MOVE_LATEST" != "false" ]]; then
+            echo "::error::move_latest '$RAW_MOVE_LATEST' is not a boolean"
+            exit 1
+          fi
           {
             echo "VERSION=$RAW_VERSION"
             echo "TAG=$RAW_TAG"
             echo "DIGEST=$RAW_DIGEST"
+            echo "MOVE_LATEST=$RAW_MOVE_LATEST"
           } >> "$GITHUB_ENV"
 
       - name: Gate - the candidate commit must be released code at this version
@@ -143,6 +162,53 @@ jobs:
             fi
           fi
 
+      - name: Gate - latest must never move backwards
+        run: |
+          set -euo pipefail
+
+          # `latest` is the tag users get by default, so moving it to an older
+          # line is a silent downgrade for everyone who does not pin. Promoting
+          # a back-line hotfix is legitimate; making it `latest` afterwards is
+          # not. So the version tag is promoted either way and `latest` is
+          # guarded: it may only move forwards.
+          #
+          # Anonymous read, like the gates above, so this still runs before the
+          # registry credential exists in the job.
+          TAGS_JSON=$(skopeo list-tags "docker://${IMAGE_REPO}")
+
+          # Compare only against released X.Y.Z tags. Candidate (sha-*) tags,
+          # `latest` and anything else are not version lines. The promoted
+          # version is excluded so a re-run that only ensures `latest` (the
+          # ALREADY_PROMOTED path) is not blocked by its own tag.
+          #
+          # `|| true` on the pipeline because grep exits 1 when it matches
+          # nothing, which under `set -o pipefail` would kill the step on a
+          # repository that has no released versions yet.
+          HIGHEST=$(printf '%s' "$TAGS_JSON" \
+            | jq -r '.Tags[]' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            | grep -vxF "$VERSION" \
+            | sort -V \
+            | tail -1 || true)
+
+          if [[ -z "$HIGHEST" ]]; then
+            echo "::notice::no other released version tags; ${VERSION} is the highest"
+          else
+            # sort -V is a version sort, so 0.1.10 correctly beats 0.1.9.
+            TOP=$(printf '%s\n%s\n' "$VERSION" "$HIGHEST" | sort -V | tail -1)
+            if [[ "$TOP" != "$VERSION" ]]; then
+              if [[ "$MOVE_LATEST" == "true" ]]; then
+                echo "::error::${VERSION} is not the highest released version (${HIGHEST} is), so moving latest to it would downgrade every unpinned user. Re-dispatch with move_latest unchecked to publish the ${VERSION} tag without touching latest."
+                exit 1
+              fi
+              echo "::notice::${VERSION} is behind ${HIGHEST}; promoting the version tag only, latest untouched"
+            fi
+          fi
+
+          if [[ "$MOVE_LATEST" != "true" ]]; then
+            echo "::notice::move_latest is unchecked; latest will not be touched"
+          fi
+
       - name: Log in to Docker Hub (the only step chain with the credential)
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -151,7 +217,7 @@ jobs:
           set -euo pipefail
           skopeo login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin <<< "$DOCKERHUB_TOKEN"
 
-      - name: Promote by digest to the version tag and latest
+      - name: Promote by digest to the version tag (and latest when allowed)
         run: |
           set -euo pipefail
           # Source is the immutable digest, not the tag, so what is promoted
@@ -162,14 +228,18 @@ jobs:
               "docker://${IMAGE_REPO}@${DIGEST}" \
               "docker://${IMAGE_REPO}:${VERSION}"
           fi
-          skopeo copy --all --preserve-digests \
-            "docker://${IMAGE_REPO}@${DIGEST}" \
-            "docker://${IMAGE_REPO}:latest"
+          if [[ "$MOVE_LATEST" == "true" ]]; then
+            skopeo copy --all --preserve-digests \
+              "docker://${IMAGE_REPO}@${DIGEST}" \
+              "docker://${IMAGE_REPO}:latest"
+          fi
 
       - name: Verify the promotion
         run: |
           set -euo pipefail
-          for t in "${VERSION}" latest; do
+          TAGS=("${VERSION}")
+          [[ "$MOVE_LATEST" == "true" ]] && TAGS+=(latest)
+          for t in "${TAGS[@]}"; do
             GOT=$(skopeo inspect --format '{{.Digest}}' "docker://${IMAGE_REPO}:${t}")
             if [[ "$GOT" != "$DIGEST" ]]; then
               echo "::error::${IMAGE_REPO}:${t} resolves to ${GOT}, expected ${DIGEST}"
@@ -183,13 +253,20 @@ jobs:
 
       - name: Summarise for the release checklist
         run: |
+          if [[ "$MOVE_LATEST" == "true" ]]; then
+            HEADING="Promoted to ${VERSION} and latest"
+            TAGLIST="\`${VERSION}\`, \`latest\`"
+          else
+            HEADING="Promoted to ${VERSION} (latest untouched)"
+            TAGLIST="\`${VERSION}\`"
+          fi
           {
-            echo "### Promoted to ${VERSION} and latest"
+            echo "### ${HEADING}"
             echo ""
             echo "| field | value |"
             echo "|---|---|"
             echo "| repository | \`${IMAGE_REPO}\` |"
             echo "| candidate | \`${TAG}\` |"
             echo "| digest | \`${DIGEST}\` |"
-            echo "| tags | \`${VERSION}\`, \`latest\` |"
+            echo "| tags | ${TAGLIST} |"
           } >> "$GITHUB_STEP_SUMMARY"
