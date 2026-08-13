@@ -41,6 +41,19 @@ pub struct AdminBootstrapResult {
     pub from_env: bool,
 }
 
+/// Outcome of [`Bootstrapper::repair_lost_sort_key_definitions`].
+#[derive(Debug, Default, Clone)]
+pub struct KeyDefinitionRepair {
+    /// Tables whose sort key definitions were restored, as
+    /// `table_name: attribute (TYPE)` lines. When the caller passed `apply =
+    /// false` these are the repairs that WOULD be made.
+    pub repaired: Vec<String>,
+    /// Tables that are damaged but could not be repaired automatically, because
+    /// no physical sort key column was found to read the type back from. These
+    /// need a human: guessing a type would resolve the key to the wrong column.
+    pub needs_attention: Vec<String>,
+}
+
 /// High-level bootstrap operations for storage backends.
 ///
 /// Covers the init, destroy, and migrate command paths. Implementations
@@ -65,6 +78,31 @@ pub trait Bootstrapper: Send + Sync {
 
     /// Run data schema migrations (stream tables, sequences, etc.).
     async fn run_data_migrations(&self) -> OpResult<()>;
+
+    /// Restore sort key attribute definitions that issue #259 deleted from table
+    /// metadata, reading each type back from the physical sort key column.
+    ///
+    /// Before the fix, `UpdateTable` replaced a table's stored attribute
+    /// definitions with the request's subset, so adding a GSI dropped the base
+    /// table's own key definitions and keyed reads silently returned another item
+    /// in the same partition. The write path no longer does that, but a table
+    /// damaged by an older build stays damaged, and it now fails its reads loudly
+    /// instead (see `TableKeyInfo::validate_sort_key_definitions`). This repairs
+    /// such tables so they serve correct reads again.
+    ///
+    /// With `apply` false this only detects and reports, writing nothing, so a
+    /// `migrate` run that has not been confirmed with `--yes` never mutates the
+    /// catalog. With `apply` true the repair is written.
+    ///
+    /// Idempotent: a table whose definitions are intact is left untouched, so
+    /// running it on a healthy deployment reports nothing and changes nothing.
+    ///
+    /// The default implementation repairs nothing, which is correct for a backend
+    /// that never wrote the definitions in the first place.
+    async fn repair_lost_sort_key_definitions(&self, apply: bool) -> OpResult<KeyDefinitionRepair> {
+        let _ = apply;
+        Ok(KeyDefinitionRepair::default())
+    }
 
     /// Acquire a cross-process lock so that concurrent `migrate` runs, such as
     /// several replicas starting at once, don't race each other applying schema

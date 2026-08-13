@@ -808,11 +808,26 @@ impl MongoEngine {
             // backends. Read-modify-write without a transaction, matching the rest
             // of this method; the catalog row is only written by UpdateTable.
             let merged_attr_defs = if let Some(new_attr_defs) = &input.attribute_definitions {
-                let current = self
-                    .describe_table_impl(account_id, &input.table_name)
-                    .await?;
-                let merged =
-                    merge_attribute_definitions(&current.attribute_definitions, new_attr_defs);
+                // Read just the stored definitions rather than a full describe_table_impl,
+                // which would also load every index. Two concurrent UpdateTables on one
+                // table can still interleave here and lose one side's additions; that is
+                // inherent to this backend's UpdateTable, which is non-transactional
+                // throughout (the index inserts and collection creation below are not
+                // atomic with this write either), so the window is narrowed rather than
+                // closed.
+                let current_defs: Vec<extenddb_core::types::AttributeDefinition> = tables_coll
+                    .find_one(
+                        doc! { "_id": { "account_id": account_id, "table_name": &input.table_name } },
+                    )
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?
+                    .as_ref()
+                    .and_then(|d| d.get("attribute_definitions"))
+                    .map(|b| bson::from_bson(b.clone()))
+                    .transpose()
+                    .map_err(|e| StorageError::Internal(format!("attr_defs parse error: {e}")))?
+                    .unwrap_or_default();
+                let merged = merge_attribute_definitions(&current_defs, new_attr_defs);
                 let merged_bson =
                     bson::to_bson(&merged).map_err(|e| StorageError::Internal(e.to_string()))?;
                 tables_coll
