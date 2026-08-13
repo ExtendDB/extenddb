@@ -1,5 +1,5 @@
 {
-  "name": "extenddb",
+  "name": "@extenddb/dev",
   "version": "0.1.0",
   "description": "ExtendDB dev server launcher: a DynamoDB-compatible database for local development and CI. Spawns the extenddb dev binary (file-backed by default, in-memory with --memory) and hands back an endpoint plus credentials any AWS SDK accepts.",
   "license": "Apache-2.0",

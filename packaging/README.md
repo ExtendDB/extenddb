@@ -34,13 +34,13 @@ Every launcher, in every language:
 ## npm
 
 ```bash
-npm install extenddb
+npm install @extenddb/dev
 npx extenddb start            # file-backed at ./.extenddb/data.db
 npx extenddb start --memory   # ephemeral
 ```
 
 ```js
-const { start } = require("extenddb");
+const { start } = require("@extenddb/dev");
 const db = await start();                 // file-backed default
 // const db = await start({ memory: true });   ephemeral
 // const db = await start({ dbPath: "ci.db" }); explicit file
@@ -96,21 +96,22 @@ deliberate second step):
    published with `--provenance` under the `candidate` dist-tag. Nothing
    reaches `latest`.
 3. Verify the candidate from a clean machine:
-   `npm install extenddb@candidate` and run a smoke script in both storage
+   `npm install @extenddb/dev@candidate` and run a smoke script in both storage
    modes.
 4. Promote, one dist-tag move per package:
 
    ```
-   npm dist-tag add extenddb@X.Y.Z latest
+   npm dist-tag add @extenddb/dev@X.Y.Z latest
    npm dist-tag add @extenddb/linux-x64@X.Y.Z latest        # and the other four
    ```
 
-One-time registry and repo setup, in order: create the npm org `extenddb`
-(both the unscoped name and the scope were unclaimed as of 2026-08-12); create
-a granular automation token scoped to the `extenddb` package and `@extenddb`
-scope with publish permission only; create the GitHub environment `npm` with
-deployment branch rule `main`, required reviewers, and the token as
-`NPM_TOKEN`.
+One-time registry and repo setup, in order: create the npm org `extenddb`.
+The launcher ships as the scoped `@extenddb/dev` rather than an unscoped
+`extenddb`, because npm's package-name similarity filter refuses the latter
+against the long-established `extend` package. Then create a granular
+automation token scoped to the `@extenddb` scope with publish permission only,
+and create the GitHub environment `npm` with deployment branch rule `main`,
+required reviewers, and the token as `NPM_TOKEN`.
 
 ## Known limits
 

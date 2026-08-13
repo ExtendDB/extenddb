@@ -1,5 +1,5 @@
 # Publishes CANDIDATE npm packages for the ExtendDB dev launcher: the five
-# @extenddb/<os>-<arch> platform binary packages plus the `extenddb` launcher
+# @extenddb/<os>-<arch> platform binary packages plus the `@extenddb/dev` launcher
 # that selects among them via optionalDependencies.
 #
 # This workflow deliberately stops at the candidate. Every package is published
@@ -7,7 +7,7 @@
 # default can come from an unverified run. Promotion is a maintainer step
 # recorded in packaging/README.md:
 #
-#   npm dist-tag add extenddb@<version> latest        (and one per platform pkg)
+#   npm dist-tag add @extenddb/dev@<version> latest   (and one per platform pkg)
 #
 # Shape, and why (mirrors .github/workflows/release-image.yml):
 #
@@ -270,5 +270,5 @@ jobs:
           ' package.json > package.json.tmp
           mv package.json.tmp package.json
 
-          echo "Publishing extenddb@${VERSION} (candidate)"
+          echo "Publishing @extenddb/dev@${VERSION} (candidate)"
           npm publish --provenance --access public --tag candidate
