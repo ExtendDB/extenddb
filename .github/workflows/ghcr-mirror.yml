@@ -17,6 +17,12 @@
 # The digest input is the contract with the manual verification that precedes
 # this job: the operator supplies the digest they verified, and this job
 # refuses to mirror anything else, even if the Docker Hub tag has moved since.
+#
+# Two artifact kinds are supported, distinguished by tag shape:
+#   sha-<40 hex>              an image candidate (multi-arch index)
+#   sha256-<64 hex>.sig       the Cosign signature artifact for an image digest
+# A signature may only be mirrored after the image it signs is already in
+# GHCR, so a dangling signature cannot exist through this path.
 
 name: ghcr-mirror
 
@@ -24,10 +30,10 @@ on:
   workflow_dispatch:
     inputs:
       candidate_tag:
-        description: 'Verified Docker Hub candidate tag, e.g. sha-<full 40-char commit>'
+        description: 'Verified Docker Hub tag: image candidate (sha-<full 40-char commit>) or Cosign signature artifact (sha256-<64 hex>.sig)'
         required: true
       expected_digest:
-        description: 'The verified multi-arch index digest, e.g. sha256:<64 hex>'
+        description: 'The verified manifest digest of that tag, e.g. sha256:<64 hex>'
         required: true
 
 # Copying between registries needs no repository content at all.
@@ -57,8 +63,17 @@ jobs:
           RAW_DIGEST: ${{ inputs.expected_digest }}
         run: |
           set -euo pipefail
-          if [[ ! "$RAW_TAG" =~ ^sha-[0-9a-f]{40}$ ]]; then
-            echo "::error::candidate_tag '$RAW_TAG' is not a commit-addressed candidate tag (sha-<40 hex>)"
+          KIND=''
+          SUBJECT_DIGEST=''
+          if [[ "$RAW_TAG" =~ ^sha-[0-9a-f]{40}$ ]]; then
+            KIND=image
+          elif [[ "$RAW_TAG" =~ ^sha256-[0-9a-f]{64}\.sig$ ]]; then
+            KIND=signature
+            # sha256-<hex>.sig  ->  sha256:<hex>  (the image digest it signs)
+            SUBJECT_DIGEST="${RAW_TAG%.sig}"
+            SUBJECT_DIGEST="${SUBJECT_DIGEST/-/:}"
+          else
+            echo "::error::candidate_tag '$RAW_TAG' is neither an image candidate (sha-<40 hex>) nor a signature artifact (sha256-<64 hex>.sig)"
             exit 1
           fi
           if [[ ! "$RAW_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -68,6 +83,8 @@ jobs:
           {
             echo "TAG=$RAW_TAG"
             echo "DIGEST=$RAW_DIGEST"
+            echo "KIND=$KIND"
+            echo "SUBJECT_DIGEST=$SUBJECT_DIGEST"
           } >> "$GITHUB_ENV"
 
       - name: Gate - skopeo present (preinstalled on ubuntu-latest)
@@ -101,6 +118,15 @@ jobs:
             fi
           fi
 
+      - name: Gate - a signature may only follow its image (signature artifacts only)
+        if: env.KIND == 'signature'
+        run: |
+          set -euo pipefail
+          if ! skopeo inspect --format '{{.Digest}}' "docker://${DST_REPO}@${SUBJECT_DIGEST}" >/dev/null 2>&1; then
+            echo "::error::signature subject ${DST_REPO}@${SUBJECT_DIGEST} is not present in GHCR; mirror the image before its signature"
+            exit 1
+          fi
+
       - name: Mirror the exact artifact (no rebuild, digests preserved)
         if: env.already-mirrored != 'true'
         run: |
@@ -119,9 +145,11 @@ jobs:
             echo "::error::published ${DST_REPO}:${TAG} digest ${DST_DIGEST} does not match verified ${DIGEST}"
             exit 1
           fi
-          RAW=$(skopeo inspect --raw "docker://${DST_REPO}:${TAG}")
-          echo "$RAW" | grep -q '"architecture": *"amd64"' || { echo "::error::amd64 missing from mirrored index"; exit 1; }
-          echo "$RAW" | grep -q '"architecture": *"arm64"' || { echo "::error::arm64 missing from mirrored index"; exit 1; }
+          if [[ "$KIND" == "image" ]]; then
+            RAW=$(skopeo inspect --raw "docker://${DST_REPO}:${TAG}")
+            echo "$RAW" | grep -q '"architecture": *"amd64"' || { echo "::error::amd64 missing from mirrored index"; exit 1; }
+            echo "$RAW" | grep -q '"architecture": *"arm64"' || { echo "::error::arm64 missing from mirrored index"; exit 1; }
+          fi
 
       - name: Log out
         if: always()
@@ -130,7 +158,7 @@ jobs:
       - name: Summarise for the release checklist
         run: |
           {
-            echo "### GHCR candidate mirrored (NOT promoted, NOT signed)"
+            echo "### GHCR ${KIND} mirrored (NOT promoted)"
             echo ""
             echo "| field | value |"
             echo "|---|---|"
