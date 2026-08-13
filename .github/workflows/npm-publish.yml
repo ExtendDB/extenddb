@@ -12,11 +12,20 @@
 # Shape, and why (mirrors .github/workflows/release-image.yml):
 #
 #   gate      Runs once. Cheap checks that need no build: the dispatch input is
-#             validated as a strict `npm-vX.Y.Z` tag (a separate namespace from
-#             the server's `vX.Y.Z` tags, because the launcher versions
-#             independently of the server), resolved to a full commit SHA, that
-#             SHA must be contained in origin/main, and the version must agree
-#             with packaging/npm/package.json at the tagged commit.
+#             validated as a strict `vX.Y.Z` tag, resolved to a full commit
+#             SHA, that SHA must be contained in origin/main, and the version
+#             must agree with the workspace version at the tagged commit.
+#
+#             The launcher versions WITH the server, off the same `vX.Y.Z` tag
+#             the container release uses, because the five platform packages
+#             ship the server binary: a server release necessarily republishes
+#             all six, and the launcher pins optionalDependencies to its own
+#             version, so an independent number could only ever answer "which
+#             launcher" and never the question users actually ask, "which
+#             server is inside this". Same convention as esbuild and biome,
+#             whose launchers pin their platform packages at the tool version.
+#             The cost is accepted: a launcher-only fix rides the next server
+#             release rather than shipping under its own number.
 #
 #   build     One job per platform, each on its NATIVE runner: no emulation and
 #             no cross-compilation, so every published binary was genuinely
@@ -67,7 +76,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing launcher release tag to publish a candidate for, e.g. npm-v0.1.0'
+        description: 'Existing release tag to publish npm candidates for, e.g. v0.1.4'
         required: true
 
 # Nothing is committed, so no write scope on the repo is needed. The publish
@@ -105,11 +114,11 @@ jobs:
 
           # 1. Strict shape first: anything else cannot be a launcher release
           #    tag and must not reach git commands as a ref expression.
-          if [[ ! "$RAW_TAG" =~ ^npm-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::input '$RAW_TAG' is not a strict launcher release tag (npm-vMAJOR.MINOR.PATCH)"
+          if [[ ! "$RAW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::input '$RAW_TAG' is not a strict release tag (vMAJOR.MINOR.PATCH)"
             exit 1
           fi
-          VERSION="${RAW_TAG#npm-v}"
+          VERSION="${RAW_TAG#v}"
 
           # 2. The tag must already exist; this workflow never creates tags.
           git fetch --no-tags origin "refs/tags/${RAW_TAG}:refs/tags/${RAW_TAG}" \
@@ -126,10 +135,23 @@ jobs:
             exit 1
           fi
 
-          # 4. The tag and the launcher version at that commit must agree.
+          # 4. The tag must agree with the workspace version, which is the
+          #    single source of truth for a release across every distribution
+          #    channel (container, npm, and later pip).
+          CARGO_VERSION=$(git show "${SHA}:Cargo.toml" \
+            | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1)
+          if [[ "$VERSION" != "$CARGO_VERSION" ]]; then
+            echo "::error::tag ${RAW_TAG} implies ${VERSION} but the workspace version at ${SHA} is ${CARGO_VERSION}"
+            exit 1
+          fi
+
+          # 5. The checked-in launcher manifest must not have drifted from it.
+          #    The publish step rewrites the version anyway, so a stale value
+          #    would not break the release; it would quietly mislead anyone
+          #    reading the manifest, which is worse.
           PKG_VERSION=$(git show "${SHA}:packaging/npm/package.json" | jq -r .version)
           if [[ "$VERSION" != "$PKG_VERSION" ]]; then
-            echo "::error::tag ${RAW_TAG} implies ${VERSION} but packaging/npm/package.json at ${SHA} says ${PKG_VERSION}"
+            echo "::error::packaging/npm/package.json at ${SHA} says ${PKG_VERSION}, expected ${VERSION} (bump it with the workspace version)"
             exit 1
           fi
 
@@ -165,6 +187,22 @@ jobs:
     env:
       BIN_NAME: extenddb${{ matrix.pkg == 'win32-x64' && '.exe' || '' }}
     steps:
+      # CodeQL's actions/cache-poisoning/poisonable-step query flags the build
+      # and test steps below, because a workflow_dispatch run executes in the
+      # default branch's context (and therefore its Actions cache scope) while
+      # checking out a ref supplied at dispatch time. Two properties make that
+      # unexploitable here, neither of which the query can see:
+      #
+      #   1. `gate` has already proved this SHA is an ancestor of origin/main
+      #      (`git merge-base --is-ancestor`), so the code executed below is
+      #      reviewed code already on main. Poisoning it would require push
+      #      access to main, which permits strictly worse things directly.
+      #   2. Nothing in this workflow reads or writes the Actions cache at all:
+      #      there is no actions/cache step, no rust-cache, and no `cache:`
+      #      input on setup-node. There is no cache entry to poison.
+      #
+      # Keep both true if this job grows: adding a cache step here would make
+      # the finding real, and it would then need a trusted-ref guard.
       - name: Check out the tagged commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:

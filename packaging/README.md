@@ -72,10 +72,19 @@ genuinely ephemeral, and contradictory options are refused.
 
 ## Releasing
 
-The launcher versions independently of the server, under its own tag
-namespace: `npm-vMAJOR.MINOR.PATCH`. The version in `npm/package.json` is the
-source of truth; the tag must match it, and the publish workflow refuses
-anything else.
+The launcher versions **with** the server, off the same `vMAJOR.MINOR.PATCH`
+tag the container release uses. The workspace version in the root `Cargo.toml`
+is the source of truth; the tag must match it, `npm/package.json` must match
+it too, and the publish workflow refuses anything else.
+
+The alignment is deliberate. The five platform packages ship the server
+binary, so a server release necessarily republishes all six, and the launcher
+pins its `optionalDependencies` to its own version. An independent launcher
+number could therefore only ever answer "which launcher", never the question
+users actually ask, "which server is inside this". It is the same convention
+esbuild and biome use, whose launchers pin their platform packages at the tool
+version. The accepted cost: a launcher-only fix rides the next server release
+rather than shipping under its own number.
 
 The binary every platform package ships is the slim dev-mode build:
 
@@ -86,8 +95,10 @@ cargo build --release --locked --no-default-features --features sqlite,dev-mode 
 Flow (mirrors the container release: candidate first, promotion is a
 deliberate second step):
 
-1. Land the release state on `main` with the right version in
-   `npm/package.json`, then tag that commit `npm-vX.Y.Z` and push the tag.
+1. Land the release state on `main` with the workspace version bumped and
+   `npm/package.json` bumped to match, then tag that commit `vX.Y.Z` and push
+   the tag. This is the same tag the container release consumes; the two
+   publish workflows are dispatched independently against it.
 2. Dispatch the `npm-publish` workflow from `main` with the tag as input.
    The gate validates shape, existence, ancestry against `main`, and the
    version match. Five native runners build, smoke test, and run the full
