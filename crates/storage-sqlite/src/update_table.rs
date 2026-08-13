@@ -215,6 +215,8 @@ impl SqliteEngine {
         }
 
         // GSI create/delete.
+        let mut merged_attr_defs: Vec<AttributeDefinition> =
+            serde_json::from_str(&ad_json).map_err(|e| StorageError::Internal(e.to_string()))?;
         let mut created: Vec<String> = Vec::new();
         let mut deleted: Vec<String> = Vec::new();
         if let Some(updates) = &input.global_secondary_index_updates {
@@ -279,8 +281,24 @@ impl SqliteEngine {
                     deleted.push(del_id);
                 }
             }
+            // Merge new attribute definitions into the existing ones.
+            // UpdateTable's AttributeDefinitions only needs to describe the
+            // attributes referenced by the new indexes; replacing the stored
+            // definitions wholesale would drop the table's own key attribute
+            // definitions and break sort-key handling on the base table
+            // (issue #259).
             if let Some(new_attr_defs) = &input.attribute_definitions {
-                let j = serde_json::to_string(new_attr_defs)
+                for new_def in new_attr_defs {
+                    if let Some(existing) = merged_attr_defs
+                        .iter_mut()
+                        .find(|d| d.attribute_name == new_def.attribute_name)
+                    {
+                        *existing = new_def.clone();
+                    } else {
+                        merged_attr_defs.push(new_def.clone());
+                    }
+                }
+                let j = serde_json::to_string(&merged_attr_defs)
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
                 update_col(
                     &mut tx,
@@ -303,7 +321,7 @@ impl SqliteEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             let base_ad: Vec<AttributeDefinition> = serde_json::from_str(&ad_json)
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let effective_ad = input.attribute_definitions.as_deref().unwrap_or(&base_ad);
+            let effective_ad: &[AttributeDefinition] = &merged_attr_defs;
 
             let mut ci = 0usize;
             let mut di = 0usize;

@@ -265,6 +265,9 @@ impl PostgresEngine {
         }
 
         // Apply GSI updates (create/delete).
+        let mut merged_attr_defs: Vec<AttributeDefinition> =
+            serde_json::from_value(ad_json.clone())
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
         let mut created_index_ids: Vec<String> = Vec::new();
         let mut deleted_index_ids: Vec<String> = Vec::new();
         if let Some(updates) = &input.global_secondary_index_updates {
@@ -344,12 +347,27 @@ impl PostgresEngine {
                 }
             }
 
-            // Update attribute_definitions on the table if new ones were provided.
+            // Merge new attribute definitions into the existing ones.
+            // UpdateTable's AttributeDefinitions only needs to describe the
+            // attributes referenced by the new indexes; replacing the stored
+            // definitions wholesale would drop the table's own key attribute
+            // definitions and break sort-key handling on the base table
+            // (issue #259).
             if let Some(new_attr_defs) = &input.attribute_definitions {
-                let ad_json = serde_json::to_value(new_attr_defs)
+                for new_def in new_attr_defs {
+                    if let Some(existing) = merged_attr_defs
+                        .iter_mut()
+                        .find(|d| d.attribute_name == new_def.attribute_name)
+                    {
+                        *existing = new_def.clone();
+                    } else {
+                        merged_attr_defs.push(new_def.clone());
+                    }
+                }
+                let merged_json = serde_json::to_value(&merged_attr_defs)
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
                 sqlx::query("UPDATE tables SET attribute_definitions = $1 WHERE account_id = $2 AND table_name = $3")
-                    .bind(&ad_json)
+                    .bind(&merged_json)
                     .bind(account_id)
                     .bind(&input.table_name)
                     .execute(&mut *tx)
@@ -368,10 +386,7 @@ impl PostgresEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             let base_attr_defs: Vec<AttributeDefinition> = serde_json::from_value(ad_json.clone())
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let effective_attr_defs = input
-                .attribute_definitions
-                .as_deref()
-                .unwrap_or(&base_attr_defs);
+            let effective_attr_defs: &[AttributeDefinition] = &merged_attr_defs;
 
             let mut create_idx = 0usize;
             let mut delete_idx = 0usize;
