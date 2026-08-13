@@ -171,6 +171,73 @@ pub fn merge_attribute_definitions(
     merged
 }
 
+/// Recover sort key attribute definitions that were lost from a table's stored
+/// metadata, using the data table's PRIMARY KEY columns as the source of truth.
+///
+/// A table whose base key schema names a RANGE attribute with no matching
+/// attribute definition cannot be read correctly: [`sk_info`] returns `None` and
+/// keyed reads degrade to a partition-only lookup. Issue #259 produced exactly
+/// that state, by having `UpdateTable` replace the stored attribute definitions
+/// with the request's subset. The write path is fixed by
+/// [`merge_attribute_definitions`]; this recovers tables already damaged by it.
+///
+/// The lost information is the attribute's scalar type. `primary_key_columns`
+/// must be the data table's PRIMARY KEY column names, because that, and only that,
+/// records the type: every table is created with all three typed columns for each
+/// sort key position (`sk_s`, `sk_n`, `sk_b`) and only the one matching the
+/// declared type joins the PRIMARY KEY. Passing the table's full column list here
+/// would match `sk_s` on every table and silently mistype every numeric and binary
+/// sort key, which would put the table straight back into the wrong-answer state
+/// this is meant to repair.
+///
+/// Returns the definitions to add, in key schema order. Attributes that already
+/// have a definition are left untouched, and a RANGE attribute with no matching
+/// PRIMARY KEY column is skipped rather than guessed: the caller reports it so the
+/// table can be looked at by hand instead of being silently given a wrong type.
+///
+/// Only sort keys are recovered. A missing HASH definition is not recoverable this
+/// way, because the partition key column is always `TEXT` regardless of the
+/// declared type, and it is not needed for correctness: partition key values are
+/// encoded by [`composite_pk_to_text`], which takes only the key schema.
+#[must_use]
+pub fn recover_sort_key_definitions(
+    base_key_schema: &[KeySchemaElement],
+    attr_defs: &[AttributeDefinition],
+    primary_key_columns: &[String],
+) -> Vec<AttributeDefinition> {
+    let mut recovered = Vec::new();
+    let range_elements: Vec<&KeySchemaElement> = base_key_schema
+        .iter()
+        .filter(|ks| ks.key_type == KeyType::Range)
+        .collect();
+
+    for (position, element) in range_elements.iter().enumerate() {
+        if attr_defs
+            .iter()
+            .any(|ad| ad.attribute_name == element.attribute_name)
+        {
+            continue;
+        }
+        let attr_type = [
+            ScalarAttributeType::S,
+            ScalarAttributeType::N,
+            ScalarAttributeType::B,
+        ]
+        .into_iter()
+        .find(|candidate| {
+            let expected = sk_column_n(position, *candidate);
+            primary_key_columns.iter().any(|c| c == &expected)
+        });
+        if let Some(attr_type) = attr_type {
+            recovered.push(AttributeDefinition {
+                attribute_name: element.attribute_name.clone(),
+                attribute_type: attr_type,
+            });
+        }
+    }
+    recovered
+}
+
 /// Encode multiple string parts into a single netstring-encoded composite key.
 ///
 /// Format: `<len>:<value>,<len>:<value>,...` — e.g., `"abc"` + `"de"` → `"3:abc,2:de,"`.
@@ -280,6 +347,106 @@ mod tests {
         let merged = merge_attribute_definitions(&existing, &[]);
 
         assert_eq!(merged, existing);
+    }
+
+    fn ks(name: &str, key_type: KeyType) -> KeySchemaElement {
+        KeySchemaElement {
+            attribute_name: name.into(),
+            key_type,
+        }
+    }
+
+    fn cols(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// Every data table is created with all three typed columns for each sort key
+    /// position, so column existence says nothing about the type; only PRIMARY KEY
+    /// membership does. This is the test that discriminates: an implementation
+    /// probing existence would answer `S` here, silently mistyping the key and
+    /// putting the table back into the wrong-answer state of #259.
+    #[test]
+    fn recover_sort_key_defs_uses_primary_key_membership_not_column_existence() {
+        let schema = vec![ks("pk", KeyType::Hash), ks("sk", KeyType::Range)];
+
+        // The real table has sk_s, sk_n and sk_b; only sk_n is in the PRIMARY KEY.
+        let recovered = recover_sort_key_definitions(&schema, &[], &cols(&["pk", "sk_n"]));
+
+        assert_eq!(
+            recovered,
+            vec![ad("sk", ScalarAttributeType::N)],
+            "the type must come from the PRIMARY KEY column, not from which typed \
+             column happens to exist"
+        );
+    }
+
+    #[test]
+    fn recover_sort_key_defs_recovers_each_scalar_type_from_the_key_column() {
+        let schema = vec![ks("pk", KeyType::Hash), ks("sk", KeyType::Range)];
+
+        for (col, expected) in [
+            ("sk_s", ScalarAttributeType::S),
+            ("sk_n", ScalarAttributeType::N),
+            ("sk_b", ScalarAttributeType::B),
+        ] {
+            assert_eq!(
+                recover_sort_key_definitions(&schema, &[], &cols(&["pk", col])),
+                vec![ad("sk", expected)],
+                "PRIMARY KEY column {col} must recover {expected:?}"
+            );
+        }
+    }
+
+    /// Multiple sort keys use the 1-indexed column suffix, so each position must be
+    /// matched against its own column rather than the first one found.
+    #[test]
+    fn recover_sort_key_defs_handles_multiple_sort_keys_by_position() {
+        let schema = vec![
+            ks("pk", KeyType::Hash),
+            ks("sk", KeyType::Range),
+            ks("sk2", KeyType::Range),
+        ];
+
+        let recovered = recover_sort_key_definitions(&schema, &[], &cols(&["pk", "sk_s", "sk2_n"]));
+
+        assert_eq!(
+            recovered,
+            vec![
+                ad("sk", ScalarAttributeType::S),
+                ad("sk2", ScalarAttributeType::N)
+            ]
+        );
+    }
+
+    #[test]
+    fn recover_sort_key_defs_leaves_intact_metadata_alone() {
+        let schema = vec![ks("pk", KeyType::Hash), ks("sk", KeyType::Range)];
+        let defs = vec![
+            ad("pk", ScalarAttributeType::S),
+            ad("sk", ScalarAttributeType::S),
+        ];
+
+        assert!(recover_sort_key_definitions(&schema, &defs, &cols(&["pk", "sk_s"])).is_empty());
+    }
+
+    #[test]
+    fn recover_sort_key_defs_ignores_a_hash_only_table() {
+        let schema = vec![ks("pk", KeyType::Hash)];
+
+        assert!(recover_sort_key_definitions(&schema, &[], &cols(&["pk"])).is_empty());
+    }
+
+    /// No sort key column in the PRIMARY KEY means no evidence. Skipping keeps the
+    /// loud failure in place instead of writing a guessed type that would resolve
+    /// the key to the wrong physical column.
+    #[test]
+    fn recover_sort_key_defs_skips_a_range_key_with_no_primary_key_column() {
+        let schema = vec![ks("pk", KeyType::Hash), ks("sk", KeyType::Range)];
+
+        assert!(
+            recover_sort_key_definitions(&schema, &[], &cols(&["pk"])).is_empty(),
+            "a type must never be invented when no sort key column is in the PRIMARY KEY"
+        );
     }
 
     #[test]

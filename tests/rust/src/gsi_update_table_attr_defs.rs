@@ -166,6 +166,139 @@ async fn table_with_gsi_added_after_population(label: &str) -> (String, String) 
     (table, "gsi259".to_owned())
 }
 
+/// Same drill on a NUMERIC sort key. The merge is type-agnostic, but the
+/// `extenddb migrate` repair recovers the lost type from the data table's PRIMARY
+/// KEY column, and every table carries all three typed columns (`sk_s`, `sk_n`,
+/// `sk_b`), so a numeric sort key is the case that catches a recovery keying off
+/// column existence instead of key membership.
+#[tokio::test]
+async fn adding_a_gsi_must_not_change_get_item_on_a_numeric_sort_key() {
+    let c = client();
+    let table = format!("Gsi259N_{}", ts());
+
+    c.create_table()
+        .table_name(&table)
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("sk")
+                .key_type(KeyType::Range)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("sk")
+                .attribute_type(ScalarAttributeType::N)
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(aws_sdk_dynamodb::types::BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+    wait_for_active(c, &table).await;
+
+    for i in 0..ITEM_COUNT {
+        let mut item = HashMap::new();
+        item.insert("pk".into(), s("shared"));
+        item.insert("sk".into(), n(i64::try_from(i).unwrap()));
+        item.insert("f01".into(), s(GSI_HASH_VALUE));
+        item.insert("f02".into(), s(&format!("gsk-{i:05}")));
+        c.put_item()
+            .table_name(&table)
+            .set_item(Some(item))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    c.update_table()
+        .table_name(&table)
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("f01")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("f02")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .global_secondary_index_updates(
+            GlobalSecondaryIndexUpdate::builder()
+                .create(
+                    CreateGlobalSecondaryIndexAction::builder()
+                        .index_name("gsi259n")
+                        .key_schema(
+                            KeySchemaElement::builder()
+                                .attribute_name("f01")
+                                .key_type(KeyType::Hash)
+                                .build()
+                                .unwrap(),
+                        )
+                        .key_schema(
+                            KeySchemaElement::builder()
+                                .attribute_name("f02")
+                                .key_type(KeyType::Range)
+                                .build()
+                                .unwrap(),
+                        )
+                        .projection(
+                            Projection::builder()
+                                .projection_type(ProjectionType::All)
+                                .build(),
+                        )
+                        .build()
+                        .unwrap(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    wait_for_index_active(c, &table, "gsi259n").await;
+
+    for i in 0..ITEM_COUNT {
+        let mut key = HashMap::new();
+        key.insert("pk".into(), s("shared"));
+        key.insert("sk".into(), n(i64::try_from(i).unwrap()));
+        let resp = c
+            .get_item()
+            .table_name(&table)
+            .set_key(Some(key))
+            .consistent_read(true)
+            .send()
+            .await
+            .unwrap();
+        let item = resp
+            .item()
+            .unwrap_or_else(|| panic!("GetItem for numeric sort key {i} returned no item"));
+        assert_eq!(
+            item.get("sk").unwrap(),
+            &n(i64::try_from(i).unwrap()),
+            "GetItem returned a different numeric sort key than the one requested ({i})"
+        );
+    }
+}
+
 /// #259: after the GSI is ACTIVE, every strongly consistent base-table GetItem
 /// must still return the item its sort key names. Before the fix this returned
 /// `sk-00000` for every request.

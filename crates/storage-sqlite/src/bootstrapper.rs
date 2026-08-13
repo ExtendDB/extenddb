@@ -9,9 +9,13 @@
 //! user. Destruction removes the database file and its WAL/SHM sidecars.
 
 use async_trait::async_trait;
-use extenddb_storage::bootstrapper::{AdminBootstrapResult, Bootstrapper, helpers};
+use extenddb_core::types::{AttributeDefinition, KeySchemaElement, KeyType};
+use extenddb_storage::bootstrapper::{
+    AdminBootstrapResult, Bootstrapper, KeyDefinitionRepair, helpers,
+};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::management_store::{OpError, OpResult};
+use extenddb_storage::util::recover_sort_key_definitions;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
 
@@ -250,6 +254,154 @@ impl Bootstrapper for SqliteBootstrapper {
             return Ok(false);
         };
         schema::table_exists(&pool, "settings").await
+    }
+
+    /// Repair table metadata damaged by the pre-fix `UpdateTable` (#259).
+    ///
+    /// SQLite keeps the catalog and the data tables in one file, so the physical
+    /// sort key columns are read with `PRAGMA table_info`. Otherwise identical to
+    /// the PostgreSQL implementation: for any base sort key with no attribute
+    /// definition, recover the type from its column name.
+    async fn repair_lost_sort_key_definitions(&self, apply: bool) -> OpResult<KeyDefinitionRepair> {
+        let mut report = KeyDefinitionRepair::default();
+        let Ok(pool) = self.pool().await else {
+            return Ok(report);
+        };
+        // A never-initialised catalog has no `tables` table, and `pool()` opens
+        // with mode=rwc, which silently creates an empty database file, so the
+        // SELECT below would hard-error rather than find nothing. PostgreSQL
+        // degrades gracefully through its get_data_db_name() guard; this is the
+        // SQLite equivalent.
+        if !schema::table_exists(&pool, "tables").await? {
+            return Ok(report);
+        }
+
+        let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+            "SELECT account_id, table_name, table_id, key_schema, attribute_definitions \
+             FROM tables ORDER BY table_name",
+        )
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| OpError::Internal(format!("Cannot read tables: {e}")))?;
+
+        for (account_id, table_name, table_id, ks_json, ad_json) in rows {
+            let key_schema: Vec<KeySchemaElement> = match serde_json::from_str(&ks_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    report
+                        .needs_attention
+                        .push(format!("{table_name}: unreadable key_schema ({e})"));
+                    continue;
+                }
+            };
+            let attr_defs: Vec<AttributeDefinition> =
+                serde_json::from_str(&ad_json).unwrap_or_default();
+
+            // Reported for every table on every run, not only when a sort key is
+            // repaired: the partition key definition is dropped by the same write and
+            // is not recoverable from the schema, because the pk column is always TEXT.
+            // It is not needed for correctness either, since partition key values are
+            // encoded from the key schema alone, so it is reported rather than guessed
+            // and keeps being reported until a human restores it.
+            let pk_missing: Vec<&str> = key_schema
+                .iter()
+                .filter(|ks| ks.key_type == KeyType::Hash)
+                .filter(|ks| {
+                    !attr_defs
+                        .iter()
+                        .any(|ad| ad.attribute_name == ks.attribute_name)
+                })
+                .map(|ks| ks.attribute_name.as_str())
+                .collect();
+            if !pk_missing.is_empty() {
+                report.needs_attention.push(format!(
+                    "{table_name}: partition key definition(s) [{}] are absent; reads and \
+                     writes are unaffected, but index key type validation cannot check them",
+                    pk_missing.join(", ")
+                ));
+            }
+
+            let missing: Vec<&KeySchemaElement> = key_schema
+                .iter()
+                .filter(|ks| ks.key_type == KeyType::Range)
+                .filter(|ks| {
+                    !attr_defs
+                        .iter()
+                        .any(|ad| ad.attribute_name == ks.attribute_name)
+                })
+                .collect();
+            if missing.is_empty() {
+                continue;
+            }
+
+            // PRIMARY KEY columns only, in key order. Every data table carries all
+            // three typed columns for each sort key position (sk_s, sk_n, sk_b), so
+            // column existence says nothing about the declared type: only the pk
+            // position reported by table_info does. `table_id` is interpolated
+            // because PRAGMA takes no bind parameters; it is checked as a UUID first
+            // so a malformed catalog row cannot reach the statement.
+            if uuid::Uuid::parse_str(&table_id).is_err() {
+                report
+                    .needs_attention
+                    .push(format!("{table_name}: table_id {table_id:?} is not a UUID"));
+                continue;
+            }
+            let mut key_columns: Vec<(i64, String)> = sqlx::query_as::<
+                _,
+                (i64, String, String, i64, Option<String>, i64),
+            >(&format!(
+                "PRAGMA table_info(\"_ddb_{table_id}\")"
+            ))
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| OpError::Internal(format!("Cannot read columns of {table_name}: {e}")))?
+            .into_iter()
+            .filter(|(.., pk_pos)| *pk_pos > 0)
+            .map(|(_, name, _, _, _, pk_pos)| (pk_pos, name))
+            .collect();
+            key_columns.sort_unstable();
+            let columns: Vec<String> = key_columns.into_iter().map(|(_, name)| name).collect();
+
+            let recovered = recover_sort_key_definitions(&key_schema, &attr_defs, &columns);
+            if recovered.is_empty() {
+                report.needs_attention.push(format!(
+                    "{table_name}: sort key(s) [{}] have no attribute definition and no \
+                     matching PRIMARY KEY column was found to recover the type from",
+                    missing
+                        .iter()
+                        .map(|ks| ks.attribute_name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                continue;
+            }
+
+            let mut merged = attr_defs;
+            merged.extend(recovered.iter().cloned());
+            let merged_json = serde_json::to_string(&merged)
+                .map_err(|e| OpError::Internal(format!("Cannot serialize definitions: {e}")))?;
+            if apply {
+                sqlx::query(
+                    "UPDATE tables SET attribute_definitions = ?1 \
+                     WHERE account_id = ?2 AND table_name = ?3",
+                )
+                .bind(&merged_json)
+                .bind(&account_id)
+                .bind(&table_name)
+                .execute(&pool)
+                .await
+                .map_err(|e| OpError::Internal(format!("Cannot repair {table_name}: {e}")))?;
+            }
+
+            for def in &recovered {
+                report.repaired.push(format!(
+                    "{table_name}: {} ({:?})",
+                    def.attribute_name, def.attribute_type
+                ));
+            }
+        }
+
+        Ok(report)
     }
 
     async fn list_table_names(&self) -> OpResult<Vec<String>> {
