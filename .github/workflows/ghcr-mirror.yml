@@ -23,6 +23,10 @@
 #   sha256-<64 hex>.sig       the Cosign signature artifact for an image digest
 # A signature may only be mirrored after the image it signs is already in
 # GHCR, so a dangling signature cannot exist through this path.
+#
+# Signatures are expected in cosign's default tag-based storage mode. OCI-1.1
+# referrers mode produces a bare sha256-<hex> tag (no .sig suffix), which this
+# gate rejects; pin tag-based mode in the signing procedure.
 
 name: ghcr-mirror
 
@@ -54,6 +58,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: ghcr          # required reviewers, prevent self-review, main only
+    # The workflow-level permissions block pins GITHUB_TOKEN read-only; this
+    # job is the only thing that pushes, so it alone gets packages: write.
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Gate - validate inputs strictly
         env:
@@ -90,7 +99,7 @@ jobs:
       - name: Gate - skopeo present (preinstalled on ubuntu-latest)
         run: |
           set -euo pipefail
-          command -v skopeo >/dev/null || sudo apt-get install -y --no-install-recommends skopeo
+          command -v skopeo >/dev/null || { sudo apt-get update -y && sudo apt-get install -y --no-install-recommends skopeo; }
           skopeo --version
 
       - name: Gate - the source tag must still resolve to the verified digest
@@ -99,6 +108,21 @@ jobs:
           SRC_DIGEST=$(skopeo inspect --format '{{.Digest}}' "docker://${SRC_REPO}:${TAG}")
           if [[ "$SRC_DIGEST" != "$DIGEST" ]]; then
             echo "::error::${SRC_REPO}:${TAG} now resolves to ${SRC_DIGEST}, not the verified ${DIGEST}; refusing to mirror an unverified artifact"
+            exit 1
+          fi
+
+      - name: Gate - the artifact must really be a Cosign signature (signature artifacts only)
+        if: env.KIND == 'signature'
+        run: |
+          set -euo pipefail
+          RAW=$(skopeo inspect --raw "docker://${SRC_REPO}:${TAG}")
+          MEDIA_TYPE=$(jq -r '.mediaType // empty' <<< "$RAW")
+          if [[ "$MEDIA_TYPE" != "application/vnd.oci.image.manifest.v1+json" ]]; then
+            echo "::error::${SRC_REPO}:${TAG} has mediaType '${MEDIA_TYPE}', not a single OCI image manifest; a .sig-shaped tag must not carry an image index"
+            exit 1
+          fi
+          if ! jq -e 'all(.layers[]; .mediaType == "application/vnd.dev.cosign.simplesigning.v1+json")' <<< "$RAW" >/dev/null; then
+            echo "::error::${SRC_REPO}:${TAG} layers are not Cosign simplesigning payloads; refusing to mirror it as a signature"
             exit 1
           fi
 
