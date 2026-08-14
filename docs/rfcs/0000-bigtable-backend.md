@@ -27,22 +27,22 @@ This RFC provides the technical specification to resolve these challenges.
 
 #### A. Table Structure & Naming
 *   **Catalog:** System metadata, accounts, and policies are stored in a single table named `__extenddb_catalog__`.
-*   **Data Tables:** DynamoDB tables map to Bigtable tables named `t<table_id_hex>` (where `table_id_hex` is a 32-character hex UUID). Data attributes are stored in column family `d`.
-*   **GSIs:** Shadow tables are named `t<table_id_hex>_g<idx_hash>` (where `idx_hash` is an 8-character hash of the index name).
+*   **Data Tables:** DynamoDB tables map to Bigtable tables named `t<table_id_hex>` (where `table_id_hex` is the first 16 hex characters of the table UUID, 17 characters total). Data attributes are stored in column family `d`.
+*   **GSIs:** Shadow tables are named `t<table_id_hex>_g<idx_hash>` (where `idx_hash` is an 8-character hash of the index name, 27 characters total).
 *   **Transaction Intents:** Column family `m` in data tables stores lock/intent cells.
 *   **TTL Markers:** Column family `t` (reserved).
 
 > [!NOTE]
-> **Naming Constraints:** Table IDs in Cloud Bigtable are limited to 50 characters. To prevent overflow, GSIs are named `t<table_id_hex>_g<idx_hash>` (43 characters total) rather than reproducing the full index name.
+> **Naming Constraints:** Table IDs in Cloud Bigtable are limited to 50 characters. To prevent overflow, GSIs are named `t<table_id_hex>_g<idx_hash>` (27 characters total) rather than reproducing the full index name.
 
 #### B. Exact Decimal & Order-Preserving Key Encoding
 Cloud Bigtable sorts row keys by raw byte lexicographical order. To maintain exact DynamoDB semantics:
 *   **String & Binary Keys:** Encoded verbatim with null-byte / length-prefixed terminators to preserve lexicographical sort order.
 *   **Number Keys:** DynamoDB supports numeric values with up to 38 significant digits and requires numerical sorting (e.g., `-10 < -2 < 0 < 1.5 < 2 < 100`). Numbers are stored as exact arbitrary-precision decimals (never floating point floats) using an order-preserving byte encoding:
-    *   **Negative numbers:** Sign byte `0x00`, followed by bit-inverted exponent and complement mantissa bytes.
+    *   **Negative numbers:** Sign byte `0x00`, followed by 1-byte bit-inverted biased exponent (`~exp_biased`), and 38-byte inverted mantissa digits (`9 - digit`) padded with `0x09`.
     *   **Zero:** Exactly `[0x80]`.
-    *   **Positive numbers:** Sign byte `0x81`, followed by big-endian exponent bytes and binary-coded decimal mantissa bytes.
-*   **GSI Index Row Keys:** Primary keys in GSI shadow tables are formatted as `[pk_val]\0[sk_val]\0[base_pk_val]\0[base_sk_val]`, ensuring exact numeric/string sort parity and uniqueness.
+    *   **Positive numbers:** Sign byte `0xFF`, followed by 1-byte biased exponent (`exp_biased = sci_exp + 130`), and 38-byte normalized decimal digits padded with `0x00`.
+*   **GSI Index Row Keys:** Primary keys in GSI shadow tables are formatted as `[encoded_gsi_pk][encoded_gsi_sk]\xFE[encoded_base_pk][encoded_base_sk]`, reusing the exact order-preserving/length-prefixed encoding of the base table. The `0xFE` byte acts as a structural separator between the secondary and base key components, avoiding bare null-byte collisions and preserving uniqueness and sort parity.
 
 ### 2. Transaction Rules & Isolation Guarantees
 
@@ -83,9 +83,10 @@ sequenceDiagram
 ```
 
 #### C. Read Isolation & Concurrency Guarantees
-*   **Read Committed (No Dirty Reads):** In Phase 3, the coordinator only writes intent lock markers to column family `m`. Actual data mutations in column family `d` are **only applied in Phase 7** after the coordinator's `COMMITTED` record is durable in `__extenddb_txn_log__`. Standard reads (`GetItem`, `Query`, `Scan`, `BatchGetItem`) read solely from column family `d` and therefore never observe uncommitted candidate writes that could roll back.
-*   **Serializable `TransactGetItems`:** `TransactGetItems` observes the committed set atomically. Before reading data rows, it checks for active intent markers in column family `m`. If an active lock is present, it coordinates with `__extenddb_txn_log__` to observe the snapshot at the transaction commit boundary, preventing dirty or partial reads.
-*   **Cross-Row Visibility for Standard Reads:** During the 2PC apply window (Phase 7), standard `Query` or `Scan` operations may observe some participant rows updated before others across separate Bigtable tables. This is fully compliant with DynamoDB's `Read Committed` isolation model, as every observed row reflects a durable, committed state.
+*   **Read Committed (No Dirty Reads):** In Phase 1, the coordinator only writes intent lock markers to column family `m`. Actual data mutations in column family `d` are **only applied in Phase 2** after the coordinator's `COMMITTED` record is durable in `__extenddb_txn_log__`. Standard reads (`GetItem`, `Query`, `Scan`, `BatchGetItem`) read solely from column family `d` and therefore never observe uncommitted candidate writes that could roll back.
+*   **Serializable `TransactGetItems`:** `TransactGetItems` observes the committed set atomically by reading all requested rows and checking for active intent markers in column family `m`. Because Bigtable lacks cross-row atomic snapshots, if *any* requested row has an active intent lock, the request immediately blocks and retries. By deferring the read until all participant locks are cleared (Phase 3), the read never observes partial transaction state, guaranteeing Serializable visibility.
+*   **Read-Your-Writes (Ack Point):** To guarantee that strongly-consistent `GetItem` or `Query` requests observe applied transaction data, the coordinator defers the HTTP 200 OK success acknowledgment (client ack) until *after* all Phase 2 mutations (data and streams) are definitively applied to column family `d`.
+*   **Cross-Row Visibility for Standard Reads:** During the 2PC apply window (Phase 2), standard `Query` or `Scan` operations may observe some participant rows updated before others across separate Bigtable tables. This is fully compliant with DynamoDB's `Read Committed` isolation model, as every observed row reflects a durable, committed state.
 
 #### D. Guarding Single-Row Writes
 All single-row mutations (`PutItem`, `UpdateItem`, `DeleteItem`) must run via `CheckAndMutateRow` to prevent overwriting active 2PC locks:
@@ -102,10 +103,9 @@ A background worker periodically scans `__extenddb_txn_log__` for transactions o
 ### 3. Stream Emissions in Transactions
 
 To ensure stream record atomicity:
-1.  **Phase 1 Resolution:** Fetch the full `TableDescription` (including `StreamSpecification` and `latest_stream_arn`) and pre-generate the `StreamRecord` payloads.
-2.  **Log Enrichment:** Store the pre-generated stream record payloads in the coordinator row of `__extenddb_txn_log__` in Phase 2.
-3.  **Phase 5 Commit:** Write the pre-generated stream records to the stream table alongside the data mutations.
-4.  **Recovery:** The recovery sweeper uses the payloads stored in the log to roll forward stream writes on crash.
+1.  **Phase 1 (Prepare):** Fetch the full `TableDescription` (including `StreamSpecification` and `latest_stream_arn`) and pre-generate the `StreamRecord` payloads.
+2.  **Phase 2 (Log Enrichment & Commit):** Store the pre-generated stream record payloads and participant mutation payloads in the coordinator row of `__extenddb_txn_log__` alongside `COMMITTED`, and apply stream records to `__extenddb_streams__` concurrently with data mutations.
+3.  **Recovery:** The recovery sweeper uses the payloads stored in the log to roll forward stream writes on crash.
 
 ### 4. Scalable TTL Indexing & Streams Integration
 
@@ -140,7 +140,7 @@ Enforce DynamoDB GSI projection behavior:
 *   **Defaulting:** If `Select` is omitted in a GSI query, default to `Select::AllProjectedAttributes`.
 
 #### B. Background Reconciler
-Implement a reconciler as an internal background worker spawned via `RuntimeHooks`. The worker scans GSIs, compares them with the base tables, and repairs missing, orphaned, or mismatched shadow rows, preventing phantom records from returning during divergence windows.
+Implement a reconciler as an internal background worker spawned via `ServerRuntimeHooks::spawn_workers`. The worker scans GSIs, compares them with the base tables, and repairs missing, orphaned, or mismatched shadow rows, preventing phantom records from returning during divergence windows.
 
 ### 6. GCP Credentials Configuration
 
