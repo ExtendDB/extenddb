@@ -3,10 +3,11 @@
 #
 # Minimal GHCR candidate mirror.
 #
-# Copies ONE already-verified, commit-addressed candidate from Docker Hub to
-# GHCR, byte-for-byte, and nothing else: no builds, no Docker Hub publication,
-# no ECR, no version tags, no `latest`, no signing. Promotion and signing are
-# manual, recorded runbook steps.
+# Copies ONE already-verified tag from Docker Hub to GHCR, byte-for-byte,
+# and nothing else: no builds, no Docker Hub publication, no ECR, no signing.
+# Signing is a manual, recorded runbook step; GHCR promotion happens through
+# this job (dispatched once per release tag, after Docker Hub promotes),
+# because GHCR has no other sanctioned write path.
 #
 # Why this exists at all: GHCR's only acceptable credential is the
 # workflow-scoped GITHUB_TOKEN, which exists only inside an Actions run, so
@@ -18,9 +19,15 @@
 # this job: the operator supplies the digest they verified, and this job
 # refuses to mirror anything else, even if the Docker Hub tag has moved since.
 #
-# Two artifact kinds are supported, distinguished by tag shape:
+# Three artifact kinds are supported, distinguished by tag shape:
 #   sha-<40 hex>              an image candidate (multi-arch index)
 #   sha256-<64 hex>.sig       the Cosign signature artifact for an image digest
+#   X.Y.Z or latest           a release tag already promoted on Docker Hub
+#
+# Known limitation, deliberate: re-pointing `latest` at a NEW digest hits the
+# no-overwrite gate and fails closed. Fine for the first release (no `latest`
+# exists); the second release needs a guarded move-latest carve-out mirroring
+# promote-image's never-move-backwards rule, or the Track 2 pipeline.
 # A signature may only be mirrored after the image it signs is already in
 # GHCR, so a dangling signature cannot exist through this path.
 #
@@ -34,7 +41,7 @@ on:
   workflow_dispatch:
     inputs:
       candidate_tag:
-        description: 'Verified Docker Hub tag: image candidate (sha-<full 40-char commit>) or Cosign signature artifact (sha256-<64 hex>.sig)'
+        description: 'Verified Docker Hub tag: image candidate (sha-<full 40-char commit>), Cosign signature artifact (sha256-<64 hex>.sig), or promoted release tag (X.Y.Z / latest)'
         required: true
       expected_digest:
         description: 'The verified manifest digest of that tag, e.g. sha256:<64 hex>'
@@ -76,13 +83,17 @@ jobs:
           SUBJECT_DIGEST=''
           if [[ "$RAW_TAG" =~ ^sha-[0-9a-f]{40}$ ]]; then
             KIND=image
+          elif [[ "$RAW_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || "$RAW_TAG" == latest ]]; then
+            # A release tag is an image index like a candidate; every image
+            # gate (digest pin, no-overwrite, platform assertions) applies.
+            KIND=image
           elif [[ "$RAW_TAG" =~ ^sha256-[0-9a-f]{64}\.sig$ ]]; then
             KIND=signature
             # sha256-<hex>.sig  ->  sha256:<hex>  (the image digest it signs)
             SUBJECT_DIGEST="${RAW_TAG%.sig}"
             SUBJECT_DIGEST="${SUBJECT_DIGEST/-/:}"
           else
-            echo "::error::candidate_tag '$RAW_TAG' is neither an image candidate (sha-<40 hex>) nor a signature artifact (sha256-<64 hex>.sig)"
+            echo "::error::candidate_tag '$RAW_TAG' is not an image candidate (sha-<40 hex>), a signature artifact (sha256-<64 hex>.sig), or a release tag (X.Y.Z / latest)"
             exit 1
           fi
           if [[ ! "$RAW_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -182,7 +193,7 @@ jobs:
       - name: Summarise for the release checklist
         run: |
           {
-            echo "### GHCR ${KIND} mirrored (NOT promoted)"
+            echo "### GHCR ${KIND} mirrored: \`${TAG}\`"
             echo ""
             echo "| field | value |"
             echo "|---|---|"
