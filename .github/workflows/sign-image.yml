@@ -34,6 +34,9 @@ on:
       expected_digest:
         description: 'The verified image index digest to sign, e.g. sha256:<64 hex>'
         required: true
+      release_tag:
+        description: 'The release this digest belongs to, e.g. v0.1.5 (annotation only)'
+        required: true
 
 permissions:
   contents: read
@@ -61,13 +64,21 @@ jobs:
       - name: Gate - validate input strictly
         env:
           RAW_DIGEST: ${{ inputs.expected_digest }}
+          RAW_RELEASE: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
           if [[ ! "$RAW_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "::error::expected_digest is not a sha256:<64 hex> digest"
             exit 1
           fi
-          echo "DIGEST=$RAW_DIGEST" >> "$GITHUB_ENV"
+          if [[ ! "$RAW_RELEASE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release_tag is not a vMAJOR.MINOR.PATCH release tag"
+            exit 1
+          fi
+          {
+            echo "DIGEST=$RAW_DIGEST"
+            echo "RELEASE=$RAW_RELEASE"
+          } >> "$GITHUB_ENV"
 
       - name: Gate - the digest must exist on Docker Hub as a multi-arch index
         run: |
@@ -108,8 +119,7 @@ jobs:
             --use-signing-config=false \
             --new-bundle-format=false \
             --tlog-upload=false \
-            -a org.extenddb.release="${{ github.ref_name }}" \
-            -a org.extenddb.signed-digest="${DIGEST}" \
+            -a org.extenddb.release="${RELEASE}" \
             "${IMAGE_REPO}@${DIGEST}"
 
       - name: Gate - the .sig TAG must exist (catches the storage-mode trap)
