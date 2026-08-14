@@ -1106,7 +1106,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "extenddb-app",
@@ -1119,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-app"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1147,7 +1147,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-auth"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "axum",
@@ -1167,7 +1167,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-cache"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "futures",
  "moka",
@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-config"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "config",
@@ -1191,7 +1191,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "base64 0.22.1",
  "bigdecimal",
@@ -1204,7 +1204,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-engine"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "base64 0.22.1",
  "crc32fast",
@@ -1223,7 +1223,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-server"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1259,7 +1259,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -1283,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-mongodb"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1313,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-postgres"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1340,7 +1340,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-sqlite"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "aes-gcm",
  "async-trait",
