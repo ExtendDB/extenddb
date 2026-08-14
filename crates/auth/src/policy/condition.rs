@@ -15,9 +15,14 @@ use super::matcher::wildcard_match;
 ///
 /// Returns `true` if the condition is satisfied. The behavior depends on the
 /// operator type:
-/// - Base operators: key must be present, all context values must match at
-///   least one policy value.
-/// - `IfExists`: passes if the key is absent; otherwise evaluates normally.
+/// - Base (bare) operators on a **single-valued** key: key must be present and
+///   its value must match at least one policy value.
+/// - Base (bare) operators on a **multivalued** key (`dynamodb:Attributes`,
+///   `dynamodb:LeadingKeys`): never match. AWS IAM requires a
+///   `ForAllValues:`/`ForAnyValue:` qualifier for multivalued keys; a bare
+///   operator on such a key is a no-op regardless of value count (BR-7085).
+/// - `IfExists`: passes if the key is absent; otherwise evaluates as the base
+///   operator (and so never matches a present multivalued key).
 /// - `Null`: checks key presence/absence.
 /// - `ForAllValues`: every context value must match some policy value.
 ///   Absent key is vacuously true.
@@ -25,6 +30,7 @@ use super::matcher::wildcard_match;
 ///   Absent key is false (unless wrapped in `IfExists`).
 pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext) -> bool {
     let context_values = context.resolve_key(&condition.key);
+    let is_multivalued = context.is_multivalued_key(&condition.key);
 
     // Expand policy variables (e.g. `${aws:PrincipalTag/Team}`) in condition values.
     let expanded_values: Vec<String> = condition
@@ -96,10 +102,18 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
         }
         ConditionOperator::IfExists(inner) => match context_values {
             None => true,
+            // A bare operator (even wrapped in IfExists) applied to a multivalued
+            // key never matches in AWS IAM — only ForAllValues/ForAnyValue do.
+            // Key present + multivalued → no match. (BR-7085)
+            Some(_) if is_multivalued => false,
             Some(vals) => evaluate_single_value_condition(inner, &vals, &expanded_values),
         },
         other => match context_values {
             None => false,
+            // Bare operator on a multivalued key never matches (BR-7085). This is
+            // fail-safe: a bare Deny becomes a no-op (matching AWS, which forces the
+            // author to use ForAnyValue:), and a bare Allow allowlist stops granting.
+            Some(_) if is_multivalued => false,
             Some(vals) => evaluate_single_value_condition(other, &vals, &expanded_values),
         },
     }
@@ -154,19 +168,21 @@ fn unwrap_if_exists(op: &ConditionOperator) -> (bool, &ConditionOperator) {
     }
 }
 
-/// Evaluate a non-set, non-IfExists condition.
+/// Evaluate a non-set, non-IfExists condition for a single-valued key.
 ///
-/// For single-valued keys, `context_values` has one element.
-/// For multi-valued keys (e.g., `dynamodb:LeadingKeys`), all context values
-/// must satisfy the condition (implicit AND).
+/// The caller (`evaluate_condition`) only reaches this for single-valued keys;
+/// bare operators on multivalued keys are rejected before this point (BR-7085).
+/// A single-valued key resolves to exactly one context value in practice, so the
+/// `all`/`any` combinators below collapse to that one value.
 ///
-/// For positive operators (`StringEquals`, `NumericEquals`, etc.): each context
-/// value must match at least one policy value (OR semantics — "value in set").
+/// For positive operators (`StringEquals`, `NumericEquals`, etc.): the context
+/// value must match at least one policy value (OR semantics across policy values
+/// — "value in set").
 ///
-/// For negative operators (`StringNotEquals`, `NumericNotEquals`, etc.): each
-/// context value must satisfy the negative comparison against ALL policy
-/// values (AND semantics — "value not in set"). This matches AWS IAM behavior
-/// where `StringNotEquals` with `["a", "b"]` means "value is neither a nor b".
+/// For negative operators (`StringNotEquals`, `NumericNotEquals`, etc.): the
+/// context value must satisfy the negative comparison against ALL policy values
+/// (AND semantics — "value not in set"). This matches AWS IAM behavior where
+/// `StringNotEquals` with `["a", "b"]` means "value is neither a nor b".
 fn evaluate_single_value_condition(
     op: &ConditionOperator,
     context_values: &[&str],
@@ -330,6 +346,12 @@ mod tests {
             self.0
                 .get(key)
                 .map(|v| v.iter().map(|s| s.as_str()).collect())
+        }
+
+        fn is_multivalued_key(&self, key: &str) -> bool {
+            // Mirror the real RequestContext classification so tests exercise the
+            // production arity rule.
+            matches!(key, "dynamodb:LeadingKeys" | "dynamodb:Attributes")
         }
     }
 
@@ -704,24 +726,167 @@ mod tests {
         ));
     }
 
-    // --- Multi-value context with base operator ---
+    // --- BR-7085: bare operators on multivalued keys must never match ---
+    //
+    // Verified against real AWS IAM (Policy Simulator + end-to-end DynamoDB): a bare
+    // (non-ForAllValues/ForAnyValue) operator applied to a multivalued key
+    // (dynamodb:Attributes, dynamodb:LeadingKeys) never matches, regardless of the
+    // operator or how many values are present. Only the set qualifiers match.
 
     #[test]
-    fn multi_value_context_all_must_match() {
-        // With a base operator (not ForAllValues), all context values must match
-        // at least one policy value
-        let ctx = TestContext::new().with("k", vec!["a", "b"]);
-        assert!(evaluate_condition(
-            &cond(ConditionOperator::StringEquals, "k", vec!["a", "b"]),
+    fn bare_op_multivalued_single_value_no_match() {
+        // Even a single requested attribute equal to the policy value does NOT match
+        // (real AWS returns "allowed"). This is the reporter's "control test", which
+        // AWS does not deny.
+        let ctx = TestContext::new().with("dynamodb:Attributes", vec!["ssn"]);
+        assert!(!evaluate_condition(
+            &cond(
+                ConditionOperator::StringEquals,
+                "dynamodb:Attributes",
+                vec!["ssn"]
+            ),
             &ctx
         ));
     }
 
     #[test]
-    fn multi_value_context_one_fails() {
-        let ctx = TestContext::new().with("k", vec!["a", "c"]);
+    fn bare_op_multivalued_all_match_no_match() {
+        let ctx = TestContext::new().with("dynamodb:Attributes", vec!["ssn", "salary"]);
         assert!(!evaluate_condition(
-            &cond(ConditionOperator::StringEquals, "k", vec!["a", "b"]),
+            &cond(
+                ConditionOperator::StringEquals,
+                "dynamodb:Attributes",
+                vec!["ssn", "salary"]
+            ),
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn bare_op_multivalued_extra_value_no_match() {
+        // The reported "bypass" shape: request ssn + fullname, policy denies [ssn].
+        let ctx = TestContext::new().with("dynamodb:Attributes", vec!["ssn", "fullname"]);
+        assert!(!evaluate_condition(
+            &cond(
+                ConditionOperator::StringEquals,
+                "dynamodb:Attributes",
+                vec!["ssn"]
+            ),
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn bare_negative_op_multivalued_no_match() {
+        let ctx = TestContext::new().with("dynamodb:Attributes", vec!["fullname"]);
+        assert!(!evaluate_condition(
+            &cond(
+                ConditionOperator::StringNotEquals,
+                "dynamodb:Attributes",
+                vec!["ssn"]
+            ),
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn bare_string_like_multivalued_no_match() {
+        let ctx = TestContext::new().with("dynamodb:Attributes", vec!["ssn"]);
+        assert!(!evaluate_condition(
+            &cond(ConditionOperator::StringLike, "dynamodb:Attributes", vec!["ss*"]),
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn bare_op_multivalued_leading_keys_no_match() {
+        let ctx = TestContext::new().with("dynamodb:LeadingKeys", vec!["user1"]);
+        assert!(!evaluate_condition(
+            &cond(
+                ConditionOperator::StringEquals,
+                "dynamodb:LeadingKeys",
+                vec!["user1"]
+            ),
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn if_exists_bare_op_multivalued_present_no_match() {
+        let ctx = TestContext::new().with("dynamodb:Attributes", vec!["ssn"]);
+        assert!(!evaluate_condition(
+            &cond(
+                ConditionOperator::IfExists(Box::new(ConditionOperator::StringEquals)),
+                "dynamodb:Attributes",
+                vec!["ssn"]
+            ),
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn if_exists_multivalued_absent_passes() {
+        // IfExists still passes when the key is absent.
+        let ctx = TestContext::new();
+        assert!(evaluate_condition(
+            &cond(
+                ConditionOperator::IfExists(Box::new(ConditionOperator::StringEquals)),
+                "dynamodb:Attributes",
+                vec!["ssn"]
+            ),
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn for_any_value_multivalued_deny_matches() {
+        // The CORRECT deny pattern: ForAnyValue:StringEquals fires when ANY requested
+        // attribute is in the denied set.
+        let ctx = TestContext::new().with("dynamodb:Attributes", vec!["ssn", "fullname"]);
+        assert!(evaluate_condition(
+            &cond(
+                ConditionOperator::ForAnyValue(Box::new(ConditionOperator::StringEquals)),
+                "dynamodb:Attributes",
+                vec!["ssn"]
+            ),
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn for_all_values_multivalued_allowlist() {
+        // Allowlist pattern: ForAllValues:StringEquals allows only when EVERY requested
+        // attribute is in the allowed set.
+        let ctx_ok = TestContext::new().with("dynamodb:Attributes", vec!["pk", "fullname"]);
+        assert!(evaluate_condition(
+            &cond(
+                ConditionOperator::ForAllValues(Box::new(ConditionOperator::StringEquals)),
+                "dynamodb:Attributes",
+                vec!["pk", "fullname"]
+            ),
+            &ctx_ok
+        ));
+        let ctx_bad = TestContext::new().with("dynamodb:Attributes", vec!["pk", "ssn"]);
+        assert!(!evaluate_condition(
+            &cond(
+                ConditionOperator::ForAllValues(Box::new(ConditionOperator::StringEquals)),
+                "dynamodb:Attributes",
+                vec!["pk", "fullname"]
+            ),
+            &ctx_bad
+        ));
+    }
+
+    #[test]
+    fn bare_op_single_valued_key_still_matches() {
+        // Regression: bare operators on single-valued keys are unaffected.
+        let ctx = TestContext::new().with("dynamodb:Select", vec!["ALL_ATTRIBUTES"]);
+        assert!(evaluate_condition(
+            &cond(
+                ConditionOperator::StringEquals,
+                "dynamodb:Select",
+                vec!["ALL_ATTRIBUTES"]
+            ),
             &ctx
         ));
     }

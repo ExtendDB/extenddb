@@ -19,6 +19,17 @@ pub trait ConditionContext {
     /// Returns `None` when the key is absent or not applicable to this context.
     /// Returns `Some(vec![])` when the key is present but has an empty value set.
     fn resolve_key(&self, key: &str) -> Option<Vec<&str>>;
+
+    /// Returns `true` if `key` is a multivalued (set-valued) condition key in this
+    /// context.
+    ///
+    /// Arity is a property of the *key*, not of how many values happen to be present
+    /// on a given request. AWS IAM requires a `ForAllValues:`/`ForAnyValue:`
+    /// set-operator qualifier for multivalued keys; a bare operator (no qualifier)
+    /// applied to a multivalued key never matches, even when a single value is
+    /// present. Verified against real AWS IAM (BR-7085). Returning `false` for an
+    /// unknown key preserves the normal single-valued evaluation path.
+    fn is_multivalued_key(&self, key: &str) -> bool;
 }
 
 /// Request parameters extracted from a `DynamoDB` operation for condition evaluation.
@@ -124,6 +135,13 @@ impl ConditionContext for RequestContext {
             }
         }
     }
+
+    fn is_multivalued_key(&self, key: &str) -> bool {
+        // Per the AWS DynamoDB service authorization reference these keys are
+        // `ArrayOfString` (multivalued); all other DynamoDB keys and tag keys are
+        // single-valued. Verified against real AWS IAM (BR-7085).
+        matches!(key, "dynamodb:LeadingKeys" | "dynamodb:Attributes")
+    }
 }
 
 /// Context for evaluating trust policy conditions during `AssumeRole`.
@@ -147,6 +165,12 @@ impl ConditionContext for AssumeRoleContext {
         } else {
             None
         }
+    }
+
+    fn is_multivalued_key(&self, _key: &str) -> bool {
+        // Trust-policy keys (`aws:PrincipalTag/*`, `sts:ExternalId`) are all
+        // single-valued.
+        false
     }
 }
 
