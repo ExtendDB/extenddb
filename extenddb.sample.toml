@@ -33,8 +33,9 @@
 
 # --- SQLite backend (developer mode) ---
 # Select with `extenddb init --backend sqlite`. The database path can be given
-# at serve time (`extenddb serve --sqlite-path <path>`) or here. Resolution order:
-#   --sqlite-path flag  ->  [storage.sqlite].path  ->  default "extenddb.sqlite".
+# at init time (`extenddb init --sqlite-path <path>`, written into this file)
+# or set here. At serve time, the EXTENDDB__STORAGE__SQLITE__PATH environment
+# variable overrides this value.
 # Use ":memory:" for an ephemeral in-memory database (data lost on shutdown).
 # [storage.sqlite]
 # path = "extenddb.sqlite"
