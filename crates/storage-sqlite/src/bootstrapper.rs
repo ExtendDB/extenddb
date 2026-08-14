@@ -38,9 +38,11 @@ impl SqliteBootstrapper {
 
     /// Build a `SqliteBootstrapper` from the config file and CLI args.
     ///
-    /// Resolution order for the database path: `--sqlite-path <p>` CLI flag,
-    /// then `[storage.sqlite].path` in the config file, then the default
-    /// `extenddb.sqlite`.
+    /// Resolution order for the database path (bootstrapper commands: init,
+    /// destroy, migrate): the `--sqlite-path <p>` CLI flag (declared on
+    /// `InitArgs`), then `[storage.sqlite].path` in the config file, then the
+    /// default `extenddb.sqlite`. `serve` does not use this path; it reads
+    /// the config (with `EXTENDDB__STORAGE__SQLITE__PATH` overriding).
     pub async fn from_config(config_path: &str, cli_args: &[String]) -> Result<Self, StorageError> {
         if let Some(p) = helpers::extract_arg(cli_args, "--sqlite-path") {
             return Ok(Self::new(p));
@@ -70,7 +72,21 @@ impl SqliteBootstrapper {
     }
 
     /// Open a short-lived single-connection pool with the standard PRAGMAs.
+    /// For a real filesystem path, the parent directory is created first:
+    /// `init --sqlite-path` may point into a directory that does not exist
+    /// yet, and bootstrapping it is exactly init's job.
     async fn pool(&self) -> OpResult<SqlitePool> {
+        if self.path != ":memory:"
+            && let Some(parent) = std::path::Path::new(&self.path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                OpError::Internal(format!(
+                    "create parent directory for SQLite database '{}': {e}",
+                    self.path
+                ))
+            })?;
+        }
         SqlitePoolOptions::new()
             .max_connections(1)
             .after_connect(|conn, _| {
