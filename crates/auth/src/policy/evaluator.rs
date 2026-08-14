@@ -214,6 +214,10 @@ mod tests {
                 .get(key)
                 .map(|v| v.iter().map(|s| s.as_str()).collect())
         }
+
+        fn is_multivalued_key(&self, key: &str) -> bool {
+            matches!(key, "dynamodb:LeadingKeys" | "dynamodb:Attributes")
+        }
     }
 
     fn parse(json: &str) -> PolicyDocument {
@@ -762,5 +766,78 @@ mod tests {
             ),
             AuthzDecision::Deny
         );
+    }
+
+    // --- BR-7085: explicit-Deny handling for the dynamodb:Attributes FGAC pattern ---
+
+    fn fgac_policies() -> [PolicyDocument; 2] {
+        let allow = parse(
+            r#"{"Version":"2012-10-17","Statement":[{
+                "Effect":"Allow","Action":"dynamodb:*","Resource":"*"
+            }]}"#,
+        );
+        // Misconfigured denylist using a BARE StringEquals on the multivalued key.
+        let deny_bare = parse(
+            r#"{"Version":"2012-10-17","Statement":[{
+                "Effect":"Deny","Action":"dynamodb:*",
+                "Resource":"arn:aws:dynamodb:us-east-1:123:table/Employees",
+                "Condition":{"StringEquals":{"dynamodb:Attributes":["ssn"]}}
+            }]}"#,
+        );
+        [allow, deny_bare]
+    }
+
+    fn eval_attrs(policies: &[PolicyDocument], attrs: Vec<&str>) -> AuthzDecision {
+        let ctx = Ctx::empty().with("dynamodb:Attributes", attrs);
+        evaluate_policies(
+            policies,
+            None,
+            None,
+            "dynamodb:GetItem",
+            "arn:aws:dynamodb:us-east-1:123:table/Employees",
+            &ctx,
+        )
+    }
+
+    #[test]
+    fn bare_deny_on_attributes_is_a_noop_ssn_alone_allowed() {
+        // Matches real AWS: requesting ssn alone is ALLOWED (bare Deny never fires).
+        // ExtendDB previously DENIED this, creating a false sense of security.
+        let p = fgac_policies();
+        assert_eq!(eval_attrs(&p, vec!["ssn"]), AuthzDecision::Allow);
+    }
+
+    #[test]
+    fn bare_deny_on_attributes_is_a_noop_ssn_plus_fullname_allowed() {
+        let p = fgac_policies();
+        assert_eq!(eval_attrs(&p, vec!["ssn", "fullname"]), AuthzDecision::Allow);
+    }
+
+    #[test]
+    fn bare_deny_on_attributes_fullname_allowed() {
+        let p = fgac_policies();
+        assert_eq!(eval_attrs(&p, vec!["fullname"]), AuthzDecision::Allow);
+    }
+
+    #[test]
+    fn for_any_value_deny_on_attributes_is_effective() {
+        // The CORRECT pattern: ForAnyValue:StringEquals denies whenever ssn is requested,
+        // whether alone or alongside another attribute.
+        let allow = parse(
+            r#"{"Version":"2012-10-17","Statement":[{
+                "Effect":"Allow","Action":"dynamodb:*","Resource":"*"
+            }]}"#,
+        );
+        let deny_any = parse(
+            r#"{"Version":"2012-10-17","Statement":[{
+                "Effect":"Deny","Action":"dynamodb:*",
+                "Resource":"arn:aws:dynamodb:us-east-1:123:table/Employees",
+                "Condition":{"ForAnyValue:StringEquals":{"dynamodb:Attributes":["ssn"]}}
+            }]}"#,
+        );
+        let p = [allow, deny_any];
+        assert_eq!(eval_attrs(&p, vec!["ssn"]), AuthzDecision::Deny);
+        assert_eq!(eval_attrs(&p, vec!["ssn", "fullname"]), AuthzDecision::Deny);
+        assert_eq!(eval_attrs(&p, vec!["fullname"]), AuthzDecision::Allow);
     }
 }
