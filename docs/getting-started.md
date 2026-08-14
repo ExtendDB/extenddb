@@ -27,6 +27,13 @@ The scripts report missing dependencies and exit — they never install
 software on your behalf. After the script completes, continue from
 [Step 2: Initialize the deployment](#2-initialize-the-deployment) below.
 
+## Quick start with Docker Compose
+
+If you have Docker, the fastest way to get a local ExtendDB stack running is with
+the included `docker-compose.yml`. It wires the official image to a PostgreSQL
+container and handles initialization automatically — no build or manual init required.
+See [Local Development with Docker Compose](local-dev-docker-compose.md).
+
 ## Prerequisites
 
 - **Storage backend** (one of):
