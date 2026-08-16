@@ -998,8 +998,27 @@ pub fn validate_index_keys(
     indexes: &[IndexKeyRef<'_>],
     attr_defs: &[AttributeDefinition],
 ) -> Result<(), DynamoDbError> {
+    validate_index_keys_in_context(item, indexes, attr_defs, SecondaryIndexEmptyContext::Item)
+}
+
+/// [`validate_index_keys`] with the caller choosing the empty-value message
+/// variant.
+///
+/// DynamoDB words the rejection differently depending on how the offending value
+/// arrived. An item supplied directly reports the attribute and index by name; a
+/// value produced by an update expression reports that the update expression
+/// attempted the change and names neither. A path that evaluates an update
+/// expression and then validates the resulting item must therefore pass
+/// [`SecondaryIndexEmptyContext::UpdateExpression`], or it rejects for the right
+/// reason with the wrong message.
+pub fn validate_index_keys_in_context(
+    item: &Item,
+    indexes: &[IndexKeyRef<'_>],
+    attr_defs: &[AttributeDefinition],
+    context: SecondaryIndexEmptyContext,
+) -> Result<(), DynamoDbError> {
     validate_index_key_types(item, indexes, attr_defs)?;
-    validate_index_key_not_empty(item, indexes, SecondaryIndexEmptyContext::Item)
+    validate_index_key_not_empty(item, indexes, context)
 }
 
 /// Indexes sorted by name, so the alphabetically-first index that uses a
