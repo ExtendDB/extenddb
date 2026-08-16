@@ -7,7 +7,7 @@ use extenddb_core::types::{
     AttributeDefinition, BillingMode, KeySchemaElement, TableDescription, UpdateTableInput,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::merge_attribute_definitions;
+use extenddb_storage::util::effective_attribute_definitions;
 
 use crate::PostgresEngine;
 
@@ -351,31 +351,18 @@ impl PostgresEngine {
 
             // Recompute attribute_definitions for the post-update table.
             //
-            // DynamoDB treats the request's AttributeDefinitions as neither a
-            // replacement for the stored set nor a pure addition to it. The
-            // effective set is the stored definitions merged with the request's,
-            // then pruned to the attributes still referenced by the table key
-            // schema or by an index that survives this update:
-            //
-            //   * replacing rather than merging would drop the base table's own
-            //     pk/sk definitions and silently degrade keyed reads to a
-            //     partition-only lookup (issue #259);
-            //   * a definition no key and no surviving index references is
-            //     dropped, so supplying an unused definition alongside a GSI add
-            //     is a no-op rather than a stored row;
-            //   * definitions referenced only by a deleted index are dropped;
-            //   * redeclaring an existing attribute keeps the STORED type, so a
-            //     conflicting redeclaration cannot silently retype a live index
-            //     key;
-            //   * sequential adds accumulate, because the stored set is the base
-            //     of the merge.
+            // The effective set is the stored definitions merged with the
+            // request's, then pruned to the attributes still referenced by the
+            // table key schema or by an index surviving this update. See
+            // effective_attribute_definitions for the measured behaviour and the
+            // reason merging alone is not enough (issue #259).
             //
             // This runs whether or not the request carried AttributeDefinitions,
-            // because a GSI deletion prunes definitions without the request
-            // naming any. The index rows were created and deleted above in this
-            // same transaction, so `indexes` already holds exactly the surviving
-            // set; the stored definitions were read under the FOR UPDATE lock, so
-            // the read-modify-write is atomic against a concurrent UpdateTable.
+            // because a GSI deletion prunes without the request naming anything.
+            // The index rows were created and deleted above in this same
+            // transaction, so `indexes` already holds exactly the surviving set;
+            // the stored definitions were read under the FOR UPDATE lock, so the
+            // read-modify-write is atomic against a concurrent UpdateTable.
             let stored_attr_defs: Vec<AttributeDefinition> =
                 serde_json::from_value(ad_json.clone())
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -383,33 +370,27 @@ impl PostgresEngine {
                 serde_json::from_value(ks_json.clone())
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            let surviving_index_key_schemas: Vec<(serde_json::Value,)> =
+            let surviving_rows: Vec<(serde_json::Value,)> =
                 sqlx::query_as("SELECT key_schema FROM indexes WHERE table_id = $1")
                     .bind(&table_id)
                     .fetch_all(&mut *tx)
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            let mut referenced: std::collections::BTreeSet<String> = table_key_schema
-                .into_iter()
-                .map(|ks| ks.attribute_name)
-                .collect();
-            for (ks_value,) in surviving_index_key_schemas {
-                let ks: Vec<KeySchemaElement> = serde_json::from_value(ks_value)
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                referenced.extend(ks.into_iter().map(|k| k.attribute_name));
+            let mut surviving_index_key_schemas: Vec<Vec<KeySchemaElement>> =
+                Vec::with_capacity(surviving_rows.len());
+            for (ks_value,) in surviving_rows {
+                surviving_index_key_schemas.push(
+                    serde_json::from_value(ks_value)
+                        .map_err(|e| StorageError::Internal(e.to_string()))?,
+                );
             }
 
-            // merge_attribute_definitions keeps the stored definition when both
-            // sides name the same attribute, which is what preserves the stored
-            // type on a conflicting redeclaration.
-            let effective: Vec<AttributeDefinition> = merge_attribute_definitions(
+            let effective = effective_attribute_definitions(
                 &stored_attr_defs,
                 input.attribute_definitions.as_deref().unwrap_or(&[]),
-            )
-            .into_iter()
-            .filter(|def| referenced.contains(&def.attribute_name))
-            .collect();
+                &table_key_schema,
+                &surviving_index_key_schemas,
+            );
 
             if effective != stored_attr_defs {
                 let effective_json = serde_json::to_value(&effective)

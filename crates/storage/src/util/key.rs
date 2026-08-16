@@ -10,6 +10,7 @@ use extenddb_core::types::{
     AttributeDefinition, AttributeValue, Item, KeySchemaElement, KeyType, ScalarAttributeType,
 };
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 
 /// Parsed sort key value ready for SQL binding.
 pub enum SortKeyValue {
@@ -169,6 +170,50 @@ pub fn merge_attribute_definitions(
         }
     }
     merged
+}
+
+/// The attribute definitions a table should hold after an `UpdateTable`.
+///
+/// DynamoDB treats the request's `AttributeDefinitions` as neither a replacement
+/// for the stored set nor a pure addition to it. The effective set is the stored
+/// definitions merged with the request's (see [`merge_attribute_definitions`]),
+/// then pruned to the attributes still referenced by the table key schema or by
+/// an index that survives the update.
+///
+/// Measured against real DynamoDB on top of the merge behaviour documented above:
+///
+/// - An unused definition supplied alongside a GSI add is dropped, so the next
+///   `DescribeTable` does not report it.
+/// - Deleting a GSI drops the definitions only that index referenced, while every
+///   definition another index or the table key still uses survives.
+///
+/// `surviving_index_key_schemas` must be the key schemas of the indexes that exist
+/// *after* the update is applied: an index being created is included, an index
+/// being deleted is not. Callers read this from their own catalog after applying
+/// the index changes, which is what makes a deletion prune.
+///
+/// Pruning can never remove a definition the table key schema names, so a table
+/// cannot lose its own pk/sk definitions through this path (issue #259). Merge
+/// order is preserved: stored definitions keep their order, surviving new ones are
+/// appended in request order.
+#[must_use]
+pub fn effective_attribute_definitions(
+    stored: &[AttributeDefinition],
+    requested: &[AttributeDefinition],
+    table_key_schema: &[KeySchemaElement],
+    surviving_index_key_schemas: &[Vec<KeySchemaElement>],
+) -> Vec<AttributeDefinition> {
+    let mut referenced: BTreeSet<&str> = table_key_schema
+        .iter()
+        .map(|ks| ks.attribute_name.as_str())
+        .collect();
+    for ks in surviving_index_key_schemas {
+        referenced.extend(ks.iter().map(|k| k.attribute_name.as_str()));
+    }
+    merge_attribute_definitions(stored, requested)
+        .into_iter()
+        .filter(|def| referenced.contains(def.attribute_name.as_str()))
+        .collect()
 }
 
 /// Recover sort key attribute definitions that were lost from a table's stored
@@ -476,5 +521,126 @@ mod tests {
             encode_netstring_composite(&a),
             encode_netstring_composite(&b)
         );
+    }
+
+    /// An unused definition supplied alongside a GSI add is dropped: DynamoDB
+    /// stores only what a key or a live index references.
+    #[test]
+    fn effective_attr_defs_drops_a_definition_no_key_or_index_uses() {
+        let stored = vec![ad("pk", ScalarAttributeType::S)];
+        let requested = vec![
+            ad("g1", ScalarAttributeType::S),
+            ad("extraUnused", ScalarAttributeType::S),
+        ];
+        let table_ks = vec![ks("pk", KeyType::Hash)];
+        let surviving = vec![vec![ks("g1", KeyType::Hash)]];
+
+        let effective = effective_attribute_definitions(&stored, &requested, &table_ks, &surviving);
+
+        let names: Vec<&str> = effective
+            .iter()
+            .map(|a| a.attribute_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["pk", "g1"]);
+    }
+
+    /// Removing an index drops the definitions only that index referenced, and
+    /// keeps the ones another surviving index still uses.
+    #[test]
+    fn effective_attr_defs_prunes_only_the_removed_index_attributes() {
+        let stored = vec![
+            ad("pk", ScalarAttributeType::S),
+            ad("goneAttr", ScalarAttributeType::S),
+            ad("keepAttr", ScalarAttributeType::S),
+        ];
+        let table_ks = vec![ks("pk", KeyType::Hash)];
+        // Only the index on keepAttr survives; the one on goneAttr was deleted.
+        let surviving = vec![vec![ks("keepAttr", KeyType::Hash)]];
+
+        let effective = effective_attribute_definitions(&stored, &[], &table_ks, &surviving);
+
+        let names: Vec<&str> = effective
+            .iter()
+            .map(|a| a.attribute_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["pk", "keepAttr"]);
+    }
+
+    /// The table's own key definitions can never be pruned, whatever the indexes
+    /// do. This is the #259 property: losing pk/sk makes keyed reads degrade to a
+    /// partition-only lookup.
+    #[test]
+    fn effective_attr_defs_never_prunes_the_table_key() {
+        let stored = vec![
+            ad("pk", ScalarAttributeType::S),
+            ad("sk", ScalarAttributeType::N),
+        ];
+        let table_ks = vec![ks("pk", KeyType::Hash), ks("sk", KeyType::Range)];
+
+        // No indexes at all: both table key definitions must still survive.
+        let effective = effective_attribute_definitions(&stored, &[], &table_ks, &[]);
+
+        let names: Vec<&str> = effective
+            .iter()
+            .map(|a| a.attribute_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["pk", "sk"]);
+        assert!(sk_info(&table_ks, &effective).is_some());
+    }
+
+    /// A conflicting redeclaration keeps the STORED type, so a live index key
+    /// cannot be silently retyped. Inherited from `merge_attribute_definitions`
+    /// and asserted here because pruning must not disturb it.
+    #[test]
+    fn effective_attr_defs_keeps_the_stored_type_on_a_conflicting_redeclaration() {
+        let stored = vec![ad("pk", ScalarAttributeType::S)];
+        let requested = vec![ad("pk", ScalarAttributeType::N)];
+        let table_ks = vec![ks("pk", KeyType::Hash)];
+
+        let effective = effective_attribute_definitions(&stored, &requested, &table_ks, &[]);
+
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].attribute_type, ScalarAttributeType::S);
+    }
+
+    /// Sequential adds accumulate: the stored set is the base of the merge, so an
+    /// earlier index's attribute is not lost when a later index is added.
+    #[test]
+    fn effective_attr_defs_accumulate_across_sequential_adds() {
+        let stored = vec![
+            ad("pk", ScalarAttributeType::S),
+            ad("g1", ScalarAttributeType::S),
+        ];
+        let requested = vec![ad("g2", ScalarAttributeType::S)];
+        let table_ks = vec![ks("pk", KeyType::Hash)];
+        let surviving = vec![vec![ks("g1", KeyType::Hash)], vec![ks("g2", KeyType::Hash)]];
+
+        let effective = effective_attribute_definitions(&stored, &requested, &table_ks, &surviving);
+
+        let names: Vec<&str> = effective
+            .iter()
+            .map(|a| a.attribute_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["pk", "g1", "g2"]);
+    }
+
+    /// An index sort key is referenced just like its hash key.
+    #[test]
+    fn effective_attr_defs_keeps_index_sort_key_attributes() {
+        let stored = vec![
+            ad("pk", ScalarAttributeType::S),
+            ad("gh", ScalarAttributeType::S),
+            ad("gr", ScalarAttributeType::N),
+        ];
+        let table_ks = vec![ks("pk", KeyType::Hash)];
+        let surviving = vec![vec![ks("gh", KeyType::Hash), ks("gr", KeyType::Range)]];
+
+        let effective = effective_attribute_definitions(&stored, &[], &table_ks, &surviving);
+
+        let names: Vec<&str> = effective
+            .iter()
+            .map(|a| a.attribute_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["pk", "gh", "gr"]);
     }
 }

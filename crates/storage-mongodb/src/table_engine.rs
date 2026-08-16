@@ -18,7 +18,8 @@ use extenddb_core::types::{
 use extenddb_storage::TableEngine;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
-    index_arn, merge_attribute_definitions, sk_info, stream_arn, table_arn,
+    effective_attribute_definitions, index_arn, merge_attribute_definitions, sk_info, stream_arn,
+    table_arn,
 };
 
 use crate::MongoEngine;
@@ -923,6 +924,53 @@ impl MongoEngine {
                     // Invalidate cache — may still have other GSIs
                     self.gsi_cache_invalidate(&desc.table_id);
                 }
+            }
+
+            // Prune definitions that no key and no surviving index references.
+            //
+            // The merge above is only half of DynamoDB's behaviour: the stored set
+            // is also pruned to the attributes still referenced by the table key
+            // schema or by an index that survives this update, so an unused
+            // definition supplied with a GSI add is not stored and deleting a GSI
+            // drops the definitions only that index used. See
+            // effective_attribute_definitions.
+            //
+            // This runs after the create/delete loop, which is what makes a
+            // deletion prune: describe_table_impl reports exactly the indexes that
+            // exist now. It is a second write rather than being folded into the
+            // merge above because index creation inside the loop needs the merged
+            // set before the surviving set is known. This backend's UpdateTable is
+            // non-transactional throughout, so this widens no window the merge did
+            // not already have.
+            let desc = self
+                .describe_table_impl(account_id, &input.table_name)
+                .await?;
+            let mut surviving_index_key_schemas: Vec<Vec<KeySchemaElement>> = Vec::new();
+            for gsi in desc.global_secondary_indexes.iter().flatten() {
+                surviving_index_key_schemas.push(gsi.key_schema.clone());
+            }
+            for lsi in desc.local_secondary_indexes.iter().flatten() {
+                surviving_index_key_schemas.push(lsi.key_schema.clone());
+            }
+
+            // The request's definitions are already folded into the stored set by
+            // the merge above, so nothing further is contributed here.
+            let effective = effective_attribute_definitions(
+                &desc.attribute_definitions,
+                &[],
+                &desc.key_schema,
+                &surviving_index_key_schemas,
+            );
+            if effective != desc.attribute_definitions {
+                let effective_bson =
+                    bson::to_bson(&effective).map_err(|e| StorageError::Internal(e.to_string()))?;
+                tables_coll
+                    .update_one(
+                        doc! { "_id": { "account_id": account_id, "table_name": &input.table_name } },
+                        doc! { "$set": { "attribute_definitions": effective_bson } },
+                    )
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
             }
         }
 
