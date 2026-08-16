@@ -7,21 +7,42 @@
 //! teardown using PostgreSQL-specific DDL. Connection pools are created
 //! lazily as needed during the bootstrap sequence.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
+use extenddb_core::types::{AttributeDefinition, KeySchemaElement};
 use extenddb_storage::bootstrapper::{
-    AdminBootstrapResult, BootstrapConfig, Bootstrapper,
+    AdminBootstrapResult, BootstrapConfig, Bootstrapper, KeyDefinitionRepair,
     helpers::{
-        check_conflict, extract_arg, generate_account_id, generate_encryption_key,
-        generate_random_password, hash_password_async,
+        check_conflict, check_conflict_redacted, extract_arg, generate_account_id,
+        generate_encryption_key, generate_random_password, hash_password_async,
     },
 };
 use extenddb_storage::management_store::{OpError, OpResult};
+use extenddb_storage::util::recover_sort_key_definitions;
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, OnceCell};
 
 use crate::CATALOG_VERSION;
 use crate::migrations;
+
+/// ExtendDB's advisory-lock namespace. PostgreSQL's two-argument form,
+/// `pg_advisory_xact_lock(classid, objid)`, lets ExtendDB reserve one stable
+/// `classid` by convention and assign a distinct `objid` to each internal lock.
+/// Other applications in the same database must avoid choosing the same keys.
+///
+/// The value itself is arbitrary. It only has to stay stable across releases and
+/// differ from any other namespace we add later.
+const ADVISORY_LOCK_NAMESPACE: i32 = 0x0045_4442; // 'E', 'D', 'B'
+/// `objid` for the schema-migration lock, which serializes concurrent `migrate`
+/// runs (for example several replicas starting at once).
+const MIGRATION_LOCK_OBJID: i32 = 1;
+
+/// Maximum time to wait for another migrator. Normal contention should clear
+/// well within this window; expiry indicates a peer that is likely wedged and
+/// needs operator attention rather than an indefinitely stuck init Job.
+const MIGRATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Utilities for bootstrapping a `PostgreSQL` backend store.
 ///
@@ -32,6 +53,9 @@ use crate::migrations;
 pub struct PostgresBootstrapper {
     config: BootstrapConfig,
     admin_pool: OnceCell<PgPool>,
+    /// Dedicated connection whose open transaction holds the migration advisory
+    /// lock. `None` when no migration lock is held.
+    lock_conn: Mutex<Option<sqlx::PgConnection>>,
 }
 
 impl PostgresBootstrapper {
@@ -42,6 +66,7 @@ impl PostgresBootstrapper {
         Self {
             config,
             admin_pool: OnceCell::new(),
+            lock_conn: Mutex::new(None),
         }
     }
 
@@ -209,6 +234,136 @@ impl Bootstrapper for PostgresBootstrapper {
         migrations::run_data_migrations(&pool).await
     }
 
+    async fn acquire_migration_lock(&self) -> OpResult<()> {
+        use std::io::Write as _;
+
+        use sqlx::Connection;
+
+        // This is not re-entrant. A second call would open a second transaction
+        // and block on the lock the first one holds, deadlocking against itself.
+        let mut held = self.lock_conn.lock().await;
+        if held.is_some() {
+            return Err(OpError::Internal(
+                "Migration lock is already held by this process".to_owned(),
+            ));
+        }
+
+        // Keep an explicit transaction open on a dedicated catalog connection
+        // for the whole migration. Transaction-level advisory locks are released
+        // automatically when that transaction ends or the connection dies.
+        //
+        // The explicit transaction is important for transaction-pooling proxies:
+        // they must retain one PostgreSQL backend until COMMIT/ROLLBACK, so the
+        // lock cannot silently move between backends as separate autocommit
+        // statements can. RDS Proxy also supports this path without session
+        // pinning. The migration statements can use separate connections because
+        // advisory locks coordinate globally within the catalog database.
+        //
+        // Advisory locks are scoped to a database, so migrators only serialize
+        // if they share this catalog database. ExtendDB replicas normally do,
+        // because they use the same catalog connection string.
+        let mut conn =
+            sqlx::PgConnection::connect_with(&self.app_connect_opts(&self.config.catalog_db))
+                .await
+                .map_err(|e| {
+                    OpError::Internal(format!("Cannot connect to take migration lock: {e}"))
+                })?;
+        sqlx::query("BEGIN")
+            .execute(&mut conn)
+            .await
+            .map_err(|e| OpError::Internal(format!("Cannot begin migration lock: {e}")))?;
+
+        // Equivalent to SET LOCAL lock_timeout, but parameterized so the Rust
+        // duration remains the single source of truth. This applies only to the
+        // dedicated transaction and is discarded by rollback on release.
+        let lock_timeout = format!("{}ms", MIGRATION_LOCK_TIMEOUT.as_millis());
+        let _: String = sqlx::query_scalar("SELECT set_config('lock_timeout', $1, true)")
+            .bind(&lock_timeout)
+            .fetch_one(&mut conn)
+            .await
+            .map_err(|e| {
+                OpError::Internal(format!("Cannot configure migration lock timeout: {e}"))
+            })?;
+
+        // Try first so that a migrator which has to wait can say so, rather
+        // than sitting silent for as long as the other migration takes.
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1, $2)")
+            .bind(ADVISORY_LOCK_NAMESPACE)
+            .bind(MIGRATION_LOCK_OBJID)
+            .fetch_one(&mut conn)
+            .await
+            .map_err(|e| OpError::Internal(format!("Cannot acquire migration lock: {e}")))?;
+        if !acquired {
+            println!("--- Another migrator holds the migration lock; waiting for it to finish...");
+            std::io::stdout()
+                .flush()
+                .map_err(|e| OpError::Internal(format!("Cannot report migration wait: {e}")))?;
+            sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+                .bind(ADVISORY_LOCK_NAMESPACE)
+                .bind(MIGRATION_LOCK_OBJID)
+                .execute(&mut conn)
+                .await
+                .map_err(|e| {
+                    if let sqlx::Error::Database(db_err) = &e
+                        && db_err.code().as_deref() == Some("55P03")
+                    {
+                        return OpError::Internal(format!(
+                            "Timed out after {}s waiting for the migration advisory lock; \
+                             another migrator may be wedged. Check the holder's logs or \
+                             terminate it before retrying: {e}",
+                            MIGRATION_LOCK_TIMEOUT.as_secs(),
+                        ));
+                    }
+                    OpError::Internal(format!("Cannot acquire migration lock: {e}"))
+                })?;
+            println!("--- Migration lock acquired.");
+            std::io::stdout()
+                .flush()
+                .map_err(|e| OpError::Internal(format!("Cannot report migration lock: {e}")))?;
+        }
+
+        // Guard against a key or lock-mode mismatch in the acquisition queries.
+        // `objsubid = 2` distinguishes the two-i32 advisory-lock keyspace from
+        // the one-i64 form, and `granted` excludes a merely waiting request.
+        let held_by_this_transaction: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_locks \
+             WHERE locktype = 'advisory' AND classid = $1 AND objid = $2 \
+               AND objsubid = 2 AND mode = 'ExclusiveLock' AND granted \
+               AND pid = pg_backend_pid())",
+        )
+        .bind(ADVISORY_LOCK_NAMESPACE)
+        .bind(MIGRATION_LOCK_OBJID)
+        .fetch_one(&mut conn)
+        .await
+        .map_err(|e| OpError::Internal(format!("Cannot verify migration lock: {e}")))?;
+        if !held_by_this_transaction {
+            return Err(OpError::Internal(
+                "PostgreSQL did not report the migration transaction's advisory lock after \
+                 acquisition; refusing to run migrations without verified serialization"
+                    .to_owned(),
+            ));
+        }
+
+        *held = Some(conn);
+        Ok(())
+    }
+
+    async fn release_migration_lock(&self) -> OpResult<()> {
+        use sqlx::Connection;
+
+        let Some(mut conn) = self.lock_conn.lock().await.take() else {
+            return Ok(());
+        };
+        // This transaction contains only the advisory lock, so rollback is the
+        // safest release: it cannot accidentally commit future work added to the
+        // dedicated connection. Closing is a backstop if rollback fails.
+        let release = sqlx::query("ROLLBACK").execute(&mut conn).await;
+        let _ = conn.close().await;
+        release
+            .map(|_| ())
+            .map_err(|e| OpError::Internal(format!("Cannot release migration lock: {e}")))
+    }
+
     async fn pending_data_migrations(&self) -> OpResult<Vec<String>> {
         let pool = self.app_pool(&self.config.data_db).await?;
         migrations::pending_data_migrations(&pool).await
@@ -272,29 +427,45 @@ impl Bootstrapper for PostgresBootstrapper {
 
     async fn bootstrap_default_account(&self) -> OpResult<()> {
         let pool = self.app_pool(&self.config.catalog_db).await?;
-        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM accounts)")
-            .fetch_one(&pool)
-            .await
-            .map_err(|e| OpError::Internal(format!("Check accounts: {e}")))?;
-
-        if exists {
-            println!("--- Default account already exists, skipping.");
-            return Ok(());
-        }
-
-        let account_id = generate_account_id();
-        println!("--- Creating default account '{account_id}'...");
+        // Reuse the existing account when already bootstrapped, otherwise create
+        // the single default account. Either way, record its id as the canonical
+        // default account so callers never infer it from list ordering. The
+        // settings write is idempotent, so it also backfills the marker for
+        // catalogs bootstrapped before it existed.
+        let account_id: String =
+            match sqlx::query_scalar("SELECT account_id FROM accounts ORDER BY account_id LIMIT 1")
+                .fetch_optional(&pool)
+                .await
+                .map_err(|e| OpError::Internal(format!("Check accounts: {e}")))?
+            {
+                Some(id) => {
+                    println!("--- Default account already exists, skipping.");
+                    id
+                }
+                None => {
+                    let id = generate_account_id();
+                    println!("--- Creating default account '{id}'...");
+                    sqlx::query(
+                        "INSERT INTO accounts (account_id, account_name) VALUES ($1, $2) \
+                     ON CONFLICT (account_id) DO NOTHING",
+                    )
+                    .bind(&id)
+                    .bind("default")
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| OpError::Internal(format!("Create account: {e}")))?;
+                    println!("    Account ID: {id}");
+                    id
+                }
+            };
         sqlx::query(
-            "INSERT INTO accounts (account_id, account_name) VALUES ($1, $2) \
-             ON CONFLICT (account_id) DO NOTHING",
+            "INSERT INTO settings (key, value) VALUES ('default_account_id', $1) \
+             ON CONFLICT (key) DO NOTHING",
         )
         .bind(&account_id)
-        .bind("default")
         .execute(&pool)
         .await
-        .map_err(|e| OpError::Internal(format!("Create account: {e}")))?;
-
-        println!("    Account ID: {account_id}");
+        .map_err(|e| OpError::Internal(format!("Record default account id: {e}")))?;
         Ok(())
     }
 
@@ -351,6 +522,147 @@ impl Bootstrapper for PostgresBootstrapper {
     async fn is_catalog_initialized(&self) -> OpResult<bool> {
         let pool = self.app_pool(&self.config.catalog_db).await?;
         migrations::table_exists(&pool, "settings").await
+    }
+
+    /// Repair table metadata damaged by the pre-fix `UpdateTable` (#259).
+    ///
+    /// Reads the catalog's key schemas and attribute definitions, and for any base
+    /// sort key with no definition recovers the type from the data table's
+    /// physical sort key column (`sk_s`/`sk_n`/`sk_b`, or the numbered variants for
+    /// multiple sort keys). Runs under the migration lock the caller holds.
+    async fn repair_lost_sort_key_definitions(&self, apply: bool) -> OpResult<KeyDefinitionRepair> {
+        let mut report = KeyDefinitionRepair::default();
+        let Ok(catalog) = self.app_pool(&self.config.catalog_db).await else {
+            return Ok(report);
+        };
+        let Some(data_db) = self.get_data_db_name().await? else {
+            return Ok(report);
+        };
+        let data = self.app_pool(&data_db).await?;
+
+        let rows: Vec<(String, String, String, serde_json::Value, serde_json::Value)> =
+            sqlx::query_as(
+                "SELECT account_id, table_name, table_id, key_schema, attribute_definitions \
+                 FROM tables ORDER BY table_name",
+            )
+            .fetch_all(&catalog)
+            .await
+            .map_err(|e| OpError::Internal(format!("Cannot read tables: {e}")))?;
+
+        for (account_id, table_name, table_id, ks_json, ad_json) in rows {
+            let key_schema: Vec<KeySchemaElement> = match serde_json::from_value(ks_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    report
+                        .needs_attention
+                        .push(format!("{table_name}: unreadable key_schema ({e})"));
+                    continue;
+                }
+            };
+            let attr_defs: Vec<AttributeDefinition> =
+                serde_json::from_value(ad_json).unwrap_or_default();
+
+            // Nothing to do unless a sort key has lost its definition.
+            // Reported for every table on every run, not only when a sort key is
+            // repaired: the partition key definition is dropped by the same write and
+            // is not recoverable from the schema, because the pk column is always TEXT.
+            // It is not needed for correctness either, since partition key values are
+            // encoded from the key schema alone, so it is reported rather than guessed
+            // and keeps being reported until a human restores it.
+            let pk_missing: Vec<&str> = key_schema
+                .iter()
+                .filter(|ks| ks.key_type == extenddb_core::types::KeyType::Hash)
+                .filter(|ks| {
+                    !attr_defs
+                        .iter()
+                        .any(|ad| ad.attribute_name == ks.attribute_name)
+                })
+                .map(|ks| ks.attribute_name.as_str())
+                .collect();
+            if !pk_missing.is_empty() {
+                report.needs_attention.push(format!(
+                    "{table_name}: partition key definition(s) [{}] are absent; reads and \
+                     writes are unaffected, but index key type validation cannot check them",
+                    pk_missing.join(", ")
+                ));
+            }
+
+            let missing: Vec<&KeySchemaElement> = key_schema
+                .iter()
+                .filter(|ks| ks.key_type == extenddb_core::types::KeyType::Range)
+                .filter(|ks| {
+                    !attr_defs
+                        .iter()
+                        .any(|ad| ad.attribute_name == ks.attribute_name)
+                })
+                .collect();
+            if missing.is_empty() {
+                continue;
+            }
+
+            // PRIMARY KEY columns only, in key order. Every data table carries all
+            // three typed columns for each sort key position (sk_s, sk_n, sk_b), so
+            // column existence says nothing about the declared type: only PRIMARY KEY
+            // membership does. `to_regclass` resolves the name through the current
+            // search_path, so this cannot match a same-named table in another schema,
+            // and returns NULL (no rows) rather than raising when the data table is
+            // absent.
+            let columns: Vec<String> = sqlx::query_as::<_, (String,)>(
+                "SELECT a.attname \
+                 FROM pg_index i \
+                 JOIN unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE \
+                 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum \
+                 WHERE i.indrelid = to_regclass($1) AND i.indisprimary \
+                 ORDER BY k.ord",
+            )
+            .bind(format!("\"_ddb_{table_id}\""))
+            .fetch_all(&data)
+            .await
+            .map_err(|e| OpError::Internal(format!("Cannot read columns of {table_name}: {e}")))?
+            .into_iter()
+            .map(|(c,)| c)
+            .collect();
+
+            let recovered = recover_sort_key_definitions(&key_schema, &attr_defs, &columns);
+            if recovered.is_empty() {
+                report.needs_attention.push(format!(
+                    "{table_name}: sort key(s) [{}] have no attribute definition and no \
+                     matching PRIMARY KEY column was found to recover the type from",
+                    missing
+                        .iter()
+                        .map(|ks| ks.attribute_name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                continue;
+            }
+
+            let mut merged = attr_defs;
+            merged.extend(recovered.iter().cloned());
+            let merged_json = serde_json::to_value(&merged)
+                .map_err(|e| OpError::Internal(format!("Cannot serialize definitions: {e}")))?;
+            if apply {
+                sqlx::query(
+                    "UPDATE tables SET attribute_definitions = $1 \
+                     WHERE account_id = $2 AND table_name = $3",
+                )
+                .bind(&merged_json)
+                .bind(&account_id)
+                .bind(&table_name)
+                .execute(&catalog)
+                .await
+                .map_err(|e| OpError::Internal(format!("Cannot repair {table_name}: {e}")))?;
+            }
+
+            for def in &recovered {
+                report.repaired.push(format!(
+                    "{table_name}: {} ({:?})",
+                    def.attribute_name, def.attribute_type
+                ));
+            }
+        }
+
+        Ok(report)
     }
 
     async fn list_table_names(&self) -> OpResult<Vec<String>> {
@@ -519,7 +831,7 @@ impl PostgresBootstrapper {
             check_conflict(pg_host.as_ref(), &parts.host, "--pg-host")?;
             check_conflict(pg_port.as_ref(), &parts.port, "--pg-port")?;
             check_conflict(extenddb_user.as_ref(), &parts.user, "--extenddb-user")?;
-            check_conflict(extenddb_pass.as_ref(), &parts.password, "--extenddb-pass")?;
+            check_conflict_redacted(extenddb_pass.as_ref(), &parts.password, "--extenddb-pass")?;
 
             if let Some(ref cli_catalog) = catalog_db
                 && cli_catalog != &parts.database

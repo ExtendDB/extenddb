@@ -21,7 +21,7 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{TransactWriteItem, TransactWriteItemsInput, TransactWriteItemsOutput};
 use extenddb_core::validation::{
     validate_attribute_name_sizes, validate_attribute_values_nesting_depth,
-    validate_item_nesting_depth, validate_item_size, validate_key_sizes,
+    validate_item_nesting_depth, validate_item_size, validate_key_not_empty,
 };
 
 /// Maximum number of items in a single `TransactWriteItems` request.
@@ -115,6 +115,31 @@ pub async fn handle_transact_write_items(
         ));
     }
 
+    // Reject oversized primary keys as a per-item cancellation, matching real
+    // DynamoDB: an oversized hash/range key in any sub-op returns
+    // TransactionCanceledException with a ValidationError cancellation reason
+    // for the offending item (an EMPTY key value, by contrast, is a top-level
+    // ValidationException and is handled in prepare_write_op).
+    {
+        let mut reasons: Vec<extenddb_core::types::CancellationReason> =
+            Vec::with_capacity(prepared.len());
+        let mut any_oversized = false;
+        for op in &prepared {
+            match op.oversized_key_reason(&ctx.limits) {
+                Some(reason) => {
+                    any_oversized = true;
+                    reasons.push(reason);
+                }
+                None => reasons.push(extenddb_core::types::CancellationReason::none()),
+            }
+        }
+        if any_oversized {
+            return Err(storage_err_to_dynamo(
+                extenddb_storage::error::StorageError::TransactionCanceled(reasons),
+            ));
+        }
+    }
+
     // Build storage operations
     let ops: Vec<extenddb_storage::TransactWriteOp<'_>> =
         prepared.iter().map(|p| p.to_storage_op()).collect();
@@ -169,6 +194,11 @@ pub async fn handle_transact_write_items(
         })
         .sum();
 
+    // NOTE: per-index (INDEXES) consumed-capacity breakdown for transactions is
+    // deferred to the storage-layer capacity-reporting follow-up: the engine has
+    // no resulting/old item for Update/Delete sub-ops, but DynamoDB reports a
+    // per-index breakdown for those ops on GSI tables. Base-table aggregate
+    // only for now.
     let consumed_capacity = capacity_helpers::transact_write_capacity(
         input.return_consumed_capacity,
         per_table_wcu.iter().map(|(t, cu)| (t.as_str(), *cu)),
@@ -218,12 +248,22 @@ async fn prepare_write_op(
         validate_item_nesting_depth(&put.item)?;
         validate_item_size(&put.item, ctx.limits.max_item_size_bytes)?;
         validate_attribute_name_sizes(&put.item, &ctx.limits)?;
-        validate_key_sizes(&put.item, &key_info.key_schema, &ctx.limits)?;
+        validate_key_not_empty(&put.item, &key_info.key_schema)?;
         let maps = build_expression_maps(
             put.expression_attribute_names.as_ref(),
             put.expression_attribute_values.as_ref(),
         );
         let condition = parse_optional_condition(put.condition_expression.as_deref(), &ctx.limits)?;
+        if let Some(ref expr) = condition {
+            extenddb_core::expression::validate_ordering_operand_types(expr, &maps).map_err(
+                |e| {
+                    crate::expression_helpers::prefix_expression_error(
+                        e,
+                        extenddb_core::expression::ExpressionKind::Condition,
+                    )
+                },
+            )?;
+        }
         // Transactions accept names/values with no expression (unlike single-item
         // APIs); only check for unused refs when a condition is present.
         if condition.is_some() {
@@ -262,12 +302,22 @@ async fn prepare_write_op(
         // Empty or oversize key values are up-front input validation in
         // DynamoDB (a top-level ValidationException), unlike a key type
         // mismatch which surfaces as a per-item cancellation reason.
-        validate_key_sizes(&del.key, &key_info.key_schema, &ctx.limits)?;
+        validate_key_not_empty(&del.key, &key_info.key_schema)?;
         let maps = build_expression_maps(
             del.expression_attribute_names.as_ref(),
             del.expression_attribute_values.as_ref(),
         );
         let condition = parse_optional_condition(del.condition_expression.as_deref(), &ctx.limits)?;
+        if let Some(ref expr) = condition {
+            extenddb_core::expression::validate_ordering_operand_types(expr, &maps).map_err(
+                |e| {
+                    crate::expression_helpers::prefix_expression_error(
+                        e,
+                        extenddb_core::expression::ExpressionKind::Condition,
+                    )
+                },
+            )?;
+        }
         if condition.is_some() {
             let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
             extenddb_core::expression::validate_unused_attributes(
@@ -304,7 +354,7 @@ async fn prepare_write_op(
         // Empty or oversize key values are up-front input validation in
         // DynamoDB (a top-level ValidationException), unlike a key type
         // mismatch which surfaces as a per-item cancellation reason.
-        validate_key_sizes(&upd.key, &key_info.key_schema, &ctx.limits)?;
+        validate_key_not_empty(&upd.key, &key_info.key_schema)?;
         let maps = build_expression_maps(
             upd.expression_attribute_names.as_ref(),
             upd.expression_attribute_values.as_ref(),
@@ -328,6 +378,16 @@ async fn prepare_write_op(
             validate_attribute_values_nesting_depth(stored)?;
         }
         let condition = parse_optional_condition(upd.condition_expression.as_deref(), &ctx.limits)?;
+        if let Some(ref expr) = condition {
+            extenddb_core::expression::validate_ordering_operand_types(expr, &maps).map_err(
+                |e| {
+                    crate::expression_helpers::prefix_expression_error(
+                        e,
+                        extenddb_core::expression::ExpressionKind::Condition,
+                    )
+                },
+            )?;
+        }
         {
             let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
             extenddb_core::expression::validate_unused_attributes(
@@ -365,13 +425,21 @@ async fn prepare_write_op(
         // Empty or oversize key values are up-front input validation in
         // DynamoDB (a top-level ValidationException), unlike a key type
         // mismatch which surfaces as a per-item cancellation reason.
-        validate_key_sizes(&cc.key, &key_info.key_schema, &ctx.limits)?;
+        validate_key_not_empty(&cc.key, &key_info.key_schema)?;
         let maps = build_expression_maps(
             cc.expression_attribute_names.as_ref(),
             cc.expression_attribute_values.as_ref(),
         );
         let condition =
             crate::expression_helpers::parse_condition_expr(&cc.condition_expression, &ctx.limits)?;
+        extenddb_core::expression::validate_ordering_operand_types(&condition, &maps).map_err(
+            |e| {
+                crate::expression_helpers::prefix_expression_error(
+                    e,
+                    extenddb_core::expression::ExpressionKind::Condition,
+                )
+            },
+        )?;
         {
             let exprs: Vec<&extenddb_core::expression::Expr> = vec![&condition];
             extenddb_core::expression::validate_unused_attributes(

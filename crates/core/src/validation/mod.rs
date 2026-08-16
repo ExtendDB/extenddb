@@ -1010,6 +1010,12 @@ fn ordered_indexes<'b, 'a>(indexes: &'b [IndexKeyRef<'a>]) -> Vec<&'b IndexKeyRe
     ordered
 }
 
+/// Readable flags for the `is_query` parameter of [`validate_select_projection`].
+/// Real DynamoDB prepends `1 validation error detected: ` to some rejections for
+/// Query but not for Scan, so callers pass one of these instead of a bare bool.
+pub const IS_QUERY: bool = true;
+pub const IS_SCAN: bool = false;
+
 /// Validate the `Select` value against `ProjectionExpression` / `AttributesToGet`
 /// presence and `IndexName`. Shared by Query and Scan so both reject the same
 /// invalid combinations with the same messages.
@@ -1029,6 +1035,7 @@ pub fn validate_select_projection(
     has_projection: bool,
     has_attributes_to_get: bool,
     has_index_name: bool,
+    is_query: bool,
 ) -> Result<(), DynamoDbError> {
     if has_projection {
         let incompatible = match select {
@@ -1038,9 +1045,16 @@ pub fn validate_select_projection(
             _ => None,
         };
         if let Some(what) = incompatible {
-            return Err(DynamoDbError::ValidationException(format!(
-                "Cannot specify the ProjectionExpression when choosing to get {what}"
-            )));
+            // Real DynamoDB prepends "1 validation error detected: " to this
+            // rejection for Query, but NOT for Scan.
+            let body =
+                format!("Cannot specify the ProjectionExpression when choosing to get {what}");
+            let msg = if is_query {
+                format!("1 validation error detected: {body}")
+            } else {
+                body
+            };
+            return Err(DynamoDbError::ValidationException(msg));
         }
     }
     if matches!(select, Some(Select::SpecificAttributes))
@@ -1122,6 +1136,29 @@ pub fn validate_conditional_operator_usage(
     }
 }
 
+/// Reject `Select=ALL_ATTRIBUTES` against a global secondary index whose
+/// projection type is not `ALL` (such an index cannot serve every attribute).
+/// Shared by Query and Scan so both reject with the identical message; a no-op
+/// unless a GSI is targeted with `Select=ALL_ATTRIBUTES`.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` when the combination is invalid.
+pub fn validate_all_attributes_index_support(
+    select: Option<Select>,
+    is_gsi: bool,
+    projection_is_all: bool,
+    index_name: &str,
+) -> Result<(), DynamoDbError> {
+    if matches!(select, Some(Select::AllAttributes)) && is_gsi && !projection_is_all {
+        return Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: Select type ALL_ATTRIBUTES is not \
+             supported for global secondary index {index_name} because its projection type is not ALL"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate partition key and sort key sizes against limits.
 ///
 /// # Errors
@@ -1135,27 +1172,82 @@ pub fn validate_key_sizes(
     for ks in key_schema {
         if let Some(value) = item.get(&ks.attribute_name) {
             validate_no_empty_key_value(&ks.attribute_name, value)?;
-            let size = key_value_byte_size(value);
-            let max_size = match ks.key_type {
-                KeyType::Hash => limits.max_partition_key_size_bytes,
-                KeyType::Range => limits.max_sort_key_size_bytes,
-            };
-            if size > max_size {
-                // Hash and range use different wording, matching Amazon
-                // DynamoDB (the hash variant has no space before the size).
-                let msg = match ks.key_type {
-                    KeyType::Hash => format!(
-                        "One or more parameter values were invalid: \
-                         Size of hashkey has exceeded the maximum size limit of{max_size} bytes"
-                    ),
-                    KeyType::Range => format!(
-                        "One or more parameter values were invalid: \
-                         Aggregated size of all range keys has exceeded the size limit of {max_size} bytes"
-                    ),
-                };
-                return Err(DynamoDbError::ValidationException(msg));
-            }
+            check_key_size(ks, value, limits)?;
         }
+    }
+    Ok(())
+}
+
+/// Validate only the byte-size limit of primary-key values (no empty-value
+/// check).
+///
+/// Used by the transaction path, which surfaces an oversized key as a per-item
+/// `TransactionCanceledException` / `ValidationError` cancellation reason, while
+/// an empty key value remains a top-level `ValidationException` — matching real
+/// `DynamoDB`.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` if a key value exceeds its size limit.
+pub fn validate_key_size_limits(
+    item: &Item,
+    key_schema: &[KeySchemaElement],
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    for ks in key_schema {
+        if let Some(value) = item.get(&ks.attribute_name) {
+            check_key_size(ks, value, limits)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate only that primary-key values are non-empty (no size check).
+///
+/// The transaction path uses this to keep the empty-key rejection as a
+/// top-level `ValidationException` (real `DynamoDB` behavior) while the size
+/// limit is enforced separately as a per-item cancellation reason.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` if a key value is empty.
+pub fn validate_key_not_empty(
+    item: &Item,
+    key_schema: &[KeySchemaElement],
+) -> Result<(), DynamoDbError> {
+    for ks in key_schema {
+        if let Some(value) = item.get(&ks.attribute_name) {
+            validate_no_empty_key_value(&ks.attribute_name, value)?;
+        }
+    }
+    Ok(())
+}
+
+/// Check a single primary-key value against its size limit. Hash and range use
+/// different wording, matching Amazon `DynamoDB` (the hash variant has no space
+/// before the size).
+fn check_key_size(
+    ks: &KeySchemaElement,
+    value: &AttributeValue,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    let size = key_value_byte_size(value);
+    let max_size = match ks.key_type {
+        KeyType::Hash => limits.max_partition_key_size_bytes,
+        KeyType::Range => limits.max_sort_key_size_bytes,
+    };
+    if size > max_size {
+        let msg = match ks.key_type {
+            KeyType::Hash => format!(
+                "One or more parameter values were invalid: \
+                 Size of hashkey has exceeded the maximum size limit of{max_size} bytes"
+            ),
+            KeyType::Range => format!(
+                "One or more parameter values were invalid: \
+                 Aggregated size of all range keys has exceeded the size limit of {max_size} bytes"
+            ),
+        };
+        return Err(DynamoDbError::ValidationException(msg));
     }
     Ok(())
 }
@@ -1633,6 +1725,70 @@ mod tests {
     }
 
     #[test]
+    fn validate_key_size_limits_rejects_oversized_but_ignores_empty() {
+        // Size-only helper: oversized hash key rejected with the exact message,
+        // but an empty key value is NOT rejected here (that stays a separate,
+        // top-level check for the transaction path).
+        let limits = LimitsConfig::default();
+        let mut big = Item::new();
+        big.insert(
+            "pk".to_owned(),
+            AttributeValue::S("a".repeat(limits.max_partition_key_size_bytes + 1)),
+        );
+        let err =
+            validate_key_size_limits(&big, &[make_ks("pk", KeyType::Hash)], &limits).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: \
+             Size of hashkey has exceeded the maximum size limit of2048 bytes"
+        );
+
+        let mut empty = Item::new();
+        empty.insert("pk".to_owned(), AttributeValue::S(String::new()));
+        assert!(
+            validate_key_size_limits(&empty, &[make_ks("pk", KeyType::Hash)], &limits).is_ok(),
+            "size-only check must ignore empty key values"
+        );
+    }
+
+    #[test]
+    fn validate_key_size_limits_range_message_matches_amazon_dynamodb() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        item.insert(
+            "sk".to_owned(),
+            AttributeValue::S("b".repeat(limits.max_sort_key_size_bytes + 1)),
+        );
+        let err =
+            validate_key_size_limits(&item, &[make_ks("sk", KeyType::Range)], &limits).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: \
+             Aggregated size of all range keys has exceeded the size limit of 1024 bytes"
+        );
+    }
+
+    #[test]
+    fn validate_key_not_empty_rejects_empty_but_ignores_oversized() {
+        // Empty-only helper: rejects an empty key value, but a merely-oversized
+        // (non-empty) key passes (size is enforced separately).
+        let limits = LimitsConfig::default();
+        let mut empty = Item::new();
+        empty.insert("pk".to_owned(), AttributeValue::S(String::new()));
+        assert!(validate_key_not_empty(&empty, &[make_ks("pk", KeyType::Hash)]).is_err());
+
+        let mut big = Item::new();
+        big.insert(
+            "pk".to_owned(),
+            AttributeValue::S("a".repeat(limits.max_partition_key_size_bytes + 1)),
+        );
+        assert!(
+            validate_key_not_empty(&big, &[make_ks("pk", KeyType::Hash)]).is_ok(),
+            "empty-only check must ignore oversized (non-empty) key values"
+        );
+    }
+
+    #[test]
     fn validate_key_sizes_hash_message_matches_amazon_dynamodb() {
         let limits = LimitsConfig::default();
         let mut item = Item::new();
@@ -2034,11 +2190,19 @@ mod tests {
             (Select::Count, "only the Count"),
         ];
         for (select, what) in cases {
-            let err = validate_select_projection(Some(select), true, false, true).unwrap_err();
+            let body =
+                format!("Cannot specify the ProjectionExpression when choosing to get {what}");
+            // Query prepends the "1 validation error detected: " prefix.
+            let q =
+                validate_select_projection(Some(select), true, false, true, IS_QUERY).unwrap_err();
             assert_eq!(
-                err.to_string(),
-                format!("Cannot specify the ProjectionExpression when choosing to get {what}")
+                q.to_string(),
+                format!("1 validation error detected: {body}")
             );
+            // Scan does NOT prepend the prefix (matches real DynamoDB).
+            let s =
+                validate_select_projection(Some(select), true, false, true, IS_SCAN).unwrap_err();
+            assert_eq!(s.to_string(), body);
         }
     }
 
@@ -2046,33 +2210,62 @@ mod tests {
     fn select_specific_attributes_requires_projection() {
         // No projection and no AttributesToGet -> rejected.
         assert!(
-            validate_select_projection(Some(Select::SpecificAttributes), false, false, false)
-                .is_err()
+            validate_select_projection(
+                Some(Select::SpecificAttributes),
+                false,
+                false,
+                false,
+                IS_QUERY
+            )
+            .is_err()
         );
         // A projection satisfies it.
         assert!(
-            validate_select_projection(Some(Select::SpecificAttributes), true, false, false)
-                .is_ok()
+            validate_select_projection(
+                Some(Select::SpecificAttributes),
+                true,
+                false,
+                false,
+                IS_QUERY
+            )
+            .is_ok()
         );
         // Legacy AttributesToGet satisfies it.
         assert!(
-            validate_select_projection(Some(Select::SpecificAttributes), false, true, false)
-                .is_ok()
+            validate_select_projection(
+                Some(Select::SpecificAttributes),
+                false,
+                true,
+                false,
+                IS_QUERY
+            )
+            .is_ok()
         );
     }
 
     #[test]
     fn select_all_projected_requires_index() {
-        let err =
-            validate_select_projection(Some(Select::AllProjectedAttributes), false, false, false)
-                .unwrap_err();
+        let err = validate_select_projection(
+            Some(Select::AllProjectedAttributes),
+            false,
+            false,
+            false,
+            IS_QUERY,
+        )
+        .unwrap_err();
         assert_eq!(
             err.to_string(),
             "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
         );
         assert!(
-            validate_select_projection(Some(Select::AllProjectedAttributes), false, false, true)
-                .is_ok()
+            validate_select_projection(
+                Some(Select::AllProjectedAttributes),
+                false,
+                false,
+                true,
+                IS_QUERY
+            )
+            .is_ok()
         );
     }
 
@@ -2183,9 +2376,14 @@ mod tests {
     fn select_projection_rule_precedes_index_rule() {
         // ALL_PROJECTED_ATTRIBUTES + ProjectionExpression + no IndexName: the
         // ProjectionExpression rule is reported, not the IndexName one.
-        let err =
-            validate_select_projection(Some(Select::AllProjectedAttributes), true, false, false)
-                .unwrap_err();
+        let err = validate_select_projection(
+            Some(Select::AllProjectedAttributes),
+            true,
+            false,
+            false,
+            IS_QUERY,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("ALL_PROJECTED_ATTRIBUTES")
                 && err

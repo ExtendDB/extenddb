@@ -1,0 +1,22 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "extenddb-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# Developer mode: `is_tls_enabled` reports plain HTTP regardless of the
+# configured TLS state. Enabled only through the app crate's `dev-mode` feature.
+dev-mode = []
+
+[dependencies]
+extenddb-core = { workspace = true }
+extenddb-storage = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+config = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

@@ -18,7 +18,11 @@ mod metrics_endpoint;
 pub mod rate_limit;
 mod request_helpers;
 mod response;
+mod serve;
 mod throttle_helpers;
+mod workers;
+
+pub use serve::{BuildInfo, LogTarget, ServeParams, log_to_syslog_raw, serve};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,6 +60,10 @@ pub struct AppState {
     pub metrics: Arc<MetricsCollector>,
     /// Whether TLS is enabled (affects cookie Secure flag).
     pub tls_enabled: bool,
+    /// Developer mode: authorization is opened for authenticated callers (SigV4
+    /// is still verified). Only ever true in a `dev-mode` build bound to
+    /// loopback; the bin's serve path enforces those preconditions.
+    pub dev_mode: bool,
     /// Allowed directories for import file operations. Empty means imports
     /// are disabled (secure default).
     pub import_paths: Arc<[Arc<std::path::PathBuf>]>,

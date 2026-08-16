@@ -87,9 +87,66 @@ pub struct TableKeyInfo {
     /// Whether the table has at least one local secondary index.
     /// Used to decide whether `ItemCollectionMetrics` should be returned.
     pub has_lsi: bool,
+    /// Global secondary indexes defined on the table (name, key schema, and
+    /// projection). Populated from the catalog and carried on the cached
+    /// `TableKeyInfo` so per-index consumed capacity can be computed without an
+    /// extra `describe_table` round-trip per write.
+    pub global_secondary_indexes: Vec<IndexInfo>,
+    /// Local secondary indexes defined on the table (name, key schema, and
+    /// projection). Same rationale as `global_secondary_indexes`.
+    pub local_secondary_indexes: Vec<IndexInfo>,
     /// Stream specification for the table, if streams are configured.
     /// Cached here to avoid an extra `describe_table` call per write operation.
     pub stream_specification: Option<super::StreamSpecification>,
+}
+
+impl TableKeyInfo {
+    /// Check the one invariant the keyed read paths depend on: every RANGE
+    /// element of the table's own key schema has a matching entry in
+    /// `attribute_definitions`.
+    ///
+    /// The storage backends derive the sort key's physical column from its
+    /// attribute definition, so a key schema whose RANGE attribute has no
+    /// definition makes them treat the table as partition-key-only and return an
+    /// arbitrary item from the partition. That is a silent wrong-answer read, so
+    /// the condition is checked where catalog metadata enters the system and
+    /// reported as an error instead of being inferred away (issue #259).
+    ///
+    /// Only `base_key_schema` is checked. Secondary index key schemas are
+    /// deliberately not, because a table written by an older build may carry an
+    /// index whose key attributes were never persisted, and refusing to load its
+    /// metadata would take the whole table offline rather than degrade that one
+    /// index.
+    ///
+    /// # Errors
+    ///
+    /// Returns the offending attribute name and the definitions that were present
+    /// when a RANGE attribute has no definition.
+    pub fn validate_sort_key_definitions(&self) -> Result<(), String> {
+        for element in &self.base_key_schema {
+            if element.key_type != KeyType::Range {
+                continue;
+            }
+            if !self
+                .attribute_definitions
+                .iter()
+                .any(|ad| ad.attribute_name == element.attribute_name)
+            {
+                return Err(format!(
+                    "table {} has sort key '{}' in its key schema with no matching \
+                     AttributeDefinition (definitions present: [{}])",
+                    self.table_name,
+                    element.attribute_name,
+                    self.attribute_definitions
+                        .iter()
+                        .map(|ad| ad.attribute_name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Extract all HASH key elements from a key schema (preserving order).
@@ -157,6 +214,96 @@ mod tests {
             attribute_name: name.into(),
             key_type,
         }
+    }
+
+    fn key_info_with(
+        base_key_schema: Vec<KeySchemaElement>,
+        attribute_definitions: Vec<AttributeDefinition>,
+    ) -> TableKeyInfo {
+        TableKeyInfo {
+            table_name: "TestTable".into(),
+            account_id: "123".into(),
+            table_id: "t1".into(),
+            key_schema: base_key_schema.clone(),
+            base_key_schema,
+            attribute_definitions,
+            has_lsi: false,
+            global_secondary_indexes: vec![],
+            local_secondary_indexes: vec![],
+            stream_specification: None,
+        }
+    }
+
+    fn ad(name: &str, attr_type: ScalarAttributeType) -> AttributeDefinition {
+        AttributeDefinition {
+            attribute_name: name.into(),
+            attribute_type: attr_type,
+        }
+    }
+
+    /// The state issue #259 left behind: the key schema still names a sort key but
+    /// its definition was dropped, which is what made the read path fall back to a
+    /// partition-only lookup. Loading such metadata must fail loudly.
+    #[test]
+    fn validate_sort_key_definitions_rejects_a_range_key_with_no_definition() {
+        let info = key_info_with(
+            vec![ks("pk", KeyType::Hash), ks("sk", KeyType::Range)],
+            vec![ad("pk", ScalarAttributeType::S)],
+        );
+
+        let err = info
+            .validate_sort_key_definitions()
+            .expect_err("a sort key with no attribute definition must be rejected");
+        assert!(
+            err.contains("sk"),
+            "error should name the sort key, got: {err}"
+        );
+        assert!(
+            err.contains("TestTable"),
+            "error should name the table, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_sort_key_definitions_accepts_a_complete_composite_key() {
+        let info = key_info_with(
+            vec![ks("pk", KeyType::Hash), ks("sk", KeyType::Range)],
+            vec![
+                ad("pk", ScalarAttributeType::S),
+                ad("sk", ScalarAttributeType::S),
+            ],
+        );
+
+        assert!(info.validate_sort_key_definitions().is_ok());
+    }
+
+    /// A hash-only table has no RANGE element, so there is nothing to check. It
+    /// must not be rejected for the absence of a sort key definition.
+    #[test]
+    fn validate_sort_key_definitions_accepts_a_hash_only_table() {
+        let info = key_info_with(
+            vec![ks("pk", KeyType::Hash)],
+            vec![ad("pk", ScalarAttributeType::S)],
+        );
+
+        assert!(info.validate_sort_key_definitions().is_ok());
+    }
+
+    /// Secondary index key schemas are deliberately out of scope: a table written
+    /// by an older build may carry an index whose key attributes were never
+    /// persisted, and refusing to load the table would take it entirely offline.
+    #[test]
+    fn validate_sort_key_definitions_ignores_index_key_schemas() {
+        let mut info = key_info_with(
+            vec![ks("pk", KeyType::Hash), ks("sk", KeyType::Range)],
+            vec![
+                ad("pk", ScalarAttributeType::S),
+                ad("sk", ScalarAttributeType::S),
+            ],
+        );
+        info.key_schema = vec![ks("f01", KeyType::Hash), ks("f02", KeyType::Range)];
+
+        assert!(info.validate_sort_key_definitions().is_ok());
     }
 
     #[test]
@@ -260,6 +407,8 @@ mod tests {
             base_key_schema: schema.clone(),
             attribute_definitions: vec![],
             has_lsi: false,
+            global_secondary_indexes: vec![],
+            local_secondary_indexes: vec![],
             stream_specification: None,
         };
         assert_eq!(info.key_schema, info.base_key_schema);
@@ -277,6 +426,8 @@ mod tests {
             base_key_schema: base_schema.clone(),
             attribute_definitions: vec![],
             has_lsi: false,
+            global_secondary_indexes: vec![],
+            local_secondary_indexes: vec![],
             stream_specification: None,
         };
         assert_eq!(info.key_schema, index_schema);

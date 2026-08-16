@@ -273,13 +273,22 @@ async fn worker(worker_id: u64, q: Arc<GsiQueue>) {
 /// backstop interval). A row already due maps to a near-zero wait so the loop
 /// re-claims promptly.
 async fn next_ready_wait(pool: &PgPool, worker_id: u64) -> Option<std::time::Duration> {
+    // The ::float8 cast is load-bearing. Since PostgreSQL 14, EXTRACT returns
+    // `numeric`, which sqlx refuses to decode into f64. Without the cast this
+    // query fails on every partition that has a pending row, and the error was
+    // swallowed into `None` below, indistinguishable from "no rows". The worker
+    // then slept its full idle backstop instead of until `ready_at`, so every
+    // asynchronous GSI propagation took ~1 s regardless of the configured
+    // delay. Errors are logged now so a decode or connection failure can never
+    // silently degrade propagation latency again.
     let secs: Option<f64> = sqlx::query_scalar(
-        "SELECT EXTRACT(EPOCH FROM (MIN(ready_at) - NOW())) FROM gsi_pending \
+        "SELECT EXTRACT(EPOCH FROM (MIN(ready_at) - NOW()))::float8 FROM gsi_pending \
          WHERE worker_partition = $1",
     )
     .bind(worker_id as i32)
     .fetch_one(pool)
     .await
+    .map_err(|e| tracing::error!("GSI worker {worker_id}: next_ready_wait failed: {e}"))
     .ok()
     .flatten();
     secs.map(|s| {

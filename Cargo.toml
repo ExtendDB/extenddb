@@ -7,14 +7,18 @@ members = [
     "crates/cache",
     "crates/engine",
     "crates/storage",
+    "crates/config",
     "crates/storage-postgres",
+    "crates/storage-mongodb",
+    "crates/storage-sqlite",
     "crates/auth",
     "crates/server",
+    "crates/app",
     "crates/bin",
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -25,9 +29,13 @@ extenddb-core = { path = "crates/core" }
 extenddb-cache = { path = "crates/cache" }
 extenddb-engine = { path = "crates/engine" }
 extenddb-storage = { path = "crates/storage" }
+extenddb-config = { path = "crates/config" }
 extenddb-storage-postgres = { path = "crates/storage-postgres" }
+extenddb-storage-mongodb = { path = "crates/storage-mongodb" }
+extenddb-storage-sqlite = { path = "crates/storage-sqlite" }
 extenddb-auth = { path = "crates/auth" }
 extenddb-server = { path = "crates/server" }
+extenddb-app = { path = "crates/app" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -40,6 +48,7 @@ anyhow = "1"
 
 # Async
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7" }
 async-trait = "0.1"
 futures = "0.3"
 
@@ -50,14 +59,14 @@ tower-http = { version = "0.6", features = ["compression-gzip", "cors", "set-hea
 hyper = { version = "1" }
 urlencoding = { version = "2.1" }
 
-# Database plugin registry
-inventory = "0.3"
-
 # Caching
 moka = { version = "0.12", features = ["future"] }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "json", "time", "uuid", "bigdecimal"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "json", "time", "uuid", "bigdecimal", "derive"] }
+mongodb = "3"
+bson = "2.13"
+dashmap = "6"
 
 # Crypto & checksums
 crc32fast = "1"
@@ -74,7 +83,6 @@ time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 # TLS
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
-rustls-pemfile = "2"
 rcgen = "0.14"
 
 # Process management

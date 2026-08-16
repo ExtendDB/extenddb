@@ -210,6 +210,9 @@ pub async fn handle_batch_write_item(
         }
     }
 
+    // NOTE: per-index (INDEXES) breakdown for batch writes is deferred to the
+    // storage-layer capacity-reporting follow-up (Delete requests lack the old
+    // item needed to attribute per-index capacity). Base-table aggregate only.
     let consumed_capacity = capacity_helpers::batch_write_capacity(
         input.return_consumed_capacity,
         per_table_wcu.iter().map(|(t, cu)| (t.as_str(), *cu)),

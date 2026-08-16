@@ -282,6 +282,34 @@ These errors occur when `auth.provider = "builtin"` is enabled.
 
 **Fix:** Attach a policy granting the required action to the user, or to a group the user belongs to. Use `extenddb manage list-user-policies` to check current policies. Remember that explicit Deny always overrides Allow.
 
+### A `Deny` on `dynamodb:Attributes` (or `dynamodb:LeadingKeys`) does not deny the request
+
+**Cause:** `dynamodb:Attributes` and `dynamodb:LeadingKeys` are *multivalued* (multi-valued) condition keys. In IAM, a **bare** condition operator (one without a `ForAnyValue:` or `ForAllValues:` qualifier) applied to a multivalued key **never matches** — regardless of the operator or how many values the request carries. This mirrors real AWS behavior exactly (verified against the IAM Policy Simulator and live DynamoDB). A policy like the following is therefore a **no-op** and grants no protection:
+
+```json
+{
+  "Effect": "Deny",
+  "Action": "dynamodb:GetItem",
+  "Resource": "*",
+  "Condition": { "StringEquals": { "dynamodb:Attributes": ["ssn"] } }
+}
+```
+
+**Fix:** Use a set qualifier. To deny a request that touches *any* of a set of attributes, use `ForAnyValue:`:
+
+```json
+{
+  "Effect": "Deny",
+  "Action": "dynamodb:GetItem",
+  "Resource": "*",
+  "Condition": { "ForAnyValue:StringEquals": { "dynamodb:Attributes": ["ssn"] } }
+}
+```
+
+To allowlist attributes (allow only when *every* requested attribute is in the set), use `ForAllValues:` on an `Allow` statement. The same rule applies to `dynamodb:LeadingKeys`.
+
+> Note: prior to v0.1.6, extenddb incorrectly treated a bare operator on these keys as an implicit AND across the requested values, so a single-attribute request appeared to be denied while a multi-attribute request leaked. That behavior diverged from AWS and gave a false sense of security. See the upgrade manual for migration guidance.
+
 ## Connection Issues
 
 ### AWS CLI returns `Could not connect to the endpoint URL`

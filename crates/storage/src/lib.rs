@@ -8,6 +8,7 @@
 //! methods receive `account_id` from the authenticated identity.
 
 pub mod authorization_store;
+pub mod backend;
 pub mod bootstrapper;
 pub mod config;
 pub mod diagnostics;
@@ -20,14 +21,15 @@ pub mod server_components;
 pub mod settings_store;
 pub mod transact;
 
+pub use backend::{Backend, BackendAlreadySet, backend_name, set_backend, try_backend};
+
 pub use transact::{IdempotencyKey, TransactGetOp, TransactWriteOp};
 
 pub use server_components::{
-    BackendError, ServerComponents, ServerComponentsFactory, ServerComponentsRegistration,
-    create_server_components,
+    BackendError, ServerComponents, ServerComponentsFactory, create_server_components,
 };
 
-pub use hooks::{ServerRuntimeHooks, WorkerContext};
+pub use hooks::{CancellationToken, ServerRuntimeHooks, WorkerContext, sleep_or_shutdown};
 
 /// Pluggable lookup for `TableKeyInfo`.
 ///

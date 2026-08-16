@@ -189,6 +189,46 @@ No prior versions exist. All deployments are fresh installs.
 
 ---
 
+## Behavior Changes by Release
+
+Catalog upgrades change the schema; behavior changes alter how the running server
+interprets existing data or configuration. Review these before upgrading a live
+deployment, even when no catalog migration is required.
+
+### v0.1.6 — IAM: bare operators on multivalued condition keys are no-ops (BR-7085)
+
+**What changed.** A **bare** condition operator (no `ForAnyValue:` / `ForAllValues:`
+qualifier) applied to a *multivalued* condition key — `dynamodb:Attributes` or
+`dynamodb:LeadingKeys` — now **never matches**, matching real AWS IAM exactly. Before
+v0.1.6, extenddb evaluated a bare operator as an implicit AND across the request's values,
+so such a condition could match and appear to enforce a restriction.
+
+**Who is affected.** Any deployment with an IAM policy that uses a bare operator (e.g.
+`StringEquals`) on `dynamodb:Attributes` or `dynamodb:LeadingKeys`. A common pattern is a
+denylist that *appeared* to protect an attribute:
+
+```json
+{ "Effect": "Deny", "Action": "dynamodb:GetItem", "Resource": "*",
+  "Condition": { "StringEquals": { "dynamodb:Attributes": ["ssn"] } } }
+```
+
+Under the old behavior this could deny a single-attribute request; after the upgrade it is a
+no-op (as it always was on real AWS). **This is a security-relevant change: policies relying
+on the old semantics no longer restrict access.**
+
+**Migration.** Rewrite affected policies to use a set qualifier before upgrading:
+
+- Denylist (block if the request touches *any* listed attribute):
+  `"ForAnyValue:StringEquals": { "dynamodb:Attributes": ["ssn"] }`
+- Allowlist (allow only when *every* requested attribute is listed):
+  `"ForAllValues:StringEquals": { "dynamodb:Attributes": ["pk", "sk"] }` on an `Allow`.
+
+The same applies to `dynamodb:LeadingKeys`. Audit existing policies with
+`extenddb manage list-user-policies` / `list-role-policies` and update any that use bare
+operators on these keys. No catalog migration is required for this change.
+
+---
+
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.

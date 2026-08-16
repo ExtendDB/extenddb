@@ -97,17 +97,17 @@ def wait_for_gsi_items(paginate, expected: int, timeout: float = 15.0):
 
     GSIs are eventually consistent: an item written to the base table is not
     guaranteed to be visible through a secondary index immediately — ExtendDB
-    applies the configured ``gsi_propagation_delay_ms``, so
-    a read-back through a GSI right after the write can return fewer
-    items than expected. Tests that write then page a GSI must poll rather than read once.
+    applies the configured ``gsi_propagation_delay_ms`` (like real DynamoDB), so
+    a read-back through a GSI right after the write can return fewer items than
+    expected. Tests that write then page a GSI must poll rather than read once.
 
     ``paginate`` is a zero-arg callable that runs the *entire* pagination and
     returns the collected list; it is retried until it returns at least
     ``expected`` items or the timeout elapses. The last collected list is
     returned so the caller's ordering/dedup assertions run on the converged
-    result. On timeout the (short) result is returned so the caller's
-    ``assert len(...) == expected`` fails — a genuine drop still surfaces as a
-    failure within the bound rather than hanging.
+    result. On timeout the short result is returned rather than raising, so the
+    caller's ``assert len(...) == expected`` fails: a genuine drop surfaces as a
+    test failure within the bound instead of hanging.
     """
     interval = _poll_interval()
     deadline = time.monotonic() + timeout
@@ -116,7 +116,6 @@ def wait_for_gsi_items(paginate, expected: int, timeout: float = 15.0):
         time.sleep(interval)
         items = paginate()
     return items
-
 
 @pytest.fixture()
 def create_and_cleanup_table(dynamodb_client, unique_table_name):

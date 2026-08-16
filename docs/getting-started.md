@@ -27,9 +27,18 @@ The scripts report missing dependencies and exit — they never install
 software on your behalf. After the script completes, continue from
 [Step 2: Initialize the deployment](#2-initialize-the-deployment) below.
 
+## Quick start with Docker Compose
+
+If you have Docker, the fastest way to get a local ExtendDB stack running is with
+the included `docker-compose.yml`. It wires the official image to a PostgreSQL
+container and handles initialization automatically — no build or manual init required.
+See [Local Development with Docker Compose](local-dev-docker-compose.md).
+
 ## Prerequisites
 
-- PostgreSQL 14+ running locally (see `docs/local-postgres-setup.md`)
+- **Storage backend** (one of):
+  - PostgreSQL 14+ running locally (see `docs/local-postgres-setup.md`)
+  - MongoDB 7.0+ with replica set (see `docs/local-mongodb-setup.md`)
 - Rust toolchain (1.88+)
 - AWS CLI v2 (for testing)
 - Python 3.10+ with virtual environment (see [Python Environment Setup](../README.md#python-environment-setup) in the README)
@@ -37,8 +46,18 @@ software on your behalf. After the script completes, continue from
 ## 1. Build extenddb
 
 ```bash
+# PostgreSQL backend (default)
 cargo build --release
+
+# MongoDB backend
+# (backends are mutually exclusive; disable the default postgres feature)
+cargo build --release --no-default-features --features mongodb
 ```
+
+Each build produces a single-backend binary. The `postgres`, `mongodb`, and
+`sqlite` features are mutually exclusive — a build enabling more than one is
+rejected at compile time — so to run two backends, build one binary per
+backend.
 
 The binary is at `target/release/extenddb`.
 
@@ -47,15 +66,17 @@ The binary is at `target/release/extenddb`.
 Run `extenddb init` to create the catalog and data databases:
 
 ```bash
+# PostgreSQL (default)
 ./target/release/extenddb init
+
+# MongoDB
+./target/release/extenddb init --backend mongodb
 ```
 
 This will:
-- Create a `extenddb` PostgreSQL user (if it doesn't exist)
 - Create the `extenddb_catalog` database (catalog metadata)
-- Create the `extenddb` database (user item data)
-- Run schema migrations
-- Generate an AES-256-GCM encryption key (for future access key storage)
+- Create the data database (user item data)
+- Generate an AES-256-GCM encryption key (for access key storage)
 - Create a default account and print the account ID
 - Create an `admin` user and print the credentials once
 - Generate a self-signed TLS certificate at `~/.extenddb/tls/`
@@ -103,6 +124,34 @@ To bind the server to a specific address (e.g., for remote access), pass `--bind
 ```
 
 This generates a certificate with SANs: `localhost`, `127.0.0.1`, and `10.0.1.5`.
+
+### SQLite backend (developer mode)
+
+For local development and CI, extenddb can run against a SQLite backend instead
+of PostgreSQL. Select it at init time with `--backend sqlite`:
+
+```bash
+./target/release/extenddb init --backend sqlite
+```
+
+This writes a config with a `[storage.sqlite]` section where the database
+location is configured (default `extenddb.sqlite`):
+
+```toml
+[storage.sqlite]
+path = "extenddb.sqlite"   # or ":memory:" for an ephemeral in-memory database
+```
+
+At serve time the path can be overridden with `--sqlite-path`. The resolution
+order is: the `--sqlite-path` flag, then `[storage.sqlite].path` in the config,
+then the default `extenddb.sqlite`:
+
+```bash
+./target/release/extenddb serve --config extenddb.toml --sqlite-path /data/extenddb.sqlite
+```
+
+Use `:memory:` (in the config or via `--sqlite-path`) for an ephemeral database
+that is discarded on shutdown.
 
 ### Generating a self-signed certificate manually
 

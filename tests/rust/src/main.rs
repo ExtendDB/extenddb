@@ -18,6 +18,8 @@ mod backup_restore;
 #[cfg(test)]
 mod batch_get_item;
 #[cfg(test)]
+mod batch_transact_authz;
+#[cfg(test)]
 mod batch_write_item;
 #[cfg(test)]
 mod binary_sort_key;
@@ -25,6 +27,8 @@ mod binary_sort_key;
 mod capacity_throttling;
 #[cfg(test)]
 mod composite_keys;
+#[cfg(test)]
+mod concurrency;
 #[cfg(test)]
 mod condition_expressions;
 #[cfg(test)]
@@ -50,6 +54,8 @@ mod gsi;
 #[cfg(test)]
 mod gsi_more;
 #[cfg(test)]
+mod gsi_update_table_attr_defs;
+#[cfg(test)]
 mod index_key_validation;
 #[cfg(test)]
 mod lsi;
@@ -68,6 +74,8 @@ mod query_more;
 #[cfg(test)]
 mod raw_http;
 #[cfg(test)]
+mod restore_active_completeness;
+#[cfg(test)]
 mod scan;
 #[cfg(test)]
 mod select_projection_validation;
@@ -85,6 +93,8 @@ mod transact_key_validation;
 mod transact_write_items;
 #[cfg(test)]
 mod transact_write_items_more;
+#[cfg(test)]
+mod transaction_key_size_validation;
 #[cfg(test)]
 mod transaction_validation;
 #[cfg(test)]
@@ -105,6 +115,8 @@ mod update_item_more;
 mod update_item_number_validation;
 #[cfg(test)]
 mod update_table_billing_validation;
+#[cfg(test)]
+mod wording_parity_validation;
 
 fn main() {
     eprintln!("Run with `cargo test` to execute integration tests.");
