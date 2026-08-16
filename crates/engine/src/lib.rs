@@ -202,6 +202,37 @@ pub(crate) fn validate_enum_fields(
     );
     Err(DynamoDbError::ValidationException(msg))
 }
+
+/// Validate the `ReturnValues` field for `PutItem` / `DeleteItem`, which accept
+/// only `NONE` or `ALL_OLD`. Matches real DynamoDB's two distinct messages:
+///
+/// - A value that IS a valid `ReturnValues` enum member but is not allowed for
+///   these operations (e.g. `UPDATED_OLD`) → `ReturnValues can only be ALL_OLD
+///   or NONE`.
+/// - A value that is not a `ReturnValues` enum member at all (e.g. `GARBAGE`) →
+///   the generic constraint error listing the full enum set.
+pub(crate) fn validate_put_delete_return_values(
+    body: &serde_json::Value,
+) -> Result<(), DynamoDbError> {
+    // Full ReturnValues enum set, in the order real DynamoDB reports it.
+    const ALL: &[&str] = &["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"];
+    if let Some(rv) = body.get("ReturnValues").and_then(serde_json::Value::as_str) {
+        if rv == "NONE" || rv == "ALL_OLD" {
+            return Ok(());
+        }
+        if ALL.contains(&rv) {
+            return Err(DynamoDbError::ValidationException(
+                "ReturnValues can only be ALL_OLD or NONE".to_owned(),
+            ));
+        }
+        return Err(DynamoDbError::ValidationException(format!(
+            "1 validation error detected: Value '{rv}' at 'returnValues' failed to satisfy \
+             constraint: Member must satisfy enum value set: [{}]",
+            ALL.join(", ")
+        )));
+    }
+    Ok(())
+}
 ///
 /// Populated by engine handlers so the server layer can record capacity,
 /// returned item counts, and returned byte counts without parsing the JSON

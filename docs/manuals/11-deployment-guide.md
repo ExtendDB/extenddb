@@ -96,26 +96,46 @@ COPY extenddb.toml /etc/extenddb/extenddb.toml
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 EXPOSE 18443
+# `extenddb healthcheck` needs no shell or curl, so it also works on a
+# distroless/scratch base. It probes GET /health over loopback.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
+  CMD ["/usr/local/bin/extenddb", "healthcheck", "--config", "/etc/extenddb/extenddb.toml"]
 ENTRYPOINT ["tini", "--"]
 CMD ["/usr/local/bin/entrypoint.sh"]
 ```
 
-extenddb always daemonizes (there is no foreground mode). In a container, the parent process exits after forking, which causes the container runtime to stop the container. Use `tini` as PID 1 and a wrapper script that starts extenddb and waits on the daemon process:
+Run the server with `serve --foreground` (alias `--no-daemon`) so it stays PID 1's
+child and receives `SIGTERM` directly. In foreground mode extenddb writes no PID
+file and never creates `run_dir`, so the root filesystem can be read-only. Use
+`tini` as PID 1 to reap any stray children and forward signals:
 
 ```bash
 #!/bin/sh
 # entrypoint.sh
-extenddb serve --config /etc/extenddb/extenddb.toml
-# Wait on the daemon PID — the PID file location depends on run_dir in extenddb.toml
-# Default: ~/.extenddb/run/extenddb-<port>.pid
-PID_FILE="${HOME}/.extenddb/run/extenddb-18443.pid"
-if [ -f "$PID_FILE" ]; then
-  tail --pid="$(cat "$PID_FILE")" -f /dev/null
-else
-  echo "extenddb failed to start — PID file not found at $PID_FILE" >&2
-  exit 1
-fi
+set -e
+# Safe to run on every start: already-applied migrations are skipped.
+extenddb migrate --yes --config /etc/extenddb/extenddb.toml
+exec extenddb serve --foreground --config /etc/extenddb/extenddb.toml
 ```
+
+`extenddb stop` cannot stop a foreground server, because there is no PID file to
+read; stop the container instead, which delivers `SIGTERM` and triggers the same
+graceful shutdown. Outside a container, where you may want `stop` to work, add
+`--write-pid-file` — it writes the PID file to the usual `run_dir` path, which
+then has to be writable.
+
+What the health check covers: `extenddb healthcheck` exits 0 when the server is
+listening, completing TLS, and serving HTTP. Use it as a liveness probe, which is
+what a Docker `HEALTHCHECK` and a Kubernetes `livenessProbe` are for. `/health`
+does not query PostgreSQL, and for a liveness probe that is the behaviour you
+want: one that failed on a database outage would restart every replica at once.
+A backend that is unreachable at startup does stop the server from listening, so
+container start-up failures are still caught.
+
+There is no readiness endpoint yet, so do not expect a Kubernetes
+`readinessProbe` on `/health` to remove a replica from service when its database
+becomes unreachable. Until a readiness endpoint that probes the storage layer
+exists, treat backend failures as something clients retry through.
 
 For Kubernetes, run `extenddb init` as an init container or a one-time Job, then deploy extenddb as a Deployment with the generated `extenddb.toml` mounted as a ConfigMap or Secret.
 

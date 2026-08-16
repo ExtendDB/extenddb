@@ -18,7 +18,11 @@ mod metrics_endpoint;
 pub mod rate_limit;
 mod request_helpers;
 mod response;
+mod serve;
 mod throttle_helpers;
+mod workers;
+
+pub use serve::{BuildInfo, LogTarget, ServeParams, log_to_syslog_raw, serve};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,6 +60,10 @@ pub struct AppState {
     pub metrics: Arc<MetricsCollector>,
     /// Whether TLS is enabled (affects cookie Secure flag).
     pub tls_enabled: bool,
+    /// Developer mode: authorization is opened for authenticated callers (SigV4
+    /// is still verified). Only ever true in a `dev-mode` build bound to
+    /// loopback; the bin's serve path enforces those preconditions.
+    pub dev_mode: bool,
     /// Allowed directories for import file operations. Empty means imports
     /// are disabled (secure default).
     pub import_paths: Arc<[Arc<std::path::PathBuf>]>,
@@ -113,6 +121,7 @@ pub async fn start_server(
     let catalog_store = state.catalog_store.clone();
     let auth_cache_for_mgmt = state.auth_cache.clone();
     let auth_cache_for_console = state.auth_cache.clone();
+    let metrics_for_console = state.metrics.clone();
     let authz_cache_for_mgmt = state.authz_cache.clone();
     let table_key_info_cache_for_mgmt = state.table_key_info_cache.clone();
     let version_info = state.version_info.clone();
@@ -144,11 +153,12 @@ pub async fn start_server(
         .route("/", post(handler::handle_request))
         .layer(DefaultBodyLimit::max(DYNAMODB_BODY_LIMIT))
         .route("/health", get(health_check))
-        // REQ-OBS-005: Prometheus-compatible metrics endpoint. Public by
-        // design (Prometheus scrapers expect no auth on the scrape URL);
-        // operators who need stricter access should expose this on a
-        // separate bind via firewall/proxy. Returns aggregate metrics
-        // only; per-request data is in the management API.
+        // REQ-OBS-005: Prometheus-compatible metrics endpoint. Requires admin
+        // HTTP Basic auth (enforced in the handler) because the payload carries
+        // per-table CloudWatch-style dimensions, so it is served only to an
+        // authorized caller. Prometheus scrapers configure
+        // `basic_auth`. The web console dashboard uses the session-authed
+        // `/console/metrics-data` route instead.
         .route("/metrics", get(metrics_endpoint::metrics_endpoint))
         // S-6: Explicit small body limit for non-DynamoDB endpoints.
         .layer(DefaultBodyLimit::max(1024))
@@ -173,6 +183,7 @@ pub async fn start_server(
             catalog_store,
             docs_store: docs_store.clone(),
             auth_cache: auth_cache_for_console,
+            metrics: metrics_for_console,
         });
         let console_router = console::router().with_state(console_state);
         app = app

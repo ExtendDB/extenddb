@@ -28,6 +28,13 @@ import requests
 
 from conftest import wait_for_active
 
+# /metrics requires admin HTTP Basic auth. The harness (devtools/run-tests)
+# exports EXTENDDB_ADMIN_USER / EXTENDDB_ADMIN_PASSWORD from `extenddb init`.
+_ADMIN_AUTH = (
+    os.environ.get("EXTENDDB_ADMIN_USER", "admin"),
+    os.environ.get("EXTENDDB_ADMIN_PASSWORD", ""),
+)
+
 
 def _endpoint() -> str:
     """Return the extenddb endpoint or fail."""
@@ -111,7 +118,7 @@ class TestMetricsEndpoint:
 
     def test_metrics_returns_200(self, endpoint_url: str) -> None:
         """GET /metrics returns 200 with JSON body."""
-        resp = requests.get(f"{endpoint_url}/metrics", timeout=10, verify=False)
+        resp = requests.get(f"{endpoint_url}/metrics", timeout=10, verify=False, auth=_ADMIN_AUTH)
         assert resp.status_code == 200
         data = resp.json()
         assert "metrics" in data
@@ -119,14 +126,14 @@ class TestMetricsEndpoint:
 
     def test_metrics_source(self, endpoint_url: str) -> None:
         """Default query reports its data source."""
-        resp = requests.get(f"{endpoint_url}/metrics", timeout=10, verify=False)
+        resp = requests.get(f"{endpoint_url}/metrics", timeout=10, verify=False, auth=_ADMIN_AUTH)
         data = resp.json()
         assert data["source"] in ("memory", "database")
 
     def test_metrics_with_window(self, endpoint_url: str) -> None:
         """Window parameter selects time range."""
         resp = requests.get(
-            f"{endpoint_url}/metrics?window=Last5Minutes", timeout=10, verify=False
+            f"{endpoint_url}/metrics?window=Last5Minutes", timeout=10, verify=False, auth=_ADMIN_AUTH
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -142,7 +149,7 @@ class TestMetricsEndpoint:
         but tolerate empty results from the database source.
         """
         resp = requests.get(
-            _metrics_url(endpoint_url, table_name=metrics_table), timeout=10, verify=False
+            _metrics_url(endpoint_url, table_name=metrics_table), timeout=10, verify=False, auth=_ADMIN_AUTH
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -168,7 +175,7 @@ class TestMetricsEndpoint:
                 table_name=metrics_table,
                 metric="ConsumedWriteCapacityUnits",
             ),
-            timeout=10, verify=False,
+            timeout=10, verify=False, auth=_ADMIN_AUTH,
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -188,7 +195,7 @@ class TestMetricsEndpoint:
                 table_name=metrics_table,
                 metric="ConsumedWriteCapacityUnits",
             ),
-            timeout=10, verify=False,
+            timeout=10, verify=False, auth=_ADMIN_AUTH,
         )
         data = resp.json()
         total_sum = sum(m["sum"] for m in data["metrics"])
@@ -209,7 +216,7 @@ class TestMetricsEndpoint:
                 table_name=metrics_table,
                 metric="ConsumedReadCapacityUnits",
             ),
-            timeout=10, verify=False,
+            timeout=10, verify=False, auth=_ADMIN_AUTH,
         )
         data = resp.json()
         total_sum = sum(m["sum"] for m in data["metrics"])
@@ -230,7 +237,7 @@ class TestMetricsEndpoint:
                 table_name=metrics_table,
                 metric="SuccessfulRequestLatency",
             ),
-            timeout=10, verify=False,
+            timeout=10, verify=False, auth=_ADMIN_AUTH,
         )
         data = resp.json()
         latency_metrics = [
@@ -251,7 +258,7 @@ class TestMetricsEndpoint:
     ) -> None:
         """Metrics include table name and operation dimensions."""
         resp = requests.get(
-            _metrics_url(endpoint_url, table_name=metrics_table), timeout=10, verify=False
+            _metrics_url(endpoint_url, table_name=metrics_table), timeout=10, verify=False, auth=_ADMIN_AUTH
         )
         data = resp.json()
         for m in data["metrics"]:
@@ -269,7 +276,7 @@ class TestMetricsEndpoint:
         only incidental latency metrics (e.g. from the query itself)."""
         resp = requests.get(
             _metrics_url(endpoint_url, table_name="nonexistent-table-xyz"),
-            timeout=10, verify=False,
+            timeout=10, verify=False, auth=_ADMIN_AUTH,
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -286,7 +293,7 @@ class TestMetricsEndpoint:
     def test_metrics_last_hour_window(self, endpoint_url: str) -> None:
         """LastHour window queries the database source (if available)."""
         resp = requests.get(
-            f"{endpoint_url}/metrics?window=LastHour", timeout=10, verify=False
+            f"{endpoint_url}/metrics?window=LastHour", timeout=10, verify=False, auth=_ADMIN_AUTH
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -297,7 +304,7 @@ class TestMetricsEndpoint:
     def test_metrics_invalid_start_time(self, endpoint_url: str) -> None:
         """Invalid ISO 8601 start time returns 400."""
         resp = requests.get(
-            f"{endpoint_url}/metrics?start=not-a-date", timeout=10, verify=False
+            f"{endpoint_url}/metrics?start=not-a-date", timeout=10, verify=False, auth=_ADMIN_AUTH
         )
         assert resp.status_code == 400
         data = resp.json()

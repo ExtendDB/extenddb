@@ -498,6 +498,71 @@ class TestRBAC:
             self.mgmt.delete_user(self.account_id, user)
             self.mgmt.delete_user(self.account_id, admin_user)
             self.mgmt.delete_role(self.account_id, role)
+
+    def test_assume_role_wrong_session_token_rejected(self):
+        """A mismatched X-Amz-Security-Token is rejected even with a valid
+        signature; the correct token authenticates. Regression: the session
+        token is compared in constant time and enforced after signature
+        verification."""
+        role = f"tokrole-{uuid.uuid4().hex[:8]}"
+        user = f"caller-{uuid.uuid4().hex[:8]}"
+
+        resp = self.mgmt.create_user(self.account_id, user, "TestPass123!")
+        assert resp.status_code == 201
+        caller_arn = f"arn:aws:iam::{self.account_id}:user/{user}"
+
+        trust_policy = {
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"AWS": caller_arn},
+                "Action": "sts:AssumeRole",
+            }],
+        }
+        resp = self.mgmt.create_role(self.account_id, role, trust_policy)
+        assert resp.status_code == 201, resp.text
+        resp = self.mgmt.put_role_policy(
+            self.account_id, role, "full-access", _full_access_policy()
+        )
+        assert resp.status_code == 204, resp.text
+
+        resp = self.mgmt.assume_role(
+            self.account_id, role, caller_arn, "tok-session"
+        )
+        assert resp.status_code == 201, resp.text
+        creds = resp.json()
+
+        try:
+            # Positive control: the correct session token authenticates.
+            good = _make_dynamodb_client(
+                self.endpoint,
+                creds["access_key_id"],
+                creds["secret_access_key"],
+                self.region,
+                session_token=creds["session_token"],
+            )
+            good.list_tables()
+
+            # Same access key + secret (so the SigV4 signature is valid), but a
+            # different value in X-Amz-Security-Token. The server must reject it
+            # with UnrecognizedClientException, not accept it or 500.
+            bad = _make_dynamodb_client(
+                self.endpoint,
+                creds["access_key_id"],
+                creds["secret_access_key"],
+                self.region,
+                session_token="FwoGZXIvYXdzEBmismatchedSessionToken0123456789ABCDEF",
+            )
+            with pytest.raises(ClientError) as exc_info:
+                bad.list_tables()
+            err = exc_info.value.response["Error"]
+            msg = err.get("Message", "")
+            assert (
+                "security token" in msg.lower() or "invalid" in msg.lower()
+            ), f"expected security-token rejection, got: {err}"
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+            self.mgmt.delete_role(self.account_id, role)
 # ---------------------------------------------------------------------------
 # Error Path Tests
 # ---------------------------------------------------------------------------

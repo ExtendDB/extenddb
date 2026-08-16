@@ -10,7 +10,8 @@ use serde_json::Value;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
 use extenddb_core::types::{
-    IndexType, ScanInput, ScanOutput, Select, TableKeyInfo, extract_key, item_size_bytes,
+    IndexType, ProjectionType, ScanInput, ScanOutput, Select, TableKeyInfo, extract_key,
+    item_size_bytes,
 };
 
 use crate::OperationContext;
@@ -169,6 +170,7 @@ pub async fn handle_scan(
             .as_ref()
             .is_some_and(|a| !a.is_empty()),
         input.index_name.is_some(),
+        extenddb_core::validation::IS_SCAN,
     )?;
 
     // Validate unused expression attributes
@@ -223,6 +225,16 @@ pub async fn handle_scan(
         return Err(DynamoDbError::ValidationException(
             "Consistent reads are not supported on global secondary indexes".to_owned(),
         ));
+    }
+
+    // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (shared with Query).
+    if let Some(ref idx) = index_info {
+        extenddb_core::validation::validate_all_attributes_index_support(
+            input.select,
+            idx.index_type == IndexType::Gsi,
+            idx.projection.projection_type == ProjectionType::All,
+            &idx.index_name,
+        )?;
     }
 
     // Validate Segment/TotalSegments — DynamoDB returns different messages per direction
@@ -289,6 +301,8 @@ pub async fn handle_scan(
             base_key_schema: key_info.key_schema.clone(),
             attribute_definitions: key_info.attribute_definitions.clone(),
             has_lsi: key_info.has_lsi,
+            global_secondary_indexes: key_info.global_secondary_indexes.clone(),
+            local_secondary_indexes: key_info.local_secondary_indexes.clone(),
             stream_specification: None, // Scans don't capture stream records
         }
     } else {
@@ -342,6 +356,9 @@ pub async fn handle_scan(
     // Validate begins_with operand types upfront (before any rows are scanned).
     if let Some(ref f) = filter {
         extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
+            |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
+        )?;
+        extenddb_core::expression::validate_ordering_operand_types(f, &combined_maps).map_err(
             |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
         )?;
     }

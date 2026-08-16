@@ -9,7 +9,9 @@ use std::time::Duration;
 use extenddb_core::metrics::MetricsCollector;
 use extenddb_core::types::UserIdentity;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{DataEngine, MetadataEngine, TableEngine};
+use extenddb_storage::{
+    CancellationToken, DataEngine, MetadataEngine, TableEngine, sleep_or_shutdown,
+};
 
 use crate::PostgresEngine;
 
@@ -20,11 +22,11 @@ const BATCH_SIZE: usize = 100;
 pub(crate) async fn ttl_cleanup_worker(
     storage: Arc<PostgresEngine>,
     metrics: Arc<MetricsCollector>,
+    token: CancellationToken,
 ) {
     let region_arc: Arc<str> = Arc::from(storage.region.as_str());
 
-    loop {
-        tokio::time::sleep(SCAN_INTERVAL).await;
+    while sleep_or_shutdown(&token, SCAN_INTERVAL).await {
         retry_pending_indexes(&storage).await;
         sweep_expired_items(&storage, &metrics, &region_arc).await;
     }

@@ -24,6 +24,13 @@ pub enum StorageError {
     IdempotentReplay,
     #[error("Idempotent parameter mismatch")]
     IdempotentMismatch,
+    /// A single-item write raced an in-flight `TransactWriteItems` on
+    /// the same item, and the backend was unable to serialize the two.
+    /// Maps to `DynamoDbError::TransactionConflictException` at the
+    /// engine boundary — DynamoDB's canonical error for this case
+    /// (RFC-0003 §4.3).
+    #[error("Transaction conflict: {0}")]
+    TransactionConflict(String),
     #[error("No-op update: {0}")]
     NoOpUpdate(String),
     #[error("Validation error: {0}")]

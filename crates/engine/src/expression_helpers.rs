@@ -9,7 +9,7 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     Expr, ExpressionKind, ExpressionMaps, KeyCondition, PathElement, Token, UpdateAction,
     parse_condition_with_depth_limit, parse_key_condition, parse_projection, parse_update_from,
-    tokenize_for, tokenize_with_limit, validate_no_reserved_words,
+    tokenize_for, tokenize_with_limit, validate_no_reserved_words, validate_ordering_operand_types,
 };
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{AttributeValue, ConditionalOperator, ExpectedAttributeValue};
@@ -202,6 +202,10 @@ pub fn resolve_condition(
 
     let maps = build_expression_maps(names, values);
     let condition = parse_optional_condition(condition_expression, limits)?;
+    if let Some(ref expr) = condition {
+        validate_ordering_operand_types(expr, &maps)
+            .map_err(|e| prefix_expression_error(e, ExpressionKind::Condition))?;
+    }
     Ok((condition, maps))
 }
 
