@@ -453,6 +453,29 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     let export_paths: Arc<[Arc<std::path::PathBuf>]> =
         Arc::from(resolve_paths(&export_paths_raw, "export")?);
 
+    // Import and export files are namespaced per account beneath each root, so a
+    // shared or nested root is no longer a cross-tenant exposure on its own.
+    // It is still worth surfacing, because it means one tenant's exports are
+    // re-importable by that same tenant and the two features share a disk quota.
+    for i in import_paths.iter() {
+        for e in export_paths.iter() {
+            if i == e {
+                tracing::warn!(
+                    "Import and export are configured with the same root ({}); files remain \
+                     namespaced per account, but consider separate directories",
+                    i.display()
+                );
+            } else if i.starts_with(e.as_path()) || e.starts_with(i.as_path()) {
+                tracing::warn!(
+                    "Import root ({}) and export root ({}) are nested; files remain namespaced \
+                     per account, but consider separate directories",
+                    i.display(),
+                    e.display()
+                );
+            }
+        }
+    }
+
     if import_paths.is_empty() {
         tracing::info!("Import disabled (no [import] paths configured)");
     } else {

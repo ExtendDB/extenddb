@@ -60,6 +60,57 @@ def extenddb_request(operation: str, body: dict) -> dict:
         error_msg = result.get("message", result.get("Message", ""))
         raise RuntimeError(f"{error_type}: {error_msg} (HTTP {resp.status_code})")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Per-account path helpers
+#
+# Import and export files are namespaced by account: a caller in account A may
+# only read and write beneath <root>/A for each configured root. A path directly
+# under the bare root is rejected, which is what stops tenants sharing an
+# instance from reading or overwriting each other's files.
+#
+# devtools/run-tests points TMPDIR at the configured root, so
+# tempfile.gettempdir() is that root.
+# ---------------------------------------------------------------------------
+
+ACCOUNT_ID = os.environ.get("EXTENDDB_TEST_ACCOUNT_ID", "123456789012")
+FOREIGN_ACCOUNT = "999999999999"
+
+
+def account_dir(account: str = ACCOUNT_ID) -> str:
+    """Return (creating if needed) the per-account subtree of the root."""
+    path = os.path.join(tempfile.gettempdir(), account)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def export_target(suffix: str = ".json") -> str:
+    """A path for an export that does not yet exist.
+
+    Export refuses to overwrite, so the destination must not be pre-created.
+    This is why export destinations cannot use NamedTemporaryFile.
+    """
+    return os.path.join(account_dir(), f"exp-{uuid.uuid4().hex}{suffix}")
+
+
+def import_source(content: str, suffix: str = ".json", account: str = ACCOUNT_ID) -> str:
+    """Write an import fixture inside `account`'s subtree and return its path."""
+    path = os.path.join(account_dir(account), f"imp-{uuid.uuid4().hex}{suffix}")
+    with open(path, "w") as f:
+        f.write(content)
+    return path
+
+
+def discard(*paths: str) -> None:
+    """Remove files that may or may not exist."""
+    for path in paths:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
 @pytest.fixture()
 def unique_table_name():
     """Generate a unique table name."""
@@ -112,8 +163,7 @@ class TestExportTable:
         desc = dynamodb_client.describe_table(TableName=table_name)
         table_arn = desc["Table"]["TableArn"]
 
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
-            export_path = f.name
+        export_path = export_target()
 
         try:
             resp = extenddb_request("ExportTableToPointInTime", {
@@ -136,7 +186,7 @@ class TestExportTable:
                 assert "Item" in obj
                 assert "pk" in obj["Item"]
         finally:
-            os.unlink(export_path)
+            discard(export_path)
 
     def test_export_empty_table(self, dynamodb_client, unique_table_name, cleanup_table):
         """Export an empty table produces empty file."""
@@ -153,8 +203,7 @@ class TestExportTable:
         desc = dynamodb_client.describe_table(TableName=name)
         table_arn = desc["Table"]["TableArn"]
 
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
-            export_path = f.name
+        export_path = export_target()
 
         try:
             resp = extenddb_request("ExportTableToPointInTime", {
@@ -163,7 +212,7 @@ class TestExportTable:
             })
             assert resp["ExportDescription"]["ItemCount"] == 0
         finally:
-            os.unlink(export_path)
+            discard(export_path)
 # ---------------------------------------------------------------------------
 # ImportTable
 # ---------------------------------------------------------------------------
@@ -179,10 +228,7 @@ class TestImportTable:
             {"Item": {"pk": {"S": f"imp-{i}"}, "val": {"N": str(i)}}}
             for i in range(3)
         ]
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            for item in items:
-                f.write(json.dumps(item) + "\n")
-            source_path = f.name
+        source_path = import_source("".join(json.dumps(i) + "\n" for i in items))
 
         try:
             resp = extenddb_request("ImportTable", {
@@ -210,7 +256,7 @@ class TestImportTable:
                 )
                 assert item["Item"]["val"]["N"] == str(i)
         finally:
-            os.unlink(source_path)
+            discard(source_path)
 
     def test_import_csv(self, dynamodb_client, unique_table_name, cleanup_table):
         """Import items from CSV file."""
@@ -218,9 +264,7 @@ class TestImportTable:
         cleanup_table(name)
 
         csv_content = "pk,name,age\ncsv-1,Alice,30\ncsv-2,Bob,25\n"
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
-            f.write(csv_content)
-            source_path = f.name
+        source_path = import_source(csv_content, suffix=".csv")
 
         try:
             resp = extenddb_request("ImportTable", {
@@ -247,7 +291,7 @@ class TestImportTable:
             assert item["Item"]["name"]["S"] == "Alice"
             assert item["Item"]["age"]["S"] == "30"
         finally:
-            os.unlink(source_path)
+            discard(source_path)
 
     def test_import_nonexistent_source(self, dynamodb_client, unique_table_name, cleanup_table):
         """Import from nonexistent path returns error."""
@@ -294,8 +338,7 @@ class TestImportTable:
         desc = dynamodb_client.describe_table(TableName=src_name)
         table_arn = desc["Table"]["TableArn"]
 
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
-            export_path = f.name
+        export_path = export_target()
 
         try:
             extenddb_request("ExportTableToPointInTime", {
@@ -329,4 +372,124 @@ class TestImportTable:
                 assert item["Item"]["n"]["N"] == expected["n"]
                 assert item["Item"]["s"]["S"] == expected["s"]
         finally:
-            os.unlink(export_path)
+            discard(export_path)
+
+
+# ---------------------------------------------------------------------------
+# Cross-tenant isolation
+# ---------------------------------------------------------------------------
+class TestCrossTenantIsolation:
+    """Import/export files are confined to the calling account's subtree.
+
+    A single instance may host several accounts, and the import/export roots are
+    server-wide. Without per-account namespacing, containment in a shared root
+    lets any tenant name another tenant's file: read it by importing it, or
+    destroy it by exporting over it. These tests drive a foreign account's path
+    directly rather than provisioning a second set of credentials, which is the
+    same approach `backup_arn_scoping` takes for ARNs.
+    """
+
+    TCP = {
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "BillingMode": "PAY_PER_REQUEST",
+    }
+
+    def _import(self, path: str, table: str) -> dict:
+        return extenddb_request("ImportTable", {
+            "FileSource": {"Path": path},
+            "InputFormat": "DYNAMODB_JSON",
+            "TableCreationParameters": {"TableName": table, **self.TCP},
+        })
+
+    def test_import_from_another_accounts_subtree_is_denied(
+        self, unique_table_name, cleanup_table
+    ):
+        """The reported read primitive: importing a co-tenant's export file."""
+        cleanup_table(unique_table_name)
+        victim = import_source(
+            json.dumps({"Item": {"pk": {"S": "secret"}}}) + "\n",
+            account=FOREIGN_ACCOUNT,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="ValidationException"):
+                self._import(victim, unique_table_name)
+        finally:
+            discard(victim)
+
+    def test_export_into_another_accounts_subtree_is_denied(
+        self, dynamodb_client, unique_table_name, cleanup_table
+    ):
+        """The reported destruction primitive: truncating a co-tenant's export.
+
+        The victim file must still hold its original bytes afterwards. Before the
+        fix it was truncated to zero length with no error to either party.
+        """
+        name = unique_table_name
+        cleanup_table(name)
+        dynamodb_client.create_table(TableName=name, **{
+            "AttributeDefinitions": self.TCP["AttributeDefinitions"],
+            "KeySchema": self.TCP["KeySchema"],
+            "BillingMode": self.TCP["BillingMode"],
+        })
+        wait_for_active(dynamodb_client, name)
+        table_arn = dynamodb_client.describe_table(TableName=name)["Table"]["TableArn"]
+
+        original = json.dumps({"Item": {"pk": {"S": "victim-data"}}}) + "\n"
+        victim = import_source(original, account=FOREIGN_ACCOUNT)
+        try:
+            with pytest.raises(RuntimeError, match="ValidationException"):
+                extenddb_request("ExportTableToPointInTime", {
+                    "TableArn": table_arn,
+                    "FilePath": victim,
+                    "ExportFormat": "DYNAMODB_JSON",
+                })
+            with open(victim) as f:
+                assert f.read() == original, "co-tenant's file was modified"
+        finally:
+            discard(victim)
+
+    def test_import_from_the_bare_root_is_denied(self, unique_table_name, cleanup_table):
+        """Containment in the shared root is not sufficient on its own."""
+        cleanup_table(unique_table_name)
+        stray = os.path.join(
+            tempfile.gettempdir(), f"unscoped-{uuid.uuid4().hex}.json"
+        )
+        with open(stray, "w") as f:
+            f.write(json.dumps({"Item": {"pk": {"S": "x"}}}) + "\n")
+        try:
+            with pytest.raises(RuntimeError, match="ValidationException"):
+                self._import(stray, unique_table_name)
+        finally:
+            discard(stray)
+
+    def test_export_refuses_to_overwrite_an_existing_file(
+        self, dynamodb_client, unique_table_name, cleanup_table
+    ):
+        """Export will not truncate a file that is already there, even its own."""
+        name = unique_table_name
+        cleanup_table(name)
+        dynamodb_client.create_table(TableName=name, **{
+            "AttributeDefinitions": self.TCP["AttributeDefinitions"],
+            "KeySchema": self.TCP["KeySchema"],
+            "BillingMode": self.TCP["BillingMode"],
+        })
+        wait_for_active(dynamodb_client, name)
+        table_arn = dynamodb_client.describe_table(TableName=name)["Table"]["TableArn"]
+
+        target = export_target()
+        try:
+            extenddb_request("ExportTableToPointInTime", {
+                "TableArn": table_arn,
+                "FilePath": target,
+                "ExportFormat": "DYNAMODB_JSON",
+            })
+            assert os.path.exists(target)
+            with pytest.raises(RuntimeError, match="already exists"):
+                extenddb_request("ExportTableToPointInTime", {
+                    "TableArn": table_arn,
+                    "FilePath": target,
+                    "ExportFormat": "DYNAMODB_JSON",
+                })
+        finally:
+            discard(target)
