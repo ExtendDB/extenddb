@@ -153,10 +153,16 @@
 #
 # max_import_bytes = 10737418240  # 10 GB default
 #
-# Deprecated: import_export_root sets a single root for both import and
-# export. If [import]/[export] sections are present, import_export_root
-# is ignored.
-# import_export_root = "/var/lib/extenddb/data"
+# Deprecated: import_export_root sets a single root for both import and export.
+# It fills only a list that the sections leave empty, so with both [import] and
+# [export] present it does nothing, and with neither present it makes the import
+# and export roots the same directory. The server logs which of those happened at
+# startup. Prefer the sections above; this key will be removed.
+#
+# It is a top-level key, so it has to appear before the first [section] header of
+# this file. Uncommenting it here would place it inside the preceding table and
+# the server would refuse to start with "unknown field import_export_root".
+#     import_export_root = "/var/lib/extenddb/data"
 
 # Runtime settings are managed via `extenddb settings set <key> <value>`, not this file.
 # See docs/getting-started.md for available runtime settings and their defaults.
