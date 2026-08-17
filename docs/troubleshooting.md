@@ -147,9 +147,24 @@ paths = ["/path/to/exports"]
 
 ### `Path must resolve under one of the configured allowed paths`
 
-**Cause:** An import or export file path resolves outside all configured allowed directories after canonicalization. This includes symlink escapes.
+**Cause:** An import or export file path does not resolve under the calling
+account's subtree of a configured allowed directory. Files are namespaced per
+account, so the path must be under `<root>/<account id>/`, not directly under
+`<root>`. This error also covers symlink escapes and paths outside every
+configured root; the wording is deliberately identical in all three cases so it
+cannot be used to probe for another account's files.
 
-**Fix:** Ensure the file path is within one of the configured `[import]` or `[export]` paths. Do not use symlinks that point outside the allowed directories.
+**Fix:** Place the file under `<root>/<account id>/`, using the account id the
+request is authenticated as. The export directory is created for you on first
+use. Do not use symlinks that point outside the allowed directories.
+
+### `Export file already exists; choose a different FilePath`
+
+**Cause:** Export refuses to overwrite. Something already exists at the
+requested `FilePath`, so the export stopped rather than truncating it. A symlink
+at that path produces the same error rather than being followed.
+
+**Fix:** Export to a new filename, or remove the existing file first.
 
 ### `Failed to daemonize: <error>`
 

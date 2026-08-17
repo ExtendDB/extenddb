@@ -220,6 +220,20 @@ pub(crate) fn ensure_account_dirs(
     Ok(())
 }
 
+/// Whether `candidate` lies within the caller's subtree of some configured root.
+///
+/// The single containment predicate for import/export. `Path::starts_with` is
+/// component-wise rather than a string prefix, so `<root>/1111` does not match a
+/// caller scoped to `<root>/111`.
+fn is_under_scoped_root(
+    candidate: &Path,
+    jail_roots: &[Arc<PathBuf>],
+    account_id: &str,
+) -> Result<bool, DynamoDbError> {
+    let scoped = account_scoped_roots(jail_roots, account_id)?;
+    Ok(scoped.iter().any(|root| candidate.starts_with(root)))
+}
+
 /// Make `path` absolute without touching the filesystem, for a containment check
 /// that must not reveal whether the path exists.
 fn absolutize(path: &Path) -> Result<PathBuf, DynamoDbError> {
@@ -252,9 +266,7 @@ fn reject_outside_account_subtree(
     if jail_roots.is_empty() {
         return Ok(());
     }
-    let scoped = account_scoped_roots(jail_roots, account_id)?;
-    let absolute = absolutize(path)?;
-    if scoped.iter().any(|root| absolute.starts_with(root)) {
+    if is_under_scoped_root(&absolutize(path)?, jail_roots, account_id)? {
         return Ok(());
     }
     Err(DynamoDbError::ValidationException(
@@ -299,13 +311,10 @@ pub(crate) fn validate_path(
 
     // Re-checked after canonicalization: the lexical test above cannot see a
     // symlinked ancestor that redirects out of the subtree.
-    if !jail_roots.is_empty() {
-        let scoped = account_scoped_roots(jail_roots, account_id)?;
-        if !scoped.iter().any(|root| canonical.starts_with(root)) {
-            return Err(DynamoDbError::ValidationException(
-                "Path must resolve under one of the configured allowed paths".to_owned(),
-            ));
-        }
+    if !jail_roots.is_empty() && !is_under_scoped_root(&canonical, jail_roots, account_id)? {
+        return Err(DynamoDbError::ValidationException(
+            "Path must resolve under one of the configured allowed paths".to_owned(),
+        ));
     }
 
     Ok(canonical)
@@ -361,8 +370,7 @@ pub(crate) fn validate_path_parent(
                     )
                 })?;
                 let resolved = canonical_cwd.join(path);
-                let scoped = account_scoped_roots(jail_roots, account_id)?;
-                if !scoped.iter().any(|root| resolved.starts_with(root)) {
+                if !is_under_scoped_root(&resolved, jail_roots, account_id)? {
                     return Err(DynamoDbError::ValidationException(
                         "Path must resolve under one of the configured allowed paths".to_owned(),
                     ));
@@ -388,8 +396,7 @@ pub(crate) fn validate_path_parent(
                     "Parent directory does not exist or is not accessible".to_owned(),
                 )
             })?;
-            let scoped = account_scoped_roots(jail_roots, account_id)?;
-            if !scoped.iter().any(|root| canonical_parent.starts_with(root)) {
+            if !is_under_scoped_root(&canonical_parent, jail_roots, account_id)? {
                 return Err(DynamoDbError::ValidationException(
                     "Path must resolve under one of the configured allowed paths".to_owned(),
                 ));
@@ -443,6 +450,27 @@ mod tests {
     impl Drop for Root {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A file outside every configured root, removed even if an assert panics.
+    struct Stray(PathBuf);
+
+    impl Stray {
+        fn new(contents: &[u8]) -> Self {
+            let path = std::env::temp_dir().join(format!("eb-stray-{}.json", uuid::Uuid::new_v4()));
+            std::fs::write(&path, contents).unwrap();
+            Self(path)
+        }
+
+        fn as_str(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+
+    impl Drop for Stray {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
         }
     }
 
@@ -525,13 +553,11 @@ mod tests {
     fn foreign_subtree_and_outside_jail_are_indistinguishable() {
         let root = Root::new();
         let foreign = root.file_for(OTHER, "a.json");
-        let outside = std::env::temp_dir().join(format!("eb-out-{}.json", uuid::Uuid::new_v4()));
-        std::fs::write(&outside, b"{}\n").unwrap();
+        let outside = Stray::new(b"{}\n");
 
         let a = validate_path(foreign.to_str().unwrap(), &root.roots(), OWNER).unwrap_err();
-        let b = validate_path(outside.to_str().unwrap(), &root.roots(), OWNER).unwrap_err();
+        let b = validate_path(outside.as_str(), &root.roots(), OWNER).unwrap_err();
         assert_eq!(message(&a), message(&b));
-        let _ = std::fs::remove_file(&outside);
     }
 
     /// A symlink planted at the export filename inside the caller's own subtree
@@ -541,10 +567,9 @@ mod tests {
     fn export_onto_a_symlink_is_rejected() {
         let root = Root::new();
         ensure_account_dirs(&root.roots(), OWNER).unwrap();
-        let outside = std::env::temp_dir().join(format!("eb-tgt-{}.json", uuid::Uuid::new_v4()));
-        std::fs::write(&outside, b"original\n").unwrap();
+        let outside = Stray::new(b"original\n");
         let link = root.0.join(OWNER).join("link.json");
-        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        std::os::unix::fs::symlink(&outside.0, &link).unwrap();
 
         let err = validate_path_parent(link.to_str().unwrap(), &root.roots(), OWNER)
             .expect_err("a symlink at the target filename must be refused");
@@ -552,8 +577,7 @@ mod tests {
             message(&err),
             "Symbolic links are not allowed in import/export paths"
         );
-        assert_eq!(std::fs::read(&outside).unwrap(), b"original\n");
-        let _ = std::fs::remove_file(&outside);
+        assert_eq!(std::fs::read(&outside.0).unwrap(), b"original\n");
     }
 
     /// Defence in depth: a malformed account id must never widen the subtree.
@@ -604,6 +628,37 @@ mod tests {
             message(&b),
             "export path leaks foreign existence"
         );
+    }
+
+    /// A relative path is resolved against the working directory before the
+    /// containment test, so it cannot sidestep the account subtree.
+    #[test]
+    fn relative_path_is_resolved_before_the_containment_test() {
+        let root = Root::new();
+        let err = validate_path("relative-name.json", &root.roots(), OWNER)
+            .expect_err("a bare relative name is not inside the account subtree");
+        assert_eq!(
+            message(&err),
+            "Path must resolve under one of the configured allowed paths"
+        );
+
+        // And a relative path that does resolve into the subtree is accepted,
+        // so the branch is proven in both directions rather than just refusing.
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let nested = cwd.join(format!("eb-rel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(nested.join(OWNER)).unwrap();
+        let file = nested.join(OWNER).join("in.json");
+        std::fs::write(&file, b"{}\n").unwrap();
+        let roots = vec![Arc::new(nested.clone())];
+        let relative = file
+            .strip_prefix(&cwd)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(!relative.starts_with('/'), "must be a relative path");
+        validate_path(&relative, &roots, OWNER).unwrap();
+        let _ = std::fs::remove_dir_all(&nested);
     }
 
     #[test]
