@@ -51,6 +51,32 @@ pub async fn handle_import_table(
     let start_time = epoch_seconds();
     let tcp = &input.table_creation_parameters;
 
+    // Validate and canonicalize the source path before creating anything. Files
+    // are namespaced per account, so a caller can only read beneath its own
+    // subtree of a root. Validating first means a refused import leaves no
+    // orphaned destination table behind.
+    let source_path = validate_path(&input.file_source.path, &ctx.import_paths, &ctx.account_id)?;
+
+    tracing::info!(
+        account_id = %ctx.account_id,
+        operation = "ImportTable",
+        table_name = %tcp.table_name,
+        resolved_path = %source_path.display(),
+        "import/export file access"
+    );
+
+    // Check file size against limit.
+    let file_meta = std::fs::metadata(&source_path).map_err(|_| {
+        DynamoDbError::ValidationException("Cannot read source file metadata".to_owned())
+    })?;
+    if file_meta.len() > ctx.limits.max_import_file_bytes {
+        return Err(DynamoDbError::ValidationException(format!(
+            "Import file size ({} bytes) exceeds maximum ({} bytes)",
+            file_meta.len(),
+            ctx.limits.max_import_file_bytes
+        )));
+    }
+
     let create_input = create_table_input_from_params(tcp);
 
     let table_desc = ctx
@@ -77,30 +103,6 @@ pub async fn handle_import_table(
         .table_key_info(&ctx.account_id, &tcp.table_name)
         .await
         .map_err(storage_err_to_dynamo)?;
-
-    // Validate and canonicalize the source path. Files are namespaced per
-    // account, so a caller can only read beneath its own subtree of a root.
-    let source_path = validate_path(&input.file_source.path, &ctx.import_paths, &ctx.account_id)?;
-
-    tracing::info!(
-        account_id = %ctx.account_id,
-        operation = "ImportTable",
-        table_name = %tcp.table_name,
-        resolved_path = %source_path.display(),
-        "import/export file access"
-    );
-
-    // Check file size against limit.
-    let file_meta = std::fs::metadata(&source_path).map_err(|_| {
-        DynamoDbError::ValidationException("Cannot read source file metadata".to_owned())
-    })?;
-    if file_meta.len() > ctx.limits.max_import_file_bytes {
-        return Err(DynamoDbError::ValidationException(format!(
-            "Import file size ({} bytes) exceeds maximum ({} bytes)",
-            file_meta.len(),
-            ctx.limits.max_import_file_bytes
-        )));
-    }
 
     // Read items using spawn_blocking to avoid blocking the async runtime.
     let format = input.input_format;

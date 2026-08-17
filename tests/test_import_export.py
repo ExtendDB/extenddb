@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import time
 import uuid
@@ -389,6 +390,8 @@ class TestCrossTenantIsolation:
     same approach `backup_arn_scoping` takes for ARNs.
     """
 
+    JAIL_REFUSED = "Path must resolve under one of the configured allowed paths"
+
     TCP = {
         "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
         "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
@@ -403,7 +406,7 @@ class TestCrossTenantIsolation:
         })
 
     def test_import_from_another_accounts_subtree_is_denied(
-        self, unique_table_name, cleanup_table
+        self, dynamodb_client, unique_table_name, cleanup_table
     ):
         """The reported read primitive: importing a co-tenant's export file."""
         cleanup_table(unique_table_name)
@@ -412,8 +415,12 @@ class TestCrossTenantIsolation:
             account=FOREIGN_ACCOUNT,
         )
         try:
-            with pytest.raises(RuntimeError, match="ValidationException"):
+            with pytest.raises(RuntimeError, match=re.escape(self.JAIL_REFUSED)):
                 self._import(victim, unique_table_name)
+            # The source is validated before the destination is created, so a
+            # refused import must leave no table behind.
+            with pytest.raises(dynamodb_client.exceptions.ResourceNotFoundException):
+                dynamodb_client.describe_table(TableName=unique_table_name)
         finally:
             discard(victim)
 
@@ -438,7 +445,7 @@ class TestCrossTenantIsolation:
         original = json.dumps({"Item": {"pk": {"S": "victim-data"}}}) + "\n"
         victim = import_source(original, account=FOREIGN_ACCOUNT)
         try:
-            with pytest.raises(RuntimeError, match="ValidationException"):
+            with pytest.raises(RuntimeError, match=re.escape(self.JAIL_REFUSED)):
                 extenddb_request("ExportTableToPointInTime", {
                     "TableArn": table_arn,
                     "FilePath": victim,
@@ -458,7 +465,7 @@ class TestCrossTenantIsolation:
         with open(stray, "w") as f:
             f.write(json.dumps({"Item": {"pk": {"S": "x"}}}) + "\n")
         try:
-            with pytest.raises(RuntimeError, match="ValidationException"):
+            with pytest.raises(RuntimeError, match=re.escape(self.JAIL_REFUSED)):
                 self._import(stray, unique_table_name)
         finally:
             discard(stray)
