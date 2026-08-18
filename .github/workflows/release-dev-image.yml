@@ -180,8 +180,12 @@ jobs:
             VERSION=${{ needs.gate.outputs.version }}
             VCS_REF=${{ needs.gate.outputs.sha }}
             BUILD_DATE=${{ needs.gate.outputs.build_date }}
-          cache-from: type=gha,scope=dev-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=dev-${{ matrix.arch }}
+          # Deliberately NO gha build cache. This job checks out a
+          # dispatch-resolved SHA (gate-verified to be an ancestor of main, but
+          # CodeQL cannot see that), and writing the default branch's actions
+          # cache from such a checkout is the cache-poisoning vector
+          # (actions/cache-poisoning/poisonable-step). Releases are rare and
+          # the LTO build dominates; the cache bought little.
 
       - name: Confirm the image really is ${{ matrix.arch }}
         run: |
