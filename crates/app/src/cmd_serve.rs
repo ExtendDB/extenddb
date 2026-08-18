@@ -99,6 +99,15 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
 
     // Dev mode serves plain HTTP with relaxed authorization; confine it to
     // loopback so it can never be exposed off-host.
+    //
+    // A container is the one case where a loopback bind is not the right lever.
+    // Inside a network namespace, binding 0.0.0.0 is not exposure: what a
+    // container publishes is decided by the port mapping on the host, so the
+    // image must bind 0.0.0.0 and containment moves to `-p 127.0.0.1:...`.
+    // `EXTENDDB_DEV_ALLOW_ANY_BIND=1` is that escape hatch, set by the dev
+    // image and nothing else. It is read only when `dev-mode` is compiled in,
+    // so a production build has no such lever at all: `postgres` and `mongodb`
+    // cannot enable `dev-mode` (see the compile_error in the bin crate).
     if cfg!(feature = "dev-mode") {
         let host = app_config.server.bind_addr.trim();
         let loopback = host == "localhost"
@@ -106,10 +115,21 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
                 .parse::<std::net::IpAddr>()
                 .map(|ip| ip.is_loopback())
                 .unwrap_or(false);
-        if !loopback {
+        let allow_any_bind = std::env::var("EXTENDDB_DEV_ALLOW_ANY_BIND")
+            .is_ok_and(|v| matches!(v.trim(), "1" | "true"));
+        if !loopback && !allow_any_bind {
             anyhow::bail!(
                 "dev-mode builds may only bind to loopback (127.0.0.1, ::1, localhost); \
-                 got server.bind_addr = '{host}'"
+                 got server.bind_addr = '{host}'. Set EXTENDDB_DEV_ALLOW_ANY_BIND=1 only \
+                 inside a container, where the published port decides exposure."
+            );
+        }
+        if !loopback && allow_any_bind {
+            tracing::warn!(
+                bind_addr = host,
+                "dev-mode is binding a non-loopback address: plain HTTP with relaxed \
+                 authorization. Publish it on loopback only (-p 127.0.0.1:PORT:PORT) and \
+                 never expose it to a shared network."
             );
         }
     }
