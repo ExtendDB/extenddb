@@ -14,7 +14,7 @@ use extenddb_core::types::{
     AttributeDefinition, BillingMode, KeySchemaElement, TableDescription, UpdateTableInput,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::merge_attribute_definitions;
+use extenddb_storage::util::effective_attribute_definitions;
 
 use crate::store::SqliteEngine;
 
@@ -284,18 +284,48 @@ impl SqliteEngine {
                     deleted.push(del_id);
                 }
             }
-            // Merge the request's attribute definitions into the stored set.
+            // Recompute attribute_definitions for the post-update table.
             //
-            // The request carries only the attributes it needs (a created index's
-            // key attributes), so replacing the column would drop the base table's
-            // own pk/sk definitions and silently degrade keyed reads to a
-            // partition-only lookup (issue #259). The existing set was read inside
-            // this BEGIN IMMEDIATE transaction, so the read-modify-write is atomic.
-            if let Some(new_attr_defs) = &input.attribute_definitions {
-                let existing: Vec<AttributeDefinition> = serde_json::from_str(&ad_json)
+            // The effective set is the stored definitions merged with the
+            // request's, then pruned to the attributes still referenced by the
+            // table key schema or by an index surviving this update. See
+            // effective_attribute_definitions for the measured behaviour and the
+            // reason merging alone is not enough (issue #259).
+            //
+            // This runs whether or not the request carried AttributeDefinitions,
+            // because a GSI deletion prunes without the request naming anything.
+            // The index rows were created and deleted above inside this BEGIN
+            // IMMEDIATE transaction, so `indexes` already holds exactly the
+            // surviving set and the read-modify-write is atomic.
+            let stored_attr_defs: Vec<AttributeDefinition> = serde_json::from_str(&ad_json)
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let table_key_schema: Vec<KeySchemaElement> = serde_json::from_str(&ks_json)
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+            let surviving_rows: Vec<(String,)> =
+                sqlx::query_as("SELECT key_schema FROM indexes WHERE table_id = ?")
+                    .bind(&table_id)
+                    .fetch_all(&mut *tx)
+                    .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
-                let merged = merge_attribute_definitions(&existing, new_attr_defs);
-                let j = serde_json::to_string(&merged)
+            let mut surviving_index_key_schemas: Vec<Vec<KeySchemaElement>> =
+                Vec::with_capacity(surviving_rows.len());
+            for (ks_text,) in &surviving_rows {
+                surviving_index_key_schemas.push(
+                    serde_json::from_str(ks_text)
+                        .map_err(|e| StorageError::Internal(e.to_string()))?,
+                );
+            }
+
+            let effective = effective_attribute_definitions(
+                &stored_attr_defs,
+                input.attribute_definitions.as_deref().unwrap_or(&[]),
+                &table_key_schema,
+                &surviving_index_key_schemas,
+            );
+
+            if effective != stored_attr_defs {
+                let j = serde_json::to_string(&effective)
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
                 update_col(
                     &mut tx,
@@ -305,8 +335,8 @@ impl SqliteEngine {
                     &j,
                 )
                 .await?;
-                merged_attr_defs_for_ddl = Some(merged);
             }
+            merged_attr_defs_for_ddl = Some(effective);
         }
 
         tx.commit()
