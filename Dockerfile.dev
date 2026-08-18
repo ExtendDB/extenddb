@@ -44,7 +44,12 @@ ARG VCS_REF
 ARG BUILD_DATE
 
 COPY --from=build --chmod=0555 /src/target/release-slim/extenddb /usr/local/bin/extenddb
-COPY --chmod=0444 LICENSE NOTICE SOFTWARE-LICENSE-NOTICES.html /usr/share/doc/extenddb/
+# The DEV notices file: generated for this image's exact feature set
+# (sqlite,dev-mode) by devtools/generate-dev-license-notices. The production
+# SOFTWARE-LICENSE-NOTICES.html covers the postgres feature set and would omit
+# attribution for dependencies this image actually bundles (libsqlite3-sys).
+COPY --chmod=0444 LICENSE NOTICE /usr/share/doc/extenddb/
+COPY --chmod=0444 SOFTWARE-LICENSE-NOTICES-DEV.html /usr/share/doc/extenddb/SOFTWARE-LICENSE-NOTICES.html
 COPY --from=build --chown=65532:65532 /state /var/lib/extenddb
 
 LABEL org.opencontainers.image.title="ExtendDB dev (SQLite)" \
