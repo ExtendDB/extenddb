@@ -59,6 +59,21 @@ adaptation when switching between ExtendDB and the real service.
 |------|----------|------|
 | TagResource / UntagResource | Validates resource ARN exists, returns `ResourceNotFoundException` for missing tables | Matches DynamoDB — validates resource ARN and returns `ResourceNotFoundException` for missing tables. |
 
+## Table References (ARN as TableName)
+
+A data-plane request may reference a table by its full ARN in place of the bare
+table name (`GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query`, `Scan`,
+`BatchGetItem`, `BatchWriteItem`, `TransactGetItems`, `TransactWriteItems`).
+
+| Area | DynamoDB | ExtendDB |
+|------|----------|------|
+| ARN as `TableName` | Accepted; resolves to the table name | Accepted; resolves to the table name |
+| ARN account id | Cross-account access is authorized (or `AccessDeniedException` for a foreign account) | Ignored: the name resolves within the caller's account. True cross-account semantics are deferred. |
+| ARN region | Mismatched region rejected (`ValidationException`, "Invalid AWS region") | Ignored (matches DynamoDB Local) |
+| Echoed table name | The supplied ARN is echoed verbatim in `ConsumedCapacity.TableName` and `BatchGetItem` response keys | Same: the supplied ARN is echoed verbatim |
+| Index / non-table / malformed ARN | Rejected (`ValidationException`) | Rejected (`ValidationException`) |
+| ARN on control-plane ops (e.g. `DescribeTable`) | Accepted | Not accepted (deferred); use the bare name |
+
 ## Secondary Indexes
 
 | Area | DynamoDB | ExtendDB |

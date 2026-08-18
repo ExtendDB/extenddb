@@ -16,7 +16,10 @@ use extenddb_engine::OperationContext;
 use serde_json::Value;
 
 use crate::AppState;
-use crate::request_helpers::{authorize_request, extract_operation, extract_table_name};
+use crate::request_helpers::{
+    authorize_request, denormalize_table_arns, extract_operation, extract_table_name,
+    normalize_table_arns,
+};
 use crate::response::{error_response, record_error_metrics, success_response};
 use crate::throttle_helpers::{
     classify_data_operation, extract_partition_value, table_description_to_throughput,
@@ -76,7 +79,7 @@ pub(crate) async fn handle_request(
     // --- Pre-auth body validation ---
     // Real DynamoDB validates request format (empty body, invalid JSON) before
     // authentication. Malformed requests get 400 regardless of auth state.
-    let input: Value = match serde_json::from_slice(&body) {
+    let mut input: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
             return error_response(
@@ -102,6 +105,15 @@ pub(crate) async fn handle_request(
         | extenddb_auth::AuthIdentity::RoleSession { account_id, .. } => {
             Arc::from(account_id.as_str())
         }
+    };
+
+    // Accept a table ARN in place of a bare TableName by normalizing it to the
+    // bare name for validation, authorization, throttling, and lookup, matching
+    // Amazon DynamoDB and DynamoDB Local. The returned pairs let the response
+    // layer echo the caller's original ARN back in table-name fields.
+    let table_arn_echo = match normalize_table_arns(&mut input, &operation) {
+        Ok(echo) => echo,
+        Err(e) => return error_response(&e, &request_id),
     };
 
     // --- Authz segment ---
@@ -237,7 +249,7 @@ pub(crate) async fn handle_request(
     // --- Response segment ---
     let response_start = std::time::Instant::now();
     let response = match dispatch_result {
-        Ok(result) => {
+        Ok(mut result) => {
             update_throttle_buckets(
                 &state.throttle,
                 &operation,
@@ -285,6 +297,8 @@ pub(crate) async fn handle_request(
                 );
             }
 
+            // Echo the caller's original ARN back in table-name fields.
+            denormalize_table_arns(&mut result.body, &operation, &table_arn_echo);
             success_response(&result.body, &request_id)
         }
         Err(e) => {
