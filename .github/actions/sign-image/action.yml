@@ -1,0 +1,108 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Composite action: sign one verified image digest with the production KMS
+# key. Attached Cosign signature, LEGACY TAG-BASED storage (sha256-<hex>.sig
+# — required by the mirror tooling and published verify instructions), Rekor
+# transparency log ON.
+#
+# Single source of truth for the signing flags. cosign v3's defaults write a
+# new-format OCI referrer and NO .sig tag (hit live on ECR, 2026-08-14); the
+# three-flag combination below is the proven tag-based mode, and the
+# post-sign gate fails if the .sig tag did not appear.
+#
+# The CALLER is responsible for: reviewer-gated environment, AWS credentials
+# (OIDC role with kms:Sign on the key), and registry login. This action only
+# signs and verifies.
+
+name: sign-image
+description: Sign a verified image digest with the production KMS key (tag-based .sig, Rekor on)
+
+inputs:
+  image-repo:
+    description: 'Registry repository, e.g. docker.io/extenddb/extenddb-postgres'
+    required: true
+  digest:
+    description: 'Verified image index digest (sha256:<64 hex>); caller must have validated it'
+    required: true
+  release-tag:
+    description: 'Release the digest belongs to (vX.Y.Z); caller must have validated it'
+    required: true
+  key-arn:
+    description: 'KMS key ARN'
+    required: true
+  cosign-version:
+    description: 'Pinned cosign version'
+    default: v3.1.3
+  cosign-sha256:
+    description: 'SHA-256 of the pinned cosign-linux-amd64 binary'
+    default: 4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71
+
+outputs:
+  sig-tag:
+    description: 'The signature tag created (sha256-<hex>.sig)'
+    value: ${{ steps.confirm.outputs.sig-tag }}
+  sig-digest:
+    description: 'Digest of the signature manifest'
+    value: ${{ steps.confirm.outputs.sig-digest }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install pinned cosign (checksum-verified)
+      shell: bash
+      env:
+        COSIGN_VERSION: ${{ inputs.cosign-version }}
+        COSIGN_SHA256: ${{ inputs.cosign-sha256 }}
+      run: |
+        set -euo pipefail
+        if command -v cosign >/dev/null && [[ "$(cosign version 2>/dev/null | awk '/GitVersion/{print $2}')" == "$COSIGN_VERSION" ]]; then
+          exit 0
+        fi
+        curl -sSfL -o /tmp/cosign \
+          "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+        echo "${COSIGN_SHA256}  /tmp/cosign" | sha256sum --check --strict
+        sudo install -m 0755 /tmp/cosign /usr/local/bin/cosign
+        cosign version
+
+    - name: Sign - attached, legacy tag-based storage, Rekor transparency log
+      shell: bash
+      env:
+        IMAGE_REPO: ${{ inputs.image-repo }}
+        DIGEST: ${{ inputs.digest }}
+        RELEASE: ${{ inputs.release-tag }}
+        KEY_ARN: ${{ inputs.key-arn }}
+      run: |
+        set -euo pipefail
+        cosign sign --yes \
+          --key "awskms:///${KEY_ARN}" \
+          --use-signing-config=false \
+          --new-bundle-format=false \
+          --tlog-upload=true \
+          -a org.extenddb.release="${RELEASE}" \
+          "${IMAGE_REPO}@${DIGEST}"
+
+    - name: Gate - the .sig TAG must exist (catches the storage-mode trap)
+      id: confirm
+      shell: bash
+      env:
+        IMAGE_REPO: ${{ inputs.image-repo }}
+        DIGEST: ${{ inputs.digest }}
+      run: |
+        set -euo pipefail
+        SIG_TAG="sha256-${DIGEST#sha256:}.sig"
+        SIG_DIGEST=$(skopeo inspect --format '{{.Digest}}' "docker://${IMAGE_REPO}:${SIG_TAG}")
+        MEDIA=$(skopeo inspect --raw "docker://${IMAGE_REPO}:${SIG_TAG}" | jq -r .mediaType)
+        [[ "$MEDIA" == "application/vnd.oci.image.manifest.v1+json" ]] || { echo "::error::signature is not a single OCI manifest"; exit 1; }
+        echo "sig-tag=$SIG_TAG" >> "$GITHUB_OUTPUT"
+        echo "sig-digest=$SIG_DIGEST" >> "$GITHUB_OUTPUT"
+
+    - name: Verify the signature (includes the Rekor entry)
+      shell: bash
+      env:
+        IMAGE_REPO: ${{ inputs.image-repo }}
+        DIGEST: ${{ inputs.digest }}
+        KEY_ARN: ${{ inputs.key-arn }}
+      run: |
+        set -euo pipefail
+        cosign verify --key "awskms:///${KEY_ARN}" "${IMAGE_REPO}@${DIGEST}" | head -1
