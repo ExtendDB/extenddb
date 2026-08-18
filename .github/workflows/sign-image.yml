@@ -17,9 +17,11 @@
 # the two-person rule mechanically: reviewer approval, no self-review,
 # main only.
 #
-# Transparency log: OFF this release, for consistency with the ECR
-# signature (made from a corp machine that cannot reach Rekor). Runners CAN
-# reach Rekor, so enabling it next release is a one-flag change here.
+# Transparency log: ON (Phase 1 decision). CI runners reach the public
+# Sigstore log, unlike corp machines (rekor.sigstore.dev is DNS-sinkholed
+# there — the reason v0.1.5 shipped without Rekor entries). The Rekor
+# bundle is attached to the .sig annotations, so mirrored signatures stay
+# verifiable with the transparency log from any registry.
 #
 # cosign v3 storage-mode trap, learned the hard way: with the default
 # signing-config machinery, cosign writes a new-format OCI referrer bundle
@@ -111,14 +113,14 @@ jobs:
           set -euo pipefail
           docker login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin <<< "$DOCKERHUB_TOKEN"
 
-      - name: Sign - attached, legacy tag-based storage, no transparency log
+      - name: Sign - attached, legacy tag-based storage, Rekor transparency log
         run: |
           set -euo pipefail
           cosign sign --yes \
             --key "awskms:///${KEY_ARN}" \
             --use-signing-config=false \
             --new-bundle-format=false \
-            --tlog-upload=false \
+            --tlog-upload=true \
             -a org.extenddb.release="${RELEASE}" \
             "${IMAGE_REPO}@${DIGEST}"
 
@@ -132,10 +134,10 @@ jobs:
           echo "SIG_TAG=$SIG_TAG" >> "$GITHUB_ENV"
           echo "SIG_DIGEST=$SIG_DIGEST" >> "$GITHUB_ENV"
 
-      - name: Verify the signature with the public key
+      - name: Verify the signature with the public key (includes the Rekor entry)
         run: |
           set -euo pipefail
-          cosign verify --key "awskms:///${KEY_ARN}" --insecure-ignore-tlog=true \
+          cosign verify --key "awskms:///${KEY_ARN}" \
             "${IMAGE_REPO}@${DIGEST}" | head -1
 
       - name: Log out
