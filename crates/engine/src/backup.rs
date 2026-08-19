@@ -161,6 +161,13 @@ pub(crate) async fn handle_restore_table_from_backup(
         .invalidate_table_key_info(&ctx.account_id, target_table_name)
         .await;
 
+    // The readiness invariant is applied on every path that hands a description to
+    // a client, and restore was the one that omitted it. Currently harmless (a
+    // restored index is CREATING, and a non-vector backend could never hold a
+    // vector-index backup because create is gated), but the invariant claims to
+    // cover exactly this class of path, so the omission was a latent inconsistency
+    // rather than a deliberate exception.
+    desc.validate_vector_index_readiness()?;
     serialize_output(&json!({ "TableDescription": desc }))
 }
 

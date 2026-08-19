@@ -301,11 +301,11 @@ GSI updates are applied asynchronously with a configurable delay, simulating rea
 ```bash
 # Set system-wide default to 0 for synchronous GSI updates (fast tests)
 ./target/release/extenddb settings --config extenddb.toml set \
-    gsi_propagation_delay_ms 0
+    index_propagation_delay_ms 0
 
 # Set to 50ms for more realistic eventual consistency
 ./target/release/extenddb settings --config extenddb.toml set \
-    gsi_propagation_delay_ms 50
+    index_propagation_delay_ms 50
 ```
 
 ### Throttling
@@ -1238,7 +1238,7 @@ extenddb supports running external test suites (e.g., Java/JUnit, Python/pytest)
 # External suites expect synchronous GSI behavior (matching real DynamoDB's
 # typical sub-millisecond propagation). The async GSI path is tested
 # separately by the extenddb-specific test_gsi_async.py suite.
-./target/release/extenddb settings --config extenddb.toml set gsi_propagation_delay_ms 0
+./target/release/extenddb settings --config extenddb.toml set index_propagation_delay_ms 0
 
 # Run all registered suites
 python3 devtools/run-external-tests

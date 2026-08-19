@@ -21,9 +21,7 @@ use extenddb_storage::util::{
     encode_netstring_composite, parse_sk, pk_to_text, sk_column, sk_column_n, sk_info,
 };
 
-use super::query::{
-    build_key, build_sk_sql, execute_dynamic_query, resolve_expr_to_av, sk_condition_bind_values,
-};
+use super::query::{build_key, build_sk_sql_and_binds, execute_dynamic_query, resolve_expr_to_av};
 use super::{
     BoundValue, all_sort_key_info, data_table_name, index_table_name, json_to_item, sk_bound,
 };
@@ -79,9 +77,11 @@ impl SqliteEngine {
 
         // Primary sort-key condition.
         if let (Some(sk_cond), Some((_, sk_type))) = (&key_condition.sk_condition, sk_info_val) {
-            sql.push_str(&build_sk_sql(sk_cond, sk_column(sk_type)));
-            for v in sk_condition_bind_values(sk_cond, sk_type, maps)? {
-                binds.push(sk_bound(&v));
+            let (sk_sql, sk_binds) =
+                build_sk_sql_and_binds(sk_cond, sk_column(sk_type), sk_type, maps)?;
+            sql.push_str(&sk_sql);
+            for v in &sk_binds {
+                binds.push(sk_bound(v));
             }
         }
 

@@ -5,6 +5,7 @@ use super::*;
 use crate::expression::resolver::ExpressionMaps;
 use crate::expression::tokenizer::tokenize;
 use crate::expression::update_parser::parse_update;
+use crate::types::{Projection, ProjectionType};
 use std::collections::HashMap;
 
 fn apply(
@@ -34,6 +35,10 @@ mod vector_validated {
             dimensions: DIMS,
             vector_attribute_name: "emb".to_owned(),
             search_schema: Vec::new(),
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
         }
     }
 
@@ -125,7 +130,7 @@ mod vector_validated {
         item.insert("other".into(), AttributeValue::S("not-a-vector".into()));
         let err = apply_validated("SET emb = other", &mut item, HashMap::new()).unwrap_err();
         assert!(
-            matches!(&err, DynamoDbError::ValidationException(m) if m.contains("Expected: a list of numbers")),
+            matches!(&err, DynamoDbError::ValidationException(m) if m.contains("Invalid type for parameter emb")),
             "unexpected error: {err:?}"
         );
     }
@@ -181,6 +186,10 @@ mod vector_validated {
                 attribute_name: "tenant".to_owned(),
                 element_type: crate::types::SearchSchemaElementType::Hash,
             }],
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
         };
         let defs = [crate::types::AttributeDefinition {
             attribute_name: "tenant".to_owned(),
@@ -212,6 +221,10 @@ mod vector_validated {
                 attribute_name: "tenant".to_owned(),
                 element_type: crate::types::SearchSchemaElementType::Hash,
             }],
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
         };
         let defs = [crate::types::AttributeDefinition {
             attribute_name: "tenant".to_owned(),
@@ -246,6 +259,10 @@ mod vector_validated {
                 attribute_name: "tenant".to_owned(),
                 element_type: crate::types::SearchSchemaElementType::Hash,
             }],
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
         };
         let defs = [crate::types::AttributeDefinition {
             attribute_name: "tenant".to_owned(),

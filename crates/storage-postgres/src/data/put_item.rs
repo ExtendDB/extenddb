@@ -59,7 +59,7 @@ impl PostgresEngine {
         let sys_delay = if indexes.is_empty() {
             0
         } else {
-            self.gsi_default_delay().await
+            self.index_propagation_delay().await
         };
 
         // When there's a condition, return_old, indexes, or stream capture, we need a transaction

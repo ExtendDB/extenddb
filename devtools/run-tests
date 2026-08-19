@@ -321,8 +321,8 @@ if $NEEDS_INTEGRATION && [[ "$TARGET" != "real-dynamodb" ]]; then
         if "$BINARY" settings --config "$CONFIG_FOR_SETTINGS" set control_plane_delay_seconds 0.05 2>/dev/null; then
             echo "  ✓ control_plane_delay_seconds set to 0.05"
         fi
-        if "$BINARY" settings --config "$CONFIG_FOR_SETTINGS" set gsi_propagation_delay_ms 0 2>/dev/null; then
-            echo "  ✓ gsi_propagation_delay_ms set to 0"
+        if "$BINARY" settings --config "$CONFIG_FOR_SETTINGS" set index_propagation_delay_ms 0 2>/dev/null; then
+            echo "  ✓ index_propagation_delay_ms set to 0"
         fi
         if "$BINARY" settings --config "$CONFIG_FOR_SETTINGS" set throttling_enabled true 2>/dev/null; then
             echo "  ✓ throttling_enabled set to true"

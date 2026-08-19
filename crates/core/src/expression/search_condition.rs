@@ -130,6 +130,21 @@ pub fn validate_search_condition_expression(
                     ))
                 })?
         } else {
+            // A bare identifier must not be a reserved word. This check existed for
+            // ProjectionExpression, where its message is byte-identical to the
+            // service, but was never wired into this expression type, so
+            // `cat = :c AND bucket = :b` was accepted and returned results where the
+            // service refuses it. Measured on 2026-08-11.
+            //
+            // Applied to the bare form only, which is the point of the rule: the
+            // `#alias` branch above exists precisely so a reserved word can be used
+            // by aliasing it.
+            if crate::expression::reserved_words::is_reserved(lhs) {
+                return Err(invalid(format!(
+                    "Invalid SearchConditionExpression: Attribute name is a reserved \
+                     keyword; reserved keyword: {lhs}"
+                )));
+            }
             (*lhs).to_owned()
         };
         if attr_name.contains('.') || attr_name.contains('[') {
@@ -219,20 +234,12 @@ pub fn validate_conditions_against_search_schema(
 ) -> Result<(), DynamoDbError> {
     let schema = search_schema.unwrap_or(&[]);
 
-    // Every referenced attribute must be part of the index search schema.
-    for condition in conditions {
-        let in_schema = schema
-            .iter()
-            .any(|element| element.attribute_name == condition.attribute_name);
-        if !in_schema {
-            return Err(invalid(
-                "SearchConditionExpression must not contain any attributes outside the vector \
-                 index search schema",
-            ));
-        }
-    }
-
     // Every partition-key (HASH) element must be present in the conditions.
+    //
+    // Ordered BEFORE the out-of-schema check deliberately: measured against the
+    // service 2026-08-19 (us-east-1), an expression whose only attribute is
+    // out-of-schema AND which omits the HASH is refused for the missing HASH,
+    // not the unknown attribute. Missing-HASH takes precedence.
     for element in schema
         .iter()
         .filter(|element| element.element_type == SearchSchemaElementType::Hash)
@@ -242,8 +249,31 @@ pub fn validate_conditions_against_search_schema(
             .any(|condition| condition.attribute_name == element.attribute_name);
         if !present {
             return Err(invalid(
-                "SearchConditionExpression must have all HASH attributes",
+                // Measured against the service 2026-08-19 (us-east-1): an
+                // expression that omits a declared HASH attribute is refused
+                // with exactly this text.
+                "SearchConditionExpression must have all HASH attributes in configured SearchSchema",
             ));
+        }
+    }
+
+    // Every referenced attribute must be part of the index search schema.
+    //
+    // Wording measured against the service on 2026-08-11. It names the offending
+    // attribute, which the previous text did not, so a caller with several
+    // conditions had to work out which one was at fault. The service's own grammar
+    // slip ("attributes that is not") is reproduced deliberately: parity means
+    // matching what clients actually receive, not correcting it.
+    for condition in conditions {
+        let in_schema = schema
+            .iter()
+            .any(|element| element.attribute_name == condition.attribute_name);
+        if !in_schema {
+            return Err(invalid(format!(
+                "SearchConditionExpression must not contain any attributes that is not in \
+                 SearchSchema. Invalid attribute: {}",
+                condition.attribute_name
+            )));
         }
     }
 
@@ -297,6 +327,71 @@ mod tests {
             DynamoDbError::ValidationException(m) => m,
             other => panic!("expected ValidationException, got {other:?}"),
         }
+    }
+
+    /// A bare reserved word is refused, with the service's wording.
+    ///
+    /// The check already existed for `ProjectionExpression`, where its message is
+    /// byte-identical to the service, but was never applied here, so
+    /// `bucket = :b` was accepted and returned results for a request the service
+    /// refuses. `bucket` is the specific word that exposed it against the live
+    /// service on 2026-08-11.
+    #[test]
+    fn a_bare_reserved_keyword_is_refused() {
+        let v = values(&[(":b", "4")]);
+        let message = err(validate_search_condition_expression(
+            "bucket = :b",
+            None,
+            Some(&v),
+        ));
+        assert_eq!(
+            message,
+            "Invalid SearchConditionExpression: Attribute name is a reserved keyword; \
+             reserved keyword: bucket"
+        );
+    }
+
+    /// Aliasing is the documented escape hatch, so the rule must apply to the bare
+    /// form only. Without this, the fix above would make reserved-word attributes
+    /// unusable rather than merely requiring an alias.
+    #[test]
+    fn an_aliased_reserved_keyword_is_accepted() {
+        let n = names(&[("#b", "bucket")]);
+        let v = values(&[(":b", "4")]);
+        let conditions = validate_search_condition_expression("#b = :b", Some(&n), Some(&v))
+            .expect("an aliased reserved word must be allowed");
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].attribute_name, "bucket");
+    }
+
+    /// The condition is rejected when it names an attribute outside the schema, and
+    /// the message names WHICH attribute, as the service's does.
+    #[test]
+    fn an_attribute_outside_the_search_schema_is_named_in_the_error() {
+        let conditions = vec![
+            SearchCondition {
+                attribute_name: "cat".to_owned(),
+                value: AttributeValue::S("alpha".to_owned()),
+            },
+            SearchCondition {
+                attribute_name: "payload".to_owned(),
+                value: AttributeValue::S("nope".to_owned()),
+            },
+        ];
+        let schema = [SearchSchemaElement {
+            attribute_name: "cat".to_owned(),
+            element_type: SearchSchemaElementType::Hash,
+        }];
+        let message = err(validate_conditions_against_search_schema(
+            &conditions,
+            Some(&schema),
+            &[],
+        ));
+        assert_eq!(
+            message,
+            "SearchConditionExpression must not contain any attributes that is not in \
+             SearchSchema. Invalid attribute: payload"
+        );
     }
 
     #[test]

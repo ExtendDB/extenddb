@@ -50,7 +50,7 @@ impl PostgresEngine {
         let sys_delay = if indexes.is_empty() {
             0
         } else {
-            self.gsi_default_delay().await
+            self.index_propagation_delay().await
         };
 
         // Sort-key binding, computed once: the key is immutable across attempts.

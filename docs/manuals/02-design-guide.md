@@ -185,7 +185,7 @@ extenddb caches a small set of operational settings in memory to avoid per-reque
 
 | Setting | Mechanism | Refresh | Justification |
 |---------|-----------|---------|---------------|
-| `gsi_propagation_delay_ms` | `AtomicU64` | Background poller every 30s | Write-path hot path; briefly-stale value only affects GSI propagation timing |
+| `index_propagation_delay_ms` | `AtomicU64` | Background poller every 30s | Write-path hot path; briefly-stale value only affects GSI propagation timing |
 | `encryption_key` | `Arc<str>` loaded at startup | Never (immutable after `extenddb init`) | Decryption key for access key secrets; generated once, never changes |
 | `log_level` / `log_destination` | Tracing filter reload | Background poller every 30s | Observability tuning; stale value only delays log level changes |
 | `throttling_enabled` | `AtomicBool` | Background poller every 30s | Capacity management toggle; briefly-stale is safe |
