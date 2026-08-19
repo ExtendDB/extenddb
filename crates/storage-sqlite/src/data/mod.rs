@@ -111,14 +111,22 @@ pub(crate) fn json_to_item(v: serde_json::Value) -> Result<Item, StorageError> {
     serde_json::from_value(v).map_err(|e| StorageError::Internal(e.to_string()))
 }
 
-/// A value bound to a sort-key column, already mapped to its SQLite storage
-/// representation per D2.
+/// A value bound into a positional `sqlx` query, already mapped to its SQLite
+/// storage representation.
+///
+/// The `Text` and `Blob` cases carry sort-key values per D2. `Int` carries a
+/// query parameter that is a number in its own right rather than a key: before it
+/// existed, the only way an integer reached SQL in this crate was interpolation.
 #[derive(Debug, Clone)]
 pub(crate) enum BoundValue {
     /// `TEXT` — used for `S` (raw string) and `N` (order-preserving encoding).
     Text(String),
     /// `BLOB` — used for `B`.
     Blob(Vec<u8>),
+    /// `INTEGER` — a numeric parameter, not a key. Distinct from `N`, which is
+    /// deliberately TEXT so that lexicographic order equals numeric order; this
+    /// is for values whose ordering is irrelevant, such as a `LIMIT`.
+    Int(i64),
 }
 
 /// Map a parsed sort-key value to its SQLite storage representation (D2):
@@ -137,8 +145,37 @@ macro_rules! bind_bound {
         match $bound {
             crate::data::BoundValue::Text(s) => $query.bind(s),
             crate::data::BoundValue::Blob(b) => $query.bind(b),
+            crate::data::BoundValue::Int(i) => $query.bind(i),
         }
     };
+}
+
+/// A positional placeholder list for `n` parameters: `?, ?, ?`.
+///
+/// Deduplicates two identical constructions on the index write paths.
+///
+/// # The call shape is load-bearing, so do not "simplify" it
+///
+/// Call sites pass this as a **named** `format!` argument:
+///
+/// ```ignore
+/// format!("INSERT INTO {t} ({}) VALUES ({binds})", cols, binds = bind_list(n))
+/// ```
+///
+/// Collapsing that to a local plus implicit capture, which reads as a tidy-up:
+///
+/// ```ignore
+/// let binds = bind_list(n);
+/// format!("INSERT INTO {t} ({}) VALUES ({binds})", cols)   // WRONG
+/// ```
+///
+/// changes nothing about the SQL and breaks a static check. With implicit
+/// capture the identifier exists only inside the format string and **no
+/// expression appears in the macro arguments at all**, so a `syn`-based rule
+/// cannot see that a `VALUES (...)` interpolation is a placeholder list rather
+/// than a value. The named form puts the name and the call in one AST node.
+pub(crate) fn bind_list(n: usize) -> String {
+    vec!["?"; n].join(", ")
 }
 
 /// Bind `pk` then a sort-key value, then `fetch_optional` a single JSON column.
@@ -148,6 +185,7 @@ macro_rules! bind_sk_fetch_optional {
         let __q = match crate::data::sk_bound($sk) {
             crate::data::BoundValue::Text(s) => __q.bind(s),
             crate::data::BoundValue::Blob(b) => __q.bind(b),
+            crate::data::BoundValue::Int(i) => __q.bind(i),
         };
         __q.fetch_optional($executor)
             .await
@@ -162,6 +200,7 @@ macro_rules! bind_sk_execute {
         let __q = match crate::data::sk_bound($sk) {
             crate::data::BoundValue::Text(s) => __q.bind(s),
             crate::data::BoundValue::Blob(b) => __q.bind(b),
+            crate::data::BoundValue::Int(i) => __q.bind(i),
         };
         __q.bind($item_json)
             .execute($executor)
@@ -177,6 +216,7 @@ macro_rules! bind_sk_only_execute {
         let __q = match crate::data::sk_bound($sk) {
             crate::data::BoundValue::Text(s) => __q.bind(s),
             crate::data::BoundValue::Blob(b) => __q.bind(b),
+            crate::data::BoundValue::Int(i) => __q.bind(i),
         };
         __q.execute($executor)
             .await

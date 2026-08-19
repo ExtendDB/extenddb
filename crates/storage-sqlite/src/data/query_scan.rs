@@ -151,7 +151,8 @@ impl SqliteEngine {
         }
 
         let fetch_limit = limit.map_or(1_000_001, |l| l + 1);
-        let _ = write!(sql, " LIMIT {fetch_limit}");
+        sql.push_str(" LIMIT ?");
+        binds.push(BoundValue::Int(fetch_limit));
 
         let rows = execute_dynamic_query(&sql, binds, &self.pool).await?;
         finalize(rows, limit, &key_info.key_schema)
@@ -299,7 +300,8 @@ impl SqliteEngine {
         }
 
         let fetch_limit = limit.map_or(1_000_001, |l| l + 1);
-        let _ = write!(sql, " LIMIT {fetch_limit}");
+        sql.push_str(" LIMIT ?");
+        binds.push(BoundValue::Int(fetch_limit));
 
         let rows = execute_dynamic_query(&sql, binds, &self.pool).await?;
         finalize(rows, limit, &key_info.key_schema)

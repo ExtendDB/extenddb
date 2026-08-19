@@ -164,6 +164,7 @@ pub(super) async fn execute_dynamic_query(
         query = match v {
             BoundValue::Text(s) => query.bind(s),
             BoundValue::Blob(b) => query.bind(b),
+            BoundValue::Int(i) => query.bind(i),
         };
     }
     let rows: Vec<(serde_json::Value,)> = query

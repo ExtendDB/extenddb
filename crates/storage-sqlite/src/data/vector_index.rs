@@ -468,10 +468,10 @@ pub(crate) async fn insert_vector_row(
         .chain(key_cols.iter().cloned())
         .chain(["vec".to_owned(), "nrm".to_owned(), "item_data".to_owned()])
         .collect::<Vec<_>>();
-    let placeholders = vec!["?"; cols.len()].join(", ");
     let sql = format!(
-        "INSERT INTO {vec_table} ({}) VALUES ({placeholders})",
-        cols.join(", ")
+        "INSERT INTO {vec_table} ({}) VALUES ({binds})",
+        cols.join(", "),
+        binds = super::bind_list(cols.len())
     );
     let key_binds = base_key_binds(item, base_key_schema, attr_defs)?;
     let mut q = sqlx::query(&sql).bind(part);

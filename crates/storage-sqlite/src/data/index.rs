@@ -475,10 +475,10 @@ pub(crate) async fn insert_index_row_multi(
     cols.push("item_data".to_owned());
     values.push(BoundValue::Text(item_json));
 
-    let placeholders = vec!["?"; cols.len()].join(", ");
     let sql = format!(
-        "INSERT OR REPLACE INTO {idx_table} ({}) VALUES ({placeholders})",
-        cols.join(", ")
+        "INSERT OR REPLACE INTO {idx_table} ({}) VALUES ({binds})",
+        cols.join(", "),
+        binds = super::bind_list(cols.len())
     );
 
     let mut query = sqlx::query(&sql);
