@@ -361,6 +361,34 @@ pub async fn handle_scan(
     // Validate ExclusiveStartKey matches the key schema
     if let Some(ref start_key) = input.exclusive_start_key {
         validate_scan_exclusive_start_key(start_key, &key_info, index_info.as_ref())?;
+
+        // Parallel scan: the ExclusiveStartKey must belong to the segment being
+        // scanned. Segment assignment is backend-private (each backend hashes or
+        // partitions differently), so the backend answers membership and the
+        // engine owns the refusal, uniformly across backends. Without this, a
+        // LastEvaluatedKey from one segment replayed against another returns a
+        // silently wrong page instead of an error. Message measured against the
+        // service (us-east-1).
+        if let (Some(seg), Some(total)) = (input.segment, input.total_segments) {
+            let in_segment = ctx
+                .storage
+                .scan_key_in_segment(
+                    &scan_key_info,
+                    start_key,
+                    seg,
+                    total,
+                    input.index_name.as_deref(),
+                )
+                .await
+                .map_err(storage_err_to_dynamo)?;
+            if !in_segment {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "The provided starting key is invalid: Invalid ExclusiveStartKey. \
+                     Please use ExclusiveStartKey with correct Segment. \
+                     TotalSegments: {total} Segment: {seg}"
+                )));
+            }
+        }
     }
 
     // Validate begins_with operand types upfront (before any rows are scanned).

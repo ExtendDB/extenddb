@@ -321,6 +321,84 @@ fn resolve_attr_name(path: &[PathElement], maps: &ExpressionMaps) -> Option<Stri
 }
 
 /// Extract the base-table partition key text from a (combined) start key.
+impl SqliteEngine {
+    /// Whether `key` belongs to `segment` under the rowid partitioning the
+    /// scan predicate uses (`rowid % total_segments = segment`).
+    ///
+    /// rowid is storage identity, not key content, so membership is only
+    /// decidable for a key whose row still exists. A key that resolves to no
+    /// row returns `true` (indeterminate, permitted): DynamoDB accepts an
+    /// `ExclusiveStartKey` that has been deleted since the previous page, and
+    /// refusing it would reject legitimate resumptions. A row that does exist
+    /// answers definitively, which is what makes the engine's cross-segment
+    /// refusal discriminating on this backend.
+    pub(crate) async fn scan_key_in_segment_impl(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        segment: i64,
+        total_segments: i64,
+        index_name: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        let ddb_table = if let Some(idx_name) = index_name {
+            let info = self
+                .fetch_index_info_by_table_id(&key_info.table_id, idx_name)
+                .await?;
+            index_table_name(&info.index_id)
+        } else {
+            data_table_name(&key_info.table_id)
+        };
+
+        let pk_name = &key_info.key_schema[0].attribute_name;
+        let Some(pk_value) = key.get(pk_name) else {
+            // Schema validation upstream already rejects this shape.
+            return Ok(false);
+        };
+        let pk_text = pk_to_text(pk_value)?.into_owned();
+
+        let mut conditions: Vec<String> = vec!["pk = ?".to_owned()];
+        let mut binds: Vec<BoundValue> = vec![BoundValue::Text(pk_text)];
+
+        let sk_info_val = sk_info(&key_info.key_schema, &key_info.attribute_definitions);
+        if let Some((sk_name, sk_type)) = sk_info_val
+            && let Some(v) = key.get(sk_name)
+        {
+            conditions.push(format!("{} = ?", sk_column(sk_type)));
+            binds.push(sk_bound(&parse_sk(v, sk_type)?));
+        }
+
+        if index_name.is_some() {
+            conditions.push("base_pk = ?".to_owned());
+            binds.push(BoundValue::Text(base_pk_from_start_key(key, key_info)?));
+            if let Some((base_name, base_type)) =
+                sk_info(&key_info.base_key_schema, &key_info.attribute_definitions)
+                && let Some(v) = key.get(base_name)
+            {
+                conditions.push(format!("base_{} = ?", sk_column(base_type)));
+                binds.push(sk_bound(&parse_sk(v, base_type)?));
+            }
+        }
+
+        let sql = format!(
+            "SELECT rowid FROM {ddb_table} WHERE {}",
+            conditions.join(" AND ")
+        );
+        let mut query = sqlx::query_as::<_, (i64,)>(&sql);
+        for bound in binds {
+            query = super::bind_bound!(query, bound);
+        }
+        let row: Option<(i64,)> = query
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        Ok(match row {
+            Some((rowid,)) => rowid.rem_euclid(total_segments) == segment,
+            None => true,
+        })
+    }
+}
+
 fn base_pk_from_start_key(
     start_key: &Item,
     key_info: &TableKeyInfo,

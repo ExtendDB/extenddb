@@ -458,30 +458,6 @@ impl PostgresEngine {
                     "The provided starting key is invalid: The provided key element does not match the schema".to_owned(),
                 ));
             }
-
-            // Parallel scan: the ExclusiveStartKey must belong to the segment
-            // being scanned. Validate against the same hashtext-based segment
-            // function used for assignment above, so a key returned as a
-            // LastEvaluatedKey for one segment is rejected when replayed against
-            // another (rather than silently returning a truncated/empty page).
-            if let (Some(seg), Some(total)) = (segment, total_segments) {
-                let pk_text = pk_to_text(&start_key[pk_name])?;
-                let in_segment: bool =
-                    sqlx::query_scalar("SELECT (hashtext($1)::bigint & 2147483647) % $2 = $3")
-                        .bind(pk_text.as_ref())
-                        .bind(total)
-                        .bind(seg)
-                        .fetch_one(&self.data_pool)
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                if !in_segment {
-                    return Err(StorageError::Validation(format!(
-                        "The provided starting key is invalid: Invalid ExclusiveStartKey. \
-                         Please use ExclusiveStartKey with correct Segment. \
-                         TotalSegments: {total} Segment: {seg}"
-                    )));
-                }
-            }
             // Actual PK/SK binding happens in execute_scan_sql.
 
             if index_name.is_some() {
