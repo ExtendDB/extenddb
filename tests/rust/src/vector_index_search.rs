@@ -2153,3 +2153,74 @@ async fn an_invalid_written_vector_reports_the_measured_whole_strings() {
 
     let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
 }
+
+/// A transaction carrying one invalid vector cancels per item, with the message
+/// PutItem would have given.
+///
+/// Probe P5 measured the split by validation LAYER, not by API: a
+/// vector-semantic failure (wrong size, wrong type, out of f32 range) comes back
+/// as `TransactionCanceledException` with `CancellationReasons` in item order,
+/// `[None, ValidationError]`, and the failing item's `Message` byte-identical to
+/// the standalone PutItem refusal. A request-deserialization failure such as
+/// `NaN` fails the whole request top-level instead, which is a different layer
+/// and is not asserted here.
+///
+/// The valid sibling operation is asserted as `None` rather than ignored: a
+/// per-request refusal would report no reasons at all, and a wrongly ordered
+/// reasons list is the other way this goes wrong.
+#[tokio::test]
+async fn a_transaction_reports_an_invalid_vector_per_item() {
+    if skip_unless_supported().await {
+        return;
+    }
+    let name = table_name("vtx_invalid");
+    create_vector_table(&name, 4, "COSINE", false).await;
+
+    let (status, text) = call(
+        "TransactWriteItems",
+        &format!(
+            r#"{{"TransactItems": [
+                {{"Put": {{"TableName": "{name}", "Item": {{"pk": {{"S": "valid"}},
+                    "emb": {{"L": [{{"N": "0.6"}}, {{"N": "0.8"}}, {{"N": "0"}}, {{"N": "0"}}]}}}}}}}},
+                {{"Put": {{"TableName": "{name}", "Item": {{"pk": {{"S": "short"}},
+                    "emb": {{"L": [{{"N": "0.1"}}, {{"N": "0.2"}}, {{"N": "0.3"}}]}}}}}}}}
+            ]}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "expected the transaction to cancel: {text}");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("body is JSON");
+    let type_field = json
+        .get("__type")
+        .and_then(|t| t.as_str())
+        .unwrap_or_else(|| panic!("no __type in body: {text}"));
+    assert!(
+        type_field.ends_with("TransactionCanceledException"),
+        "expected TransactionCanceledException, got {type_field}: {text}"
+    );
+    let reasons = json
+        .get("CancellationReasons")
+        .and_then(|r| r.as_array())
+        .unwrap_or_else(|| panic!("no CancellationReasons: {text}"));
+    assert_eq!(reasons.len(), 2, "one reason per item: {text}");
+    assert_eq!(
+        reasons[0].get("Code").and_then(|c| c.as_str()),
+        Some("None"),
+        "the valid item must report None: {text}"
+    );
+    assert_eq!(
+        reasons[1].get("Code").and_then(|c| c.as_str()),
+        Some("ValidationError"),
+        "the invalid item must report ValidationError: {text}"
+    );
+    assert_eq!(
+        reasons[1].get("Message").and_then(|m| m.as_str()),
+        Some(
+            "One or more parameter values are not valid. One or more parameter values were \
+             invalid . Invalid size for parameter emb, Expected: 4, Actual: 3. IndexName: vidx"
+        ),
+        "the per-item message must equal the PutItem refusal: {text}"
+    );
+
+    let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+}
