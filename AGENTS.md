@@ -378,7 +378,7 @@ Expression parsing lives in `crates/core/src/expression/`. This is pure sync Rus
 | Local PostgreSQL Setup | `docs/local-postgres-setup.md`                    | PostgreSQL installation and config     |
 | Local MongoDB Setup | `docs/local-mongodb-setup.md`                     | MongoDB installation and config        |
 | Testing Design | `docs/design/09-testing.md`                       | Test strategy and infrastructure       |
-| Extending Storage | `12-backend-plugin-architecture.md` | Guide to implementing storage backends |
+| Extending Storage | `docs/design/04-component-storage.md` | Guide to implementing storage backends (sections 10 and 11) |
 
 Build PDFs:
 

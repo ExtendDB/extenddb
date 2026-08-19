@@ -17,6 +17,9 @@ This directory contains the authoritative design documents for ExtendDB (extendd
 | 09 | [Testing](09-testing.md) | Test strategy, reference suites, golden files, multi-language test suites, coverage tracking |
 | 10 | [Licenses](10-dependency-licenses.md) | Licensing summary for third-party dependencies |
 | 11 | [Scaling](11-high-availability.md) | DRAFT document on scaling ExtendDB |
+| 12 | [Auth / Authz Cache](12-auth-authz-cache.md) | Stale-while-revalidate cache for credential and authorization lookups |
+| 13 | [MongoDB Storage](13-storage-mongodb.md) | MongoDB backend design: collections, transactions, streams, GSI propagation (`extenddb-storage-mongodb` crate) |
+| 14 | [Browser WASM Playground](14-wasm-browser-playground.md) | RFC: the engine compiled to WebAssembly and running in a browser tab, executor seam, invariants, rollout |
 
 
 ## How to Use These Docs
