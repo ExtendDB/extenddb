@@ -19,6 +19,7 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::effective_attribute_definitions;
+use extenddb_storage::vector_lifecycle::VectorIndexBuild;
 
 use crate::store::SqliteEngine;
 
@@ -768,17 +769,25 @@ impl SqliteEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+        // The build's storage primitives, owned, so the detached task can
+        // outlive this call. The shared drivers in
+        // `extenddb_storage::vector_lifecycle` own the ordering rules; this
+        // value owns the SQL.
+        let mut ops = crate::data::vector_index::SqliteVectorBuild {
+            pool: self.pool.clone(),
+            write_lock: std::sync::Arc::clone(&self.write_lock),
+            gsi_notify: self.gsi_notify(),
+            table_id: table_id.to_owned(),
+            index_id: index_id.to_owned(),
+            base_key_schema: base_ks.to_vec(),
+            attribute_definitions: effective_ad.to_vec(),
+            meta: None,
+        };
+
         // The scan is about to start, so the member becomes true. Set outside the
         // backfill transaction, otherwise no observer could see it: the whole point
         // of the flag is to be readable while the scan is in progress.
-        sqlx::query(
-            "UPDATE vector_indexes SET backfilling = 1 WHERE table_id = ? AND index_id = ?",
-        )
-        .bind(table_id)
-        .bind(index_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        ops.set_backfilling().await?;
 
         let mut meta_tx = self
             .pool
@@ -800,31 +809,30 @@ impl SqliteEngine {
             .commit()
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
+        ops.meta = Some(metas);
 
-        // Everything the scan needs, owned, so it can outlive this call.
-        let pool = self.pool.clone();
-        let write_lock = std::sync::Arc::clone(&self.write_lock);
         let batch_delay =
             std::time::Duration::from_millis(self.vector_backfill_batch_delay().await);
         // The floor on how long the index stays CREATING. Captured with the
         // creation instant here rather than inside the task, so the hold
         // measures from when the caller could first observe the index, and a
         // live settings change mid-build does not move an in-flight deadline.
+        // The wait itself lives in the shared driver, beside the flip it delays.
         let min_creating =
             std::time::Duration::from_millis(self.vector_index_min_creating_ms().await);
         let created_at = tokio::time::Instant::now();
-        let owned_table_id = table_id.to_owned();
         let owned_index_id = index_id.to_owned();
         let owned_index_name = create.index_name.clone();
-        let owned_base_ks = base_ks.to_vec();
-        let owned_ad = effective_ad.to_vec();
-        let gsi_notify = self.gsi_notify();
 
         // Registered BEFORE the spawn, so there is no instant where the catalog
         // says CREATING and the registry disagrees while the task is viable. The
         // guard deregisters on every exit path including a panic, which is the
         // whole point: a CREATING index with no registry entry is provably
         // orphaned, and the worker's recovery sweep may rebuild it.
+        //
+        // This registry is build OWNERSHIP, which the shared lifecycle leaves to
+        // the backend by design: a single process can prove a build's liveness
+        // in memory, where a multi-process backend needs a cross-process claim.
         self.vector_builds_running
             .lock()
             .expect("registry poisoned")
@@ -836,12 +844,10 @@ impl SqliteEngine {
         // and writable throughout, taking over eight minutes on an empty table when
         // measured, and searches against the index are refused until it is ACTIVE.
         //
-        // Not awaited, so failures cannot be returned to the caller. They are logged
-        // and the index is deliberately LEFT in CREATING, which is the state the
-        // worker's recovery sweep repairs at runtime (and
-        // `reconcile_incomplete_vector_indexes` at startup). Flipping it to
-        // ACTIVE on error would publish a partially populated index, and there is no
-        // failure state on the wire for an index to sit in.
+        // Not awaited, so failures cannot be returned to the caller. They are
+        // logged by `complete_build`, which deliberately leaves the index in
+        // CREATING: that is the state the worker's recovery sweep repairs at
+        // runtime (and `reconcile_incomplete_vector_indexes` at startup).
         tokio::spawn(async move {
             struct Deregister(
                 std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
@@ -854,75 +860,15 @@ impl SqliteEngine {
                     }
                 }
             }
-            let _deregister = Deregister(registry, owned_index_id.clone());
-            let result = crate::data::vector_index::backfill_vector_index_in_batches(
-                &pool,
-                &write_lock,
-                &owned_table_id,
-                &metas,
-                &owned_base_ks,
-                &owned_ad,
+            let _deregister = Deregister(registry, owned_index_id);
+            extenddb_storage::vector_lifecycle::complete_build(
+                ops,
+                &owned_index_name,
+                extenddb_storage::vector_lifecycle::BACKFILL_BATCH,
                 batch_delay,
+                Some(created_at + min_creating),
             )
             .await;
-            match result {
-                Ok(outcome) => {
-                    // The service's online-index machinery never finishes an
-                    // added index instantly, so the CREATING walk (`Backfilling`
-                    // false, then true, then ACTIVE with the member absent) is
-                    // always observable there. A local backfill over a small
-                    // table completes in milliseconds, which would collapse that
-                    // walk into an instant no DescribeTable poll can catch, so
-                    // the flip waits out the remainder of the configured floor.
-                    // Searches keep answering the documented not-ready rejection
-                    // and writes keep queuing behind the CREATING hold for the
-                    // duration, exactly as during a real backfill.
-                    tokio::time::sleep_until(created_at + min_creating).await;
-                    // Populated, so the index can serve. `backfilling` is cleared to
-                    // NULL rather than set to 0, because the service removes the
-                    // member once ACTIVE and the catalog CHECK constraint enforces
-                    // that pairing. The skipped count is recorded in the same flip,
-                    // but only in the catalog (and the log line below): DescribeTable
-                    // parity forbids inventing a response field for it, so an
-                    // operator diagnosing missing search results finds it by
-                    // querying the catalog, not through the API.
-                    let flip = sqlx::query(
-                        "UPDATE vector_indexes SET index_status = 'ACTIVE', backfilling = NULL, \
-                         skipped_item_count = ? \
-                         WHERE table_id = ? AND index_id = ?",
-                    )
-                    .bind(i64::try_from(outcome.skipped).unwrap_or(i64::MAX))
-                    .bind(&owned_table_id)
-                    .bind(&owned_index_id)
-                    .execute(&pool)
-                    .await;
-                    match flip {
-                        Ok(_) => {
-                            tracing::info!(
-                                index_name = %owned_index_name,
-                                vectors_indexed = outcome.written,
-                                vectors_skipped = outcome.skipped,
-                                "vector index backfill complete"
-                            );
-                            // Writes that landed during the backfill were held by the
-                            // worker because this index was CREATING. It is ACTIVE
-                            // now, so wake the worker rather than leaving them to sit
-                            // until its next idle timeout.
-                            gsi_notify.notify_waiters();
-                        }
-                        Err(e) => tracing::error!(
-                            index_name = %owned_index_name,
-                            "vector index backfill finished but the ACTIVE flip failed, \
-                             leaving it CREATING for startup reconciliation: {e}"
-                        ),
-                    }
-                }
-                Err(e) => tracing::error!(
-                    index_name = %owned_index_name,
-                    "vector index backfill failed, leaving it CREATING for startup \
-                     reconciliation: {e}"
-                ),
-            }
         });
         Ok(())
     }
@@ -1144,10 +1090,16 @@ impl SqliteEngine {
     /// Drop, recreate, backfill, and flip one vector index to `ACTIVE`.
     ///
     /// The shared body of startup reconciliation and the worker's runtime
-    /// recovery, factored so the two repairs cannot drift. The backfill runs on
-    /// the batched path, releasing the write lock between batches, so a recovery
+    /// recovery lives in `extenddb_storage::vector_lifecycle::rebuild_index`,
+    /// factored so the two repairs cannot drift. The backfill runs on the
+    /// batched path, releasing the write lock between batches, so a recovery
     /// on a large table cannot become a write-availability outage for every
-    /// other table.
+    /// other table. An earlier version ran the whole backfill in one lock-held
+    /// transaction, which on a large table blocked writes to EVERY table for
+    /// the full rebuild. The batched path is safe here for the same reasons it
+    /// is safe on create: the index is CREATING throughout, so the worker
+    /// holds this table's queue rows and searches are refused, and the rowid
+    /// cursor tolerates concurrent base-table writes.
     async fn rebuild_one_vector_index(
         &self,
         index_id: &str,
@@ -1160,78 +1112,24 @@ impl SqliteEngine {
         let attr_defs: Vec<AttributeDefinition> = serde_json::from_str(base_ad_json)
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // Drop and recreate under the lock, then backfill BATCHED, releasing the
-        // lock between batches exactly as the normal create path does. An earlier
-        // version ran the whole backfill in one lock-held transaction, which on a
-        // large table blocked writes to EVERY table for the full rebuild: a
-        // write-availability outage as the price of recovering one index. The
-        // batched path is safe here for the same reasons it is safe on create:
-        // the index is CREATING throughout, so the worker holds this table's
-        // queue rows and searches are refused, and the rowid cursor tolerates
-        // concurrent base-table writes. Recovery uses no batch delay: the lever
-        // exists for tests, and recovery should finish as fast as batching
-        // allows.
-        let meta;
-        {
-            let _writer = self.write_lock.lock().await;
-            Self::drop_vector_data_table_by_id(&self.pool, table_id, index_id).await?;
-
-            let mut data_tx = self
-                .pool
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            Self::create_vector_data_table(
-                &mut data_tx,
-                table_id,
-                index_id,
-                &base_key_schema,
-                &attr_defs,
-            )
-            .await?;
-            // The definition is read from the catalog rather than reconstructed,
-            // because the request that created it is long gone.
-            meta = crate::data::vector_index::fetch_vector_indexes_for_table(
-                &mut data_tx,
-                table_id,
-            )
-            .await?
-            .into_iter()
-            .find(|m| m.index_id == index_id)
-            .ok_or_else(|| {
-                StorageError::Internal(format!(
-                    "vector index {index_id} was selected as CREATING but has no catalog row"
-                ))
-            })?;
-            data_tx
-                .commit()
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-        }
-
-        let outcome = crate::data::vector_index::backfill_vector_index_in_batches(
-            &self.pool,
-            &self.write_lock,
-            table_id,
-            &meta,
-            &base_key_schema,
-            &attr_defs,
-            std::time::Duration::ZERO,
+        // `meta` starts empty: the shared driver's reset step reloads the
+        // definition from the catalog inside its own transaction, because the
+        // request that created the index is long gone.
+        let mut ops = crate::data::vector_index::SqliteVectorBuild {
+            pool: self.pool.clone(),
+            write_lock: std::sync::Arc::clone(&self.write_lock),
+            gsi_notify: self.gsi_notify(),
+            table_id: table_id.to_owned(),
+            index_id: index_id.to_owned(),
+            base_key_schema,
+            attribute_definitions: attr_defs,
+            meta: None,
+        };
+        extenddb_storage::vector_lifecycle::rebuild_index(
+            &mut ops,
+            extenddb_storage::vector_lifecycle::BACKFILL_BATCH,
         )
-        .await?;
-
-        sqlx::query(
-            "UPDATE vector_indexes SET index_status = 'ACTIVE', backfilling = NULL, \
-             skipped_item_count = ? \
-             WHERE table_id = ? AND index_id = ?",
-        )
-        .bind(i64::try_from(outcome.skipped).unwrap_or(i64::MAX))
-        .bind(table_id)
-        .bind(index_id)
-        .execute(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
-        Ok(outcome.written)
     }
 }
 

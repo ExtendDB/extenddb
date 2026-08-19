@@ -159,9 +159,24 @@ pub async fn complete_build<B: VectorIndexBuild>(
     index_name: &str,
     batch_size: i64,
     batch_delay: Duration,
+    earliest_active: Option<tokio::time::Instant>,
 ) {
     match run_backfill(&mut ops, batch_size, batch_delay).await {
         Ok(outcome) => {
+            // The service's online-index machinery never finishes an added index
+            // instantly, so the CREATING walk (`Backfilling` false, then true,
+            // then ACTIVE with the member absent) is always observable there. A
+            // local backfill over a small table completes in milliseconds, which
+            // would collapse that walk into an instant no DescribeTable poll can
+            // catch, so the flip waits out the remainder of the caller's floor.
+            // Searches keep answering the documented not-ready rejection and
+            // writes keep queuing behind the CREATING hold for the duration,
+            // exactly as during a real backfill. `None` on the repair paths:
+            // recovery is not a client-observable creation and should publish as
+            // fast as batching allows.
+            if let Some(deadline) = earliest_active {
+                tokio::time::sleep_until(deadline).await;
+            }
             match ops.mark_active(outcome.skipped).await {
                 Ok(()) => {
                     tracing::info!(
@@ -340,7 +355,7 @@ mod tests {
         let mock = MockBuild::default();
         mock.0.lock().unwrap().batches =
             vec![Ok(batch(2, 1, 2, Some(2))), Ok(batch(0, 1, 0, None))];
-        complete_build(mock.clone(), "vidx", 2, Duration::ZERO).await;
+        complete_build(mock.clone(), "vidx", 2, Duration::ZERO, None).await;
         assert_eq!(
             mock.log(),
             vec![
@@ -359,7 +374,7 @@ mod tests {
     async fn complete_build_leaves_a_failed_build_in_creating() {
         let mock = MockBuild::default();
         mock.0.lock().unwrap().batches = vec![Err(StorageError::Internal("scan died".to_owned()))];
-        complete_build(mock.clone(), "vidx", 2, Duration::ZERO).await;
+        complete_build(mock.clone(), "vidx", 2, Duration::ZERO, None).await;
         assert_eq!(
             mock.log(),
             vec!["batch(cursor=None, limit=2)"],
@@ -378,7 +393,7 @@ mod tests {
             s.batches = vec![Ok(batch(1, 0, 0, None))];
             s.flip_fails = true;
         }
-        complete_build(mock.clone(), "vidx", 2, Duration::ZERO).await;
+        complete_build(mock.clone(), "vidx", 2, Duration::ZERO, None).await;
         assert_eq!(
             mock.log(),
             vec!["batch(cursor=None, limit=2)", "mark_active(skipped=0)"],
