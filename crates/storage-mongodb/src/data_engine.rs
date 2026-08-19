@@ -252,12 +252,7 @@ impl MongoEngine {
         // work so the caller sees a top-level ValidationException on
         // wrong-type or empty index-key attributes (D-M10, RFC-0003
         // §2.3).
-        self.validate_index_keys_for_item(
-            key_info,
-            &item,
-            extenddb_core::validation::SecondaryIndexEmptyContext::Item,
-        )
-        .await?;
+        self.validate_index_keys_for_item(key_info, &item).await?;
 
         let coll_name = data_collection_name(&key_info.table_id);
         let coll = self.data_db.collection::<Document>(&coll_name);
@@ -821,13 +816,9 @@ impl MongoEngine {
                 // the resulting item — D-M10, RFC-0003 §2.3. Same
                 // shape as put_item's up-front check, but the
                 // post-update item is what actually gets written.
-                self.validate_index_keys_for_item(
-                    key_info,
-                    &new_item,
-                    extenddb_core::validation::SecondaryIndexEmptyContext::UpdateExpression,
-                )
-                .await
-                .map_err(TxErr::Fatal)?;
+                self.validate_index_keys_for_item(key_info, &new_item)
+                    .await
+                    .map_err(TxErr::Fatal)?;
 
                 let mut new_doc = item_to_document(
                     &new_item,
@@ -1711,7 +1702,6 @@ impl MongoEngine {
         &self,
         key_info: &TableKeyInfo,
         item: &Item,
-        context: extenddb_core::validation::SecondaryIndexEmptyContext,
     ) -> Result<(), StorageError> {
         let idx_pairs = self.fetch_index_key_schemas(&key_info.table_id).await?;
         if idx_pairs.is_empty() {
@@ -1724,13 +1714,8 @@ impl MongoEngine {
                 key_schema: ks.as_slice(),
             })
             .collect();
-        extenddb_core::validation::validate_index_keys_in_context(
-            item,
-            &refs,
-            &key_info.attribute_definitions,
-            context,
-        )
-        .map_err(|e| StorageError::Validation(e.to_string()))
+        extenddb_core::validation::validate_index_keys(item, &refs, &key_info.attribute_definitions)
+            .map_err(|e| StorageError::Validation(e.to_string()))
     }
 
     async fn sync_indexes_in_session(
@@ -2557,11 +2542,10 @@ impl MongoEngine {
                             key_schema: ks.as_slice(),
                         })
                         .collect();
-                    extenddb_core::validation::validate_index_keys_in_context(
+                    extenddb_core::validation::validate_index_keys(
                         &item,
                         &idx_refs,
                         &key_info.attribute_definitions,
-                        extenddb_core::validation::SecondaryIndexEmptyContext::UpdateExpression,
                     )
                     .map_err(|e| {
                         TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
