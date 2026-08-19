@@ -1918,3 +1918,238 @@ async fn if_not_exists_cannot_smuggle_a_malformed_vector() {
 
     let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
 }
+
+/// Assert a 400 `ValidationException` whose message is the whole measured string.
+///
+/// Whole-string, because every wording quirk in this family is load-bearing and a
+/// `contains` assertion is exactly what let three of them drift.
+fn assert_validation_message(status: u16, body: &str, expected: &str) {
+    assert_eq!(status, 400, "expected HTTP 400, body: {body}");
+    let json: serde_json::Value = serde_json::from_str(body).expect("body is JSON");
+    let type_field = json
+        .get("__type")
+        .and_then(|t| t.as_str())
+        .unwrap_or_else(|| panic!("no __type in body: {body}"));
+    assert!(
+        type_field.ends_with("ValidationException"),
+        "expected ValidationException, got {type_field} (body: {body})"
+    );
+    let message = json
+        .get("message")
+        .or_else(|| json.get("Message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or_else(|| panic!("no message in body: {body}"));
+    assert_eq!(message, expected);
+}
+
+/// `SearchVectors` reports its charge under both measured member names.
+///
+/// Measured on 2026-08-19 (probe P8) against real Amazon DynamoDB: the response
+/// carries `{"VectorSearchRequestBytes": N, "VectorSearchUnits": N}` with the two
+/// always equal, under `INDEXES` and `TOTAL` alike, and carries neither
+/// `TableName` nor `CapacityUnits`. ExtendDB emitted the bytes member alone, so a
+/// client reading the units member got `null` where the service gives a number.
+///
+/// The absent members are asserted as well as the present ones: a `ConsumedCapacity`
+/// built from the ordinary table-capacity shape would satisfy a present-members-only
+/// check while returning two members no vector search ever returns.
+#[tokio::test]
+async fn the_search_charge_reports_both_measured_capacity_members() {
+    if skip_unless_supported().await {
+        return;
+    }
+    let name = table_name("vcap_shape");
+    create_vector_table(&name, 4, "COSINE", false).await;
+    put_vector(&name, "a", None, &[1.0, 0.0, 0.0, 0.0]).await;
+    put_vector(&name, "b", None, &[0.0, 1.0, 0.0, 0.0]).await;
+    // Converge first, so the charge is measured against a populated result set.
+    search_until_count(&name, &[1.0, 0.0, 0.0, 0.0], 2, None, 2).await;
+
+    for granularity in ["INDEXES", "TOTAL"] {
+        let body = format!(
+            r#"{{
+            "TableName": "{name}",
+            "IndexName": "vidx",
+            "SearchVector": [{{"N": "1"}}, {{"N": "0"}}, {{"N": "0"}}, {{"N": "0"}}],
+            "TopK": 2,
+            "ReturnConsumedCapacity": "{granularity}"
+        }}"#
+        );
+        let (status, text) = call("SearchVectors", &body).await;
+        assert_eq!(status, 200, "SearchVectors failed: {text}");
+        let json: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+        let capacity = json
+            .get("ConsumedCapacity")
+            .unwrap_or_else(|| panic!("no ConsumedCapacity at {granularity}: {text}"));
+        let mut members: Vec<&str> = capacity
+            .as_object()
+            .unwrap_or_else(|| panic!("ConsumedCapacity is not an object: {text}"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        members.sort_unstable();
+        assert_eq!(
+            members,
+            ["VectorSearchRequestBytes", "VectorSearchUnits"],
+            "at {granularity}, the search charge must carry exactly the two \
+             measured members: {text}"
+        );
+        let bytes = capacity["VectorSearchRequestBytes"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("VectorSearchRequestBytes is not a number: {text}"));
+        let units = capacity["VectorSearchUnits"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("VectorSearchUnits is not a number: {text}"));
+        assert!(
+            (bytes - units).abs() < f64::EPSILON,
+            "the two members must be equal, got {bytes} and {units}: {text}"
+        );
+        assert!(
+            bytes >= 1024.0,
+            "the measured floor is 1024, got {bytes}: {text}"
+        );
+    }
+
+    let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+}
+
+/// Every invalid search-vector component returns one measured whole string.
+///
+/// Probe P4, 2026-08-19: `NaN`, `Infinity` and a value outside the f32 range all
+/// produce the identical message on the search path, so the caller cannot tell
+/// the three causes apart. ExtendDB returned its first sentence only.
+///
+/// All three inputs are exercised rather than one, because they take different
+/// code paths (parse failure, non-finite parse, out-of-range parse) and the
+/// service collapses them deliberately.
+#[tokio::test]
+async fn an_invalid_search_vector_reports_the_measured_whole_string() {
+    if skip_unless_supported().await {
+        return;
+    }
+    let name = table_name("vsearch_invalid");
+    create_vector_table(&name, 2, "COSINE", false).await;
+    put_vector(&name, "a", None, &[1.0, 0.0]).await;
+
+    for component in ["NaN", "Infinity", "3.5E38"] {
+        let body = format!(
+            r#"{{
+            "TableName": "{name}",
+            "IndexName": "vidx",
+            "SearchVector": [{{"N": "{component}"}}, {{"N": "0"}}],
+            "TopK": 1
+        }}"#
+        );
+        let (status, text) = call("SearchVectors", &body).await;
+        assert_validation_message(
+            status,
+            &text,
+            "Search vector contains invalid values. All values in the search vector must be a \
+             32-bit floating-point number attribute",
+        );
+    }
+
+    let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+}
+
+/// The write path's three vector rejections, each as a whole measured string.
+///
+/// Probes P4, P5, P9 and P10 on 2026-08-19, all against index `vidx` on
+/// attribute `emb`, which is what this suite's fixture builds, so these compare
+/// byte for byte against the captured wire responses rather than against a
+/// re-templated form of them. PR 244 recorded wrong-dimension wire coverage as a
+/// known gap; this closes it.
+///
+/// Both directions of the size error are asserted (too short and too long) and
+/// UpdateItem as well as PutItem, because the service was measured to use one
+/// template for all four and a per-path template is the natural way to get it
+/// wrong.
+#[tokio::test]
+async fn an_invalid_written_vector_reports_the_measured_whole_strings() {
+    if skip_unless_supported().await {
+        return;
+    }
+    let name = table_name("vwrite_invalid");
+    create_vector_table(&name, 4, "COSINE", false).await;
+    put_vector(&name, "indexed1", None, &[0.6, 0.8, 0.0, 0.0]).await;
+
+    let put = |pk: &str, value: &str| {
+        let body = format!(
+            r#"{{
+            "TableName": "{name}",
+            "Item": {{"pk": {{"S": "{pk}"}}, "emb": {value}}}
+        }}"#
+        );
+        async move { call("PutItem", &body).await }
+    };
+
+    // Too short.
+    let (status, text) = put(
+        "short",
+        r#"{"L": [{"N": "0.1"}, {"N": "0.2"}, {"N": "0.3"}]}"#,
+    )
+    .await;
+    assert_validation_message(
+        status,
+        &text,
+        "One or more parameter values are not valid. One or more parameter values were invalid . \
+         Invalid size for parameter emb, Expected: 4, Actual: 3. IndexName: vidx",
+    );
+
+    // Too long: same template, different count.
+    let (status, text) = put(
+        "long",
+        r#"{"L": [{"N": "0.1"}, {"N": "0.2"}, {"N": "0.3"}, {"N": "0.4"}, {"N": "0.5"}]}"#,
+    )
+    .await;
+    assert_validation_message(
+        status,
+        &text,
+        "One or more parameter values are not valid. One or more parameter values were invalid . \
+         Invalid size for parameter emb, Expected: 4, Actual: 5. IndexName: vidx",
+    );
+
+    // Wrong attribute type: a String where the index expects a list. Sparse
+    // semantics cover a MISSING attribute only, so this is a refused write.
+    let (status, text) = put("strattr", r#"{"S": "not-a-vector"}"#).await;
+    assert_validation_message(
+        status,
+        &text,
+        "One or more parameter values are not valid. One or more parameter values were invalid . \
+         Invalid type for parameter emb, Expected: L, Actual: S. IndexName: vidx",
+    );
+
+    // A valid DynamoDB number that no f32 can hold. The service echoes it in its
+    // own normalised form, 3.5E+38 for the submitted 3.5E38.
+    let (status, text) = put(
+        "overflow",
+        r#"{"L": [{"N": "0"}, {"N": "3.5E38"}, {"N": "0"}, {"N": "0"}]}"#,
+    )
+    .await;
+    assert_validation_message(
+        status,
+        &text,
+        "One or more parameter values are not valid. One or more parameter values were invalid . \
+         Invalid value for parameter emb[1], Value: 3.5E+38 is outside valid range \
+         [-3.4028235E38, 3.4028235E38]. IndexName: vidx",
+    );
+
+    // UpdateItem shares PutItem's wording exactly, on an item already indexed.
+    let (status, text) = call(
+        "UpdateItem",
+        &format!(
+            r#"{{"TableName": "{name}", "Key": {{"pk": {{"S": "indexed1"}}}},
+                "UpdateExpression": "SET emb = :v",
+                "ExpressionAttributeValues": {{":v": {{"L": [{{"N": "0.1"}}, {{"N": "0.2"}}, {{"N": "0.3"}}]}}}}}}"#
+        ),
+    )
+    .await;
+    assert_validation_message(
+        status,
+        &text,
+        "One or more parameter values are not valid. One or more parameter values were invalid . \
+         Invalid size for parameter emb, Expected: 4, Actual: 3. IndexName: vidx",
+    );
+
+    let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+}
