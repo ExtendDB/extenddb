@@ -57,10 +57,11 @@ fi
 RUN_ID="devsmoke-$$-${RANDOM}"
 FILE_CTR="${RUN_ID}-file"
 MEM_CTR="${RUN_ID}-mem"
+MOVED_CTR="${RUN_ID}-moved"
 VOLUME="${RUN_ID}-data"
 
 cleanup() {
-    docker rm -f "$FILE_CTR" "$MEM_CTR" >/dev/null 2>&1 || true
+    docker rm -f "$FILE_CTR" "$MEM_CTR" "$MOVED_CTR" >/dev/null 2>&1 || true
     docker volume rm "$VOLUME" >/dev/null 2>&1 || true
     if [[ "$BUILT_IMAGE" == 1 ]]; then
         docker image rm "$EXTENDDB_IMAGE" >/dev/null 2>&1 || true
@@ -82,8 +83,9 @@ wait_for_health() {
 }
 
 host_port() {
-    docker inspect "$1" \
-        --format '{{(index (index .NetworkSettings.Ports "18443/tcp") 0).HostPort}}'
+    local ctr="$1" cport="${2:-18443}"
+    docker inspect "$ctr" \
+        --format "{{(index (index .NetworkSettings.Ports \"${cport}/tcp\") 0).HostPort}}"
 }
 
 # Dev-mode seeds AWS's documented example credential (see seed_dev_credential
@@ -165,6 +167,22 @@ if ddb "$MPORT" get-item --table-name ephemeral --key '{"pk":{"S":"k1"}}' >/dev/
     echo "error: memory mode persisted across restart; mode switch is broken" >&2
     exit 1
 fi
+
+echo "== moved port: EXTENDDB__SERVER__PORT must be probed by the healthcheck =="
+# Discriminates the env-aware healthcheck from a hardcoded one: with the probe
+# pinned to the default port this container never reports healthy, so
+# wait_for_health times out and the run fails. Guards against regressing to a
+# hardcoded --endpoint whenever the default happens to match the test's port,
+# and covers the upcoming default-port change for free.
+MOVED_PORT=28123
+docker run -d --name "$MOVED_CTR" \
+    -e EXTENDDB__SERVER__PORT="$MOVED_PORT" \
+    -p 127.0.0.1:0:"$MOVED_PORT" "$EXTENDDB_IMAGE" >/dev/null
+wait_for_health "$MOVED_CTR"
+VPORT=$(host_port "$MOVED_CTR" "$MOVED_PORT")
+ddb "$VPORT" list-tables >/dev/null \
+    || { echo "error: data plane unreachable on the moved port" >&2; exit 1; }
+docker rm -f "$MOVED_CTR" >/dev/null
 
 echo "== notices: the dev licence file is present in the image =="
 docker cp "$FILE_CTR":/usr/share/doc/extenddb/SOFTWARE-LICENSE-NOTICES.html /tmp/"$RUN_ID"-notices.html
