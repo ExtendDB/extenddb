@@ -101,6 +101,32 @@ jobs:
           fi
           echo "::notice::Overview is ${BYTES} bytes, short description ${#SHORT} characters"
 
+      - name: Every link in the Overview must resolve
+        env:
+          FILE: ${{ steps.src.outputs.file }}
+        run: |
+          set -euo pipefail
+          # This page is a public front door, so a dead link is worse than a
+          # blank page. Loopback URLs are examples inside code blocks, not links.
+          FAILED=0
+          while read -r url; do
+            [[ -z "$url" ]] && continue
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' -L --max-time 20 "$url" || echo 000)
+            if [[ "$CODE" != "200" ]]; then
+              echo "::error::${CODE} ${url}"
+              FAILED=1
+            else
+              echo "  200 ${url}"
+            fi
+          done < <(grep -oE 'https://[^)"[:space:]]+' "$FILE" \
+                     | sed 's/[),.]*$//' \
+                     | grep -v '127\.0\.0\.1' \
+                     | sort -u)
+          if (( FAILED )); then
+            echo "::error::${FILE} contains links that do not resolve"
+            exit 1
+          fi
+
       - name: The Docker Hub repository must already exist
         env:
           IMAGE: ${{ inputs.image }}
