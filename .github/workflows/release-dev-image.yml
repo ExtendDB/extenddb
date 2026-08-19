@@ -250,6 +250,16 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Gate - skopeo and jq present (preinstalled on ubuntu-latest)
+        # The forward-only `latest` guard depends on both. Verified before any
+        # irreversible push so a missing tool fails the run here, not after the
+        # version tag is already public. Same pattern as promote-image.yml.
+        run: |
+          set -euo pipefail
+          command -v skopeo >/dev/null || sudo apt-get install -y --no-install-recommends skopeo
+          skopeo --version
+          jq --version
+
       - name: Push version tag and latest, guarded
         id: push
         env:
@@ -274,9 +284,16 @@ jobs:
           docker buildx imagetools create -t "${REPO}:${VERSION}" "${REPO}:${CANDIDATE}"
 
           # `latest` only moves forward: skip if any released version is higher.
-          HIGHEST=$( { skopeo list-tags "docker://${REPO}" 2>/dev/null \
-                        | jq -r '.Tags[]' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true; } \
-                      | grep -vFx "$VERSION" | sort -V | tail -1)
+          # Fail CLOSED: a failed listing must refuse to move `latest`, not
+          # treat the registry as empty and move it anyway. An empty result
+          # from a SUCCESSFUL listing is legitimate (first release).
+          if ! TAGS_JSON=$(skopeo list-tags "docker://${REPO}"); then
+            echo "::error::listing ${REPO} tags failed; refusing to move latest without knowing the highest released version. The ${VERSION} tag is published; re-run once the registry is reachable."
+            exit 1
+          fi
+          HIGHEST=$(jq -r '.Tags[]' <<<"$TAGS_JSON" \
+                      | { grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true; } \
+                      | { grep -vFx "$VERSION" || true; } | sort -V | tail -1)
           if [[ -n "$HIGHEST" && "$(printf '%s\n%s\n' "$HIGHEST" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]]; then
             echo "::warning::released ${HIGHEST} is newer than ${VERSION}; latest is NOT moved."
           else

@@ -75,7 +75,11 @@ WORKDIR /var/lib/extenddb
 USER 65532:65532
 EXPOSE 18443
 STOPSIGNAL SIGTERM
+# No --endpoint: the probe resolves its target the same way `serve` does
+# (EXTENDDB__SERVER__* overrides on built-in defaults), so a server moved with
+# EXTENDDB__SERVER__PORT is probed on that port rather than sitting unhealthy
+# forever, which would also wedge `depends_on: condition: service_healthy`.
 HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=5 \
-  CMD ["extenddb", "healthcheck", "--endpoint", "http://127.0.0.1:18443"]
+  CMD ["extenddb", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/extenddb"]
 CMD ["serve", "--foreground"]

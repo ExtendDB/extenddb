@@ -105,7 +105,22 @@ fn resolve_target(args: &HealthcheckArgs) -> anyhow::Result<Target> {
             .map_err(|e| anyhow::anyhow!("Failed to load config '{}': {e}", args.config))?;
         (probe_host(&cfg.server.bind_addr), cfg.server.port)
     } else {
-        ("127.0.0.1".to_owned(), DEFAULT_PORT)
+        // Zero-config (the dev container case): the server derives its address
+        // from `EXTENDDB__SERVER__*` environment overrides on built-in
+        // defaults, so the probe must honour the same overrides or a server
+        // moved with `EXTENDDB__SERVER__PORT` serves correctly while sitting
+        // unhealthy forever. An unparseable port is reported rather than
+        // defaulted: `serve` would refuse the same value, so a silently
+        // "healthy" default-port probe would mask the real failure.
+        let host = std::env::var("EXTENDDB__SERVER__BIND_ADDR")
+            .map_or_else(|_| "127.0.0.1".to_owned(), |b| probe_host(&b));
+        let port = match std::env::var("EXTENDDB__SERVER__PORT") {
+            Ok(v) => v.trim().parse::<u16>().map_err(|e| {
+                anyhow::anyhow!("EXTENDDB__SERVER__PORT '{v}' is not a valid port: {e}")
+            })?,
+            Err(_) => DEFAULT_PORT,
+        };
+        (host, port)
     };
     Ok(Target {
         host,
