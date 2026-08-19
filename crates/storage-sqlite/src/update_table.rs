@@ -1191,7 +1191,7 @@ mod reconciler_tests {
         }))
         .expect("input");
         engine
-            .create_table_impl(account, input)
+            .create_table_impl(account, input, false)
             .await
             .expect("create table");
 
@@ -1271,7 +1271,7 @@ mod reconciler_tests {
         }))
         .expect("input");
         engine
-            .create_table_impl(account, input)
+            .create_table_impl(account, input, false)
             .await
             .expect("create table");
 
@@ -1386,7 +1386,7 @@ mod reconciler_tests {
         }))
         .expect("input");
         engine
-            .create_table_impl("000000000000", input)
+            .create_table_impl("000000000000", input, false)
             .await
             .expect("create table");
         let (table_id,): (String,) =
@@ -1511,7 +1511,7 @@ mod reconciler_tests {
         }))
         .expect("input");
         engine
-            .create_table_impl("000000000000", input)
+            .create_table_impl("000000000000", input, false)
             .await
             .expect("create table");
         let (table_id,): (String,) =
@@ -1598,7 +1598,7 @@ mod reconciler_tests {
         }))
         .expect("input");
         engine
-            .create_table_impl("000000000000", input)
+            .create_table_impl("000000000000", input, false)
             .await
             .expect("create table");
         let (table_id,): (String,) =
