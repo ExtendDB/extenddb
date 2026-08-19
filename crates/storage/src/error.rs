@@ -70,6 +70,13 @@ pub enum StorageError {
     /// never claimed, so it is not a bug and must not be logged as one.
     #[error("Not supported by this storage backend: {0}")]
     Unsupported(String),
+    /// The request targets a resource whose current state forbids the change.
+    /// Maps to `ResourceInUseException`, which the service uses for a vector
+    /// index deleted while its creation is still allocating resources (measured
+    /// 2026-08-19). Carries the whole message because the state, and therefore
+    /// the wording, is known only to the backend that holds it.
+    #[error("{0}")]
+    ResourceInUse(String),
     #[error("Internal error: {0}")]
     Internal(String),
 }

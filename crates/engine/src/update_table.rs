@@ -175,39 +175,7 @@ pub async fn handle_update_table(
         .storage
         .update_table(&ctx.account_id, input)
         .await
-        .map_err(|e| match e {
-            extenddb_storage::error::StorageError::TableNotFound(_name) => {
-                DynamoDbError::ResourceNotFoundException("Requested resource not found".to_string())
-            }
-            extenddb_storage::error::StorageError::TableNotActive(name) => {
-                DynamoDbError::ResourceInUseException(format!(
-                    "Table {name} is not in ACTIVE state"
-                ))
-            }
-            extenddb_storage::error::StorageError::IndexAlreadyExists(name) => {
-                DynamoDbError::ValidationException(format!(
-                    "One or more parameter values were invalid: Index already exists: {name}"
-                ))
-            }
-            extenddb_storage::error::StorageError::IndexNotFound(name) => {
-                DynamoDbError::ResourceNotFoundException(format!(
-                    "Requested resource not found: Index {name} for table {table_name}"
-                ))
-            }
-            extenddb_storage::error::StorageError::NoOpUpdate(msg) => {
-                DynamoDbError::ValidationException(msg)
-            }
-            extenddb_storage::error::StorageError::Validation(msg) => {
-                DynamoDbError::ValidationException(msg)
-            }
-            extenddb_storage::error::StorageError::LimitExceeded(msg) => {
-                DynamoDbError::LimitExceededException(msg)
-            }
-            other => {
-                tracing::error!(internal_error = %other, "storage internal error");
-                DynamoDbError::InternalServerError("Internal server error".to_owned())
-            }
-        })?;
+        .map_err(|e| update_table_err_to_dynamo(e, &table_name))?;
 
     // A declared-capable backend must not silently drop the vector index change.
     // Checked against the description it returned, so this cannot be opted out of.
@@ -229,4 +197,109 @@ pub async fn handle_update_table(
         table_description: desc,
     };
     serialize_output(&output)
+}
+
+/// Map a backend failure from `update_table` onto the wire error.
+///
+/// A named function rather than an inline closure so every arm is reachable from
+/// a unit test. Two of them are not reachable any other way: no in-tree backend
+/// yet returns `Unsupported` or `ResourceInUse` from `update_table`, and the
+/// vector capability gate refuses vector requests before the backend is called
+/// at all, so a wire test cannot provoke either one today.
+fn update_table_err_to_dynamo(
+    e: extenddb_storage::error::StorageError,
+    table_name: &str,
+) -> DynamoDbError {
+    use extenddb_storage::error::StorageError;
+    match e {
+        StorageError::TableNotFound(_name) => {
+            DynamoDbError::ResourceNotFoundException("Requested resource not found".to_string())
+        }
+        StorageError::TableNotActive(name) => {
+            DynamoDbError::ResourceInUseException(format!("Table {name} is not in ACTIVE state"))
+        }
+        StorageError::IndexAlreadyExists(name) => DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: Index already exists: {name}"
+        )),
+        StorageError::IndexNotFound(name) => DynamoDbError::ResourceNotFoundException(format!(
+            "Requested resource not found: Index {name} for table {table_name}"
+        )),
+        StorageError::NoOpUpdate(msg) => DynamoDbError::ValidationException(msg),
+        StorageError::Validation(msg) => DynamoDbError::ValidationException(msg),
+        StorageError::LimitExceeded(msg) => DynamoDbError::LimitExceededException(msg),
+        // Not a fault, so deliberately not logged at error level: the backend
+        // never claimed the feature. Same mapping CreateTable uses; without this
+        // arm a capability refusal fell through to a 500, which tells a caller
+        // the server is broken when the request simply cannot be served here.
+        StorageError::Unsupported(msg) => DynamoDbError::ValidationException(msg),
+        // The change is refused by the resource's current state, not by the
+        // request. The backend supplies the whole message because only it knows
+        // the state.
+        StorageError::ResourceInUse(msg) => DynamoDbError::ResourceInUseException(msg),
+        other => {
+            tracing::error!(internal_error = %other, "storage internal error");
+            DynamoDbError::InternalServerError("Internal server error".to_owned())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use extenddb_storage::error::StorageError;
+
+    /// A backend that cannot serve the request reports a 400, not a 500.
+    ///
+    /// This arm was missing while CreateTable had it, so the same refusal
+    /// answered differently depending on which operation carried it. It matters
+    /// for a backend whose vector capability is decided at runtime rather than at
+    /// compile time: its refusal arrives through this path.
+    #[test]
+    fn an_unsupported_feature_is_a_validation_exception() {
+        let err = update_table_err_to_dynamo(
+            StorageError::Unsupported("Vector indexes are not supported here".to_owned()),
+            "t",
+        );
+        match err {
+            DynamoDbError::ValidationException(msg) => {
+                assert_eq!(msg, "Vector indexes are not supported here");
+            }
+            other => panic!("expected ValidationException, got {other:?}"),
+        }
+    }
+
+    /// The backend's whole message survives, unwrapped and unprefixed, because
+    /// the service's own wording for this case names both the table and the index
+    /// and no layer above the backend knows either.
+    #[test]
+    fn a_resource_in_use_refusal_keeps_the_backend_message() {
+        let measured = extenddb_core::types::vector_index_delete_in_allocation_phase("t", "vidx");
+        let err = update_table_err_to_dynamo(StorageError::ResourceInUse(measured.clone()), "t");
+        match err {
+            DynamoDbError::ResourceInUseException(msg) => assert_eq!(msg, measured),
+            other => panic!("expected ResourceInUseException, got {other:?}"),
+        }
+    }
+
+    /// The measured whole string, byte for byte, from probe P2 on 2026-08-19.
+    #[test]
+    fn the_allocation_phase_refusal_is_the_measured_whole_string() {
+        assert_eq!(
+            extenddb_core::types::vector_index_delete_in_allocation_phase(
+                "eddbprobe-backfill",
+                "vidx2"
+            ),
+            "Attempt to change a resource which is still in use: Index creation is in resource \
+             allocation phase. Retry deletion during backfilling phase or when the index is \
+             active. Table: eddbprobe-backfill Index: vidx2"
+        );
+    }
+
+    /// A genuine fault still reports a 500 and is still logged as one.
+    #[test]
+    fn an_internal_failure_is_still_an_internal_server_error() {
+        let err =
+            update_table_err_to_dynamo(StorageError::Internal("disk on fire".to_owned()), "t");
+        assert!(matches!(err, DynamoDbError::InternalServerError(_)));
+    }
 }

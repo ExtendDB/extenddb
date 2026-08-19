@@ -589,6 +589,27 @@ pub const VECTOR_INDEX_ALREADY_EXISTS: &str = "Attempting to create an index whi
 pub const VECTOR_INDEX_CREATE_IN_USE_PREFIX: &str =
     "Attempt to change a resource which is still in use: Index is being created.";
 
+/// Message the service returns when a vector index is deleted while its creation
+/// is still in the resource-allocation phase.
+///
+/// Measured byte-exact on 2026-08-19 (probe P2), carried as a
+/// `ResourceInUseException` with HTTP 400. Deleting a `CREATING` vector index is
+/// phase-dependent: refused while the index reports `Backfilling: false`,
+/// accepted once it reports `Backfilling: true`, which is why the text tells the
+/// caller to retry rather than that the request was wrong.
+///
+/// A function rather than a bare constant because the service names both
+/// resources, separated by a single space and with no comma:
+/// "... is active. Table: t Index: i".
+#[must_use]
+pub fn vector_index_delete_in_allocation_phase(table_name: &str, index_name: &str) -> String {
+    format!(
+        "Attempt to change a resource which is still in use: Index creation is in resource \
+         allocation phase. Retry deletion during backfilling phase or when the index is active. \
+         Table: {table_name} Index: {index_name}"
+    )
+}
+
 impl VectorIndexDescription {
     /// Reject a description whose reported state the service would never produce.
     ///

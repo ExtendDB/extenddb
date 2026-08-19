@@ -137,6 +137,10 @@ pub(crate) fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) ->
         // "unsupported" error class, and the request is invalid against this
         // deployment rather than a server failure.
         StorageError::Unsupported(msg) => DynamoDbError::ValidationException(msg),
+        // The resource exists and the request is well formed; its current state
+        // forbids the change. The backend owns the wording because it owns the
+        // state.
+        StorageError::ResourceInUse(msg) => DynamoDbError::ResourceInUseException(msg),
         StorageError::CatalogVersionMismatch { expected, found } => {
             tracing::error!("Catalog version mismatch: expected {expected}, found {found}");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
