@@ -532,4 +532,31 @@ mod tests {
             .contains("does not match type in search schema")
         );
     }
+
+    /// An absent `SearchConditionExpression` against an index that declares a
+    /// HASH element is itself a validation failure, so the caller may run this
+    /// unconditionally rather than guarding on a non-empty condition list.
+    /// Guarding it would let such a search reach a backend with no partition
+    /// scope, while `VectorSearch::hash_key` promises backends that `Some` is a
+    /// mandatory predicate whenever the index declares a HASH element.
+    #[test]
+    fn schema_requires_partition_key_when_no_conditions_supplied() {
+        assert!(
+            err(validate_conditions_against_search_schema(
+                &[],
+                Some(&schema()),
+                &defs()
+            ))
+            .contains("SearchConditionExpression must have all HASH attributes")
+        );
+    }
+
+    /// Converse control: with no search schema there is no HASH element to
+    /// require, so an absent expression stays valid. Without this the test
+    /// above would also pass for a function that rejected every empty input.
+    #[test]
+    fn no_schema_and_no_conditions_is_valid() {
+        validate_conditions_against_search_schema(&[], None, &defs()).unwrap();
+        validate_conditions_against_search_schema(&[], Some(&[]), &defs()).unwrap();
+    }
 }
