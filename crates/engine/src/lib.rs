@@ -29,6 +29,7 @@ mod put_item;
 mod query;
 mod read_helpers;
 mod scan;
+mod search_vectors;
 pub mod stream_capture;
 mod streams;
 mod tagging;
@@ -38,6 +39,7 @@ mod transact_write_items;
 mod ttl;
 mod update_item;
 mod update_table;
+mod vector_gate;
 
 pub use batch_get_item::handle_batch_get_item;
 pub use batch_write_item::handle_batch_write_item;
@@ -53,6 +55,7 @@ pub use list_tables::handle_list_tables;
 pub use put_item::handle_put_item;
 pub use query::handle_query;
 pub use scan::handle_scan;
+pub use search_vectors::handle_search_vectors;
 pub use streams::{
     handle_describe_stream, handle_get_records, handle_get_shard_iterator, handle_list_streams,
 };
@@ -91,6 +94,7 @@ pub fn is_known_operation(operation: &str) -> bool {
             | "UpdateItem"
             | "Query"
             | "Scan"
+            | "SearchVectors"
             | "BatchGetItem"
             | "BatchWriteItem"
             | "TransactGetItems"
@@ -367,6 +371,7 @@ pub async fn dispatch(
         "UpdateItem" => handle_update_item(body, ctx).await,
         "Query" => handle_query(body, ctx).await,
         "Scan" => handle_scan(body, ctx).await,
+        "SearchVectors" => handle_search_vectors(body, ctx).await,
         "BatchGetItem" => handle_batch_get_item(body, ctx).await,
         "BatchWriteItem" => handle_batch_write_item(body, ctx).await,
         "TransactGetItems" => handle_transact_get_items(body, ctx).await,

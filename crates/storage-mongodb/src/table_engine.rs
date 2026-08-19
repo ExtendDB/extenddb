@@ -17,7 +17,10 @@ use extenddb_core::types::{
 };
 use extenddb_storage::TableEngine;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{index_arn, sk_info, stream_arn, table_arn};
+use extenddb_storage::util::{
+    effective_attribute_definitions, index_arn, merge_attribute_definitions, sk_info, stream_arn,
+    table_arn,
+};
 
 use crate::MongoEngine;
 use crate::data::data_collection_name;
@@ -527,6 +530,10 @@ impl MongoEngine {
             sse_description,
             table_class_summary,
             on_demand_throughput: input.on_demand_throughput,
+            // Fields for features this backend does not implement, vector
+            // indexes today, take their defaults. Adding one to
+            // TableDescription then does not break this build.
+            ..Default::default()
         })
     }
 
@@ -797,6 +804,48 @@ impl MongoEngine {
 
         // Handle GSI updates
         if let Some(gsi_updates) = &input.global_secondary_index_updates {
+            // Persist the request's attribute definitions, merged into the stored
+            // set. This backend previously never wrote them at all, so a created
+            // index's key attributes were missing from the catalog and `sk_info`
+            // resolved the index's own sort key to `None`, making it behave as
+            // hash-only. Merging (rather than replacing) is what keeps the base
+            // table's pk/sk definitions intact, which is issue #259 on the SQL
+            // backends. Read-modify-write without a transaction, matching the rest
+            // of this method; the catalog row is only written by UpdateTable.
+            let merged_attr_defs = if let Some(new_attr_defs) = &input.attribute_definitions {
+                // Read just the stored definitions rather than a full describe_table_impl,
+                // which would also load every index. Two concurrent UpdateTables on one
+                // table can still interleave here and lose one side's additions; that is
+                // inherent to this backend's UpdateTable, which is non-transactional
+                // throughout (the index inserts and collection creation below are not
+                // atomic with this write either), so the window is narrowed rather than
+                // closed.
+                let current_defs: Vec<extenddb_core::types::AttributeDefinition> = tables_coll
+                    .find_one(
+                        doc! { "_id": { "account_id": account_id, "table_name": &input.table_name } },
+                    )
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?
+                    .as_ref()
+                    .and_then(|d| d.get("attribute_definitions"))
+                    .map(|b| bson::from_bson(b.clone()))
+                    .transpose()
+                    .map_err(|e| StorageError::Internal(format!("attr_defs parse error: {e}")))?
+                    .unwrap_or_default();
+                let merged = merge_attribute_definitions(&current_defs, new_attr_defs);
+                let merged_bson =
+                    bson::to_bson(&merged).map_err(|e| StorageError::Internal(e.to_string()))?;
+                tables_coll
+                    .update_one(
+                        doc! { "_id": { "account_id": account_id, "table_name": &input.table_name } },
+                        doc! { "$set": { "attribute_definitions": merged_bson } },
+                    )
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                Some(merged)
+            } else {
+                None
+            };
             for update in gsi_updates {
                 if let Some(create) = &update.create {
                     // Fetch table_id
@@ -854,7 +903,9 @@ impl MongoEngine {
                         &index_id,
                         &create.key_schema,
                         &desc.key_schema,
-                        &desc.attribute_definitions,
+                        merged_attr_defs
+                            .as_deref()
+                            .unwrap_or(&desc.attribute_definitions),
                     )
                     .await?;
 
@@ -877,6 +928,53 @@ impl MongoEngine {
                     // Invalidate cache — may still have other GSIs
                     self.gsi_cache_invalidate(&desc.table_id);
                 }
+            }
+
+            // Prune definitions that no key and no surviving index references.
+            //
+            // The merge above is only half of DynamoDB's behaviour: the stored set
+            // is also pruned to the attributes still referenced by the table key
+            // schema or by an index that survives this update, so an unused
+            // definition supplied with a GSI add is not stored and deleting a GSI
+            // drops the definitions only that index used. See
+            // effective_attribute_definitions.
+            //
+            // This runs after the create/delete loop, which is what makes a
+            // deletion prune: describe_table_impl reports exactly the indexes that
+            // exist now. It is a second write rather than being folded into the
+            // merge above because index creation inside the loop needs the merged
+            // set before the surviving set is known. This backend's UpdateTable is
+            // non-transactional throughout, so this widens no window the merge did
+            // not already have.
+            let desc = self
+                .describe_table_impl(account_id, &input.table_name)
+                .await?;
+            let mut surviving_index_key_schemas: Vec<Vec<KeySchemaElement>> = Vec::new();
+            for gsi in desc.global_secondary_indexes.iter().flatten() {
+                surviving_index_key_schemas.push(gsi.key_schema.clone());
+            }
+            for lsi in desc.local_secondary_indexes.iter().flatten() {
+                surviving_index_key_schemas.push(lsi.key_schema.clone());
+            }
+
+            // The request's definitions are already folded into the stored set by
+            // the merge above, so nothing further is contributed here.
+            let effective = effective_attribute_definitions(
+                &desc.attribute_definitions,
+                &[],
+                &desc.key_schema,
+                &surviving_index_key_schemas,
+            );
+            if effective != desc.attribute_definitions {
+                let effective_bson =
+                    bson::to_bson(&effective).map_err(|e| StorageError::Internal(e.to_string()))?;
+                tables_coll
+                    .update_one(
+                        doc! { "_id": { "account_id": account_id, "table_name": &input.table_name } },
+                        doc! { "$set": { "attribute_definitions": effective_bson } },
+                    )
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
             }
         }
 
@@ -985,22 +1083,23 @@ impl MongoEngine {
             .find(doc! { "_id.table_id": &table_id })
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
-        let mut global_secondary_indexes = Vec::new();
-        let mut local_secondary_indexes = Vec::new();
+        let mut infos = Vec::new();
         while let Some(idx_doc) = idx_cursor
             .try_next()
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?
         {
-            let info = index_info_from_doc(&idx_doc)?;
-            match info.index_type {
-                IndexType::Gsi => global_secondary_indexes.push(info),
-                IndexType::Lsi => local_secondary_indexes.push(info),
-            }
+            infos.push(index_info_from_doc(&idx_doc)?);
         }
+        // Grouped by core rather than matched here, so a new IndexType variant
+        // does not break this backend. `index_info_from_doc` already rejects any
+        // kind this backend cannot have created.
+        let grouped = extenddb_core::types::partition_indexes(infos);
+        let global_secondary_indexes = grouped.gsis;
+        let local_secondary_indexes = grouped.lsis;
         let has_lsi = !local_secondary_indexes.is_empty();
 
-        Ok(TableKeyInfo {
+        let key_info = TableKeyInfo {
             table_name,
             account_id,
             table_id,
@@ -1011,7 +1110,18 @@ impl MongoEngine {
             global_secondary_indexes,
             local_secondary_indexes,
             stream_specification,
-        })
+            // Fields for features this backend does not implement, vector
+            // indexes today, take their defaults. Adding one to TableKeyInfo
+            // then does not break this build.
+            ..Default::default()
+        };
+        // Catalog metadata that cannot describe its own sort key would make the
+        // keyed read paths fall back to a partition-only lookup and return the
+        // wrong item, so refuse it here rather than serve a wrong answer (#259).
+        key_info
+            .validate_sort_key_definitions()
+            .map_err(StorageError::Internal)?;
+        Ok(key_info)
     }
 
     async fn index_info_impl(
@@ -1334,6 +1444,10 @@ impl MongoEngine {
             sse_description,
             table_class_summary,
             on_demand_throughput,
+            // Fields for features this backend does not implement, vector
+            // indexes today, take their defaults. Adding one to
+            // TableDescription then does not break this build.
+            ..Default::default()
         })
     }
 

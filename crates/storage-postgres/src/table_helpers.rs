@@ -80,8 +80,22 @@ impl PostgresEngine {
         let idx_sks = data::all_sort_key_info(index_key_schema, attr_defs);
         let base_sks = data::all_sort_key_info(base_key_schema, base_attr_defs);
 
+        // Order by whatever key columns the base table actually has. A
+        // hash-only base table has no sort-key columns at all, so naming them
+        // unconditionally makes the backfill fail with "column sk_s does not
+        // exist" and the whole GSI add is rolled back.
+        let mut order_cols = vec!["pk".to_owned()];
+        for (i, _) in base_sks.iter().enumerate() {
+            if i == 0 {
+                order_cols.extend(["sk_s".to_owned(), "sk_n".to_owned(), "sk_b".to_owned()]);
+            } else {
+                let n = i + 1;
+                order_cols.extend([format!("sk{n}_s"), format!("sk{n}_n"), format!("sk{n}_b")]);
+            }
+        }
         let sql = format!(
-            "SELECT item_data FROM {base_table} ORDER BY pk, sk_s, sk_n, sk_b LIMIT $1 OFFSET $2"
+            "SELECT item_data FROM {base_table} ORDER BY {} LIMIT $1 OFFSET $2",
+            order_cols.join(", ")
         );
         let mut offset: i64 = 0;
         loop {
@@ -351,6 +365,10 @@ impl PostgresEngine {
             on_demand_throughput: row
                 .on_demand_throughput
                 .and_then(|v| serde_json::from_value(v).ok()),
+            // Fields for features this backend does not implement, vector
+            // indexes today, take their defaults. Adding one to
+            // TableDescription then does not break this build.
+            ..Default::default()
         })
     }
 }

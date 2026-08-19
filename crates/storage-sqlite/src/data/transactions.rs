@@ -72,7 +72,7 @@ impl SqliteEngine {
         // runtime setting, not an invariant of this write, so it does not need
         // to be read under the lock, and the lock serialises every write in the
         // process: work done inside it is the backend's throughput bottleneck.
-        let system_delay = self.gsi_default_delay().await;
+        let system_delay = self.index_propagation_delay().await;
         let _writer = self.write_lock.lock().await;
         // Fetch index metadata per distinct table AFTER acquiring the write lock,
         // so a GSI added by a concurrent UpdateTable (same lock) is not missed and
@@ -159,7 +159,17 @@ impl SqliteEngine {
             }
         }
 
-        // Persist async GSI work for each op inside the same transaction.
+        // Persist index work for each op inside the same transaction: async GSI
+        // rows, and vector maintenance which is applied here when the propagation
+        // delay is 0 and enqueued otherwise.
+        //
+        // Deliberately after every op is staged rather than inside each op, so
+        // there is one call site instead of three. Both paths stay atomic with the
+        // item writes either way: the synchronous apply runs in this transaction,
+        // and a pending row is inserted into it, so a cancelled transaction leaves
+        // neither behind. The vector apply reads only the op's own before/after
+        // items, never the base table, so its position relative to the other ops'
+        // staged writes cannot change its result.
         let mut needs_notify = false;
         for (op, (old_item, new_item)) in ops.iter().zip(op_items.iter()) {
             let indexes = &table_indexes[op_table_name(op)];
@@ -175,6 +185,22 @@ impl SqliteEngine {
                 .await?;
                 if n > 0 {
                     needs_notify = true;
+                }
+                let key_info = op_key_info(op);
+                if !key_info.vector_indexes.is_empty() {
+                    let n = crate::data::vector_index::maintain_vector_indexes(
+                        &mut tx,
+                        &key_info.table_id,
+                        &key_info.key_schema,
+                        &key_info.attribute_definitions,
+                        old_item.as_ref(),
+                        new_item.as_ref(),
+                        system_delay,
+                    )
+                    .await?;
+                    if n > 0 {
+                        needs_notify = true;
+                    }
                 }
             }
         }
@@ -379,9 +405,14 @@ async fn execute_transact_write_op(
                 existing.as_ref(),
             )?;
             let mut item = existing.clone().unwrap_or_else(|| (*key).clone());
-            expression::apply_update(actions, &mut item, maps).map_err(|e| {
-                TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
-            })?;
+            expression::apply_update_validated(
+                actions,
+                &mut item,
+                maps,
+                &key_info.vector_indexes,
+                &key_info.attribute_definitions,
+            )
+            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
             validation::validate_item_size(&item, max_item_size_bytes).map_err(|e| {
                 TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
             })?;

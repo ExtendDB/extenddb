@@ -35,8 +35,29 @@ pub async fn handle_update_table(
         ));
     }
 
+    crate::vector_gate::ensure_update_table_supported(
+        input.vector_index_updates.as_ref(),
+        ctx.storage.as_vector_search(),
+    )?;
+    // Same per-index rules CreateTable applies, so a malformed index is rejected
+    // identically whichever path it arrives by.
+    extenddb_core::validation::validate_vector_index_updates(
+        input.vector_index_updates.as_ref(),
+        input.attribute_definitions.as_deref().unwrap_or_default(),
+    )?;
+
     let has_gsi_updates = input
         .global_secondary_index_updates
+        .as_ref()
+        .is_some_and(|u| !u.is_empty());
+    // Vector index changes count as a specified field. Measured 2026-08-06: the
+    // service accepts an UpdateTable carrying only VectorIndexUpdates, which is
+    // how the backfill lifecycle was observed. Omitting it here rejected that
+    // request as empty, so a vector-capable backend could never have been reached
+    // by the one operation the contract models a lifecycle for. An empty list is
+    // not a change, matching how the capability gate treats it.
+    let has_vector_updates = input
+        .vector_index_updates
         .as_ref()
         .is_some_and(|u| !u.is_empty());
 
@@ -48,6 +69,7 @@ pub async fn handle_update_table(
         && input.table_class.is_none()
         && input.on_demand_throughput.is_none()
         && !has_gsi_updates
+        && !has_vector_updates
     {
         return Err(DynamoDbError::ValidationException(
             "At least one of BillingMode, ProvisionedThroughput, DeletionProtectionEnabled, StreamSpecification, or GlobalSecondaryIndexUpdates must be specified".to_owned(),
@@ -146,6 +168,9 @@ pub async fn handle_update_table(
     }
 
     let table_name = input.table_name.clone();
+    // Kept for the post-condition check below, since `input` is moved into the
+    // backend call.
+    let vector_index_updates = input.vector_index_updates.clone();
     let desc = ctx
         .storage
         .update_table(&ctx.account_id, input)
@@ -175,11 +200,18 @@ pub async fn handle_update_table(
             extenddb_storage::error::StorageError::Validation(msg) => {
                 DynamoDbError::ValidationException(msg)
             }
+            extenddb_storage::error::StorageError::LimitExceeded(msg) => {
+                DynamoDbError::LimitExceededException(msg)
+            }
             other => {
                 tracing::error!(internal_error = %other, "storage internal error");
                 DynamoDbError::InternalServerError("Internal server error".to_owned())
             }
         })?;
+
+    // A declared-capable backend must not silently drop the vector index change.
+    // Checked against the description it returned, so this cannot be opted out of.
+    crate::vector_gate::ensure_vector_updates_applied(vector_index_updates.as_ref(), &desc)?;
 
     // Drop the cached TableKeyInfo: index changes, stream-spec changes, and
     // throughput changes all alter what the cached value contains.

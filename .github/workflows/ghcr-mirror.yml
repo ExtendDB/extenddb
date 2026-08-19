@@ -1,0 +1,230 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Minimal GHCR candidate mirror.
+#
+# Copies ONE already-verified tag from Docker Hub to GHCR, byte-for-byte,
+# and nothing else: no builds, no Docker Hub publication, no ECR, no signing.
+# Signing is a manual, recorded runbook step; GHCR promotion happens through
+# this job (dispatched once per release tag, after Docker Hub promotes),
+# because GHCR has no other sanctioned write path.
+#
+# Why this exists at all: GHCR's only acceptable credential is the
+# workflow-scoped GITHUB_TOKEN, which exists only inside an Actions run, so
+# the GHCR copy cannot be a manual push (and a PAT is not an option). Every
+# run is human-gated by the protected `ghcr` environment: reviewer approval,
+# main-only, no stored secrets.
+#
+# The digest input is the contract with the manual verification that precedes
+# this job: the operator supplies the digest they verified, and this job
+# refuses to mirror anything else, even if the Docker Hub tag has moved since.
+#
+# Three artifact kinds are supported, distinguished by tag shape:
+#   sha-<40 hex>              an image candidate (multi-arch index)
+#   sha256-<64 hex>.sig       the Cosign signature artifact for an image digest
+#   X.Y.Z or latest           a release tag already promoted on Docker Hub
+#
+# `latest` is the one tag allowed to move, under a guard derived from
+# registry state: it may only move to the digest that the HIGHEST existing
+# X.Y.Z tag on GHCR already serves. Promote the version tag first, then
+# dispatch `latest`. Moving latest backwards, or to a digest no version tag
+# serves, fails closed. (First hit live on the 0.1.6 release, as predicted
+# by the previous revision of this header.)
+# A signature may only be mirrored after the image it signs is already in
+# GHCR, so a dangling signature cannot exist through this path.
+#
+# Signatures are expected in cosign's default tag-based storage mode. OCI-1.1
+# referrers mode produces a bare sha256-<hex> tag (no .sig suffix), which this
+# gate rejects; pin tag-based mode in the signing procedure.
+
+name: ghcr-mirror
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_tag:
+        description: 'Verified Docker Hub tag: image candidate (sha-<full 40-char commit>), Cosign signature artifact (sha256-<64 hex>.sig), or promoted release tag (X.Y.Z / latest)'
+        required: true
+      expected_digest:
+        description: 'The verified manifest digest of that tag, e.g. sha256:<64 hex>'
+        required: true
+
+# Copying between registries needs no repository content at all.
+permissions:
+  contents: read
+
+# Two mirror runs must never race on the same destination.
+concurrency:
+  group: ghcr-mirror-extenddb-postgres
+  cancel-in-progress: false
+
+env:
+  SRC_REPO: docker.io/extenddb/extenddb-postgres
+  DST_REPO: ghcr.io/extenddb/extenddb-postgres
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ghcr          # required reviewers, prevent self-review, main only
+    # The workflow-level permissions block pins GITHUB_TOKEN read-only; this
+    # job is the only thing that pushes, so it alone gets packages: write.
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Gate - validate inputs strictly
+        env:
+          # Dispatch inputs are untrusted; they reach the shell only through
+          # the environment, never by interpolation into script source.
+          RAW_TAG: ${{ inputs.candidate_tag }}
+          RAW_DIGEST: ${{ inputs.expected_digest }}
+        run: |
+          set -euo pipefail
+          KIND=''
+          SUBJECT_DIGEST=''
+          if [[ "$RAW_TAG" =~ ^sha-[0-9a-f]{40}$ ]]; then
+            KIND=image
+          elif [[ "$RAW_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || "$RAW_TAG" == latest ]]; then
+            # A release tag is an image index like a candidate; every image
+            # gate (digest pin, no-overwrite, platform assertions) applies.
+            KIND=image
+          elif [[ "$RAW_TAG" =~ ^sha256-[0-9a-f]{64}\.sig$ ]]; then
+            KIND=signature
+            # sha256-<hex>.sig  ->  sha256:<hex>  (the image digest it signs)
+            SUBJECT_DIGEST="${RAW_TAG%.sig}"
+            SUBJECT_DIGEST="${SUBJECT_DIGEST/-/:}"
+          else
+            echo "::error::candidate_tag '$RAW_TAG' is not an image candidate (sha-<40 hex>), a signature artifact (sha256-<64 hex>.sig), or a release tag (X.Y.Z / latest)"
+            exit 1
+          fi
+          if [[ ! "$RAW_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::expected_digest is not a sha256:<64 hex> digest"
+            exit 1
+          fi
+          {
+            echo "TAG=$RAW_TAG"
+            echo "DIGEST=$RAW_DIGEST"
+            echo "KIND=$KIND"
+            echo "SUBJECT_DIGEST=$SUBJECT_DIGEST"
+          } >> "$GITHUB_ENV"
+
+      - name: Gate - skopeo present (preinstalled on ubuntu-latest)
+        run: |
+          set -euo pipefail
+          command -v skopeo >/dev/null || { sudo apt-get update -y && sudo apt-get install -y --no-install-recommends skopeo; }
+          skopeo --version
+
+      - name: Gate - the source tag must still resolve to the verified digest
+        run: |
+          set -euo pipefail
+          SRC_DIGEST=$(skopeo inspect --format '{{.Digest}}' "docker://${SRC_REPO}:${TAG}")
+          if [[ "$SRC_DIGEST" != "$DIGEST" ]]; then
+            echo "::error::${SRC_REPO}:${TAG} now resolves to ${SRC_DIGEST}, not the verified ${DIGEST}; refusing to mirror an unverified artifact"
+            exit 1
+          fi
+
+      - name: Gate - the artifact must really be a Cosign signature (signature artifacts only)
+        if: env.KIND == 'signature'
+        run: |
+          set -euo pipefail
+          RAW=$(skopeo inspect --raw "docker://${SRC_REPO}:${TAG}")
+          MEDIA_TYPE=$(jq -r '.mediaType // empty' <<< "$RAW")
+          if [[ "$MEDIA_TYPE" != "application/vnd.oci.image.manifest.v1+json" ]]; then
+            echo "::error::${SRC_REPO}:${TAG} has mediaType '${MEDIA_TYPE}', not a single OCI image manifest; a .sig-shaped tag must not carry an image index"
+            exit 1
+          fi
+          if ! jq -e 'all(.layers[]; .mediaType == "application/vnd.dev.cosign.simplesigning.v1+json")' <<< "$RAW" >/dev/null; then
+            echo "::error::${SRC_REPO}:${TAG} layers are not Cosign simplesigning payloads; refusing to mirror it as a signature"
+            exit 1
+          fi
+
+      - name: Gate - refuse to overwrite an existing destination tag
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin <<< "$GHCR_TOKEN"
+          if DST_DIGEST=$(skopeo inspect --format '{{.Digest}}' "docker://${DST_REPO}:${TAG}" 2>/dev/null); then
+            if [[ "$DST_DIGEST" == "$DIGEST" ]]; then
+              echo "already-mirrored=true" >> "$GITHUB_ENV"
+              echo "::notice::${DST_REPO}:${TAG} already exists with the exact verified digest; nothing to do"
+            elif [[ "$TAG" == "latest" ]]; then
+              # latest may move, but only forward: the target digest must be
+              # the one served by the HIGHEST version tag already on GHCR.
+              # (The version tag is mirrored before latest, so ordering is
+              # enforced structurally; promote-image applied the same rule
+              # on Docker Hub before anything reached this job.)
+              HIGHEST=$(skopeo list-tags "docker://${DST_REPO}" \
+                | jq -r '.Tags[]' \
+                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+                | sort -V \
+                | tail -1 || true)
+              if [[ -z "$HIGHEST" ]]; then
+                echo "::error::no version tags exist on ${DST_REPO}; latest has nothing to follow"
+                exit 1
+              fi
+              HIGHEST_DIGEST=$(skopeo inspect --format '{{.Digest}}' "docker://${DST_REPO}:${HIGHEST}")
+              if [[ "$HIGHEST_DIGEST" != "$DIGEST" ]]; then
+                echo "::error::latest may only move to the digest of the highest version tag (${HIGHEST} -> ${HIGHEST_DIGEST}); mirror the version tag first"
+                exit 1
+              fi
+              echo "::notice::moving latest forward to the digest of ${HIGHEST}"
+            else
+              echo "::error::${DST_REPO}:${TAG} already exists with different digest ${DST_DIGEST}; refusing to overwrite"
+              exit 1
+            fi
+          fi
+
+      - name: Gate - a signature may only follow its image (signature artifacts only)
+        if: env.KIND == 'signature'
+        run: |
+          set -euo pipefail
+          if ! skopeo inspect --format '{{.Digest}}' "docker://${DST_REPO}@${SUBJECT_DIGEST}" >/dev/null 2>&1; then
+            echo "::error::signature subject ${DST_REPO}@${SUBJECT_DIGEST} is not present in GHCR; mirror the image before its signature"
+            exit 1
+          fi
+
+      - name: Mirror the exact artifact (no rebuild, digests preserved)
+        if: env.already-mirrored != 'true'
+        run: |
+          set -euo pipefail
+          # --all copies every platform image; --preserve-digests fails rather
+          # than rewrite any manifest, so the GHCR copy is byte-identical.
+          skopeo copy --all --preserve-digests \
+            "docker://${SRC_REPO}:${TAG}" \
+            "docker://${DST_REPO}:${TAG}"
+
+      - name: Verify the published copy
+        run: |
+          set -euo pipefail
+          DST_DIGEST=$(skopeo inspect --format '{{.Digest}}' "docker://${DST_REPO}:${TAG}")
+          if [[ "$DST_DIGEST" != "$DIGEST" ]]; then
+            echo "::error::published ${DST_REPO}:${TAG} digest ${DST_DIGEST} does not match verified ${DIGEST}"
+            exit 1
+          fi
+          if [[ "$KIND" == "image" ]]; then
+            RAW=$(skopeo inspect --raw "docker://${DST_REPO}:${TAG}")
+            echo "$RAW" | grep -q '"architecture": *"amd64"' || { echo "::error::amd64 missing from mirrored index"; exit 1; }
+            echo "$RAW" | grep -q '"architecture": *"arm64"' || { echo "::error::arm64 missing from mirrored index"; exit 1; }
+          fi
+
+      - name: Log out
+        if: always()
+        run: skopeo logout ghcr.io || true
+
+      - name: Summarise for the release checklist
+        run: |
+          {
+            echo "### GHCR ${KIND} mirrored: \`${TAG}\`"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| source | \`${SRC_REPO}:${TAG}\` |"
+            echo "| destination | \`${DST_REPO}:${TAG}\` |"
+            echo "| digest | \`${DIGEST}\` |"
+            echo ""
+            echo "Next manual steps: anonymous pull + native smoke tests on both"
+            echo "architectures, first-push package settings (visibility), signing,"
+            echo "then promotion per the release runbook."
+          } >> "$GITHUB_STEP_SUMMARY"

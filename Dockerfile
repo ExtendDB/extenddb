@@ -31,7 +31,7 @@ RUN test -n "${VERSION}" \
  && test "${BUILD_DATE}" != unknown \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates=20230311+deb12u1 \
+      ca-certificates \
       tini=0.19.0-1+b3 \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd --gid 10001 extenddb \

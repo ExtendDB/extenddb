@@ -430,6 +430,7 @@ impl PostgresEngine {
                 .as_ref()
                 .map(|tc| serde_json::json!({ "TableClass": tc })),
             on_demand_throughput: input.on_demand_throughput,
+            ..Default::default()
         })
     }
 }

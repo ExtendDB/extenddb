@@ -568,7 +568,7 @@ propagation delay. LSI updates are always synchronous.
 **Implementation:**
 - Each GSI has an optional `propagation_delay_ms` column in the `indexes` table
 - If `propagation_delay_ms` is `NULL` or negative, the system default is used
-  (default: 10ms, configurable via `gsi_propagation_delay_ms` setting)
+  (default: 10ms, configurable via `index_propagation_delay_ms` setting)
 - If `propagation_delay_ms` is `0`, the GSI is updated synchronously in the
   same transaction as the base table write
 - If `propagation_delay_ms` is positive, the GSI update is enqueued and applied

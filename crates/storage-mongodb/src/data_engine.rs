@@ -809,8 +809,14 @@ impl MongoEngine {
                 };
 
                 let mut new_item = existing_item;
-                expression::apply_update(actions, &mut new_item, maps)
-                    .map_err(|e| TxErr::Fatal(StorageError::Validation(e.to_string())))?;
+                expression::apply_update_validated(
+                    actions,
+                    &mut new_item,
+                    maps,
+                    &key_info.vector_indexes,
+                    &key_info.attribute_definitions,
+                )
+                .map_err(|e| TxErr::Fatal(StorageError::Validation(e.to_string())))?;
 
                 // Reject wrong-type or empty index-key attributes on
                 // the resulting item — D-M10, RFC-0003 §2.3. Same
@@ -2523,7 +2529,14 @@ impl MongoEngine {
                     }
                 }
 
-                expression::apply_update(actions, &mut item, maps).map_err(|e| {
+                expression::apply_update_validated(
+                    actions,
+                    &mut item,
+                    maps,
+                    &key_info.vector_indexes,
+                    &key_info.attribute_definitions,
+                )
+                .map_err(|e| {
                     TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
                 })?;
 
@@ -2777,8 +2790,14 @@ impl MongoEngine {
                     // Condition allows the upsert. Build the new item
                     // from `key` + apply update actions.
                     let mut new_item = key.clone();
-                    expression::apply_update(actions, &mut new_item, maps)
-                        .map_err(|e| StorageError::Validation(e.to_string()))?;
+                    expression::apply_update_validated(
+                        actions,
+                        &mut new_item,
+                        maps,
+                        &key_info.vector_indexes,
+                        &key_info.attribute_definitions,
+                    )
+                    .map_err(|e| StorageError::Validation(e.to_string()))?;
                     let new_doc = item_to_document(
                         &new_item,
                         &key_info.key_schema,
@@ -2798,8 +2817,14 @@ impl MongoEngine {
 
         let existing_item = document_to_item(&existing)?;
         let mut new_item = existing_item.clone();
-        expression::apply_update(actions, &mut new_item, maps)
-            .map_err(|e| StorageError::Validation(e.to_string()))?;
+        expression::apply_update_validated(
+            actions,
+            &mut new_item,
+            maps,
+            &key_info.vector_indexes,
+            &key_info.attribute_definitions,
+        )
+        .map_err(|e| StorageError::Validation(e.to_string()))?;
 
         let new_doc = item_to_document(
             &new_item,

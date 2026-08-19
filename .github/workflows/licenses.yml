@@ -1,0 +1,73 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# PR-time license notices freshness check.
+#
+# SOFTWARE-LICENSE-NOTICES.html embeds the version of every workspace crate,
+# so it goes stale on any version bump or dependency change. Until now the
+# only check lived in release-image's gate, so a PR could merge fully green
+# while leaving main unreleasable — exactly what happened with the 0.1.6
+# bump (#271, fixed by #272). This runs the SAME script with the SAME pinned
+# cargo-about (the script refuses any other version), so PR-time and
+# release-time can never disagree.
+#
+# Path-filtered to the generator's actual inputs; the release gate remains
+# the unconditional backstop.
+
+name: Licenses
+
+on:
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - 'SOFTWARE-LICENSE-NOTICES.html'
+      - 'SOFTWARE-LICENSE-NOTICES-DEV.html'
+      - 'about.toml'
+      - 'about.hbs'
+      - 'devtools/generate-software-license-notices'
+      - 'devtools/generate-dev-license-notices'
+      - '.github/workflows/licenses.yml'
+  merge_group:
+  push:
+    branches: [main]
+    paths:
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - 'SOFTWARE-LICENSE-NOTICES.html'
+      - 'SOFTWARE-LICENSE-NOTICES-DEV.html'
+      - 'about.toml'
+      - 'about.hbs'
+      - 'devtools/generate-software-license-notices'
+      - 'devtools/generate-dev-license-notices'
+      - '.github/workflows/licenses.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  notices-current:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - name: Cache cargo-about
+        id: cache-cargo-about
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-about
+          key: cargo-about-0.9.0-${{ runner.os }}
+      - name: Install cargo-about (same pin as the release gate)
+        if: steps.cache-cargo-about.outputs.cache-hit != 'true'
+        run: cargo install --locked --version 0.9.0 --features cli cargo-about
+      - name: Notices must be current
+        run: ./devtools/generate-software-license-notices --check
+      - name: DEV notices must be current
+        # The dev image ships SOFTWARE-LICENSE-NOTICES-DEV.html for its own
+        # feature set (sqlite,dev-mode). Same incident class as #271/#272: a
+        # version bump or dependency change that only the release gate catches
+        # leaves main unreleasable. Same script, same pinned cargo-about.
+        run: ./devtools/generate-dev-license-notices --check

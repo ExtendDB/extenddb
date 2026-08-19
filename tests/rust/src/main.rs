@@ -54,6 +54,10 @@ mod gsi;
 #[cfg(test)]
 mod gsi_more;
 #[cfg(test)]
+mod gsi_on_hash_only_table;
+#[cfg(test)]
+mod gsi_update_table_attr_defs;
+#[cfg(test)]
 mod index_key_validation;
 #[cfg(test)]
 mod lsi;
@@ -112,7 +116,16 @@ mod update_item_more;
 #[cfg(test)]
 mod update_item_number_validation;
 #[cfg(test)]
+mod update_table_attribute_definitions;
 mod update_table_billing_validation;
+#[cfg(test)]
+mod vector_index_search;
+#[cfg(test)]
+mod vector_index_unsupported;
+#[cfg(test)]
+mod vector_index_update_rules;
+#[cfg(test)]
+mod vector_index_write_capacity;
 #[cfg(test)]
 mod wording_parity_validation;
 

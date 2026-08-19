@@ -10,14 +10,16 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use extenddb_core::types::{AttributeDefinition, KeySchemaElement};
 use extenddb_storage::bootstrapper::{
-    AdminBootstrapResult, BootstrapConfig, Bootstrapper,
+    AdminBootstrapResult, BootstrapConfig, Bootstrapper, KeyDefinitionRepair,
     helpers::{
-        check_conflict, extract_arg, generate_account_id, generate_encryption_key,
-        generate_random_password, hash_password_async,
+        check_conflict, check_conflict_redacted, extract_arg, generate_account_id,
+        generate_encryption_key, generate_random_password, hash_password_async,
     },
 };
 use extenddb_storage::management_store::{OpError, OpResult};
+use extenddb_storage::util::recover_sort_key_definitions;
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio::sync::{Mutex, OnceCell};
@@ -522,6 +524,147 @@ impl Bootstrapper for PostgresBootstrapper {
         migrations::table_exists(&pool, "settings").await
     }
 
+    /// Repair table metadata damaged by the pre-fix `UpdateTable` (#259).
+    ///
+    /// Reads the catalog's key schemas and attribute definitions, and for any base
+    /// sort key with no definition recovers the type from the data table's
+    /// physical sort key column (`sk_s`/`sk_n`/`sk_b`, or the numbered variants for
+    /// multiple sort keys). Runs under the migration lock the caller holds.
+    async fn repair_lost_sort_key_definitions(&self, apply: bool) -> OpResult<KeyDefinitionRepair> {
+        let mut report = KeyDefinitionRepair::default();
+        let Ok(catalog) = self.app_pool(&self.config.catalog_db).await else {
+            return Ok(report);
+        };
+        let Some(data_db) = self.get_data_db_name().await? else {
+            return Ok(report);
+        };
+        let data = self.app_pool(&data_db).await?;
+
+        let rows: Vec<(String, String, String, serde_json::Value, serde_json::Value)> =
+            sqlx::query_as(
+                "SELECT account_id, table_name, table_id, key_schema, attribute_definitions \
+                 FROM tables ORDER BY table_name",
+            )
+            .fetch_all(&catalog)
+            .await
+            .map_err(|e| OpError::Internal(format!("Cannot read tables: {e}")))?;
+
+        for (account_id, table_name, table_id, ks_json, ad_json) in rows {
+            let key_schema: Vec<KeySchemaElement> = match serde_json::from_value(ks_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    report
+                        .needs_attention
+                        .push(format!("{table_name}: unreadable key_schema ({e})"));
+                    continue;
+                }
+            };
+            let attr_defs: Vec<AttributeDefinition> =
+                serde_json::from_value(ad_json).unwrap_or_default();
+
+            // Nothing to do unless a sort key has lost its definition.
+            // Reported for every table on every run, not only when a sort key is
+            // repaired: the partition key definition is dropped by the same write and
+            // is not recoverable from the schema, because the pk column is always TEXT.
+            // It is not needed for correctness either, since partition key values are
+            // encoded from the key schema alone, so it is reported rather than guessed
+            // and keeps being reported until a human restores it.
+            let pk_missing: Vec<&str> = key_schema
+                .iter()
+                .filter(|ks| ks.key_type == extenddb_core::types::KeyType::Hash)
+                .filter(|ks| {
+                    !attr_defs
+                        .iter()
+                        .any(|ad| ad.attribute_name == ks.attribute_name)
+                })
+                .map(|ks| ks.attribute_name.as_str())
+                .collect();
+            if !pk_missing.is_empty() {
+                report.needs_attention.push(format!(
+                    "{table_name}: partition key definition(s) [{}] are absent; reads and \
+                     writes are unaffected, but index key type validation cannot check them",
+                    pk_missing.join(", ")
+                ));
+            }
+
+            let missing: Vec<&KeySchemaElement> = key_schema
+                .iter()
+                .filter(|ks| ks.key_type == extenddb_core::types::KeyType::Range)
+                .filter(|ks| {
+                    !attr_defs
+                        .iter()
+                        .any(|ad| ad.attribute_name == ks.attribute_name)
+                })
+                .collect();
+            if missing.is_empty() {
+                continue;
+            }
+
+            // PRIMARY KEY columns only, in key order. Every data table carries all
+            // three typed columns for each sort key position (sk_s, sk_n, sk_b), so
+            // column existence says nothing about the declared type: only PRIMARY KEY
+            // membership does. `to_regclass` resolves the name through the current
+            // search_path, so this cannot match a same-named table in another schema,
+            // and returns NULL (no rows) rather than raising when the data table is
+            // absent.
+            let columns: Vec<String> = sqlx::query_as::<_, (String,)>(
+                "SELECT a.attname \
+                 FROM pg_index i \
+                 JOIN unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE \
+                 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum \
+                 WHERE i.indrelid = to_regclass($1) AND i.indisprimary \
+                 ORDER BY k.ord",
+            )
+            .bind(format!("\"_ddb_{table_id}\""))
+            .fetch_all(&data)
+            .await
+            .map_err(|e| OpError::Internal(format!("Cannot read columns of {table_name}: {e}")))?
+            .into_iter()
+            .map(|(c,)| c)
+            .collect();
+
+            let recovered = recover_sort_key_definitions(&key_schema, &attr_defs, &columns);
+            if recovered.is_empty() {
+                report.needs_attention.push(format!(
+                    "{table_name}: sort key(s) [{}] have no attribute definition and no \
+                     matching PRIMARY KEY column was found to recover the type from",
+                    missing
+                        .iter()
+                        .map(|ks| ks.attribute_name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                continue;
+            }
+
+            let mut merged = attr_defs;
+            merged.extend(recovered.iter().cloned());
+            let merged_json = serde_json::to_value(&merged)
+                .map_err(|e| OpError::Internal(format!("Cannot serialize definitions: {e}")))?;
+            if apply {
+                sqlx::query(
+                    "UPDATE tables SET attribute_definitions = $1 \
+                     WHERE account_id = $2 AND table_name = $3",
+                )
+                .bind(&merged_json)
+                .bind(&account_id)
+                .bind(&table_name)
+                .execute(&catalog)
+                .await
+                .map_err(|e| OpError::Internal(format!("Cannot repair {table_name}: {e}")))?;
+            }
+
+            for def in &recovered {
+                report.repaired.push(format!(
+                    "{table_name}: {} ({:?})",
+                    def.attribute_name, def.attribute_type
+                ));
+            }
+        }
+
+        Ok(report)
+    }
+
     async fn list_table_names(&self) -> OpResult<Vec<String>> {
         let Ok(pool) = self.app_pool(&self.config.catalog_db).await else {
             return Ok(Vec::new());
@@ -688,7 +831,7 @@ impl PostgresBootstrapper {
             check_conflict(pg_host.as_ref(), &parts.host, "--pg-host")?;
             check_conflict(pg_port.as_ref(), &parts.port, "--pg-port")?;
             check_conflict(extenddb_user.as_ref(), &parts.user, "--extenddb-user")?;
-            check_conflict(extenddb_pass.as_ref(), &parts.password, "--extenddb-pass")?;
+            check_conflict_redacted(extenddb_pass.as_ref(), &parts.password, "--extenddb-pass")?;
 
             if let Some(ref cli_catalog) = catalog_db
                 && cli_catalog != &parts.database

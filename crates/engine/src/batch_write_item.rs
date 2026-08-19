@@ -127,6 +127,11 @@ pub async fn handle_batch_write_item(
                 validate_item_size(&put.item, ctx.limits.max_item_size_bytes)?;
                 validate_attribute_name_sizes(&put.item, &ctx.limits)?;
                 validate_key_sizes(&put.item, &key_info.key_schema, &ctx.limits)?;
+                extenddb_core::validation::validate_vector_write(
+                    &put.item,
+                    &key_info.vector_indexes,
+                    &key_info.attribute_definitions,
+                )?;
 
                 collect_icm_if_needed(
                     input.return_item_collection_metrics,

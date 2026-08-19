@@ -1,0 +1,344 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Publishes the `extenddb-dev` container image (SQLite + dev-mode) to Docker
+# Hub, for linux/amd64 and linux/arm64, in a SINGLE dispatch: gate, build,
+# smoke test, push, sign.
+#
+# Why one dispatch where the Postgres image splits build and promotion:
+# extenddb-dev is explicitly a development image (plain HTTP, open
+# authorization, distroless). The two-person build-then-promote split guards a
+# production artifact; here the reviewer-gated `dockerhub` environment approval
+# on the publish job is the single human step, by release-owner decision
+# (2026-08-15). Everything before that approval runs credential-free.
+#
+# Structure mirrors release-image.yml deliberately — same gate rules, same
+# native-runner-per-arch build, same tested-artifact-is-published-artifact
+# property via docker save/load — so a reviewer of one can read the other.
+# Differences beyond the single-dispatch shape:
+#
+#   * Dockerfile.dev, IMAGE_REPO extenddb/extenddb-dev, and the DEV licence
+#     notices gate (devtools/generate-dev-license-notices --check), which pins
+#     the notices for THIS image's feature set (sqlite,dev-mode).
+#   * The publish job pushes the version tag and `latest` directly (guarded:
+#     refuses to overwrite an existing version tag; `latest` only moves
+#     forward, by highest-semver comparison).
+#   * Signing runs in the same job via the shared sign-image composite action
+#     (OIDC to the KMS signing role, Rekor transparency log on). Requires the
+#     composite action from PR #279 to be on main.
+#
+# Trigger: manual workflow_dispatch only, same rationale as release-image.yml
+# (a tag trigger would execute the workflow definition from the tagged
+# revision rather than reviewed main).
+#
+# One-time setup beyond the existing `dockerhub` environment: the Docker Hub
+# repository extenddb/extenddb-dev must exist.
+
+name: release-dev-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag to release, e.g. v0.1.6'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-image-extenddb-dev
+  cancel-in-progress: false
+
+env:
+  IMAGE_REPO: extenddb/extenddb-dev
+  KEY_ARN: arn:aws:kms:us-east-1:975306274793:key/654ab7f4-4a11-45e1-a313-3a6989f3721c
+  # Pinned AWS CLI for runners that lack it (the smoke test needs `aws`).
+  AWSCLI_VERSION: 2.31.6
+  AWSCLI_SHA256_X86_64: 45fdcc3003056b3e85c23776636e74208dc2fc16f26278acdbe8eafe3d4e752b
+  AWSCLI_SHA256_AARCH64: 517dec4ce83fabe7ace6164bb6189cdb686ef816332ccf83e81999e3fb57cad5
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      sha: ${{ steps.meta.outputs.sha }}
+      build_date: ${{ steps.meta.outputs.build_date }}
+    steps:
+      - name: Check out main (the reviewed workflow's own ref)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Gate - the tag must identify released code
+        id: meta
+        env:
+          RAW_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RAW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::input '$RAW_TAG' is not a strict semantic version tag (vMAJOR.MINOR.PATCH)"
+            exit 1
+          fi
+          VERSION="${RAW_TAG#v}"
+
+          git fetch --no-tags origin "refs/tags/${RAW_TAG}:refs/tags/${RAW_TAG}" \
+            || { echo "::error::tag ${RAW_TAG} does not exist on origin"; exit 1; }
+          SHA=$(git rev-list -n 1 "refs/tags/${RAW_TAG}")
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::could not resolve ${RAW_TAG} to a full commit SHA"; exit 1; }
+
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "::error::${RAW_TAG} (${SHA}) is not contained in origin/main"
+            exit 1
+          fi
+
+          CARGO_VERSION=$(git show "${SHA}:Cargo.toml" | grep -m1 '^version' | sed 's/.*"\(.*\)".*/\1/')
+          if [[ "$VERSION" != "$CARGO_VERSION" ]]; then
+            echo "::error::tag ${RAW_TAG} implies ${VERSION} but Cargo.toml at ${SHA} says ${CARGO_VERSION}"
+            exit 1
+          fi
+
+          BUILD_DATE=$(TZ=UTC git show -s --date=format-local:'%Y-%m-%dT%H:%M:%SZ' --format=%cd "$SHA")
+
+          {
+            echo "version=$VERSION"
+            echo "sha=$SHA"
+            echo "build_date=$BUILD_DATE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out the tagged commit for the licence gate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ steps.meta.outputs.sha }}
+
+      - name: Gate - DEV licence notices must match Cargo.lock
+        # The dev image ships SOFTWARE-LICENSE-NOTICES-DEV.html, generated for
+        # its own feature set. The production notices file covers the postgres
+        # set and would omit dependencies this image bundles.
+        run: |
+          set -euo pipefail
+          cargo install --locked --version 0.9.0 --features cli cargo-about
+          ./devtools/generate-dev-license-notices --check
+
+  build:
+    needs: gate
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm      # native arm64, no qemu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+
+      - name: Ensure smoke-test prerequisites
+        run: |
+          set -euo pipefail
+          if ! command -v aws >/dev/null 2>&1; then
+            case "$(uname -m)" in
+              x86_64)  EXPECTED="$AWSCLI_SHA256_X86_64";  PKG="awscli-exe-linux-x86_64-${AWSCLI_VERSION}.zip" ;;
+              aarch64) EXPECTED="$AWSCLI_SHA256_AARCH64"; PKG="awscli-exe-linux-aarch64-${AWSCLI_VERSION}.zip" ;;
+              *) echo "::error::unsupported architecture $(uname -m)"; exit 1 ;;
+            esac
+            curl -fsSL "https://awscli.amazonaws.com/${PKG}" -o /tmp/awscli.zip
+            echo "${EXPECTED}  /tmp/awscli.zip" | sha256sum -c - \
+              || { echo "::error::AWS CLI download failed checksum verification"; exit 1; }
+            unzip -q /tmp/awscli.zip -d /tmp
+            sudo /tmp/aws/install
+          fi
+          for c in docker aws python3; do
+            command -v "$c" >/dev/null || { echo "::error::missing $c"; exit 1; }
+          done
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+
+      - name: Build the dev image for ${{ matrix.platform }}, not pushed
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        with:
+          context: .
+          file: Dockerfile.dev
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          tags: ${{ env.IMAGE_REPO }}:sha-${{ needs.gate.outputs.sha }}-${{ matrix.arch }}
+          build-args: |
+            VERSION=${{ needs.gate.outputs.version }}
+            VCS_REF=${{ needs.gate.outputs.sha }}
+            BUILD_DATE=${{ needs.gate.outputs.build_date }}
+          # Deliberately NO gha build cache. This job checks out a
+          # dispatch-resolved SHA (gate-verified to be an ancestor of main, but
+          # CodeQL cannot see that), and writing the default branch's actions
+          # cache from such a checkout is the cache-poisoning vector
+          # (actions/cache-poisoning/poisonable-step). Releases are rare and
+          # the LTO build dominates; the cache bought little.
+
+      - name: Confirm the image really is ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          ACTUAL=$(docker image inspect \
+            '${{ env.IMAGE_REPO }}:sha-${{ needs.gate.outputs.sha }}-${{ matrix.arch }}' \
+            --format '{{.Architecture}}')
+          [[ "$ACTUAL" == "${{ matrix.arch }}" ]] \
+            || { echo "::error::expected ${{ matrix.arch }}, image reports $ACTUAL"; exit 1; }
+
+      - name: Smoke test the built image
+        env:
+          EXTENDDB_IMAGE: ${{ env.IMAGE_REPO }}:sha-${{ needs.gate.outputs.sha }}-${{ matrix.arch }}
+        run: ./ci/smoke-test-dev-container.sh
+
+      - name: Save the tested image as an artifact
+        run: |
+          set -euo pipefail
+          docker save '${{ env.IMAGE_REPO }}:sha-${{ needs.gate.outputs.sha }}-${{ matrix.arch }}' \
+            | gzip > "dev-image-${{ matrix.arch }}.tar.gz"
+          ls -lh "dev-image-${{ matrix.arch }}.tar.gz"
+
+      - name: Upload the image artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: dev-image-${{ matrix.arch }}
+          path: dev-image-${{ matrix.arch }}.tar.gz
+          retention-days: 1
+          compression-level: 0
+
+  publish:
+    needs: [gate, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: dockerhub       # the single approval gate; only job with credentials
+    permissions:
+      contents: read
+      id-token: write            # OIDC for the signing role; no stored AWS secrets
+    steps:
+      - name: Check out main (for the sign-image composite action)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      - name: Download the tested images
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          path: images
+          pattern: dev-image-*
+          merge-multiple: true
+
+      - name: Load both images
+        run: |
+          set -euo pipefail
+          for f in images/dev-image-*.tar.gz; do gunzip -c "$f" | docker load; done
+          docker image ls '${{ env.IMAGE_REPO }}'
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Gate - skopeo and jq present (preinstalled on ubuntu-latest)
+        # The forward-only `latest` guard depends on both. Verified before any
+        # irreversible push so a missing tool fails the run here, not after the
+        # version tag is already public. Same pattern as promote-image.yml.
+        run: |
+          set -euo pipefail
+          command -v skopeo >/dev/null || sudo apt-get install -y --no-install-recommends skopeo
+          skopeo --version
+          jq --version
+
+      - name: Push version tag and latest, guarded
+        id: push
+        env:
+          SHA: ${{ needs.gate.outputs.sha }}
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          REPO='${{ env.IMAGE_REPO }}'
+          CANDIDATE="sha-${SHA}"
+
+          # A released version tag is immutable: refuse to overwrite.
+          if docker buildx imagetools inspect "${REPO}:${VERSION}" >/dev/null 2>&1; then
+            echo "::error::${REPO}:${VERSION} already exists; refusing to overwrite a released tag."
+            exit 1
+          fi
+
+          # Per-arch images first, then the manifest lists.
+          docker push "${REPO}:${CANDIDATE}-amd64"
+          docker push "${REPO}:${CANDIDATE}-arm64"
+          docker buildx imagetools create -t "${REPO}:${CANDIDATE}" \
+            "${REPO}:${CANDIDATE}-amd64" "${REPO}:${CANDIDATE}-arm64"
+          docker buildx imagetools create -t "${REPO}:${VERSION}" "${REPO}:${CANDIDATE}"
+
+          # `latest` only moves forward: skip if any released version is higher.
+          # Fail CLOSED: a failed listing must refuse to move `latest`, not
+          # treat the registry as empty and move it anyway. An empty result
+          # from a SUCCESSFUL listing is legitimate (first release).
+          if ! TAGS_JSON=$(skopeo list-tags "docker://${REPO}"); then
+            echo "::error::listing ${REPO} tags failed; refusing to move latest without knowing the highest released version. The ${VERSION} tag is published; re-run once the registry is reachable."
+            exit 1
+          fi
+          HIGHEST=$(jq -r '.Tags[]' <<<"$TAGS_JSON" \
+                      | { grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true; } \
+                      | { grep -vFx "$VERSION" || true; } | sort -V | tail -1)
+          if [[ -n "$HIGHEST" && "$(printf '%s\n%s\n' "$HIGHEST" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]]; then
+            echo "::warning::released ${HIGHEST} is newer than ${VERSION}; latest is NOT moved."
+          else
+            docker buildx imagetools create -t "${REPO}:latest" "${REPO}:${VERSION}"
+          fi
+
+          DIGEST=$(docker buildx imagetools inspect "${REPO}:${VERSION}" \
+                     --format '{{.Manifest.Digest}}')
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Verify both architectures are in the published image
+        run: |
+          set -euo pipefail
+          OUT=$(docker buildx imagetools inspect \
+                  '${{ env.IMAGE_REPO }}:${{ needs.gate.outputs.version }}')
+          echo "$OUT"
+          echo "$OUT" | grep -q 'linux/amd64' || { echo "::error::amd64 missing"; exit 1; }
+          echo "$OUT" | grep -q 'linux/arm64' || { echo "::error::arm64 missing"; exit 1; }
+
+      - name: Assume the signing role via OIDC (no stored AWS secrets)
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::975306274793:role/ExtendDBContainerSigningCI
+          role-session-name: extenddb-dev-sign-${{ github.run_id }}
+          aws-region: us-east-1
+
+      - name: Sign the published digest (shared composite action, Rekor on)
+        id: sign
+        uses: ./.github/actions/sign-image
+        with:
+          image-repo: docker.io/${{ env.IMAGE_REPO }}
+          digest: ${{ steps.push.outputs.digest }}
+          release-tag: v${{ needs.gate.outputs.version }}
+          key-arn: ${{ env.KEY_ARN }}
+
+      - name: Summarise for the release checklist
+        run: |
+          {
+            echo "### extenddb-dev ${{ needs.gate.outputs.version }} published and signed"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| image | \`${{ env.IMAGE_REPO }}:${{ needs.gate.outputs.version }}\` |"
+            echo "| index digest | \`${{ steps.push.outputs.digest }}\` |"
+            echo "| signature tag | \`${{ steps.sign.outputs.sig-tag }}\` |"
+            echo "| platforms | linux/amd64, linux/arm64 |"
+            echo "| commit | \`${{ needs.gate.outputs.sha }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

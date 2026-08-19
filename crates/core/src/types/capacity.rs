@@ -50,6 +50,29 @@ pub struct Capacity {
     pub write_capacity_units: Option<f64>,
 }
 
+/// Capacity consumed by a vector index.
+///
+/// Vector indexes meter in their own units, separate from table read and write
+/// capacity: `VectorSearchRequestBytes` for `SearchVectors`, and
+/// `VectorWriteRequestBytes` for writes replicated into the index. Both are
+/// byte figures, not unit figures, and each is omitted rather than reported as
+/// zero when the operation does not consume it.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct VectorCapacity {
+    /// Bytes consumed by a `SearchVectors` operation.
+    #[serde(
+        rename = "VectorSearchRequestBytes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub vector_search_request_bytes: Option<f64>,
+    /// Bytes consumed replicating a write into the index.
+    #[serde(
+        rename = "VectorWriteRequestBytes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub vector_write_request_bytes: Option<f64>,
+}
+
 /// Consumed capacity information returned when requested.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConsumedCapacity {
@@ -80,6 +103,14 @@ pub struct ConsumedCapacity {
         skip_serializing_if = "Option::is_none"
     )]
     pub local_secondary_indexes: Option<HashMap<String, Capacity>>,
+    /// Per-vector-index capacity breakdown, keyed by index name.
+    ///
+    /// Measured against the service 2026-08-13: reported only for `INDEXES`,
+    /// not for `TOTAL` (which returns `TableName` and `CapacityUnits` alone,
+    /// without even the `Table` breakdown), and absent entirely rather than
+    /// empty when the operation charged no vector capacity.
+    #[serde(rename = "VectorIndexes", skip_serializing_if = "Option::is_none")]
+    pub vector_indexes: Option<HashMap<String, VectorCapacity>>,
 }
 
 /// Controls whether the existing item is returned in the error response when a
@@ -150,6 +181,42 @@ pub struct ItemCollectionMetrics {
 }
 
 impl ConsumedCapacity {
+    /// Attach a vector-index write charge, keyed by index name.
+    ///
+    /// A charge of `None` for an index means the operation did not touch that
+    /// index's projected entry and so consumed nothing; such indexes are left
+    /// out of the map entirely, and when no index is charged the whole
+    /// `VectorIndexes` field is omitted. That matches the service, which omits
+    /// rather than zero-fills (measured 2026-08-13).
+    ///
+    /// Only applied at `INDEXES` granularity: `TOTAL` does not carry the map.
+    #[must_use]
+    pub fn with_vector_writes(
+        mut self,
+        charges: impl IntoIterator<Item = (String, f64)>,
+        indexes: bool,
+    ) -> Self {
+        if !indexes {
+            return self;
+        }
+        let map: HashMap<String, VectorCapacity> = charges
+            .into_iter()
+            .map(|(name, bytes)| {
+                (
+                    name,
+                    VectorCapacity {
+                        vector_search_request_bytes: None,
+                        vector_write_request_bytes: Some(bytes),
+                    },
+                )
+            })
+            .collect();
+        if !map.is_empty() {
+            self.vector_indexes = Some(map);
+        }
+        self
+    }
+
     /// Build a `ConsumedCapacity` for a read operation with real capacity units.
     #[must_use]
     pub fn read(table_name: &str, cu: f64, indexes: bool) -> Self {
@@ -169,6 +236,7 @@ impl ConsumedCapacity {
             },
             global_secondary_indexes: None,
             local_secondary_indexes: None,
+            vector_indexes: None,
         }
     }
 
@@ -191,6 +259,7 @@ impl ConsumedCapacity {
             },
             global_secondary_indexes: None,
             local_secondary_indexes: None,
+            vector_indexes: None,
         }
     }
 
@@ -217,6 +286,7 @@ impl ConsumedCapacity {
             },
             global_secondary_indexes: None,
             local_secondary_indexes: None,
+            vector_indexes: None,
         }
     }
 
@@ -243,6 +313,7 @@ impl ConsumedCapacity {
             },
             global_secondary_indexes: None,
             local_secondary_indexes: None,
+            vector_indexes: None,
         }
     }
 
@@ -275,6 +346,7 @@ impl ConsumedCapacity {
             table: breakdown.then(|| Capacity::units(base_cu)),
             global_secondary_indexes: if breakdown { map_or_none(gsi) } else { None },
             local_secondary_indexes: if breakdown { map_or_none(lsi) } else { None },
+            vector_indexes: None,
         }
     }
 }

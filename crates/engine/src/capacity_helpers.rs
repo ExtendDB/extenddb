@@ -76,9 +76,11 @@ pub fn write_capacity_indexed(
             let (gsi, lsi) =
                 index_write_units(old_item, new_item, charge_unchanged_projection, key_info);
             let breakdown = rcc == ReturnConsumedCapacity::Indexes;
-            Some(ConsumedCapacity::write_indexed(
-                table_name, base_cu, gsi, lsi, breakdown,
-            ))
+            let vector = vector_write_charges(old_item, new_item, key_info);
+            Some(
+                ConsumedCapacity::write_indexed(table_name, base_cu, gsi, lsi, breakdown)
+                    .with_vector_writes(vector, breakdown),
+            )
         }
     }
 }
@@ -138,6 +140,101 @@ pub fn index_write_units(
     }
 
     (gsi, lsi)
+}
+
+/// Per-vector-index `VectorWriteRequestBytes` for an item transition.
+///
+/// Measured model (2026-08-13, live service): the charge is
+/// `max(dimensions * 4 + projected_non_vector_bytes, 1024)`, incurred whenever
+/// the PROJECTED index entry changes (which is not the same rule the public
+/// docs state), and DOUBLED when the search-schema HASH value changes, because
+/// the entry moves partition and is billed as a delete plus an insert. The
+/// charged image is the written one, or the deleted one for a delete.
+///
+/// Returns an empty map when nothing is charged; callers pass the result to
+/// [`ConsumedCapacity::with_vector_writes`], which omits empty maps to match
+/// the service's omit-rather-than-zero-fill behaviour.
+#[must_use]
+pub fn vector_write_charges(
+    old_item: Option<&Item>,
+    new_item: Option<&Item>,
+    key_info: &TableKeyInfo,
+) -> Vec<(String, f64)> {
+    use extenddb_core::vector_capacity::{
+        ProjectedAttributes, projected_entry_changed, search_schema_partition_moved,
+        vector_write_request_bytes,
+    };
+
+    let base_keys: Vec<&str> = key_info
+        .base_key_schema
+        .iter()
+        .map(|k| k.attribute_name.as_str())
+        .collect();
+
+    let mut charges = Vec::new();
+    for vi in &key_info.vector_indexes {
+        let search_attrs: Vec<&str> = vi
+            .search_schema
+            .iter()
+            .map(|e| e.attribute_name.as_str())
+            .collect();
+        // INCLUDE is keys + search schema + the named extras, which the
+        // KeysOnly variant's attribute lists express by unioning the extras
+        // into the always-projected set.
+        let include_extras: Vec<&str> = match vi.projection.projection_type {
+            extenddb_core::types::ProjectionType::Include => vi
+                .projection
+                .non_key_attributes
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(String::as_str)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let keys_union: Vec<&str> = base_keys
+            .iter()
+            .copied()
+            .chain(include_extras.iter().copied())
+            .collect();
+        let projected = match vi.projection.projection_type {
+            extenddb_core::types::ProjectionType::All => ProjectedAttributes::All,
+            extenddb_core::types::ProjectionType::KeysOnly
+            | extenddb_core::types::ProjectionType::Include => ProjectedAttributes::KeysOnly {
+                key_attributes: &keys_union,
+                search_schema_attributes: &search_attrs,
+            },
+        };
+
+        if !projected_entry_changed(old_item, new_item, &vi.vector_attribute_name, projected) {
+            continue;
+        }
+
+        // Delete charges the removed image; everything else the written one.
+        let charged_image = match (new_item, old_item) {
+            (Some(n), _) if n.contains_key(&vi.vector_attribute_name) => n,
+            (_, Some(o)) if o.contains_key(&vi.vector_attribute_name) => o,
+            _ => continue,
+        };
+        let mut bytes = vector_write_request_bytes(
+            vi.dimensions,
+            charged_image,
+            &vi.vector_attribute_name,
+            projected,
+        );
+
+        let hash_attr = vi
+            .search_schema
+            .iter()
+            .find(|e| e.element_type == extenddb_core::types::SearchSchemaElementType::Hash)
+            .map(|e| e.attribute_name.as_str());
+        if search_schema_partition_moved(old_item, new_item, hash_attr) {
+            bytes *= 2.0;
+        }
+
+        charges.push((vi.index_name.clone(), bytes));
+    }
+    charges
 }
 
 /// Write units for one index transition, or `None` when neither item projects

@@ -195,6 +195,16 @@ pub async fn handle_update_item(
         &key_info.attribute_definitions,
     )?;
 
+    // Vector and search-schema attributes are deliberately NOT validated here.
+    // Their validity is a property of the stored value, and the stored value
+    // does not exist until the actions have been evaluated against the
+    // pre-update image, which only the storage layer holds. Validating
+    // expression forms here instead would silently miss every RHS that is not
+    // a bare placeholder (`list_append`, `if_not_exists`, attribute copies, and
+    // anything added later). The authoritative check is
+    // `expression::apply_update_validated`, which every backend applies to the
+    // evaluated image and which no expression form can bypass.
+
     // Amazon DynamoDB enforces nesting depth on values that are stored as item
     // attributes. For UpdateExpression, walk each SET action's RHS to find the
     // EAV placeholders it references, resolve them against `maps.values`, and

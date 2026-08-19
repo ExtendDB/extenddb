@@ -586,6 +586,7 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-dynamodb",
+ "aws-sigv4",
  "aws-smithy-http-client",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
