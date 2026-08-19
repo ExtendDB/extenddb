@@ -22,9 +22,11 @@ on:
       - '**/Cargo.toml'
       - 'Cargo.lock'
       - 'SOFTWARE-LICENSE-NOTICES.html'
+      - 'SOFTWARE-LICENSE-NOTICES-DEV.html'
       - 'about.toml'
       - 'about.hbs'
       - 'devtools/generate-software-license-notices'
+      - 'devtools/generate-dev-license-notices'
       - '.github/workflows/licenses.yml'
   merge_group:
   push:
@@ -33,9 +35,11 @@ on:
       - '**/Cargo.toml'
       - 'Cargo.lock'
       - 'SOFTWARE-LICENSE-NOTICES.html'
+      - 'SOFTWARE-LICENSE-NOTICES-DEV.html'
       - 'about.toml'
       - 'about.hbs'
       - 'devtools/generate-software-license-notices'
+      - 'devtools/generate-dev-license-notices'
       - '.github/workflows/licenses.yml'
 
 permissions:
@@ -61,3 +65,9 @@ jobs:
         run: cargo install --locked --version 0.9.0 --features cli cargo-about
       - name: Notices must be current
         run: ./devtools/generate-software-license-notices --check
+      - name: DEV notices must be current
+        # The dev image ships SOFTWARE-LICENSE-NOTICES-DEV.html for its own
+        # feature set (sqlite,dev-mode). Same incident class as #271/#272: a
+        # version bump or dependency change that only the release gate catches
+        # leaves main unreleasable. Same script, same pinned cargo-about.
+        run: ./devtools/generate-dev-license-notices --check
