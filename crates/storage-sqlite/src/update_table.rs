@@ -70,6 +70,45 @@ impl SqliteEngine {
             }
         }
 
+        // The other direction of the same rule: a vector index cannot be ADDED to
+        // a table that is provisioned. Measured 2026-08-19 against a live
+        // PROVISIONED table, which returned the identical string, so the two
+        // directions share one constant.
+        //
+        // The check is on the request's NET billing mode, not the table's stored
+        // mode: an UpdateTable that switches to PAY_PER_REQUEST and creates the
+        // index in the same call was measured to succeed. That is the same
+        // net-effect evaluation the index-count limit below uses, and it is why
+        // the request's own billing_mode wins when present.
+        let creates_vector_index = input
+            .vector_index_updates
+            .as_ref()
+            .is_some_and(|updates| updates.iter().any(|u| u.create.is_some()));
+        if creates_vector_index {
+            let net_pay_per_request = match input.billing_mode {
+                Some(mode) => mode == BillingMode::PayPerRequest,
+                None => {
+                    // A NULL stored billing_mode means PROVISIONED, matching how
+                    // the throughput checks below read it.
+                    let stored: Option<String> = sqlx::query_scalar(
+                        "SELECT billing_mode FROM tables WHERE account_id = ? AND table_name = ?",
+                    )
+                    .bind(account_id)
+                    .bind(&input.table_name)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?
+                    .flatten();
+                    stored.as_deref() == Some("PAY_PER_REQUEST")
+                }
+            };
+            if !net_pay_per_request {
+                return Err(StorageError::Validation(
+                    extenddb_core::types::VECTOR_INDEX_REQUIRES_PAY_PER_REQUEST.to_owned(),
+                ));
+            }
+        }
+
         // Reject ProvisionedThroughput when the effective billing mode is
         // PAY_PER_REQUEST. The effective mode is the requested billing_mode when
         // the request changes it, otherwise the table's current mode. Real
