@@ -1,41 +1,49 @@
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# Publish the Docker Hub repository Overview from a file in this repository.
+# Publish a Docker Hub repository Overview from a file in this repository.
 #
 # Neither `docker push` nor the `skopeo copy` that promote-image uses touches
 # repository metadata: the Overview lives on the Docker Hub repository object,
 # not on any image. GHCR derives its description from the OCI labels the
-# Dockerfile already sets, so the same image reads as documented there and blank
+# Dockerfiles already set, so the same image reads as documented there and blank
 # on Docker Hub. That is why this exists as its own step rather than falling out
 # of a push.
 #
-# Sourced from `docker/dockerhub-overview.md` so the published Overview is
+# Sourced from `docker/dockerhub-overview*.md` so the published Overview is
 # reviewed like any other content and cannot drift from the repository.
 #
 # Dispatch-only and gated on the `dockerhub` environment, because it uses the
 # same credential that can push images. Deliberately NOT wired into
 # promote-image: the Overview is version-neutral, so a wording fix should not
 # require a release, and a release should not silently rewrite it.
+#
+# One image per dispatch rather than a matrix over both, because a Docker Hub
+# repository that does not exist yet must fail loudly for that image alone
+# instead of failing a run that also had work to do for the other.
 
 name: Docker Hub description
 
 on:
   workflow_dispatch:
+    inputs:
+      image:
+        description: 'Which Docker Hub repository to publish the Overview for'
+        required: true
+        type: choice
+        options:
+          - extenddb-postgres
+          - extenddb-dev
 
 permissions:
   contents: read
 
 concurrency:
-  group: dockerhub-description-extenddb-postgres
+  group: dockerhub-description-${{ inputs.image }}
   cancel-in-progress: false
 
 env:
   HUB_NAMESPACE: extenddb
-  HUB_REPO: extenddb-postgres
-  OVERVIEW_FILE: docker/dockerhub-overview.md
-  # Docker Hub caps the short description at 100 characters.
-  SHORT_DESCRIPTION: DynamoDB-compatible API adapter backed by your own PostgreSQL 14+ database
 
 jobs:
   publish-description:
@@ -46,27 +54,76 @@ jobs:
       - name: Check out main
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: The Overview file must exist and be non-trivial
+      - name: Resolve the Overview source for this image
+        id: src
+        env:
+          IMAGE: ${{ inputs.image }}
         run: |
           set -euo pipefail
-          if [[ ! -s "$OVERVIEW_FILE" ]]; then
-            echo "::error::$OVERVIEW_FILE is missing or empty"
+          # Docker Hub caps the short description at 100 characters; asserted below.
+          case "$IMAGE" in
+            extenddb-postgres)
+              FILE='docker/dockerhub-overview.md'
+              SHORT='DynamoDB-compatible API adapter backed by your own PostgreSQL 14+ database'
+              ;;
+            extenddb-dev)
+              FILE='docker/dockerhub-overview-dev.md'
+              SHORT='DynamoDB-compatible API over SQLite for local dev and CI. Plain HTTP, not for production.'
+              ;;
+            *)
+              echo "::error::unknown image '$IMAGE'"
+              exit 1
+              ;;
+          esac
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          echo "::notice::publishing $FILE to ${IMAGE}"
+
+      - name: The Overview file must exist and be within Docker Hub's limits
+        env:
+          FILE: ${{ steps.src.outputs.file }}
+          SHORT: ${{ steps.src.outputs.short }}
+        run: |
+          set -euo pipefail
+          if [[ ! -s "$FILE" ]]; then
+            echo "::error::$FILE is missing or empty"
             exit 1
           fi
-          BYTES=$(wc -c < "$OVERVIEW_FILE")
+          BYTES=$(wc -c < "$FILE")
           # Docker Hub caps full_description at 25000 characters.
           if (( BYTES > 25000 )); then
-            echo "::error::$OVERVIEW_FILE is ${BYTES} bytes; Docker Hub caps the Overview at 25000"
+            echo "::error::$FILE is ${BYTES} bytes; Docker Hub caps the Overview at 25000"
             exit 1
           fi
-          if (( ${#SHORT_DESCRIPTION} > 100 )); then
-            echo "::error::SHORT_DESCRIPTION is ${#SHORT_DESCRIPTION} characters; Docker Hub caps it at 100"
+          if (( ${#SHORT} > 100 )); then
+            echo "::error::short description is ${#SHORT} characters; Docker Hub caps it at 100"
             exit 1
           fi
-          echo "::notice::Overview is ${BYTES} bytes"
+          echo "::notice::Overview is ${BYTES} bytes, short description ${#SHORT} characters"
+
+      - name: The Docker Hub repository must already exist
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          set -euo pipefail
+          # A 404 here means the repository has not been created yet. Say so
+          # plainly rather than letting the PATCH fail with an opaque error.
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
+            "https://hub.docker.com/v2/repositories/${HUB_NAMESPACE}/${IMAGE}/")
+          if [[ "$CODE" == "404" ]]; then
+            echo "::error::docker.io/${HUB_NAMESPACE}/${IMAGE} does not exist. Create the repository on Docker Hub first."
+            exit 1
+          fi
+          if [[ "$CODE" != "200" ]]; then
+            echo "::error::unexpected HTTP ${CODE} querying docker.io/${HUB_NAMESPACE}/${IMAGE}"
+            exit 1
+          fi
 
       - name: Publish the Overview
         env:
+          IMAGE: ${{ inputs.image }}
+          FILE: ${{ steps.src.outputs.file }}
+          SHORT: ${{ steps.src.outputs.short }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
@@ -85,24 +142,26 @@ jobs:
             exit 1
           fi
 
-          jq -n \
-              --rawfile full "$OVERVIEW_FILE" \
-              --arg short "$SHORT_DESCRIPTION" \
+          jq -n --rawfile full "$FILE" --arg short "$SHORT" \
               '{full_description:$full, description:$short}' \
             | curl -sS --fail-with-body -X PATCH \
                 -H "Authorization: JWT ${TOKEN}" \
                 -H 'Content-Type: application/json' \
                 --data @- \
-                "https://hub.docker.com/v2/repositories/${HUB_NAMESPACE}/${HUB_REPO}/" \
+                "https://hub.docker.com/v2/repositories/${HUB_NAMESPACE}/${IMAGE}/" \
             > /dev/null
 
       - name: Verify it took effect
+        env:
+          IMAGE: ${{ inputs.image }}
+          FILE: ${{ steps.src.outputs.file }}
+          SHORT: ${{ steps.src.outputs.short }}
         run: |
           set -euo pipefail
           # Read back anonymously: proves the Overview is what an unauthenticated
-          # visitor now sees, rather than trusting the write's response.
+          # visitor now sees, rather than trusting the write's own response.
           GOT=$(curl -sS --fail-with-body \
-            "https://hub.docker.com/v2/repositories/${HUB_NAMESPACE}/${HUB_REPO}/")
+            "https://hub.docker.com/v2/repositories/${HUB_NAMESPACE}/${IMAGE}/")
           GOT_FULL=$(jq -r '.full_description // ""' <<< "$GOT")
           GOT_SHORT=$(jq -r '.description // ""' <<< "$GOT")
 
@@ -110,13 +169,13 @@ jobs:
             echo "::error::Overview is still empty after the PATCH"
             exit 1
           fi
-          if ! diff -q <(printf '%s' "$GOT_FULL") <(cat "$OVERVIEW_FILE") >/dev/null; then
-            echo "::error::published Overview does not match ${OVERVIEW_FILE}"
-            diff <(printf '%s' "$GOT_FULL") "$OVERVIEW_FILE" | head -20 || true
+          if ! diff -q <(printf '%s' "$GOT_FULL") <(cat "$FILE") >/dev/null; then
+            echo "::error::published Overview does not match ${FILE}"
+            diff <(printf '%s' "$GOT_FULL") "$FILE" | head -20 || true
             exit 1
           fi
-          if [[ "$GOT_SHORT" != "$SHORT_DESCRIPTION" ]]; then
-            echo "::error::short description is '${GOT_SHORT}', expected '${SHORT_DESCRIPTION}'"
+          if [[ "$GOT_SHORT" != "$SHORT" ]]; then
+            echo "::error::short description is '${GOT_SHORT}', expected '${SHORT}'"
             exit 1
           fi
-          echo "::notice::Overview published and verified anonymously"
+          echo "::notice::Overview for ${IMAGE} published and verified anonymously"
