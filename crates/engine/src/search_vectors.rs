@@ -180,38 +180,11 @@ pub async fn handle_search_vectors(
         )));
     }
 
-    if !conditions.is_empty() {
-        validate_conditions_against_search_schema(
-            &conditions,
-            vector_index.search_schema.as_deref(),
-            &table.attribute_definitions,
-        )?;
-    }
-
-    // The index's HASH element scopes the search to one partition; the
-    // remaining conditions narrow within it. Declaring a HASH element is
-    // optional, but when the index has one the service requires the search to
-    // supply it, so validation upstream guarantees it is present here.
-    let hash_attr = vector_index
-        .search_schema
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .find(|e| e.element_type == SearchSchemaElementType::Hash)
-        .map(|e| e.attribute_name.as_str());
-
-    let hash_key: Option<(&str, &AttributeValue)> = hash_attr.and_then(|name| {
-        conditions
-            .iter()
-            .find(|c| c.attribute_name == name)
-            .map(|c| (c.attribute_name.as_str(), &c.value))
-    });
-
-    let filters: Vec<(&str, &AttributeValue)> = conditions
-        .iter()
-        .filter(|c| Some(c.attribute_name.as_str()) != hash_attr)
-        .map(|c| (c.attribute_name.as_str(), &c.value))
-        .collect();
+    let (hash_key, filters) = resolve_search_scope(
+        &conditions,
+        vector_index.search_schema.as_deref(),
+        &table.attribute_definitions,
+    )?;
 
     let search_output = vector_search
         .search_vectors(extenddb_storage::VectorSearch {
@@ -379,9 +352,142 @@ fn search_request_bytes(dimensions: u32, returned_non_vector_bytes: usize) -> f6
         .max(MIN_SEARCH_BYTES)
 }
 
+/// Resolved search scope: the partition-scoping HASH equality, if the index
+/// declares one, and the remaining inline-filter equalities.
+type SearchScope<'a> = (
+    Option<(&'a str, &'a AttributeValue)>,
+    Vec<(&'a str, &'a AttributeValue)>,
+);
+
+/// Validate a search's conditions against the index search schema, then split
+/// them into the partition scope and the remaining inline filters.
+///
+/// The index's HASH element scopes the search to one partition; the remaining
+/// conditions narrow within it. Declaring a HASH element is optional, but when
+/// the index has one the service requires the search to supply it.
+///
+/// Validation runs unconditionally, including when the caller supplied no
+/// `SearchConditionExpression` at all. That is the whole point of doing it here
+/// rather than at the call site behind a non-empty check: an index declaring a
+/// HASH element and a search with no expression is a validation failure, and
+/// skipping the check for empty conditions would return `None` for `hash_key`
+/// and hand the backend an unscoped search. `VectorSearch::hash_key` promises
+/// backend authors that `Some` is a mandatory predicate whenever the index
+/// declares a HASH element, so that promise has to hold on every path.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` when the conditions reference an
+/// attribute outside the search schema, omit a declared HASH attribute, or carry
+/// a value whose type disagrees with the table's attribute definitions.
+fn resolve_search_scope<'a>(
+    conditions: &'a [extenddb_core::expression::SearchCondition],
+    search_schema: Option<&'a [extenddb_core::types::SearchSchemaElement]>,
+    attribute_definitions: &[extenddb_core::types::AttributeDefinition],
+) -> Result<SearchScope<'a>, DynamoDbError> {
+    validate_conditions_against_search_schema(conditions, search_schema, attribute_definitions)?;
+
+    let hash_attr = search_schema
+        .unwrap_or_default()
+        .iter()
+        .find(|e| e.element_type == SearchSchemaElementType::Hash)
+        .map(|e| e.attribute_name.as_str());
+
+    let hash_key: Option<(&str, &AttributeValue)> = hash_attr.and_then(|name| {
+        conditions
+            .iter()
+            .find(|c| c.attribute_name == name)
+            .map(|c| (c.attribute_name.as_str(), &c.value))
+    });
+
+    // The validation above is what makes this hold; assert it so a future change
+    // that reintroduces a conditional guard fails here rather than silently
+    // serving an unscoped search.
+    debug_assert!(
+        hash_attr.is_none() || hash_key.is_some(),
+        "index declares a HASH element but the resolved scope has no hash_key"
+    );
+
+    let filters: Vec<(&str, &AttributeValue)> = conditions
+        .iter()
+        .filter(|c| Some(c.attribute_name.as_str()) != hash_attr)
+        .map(|c| (c.attribute_name.as_str(), &c.value))
+        .collect();
+
+    Ok((hash_key, filters))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use extenddb_core::expression::SearchCondition;
+    use extenddb_core::types::{
+        AttributeDefinition, ScalarAttributeType, SearchSchemaElement, SearchSchemaElementType,
+    };
+
+    fn hash_schema() -> Vec<SearchSchemaElement> {
+        vec![SearchSchemaElement {
+            attribute_name: "Country".to_owned(),
+            element_type: SearchSchemaElementType::Hash,
+        }]
+    }
+
+    fn country_defs() -> Vec<AttributeDefinition> {
+        vec![AttributeDefinition {
+            attribute_name: "Country".to_owned(),
+            attribute_type: ScalarAttributeType::S,
+        }]
+    }
+
+    fn country_cond(v: &str) -> Vec<SearchCondition> {
+        vec![SearchCondition {
+            attribute_name: "Country".to_owned(),
+            value: AttributeValue::S(v.to_owned()),
+        }]
+    }
+
+    /// The defect this guards: an index declaring a HASH element, searched with
+    /// no `SearchConditionExpression` at all, must be refused. Resolving the
+    /// scope without validating first would yield `hash_key: None` and hand the
+    /// backend an unscoped search, contradicting the `VectorSearch::hash_key`
+    /// contract that backends may treat `Some` as a mandatory predicate.
+    #[test]
+    fn hash_index_searched_with_no_conditions_is_refused() {
+        let schema = hash_schema();
+        let err = resolve_search_scope(&[], Some(&schema), &country_defs()).unwrap_err();
+        let DynamoDbError::ValidationException(msg) = err else {
+            panic!("expected ValidationException");
+        };
+        assert!(
+            msg.contains("SearchConditionExpression must have all HASH attributes"),
+            "got: {msg}"
+        );
+    }
+
+    /// Converse control: an index with no search schema has no scope to require,
+    /// so no conditions is valid and the resolved scope is empty. Without this,
+    /// the test above would also pass for a function that refused every search.
+    #[test]
+    fn index_without_search_schema_allows_no_conditions() {
+        let (hash_key, filters) = resolve_search_scope(&[], None, &country_defs()).unwrap();
+        assert!(hash_key.is_none());
+        assert!(filters.is_empty());
+    }
+
+    /// The scope is populated when supplied, and the HASH attribute is not also
+    /// repeated as an inline filter.
+    #[test]
+    fn hash_condition_becomes_the_scope_and_not_a_filter() {
+        let conds = country_cond("USA");
+        let schema = hash_schema();
+        let (hash_key, filters) =
+            resolve_search_scope(&conds, Some(&schema), &country_defs()).unwrap();
+        assert_eq!(hash_key.map(|(n, _)| n), Some("Country"));
+        assert!(
+            filters.is_empty(),
+            "HASH attribute must not be repeated as an inline filter, got {filters:?}"
+        );
+    }
 
     #[test]
     fn parse_search_vector_ok() {
