@@ -142,7 +142,7 @@ built. Read the table as "what the wasm crate work does to a crate you may own".
 | `extenddb-core` | `time` gains the `wasm-bindgen` feature, so time formatting has a clock source in a browser | feature addition | none |
 | `extenddb-auth` | `axum` is replaced by `http`, and three files import `http::HeaderMap` instead of `axum::http::HeaderMap` | unconditional, every target | type-identical, see below |
 | `extenddb-cache` | a pass-through stale-while-revalidate implementation with no `moka` and no background refresh task | target-gated module | none |
-| `extenddb-engine` | `tokio` moves to a native-only dependency table; the three `SystemTime::now` sites in `streams.rs` (lines 142, 203, 237, all computing Unix epoch seconds for shard iterators) move to the `time` crate's UTC clock, which is what the `wasm-bindgen` feature in the row above enables; and the `ImportTable` and `ExportTableToPointInTime` dispatch arms are gated off | `cfg(not(target_arch = "wasm32"))` plus a clock swap | none |
+| `extenddb-engine` | `tokio` moves to a native-only dependency table; the three `SystemTime::now` sites in `streams.rs` (lines 142, 203, 237) move to the `time` crate's UTC clock, which is what the `wasm-bindgen` feature in the row above enables, and which is the project's convention rather than a defect being corrected: those three lines are correct on native; and the `ImportTable` and `ExportTableToPointInTime` dispatch arms are gated off | `cfg(not(target_arch = "wasm32"))` plus a clock swap | none |
 | `extenddb-storage` | six dependencies move native-only: `extenddb-auth`, `tokio`, `tokio-util`, `bcrypt`, `rand`, `aes-gcm`. The runtime-hooks surface and the backend registry move with them | `cfg(not(target_arch = "wasm32"))` | none |
 | `extenddb-storage-sqlite` | the executor seam, and a manifest that splits by target (section 6.4) | `cfg(target_arch)` | zero behavior change, evidenced per section 14 |
 | `uuid` (workspace) | the `js` feature, so v4 generation has a randomness source in a browser | feature addition | none |
@@ -364,11 +364,12 @@ adapter that would live in the codebase permanently. Converting the three module
 the smaller cost and leaves nothing behind.
 
 `stream.rs` cannot be excluded either, because `create_table.rs` calls
-`Self::init_stream_shards`, which lives there. It is ported whole. That does not give
-the wasm build streams, since the stream read APIs stay stubbed. It is worth stating
-what it does give, because the opposite inference is easy to make: the data plane's
+`Self::init_stream_shards`, which lives there. It is ported whole, and it is implemented
+rather than stubbed, which is why the stream read operations are rejected at the dispatch
+boundary instead (section 9.2). It is worth stating
+what porting it does give, because the opposite inference is easy to make: the data plane's
 stream capture lives in `data/tx_helpers.rs` rather than in `stream.rs`, so a write to
-a stream-enabled table behaves correctly on wasm while the read APIs return an error.
+a stream-enabled table behaves correctly on wasm even though no stream can be read.
 
 The catalog half is the genuinely unconverted set, 112 statement sites
 with zero conversion work: its SQL and its `sqlx` calls are not rewritten, and it stays
@@ -912,14 +913,15 @@ is enforced:
 | Excluded | How it is excluded |
 |---|---|
 | SearchVectors, and CreateTable or UpdateTable carrying vector indexes | Structurally. The engine asks the backend for a vector-search capability before doing any vector work, and the wasm build does not provide one, so the request is rejected before it reaches storage. Returning that capability *is* the implementation, so the wasm build cannot claim it by accident. |
-| UpdateTable, backup and restore, import and export, stream read APIs, TTL, tags, management and IAM | By compilation. Those modules are not compiled on wasm (section 6.2), so the trait methods return the unsupported error. |
-| Secondary indexes (GSI and LSI), TransactWriteItems, TransactGetItems | Deliberately, by an explicit gate. Their storage code does compile on wasm once the seam lands, so v1 has to reject them rather than let an untested surface open by accident. |
+| UpdateTable, backup and restore, import and export, tags, management and IAM | By compilation. Those modules are not compiled on wasm (section 6.2), so the trait methods return the unsupported error. |
+| Stream reads, TTL, secondary indexes (GSI and LSI), TransactWriteItems, TransactGetItems | By the dispatch-boundary allowlist, because for all of these the storage code works. The narrow seam leaves `metadata.rs` and `stream.rs` present and implemented, the latter forced by `create_table.rs` calling `init_stream_shards` from it, and the secondary-index and transaction paths compile once the seam lands. Compilation excludes nothing here, so the rejection has to happen before `dispatch`. |
 
-The third row's mechanism is weaker than the first row's and the difference is worth being
-plain about. Row 1 is capability-shaped: the wasm build cannot claim vector search without
-implementing it, so the exclusion cannot be undone by forgetting something. Row 3 cannot
-take that shape, and the reason is a contract rather than a cost. `index_info`,
-`index_info_by_table_id`, `transact_get_items`, and `transact_write_items` are required
+The allowlist row's mechanism is weaker than the capability row's, and the difference is
+worth being plain about. The vector-search exclusion is capability-shaped: the wasm build
+cannot claim vector search without implementing it, so it cannot be undone by forgetting
+something. The allowlist row cannot take that shape, and the reason is a contract rather than
+a cost. `index_info`, `index_info_by_table_id`, `transact_get_items`, and
+`transact_write_items` are required
 trait methods with no default body, and index selection is an `Option<&str>` parameter
 rather than a surface, so there is nothing to withhold. Synthesising an accessor for them is
 rejected because it would encode "some backends may never have this", which is true of
@@ -933,6 +935,13 @@ indistinguishable from an unfinished port**, both to a reader and to a future co
 deciding whether to finish it. This makes excluded operations unreachable without editing a
 named list and a test. It does not make them unimplementable, and the document does not
 claim otherwise.
+
+The allowlist carries one load that is easy to miss, since it was chosen on other grounds.
+It is also what keeps the local mappers in `ttl.rs:158` and `streams.rs:255` off the wasm
+path: neither handles `StorageError::Unsupported`, so a TTL or stream request that reached
+storage and came back unsupported would surface as a 500 logged as a fault. Rejecting before
+`dispatch` means no such request exists, which is why those two mappers are latent rather
+than a dependency of this plan (section 9.2).
 
 There is a second reason, about the shipping product rather than about future readers. The
 proof of concept's stub helper returned `StorageError::Internal`, so every unported operation
@@ -1126,7 +1135,7 @@ Both packages are named because they are siblings rather than one depending on t
 and not `extenddb-engine`. Between them their graphs cover `core`, `auth`, `cache`, and
 `storage`. Checking only the seam crate would leave `crates/engine` unverified, which is
 precisely where the `SystemTime::now` sites in `streams.rs` are, so the gate would not
-cover the fix shipping alongside it. In PR-B the same job collapses to `-p extenddb-wasm`,
+cover the clock swap shipping alongside it. In PR-B the same job collapses to `-p extenddb-wasm`,
 whose single graph subsumes both. The rule is unchanged in either form: the job's coverage
 is the wasm dependency graph, not a path filter.
 
@@ -1428,7 +1437,7 @@ proposal rather than an implementation detail. Nine commits:
    because rustc enumerates anything missed twice over, once for the field and once for the
    dependency.
 8. `build: make the shared crates compile for wasm32`: `core`, `auth`, `cache` (the SWR
-   shim), `storage`, and `engine`, including the `SystemTime::now` fix in
+   shim), `storage`, and `engine`, including the `SystemTime::now` clock swap in
    `engine/src/streams.rs`. **This is the only commit that touches crates owned by other
    people**, which is exactly why it is its own commit. Those owners have no stake in the
    wasm executor or the CI gate, and asking them to review a large mixed commit to reach
