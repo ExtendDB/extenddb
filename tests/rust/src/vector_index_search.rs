@@ -2134,6 +2134,34 @@ async fn an_invalid_written_vector_reports_the_measured_whole_strings() {
          [-3.4028235E38, 3.4028235E38]. IndexName: vidx",
     );
 
+    // A wrong-typed element INSIDE the list. Measured (probe P13) to use the
+    // SINGLE-sentence envelope, unlike every other case in this test: the
+    // envelope varies by error kind, not by nesting level.
+    let (status, text) = put(
+        "badelem",
+        r#"{"L": [{"N": "0.1"}, {"S": "x"}, {"N": "0"}, {"N": "0"}]}"#,
+    )
+    .await;
+    assert_validation_message(
+        status,
+        &text,
+        "One or more parameter values were invalid. Invalid type for parameter emb[1], \
+         Expected: 32-bit floating point number, Actual: S. IndexName: vidx",
+    );
+
+    // BOOL, the measured case that shows the token is not limited to key types.
+    let (status, text) = put(
+        "boolelem",
+        r#"{"L": [{"N": "0.1"}, {"BOOL": true}, {"N": "0"}, {"N": "0"}]}"#,
+    )
+    .await;
+    assert_validation_message(
+        status,
+        &text,
+        "One or more parameter values were invalid. Invalid type for parameter emb[1], \
+         Expected: 32-bit floating point number, Actual: BOOL. IndexName: vidx",
+    );
+
     // UpdateItem shares PutItem's wording exactly, on an item already indexed.
     let (status, text) = call(
         "UpdateItem",

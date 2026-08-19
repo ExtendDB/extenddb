@@ -524,9 +524,9 @@ mod tests {
         let message = err(&item_with_vector(value));
         assert_eq!(
             message,
-            "One or more parameter values are not valid. One or more parameter values were \
-             invalid . Invalid type for parameter ProductEmbedding[2], Expected: 32-bit \
-             floating point number, Actual: S. IndexName: ProductIndex"
+            "One or more parameter values were invalid. Invalid type for parameter \
+             ProductEmbedding[2], Expected: 32-bit floating point number, Actual: S. \
+             IndexName: ProductIndex"
         );
     }
 
@@ -642,6 +642,41 @@ mod tests {
             probe_err(AttributeValue::S("not-a-vector".to_owned())),
             "One or more parameter values are not valid. One or more parameter values were \
              invalid . Invalid type for parameter emb, Expected: L, Actual: S. IndexName: vidx"
+        );
+    }
+
+    /// Byte-for-byte against probe P13, and the reason the two envelopes are
+    /// separate constants.
+    ///
+    /// A wrong-typed element INSIDE the list uses the SINGLE-sentence envelope,
+    /// "One or more parameter values were invalid. " with an ordinary full stop,
+    /// where the attribute-level size and type errors above and the element-level
+    /// range error below all use the doubled one. The envelope varies by error
+    /// KIND, not by nesting level, which is exactly the inference an earlier pass
+    /// got wrong: four captures happened to be doubled-envelope kinds, so the
+    /// envelope looked universal.
+    ///
+    /// Both measured actual types are asserted, because `BOOL` is the one that
+    /// shows the type token is not restricted to the scalar key types.
+    #[test]
+    fn wrong_element_type_is_byte_identical_to_the_service() {
+        let with = |element: AttributeValue| {
+            probe_err(AttributeValue::L(vec![
+                AttributeValue::N("0.1".to_owned()),
+                element,
+                AttributeValue::N("0".to_owned()),
+                AttributeValue::N("0".to_owned()),
+            ]))
+        };
+        assert_eq!(
+            with(AttributeValue::S("x".to_owned())),
+            "One or more parameter values were invalid. Invalid type for parameter emb[1], \
+             Expected: 32-bit floating point number, Actual: S. IndexName: vidx"
+        );
+        assert_eq!(
+            with(AttributeValue::Bool(true)),
+            "One or more parameter values were invalid. Invalid type for parameter emb[1], \
+             Expected: 32-bit floating point number, Actual: BOOL. IndexName: vidx"
         );
     }
 
