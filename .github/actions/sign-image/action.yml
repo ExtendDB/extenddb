@@ -105,4 +105,4 @@ runs:
         KEY_ARN: ${{ inputs.key-arn }}
       run: |
         set -euo pipefail
-        cosign verify --key "awskms:///${KEY_ARN}" "${IMAGE_REPO}@${DIGEST}" | head -1
+        cosign verify --key "awskms:///${KEY_ARN}" "${IMAGE_REPO}@${DIGEST}" >/dev/null
