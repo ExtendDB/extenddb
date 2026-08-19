@@ -1,0 +1,113 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Composite action: promote one verified digest to `X.Y.Z` (and optionally
+# `latest`) on ONE destination registry. The single source of truth for the
+# per-registry promotion rules, shared by promote-image.yml (three registries)
+# and any image workflow that fans out (e.g. extenddb-dev):
+#
+#   * version tags are immutable: an existing version tag with a different
+#     digest fails; the identical digest is an idempotent no-op
+#   * promotion refuses unsigned artifacts: the Cosign signature tag for the
+#     digest must exist on the destination, or be copied from the source;
+#     if neither has it, the leg fails
+#   * `latest` only moves forward, judged against THE DESTINATION's own tag
+#     list (registries can diverge through partial promotions; each destination
+#     defends itself)
+#   * every copy is by digest with --preserve-digests and post-copy assertion
+#
+# The CALLER handles registry authentication (login before, logout after) and
+# approval gating. This action only promotes and verifies.
+
+name: promote-registry
+description: Promote a verified digest to version (+ guarded latest) on one registry
+
+inputs:
+  src-repo:
+    description: 'Source repository holding the digest and its signature, e.g. docker.io/extenddb/extenddb-postgres'
+    required: true
+  dst-repo:
+    description: 'Destination repository, e.g. ghcr.io/extenddb/extenddb-postgres'
+    required: true
+  version:
+    description: 'Version to promote to (X.Y.Z, no v prefix); caller must have validated it'
+    required: true
+  digest:
+    description: 'Verified index digest (sha256:<64 hex>); caller must have validated it'
+    required: true
+  move-latest:
+    description: 'Whether this promotion also moves latest (true/false)'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Promote ${{ inputs.dst-repo }} to ${{ inputs.version }}
+      shell: bash
+      env:
+        SRC: ${{ inputs.src-repo }}
+        DST: ${{ inputs.dst-repo }}
+        VERSION: ${{ inputs.version }}
+        DIGEST: ${{ inputs.digest }}
+        MOVE_LATEST: ${{ inputs.move-latest }}
+      run: |
+        set -euo pipefail
+        SIG_TAG="sha256-${DIGEST#sha256:}.sig"
+
+        # --- version tag: immutable, idempotent on the identical digest ---
+        if EXISTING=$(skopeo inspect --format '{{.Digest}}' "docker://${DST}:${VERSION}" 2>/dev/null); then
+          if [[ "$EXISTING" != "$DIGEST" ]]; then
+            echo "::error::${DST}:${VERSION} already exists with different digest ${EXISTING}; released versions are immutable"
+            exit 1
+          fi
+          echo "::notice::${DST}:${VERSION} already promoted with the exact digest"
+        else
+          skopeo copy --all --preserve-digests \
+            "docker://${SRC}@${DIGEST}" \
+            "docker://${DST}:${VERSION}"
+        fi
+
+        # --- refuse unsigned promotion: the signature must exist on DST ---
+        if ! DST_SIG=$(skopeo inspect --format '{{.Digest}}' "docker://${DST}:${SIG_TAG}" 2>/dev/null); then
+          if SRC_SIG=$(skopeo inspect --format '{{.Digest}}' "docker://${SRC}:${SIG_TAG}" 2>/dev/null); then
+            skopeo copy --preserve-digests \
+              "docker://${SRC}:${SIG_TAG}" \
+              "docker://${DST}:${SIG_TAG}"
+            DST_SIG=$(skopeo inspect --format '{{.Digest}}' "docker://${DST}:${SIG_TAG}")
+            [[ "$DST_SIG" == "$SRC_SIG" ]] || { echo "::error::signature copy digest mismatch (${DST_SIG} != ${SRC_SIG})"; exit 1; }
+          else
+            echo "::error::no Cosign signature for ${DIGEST} on ${SRC} or ${DST}; refusing to promote an unsigned artifact"
+            exit 1
+          fi
+        fi
+
+        # --- latest: forward-only, judged against THIS destination's tags ---
+        if [[ "$MOVE_LATEST" == "true" ]]; then
+          HIGHEST=$(skopeo list-tags "docker://${DST}" \
+            | jq -r '.Tags[]' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            | grep -vxF "$VERSION" \
+            | sort -V \
+            | tail -1 || true)
+          if [[ -n "$HIGHEST" ]]; then
+            TOP=$(printf '%s\n%s\n' "$VERSION" "$HIGHEST" | sort -V | tail -1)
+            if [[ "$TOP" != "$VERSION" ]]; then
+              echo "::error::${VERSION} is not the highest version on ${DST} (${HIGHEST} is); moving latest backwards is refused per destination"
+              exit 1
+            fi
+          fi
+          skopeo copy --all --preserve-digests \
+            "docker://${SRC}@${DIGEST}" \
+            "docker://${DST}:latest"
+        fi
+
+        # --- verify everything this leg touched ---
+        TAGS=("${VERSION}")
+        [[ "$MOVE_LATEST" == "true" ]] && TAGS+=(latest)
+        for t in "${TAGS[@]}"; do
+          GOT=$(skopeo inspect --format '{{.Digest}}' "docker://${DST}:${t}")
+          [[ "$GOT" == "$DIGEST" ]] || { echo "::error::${DST}:${t} resolves to ${GOT}, expected ${DIGEST}"; exit 1; }
+        done
+        skopeo inspect --format '{{.Digest}}' "docker://${DST}:${SIG_TAG}" >/dev/null \
+          || { echo "::error::signature ${DST}:${SIG_TAG} missing after promotion"; exit 1; }
+        echo "::notice::${DST}: promoted ${VERSION}$([[ "$MOVE_LATEST" == "true" ]] && echo ' + latest'), signature present"
