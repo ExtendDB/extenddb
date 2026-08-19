@@ -118,7 +118,7 @@ mod tests {
         }))
         .expect("input");
         engine
-            .create_table_impl(account, input)
+            .create_table_impl(account, input, false)
             .await
             .expect("create table");
 
