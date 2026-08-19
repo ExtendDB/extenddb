@@ -26,6 +26,17 @@ fn invalid(msg: impl Into<String>) -> DynamoDbError {
     DynamoDbError::ValidationException(msg.into())
 }
 
+/// Envelope every vector-attribute rejection carries.
+///
+/// Measured byte-exact against real Amazon DynamoDB on 2026-08-19 across four
+/// captures (probes P4, P5, P9 and P10: wrong dimension count, wrong attribute
+/// type, component out of f32 range, and the per-item TransactWriteItems
+/// cancellation reason, which repeats the PutItem wording verbatim). Both
+/// oddities are the service's own: the sentence is stated twice, in two
+/// different tenses, and there is a space before the second full stop.
+const INVALID_PARAMETER_VALUES: &str =
+    "One or more parameter values are not valid. One or more parameter values were invalid .";
+
 /// Validate the vector-relevant attributes of an item being written against the
 /// table's vector indexes.
 ///
@@ -192,25 +203,25 @@ fn validate_vector_attribute(
     let dimensions = index.dimensions as usize;
 
     let AttributeValue::L(elements) = value else {
-        // Measured 2026-08-07 against N, S and NS in the vector position, all three
-        // of which produce this exact text. Note "32-bit floating point number
-        // list" rather than any phrasing of "list of numbers", and no full stop
-        // before IndexName, matching the size message below.
+        // Measured 2026-08-19 with a String in the vector position: the service
+        // names DynamoDB type tokens, "Expected: L, Actual: S", not a prose type.
+        // An earlier reading recorded "32-bit floating point number list" with no
+        // actual type at all, which the byte-exact wire capture contradicts.
         return Err(invalid(format!(
-            "One or more parameter values were invalid. Invalid type for parameter {attr}, \
-             Expected: 32-bit floating point number list IndexName: {index_name}"
+            "{INVALID_PARAMETER_VALUES} Invalid type for parameter {attr}, Expected: L, \
+             Actual: {}. IndexName: {index_name}",
+            attribute_type_token(value)
         )));
     };
 
     if elements.len() != dimensions {
-        // Punctuation matches the service exactly, verified 2026-08-05:
-        // "...were invalid. Invalid size for parameter emb, Expected: 4,
-        //  Actual: 3 IndexName: vidx"
-        // Note the full stop after "invalid", the comma after the parameter
-        // name, and the absence of one after the actual count.
+        // Punctuation matches the service exactly, verified 2026-08-19 across
+        // PutItem, UpdateItem and TransactWriteItems, for both too-short and
+        // too-long vectors: a comma after the parameter name and a full stop
+        // after the actual count.
         return Err(invalid(format!(
-            "One or more parameter values were invalid. Invalid size for parameter {attr}, \
-             Expected: {dimensions}, Actual: {} IndexName: {index_name}",
+            "{INVALID_PARAMETER_VALUES} Invalid size for parameter {attr}, \
+             Expected: {dimensions}, Actual: {}. IndexName: {index_name}",
             elements.len()
         )));
     }
@@ -230,15 +241,19 @@ fn validate_vector_attribute(
                         .map(format_scientific)
                         .unwrap_or_else(|_| number.clone());
                     return Err(invalid(format!(
-                        "One or more parameter values were invalid. Invalid value for parameter \
+                        "{INVALID_PARAMETER_VALUES} Invalid value for parameter \
                          {attr}[{position}], Value: {display} is outside valid range \
                          [-3.4028235E38, 3.4028235E38]. IndexName: {index_name}"
                     )));
                 }
             }
             other => {
+                // The envelope is measured; the body is not. No probe has put a
+                // non-number INSIDE the list, so the "Expected: 32-bit floating
+                // point number" wording is inherited from an earlier reading of
+                // the service and is the one part of this family still unverified.
                 return Err(invalid(format!(
-                    "One or more parameter values were invalid. Invalid type for parameter \
+                    "{INVALID_PARAMETER_VALUES} Invalid type for parameter \
                      {attr}[{position}], Expected: 32-bit floating point number, Actual: {}. \
                      IndexName: {index_name}",
                     attribute_type_token(other)
