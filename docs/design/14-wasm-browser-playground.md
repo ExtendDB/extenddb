@@ -913,8 +913,14 @@ is enforced:
 | Excluded | How it is excluded |
 |---|---|
 | SearchVectors, and CreateTable or UpdateTable carrying vector indexes | Structurally. The engine asks the backend for a vector-search capability before doing any vector work, and the wasm build does not provide one, so the request is rejected before it reaches storage. Returning that capability *is* the implementation, so the wasm build cannot claim it by accident. |
-| UpdateTable, backup and restore, import and export, tags, management and IAM | By compilation. Those modules are not compiled on wasm (section 6.2), so the trait methods return the unsupported error. |
+| UpdateTable, backup and restore, import and export, tags, management and IAM | By compilation. Those modules are not compiled on wasm (section 6.2). How the residual trait surface is satisfied is a PR-B question and not a settled one: `StorageEngine` (`crates/storage/src/lib.rs:726`) is a supertrait over six traits including `BackupEngine` and `WorkerStore`, so the wasm build either narrows the bound it uses or carries wasm-only arms for the methods whose modules are absent. |
 | Stream reads, TTL, secondary indexes (GSI and LSI), TransactWriteItems, TransactGetItems | By the dispatch-boundary allowlist, because for all of these the storage code works. The narrow seam leaves `metadata.rs` and `stream.rs` present and implemented, the latter forced by `create_table.rs` calling `init_stream_shards` from it, and the secondary-index and transaction paths compile once the seam lands. Compilation excludes nothing here, so the rejection has to happen before `dispatch`. |
+
+The allowlist equals the documented v1 surface, so it is the operative gate for every row
+above: an excluded request is rejected there, before `dispatch`, whatever else is true of it.
+The other two rows describe additional properties rather than the cause of rejection. The
+capability check bounds what the wasm build can claim at the storage contract, and compilation
+bounds what it contains.
 
 The allowlist row's mechanism is weaker than the capability row's, and the difference is
 worth being plain about. The vector-search exclusion is capability-shaped: the wasm build
