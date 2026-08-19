@@ -349,7 +349,7 @@ on wasm at file granularity.
 | create table, delete table, metadata, table helpers | yes | yes |
 | `stream.rs` (22 statement sites) | yes, whole | yes |
 | `update_table.rs` (57 statement sites) | yes | no |
-| `workers.rs` (23 sites) | yes | no |
+| `workers.rs` (25 sites) | yes | no |
 | `backup.rs` (18 sites) | yes | no |
 | catalog half: catalog store, admin store, authorization store, management store, credential store, bootstrapper, hooks, operations, config, backend factories | no, stays on `sqlx` | no |
 
@@ -1410,16 +1410,18 @@ proposal rather than an implementation detail. Nine commits:
    only, with unit tests for `Param`, `ColumnDecode`, and tuple decoding. This commit also
    carries the `xtask` that extracts SQL literals and `format!` templates (section 14.1),
    so the identity artifact can be regenerated at every commit below rather than only at
-   the endpoints. **No call site is converted in this commit** until the decode path has run
-   on both targets, because a conversion built on an unproven decode layer would have to be
-   redone rather than corrected.
+   the endpoints. No call site is converted here, because the crate and the extractor are all
+   this commit contains.
 2. `refactor(sqlite): split the engine half into extenddb-sqlite-engine`. A `git mv`, the
    manifests, the visibility changes that follow from the new crate boundary, and one
    field. Nothing else, so the diff reads as a move.
 3. `refactor(sqlite): route the vertical slice through the executor`: `store.rs`,
    `schema.rs`, `table_helpers.rs` including the three hand-written `FromDbRow` impls with
    the derives deleted, `data/mod.rs`, `data/query.rs`, `data/query_scan.rs`. 22 sites.
-   **This is the proof-of-pattern commit,** and the one to point a reviewer at first.
+   **This is the proof-of-pattern commit,** and the one to point a reviewer at first. It is
+   also the first conversion, so it lands only after the decode path has run on both targets:
+   a conversion built on an unproven decode layer would have to be redone rather than
+   corrected.
 4. `refactor(sqlite): route the data-plane write path through the executor`:
    `data/tx_helpers.rs`, `data/index.rs`, `data/vector_index.rs`,
    `data/{put,update,delete}_item.rs`, `data/transactions.rs`, `data/data_engine.rs`,
@@ -1429,8 +1431,8 @@ proposal rather than an implementation detail. Nine commits:
    `create_table.rs`, `delete_table.rs`, `table_engine.rs`, `metadata.rs`, `stream.rs`,
    `worker.rs`, `vector_search.rs`.
 6. `refactor(sqlite): route update_table, workers and backup through the executor`: the
-   98-site set that is seamed but never compiles on wasm (section 6.2), which is
-   `update_table.rs` at 57, `workers.rs` at 23, and `backup.rs` at 18.
+   100-site set that is seamed but never compiles on wasm (section 6.2), which is
+   `update_table.rs` at 57, `workers.rs` at 25, and `backup.rs` at 18.
 7. `refactor(sqlite): drop the sqlx dependency from extenddb-sqlite-engine`: delete the
    `pool` field, `Tx::sqlx_tx`, and `Db::from_pool`, remove sqlx from the engine manifest,
    add `clippy.toml`. **This is the enforcement commit,** and nothing in it is judgement,
