@@ -26,16 +26,28 @@ fn invalid(msg: impl Into<String>) -> DynamoDbError {
     DynamoDbError::ValidationException(msg.into())
 }
 
-/// Envelope every vector-attribute rejection carries.
+/// Envelope the service uses for a vector-attribute rejection whose kind states
+/// the sentence twice.
 ///
 /// Measured byte-exact against real Amazon DynamoDB on 2026-08-19 across four
 /// captures (probes P4, P5, P9 and P10: wrong dimension count, wrong attribute
-/// type, component out of f32 range, and the per-item TransactWriteItems
+/// type, a component out of f32 range, and the per-item TransactWriteItems
 /// cancellation reason, which repeats the PutItem wording verbatim). Both
 /// oddities are the service's own: the sentence is stated twice, in two
 /// different tenses, and there is a space before the second full stop.
-const INVALID_PARAMETER_VALUES: &str =
+///
+/// Not universal. Probe P13 measured the element-level TYPE error using
+/// [`INVALID_PARAMETER_VALUES_ONCE`] instead, so the envelope goes with the error
+/// KIND rather than with this file. Reading the four captures above as one rule
+/// is what got it wrong once already: they are all doubled-envelope kinds.
+const INVALID_PARAMETER_VALUES_TWICE: &str =
     "One or more parameter values are not valid. One or more parameter values were invalid .";
+
+/// Envelope for the element-level type error: one sentence, ordinary full stop.
+///
+/// Measured byte-exact on 2026-08-19 (probe P13), for both a String and a BOOL
+/// element inside the vector list.
+const INVALID_PARAMETER_VALUES_ONCE: &str = "One or more parameter values were invalid.";
 
 /// Validate the vector-relevant attributes of an item being written against the
 /// table's vector indexes.
@@ -208,7 +220,7 @@ fn validate_vector_attribute(
         // An earlier reading recorded "32-bit floating point number list" with no
         // actual type at all, which the byte-exact wire capture contradicts.
         return Err(invalid(format!(
-            "{INVALID_PARAMETER_VALUES} Invalid type for parameter {attr}, Expected: L, \
+            "{INVALID_PARAMETER_VALUES_TWICE} Invalid type for parameter {attr}, Expected: L, \
              Actual: {}. IndexName: {index_name}",
             attribute_type_token(value)
         )));
@@ -220,7 +232,7 @@ fn validate_vector_attribute(
         // too-long vectors: a comma after the parameter name and a full stop
         // after the actual count.
         return Err(invalid(format!(
-            "{INVALID_PARAMETER_VALUES} Invalid size for parameter {attr}, \
+            "{INVALID_PARAMETER_VALUES_TWICE} Invalid size for parameter {attr}, \
              Expected: {dimensions}, Actual: {}. IndexName: {index_name}",
             elements.len()
         )));
@@ -241,19 +253,20 @@ fn validate_vector_attribute(
                         .map(format_scientific)
                         .unwrap_or_else(|_| number.clone());
                     return Err(invalid(format!(
-                        "{INVALID_PARAMETER_VALUES} Invalid value for parameter \
+                        "{INVALID_PARAMETER_VALUES_TWICE} Invalid value for parameter \
                          {attr}[{position}], Value: {display} is outside valid range \
                          [-3.4028235E38, 3.4028235E38]. IndexName: {index_name}"
                     )));
                 }
             }
             other => {
-                // The envelope is measured; the body is not. No probe has put a
-                // non-number INSIDE the list, so the "Expected: 32-bit floating
-                // point number" wording is inherited from an earlier reading of
-                // the service and is the one part of this family still unverified.
+                // The one member of this family with a single-sentence envelope,
+                // measured 2026-08-19 (probe P13) for a String and a BOOL element.
+                // The range error immediately above is also element-level and IS
+                // doubled, so position in the item is not the discriminator: the
+                // error kind is.
                 return Err(invalid(format!(
-                    "{INVALID_PARAMETER_VALUES} Invalid type for parameter \
+                    "{INVALID_PARAMETER_VALUES_ONCE} Invalid type for parameter \
                      {attr}[{position}], Expected: 32-bit floating point number, Actual: {}. \
                      IndexName: {index_name}",
                     attribute_type_token(other)
