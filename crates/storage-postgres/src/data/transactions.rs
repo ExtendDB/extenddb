@@ -430,9 +430,14 @@ async fn execute_transact_write_op(
                 *return_values_on_ccf,
                 existing.as_ref(),
             )?;
-            expression::apply_update(actions, &mut item, maps).map_err(|e| {
-                TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
-            })?;
+            expression::apply_update_validated(
+                actions,
+                &mut item,
+                maps,
+                &key_info.vector_indexes,
+                &key_info.attribute_definitions,
+            )
+            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
             // Validate post-update item size
             validation::validate_item_size(&item, max_item_size_bytes).map_err(|e| {
                 TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))

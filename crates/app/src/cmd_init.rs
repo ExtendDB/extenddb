@@ -29,6 +29,12 @@ pub struct InitArgs {
     #[arg(long)]
     catalog_db: Option<String>,
 
+    /// SQLite database file path (default: extenddb.sqlite). The chosen path
+    /// is written to the generated config file, so `serve` finds it without
+    /// further flags. SQLite backend only.
+    #[arg(long)]
+    sqlite_path: Option<String>,
+
     /// PostgreSQL host (hostname, IP address, or absolute Unix socket directory path)
     #[arg(long)]
     pg_host: Option<String>,
@@ -342,4 +348,37 @@ async fn run_init_migrations(
 /// Extract a CLI argument value by flag name.
 fn extract_arg(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InitArgs;
+    use clap::Args as _;
+    use clap::FromArgMatches as _;
+
+    fn parse(args: &[&str]) -> Result<InitArgs, clap::Error> {
+        let cmd = InitArgs::augment_args(clap::Command::new("init"));
+        let matches =
+            cmd.try_get_matches_from(std::iter::once("init").chain(args.iter().copied()))?;
+        InitArgs::from_arg_matches(&matches)
+    }
+
+    /// Regression test for issue #267: `--sqlite-path` was documented and read
+    /// by the SQLite bootstrapper via `extract_arg`, but never declared to
+    /// clap, so every invocation was rejected with "unexpected argument"
+    /// before the bootstrapper could run.
+    #[test]
+    fn init_accepts_sqlite_path() {
+        let args =
+            parse(&["--backend", "sqlite", "--sqlite-path", "/data/x.sqlite"]).expect("parse");
+        assert_eq!(args.sqlite_path.as_deref(), Some("/data/x.sqlite"));
+    }
+
+    /// The control: an actually-unknown flag must still be rejected, proving
+    /// the test above discriminates on the declaration rather than on clap
+    /// somehow accepting arbitrary arguments.
+    #[test]
+    fn init_rejects_unknown_flags() {
+        assert!(parse(&["--sqlite-pathological", "/data/x.sqlite"]).is_err());
+    }
 }

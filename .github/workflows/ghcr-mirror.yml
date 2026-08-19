@@ -24,10 +24,12 @@
 #   sha256-<64 hex>.sig       the Cosign signature artifact for an image digest
 #   X.Y.Z or latest           a release tag already promoted on Docker Hub
 #
-# Known limitation, deliberate: re-pointing `latest` at a NEW digest hits the
-# no-overwrite gate and fails closed. Fine for the first release (no `latest`
-# exists); the second release needs a guarded move-latest carve-out mirroring
-# promote-image's never-move-backwards rule, or the Track 2 pipeline.
+# `latest` is the one tag allowed to move, under a guard derived from
+# registry state: it may only move to the digest that the HIGHEST existing
+# X.Y.Z tag on GHCR already serves. Promote the version tag first, then
+# dispatch `latest`. Moving latest backwards, or to a digest no version tag
+# serves, fails closed. (First hit live on the 0.1.6 release, as predicted
+# by the previous revision of this header.)
 # A signature may only be mirrored after the image it signs is already in
 # GHCR, so a dangling signature cannot exist through this path.
 #
@@ -147,6 +149,27 @@ jobs:
             if [[ "$DST_DIGEST" == "$DIGEST" ]]; then
               echo "already-mirrored=true" >> "$GITHUB_ENV"
               echo "::notice::${DST_REPO}:${TAG} already exists with the exact verified digest; nothing to do"
+            elif [[ "$TAG" == "latest" ]]; then
+              # latest may move, but only forward: the target digest must be
+              # the one served by the HIGHEST version tag already on GHCR.
+              # (The version tag is mirrored before latest, so ordering is
+              # enforced structurally; promote-image applied the same rule
+              # on Docker Hub before anything reached this job.)
+              HIGHEST=$(skopeo list-tags "docker://${DST_REPO}" \
+                | jq -r '.Tags[]' \
+                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+                | sort -V \
+                | tail -1 || true)
+              if [[ -z "$HIGHEST" ]]; then
+                echo "::error::no version tags exist on ${DST_REPO}; latest has nothing to follow"
+                exit 1
+              fi
+              HIGHEST_DIGEST=$(skopeo inspect --format '{{.Digest}}' "docker://${DST_REPO}:${HIGHEST}")
+              if [[ "$HIGHEST_DIGEST" != "$DIGEST" ]]; then
+                echo "::error::latest may only move to the digest of the highest version tag (${HIGHEST} -> ${HIGHEST_DIGEST}); mirror the version tag first"
+                exit 1
+              fi
+              echo "::notice::moving latest forward to the digest of ${HIGHEST}"
             else
               echo "::error::${DST_REPO}:${TAG} already exists with different digest ${DST_DIGEST}; refusing to overwrite"
               exit 1

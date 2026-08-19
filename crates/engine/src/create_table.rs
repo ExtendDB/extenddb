@@ -44,12 +44,31 @@ pub async fn handle_create_table(
 
     validate_create_table(&input, &ctx.limits)?;
 
+    crate::vector_gate::ensure_create_table_supported(
+        input.vector_indexes.as_ref(),
+        ctx.storage.as_vector_search(),
+    )?;
+
     let table_name = input.table_name.clone();
+    // Kept for the post-condition check below, since `input` is moved into the
+    // backend call.
+    let requested_vector_indexes = input.vector_indexes.clone();
     let table_desc = ctx
         .storage
         .create_table(&ctx.account_id, input)
         .await
         .map_err(storage_err_to_dynamo)?;
+
+    // A declared-capable backend must not silently drop the indexes it was asked
+    // to create. The capability gate above proves only that it *can*.
+    crate::vector_gate::ensure_vector_indexes_applied(
+        requested_vector_indexes.as_ref(),
+        &table_desc,
+    )?;
+
+    // Same invariant as the describe path: a newly created index must not be
+    // reported ready while it is still being populated.
+    table_desc.validate_vector_index_readiness()?;
 
     // Drop any cached TableKeyInfo (typically a negative-cached "not found"
     // from a prior describe attempt) so requests against the new table see
@@ -100,6 +119,11 @@ pub(crate) fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) ->
             tracing::error!(internal_error = %msg, "storage connection error");
             DynamoDbError::ServiceUnavailable("Service is temporarily unavailable".to_owned())
         }
+        // Not a fault, so deliberately not logged at error level: the backend
+        // never claimed the feature. ValidationException because DynamoDB has no
+        // "unsupported" error class, and the request is invalid against this
+        // deployment rather than a server failure.
+        StorageError::Unsupported(msg) => DynamoDbError::ValidationException(msg),
         StorageError::CatalogVersionMismatch { expected, found } => {
             tracing::error!("Catalog version mismatch: expected {expected}, found {found}");
             DynamoDbError::InternalServerError("Internal server error".to_owned())

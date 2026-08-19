@@ -150,9 +150,18 @@ impl PostgresEngine {
                 Err(e) => return Err(e),
             }
 
-            // Apply update actions
-            expression::apply_update(actions, &mut item, maps)
-                .map_err(|e| StorageError::Validation(e.to_string()))?;
+            // Apply update actions and validate the resulting image against the
+            // table's vector indexes: vector validity is a property of the stored
+            // value, and expression-form checks cannot cover if_not_exists /
+            // list_append / copy-from-attribute forms.
+            expression::apply_update_validated(
+                actions,
+                &mut item,
+                maps,
+                &key_info.vector_indexes,
+                &key_info.attribute_definitions,
+            )
+            .map_err(|e| StorageError::Validation(e.to_string()))?;
 
             // Validate post-update item size (400 KB limit)
             validation::validate_item_size(&item, self.max_item_size_bytes)

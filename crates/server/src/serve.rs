@@ -430,28 +430,30 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         Ok(resolved)
     };
 
-    // Build effective path lists: new config takes precedence over deprecated.
-    let mut import_paths_raw = app_config.import_config.paths.clone();
-    let mut export_paths_raw = app_config.export_config.paths.clone();
-    if let Some(ref legacy) = app_config.import_export_root {
-        if import_paths_raw.is_empty() {
-            import_paths_raw.push(legacy.clone());
-        }
-        if export_paths_raw.is_empty() {
-            export_paths_raw.push(legacy.clone());
-        }
-        if !app_config.import_config.paths.is_empty() && !app_config.export_config.paths.is_empty()
-        {
-            tracing::warn!(
-                "Both import_export_root and [import]/[export] sections configured; import_export_root is ignored"
-            );
-        }
+    // Build effective path lists: a populated section wins, and the deprecated
+    // import_export_root fills only a list a section left empty. Which surface
+    // won decides what the diagnostics should say, so it is recorded.
+    let effective = crate::import_export_paths::EffectivePaths::resolve(
+        &app_config.import_config.paths,
+        &app_config.export_config.paths,
+        app_config.import_export_root.as_deref(),
+    );
+    for notice in effective.legacy_notices() {
+        tracing::warn!("{notice}");
     }
 
     let import_paths: Arc<[Arc<std::path::PathBuf>]> =
-        Arc::from(resolve_paths(&import_paths_raw, "import")?);
+        Arc::from(resolve_paths(&effective.import, "import")?);
     let export_paths: Arc<[Arc<std::path::PathBuf>]> =
-        Arc::from(resolve_paths(&export_paths_raw, "export")?);
+        Arc::from(resolve_paths(&effective.export, "export")?);
+
+    for notice in crate::import_export_paths::overlap_notices(
+        &import_paths,
+        &export_paths,
+        effective.overlap_is_inherent(),
+    ) {
+        tracing::warn!("{notice}");
+    }
 
     if import_paths.is_empty() {
         tracing::info!("Import disabled (no [import] paths configured)");

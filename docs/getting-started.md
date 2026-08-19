@@ -142,16 +142,20 @@ location is configured (default `extenddb.sqlite`):
 path = "extenddb.sqlite"   # or ":memory:" for an ephemeral in-memory database
 ```
 
-At serve time the path can be overridden with `--sqlite-path`. The resolution
-order is: the `--sqlite-path` flag, then `[storage.sqlite].path` in the config,
-then the default `extenddb.sqlite`:
+At init time the path can be chosen with `--sqlite-path`, which also writes it
+into the generated config. At serve time the path comes from
+`[storage.sqlite].path` in the config, or the `EXTENDDB__STORAGE__SQLITE__PATH`
+environment variable, which overrides the config:
 
 ```bash
-./target/release/extenddb serve --config extenddb.toml --sqlite-path /data/extenddb.sqlite
+./target/release/extenddb init --backend sqlite --sqlite-path /data/extenddb.sqlite
+./target/release/extenddb serve --config extenddb.toml
+# or, overriding at serve time:
+EXTENDDB__STORAGE__SQLITE__PATH=/data/other.sqlite ./target/release/extenddb serve --config extenddb.toml
 ```
 
-Use `:memory:` (in the config or via `--sqlite-path`) for an ephemeral database
-that is discarded on shutdown.
+Use `:memory:` (in the config, the environment variable, or `init
+--sqlite-path`) for an ephemeral database that is discarded on shutdown.
 
 ### Generating a self-signed certificate manually
 

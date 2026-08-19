@@ -15,4 +15,5 @@ pub mod serde_helpers;
 pub mod throttle;
 pub mod types;
 pub mod validation;
+pub mod vector_capacity;
 pub mod version;
