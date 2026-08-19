@@ -71,7 +71,7 @@ impl<'de> serde::Deserialize<'de> for ScalarAttributeType {
 /// Used by data operations (`PutItem`, `GetItem`) that need key metadata
 /// without the full `TableDescription` overhead. Includes stream specification
 /// so write operations can check stream status without an extra SQL round-trip.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TableKeyInfo {
     pub table_name: String,
     pub account_id: String,
@@ -98,6 +98,24 @@ pub struct TableKeyInfo {
     /// Stream specification for the table, if streams are configured.
     /// Cached here to avoid an extra `describe_table` call per write operation.
     pub stream_specification: Option<super::StreamSpecification>,
+    /// Vector indexes on the table, if any. Carried so write operations can
+    /// validate vector-valued and search-schema attributes without an extra
+    /// catalog round-trip.
+    pub vector_indexes: Vec<VectorIndexKeyInfo>,
+}
+
+/// Vector-index metadata needed by the write path to validate an item's
+/// vector-valued attribute and its search-schema attributes.
+#[derive(Debug, Clone)]
+pub struct VectorIndexKeyInfo {
+    /// Name of the vector index.
+    pub index_name: String,
+    /// Declared vector dimension.
+    pub dimensions: u32,
+    /// Item attribute that carries the vector.
+    pub vector_attribute_name: String,
+    /// Search-schema elements (partition key and inline filters).
+    pub search_schema: Vec<super::table::SearchSchemaElement>,
 }
 
 impl TableKeyInfo {
@@ -188,6 +206,8 @@ pub enum IndexType {
     Gsi,
     /// Local secondary index — same partition key as base table.
     Lsi,
+    /// Vector index — searched only via the vector search API, not Scan/Query.
+    Vector,
 }
 
 /// Metadata for a secondary index, used by query/scan operations.
@@ -203,6 +223,43 @@ pub struct IndexInfo {
     pub key_schema: Vec<KeySchemaElement>,
     /// Projection configuration.
     pub projection: super::table::Projection,
+}
+
+/// Index rows grouped by kind.
+///
+/// Returned by [`partition_indexes`]. Exists so a backend reading its own index
+/// catalog does not match on [`IndexType`] itself: adding a variant would
+/// otherwise break every such match, which is how adding the vector variant
+/// broke a backend that will never serve one. New variants land here instead.
+#[derive(Debug, Default, Clone)]
+pub struct PartitionedIndexes {
+    /// Global secondary indexes.
+    pub gsis: Vec<IndexInfo>,
+    /// Local secondary indexes.
+    pub lsis: Vec<IndexInfo>,
+    /// Vector indexes. A backend that does not declare vector support will never
+    /// have created one, so this being non-empty in that case means the catalog
+    /// disagrees with the backend's capability.
+    pub vectors: Vec<IndexInfo>,
+}
+
+/// Group index rows by kind.
+///
+/// Callers take the groups they serve and ignore the rest, so a backend needs no
+/// knowledge of index kinds it does not implement.
+pub fn partition_indexes<I>(indexes: I) -> PartitionedIndexes
+where
+    I: IntoIterator<Item = IndexInfo>,
+{
+    let mut out = PartitionedIndexes::default();
+    for info in indexes {
+        match info.index_type {
+            IndexType::Gsi => out.gsis.push(info),
+            IndexType::Lsi => out.lsis.push(info),
+            IndexType::Vector => out.vectors.push(info),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -231,6 +288,7 @@ mod tests {
             global_secondary_indexes: vec![],
             local_secondary_indexes: vec![],
             stream_specification: None,
+            vector_indexes: vec![],
         }
     }
 
@@ -410,6 +468,7 @@ mod tests {
             global_secondary_indexes: vec![],
             local_secondary_indexes: vec![],
             stream_specification: None,
+            vector_indexes: vec![],
         };
         assert_eq!(info.key_schema, info.base_key_schema);
     }
@@ -429,10 +488,87 @@ mod tests {
             global_secondary_indexes: vec![],
             local_secondary_indexes: vec![],
             stream_specification: None,
+            vector_indexes: vec![],
         };
         assert_eq!(info.key_schema, index_schema);
         assert_eq!(info.base_key_schema, base_schema);
         assert_ne!(info.key_schema, info.base_key_schema);
         assert_eq!(info.base_key_schema[0].attribute_name, "pk");
+    }
+}
+
+#[cfg(test)]
+mod partition_tests {
+    use super::*;
+    use crate::types::table::{Projection, ProjectionType};
+
+    fn info(name: &str, index_type: IndexType) -> IndexInfo {
+        IndexInfo {
+            index_name: name.to_owned(),
+            index_id: format!("{name}-id"),
+            index_type,
+            key_schema: Vec::new(),
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
+        }
+    }
+
+    /// The point of the helper: a caller takes the groups it serves and never
+    /// matches on `IndexType`, so a new variant cannot break it.
+    #[test]
+    fn groups_each_kind_separately() {
+        let out = partition_indexes(vec![
+            info("g1", IndexType::Gsi),
+            info("l1", IndexType::Lsi),
+            info("v1", IndexType::Vector),
+            info("g2", IndexType::Gsi),
+        ]);
+        assert_eq!(
+            out.gsis
+                .iter()
+                .map(|i| i.index_name.as_str())
+                .collect::<Vec<_>>(),
+            ["g1", "g2"]
+        );
+        assert_eq!(
+            out.lsis
+                .iter()
+                .map(|i| i.index_name.as_str())
+                .collect::<Vec<_>>(),
+            ["l1"]
+        );
+        assert_eq!(
+            out.vectors
+                .iter()
+                .map(|i| i.index_name.as_str())
+                .collect::<Vec<_>>(),
+            ["v1"]
+        );
+    }
+
+    /// Input order is preserved within a group, so a caller that relied on
+    /// catalog ordering keeps it.
+    #[test]
+    fn preserves_input_order_within_a_group() {
+        let out = partition_indexes(vec![
+            info("b", IndexType::Gsi),
+            info("a", IndexType::Gsi),
+            info("c", IndexType::Gsi),
+        ]);
+        assert_eq!(
+            out.gsis
+                .iter()
+                .map(|i| i.index_name.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "a", "c"]
+        );
+    }
+
+    #[test]
+    fn empty_input_yields_empty_groups() {
+        let out = partition_indexes(Vec::new());
+        assert!(out.gsis.is_empty() && out.lsis.is_empty() && out.vectors.is_empty());
     }
 }

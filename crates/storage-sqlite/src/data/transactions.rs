@@ -379,9 +379,14 @@ async fn execute_transact_write_op(
                 existing.as_ref(),
             )?;
             let mut item = existing.clone().unwrap_or_else(|| (*key).clone());
-            expression::apply_update(actions, &mut item, maps).map_err(|e| {
-                TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
-            })?;
+            expression::apply_update_validated(
+                actions,
+                &mut item,
+                maps,
+                &key_info.vector_indexes,
+                &key_info.attribute_definitions,
+            )
+            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
             validation::validate_item_size(&item, max_item_size_bytes).map_err(|e| {
                 TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
             })?;

@@ -18,7 +18,10 @@ use crate::transact_write_helpers::{
 };
 use crate::{DispatchMetrics, DispatchResult};
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::types::{TransactWriteItem, TransactWriteItemsInput, TransactWriteItemsOutput};
+use extenddb_core::expression::{Expr, ExpressionMaps, PathElement, UpdateAction};
+use extenddb_core::types::{
+    CancellationReason, Item, TransactWriteItem, TransactWriteItemsInput, TransactWriteItemsOutput,
+};
 use extenddb_core::validation::{
     validate_attribute_name_sizes, validate_attribute_values_nesting_depth,
     validate_item_nesting_depth, validate_item_size, validate_key_not_empty,
@@ -141,6 +144,19 @@ pub async fn handle_transact_write_items(
     }
 
     // Build storage operations
+    // Vector-valued and search-schema validation failures surface as per-item
+    // cancellation reasons rather than a top-level ValidationException.
+    if let Some(reasons) = collect_vector_cancellation_reasons(&prepared) {
+        let codes: Vec<String> = reasons.iter().map(|r| r.code.clone()).collect();
+        return Err(DynamoDbError::TransactionCanceledException {
+            message: format!(
+                "Transaction cancelled, please refer cancellation reasons for specific reasons [{}]",
+                codes.join(", ")
+            ),
+            cancellation_reasons: reasons,
+        });
+    }
+
     let ops: Vec<extenddb_storage::TransactWriteOp<'_>> =
         prepared.iter().map(|p| p.to_storage_op()).collect();
 
@@ -232,6 +248,85 @@ pub async fn handle_transact_write_items(
             ..Default::default()
         },
     })
+}
+
+/// Validate the vector-valued and search-schema attributes of each prepared
+/// write operation. Returns per-item cancellation reasons when any operation
+/// fails, or `None` when all pass.
+fn collect_vector_cancellation_reasons(prepared: &[PreparedOp]) -> Option<Vec<CancellationReason>> {
+    let mut reasons = Vec::with_capacity(prepared.len());
+    let mut any_error = false;
+    for op in prepared {
+        let result = match op {
+            PreparedOp::Put { key_info, item, .. } => {
+                extenddb_core::validation::validate_vector_write(
+                    item,
+                    &key_info.vector_indexes,
+                    &key_info.attribute_definitions,
+                )
+            }
+            PreparedOp::Update {
+                key_info,
+                actions,
+                maps,
+                ..
+            } => {
+                let assigned = assigned_vector_attributes(actions, maps);
+                extenddb_core::validation::validate_vector_write(
+                    &assigned,
+                    &key_info.vector_indexes,
+                    &key_info.attribute_definitions,
+                )
+            }
+            _ => Ok(()),
+        };
+        match result {
+            Ok(()) => reasons.push(CancellationReason::none()),
+            Err(DynamoDbError::ValidationException(message)) => {
+                any_error = true;
+                reasons.push(CancellationReason::validation_error(message));
+            }
+            Err(other) => {
+                any_error = true;
+                reasons.push(CancellationReason::validation_error(other.to_string()));
+            }
+        }
+    }
+    any_error.then_some(reasons)
+}
+
+/// Collect direct `SET attr = :value` assignments into a partial item for
+/// vector validation.
+///
+/// This covers the bare-placeholder form ONLY, and deliberately so: it exists
+/// to produce the correct per-item `CancellationReason` vector for the common
+/// case, which the storage layer cannot reproduce because it aborts at the
+/// first failing operation. It is NOT the authoritative vector check and must
+/// never be treated as one. Any RHS that is not a bare placeholder
+/// (`list_append`, `if_not_exists`, an attribute copy, or a form added later)
+/// is invisible here and is caught instead by
+/// `expression::apply_update_validated` on the evaluated image inside the
+/// transaction, which every backend applies.
+fn assigned_vector_attributes(actions: &[UpdateAction], maps: &ExpressionMaps) -> Item {
+    let mut assigned = Item::new();
+    for action in actions {
+        if let UpdateAction::Set {
+            path,
+            value: Expr::Placeholder(placeholder),
+        } = action
+            && path.len() == 1
+            && let PathElement::Attribute(name) = &path[0]
+        {
+            let resolved = name
+                .strip_prefix('#')
+                .and_then(|reference| maps.names.get(reference).map(String::as_str))
+                .unwrap_or(name.as_str());
+            if let Some(value) = maps.values.get(placeholder) {
+                assigned.insert(resolved.to_owned(), value.clone());
+            }
+        }
+    }
+    assigned
 }
 
 /// Parse and validate a single `TransactWriteItem`, returning a `PreparedOp`.

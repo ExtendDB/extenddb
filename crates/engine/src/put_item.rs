@@ -160,6 +160,12 @@ pub async fn handle_put_item(
         &key_info.attribute_definitions,
     )?;
 
+    extenddb_core::validation::validate_vector_write(
+        &input.item,
+        &key_info.vector_indexes,
+        &key_info.attribute_definitions,
+    )?;
+
     let return_old = input.return_values == ReturnValues::AllOld;
     let capacity_requested =
         input.return_consumed_capacity != extenddb_core::types::ReturnConsumedCapacity::None;

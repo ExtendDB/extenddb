@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::DynamoDbError;
 use crate::types::AttributeValue;
+use crate::types::{AttributeDefinition, VectorIndexKeyInfo};
 
 use super::ast::{ArithOp, Expr, PathElement, UpdateAction};
 use super::resolver::{ExpressionMaps, resolve_element_name, resolve_path};
@@ -22,7 +23,7 @@ use super::resolver::{ExpressionMaps, resolve_element_name, resolve_path};
 /// # Errors
 ///
 /// Returns `ValidationException` for unresolvable placeholders or type errors.
-pub fn apply_update(
+pub(crate) fn apply_update(
     actions: &[UpdateAction],
     item: &mut BTreeMap<String, AttributeValue>,
     maps: &ExpressionMaps,
@@ -55,6 +56,69 @@ pub fn apply_update(
         }
     }
     Ok(())
+}
+
+/// Apply a list of update actions and validate the resulting item image
+/// against the table's vector indexes.
+///
+/// Every write path that mutates an item through an `UpdateExpression` must
+/// use this rather than [`apply_update`], because vector validity is a
+/// property of the *stored value*, not of the expression that produced it.
+/// `SET emb = :v` can be checked from the expression, but
+/// `SET emb = list_append(:a, :b)`, `SET emb = other_attr`,
+/// `SET emb = if_not_exists(emb, :v)` and any SET syntax added later cannot:
+/// the value only exists once the actions have been evaluated against the
+/// pre-update image. Validating the image is therefore the only check no
+/// expression form can bypass, now or in future.
+///
+/// Getting this wrong is silent rather than loud, which is why it is enforced
+/// here instead of being left to each caller: an unvalidated wrong-dimension
+/// list is accepted, then either fails as a 500 when the index propagation
+/// delay is 0, or returns 200 and is dropped by the propagation worker when it
+/// is greater than 0, leaving the index permanently stale with no error
+/// surfaced to anyone.
+///
+/// # Errors
+///
+/// Returns `ValidationException` for unresolvable placeholders or type errors
+/// while applying the actions, or when the resulting image has a CHANGED
+/// vector or search-schema attribute that is invalid for one of
+/// `vector_indexes`. Unchanged values are not re-validated: the service does
+/// not reject an unrelated update to an item carrying a pre-existing invalid
+/// value (measured 2026-08-14), and whole-image validation would make items
+/// the backfill deliberately skipped permanently un-updatable.
+pub fn apply_update_validated(
+    actions: &[UpdateAction],
+    item: &mut BTreeMap<String, AttributeValue>,
+    maps: &ExpressionMaps,
+    vector_indexes: &[VectorIndexKeyInfo],
+    attribute_definitions: &[AttributeDefinition],
+) -> Result<(), DynamoDbError> {
+    // Snapshot only the vector-relevant attributes (the vector attribute and
+    // the search-schema attributes of each index) rather than cloning the
+    // whole item, which can be up to 400KB.
+    let mut before = BTreeMap::new();
+    for index in vector_indexes {
+        for name in std::iter::once(index.vector_attribute_name.as_str()).chain(
+            index
+                .search_schema
+                .iter()
+                .map(|e| e.attribute_name.as_str()),
+        ) {
+            if let Some(value) = item.get(name) {
+                before
+                    .entry(name.to_owned())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+    }
+    apply_update(actions, item, maps)?;
+    crate::validation::validate_vector_write_changed(
+        item,
+        &before,
+        vector_indexes,
+        attribute_definitions,
+    )
 }
 
 /// Evaluate a SET value expression to produce an `AttributeValue`.

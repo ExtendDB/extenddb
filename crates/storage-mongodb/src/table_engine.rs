@@ -530,6 +530,10 @@ impl MongoEngine {
             sse_description,
             table_class_summary,
             on_demand_throughput: input.on_demand_throughput,
+            // Fields for features this backend does not implement, vector
+            // indexes today, take their defaults. Adding one to
+            // TableDescription then does not break this build.
+            ..Default::default()
         })
     }
 
@@ -1079,19 +1083,20 @@ impl MongoEngine {
             .find(doc! { "_id.table_id": &table_id })
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
-        let mut global_secondary_indexes = Vec::new();
-        let mut local_secondary_indexes = Vec::new();
+        let mut infos = Vec::new();
         while let Some(idx_doc) = idx_cursor
             .try_next()
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?
         {
-            let info = index_info_from_doc(&idx_doc)?;
-            match info.index_type {
-                IndexType::Gsi => global_secondary_indexes.push(info),
-                IndexType::Lsi => local_secondary_indexes.push(info),
-            }
+            infos.push(index_info_from_doc(&idx_doc)?);
         }
+        // Grouped by core rather than matched here, so a new IndexType variant
+        // does not break this backend. `index_info_from_doc` already rejects any
+        // kind this backend cannot have created.
+        let grouped = extenddb_core::types::partition_indexes(infos);
+        let global_secondary_indexes = grouped.gsis;
+        let local_secondary_indexes = grouped.lsis;
         let has_lsi = !local_secondary_indexes.is_empty();
 
         let key_info = TableKeyInfo {
@@ -1105,6 +1110,10 @@ impl MongoEngine {
             global_secondary_indexes,
             local_secondary_indexes,
             stream_specification,
+            // Fields for features this backend does not implement, vector
+            // indexes today, take their defaults. Adding one to TableKeyInfo
+            // then does not break this build.
+            ..Default::default()
         };
         // Catalog metadata that cannot describe its own sort key would make the
         // keyed read paths fall back to a partition-only lookup and return the
@@ -1435,6 +1444,10 @@ impl MongoEngine {
             sse_description,
             table_class_summary,
             on_demand_throughput,
+            // Fields for features this backend does not implement, vector
+            // indexes today, take their defaults. Adding one to
+            // TableDescription then does not break this build.
+            ..Default::default()
         })
     }
 

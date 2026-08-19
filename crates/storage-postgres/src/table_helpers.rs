@@ -365,6 +365,10 @@ impl PostgresEngine {
             on_demand_throughput: row
                 .on_demand_throughput
                 .and_then(|v| serde_json::from_value(v).ok()),
+            // Fields for features this backend does not implement, vector
+            // indexes today, take their defaults. Adding one to
+            // TableDescription then does not break this build.
+            ..Default::default()
         })
     }
 }

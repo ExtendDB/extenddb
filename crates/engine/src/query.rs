@@ -60,6 +60,15 @@ pub async fn handle_query(
         None
     };
 
+    // A vector index is searched only via the vector search API, never queried.
+    if let Some(ref idx) = index_info
+        && idx.index_type == IndexType::Vector
+    {
+        return Err(DynamoDbError::ValidationException(
+            "Query operation not supported on this index type".to_owned(),
+        ));
+    }
+
     // ConsistentRead is not supported on GSI queries (tenet 1: fidelity).
     if input.consistent_read == Some(true)
         && let Some(ref idx) = index_info
@@ -103,6 +112,7 @@ pub async fn handle_query(
             global_secondary_indexes: key_info.global_secondary_indexes.clone(),
             local_secondary_indexes: key_info.local_secondary_indexes.clone(),
             stream_specification: None, // Queries don't capture stream records
+            vector_indexes: key_info.vector_indexes.clone(),
         }
     } else {
         key_info.clone()

@@ -23,7 +23,7 @@ pub use batch::{
 };
 pub use capacity::{
     Capacity, ConsumedCapacity, ItemCollectionMetrics, ReturnConsumedCapacity,
-    ReturnItemCollectionMetrics, ReturnValuesOnConditionCheckFailure,
+    ReturnItemCollectionMetrics, ReturnValuesOnConditionCheckFailure, VectorCapacity,
 };
 pub use import_export::{
     CsvOptions, ExportDescription, ExportFormat, ExportStatus, ExportTableToPointInTimeInput,
@@ -37,8 +37,9 @@ pub use item::{
     item_size_bytes,
 };
 pub use key_schema::{
-    AttributeDefinition, IndexInfo, IndexType, KeySchemaElement, KeyType, ScalarAttributeType,
-    TableKeyInfo, hash_key_elements, is_multipart_key_schema, range_key_elements,
+    AttributeDefinition, IndexInfo, IndexType, KeySchemaElement, KeyType, PartitionedIndexes,
+    ScalarAttributeType, TableKeyInfo, VectorIndexKeyInfo, hash_key_elements,
+    is_multipart_key_schema, partition_indexes, range_key_elements,
 };
 pub use query::{Condition, QueryInput, QueryOutput, ScanInput, ScanOutput, Select};
 pub use stream::{
@@ -49,16 +50,22 @@ pub use stream::{
 };
 pub use table::{
     BillingMode, BillingModeSummary, CreateGsiAction, CreateTableInput, CreateTableOutput,
-    DeleteGsiAction, DeleteTableInput, DeleteTableOutput, DescribeLimitsOutput, DescribeTableInput,
-    DescribeTableOutput, DescribeTimeToLiveInput, DescribeTimeToLiveOutput,
-    GlobalSecondaryIndexUpdate, GsiDescription, GsiInput, ListTablesInput, ListTablesOutput,
-    ListTagsOfResourceInput, ListTagsOfResourceOutput, LsiDescription, LsiInput,
+    DeleteGsiAction, DeleteTableInput, DeleteTableOutput, DeleteVectorIndexAction,
+    DescribeLimitsOutput, DescribeTableInput, DescribeTableOutput, DescribeTimeToLiveInput,
+    DescribeTimeToLiveOutput, DistanceFunction, GlobalSecondaryIndexUpdate, GsiDescription,
+    GsiInput, IndexStatus, ListTablesInput, ListTablesOutput, ListTagsOfResourceInput,
+    ListTagsOfResourceOutput, LsiDescription, LsiInput, MAX_VECTOR_INDEXES_PER_TABLE,
     OnDemandThroughput, Projection, ProjectionType, ProvisionedThroughput,
-    ProvisionedThroughputDescription, SseDescription, SseType, StreamSpecification, StreamViewType,
-    TableDescription, TableStatus, Tag, TagResourceInput, TimeToLiveDescription,
-    TimeToLiveSpecification, TimeToLiveSpecificationOutput, TimeToLiveStatus, UntagResourceInput,
-    UpdateGsiAction, UpdateTableInput, UpdateTableOutput, UpdateTimeToLiveInput,
-    UpdateTimeToLiveOutput,
+    ProvisionedThroughputDescription, SearchSchemaElement, SearchSchemaElementType, SseDescription,
+    SseType, StreamSpecification, StreamViewType, TableDescription, TableStatus, Tag,
+    TagResourceInput, TimeToLiveDescription, TimeToLiveSpecification,
+    TimeToLiveSpecificationOutput, TimeToLiveStatus, UntagResourceInput, UpdateGsiAction,
+    UpdateTableInput, UpdateTableOutput, UpdateTimeToLiveInput, UpdateTimeToLiveOutput,
+    VECTOR_INDEX_ALREADY_EXISTS, VECTOR_INDEX_COUNT_LIMIT_CREATE, VECTOR_INDEX_COUNT_LIMIT_UPDATE,
+    VECTOR_INDEX_CREATE_IN_USE_PREFIX, VECTOR_INDEX_REQUIRES_PAY_PER_REQUEST,
+    VECTOR_SEARCH_SCHEMA_UNDECLARED, VectorAttribute, VectorIndexDescription,
+    VectorIndexSpecification, VectorIndexUpdate, vector_attribute_conflicting_definition,
+    vector_attribute_redefines_key,
 };
 pub use transaction::{
     CancellationReason, ItemResponse, TransactConditionCheck, TransactDelete, TransactGet,

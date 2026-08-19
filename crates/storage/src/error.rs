@@ -43,6 +43,11 @@ pub enum StorageError {
     CatalogNotInitialized,
     #[error("Connection error: {0}")]
     Connection(String),
+    /// The backend does not implement the requested feature. Distinct from
+    /// `Internal`, which reports a fault: this reports a capability the backend
+    /// never claimed, so it is not a bug and must not be logged as one.
+    #[error("Not supported by this storage backend: {0}")]
+    Unsupported(String),
     #[error("Internal error: {0}")]
     Internal(String),
 }

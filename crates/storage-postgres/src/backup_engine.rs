@@ -448,6 +448,7 @@ impl BackupEngine for PostgresEngine {
                 sse_specification: None,
                 table_class: None,
                 on_demand_throughput: None,
+                ..Default::default()
             };
 
             // Create the table with the ACTIVE transition deferred: it enters

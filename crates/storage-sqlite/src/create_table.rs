@@ -398,6 +398,10 @@ impl SqliteEngine {
                 .as_ref()
                 .map(|tc| serde_json::json!({ "TableClass": tc })),
             on_demand_throughput: input.on_demand_throughput,
+            // Fields for features this backend does not implement, vector
+            // indexes today, take their defaults, so adding one to this type
+            // does not break this build.
+            ..Default::default()
         })
     }
 }
