@@ -25,6 +25,14 @@ pub(crate) async fn run_catalog_migrations(pool: &PgPool) -> OpResult<()> {
             .execute(pool)
             .await
             .map_err(|e| OpError::Internal(format!("Migration {filename} failed: {e}")))?;
+        // TODO(#221): applying this SQL and recording it are separate commits.
+        // A crash here can leave a migration applied but unrecorded. Catalog 001
+        // is normally shielded from replay by its version write, data 001 has an
+        // adoption guard, and data 002 is repeatable, but those are narrow
+        // recovery properties: catalog 001 is not idempotent and replaying data
+        // 003 drops the token table. The sqlx adoption must remove the files'
+        // own BEGIN/COMMIT and commit each ledger row with its migration before
+        // another migration lands.
         record_migration(pool, filename).await?;
     }
     println!("    Migrations applied.");
@@ -42,6 +50,10 @@ pub(crate) const DATA_MIGRATIONS: &[(&str, &str)] = &[
     (
         "002_gsi_pending.sql",
         include_str!("../../storage-postgres/data_migrations/002_gsi_pending.sql"),
+    ),
+    (
+        "003_idempotency_account_scope.sql",
+        include_str!("../../storage-postgres/data_migrations/003_idempotency_account_scope.sql"),
     ),
 ];
 
@@ -87,6 +99,14 @@ pub(crate) async fn run_data_migrations(pool: &PgPool) -> OpResult<()> {
             .execute(pool)
             .await
             .map_err(|e| OpError::Internal(format!("Data migration {filename} failed: {e}")))?;
+        // TODO(#221): applying this SQL and recording it are separate commits.
+        // A crash here can leave a migration applied but unrecorded. Catalog 001
+        // is normally shielded from replay by its version write, data 001 has an
+        // adoption guard, and data 002 is repeatable, but those are narrow
+        // recovery properties: catalog 001 is not idempotent and replaying data
+        // 003 drops the token table. The sqlx adoption must remove the files'
+        // own BEGIN/COMMIT and commit each ledger row with its migration before
+        // another migration lands.
         record_migration(pool, filename).await?;
     }
     println!("    Data migrations applied.");

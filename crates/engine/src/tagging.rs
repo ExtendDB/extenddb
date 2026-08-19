@@ -13,40 +13,85 @@ use crate::OperationContext;
 use crate::sanitize_storage_error;
 use crate::serialize_output;
 
+/// Split a `DynamoDB` resource ARN into `(region, account, resource)`.
+///
+/// Expected format: `arn:aws:dynamodb:{region}:{account}:table/{name}[/...]`
+fn split_dynamodb_arn(arn: &str) -> Option<(&str, &str, &str)> {
+    let rest = arn.strip_prefix("arn:aws:dynamodb:")?;
+    let mut parts = rest.splitn(3, ':');
+    let region = parts.next()?;
+    let account = parts.next()?;
+    let resource = parts.next()?;
+    Some((region, account, resource))
+}
+
 /// Extract the table name from a `DynamoDB` table ARN.
 ///
 /// Expected format: `arn:aws:dynamodb:{region}:{account}:table/{name}[/...]`
 fn extract_table_name_from_arn(arn: &str) -> Option<&str> {
-    let resource = arn.strip_prefix("arn:aws:dynamodb:")?.split(':').nth(2)?;
+    let (_, _, resource) = split_dynamodb_arn(arn)?;
     let table_name = resource.strip_prefix("table/")?;
     // Strip any sub-resource (e.g. /index/foo, /stream/label)
     Some(table_name.split('/').next().unwrap_or(table_name))
 }
 
-/// Extract the account ID from a `DynamoDB` table ARN.
-fn extract_account_from_arn(arn: &str) -> Option<&str> {
-    arn.strip_prefix("arn:aws:dynamodb:")?.split(':').nth(1)
-}
-
-/// Validate that the ARN refers to an existing table.
+/// Validate that the ARN refers to an existing table owned by the caller.
 ///
-/// Returns `ResourceNotFoundException` if the table does not exist.
+/// The error classes and messages below match `DynamoDB`, verified against the
+/// service:
+///
+/// | Input | Result |
+/// |---|---|
+/// | Does not start with `arn:` | `ValidationException` (ARNs must start with `arn:`) |
+/// | Valid ARN for another service | `AccessDeniedException` |
+/// | `DynamoDB` ARN naming a non-table resource | `ValidationException` (not a `DynamoDB` resource arn) |
+/// | Account differs from the caller's | `AccessDeniedException` |
+/// | Region differs from this deployment's | `ValidationException` (invalid `TableArn`) |
+/// | Table does not exist | `ResourceNotFoundException` |
+///
+/// Account is checked before region, matching the service: a cross-account ARN
+/// is denied without revealing whether its region is valid.
 async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), DynamoDbError> {
-    let table_name = extract_table_name_from_arn(arn).ok_or_else(|| {
-        DynamoDbError::ValidationException(format!(
-            "1 validation error detected: Value '{arn}' at 'resourceArn' failed to satisfy constraint: \
-             Member must satisfy regular expression pattern: arn:aws:dynamodb:.+"
-        ))
-    })?;
+    if !arn.starts_with("arn:") {
+        return Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: ARNs must start with 'arn:': {arn}"
+        )));
+    }
 
-    // Check the ARN's account matches the caller's account.
-    if let Some(arn_account) = extract_account_from_arn(arn)
-        && arn_account != ctx.account_id.as_ref()
-    {
+    // An ARN for another service is denied rather than reported as malformed:
+    // authorization is evaluated against the resource before its shape is
+    // inspected further.
+    let Some((arn_region, arn_account, resource)) = split_dynamodb_arn(arn) else {
+        return Err(DynamoDbError::AccessDeniedException(
+            "Access is denied".to_owned(),
+        ));
+    };
+
+    if !resource.starts_with("table/") {
+        return Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: \
+             Provided Arn is not a DynamoDB resource arn: {arn}"
+        )));
+    }
+
+    if arn_account != ctx.account_id.as_ref() {
         return Err(DynamoDbError::AccessDeniedException(
             "Access is denied".to_owned(),
         ));
     }
+
+    if arn_region != ctx.region.as_ref() {
+        return Err(DynamoDbError::ValidationException(format!(
+            "Invalid TableArn: Invalid ResourceArn provided as input {arn}"
+        )));
+    }
+
+    let table_name = extract_table_name_from_arn(arn).ok_or_else(|| {
+        DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: \
+             Provided Arn is not a DynamoDB resource arn: {arn}"
+        ))
+    })?;
 
     // Verify the table exists via table_key_info (lightweight check).
     ctx.storage
@@ -55,7 +100,7 @@ async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), 
         .map_err(|e| match e {
             extenddb_storage::error::StorageError::TableNotFound(_) => {
                 DynamoDbError::ResourceNotFoundException(format!(
-                    "Requested resource not found: {arn}"
+                    "Requested resource not found: ResourceArn: {arn} not found"
                 ))
             }
             other => sanitize_storage_error(other),

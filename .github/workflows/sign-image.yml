@@ -1,0 +1,113 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# BREAK-GLASS standalone signer. Routine releases sign inside the
+# release-image pipeline's publish stage (same composite action, same
+# approval); dispatch this only for exceptional cases: re-signing after key
+# rotation, signing a digest the pipeline did not produce, or recovery.
+#
+# Signing logic lives in .github/actions/sign-image (single source of truth
+# shared with the pipeline). This wrapper supplies what the action requires:
+# the reviewer-gated `dockerhub` environment (registry credential +
+# two-person rule), OIDC-federated AWS credentials, and strict input
+# validation.
+
+name: sign-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_digest:
+        description: 'The verified image index digest to sign, e.g. sha256:<64 hex>'
+        required: true
+      release_tag:
+        description: 'The release this digest belongs to, e.g. v0.1.5 (annotation only)'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sign-image-extenddb-postgres
+  cancel-in-progress: false
+
+env:
+  IMAGE_REPO: docker.io/extenddb/extenddb-postgres
+  KEY_ARN: arn:aws:kms:us-east-1:975306274793:key/654ab7f4-4a11-45e1-a313-3a6989f3721c
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: dockerhub     # required reviewers, prevent self-review, main only
+    permissions:
+      contents: read
+      id-token: write          # OIDC token for AWS role assumption
+    steps:
+      - name: Gate - validate inputs strictly
+        env:
+          RAW_DIGEST: ${{ inputs.expected_digest }}
+          RAW_RELEASE: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RAW_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::expected_digest is not a sha256:<64 hex> digest"
+            exit 1
+          fi
+          if [[ ! "$RAW_RELEASE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release_tag is not a vMAJOR.MINOR.PATCH release tag"
+            exit 1
+          fi
+          {
+            echo "DIGEST=$RAW_DIGEST"
+            echo "RELEASE=$RAW_RELEASE"
+          } >> "$GITHUB_ENV"
+
+      - name: Gate - the digest must exist on Docker Hub as a multi-arch index
+        run: |
+          set -euo pipefail
+          RAW=$(skopeo inspect --raw "docker://${IMAGE_REPO}@${DIGEST}")
+          grep -q '"architecture": *"amd64"' <<< "$RAW" || { echo "::error::amd64 missing from index"; exit 1; }
+          grep -q '"architecture": *"arm64"' <<< "$RAW" || { echo "::error::arm64 missing from index"; exit 1; }
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+
+      - name: Assume the signing role via OIDC (no stored AWS secrets)
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::975306274793:role/ExtendDBContainerSigningCI
+          role-session-name: extenddb-sign-${{ github.run_id }}
+          aws-region: us-east-1
+
+      - name: Log in to Docker Hub (environment credential)
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          docker login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin <<< "$DOCKERHUB_TOKEN"
+
+      - name: Sign via the shared composite action
+        id: sign
+        uses: ./.github/actions/sign-image
+        with:
+          image-repo: docker.io/extenddb/extenddb-postgres
+          digest: ${{ env.DIGEST }}
+          release-tag: ${{ env.RELEASE }}
+          key-arn: ${{ env.KEY_ARN }}
+
+      - name: Log out
+        if: always()
+        run: docker logout docker.io || true
+
+      - name: Summarise
+        run: |
+          {
+            echo "### Docker Hub image signed (break-glass path)"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| image | \`${IMAGE_REPO}@${DIGEST}\` |"
+            echo "| signature | \`${IMAGE_REPO}:${{ steps.sign.outputs.sig-tag }}\` |"
+            echo "| signature digest | \`${{ steps.sign.outputs.sig-digest }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

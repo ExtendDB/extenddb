@@ -10,8 +10,8 @@
 use std::sync::atomic::AtomicU64;
 
 use extenddb_core::types::{
-    ConsumedCapacity, Item, ItemCollectionMetrics, KeySchemaElement, ReturnConsumedCapacity,
-    ReturnItemCollectionMetrics,
+    ConsumedCapacity, Item, ItemCollectionMetrics, KeySchemaElement, Projection, ProjectionType,
+    ReturnConsumedCapacity, ReturnItemCollectionMetrics, TableKeyInfo, item_size_bytes,
 };
 
 /// Global counter for requests that used approximate consumed capacity.
@@ -52,6 +52,291 @@ pub fn write_capacity(
     }
 }
 
+/// Build a write `ConsumedCapacity` with a per-index breakdown for `INDEXES`
+/// mode, or the plain table-level capacity otherwise.
+///
+/// `base_cu` is the base-table write capacity. `old_item` and `new_item`
+/// describe the index transition: inserts provide only the new item, deletes
+/// only the old item, and replacements/updates provide both. Index metadata
+/// comes from the cached `TableKeyInfo`.
+#[must_use]
+pub fn write_capacity_indexed(
+    rcc: ReturnConsumedCapacity,
+    table_name: &str,
+    base_cu: f64,
+    old_item: Option<&Item>,
+    new_item: Option<&Item>,
+    charge_unchanged_projection: bool,
+    key_info: &TableKeyInfo,
+) -> Option<ConsumedCapacity> {
+    match rcc {
+        ReturnConsumedCapacity::None => None,
+        rcc => {
+            CAPACITY_REQUEST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (gsi, lsi) =
+                index_write_units(old_item, new_item, charge_unchanged_projection, key_info);
+            let breakdown = rcc == ReturnConsumedCapacity::Indexes;
+            let vector = vector_write_charges(old_item, new_item, key_info);
+            Some(
+                ConsumedCapacity::write_indexed(table_name, base_cu, gsi, lsi, breakdown)
+                    .with_vector_writes(vector, breakdown),
+            )
+        }
+    }
+}
+
+/// Compute per-GSI and per-LSI write capacity units for an item transition.
+///
+/// Returns `(gsi_units, lsi_units)` keyed by index name. Sparse-index inserts
+/// and deletes are charged from the projection that exists. When both versions
+/// project into an index, a changed key is a delete plus an insert. With an
+/// unchanged key, updates skip identical projected entries while PutItem
+/// replacements still charge the index write.
+///
+/// Index metadata is read from the cached `TableKeyInfo`, so no extra catalog
+/// round-trip is needed.
+#[must_use]
+pub fn index_write_units(
+    old_item: Option<&Item>,
+    new_item: Option<&Item>,
+    charge_unchanged_projection: bool,
+    key_info: &TableKeyInfo,
+) -> (
+    std::collections::HashMap<String, f64>,
+    std::collections::HashMap<String, f64>,
+) {
+    let base_keys: Vec<&str> = key_info
+        .base_key_schema
+        .iter()
+        .map(|k| k.attribute_name.as_str())
+        .collect();
+
+    let mut gsi = std::collections::HashMap::new();
+    for index in &key_info.global_secondary_indexes {
+        if let Some(cu) = one_index_write_units(
+            old_item,
+            new_item,
+            charge_unchanged_projection,
+            &index.key_schema,
+            &base_keys,
+            &index.projection,
+        ) {
+            gsi.insert(index.index_name.clone(), cu);
+        }
+    }
+
+    let mut lsi = std::collections::HashMap::new();
+    for index in &key_info.local_secondary_indexes {
+        if let Some(cu) = one_index_write_units(
+            old_item,
+            new_item,
+            charge_unchanged_projection,
+            &index.key_schema,
+            &base_keys,
+            &index.projection,
+        ) {
+            lsi.insert(index.index_name.clone(), cu);
+        }
+    }
+
+    (gsi, lsi)
+}
+
+/// Per-vector-index `VectorWriteRequestBytes` for an item transition.
+///
+/// Measured model (2026-08-13, live service): the charge is
+/// `max(dimensions * 4 + projected_non_vector_bytes, 1024)`, incurred whenever
+/// the PROJECTED index entry changes (which is not the same rule the public
+/// docs state), and DOUBLED when the search-schema HASH value changes, because
+/// the entry moves partition and is billed as a delete plus an insert. The
+/// charged image is the written one, or the deleted one for a delete.
+///
+/// Returns an empty map when nothing is charged; callers pass the result to
+/// [`ConsumedCapacity::with_vector_writes`], which omits empty maps to match
+/// the service's omit-rather-than-zero-fill behaviour.
+#[must_use]
+pub fn vector_write_charges(
+    old_item: Option<&Item>,
+    new_item: Option<&Item>,
+    key_info: &TableKeyInfo,
+) -> Vec<(String, f64)> {
+    use extenddb_core::vector_capacity::{
+        ProjectedAttributes, projected_entry_changed, search_schema_partition_moved,
+        vector_write_request_bytes,
+    };
+
+    let base_keys: Vec<&str> = key_info
+        .base_key_schema
+        .iter()
+        .map(|k| k.attribute_name.as_str())
+        .collect();
+
+    let mut charges = Vec::new();
+    for vi in &key_info.vector_indexes {
+        let search_attrs: Vec<&str> = vi
+            .search_schema
+            .iter()
+            .map(|e| e.attribute_name.as_str())
+            .collect();
+        // INCLUDE is keys + search schema + the named extras, which the
+        // KeysOnly variant's attribute lists express by unioning the extras
+        // into the always-projected set.
+        let include_extras: Vec<&str> = match vi.projection.projection_type {
+            extenddb_core::types::ProjectionType::Include => vi
+                .projection
+                .non_key_attributes
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(String::as_str)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let keys_union: Vec<&str> = base_keys
+            .iter()
+            .copied()
+            .chain(include_extras.iter().copied())
+            .collect();
+        let projected = match vi.projection.projection_type {
+            extenddb_core::types::ProjectionType::All => ProjectedAttributes::All,
+            extenddb_core::types::ProjectionType::KeysOnly
+            | extenddb_core::types::ProjectionType::Include => ProjectedAttributes::KeysOnly {
+                key_attributes: &keys_union,
+                search_schema_attributes: &search_attrs,
+            },
+        };
+
+        if !projected_entry_changed(old_item, new_item, &vi.vector_attribute_name, projected) {
+            continue;
+        }
+
+        // Delete charges the removed image; everything else the written one.
+        let charged_image = match (new_item, old_item) {
+            (Some(n), _) if n.contains_key(&vi.vector_attribute_name) => n,
+            (_, Some(o)) if o.contains_key(&vi.vector_attribute_name) => o,
+            _ => continue,
+        };
+        let mut bytes = vector_write_request_bytes(
+            vi.dimensions,
+            charged_image,
+            &vi.vector_attribute_name,
+            projected,
+        );
+
+        let hash_attr = vi
+            .search_schema
+            .iter()
+            .find(|e| e.element_type == extenddb_core::types::SearchSchemaElementType::Hash)
+            .map(|e| e.attribute_name.as_str());
+        if search_schema_partition_moved(old_item, new_item, hash_attr) {
+            bytes *= 2.0;
+        }
+
+        charges.push((vi.index_name.clone(), bytes));
+    }
+    charges
+}
+
+/// Write units for one index transition, or `None` when neither item projects
+/// into the sparse index.
+fn one_index_write_units(
+    old_item: Option<&Item>,
+    new_item: Option<&Item>,
+    charge_unchanged_projection: bool,
+    index_key_schema: &[KeySchemaElement],
+    base_keys: &[&str],
+    projection: &Projection,
+) -> Option<f64> {
+    let old_projection = old_item
+        .and_then(|item| sparse_index_projection(item, index_key_schema, base_keys, projection));
+    let new_projection = new_item
+        .and_then(|item| sparse_index_projection(item, index_key_schema, base_keys, projection));
+
+    match (old_projection, new_projection) {
+        (None, None) => None,
+        (Some(projected), None) | (None, Some(projected)) => {
+            Some(write_capacity_units(item_size_bytes(&projected)))
+        }
+        (Some(old_projected), Some(new_projected)) => {
+            let same_key = old_item.zip(new_item).is_some_and(|(old, new)| {
+                index_key_schema
+                    .iter()
+                    .all(|key| old.get(&key.attribute_name) == new.get(&key.attribute_name))
+            });
+            if same_key && !charge_unchanged_projection && old_projected == new_projected {
+                return None;
+            }
+
+            let old_cu = write_capacity_units(item_size_bytes(&old_projected));
+            let new_cu = write_capacity_units(item_size_bytes(&new_projected));
+            Some(if same_key {
+                old_cu.max(new_cu)
+            } else {
+                old_cu + new_cu
+            })
+        }
+    }
+}
+
+/// Project an item into one index, or return `None` when the item is not a
+/// member of the sparse index.
+fn sparse_index_projection(
+    item: &Item,
+    index_key_schema: &[KeySchemaElement],
+    base_keys: &[&str],
+    projection: &Projection,
+) -> Option<Item> {
+    if index_key_schema
+        .iter()
+        .any(|key| !item.contains_key(&key.attribute_name))
+    {
+        return None;
+    }
+    Some(project_index_item(
+        item,
+        index_key_schema,
+        base_keys,
+        projection,
+    ))
+}
+
+/// Build the subset of `item` that an index materializes, per its projection.
+fn project_index_item(
+    item: &Item,
+    index_key_schema: &[KeySchemaElement],
+    base_keys: &[&str],
+    projection: &Projection,
+) -> Item {
+    match projection.projection_type {
+        // ALL projects the entire item.
+        ProjectionType::All => item.clone(),
+        // KEYS_ONLY and INCLUDE always project index keys + base table keys.
+        ProjectionType::KeysOnly | ProjectionType::Include => {
+            let mut out = Item::new();
+            for ks in index_key_schema {
+                if let Some(v) = item.get(&ks.attribute_name) {
+                    out.insert(ks.attribute_name.clone(), v.clone());
+                }
+            }
+            for k in base_keys {
+                if let Some(v) = item.get(*k) {
+                    out.insert((*k).to_owned(), v.clone());
+                }
+            }
+            if projection.projection_type == ProjectionType::Include
+                && let Some(non_key) = &projection.non_key_attributes
+            {
+                for a in non_key {
+                    if let Some(v) = item.get(a) {
+                        out.insert(a.clone(), v.clone());
+                    }
+                }
+            }
+            out
+        }
+    }
+}
+
 /// Build a `Vec<ConsumedCapacity>` for a batch/transaction read, or `None` if not requested.
 /// One entry per distinct table name with real CU values.
 #[must_use]
@@ -74,7 +359,7 @@ pub fn batch_read_capacity<'a>(
 }
 
 /// Build a `Vec<ConsumedCapacity>` for a batch/transaction write, or `None` if not requested.
-/// One entry per distinct table name with real CU values.
+/// One entry per distinct table name with real CU values (base-table aggregate only).
 #[must_use]
 pub fn batch_write_capacity<'a>(
     rcc: ReturnConsumedCapacity,
@@ -88,6 +373,52 @@ pub fn batch_write_capacity<'a>(
             Some(
                 table_cus
                     .map(|(t, cu)| ConsumedCapacity::write(t, cu, indexes))
+                    .collect(),
+            )
+        }
+    }
+}
+
+/// Build a `Vec<ConsumedCapacity>` for `TransactGetItems`, or `None` if not requested.
+///
+/// Transactions differ from single-item/batch reads: real DynamoDB emits the
+/// granular `ReadCapacityUnits` sub-field, so this uses `ConsumedCapacity::transact_read`.
+#[must_use]
+pub fn transact_read_capacity<'a>(
+    rcc: ReturnConsumedCapacity,
+    table_cus: impl Iterator<Item = (&'a str, f64)>,
+) -> Option<Vec<ConsumedCapacity>> {
+    match rcc {
+        ReturnConsumedCapacity::None => None,
+        rcc => {
+            CAPACITY_REQUEST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let indexes = rcc == ReturnConsumedCapacity::Indexes;
+            Some(
+                table_cus
+                    .map(|(t, cu)| ConsumedCapacity::transact_read(t, cu, indexes))
+                    .collect(),
+            )
+        }
+    }
+}
+
+/// Build a `Vec<ConsumedCapacity>` for `TransactWriteItems`, or `None` if not requested.
+///
+/// Transactions differ from single-item/batch writes: real DynamoDB emits the
+/// granular `WriteCapacityUnits` sub-field, so this uses `ConsumedCapacity::transact_write`.
+#[must_use]
+pub fn transact_write_capacity<'a>(
+    rcc: ReturnConsumedCapacity,
+    table_cus: impl Iterator<Item = (&'a str, f64)>,
+) -> Option<Vec<ConsumedCapacity>> {
+    match rcc {
+        ReturnConsumedCapacity::None => None,
+        rcc => {
+            CAPACITY_REQUEST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let indexes = rcc == ReturnConsumedCapacity::Indexes;
+            Some(
+                table_cus
+                    .map(|(t, cu)| ConsumedCapacity::transact_write(t, cu, indexes))
                     .collect(),
             )
         }
@@ -142,4 +473,93 @@ pub fn item_metrics(
         .find(|ks| ks.key_type == extenddb_core::types::KeyType::Hash)?;
     let pk_value = item_or_key.get(&pk.attribute_name)?;
     Some(ItemCollectionMetrics::stub(&pk.attribute_name, pk_value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use extenddb_core::types::{AttributeValue, KeyType};
+
+    fn key(name: &str) -> KeySchemaElement {
+        KeySchemaElement {
+            attribute_name: name.to_owned(),
+            key_type: KeyType::Hash,
+        }
+    }
+
+    fn item(pk: &str, index_key: Option<&str>) -> Item {
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S(pk.to_owned()));
+        if let Some(value) = index_key {
+            item.insert("gsi_pk".to_owned(), AttributeValue::S(value.to_owned()));
+        }
+        item
+    }
+
+    fn keys_only() -> Projection {
+        Projection {
+            projection_type: ProjectionType::KeysOnly,
+            non_key_attributes: None,
+        }
+    }
+
+    #[test]
+    fn charges_deleted_sparse_index_projection() {
+        let old = item("item", Some("old"));
+        let new = item("item", None);
+        let units = one_index_write_units(
+            Some(&old),
+            Some(&new),
+            false,
+            &[key("gsi_pk")],
+            &["pk"],
+            &keys_only(),
+        );
+        assert_eq!(units, Some(1.0));
+    }
+
+    #[test]
+    fn changing_index_key_charges_delete_and_insert() {
+        let old = item("item", Some("old"));
+        let new = item("item", Some("new"));
+        let units = one_index_write_units(
+            Some(&old),
+            Some(&new),
+            false,
+            &[key("gsi_pk")],
+            &["pk"],
+            &keys_only(),
+        );
+        assert_eq!(units, Some(2.0));
+    }
+
+    #[test]
+    fn update_skips_unchanged_projection_but_replacement_charges_it() {
+        let mut old = item("item", Some("index"));
+        old.insert("other".to_owned(), AttributeValue::S("old".to_owned()));
+        let mut new = item("item", Some("index"));
+        new.insert("other".to_owned(), AttributeValue::S("new".to_owned()));
+        let key_schema = [key("gsi_pk")];
+        let projection = keys_only();
+
+        let update_units = one_index_write_units(
+            Some(&old),
+            Some(&new),
+            false,
+            &key_schema,
+            &["pk"],
+            &projection,
+        );
+        assert_eq!(update_units, None);
+
+        let replacement_units = one_index_write_units(
+            Some(&old),
+            Some(&new),
+            true,
+            &key_schema,
+            &["pk"],
+            &projection,
+        );
+        assert_eq!(replacement_units, Some(1.0));
+    }
 }

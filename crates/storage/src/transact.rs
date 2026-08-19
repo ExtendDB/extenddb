@@ -9,6 +9,21 @@ use extenddb_core::types::{Item, ReturnValuesOnConditionCheckFailure, TableKeyIn
 
 use crate::StreamCapture;
 
+/// Idempotency scope for a `TransactWriteItems` request.
+///
+/// A `ClientRequestToken` is unique per account in Amazon DynamoDB, not
+/// globally, so the token is stored and looked up under `(account_id, token)`.
+/// `fingerprint` distinguishes a genuine replay from a reused token carrying a
+/// different request, within that same account scope.
+pub struct IdempotencyKey<'a> {
+    /// Account that owns the token. Scopes the dedup keyspace.
+    pub account_id: &'a str,
+    /// The client-supplied `ClientRequestToken`.
+    pub token: &'a str,
+    /// Collision-resistant fingerprint of the request payload.
+    pub fingerprint: &'a str,
+}
+
 /// A single get operation within a transactional read.
 pub struct TransactGetOp<'a> {
     /// Table metadata.

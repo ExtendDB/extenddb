@@ -169,7 +169,8 @@ async fn health_endpoint() {
 
 #[tokio::test]
 async fn metrics_endpoint() {
-    // /metrics is a extenddb-specific extension, not present on real DynamoDB.
+    // /metrics is an extenddb-specific extension, not present on real DynamoDB.
+    // It requires admin authentication; an unauthenticated request returns 401.
     if is_real_dynamodb() {
         return;
     }
@@ -179,7 +180,7 @@ async fn metrics_endpoint() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.status().as_u16(), 401);
 }
 
 #[tokio::test]

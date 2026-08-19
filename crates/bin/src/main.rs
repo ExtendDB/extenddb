@@ -1,137 +1,120 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! extenddb binary — entry point for the Virtual `DynamoDB` server.
+//! extenddb — the ExtendDB server binary.
 //!
-//! Provides subcommands for server operation and lifecycle management:
-//! `serve`, `init`, `destroy`, `verify`, `migrate`, `status`, `stop`, `settings`.
-//! Running with no subcommand prints version information.
+//! This is the reference thin bin for the per-backend packaging model: it
+//! installs exactly one backend and hands off to the shared `extenddb-app` CLI.
+//! A third-party backend author copies this file, swaps the `backend()` call for
+//! their crate, and ships their own `extenddb-<backend>` image — with no edits to
+//! any ExtendDB core crate.
+//!
+//! In-tree backends are selected by mutually exclusive Cargo features:
+//! `postgres` (the default production backend), `mongodb` (production, built with
+//! `--no-default-features --features mongodb`), and `sqlite`/`sqlite-memory` (the
+//! dev/CI backend). Exactly one must be enabled: [`set_backend`] installs one
+//! backend per process, so a build with more than one would be ambiguous and is
+//! rejected at compile time.
 
-mod cmd_catalog_check;
-mod cmd_destroy;
-mod cmd_init;
-mod cmd_manage;
-mod cmd_migrate;
-mod cmd_serve;
-mod cmd_settings;
-mod cmd_status;
-mod cmd_stop;
-mod cmd_verify;
-mod config;
-mod init_helpers;
-mod manage_http;
-mod manage_types;
-mod serve_helpers;
-mod util;
-mod workers;
+// Exactly one backend feature must be enabled.
+#[cfg(any(
+    all(feature = "postgres", feature = "sqlite"),
+    all(feature = "postgres", feature = "mongodb"),
+    all(feature = "sqlite", feature = "mongodb"),
+))]
+compile_error!(
+    "the `postgres`, `mongodb`, and `sqlite` features are mutually exclusive: a \
+     thin bin installs exactly one backend (e.g. build the MongoDB binary with \
+     `--no-default-features --features mongodb`)"
+);
+#[cfg(not(any(feature = "postgres", feature = "mongodb", feature = "sqlite")))]
+compile_error!(
+    "no backend selected: enable the `postgres` (default), `mongodb`, or `sqlite` feature"
+);
 
-use clap::{Parser, Subcommand};
-
-#[derive(Parser)]
-#[command(name = "extenddb", about = "ExtendDB — DynamoDB-compatible API server")]
-struct Cli {
-    /// Print version and exit
-    #[arg(short = 'V', long)]
-    version: bool,
-
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Start the extenddb server
-    Serve(cmd_serve::ServeArgs),
-    /// Initialize a new extenddb deployment
-    Init(cmd_init::InitArgs),
-    /// Tear down a extenddb deployment
-    Destroy(cmd_destroy::DestroyArgs),
-    /// Validate a extenddb deployment
-    Verify(cmd_verify::VerifyArgs),
-    /// Apply catalog schema migrations
-    Migrate(cmd_migrate::MigrateArgs),
-    /// Check if the extenddb server is running
-    Status(cmd_status::StatusArgs),
-    /// Stop the running extenddb server
-    Stop(cmd_stop::StopArgs),
-    /// Read or write runtime settings
-    Settings(cmd_settings::SettingsArgs),
-    /// Manage admin users and accounts via the management API
-    Manage(cmd_manage::ManageArgs),
-    /// Check catalog and data database integrity
-    CatalogCheck(cmd_catalog_check::CatalogCheckArgs),
-    /// Print version, catalog version, git commit, and build timestamp
-    Version,
-}
+// Developer mode relaxes the security posture (plain HTTP on loopback, open
+// authorization). It is a dev/CI-only profile and must be built only with a
+// dev/CI-suitable backend. Rather than denying each production backend by name
+// (every backend is a production backend unless proven otherwise, so a deny-list
+// would have to grow with each new one), require a known dev backend: dev-mode
+// compiles only when `sqlite` is enabled. `sqlite-memory` enables `sqlite`, so it
+// is covered too; postgres, mongodb — or any future production backend — fail the
+// build, so there is no path by which a production deployment can serve in dev mode.
+#[cfg(all(feature = "dev-mode", not(feature = "sqlite")))]
+compile_error!(
+    "the `dev-mode` feature requires a dev/CI backend such as `sqlite`; it must \
+     not be built with a production backend like `postgres` or `mongodb` (build \
+     with `--no-default-features --features sqlite-memory,dev-mode`)"
+);
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    // Install the compiled-in backend before dispatch. The compiler checks this
+    // call; there is no link-time auto-registration and no name to resolve, so a
+    // missing or mistyped backend cannot become a runtime error.
+    #[cfg(feature = "postgres")]
+    extenddb_storage::set_backend(extenddb_storage_postgres::backend())?;
+    #[cfg(feature = "sqlite")]
+    extenddb_storage::set_backend(extenddb_storage_sqlite::backend())?;
+    #[cfg(feature = "mongodb")]
+    extenddb_storage::set_backend(extenddb_storage_mongodb::backend())?;
 
-    if cli.version {
-        print_version();
-        return Ok(());
-    }
-
-    match cli.command.unwrap_or(Command::Version) {
-        Command::Serve(args) => cmd_serve::run(&args),
-        Command::Init(args) => {
-            let code = run_interactive(cmd_init::run(args))?;
-            if code != 0 {
-                std::process::exit(i32::from(code));
-            }
-            Ok(())
-        }
-        Command::Destroy(args) => run_interactive(cmd_destroy::run(args)),
-        Command::Verify(args) => run_interactive(cmd_verify::run(args)),
-        Command::Migrate(args) => run_interactive(cmd_migrate::run(args)),
-        Command::Status(args) => {
-            cmd_status::run(&args);
-            Ok(())
-        }
-        Command::Stop(args) => {
-            cmd_stop::run(&args);
-            Ok(())
-        }
-        Command::Settings(args) => run_interactive(cmd_settings::run(args)),
-        Command::Manage(args) => run_interactive(cmd_manage::run(args)),
-        Command::CatalogCheck(args) => run_interactive(cmd_catalog_check::run(args)),
-        Command::Version => {
-            print_version();
-            Ok(())
-        }
-    }
+    extenddb_app::run(extenddb_app::BuildInfo {
+        // Read from the bin crate so the reported version is the deployed
+        // artifact's, not a library crate's.
+        version: env!("CARGO_PKG_VERSION"),
+        git_hash: env!("EXTENDDB_GIT_HASH"),
+        build_time: env!("EXTENDDB_BUILD_TIME"),
+    })
 }
 
-/// Print version, catalog version, git commit hash, and build timestamp.
-fn print_version() {
-    println!("extenddb {}", env!("CARGO_PKG_VERSION"));
+#[cfg(test)]
+mod tests {
+    /// Install this binary's backend once for the test process.
+    fn install_backend() {
+        #[cfg(feature = "postgres")]
+        let _ = extenddb_storage::set_backend(extenddb_storage_postgres::backend());
+        #[cfg(feature = "sqlite")]
+        let _ = extenddb_storage::set_backend(extenddb_storage_sqlite::backend());
+        #[cfg(feature = "mongodb")]
+        let _ = extenddb_storage::set_backend(extenddb_storage_mongodb::backend());
+    }
 
-    // Report catalog version(s) for all registered backend(s)
-    let backends = extenddb_storage::operations::list_operations_backends();
-    if backends.is_empty() {
-        println!("catalog unknown (no backends registered)");
-    } else {
-        for backend in backends {
-            let version = extenddb_storage::operations::catalog_version(backend)
-                .unwrap_or_else(|_| "unknown".to_string());
-            println!("catalog {version} ({backend})");
+    /// Zero-config serve contract: with the SQLite backend installed,
+    /// built-in defaults deserialize with no config file, bind to loopback
+    /// (so the dev-mode loopback guard passes), and select the backend's
+    /// default storage path.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn builtin_defaults_load_for_sqlite_and_bind_loopback() {
+        install_backend();
+        let cfg = extenddb_config::load_builtin_defaults()
+            .expect("sqlite storage config has no required fields");
+        assert_eq!(cfg.server.bind_addr, "127.0.0.1");
+        assert_eq!(cfg.server.port, 18443);
+        // The sqlite config absolutizes a relative file path against the
+        // working directory, so match on the invariant part of each default.
+        let path = cfg.storage.connection_config();
+        if cfg!(feature = "sqlite-memory") {
+            assert_eq!(path, ":memory:");
+        } else {
+            assert!(
+                path.ends_with("extenddb.sqlite"),
+                "default file path should be extenddb.sqlite, got: {path}"
+            );
         }
     }
 
-    println!("commit {}", env!("EXTENDDB_GIT_HASH"));
-    println!("built {}", env!("EXTENDDB_BUILD_TIME"));
-}
-
-/// Run an async subcommand with a single-threaded tokio runtime and stderr logging.
-/// All non-serve subcommands are interactive (D-24).
-fn run_interactive<T>(
-    future: impl std::future::Future<Output = anyhow::Result<T>>,
-) -> anyhow::Result<T> {
-    tracing_subscriber::fmt()
-        .try_init()
-        .unwrap_or_else(|e| eprintln!("Warning: logging init failed: {e}"));
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(future)
+    /// `load_builtin_defaults` is only reachable from dev-mode builds (a
+    /// postgres + dev-mode binary is a compile error), but its defaults must
+    /// never relax the production posture regardless of backend: loopback
+    /// bind and TLS enabled.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn builtin_defaults_keep_loopback_and_tls_for_postgres() {
+        install_backend();
+        let cfg = extenddb_config::load_builtin_defaults()
+            .expect("postgres storage config defaults to a local dev connection");
+        assert_eq!(cfg.server.bind_addr, "127.0.0.1");
+        assert!(cfg.server.tls.enabled);
+    }
 }

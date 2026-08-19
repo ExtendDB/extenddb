@@ -13,7 +13,6 @@ extenddb-core = { workspace = true }
 extenddb-storage = { workspace = true }
 extenddb-auth = { workspace = true }
 futures = { workspace = true }
-inventory = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 serde = { workspace = true }

@@ -17,8 +17,23 @@ pub enum DynamoDbError {
     ValidationException(String),
     #[error("{0}")]
     ResourceNotFoundException(String),
+    /// SP-ERR-002: HTTP 400. Backup-specific not-found, distinct from
+    /// `ResourceNotFoundException`. Returned by `DescribeBackup`, `DeleteBackup`
+    /// and `RestoreTableFromBackup` for a backup ARN in the caller's account
+    /// that does not exist (or has been deleted).
+    #[error("{0}")]
+    BackupNotFoundException(String),
     #[error("{0}")]
     ResourceInUseException(String),
+    /// A per-table or per-account limit was exceeded.
+    ///
+    /// Distinct from `ValidationException` on purpose: the service uses this
+    /// class for the vector-index count limit when the index is added through
+    /// `UpdateTable`, while `CreateTable` reports the same limit as a
+    /// `ValidationException`. Measured 2026-08-13; see
+    /// `VECTOR_INDEX_COUNT_LIMIT_UPDATE`.
+    #[error("{0}")]
+    LimitExceededException(String),
     #[error("{0}")]
     ConditionalCheckFailedException(String, Option<Item>),
     #[error("{message}")]
@@ -98,7 +113,9 @@ impl DynamoDbError {
         match self {
             Self::ValidationException(_)
             | Self::ResourceNotFoundException(_)
+            | Self::BackupNotFoundException(_)
             | Self::ResourceInUseException(_)
+            | Self::LimitExceededException(_)
             | Self::ConditionalCheckFailedException(..)
             | Self::TransactionCanceledException { .. }
             | Self::IdempotentParameterMismatchException(_)
@@ -137,7 +154,9 @@ impl DynamoDbError {
         match self {
             Self::ValidationException(_) => "ValidationException",
             Self::ResourceNotFoundException(_) => "ResourceNotFoundException",
+            Self::BackupNotFoundException(_) => "BackupNotFoundException",
             Self::ResourceInUseException(_) => "ResourceInUseException",
+            Self::LimitExceededException(_) => "LimitExceededException",
             Self::ConditionalCheckFailedException(..) => "ConditionalCheckFailedException",
             Self::TransactionCanceledException { .. } => "TransactionCanceledException",
             Self::IdempotentParameterMismatchException(_) => "IdempotentParameterMismatchException",
@@ -201,7 +220,9 @@ impl DynamoDbError {
         match self {
             Self::ValidationException(m)
             | Self::ResourceNotFoundException(m)
+            | Self::BackupNotFoundException(m)
             | Self::ResourceInUseException(m)
+            | Self::LimitExceededException(m)
             | Self::ConditionalCheckFailedException(m, _)
             | Self::IdempotentParameterMismatchException(m)
             | Self::SerializationException(m)
@@ -270,6 +291,7 @@ mod tests {
             ),
             (DynamoDbError::IncompleteSignature(String::new()), 400),
             (DynamoDbError::InternalServerError(String::new()), 500),
+            (DynamoDbError::LimitExceededException(String::new()), 400),
             (
                 DynamoDbError::ItemCollectionSizeLimitExceededException(String::new()),
                 400,
@@ -294,6 +316,7 @@ mod tests {
             (DynamoDbError::RequestTimeoutException(String::new()), 408),
             (DynamoDbError::ResourceInUseException(String::new()), 400),
             (DynamoDbError::ResourceNotFoundException(String::new()), 400),
+            (DynamoDbError::BackupNotFoundException(String::new()), 400),
             (DynamoDbError::SerializationException(String::new()), 400),
             (DynamoDbError::ServiceUnavailable(String::new()), 503),
             (DynamoDbError::ThrottlingException(String::new()), 400),

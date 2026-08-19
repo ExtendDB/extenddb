@@ -42,12 +42,41 @@ kill <pid>
 
 extenddb handles SIGTERM and SIGINT gracefully — it drains active connections for up to 5 seconds before exiting.
 
+Note that `extenddb stop` reads the PID file, which a server started with
+`serve --foreground` does not write by default. Stop a foreground server through
+whatever supervises it (container runtime, systemd, your shell) or send it
+SIGTERM directly. Alternatively start it with
+`serve --foreground --write-pid-file`, which writes the PID file to the usual
+`run_dir` path so `stop` and `status` work as they do in daemon mode.
+
 ### Health Check
 
 ```bash
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 # {"status":"healthy"}
 ```
+
+Or without `curl` — useful inside a minimal container image, and what a Docker
+`HEALTHCHECK` should call:
+
+```bash
+./target/release/extenddb healthcheck --config extenddb.toml
+echo $?   # 0 = healthy, 1 = not
+```
+
+`healthcheck` reads the port from the config file, or takes an explicit
+`--endpoint https://host:port`. It accepts the server's self-signed certificate.
+
+This checks liveness, not readiness. `/health` is a static handler that does not
+query PostgreSQL, so it reports healthy even when the database has become
+unreachable since startup. That is intentional for a liveness probe: one that
+failed on a database outage would restart every replica at once and prolong the
+outage. A database that is unreachable at startup stops the server from listening
+at all, so that case is still caught.
+
+There is no readiness endpoint yet, so nothing will currently drain traffic from
+a replica whose backend is gone. Until one exists, gate on `/health` for restarts
+only, and rely on client retries for backend failures.
 
 ## Configuration Reference
 

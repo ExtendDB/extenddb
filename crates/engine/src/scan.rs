@@ -10,7 +10,8 @@ use serde_json::Value;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
 use extenddb_core::types::{
-    IndexType, ScanInput, ScanOutput, Select, TableKeyInfo, extract_key, item_size_bytes,
+    IndexType, ProjectionType, ScanInput, ScanOutput, Select, TableKeyInfo, extract_key,
+    item_size_bytes,
 };
 
 use crate::OperationContext;
@@ -44,28 +45,24 @@ pub async fn handle_scan(
     // --- Legacy vs expression mutual exclusivity checks ---
     let has_fe = input.filter_expression.is_some();
     let has_sf = input.scan_filter.as_ref().is_some_and(|m| !m.is_empty());
-
-    if has_fe && has_sf {
-        return Err(DynamoDbError::ValidationException(
-            "Can not use both expression and non-expression parameters in the same request: \
-             Non-expression parameters: {ScanFilter} Expression parameters: {FilterExpression}"
-                .to_owned(),
-        ));
-    }
-
     let has_pe = input.projection_expression.is_some();
     let has_atg = input
         .attributes_to_get
         .as_ref()
         .is_some_and(|a| !a.is_empty());
+    let has_cond_op = input.conditional_operator.is_some();
 
-    if has_pe && has_atg {
-        return Err(DynamoDbError::ValidationException(
-            "Can not use both expression and non-expression parameters in the same request: \
-             Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}"
-                .to_owned(),
-        ));
-    }
+    extenddb_core::validation::validate_no_expression_param_mixing(
+        &[
+            ("AttributesToGet", has_atg),
+            ("ScanFilter", has_sf),
+            ("ConditionalOperator", has_cond_op),
+        ],
+        &[
+            ("ProjectionExpression", has_pe),
+            ("FilterExpression", has_fe),
+        ],
+    )?;
 
     let maps = build_expression_maps(
         input.expression_attribute_names.as_ref(),
@@ -86,6 +83,12 @@ pub async fn handle_scan(
         input.expression_attribute_values.as_ref(),
         has_filter_expr,
         &[ExpressionKind::Filter],
+    )?;
+
+    // ConditionalOperator requires a ScanFilter with two or more conditions.
+    extenddb_core::validation::validate_conditional_operator_usage(
+        has_cond_op,
+        input.scan_filter.as_ref().map_or(0, HashMap::len),
     )?;
 
     // Parse FilterExpression or desugar legacy ScanFilter
@@ -167,6 +170,7 @@ pub async fn handle_scan(
             .as_ref()
             .is_some_and(|a| !a.is_empty()),
         input.index_name.is_some(),
+        extenddb_core::validation::IS_SCAN,
     )?;
 
     // Validate unused expression attributes
@@ -213,6 +217,15 @@ pub async fn handle_scan(
         None
     };
 
+    // A vector index is searched only via the vector search API, never scanned.
+    if let Some(ref idx) = index_info
+        && idx.index_type == IndexType::Vector
+    {
+        return Err(DynamoDbError::ValidationException(
+            "Scan operation not supported on this index type".to_owned(),
+        ));
+    }
+
     // ConsistentRead is not supported on GSI scans (tenet 1: fidelity).
     if input.consistent_read == Some(true)
         && let Some(ref idx) = index_info
@@ -221,6 +234,16 @@ pub async fn handle_scan(
         return Err(DynamoDbError::ValidationException(
             "Consistent reads are not supported on global secondary indexes".to_owned(),
         ));
+    }
+
+    // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (shared with Query).
+    if let Some(ref idx) = index_info {
+        extenddb_core::validation::validate_all_attributes_index_support(
+            input.select,
+            idx.index_type == IndexType::Gsi,
+            idx.projection.projection_type == ProjectionType::All,
+            &idx.index_name,
+        )?;
     }
 
     // Validate Segment/TotalSegments — DynamoDB returns different messages per direction
@@ -287,7 +310,10 @@ pub async fn handle_scan(
             base_key_schema: key_info.key_schema.clone(),
             attribute_definitions: key_info.attribute_definitions.clone(),
             has_lsi: key_info.has_lsi,
+            global_secondary_indexes: key_info.global_secondary_indexes.clone(),
+            local_secondary_indexes: key_info.local_secondary_indexes.clone(),
             stream_specification: None, // Scans don't capture stream records
+            vector_indexes: key_info.vector_indexes.clone(),
         }
     } else {
         key_info.clone()
@@ -340,6 +366,9 @@ pub async fn handle_scan(
     // Validate begins_with operand types upfront (before any rows are scanned).
     if let Some(ref f) = filter {
         extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
+            |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
+        )?;
+        extenddb_core::expression::validate_ordering_operand_types(f, &combined_maps).map_err(
             |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
         )?;
     }

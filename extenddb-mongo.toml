@@ -1,0 +1,32 @@
+# ExtendDB config for MongoDB backend (integration testing)
+
+[server]
+bind_addr = "127.0.0.1"
+port = 8100
+region = "us-east-1"
+
+[server.tls]
+cert_path = "~/.extenddb/tls/cert.pem"
+key_path = "~/.extenddb/tls/key.pem"
+
+[storage]
+backend = "mongodb"
+
+[storage.mongodb]
+connection_string = "mongodb://localhost:27017/?replicaSet=rs0&directConnection=true"
+
+[limits]
+enforce_reserved_keywords = true
+
+[auth]
+provider = "builtin"
+
+[logging]
+level = "debug"
+format = "pretty"
+
+[import]
+paths = ["/private/tmp", "/tmp"]
+
+[export]
+paths = ["/private/tmp", "/tmp"]

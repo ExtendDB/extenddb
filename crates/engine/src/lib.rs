@@ -29,6 +29,7 @@ mod put_item;
 mod query;
 mod read_helpers;
 mod scan;
+mod search_vectors;
 pub mod stream_capture;
 mod streams;
 mod tagging;
@@ -38,6 +39,7 @@ mod transact_write_items;
 mod ttl;
 mod update_item;
 mod update_table;
+mod vector_gate;
 
 pub use batch_get_item::handle_batch_get_item;
 pub use batch_write_item::handle_batch_write_item;
@@ -53,6 +55,7 @@ pub use list_tables::handle_list_tables;
 pub use put_item::handle_put_item;
 pub use query::handle_query;
 pub use scan::handle_scan;
+pub use search_vectors::handle_search_vectors;
 pub use streams::{
     handle_describe_stream, handle_get_records, handle_get_shard_iterator, handle_list_streams,
 };
@@ -91,6 +94,7 @@ pub fn is_known_operation(operation: &str) -> bool {
             | "UpdateItem"
             | "Query"
             | "Scan"
+            | "SearchVectors"
             | "BatchGetItem"
             | "BatchWriteItem"
             | "TransactGetItems"
@@ -201,6 +205,37 @@ pub(crate) fn validate_enum_fields(
         errors.join("; ")
     );
     Err(DynamoDbError::ValidationException(msg))
+}
+
+/// Validate the `ReturnValues` field for `PutItem` / `DeleteItem`, which accept
+/// only `NONE` or `ALL_OLD`. Matches real DynamoDB's two distinct messages:
+///
+/// - A value that IS a valid `ReturnValues` enum member but is not allowed for
+///   these operations (e.g. `UPDATED_OLD`) → `ReturnValues can only be ALL_OLD
+///   or NONE`.
+/// - A value that is not a `ReturnValues` enum member at all (e.g. `GARBAGE`) →
+///   the generic constraint error listing the full enum set.
+pub(crate) fn validate_put_delete_return_values(
+    body: &serde_json::Value,
+) -> Result<(), DynamoDbError> {
+    // Full ReturnValues enum set, in the order real DynamoDB reports it.
+    const ALL: &[&str] = &["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"];
+    if let Some(rv) = body.get("ReturnValues").and_then(serde_json::Value::as_str) {
+        if rv == "NONE" || rv == "ALL_OLD" {
+            return Ok(());
+        }
+        if ALL.contains(&rv) {
+            return Err(DynamoDbError::ValidationException(
+                "ReturnValues can only be ALL_OLD or NONE".to_owned(),
+            ));
+        }
+        return Err(DynamoDbError::ValidationException(format!(
+            "1 validation error detected: Value '{rv}' at 'returnValues' failed to satisfy \
+             constraint: Member must satisfy enum value set: [{}]",
+            ALL.join(", ")
+        )));
+    }
+    Ok(())
 }
 ///
 /// Populated by engine handlers so the server layer can record capacity,
@@ -336,6 +371,7 @@ pub async fn dispatch(
         "UpdateItem" => handle_update_item(body, ctx).await,
         "Query" => handle_query(body, ctx).await,
         "Scan" => handle_scan(body, ctx).await,
+        "SearchVectors" => handle_search_vectors(body, ctx).await,
         "BatchGetItem" => handle_batch_get_item(body, ctx).await,
         "BatchWriteItem" => handle_batch_write_item(body, ctx).await,
         "TransactGetItems" => handle_transact_get_items(body, ctx).await,

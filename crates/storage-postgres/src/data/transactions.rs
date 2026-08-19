@@ -11,7 +11,7 @@ use extenddb_core::types::{
 };
 use extenddb_core::validation;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{TransactGetOp, TransactWriteOp};
+use extenddb_storage::{IdempotencyKey, TransactGetOp, TransactWriteOp};
 
 use super::index::{IndexMeta, enqueue_async_indexes, fetch_indexes_for_table, sync_indexes};
 use super::tx_helpers::{
@@ -70,7 +70,7 @@ impl PostgresEngine {
     pub(crate) async fn transact_write_items_impl(
         &self,
         ops: &[TransactWriteOp<'_>],
-        token: Option<(&str, &str)>,
+        idempotency: Option<IdempotencyKey<'_>>,
     ) -> Result<(), StorageError> {
         // Pre-fetch indexes for each unique table involved in the transaction.
         let mut table_indexes: HashMap<String, Vec<IndexMeta>> = HashMap::new();
@@ -83,10 +83,9 @@ impl PostgresEngine {
             }
         }
 
-        // D-4: Read system default delay from cache (P119).
-        let sys_delay = self
-            .gsi_default_delay_ms
-            .load(std::sync::atomic::Ordering::Relaxed);
+        // D-4: Read the system default delay live (P119), so a runtime change
+        // applies to this transaction rather than up to 30 s later.
+        let sys_delay = self.index_propagation_delay().await;
 
         let mut tx = self
             .data_pool
@@ -94,9 +93,11 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // Check idempotency token within the transaction (BLOCKER #2 fix).
-        if let Some((tok, fp)) = token {
-            check_idempotency_token_in_tx(&mut tx, tok, fp).await?;
+        // Check the idempotency token within the transaction so token storage
+        // and data writes commit together. The token is scoped to its account.
+        if let Some(key) = idempotency {
+            check_idempotency_token_in_tx(&mut tx, key.account_id, key.token, key.fingerprint)
+                .await?;
         }
 
         let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());
@@ -429,9 +430,14 @@ async fn execute_transact_write_op(
                 *return_values_on_ccf,
                 existing.as_ref(),
             )?;
-            expression::apply_update(actions, &mut item, maps).map_err(|e| {
-                TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
-            })?;
+            expression::apply_update_validated(
+                actions,
+                &mut item,
+                maps,
+                &key_info.vector_indexes,
+                &key_info.attribute_definitions,
+            )
+            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
             // Validate post-update item size
             validation::validate_item_size(&item, max_item_size_bytes).map_err(|e| {
                 TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))

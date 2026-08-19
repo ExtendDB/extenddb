@@ -1,4 +1,5 @@
 /target
+/target-*
 extenddb.toml
 __pycache__/
 .coverage
@@ -10,3 +11,17 @@ pdfs/
 docs/rendered/
 discussions/
 .DS_Store
+extenddb.sqlite
+extenddb.sqlite-shm
+extenddb.sqlite-wal
+extenddb.toml.bak
+
+# Local container environment files
+.env
+.env.*
+!.env.example
+
+# Local test/dev config files
+extenddb-*.toml
+extenddb-*.toml.bak
+extenddb-*.toml.keep

@@ -33,3 +33,4 @@ decision, write a new ADR.
 | [0001](0001-documentation-format.md) | Documentation format — Markdown over LaTeX | Accepted |
 | [0002](0002-sql-injection-defense.md) | SQL injection defense | Accepted |
 | [0003](0003-catalog-migration-mechanism.md) | Adopt sqlx::migrate for PostgreSQL catalog and data schema migrations | Proposed |
+| [0004](0004-vector-search-exact-scan.md) | Vector search is an exact scan over one row per vector | Proposed |

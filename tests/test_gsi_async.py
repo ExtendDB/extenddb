@@ -230,7 +230,7 @@ class TestGsiAsyncPropagation:
     def test_gsi_sync_path_with_zero_delay(
         self, dynamodb_client, gsi_table
     ):
-        """When gsi_propagation_delay_ms=0, GSI updates are synchronous.
+        """When index_propagation_delay_ms=0, GSI updates are synchronous.
 
         Sets the system-wide delay to 0, writes an item, and asserts
         the GSI query returns the item immediately (single query, no
@@ -239,8 +239,8 @@ class TestGsiAsyncPropagation:
         table_name = gsi_table
 
         # Save original delay and set to 0 (sync mode).
-        original_delay = extenddb_settings_get("gsi_propagation_delay_ms")
-        extenddb_settings_set("gsi_propagation_delay_ms", "0")
+        original_delay = extenddb_settings_get("index_propagation_delay_ms")
+        extenddb_settings_set("index_propagation_delay_ms", "0")
 
         try:
             pk = f"sync-{uuid.uuid4().hex[:8]}"
@@ -265,28 +265,28 @@ class TestGsiAsyncPropagation:
                 ExpressionAttributeValues={":pk": {"S": gsi_pk}},
             )
             assert resp["Count"] == 1, (
-                "With gsi_propagation_delay_ms=0, GSI should be "
+                "With index_propagation_delay_ms=0, GSI should be "
                 "immediately consistent"
             )
             assert resp["Items"][0]["data"]["S"] == "sync-value"
         finally:
             # Restore original delay.
-            extenddb_settings_set("gsi_propagation_delay_ms", original_delay)
+            extenddb_settings_set("index_propagation_delay_ms", original_delay)
 
     def test_gsi_configured_delay_range(
         self, dynamodb_client, gsi_table
     ):
         """GSI propagation delay falls within the configured range.
 
-        Sets gsi_propagation_delay_ms to 50, writes items, and measures
+        Sets index_propagation_delay_ms to 50, writes items, and measures
         the observed propagation delay. The delay should be within
         [1, 50]ms (the random range used by the worker).
         """
         table_name = gsi_table
 
         # Save original delay and set to 50ms.
-        original_delay = extenddb_settings_get("gsi_propagation_delay_ms")
-        extenddb_settings_set("gsi_propagation_delay_ms", "50")
+        original_delay = extenddb_settings_get("index_propagation_delay_ms")
+        extenddb_settings_set("index_propagation_delay_ms", "50")
 
         try:
             delays = []
@@ -336,4 +336,4 @@ class TestGsiAsyncPropagation:
                 f"Delays exceeded 500ms: {[f'{d:.1f}' for d in delays]}"
             )
         finally:
-            extenddb_settings_set("gsi_propagation_delay_ms", original_delay)
+            extenddb_settings_set("index_propagation_delay_ms", original_delay)

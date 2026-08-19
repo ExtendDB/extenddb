@@ -15,10 +15,28 @@ pub type Validator = fn(&str) -> Result<(), &'static str>;
 pub const KNOWN_KEYS: &[(&str, Validator)] = &[
     ("allow_credential_import", validate_bool),
     ("control_plane_delay_seconds", validate_delay_seconds),
-    ("gsi_propagation_delay_ms", validate_gsi_delay_ms),
+    (
+        extenddb_core::settings_keys::INDEX_PROPAGATION_DELAY_MS,
+        validate_index_propagation_delay_ms,
+    ),
+    // Deprecated alias, still writable so an existing script or runbook keeps
+    // working. `set_setting` canonicalises it, so it updates the same row rather
+    // than creating a second one that the read path would ignore.
+    (
+        extenddb_core::settings_keys::LEGACY_GSI_PROPAGATION_DELAY_MS,
+        validate_index_propagation_delay_ms,
+    ),
     ("log_level", validate_log_level),
     ("sqlx_log_level", validate_log_level),
     ("throttling_enabled", validate_bool),
+    // A test lever, writable for the same reason the propagation delay is: the
+    // ordering property it exists to expose (a write landing mid-backfill must not
+    // be overwritten by the backfill's older snapshot) cannot be observed unless a
+    // test can slow the backfill down from outside the process.
+    (
+        extenddb_core::settings_keys::VECTOR_BACKFILL_BATCH_DELAY_MS,
+        validate_backfill_batch_delay_ms,
+    ),
 ];
 
 /// Read-only keys that cannot be changed via the settings API.
@@ -32,6 +50,18 @@ fn validate_log_level(value: &str) -> Result<(), &'static str> {
     match value {
         "trace" | "debug" | "info" | "warn" | "error" => Ok(()),
         _ => Err("must be one of: trace, debug, info, warn, error"),
+    }
+}
+
+/// Milliseconds, bounded so a mistyped value cannot wedge a backfill indefinitely.
+///
+/// The cap is generous next to any legitimate test need and small enough that the
+/// worst case is a slow backfill rather than one that never finishes.
+fn validate_backfill_batch_delay_ms(value: &str) -> Result<(), &'static str> {
+    match value.parse::<u64>() {
+        Ok(ms) if ms <= 60_000 => Ok(()),
+        Ok(_) => Err("must be between 0 and 60000 milliseconds"),
+        Err(_) => Err("must be a non-negative integer number of milliseconds"),
     }
 }
 
@@ -50,7 +80,7 @@ fn validate_delay_seconds(value: &str) -> Result<(), &'static str> {
     }
 }
 
-fn validate_gsi_delay_ms(value: &str) -> Result<(), &'static str> {
+fn validate_index_propagation_delay_ms(value: &str) -> Result<(), &'static str> {
     match value.parse::<u32>() {
         Ok(0..=10000) => Ok(()),
         Ok(_) => Err("must be between 0 and 10000"),
@@ -93,6 +123,9 @@ pub async fn set_setting(
         )));
     }
 
+    // Write under the canonical name, so setting the deprecated alias updates the row
+    // the read path actually consults instead of adding a second, ignored one.
+    let key = extenddb_core::settings_keys::canonical_key(key);
     store.set_setting(key, value).await?;
 
     tracing::warn!(

@@ -50,6 +50,29 @@ pub struct Capacity {
     pub write_capacity_units: Option<f64>,
 }
 
+/// Capacity consumed by a vector index.
+///
+/// Vector indexes meter in their own units, separate from table read and write
+/// capacity: `VectorSearchRequestBytes` for `SearchVectors`, and
+/// `VectorWriteRequestBytes` for writes replicated into the index. Both are
+/// byte figures, not unit figures, and each is omitted rather than reported as
+/// zero when the operation does not consume it.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct VectorCapacity {
+    /// Bytes consumed by a `SearchVectors` operation.
+    #[serde(
+        rename = "VectorSearchRequestBytes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub vector_search_request_bytes: Option<f64>,
+    /// Bytes consumed replicating a write into the index.
+    #[serde(
+        rename = "VectorWriteRequestBytes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub vector_write_request_bytes: Option<f64>,
+}
+
 /// Consumed capacity information returned when requested.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConsumedCapacity {
@@ -80,6 +103,14 @@ pub struct ConsumedCapacity {
         skip_serializing_if = "Option::is_none"
     )]
     pub local_secondary_indexes: Option<HashMap<String, Capacity>>,
+    /// Per-vector-index capacity breakdown, keyed by index name.
+    ///
+    /// Measured against the service 2026-08-13: reported only for `INDEXES`,
+    /// not for `TOTAL` (which returns `TableName` and `CapacityUnits` alone,
+    /// without even the `Table` breakdown), and absent entirely rather than
+    /// empty when the operation charged no vector capacity.
+    #[serde(rename = "VectorIndexes", skip_serializing_if = "Option::is_none")]
+    pub vector_indexes: Option<HashMap<String, VectorCapacity>>,
 }
 
 /// Controls whether the existing item is returned in the error response when a
@@ -150,9 +181,95 @@ pub struct ItemCollectionMetrics {
 }
 
 impl ConsumedCapacity {
+    /// Attach a vector-index write charge, keyed by index name.
+    ///
+    /// A charge of `None` for an index means the operation did not touch that
+    /// index's projected entry and so consumed nothing; such indexes are left
+    /// out of the map entirely, and when no index is charged the whole
+    /// `VectorIndexes` field is omitted. That matches the service, which omits
+    /// rather than zero-fills (measured 2026-08-13).
+    ///
+    /// Only applied at `INDEXES` granularity: `TOTAL` does not carry the map.
+    #[must_use]
+    pub fn with_vector_writes(
+        mut self,
+        charges: impl IntoIterator<Item = (String, f64)>,
+        indexes: bool,
+    ) -> Self {
+        if !indexes {
+            return self;
+        }
+        let map: HashMap<String, VectorCapacity> = charges
+            .into_iter()
+            .map(|(name, bytes)| {
+                (
+                    name,
+                    VectorCapacity {
+                        vector_search_request_bytes: None,
+                        vector_write_request_bytes: Some(bytes),
+                    },
+                )
+            })
+            .collect();
+        if !map.is_empty() {
+            self.vector_indexes = Some(map);
+        }
+        self
+    }
+
     /// Build a `ConsumedCapacity` for a read operation with real capacity units.
     #[must_use]
     pub fn read(table_name: &str, cu: f64, indexes: bool) -> Self {
+        Self {
+            table_name: table_name.to_owned(),
+            capacity_units: cu,
+            read_capacity_units: None,
+            write_capacity_units: None,
+            table: if indexes {
+                Some(Capacity {
+                    capacity_units: cu,
+                    read_capacity_units: None,
+                    write_capacity_units: None,
+                })
+            } else {
+                None
+            },
+            global_secondary_indexes: None,
+            local_secondary_indexes: None,
+            vector_indexes: None,
+        }
+    }
+
+    /// Build a `ConsumedCapacity` for a write operation with real capacity units.
+    #[must_use]
+    pub fn write(table_name: &str, cu: f64, indexes: bool) -> Self {
+        Self {
+            table_name: table_name.to_owned(),
+            capacity_units: cu,
+            read_capacity_units: None,
+            write_capacity_units: None,
+            table: if indexes {
+                Some(Capacity {
+                    capacity_units: cu,
+                    read_capacity_units: None,
+                    write_capacity_units: None,
+                })
+            } else {
+                None
+            },
+            global_secondary_indexes: None,
+            local_secondary_indexes: None,
+            vector_indexes: None,
+        }
+    }
+
+    /// Build a `ConsumedCapacity` for a transaction read (`TransactGetItems`).
+    ///
+    /// Unlike single-item and batch reads, real DynamoDB includes the granular
+    /// `ReadCapacityUnits` sub-field for transactions — both at the top level
+    /// and inside the nested `Table` breakdown at INDEXES granularity.
+    #[must_use]
+    pub fn transact_read(table_name: &str, cu: f64, indexes: bool) -> Self {
         Self {
             table_name: table_name.to_owned(),
             capacity_units: cu,
@@ -169,12 +286,17 @@ impl ConsumedCapacity {
             },
             global_secondary_indexes: None,
             local_secondary_indexes: None,
+            vector_indexes: None,
         }
     }
 
-    /// Build a `ConsumedCapacity` for a write operation with real capacity units.
+    /// Build a `ConsumedCapacity` for a transaction write (`TransactWriteItems`).
+    ///
+    /// Unlike single-item and batch writes, real DynamoDB includes the granular
+    /// `WriteCapacityUnits` sub-field for transactions — both at the top level
+    /// and inside the nested `Table` breakdown at INDEXES granularity.
     #[must_use]
-    pub fn write(table_name: &str, cu: f64, indexes: bool) -> Self {
+    pub fn transact_write(table_name: &str, cu: f64, indexes: bool) -> Self {
         Self {
             table_name: table_name.to_owned(),
             capacity_units: cu,
@@ -191,7 +313,68 @@ impl ConsumedCapacity {
             },
             global_secondary_indexes: None,
             local_secondary_indexes: None,
+            vector_indexes: None,
         }
+    }
+
+    /// Build a write `ConsumedCapacity` whose aggregate total includes the base
+    /// table plus every affected secondary index.
+    ///
+    /// `base_cu` is the base-table write capacity. `gsi`/`lsi` map each affected
+    /// index name to its write capacity. DynamoDB reports the aggregate total as
+    /// `base + Σ(GSI) + Σ(LSI)`, and — in `INDEXES` mode — the per-table `Table`
+    /// capacity plus the two per-index maps.
+    ///
+    /// When `breakdown` is true (`INDEXES` mode) the `Table`,
+    /// `GlobalSecondaryIndexes` and `LocalSecondaryIndexes` fields are populated;
+    /// when false (`TOTAL` mode) only the aggregate is returned, but that
+    /// aggregate still reflects the index writes.
+    #[must_use]
+    pub fn write_indexed(
+        table_name: &str,
+        base_cu: f64,
+        gsi: HashMap<String, f64>,
+        lsi: HashMap<String, f64>,
+        breakdown: bool,
+    ) -> Self {
+        let total = base_cu + gsi.values().sum::<f64>() + lsi.values().sum::<f64>();
+        Self {
+            table_name: table_name.to_owned(),
+            capacity_units: total,
+            read_capacity_units: None,
+            write_capacity_units: None,
+            table: breakdown.then(|| Capacity::units(base_cu)),
+            global_secondary_indexes: if breakdown { map_or_none(gsi) } else { None },
+            local_secondary_indexes: if breakdown { map_or_none(lsi) } else { None },
+            vector_indexes: None,
+        }
+    }
+}
+
+impl Capacity {
+    /// Capacity for a single-item write, which reports only `CapacityUnits`.
+    #[must_use]
+    fn units(cu: f64) -> Self {
+        Self {
+            capacity_units: cu,
+            read_capacity_units: None,
+            write_capacity_units: None,
+        }
+    }
+}
+
+/// Convert a per-index units map into `Some(map of Capacity)`, or `None` when
+/// empty so the field is omitted from the response.
+fn map_or_none(units: HashMap<String, f64>) -> Option<HashMap<String, Capacity>> {
+    if units.is_empty() {
+        None
+    } else {
+        Some(
+            units
+                .into_iter()
+                .map(|(name, cu)| (name, Capacity::units(cu)))
+                .collect(),
+        )
     }
 }
 
@@ -203,5 +386,37 @@ impl ItemCollectionMetrics {
             item_collection_key: HashMap::from([(pk_name.to_owned(), pk_value.clone())]),
             size_estimate_range_gb: [0.0, 1.0],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indexed_write_omits_granular_write_capacity_units() {
+        let capacity = ConsumedCapacity::write_indexed(
+            "table",
+            1.0,
+            HashMap::from([("gsi".to_owned(), 1.0)]),
+            HashMap::from([("lsi".to_owned(), 1.0)]),
+            true,
+        );
+        let Ok(value) = serde_json::to_value(capacity) else {
+            panic!("indexed capacity should serialize");
+        };
+
+        assert!(value.get("WriteCapacityUnits").is_none());
+        assert!(value["Table"].get("WriteCapacityUnits").is_none());
+        assert!(
+            value["GlobalSecondaryIndexes"]["gsi"]
+                .get("WriteCapacityUnits")
+                .is_none()
+        );
+        assert!(
+            value["LocalSecondaryIndexes"]["lsi"]
+                .get("WriteCapacityUnits")
+                .is_none()
+        );
     }
 }

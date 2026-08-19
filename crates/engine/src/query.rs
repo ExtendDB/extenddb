@@ -11,7 +11,8 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::PathElement;
 use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
 use extenddb_core::types::{
-    IndexType, KeyType, QueryInput, QueryOutput, Select, TableKeyInfo, extract_key, item_size_bytes,
+    IndexType, KeyType, ProjectionType, QueryInput, QueryOutput, Select, TableKeyInfo, extract_key,
+    item_size_bytes,
 };
 
 use crate::OperationContext;
@@ -59,6 +60,15 @@ pub async fn handle_query(
         None
     };
 
+    // A vector index is searched only via the vector search API, never queried.
+    if let Some(ref idx) = index_info
+        && idx.index_type == IndexType::Vector
+    {
+        return Err(DynamoDbError::ValidationException(
+            "Query operation not supported on this index type".to_owned(),
+        ));
+    }
+
     // ConsistentRead is not supported on GSI queries (tenet 1: fidelity).
     if input.consistent_read == Some(true)
         && let Some(ref idx) = index_info
@@ -67,6 +77,16 @@ pub async fn handle_query(
         return Err(DynamoDbError::ValidationException(
             "Consistent reads are not supported on global secondary indexes".to_owned(),
         ));
+    }
+
+    // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (shared with Scan).
+    if let Some(ref idx) = index_info {
+        extenddb_core::validation::validate_all_attributes_index_support(
+            input.select,
+            idx.index_type == IndexType::Gsi,
+            idx.projection.projection_type == ProjectionType::All,
+            &idx.index_name,
+        )?;
     }
 
     // Validate Limit >= 1 (REQ-QUERY-001)
@@ -89,48 +109,43 @@ pub async fn handle_query(
             base_key_schema: key_info.key_schema.clone(),
             attribute_definitions: key_info.attribute_definitions.clone(),
             has_lsi: key_info.has_lsi,
+            global_secondary_indexes: key_info.global_secondary_indexes.clone(),
+            local_secondary_indexes: key_info.local_secondary_indexes.clone(),
             stream_specification: None, // Queries don't capture stream records
+            vector_indexes: key_info.vector_indexes.clone(),
         }
     } else {
         key_info.clone()
     };
 
     // --- Legacy vs expression mutual exclusivity checks ---
-    let has_kce = input.key_condition_expression.is_some();
+    let kce_present = input.key_condition_expression.is_some();
     let has_kc = input.key_conditions.as_ref().is_some_and(|m| !m.is_empty());
-
-    if has_kce && has_kc {
-        return Err(DynamoDbError::ValidationException(
-            "Can not use both expression and non-expression parameters in the same request: \
-             Non-expression parameters: {KeyConditions} Expression parameters: {KeyConditionExpression}"
-                .to_owned(),
-        ));
-    }
-
     let has_fe = input.filter_expression.is_some();
     let has_qf = input.query_filter.as_ref().is_some_and(|m| !m.is_empty());
-
-    if has_fe && has_qf {
-        return Err(DynamoDbError::ValidationException(
-            "Can not use both expression and non-expression parameters in the same request: \
-             Non-expression parameters: {QueryFilter} Expression parameters: {FilterExpression}"
-                .to_owned(),
-        ));
-    }
-
     let has_pe = input.projection_expression.is_some();
     let has_atg = input
         .attributes_to_get
         .as_ref()
         .is_some_and(|a| !a.is_empty());
+    let has_cond_op = input.conditional_operator.is_some();
 
-    if has_pe && has_atg {
-        return Err(DynamoDbError::ValidationException(
-            "Can not use both expression and non-expression parameters in the same request: \
-             Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}"
-                .to_owned(),
-        ));
-    }
+    // KeyConditions legitimately combines with FilterExpression and
+    // ProjectionExpression, so it joins the mixing check only when
+    // KeyConditionExpression is also present.
+    extenddb_core::validation::validate_no_expression_param_mixing(
+        &[
+            ("AttributesToGet", has_atg),
+            ("QueryFilter", has_qf),
+            ("ConditionalOperator", has_cond_op),
+            ("KeyConditions", has_kc && kce_present),
+        ],
+        &[
+            ("ProjectionExpression", has_pe),
+            ("FilterExpression", has_fe),
+            ("KeyConditionExpression", kce_present),
+        ],
+    )?;
 
     // An explicitly empty KeyConditionExpression is rejected up front, before
     // the expression-parameter-usage checks (matching real DynamoDB).
@@ -162,6 +177,12 @@ pub async fn handle_query(
         input.expression_attribute_values.as_ref(),
         has_kce || has_filter_expr,
         &[],
+    )?;
+
+    // ConditionalOperator requires a QueryFilter with two or more conditions.
+    extenddb_core::validation::validate_conditional_operator_usage(
+        has_cond_op,
+        input.query_filter.as_ref().map_or(0, HashMap::len),
     )?;
 
     // Parse KeyConditionExpression or desugar legacy KeyConditions
@@ -352,6 +373,7 @@ pub async fn handle_query(
             .as_ref()
             .is_some_and(|a| !a.is_empty()),
         input.index_name.is_some(),
+        extenddb_core::validation::IS_QUERY,
     )?;
 
     // When Select=ALL_PROJECTED_ATTRIBUTES, capture the index info for post-read filtering.
@@ -385,6 +407,9 @@ pub async fn handle_query(
     // Validate begins_with operand types upfront (before any rows are read).
     if let Some(ref f) = filter {
         extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
+            |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
+        )?;
+        extenddb_core::expression::validate_ordering_operand_types(f, &combined_maps).map_err(
             |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
         )?;
     }

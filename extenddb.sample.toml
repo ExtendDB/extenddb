@@ -29,7 +29,16 @@
 # run_dir = "~/.extenddb/run"  # Directory for PID file (~ is expanded to $HOME)
 
 [storage]
-# backend = "postgres"         # Storage backend (only "postgres" supported)
+# backend = "postgres"         # Storage backend: "postgres" (default), "mongodb", or "sqlite".
+
+# --- SQLite backend (developer mode) ---
+# Select with `extenddb init --backend sqlite`. The database path can be given
+# at init time (`extenddb init --sqlite-path <path>`, written into this file)
+# or set here. At serve time, the EXTENDDB__STORAGE__SQLITE__PATH environment
+# variable overrides this value.
+# Use ":memory:" for an ephemeral in-memory database (data lost on shutdown).
+# [storage.sqlite]
+# path = "extenddb.sqlite"
 
 [storage.postgres]
 # Connection string points to the CATALOG database.
@@ -51,6 +60,11 @@
                                 # a startup warning). With auth enabled, each
                                 # DynamoDB request makes concurrent authz queries
                                 # — size this to match expected concurrency.
+
+[storage.mongodb]
+# MongoDB connection string. Requires a replica set (even single-node).
+# connection_string = "mongodb://localhost:27017/?replicaSet=rs0"
+# max_pool_size = 20           # Maximum concurrent connections to MongoDB.
 
 [auth]
 # provider = "builtin"          # Auth provider:
@@ -127,18 +141,29 @@
 # All file paths are canonicalized and must resolve under one of the
 # configured roots. Symlinks escaping a root are rejected.
 #
+# Files are namespaced per account beneath each root: a caller in account
+# 111122223333 may only read and write under <root>/111122223333. A path that
+# resolves elsewhere is rejected, so tenants sharing an instance cannot read or
+# overwrite each other's files. Export refuses to overwrite an existing file.
+#
 # [import]
-# paths = ["/var/lib/extenddb/imports", "/mnt/shared/data"]
+# paths = ["/var/lib/extenddb/imports"]
 #
 # [export]
 # paths = ["/var/lib/extenddb/exports"]
 #
 # max_import_bytes = 10737418240  # 10 GB default
 #
-# Deprecated: import_export_root sets a single root for both import and
-# export. If [import]/[export] sections are present, import_export_root
-# is ignored.
-# import_export_root = "/var/lib/extenddb/data"
+# Deprecated: import_export_root sets a single root for both import and export.
+# It fills only a list that the sections leave empty, so with both [import] and
+# [export] present it does nothing, and with neither present it makes the import
+# and export roots the same directory. The server logs which of those happened at
+# startup. Prefer the sections above; this key will be removed.
+#
+# It is a top-level key, so it has to appear before the first [section] header of
+# this file. Uncommenting it here would place it inside the preceding table and
+# the server would refuse to start with "unknown field import_export_root".
+#     import_export_root = "/var/lib/extenddb/data"
 
 # Runtime settings are managed via `extenddb settings set <key> <value>`, not this file.
 # See docs/getting-started.md for available runtime settings and their defaults.

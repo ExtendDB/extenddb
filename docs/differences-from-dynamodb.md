@@ -8,10 +8,12 @@ adaptation when switching between ExtendDB and the real service.
 
 | Area | DynamoDB | ExtendDB |
 |------|----------|------|
-| Storage backend | Proprietary distributed storage | PostgreSQL |
+| Storage backend | Proprietary distributed storage | PostgreSQL (default) or MongoDB (feature flag) |
 | Global Tables | CreateGlobalTable, replication | Not implemented (returns UnknownOperationException) |
 | DAX (Accelerator) | In-memory caching layer | Not applicable |
 | PartiQL | ExecuteStatement, BatchExecuteStatement | Not implemented (returns UnknownOperationException) |
+| Numeric precision on partition/sort keys (MongoDB backend only) | 38 significant digits | 34 significant digits (BSON Decimal128). Values that exceed this precision are rejected at write and query time with a ValidationException rather than silently downcast. PostgreSQL backend supports the full 38 digits. |
+| Inverted numeric `BETWEEN` on a sort key (MongoDB backend only) | ValidationException ("The BETWEEN operator requires upper bound to be greater than or equal to lower bound") | Same error in all practical cases. The inversion guard compares bounds via `f64`, so a `KeyConditionExpression` `BETWEEN` whose bounds are inverted only beyond f64's ~15–17 significant digits (e.g. `BETWEEN 10000000000000002 AND 10000000000000001`) is not rejected and returns an empty result set instead. Valid ranges are never wrongly rejected. |
 
 ## Authentication and Authorization (AWS IAM/STS auth surface used by DynamoDB)
 
@@ -61,7 +63,8 @@ adaptation when switching between ExtendDB and the real service.
 
 | Area | DynamoDB | ExtendDB |
 |------|----------|------|
-| GSI update propagation | Eventually consistent (milliseconds to seconds) | Per-GSI propagation delay. System default: `gsi_propagation_delay_ms` setting (default 10ms). Each GSI can override with its own `propagation_delay_ms` (stored in catalog). A value of 0 means synchronous (future sync GSI feature). |
+| GSI update propagation | Eventually consistent (milliseconds to seconds) | Per-GSI propagation delay. System default: `index_propagation_delay_ms` setting (default 10ms). Each GSI can override with its own `propagation_delay_ms` (stored in catalog). A value of 0 means synchronous (future sync GSI feature). |
+| Vector index update propagation | Eventually consistent, the same model as a GSI | Matches DynamoDB. Maintenance is queued on the same propagation queue as async GSIs, so a search immediately after a write may not see it. Governed by the same `index_propagation_delay_ms` setting; unlike a GSI there is no per-index override. A value of 0 applies maintenance synchronously in the write's own transaction, which is stricter than the service and exists so a test can assert steady state without waiting. |
 | Multi-part base table keys | Not supported | Preview extension (opt-in via `enable_multipart_keys` setting). Standard single/composite keys work identically. |
 
 ## Capacity and Throttling
@@ -90,7 +93,7 @@ ExtendDB exposes runtime settings that have no DynamoDB equivalent:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `control_plane_delay_seconds` | 5 | Simulated delay for table state transitions (CREATING → ACTIVE, DELETING → removed) |
-| `gsi_propagation_delay_ms` | 10 | System-wide default GSI propagation delay (milliseconds). Per-GSI overrides stored in catalog. 0 = synchronous. |
+| `index_propagation_delay_ms` | 10 | System-wide default propagation delay for asynchronous secondary-index maintenance (milliseconds), covering GSIs and vector indexes alike. Per-GSI overrides stored in catalog; vector indexes have no per-index override. 0 = synchronous. Accepts the pre-rename name `gsi_propagation_delay_ms` as a deprecated alias, and a catalog created before the rename keeps honouring a value stored under it. |
 | `throttling_enabled` | `true` | Enable provisioned capacity throttling (token bucket per table/partition) |
 | `enable_multipart_keys` | `false` | Enable multi-part base table key extension |
 | `log_level` | `info` | Runtime log level (trace, debug, info, warn, error) |

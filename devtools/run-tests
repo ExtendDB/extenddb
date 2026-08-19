@@ -13,6 +13,7 @@
 #   devtools/run-tests --extenddb --rust --release
 #   devtools/run-tests --extenddb --filter PATTERN --pytest
 #   devtools/run-tests --extenddb --catalog-check --config PATH
+#   devtools/run-tests --extenddb --pytest --backend mongodb
 #
 # Target flag (exactly one required, mutually exclusive):
 #   --extenddb            targeting a local extenddb instance
@@ -28,6 +29,10 @@
 #   --catalog-check   post-test catalog integrity check
 #
 # Options:
+#   --backend NAME    storage backend the running server uses:
+#                       postgres (default) or mongodb.
+#                       Gates postgres-only paths (pg connection-string
+#                       extraction, test_cli_lifecycle.py).
 #   --release         use release build for Rust tests
 #   --filter PATTERN  pass to cargo test / pytest -k
 #   --parallel[=N]    run pytest in parallel (default: 1/3 of CPU cores)
@@ -67,6 +72,7 @@ RELEASE=false
 FILTER=""
 CONFIG_PATH=""
 PARALLEL=""
+BACKEND="postgres"
 
 usage() {
     cat <<'EOF'
@@ -86,6 +92,8 @@ Suites (at least one required):
   --catalog-check   post-test catalog integrity check
 
 Options:
+  --backend NAME    storage backend the running server uses:
+                      postgres (default) or mongodb.
   --release         release build for Rust tests
   --filter PATTERN  filter for cargo test / pytest -k
   --parallel[=N]    run pytest in parallel (default: 1/3 of CPU cores)
@@ -112,6 +120,7 @@ while [[ $# -gt 0 ]]; do
         --filter)         FILTER="$2"; shift 2 ;;
         --catalog-check)  RUN_CATALOG_CHECK=true; shift ;;
         --config)         CONFIG_PATH="$2"; shift 2 ;;
+        --backend)        BACKEND="$2"; shift 2 ;;
         --parallel)
             # --parallel (no argument) or --parallel=N
             PARALLEL="auto"; shift
@@ -123,6 +132,15 @@ while [[ $# -gt 0 ]]; do
         *)                echo "error: unknown option: $1"; usage ;;
     esac
 done
+
+# --- Validate: backend name ---
+case "$BACKEND" in
+    postgres|sqlite|mongodb) ;;
+    *)
+        echo "error: --backend must be 'postgres', 'sqlite' or 'mongodb' (got: $BACKEND)"
+        exit 1
+        ;;
+esac
 
 # --- Validate: target flag required ---
 if [[ -z "$TARGET" ]]; then
@@ -212,6 +230,7 @@ if [[ "$TARGET" == "real-dynamodb" ]]; then
     echo "  EXTENDDB_TEST_ENDPOINT = (not set — using AWS SDK defaults)"
     echo "  AWS_ACCESS_KEY_ID  = ${AWS_ACCESS_KEY_ID:-(from ~/.aws)}"
 else
+    echo "  backend            = $BACKEND"
     echo "  EXTENDDB_TEST_ENDPOINT = ${EXTENDDB_TEST_ENDPOINT:-}"
     echo "  AWS_ACCESS_KEY_ID  = ${AWS_ACCESS_KEY_ID:-(will be provisioned)}"
 fi
@@ -302,38 +321,53 @@ if $NEEDS_INTEGRATION && [[ "$TARGET" != "real-dynamodb" ]]; then
         if "$BINARY" settings --config "$CONFIG_FOR_SETTINGS" set control_plane_delay_seconds 0.05 2>/dev/null; then
             echo "  ✓ control_plane_delay_seconds set to 0.05"
         fi
-        if "$BINARY" settings --config "$CONFIG_FOR_SETTINGS" set gsi_propagation_delay_ms 0 2>/dev/null; then
-            echo "  ✓ gsi_propagation_delay_ms set to 0"
+        if "$BINARY" settings --config "$CONFIG_FOR_SETTINGS" set index_propagation_delay_ms 0 2>/dev/null; then
+            echo "  ✓ index_propagation_delay_ms set to 0"
         fi
         if "$BINARY" settings --config "$CONFIG_FOR_SETTINGS" set throttling_enabled true 2>/dev/null; then
             echo "  ✓ throttling_enabled set to true"
         fi
     fi
 
-    # Import/export paths
+    # Import/export paths. The Python tests write fixtures via tempfile, which
+    # honours $TMPDIR — on macOS that is under /var/folders, not /tmp. Allow
+    # whatever tempfile will use so exported/imported file paths validate on
+    # every platform (Linux leaves TMPDIR unset, so this is /tmp there).
+    TMP_ALLOWED="${TMPDIR:-/tmp}"; TMP_ALLOWED="${TMP_ALLOWED%/}"
     if [[ -f "$CONFIG_FOR_SETTINGS" ]]; then
         NEED_RESTART=false
-        if ! grep -qE '^\[import\]' "$CONFIG_FOR_SETTINGS" || \
-           ! grep -A1 '^\[import\]' "$CONFIG_FOR_SETTINGS" | grep -q '/tmp'; then
+        if ! grep -A1 '^\[import\]' "$CONFIG_FOR_SETTINGS" 2>/dev/null | grep -qF "$TMP_ALLOWED"; then
             sed '/^# \[import\]/d; /^# paths = \[\].*import/d' "$CONFIG_FOR_SETTINGS" > "$CONFIG_FOR_SETTINGS.tmp" \
                 && mv "$CONFIG_FOR_SETTINGS.tmp" "$CONFIG_FOR_SETTINGS"
-            printf '\n[import]\npaths = ["/tmp"]\n' >> "$CONFIG_FOR_SETTINGS"
+            printf '\n[import]\npaths = ["%s"]\n' "$TMP_ALLOWED" >> "$CONFIG_FOR_SETTINGS"
             NEED_RESTART=true
-            echo "  ✓ [import] paths configured for /tmp"
+            echo "  ✓ [import] paths configured for $TMP_ALLOWED"
         fi
-        if ! grep -qE '^\[export\]' "$CONFIG_FOR_SETTINGS" || \
-           ! grep -A1 '^\[export\]' "$CONFIG_FOR_SETTINGS" | grep -q '/tmp'; then
+        if ! grep -A1 '^\[export\]' "$CONFIG_FOR_SETTINGS" 2>/dev/null | grep -qF "$TMP_ALLOWED"; then
             sed '/^# \[export\]/d; /^# paths = \[\].*export/d' "$CONFIG_FOR_SETTINGS" > "$CONFIG_FOR_SETTINGS.tmp" \
                 && mv "$CONFIG_FOR_SETTINGS.tmp" "$CONFIG_FOR_SETTINGS"
-            printf '\n[export]\npaths = ["/tmp"]\n' >> "$CONFIG_FOR_SETTINGS"
+            printf '\n[export]\npaths = ["%s"]\n' "$TMP_ALLOWED" >> "$CONFIG_FOR_SETTINGS"
             NEED_RESTART=true
-            echo "  ✓ [export] paths configured for /tmp"
+            echo "  ✓ [export] paths configured for $TMP_ALLOWED"
         fi
         if $NEED_RESTART && [[ -x "$BINARY" ]]; then
             echo "  Restarting server to pick up import/export config..."
-            "$BINARY" stop --config "$CONFIG_FOR_SETTINGS" 2>/dev/null || true
+            # Report failures instead of hiding them. A health check alone is not
+            # proof of a restart: if `stop` cannot signal the server (a
+            # --foreground server without --write-pid-file writes no PID file)
+            # the old process keeps serving and answers the health check while
+            # the new config is never picked up.
+            if ! "$BINARY" stop --config "$CONFIG_FOR_SETTINGS"; then
+                echo "  ✗ Could not stop the running server to apply the config change."
+                echo "    If it was started with 'serve --foreground', restart it with"
+                echo "    --write-pid-file so 'stop' can signal it."
+                exit 1
+            fi
             sleep 1
-            "$BINARY" serve --config "$CONFIG_FOR_SETTINGS" 2>/dev/null
+            if ! "$BINARY" serve --config "$CONFIG_FOR_SETTINGS"; then
+                echo "  ✗ Server failed to start after config change"
+                exit 1
+            fi
             sleep 2
             if health_check "$EXTENDDB_TEST_ENDPOINT"; then
                 echo "  ✓ Server restarted with import/export enabled"
@@ -345,18 +379,17 @@ if $NEEDS_INTEGRATION && [[ "$TARGET" != "real-dynamodb" ]]; then
     fi
 
     # Export PG connection string for CLI lifecycle tests (PostgreSQL only).
-    # Extract from config, strip the database name to get the base URL.
-    # This is only needed for test_cli_lifecycle.py which is PostgreSQL-specific
-    # and excluded from the main pytest suite.
-    if [[ -z "${EXTENDDB_TEST_PG_CONNECTION_STRING:-}" && -f "$CONFIG_FOR_SETTINGS" ]]; then
-        # Only try to extract connection_string for PostgreSQL backend
-        if grep -q '^[[:space:]]*backend[[:space:]]*=[[:space:]]*"postgres"' "$CONFIG_FOR_SETTINGS" 2>/dev/null; then
-            FULL_CONN=$(grep 'connection_string' "$CONFIG_FOR_SETTINGS" | sed -n 's/.*connection_string[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-            if [[ -n "$FULL_CONN" ]]; then
-                # Strip trailing /database_name to get base URL
-                export EXTENDDB_TEST_PG_CONNECTION_STRING="${FULL_CONN%/*}"
-                echo "  ✓ EXTENDDB_TEST_PG_CONNECTION_STRING=${EXTENDDB_TEST_PG_CONNECTION_STRING}"
-            fi
+    # test_cli_lifecycle.py is PostgreSQL-specific and excluded from the
+    # main pytest suite; it opens its own extenddb instances via the
+    # connection string. Skipped on the mongo backend.
+    if [[ "$BACKEND" == "postgres" \
+        && -z "${EXTENDDB_TEST_PG_CONNECTION_STRING:-}" \
+        && -f "$CONFIG_FOR_SETTINGS" ]]; then
+        FULL_CONN=$(grep 'connection_string' "$CONFIG_FOR_SETTINGS" 2>/dev/null | sed -n 's/.*connection_string[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 || true)
+        if [[ -n "$FULL_CONN" ]]; then
+            # Strip trailing /database_name to get base URL
+            export EXTENDDB_TEST_PG_CONNECTION_STRING="${FULL_CONN%/*}"
+            echo "  ✓ EXTENDDB_TEST_PG_CONNECTION_STRING=${EXTENDDB_TEST_PG_CONNECTION_STRING}"
         fi
     fi
     echo ""
@@ -428,7 +461,7 @@ if $RUN_PYTEST; then
     fi
     echo "  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}"
     # CLI lifecycle tests manage their own server; exclude from main suite
-    PYTEST_ARGS=(python3 -m pytest tests/ -v --ignore=tests/python --ignore=tests/test_cli_lifecycle.py --ignore=tests/test_gsi_async_queue.py)
+    PYTEST_ARGS=(python3 -m pytest tests/ -v --ignore=tests/python --ignore=tests/test_cli_lifecycle.py --ignore=tests/test_cli_container_readiness.py --ignore=tests/test_cli_migrate_concurrency.py --ignore=tests/test_gsi_async_queue.py)
     # Parallel execution (--parallel): distribute by file so module/class-scoped
     # fixtures stay within a single worker.
     if [[ -n "$PARALLEL" ]] && python3 -c "import xdist" 2>/dev/null; then
@@ -513,11 +546,14 @@ if $RUN_COMPREHENSIVE; then
     echo ""
 fi
 
-# --- CLI lifecycle tests (run last — they start/stop their own servers) ---
-if $RUN_PYTEST && [[ "$TARGET" != "real-dynamodb" && -n "${EXTENDDB_TEST_PG_CONNECTION_STRING:-}" ]]; then
+# --- CLI lifecycle tests (postgres-only; run last — they start/stop their own servers) ---
+if $RUN_PYTEST \
+    && [[ "$TARGET" != "real-dynamodb" \
+        && "$BACKEND" == "postgres" \
+        && -n "${EXTENDDB_TEST_PG_CONNECTION_STRING:-}" ]]; then
     CLI_OUTFILE="discussions/test-cli-${HASH}.txt"
     echo "=== CLI lifecycle tests → ${CLI_OUTFILE} ==="
-    CLI_ARGS=(python3 -m pytest tests/test_cli_lifecycle.py -v)
+    CLI_ARGS=(python3 -m pytest tests/test_cli_lifecycle.py tests/test_cli_container_readiness.py tests/test_cli_migrate_concurrency.py -v)
     if [[ -n "$FILTER" ]]; then
         CLI_ARGS+=(-k "$FILTER")
     fi

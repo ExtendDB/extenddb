@@ -14,10 +14,17 @@ use crate::PostgresEngine;
 
 impl PostgresEngine {
     /// Core implementation of `create_table` (Fix #4: wrapped in a transaction).
+    /// Create a table. When `defer_active` is set (the restore path), the row
+    /// is written `CREATING` with **no** scheduled transition, so the
+    /// background control-plane worker cannot flip it to `ACTIVE` while the
+    /// caller is still populating it; the caller sets `ACTIVE` itself once the
+    /// data copy completes. Normal `CreateTable` passes `false` and gets the
+    /// usual timed transition.
     pub(crate) async fn create_table_impl(
         &self,
         account_id: &str,
         input: CreateTableInput,
+        defer_active: bool,
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
         let table_id = uuid::Uuid::new_v4().to_string();
@@ -77,10 +84,12 @@ impl PostgresEngine {
                 creation_date_time, table_arn, table_id, deletion_protection_enabled,
                 status_transition_at, table_class, sse_specification, on_demand_throughput)
                VALUES ($1, $2, $3, $4, $5, $6, $7,
-                CASE WHEN (SELECT secs FROM delay) = 0
+                CASE WHEN $14 THEN 'CREATING'
+                     WHEN (SELECT secs FROM delay) = 0
                      THEN 'ACTIVE' ELSE 'CREATING' END,
                 NOW(), $8, $9, $10,
-                CASE WHEN (SELECT secs FROM delay) = 0
+                CASE WHEN $14 THEN NULL
+                     WHEN (SELECT secs FROM delay) = 0
                      THEN NULL
                      ELSE NOW() + make_interval(secs => (SELECT secs FROM delay))
                 END,
@@ -100,6 +109,7 @@ impl PostgresEngine {
         .bind(&input.table_class)
         .bind(&sse_spec_json)
         .bind(&on_demand_json)
+        .bind(defer_active)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| match &e {
@@ -420,6 +430,7 @@ impl PostgresEngine {
                 .as_ref()
                 .map(|tc| serde_json::json!({ "TableClass": tc })),
             on_demand_throughput: input.on_demand_throughput,
+            ..Default::default()
         })
     }
 }

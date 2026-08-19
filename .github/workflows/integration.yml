@@ -47,7 +47,9 @@ jobs:
 
       - name: Start ExtendDB
         run: |
-          ./target/release/extenddb serve --config extenddb.toml --foreground &
+          # --write-pid-file so devtools/run-tests can restart the server with
+          # 'extenddb stop' when it needs to apply a config change.
+          ./target/release/extenddb serve --config extenddb.toml --foreground --write-pid-file &
           for i in $(seq 1 30); do
             if curl -sk https://127.0.0.1:18443/health | grep -q healthy; then
               echo "Server ready"
@@ -72,6 +74,109 @@ jobs:
           EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
           EXTENDDB_TEST_PG_ADMIN_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
         run: devtools/run-tests --extenddb --pytest --comprehensive --parallel --filter "not import_export"
+
+  run-integration-sqlite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build release (SQLite backend)
+        run: cargo build --release -p extenddb --no-default-features --features sqlite
+
+      - name: Initialize ExtendDB
+        id: init
+        run: |
+          output=$(./target/release/extenddb init --backend sqlite --config extenddb.toml 2>&1)
+          echo "$output"
+          password=$(echo "$output" | grep -oP 'Password: \K\S+')
+          echo "admin_password=$password" >> "$GITHUB_OUTPUT"
+
+      - name: Start ExtendDB
+        run: |
+          # --write-pid-file so devtools/run-tests can restart the server with
+          # 'extenddb stop' when it needs to apply a config change.
+          ./target/release/extenddb serve --config extenddb.toml --foreground --write-pid-file &
+          for i in $(seq 1 30); do
+            if curl -sk https://127.0.0.1:18443/health | grep -q healthy; then
+              echo "Server ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server failed to start"
+          exit 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run integration tests
+        env:
+          EXTENDDB_TEST_ENDPOINT: https://127.0.0.1:18443
+          EXTENDDB_ADMIN_USER: admin
+          EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
+        run: devtools/run-tests --extenddb --pytest --comprehensive --parallel --filter "not import_export"
+
+  run-integration-dev-mode:
+    # dev-mode was shipped with no CI coverage at all, which is how the batch and
+    # transaction authorization regression reached main: the build compiled, so
+    # a feature-matrix check passed, while nothing ever issued a request against
+    # a dev-mode server. This job starts one and exercises the data plane.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build release (dev mode, in-memory SQLite)
+        run: cargo build --release -p extenddb --no-default-features --features sqlite-memory,dev-mode
+
+      - name: Start ExtendDB in dev mode
+        run: |
+          # No config file on purpose: dev mode falls back to built-in defaults,
+          # which is the zero-config path a user gets, and the one the profile
+          # documents as a DynamoDB Local replacement.
+          ./target/release/extenddb serve --foreground --port 18444 --config /nonexistent.toml &
+          for i in $(seq 1 30); do
+            if curl -s http://127.0.0.1:18444/health | grep -q healthy; then
+              echo "Server ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server failed to start"
+          exit 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run dev-mode authorization tests
+        env:
+          EXTENDDB_TEST_ENDPOINT: http://127.0.0.1:18444
+          EXTENDDB_TEST_DEV_MODE: "1"
+          AWS_DEFAULT_REGION: us-east-1
+          # The seeded zero-config dev credential. AWS's documented example key,
+          # which grants nothing anywhere; it exists so SigV4 has a key to verify.
+          AWS_ACCESS_KEY_ID: AKIAIOSFODNN7EXAMPLE
+          AWS_SECRET_ACCESS_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+        run: python3 -m pytest tests/test_dev_mode_authorization.py -v
 
   run-rust-integration:
     runs-on: ubuntu-latest
@@ -114,7 +219,9 @@ jobs:
 
       - name: Start ExtendDB
         run: |
-          ./target/release/extenddb serve --config extenddb.toml --foreground &
+          # --write-pid-file so devtools/run-tests can restart the server with
+          # 'extenddb stop' when it needs to apply a config change.
+          ./target/release/extenddb serve --config extenddb.toml --foreground --write-pid-file &
           for i in $(seq 1 30); do
             if curl -sk https://127.0.0.1:18443/health | grep -q healthy; then
               echo "Server ready"
@@ -125,44 +232,106 @@ jobs:
           echo "Server failed to start"
           exit 1
 
-      - name: Provision IAM test user and access key
-        id: creds
-        env:
-          EXTENDDB_PASSWORD: ${{ steps.init.outputs.admin_password }}
-        run: |
-          acc='${{ steps.init.outputs.account_id }}'
-          ./target/release/extenddb manage --user admin create-user \
-            --account-id "$acc" --user-name tester
-          ./target/release/extenddb manage --user admin put-user-policy \
-            --account-id "$acc" --user-name tester --policy-name ddbfull \
-            --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"dynamodb:*","Resource":"*"}]}'
-          ./target/release/extenddb manage --user admin create-access-key \
-            --account-id "$acc" --user-name tester > /tmp/key.json
-          echo "akid=$(jq -r .access_key_id /tmp/key.json)" >> "$GITHUB_OUTPUT"
-          secret=$(jq -r .secret_access_key /tmp/key.json)
-          echo "::add-mask::$secret"
-          echo "secret=$secret" >> "$GITHUB_OUTPUT"
-
+      # Driven through devtools/run-tests rather than a bare `cargo test`, because the
+      # harness provisions what several suites require and a raw invocation does not:
+      # devtools/provision-test-credentials creates account 123456789012 with an IAM
+      # user, access key and full-access policy, and exports the credentials.
+      #
+      # batch_transact_authz targets that account and skips itself when
+      # EXTENDDB_ADMIN_PASSWORD is absent, so under a bare `cargo test` all ten of its
+      # tests reported ok WITHOUT EXECUTING, in every run since they landed in #232.
+      # The vector backfill tests need the same access to set the batch delay.
       - name: Run Rust integration tests
         env:
           EXTENDDB_TEST_ENDPOINT: https://127.0.0.1:18443
           AWS_DEFAULT_REGION: us-east-1
-          AWS_ACCESS_KEY_ID: ${{ steps.creds.outputs.akid }}
-          AWS_SECRET_ACCESS_KEY: ${{ steps.creds.outputs.secret }}
+          EXTENDDB_ADMIN_USER: admin
+          EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
+          # PostgreSQL implements no vector search, so this is the job where the
+          # wire refusal tests must actually run. Both vector suites adapt to
+          # whatever the backend reports, so the refusal suite could skip every
+          # assertion here and still report green. "0" asserts the backend
+          # refuses vector indexes, making those tests mandatory rather than
+          # optional, and turns a silent skip into a failure.
+          EXTENDDB_EXPECT_VECTORS: "0"
+        run: devtools/run-tests --extenddb --rust-integration --release
+  run-rust-integration-sqlite:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build release (SQLite backend)
+        run: cargo build --release -p extenddb --no-default-features --features sqlite
+
+      - name: Initialize ExtendDB
+        id: init
         run: |
-          # Self-signed cert generated by init; trust it for the SDK client.
-          export EXTENDDB_CA_CERT="$(grep -oP 'cert_path\s*=\s*"\K[^"]+' extenddb.toml)"
-          # The suite shares one SDK client across tests; the hyper connection
-          # pool is bound to the first test's runtime, so run serially.
-          cd tests/rust && cargo test -- --test-threads=1
+          output=$(./target/release/extenddb init --backend sqlite --config extenddb.toml 2>&1)
+          echo "$output"
+          echo "admin_password=$(echo "$output" | grep -oP 'Password: \K\S+')" >> "$GITHUB_OUTPUT"
+
+      - name: Enable provisioned-capacity throttling enforcement
+        run: ./target/release/extenddb settings set throttling_enabled true
+
+      - name: Start ExtendDB
+        run: |
+          ./target/release/extenddb serve --config extenddb.toml --foreground --write-pid-file &
+          for i in $(seq 1 30); do
+            if curl -sk https://127.0.0.1:18443/health | grep -q healthy; then
+              echo "Server ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server failed to start"
+          exit 1
+
+      # Driven through devtools/run-tests rather than a bare `cargo test`, because the
+      # harness provisions what several suites require and a raw invocation does not:
+      # devtools/provision-test-credentials creates account 123456789012 with an IAM
+      # user, access key and full-access policy, and exports the credentials.
+      #
+      # batch_transact_authz targets that account and skips itself when
+      # EXTENDDB_ADMIN_PASSWORD is absent, so under a bare `cargo test` all ten of its
+      # tests reported ok WITHOUT EXECUTING, in every run since they landed in #232.
+      # The vector backfill tests need the same access to set the batch delay.
+      - name: Run Rust integration tests
+        env:
+          EXTENDDB_TEST_ENDPOINT: https://127.0.0.1:18443
+          AWS_DEFAULT_REGION: us-east-1
+          EXTENDDB_ADMIN_USER: admin
+          EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
+          # Both vector suites self-skip when the backend is the wrong kind, so without
+          # this the positive suite could skip every assertion and still report green,
+          # which is what would happen if the backend lost the capability. Pinning the
+          # expectation turns that skip into a failure.
+          EXTENDDB_EXPECT_VECTORS: "1"
+        run: devtools/run-tests --extenddb --rust-integration --release
 
   integration:
     runs-on: ubuntu-latest
-    needs: [run-integration, run-rust-integration]
+    needs:
+      [
+        run-integration,
+        run-integration-sqlite,
+        run-integration-dev-mode,
+        run-rust-integration,
+        run-rust-integration-sqlite,
+      ]
     if: always()
     steps:
       - run: |
           if [ "${{ needs.run-integration.result }}" != "success" ] || \
-             [ "${{ needs.run-rust-integration.result }}" != "success" ]; then
+             [ "${{ needs.run-integration-sqlite.result }}" != "success" ] || \
+             [ "${{ needs.run-integration-dev-mode.result }}" != "success" ] || \
+             [ "${{ needs.run-rust-integration.result }}" != "success" ] || \
+             [ "${{ needs.run-rust-integration-sqlite.result }}" != "success" ]; then
             exit 1
           fi
