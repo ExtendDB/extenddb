@@ -448,22 +448,27 @@ mod tests {
 
     /// Exact wording, not fragments.
     ///
-    /// Verified against real DynamoDB on 2026-08-05: a `PutItem` carrying three
-    /// values against a four-dimension index returned
-    /// "One or more parameter values were invalid. Invalid size for parameter
-    /// emb, Expected: 4, Actual: 3 IndexName: vidx".
+    /// Re-measured against real Amazon DynamoDB on 2026-08-19 (probes P5 and P9,
+    /// three separate captures across PutItem, UpdateItem and the per-item
+    /// TransactWriteItems cancellation reason). A `PutItem` carrying three values
+    /// against a four-dimension index returns
+    /// "One or more parameter values are not valid. One or more parameter values
+    /// were invalid . Invalid size for parameter emb, Expected: 4, Actual: 3.
+    /// IndexName: vidx".
     ///
-    /// The punctuation is load-bearing: a full stop after "invalid", a comma
-    /// after the parameter name, and no separator after the actual count. The
-    /// fragment assertions above cannot catch a regression in any of those, so
-    /// this asserts the whole string.
+    /// The punctuation is load-bearing and three parts of it were wrong before:
+    /// the leading "are not valid" sentence was missing, the space before the
+    /// full stop after "invalid" was missing, and the full stop after the actual
+    /// count was missing. The fragment assertions above cannot catch a
+    /// regression in any of those, so this asserts the whole string.
     #[test]
     fn dimension_mismatch_message_matches_the_service_exactly() {
         let message = err(&item_with_vector(num_vec(&["0.1", "0.2", "0.3"])));
         assert_eq!(
             message,
-            "One or more parameter values were invalid. Invalid size for parameter \
-             ProductEmbedding, Expected: 5, Actual: 3 IndexName: ProductIndex"
+            "One or more parameter values are not valid. One or more parameter values were \
+             invalid . Invalid size for parameter ProductEmbedding, Expected: 5, Actual: 3. \
+             IndexName: ProductIndex"
         );
     }
 
@@ -473,18 +478,22 @@ mod tests {
         assert!(message.contains("Expected: 5, Actual: 0"));
     }
 
-    /// Asserted whole rather than by fragment. Every message below was measured
-    /// against the live service on 2026-08-07, and the previous fragment assertions
-    /// excluded the "One or more parameter values were invalid" prefix, which is
-    /// precisely where three of the four had drifted: two used a colon where the
-    /// service uses a full stop, and one omitted the prefix entirely.
+    /// Asserted whole rather than by fragment.
+    ///
+    /// Re-measured 2026-08-19 (probes P5 and P10, a String in the vector
+    /// position): the service names the DynamoDB type tokens rather than a prose
+    /// type, "Expected: L, Actual: S", and carries the same doubled-sentence
+    /// envelope as the size message. The earlier "32-bit floating point number
+    /// list" wording came from a 2026-08-07 reading that the byte-exact wire
+    /// capture contradicts.
     #[test]
     fn rejects_non_list_vector() {
         let message = err(&item_with_vector(AttributeValue::N("0.1".to_owned())));
         assert_eq!(
             message,
-            "One or more parameter values were invalid. Invalid type for parameter \
-             ProductEmbedding, Expected: 32-bit floating point number list IndexName: ProductIndex"
+            "One or more parameter values are not valid. One or more parameter values were \
+             invalid . Invalid type for parameter ProductEmbedding, Expected: L, Actual: N. \
+             IndexName: ProductIndex"
         );
     }
 
@@ -500,9 +509,9 @@ mod tests {
         let message = err(&item_with_vector(value));
         assert_eq!(
             message,
-            "One or more parameter values were invalid. Invalid type for parameter \
-             ProductEmbedding[2], Expected: 32-bit floating point number, Actual: S. \
-             IndexName: ProductIndex"
+            "One or more parameter values are not valid. One or more parameter values were \
+             invalid . Invalid type for parameter ProductEmbedding[2], Expected: 32-bit \
+             floating point number, Actual: S. IndexName: ProductIndex"
         );
     }
 
@@ -520,9 +529,9 @@ mod tests {
         let message = err(&item_with_vector(value));
         assert_eq!(
             message,
-            "One or more parameter values were invalid. Invalid value for parameter \
-             ProductEmbedding[1], Value: 1.3E+40 is outside valid range \
-             [-3.4028235E38, 3.4028235E38]. IndexName: ProductIndex"
+            "One or more parameter values are not valid. One or more parameter values were \
+             invalid . Invalid value for parameter ProductEmbedding[1], Value: 1.3E+40 is \
+             outside valid range [-3.4028235E38, 3.4028235E38]. IndexName: ProductIndex"
         );
     }
 
@@ -571,6 +580,66 @@ mod tests {
         // it must still be accepted as representable.
         let item = item_with_vector(num_vec(&["0.1", "0.2", "0.3", "0.4", "3.4028235E38"]));
         validate_vector_write(&item, &[index()], &defs()).unwrap();
+    }
+
+    /// The probe fixture: attribute `emb`, index `vidx`, four dimensions, which is
+    /// exactly what probes P4, P5, P9 and P10 ran against real Amazon DynamoDB on
+    /// 2026-08-19. Lets the three assertions below compare against the captured
+    /// wire strings byte for byte rather than against a re-templated form of them.
+    fn probe_index() -> VectorIndexKeyInfo {
+        VectorIndexKeyInfo {
+            index_name: "vidx".to_owned(),
+            dimensions: 4,
+            vector_attribute_name: "emb".to_owned(),
+            search_schema: Vec::new(),
+            projection: crate::types::Projection {
+                projection_type: crate::types::ProjectionType::All,
+                non_key_attributes: None,
+            },
+        }
+    }
+
+    fn probe_err(vector: AttributeValue) -> String {
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S("a".to_owned()));
+        item.insert("emb".to_owned(), vector);
+        match validate_vector_write(&item, &[probe_index()], &[]).unwrap_err() {
+            DynamoDbError::ValidationException(m) => m,
+            other => panic!("expected ValidationException, got {other:?}"),
+        }
+    }
+
+    /// Byte-for-byte against the captured response of probe P5/P9
+    /// (`P5-put-wrong-dims`, `P9-put-3-of-4`).
+    #[test]
+    fn wrong_dimension_count_is_byte_identical_to_the_service() {
+        assert_eq!(
+            probe_err(num_vec(&["0.1", "0.2", "0.3"])),
+            "One or more parameter values are not valid. One or more parameter values were \
+             invalid . Invalid size for parameter emb, Expected: 4, Actual: 3. IndexName: vidx"
+        );
+    }
+
+    /// Byte-for-byte against `P5-put-wrong-type` / `P10-put-string-attr`.
+    #[test]
+    fn wrong_attribute_type_is_byte_identical_to_the_service() {
+        assert_eq!(
+            probe_err(AttributeValue::S("not-a-vector".to_owned())),
+            "One or more parameter values are not valid. One or more parameter values were \
+             invalid . Invalid type for parameter emb, Expected: L, Actual: S. IndexName: vidx"
+        );
+    }
+
+    /// Byte-for-byte against `P4-put-f32-overflow`, including the service's
+    /// `3.5E+38` normalisation of the submitted `3.5E38`.
+    #[test]
+    fn f32_overflow_is_byte_identical_to_the_service() {
+        assert_eq!(
+            probe_err(num_vec(&["0", "3.5E38", "0", "0"])),
+            "One or more parameter values are not valid. One or more parameter values were \
+             invalid . Invalid value for parameter emb[1], Value: 3.5E+38 is outside valid \
+             range [-3.4028235E38, 3.4028235E38]. IndexName: vidx"
+        );
     }
 
     #[test]
