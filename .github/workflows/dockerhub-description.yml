@@ -1,0 +1,122 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Publish the Docker Hub repository Overview from a file in this repository.
+#
+# Neither `docker push` nor the `skopeo copy` that promote-image uses touches
+# repository metadata: the Overview lives on the Docker Hub repository object,
+# not on any image. GHCR derives its description from the OCI labels the
+# Dockerfile already sets, so the same image reads as documented there and blank
+# on Docker Hub. That is why this exists as its own step rather than falling out
+# of a push.
+#
+# Sourced from `docker/dockerhub-overview.md` so the published Overview is
+# reviewed like any other content and cannot drift from the repository.
+#
+# Dispatch-only and gated on the `dockerhub` environment, because it uses the
+# same credential that can push images. Deliberately NOT wired into
+# promote-image: the Overview is version-neutral, so a wording fix should not
+# require a release, and a release should not silently rewrite it.
+
+name: Docker Hub description
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dockerhub-description-extenddb-postgres
+  cancel-in-progress: false
+
+env:
+  HUB_NAMESPACE: extenddb
+  HUB_REPO: extenddb-postgres
+  OVERVIEW_FILE: docker/dockerhub-overview.md
+  # Docker Hub caps the short description at 100 characters.
+  SHORT_DESCRIPTION: DynamoDB-compatible API adapter backed by your own PostgreSQL 14+ database
+
+jobs:
+  publish-description:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: dockerhub
+    steps:
+      - name: Check out main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: The Overview file must exist and be non-trivial
+        run: |
+          set -euo pipefail
+          if [[ ! -s "$OVERVIEW_FILE" ]]; then
+            echo "::error::$OVERVIEW_FILE is missing or empty"
+            exit 1
+          fi
+          BYTES=$(wc -c < "$OVERVIEW_FILE")
+          # Docker Hub caps full_description at 25000 characters.
+          if (( BYTES > 25000 )); then
+            echo "::error::$OVERVIEW_FILE is ${BYTES} bytes; Docker Hub caps the Overview at 25000"
+            exit 1
+          fi
+          if (( ${#SHORT_DESCRIPTION} > 100 )); then
+            echo "::error::SHORT_DESCRIPTION is ${#SHORT_DESCRIPTION} characters; Docker Hub caps it at 100"
+            exit 1
+          fi
+          echo "::notice::Overview is ${BYTES} bytes"
+
+      - name: Publish the Overview
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Hub API v2 wants a session token, then a PATCH on the repository.
+          TOKEN=$(jq -n --arg u "$DOCKERHUB_USERNAME" --arg p "$DOCKERHUB_TOKEN" \
+              '{username:$u, password:$p}' \
+            | curl -sS --fail-with-body -X POST \
+                -H 'Content-Type: application/json' \
+                --data @- \
+                https://hub.docker.com/v2/users/login/ \
+            | jq -r '.token')
+          if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
+            echo "::error::could not obtain a Docker Hub session token"
+            exit 1
+          fi
+
+          jq -n \
+              --rawfile full "$OVERVIEW_FILE" \
+              --arg short "$SHORT_DESCRIPTION" \
+              '{full_description:$full, description:$short}' \
+            | curl -sS --fail-with-body -X PATCH \
+                -H "Authorization: JWT ${TOKEN}" \
+                -H 'Content-Type: application/json' \
+                --data @- \
+                "https://hub.docker.com/v2/repositories/${HUB_NAMESPACE}/${HUB_REPO}/" \
+            > /dev/null
+
+      - name: Verify it took effect
+        run: |
+          set -euo pipefail
+          # Read back anonymously: proves the Overview is what an unauthenticated
+          # visitor now sees, rather than trusting the write's response.
+          GOT=$(curl -sS --fail-with-body \
+            "https://hub.docker.com/v2/repositories/${HUB_NAMESPACE}/${HUB_REPO}/")
+          GOT_FULL=$(jq -r '.full_description // ""' <<< "$GOT")
+          GOT_SHORT=$(jq -r '.description // ""' <<< "$GOT")
+
+          if [[ -z "$GOT_FULL" ]]; then
+            echo "::error::Overview is still empty after the PATCH"
+            exit 1
+          fi
+          if ! diff -q <(printf '%s' "$GOT_FULL") <(cat "$OVERVIEW_FILE") >/dev/null; then
+            echo "::error::published Overview does not match ${OVERVIEW_FILE}"
+            diff <(printf '%s' "$GOT_FULL") "$OVERVIEW_FILE" | head -20 || true
+            exit 1
+          fi
+          if [[ "$GOT_SHORT" != "$SHORT_DESCRIPTION" ]]; then
+            echo "::error::short description is '${GOT_SHORT}', expected '${SHORT_DESCRIPTION}'"
+            exit 1
+          fi
+          echo "::notice::Overview published and verified anonymously"
