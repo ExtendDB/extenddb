@@ -182,8 +182,10 @@ macro_rules! bind_bound {
 /// unparsed token stream, so there is no typed node until a rule parses them; **once
 /// parsed, the named form yields a single `Expr::Assign` binding the hole's name to the
 /// call.** That is what makes it better than a positional argument: the name and the
-/// call are associated structurally, so a rule does not have to map format-string holes
-/// to argument indices and cannot be off by one.
+/// call are associated structurally, so a rule does not have to map *this* hole to an
+/// argument index and cannot be off by one for it. The same format string still holds a
+/// positional hole, the `({})` filled by `cols.join(", ")`, so a rule that wants to
+/// classify that one does need hole-to-index resolution.
 pub(crate) fn bind_list(n: usize) -> String {
     vec!["?"; n].join(", ")
 }
