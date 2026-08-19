@@ -1,6 +1,6 @@
 {
   "name": "@extenddb/dev",
-  "version": "0.1.3",
+  "version": "0.1.7",
   "description": "ExtendDB dev server launcher: a DynamoDB-compatible database for local development and CI. Spawns the extenddb dev binary (file-backed by default, in-memory with --memory) and hands back an endpoint plus credentials any AWS SDK accepts.",
   "license": "Apache-2.0",
   "repository": {
@@ -25,10 +25,10 @@
     "test": "node test/launcher.test.js"
   },
   "optionalDependencies": {
-    "@extenddb/linux-x64": "0.1.0",
-    "@extenddb/linux-arm64": "0.1.0",
-    "@extenddb/darwin-x64": "0.1.0",
-    "@extenddb/darwin-arm64": "0.1.0",
-    "@extenddb/win32-x64": "0.1.0"
+    "@extenddb/linux-x64": "0.1.7",
+    "@extenddb/linux-arm64": "0.1.7",
+    "@extenddb/darwin-x64": "0.1.7",
+    "@extenddb/darwin-arm64": "0.1.7",
+    "@extenddb/win32-x64": "0.1.7"
   }
 }
