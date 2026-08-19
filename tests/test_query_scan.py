@@ -1223,25 +1223,28 @@ class TestGSIOnHashOnlyBaseTable:
 
     def test_scan_pagination_on_gsi(self, dynamodb_client, gsi_on_hash_only_base_table):
         """Scan on GSI with Limit paginates correctly over hash-only base table."""
-        all_items = []
-        exclusive_start_key = None
+        def _collect():
+            all_items = []
+            exclusive_start_key = None
+            while True:
+                kwargs = {
+                    "TableName": gsi_on_hash_only_base_table,
+                    "IndexName": "CategoryPriorityGSI",
+                    "Limit": 3,
+                }
+                if exclusive_start_key:
+                    kwargs["ExclusiveStartKey"] = exclusive_start_key
 
-        while True:
-            kwargs = {
-                "TableName": gsi_on_hash_only_base_table,
-                "IndexName": "CategoryPriorityGSI",
-                "Limit": 3,
-            }
-            if exclusive_start_key:
-                kwargs["ExclusiveStartKey"] = exclusive_start_key
+                resp = dynamodb_client.scan(**kwargs)
+                all_items.extend(resp["Items"])
 
-            resp = dynamodb_client.scan(**kwargs)
-            all_items.extend(resp["Items"])
+                if "LastEvaluatedKey" not in resp:
+                    break
+                exclusive_start_key = resp["LastEvaluatedKey"]
+            return all_items
 
-            if "LastEvaluatedKey" not in resp:
-                break
-            exclusive_start_key = resp["LastEvaluatedKey"]
-
+        # GSI is eventually consistent — poll until all writes have propagated.
+        all_items = wait_for_gsi_items(_collect, 7)
         assert len(all_items) == 7
         ids = sorted(item["itemId"]["S"] for item in all_items)
         assert ids == sorted(f"item-{i}" for i in range(1, 8))
@@ -1252,7 +1255,7 @@ class TestGSIOnHashOnlyBaseTable:
         The first query populates the internal base_key_cache. Subsequent queries
         hit the cache. Any cache corruption would cause pagination to break.
         """
-        for run in range(5):
+        def _collect():
             all_items = []
             exclusive_start_key = None
             while True:
@@ -1270,7 +1273,13 @@ class TestGSIOnHashOnlyBaseTable:
                 if "LastEvaluatedKey" not in resp:
                     break
                 exclusive_start_key = resp["LastEvaluatedKey"]
-            assert len(all_items) == 7, (
+            return all_items
+
+        # First run polls for GSI convergence; subsequent runs must stay consistent.
+        for run in range(5):
+            expected = 7
+            all_items = wait_for_gsi_items(_collect, expected) if run == 0 else _collect()
+            assert len(all_items) == expected, (
                 f"Run {run+1}: expected 7 items but got {len(all_items)}"
             )
 
@@ -1284,25 +1293,29 @@ class TestGSIOnHashOnlyBaseTable:
         If the tie-breaker accidentally followed ScanIndexForward, reverse
         pagination would skip items or loop.
         """
-        all_items = []
-        exclusive_start_key = None
-        while True:
-            kwargs = {
-                "TableName": gsi_on_hash_only_base_table,
-                "IndexName": "CategoryPriorityGSI",
-                "KeyConditionExpression": "category = :c",
-                "ExpressionAttributeValues": {":c": {"S": "urgent"}},
-                "ScanIndexForward": False,
-                "Limit": 3,
-            }
-            if exclusive_start_key:
-                kwargs["ExclusiveStartKey"] = exclusive_start_key
-            resp = dynamodb_client.query(**kwargs)
-            all_items.extend(resp["Items"])
-            if "LastEvaluatedKey" not in resp:
-                break
-            exclusive_start_key = resp["LastEvaluatedKey"]
+        def _collect():
+            all_items = []
+            exclusive_start_key = None
+            while True:
+                kwargs = {
+                    "TableName": gsi_on_hash_only_base_table,
+                    "IndexName": "CategoryPriorityGSI",
+                    "KeyConditionExpression": "category = :c",
+                    "ExpressionAttributeValues": {":c": {"S": "urgent"}},
+                    "ScanIndexForward": False,
+                    "Limit": 3,
+                }
+                if exclusive_start_key:
+                    kwargs["ExclusiveStartKey"] = exclusive_start_key
+                resp = dynamodb_client.query(**kwargs)
+                all_items.extend(resp["Items"])
+                if "LastEvaluatedKey" not in resp:
+                    break
+                exclusive_start_key = resp["LastEvaluatedKey"]
+            return all_items
 
+        # GSI is eventually consistent — poll until all writes have propagated.
+        all_items = wait_for_gsi_items(_collect, 7)
         assert len(all_items) == 7, (
             f"Reverse GSI pagination: expected 7 items but got {len(all_items)}"
         )
@@ -1535,24 +1548,28 @@ class TestBaseKeySchemaFlow:
         self, dynamodb_client, base_key_schema_table
     ):
         """GSI query: base_key_schema differs from key_schema, used for tie-breaking."""
-        all_items = []
-        exclusive_start_key = None
-        while True:
-            kwargs = {
-                "TableName": base_key_schema_table,
-                "IndexName": "TestGSI",
-                "KeyConditionExpression": "gsi_pk = :gpk",
-                "ExpressionAttributeValues": {":gpk": {"S": "shared"}},
-                "Limit": 3,
-            }
-            if exclusive_start_key:
-                kwargs["ExclusiveStartKey"] = exclusive_start_key
-            resp = dynamodb_client.query(**kwargs)
-            all_items.extend(resp["Items"])
-            if "LastEvaluatedKey" not in resp:
-                break
-            exclusive_start_key = resp["LastEvaluatedKey"]
+        def _collect():
+            all_items = []
+            exclusive_start_key = None
+            while True:
+                kwargs = {
+                    "TableName": base_key_schema_table,
+                    "IndexName": "TestGSI",
+                    "KeyConditionExpression": "gsi_pk = :gpk",
+                    "ExpressionAttributeValues": {":gpk": {"S": "shared"}},
+                    "Limit": 3,
+                }
+                if exclusive_start_key:
+                    kwargs["ExclusiveStartKey"] = exclusive_start_key
+                resp = dynamodb_client.query(**kwargs)
+                all_items.extend(resp["Items"])
+                if "LastEvaluatedKey" not in resp:
+                    break
+                exclusive_start_key = resp["LastEvaluatedKey"]
+            return all_items
 
+        # GSI is eventually consistent — poll until all writes have propagated.
+        all_items = wait_for_gsi_items(_collect, 12)
         assert len(all_items) == 12
         # No duplicates across pages
         item_keys = [(i["pk"]["S"], i["sk"]["N"]) for i in all_items]
@@ -1562,22 +1579,26 @@ class TestBaseKeySchemaFlow:
         self, dynamodb_client, base_key_schema_table
     ):
         """GSI scan: base_key_schema provides base PK/SK for compound pagination."""
-        all_items = []
-        exclusive_start_key = None
-        while True:
-            kwargs = {
-                "TableName": base_key_schema_table,
-                "IndexName": "TestGSI",
-                "Limit": 4,
-            }
-            if exclusive_start_key:
-                kwargs["ExclusiveStartKey"] = exclusive_start_key
-            resp = dynamodb_client.scan(**kwargs)
-            all_items.extend(resp["Items"])
-            if "LastEvaluatedKey" not in resp:
-                break
-            exclusive_start_key = resp["LastEvaluatedKey"]
+        def _collect():
+            all_items = []
+            exclusive_start_key = None
+            while True:
+                kwargs = {
+                    "TableName": base_key_schema_table,
+                    "IndexName": "TestGSI",
+                    "Limit": 4,
+                }
+                if exclusive_start_key:
+                    kwargs["ExclusiveStartKey"] = exclusive_start_key
+                resp = dynamodb_client.scan(**kwargs)
+                all_items.extend(resp["Items"])
+                if "LastEvaluatedKey" not in resp:
+                    break
+                exclusive_start_key = resp["LastEvaluatedKey"]
+            return all_items
 
+        # GSI is eventually consistent — poll until all writes have propagated.
+        all_items = wait_for_gsi_items(_collect, 12)
         assert len(all_items) == 12
         item_keys = [(i["pk"]["S"], i["sk"]["N"]) for i in all_items]
         assert len(item_keys) == len(set(item_keys))

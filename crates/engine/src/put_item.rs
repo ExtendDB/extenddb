@@ -65,25 +65,7 @@ pub async fn handle_put_item(
     )?;
     crate::validate_put_delete_return_values(&body)?;
 
-    let input: PutItemInput = serde_json::from_value(body).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("parameter values were invalid")
-            || msg.contains("may not be empty")
-            || msg.contains("contains duplicates")
-            || msg.contains("Null attribute value")
-            || msg.contains("validation error detected")
-            || msg.contains("must not be empty")
-            || msg.contains("Syntax error; key")
-            || msg.contains("AttributeValue is empty")
-            || msg.contains("AttributeValue has more than one datatypes set")
-        {
-            DynamoDbError::ValidationException(msg)
-        } else {
-            DynamoDbError::SerializationException(format!(
-                "Start of structure or map found where not expected: {e}"
-            ))
-        }
-    })?;
+    let input: PutItemInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     // Reject mixing legacy and expression parameters, then EAN/EAV supplied
     // without a referencing expression.
@@ -147,6 +129,12 @@ pub async fn handle_put_item(
             &std::collections::HashSet::new(),
         )?;
     }
+
+    // Item-size limit is validated before the existence check so a genuinely
+    // oversized item to a missing table returns ValidationException (matching
+    // Amazon DynamoDB), not ResourceNotFoundException. Key/attribute-definition
+    // checks stay after existence — they need the table's key schema.
+    extenddb_core::validation::validate_item_size(&input.item, ctx.limits.max_item_size_bytes)?;
 
     let key_info = ctx
         .table_key_info(&input.table_name)

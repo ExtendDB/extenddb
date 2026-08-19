@@ -28,9 +28,15 @@ they are out of scope here and are tracked separately:
   it against an existing table (Amazon DynamoDB requires a Value).
 
 Some other checks are intentionally *post-existence* on Amazon DynamoDB and
-must keep returning ``ResourceNotFoundException`` for an absent table. The most
-visible one is the item-size limit (PutItem / BatchWriteItem). The control
-tests at the bottom pin that boundary so the fix does not over-correct.
+must keep returning ``ResourceNotFoundException`` for an absent table (the
+key-schema-dependent checks, which need the table's key schema).
+
+The item-size limit (PutItem / BatchWriteItem) is *pre-existence*: a genuinely
+oversized item (> the 400 KB / 409,600-byte limit) to an absent table returns
+``ValidationException``. An earlier revision of this file claimed the opposite,
+but its "big" item was ``"x" * 400001`` (~400,004 bytes) — actually *under* the
+limit, so it was never oversized and returned ``ResourceNotFoundException`` for
+the wrong reason. Verified against Amazon DynamoDB with a >400 KB item.
 
 All expected behaviour here was captured from Amazon DynamoDB via the AWS CLI
 (profile ``asomasun-admin``, us-east-1).
@@ -172,29 +178,29 @@ class TestValidationBeforeExistence:
         _assert_validation(ei, "duplicates")
 
 
-class TestValidationAfterExistence:
-    """Controls: checks that stay post-existence on Amazon DynamoDB.
+class TestItemSizeBeforeExistence:
+    """Item-size limit is validated *before* the existence check.
 
-    These must keep returning ResourceNotFoundException for an absent table so
-    the precedence fix does not move item-content validation ahead of the
-    existence check.
+    Verified against Amazon DynamoDB: a genuinely oversized item (> the 400 KB /
+    409,600-byte limit) to an absent table returns ``ValidationException``, not
+    ``ResourceNotFoundException``. (A sub-limit item to an absent table correctly
+    returns ``ResourceNotFoundException`` because it is not oversized.)
     """
 
-    def _big_item(self) -> dict:
-        return {"a": {"S": "k"}, "b": {"S": "x" * 400001}}
+    def _oversized_item(self) -> dict:
+        # > 400 KB (409,600 bytes): a single ~410 KB attribute value.
+        return {"a": {"S": "k"}, "b": {"S": "x" * 410000}}
 
-    def test_put_item_too_big_is_resource_not_found(self, client):
+    def test_put_item_too_big_before_existence(self, client):
         with pytest.raises(ClientError) as ei:
-            client.put_item(TableName=ABSENT_TABLE, Item=self._big_item())
-        code, _ = _error(ei)
-        assert code == "ResourceNotFoundException", f"got {code}"
+            client.put_item(TableName=ABSENT_TABLE, Item=self._oversized_item())
+        _assert_validation(ei, "Item size has exceeded the maximum allowed size")
 
-    def test_batch_write_item_too_big_is_resource_not_found(self, client):
+    def test_batch_write_item_too_big_before_existence(self, client):
         with pytest.raises(ClientError) as ei:
             client.batch_write_item(
                 RequestItems={
-                    ABSENT_TABLE: [{"PutRequest": {"Item": self._big_item()}}]
+                    ABSENT_TABLE: [{"PutRequest": {"Item": self._oversized_item()}}]
                 },
             )
-        code, _ = _error(ei)
-        assert code == "ResourceNotFoundException", f"got {code}"
+        _assert_validation(ei, "Item size has exceeded the maximum allowed size")

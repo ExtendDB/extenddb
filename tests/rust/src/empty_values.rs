@@ -7,7 +7,7 @@
 use crate::test_base::*;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType, Put,
-    ScalarAttributeType, TransactWriteItem, WriteRequest,
+    ScalarAttributeType, TransactWriteItem, Update, WriteRequest,
 };
 use std::collections::HashMap;
 
@@ -253,6 +253,61 @@ async fn transact_write_with_empty_string() {
         .await
         .unwrap();
     assert_eq!(resp.item().unwrap().get("val").unwrap(), &s(""));
+}
+
+/// Regression: a TransactWriteItems `Update` that sets non-key attributes to an
+/// empty string and empty binary must be accepted — empty values are valid on
+/// non-key attributes on real DynamoDB. Guards the transactional update path
+/// against faulting (previously a server-side error on an empty-value SET).
+#[tokio::test]
+async fn transact_update_with_empty_string_and_binary() {
+    let c = client();
+    let name = create_simple_table(c).await;
+    let mut item = HashMap::new();
+    item.insert("pk".into(), s("k1"));
+    item.insert("val".into(), s("notempty"));
+    c.put_item()
+        .table_name(&name)
+        .set_item(Some(item))
+        .send()
+        .await
+        .unwrap();
+    c.transact_write_items()
+        .transact_items(
+            TransactWriteItem::builder()
+                .update(
+                    Update::builder()
+                        .table_name(&name)
+                        .key("pk", s("k1"))
+                        .update_expression("SET s_attr = :s, b_attr = :b")
+                        .expression_attribute_values(":s", s(""))
+                        .expression_attribute_values(
+                            ":b",
+                            AttributeValue::B(aws_smithy_types::Blob::new(Vec::<u8>::new())),
+                        )
+                        .build()
+                        .unwrap(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let resp = c
+        .get_item()
+        .table_name(&name)
+        .key("pk", s("k1"))
+        .consistent_read(true)
+        .send()
+        .await
+        .unwrap();
+    let got = resp.item().unwrap();
+    assert_eq!(got.get("s_attr").unwrap(), &s(""));
+    if let AttributeValue::B(blob) = got.get("b_attr").unwrap() {
+        assert!(blob.as_ref().is_empty());
+    } else {
+        panic!("Expected binary type for b_attr");
+    }
 }
 
 #[tokio::test]

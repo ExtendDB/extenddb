@@ -1146,19 +1146,22 @@ pub fn validate_index_key_not_empty(
             let Some(value) = item.get(&ks.attribute_name) else {
                 continue;
             };
-            let empty = matches!(value, AttributeValue::S(s) if s.is_empty())
-                || matches!(value, AttributeValue::B(b) if b.is_empty());
-            if empty {
+            let empty_kind = match value {
+                AttributeValue::S(s) if s.is_empty() => Some("string"),
+                AttributeValue::B(b) if b.is_empty() => Some("binary"),
+                _ => None,
+            };
+            if let Some(kind) = empty_kind {
                 let msg = match ctx {
                     SecondaryIndexEmptyContext::Item => format!(
                         "One or more parameter values are not valid. A value specified for a secondary index key is not supported. \
-                         The AttributeValue for a key attribute cannot contain an empty string value. IndexName: {}, IndexKey: {}",
+                         The AttributeValue for a key attribute cannot contain an empty {kind} value. IndexName: {}, IndexKey: {}",
                         idx.index_name, ks.attribute_name
                     ),
-                    SecondaryIndexEmptyContext::UpdateExpression =>
+                    SecondaryIndexEmptyContext::UpdateExpression => format!(
                         "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. \
-                         The AttributeValue for a key attribute cannot contain an empty string value."
-                            .to_owned(),
+                         The AttributeValue for a key attribute cannot contain an empty {kind} value."
+                    ),
                 };
                 return Err(DynamoDbError::ValidationException(msg));
             }
@@ -1180,8 +1183,27 @@ pub fn validate_index_keys(
     indexes: &[IndexKeyRef<'_>],
     attr_defs: &[AttributeDefinition],
 ) -> Result<(), DynamoDbError> {
+    validate_index_keys_in_context(item, indexes, attr_defs, SecondaryIndexEmptyContext::Item)
+}
+
+/// [`validate_index_keys`] with the caller choosing the empty-value message
+/// variant.
+///
+/// DynamoDB words the rejection differently depending on how the offending value
+/// arrived. An item supplied directly reports the attribute and index by name; a
+/// value produced by an update expression reports that the update expression
+/// attempted the change and names neither. A path that evaluates an update
+/// expression and then validates the resulting item must therefore pass
+/// [`SecondaryIndexEmptyContext::UpdateExpression`], or it rejects for the right
+/// reason with the wrong message.
+pub fn validate_index_keys_in_context(
+    item: &Item,
+    indexes: &[IndexKeyRef<'_>],
+    attr_defs: &[AttributeDefinition],
+    context: SecondaryIndexEmptyContext,
+) -> Result<(), DynamoDbError> {
     validate_index_key_types(item, indexes, attr_defs)?;
-    validate_index_key_not_empty(item, indexes, SecondaryIndexEmptyContext::Item)
+    validate_index_key_not_empty(item, indexes, context)
 }
 
 /// Indexes sorted by name, so the alphabetically-first index that uses a
@@ -2761,6 +2783,42 @@ mod tests {
             upd_err.to_string(),
             "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. \
              The AttributeValue for a key attribute cannot contain an empty string value."
+        );
+    }
+
+    #[test]
+    fn index_key_empty_binary_messages_by_context() {
+        // An empty BINARY value on a secondary-index key must be reported as an
+        // "empty binary value" (matching real DynamoDB), not "empty string value".
+        let owned = [idx("gsi1", "lsi1sk")];
+        let refs: Vec<IndexKeyRef<'_>> = owned
+            .iter()
+            .map(|(n, ks)| IndexKeyRef {
+                index_name: n,
+                key_schema: ks,
+            })
+            .collect();
+        let mut item = Item::new();
+        item.insert("lsi1sk".to_owned(), AttributeValue::B(Vec::new()));
+
+        let put_err = validate_index_key_not_empty(&item, &refs, SecondaryIndexEmptyContext::Item)
+            .unwrap_err();
+        assert_eq!(
+            put_err.to_string(),
+            "One or more parameter values are not valid. A value specified for a secondary index key is not supported. \
+             The AttributeValue for a key attribute cannot contain an empty binary value. IndexName: gsi1, IndexKey: lsi1sk"
+        );
+
+        let upd_err = validate_index_key_not_empty(
+            &item,
+            &refs,
+            SecondaryIndexEmptyContext::UpdateExpression,
+        )
+        .unwrap_err();
+        assert_eq!(
+            upd_err.to_string(),
+            "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. \
+             The AttributeValue for a key attribute cannot contain an empty binary value."
         );
     }
 

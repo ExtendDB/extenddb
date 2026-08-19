@@ -75,11 +75,36 @@ where
         return Err(de::Error::custom(format!("{field_name} must not be empty")));
     }
     let mut out = HashMap::with_capacity(raw.len());
-    for (key, value) in raw {
-        validate_placeholder_key(&key, prefix, field_name, include_size_in_too_long)
+    // Pass 1: validate every key first, so a malformed key is reported before
+    // any value error (DynamoDB validates key syntax ahead of value contents).
+    for key in raw.keys() {
+        validate_placeholder_key(key, prefix, field_name, include_size_in_too_long)
             .map_err(de::Error::custom)?;
+    }
+    // Pass 2: per-value check and conversion.
+    for (key, value) in raw {
         check_value(&key, &value).map_err(de::Error::custom)?;
-        let converted = convert(value).map_err(de::Error::custom)?;
+        let converted = convert(value).map_err(|e| {
+            let msg = e.to_string();
+            // Semantic value-validation errors are wrapped with the field name
+            // and the offending key (DynamoDB parity). Wire/type errors (wrong
+            // JSON shape for a datatype) pass through as-is.
+            let is_value_validation = msg.starts_with("One or more parameter values were invalid:")
+                || msg.contains("Supplied AttributeValue is empty")
+                || msg.contains("Supplied AttributeValue has more than one datatypes set")
+                || msg.contains("cannot be converted to a numeric value")
+                || msg.contains("significant digits in a Number")
+                || msg.starts_with("Number overflow")
+                || msg.starts_with("Number underflow")
+                || msg.contains("Input collection contains duplicates");
+            if is_value_validation {
+                de::Error::custom(format!(
+                    "{field_name} contains invalid value: {msg} for key {key}"
+                ))
+            } else {
+                de::Error::custom(msg)
+            }
+        })?;
         out.insert(key, converted);
     }
     Ok(Some(out))
@@ -262,6 +287,162 @@ mod tests {
                 r#"ExpressionAttributeValues contains invalid key: Syntax error; key: ":""#
             )
         );
+    }
+
+    #[test]
+    fn values_null_non_boolean_is_validation_error() {
+        // {"NULL":"no"} is a validation error on real DynamoDB, not a parse
+        // (Serialization) error. Must be prefixed and name its key.
+        let msg = values_err(r#"{"values":{":b":{"NULL":"no"}}}"#);
+        assert!(
+            msg.contains(
+                "ExpressionAttributeValues contains invalid value: One or more parameter \
+                 values were invalid: Null attribute value types must have the value of \
+                 true for key :b"
+            ),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn values_null_false_is_validation_error() {
+        let msg = values_err(r#"{"values":{":b":{"NULL":false}}}"#);
+        assert!(
+            msg.contains(
+                "ExpressionAttributeValues contains invalid value: One or more parameter \
+                 values were invalid: Null attribute value types must have the value of \
+                 true for key :b"
+            ),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn values_null_true_accepted() {
+        let parsed: TestValues =
+            serde_json::from_str(r#"{"values":{":b":{"NULL":true}}}"#).unwrap();
+        assert!(parsed.values.is_some());
+    }
+
+    #[test]
+    fn values_empty_set_wrapped_with_key() {
+        for (av, needle) in [
+            (r#"{"SS":[]}"#, "An string set  may not be empty"),
+            (r#"{"NS":[]}"#, "An number set  may not be empty"),
+            (r#"{"BS":[]}"#, "Binary sets should not be empty"),
+        ] {
+            let msg = values_err(&format!(r#"{{"values":{{":b":{av}}}}}"#));
+            let expected = format!(
+                "ExpressionAttributeValues contains invalid value: One or more \
+                 parameter values were invalid: {needle} for key :b"
+            );
+            assert!(msg.contains(&expected), "av={av} got: {msg}");
+        }
+    }
+
+    #[test]
+    fn values_duplicate_set_wrapped_with_key() {
+        let ss = values_err(r#"{"values":{":b":{"SS":["a","a"]}}}"#);
+        assert!(
+            ss.contains(
+                "ExpressionAttributeValues contains invalid value: One or more parameter \
+                 values were invalid: Input collection [a, a] contains duplicates. for key :b"
+            ),
+            "{ss}"
+        );
+        // Binary duplicates carry the "of type BS" qualifier (DynamoDB parity).
+        let bs = values_err(r#"{"values":{":b":{"BS":["Yg==","Yg=="]}}}"#);
+        assert!(
+            bs.contains(
+                "ExpressionAttributeValues contains invalid value: One or more parameter \
+                 values were invalid: Input collection [Yg==, Yg==]of type BS contains \
+                 duplicates. for key :b"
+            ),
+            "{bs}"
+        );
+    }
+
+    #[test]
+    fn values_invalid_key_reported_before_value_error() {
+        // Map has a malformed value (:b -> unknown type) AND a malformed key (b
+        // without the ':' prefix). The key error must win, matching DynamoDB.
+        let msg = values_err(r#"{"values":{":b":{"a":""},"b":{"S":"a"}}}"#);
+        assert!(
+            msg.contains(
+                r#"ExpressionAttributeValues contains invalid key: Syntax error; key: "b""#
+            ),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn values_unsupported_datatype_wrapped_with_key() {
+        // An unrecognized datatype tag is reported as an empty AttributeValue,
+        // wrapped with the field name and key.
+        let msg = values_err(r#"{"values":{":b":{"a":""}}}"#);
+        assert!(
+            msg.contains(
+                "ExpressionAttributeValues contains invalid value: Supplied AttributeValue \
+                 is empty, must contain exactly one of the supported datatypes for key :b"
+            ),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn values_multiple_datatypes_wrapped_with_key() {
+        let msg = values_err(r#"{"values":{":b":{"S":"a","N":"1"}}}"#);
+        assert!(
+            msg.contains(
+                "ExpressionAttributeValues contains invalid value: Supplied AttributeValue \
+                 has more than one datatypes set, must contain exactly one of the supported \
+                 datatypes for key :b"
+            ),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn values_invalid_number_wrapped_with_key() {
+        // Empty, non-numeric, overflow, underflow, 38-digit, and NS-duplicate
+        // all wrap with the field name and key, matching real DynamoDB.
+        for (av, needle) in [
+            (
+                r#"{"N":""}"#,
+                "The parameter cannot be converted to a numeric value",
+            ),
+            (
+                r#"{"N":"b"}"#,
+                "The parameter cannot be converted to a numeric value: b",
+            ),
+            (
+                r#"{"S":"a","N":""}"#,
+                "The parameter cannot be converted to a numeric value",
+            ),
+            (
+                r#"{"NS":["1","b"]}"#,
+                "The parameter cannot be converted to a numeric value: b",
+            ),
+            (
+                r#"{"NS":["1","1"]}"#,
+                "Input collection contains duplicates",
+            ),
+            (
+                r#"{"N":"1e126"}"#,
+                "Number overflow. Attempting to store a number with magnitude larger",
+            ),
+            (
+                r#"{"N":"1e-131"}"#,
+                "Number underflow. Attempting to store a number with magnitude smaller",
+            ),
+        ] {
+            let msg = values_err(&format!(r#"{{"values":{{":b":{av}}}}}"#));
+            let expected = format!("ExpressionAttributeValues contains invalid value: {needle}");
+            assert!(
+                msg.contains(&expected) && msg.contains("for key :b"),
+                "av={av} got: {msg}"
+            );
+        }
     }
 
     #[test]

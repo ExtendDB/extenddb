@@ -167,6 +167,22 @@ impl PostgresEngine {
             validation::validate_item_size(&item, self.max_item_size_bytes)
                 .map_err(|e| StorageError::Validation(e.to_string()))?;
 
+            // Secondary-index key validation on the post-update item, matching
+            // the transactional Update path: an update expression must not set
+            // an index key to a mismatched type, nor to an empty string or
+            // binary value. Validating the evaluated image rather than the
+            // expression is what covers if_not_exists and list_append, whose
+            // result is not knowable from the expression alone.
+            let idx_refs = super::transactions::index_key_refs(&indexes);
+            validation::validate_index_key_types(&item, &idx_refs, &key_info.attribute_definitions)
+                .map_err(|e| StorageError::Validation(e.to_string()))?;
+            validation::validate_index_key_not_empty(
+                &item,
+                &idx_refs,
+                validation::SecondaryIndexEmptyContext::UpdateExpression,
+            )
+            .map_err(|e| StorageError::Validation(e.to_string()))?;
+
             let new_item = if return_new { Some(item.clone()) } else { None };
 
             let item_json =
