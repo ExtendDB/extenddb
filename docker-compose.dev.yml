@@ -18,7 +18,7 @@ services:
   extenddb-dev:
     image: ${EXTENDDB_DEV_IMAGE:-extenddb/extenddb-dev:latest}
     ports:
-      - "127.0.0.1:18443:18443"
+      - "127.0.0.1:18080:18080"
     volumes:
       - extenddb-dev-data:/var/lib/extenddb
     restart: unless-stopped
@@ -31,7 +31,7 @@ services:
     environment:
       EXTENDDB__STORAGE__SQLITE__PATH: ":memory:"
     ports:
-      - "127.0.0.1:18444:18443"
+      - "127.0.0.1:18081:18080"
 
 volumes:
   extenddb-dev-data:

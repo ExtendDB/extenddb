@@ -5,7 +5,7 @@ SQLite, built for local development and CI. There is no external database, no
 init step, and no certificate to trust:
 
 ```bash
-docker run -d -p 127.0.0.1:18443:18443 -v extenddb:/var/lib/extenddb \
+docker run -d -p 127.0.0.1:18080:18080 -v extenddb:/var/lib/extenddb \
   extenddb/extenddb-dev
 ```
 
@@ -13,7 +13,7 @@ docker run -d -p 127.0.0.1:18443:18443 -v extenddb:/var/lib/extenddb \
 AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE \
 AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY \
 aws dynamodb list-tables \
-  --region us-east-1 --endpoint-url http://127.0.0.1:18443
+  --region us-east-1 --endpoint-url http://127.0.0.1:18080
 ```
 
 It is **not the production image**. For a durable, TLS-terminated deployment use
@@ -38,7 +38,7 @@ Because of that, the server must not be reachable from other machines. The
 image binds `0.0.0.0` **inside** the container (required for port publishing to
 work at all; this is what `EXTENDDB_DEV_ALLOW_ANY_BIND=1` in the image enables),
 and containment moves to the publish flag: always bind the host side to
-loopback, `-p 127.0.0.1:18443:18443`, as every example here does. Do not
+loopback, `-p 127.0.0.1:18080:18080`, as every example here does. Do not
 publish this port on a shared or routable interface.
 
 ## Storage modes
@@ -50,7 +50,7 @@ One image serves both modes; the mode is chosen at run time.
 container restarts and upgrades:
 
 ```bash
-docker run -d -p 127.0.0.1:18443:18443 -v extenddb:/var/lib/extenddb \
+docker run -d -p 127.0.0.1:18080:18080 -v extenddb:/var/lib/extenddb \
   extenddb/extenddb-dev
 ```
 
@@ -58,7 +58,7 @@ docker run -d -p 127.0.0.1:18443:18443 -v extenddb:/var/lib/extenddb \
 container stops — useful for test suites that want a pristine database per run:
 
 ```bash
-docker run -d -p 127.0.0.1:18443:18443 \
+docker run -d -p 127.0.0.1:18080:18080 \
   -e EXTENDDB__STORAGE__SQLITE__PATH=:memory: \
   extenddb/extenddb-dev
 ```

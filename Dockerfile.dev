@@ -69,11 +69,18 @@ LABEL org.opencontainers.image.title="ExtendDB dev (SQLite)" \
 # For an ephemeral instance, set EXTENDDB__STORAGE__SQLITE__PATH=:memory:.
 ENV HOME=/var/lib/extenddb \
     EXTENDDB__SERVER__BIND_ADDR=0.0.0.0 \
+    EXTENDDB__SERVER__PORT=18080 \
     EXTENDDB__STORAGE__SQLITE__PATH=/var/lib/extenddb/extenddb.sqlite \
     EXTENDDB_DEV_ALLOW_ANY_BIND=1
 WORKDIR /var/lib/extenddb
 USER 65532:65532
-EXPOSE 18443
+# 18080, not the project default 18443: the `1` + `8443` scheme signals TLS,
+# and this image serves plain HTTP — an HTTPS-looking port invites `https://`
+# and a connection failure that looks like a bug. `1` + `8080` applies the same
+# rule to the plain-HTTP convention, so the pair self-documents (18443 = TLS,
+# 18080 = plain). 8000 is deliberately avoided: a comparable local emulator
+# binds it, and differential testing would have the two fight for the port.
+EXPOSE 18080
 STOPSIGNAL SIGTERM
 # No --endpoint: the probe resolves its target the same way `serve` does
 # (EXTENDDB__SERVER__* overrides on built-in defaults), so a server moved with

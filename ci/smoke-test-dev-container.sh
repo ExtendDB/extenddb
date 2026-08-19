@@ -83,7 +83,7 @@ wait_for_health() {
 }
 
 host_port() {
-    local ctr="$1" cport="${2:-18443}"
+    local ctr="$1" cport="${2:-18080}"
     docker inspect "$ctr" \
         --format "{{(index (index .NetworkSettings.Ports \"${cport}/tcp\") 0).HostPort}}"
 }
@@ -120,7 +120,7 @@ fi
 
 echo "== file mode: zero-config start, healthcheck, data plane =="
 docker run -d --name "$FILE_CTR" -v "$VOLUME":/var/lib/extenddb \
-    -p 127.0.0.1:0:18443 "$EXTENDDB_IMAGE" >/dev/null
+    -p 127.0.0.1:0:18080 "$EXTENDDB_IMAGE" >/dev/null
 wait_for_health "$FILE_CTR"
 PORT=$(host_port "$FILE_CTR")
 ddb "$PORT" create-table --table-name smoke \
@@ -138,7 +138,7 @@ GOT=$(ddb "$PORT" get-item --table-name smoke --key '{"pk":{"S":"k1"}}' \
 echo "== file mode: the item must survive a full container restart =="
 docker rm -f "$FILE_CTR" >/dev/null
 docker run -d --name "$FILE_CTR" -v "$VOLUME":/var/lib/extenddb \
-    -p 127.0.0.1:0:18443 "$EXTENDDB_IMAGE" >/dev/null
+    -p 127.0.0.1:0:18080 "$EXTENDDB_IMAGE" >/dev/null
 wait_for_health "$FILE_CTR"
 PORT=$(host_port "$FILE_CTR")
 GOT=$(ddb "$PORT" get-item --table-name smoke --key '{"pk":{"S":"k1"}}' \
@@ -149,7 +149,7 @@ GOT=$(ddb "$PORT" get-item --table-name smoke --key '{"pk":{"S":"k1"}}' \
 echo "== memory mode: works, and must NOT survive a restart (negative control) =="
 docker run -d --name "$MEM_CTR" \
     -e EXTENDDB__STORAGE__SQLITE__PATH=:memory: \
-    -p 127.0.0.1:0:18443 "$EXTENDDB_IMAGE" >/dev/null
+    -p 127.0.0.1:0:18080 "$EXTENDDB_IMAGE" >/dev/null
 wait_for_health "$MEM_CTR"
 MPORT=$(host_port "$MEM_CTR")
 ddb "$MPORT" create-table --table-name ephemeral \
