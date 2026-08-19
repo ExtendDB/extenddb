@@ -176,8 +176,14 @@ macro_rules! bind_bound {
 /// capture the identifier exists only inside the format string and **no
 /// expression appears in the macro arguments at all**, so a `syn`-based rule
 /// cannot see that a `VALUES (...)` interpolation is a placeholder list rather
-/// than a value. The named form puts the call in the macro's argument tokens,
-/// where a token-stream parser can find it.
+/// than a value.
+///
+/// The named form fixes that in two steps. `syn` hands a macro's arguments over as an
+/// unparsed token stream, so there is no typed node until a rule parses them; **once
+/// parsed, the named form yields a single `Expr::Assign` binding the hole's name to the
+/// call.** That is what makes it better than a positional argument: the name and the
+/// call are associated structurally, so a rule does not have to map format-string holes
+/// to argument indices and cannot be off by one.
 pub(crate) fn bind_list(n: usize) -> String {
     vec!["?"; n].join(", ")
 }
