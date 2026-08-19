@@ -35,11 +35,13 @@
 # highest released one, and `move_latest` is the explicit escape hatch for a
 # hotfix that must not become `latest`.
 
-# Fan-out: after Docker Hub promotes, the same run applies the identical
-# tags to GHCR (GITHUB_TOKEN, packages: write) and ECR Public (OIDC role) by
-# digest. One approval covers all three registries; each leg has the same
-# no-overwrite and forward-only-latest properties, and a mismatch on any
-# registry fails the run.
+# Fan-out: after the Docker Hub gates pass, this run promotes all three
+# registries through the promote-registry composite action — one shared
+# implementation of the no-overwrite rule, the refuse-unsigned rule, and the
+# forward-only latest rule (judged against EACH destination's own tag list,
+# so no leg can move latest backwards even if registries have diverged).
+# The image is an allowlisted choice input, so extenddb-dev promotes through
+# the same file rather than a fork of it.
 
 name: promote-image
 
@@ -59,6 +61,13 @@ on:
         description: 'Move `latest` to this digest. Uncheck for a back-line hotfix that must not become latest.'
         type: boolean
         default: true
+      image:
+        description: 'Which image to promote'
+        type: choice
+        options:
+          - extenddb-postgres
+          - extenddb-dev
+        default: extenddb-postgres
 
 permissions:
   contents: read
@@ -69,7 +78,10 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE_REPO: docker.io/extenddb/extenddb-postgres
+  # inputs.image is a closed choice list; no free text reaches these paths.
+  IMAGE_REPO: docker.io/extenddb/${{ inputs.image }}
+  GHCR_REPO: ghcr.io/extenddb/${{ inputs.image }}
+  ECR_REPO: public.ecr.aws/extenddb/${{ inputs.image }}
 
 jobs:
   promote:
@@ -227,104 +239,62 @@ jobs:
           set -euo pipefail
           skopeo login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin <<< "$DOCKERHUB_TOKEN"
 
-      - name: Promote by digest to the version tag (and latest when allowed)
-        run: |
-          set -euo pipefail
-          # Source is the immutable digest, not the tag, so what is promoted
-          # is byte-identical to what was verified. --preserve-digests fails
-          # rather than rewrite any manifest.
-          if [[ "${ALREADY_PROMOTED:-}" != "true" ]]; then
-            skopeo copy --all --preserve-digests \
-              "docker://${IMAGE_REPO}@${DIGEST}" \
-              "docker://${IMAGE_REPO}:${VERSION}"
-          fi
-          if [[ "$MOVE_LATEST" == "true" ]]; then
-            skopeo copy --all --preserve-digests \
-              "docker://${IMAGE_REPO}@${DIGEST}" \
-              "docker://${IMAGE_REPO}:latest"
-          fi
+      - name: Promote Docker Hub (shared per-registry rules)
+        uses: ./.github/actions/promote-registry
+        with:
+          src-repo: ${{ env.IMAGE_REPO }}
+          dst-repo: ${{ env.IMAGE_REPO }}
+          version: ${{ env.VERSION }}
+          digest: ${{ env.DIGEST }}
+          move-latest: ${{ env.MOVE_LATEST }}
 
-      - name: Verify the promotion
-        run: |
-          set -euo pipefail
-          TAGS=("${VERSION}")
-          [[ "$MOVE_LATEST" == "true" ]] && TAGS+=(latest)
-          for t in "${TAGS[@]}"; do
-            GOT=$(skopeo inspect --format '{{.Digest}}' "docker://${IMAGE_REPO}:${t}")
-            if [[ "$GOT" != "$DIGEST" ]]; then
-              echo "::error::${IMAGE_REPO}:${t} resolves to ${GOT}, expected ${DIGEST}"
-              exit 1
-            fi
-          done
-
-      - name: Fan out - promote GHCR by digest (same tags, same gates)
+      - name: Log in to GHCR
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GHCR_REPO: ghcr.io/extenddb/extenddb-postgres
+        # Constant username: GHCR ignores it when the password is a GitHub
+        # token, and it keeps the operator identity (github.actor) out of the
+        # run block entirely.
         run: |
           set -euo pipefail
-          skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin <<< "$GHCR_TOKEN"
-          # Version tag: immutable; identical-digest re-runs are no-ops.
-          if EXISTING=$(skopeo inspect --format '{{.Digest}}' "docker://${GHCR_REPO}:${VERSION}" 2>/dev/null); then
-            if [[ "$EXISTING" != "$DIGEST" ]]; then
-              echo "::error::${GHCR_REPO}:${VERSION} already exists with different digest ${EXISTING}"
-              exit 1
-            fi
-          else
-            skopeo copy --all --preserve-digests \
-              "docker://${IMAGE_REPO}@${DIGEST}" \
-              "docker://${GHCR_REPO}:${VERSION}"
-          fi
-          # latest: forward-only, and only when this dispatch moves it.
-          if [[ "$MOVE_LATEST" == "true" ]]; then
-            skopeo copy --all --preserve-digests \
-              "docker://${IMAGE_REPO}@${DIGEST}" \
-              "docker://${GHCR_REPO}:latest"
-          fi
-          for t in "${VERSION}" $([[ "$MOVE_LATEST" == "true" ]] && echo latest); do
-            GOT=$(skopeo inspect --format '{{.Digest}}' "docker://${GHCR_REPO}:${t}")
-            [[ "$GOT" == "$DIGEST" ]] || { echo "::error::${GHCR_REPO}:${t} resolves to ${GOT}"; exit 1; }
-          done
-          skopeo logout ghcr.io
+          skopeo login ghcr.io -u x-access-token --password-stdin <<< "$GHCR_TOKEN"
 
-      - name: Fan out - assume the ECR publisher role via OIDC
+      - name: Promote GHCR (same shared rules, destination-judged latest)
+        uses: ./.github/actions/promote-registry
+        with:
+          src-repo: ${{ env.IMAGE_REPO }}
+          dst-repo: ${{ env.GHCR_REPO }}
+          version: ${{ env.VERSION }}
+          digest: ${{ env.DIGEST }}
+          move-latest: ${{ env.MOVE_LATEST }}
+
+      - name: Assume the ECR publisher role via OIDC
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
           role-to-assume: arn:aws:iam::975306274793:role/ExtendDBEcrPublicGitHubPublisher
           role-session-name: extenddb-promote-${{ github.run_id }}
           aws-region: us-east-1
 
-      - name: Fan out - promote ECR Public by digest (same tags, same gates)
-        env:
-          ECR_REPO: public.ecr.aws/extenddb/extenddb-postgres
+      - name: Log in to ECR Public
         run: |
           set -euo pipefail
           aws ecr-public get-login-password --region us-east-1 \
             | skopeo login public.ecr.aws -u AWS --password-stdin
-          if EXISTING=$(skopeo inspect --format '{{.Digest}}' "docker://${ECR_REPO}:${VERSION}" 2>/dev/null); then
-            if [[ "$EXISTING" != "$DIGEST" ]]; then
-              echo "::error::${ECR_REPO}:${VERSION} already exists with different digest ${EXISTING}"
-              exit 1
-            fi
-          else
-            skopeo copy --all --preserve-digests \
-              "docker://${IMAGE_REPO}@${DIGEST}" \
-              "docker://${ECR_REPO}:${VERSION}"
-          fi
-          if [[ "$MOVE_LATEST" == "true" ]]; then
-            skopeo copy --all --preserve-digests \
-              "docker://${IMAGE_REPO}@${DIGEST}" \
-              "docker://${ECR_REPO}:latest"
-          fi
-          for t in "${VERSION}" $([[ "$MOVE_LATEST" == "true" ]] && echo latest); do
-            GOT=$(skopeo inspect --format '{{.Digest}}' "docker://${ECR_REPO}:${t}")
-            [[ "$GOT" == "$DIGEST" ]] || { echo "::error::${ECR_REPO}:${t} resolves to ${GOT}"; exit 1; }
-          done
-          skopeo logout public.ecr.aws
 
-      - name: Log out
+      - name: Promote ECR Public (same shared rules, destination-judged latest)
+        uses: ./.github/actions/promote-registry
+        with:
+          src-repo: ${{ env.IMAGE_REPO }}
+          dst-repo: ${{ env.ECR_REPO }}
+          version: ${{ env.VERSION }}
+          digest: ${{ env.DIGEST }}
+          move-latest: ${{ env.MOVE_LATEST }}
+
+      - name: Log out of every registry
         if: always()
-        run: skopeo logout docker.io || true
+        run: |
+          skopeo logout docker.io || true
+          skopeo logout ghcr.io || true
+          skopeo logout public.ecr.aws || true
 
       - name: Summarise for the release checklist
         run: |
@@ -340,7 +310,7 @@ jobs:
             echo ""
             echo "| field | value |"
             echo "|---|---|"
-            echo "| registries | \`${IMAGE_REPO}\`, \`ghcr.io/extenddb/extenddb-postgres\`, \`public.ecr.aws/extenddb/extenddb-postgres\` |"
+            echo "| registries | \`${IMAGE_REPO}\`, \`${GHCR_REPO}\`, \`${ECR_REPO}\` |"
             echo "| candidate | \`${TAG}\` |"
             echo "| digest | \`${DIGEST}\` |"
             echo "| tags | ${TAGLIST} |"
