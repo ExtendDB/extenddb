@@ -119,7 +119,13 @@ mod update_item_number_validation;
 mod update_table_attribute_definitions;
 mod update_table_billing_validation;
 #[cfg(test)]
+mod vector_index_search;
+#[cfg(test)]
 mod vector_index_unsupported;
+#[cfg(test)]
+mod vector_index_update_rules;
+#[cfg(test)]
+mod vector_index_write_capacity;
 #[cfg(test)]
 mod wording_parity_validation;
 

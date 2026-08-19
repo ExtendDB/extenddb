@@ -85,7 +85,7 @@ impl PostgresEngine {
 
         // D-4: Read the system default delay live (P119), so a runtime change
         // applies to this transaction rather than up to 30 s later.
-        let sys_delay = self.gsi_default_delay().await;
+        let sys_delay = self.index_propagation_delay().await;
 
         let mut tx = self
             .data_pool

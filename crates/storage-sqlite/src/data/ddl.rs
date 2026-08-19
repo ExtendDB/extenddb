@@ -15,7 +15,10 @@ use extenddb_core::types::{
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::sk_column_n;
 
-use super::{all_sort_key_info, data_table_name, index_table_name};
+use super::{
+    all_sort_key_info, data_table_name, index_table_name, vector_table_glob_pattern,
+    vector_table_name,
+};
 use crate::store::SqliteEngine;
 
 /// SQLite column type for the Nth sort-key position and scalar type (D2).
@@ -95,6 +98,113 @@ impl SqliteEngine {
         Ok(())
     }
 
+    /// Create a vector-index data table: one row per indexed vector.
+    ///
+    /// `part` is the search-schema HASH value when one is declared, and a single
+    /// constant otherwise, so an unscoped index is one partition rather than a
+    /// separate code path. `nrm` is the vector's precomputed L2 norm, so cosine
+    /// costs one dot product at query time instead of two passes.
+    ///
+    /// # Safety (SQL injection)
+    /// `index_id` is a server-generated UUID and column names are constants, so
+    /// no user input reaches the DDL. Vector attribute names are stored as data,
+    /// never as identifiers.
+    pub(crate) async fn create_vector_data_table(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        table_id: &str,
+        index_id: &str,
+        base_key_schema: &[KeySchemaElement],
+        base_attr_defs: &[AttributeDefinition],
+    ) -> Result<(), StorageError> {
+        let vec_table = vector_table_name(table_id, index_id);
+        let base_sks = all_sort_key_info(base_key_schema, base_attr_defs);
+
+        let mut col_defs = vec![
+            "part TEXT NOT NULL".to_owned(),
+            "base_pk TEXT NOT NULL".to_owned(),
+        ];
+        for i in 0..base_sks.len() {
+            col_defs.extend(base_sk_col_defs(i));
+        }
+        col_defs.push("vec BLOB NOT NULL".to_owned());
+        col_defs.push("nrm REAL NOT NULL".to_owned());
+        col_defs.push("item_data TEXT NOT NULL".to_owned());
+
+        // Keyed by the base item, not by the partition, so one base item yields
+        // at most one vector row and a re-put replaces rather than duplicates.
+        let mut pk_cols = vec!["base_pk".to_owned()];
+        for (i, &(_, sk_type)) in base_sks.iter().enumerate() {
+            pk_cols.push(format!("base_{}", sk_column_n(i, sk_type)));
+        }
+
+        let ddl = format!(
+            "CREATE TABLE {vec_table} (\n    {},\n    PRIMARY KEY ({})\n)",
+            col_defs.join(",\n    "),
+            pk_cols.join(", ")
+        );
+        sqlx::query(&ddl)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        // The scan is always partition-scoped, so this index is what keeps a
+        // search off the full table when a HASH element is declared.
+        let part_idx =
+            format!("CREATE INDEX \"_vidx_part_{table_id}_{index_id}\" ON {vec_table} (part)");
+        sqlx::query(&part_idx)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Drop every vector-index data table belonging to one DynamoDB table.
+    ///
+    /// Discovered from `sqlite_master` rather than from the catalog, because the
+    /// caller runs this after the catalog rows have been cascade-deleted in the
+    /// same transaction, so `vector_indexes` is already empty for this table.
+    /// Without this, dropping a table would leave its vector data tables behind
+    /// forever with nothing left pointing at them.
+    /// Drop one vector index's data table.
+    ///
+    /// The table-drop path sweeps `sqlite_master` instead, because by the time it
+    /// runs the catalog rows have already cascade-deleted and the index ids are
+    /// unreadable. Here the id is known, so the name is derived directly rather
+    /// than matched by pattern.
+    pub(crate) async fn drop_vector_data_table_by_id(
+        pool: &sqlx::SqlitePool,
+        table_id: &str,
+        index_id: &str,
+    ) -> Result<(), StorageError> {
+        let vec_table = vector_table_name(table_id, index_id);
+        sqlx::query(&format!("DROP TABLE IF EXISTS {vec_table}"))
+            .execute(pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn drop_all_vector_data_tables(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        table_id: &str,
+    ) -> Result<(), StorageError> {
+        let names: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name GLOB ?",
+        )
+        .bind(vector_table_glob_pattern(table_id))
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        for name in names {
+            // Names come from sqlite_master, not from user input, and are quoted.
+            sqlx::query(&format!("DROP TABLE IF EXISTS \"{name}\""))
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// Drop the per-DynamoDB-table data table.
     pub(crate) async fn drop_data_table(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -105,6 +215,9 @@ impl SqliteEngine {
             .execute(&mut **tx)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
+        // Vector data tables are keyed by index, not by table, so they are not
+        // reached by dropping the item table or by the catalog cascade.
+        Self::drop_all_vector_data_tables(tx, table_id).await?;
         Ok(())
     }
 
@@ -229,6 +342,10 @@ impl SqliteEngine {
         let (global_secondary_indexes, local_secondary_indexes) =
             self.fetch_all_index_info(&table_id).await?;
         let has_lsi = !local_secondary_indexes.is_empty();
+        // Vector indexes ride on the cached key info too, so the write path can
+        // decide whether any maintenance is needed without a query, and so the
+        // engine can validate vector attributes on writes.
+        let vector_indexes = self.fetch_vector_index_key_info(&table_id).await?;
 
         let key_info = TableKeyInfo {
             table_name: table_name.to_owned(),
@@ -241,10 +358,10 @@ impl SqliteEngine {
             global_secondary_indexes,
             local_secondary_indexes,
             stream_specification,
-            // Fields for features this backend does not implement, vector
-            // indexes today, take their defaults, so adding one to this type
-            // does not break this build.
-            ..Default::default()
+            // Every field is populated, with no `..Default::default()` spread: a
+            // new core field should break this site and force a decision about
+            // whether the write path needs it, rather than silently defaulting.
+            vector_indexes,
         };
         // Catalog metadata that cannot describe its own sort key would make the
         // keyed read paths fall back to a partition-only lookup and return the
@@ -253,6 +370,49 @@ impl SqliteEngine {
             .validate_sort_key_definitions()
             .map_err(StorageError::Internal)?;
         Ok(key_info)
+    }
+
+    /// Fetch the vector indexes of a table in the shape the engine caches.
+    ///
+    /// Note what this cannot carry: `VectorIndexKeyInfo` has no distance
+    /// function, so a search still reads the catalog for it. Widening that
+    /// type would remove the last per-search catalog read.
+    async fn fetch_vector_index_key_info(
+        &self,
+        table_id: &str,
+    ) -> Result<Vec<extenddb_core::types::VectorIndexKeyInfo>, StorageError> {
+        let rows: Vec<(String, i64, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT index_name, dimensions, vector_attribute, search_schema, projection \
+             FROM vector_indexes WHERE table_id = ?",
+        )
+        .bind(table_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (index_name, dimensions, vector_attribute, search_schema, projection) in rows {
+            let attr: extenddb_core::types::VectorAttribute =
+                serde_json::from_str(&vector_attribute)
+                    .map_err(|e| StorageError::Internal(format!("vector_attribute: {e}")))?;
+            let search_schema = match search_schema.as_deref() {
+                Some(json) => serde_json::from_str(json)
+                    .map_err(|e| StorageError::Internal(format!("search_schema: {e}")))?,
+                None => Vec::new(),
+            };
+            let projection: extenddb_core::types::Projection = serde_json::from_str(&projection)
+                .map_err(|e| StorageError::Internal(format!("vector projection: {e}")))?;
+            out.push(extenddb_core::types::VectorIndexKeyInfo {
+                index_name,
+                dimensions: u32::try_from(dimensions).map_err(|_| {
+                    StorageError::Internal(format!("vector dimensions out of range: {dimensions}"))
+                })?,
+                vector_attribute_name: attr.attribute_name,
+                search_schema,
+                projection,
+            });
+        }
+        Ok(out)
     }
 
     /// Fetch every secondary index defined on a table, split into

@@ -200,6 +200,9 @@ pub async fn handle_update_table(
             extenddb_storage::error::StorageError::Validation(msg) => {
                 DynamoDbError::ValidationException(msg)
             }
+            extenddb_storage::error::StorageError::LimitExceeded(msg) => {
+                DynamoDbError::LimitExceededException(msg)
+            }
             other => {
                 tracing::error!(internal_error = %other, "storage internal error");
                 DynamoDbError::InternalServerError("Internal server error".to_owned())

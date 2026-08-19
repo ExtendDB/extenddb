@@ -37,7 +37,7 @@ impl SqliteEngine {
         // runtime setting, not an invariant of this write, so it does not need
         // to be read under the lock, and the lock serialises every write in the
         // process: work done inside it is the backend's throughput bottleneck.
-        let system_delay = self.gsi_default_delay().await;
+        let system_delay = self.index_propagation_delay().await;
         let _writer = self.write_lock.lock().await;
         let indexes = fetch_indexes_for_table(&key_info.table_id, &self.pool).await?;
 
@@ -102,7 +102,7 @@ impl SqliteEngine {
             )
             .await?;
         }
-        let enqueued = enqueue_async_indexes(
+        let enqueued_gsi = enqueue_async_indexes(
             &mut tx,
             key_info,
             &indexes,
@@ -112,6 +112,27 @@ impl SqliteEngine {
         )
         .await?
             > 0;
+        // Vector indexes: applied in this transaction when the propagation delay is
+        // 0, otherwise enqueued alongside the async GSI work. Gated on the cached
+        // key info so a table without them costs no extra query, and deliberately
+        // outside the `indexes` guard above: a table may have a vector index and no
+        // GSI or LSI at all.
+        let enqueued_vector = if key_info.vector_indexes.is_empty() {
+            false
+        } else {
+            crate::data::vector_index::maintain_vector_indexes(
+                &mut tx,
+                &key_info.table_id,
+                &key_info.key_schema,
+                &key_info.attribute_definitions,
+                old.as_ref(),
+                Some(&item),
+                system_delay,
+            )
+            .await?
+                > 0
+        };
+        let enqueued = enqueued_gsi || enqueued_vector;
 
         if let Some(capture) = stream {
             write_stream_record_in_tx(&mut tx, key_info, capture, old.as_ref(), Some(&item))

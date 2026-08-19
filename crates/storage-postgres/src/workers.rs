@@ -14,6 +14,22 @@ use extenddb_storage::{CancellationToken, DataEngine, MetadataEngine, StreamEngi
 use sqlx::PgPool;
 
 use crate::PostgresEngine;
+/// Read the propagation-delay setting through the settings store, preferring the
+/// canonical key and falling back to the pre-rename one. See
+/// `INDEX_PROPAGATION_DELAY_QUERY` for why the old name is still honoured.
+async fn read_index_propagation_delay<S: SettingsStore + ?Sized>(
+    settings: &S,
+) -> extenddb_storage::management_store::OpResult<Option<String>> {
+    if let Some(v) = settings
+        .get_setting(extenddb_core::settings_keys::INDEX_PROPAGATION_DELAY_MS)
+        .await?
+    {
+        return Ok(Some(v));
+    }
+    settings
+        .get_setting(extenddb_core::settings_keys::LEGACY_GSI_PROPAGATION_DELAY_MS)
+        .await
+}
 
 pub(crate) async fn poll_control_plane_transitions<S: SettingsStore + ?Sized>(
     storage: Arc<PostgresEngine>,
@@ -175,7 +191,7 @@ pub(crate) async fn poll_gsi_delay<S: SettingsStore + ?Sized>(
     const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
     while tick(&token, POLL_INTERVAL).await {
-        match store.get_setting("gsi_propagation_delay_ms").await {
+        match read_index_propagation_delay(store.as_ref()).await {
             Ok(Some(val)) => {
                 if let Ok(ms) = val.parse::<u64>() {
                     gsi_delay.store(ms, std::sync::atomic::Ordering::Relaxed);
@@ -184,12 +200,12 @@ pub(crate) async fn poll_gsi_delay<S: SettingsStore + ?Sized>(
             Ok(None) => {
                 // Setting removed - revert to default
                 gsi_delay.store(
-                    crate::DEFAULT_GSI_PROPAGATION_DELAY_MS,
+                    crate::DEFAULT_INDEX_PROPAGATION_DELAY_MS,
                     std::sync::atomic::Ordering::Relaxed,
                 );
             }
             Err(e) => {
-                tracing::debug!("Failed to query gsi_propagation_delay_ms: {e:?}");
+                tracing::debug!("Failed to query index_propagation_delay_ms: {e:?}");
             }
         }
     }

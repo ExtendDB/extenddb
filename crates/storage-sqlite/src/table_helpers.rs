@@ -52,6 +52,25 @@ pub(crate) struct IndexRow {
     pub provisioned_throughput: Option<String>,
 }
 
+/// A `vector_indexes` catalog row, in `FromRow` field order.
+#[derive(sqlx::FromRow)]
+pub(crate) struct VectorIndexRow {
+    pub index_name: String,
+    #[allow(dead_code)]
+    pub index_id: String,
+    pub dimensions: i64,
+    pub distance_function: String,
+    pub vector_attribute: String,
+    pub search_schema: Option<String>,
+    pub projection: String,
+    pub index_status: String,
+    pub backfilling: Option<i64>,
+}
+
+/// Columns selected for a `VectorIndexRow`, in `FromRow` field order.
+pub(crate) const VECTOR_INDEX_COLUMNS: &str = "index_name, index_id, dimensions, \
+     distance_function, vector_attribute, search_schema, projection, index_status, backfilling";
+
 /// Columns selected for a `TableRow`, in `FromRow` field order.
 pub(crate) const TABLE_COLUMNS: &str = "table_name, key_schema, attribute_definitions, \
      billing_mode, provisioned_throughput, stream_specification, table_status, \
@@ -93,7 +112,19 @@ impl SqliteEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        self.build_table_description_from_row(account_id, row, index_rows)
+        let vector_rows: Vec<VectorIndexRow> = sqlx::query_as(&format!(
+            "SELECT {VECTOR_INDEX_COLUMNS} FROM vector_indexes WHERE table_id = ?"
+        ))
+        .bind(&row.table_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        let table_name_owned = row.table_name.clone();
+        let mut desc = self.build_table_description_from_row(account_id, row, index_rows)?;
+        desc.vector_indexes =
+            self.vector_index_descriptions(account_id, &table_name_owned, vector_rows)?;
+        Ok(desc)
     }
 
     pub(crate) fn build_table_description_from_row(
@@ -240,11 +271,67 @@ impl SqliteEngine {
                 .on_demand_throughput
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok()),
-            // Fields for features this backend does not implement, vector
-            // indexes today, take their defaults, so adding one to this type
-            // does not break this build.
+            // Any core field this backend does not populate takes its default, so
+            // adding one does not break this build.
             ..Default::default()
         })
+    }
+
+    /// Build the vector index descriptions for a table.
+    ///
+    /// Separate from `build_table_description_from_row` so the shared builder
+    /// keeps one signature for every caller. Applied on the describe path, which
+    /// is where a client reads an index definition in order to search it.
+    pub(crate) fn vector_index_descriptions(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        vector_rows: Vec<VectorIndexRow>,
+    ) -> Result<Option<Vec<extenddb_core::types::VectorIndexDescription>>, StorageError> {
+        let mut vector_index_descs: Vec<extenddb_core::types::VectorIndexDescription> = Vec::new();
+        for vi in vector_rows {
+            // Deliberately fails rather than defaulting on a bad parse: a vector
+            // index we cannot describe faithfully must not be reported as if we
+            // could, because a client uses the description to build a search.
+            let vector_attribute = parse_json(&vi.vector_attribute, "vector_attribute")?;
+            let search_schema = vi
+                .search_schema
+                .as_deref()
+                .map(|s| parse_json(s, "vector search_schema"))
+                .transpose()?;
+            let projection = parse_json(&vi.projection, "vector projection")?;
+            let distance_function = parse_json(
+                &format!("\"{}\"", vi.distance_function),
+                "distance_function",
+            )?;
+            let index_status = parse_json(&format!("\"{}\"", vi.index_status), "vector status")?;
+            let desc = extenddb_core::types::VectorIndexDescription {
+                index_name: vi.index_name.clone(),
+                vector_attribute,
+                dimensions: u32::try_from(vi.dimensions).map_err(|_| {
+                    StorageError::Internal(format!(
+                        "vector dimensions out of range: {}",
+                        vi.dimensions
+                    ))
+                })?,
+                search_schema,
+                distance_function,
+                index_status,
+                backfilling: vi.backfilling.map(|b| b != 0),
+                index_size_bytes: 0,
+                item_count: 0,
+                index_arn: index_arn(&self.region, account_id, table_name, &vi.index_name),
+                projection: Some(projection),
+            };
+            // The readiness rule is core's, applied here so a backend bug cannot
+            // emit a description the wire contract forbids. Cheaper to catch on
+            // the way out than to debug from a client.
+            desc.validate_readiness()
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            vector_index_descs.push(desc);
+        }
+
+        Ok((!vector_index_descs.is_empty()).then_some(vector_index_descs))
     }
 
     /// Backfill existing base-table items into a newly created GSI, batched to

@@ -828,9 +828,9 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 ### GSI query returns stale data after a write
 
-**Cause:** GSI updates are applied asynchronously with a configurable propagation delay (default 10ms). This matches real DynamoDB's eventually consistent GSI behavior. Each GSI can have its own `propagation_delay_ms` setting; the system-wide default is controlled by the `gsi_propagation_delay_ms` runtime setting.
+**Cause:** GSI updates are applied asynchronously with a configurable propagation delay (default 10ms). This matches real DynamoDB's eventually consistent GSI behavior. Each GSI can have its own `propagation_delay_ms` setting; the system-wide default is controlled by the `index_propagation_delay_ms` runtime setting.
 
-**Fix:** This is expected behavior. For tests that query GSIs after writes, poll/retry the GSI query until the expected data appears. To make all GSIs synchronous for testing, set `extenddb settings set gsi_propagation_delay_ms 0`. For production-like testing, keep the default async delay.
+**Fix:** This is expected behavior. For tests that query GSIs after writes, poll/retry the GSI query until the expected data appears. To make all GSIs synchronous for testing, set `extenddb settings set index_propagation_delay_ms 0`. For production-like testing, keep the default async delay.
 
 ## Connection Pool Exhaustion
 

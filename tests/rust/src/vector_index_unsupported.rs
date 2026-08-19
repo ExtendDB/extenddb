@@ -52,7 +52,7 @@ fn http_client() -> reqwest::Client {
 /// dispatch, so an unsigned request never reaches the capability gate and the
 /// test would pass for the wrong reason, asserting an auth failure while
 /// believing it asserted a vector refusal.
-async fn call(target: &str, body: &str) -> (u16, String) {
+pub(crate) async fn call(target: &str, body: &str) -> (u16, String) {
     let access_key = std::env::var("AWS_ACCESS_KEY_ID").expect("AWS_ACCESS_KEY_ID must be set");
     let secret_key =
         std::env::var("AWS_SECRET_ACCESS_KEY").expect("AWS_SECRET_ACCESS_KEY must be set");
@@ -142,7 +142,7 @@ fn assert_validation_exception(status: u16, body: &str, expected_message: &str) 
     assert_eq!(message, expected_message);
 }
 
-fn table_name(suffix: &str) -> String {
+pub(crate) fn table_name(suffix: &str) -> String {
     format!("vec_wire_{}_{}", suffix, uuid::Uuid::new_v4().simple())
 }
 
@@ -152,9 +152,7 @@ fn table_name(suffix: &str) -> String {
 /// answer, because the capability is not otherwise observable over the wire.
 /// Every test here asserts a refusal, so on a backend that *does* implement
 /// vector search they must skip rather than fail: the refusals are the contract
-/// for non-participating backends only. No in-tree backend implements it today,
-/// so this returns false for both, and the mechanism exists for the first one that
-/// does.
+/// for non-participating backends only.
 ///
 /// Deliberately distinguishes the refusal from any other failure. Treating "not a
 /// 200" as unsupported would make the whole suite skip silently the first time an
@@ -188,18 +186,23 @@ async fn backend_supports_vectors() -> bool {
     panic!("vector support probe failed for an unrelated reason: {status} {text}");
 }
 
+/// Whether the running backend implements vector indexes, for the suite that
+/// asserts the participating behaviour. Named positively so the caller reads as
+/// an opt-in rather than as a double negative.
+pub(crate) async fn vectors_supported() -> bool {
+    !is_real_dynamodb() && backend_supports_vectors().await
+}
+
 /// What this run asserts about the backend's vector capability.
 ///
-/// Three states on purpose. A suite that adapts to whatever the backend reports
-/// never asserts *which* backend is under test, so a backend that silently gained
-/// or lost vector support would change what is exercised and still report green.
-/// `EXTENDDB_EXPECT_VECTORS` lets a CI job state its expectation:
+/// Three states on purpose. Both vector suites otherwise adapt to whatever the
+/// backend reports, so no run asserts *which* backend is under test, and a backend
+/// that silently lost vector support would skip the entire positive suite and still
+/// report green. `EXTENDDB_EXPECT_VECTORS` lets a CI job state its expectation:
 ///
-/// - `1`: the backend must support vectors, so a positive suite failing to run is
-///   an error rather than a skip. No such suite exists yet; it arrives with the
-///   first participating backend, and the variable is defined here so that suite
-///   inherits the guard rather than inventing one.
-/// - `0`: the backend must not, so these refusal tests failing to run is an error.
+/// - `1`: the backend must support vectors. The positive suite failing to run is an
+///   error rather than a skip.
+/// - `0`: the backend must not. The refusal suite failing to run is an error.
 /// - unset: adapt quietly, so a plain local `cargo test` works against either
 ///   backend without ceremony.
 ///
@@ -221,8 +224,8 @@ pub(crate) fn expect_vectors() -> Option<bool> {
 ///
 /// The expectation is read *before* probing, not inside the assertion. Reading it
 /// inside a short-circuiting `&&` meant an invalid value was never validated on a
-/// backend without vector support, which is every backend today: the typo guard
-/// was dead exactly where it was needed.
+/// backend without vector support, so the typo guard was dead in the Postgres job,
+/// which is the one job these refusal tests exist for.
 async fn skip_if_supported() -> bool {
     if is_real_dynamodb() {
         return true;
@@ -235,10 +238,9 @@ async fn skip_if_supported() -> bool {
          these refusal tests would skip: either a backend gained vector support \
          unnoticed, or this job sets the wrong expectation"
     );
-    // The converse matters here too, and not only in a positive suite. Until a
-    // backend implements vector search there is no positive suite to notice a run
-    // that claims support the backend does not have, so the claim would pass
-    // unchecked.
+    // The converse is asserted here too rather than left to the positive suite
+    // alone: a run claiming support against a backend that refuses is wrong
+    // whichever suite happens to notice first.
     assert!(
         !(!supported && expected == Some(true)),
         "EXTENDDB_EXPECT_VECTORS=1 but the backend refuses vector indexes: either \

@@ -89,9 +89,21 @@ impl<'de> serde::Deserialize<'de> for DistanceFunction {
             "COSINE" => Ok(Self::Cosine),
             "EUCLIDEAN" => Ok(Self::Euclidean),
             "DOT_PRODUCT" => Ok(Self::DotProduct),
+            // Enum order measured against the live service 2026-08-06, and it is
+            // neither alphabetical nor this enum's declaration order:
+            //   [DOT_PRODUCT, COSINE, EUCLIDEAN]
+            // An earlier version guessed alphabetical and was wrong.
+            //
+            // KNOWN DIVERGENCE: the service reports the positional path
+            // 'vectorIndexes.1.member.distanceFunction'; this says
+            // 'distanceFunction'. A serde deserializer for the enum cannot know its
+            // index within the request, so closing this means deserialising the
+            // field permissively and validating it in `validate_one_vector_index`,
+            // which already does exactly that for the required `Projection` and
+            // knows the 1-based position. Deliberately left as a separate change.
             other => Err(serde::de::Error::custom(format!(
                 "1 validation error detected: Value '{other}' at 'distanceFunction' \
-                 failed to satisfy constraint: Member must satisfy enum value set: [COSINE, DOT_PRODUCT, EUCLIDEAN]"
+                 failed to satisfy constraint: Member must satisfy enum value set: [DOT_PRODUCT, COSINE, EUCLIDEAN]"
             ))),
         }
     }
@@ -691,10 +703,7 @@ pub struct CreateTableInput {
     pub key_schema: Vec<KeySchemaElement>,
     #[serde(rename = "AttributeDefinitions")]
     pub attribute_definitions: Vec<AttributeDefinition>,
-    // Some clients send the billing/throughput mode under the field name
-    // TableThroughputMode instead of BillingMode; accept it as an alias so such
-    // requests are not rejected for a missing billing mode.
-    #[serde(rename = "BillingMode", alias = "TableThroughputMode")]
+    #[serde(rename = "BillingMode")]
     pub billing_mode: Option<BillingMode>,
     #[serde(rename = "ProvisionedThroughput")]
     pub provisioned_throughput: Option<ProvisionedThroughput>,
@@ -825,9 +834,7 @@ pub struct UpdateGsiAction {
 pub struct UpdateTableInput {
     #[serde(rename = "TableName")]
     pub table_name: String,
-    // Accept TableThroughputMode as an alias for BillingMode (see
-    // CreateTableInput): some clients send the billing mode under that name.
-    #[serde(rename = "BillingMode", alias = "TableThroughputMode")]
+    #[serde(rename = "BillingMode")]
     pub billing_mode: Option<BillingMode>,
     #[serde(rename = "ProvisionedThroughput")]
     pub provisioned_throughput: Option<ProvisionedThroughput>,
@@ -983,10 +990,16 @@ pub struct DescribeLimitsOutput {
 mod tests {
     use super::*;
 
+    /// `TableThroughputMode` is not a member of DynamoDB's CreateTable request:
+    /// the model has `BillingMode` only (verified against aws-sdk-dynamodb 1.119.0,
+    /// where the field does not appear at all). An earlier version of this type
+    /// accepted it as an alias, which meant a request that produced a
+    /// PAY_PER_REQUEST table here would be ignored by AWS and produce a
+    /// PROVISIONED table there: an accept-direction divergence, where code written
+    /// against ExtendDB breaks against the real service. Under AWS JSON 1.0 an
+    /// unknown member is ignored, which is what must happen here.
     #[test]
-    fn create_table_accepts_table_throughput_mode_alias() {
-        // A client that sends the billing mode under `TableThroughputMode`
-        // (instead of `BillingMode`) must populate billing_mode all the same.
+    fn create_table_ignores_the_unknown_table_throughput_mode_member() {
         let json = r#"{
             "TableName": "t",
             "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
@@ -994,7 +1007,10 @@ mod tests {
             "TableThroughputMode": "PAY_PER_REQUEST"
         }"#;
         let input: CreateTableInput = serde_json::from_str(json).unwrap();
-        assert_eq!(input.billing_mode, Some(BillingMode::PayPerRequest));
+        assert_eq!(
+            input.billing_mode, None,
+            "an unknown member must be ignored, not treated as BillingMode"
+        );
     }
 
     #[test]
@@ -1010,10 +1026,13 @@ mod tests {
     }
 
     #[test]
-    fn update_table_accepts_table_throughput_mode_alias() {
+    fn update_table_ignores_the_unknown_table_throughput_mode_member() {
         let json = r#"{"TableName": "t", "TableThroughputMode": "PROVISIONED"}"#;
         let input: UpdateTableInput = serde_json::from_str(json).unwrap();
-        assert_eq!(input.billing_mode, Some(BillingMode::Provisioned));
+        assert_eq!(
+            input.billing_mode, None,
+            "an unknown member must be ignored"
+        );
     }
 
     #[test]

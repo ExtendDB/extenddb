@@ -116,6 +116,11 @@ pub struct VectorIndexKeyInfo {
     pub vector_attribute_name: String,
     /// Search-schema elements (partition key and inline filters).
     pub search_schema: Vec<super::table::SearchSchemaElement>,
+    /// The index's projection. The write-capacity charge depends on it:
+    /// measured against the service 2026-08-13, a change to a non-indexed
+    /// attribute IS charged under `ALL` and is not under `KEYS_ONLY`, and
+    /// under `KEYS_ONLY` the vector blob itself is not counted either.
+    pub projection: super::table::Projection,
 }
 
 impl TableKeyInfo {

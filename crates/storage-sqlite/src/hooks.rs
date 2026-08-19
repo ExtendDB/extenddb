@@ -66,11 +66,11 @@ impl ServerRuntimeHooks for SqliteRuntimeHooks {
         });
 
         // Keep the cached GSI propagation delay in sync with the setting.
-        let gsi_default = self.engine.gsi_default_delay_ms.clone();
+        let index_delay_cache = self.engine.index_propagation_delay_cache.clone();
         let catalog_store = ctx.catalog_store.clone();
         let token = ctx.shutdown.clone();
         let gsi_delay = tokio::spawn(async move {
-            workers::poll_gsi_delay(catalog_store, gsi_default, token).await;
+            workers::poll_index_propagation_delay(catalog_store, index_delay_cache, token).await;
         });
 
         vec![
