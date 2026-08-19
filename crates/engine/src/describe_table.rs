@@ -25,6 +25,10 @@ pub async fn handle_describe_table(
         .await
         .map_err(storage_err_to_dynamo)?;
 
+    // A backend must not tell a client an index is ready while it is still being
+    // populated; the first search would silently undercount.
+    table_desc.validate_vector_index_readiness()?;
+
     let output = DescribeTableOutput { table: table_desc };
     serialize_output(&output)
 }

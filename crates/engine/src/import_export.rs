@@ -347,6 +347,7 @@ fn create_table_input_from_params(tcp: &TableCreationParameters) -> CreateTableI
         provisioned_throughput: tcp.provisioned_throughput.clone(),
         global_secondary_indexes: tcp.global_secondary_indexes.clone(),
         local_secondary_indexes: None,
+        vector_indexes: None,
         stream_specification: None,
         sse_specification: None,
         tags: None,

@@ -1,4 +1,5 @@
 /target
+/target-*
 extenddb.toml
 __pycache__/
 .coverage
@@ -19,3 +20,8 @@ extenddb.toml.bak
 .env
 .env.*
 !.env.example
+
+# Local test/dev config files
+extenddb-*.toml
+extenddb-*.toml.bak
+extenddb-*.toml.keep

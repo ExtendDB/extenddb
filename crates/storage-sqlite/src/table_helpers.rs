@@ -240,6 +240,10 @@ impl SqliteEngine {
                 .on_demand_throughput
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok()),
+            // Fields for features this backend does not implement, vector
+            // indexes today, take their defaults, so adding one to this type
+            // does not break this build.
+            ..Default::default()
         })
     }
 

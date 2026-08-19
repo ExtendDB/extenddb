@@ -64,8 +64,14 @@ impl SqliteEngine {
 
         // Start from the existing image, or from the key for a fresh upsert.
         let mut item = old.clone().unwrap_or_else(|| key.clone());
-        expression::apply_update(actions, &mut item, maps)
-            .map_err(|e| StorageError::Validation(e.to_string()))?;
+        expression::apply_update_validated(
+            actions,
+            &mut item,
+            maps,
+            &key_info.vector_indexes,
+            &key_info.attribute_definitions,
+        )
+        .map_err(|e| StorageError::Validation(e.to_string()))?;
         validation::validate_item_size(&item, self.max_item_size_bytes)
             .map_err(|e| StorageError::Validation(e.to_string()))?;
         // Secondary-index key validation on the post-update item, matching the

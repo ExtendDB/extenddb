@@ -315,6 +315,10 @@ impl PostgresEngine {
             global_secondary_indexes,
             local_secondary_indexes,
             stream_specification,
+            // Fields for features this backend does not implement, vector
+            // indexes today, take their defaults. Adding one to TableKeyInfo
+            // then does not break this build.
+            ..Default::default()
         };
         // Catalog metadata that cannot describe its own sort key would make the
         // keyed read paths fall back to a partition-only lookup and return the
@@ -341,8 +345,7 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let mut gsis = Vec::new();
-        let mut lsis = Vec::new();
+        let mut infos = Vec::new();
         for (index_name, idx_type_str, index_id, ks_json, proj_json) in rows {
             let index_type = match idx_type_str.as_str() {
                 "GSI" => IndexType::Gsi,
@@ -364,12 +367,13 @@ impl PostgresEngine {
                 key_schema,
                 projection,
             };
-            match index_type {
-                IndexType::Gsi => gsis.push(info),
-                IndexType::Lsi => lsis.push(info),
-            }
+            infos.push(info);
         }
-        Ok((gsis, lsis))
+        // Grouped by core rather than matched here, so a new IndexType variant
+        // does not break this backend. The string parse above already rejects
+        // any kind this backend cannot have created.
+        let grouped = extenddb_core::types::partition_indexes(infos);
+        Ok((grouped.gsis, grouped.lsis))
     }
 
     /// Fetch metadata for a secondary index from the catalog.

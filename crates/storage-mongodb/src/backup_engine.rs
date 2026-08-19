@@ -490,6 +490,10 @@ impl BackupEngine for MongoEngine {
                 sse_specification,
                 table_class,
                 on_demand_throughput,
+                // Fields for features this backend does not implement, vector
+                // indexes today, take their defaults. Adding one to
+                // CreateTableInput then does not break this build.
+                ..Default::default()
             };
 
             // Create the table with the ACTIVE transition deferred: it enters

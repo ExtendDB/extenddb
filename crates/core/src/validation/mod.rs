@@ -1,13 +1,18 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 pub mod number;
+pub mod vector_item;
+
+pub use vector_item::{
+    MAX_HASH_KEY_SIZE, MAX_INLINE_FILTER_SIZE, validate_vector_write, validate_vector_write_changed,
+};
 
 use crate::error::{DynamoDbError, ErrorMessageKey, error_message};
 use crate::limits::LimitsConfig;
 use crate::types::{
     AttributeDefinition, AttributeValue, BillingMode, CreateTableInput, DeleteItemInput,
-    GetItemInput, Item, KeySchemaElement, KeyType, PutItemInput, ReturnValues, ScalarAttributeType,
-    Select, UpdateItemInput, item_size_bytes,
+    GetItemInput, Item, KeySchemaElement, KeyType, MAX_VECTOR_INDEXES_PER_TABLE, PutItemInput,
+    ReturnValues, ScalarAttributeType, Select, UpdateItemInput, item_size_bytes,
 };
 
 /// Validate a table name per Virtual `DynamoDB` rules.
@@ -102,7 +107,173 @@ pub fn validate_create_table(
     validate_lsi_requires_range_key(input)?;
     validate_unique_index_names(input)?;
     validate_index_projections(input)?;
+    validate_vector_indexes(input)?;
     validate_stream_specification(input)?;
+    Ok(())
+}
+
+/// Validate the `VectorIndexes` on a `CreateTable` request.
+///
+/// POC scope: each index name must be well-formed, `Dimensions` must be in
+/// `1..=4096`, and the vector attribute name must be non-empty. The distance
+/// function is enforced by the type system (enum deserialization).
+/// Rules that apply to one vector index specification, wherever it arrives from.
+///
+/// `CreateTable` and `UpdateTable`'s create action carry the same shape, so they
+/// get the same rules: a malformed index is rejected identically whichever path
+/// it arrives by, rather than each handler enforcing its own subset.
+///
+/// `position` numbers the element within its request list, from 1, because that is
+/// how the service numbers it in the message below.
+/// Attribute-definition rules for one vector index, applied on both paths.
+///
+/// Both are decidable from the request alone, so they belong here rather than
+/// in a backend: the vector attribute must NOT be declared in
+/// `AttributeDefinitions` (the opposite of the rule for key attributes), and
+/// every `SearchSchema` element MUST be. Measured 2026-08-13; on `UpdateTable`
+/// the search-schema definition must be present in that request even when the
+/// attribute is already declared on the table.
+fn validate_vector_index_attribute_definitions(
+    vi: &crate::types::VectorIndexSpecification,
+    attribute_definitions: &[AttributeDefinition],
+) -> Result<(), DynamoDbError> {
+    let declared = |name: &str| {
+        attribute_definitions
+            .iter()
+            .any(|ad| ad.attribute_name == name)
+    };
+    let vector_attr = &vi.vector_attribute.attribute_name;
+    if declared(vector_attr) {
+        return Err(DynamoDbError::ValidationException(
+            crate::types::vector_attribute_conflicting_definition(vector_attr),
+        ));
+    }
+    for element in vi.search_schema.iter().flatten() {
+        if !declared(&element.attribute_name) {
+            return Err(DynamoDbError::ValidationException(
+                crate::types::VECTOR_SEARCH_SCHEMA_UNDECLARED.to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_one_vector_index(
+    vi: &crate::types::VectorIndexSpecification,
+    position: usize,
+    field: &str,
+) -> Result<(), DynamoDbError> {
+    // Projection is required by the service. Reported with the service's own
+    // message, which numbers the offending list element from 1, not 0. Measured
+    // on 2026-08-06 by bypassing botocore's client-side check so the request
+    // reached the service:
+    //   Value null at 'vectorIndexes.1.member.projection' failed to satisfy
+    //   constraint: Member must not be null
+    if vi.projection.is_none() {
+        return Err(DynamoDbError::ValidationException(format!(
+            "1 validation error detected: Value null at \
+             '{field}.{position}.member.projection' failed to satisfy constraint: \
+             Member must not be null"
+        )));
+    }
+    validate_index_name(&vi.index_name)?;
+    if vi.dimensions < 1 || vi.dimensions > 4096 {
+        // Verified against the service 2026-08-05: Dimensions=4097 and 8192
+        // both return exactly this message. The lower bound is not observable
+        // through an SDK because botocore rejects Dimensions=0 client-side, but
+        // the service text names both bounds, so it is reused here.
+        return Err(DynamoDbError::ValidationException(
+            "One or more parameter values were invalid: Number of dimensions must be \
+             between 1 and 4096 inclusive."
+                .to_owned(),
+        ));
+    }
+    if vi.vector_attribute.attribute_name.is_empty() {
+        return Err(DynamoDbError::ValidationException(
+            "VectorAttribute.AttributeName must not be empty".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_vector_indexes(input: &CreateTableInput) -> Result<(), DynamoDbError> {
+    let Some(vis) = input.vector_indexes.as_ref() else {
+        return Ok(());
+    };
+
+    // Per-index shape first, then the table-level constraints. Which the service
+    // reports first is unobservable from outside, because botocore rejects a
+    // malformed index client-side before the request is sent, so the order that
+    // preserves the already-measured per-index messages is the right one to keep.
+    for (position, vi) in vis.iter().enumerate() {
+        validate_one_vector_index(vi, position + 1, "vectorIndexes")?;
+    }
+
+    // Vector indexes are supported only on on-demand tables. Documented under
+    // "Requirements and limitations" and again in the quota table, which lists
+    // vector index capacity mode as on-demand only. `BillingMode` defaults to
+    // PROVISIONED when absent, so an omitted BillingMode is a rejection too.
+    //
+    // Wording measured against the service on 2026-08-11; the earlier text was a
+    // reasonable paraphrase but not what the service says.
+    if !vis.is_empty()
+        && input.billing_mode.unwrap_or(BillingMode::Provisioned) != BillingMode::PayPerRequest
+    {
+        return Err(DynamoDbError::ValidationException(
+            "One or more parameter values were invalid: Vector indexes are only supported \
+             for PAY_PER_REQUEST tables"
+                .to_owned(),
+        ));
+    }
+
+    // Wording measured against the service on 2026-08-11. Note the service does not
+    // echo the offending count here, unlike its SearchSchema messages, so neither
+    // does this.
+    if vis.len() > MAX_VECTOR_INDEXES_PER_TABLE {
+        return Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: VectorIndex count exceeds the \
+             per-table limit of {MAX_VECTOR_INDEXES_PER_TABLE}"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Validate the vector index changes on an `UpdateTable` request.
+///
+/// Deliberately limited to what core can decide from the request alone. It does
+/// not check whether a created name is already taken, or whether a deleted index
+/// exists, because the service's error for a name clash changes CLASS with the
+/// state of the existing index, `ValidationException` when it is ACTIVE and
+/// `ResourceInUseException` while it is still creating, and `TableKeyInfo` does
+/// not carry index status. Reporting the wrong class would be worse than leaving
+/// it to the layer that knows. Those messages are recorded as
+/// [`VECTOR_INDEX_ALREADY_EXISTS`](crate::types::VECTOR_INDEX_ALREADY_EXISTS) and
+/// [`VECTOR_INDEX_CREATE_IN_USE_PREFIX`](crate::types::VECTOR_INDEX_CREATE_IN_USE_PREFIX)
+/// so both backends produce identical text.
+///
+/// # Errors
+/// Returns [`DynamoDbError::ValidationException`] if vector search is disabled for
+/// the deployment, or if a create action carries a malformed index.
+pub fn validate_vector_index_updates(
+    updates: Option<&Vec<crate::types::VectorIndexUpdate>>,
+    attribute_definitions: &[AttributeDefinition],
+) -> Result<(), DynamoDbError> {
+    let Some(updates) = updates else {
+        return Ok(());
+    };
+    if updates.is_empty() {
+        return Ok(());
+    }
+    for (position, update) in updates.iter().enumerate() {
+        if let Some(create) = update.create.as_ref() {
+            validate_one_vector_index(create, position + 1, "vectorIndexUpdates")?;
+            validate_vector_index_attribute_definitions(create, attribute_definitions)?;
+        }
+        if let Some(delete) = update.delete.as_ref() {
+            validate_index_name(&delete.index_name)?;
+        }
+    }
     Ok(())
 }
 
@@ -383,6 +554,20 @@ fn validate_attribute_definitions(input: &CreateTableInput) -> Result<(), Dynamo
             for ks in &lsi.key_schema {
                 if !key_attrs.contains(&ks.attribute_name.as_str()) {
                     key_attrs.push(&ks.attribute_name);
+                }
+            }
+        }
+    }
+    // Vector-index search-schema attributes are declared in AttributeDefinitions
+    // but are not part of the base or secondary-index key schema, so count them
+    // as used to satisfy the definition/key correspondence check.
+    if let Some(vis) = &input.vector_indexes {
+        for vi in vis {
+            if let Some(schema) = &vi.search_schema {
+                for element in schema {
+                    if !key_attrs.contains(&element.attribute_name.as_str()) {
+                        key_attrs.push(&element.attribute_name);
+                    }
                 }
             }
         }
@@ -1410,11 +1595,272 @@ fn validate_unique_index_names(input: &CreateTableInput) -> Result<(), DynamoDbE
             }
         }
     }
+    if let Some(vis) = &input.vector_indexes {
+        for vi in vis {
+            if !names.insert(&vi.index_name) {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "One or more parameter values were invalid: Duplicate index name: {}",
+                    vi.index_name
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// A create arriving by UpdateTable gets the same rules as one arriving by
+    /// CreateTable, including the field name in the message path.
+    #[test]
+    fn update_table_creates_get_the_same_rules_as_create_table() {
+        use crate::types::{DeleteVectorIndexAction, VectorIndexUpdate};
+        let spec = |projection| VectorIndexSpecification {
+            index_name: "vidx".to_owned(),
+            dimensions: 4,
+            distance_function: DistanceFunction::Cosine,
+            vector_attribute: VectorAttribute {
+                attribute_name: "emb".to_owned(),
+            },
+            search_schema: None,
+            projection,
+        };
+        let all = || {
+            Some(Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            })
+        };
+
+        // None and empty are not changes, so an ordinary UpdateTable is unaffected.
+        assert!(validate_vector_index_updates(None, &[]).is_ok());
+        assert!(validate_vector_index_updates(Some(&Vec::new()), &[]).is_ok());
+
+        // Missing projection is caught here too, under this request's field name.
+        let updates = vec![crate::types::VectorIndexUpdate {
+            create: Some(spec(None)),
+            delete: None,
+        }];
+        let err = validate_vector_index_updates(Some(&updates), &[])
+            .expect_err("a malformed create must be rejected on this path as well");
+        match err {
+            DynamoDbError::ValidationException(m) => assert!(
+                m.contains("vectorIndexUpdates.1.member.projection"),
+                "should name this request's field and element: {m}"
+            ),
+            other => panic!("expected ValidationException, got {other:?}"),
+        }
+
+        // Dimensions bound applies here too.
+        let updates = vec![crate::types::VectorIndexUpdate {
+            create: Some(VectorIndexSpecification {
+                dimensions: 4097,
+                ..spec(all())
+            }),
+            delete: None,
+        }];
+        assert!(validate_vector_index_updates(Some(&updates), &[]).is_err());
+
+        // A well-formed create, and a delete, both pass.
+        let updates = vec![
+            VectorIndexUpdate {
+                create: Some(spec(all())),
+                delete: None,
+            },
+            VectorIndexUpdate {
+                create: None,
+                delete: Some(DeleteVectorIndexAction {
+                    index_name: "other".to_owned(),
+                }),
+            },
+        ];
+        assert!(validate_vector_index_updates(Some(&updates), &[]).is_ok());
+    }
+
+    use crate::types::{DistanceFunction, VectorAttribute, VectorIndexSpecification};
+
+    /// The service requires `Projection` on every vector index, and numbers the
+    /// offending element from 1. Measured on 2026-08-06 by bypassing botocore's
+    /// client-side check so the request reached the service. Asserted exactly,
+    /// because a client parsing the path would be misled by 0-based numbering.
+    /// Builds a vector index spec for the update-path parity test below. The
+    /// asserted messages were measured against the live service on 2026-08-13
+    /// (us-east-1), so the test pins service wording, not our own.
+    fn vi_spec(name: &str, attr: &str, schema: &[&str]) -> VectorIndexSpecification {
+        VectorIndexSpecification {
+            index_name: name.to_owned(),
+            vector_attribute: VectorAttribute {
+                attribute_name: attr.to_owned(),
+            },
+            dimensions: 8,
+            distance_function: DistanceFunction::Cosine,
+            projection: Some(Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            }),
+            search_schema: if schema.is_empty() {
+                None
+            } else {
+                Some(
+                    schema
+                        .iter()
+                        .map(|n| crate::types::SearchSchemaElement {
+                            attribute_name: (*n).to_owned(),
+                            element_type: crate::types::SearchSchemaElementType::Hash,
+                        })
+                        .collect(),
+                )
+            },
+        }
+    }
+    /// The same two attribute-definition rules apply on the update path, against
+    /// the definitions carried by THAT request. Measured: omitting the
+    /// definition fails even when the attribute is already on the table.
+    #[test]
+    fn update_path_applies_the_attribute_definition_rules() {
+        let create = vi_spec("vidx", "emb", &["tenant"]);
+        let updates = vec![crate::types::VectorIndexUpdate {
+            create: Some(create),
+            delete: None,
+        }];
+        let err =
+            validate_vector_index_updates(Some(&updates), &[make_ad("pk", ScalarAttributeType::S)])
+                .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            crate::types::VECTOR_SEARCH_SCHEMA_UNDECLARED
+        );
+        validate_vector_index_updates(
+            Some(&updates),
+            &[
+                make_ad("pk", ScalarAttributeType::S),
+                make_ad("tenant", ScalarAttributeType::S),
+            ],
+        )
+        .unwrap();
+
+        let declared = vi_spec("vidx", "emb", &[]);
+        let updates = vec![crate::types::VectorIndexUpdate {
+            create: Some(declared),
+            delete: None,
+        }];
+        let err = validate_vector_index_updates(
+            Some(&updates),
+            &[make_ad("emb", ScalarAttributeType::S)],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            crate::types::vector_attribute_conflicting_definition("emb")
+        );
+    }
+
+    #[test]
+    fn missing_vector_index_projection_matches_the_service_message() {
+        fn spec(projection: Option<Projection>) -> VectorIndexSpecification {
+            VectorIndexSpecification {
+                index_name: "vidx".to_owned(),
+                dimensions: 4,
+                distance_function: DistanceFunction::Cosine,
+                vector_attribute: VectorAttribute {
+                    attribute_name: "emb".to_owned(),
+                },
+                search_schema: None,
+                projection,
+            }
+        }
+        let all = || {
+            Some(Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            })
+        };
+
+        // First element omitted: reported as element 1.
+        let input = CreateTableInput {
+            table_name: "t".to_owned(),
+            vector_indexes: Some(vec![spec(None)]),
+            ..Default::default()
+        };
+        let err = validate_vector_indexes(&input).expect_err("must be rejected");
+        assert!(
+            format!("{err:?}").contains("vectorIndexes.1.member.projection"),
+            "expected element 1 in the path: {err:?}"
+        );
+
+        // Second element omitted: reported as element 2, not 1.
+        let input = CreateTableInput {
+            table_name: "t".to_owned(),
+            vector_indexes: Some(vec![spec(all()), spec(None)]),
+            ..Default::default()
+        };
+        let err = validate_vector_indexes(&input).expect_err("must be rejected");
+        match err {
+            DynamoDbError::ValidationException(m) => assert_eq!(
+                m,
+                "1 validation error detected: Value null at \
+                 'vectorIndexes.2.member.projection' failed to satisfy constraint: \
+                 Member must not be null"
+            ),
+            other => panic!("expected ValidationException, got {other:?}"),
+        }
+
+        // Present on every element: accepted.
+        let input = CreateTableInput {
+            table_name: "t".to_owned(),
+            billing_mode: Some(crate::types::BillingMode::PayPerRequest),
+            vector_indexes: Some(vec![spec(all()), spec(all())]),
+            ..Default::default()
+        };
+        assert!(validate_vector_indexes(&input).is_ok());
+    }
+
+    /// Both table-level vector messages, pinned to what the service returns.
+    #[test]
+    fn the_table_level_vector_messages_match_the_service() {
+        // Billing mode. PROVISIONED is the default when BillingMode is absent, so
+        // the omitted case is asserted too.
+        for billing in [Some(BillingMode::Provisioned), None] {
+            let mut input = base_input(
+                vec![make_ks("pk", KeyType::Hash)],
+                vec![make_ad("pk", ScalarAttributeType::S)],
+            );
+            input.billing_mode = billing;
+            input.vector_indexes = Some(vec![vi_spec("vidx", "emb", &[])]);
+            let err = validate_vector_indexes(&input)
+                .expect_err("a vector index requires PAY_PER_REQUEST");
+            assert_eq!(
+                format!("{err}"),
+                "One or more parameter values were invalid: Vector indexes are only \
+                 supported for PAY_PER_REQUEST tables"
+            );
+        }
+
+        // The per-table cap, asserted as a boundary so an off-by-one cannot hide.
+        let mut input = base_input(
+            vec![make_ks("pk", KeyType::Hash)],
+            vec![make_ad("pk", ScalarAttributeType::S)],
+        );
+        let at_cap: Vec<_> = (0..MAX_VECTOR_INDEXES_PER_TABLE)
+            .map(|i| vi_spec(&format!("idx{i}"), "emb", &[]))
+            .collect();
+        input.vector_indexes = Some(at_cap);
+        validate_vector_indexes(&input).expect("the cap itself is allowed");
+
+        let over_cap: Vec<_> = (0..=MAX_VECTOR_INDEXES_PER_TABLE)
+            .map(|i| vi_spec(&format!("idx{i}"), "emb", &[]))
+            .collect();
+        input.vector_indexes = Some(over_cap);
+        let err = validate_vector_indexes(&input).expect_err("one over the cap is refused");
+        assert_eq!(
+            format!("{err}"),
+            format!(
+                "One or more parameter values were invalid: VectorIndex count exceeds the \
+                 per-table limit of {MAX_VECTOR_INDEXES_PER_TABLE}"
+            )
+        );
+    }
     use super::*;
     use crate::types::{GsiInput, Projection, ProjectionType};
 
@@ -1444,6 +1890,7 @@ mod tests {
             provisioned_throughput: None,
             global_secondary_indexes: None,
             local_secondary_indexes: None,
+            vector_indexes: None,
             stream_specification: None,
             sse_specification: None,
             tags: None,

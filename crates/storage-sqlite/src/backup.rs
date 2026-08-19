@@ -352,6 +352,7 @@ impl BackupEngine for SqliteEngine {
                 sse_specification: None,
                 table_class: None,
                 on_demand_throughput: None,
+                ..Default::default()
             };
 
             let desc = self.create_table(&account_id, create_input).await?;
@@ -368,6 +369,7 @@ impl BackupEngine for SqliteEngine {
                 global_secondary_indexes: Vec::new(),
                 local_secondary_indexes: Vec::new(),
                 stream_specification: None,
+                ..Default::default()
             };
 
             let items: Vec<(String,)> =
