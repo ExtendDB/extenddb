@@ -112,6 +112,13 @@ pub(crate) fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) ->
         StorageError::IndexAlreadyExists(name) => DynamoDbError::ValidationException(format!(
             "One or more parameter values were invalid: Index already exists: {name}"
         )),
+        StorageError::LimitExceeded(msg) => DynamoDbError::LimitExceededException(msg),
+        // Retryable by definition, so it maps like Connection: a 503 the SDKs
+        // retry, rather than a 500 they surface.
+        StorageError::Transient(msg) => {
+            tracing::warn!(transient_error = %msg, "transient storage error");
+            DynamoDbError::ServiceUnavailable("Service is temporarily unavailable".to_owned())
+        }
         StorageError::DeletionProtected(arn) => DynamoDbError::ValidationException(format!(
             "Resource '{arn}' cannot be deleted as it is currently protected against deletion. Disable deletion protection first then try again."
         )),

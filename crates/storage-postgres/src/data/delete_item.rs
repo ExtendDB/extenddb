@@ -39,7 +39,7 @@ impl PostgresEngine {
         let sys_delay = if indexes.is_empty() {
             0
         } else {
-            self.gsi_default_delay().await
+            self.index_propagation_delay().await
         };
 
         let needs_tx = condition.is_some() || return_old || !indexes.is_empty() || stream.is_some();

@@ -27,7 +27,7 @@ impl SqliteEngine {
         // runtime setting, not an invariant of this write, so it does not need
         // to be read under the lock, and the lock serialises every write in the
         // process: work done inside it is the backend's throughput bottleneck.
-        let system_delay = self.gsi_default_delay().await;
+        let system_delay = self.index_propagation_delay().await;
         let _writer = self.write_lock.lock().await;
         // Read the index set after acquiring the write lock so a concurrently
         // added GSI (UpdateTable holds the same lock) is not missed.
@@ -69,6 +69,24 @@ impl SqliteEngine {
                     system_delay,
                 )
                 .await?;
+            }
+            // Vector rows for this base item are removed too. `new_item` is None,
+            // so this is a pure removal, applied in this transaction when the
+            // propagation delay is 0 and enqueued otherwise.
+            if !key_info.vector_indexes.is_empty()
+                && crate::data::vector_index::maintain_vector_indexes(
+                    &mut tx,
+                    &key_info.table_id,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                    old.as_ref(),
+                    None,
+                    system_delay,
+                )
+                .await?
+                    > 0
+            {
+                enqueued = true;
             }
             if enqueue_async_indexes(
                 &mut tx,

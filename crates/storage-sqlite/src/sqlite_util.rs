@@ -90,3 +90,60 @@ mod tests {
         assert_eq!(parsed.offset(), time::UtcOffset::UTC);
     }
 }
+
+/// Map a sqlx error to a `StorageError`, classifying transient failures.
+///
+/// Transient means retry is expected to succeed: connection/pool trouble, I/O
+/// errors, and SQLite's BUSY (5) / LOCKED (6) result codes, including their
+/// extended forms (`code & 0xff`). Everything else is `Internal`, which the
+/// queue worker treats as poison. The classification errs narrow on purpose: a
+/// mis-classified poison row retries forever (visible, bounded to one row),
+/// while a mis-classified transient error drops a row silently.
+pub(crate) fn map_sqlx_err(e: sqlx::Error) -> extenddb_storage::error::StorageError {
+    use extenddb_storage::error::StorageError;
+    let transient = match &e {
+        sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::WorkerCrashed => true,
+        sqlx::Error::Database(db) => db
+            .code()
+            .and_then(|c| c.parse::<i64>().ok())
+            .is_some_and(|code| matches!(code & 0xff, 5 | 6)),
+        _ => false,
+    };
+    if transient {
+        StorageError::Transient(e.to_string())
+    } else {
+        StorageError::Internal(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod map_sqlx_err_tests {
+    use super::map_sqlx_err;
+    use extenddb_storage::error::StorageError;
+
+    #[test]
+    fn io_errors_are_transient() {
+        let e = sqlx::Error::Io(std::io::Error::other("disk hiccup"));
+        assert!(matches!(map_sqlx_err(e), StorageError::Transient(_)));
+    }
+
+    #[test]
+    fn pool_timeout_is_transient() {
+        assert!(matches!(
+            map_sqlx_err(sqlx::Error::PoolTimedOut),
+            StorageError::Transient(_)
+        ));
+    }
+
+    /// Anything not positively identified as retryable stays Internal, which
+    /// the worker treats as poison. Narrow on purpose: a mis-classified poison
+    /// row retries forever (visible), a mis-classified transient error drops a
+    /// row silently.
+    #[test]
+    fn unknown_errors_stay_internal() {
+        assert!(matches!(
+            map_sqlx_err(sqlx::Error::RowNotFound),
+            StorageError::Internal(_)
+        ));
+    }
+}

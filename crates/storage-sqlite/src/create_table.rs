@@ -194,6 +194,61 @@ impl SqliteEngine {
             }
         }
 
+        // Vector indexes. A CreateTable's table is empty, so there is nothing to
+        // backfill: the index goes straight to ACTIVE with no `backfilling`
+        // member, which is the state the service reports for an index created
+        // this way. The UpdateTable path is the one that drives a real lifecycle.
+        let mut vector_ids: Vec<String> = Vec::new();
+        if let Some(vis) = &input.vector_indexes {
+            for vi in vis {
+                let vec_attr = serde_json::to_string(&vi.vector_attribute)
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let search_schema = vi
+                    .search_schema
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let proj = vi
+                    .projection
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| StorageError::Internal(e.to_string()))?
+                    .ok_or_else(|| {
+                        // Core validation requires Projection, so reaching here
+                        // means the request bypassed validation rather than that
+                        // the caller omitted it.
+                        StorageError::Internal(
+                            "vector index reached storage without a projection".to_owned(),
+                        )
+                    })?;
+                let distance = serde_json::to_string(&vi.distance_function)
+                    .map_err(|e| StorageError::Internal(e.to_string()))?
+                    .trim_matches('"')
+                    .to_owned();
+                let index_id = uuid::Uuid::new_v4().to_string();
+                sqlx::query(
+                    "INSERT INTO vector_indexes \
+                     (table_id, index_name, index_id, dimensions, distance_function, \
+                      vector_attribute, search_schema, projection, index_status, backfilling) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', NULL)",
+                )
+                .bind(&table_id)
+                .bind(&vi.index_name)
+                .bind(&index_id)
+                .bind(i64::from(vi.dimensions))
+                .bind(&distance)
+                .bind(&vec_attr)
+                .bind(&search_schema)
+                .bind(&proj)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                vector_ids.push(index_id);
+            }
+        }
+
         // Tags.
         if let Some(tags) = &input.tags {
             for tag in tags {
@@ -256,6 +311,18 @@ impl SqliteEngine {
                         &lsi_ids[i],
                         &lsi.key_schema,
                         &input.attribute_definitions,
+                        &input.key_schema,
+                        &input.attribute_definitions,
+                    )
+                    .await?;
+                }
+            }
+            if input.vector_indexes.is_some() {
+                for index_id in &vector_ids {
+                    Self::create_vector_data_table(
+                        &mut data_tx,
+                        &table_id,
+                        index_id,
                         &input.key_schema,
                         &input.attribute_definitions,
                     )
@@ -368,6 +435,37 @@ impl SqliteEngine {
             })
         });
 
+        // Echo the vector indexes we just created. Built from the request plus the
+        // ids assigned above rather than re-read from the catalog, which would add
+        // a round trip to say something already known. A CreateTable's table is
+        // empty, so each index is ACTIVE with no `backfilling` member.
+        let vector_index_descs: Option<Vec<extenddb_core::types::VectorIndexDescription>> = input
+            .vector_indexes
+            .as_ref()
+            .map(|vis| {
+                vis.iter()
+                    .map(|vi| extenddb_core::types::VectorIndexDescription {
+                        index_name: vi.index_name.clone(),
+                        vector_attribute: vi.vector_attribute.clone(),
+                        dimensions: vi.dimensions,
+                        search_schema: vi.search_schema.clone(),
+                        distance_function: vi.distance_function,
+                        index_status: extenddb_core::types::IndexStatus::Active,
+                        backfilling: None,
+                        index_size_bytes: 0,
+                        item_count: 0,
+                        index_arn: extenddb_storage::util::index_arn(
+                            &self.region,
+                            account_id,
+                            &input.table_name,
+                            &vi.index_name,
+                        ),
+                        projection: vi.projection.clone(),
+                    })
+                    .collect()
+            })
+            .filter(|v: &Vec<_>| !v.is_empty());
+
         Ok(TableDescription {
             table_name: input.table_name,
             key_schema: input.key_schema,
@@ -398,10 +496,12 @@ impl SqliteEngine {
                 .as_ref()
                 .map(|tc| serde_json::json!({ "TableClass": tc })),
             on_demand_throughput: input.on_demand_throughput,
-            // Fields for features this backend does not implement, vector
-            // indexes today, take their defaults, so adding one to this type
-            // does not break this build.
-            ..Default::default()
+            // Every field is populated deliberately, with no `..Default::default()`
+            // spread. This response is the complete description of what was just
+            // created, so a new core field should break this site and force a
+            // decision about whether create must report it, rather than silently
+            // defaulting. Sites that legitimately opt out still use the spread.
+            vector_indexes: vector_index_descs,
         })
     }
 }

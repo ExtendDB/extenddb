@@ -315,7 +315,7 @@ INSERT INTO settings (key, value) VALUES ('catalog_version', '0.0.2')
 ON CONFLICT (key) DO NOTHING;
 INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0.25')
 ON CONFLICT (key) DO NOTHING;
-INSERT INTO settings (key, value) VALUES ('gsi_propagation_delay_ms', '10')
+INSERT INTO settings (key, value) VALUES ('index_propagation_delay_ms', '10')
 ON CONFLICT (key) DO NOTHING;
 
 COMMIT;

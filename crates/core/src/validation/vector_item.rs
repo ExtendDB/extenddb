@@ -91,6 +91,97 @@ pub fn validate_vector_write_changed(
     Ok(())
 }
 
+/// Extract the components of a vector attribute as `f32`s.
+///
+/// Lives beside [`validate_vector_write`] deliberately: the two must agree on what
+/// a vector attribute is, and separating them invites a backend that stores
+/// something the validator would have rejected. Every backend indexing a vector
+/// should use this rather than reading the attribute itself.
+///
+/// Returns `None` when the value is not a list of numbers each parsing to a finite
+/// `f32`, which is exactly the condition `validate_vector_write` rejects. A caller
+/// that has already validated can treat `None` as an internal inconsistency rather
+/// than as bad input.
+///
+/// The narrowing to `f32` is deliberate and lossy for a caller supplying more
+/// precision: the wire type is arbitrary-precision decimal, embedding models emit
+/// single precision, and the service's declared dimensionality is in `f32` terms.
+#[must_use]
+pub fn vector_components(value: &AttributeValue) -> Option<Vec<f32>> {
+    let AttributeValue::L(elements) = value else {
+        return None;
+    };
+    let mut out = Vec::with_capacity(elements.len());
+    for element in elements {
+        let AttributeValue::N(number) = element else {
+            return None;
+        };
+        let parsed = number.parse::<f32>().ok()?;
+        if !parsed.is_finite() {
+            return None;
+        }
+        out.push(parsed);
+    }
+    Some(out)
+}
+
+/// Rebuild a vector attribute from the `f32` components a backend stored.
+///
+/// The inverse of [`vector_components`], and the only way a backend should return a
+/// stored vector. An index holds 32-bit floats, which is the width the service
+/// validates against: it rejects a component outside
+/// `[-3.4028235E38, 3.4028235E38]`, exactly `f32::MAX`, and names the expected type
+/// "32-bit floating point number". So a client that writes more precision than an
+/// `f32` carries reads back the narrowed value rather than the decimal it sent, and
+/// reconstructing from the stored bits is what reproduces that. Retaining the
+/// client's original text would be a divergence dressed up as fidelity.
+///
+/// Living here rather than in a backend keeps every backend returning identical
+/// text for identical stored bits.
+#[must_use]
+pub fn vector_attribute(components: &[f32]) -> AttributeValue {
+    AttributeValue::L(
+        components
+            .iter()
+            .map(|component| AttributeValue::N(format_component(*component)))
+            .collect(),
+    )
+}
+
+/// Canonical `N` text for one stored component.
+///
+/// Plain decimal, always, which is `f32`'s `Display`. Measured against the live
+/// service on 2026-08-07: DynamoDB never returns an exponent, whatever it was sent.
+/// `3.4028235E+38` reads back as `340282350000000000000000000000000000000` and
+/// `1E-40` as `0.0000000000000000000000000000000000000001`, both of which are
+/// exactly what `Display` produces for the same `f32`.
+///
+/// This corrects an earlier reading of the 38-digit limit as a limit on characters.
+/// It bounds *significant* digits, and an `f32`'s shortest round-tripping form
+/// carries at most 9 of them, so no stored component can approach it however long
+/// the expansion runs. A 38-significant-digit value was accepted and returned
+/// verbatim in the same probe.
+///
+/// The one departure from `Display` is negative zero, which the service also
+/// normalises: `-0` reads back as `0`.
+fn format_component(value: f32) -> String {
+    if value == 0.0 {
+        // Covers -0.0, which compares equal to 0.0.
+        return "0".to_owned();
+    }
+    format!("{value}")
+}
+
+/// The L2 norm of a vector, precomputed at write time.
+///
+/// Stored alongside the vector so a cosine search costs one dot product per
+/// candidate instead of also summing squares. Computed here rather than in a
+/// backend so every backend stores the same value for the same vector.
+#[must_use]
+pub fn vector_norm(components: &[f32]) -> f32 {
+    components.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
 /// Validate a single vector-valued attribute against an index definition.
 fn validate_vector_attribute(
     value: &AttributeValue,
@@ -101,9 +192,13 @@ fn validate_vector_attribute(
     let dimensions = index.dimensions as usize;
 
     let AttributeValue::L(elements) = value else {
+        // Measured 2026-08-07 against N, S and NS in the vector position, all three
+        // of which produce this exact text. Note "32-bit floating point number
+        // list" rather than any phrasing of "list of numbers", and no full stop
+        // before IndexName, matching the size message below.
         return Err(invalid(format!(
-            "One or more parameter values were invalid: Invalid type for parameter {attr}, \
-             Expected: a list of numbers. IndexName: {index_name}"
+            "One or more parameter values were invalid. Invalid type for parameter {attr}, \
+             Expected: 32-bit floating point number list IndexName: {index_name}"
         )));
     };
 
@@ -135,14 +230,15 @@ fn validate_vector_attribute(
                         .map(format_scientific)
                         .unwrap_or_else(|_| number.clone());
                     return Err(invalid(format!(
-                        "Invalid value for parameter {attr}[{position}], Value: {display} is \
-                         outside valid range [-3.4028235E38, 3.4028235E38]. IndexName: {index_name}"
+                        "One or more parameter values were invalid. Invalid value for parameter \
+                         {attr}[{position}], Value: {display} is outside valid range \
+                         [-3.4028235E38, 3.4028235E38]. IndexName: {index_name}"
                     )));
                 }
             }
             other => {
                 return Err(invalid(format!(
-                    "One or more parameter values were invalid: Invalid type for parameter \
+                    "One or more parameter values were invalid. Invalid type for parameter \
                      {attr}[{position}], Expected: 32-bit floating point number, Actual: {}. \
                      IndexName: {index_name}",
                     attribute_type_token(other)
@@ -228,7 +324,11 @@ fn attribute_type_token(value: &AttributeValue) -> &'static str {
 /// Format a float in upper-case scientific notation with an explicit exponent
 /// sign, e.g. `1.3E+40` or `-1.3E+40`.
 fn format_scientific(value: f64) -> String {
-    let formatted = format!("{value:E}");
+    with_exponent_sign(format!("{value:E}"))
+}
+
+/// Rust omits the `+` on a positive exponent; the service includes it.
+fn with_exponent_sign(formatted: String) -> String {
     if let Some(exponent_pos) = formatted.find('E') {
         let (mantissa, exponent) = formatted.split_at(exponent_pos);
         let digits = &exponent[1..];
@@ -262,6 +362,10 @@ mod tests {
                     element_type: SearchSchemaElementType::InlineFilter,
                 },
             ],
+            projection: crate::types::Projection {
+                projection_type: crate::types::ProjectionType::All,
+                non_key_attributes: None,
+            },
         }
     }
 
@@ -349,10 +453,19 @@ mod tests {
         assert!(message.contains("Expected: 5, Actual: 0"));
     }
 
+    /// Asserted whole rather than by fragment. Every message below was measured
+    /// against the live service on 2026-08-07, and the previous fragment assertions
+    /// excluded the "One or more parameter values were invalid" prefix, which is
+    /// precisely where three of the four had drifted: two used a colon where the
+    /// service uses a full stop, and one omitted the prefix entirely.
     #[test]
     fn rejects_non_list_vector() {
         let message = err(&item_with_vector(AttributeValue::N("0.1".to_owned())));
-        assert!(message.contains("Invalid type for parameter ProductEmbedding"));
+        assert_eq!(
+            message,
+            "One or more parameter values were invalid. Invalid type for parameter \
+             ProductEmbedding, Expected: 32-bit floating point number list IndexName: ProductIndex"
+        );
     }
 
     #[test]
@@ -365,10 +478,16 @@ mod tests {
             AttributeValue::N("0.5".to_owned()),
         ]);
         let message = err(&item_with_vector(value));
-        assert!(message.contains("Invalid type for parameter ProductEmbedding[2]"));
-        assert!(message.contains("Expected: 32-bit floating point number, Actual: S"));
+        assert_eq!(
+            message,
+            "One or more parameter values were invalid. Invalid type for parameter \
+             ProductEmbedding[2], Expected: 32-bit floating point number, Actual: S. \
+             IndexName: ProductIndex"
+        );
     }
 
+    /// The offending value is echoed in scientific notation whatever form it was
+    /// sent in: the service answered `Value: 4E+38` to a plain 39-digit integer.
     #[test]
     fn rejects_value_out_of_range() {
         let value = AttributeValue::L(vec![
@@ -379,10 +498,12 @@ mod tests {
             AttributeValue::N("0.5".to_owned()),
         ]);
         let message = err(&item_with_vector(value));
-        assert!(message.contains(
-            "Invalid value for parameter ProductEmbedding[1], Value: 1.3E+40 is outside \
-             valid range [-3.4028235E38, 3.4028235E38]. IndexName: ProductIndex"
-        ));
+        assert_eq!(
+            message,
+            "One or more parameter values were invalid. Invalid value for parameter \
+             ProductEmbedding[1], Value: 1.3E+40 is outside valid range \
+             [-3.4028235E38, 3.4028235E38]. IndexName: ProductIndex"
+        );
     }
 
     #[test]
@@ -436,5 +557,130 @@ mod tests {
     fn format_scientific_adds_exponent_sign() {
         assert_eq!(format_scientific(1.3e40), "1.3E+40");
         assert_eq!(format_scientific(-1.3e40), "-1.3E+40");
+    }
+
+    /// The invariant that makes reconstruction safe: whatever text is produced for a
+    /// stored component must parse back to the identical bits. If this fails, a
+    /// search returns a vector that is not the one indexed.
+    ///
+    /// Negative zero is the one deliberate exception and is asserted separately.
+    #[test]
+    fn rebuilding_a_vector_round_trips_the_stored_bits() {
+        let components = [
+            0.0f32,
+            1.0,
+            -1.0,
+            0.1,
+            0.123_456_79,
+            f32::MAX,
+            f32::MIN,
+            f32::MIN_POSITIVE,
+            1e-40, // subnormal
+            3.4e38,
+            -1.5e-30,
+        ];
+        let rebuilt = vector_attribute(&components);
+        let parsed = vector_components(&rebuilt).expect("rebuilt vector must revalidate");
+        assert_eq!(parsed.len(), components.len());
+        for (original, back) in components.iter().zip(parsed.iter()) {
+            assert_eq!(
+                original.to_bits(),
+                back.to_bits(),
+                "component {original} did not round-trip"
+            );
+        }
+    }
+
+    /// `N` carries one zero, so a stored `-0.0` returns as `0`. The sign of zero is
+    /// unobservable through any of the three distance functions, so normalising it
+    /// cannot change a score or an ordering.
+    #[test]
+    fn negative_zero_is_normalised() {
+        assert_eq!(format_component(-0.0), "0");
+        assert_eq!(format_component(0.0), "0");
+        let parsed = vector_components(&vector_attribute(&[-0.0f32])).expect("valid");
+        assert_eq!(parsed[0].to_bits(), 0.0f32.to_bits());
+    }
+
+    /// Ordinary embedding magnitudes must not be dressed up in exponents: the plain
+    /// form is what a client wrote and what it expects to read.
+    #[test]
+    fn ordinary_magnitudes_stay_in_plain_decimal() {
+        assert_eq!(format_component(0.5), "0.5");
+        assert_eq!(format_component(-1.25), "-1.25");
+        assert_eq!(format_component(1.0), "1");
+        assert_eq!(format_component(0.000_123), "0.000123");
+    }
+
+    /// `Display` never uses an exponent, and neither does the service. These exact
+    /// strings were read back from real DynamoDB on 2026-08-07 after sending
+    /// `3.4028235E+38` and `1E-40`, so matching them is measured parity rather than
+    /// a formatting preference.
+    #[test]
+    fn extreme_magnitudes_match_the_plain_form_the_service_returns() {
+        assert_eq!(
+            format_component(f32::MAX),
+            "340282350000000000000000000000000000000"
+        );
+        assert_eq!(
+            format_component(1e-40),
+            "0.0000000000000000000000000000000000000001"
+        );
+        assert!(
+            !format_component(f32::MAX).contains('E'),
+            "an exponent is never returned by the service"
+        );
+    }
+
+    /// A client writing more precision than an `f32` carries reads back the narrowed
+    /// value, which is what the service does, rather than its own decimal string.
+    #[test]
+    fn excess_client_precision_is_narrowed_not_preserved() {
+        let written =
+            AttributeValue::L(vec![AttributeValue::N("0.12345678901234567890".to_owned())]);
+        let stored = vector_components(&written).expect("valid vector");
+        let returned = vector_attribute(&stored);
+        assert_eq!(
+            returned,
+            AttributeValue::L(vec![AttributeValue::N("0.12345679".to_owned())])
+        );
+    }
+
+    /// The extractor must accept exactly what the validator accepts. If these
+    /// drift, a backend stores a vector the validator would have rejected, or
+    /// refuses one it accepted.
+    #[test]
+    fn the_extractor_accepts_what_the_validator_accepts() {
+        let good = AttributeValue::L(vec![
+            AttributeValue::N("0.5".to_owned()),
+            AttributeValue::N("-1".to_owned()),
+            AttributeValue::N("0".to_owned()),
+        ]);
+        assert_eq!(vector_components(&good), Some(vec![0.5, -1.0, 0.0]));
+    }
+
+    #[test]
+    fn the_extractor_rejects_a_non_list() {
+        assert!(vector_components(&AttributeValue::S("nope".to_owned())).is_none());
+    }
+
+    #[test]
+    fn the_extractor_rejects_a_non_numeric_element() {
+        let bad = AttributeValue::L(vec![AttributeValue::S("1".to_owned())]);
+        assert!(vector_components(&bad).is_none());
+    }
+
+    /// A component that overflows f32 is rejected rather than becoming infinity,
+    /// which would poison every distance computed against it.
+    #[test]
+    fn the_extractor_rejects_a_component_that_is_not_finite_in_f32() {
+        let bad = AttributeValue::L(vec![AttributeValue::N("1e40".to_owned())]);
+        assert!(vector_components(&bad).is_none());
+    }
+
+    #[test]
+    fn the_norm_is_the_euclidean_length() {
+        assert!((vector_norm(&[3.0, 4.0]) - 5.0).abs() < 1e-6);
+        assert!(vector_norm(&[0.0, 0.0]).abs() < 1e-6);
     }
 }

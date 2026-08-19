@@ -135,10 +135,23 @@ pub struct PostgresConfig {
 /// (`_ddb_*` tables, GSI tables). This separation allows the catalog and
 /// data to live in different `PostgreSQL` databases (Bug 1, P54).
 /// Default GSI propagation delay (milliseconds) when the
-/// `gsi_propagation_delay_ms` setting is absent. Mirrors the value seeded by
+/// `index_propagation_delay_ms` setting is absent. Mirrors the value seeded by
 /// the catalog schema, and is the single definition used by both the live read
 /// on the write path and the background refresh worker.
-pub(crate) const DEFAULT_GSI_PROPAGATION_DELAY_MS: u64 = 10;
+pub(crate) const DEFAULT_INDEX_PROPAGATION_DELAY_MS: u64 = 10;
+
+/// Read the propagation-delay setting, preferring the canonical key and falling back
+/// to the pre-rename one.
+///
+/// A catalog created before the rename holds the operator's value under the old name,
+/// and the server refuses to start on a catalog-version mismatch rather than migrating,
+/// so no upgrade step ever rewrites that row. Reading past it would silently reset a
+/// configured delay to the default; since 0 means synchronous, the silent change would
+/// be from strict to eventually consistent. `ORDER BY ... DESC` makes the preference
+/// deterministic when both rows exist.
+pub(crate) const INDEX_PROPAGATION_DELAY_QUERY: &str = "SELECT value FROM settings \
+     WHERE key IN ('index_propagation_delay_ms', 'gsi_propagation_delay_ms') \
+     ORDER BY key = 'index_propagation_delay_ms' DESC LIMIT 1";
 
 pub struct PostgresEngine {
     pub(crate) pool: PgPool,
@@ -152,10 +165,10 @@ pub struct PostgresEngine {
     /// D-4: Async GSI update queue. `None` until `start_gsi_workers()` is called.
     pub(crate) gsi_queue: Option<Arc<gsi_queue::GsiQueue>>,
     /// P119: Cached GSI default propagation delay (milliseconds). Refreshed by
-    /// the background poller every 30s and re-warmed by `gsi_default_delay`.
+    /// the background poller every 30s and re-warmed by `index_propagation_delay`.
     /// This is only a fallback for when the live read fails; the write path
     /// reads the setting live so a runtime change applies to the next write.
-    pub gsi_default_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    pub index_propagation_delay_cache: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl PostgresEngine {
@@ -208,15 +221,13 @@ impl PostgresEngine {
         };
 
         // P119: Read initial GSI propagation delay from settings table.
-        let initial_gsi_delay: u64 = sqlx::query_as::<_, (String,)>(
-            "SELECT value FROM settings WHERE key = 'gsi_propagation_delay_ms'",
-        )
-        .fetch_optional(&pool)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|(v,)| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_GSI_PROPAGATION_DELAY_MS);
+        let initial_gsi_delay: u64 = sqlx::query_as::<_, (String,)>(INDEX_PROPAGATION_DELAY_QUERY)
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|(v,)| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_INDEX_PROPAGATION_DELAY_MS);
 
         Ok(Self {
             pool,
@@ -225,7 +236,9 @@ impl PostgresEngine {
             max_item_size_bytes: config.max_item_size_bytes,
             control_plane_notify: Arc::new(tokio::sync::Notify::new()),
             gsi_queue: None,
-            gsi_default_delay_ms: Arc::new(std::sync::atomic::AtomicU64::new(initial_gsi_delay)),
+            index_propagation_delay_cache: Arc::new(std::sync::atomic::AtomicU64::new(
+                initial_gsi_delay,
+            )),
         })
     }
 
@@ -236,7 +249,7 @@ impl PostgresEngine {
     #[must_use]
     /// Current GSI propagation delay (ms); `0` means synchronous.
     ///
-    /// Reads the `gsi_propagation_delay_ms` setting live from the catalog so an
+    /// Reads the `index_propagation_delay_ms` setting live from the catalog so an
     /// out-of-process change (`extenddb settings set`) applies to the next write
     /// rather than up to 30 s later when the poll worker refreshes the cache.
     /// Callers skip this entirely for tables with no secondary indexes, so a
@@ -245,24 +258,23 @@ impl PostgresEngine {
     /// On a read error the cached value is used and the error is logged, so a
     /// degraded catalog serves a stale delay loudly rather than silently. On
     /// success the cache is re-warmed, keeping the fallback fresh.
-    pub(crate) async fn gsi_default_delay(&self) -> u64 {
+    pub(crate) async fn index_propagation_delay(&self) -> u64 {
         use std::sync::atomic::Ordering;
-        let live = sqlx::query_as::<_, (String,)>(
-            "SELECT value FROM settings WHERE key = 'gsi_propagation_delay_ms'",
-        )
-        .fetch_optional(&self.pool)
-        .await;
+        let live = sqlx::query_as::<_, (String,)>(INDEX_PROPAGATION_DELAY_QUERY)
+            .fetch_optional(&self.pool)
+            .await;
         match live {
             Ok(row) => {
                 let ms = row
                     .and_then(|(v,)| v.parse::<u64>().ok())
-                    .unwrap_or(DEFAULT_GSI_PROPAGATION_DELAY_MS);
-                self.gsi_default_delay_ms.store(ms, Ordering::Relaxed);
+                    .unwrap_or(DEFAULT_INDEX_PROPAGATION_DELAY_MS);
+                self.index_propagation_delay_cache
+                    .store(ms, Ordering::Relaxed);
                 ms
             }
             Err(e) => {
-                tracing::debug!("gsi_default_delay: live read failed, using cache: {e:?}");
-                self.gsi_default_delay_ms.load(Ordering::Relaxed)
+                tracing::debug!("index_propagation_delay: live read failed, using cache: {e:?}");
+                self.index_propagation_delay_cache.load(Ordering::Relaxed)
             }
         }
     }
@@ -376,7 +388,7 @@ use extenddb_storage::server_components::{BackendError, ServerComponents};
 struct PostgresRuntimeHooks {
     engine: Arc<PostgresEngine>,
     control_plane_notify: Arc<tokio::sync::Notify>,
-    gsi_default_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    index_propagation_delay_cache: Arc<std::sync::atomic::AtomicU64>,
     data_db_name: String,
 }
 
@@ -444,7 +456,7 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
 
         // 7. GSI delay poller
         let catalog_store_for_gsi = ctx.catalog_store.clone();
-        let gsi_delay = self.gsi_default_delay_ms.clone();
+        let gsi_delay = self.index_propagation_delay_cache.clone();
         let token = ctx.shutdown.clone();
         let gsi_poller = tokio::spawn(async move {
             workers::poll_gsi_delay(catalog_store_for_gsi, gsi_delay, token).await;
@@ -527,7 +539,7 @@ fn server_components_factory(
 
         // Get references to fields we need before wrapping
         let control_plane_notify = engine.control_plane_notify.clone();
-        let gsi_default_delay_ms = engine.gsi_default_delay_ms.clone();
+        let index_propagation_delay_cache = engine.index_propagation_delay_cache.clone();
 
         // Wrap engine in Arc
         let engine = Arc::new(engine);
@@ -584,7 +596,7 @@ fn server_components_factory(
         let runtime_hooks = Box::new(PostgresRuntimeHooks {
             engine: engine.clone(),
             control_plane_notify,
-            gsi_default_delay_ms,
+            index_propagation_delay_cache,
             data_db_name,
         });
 
