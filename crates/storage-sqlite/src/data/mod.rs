@@ -114,9 +114,12 @@ pub(crate) fn json_to_item(v: serde_json::Value) -> Result<Item, StorageError> {
 /// A value bound into a positional `sqlx` query, already mapped to its SQLite
 /// storage representation.
 ///
-/// The `Text` and `Blob` cases carry sort-key values per D2. `Int` carries a
-/// query parameter that is a number in its own right rather than a key: before it
-/// existed, the only way an integer reached SQL in this crate was interpolation.
+/// The `Text` and `Blob` cases carry sort-key values per D2. `Int` carries a query
+/// parameter that is a number in its own right rather than a key. `BoundValue`
+/// previously had no integer case, so an integer travelling through a
+/// `BoundValue`-mediated bind list had to be interpolated instead, which is what the
+/// two `LIMIT` sites did. Integers bound directly, not through a `BoundValue`, were
+/// always possible and are used elsewhere.
 #[derive(Debug, Clone)]
 pub(crate) enum BoundValue {
     /// `TEXT` — used for `S` (raw string) and `N` (order-preserving encoding).
@@ -173,7 +176,8 @@ macro_rules! bind_bound {
 /// capture the identifier exists only inside the format string and **no
 /// expression appears in the macro arguments at all**, so a `syn`-based rule
 /// cannot see that a `VALUES (...)` interpolation is a placeholder list rather
-/// than a value. The named form puts the name and the call in one AST node.
+/// than a value. The named form puts the call in the macro's argument tokens,
+/// where a token-stream parser can find it.
 pub(crate) fn bind_list(n: usize) -> String {
     vec!["?"; n].join(", ")
 }
@@ -185,7 +189,10 @@ macro_rules! bind_sk_fetch_optional {
         let __q = match crate::data::sk_bound($sk) {
             crate::data::BoundValue::Text(s) => __q.bind(s),
             crate::data::BoundValue::Blob(b) => __q.bind(b),
-            crate::data::BoundValue::Int(i) => __q.bind(i),
+            crate::data::BoundValue::Int(_) => unreachable!(
+                "sk_bound never yields Int: N is encoded as TEXT so lexicographic \
+order equals numeric order"
+            ),
         };
         __q.fetch_optional($executor)
             .await
@@ -200,7 +207,10 @@ macro_rules! bind_sk_execute {
         let __q = match crate::data::sk_bound($sk) {
             crate::data::BoundValue::Text(s) => __q.bind(s),
             crate::data::BoundValue::Blob(b) => __q.bind(b),
-            crate::data::BoundValue::Int(i) => __q.bind(i),
+            crate::data::BoundValue::Int(_) => unreachable!(
+                "sk_bound never yields Int: N is encoded as TEXT so lexicographic \
+order equals numeric order"
+            ),
         };
         __q.bind($item_json)
             .execute($executor)
@@ -216,7 +226,10 @@ macro_rules! bind_sk_only_execute {
         let __q = match crate::data::sk_bound($sk) {
             crate::data::BoundValue::Text(s) => __q.bind(s),
             crate::data::BoundValue::Blob(b) => __q.bind(b),
-            crate::data::BoundValue::Int(i) => __q.bind(i),
+            crate::data::BoundValue::Int(_) => unreachable!(
+                "sk_bound never yields Int: N is encoded as TEXT so lexicographic \
+order equals numeric order"
+            ),
         };
         __q.execute($executor)
             .await
