@@ -293,7 +293,7 @@ jobs:
       MOVE_LATEST: ${{ needs.promote.outputs.move_latest }}
     steps:
       - name: Check out (composite action lives in-repo)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # releases-v4 pin
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - name: Log in to GHCR
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
