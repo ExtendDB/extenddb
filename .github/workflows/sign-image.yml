@@ -30,11 +30,14 @@ on:
         description: 'Which image the digest belongs to'
         type: choice
         options:
-          # extenddb-dev joins once the key question is decided (#290 review:
-          # the production key signing a dev image makes a plain-HTTP dev
-          # build verify exactly like a release; separate key, or annotation-
-          # enforced verify, to be decided with #281 before the dev image
-          # ships) and its Docker Hub repository exists.
+          # Key decision (release owner, 2026-08-20): ONE key signs every
+          # image tier; verifiers distinguish images by the signed
+          # annotations (org.extenddb.release + image repo), and the key
+          # itself is slated to be phased out for keyless workflow-identity
+          # signing, which distinguishes tiers automatically. extenddb-dev
+          # joins this list once its Docker Hub repository exists and #281's
+          # release path is live (a dev dispatch today would burn an
+          # approval and die on a 404).
           - extenddb-postgres
         default: extenddb-postgres
       reason:
@@ -53,8 +56,11 @@ env:
   # locally (API-side enforcement of choice lists is undocumented; the case
   # statement makes the security property local and costs nothing).
   IMAGE_REPO: docker.io/extenddb/${{ inputs.image }}
-  # This key vouches for every image in the choice list; adding an image
-  # here is a trust decision about what the key signs, not just plumbing.
+  # This ONE key vouches for every ExtendDB image, all tiers (decision
+  # 2026-08-20): a signature means "official ExtendDB build", and WHICH
+  # build is attested by the signed annotations, not the key. Admission
+  # policies must therefore match annotations/repo, never key alone.
+  # Slated for keyless (workflow-identity) signing long-term.
   KEY_ARN: arn:aws:kms:us-east-1:975306274793:key/654ab7f4-4a11-45e1-a313-3a6989f3721c
 
 jobs:
