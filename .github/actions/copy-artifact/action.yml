@@ -1,0 +1,80 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Composite action: copy ONE artifact (an image index by digest, or a Cosign
+# signature by tag) from a source repository to a destination, idempotently
+# and fail-closed. Shared by the release pipeline's propagate stage and
+# anything else that mirrors artifacts, so the probe and guard semantics
+# exist once:
+#
+#   * existence probes are three-way: definite manifest-unknown means absent;
+#     success means present; anything else (network blip, auth error) aborts
+#     rather than masquerading as absence
+#   * destination already holds the expected digest -> no-op (re-entrant)
+#   * destination holds a DIFFERENT digest -> hard error, never overwrite
+#   * copies are --preserve-digests with a post-copy digest assertion
+#
+# The CALLER handles authentication.
+
+name: copy-artifact
+description: Idempotent, fail-closed copy of one artifact between repositories
+
+inputs:
+  src-repo:
+    description: 'Source repository'
+    required: true
+  dst-repo:
+    description: 'Destination repository'
+    required: true
+  tag:
+    description: 'Tag to create at the destination (also the source tag for tag-addressed artifacts)'
+    required: true
+  digest:
+    description: 'Expected digest (sha256:<64 hex>) of the artifact'
+    required: true
+  by-digest:
+    description: 'true: copy source by @digest (immutable); false: copy source by :tag (signature artifacts)'
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - name: Copy ${{ inputs.tag }} to ${{ inputs.dst-repo }}
+      shell: bash
+      env:
+        SRC: ${{ inputs.src-repo }}
+        DST: ${{ inputs.dst-repo }}
+        TAG: ${{ inputs.tag }}
+        WANT: ${{ inputs.digest }}
+        BY_DIGEST: ${{ inputs.by-digest }}
+      run: |
+        set -euo pipefail
+        [[ -n "$TAG" && -n "$WANT" ]] || { echo "::error::empty tag or digest reached copy-artifact"; exit 1; }
+
+        probe() {
+          local ref="$1" out
+          if out=$(skopeo inspect --format '{{.Digest}}' "docker://${ref}" 2>&1); then
+            printf '%s' "$out"; return 0
+          elif grep -qiE 'manifest unknown|name unknown|not found|unauthorized: repository .* not found' <<< "$out"; then
+            return 9
+          else
+            echo "::error::probe of ${ref} failed (not a definite absence): ${out}" >&2
+            exit 1
+          fi
+        }
+
+        set +e; EXISTING=$(probe "${DST}:${TAG}"); rc=$?; set -e
+        if [[ $rc == 0 ]]; then
+          [[ "$EXISTING" == "$WANT" ]] && { echo "::notice::${DST}:${TAG} already present with the expected digest"; exit 0; }
+          echo "::error::${DST}:${TAG} exists with different digest ${EXISTING}; refusing to overwrite"
+          exit 1
+        fi
+        [[ $rc == 9 ]] || exit 1
+
+        if [[ "$BY_DIGEST" == "true" ]]; then
+          skopeo copy --all --preserve-digests "docker://${SRC}@${WANT}" "docker://${DST}:${TAG}"
+        else
+          skopeo copy --preserve-digests "docker://${SRC}:${TAG}" "docker://${DST}:${TAG}"
+        fi
+        GOT=$(probe "${DST}:${TAG}") || { echo "::error::${DST}:${TAG} missing after copy"; exit 1; }
+        [[ "$GOT" == "$WANT" ]] || { echo "::error::${DST}:${TAG} resolves to ${GOT}, expected ${WANT}"; exit 1; }
