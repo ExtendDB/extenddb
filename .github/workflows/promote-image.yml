@@ -117,6 +117,12 @@ jobs:
           RAW_MOVE_LATEST: ${{ inputs.move_latest }}
         run: |
           set -euo pipefail
+          # Local allowlist enforcement: API-side choice enforcement is
+          # undocumented, so the security property is proven here.
+          case "${{ inputs.image }}" in
+            extenddb-postgres) ;;
+            *) echo "::error::image '${{ inputs.image }}' is not in the allowlist"; exit 1 ;;
+          esac
           if [[ ! "$RAW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::version '$RAW_VERSION' is not strict semver (MAJOR.MINOR.PATCH)"
             exit 1
@@ -335,12 +341,13 @@ jobs:
           skopeo logout public.ecr.aws || true
 
       - name: Summarise for the release checklist
+        if: always()
         run: |
           if [[ "$MOVE_LATEST" == "true" ]]; then
-            HEADING="Promoted to ${VERSION} and latest"
+            HEADING="Promoted to ${VERSION} and latest (all registries)"
             TAGLIST="\`${VERSION}\`, \`latest\`"
           else
-            HEADING="Promoted to ${VERSION} (latest untouched)"
+            HEADING="Promoted to ${VERSION} on all registries (latest untouched)"
             TAGLIST="\`${VERSION}\`"
           fi
           {
@@ -349,7 +356,6 @@ jobs:
             echo "| field | value |"
             echo "|---|---|"
             echo "| registries | \`${IMAGE_REPO}\`, \`${GHCR_REPO}\`, \`${ECR_REPO}\` |"
-            echo "| candidate | \`${TAG}\` |"
             echo "| digest | \`${DIGEST}\` |"
             echo "| tags | ${TAGLIST} |"
           } >> "$GITHUB_STEP_SUMMARY"
