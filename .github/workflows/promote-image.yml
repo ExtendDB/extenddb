@@ -65,8 +65,10 @@ on:
         description: 'Which image to promote'
         type: choice
         options:
+          # extenddb-dev joins when its GHCR/ECR repositories exist and a
+          # signed dev candidate is produced upstream (see #283 review);
+          # ECR Public does not auto-create repositories on push.
           - extenddb-postgres
-          - extenddb-dev
         default: extenddb-postgres
 
 permissions:
