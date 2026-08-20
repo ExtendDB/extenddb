@@ -38,8 +38,8 @@ impl SqliteEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let row: Option<(String, String, String, String)> = sqlx::query_as(
-            "SELECT table_status, table_id, key_schema, attribute_definitions \
+        let row: Option<(String, String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT table_status, table_id, key_schema, attribute_definitions, billing_mode \
              FROM tables WHERE account_id = ? AND table_name = ?",
         )
         .bind(account_id)
@@ -48,7 +48,10 @@ impl SqliteEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let (status, table_id, ks_json, ad_json) =
+        // `stored_billing_mode` is read once here and threaded through every
+        // billing check below, so the several readers of one row cannot
+        // disagree. A NULL stored value means PROVISIONED.
+        let (status, table_id, ks_json, ad_json, stored_billing_mode) =
             row.ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
         if status != "ACTIVE" {
             return Err(StorageError::TableNotActive(input.table_name.clone()));
@@ -88,20 +91,7 @@ impl SqliteEngine {
         if creates_vector_index {
             let net_pay_per_request = match input.billing_mode {
                 Some(mode) => mode == BillingMode::PayPerRequest,
-                None => {
-                    // A NULL stored billing_mode means PROVISIONED, matching how
-                    // the throughput checks below read it.
-                    let stored: Option<String> = sqlx::query_scalar(
-                        "SELECT billing_mode FROM tables WHERE account_id = ? AND table_name = ?",
-                    )
-                    .bind(account_id)
-                    .bind(&input.table_name)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?
-                    .flatten();
-                    stored.as_deref() == Some("PAY_PER_REQUEST")
-                }
+                None => stored_billing_mode.as_deref() == Some("PAY_PER_REQUEST"),
             };
             if !net_pay_per_request {
                 return Err(StorageError::Validation(
@@ -121,17 +111,7 @@ impl SqliteEngine {
             let effective_ppr = match input.billing_mode {
                 Some(BillingMode::PayPerRequest) => true,
                 Some(BillingMode::Provisioned) => false,
-                None => {
-                    let current_bm: Option<Option<String>> = sqlx::query_scalar(
-                        "SELECT billing_mode FROM tables WHERE account_id = ? AND table_name = ?",
-                    )
-                    .bind(account_id)
-                    .bind(&input.table_name)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    current_bm.flatten().as_deref() == Some("PAY_PER_REQUEST")
-                }
+                None => stored_billing_mode.as_deref() == Some("PAY_PER_REQUEST"),
             };
             if effective_ppr {
                 return Err(StorageError::Validation(
@@ -144,8 +124,8 @@ impl SqliteEngine {
         if matches!(input.billing_mode, Some(BillingMode::Provisioned))
             && let Some(ref pt) = input.provisioned_throughput
         {
-            let current: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-                "SELECT billing_mode, provisioned_throughput FROM tables \
+            let current: Option<Option<String>> = sqlx::query_scalar(
+                "SELECT provisioned_throughput FROM tables \
                  WHERE account_id = ? AND table_name = ?",
             )
             .bind(account_id)
@@ -153,8 +133,9 @@ impl SqliteEngine {
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
-            if let Some((bm, cur_pt)) = current {
-                let is_prov = bm.as_deref() == Some("PROVISIONED") || bm.is_none();
+            if let Some(cur_pt) = current {
+                let is_prov = stored_billing_mode.as_deref() == Some("PROVISIONED")
+                    || stored_billing_mode.is_none();
                 let cur: serde_json::Value = cur_pt
                     .as_deref()
                     .and_then(|s| serde_json::from_str(s).ok())
