@@ -1,10 +1,12 @@
 # Publishes an immutable, commit-addressed CANDIDATE of the ExtendDB PostgreSQL
 # container image to Docker Hub, for linux/amd64 and linux/arm64.
 #
-# This workflow deliberately stops at the candidate. It never creates the
-# version tag or `latest`: promotion, registry mirroring, verification, and
-# signing are maintainer steps recorded in the release runbook. That keeps the
-# blast radius of any workflow defect to a tag no user consumes.
+# This workflow never creates the version tag or `latest` (promotion is
+# promote-image's job, separately approved), but it carries the candidate all
+# the way to signed-and-mirrored: publish + sign under the dockerhub
+# environment approval, then propagation to GHCR + ECR under the ghcr
+# environment approval. Any defect's blast radius stays a tag no user
+# consumes.
 #
 # Shape, and why:
 #
@@ -22,15 +24,18 @@
 #             bit-for-bit what was tested. These jobs hold NO registry
 #             credentials.
 #
-#   publish   Runs once, after both architectures pass. This is the only job
-#             with Docker Hub credentials, so the token never exists in a job
-#             that is executing a freshly built image, and never exists at all
-#             unless both architectures passed. It pushes ONLY the
-#             commit-addressed candidate tags:
+#   publish   Runs once, after both architectures pass. The only job with
+#             Docker Hub credentials; the token never coexists with a job
+#             executing a freshly built image. Pushes ONLY commit-addressed
+#             candidate tags (sha-<full-commit>{,-amd64,-arm64}), verifies the
+#             tag ANONYMOUSLY, then signs the index digest (KMS via OIDC,
+#             Rekor, tag-based .sig).
 #
-#               sha-<full-commit>-amd64
-#               sha-<full-commit>-arm64
-#               sha-<full-commit>          (multi-arch manifest list)
+#   propagate Second approval (ghcr environment): copies image + signature to
+#             GHCR and ECR Public via the copy-artifact composite action —
+#             idempotent, fail-closed, digest-asserted. GHCR writes are gated
+#             by the ghcr environment's own reviewers; the ECR role's OIDC
+#             trust covers both protected environments.
 #
 # Trigger: manual workflow_dispatch only. There is intentionally no
 # `push: tags:` trigger: a tag-triggered run executes the workflow definition
@@ -261,9 +266,22 @@ jobs:
   publish-candidate:
     needs: [gate, build]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    environment: dockerhub       # the single approval gate, and the only job with secrets
+    timeout-minutes: 45
+    environment: dockerhub       # approval 1: publish + sign (the only job with Docker Hub secrets)
+    # Signing rides the publish approval (release owner decision 2026-08-18);
+    # propagation is the next job, under the ghcr environment's own gate.
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      candidate: ${{ steps.push.outputs.candidate }}
+      sig-tag: ${{ steps.sign.outputs.sig-tag }}
+      sig-digest: ${{ steps.sign.outputs.sig-digest }}
+    permissions:
+      contents: read
+      id-token: write   # KMS signing role (OIDC)
     steps:
+      - name: Check out (composite signing action lives in-repo)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
       - name: Download the tested images
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
@@ -295,24 +313,40 @@ jobs:
           REPO='${{ env.IMAGE_REPO }}'
           CANDIDATE="sha-${SHA}"
 
-          # Refuse to overwrite: a candidate tag for this commit must not
-          # already exist pointing at anything else. Idempotent re-runs of the
-          # identical artifact are the only permitted repeat.
-          if docker buildx imagetools inspect "${REPO}:${CANDIDATE}" >/dev/null 2>&1; then
-            echo "::error::candidate ${REPO}:${CANDIDATE} already exists; refusing to overwrite. Verify and promote the existing candidate, or investigate."
-            exit 1
+          # Idempotent no-overwrite: if the candidate tag exists and holds
+          # EXACTLY what this run built, fall through to sign and propagate
+          # (a failed earlier run must be finishable by re-dispatch, or the
+          # failure-prone tail strands a published-but-unsigned candidate no
+          # re-dispatch can fix). Identity is compared by per-arch image
+          # config digest — the image ID, which docker save/load preserves
+          # and the smoke test certified — with NO registry mutation: a
+          # different artifact errors before anything is pushed.
+          if EXISTING=$(docker buildx imagetools inspect "${REPO}:${CANDIDATE}" --format '{{.Manifest.Digest}}' 2>/dev/null); then
+            RAW=$(skopeo inspect --no-creds --raw "docker://${REPO}@${EXISTING}")
+            MATCH=true
+            for arch in amd64 arm64; do
+              MDIGEST=$(jq -r --arg a "$arch" '.manifests[] | select(.platform.architecture == $a) | .digest' <<< "$RAW")
+              [[ -n "$MDIGEST" && "$MDIGEST" != "null" ]] || { MATCH=false; break; }
+              REMOTE_ID=$(skopeo inspect --no-creds --raw "docker://${REPO}@${MDIGEST}" | jq -r '.config.digest')
+              LOCAL_ID=$(docker image inspect "${REPO}:${CANDIDATE}-${arch}" --format '{{.Id}}')
+              [[ "$REMOTE_ID" == "$LOCAL_ID" ]] || { MATCH=false; break; }
+            done
+            if [[ "$MATCH" != "true" ]]; then
+              echo "::error::candidate ${REPO}:${CANDIDATE} exists (${EXISTING}) but does not match the images this run built and tested; refusing to overwrite"
+              exit 1
+            fi
+            echo "::notice::candidate already published with the identical artifact; continuing to sign/propagate"
+            DIGEST="$EXISTING"
+          else
+            # Per-arch tags first: a manifest list can only reference images
+            # that already exist in the registry.
+            docker push "${REPO}:${CANDIDATE}-amd64"
+            docker push "${REPO}:${CANDIDATE}-arm64"
+            docker buildx imagetools create -t "${REPO}:${CANDIDATE}" \
+              "${REPO}:${CANDIDATE}-amd64" "${REPO}:${CANDIDATE}-arm64"
+            DIGEST=$(docker buildx imagetools inspect "${REPO}:${CANDIDATE}" \
+                       --format '{{.Manifest.Digest}}')
           fi
-
-          # Per-arch tags first: a manifest list can only reference images that
-          # already exist in the registry.
-          docker push "${REPO}:${CANDIDATE}-amd64"
-          docker push "${REPO}:${CANDIDATE}-arm64"
-
-          docker buildx imagetools create -t "${REPO}:${CANDIDATE}" \
-            "${REPO}:${CANDIDATE}-amd64" "${REPO}:${CANDIDATE}-arm64"
-
-          DIGEST=$(docker buildx imagetools inspect "${REPO}:${CANDIDATE}" \
-                     --format '{{.Manifest.Digest}}')
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
           echo "candidate=${CANDIDATE}" >> "$GITHUB_OUTPUT"
 
@@ -325,7 +359,41 @@ jobs:
           echo "$OUT" | grep -q 'linux/amd64' || { echo "::error::amd64 missing"; exit 1; }
           echo "$OUT" | grep -q 'linux/arm64' || { echo "::error::arm64 missing"; exit 1; }
 
+      - name: Verify the candidate anonymously (the TAG, with no credential)
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          CANDIDATE: ${{ steps.push.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          # --no-creds: skopeo otherwise reads the docker login from
+          # ~/.docker/config.json, which would make this a maintainer-
+          # credentialed fetch. And the check must be TAG-addressed: a
+          # digest-addressed inspect is content-addressed and proves nothing
+          # about what the tag serves to users.
+          GOT=$(skopeo inspect --no-creds --format '{{.Digest}}' "docker://${IMAGE_REPO}:${CANDIDATE}")
+          [[ "$GOT" == "$DIGEST" ]] || { echo "::error::${IMAGE_REPO}:${CANDIDATE} anonymously resolves to ${GOT}, expected ${DIGEST}"; exit 1; }
+          RAW=$(skopeo inspect --no-creds --raw "docker://${IMAGE_REPO}:${CANDIDATE}")
+          grep -q '"architecture": *"amd64"' <<< "$RAW" || { echo "::error::amd64 missing from published index"; exit 1; }
+          grep -q '"architecture": *"arm64"' <<< "$RAW" || { echo "::error::arm64 missing from published index"; exit 1; }
+
+      - name: Assume the signing role via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::975306274793:role/ExtendDBContainerSigningCI
+          role-session-name: extenddb-release-sign-${{ github.run_id }}
+          aws-region: us-east-1
+
+      - name: Sign the candidate (composite action; Rekor ON, tag-based .sig)
+        id: sign
+        uses: ./.github/actions/sign-image
+        with:
+          image-repo: ${{ env.IMAGE_REPO }}
+          digest: ${{ steps.push.outputs.digest }}
+          release-tag: v${{ needs.gate.outputs.version }}
+          key-arn: arn:aws:kms:us-east-1:975306274793:key/654ab7f4-4a11-45e1-a313-3a6989f3721c
+
       - name: Summarise for the release checklist
+        if: always()
         run: |
           {
             echo "### Candidate published (NOT promoted)"
@@ -338,18 +406,105 @@ jobs:
             echo "| version (from tag) | \`${{ needs.gate.outputs.version }}\` |"
             echo "| commit | \`${{ needs.gate.outputs.sha }}\` |"
             echo "| build date (commit-derived) | \`${{ needs.gate.outputs.build_date }}\` |"
+            echo "| signature | \`${{ steps.sign.outputs.sig-tag }}\` (Rekor logged) |"
             echo ""
-            echo "Next steps are manual, per the release runbook: record this digest,"
-            echo "pull and smoke test anonymously by digest on both architectures,"
-            echo "mirror the exact artifact to the other registries, sign, then"
-            echo "promote the digest to the version tag and \`latest\`."
+            echo "Published and signed on Docker Hub. Next: the propagate job"
+            echo "(ghcr environment approval) copies image + signature to GHCR"
+            echo "and ECR; after that, dispatch promote-image with this digest"
+            echo "to create the version tag and \`latest\`."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Approval 2 (ghcr environment): propagate image + signature to the mirror
+  # registries, only after publish + sign completed. GHCR writes are gated by
+  # the ghcr environment's own reviewers; the ECR role's OIDC trust covers
+  # both protected environments. All copies go through the copy-artifact
+  # composite action: idempotent, fail-closed probes, digest-asserted.
+  propagate:
+    needs: [gate, publish-candidate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ghcr
+    permissions:
+      contents: read
+      packages: write   # GHCR
+      id-token: write   # ECR (OIDC role)
+    env:
+      DIGEST: ${{ needs.publish-candidate.outputs.digest }}
+      CANDIDATE: ${{ needs.publish-candidate.outputs.candidate }}
+      SIG_TAG: ${{ needs.publish-candidate.outputs.sig-tag }}
+      SIG_DIGEST: ${{ needs.publish-candidate.outputs.sig-digest }}
+    steps:
+      - name: Check out (composite action lives in-repo)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Constant username: GHCR ignores it with a GitHub token, and it
+        # keeps the operator identity out of the run block.
+        run: |
+          set -euo pipefail
+          skopeo login ghcr.io -u x-access-token --password-stdin <<< "$GHCR_TOKEN"
+
+      - name: Copy image to GHCR (by digest)
+        uses: ./.github/actions/copy-artifact
+        with:
+          src-repo: ${{ env.IMAGE_REPO }}
+          dst-repo: ghcr.io/extenddb/extenddb-postgres
+          tag: ${{ env.CANDIDATE }}
+          digest: ${{ env.DIGEST }}
+          by-digest: 'true'
+
+      - name: Copy signature to GHCR (tag-addressed)
+        uses: ./.github/actions/copy-artifact
+        with:
+          src-repo: ${{ env.IMAGE_REPO }}
+          dst-repo: ghcr.io/extenddb/extenddb-postgres
+          tag: ${{ env.SIG_TAG }}
+          digest: ${{ env.SIG_DIGEST }}
+          by-digest: 'false'
+
+      - name: Assume the ECR publisher role via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::975306274793:role/ExtendDBEcrPublicGitHubPublisher
+          role-session-name: extenddb-release-propagate-${{ github.run_id }}
+          aws-region: us-east-1
+
+      - name: Log in to ECR Public
+        run: |
+          set -euo pipefail
+          aws ecr-public get-login-password --region us-east-1 \
+            | skopeo login public.ecr.aws -u AWS --password-stdin
+
+      - name: Copy image to ECR Public (by digest)
+        uses: ./.github/actions/copy-artifact
+        with:
+          src-repo: ${{ env.IMAGE_REPO }}
+          dst-repo: public.ecr.aws/extenddb/extenddb-postgres
+          tag: ${{ env.CANDIDATE }}
+          digest: ${{ env.DIGEST }}
+          by-digest: 'true'
+
+      - name: Copy signature to ECR Public (tag-addressed)
+        uses: ./.github/actions/copy-artifact
+        with:
+          src-repo: ${{ env.IMAGE_REPO }}
+          dst-repo: public.ecr.aws/extenddb/extenddb-postgres
+          tag: ${{ env.SIG_TAG }}
+          digest: ${{ env.SIG_DIGEST }}
+          by-digest: 'false'
+
+      - name: Log out of the mirror registries
+        if: always()
+        run: |
+          skopeo logout ghcr.io || true
+          skopeo logout public.ecr.aws || true
 
 # Deliberate omissions, and what closing them would cost.
 #
-# No version tag or `latest`: promotion is a manual, recorded runbook step for
-# the initial releases. Automating it (with existing-tag protection and latest
-# ordering) is the Track 2 follow-up.
+# No version tag or `latest`: promotion is promote-image's job — a separate
+# human decision (soak time), one approved dispatch, all three registries.
 #
 # No provenance or SBOM attestations. Those are produced by the registry/OCI
 # exporter, while `load: true` requires the local docker exporter, and `load`
