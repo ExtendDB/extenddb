@@ -81,6 +81,9 @@ class TestCliLifecycle:
 
         assert "001_data_schema.sql" in tracked, tracked
         assert "002_gsi_pending.sql" in tracked, tracked
+        # Programmatic (code) migration for the GSI base-key index is tracked in
+        # the same ledger, so `migrate` treats it exactly like a SQL migration.
+        assert "003_gsi_base_key_index" in tracked, tracked
 
     def test_migrate_applies_pending_data_migration(self, cli_env):
         """`extenddb migrate` applies a pending *data* migration on an existing
@@ -160,6 +163,90 @@ class TestCliLifecycle:
                 assert {"worker_partition", "ready_at", "index_context"} <= cols, cols
         finally:
             conn.close()
+
+    def test_migrate_applies_base_key_index_code_migration(self, cli_env):
+        """`extenddb migrate` applies the programmatic GSI base-key-index
+        migration (`003_gsi_base_key_index`) and never re-runs it.
+
+        The base-key index makes GSI-propagation deletes (`WHERE base_pk = $1
+        AND base_sk_* = $2`) index scans instead of sequential scans. New tables
+        get it at creation time; this migration adds it to tables created before
+        the index existed. It is a *code* migration (it enumerates the
+        dynamically-named `_ddb_*` tables and uses `CREATE INDEX CONCURRENTLY`),
+        so this verifies it is wired into the same pending/apply/tracking flow as
+        the SQL migrations: pending is detected, `migrate` refuses without
+        `--yes`, applies with `--yes`, records the ledger row, and is idempotent
+        on a second run. (Index derivation itself is the same logic exercised at
+        table-creation time across the GSI integration suite.)
+        """
+        import psycopg2
+
+        result = _run_extenddb(
+            "init", *_init_args(cli_env),
+            config=cli_env["config_path"],
+            env_override={"EXTENDDB_ADMIN_PASSWORD": "TestPass1!"},
+        )
+        assert result.returncode == 0
+
+        data_db = cli_env["db_name"][: -len("_catalog")]
+
+        def _data_conn():
+            return psycopg2.connect(PG_ADMIN_CONN + "/" + data_db)
+
+        # Simulate a deployment created before 003 existed: drop only its ledger
+        # row so `migrate` sees the code migration as pending again.
+        conn = _data_conn()
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM schema_history "
+                    "WHERE filename = '003_gsi_base_key_index'"
+                )
+                cur.execute(
+                    "SELECT EXISTS(SELECT 1 FROM schema_history "
+                    "WHERE filename = '003_gsi_base_key_index')"
+                )
+                assert cur.fetchone()[0] is False
+        finally:
+            conn.close()
+
+        # Without --yes, migrate must refuse while the code migration is pending.
+        refused = _run_extenddb(
+            "migrate", *_pg_args(),
+            config=cli_env["config_path"],
+            check=False,
+        )
+        assert refused.returncode != 0, refused.stdout + refused.stderr
+        assert "003_gsi_base_key_index" in (refused.stdout + refused.stderr)
+
+        # With --yes, migrate applies and records the code migration.
+        applied = _run_extenddb(
+            "migrate", "--yes", *_pg_args(),
+            config=cli_env["config_path"],
+            check=False,
+        )
+        assert applied.returncode == 0, applied.stdout + applied.stderr
+
+        conn = _data_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT EXISTS(SELECT 1 FROM schema_history "
+                    "WHERE filename = '003_gsi_base_key_index')"
+                )
+                assert cur.fetchone()[0] is True
+        finally:
+            conn.close()
+
+        # Idempotent: a second migrate finds nothing pending.
+        again = _run_extenddb(
+            "migrate", "--yes", *_pg_args(),
+            config=cli_env["config_path"],
+            check=False,
+        )
+        assert again.returncode == 0, again.stdout + again.stderr
+        assert "up to date" in again.stdout.lower(), again.stdout
 
     def test_init_serve_status_stop(self, cli_env):
         """Full lifecycle: init → serve → status → stop."""

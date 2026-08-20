@@ -113,6 +113,102 @@ pub(crate) async fn run_data_migrations(pool: &PgPool) -> OpResult<()> {
     Ok(())
 }
 
+/// Programmatic ("code") data migrations, tracked in `schema_history` alongside
+/// the SQL migrations. Unlike a static `.sql` file, these enumerate the
+/// dynamically-named index tables (`_ddb_<id>`) from the catalog and must run
+/// outside a transaction (they use `CREATE INDEX CONCURRENTLY`), so they cannot
+/// be expressed as SQL in [`DATA_MIGRATIONS`]. Applied by `extenddb migrate`
+/// after the SQL migrations, so the operator controls when the change happens.
+pub(crate) const DATA_CODE_MIGRATIONS: &[&str] = &["003_gsi_base_key_index"];
+
+/// Run programmatic data migrations, skipping already-applied ones.
+///
+/// Needs the catalog pool (to enumerate index tables and their base key schema)
+/// and the data pool (where the `_ddb_*` tables and the `schema_history` ledger
+/// live). Each step is recorded in `schema_history` and skipped on later runs,
+/// exactly like the SQL migrations.
+pub(crate) async fn run_data_code_migrations(
+    catalog_pool: &PgPool,
+    data_pool: &PgPool,
+) -> OpResult<()> {
+    for name in DATA_CODE_MIGRATIONS {
+        if is_migration_applied(data_pool, name).await? {
+            println!("    {name} — already applied, skipping.");
+            continue;
+        }
+        println!("    Applying {name}...");
+        match *name {
+            "003_gsi_base_key_index" => {
+                ensure_gsi_base_key_indexes(catalog_pool, data_pool).await?;
+            }
+            other => {
+                return Err(OpError::Internal(format!(
+                    "Unknown data code migration: {other}"
+                )));
+            }
+        }
+        record_migration(data_pool, name).await?;
+    }
+    Ok(())
+}
+
+/// Create the base-table-key index on every existing GSI/LSI table.
+///
+/// During GSI propagation each index table (`_ddb_<id>`) is looked up back to
+/// its base item via `WHERE base_pk = $1 AND base_sk_* = $2`; without a leading
+/// `(base_pk, base_sk_*)` index that is a sequential scan. New tables get this
+/// index at creation time (see `ddl.rs`); this migration adds it to tables
+/// created before the index existed. `CREATE INDEX CONCURRENTLY IF NOT EXISTS`
+/// is idempotent and does not block concurrent writes.
+async fn ensure_gsi_base_key_indexes(catalog_pool: &PgPool, data_pool: &PgPool) -> OpResult<()> {
+    use extenddb_core::types::{AttributeDefinition, KeySchemaElement};
+    use extenddb_storage::util::{sk_column, sk_column_n};
+
+    // Enumerate every index and its base table key schema from the catalog.
+    let rows: Vec<(String, serde_json::Value, serde_json::Value)> = sqlx::query_as(
+        "SELECT i.index_id, t.key_schema, t.attribute_definitions \
+         FROM indexes i \
+         JOIN tables t ON i.table_id = t.table_id",
+    )
+    .fetch_all(catalog_pool)
+    .await
+    .map_err(|e| OpError::Internal(format!("Enumerate indexes: {e}")))?;
+
+    for (index_id, ks_json, ad_json) in rows {
+        let base_ks: Vec<KeySchemaElement> =
+            serde_json::from_value(ks_json).map_err(|e| OpError::Internal(e.to_string()))?;
+        let attr_defs: Vec<AttributeDefinition> =
+            serde_json::from_value(ad_json).map_err(|e| OpError::Internal(e.to_string()))?;
+
+        let base_sks = crate::data::all_sort_key_info(&base_ks, &attr_defs);
+        let idx_table = crate::data::index_table_name(&index_id);
+        let idx_name = format!("_ddb_{index_id}_base_key_idx");
+
+        let mut base_key_cols = vec!["base_pk".to_owned()];
+        for (i, &(_, sk_type)) in base_sks.iter().enumerate() {
+            let col = if i == 0 {
+                format!("base_{}", sk_column(sk_type))
+            } else {
+                format!("base_{}", sk_column_n(i, sk_type))
+            };
+            base_key_cols.push(col);
+        }
+
+        // CONCURRENTLY cannot run inside a transaction, so execute on the pool.
+        let sql = format!(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS \"{}\" ON {} ({})",
+            idx_name,
+            idx_table,
+            base_key_cols.join(", ")
+        );
+        sqlx::query(&sql)
+            .execute(data_pool)
+            .await
+            .map_err(|e| OpError::Internal(format!("Base key index on {idx_table}: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Check if a table exists in the public schema.
 pub(crate) async fn table_exists(pool: &PgPool, name: &str) -> OpResult<bool> {
     let exists: bool = sqlx::query_scalar(
@@ -149,6 +245,12 @@ pub(crate) async fn pending_data_migrations(pool: &PgPool) -> OpResult<Vec<Strin
             continue;
         }
         pending.push((*filename).to_owned());
+    }
+    // Code migrations are tracked in the same data-database ledger.
+    for name in DATA_CODE_MIGRATIONS {
+        if !is_migration_applied(pool, name).await? {
+            pending.push((*name).to_owned());
+        }
     }
     Ok(pending)
 }

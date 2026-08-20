@@ -222,8 +222,14 @@ impl SqliteEngine {
     }
 
     /// Create a GSI/LSI data table. GSI keys are not unique, so the primary key
-    /// is `(pk, sk*, base_pk, base_sk*)` to keep one row per base item, and an
-    /// ordering index covers `(pk, sk*, base_pk, base_sk*)`.
+    /// is `(pk, base_pk, base_sk*)`: the base-table key is what makes a row
+    /// unique, keeping one row per base item per index partition.
+    ///
+    /// Two secondary indexes are created:
+    /// - `idx_order_*` on `(pk, sk*, base_pk, base_sk*)`, for sort-key ordering
+    ///   within an index partition. Only when the index declares a sort key.
+    /// - `idx_base_key_*` on `(base_pk, base_sk*)`, for the reverse lookup that
+    ///   index propagation uses to delete an item's old index row. Always.
     pub(crate) async fn create_index_data_table(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         index_id: &str,
@@ -279,6 +285,31 @@ impl SqliteEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
         }
+
+        // Index on the base-table key columns, for `delete_index_row_multi`.
+        //
+        // GSI/LSI propagation deletes the old index row by base-table key:
+        // `DELETE FROM <idx> WHERE base_pk = ? AND base_sk* = ?`, with no `pk`
+        // predicate. Both the PRIMARY KEY and the ordering index above lead
+        // with `pk`, so neither can serve that filter and SQLite plans a full
+        // `SCAN` of the index table on every propagating write. Unconditional
+        // rather than gated on `idx_sks`, because the reverse lookup happens
+        // whether or not the index declares a sort key.
+        {
+            let mut base_key_cols = vec!["base_pk".to_owned()];
+            for (i, &(_, sk_type)) in base_sks.iter().enumerate() {
+                base_key_cols.push(format!("base_{}", sk_column_n(i, sk_type)));
+            }
+            let base_key_idx = format!(
+                "CREATE INDEX \"idx_base_key_{index_id}\" ON {idx_table} ({})",
+                base_key_cols.join(", ")
+            );
+            sqlx::query(&base_key_idx)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
+
         Ok(())
     }
 
@@ -533,5 +564,187 @@ impl SqliteEngine {
             key_schema,
             projection,
         })
+    }
+}
+
+#[cfg(test)]
+mod index_data_table_tests {
+    use crate::store::SqliteEngine;
+    use extenddb_core::types::{
+        AttributeDefinition, KeySchemaElement, KeyType, ScalarAttributeType,
+    };
+    use sqlx::sqlite::SqlitePool;
+
+    fn hash(name: &str) -> KeySchemaElement {
+        KeySchemaElement {
+            attribute_name: name.to_owned(),
+            key_type: KeyType::Hash,
+        }
+    }
+
+    fn range(name: &str) -> KeySchemaElement {
+        KeySchemaElement {
+            attribute_name: name.to_owned(),
+            key_type: KeyType::Range,
+        }
+    }
+
+    fn attr(name: &str, t: ScalarAttributeType) -> AttributeDefinition {
+        AttributeDefinition {
+            attribute_name: name.to_owned(),
+            attribute_type: t,
+        }
+    }
+
+    /// Create an index data table through the real DDL path.
+    async fn make_index_table(
+        index_key_schema: &[KeySchemaElement],
+        attr_defs: &[AttributeDefinition],
+        base_key_schema: &[KeySchemaElement],
+        base_attr_defs: &[AttributeDefinition],
+    ) -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        SqliteEngine::create_index_data_table(
+            &mut tx,
+            "probe",
+            index_key_schema,
+            attr_defs,
+            base_key_schema,
+            base_attr_defs,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        pool
+    }
+
+    /// The plan SQLite chooses for the reverse-lookup DELETE that index
+    /// propagation issues. `SEARCH` means an index is used, `SCAN` means a full
+    /// table scan.
+    async fn delete_plan(pool: &SqlitePool, where_clause: &str) -> String {
+        let rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(&format!(
+            "EXPLAIN QUERY PLAN DELETE FROM \"_ddb_probe\" WHERE {where_clause}"
+        ))
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        rows.into_iter()
+            .map(|r| r.3)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    #[tokio::test]
+    async fn reverse_lookup_delete_uses_an_index_composite_base_key() {
+        let pool = make_index_table(
+            &[hash("gsi_pk"), range("gsi_sk")],
+            &[
+                attr("gsi_pk", ScalarAttributeType::S),
+                attr("gsi_sk", ScalarAttributeType::S),
+            ],
+            &[hash("id"), range("ts")],
+            &[
+                attr("id", ScalarAttributeType::S),
+                attr("ts", ScalarAttributeType::S),
+            ],
+        )
+        .await;
+
+        let plan = delete_plan(&pool, "base_pk = 'x' AND base_sk_s = 'y'").await;
+
+        assert!(
+            plan.contains("SEARCH"),
+            "reverse-lookup DELETE must use an index, got plan: {plan}"
+        );
+        assert!(
+            plan.contains("idx_base_key_probe"),
+            "must use the base-key index specifically, got plan: {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN"),
+            "must not fall back to a table scan, got plan: {plan}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reverse_lookup_delete_uses_an_index_hash_only_base_key() {
+        let pool = make_index_table(
+            &[hash("gsi_pk"), range("gsi_sk")],
+            &[
+                attr("gsi_pk", ScalarAttributeType::S),
+                attr("gsi_sk", ScalarAttributeType::S),
+            ],
+            &[hash("id")],
+            &[attr("id", ScalarAttributeType::S)],
+        )
+        .await;
+
+        let plan = delete_plan(&pool, "base_pk = 'x'").await;
+
+        assert!(
+            plan.contains("SEARCH") && plan.contains("idx_base_key_probe"),
+            "hash-only base key must still index the reverse lookup, got plan: {plan}"
+        );
+        assert!(!plan.contains("SCAN"), "got plan: {plan}");
+    }
+
+    /// The ordering index is only created when the index declares a sort key, so
+    /// a sort-key-less index is the case where the base-key index is the *only*
+    /// secondary index. It must still be created, which is why that block is
+    /// unconditional.
+    #[tokio::test]
+    async fn reverse_lookup_delete_uses_an_index_when_index_has_no_sort_key() {
+        let pool = make_index_table(
+            &[hash("gsi_pk")],
+            &[attr("gsi_pk", ScalarAttributeType::S)],
+            &[hash("id"), range("ts")],
+            &[
+                attr("id", ScalarAttributeType::S),
+                attr("ts", ScalarAttributeType::S),
+            ],
+        )
+        .await;
+
+        let plan = delete_plan(&pool, "base_pk = 'x' AND base_sk_s = 'y'").await;
+
+        assert!(
+            plan.contains("SEARCH") && plan.contains("idx_base_key_probe"),
+            "an index with no sort key still needs the base-key index, got plan: {plan}"
+        );
+        assert!(!plan.contains("SCAN"), "got plan: {plan}");
+    }
+
+    /// Guards the column order. An index on `(base_sk_s, base_pk)` would also
+    /// satisfy the assertions above, but would not serve a `base_pk`-only
+    /// lookup, so pin that the index leads with `base_pk`.
+    #[tokio::test]
+    async fn base_key_index_leads_with_base_pk() {
+        let pool = make_index_table(
+            &[hash("gsi_pk"), range("gsi_sk")],
+            &[
+                attr("gsi_pk", ScalarAttributeType::S),
+                attr("gsi_sk", ScalarAttributeType::S),
+            ],
+            &[hash("id"), range("ts")],
+            &[
+                attr("id", ScalarAttributeType::S),
+                attr("ts", ScalarAttributeType::S),
+            ],
+        )
+        .await;
+
+        let cols: Vec<(i64, i64, Option<String>)> =
+            sqlx::query_as("PRAGMA index_info(\"idx_base_key_probe\")")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let names: Vec<String> = cols.into_iter().filter_map(|c| c.2).collect();
+
+        assert_eq!(
+            names,
+            vec!["base_pk".to_owned(), "base_sk_s".to_owned()],
+            "base-key index must lead with base_pk"
+        );
     }
 }

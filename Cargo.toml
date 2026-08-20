@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -101,3 +101,15 @@ config = "0.14"
 
 # Security
 zeroize = { version = "1.8", features = ["derive"] }
+
+# Size-optimised profile for the `extenddb-dev` container image only.
+#
+# Deliberately NOT applied to `[profile.release]`: the production Postgres and
+# MongoDB binaries keep their debug symbols so a panic backtrace from a customer
+# deployment stays readable, and they keep the faster default codegen settings.
+# Nothing builds with this profile unless it passes `--profile release-slim`.
+[profile.release-slim]
+inherits = "release"
+strip = true
+lto = true
+codegen-units = 1
