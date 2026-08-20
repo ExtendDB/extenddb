@@ -579,6 +579,15 @@ impl MongoEngine {
         self.drop_index_collections_for_table(&desc.table_id)
             .await?;
 
+        // Tags are keyed by the table ARN rather than table_id. Remove them
+        // before deleting the table metadata so a table recreated with the
+        // same name cannot inherit the previous table's tags.
+        self.catalog_db
+            .collection::<Document>("tags")
+            .delete_many(doc! { "resource_arn": &desc.table_arn })
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
         self.gsi_cache_invalidate(&desc.table_id);
 
         // Delete stream_shards, stream_records, and their sequence counters

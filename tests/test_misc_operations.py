@@ -35,6 +35,25 @@ def tagged_table(dynamodb_client):
 class TestTagResource:
     """TagResource operation tests."""
 
+    def test_tags_do_not_survive_table_recreation(
+        self, dynamodb_client, create_and_cleanup_table, unique_table_name
+    ):
+        """Deleting and recreating a table with the same name starts untagged."""
+        first = create_and_cleanup_table(unique_table_name)
+        first_arn = first["TableDescription"]["TableArn"]
+        dynamodb_client.tag_resource(
+            ResourceArn=first_arn,
+            Tags=[{"Key": "Lifecycle", "Value": "stale-must-not-survive"}],
+        )
+
+        dynamodb_client.delete_table(TableName=unique_table_name)
+        wait_for_deleted(dynamodb_client, unique_table_name)
+
+        second = create_and_cleanup_table(unique_table_name)
+        second_arn = second["TableDescription"]["TableArn"]
+        assert second_arn == first_arn
+        assert dynamodb_client.list_tags_of_resource(ResourceArn=second_arn)["Tags"] == []
+
     def test_tag_and_list(self, dynamodb_client, tagged_table):
         _table_name, table_arn = tagged_table
         dynamodb_client.tag_resource(
