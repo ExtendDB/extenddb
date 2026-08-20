@@ -514,6 +514,10 @@ mod tests {
     /// envelope as the size message. The earlier "32-bit floating point number
     /// list" wording came from a 2026-08-07 reading that the byte-exact wire
     /// capture contradicts.
+    ///
+    /// The `Actual: N` token below is extrapolated from that token table (the
+    /// captures hold `Actual: S` at attribute level and `BOOL` at element
+    /// level); the measured `S` case is pinned by the `probe_err` tests.
     #[test]
     fn rejects_non_list_vector() {
         let message = err(&item_with_vector(AttributeValue::N("0.1".to_owned())));

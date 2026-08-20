@@ -112,6 +112,12 @@ pub trait VectorIndexBuild: Send {
 /// actually proceed during the pause. Zero in production; a test sets it so a
 /// write is guaranteed to land mid-backfill.
 ///
+/// Exported deliberately, not by accident: it is the building block the two
+/// drivers compose, and a backend orchestrating its own build task may call it
+/// directly. A caller that does so owns the failure contract [`complete_build`]
+/// otherwise provides: on error, leave the index CREATING and let recovery
+/// rebuild it.
+///
 /// # Errors
 /// Propagates the first batch or heartbeat failure; rows already committed by
 /// earlier batches stay in place for the recovery rebuild to supersede.
@@ -222,6 +228,12 @@ pub async fn complete_build<B: VectorIndexBuild>(
 /// Deliberately does NOT notify: the backend's recovery paths own when held
 /// queue rows become claimable (startup reconciliation runs before the workers
 /// exist; runtime recovery notifies once after a whole sweep).
+///
+/// One deliberate exception to the status sequence in the module docs: a
+/// rebuild does not re-assert `Backfilling: true`, so an index whose build died
+/// before its own `set_backfilling` call is rebuilt while DescribeTable still
+/// reports `false`. This matches the pre-extraction behavior; the flip to
+/// `ACTIVE` clears the member either way.
 ///
 /// # Errors
 /// Unlike [`complete_build`], every failure propagates, including the terminal
