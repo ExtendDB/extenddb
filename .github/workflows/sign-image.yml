@@ -140,13 +140,17 @@ jobs:
         run: docker logout docker.io || true
 
       - name: Summarise
+        env:
+          # Free text; reaches the shell only through the environment, per
+          # the repo convention (inputs.image above is allowlist-validated).
+          REASON: ${{ inputs.reason }}
         run: |
           {
             echo "### ${{ inputs.image }} signed (break-glass path)"
             echo ""
             echo "| field | value |"
             echo "|---|---|"
-            echo "| reason | ${{ inputs.reason }} |"
+            echo "| reason | ${REASON} |"
             echo "| image | \`${IMAGE_REPO}@${DIGEST}\` |"
             echo "| signature | \`${IMAGE_REPO}:${{ steps.sign.outputs.sig-tag }}\` |"
             echo "| signature digest | \`${{ steps.sign.outputs.sig-digest }}\` |"
