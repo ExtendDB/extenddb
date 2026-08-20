@@ -4,7 +4,10 @@
 # BREAK-GLASS standalone signer. Routine releases sign inside the
 # release-image pipeline's publish stage (same composite action, same
 # approval); dispatch this only for exceptional cases: re-signing after key
-# rotation, signing a digest the pipeline did not produce, or recovery.
+# rotation, signing a digest the pipeline did not produce, or finishing a
+# release whose publish-stage signing failed after the push. Every dispatch
+# records a required reason, echoed to the summary and annotated into the
+# signature payload.
 #
 # Signing logic lives in .github/actions/sign-image (single source of truth
 # shared with the pipeline). This wrapper supplies what the action requires:
@@ -27,21 +30,31 @@ on:
         description: 'Which image the digest belongs to'
         type: choice
         options:
+          # extenddb-dev joins once the key question is decided (#290 review:
+          # the production key signing a dev image makes a plain-HTTP dev
+          # build verify exactly like a release; separate key, or annotation-
+          # enforced verify, to be decided with #281 before the dev image
+          # ships) and its Docker Hub repository exists.
           - extenddb-postgres
-          - extenddb-dev
         default: extenddb-postgres
+      reason:
+        description: 'Why the break-glass path is being used (recorded in the summary and signed into the annotations)'
+        required: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: sign-image-extenddb-postgres
+  group: sign-image-${{ inputs.image }}
   cancel-in-progress: false
 
 env:
-  # inputs.image is constrained by the choice list above — a closed allowlist,
-  # not free text — so this concatenation cannot be steered anywhere else.
+  # inputs.image is a choice list, and the first gate below re-validates it
+  # locally (API-side enforcement of choice lists is undocumented; the case
+  # statement makes the security property local and costs nothing).
   IMAGE_REPO: docker.io/extenddb/${{ inputs.image }}
+  # This key vouches for every image in the choice list; adding an image
+  # here is a trust decision about what the key signs, not just plumbing.
   KEY_ARN: arn:aws:kms:us-east-1:975306274793:key/654ab7f4-4a11-45e1-a313-3a6989f3721c
 
 jobs:
@@ -57,14 +70,24 @@ jobs:
         env:
           RAW_DIGEST: ${{ inputs.expected_digest }}
           RAW_RELEASE: ${{ inputs.release_tag }}
+          RAW_IMAGE: ${{ inputs.image }}
+          RAW_REASON: ${{ inputs.reason }}
         run: |
           set -euo pipefail
+          case "$RAW_IMAGE" in
+            extenddb-postgres) ;;
+            *) echo "::error::image '$RAW_IMAGE' is not in the allowlist"; exit 1 ;;
+          esac
           if [[ ! "$RAW_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "::error::expected_digest is not a sha256:<64 hex> digest"
             exit 1
           fi
           if [[ ! "$RAW_RELEASE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::release_tag is not a vMAJOR.MINOR.PATCH release tag"
+            exit 1
+          fi
+          if [[ -z "${RAW_REASON// /}" ]]; then
+            echo "::error::a non-empty reason is required for the break-glass path"
             exit 1
           fi
           {
@@ -79,7 +102,7 @@ jobs:
           grep -q '"architecture": *"amd64"' <<< "$RAW" || { echo "::error::amd64 missing from index"; exit 1; }
           grep -q '"architecture": *"arm64"' <<< "$RAW" || { echo "::error::arm64 missing from index"; exit 1; }
 
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # releases-v4 backport head, same pin as release-image.yml
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Assume the signing role via OIDC (no stored AWS secrets)
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
@@ -96,6 +119,8 @@ jobs:
           set -euo pipefail
           docker login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin <<< "$DOCKERHUB_TOKEN"
 
+      # The break-glass reason is signed into the payload, not just logged:
+      # the composite action's annotations are part of what the key attests.
       - name: Sign via the shared composite action
         id: sign
         uses: ./.github/actions/sign-image
@@ -104,6 +129,7 @@ jobs:
           digest: ${{ env.DIGEST }}
           release-tag: ${{ env.RELEASE }}
           key-arn: ${{ env.KEY_ARN }}
+          extra-annotation: org.extenddb.break-glass-reason=${{ inputs.reason }}
 
       - name: Log out
         if: always()
@@ -112,10 +138,11 @@ jobs:
       - name: Summarise
         run: |
           {
-            echo "### Docker Hub image signed (break-glass path)"
+            echo "### ${{ inputs.image }} signed (break-glass path)"
             echo ""
             echo "| field | value |"
             echo "|---|---|"
+            echo "| reason | ${{ inputs.reason }} |"
             echo "| image | \`${IMAGE_REPO}@${DIGEST}\` |"
             echo "| signature | \`${IMAGE_REPO}:${{ steps.sign.outputs.sig-tag }}\` |"
             echo "| signature digest | \`${{ steps.sign.outputs.sig-digest }}\` |"

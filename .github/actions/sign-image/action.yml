@@ -37,6 +37,9 @@ inputs:
   cosign-sha256:
     description: 'SHA-256 of the pinned cosign-linux-amd64 binary'
     default: 4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71
+  extra-annotation:
+    description: 'Optional additional key=value annotation to sign into the payload'
+    default: ''
 
 outputs:
   sig-tag:
@@ -72,14 +75,22 @@ runs:
         DIGEST: ${{ inputs.digest }}
         RELEASE: ${{ inputs.release-tag }}
         KEY_ARN: ${{ inputs.key-arn }}
+        EXTRA_ANNOTATION: ${{ inputs.extra-annotation }}
       run: |
         set -euo pipefail
+        EXTRA_ARGS=()
+        if [[ -n "$EXTRA_ANNOTATION" ]]; then
+          [[ "$EXTRA_ANNOTATION" =~ ^[a-zA-Z0-9._-]+=.+$ ]] \
+            || { echo "::error::extra-annotation must be key=value"; exit 1; }
+          EXTRA_ARGS+=(-a "$EXTRA_ANNOTATION")
+        fi
         cosign sign --yes \
           --key "awskms:///${KEY_ARN}" \
           --use-signing-config=false \
           --new-bundle-format=false \
           --tlog-upload=true \
           -a org.extenddb.release="${RELEASE}" \
+          "${EXTRA_ARGS[@]}" \
           "${IMAGE_REPO}@${DIGEST}"
 
     - name: Gate - the .sig TAG must exist (catches the storage-mode trap)
