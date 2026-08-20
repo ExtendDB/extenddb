@@ -17,7 +17,7 @@ Data is durable across restarts by default, or entirely in memory when you want 
 Run:
 
 ```bash
-docker run -d -p 127.0.0.1:18443:18443 -v extenddb:/var/lib/extenddb extenddb/extenddb-dev
+docker run -d -p 127.0.0.1:18080:18080 -v extenddb:/var/lib/extenddb extenddb/extenddb-dev
 ```
 
 Then use it like DynamoDB. The server seeds AWS's documented example credential and prints it at startup:
@@ -25,7 +25,7 @@ Then use it like DynamoDB. The server seeds AWS's documented example credential 
 ```bash
 AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE \
 AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY \
-aws dynamodb list-tables --region us-east-1 --endpoint-url http://127.0.0.1:18443
+aws dynamodb list-tables --region us-east-1 --endpoint-url http://127.0.0.1:18080
 ```
 
 For an in-memory database that vanishes with the container, drop the volume and add `-e EXTENDDB__STORAGE__SQLITE__PATH=:memory:`.
