@@ -1,0 +1,230 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Publish a Docker Hub repository Overview from a file in this repository.
+#
+# Neither `docker push` nor the `skopeo copy` that promote-image uses touches
+# repository metadata: the Overview lives on the Docker Hub repository object,
+# not on any image. GHCR derives its description from the OCI labels the
+# Dockerfiles already set, so the same image reads as documented there and blank
+# on Docker Hub. That is why this exists as its own step rather than falling out
+# of a push.
+#
+# Sourced from `docker/dockerhub-overview*.md` so the published Overview is
+# reviewed like any other content and cannot drift from the repository.
+#
+# Two jobs: `validate` is credential-free and ungated, so a dead link, an
+# oversize file, or a missing Docker Hub repository is discovered on dispatch
+# without spending a reviewer approval. `publish` needs validate and carries
+# the `dockerhub` environment gate, because it uses the same credential that
+# can push images. Deliberately NOT wired into promote-image: the Overview is
+# version-neutral, so a wording fix should not require a release, and a
+# release should not silently rewrite it.
+#
+# One image per dispatch rather than a matrix over both, because a Docker Hub
+# repository that does not exist yet must fail loudly for that image alone
+# instead of failing a run that also had work to do for the other.
+
+name: Docker Hub description
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'Which Docker Hub repository to publish the Overview for'
+        required: true
+        type: choice
+        options:
+          - extenddb-postgres
+          - extenddb-dev
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dockerhub-description-${{ inputs.image }}
+  cancel-in-progress: false
+
+env:
+  HUB_NAMESPACE: extenddb
+
+jobs:
+  # Credential-free, no environment gate: everything that can be proven
+  # without a secret is proven before a reviewer is asked to approve.
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      file: ${{ steps.src.outputs.file }}
+      short: ${{ steps.src.outputs.short }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Resolve the Overview source for this image
+        id: src
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          set -euo pipefail
+          # Docker Hub caps the short description at 100 characters; asserted below.
+          case "$IMAGE" in
+            extenddb-postgres)
+              FILE='docker/dockerhub-overview.md'
+              SHORT='DynamoDB-compatible API adapter backed by your own PostgreSQL 14+ database'
+              ;;
+            extenddb-dev)
+              FILE='docker/dockerhub-overview-dev.md'
+              SHORT='DynamoDB-compatible API over SQLite for local dev and CI. Plain HTTP, not for production.'
+              ;;
+            *)
+              echo "::error::unknown image '$IMAGE'"
+              exit 1
+              ;;
+          esac
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          echo "::notice::publishing $FILE to ${IMAGE}"
+
+      - name: The Overview file must exist and be within Docker Hub's limits
+        env:
+          FILE: ${{ steps.src.outputs.file }}
+          SHORT: ${{ steps.src.outputs.short }}
+        run: |
+          set -euo pipefail
+          if [[ ! -s "$FILE" ]]; then
+            echo "::error::$FILE is missing or empty"
+            exit 1
+          fi
+          BYTES=$(wc -c < "$FILE")
+          # Docker Hub caps full_description at 25000 characters.
+          if (( BYTES > 25000 )); then
+            echo "::error::$FILE is ${BYTES} bytes; Docker Hub caps the Overview at 25000"
+            exit 1
+          fi
+          if (( ${#SHORT} > 100 )); then
+            echo "::error::short description is ${#SHORT} characters; Docker Hub caps it at 100"
+            exit 1
+          fi
+          echo "::notice::Overview is ${BYTES} bytes, short description ${#SHORT} characters"
+
+      - name: Every link in the Overview must resolve
+        env:
+          FILE: ${{ steps.src.outputs.file }}
+        run: |
+          set -euo pipefail
+          # This page is a public front door, so a dead link is worse than a
+          # blank page. Loopback URLs are examples inside code blocks, not links.
+          # --retry so a transient blip does not fail the run.
+          FAILED=0
+          while read -r url; do
+            [[ -z "$url" ]] && continue
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' -L --max-time 20 \
+                     --retry 2 --retry-delay 3 "$url" || echo 000)
+            if [[ "$CODE" != "200" ]]; then
+              echo "::error::${CODE} ${url}"
+              FAILED=1
+            else
+              echo "  200 ${url}"
+            fi
+          done < <(grep -oE 'https://[^)"[:space:]]+' "$FILE" \
+                     | sed 's/[),.]*$//' \
+                     | grep -v '127\.0\.0\.1' \
+                     | sort -u)
+          if (( FAILED )); then
+            echo "::error::${FILE} contains links that do not resolve"
+            exit 1
+          fi
+
+      - name: The Docker Hub repository must already exist
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          set -euo pipefail
+          # A 404 here means the repository has not been created yet. Say so
+          # plainly rather than letting the PATCH fail with an opaque error.
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' --retry 2 --retry-delay 3 \
+            "https://hub.docker.com/v2/repositories/${HUB_NAMESPACE}/${IMAGE}/")
+          if [[ "$CODE" == "404" ]]; then
+            echo "::error::docker.io/${HUB_NAMESPACE}/${IMAGE} does not exist. Create the repository on Docker Hub first."
+            exit 1
+          fi
+          if [[ "$CODE" != "200" ]]; then
+            echo "::error::unexpected HTTP ${CODE} querying docker.io/${HUB_NAMESPACE}/${IMAGE}"
+            exit 1
+          fi
+
+  # The only job with the credential, behind the dockerhub environment gate.
+  # By the time a reviewer approves, the content has already passed validation.
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: dockerhub
+    env:
+      FILE: ${{ needs.validate.outputs.file }}
+      SHORT: ${{ needs.validate.outputs.short }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Publish the Overview
+        env:
+          IMAGE: ${{ inputs.image }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Hub API v2 wants a session token, then a PATCH on the repository.
+          TOKEN=$(jq -n --arg u "$DOCKERHUB_USERNAME" --arg p "$DOCKERHUB_TOKEN" \
+              '{username:$u, password:$p}' \
+            | curl -sS --fail-with-body -X POST \
+                -H 'Content-Type: application/json' \
+                --data @- \
+                https://hub.docker.com/v2/users/login/ \
+            | jq -r '.token')
+          if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
+            echo "::error::could not obtain a Docker Hub session token"
+            exit 1
+          fi
+
+          jq -n --rawfile full "$FILE" --arg short "$SHORT" \
+              '{full_description:$full, description:$short}' \
+            | curl -sS --fail-with-body -X PATCH \
+                -H "Authorization: JWT ${TOKEN}" \
+                -H 'Content-Type: application/json' \
+                --data @- \
+                "https://hub.docker.com/v2/repositories/${HUB_NAMESPACE}/${IMAGE}/" \
+            > /dev/null
+
+      - name: Verify it took effect
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          set -euo pipefail
+          # Read back anonymously: proves the Overview is what an unauthenticated
+          # visitor now sees, rather than trusting the write's own response.
+          GOT=$(curl -sS --fail-with-body \
+            "https://hub.docker.com/v2/repositories/${HUB_NAMESPACE}/${IMAGE}/")
+          GOT_FULL=$(jq -r '.full_description // ""' <<< "$GOT")
+          GOT_SHORT=$(jq -r '.description // ""' <<< "$GOT")
+
+          if [[ -z "$GOT_FULL" ]]; then
+            echo "::error::Overview is still empty after the PATCH"
+            exit 1
+          fi
+          # Both sides are command substitutions, so both have trailing
+          # newlines stripped: apples-to-apples. Comparing a stripped
+          # substitution against raw `cat` output false-fails on the
+          # trailing newline every .md file ends with.
+          if [[ "$GOT_FULL" != "$(cat "$FILE")" ]]; then
+            echo "::error::published Overview does not match ${FILE}"
+            diff <(printf '%s\n' "$GOT_FULL") "$FILE" | head -20 || true
+            exit 1
+          fi
+          if [[ "$GOT_SHORT" != "$SHORT" ]]; then
+            echo "::error::short description is '${GOT_SHORT}', expected '${SHORT}'"
+            exit 1
+          fi
+          echo "::notice::Overview for ${IMAGE} published and verified anonymously"
