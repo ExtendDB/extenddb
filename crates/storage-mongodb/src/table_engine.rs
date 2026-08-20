@@ -572,12 +572,12 @@ impl MongoEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // Delete index entries
-        self.catalog_db
-            .collection::<Document>("indexes")
-            .delete_many(doc! { "_id.table_id": &desc.table_id })
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        // Drop each physical GSI/LSI collection before deleting its catalog
+        // metadata. The index documents are stored separately from the table
+        // document, so dropping the base collection alone does not remove
+        // `_ddb_<index_id>` collections.
+        self.drop_index_collections_for_table(&desc.table_id)
+            .await?;
 
         self.gsi_cache_invalidate(&desc.table_id);
 
@@ -916,14 +916,25 @@ impl MongoEngine {
                     let desc = self
                         .describe_table_impl(account_id, &input.table_name)
                         .await?;
-                    let result = self.catalog_db.collection::<Document>("indexes")
-                        .delete_one(doc! { "_id": { "table_id": &desc.table_id, "index_name": &delete.index_name } })
+                    let indexes_coll = self.catalog_db.collection::<Document>("indexes");
+                    let index_filter = doc! { "_id": { "table_id": &desc.table_id, "index_name": &delete.index_name } };
+                    let index_doc = indexes_coll
+                        .find_one(index_filter.clone())
                         .await
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-                    if result.deleted_count == 0 {
-                        return Err(StorageError::IndexNotFound(delete.index_name.clone()));
-                    }
+                    let index_id = index_doc
+                        .as_ref()
+                        .and_then(|doc| doc.get_str("index_id").ok())
+                        .map(str::to_owned)
+                        .ok_or_else(|| StorageError::IndexNotFound(delete.index_name.clone()))?;
+
+                    self.drop_index_collection(&index_id).await?;
+
+                    indexes_coll
+                        .delete_one(index_filter)
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))?;
 
                     // Invalidate cache — may still have other GSIs
                     self.gsi_cache_invalidate(&desc.table_id);
@@ -1510,6 +1521,61 @@ impl MongoEngine {
         coll.create_index(IndexModel::builder().keys(keys).options(opts).build())
             .await
             .map_err(|e| StorageError::Internal(format!("index-coll index: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Drop the physical collection backing one secondary index.
+    async fn drop_index_collection(&self, index_id: &str) -> Result<(), StorageError> {
+        let coll_name = data_collection_name(index_id);
+        let collections = self
+            .data_db
+            .list_collection_names()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        if collections.iter().any(|name| name == &coll_name) {
+            self.data_db
+                .collection::<Document>(&coll_name)
+                .drop()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
+
+        Ok(())
+    }
+
+    /// Drop all physical secondary-index collections for a table before its
+    /// catalog index documents are removed.
+    async fn drop_index_collections_for_table(&self, table_id: &str) -> Result<(), StorageError> {
+        use futures::TryStreamExt;
+
+        let indexes_coll = self.catalog_db.collection::<Document>("indexes");
+        let mut cursor = indexes_coll
+            .find(doc! { "_id.table_id": table_id })
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        let mut index_ids = Vec::new();
+        while let Some(index_doc) = cursor
+            .try_next()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?
+        {
+            let index_id = index_doc.get_str("index_id").map_err(|_| {
+                StorageError::Internal("index document missing index_id".to_owned())
+            })?;
+            index_ids.push(index_id.to_owned());
+        }
+
+        for index_id in index_ids {
+            self.drop_index_collection(&index_id).await?;
+        }
+
+        indexes_coll
+            .delete_many(doc! { "_id.table_id": table_id })
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         Ok(())
     }
