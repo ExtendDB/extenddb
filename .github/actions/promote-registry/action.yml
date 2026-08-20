@@ -115,10 +115,13 @@ runs:
           [[ "$DST_SIG" == "$SRC_SIG" ]] || { echo "::error::signature copy digest mismatch (${DST_SIG} != ${SRC_SIG})"; exit 1; }
         fi
         # The signature must actually VERIFY, not merely exist: an empty or
-        # wrong-key manifest at the .sig tag name must not pass. ignore-tlog
-        # because pre-Rekor releases (<= 0.1.6) have no transparency entries;
-        # key verification is unaffected. Tighten when all live releases do.
-        cosign verify --key "$PUBKEY" --insecure-ignore-tlog=true "${SRC}@${DIGEST}" >/dev/null
+        # wrong-key manifest at the .sig tag name must not pass. Verified
+        # against the DESTINATION, so all three paths are covered — a sig
+        # copied just now, a sig from an earlier run, and whatever else may
+        # be sitting at the tag name on DST. ignore-tlog because pre-Rekor
+        # releases (<= 0.1.6) have no transparency entries; key verification
+        # is unaffected. Tighten when all live releases do.
+        cosign verify --key "$PUBKEY" --insecure-ignore-tlog=true "${DST}@${DIGEST}" >/dev/null
 
         # --- 2. version tag: immutable, idempotent on the identical digest ---
         set +e; EXISTING=$(probe "${DST}:${VERSION}"); rc=$?; set -e
