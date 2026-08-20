@@ -35,13 +35,16 @@
 # highest released one, and `move_latest` is the explicit escape hatch for a
 # hotfix that must not become `latest`.
 
-# Fan-out: after the Docker Hub gates pass, this run promotes all three
-# registries through the promote-registry composite action — one shared
-# implementation of the no-overwrite rule, the refuse-unsigned rule, and the
-# forward-only latest rule (judged against EACH destination's own tag list,
-# so no leg can move latest backwards even if registries have diverged).
-# The image is an allowlisted choice input, so extenddb-dev promotes through
-# the same file rather than a fork of it.
+# Two-wave promotion, one dispatch:
+#   wave 1 (approval 1, dockerhub environment): gates, then Docker Hub — the
+#     canonical registry — promotes and verifies alone, as the canary.
+#   wave 2 (approval 2, ghcr environment): GHCR and ECR promote together,
+#     only after the canary verified. GHCR writes are thereby gated by the
+#     ghcr environment's own reviewers (not bypassed via dockerhub's), and
+#     the ECR role's OIDC trust includes this environment.
+# All legs run the promote-registry composite action — one implementation of
+# signature-first, no-overwrite, and forward-only latest (judged against
+# each destination's own tags). The image is an allowlisted choice input.
 
 name: promote-image
 
@@ -92,10 +95,12 @@ jobs:
     # Required reviewers + prevent-self-review + main-only branch rule: the
     # dispatcher cannot approve their own promotion.
     environment: dockerhub
+    outputs:
+      version: ${{ steps.results.outputs.version }}
+      digest: ${{ steps.results.outputs.digest }}
+      move_latest: ${{ steps.results.outputs.move_latest }}
     permissions:
       contents: read
-      packages: write   # GHCR promotion leg
-      id-token: write   # ECR promotion leg (OIDC role)
     steps:
       - name: Check out main (ancestry and version gates need history)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -178,7 +183,6 @@ jobs:
           set -euo pipefail
           if EXISTING=$(skopeo inspect --format '{{.Digest}}' "docker://${IMAGE_REPO}:${VERSION}" 2>/dev/null); then
             if [[ "$EXISTING" == "$DIGEST" ]]; then
-              echo "ALREADY_PROMOTED=true" >> "$GITHUB_ENV"
               echo "::notice::${IMAGE_REPO}:${VERSION} already exists with the exact verified digest; will only ensure latest"
             else
               echo "::error::${IMAGE_REPO}:${VERSION} already exists with different digest ${EXISTING}; released versions are immutable through this workflow"
@@ -202,8 +206,8 @@ jobs:
 
           # Compare only against released X.Y.Z tags. Candidate (sha-*) tags,
           # `latest` and anything else are not version lines. The promoted
-          # version is excluded so a re-run that only ensures `latest` (the
-          # ALREADY_PROMOTED path) is not blocked by its own tag.
+          # version is excluded so an idempotent re-run is not blocked by
+          # its own tag (the composite action no-ops on identical digests).
           #
           # `|| true` on the pipeline because grep exits 1 when it matches
           # nothing, which under `set -o pipefail` would kill the step on a
@@ -250,17 +254,50 @@ jobs:
           digest: ${{ env.DIGEST }}
           move-latest: ${{ env.MOVE_LATEST }}
 
+      - name: Export wave-1 results for the mirror wave
+        id: results
+        run: |
+          set -euo pipefail
+          {
+            echo "version=${VERSION}"
+            echo "digest=${DIGEST}"
+            echo "move_latest=${MOVE_LATEST}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log out
+        if: always()
+        run: skopeo logout docker.io || true
+
+  # Wave 2: mirrors promote together, only after the canonical registry
+  # verified. Runs under the ghcr environment so GHCR writes are approved by
+  # that environment's own reviewers; the ECR role's OIDC trust includes
+  # this environment (equally protected: same reviewers, main-only).
+  promote-mirrors:
+    needs: promote
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ghcr
+    permissions:
+      contents: read
+      packages: write   # GHCR leg
+      id-token: write   # ECR leg (OIDC role)
+    env:
+      VERSION: ${{ needs.promote.outputs.version }}
+      DIGEST: ${{ needs.promote.outputs.digest }}
+      MOVE_LATEST: ${{ needs.promote.outputs.move_latest }}
+    steps:
+      - name: Check out (composite action lives in-repo)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # releases-v4 pin
       - name: Log in to GHCR
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         # Constant username: GHCR ignores it when the password is a GitHub
-        # token, and it keeps the operator identity (github.actor) out of the
-        # run block entirely.
+        # token, and it keeps the operator identity out of the run block.
         run: |
           set -euo pipefail
           skopeo login ghcr.io -u x-access-token --password-stdin <<< "$GHCR_TOKEN"
 
-      - name: Promote GHCR (same shared rules, destination-judged latest)
+      - name: Promote GHCR (shared per-registry rules)
         uses: ./.github/actions/promote-registry
         with:
           src-repo: ${{ env.IMAGE_REPO }}
@@ -282,7 +319,7 @@ jobs:
           aws ecr-public get-login-password --region us-east-1 \
             | skopeo login public.ecr.aws -u AWS --password-stdin
 
-      - name: Promote ECR Public (same shared rules, destination-judged latest)
+      - name: Promote ECR Public (shared per-registry rules)
         uses: ./.github/actions/promote-registry
         with:
           src-repo: ${{ env.IMAGE_REPO }}
@@ -291,10 +328,9 @@ jobs:
           digest: ${{ env.DIGEST }}
           move-latest: ${{ env.MOVE_LATEST }}
 
-      - name: Log out of every registry
+      - name: Log out of the mirror registries
         if: always()
         run: |
-          skopeo logout docker.io || true
           skopeo logout ghcr.io || true
           skopeo logout public.ecr.aws || true
 

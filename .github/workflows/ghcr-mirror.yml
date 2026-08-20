@@ -19,17 +19,13 @@
 # this job: the operator supplies the digest they verified, and this job
 # refuses to mirror anything else, even if the Docker Hub tag has moved since.
 #
-# Three artifact kinds are supported, distinguished by tag shape:
+# Two artifact kinds are supported, distinguished by tag shape:
 #   sha-<40 hex>              an image candidate (multi-arch index)
 #   sha256-<64 hex>.sig       the Cosign signature artifact for an image digest
-#   X.Y.Z or latest           a release tag already promoted on Docker Hub
 #
-# `latest` is the one tag allowed to move, under a guard derived from
-# registry state: it may only move to the digest that the HIGHEST existing
-# X.Y.Z tag on GHCR already serves. Promote the version tag first, then
-# dispatch `latest`. Moving latest backwards, or to a digest no version tag
-# serves, fails closed. (First hit live on the 0.1.6 release, as predicted
-# by the previous revision of this header.)
+# Release tags (X.Y.Z, latest) are promote-image's job — this workflow
+# carried them for the v0.1.5/v0.1.6 manual era and was narrowed back when
+# the promote fan-out landed, so GHCR latest has exactly one writer.
 # A signature may only be mirrored after the image it signs is already in
 # GHCR, so a dangling signature cannot exist through this path.
 #
@@ -43,7 +39,7 @@ on:
   workflow_dispatch:
     inputs:
       candidate_tag:
-        description: 'Verified Docker Hub tag: image candidate (sha-<full 40-char commit>), Cosign signature artifact (sha256-<64 hex>.sig), or promoted release tag (X.Y.Z / latest)'
+        description: 'Verified Docker Hub tag: image candidate (sha-<full 40-char commit>) or Cosign signature artifact (sha256-<64 hex>.sig)'
         required: true
       expected_digest:
         description: 'The verified manifest digest of that tag, e.g. sha256:<64 hex>'
@@ -85,17 +81,13 @@ jobs:
           SUBJECT_DIGEST=''
           if [[ "$RAW_TAG" =~ ^sha-[0-9a-f]{40}$ ]]; then
             KIND=image
-          elif [[ "$RAW_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || "$RAW_TAG" == latest ]]; then
-            # A release tag is an image index like a candidate; every image
-            # gate (digest pin, no-overwrite, platform assertions) applies.
-            KIND=image
           elif [[ "$RAW_TAG" =~ ^sha256-[0-9a-f]{64}\.sig$ ]]; then
             KIND=signature
             # sha256-<hex>.sig  ->  sha256:<hex>  (the image digest it signs)
             SUBJECT_DIGEST="${RAW_TAG%.sig}"
             SUBJECT_DIGEST="${SUBJECT_DIGEST/-/:}"
           else
-            echo "::error::candidate_tag '$RAW_TAG' is not an image candidate (sha-<40 hex>), a signature artifact (sha256-<64 hex>.sig), or a release tag (X.Y.Z / latest)"
+            echo "::error::candidate_tag '$RAW_TAG' is neither an image candidate (sha-<40 hex>) nor a signature artifact (sha256-<64 hex>.sig); release tags go through promote-image"
             exit 1
           fi
           if [[ ! "$RAW_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -149,27 +141,6 @@ jobs:
             if [[ "$DST_DIGEST" == "$DIGEST" ]]; then
               echo "already-mirrored=true" >> "$GITHUB_ENV"
               echo "::notice::${DST_REPO}:${TAG} already exists with the exact verified digest; nothing to do"
-            elif [[ "$TAG" == "latest" ]]; then
-              # latest may move, but only forward: the target digest must be
-              # the one served by the HIGHEST version tag already on GHCR.
-              # (The version tag is mirrored before latest, so ordering is
-              # enforced structurally; promote-image applied the same rule
-              # on Docker Hub before anything reached this job.)
-              HIGHEST=$(skopeo list-tags "docker://${DST_REPO}" \
-                | jq -r '.Tags[]' \
-                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
-                | sort -V \
-                | tail -1 || true)
-              if [[ -z "$HIGHEST" ]]; then
-                echo "::error::no version tags exist on ${DST_REPO}; latest has nothing to follow"
-                exit 1
-              fi
-              HIGHEST_DIGEST=$(skopeo inspect --format '{{.Digest}}' "docker://${DST_REPO}:${HIGHEST}")
-              if [[ "$HIGHEST_DIGEST" != "$DIGEST" ]]; then
-                echo "::error::latest may only move to the digest of the highest version tag (${HIGHEST} -> ${HIGHEST_DIGEST}); mirror the version tag first"
-                exit 1
-              fi
-              echo "::notice::moving latest forward to the digest of ${HIGHEST}"
             else
               echo "::error::${DST_REPO}:${TAG} already exists with different digest ${DST_DIGEST}; refusing to overwrite"
               exit 1
