@@ -22,7 +22,7 @@ To learn how to configure and operate it, see [getting started](https://github.c
 
 Pin `X.Y.Z` or a digest for production; a version tag is never overwritten. `latest` tracks the highest release and only moves forward. Tags of the form `sha-<commit>` are unpromoted build candidates, not releases. Both `linux/amd64` and `linux/arm64` ship as one multi-architecture index.
 
-Every published image is signed with ExtendDB's release key, an ECDSA P-256 key held in AWS KMS. Each [release](https://github.com/ExtendDB/extenddb/releases) attaches the public key and gives the exact `cosign verify` command for that release. The same images are mirrored by digest to `ghcr.io/extenddb/extenddb-postgres`.
+Every published image is signed with ExtendDB's release key, an ECDSA P-256 key held in AWS KMS. The public key is committed in the repository as [`extenddb-signing.pub.pem`](https://github.com/ExtendDB/extenddb/blob/main/extenddb-signing.pub.pem), for use with `cosign verify --key`. The same images and their signatures are mirrored by digest to `ghcr.io/extenddb/extenddb-postgres` and `public.ecr.aws/extenddb/extenddb-postgres`.
 
 ## Note
 
