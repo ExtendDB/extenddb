@@ -34,11 +34,9 @@ on:
           # image tier; verifiers distinguish images by the signed
           # annotations (org.extenddb.release + image repo), and the key
           # itself is slated to be phased out for keyless workflow-identity
-          # signing, which distinguishes tiers automatically. extenddb-dev
-          # joins this list once its Docker Hub repository exists and #281's
-          # release path is live (a dev dispatch today would burn an
-          # approval and die on a 404).
+          # signing, which distinguishes tiers automatically.
           - extenddb-postgres
+          - extenddb-dev
         default: extenddb-postgres
       reason:
         description: 'Why the break-glass path is being used (recorded in the summary and signed into the annotations)'
@@ -81,7 +79,7 @@ jobs:
         run: |
           set -euo pipefail
           case "$RAW_IMAGE" in
-            extenddb-postgres) ;;
+            extenddb-postgres|extenddb-dev) ;;
             *) echo "::error::image '$RAW_IMAGE' is not in the allowlist"; exit 1 ;;
           esac
           if [[ ! "$RAW_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
