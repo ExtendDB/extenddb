@@ -98,6 +98,24 @@ runs:
           fi
         }
 
+        # settle(): post-WRITE assertion with a bounded settle window. ECR
+        # Public exhibits read-after-write lag (observed live: a copy's own
+        # log confirms the write, the immediate read 404s, and the tag is
+        # visible seconds later — this failed the v0.1.8 dev propagation).
+        # Retrying is ONLY correct after our own write; state DECISIONS
+        # (exists/absent/verify) stay strict single probes.
+        settle() {
+          local ref="$1" want="$2" got rc
+          for _ in 1 2 3 4 5 6; do
+            set +e; got=$(probe "$ref"); rc=$?; set -e
+            [[ $rc == 0 && "$got" == "$want" ]] && return 0
+            [[ $rc == 0 && "$got" != "$want" ]] && { echo "::error::${ref} resolves to ${got}, expected ${want}" >&2; return 1; }
+            sleep 5
+          done
+          echo "::error::${ref} not visible with expected digest after settle window" >&2
+          return 1
+        }
+
         # --- 1. signature first: verified before ANY tag is placed ---
         set +e; DST_SIG=$(probe "${DST}:${SIG_TAG}"); rc=$?; set -e
         [[ $rc == 0 || $rc == 9 ]] || exit 1
@@ -111,8 +129,7 @@ runs:
           skopeo copy --preserve-digests \
             "docker://${SRC}:${SIG_TAG}" \
             "docker://${DST}:${SIG_TAG}"
-          DST_SIG=$(probe "${DST}:${SIG_TAG}") || { echo "::error::signature missing after copy"; exit 1; }
-          [[ "$DST_SIG" == "$SRC_SIG" ]] || { echo "::error::signature copy digest mismatch (${DST_SIG} != ${SRC_SIG})"; exit 1; }
+          settle "${DST}:${SIG_TAG}" "$SRC_SIG" || { echo "::error::signature missing or mismatched after copy"; exit 1; }
         fi
         # The signature must actually VERIFY, not merely exist: an empty or
         # wrong-key manifest at the .sig tag name must not pass. Verified
@@ -165,7 +182,6 @@ runs:
         TAGS=("${VERSION}")
         [[ "$MOVE_LATEST" == "true" ]] && TAGS+=(latest)
         for t in "${TAGS[@]}"; do
-          GOT=$(probe "${DST}:${t}") || { echo "::error::${DST}:${t} missing after promotion"; exit 1; }
-          [[ "$GOT" == "$DIGEST" ]] || { echo "::error::${DST}:${t} resolves to ${GOT}, expected ${DIGEST}"; exit 1; }
+          settle "${DST}:${t}" "$DIGEST" || exit 1
         done
         echo "::notice::${DST}: promoted ${VERSION}$([[ "$MOVE_LATEST" == "true" ]] && echo ' + latest'), signature verified"
