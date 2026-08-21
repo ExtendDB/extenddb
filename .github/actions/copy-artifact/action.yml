@@ -76,5 +76,16 @@ runs:
         else
           skopeo copy --preserve-digests "docker://${SRC}:${TAG}" "docker://${DST}:${TAG}"
         fi
-        GOT=$(probe "${DST}:${TAG}") || { echo "::error::${DST}:${TAG} missing after copy"; exit 1; }
-        [[ "$GOT" == "$WANT" ]] || { echo "::error::${DST}:${TAG} resolves to ${GOT}, expected ${WANT}"; exit 1; }
+        # Post-WRITE assertion with a bounded settle window: ECR Public shows
+        # read-after-write lag (a copy's own log confirms the write and the
+        # immediate read 404s — failed the v0.1.8 dev propagation live).
+        # Retry is only correct after our own write; the existence DECISION
+        # above stays a strict single probe.
+        for _ in 1 2 3 4 5 6; do
+          set +e; GOT=$(probe "${DST}:${TAG}"); rc=$?; set -e
+          [[ $rc == 0 && "$GOT" == "$WANT" ]] && exit 0
+          [[ $rc == 0 && "$GOT" != "$WANT" ]] && { echo "::error::${DST}:${TAG} resolves to ${GOT}, expected ${WANT}"; exit 1; }
+          sleep 5
+        done
+        echo "::error::${DST}:${TAG} not visible with expected digest after settle window"
+        exit 1
