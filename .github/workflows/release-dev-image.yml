@@ -1,9 +1,20 @@
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# Publishes the `extenddb-dev` container image (SQLite + dev-mode) to Docker
-# Hub, for linux/amd64 and linux/arm64, in a SINGLE dispatch: gate, build,
-# smoke test, push, sign.
+# Publishes the `extenddb-dev` container image (SQLite + dev-mode) to ALL
+# THREE registries, for linux/amd64 and linux/arm64, in a SINGLE dispatch:
+# gate, build, smoke test, push, sign (dockerhub environment approval), then
+# propagate to GHCR and ECR Public (ghcr environment approval) via the
+# promote-registry composite action — signature verified at each destination
+# before any tag is placed, forward-only latest per destination.
+#
+# Re-entrant on registry state: if the version tag already exists on Docker
+# Hub WITH a verifying signature, the publish job treats the published,
+# attested artifact as authoritative and skips pushing/signing (a rebuild is
+# not bit-reproducible, so comparing a fresh build against the released
+# artifact would always refuse). This is what lets a re-dispatch finish an
+# interrupted release, or backfill the mirror registries for a version that
+# shipped before the propagate wave existed (v0.1.7).
 #
 # Why one dispatch where the Postgres image splits build and promotion:
 # extenddb-dev is explicitly a development image (plain HTTP, open
@@ -220,7 +231,9 @@ jobs:
     needs: [gate, build]
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    environment: dockerhub       # the single approval gate; only job with credentials
+    environment: dockerhub       # approval 1: publish + sign (Docker Hub credential lives here)
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     permissions:
       contents: read
       id-token: write            # OIDC for the signing role; no stored AWS secrets
@@ -265,14 +278,54 @@ jobs:
         env:
           SHA: ${{ needs.gate.outputs.sha }}
           VERSION: ${{ needs.gate.outputs.version }}
+          COSIGN_VERSION: v3.1.3
+          COSIGN_SHA256: 4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71
         run: |
           set -euo pipefail
           REPO='${{ env.IMAGE_REPO }}'
           CANDIDATE="sha-${SHA}"
 
-          # A released version tag is immutable: refuse to overwrite.
-          if docker buildx imagetools inspect "${REPO}:${VERSION}" >/dev/null 2>&1; then
-            echo "::error::${REPO}:${VERSION} already exists; refusing to overwrite a released tag."
+          # A released version tag is immutable. If it exists AND its
+          # signature VERIFIES against the committed release key, the
+          # published artifact is authoritative: skip pushing and signing
+          # (re-dispatch recovery / mirror backfill). Exists but UNSIGNED:
+          # fall through to signing only. Exists with a signature that fails
+          # verification: abort loudly — skipping would report success on an
+          # artifact that can never propagate (the destination verify would
+          # refuse it forever). Probe failures other than a definite absence
+          # abort. Captured output is shape-validated because 2>&1 merges
+          # skopeo warnings into successful captures.
+          if OUT=$(skopeo inspect --no-creds --format '{{.Digest}}' "docker://${REPO}:${VERSION}" 2>&1); then
+            if [[ ! "$OUT" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::digest capture for ${REPO}:${VERSION} is polluted or malformed: ${OUT}"
+              exit 1
+            fi
+            EXISTING="$OUT"
+            SIG_TAG="sha256-${EXISTING#sha256:}.sig"
+            if skopeo inspect --no-creds --format '{{.Digest}}' "docker://${REPO}:${SIG_TAG}" >/dev/null 2>&1; then
+              # The signature must VERIFY, not merely exist: a wrong-key or
+              # garbage manifest at the tag name must abort, not skip.
+              if ! command -v cosign >/dev/null || [[ "$(cosign version 2>/dev/null | awk '/GitVersion/{print $2}')" != "$COSIGN_VERSION" ]]; then
+                curl -sSfL -o /tmp/cosign \
+                  "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+                echo "${COSIGN_SHA256}  /tmp/cosign" | sha256sum --check --strict
+                sudo install -m 0755 /tmp/cosign /usr/local/bin/cosign
+              fi
+              if ! cosign verify --key extenddb-signing.pub.pem "${REPO}@${EXISTING}" >/dev/null; then
+                echo "::error::${REPO}:${VERSION} carries a signature artifact that does NOT verify against the release key; refusing to skip. Investigate before re-dispatching."
+                exit 1
+              fi
+              echo "::notice::${REPO}:${VERSION} already published and its signature verifies; treating published state as authoritative"
+              echo "digest=$EXISTING" >> "$GITHUB_OUTPUT"
+              echo "already-published=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::notice::${REPO}:${VERSION} exists but is unsigned; continuing to sign the existing digest"
+            echo "digest=$EXISTING" >> "$GITHUB_OUTPUT"
+            echo "already-published=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          elif ! grep -qiE 'manifest unknown|name unknown|not found' <<< "$OUT"; then
+            echo "::error::probe of ${REPO}:${VERSION} failed (not a definite absence): ${OUT}"
             exit 1
           fi
 
@@ -320,8 +373,22 @@ jobs:
           role-session-name: extenddb-dev-sign-${{ github.run_id }}
           aws-region: us-east-1
 
+      - name: Does the signature already exist? (re-entry — never double-sign)
+        id: sigstate
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          SIG_TAG="sha256-${DIGEST#sha256:}.sig"
+          if skopeo inspect --no-creds --format '{{.Digest}}' "docker://${IMAGE_REPO}:${SIG_TAG}" >/dev/null 2>&1; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Sign the published digest (shared composite action, Rekor on)
         id: sign
+        if: steps.sigstate.outputs.present != 'true'
         uses: ./.github/actions/sign-image
         with:
           image-repo: docker.io/${{ env.IMAGE_REPO }}
@@ -338,7 +405,110 @@ jobs:
             echo "|---|---|"
             echo "| image | \`${{ env.IMAGE_REPO }}:${{ needs.gate.outputs.version }}\` |"
             echo "| index digest | \`${{ steps.push.outputs.digest }}\` |"
-            echo "| signature tag | \`${{ steps.sign.outputs.sig-tag }}\` |"
+            echo "| signature tag | \`sha256-$(D='${{ steps.push.outputs.digest }}'; echo ${D#sha256:}).sig\` |"
             echo "| platforms | linux/amd64, linux/arm64 |"
             echo "| commit | \`${{ needs.gate.outputs.sha }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Approval 2 (ghcr environment): propagate version, guarded latest, and the
+  # signature to GHCR and ECR Public. move-latest is derived from Docker Hub
+  # state (latest points at this digest), so a backfill dispatch mirrors
+  # exactly what the canonical registry serves; each destination re-guards
+  # forward-only latest itself via the composite action.
+  propagate:
+    needs: [gate, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ghcr
+    permissions:
+      contents: read
+      packages: write   # GHCR
+      id-token: write   # ECR (OIDC publisher role)
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+      DIGEST: ${{ needs.publish.outputs.digest }}
+    steps:
+      - name: Check out (composite action lives in-repo)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      - name: Derive move-latest from Docker Hub state
+        id: ml
+        run: |
+          set -euo pipefail
+          if OUT=$(skopeo inspect --no-creds --format '{{.Digest}}' "docker://${IMAGE_REPO}:latest" 2>&1); then
+            # Shape-validate: 2>&1 merges warnings into successful captures,
+            # and a polluted OUT here would silently strand the mirrors'
+            # latest (never equal to DIGEST, green run).
+            if [[ ! "$OUT" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::digest capture for ${IMAGE_REPO}:latest is polluted or malformed: ${OUT}"
+              exit 1
+            fi
+            [[ "$OUT" == "$DIGEST" ]] && MV=true || MV=false
+          elif grep -qiE 'manifest unknown|name unknown|not found' <<< "$OUT"; then
+            MV=false
+          else
+            echo "::error::probe of ${IMAGE_REPO}:latest failed: ${OUT}"
+            exit 1
+          fi
+          echo "move-latest=$MV" >> "$GITHUB_OUTPUT"
+          echo "::notice::Docker Hub latest $([[ $MV == true ]] && echo 'points at this digest; mirrors will move latest' || echo 'does not point at this digest; mirrors leave latest alone')"
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          skopeo login ghcr.io -u x-access-token --password-stdin <<< "$GHCR_TOKEN"
+
+      - name: Propagate to GHCR
+        uses: ./.github/actions/promote-registry
+        with:
+          src-repo: docker.io/extenddb/extenddb-dev
+          dst-repo: ghcr.io/extenddb/extenddb-dev
+          version: ${{ env.VERSION }}
+          digest: ${{ env.DIGEST }}
+          move-latest: ${{ steps.ml.outputs.move-latest }}
+
+      - name: Assume the ECR publisher role via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::975306274793:role/ExtendDBEcrPublicGitHubPublisher
+          role-session-name: extenddb-dev-propagate-${{ github.run_id }}
+          aws-region: us-east-1
+
+      - name: Log in to ECR Public
+        run: |
+          set -euo pipefail
+          aws ecr-public get-login-password --region us-east-1 \
+            | skopeo login public.ecr.aws -u AWS --password-stdin
+
+      - name: Propagate to ECR Public
+        uses: ./.github/actions/promote-registry
+        with:
+          src-repo: docker.io/extenddb/extenddb-dev
+          dst-repo: public.ecr.aws/extenddb/extenddb-dev
+          version: ${{ env.VERSION }}
+          digest: ${{ env.DIGEST }}
+          move-latest: ${{ steps.ml.outputs.move-latest }}
+
+      - name: Log out of the mirror registries
+        if: always()
+        run: |
+          skopeo logout ghcr.io || true
+          skopeo logout public.ecr.aws || true
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "### extenddb-dev ${VERSION} propagated"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| registries | \`ghcr.io/extenddb/extenddb-dev\`, \`public.ecr.aws/extenddb/extenddb-dev\` |"
+            echo "| digest | \`${DIGEST}\` |"
+            echo "| latest moved | ${{ steps.ml.outputs.move-latest }} |"
+            echo ""
+            echo "First GHCR push auto-creates the package: verify repo linkage and"
+            echo "visibility per runbook 10.6."
           } >> "$GITHUB_STEP_SUMMARY"
