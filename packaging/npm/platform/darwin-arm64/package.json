@@ -1,0 +1,22 @@
+{
+  "name": "@extenddb/darwin-arm64",
+  "version": "0.0.0-placeholder",
+  "description": "ExtendDB dev server binary for darwin arm64. Install the 'extenddb' package instead; npm selects this automatically.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ExtendDB/extenddb.git",
+    "directory": "packaging/npm/platform/darwin-arm64"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "extenddb",
+    "NOTICE"
+  ],
+  "preferUnplugged": true
+}

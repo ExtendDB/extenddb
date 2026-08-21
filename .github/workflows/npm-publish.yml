@@ -1,0 +1,337 @@
+# Publishes CANDIDATE npm packages for the ExtendDB dev launcher: the five
+# @extenddb/<os>-<arch> platform binary packages plus the `@extenddb/dev` launcher
+# that selects among them via optionalDependencies.
+#
+# This workflow deliberately stops at the candidate. Every package is published
+# under the `candidate` dist-tag, never `latest`, so nothing a user installs by
+# default can come from an unverified run. Promotion is a maintainer step
+# recorded in packaging/README.md:
+#
+#   npm dist-tag add @extenddb/dev@<version> latest   (and one per platform pkg)
+#
+# Shape, and why (mirrors .github/workflows/release-image.yml):
+#
+#   gate      Runs once. Cheap checks that need no build: the dispatch input is
+#             validated as a strict `vX.Y.Z` tag, resolved to a full commit
+#             SHA, that SHA must be contained in origin/main, and the version
+#             must agree with the workspace version at the tagged commit.
+#
+#             The launcher versions WITH the server, off the same `vX.Y.Z` tag
+#             the container release uses, because the five platform packages
+#             ship the server binary: a server release necessarily republishes
+#             all six, and the launcher pins optionalDependencies to its own
+#             version, so an independent number could only ever answer "which
+#             launcher" and never the question users actually ask, "which
+#             server is inside this". Same convention as esbuild and biome,
+#             whose launchers pin their platform packages at the tool version.
+#             The cost is accepted: a launcher-only fix rides the next server
+#             release rather than shipping under its own number.
+#
+#   build     One job per platform, each on its NATIVE runner: no emulation and
+#             no cross-compilation, so every published binary was genuinely
+#             executed. Each job builds the slim dev-mode binary, smoke tests
+#             `--version`, then runs the full launcher test suite against the
+#             built binary (the same suite that gates the packaging directory),
+#             and uploads the binary as an artifact. These jobs hold NO
+#             registry credentials.
+#
+#   publish   Runs once, after all five platforms pass, in the `npm` protected
+#             environment. This is the only job with the npm token, so the
+#             token never exists in a job that is executing a freshly built
+#             binary, and never exists at all unless every platform passed.
+#             Publishes with --provenance, binding each package to this
+#             workflow run and commit.
+#
+# Trigger: manual workflow_dispatch only. There is intentionally no
+# `push: tags:` trigger: a tag-triggered run executes the workflow definition
+# from the tagged revision, which may be older than the reviewed workflow on
+# protected main. Dispatching from main runs the current definition against an
+# existing, validated tag.
+#
+# One-time setup (Settings -> Environments -> npm):
+#   Deployment branches: Selected, rule `branch: main`. A dispatch from any
+#     other ref cannot read the token at all.
+#   Required reviewers: the candidate publish must be approved before it runs.
+#   Secrets: none. Authentication is npm trusted publishing (OIDC), so there
+#     is no token to store, leak, or rotate. The environment gate is still
+#     load-bearing: npm matches the environment name as part of the trust
+#     relationship, so a run outside `npm` cannot mint a publish credential.
+#
+# Plus, once on the registry, per package (all six: @extenddb/dev and the five
+# @extenddb/<os>-<arch>): Settings -> Trusted Publisher -> GitHub Actions, with
+#   Organization or user: ExtendDB
+#   Repository:           extenddb
+#   Workflow filename:    npm-publish.yml
+#   Environment:          npm
+# Every field is matched exactly, the workflow filename included, so renaming
+# this file breaks publishing until the six entries are updated.
+#
+# npm requires a package to exist before a trusted publisher can be configured,
+# so all six were first published as 0.0.0 placeholders under the `placeholder`
+# dist-tag from a maintainer machine.
+
+name: npm-publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to publish npm candidates for, e.g. v0.1.4'
+        required: true
+
+# Nothing is committed, so no write scope on the repo is needed. The publish
+# job adds id-token at job level, which is what both authenticates to npm
+# (trusted publishing) and attests provenance.
+permissions:
+  contents: read
+
+# Two launcher releases must never race.
+concurrency:
+  group: npm-publish-extenddb
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      sha: ${{ steps.meta.outputs.sha }}
+    steps:
+      - name: Check out main (the reviewed workflow's own ref)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          fetch-depth: 0         # tag resolution and the ancestry gate need history
+
+      - name: Gate - the tag must identify released launcher code
+        id: meta
+        env:
+          # Dispatch inputs are untrusted; they reach the shell only through the
+          # environment, never by interpolation into the script source.
+          RAW_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # 1. Strict shape first: anything else cannot be a launcher release
+          #    tag and must not reach git commands as a ref expression.
+          if [[ ! "$RAW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::input '$RAW_TAG' is not a strict release tag (vMAJOR.MINOR.PATCH)"
+            exit 1
+          fi
+          VERSION="${RAW_TAG#v}"
+
+          # 2. The tag must already exist; this workflow never creates tags.
+          git fetch --no-tags origin "refs/tags/${RAW_TAG}:refs/tags/${RAW_TAG}" \
+            || { echo "::error::tag ${RAW_TAG} does not exist on origin"; exit 1; }
+          SHA=$(git rev-list -n 1 "refs/tags/${RAW_TAG}")
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::could not resolve ${RAW_TAG} to a full commit SHA"; exit 1; }
+
+          # 3. The tagged commit must be on main, so a tag pushed on an
+          #    unmerged branch cannot publish unreviewed code publicly.
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "::error::${RAW_TAG} (${SHA}) is not contained in origin/main"
+            exit 1
+          fi
+
+          # 4. The tag must agree with the workspace version, which is the
+          #    single source of truth for a release across every distribution
+          #    channel (container, npm, and later pip).
+          CARGO_VERSION=$(git show "${SHA}:Cargo.toml" \
+            | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1)
+          if [[ "$VERSION" != "$CARGO_VERSION" ]]; then
+            echo "::error::tag ${RAW_TAG} implies ${VERSION} but the workspace version at ${SHA} is ${CARGO_VERSION}"
+            exit 1
+          fi
+
+          # 5. The checked-in launcher manifest must not have drifted from it.
+          #    The publish step rewrites the version anyway, so a stale value
+          #    would not break the release; it would quietly mislead anyone
+          #    reading the manifest, which is worse.
+          PKG_VERSION=$(git show "${SHA}:packaging/npm/package.json" | jq -r .version)
+          if [[ "$VERSION" != "$PKG_VERSION" ]]; then
+            echo "::error::packaging/npm/package.json at ${SHA} says ${PKG_VERSION}, expected ${VERSION} (bump it with the workspace version)"
+            exit 1
+          fi
+
+          {
+            echo "version=$VERSION"
+            echo "sha=$SHA"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: gate
+    # If one platform fails, cancel the rest: nothing is published either way.
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - pkg: linux-x64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - pkg: linux-arm64
+            runner: ubuntu-24.04-arm      # native arm64, no qemu
+            target: aarch64-unknown-linux-gnu
+          - pkg: darwin-x64
+            runner: macos-13              # last Intel macOS runner
+            target: x86_64-apple-darwin
+          - pkg: darwin-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+          - pkg: win32-x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60          # a hung Rust build must not burn the 6h default
+    env:
+      BIN_NAME: extenddb${{ matrix.pkg == 'win32-x64' && '.exe' || '' }}
+    steps:
+      # CodeQL's actions/cache-poisoning/poisonable-step query flags the build
+      # and test steps below, because a workflow_dispatch run executes in the
+      # default branch's context (and therefore its Actions cache scope) while
+      # checking out a ref supplied at dispatch time. Two properties make that
+      # unexploitable here, neither of which the query can see:
+      #
+      #   1. `gate` has already proved this SHA is an ancestor of origin/main
+      #      (`git merge-base --is-ancestor`), so the code executed below is
+      #      reviewed code already on main. Poisoning it would require push
+      #      access to main, which permits strictly worse things directly.
+      #   2. Nothing in this workflow reads or writes the Actions cache at all:
+      #      there is no actions/cache step, no rust-cache, and no `cache:`
+      #      input on setup-node. There is no cache entry to poison.
+      #
+      # Keep both true if this job grows: adding a cache step here would make
+      # the finding real, and it would then need a trusted-ref guard.
+      - name: Check out the tagged commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+
+      - name: Build the slim dev-mode binary
+        # SQLite backend only, dev-mode on: the launcher's contract binary.
+        # `--locked` so the build is exactly the reviewed Cargo.lock.
+        run: cargo build --release --locked --no-default-features --features sqlite,dev-mode -p extenddb
+
+      - name: Smoke test - the native binary must run
+        shell: bash
+        run: |
+          set -euo pipefail
+          "target/release/${BIN_NAME}" --version
+
+      - name: Run the launcher test suite against the built binary
+        # The same suite that gates packaging/ in CI, here proving the real
+        # release binary on the real target platform, including the
+        # file-persistence and memory-mode contracts.
+        shell: bash
+        env:
+          EXTENDDB_BINARY: ${{ github.workspace }}/target/release/extenddb${{ matrix.pkg == 'win32-x64' && '.exe' || '' }}
+        run: |
+          set -euo pipefail
+          cd packaging/npm
+          node test/launcher.test.js
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: bin-${{ matrix.pkg }}
+          path: target/release/${{ env.BIN_NAME }}
+          if-no-files-found: error
+
+  publish:
+    needs: [gate, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The protected environment requires reviewer approval, and its name is
+    # part of the npm trusted-publisher match, so it gates credential minting
+    # rather than merely gating a stored secret.
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write            # mints the OIDC token npm exchanges for a
+                                 # short-lived publish credential; also what
+                                 # --provenance is attested from
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+
+      - name: Set up node against the public registry
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted publishing needs npm >= 11.5.1 for the OIDC exchange, and the
+      # Node 22 image bundles npm 10. Without this the publish falls back to
+      # looking for a token and fails with ENEEDAUTH.
+      - name: Upgrade npm to a trusted-publishing capable version
+        run: |
+          set -euo pipefail
+          npm install -g npm@11
+          npm --version
+
+      - name: Download the built binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          path: artifacts/
+
+      - name: Publish the five platform packages (candidate dist-tag)
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # The platform list is derived from the launcher's
+          # optionalDependencies, the single source of truth, so the publish
+          # loop cannot drift from what the launcher wires up. The build
+          # matrix is asserted against the same list below: a platform in the
+          # dependencies but missing from the matrix has no artifact and
+          # fails here, loudly, before anything is published.
+          PLATFORMS=$(jq -r '.optionalDependencies | keys[] | ltrimstr("@extenddb/")' packaging/npm/package.json)
+
+          for pkg in $PLATFORMS; do
+            dir="packaging/npm/platform/${pkg}"
+            bin="extenddb"; [[ "$pkg" == win32-* ]] && bin="extenddb.exe"
+
+            [[ -d "$dir" ]] || { echo "::error::no template for ${pkg} (optionalDependencies/platform drift)"; exit 1; }
+            [[ -f "artifacts/bin-${pkg}/${bin}" ]] || { echo "::error::no built artifact for ${pkg} (optionalDependencies/build-matrix drift)"; exit 1; }
+
+            # Stage the binary at the package root, where the launcher's
+            # require.resolve contract expects it, plus the licence files
+            # Apache-2.0 section 4 requires in every distribution. npm
+            # includes LICENSE and NOTICE regardless of the files whitelist.
+            cp "artifacts/bin-${pkg}/${bin}" "${dir}/${bin}"
+            chmod +x "${dir}/${bin}"
+            cp LICENSE NOTICE "${dir}/"
+
+            jq --arg v "$VERSION" '.version = $v' "${dir}/package.json" > "${dir}/package.json.tmp"
+            mv "${dir}/package.json.tmp" "${dir}/package.json"
+
+            echo "Publishing @extenddb/${pkg}@${VERSION} (candidate)"
+            npm publish --provenance --access public --tag candidate "${dir}"
+          done
+
+      - name: Publish the launcher package (candidate dist-tag)
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          cp LICENSE NOTICE packaging/npm/
+          cd packaging/npm
+
+          # The launcher and its platform packages are one release: pin the
+          # optionalDependencies to exactly this version so npm can never mix
+          # a launcher with binaries from a different release.
+          jq --arg v "$VERSION" '
+            .version = $v
+            | .optionalDependencies |= with_entries(.value = $v)
+          ' package.json > package.json.tmp
+          mv package.json.tmp package.json
+
+          echo "Publishing @extenddb/dev@${VERSION} (candidate)"
+          npm publish --provenance --access public --tag candidate
