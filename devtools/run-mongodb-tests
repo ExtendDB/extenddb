@@ -80,6 +80,10 @@ SERVER_LOG="$OUTPUT_DIR/server.log"
 CONTAINER_NAME="extenddb-runtests-mongo-${MONGO_PORT}"
 BINARY="./target/release/extenddb"
 
+# Enable the deterministic GSI backfill race-test gate in the server process.
+# The gate remains disabled for normal MongoDB deployments.
+export EXTENDDB_TEST_MONGODB_CONTAINER="$CONTAINER_NAME"
+
 if [[ ! -x "$BINARY" ]]; then
     echo "error: $BINARY not found. Build first: cargo build --release --no-default-features --features mongodb" >&2
     exit 1

@@ -37,6 +37,10 @@ pub const KNOWN_KEYS: &[(&str, Validator)] = &[
         extenddb_core::settings_keys::VECTOR_BACKFILL_BATCH_DELAY_MS,
         validate_backfill_batch_delay_ms,
     ),
+    (
+        extenddb_core::settings_keys::GSI_BACKFILL_TEST_GATE,
+        validate_backfill_test_gate,
+    ),
 ];
 
 /// Read-only keys that cannot be changed via the settings API.
@@ -62,6 +66,13 @@ fn validate_backfill_batch_delay_ms(value: &str) -> Result<(), &'static str> {
         Ok(ms) if ms <= 60_000 => Ok(()),
         Ok(_) => Err("must be between 0 and 60000 milliseconds"),
         Err(_) => Err("must be a non-negative integer number of milliseconds"),
+    }
+}
+
+fn validate_backfill_test_gate(value: &str) -> Result<(), &'static str> {
+    match value {
+        "armed" | "paused" | "release" | "idle" => Ok(()),
+        _ => Err("must be one of: armed, paused, release, idle"),
     }
 }
 

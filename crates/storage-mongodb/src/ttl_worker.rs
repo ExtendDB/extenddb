@@ -65,10 +65,10 @@ pub(crate) async fn stream_record_cleanup_worker(storage: Arc<MongoEngine>) {
 /// Live writes during the backfill window continue to route through
 /// `sync_indexes` / `sync_indexes_in_session`, which write to
 /// CREATING indexes too (indexes catalog membership, not status, is
-/// what gates the write path). All writes are upserts on the same
-/// `_id` shape, so a base item touched by both the backfill and a
-/// concurrent write converges regardless of interleaving —
-/// RFC-0003 §2.4.
+/// what gates the write path). Both paths use a transaction over the
+/// base and index rows, so a concurrent mutation serializes with or
+/// aborts the backfill rather than being overwritten by a stale upsert
+/// — RFC-0003 §2.4.
 pub(crate) async fn gsi_backfill_worker(storage: Arc<MongoEngine>) {
     loop {
         tokio::time::sleep(GSI_BACKFILL_INTERVAL).await;

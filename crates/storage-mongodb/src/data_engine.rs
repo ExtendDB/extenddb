@@ -2892,8 +2892,6 @@ impl MongoEngine {
         cursor: Option<&bson::Bson>,
         batch_size: i64,
     ) -> Result<GsiBackfillProgress, StorageError> {
-        use futures::TryStreamExt;
-
         let base_coll_name = data_collection_name(&key_info.table_id);
         let base_coll = self.data_db.collection::<Document>(&base_coll_name);
         let idx_coll_name = data_collection_name(index_id);
@@ -2909,57 +2907,205 @@ impl MongoEngine {
             .limit(batch_size)
             .build();
 
-        let base_cursor = base_coll
-            .find(filter)
-            .with_options(opts)
+        // The base scan and index writes must share a transaction. Live item
+        // mutations update the base row and its index row in one transaction;
+        // the conditional base-document claim below additionally makes a
+        // DeleteItem race fail before the backfill can create an index row
+        // that did not exist when the delete committed.
+        let mut session = self
+            .client
+            .start_session()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let tx_options = mongodb::options::TransactionOptions::builder()
+            .read_concern(mongodb::options::ReadConcern::snapshot())
+            .write_concern(
+                mongodb::options::WriteConcern::builder()
+                    .w(mongodb::options::Acknowledgment::Majority)
+                    .build(),
+            )
+            .build();
+        session
+            .start_transaction()
+            .with_options(tx_options)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let docs: Vec<Document> = base_cursor
-            .try_collect()
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-        let scanned = docs.len();
-        let last_id = docs.last().and_then(|d| d.get("_id").cloned());
-
-        for doc in docs {
-            let item = document_to_item(&doc)?;
-            if !item_has_index_keys(&item, idx_key_schema) {
-                continue;
-            }
-
-            let projected = project_item(&item, idx_key_schema, &key_info.key_schema, projection);
-            let idx_doc = index_document(
-                &projected,
-                idx_key_schema,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )?;
-            let filter = index_entry_filter(
-                &projected,
-                idx_key_schema,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )?;
-            let opts = mongodb::options::ReplaceOptions::builder()
-                .upsert(true)
-                .build();
-            idx_coll
-                .replace_one(filter, idx_doc)
+        let batch_result: Result<GsiBackfillProgress, StorageError> = async {
+            let mut base_cursor = base_coll
+                .find(filter)
                 .with_options(opts)
+                .session(&mut session)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+            let mut docs = Vec::new();
+            while let Some(result) = base_cursor.next(&mut session).await {
+                docs.push(result.map_err(|e| StorageError::Internal(e.to_string()))?);
+            }
+
+            let scanned = docs.len();
+            let last_id = docs.last().and_then(|d| d.get("_id").cloned());
+
+            // The test gate is deliberately between the snapshot read and
+            // the first base/index write. It lets an API test commit a
+            // DeleteItem at the exact point that used to permit a stale
+            // backfill upsert.
+            self.wait_for_gsi_backfill_test_gate().await?;
+
+            for doc in docs {
+                let item = document_to_item(&doc)?;
+                if !item_has_index_keys(&item, idx_key_schema) {
+                    continue;
+                }
+
+                let base_id = doc.get("_id").cloned().ok_or_else(|| {
+                    StorageError::Internal("base document missing _id".to_owned())
+                })?;
+                let item_data = doc.get("item_data").cloned().ok_or_else(|| {
+                    StorageError::Internal("base document missing item_data".to_owned())
+                })?;
+
+                // Claim the exact base snapshot before writing its index row.
+                // This is a real write on the base document, so a concurrent
+                // DeleteItem/UpdateItem conflicts with or precedes the claim;
+                // a read-only snapshot would not provide that guarantee.
+                let guard_token = uuid::Uuid::new_v4().to_string();
+                let guard_result = base_coll
+                    .update_one(
+                        doc! { "_id": &base_id, "item_data": item_data },
+                        doc! { "$set": { "_backfill_guard": &guard_token } },
+                    )
+                    .session(&mut session)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                if guard_result.matched_count == 0 {
+                    continue;
+                }
+
+                let projected =
+                    project_item(&item, idx_key_schema, &key_info.key_schema, projection);
+                let idx_doc = index_document(
+                    &projected,
+                    idx_key_schema,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                )?;
+                let filter = index_entry_filter(
+                    &projected,
+                    idx_key_schema,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                )?;
+                let replace_opts = mongodb::options::ReplaceOptions::builder()
+                    .upsert(true)
+                    .build();
+                idx_coll
+                    .replace_one(filter, idx_doc)
+                    .with_options(replace_opts)
+                    .session(&mut session)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+                base_coll
+                    .update_one(
+                        doc! { "_id": &base_id, "_backfill_guard": &guard_token },
+                        doc! { "$unset": { "_backfill_guard": "" } },
+                    )
+                    .session(&mut session)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+            }
+
+            Ok(GsiBackfillProgress {
+                scanned,
+                last_id,
+                done: (scanned as i64) < batch_size,
+            })
         }
+        .await;
+
+        let progress = match batch_result {
+            Ok(progress) => progress,
+            Err(error) => {
+                let _ = session.abort_transaction().await;
+                return Err(error);
+            }
+        };
+
+        session
+            .commit_transaction()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         // A short-read (fewer docs than the batch size) means we've
         // reached the end of the base collection. Upstream flips the
         // index to ACTIVE when that happens.
-        Ok(GsiBackfillProgress {
-            scanned,
-            last_id,
-            done: (scanned as i64) < batch_size,
-        })
+        Ok(progress)
+    }
+
+    /// Pause once when the test gate is armed, after a backfill batch has been
+    /// read but before it claims or writes any base/index rows. The gate is
+    /// controlled through the authenticated management settings API and is
+    /// inert unless a test explicitly sets it to `armed`.
+    async fn wait_for_gsi_backfill_test_gate(&self) -> Result<(), StorageError> {
+        use std::time::{Duration, Instant};
+
+        if !self.test_backfill_gate_enabled {
+            return Ok(());
+        }
+
+        let settings = self.catalog_db.collection::<Document>("settings");
+        let key = extenddb_core::settings_keys::GSI_BACKFILL_TEST_GATE;
+        let armed = settings
+            .find_one(doc! { "_id": key, "value": "armed" })
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        if armed.is_none() {
+            return Ok(());
+        }
+
+        let claimed = settings
+            .update_one(
+                doc! { "_id": key, "value": "armed" },
+                doc! { "$set": { "value": "paused" } },
+            )
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        if claimed.matched_count == 0 {
+            return Ok(());
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let state = settings
+                .find_one(doc! { "_id": key })
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?
+                .and_then(|d| d.get_str("value").ok().map(str::to_owned));
+            if state.as_deref() == Some("release") {
+                settings
+                    .update_one(
+                        doc! { "_id": key, "value": "release" },
+                        doc! { "$set": { "value": "idle" } },
+                    )
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                let _ = settings
+                    .update_one(
+                        doc! { "_id": key, "value": "paused" },
+                        doc! { "$set": { "value": "idle" } },
+                    )
+                    .await;
+                return Err(StorageError::Internal(
+                    "timed out waiting for GSI backfill test gate release".to_owned(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 

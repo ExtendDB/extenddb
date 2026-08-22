@@ -230,6 +230,9 @@ pub struct MongoEngine {
     /// so GSI additions/removals on other ExtendDB instances converge within
     /// the TTL window.
     gsi_cache: dashmap::DashMap<String, (bool, std::time::Instant)>,
+    /// Enables the deterministic GSI backfill race-test gate only when the
+    /// MongoDB integration runner explicitly identifies itself.
+    test_backfill_gate_enabled: bool,
 }
 
 /// Build a MongoDB client from a connection string, applying the shared
@@ -295,6 +298,8 @@ impl MongoEngine {
 
         let catalog_db = client.database("extenddb_catalog");
         let data_db = client.database("extenddb_data");
+        let test_backfill_gate_enabled =
+            std::env::var_os("EXTENDDB_TEST_MONGODB_CONTAINER").is_some();
 
         Ok(Self {
             client,
@@ -302,6 +307,7 @@ impl MongoEngine {
             data_db,
             region: region.to_owned(),
             gsi_cache: dashmap::DashMap::new(),
+            test_backfill_gate_enabled,
         })
     }
 
