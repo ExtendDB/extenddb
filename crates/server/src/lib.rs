@@ -380,7 +380,13 @@ async fn shutdown_signal() {
 }
 
 /// Non-unix: there is no SIGTERM; Ctrl+C (which tokio maps to the console
-/// control handler on Windows) is the only shutdown signal.
+/// control handler on Windows) is the only shutdown signal — and it only
+/// fires for an interactive console. Supervisors that terminate the process
+/// directly (including the npm launcher's `stop()`, which is
+/// `TerminateProcess` on Windows) hard-kill without reaching this path, so
+/// the worker drain is skipped. That is acceptable: drain only cancels and
+/// joins background workers — it flushes nothing, and storage commits
+/// per-transaction.
 #[cfg(not(unix))]
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
