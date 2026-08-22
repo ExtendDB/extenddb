@@ -5,10 +5,21 @@
 
 /// Check whether a process is alive using `kill(pid, 0)` (POSIX signal 0).
 /// Works on both Linux and macOS (no `/proc` dependency).
+#[cfg(unix)]
 pub fn is_process_alive(pid: i32) -> bool {
     // SAFETY: kill with signal 0 performs error checking without sending a
     // signal. Returns 0 if the process exists and we have permission.
     unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Non-unix fallback: there is no dependency-free liveness probe, so assume
+/// the process is alive. This is the conservative direction for every caller:
+/// guards that refuse to run alongside a live server keep refusing, and
+/// `status` at worst reports a stale PID. PID files only exist in daemon
+/// mode, which is unix-only, so this path is effectively unreachable.
+#[cfg(not(unix))]
+pub fn is_process_alive(_pid: i32) -> bool {
+    true
 }
 
 /// Append a secret to the backend argument vector when the corresponding CLI

@@ -362,6 +362,7 @@ fn send_https_redirect(stream: &tokio::net::TcpStream, addr: std::net::SocketAdd
     let _ = stream.try_write(response.as_bytes());
 }
 
+#[cfg(unix)]
 async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
     let Ok(mut sigterm) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -375,5 +376,13 @@ async fn shutdown_signal() {
         _ = ctrl_c => {},
         _ = sigterm.recv() => {},
     }
+    tracing::info!("Shutdown signal received, draining connections...");
+}
+
+/// Non-unix: there is no SIGTERM; Ctrl+C (which tokio maps to the console
+/// control handler on Windows) is the only shutdown signal.
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
     tracing::info!("Shutdown signal received, draining connections...");
 }

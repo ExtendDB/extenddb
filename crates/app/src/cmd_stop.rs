@@ -6,18 +6,24 @@
 //! Reads the PID file, sends SIGTERM, polls until the process exits (or
 //! times out), and cleans up the stale PID file.
 
+#[cfg(unix)]
 use std::thread;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use clap::Args;
 
+#[cfg(unix)]
 use crate::util::is_process_alive;
+#[cfg(unix)]
 use extenddb_config as config;
 
 /// Maximum time to wait for the process to exit after SIGTERM.
+#[cfg(unix)]
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Poll interval when waiting for process exit.
+#[cfg(unix)]
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Args)]
@@ -31,7 +37,22 @@ pub struct StopArgs {
     port: Option<u16>,
 }
 
+/// Non-unix: daemon mode does not exist, so there is never a PID file to
+/// read or a SIGTERM to send. The server always runs in the foreground
+/// here — stop it from whatever started it (Ctrl+C, the supervisor, or the
+/// npm launcher's `stop()`).
+#[cfg(not(unix))]
+pub fn run(_args: &StopArgs) {
+    eprintln!(
+        "`extenddb stop` is not supported on this platform: daemon mode is \
+         unix-only, so the server always runs in the foreground. Stop it from \
+         the terminal or supervisor that started it."
+    );
+    std::process::exit(1);
+}
+
 /// Stop the extenddb daemon by reading its PID file and sending SIGTERM.
+#[cfg(unix)]
 pub fn run(args: &StopArgs) {
     let app_config = config::load(&args.config).ok();
 
