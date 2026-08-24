@@ -52,7 +52,12 @@ Where `pk_tag` and `sk_tag` identify the DynamoDB scalar type (`0x53` for `S`, `
     *   **Negative numbers:** Sign byte `0x00`, followed by bit-inverted exponent and complement mantissa bytes.
     *   **Zero:** Exactly `[0x80]`.
     *   **Positive numbers:** Sign byte `0x81`, followed by big-endian exponent bytes and binary-coded decimal mantissa bytes.
-*   **GSI Index Row Keys:** Primary keys in GSI shadow tables follow the exact same encoding rules for the index partition and sort keys, formatted as `[gsi_pk_tag][gsi_pk_len][gsi_pk_bytes][gsi_sk_tag][gsi_sk_bytes][base_pk_tag][base_pk_len][base_pk_bytes][base_sk_tag][base_sk_bytes]`, ensuring full sort order preservation and primary key uniqueness.
+*   **GSI Index Row Keys:** Primary keys in GSI shadow tables follow the composite key format:
+    ```text
+    GSI Composite Key: [gsi_pk_tag:1] [gsi_pk_len:u32BE:4] [gsi_pk_bytes] [gsi_sk_tag:1] [gsi_sk_bytes_escaped] [0x00 0x00] [base_pk_tag:1] [base_pk_len:u32BE:4] [base_pk_bytes] [base_sk_tag:1] [base_sk_bytes]
+    ```
+    *   **Non-Terminal Sort Key Escape Encoding (`gsi_sk`):** The non-terminal `gsi_sk` segment is encoded using the FoundationDB tuple order-preserving escape encoding: each `0x00` byte within `gsi_sk_bytes` is escaped as `0x00 0xFF`, and the segment is terminated with delimiter `0x00 0x00`. Raw-to-end-of-key is only safe for the terminal segment; if `gsi_sk` were raw and unterminated, the subsequent byte (the `base_pk_tag`, e.g. `0x53`) would participate in lexicographical comparisons, causing sort inversion (for example, sort key `"A"` ordering after `"AB"` because `0x53 > 0x42`), breaking GSI query ordering, `begins_with`, and `between`. Escape-encoding and terminating with `0x00 0x00` completely prevents sort inversion and ensures unambiguous segment boundary decoding for reconciler parsing and primary key uniqueness.
+    *   **Terminal Sort Key Raw Encoding (`base_sk`):** The terminal `base_sk` segment remains raw order-preserving bytes to the end of the row key.
 
 ### 2. Transaction Rules & Isolation Guarantees
 
@@ -61,7 +66,7 @@ Where `pk_tag` and `sk_tag` identify the DynamoDB scalar type (`0x53` for `S`, `
 *   **Duplicate Participant Rejection:** A single `TransactWriteItems` request cannot contain multiple operations on the same item. Any transaction with duplicate primary keys is rejected upfront with `ValidationException`.
 
 #### B. Lock-then-Read 2PC Flow
-The `TransactWriteItems` coordinator acquires locks *before* reading data and evaluating condition expressions, and applies mutations via fenced CAS:
+The `TransactWriteItems` coordinator acquires locks *before* reading data and evaluating condition expressions, applies mutations via fenced CAS, and returns success to the client only after Phase 2 mutations are applied:
 
 ```mermaid
 sequenceDiagram
@@ -89,13 +94,18 @@ sequenceDiagram
     loop For each participant row
         C->>B: Fenced Apply (CheckAndMutateRow: if m:intent:<txn_id> present, write d, set m:v, delete m:intent)
     end
-    C->>B: Phase 3: Clean up (Write CLEANED to log, then drop txn row)
+    Note over C: Return HTTP 200 OK (Success Ack Boundary)
+    C->>B: Phase 3: Clean up (Emit streams, write CLEANED to log, drop txn row)
 ```
 
 #### C. Read Isolation & Concurrency Guarantees
+*   **Success Acknowledgment Boundary:** The HTTP 200 OK success acknowledgment is returned to the client **after** all Phase 2 fenced mutations are durably applied to column family `d` and GSI shadow tables. This guarantees monotonic Read-Your-Writes consistency: any subsequent strongly-consistent read (`GetItem` or `TransactGetItems`) issued by the client after receiving the 200 OK response is guaranteed to observe the updated state in column family `d`.
 *   **Read Committed (No Dirty Reads):** In Phase 1 / Phase 2, the transaction coordinator only writes intent lock markers (`m:intent:<txn_id>`) to column family `m`. Actual data mutations in column family `d` are **only applied in Phase 2 Apply** after the coordinator's `COMMITTED` record is durable in `__extenddb_txn_log__`. Standard reads (`GetItem`, `Query`, `Scan`, `BatchGetItem`) read solely from column family `d` and therefore never observe uncommitted candidate writes that could roll back.
 *   **Fenced Phase 2 Apply:** During Phase 2 Apply, participant mutations are applied via `CheckAndMutateRow` using a fencing predicate that asserts the coordinator's own intent marker `m:intent:<txn_id>` is still present on the participant row. The atomic mutation payload applies the data changes to family `d`, updates the row version `m:v`, and deletes `m:intent:<txn_id>` in a single atomic RPC. This guarantees that if an intent was timed out or aborted by the recovery sweeper, a slow/stalled coordinator cannot execute an unfenced write over newer state.
-*   **Serializable `TransactGetItems`:** `TransactGetItems` observes the committed set atomically. Before reading data rows, it checks for active intent markers in column family `m`. If an active lock is present, it coordinates with `__extenddb_txn_log__` to observe the snapshot at the transaction commit boundary, preventing dirty or partial reads.
+*   **Serializable `TransactGetItems` (Read-Through-Log Snapshot Rule):** `TransactGetItems` observes the committed set atomically. Before serving data rows, it checks for active intent markers (`m:intent:<txn_id>`) in column family `m`:
+    *   **Intent Present & Txn `COMMITTED`:** Serve the logged post-image from the coordinator row's mutation payloads in `__extenddb_txn_log__` (reflecting the durable commit even if Phase 2 apply has not yet executed on that participant row).
+    *   **Intent Present & Txn `PENDING`:** Serve the current value from column family `d` (since Phase 2 apply cannot have started, `d` reflects the pre-transaction committed snapshot).
+    *   **No Active Intent (or Txn `CLEANED`/`ABORTED`):** Serve the current value from column family `d` directly.
 *   **Cross-Row Visibility for Standard Reads:** Standard `Query` or `Scan` operations may observe some participant rows updated before others across separate Bigtable tables during the commit apply window. This is fully compliant with DynamoDB's `Read Committed` isolation model, as every observed row reflects a durable, committed state.
 
 #### D. Optimistic Concurrency Control (OCC) Row Versioning for Single-Row Writes
@@ -104,8 +114,8 @@ All single-row writes (`PutItem`, `UpdateItem`, `DeleteItem`) maintain an explic
 *   **Conditional Writes (`PutItem`, `UpdateItem`, `DeleteItem` with `ConditionExpression`):**
     1.  **Read & Version Capture:** The engine reads the current row from Bigtable, extracting the existing item and capturing `read_version = m:v` (`Option<u64>`).
     2.  **In-Memory Condition Evaluation:** `evaluate_condition` checks the condition expression against the read image. If false, `StorageError::ConditionFailed` is returned immediately.
-    3.  **Atomic OCC CAS Mutation:** The write is submitted via `CheckAndMutateRow`:
-        *   **Existing Row (`read_version = Some(v)`):** Predicate filter uses a composite condition: `(no active intent in m) AND (m:v == v)`. Mutations (write `d`, set `m:v = v + 1`, or delete `d` and `m:v`) are placed in `true_mutations`. If the row was modified concurrently or locked, `predicate_matched == false`, and the engine returns `TransactionConflict`.
+    3.  **Atomic OCC CAS Mutation (De Morgan Form):** Cloud Bigtable row filters do not have a native boolean `NOT` operator. Therefore, the OCC predicate cannot be expressed as `(no active intent) AND (m:v == v)` with `true_mutations`. Instead, OCC writes use the equivalent De Morgan conflict form:
+        *   **Existing Row (`read_version = Some(v)`):** Predicate filter matches if `(active intent exists in m) OR (m:v != v)` using `RowFilter::Interleave` (combining active intent filter with a version mismatch condition filter), with write/delete mutations placed in `false_mutations`. If the row was modified concurrently, locked, or deleted, `predicate_matched == true`, mutations are not applied, and the engine returns `TransactionConflict`. If no conflict exists, `predicate_matched == false`, and Bigtable atomically applies `false_mutations`.
         *   **New Row Insert (`read_version = None`):** Predicate filter matches if `(active intent exists in m) OR (m:v exists) OR (family d exists)`. Mutations are placed in `false_mutations`. If the row already exists or is locked, `predicate_matched == true`, and the engine returns `TransactionConflict`.
 *   **Unconditional Writes:**
     *   **Predicate Filter:** Matches if an active 2PC intent exists in family `m` (`^intent:.*$` with timestamp $\ge$ `now - intent_timeout`).
