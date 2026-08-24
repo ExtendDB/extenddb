@@ -1,6 +1,6 @@
 # Technical Debt Tracker
 
-Last updated: 2026-08-19
+Last updated: 2026-08-20
 
 ## Categories
 
@@ -31,6 +31,7 @@ Last updated: 2026-08-19
 | F-16 | `transact_write_items.rs` passes `None` for `old_item` in stream capture — `OldImage` always `None` for transaction-originated stream records | `engine/transact_write_items.rs` | Medium | P27 |
 | F-17 | `validate_attribute_name_sizes` only checks top-level attribute names — nested map keys not validated | `core/validation/mod.rs` | Low | P30 |
 | F-18 | ~~UpdateTable Delete of a vector index in the resource-allocation phase (`CREATING`, `Backfilling: false`) is accepted; Amazon DynamoDB refuses it with `ResourceInUseException` until backfilling starts~~ Both backends now enforce the phase rule with the measured message, and both hold the phase open under `vector_allocation_phase_delay_ms` so a client can observe it | ~~`storage-sqlite/update_table.rs` (vector delete branch), `core/types/table.rs` (`vector_index_delete_in_allocation_phase`)~~ | ~~Medium~~ | vector probe P2 |
+| F-19 | SQLite backup does not capture vector indexes, so `RestoreTableFromBackup` silently produces the table without them. Amazon DynamoDB preserves vector state through backup and restore (measured). The PostgreSQL backend refuses the restore rather than matching this, so the two backends fail differently: one refuses with a reason, one loses declared indexes quietly. Fix: capture the index set in the SQLite backup row and either restore it or refuse, matching PostgreSQL | `storage-sqlite/backup.rs` (no `vector_indexes` capture), `storage-postgres/backup_engine.rs:467-497` (the refusal to match) | Medium | PR-2 docs stage |
 
 ## Cleanup
 

@@ -102,8 +102,19 @@ impl SqliteEngine {
     ///
     /// `part` is the search-schema HASH value when one is declared, and a single
     /// constant otherwise, so an unscoped index is one partition rather than a
-    /// separate code path. `nrm` is the vector's precomputed L2 norm, so cosine
-    /// costs one dot product at query time instead of two passes.
+    /// separate code path.
+    ///
+    /// `nrm` holds the vector's precomputed L2 norm and **this backend's search path
+    /// no longer reads it**. It is an `f32` from the shared norm helper, which
+    /// overflows and underflows inside the range of components validation accepts, so
+    /// the scorer recomputes both norms in `f64` from the vector it has already
+    /// decoded. The column is still written, and kept rather than dropped because
+    /// removing it would need a data migration for no benefit.
+    ///
+    /// The same column name is load-bearing on the PostgreSQL backend, which is the
+    /// asymmetry to know about: its zero test runs in SQL, where the stored vector's
+    /// norm cannot be recomputed, so it reads `nrm` and its scoring expression
+    /// compensates for the `f32` range separately.
     ///
     /// # Safety (SQL injection)
     /// `index_id` is a server-generated UUID and column names are constants, so

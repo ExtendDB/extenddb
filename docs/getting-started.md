@@ -199,7 +199,7 @@ You should see all checks pass:
 --- Checking catalog connection...
   OK: Connected to catalog.
 --- Checking catalog version...
-  OK: Catalog version 0.0.2
+  OK: Catalog version 0.0.3
 --- Checking data database...
   OK: Connected to data database 'extenddb_catalog_data'.
 --- Enumerating tables...
@@ -211,11 +211,12 @@ You should see all checks pass:
 
 ## 4. Start the server
 
-extenddb runs as a daemon (background process) and logs to syslog. On startup it prints a banner to stdout confirming the version, catalog version, and bind address, then forks to background.
+extenddb runs as a daemon (background process) and logs to syslog. On startup it prints a two-line banner to stdout, the version, catalog version and bind address followed by the storage backend and its redacted connection string, then forks to background. It says "starting", not "listening": the socket is not accepting connections yet at that point.
 
 ```bash
 ./target/release/extenddb serve --config extenddb.toml
-# extenddb 0.0.2 (catalog 0.0.2) listening on 127.0.0.1:18443
+# extenddb 0.1.6 (catalog 0.0.3) starting on 127.0.0.1:18443
+#   storage: postgres (postgresql://extenddb:***@localhost:5432/extenddb_catalog)
 ```
 
 Check status (includes the daemon PID):
@@ -1292,8 +1293,8 @@ Each runner requires its tools to be installed. The runner checks prerequisites 
 
 ```bash
 ./target/release/extenddb version
-# extenddb 0.0.2
-# catalog 0.0.2
+# extenddb 0.1.6
+# catalog 0.0.3 (postgres)
 # commit abc1234
 # built 2026-04-17T12:00:00Z
 ```
@@ -1324,7 +1325,7 @@ The `storage.postgres.catalog_pool_size` setting controls the maximum number of 
 
 **When to increase:** If you see elevated latency under concurrent load, the pool may be saturated. Requests queue at the pool level when all connections are in use. Increase `pool_size` (and `catalog_pool_size` if auth is enabled) to allow more concurrent transactions.
 
-**Relationship to PostgreSQL `max_connections`:** The total connection footprint is `pool_size + catalog_pool_size + 1` (the extra 1 is for the log-level poller). PostgreSQL's default `max_connections` is 100. Ensure `pool_size + catalog_pool_size + 1` does not exceed your PostgreSQL `max_connections` setting.
+**Relationship to PostgreSQL `max_connections`:** The total connection footprint is `pool_size + catalog_pool_size + 1` (the extra 1 is for the log-level poller), plus one connection per vector index build running on the server and one while a schema migration runs. Those extra sessions are opened outside both pools on purpose, for two different reasons. A build's ownership lock is session-scoped, so it needs a session that ends when the build does: a pooled connection would return to the pool still holding the lock. The migration lock is transaction-scoped, and needs a pinned connection because its explicit transaction has to retain one PostgreSQL backend until COMMIT, which is what stops a transaction-pooling proxy from letting the lock move between backends. PostgreSQL's default `max_connections` is 100. Ensure `pool_size + catalog_pool_size + 1`, plus the number of vector index builds you expect to overlap, does not exceed your PostgreSQL `max_connections` setting.
 
 **Example:** To support 50 concurrent data operations with auth enabled, set both pools to 50 in `extenddb.toml` and ensure PostgreSQL allows at least 101 connections.
 

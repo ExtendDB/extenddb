@@ -430,7 +430,7 @@ walkthroughs, and troubleshooting. It dispatches to domain-specific reference fi
     ├── postgres/         PostgreSQL readiness and installation
     ├── first-request/    AWS CLI/SDK configuration, first CRUD
     ├── samples/          sample_app.py and stream_consumer.py
-    └── troubleshooting/  Symptom-to-fix lookup (16 indexed errors)
+    └── troubleshooting/  Symptom-to-fix lookup (17 indexed errors)
 ```
 
 Activate when the user asks about installing, configuring, running, or debugging ExtendDB.

@@ -535,16 +535,16 @@ impl PostgresEngine {
         )> = Vec::new();
         // Vector index create/delete.
         //
-        // Delete is implemented; Create is refused. Creating an index means
-        // building and maintaining its data table, which this backend cannot yet
-        // do, and a catalog row with no storage behind it would be an index that
-        // reports ACTIVE and answers nothing. Refusing is the same fail-closed
-        // posture the backend takes for every other vector operation.
+        // Both are implemented and both are reachable over the wire: this backend
+        // declares vector search capability whenever pgvector is present, so the
+        // engine's gate passes and a client can create or delete a vector index
+        // here. Create records the catalog row in this transaction and starts the
+        // build after the commit, which is why the created ids are collected
+        // rather than acted on inline.
         //
-        // Neither branch is reachable over the wire yet: the engine refuses
-        // vector index updates while this backend declares no vector search
-        // capability, so these paths are exercised below the wire. They are
-        // implemented now because the catalog state they act on is created here.
+        // A catalog row with no storage behind it would be an index that reports
+        // ACTIVE and answers nothing, so the create path's failure story is to
+        // leave the index CREATING for recovery rather than to publish it.
         // Wrapped so a failure anywhere in this block gives the holds back.
         //
         // `take_hold` writes to the data database, a different database from the

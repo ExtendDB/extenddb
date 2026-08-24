@@ -1409,6 +1409,38 @@ async fn a_tiny_query_vector_still_scores_every_hit_as_a_number() {
         );
     }
 
+    // The semantic half, and the only observable that distinguishes a computed
+    // ranking from the zero-vector answer. A tiny vector is not a zero vector: the
+    // row parallel to it is nearly identical, so its cosine distance is ~0, and the
+    // orthogonal row is exactly 1.0. A backend that treats the query as zero returns
+    // 1.0 for BOTH and still passes every assertion above, which is precisely the
+    // state one backend was in: it reported a ranking it had not computed.
+    let pks = hit_pks(&response);
+    assert_eq!(
+        pks,
+        vec!["parallel", "orthogonal"],
+        "the parallel row must rank first: {response}"
+    );
+    let score_of = |pk: &str| -> f64 {
+        hits.iter()
+            .find(|h| h.pointer("/Item/pk/S").and_then(|v| v.as_str()) == Some(pk))
+            .and_then(|h| h.get("Score"))
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_else(|| panic!("no score for {pk}: {response}"))
+    };
+    assert!(
+        score_of("parallel") < 1e-6,
+        "a tiny query parallel to the stored vector is a ~0 cosine distance, not the \
+         zero-vector answer: got {}",
+        score_of("parallel")
+    );
+    assert!(
+        (score_of("orthogonal") - 1.0).abs() < 1e-6,
+        "and orthogonal to it is exactly 1.0, by the metric rather than by the guard: \
+         got {}",
+        score_of("orthogonal")
+    );
+
     let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
 }
 

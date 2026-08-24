@@ -50,9 +50,23 @@
                                 # Minimum: 10 (smaller values are clamped with
                                 # a startup warning). Total PostgreSQL
                                 # connections used: pool_size + catalog_pool_size + 1
-                                # (log-level poller: 1). Increase for
-                                # higher concurrency; ensure PostgreSQL
-                                # max_connections >= pool_size + catalog_pool_size + 1.
+                                # (log-level poller: 1), plus one per vector
+                                # index build running on this server and one
+                                # while a schema migration runs. Both sit
+                                # OUTSIDE both pools, for two different reasons.
+                                # A build's ownership lock is SESSION-scoped, so
+                                # it needs a session that ends when the build
+                                # ends: a pooled connection returns to the pool
+                                # still holding the lock. The migration lock is
+                                # TRANSACTION-scoped and needs a pinned
+                                # connection instead, because its explicit
+                                # transaction must retain one PostgreSQL backend
+                                # until COMMIT; a transaction-pooling proxy could
+                                # otherwise let the lock move between backends.
+                                # Increase for higher concurrency; ensure
+                                # PostgreSQL max_connections >= pool_size +
+                                # catalog_pool_size + 1 + the number of vector
+                                # index builds you expect to overlap.
 # catalog_pool_size = 20       # Maximum concurrent connections for the
                                 # management/catalog pool (authz, IAM, console).
                                 # Defaults to pool_size if not set.

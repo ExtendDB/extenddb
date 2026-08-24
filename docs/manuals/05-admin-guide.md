@@ -176,6 +176,8 @@ Managed via `extenddb settings set`. Changes take effect within 30 seconds witho
 | `log_level` | `info` | Log level: trace, debug, info, warn, error |
 | `control_plane_delay_seconds` | `5` | Delay for table status transitions (0 = instant) |
 | `allow_credential_import` | `true` | Whether `import-access-key` is allowed |
+| `vector_backfill_batch_delay_ms` | `0` | **Test-oriented.** Milliseconds to pause between batches while a vector index backfills. Zero in production. A test sets it so a write is guaranteed to land while the index is still building; the pause is outside any lock, so the table stays writable throughout either way. |
+| `vector_allocation_phase_delay_ms` | `0` | **Test-oriented.** Milliseconds to hold a new vector index in the resource-allocation phase (`CREATING` with `Backfilling: false`) before the scan starts. Zero in production. Both transitions otherwise happen inside one `UpdateTable` call, so without this a client cannot observe the phase that the delete rule turns on. |
 
 ```bash
 # View current settings

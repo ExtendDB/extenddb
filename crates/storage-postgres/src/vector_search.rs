@@ -85,6 +85,17 @@ fn score_expression(function: DistanceFunction, norm_param: usize) -> String {
         // the measured answer for a zero vector on either side, and what SQLite
         // returns for the same input.
         //
+        // Worth knowing what the underflow end actually degrades to, because it is
+        // narrower than "returns 1.0". Measured through this expression with a 1e-30
+        // query vector at five angles: parallel 0, 45 degrees 0, orthogonal 1,
+        // 135 degrees 2, antiparallel 2. Only the exactly-orthogonal case reaches the
+        // substitute, because only there is the inner product also zero and the
+        // quotient 0/0; the other four give pgvector an infinity that it clamps to
+        // plus or minus 1 before we see it. So the distance collapses into three
+        // values by the SIGN of the inner product: ranking still separates
+        // nearer-than-orthogonal from farther, and loses all resolution inside each
+        // half.
+        //
         // The wrapper also makes the two sides safe independently. The stored side is
         // masked today only because `nrm` comes from the shared `vector_norm`, which
         // accumulates in f32, so a tiny stored vector reads as zero and takes the

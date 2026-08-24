@@ -250,7 +250,7 @@ Key PostgreSQL settings for extenddb workloads:
 - `shared_buffers`: 25% of available RAM
 - `effective_cache_size`: 75% of available RAM
 - `work_mem`: 64MB (for sort operations in Query/Scan)
-- `max_connections`: ≥ extenddb pool_size + 10
+- `max_connections`: ≥ extenddb pool_size + 10, and add one per vector index build you expect to overlap (a build holds its own session outside the pools)
 
 ### Monitoring Queries
 
