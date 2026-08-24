@@ -257,6 +257,10 @@ export EXTENDDB_TEST_ENDPOINT="https://127.0.0.1:$BIND_PORT"
 export EXTENDDB_ADMIN_USER=admin
 export EXTENDDB_ADMIN_PASSWORD="$ADMIN_PASSWORD"
 
+# MongoDB-specific tests use mongosh in this runner's container to verify
+# physical index lifecycle after exercising the DynamoDB API.
+export EXTENDDB_TEST_MONGODB_CONTAINER="$CONTAINER_NAME"
+
 # Some tests read EXTENDDB_CONFIG to invoke `extenddb settings` against
 # the running instance. Without this, they fall back to `./extenddb.toml`
 # in the repo root, which is a stale dev config that points at a

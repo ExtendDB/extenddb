@@ -111,9 +111,12 @@ pub async fn handle_update_time_to_live(
     } else {
         // Disable path: metadata already updated (sweeper won't pick up this table).
         // Drop the index. Safe because sweeper checks ttl_index_ready which is now FALSE.
+        let ttl_attribute = current.attribute_name.as_deref().ok_or_else(|| {
+            DynamoDbError::InternalServerError("TTL attribute is missing".to_owned())
+        })?;
         if let Err(e) = ctx
             .storage
-            .drop_ttl_index(&ctx.account_id, &input.table_name)
+            .drop_ttl_index(&ctx.account_id, &input.table_name, ttl_attribute)
             .await
         {
             tracing::warn!("TTL index drop failed for {}: {e}", input.table_name);

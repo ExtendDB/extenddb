@@ -368,9 +368,11 @@ impl MetadataEngine for MongoEngine {
         &self,
         account_id: &str,
         table_name: &str,
+        ttl_attribute: &str,
     ) -> BoxFuture<'_, Result<(), StorageError>> {
         let account_id = account_id.to_string();
         let table_name = table_name.to_string();
+        let ttl_attribute = ttl_attribute.to_string();
         Box::pin(async move {
             let tables_coll = self.catalog_db.collection::<Document>("tables");
             let id_filter =
@@ -390,12 +392,10 @@ impl MetadataEngine for MongoEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?
                 .ok_or_else(|| StorageError::TableNotFound(table_name.clone()))?;
-
             let table_id = table_doc
                 .get_str("table_id")
                 .map_err(|_| StorageError::Internal("missing table_id".to_string()))?;
 
-            let ttl_attribute = table_doc.get_str("ttl_attribute").unwrap_or_default();
             let index_name = format!("idx_ttl_{ttl_attribute}");
 
             let coll_name = data_collection_name(table_id);
