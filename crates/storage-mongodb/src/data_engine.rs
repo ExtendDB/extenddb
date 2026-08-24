@@ -2921,6 +2921,10 @@ impl MongoEngine {
         let opts = mongodb::options::FindOptions::builder()
             .sort(doc! { "_id": 1 })
             .limit(batch_size)
+            // The batch is read outside the per-item write transactions, but
+            // must not include a document that can later be rolled back after
+            // its index write is majority-committed during a primary stepdown.
+            .read_concern(mongodb::options::ReadConcern::majority())
             .build();
 
         // The read is intentionally outside the write transactions. The
