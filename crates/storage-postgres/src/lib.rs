@@ -39,6 +39,19 @@ pub use catalog_store::PostgresCatalogStore;
 pub use config::PostgresStorageConfig;
 pub use config::parse_connection_string;
 pub use credential_store::DbCredentialStore;
+/// Apply one queued vector row from its own context.
+///
+/// Reachable so an integration test can drive the classification the propagation
+/// worker performs, and hidden because starting or running a deployment never calls
+/// it, unlike the two recovery entry points above.
+#[doc(hidden)]
+pub use data::vector_index::apply_claimed_vector_row;
+/// Rebuild vector index builds whose heartbeat has gone stale. The runtime half of
+/// the same repair, exported for the same reason and for its test.
+pub use data::vector_index::rebuild_stuck_vector_indexes;
+/// Rebuild vector indexes a crash left mid-build. A startup step, exported because
+/// it is part of bringing a deployment up rather than an internal detail.
+pub use data::vector_index::reconcile_incomplete_vector_indexes;
 
 /// The `PostgreSQL` storage backend.
 ///
@@ -404,6 +417,48 @@ impl PostgresEngine {
         &self.data_pool
     }
 
+    /// Milliseconds to pause between vector backfill batches.
+    ///
+    /// Read live for the same reason the propagation delay is: a test sets it with
+    /// `settings set` and needs it to apply to the next backfill rather than up to
+    /// 30 s later. Zero when unset or unparseable, which is the production value,
+    /// so a malformed setting cannot slow a real backfill down.
+    pub(crate) async fn vector_backfill_batch_delay(&self) -> u64 {
+        let live: Result<Option<(String,)>, _> =
+            sqlx::query_as("SELECT value FROM settings WHERE key = $1")
+                .bind(extenddb_core::settings_keys::VECTOR_BACKFILL_BATCH_DELAY_MS)
+                .fetch_optional(&self.pool)
+                .await;
+        match live {
+            Ok(row) => row.and_then(|(v,)| v.parse::<u64>().ok()).unwrap_or(0),
+            Err(e) => {
+                tracing::debug!("vector_backfill_batch_delay: live read failed, using 0: {e:?}");
+                0
+            }
+        }
+    }
+
+    /// Milliseconds to hold a new vector index in the resource-allocation phase.
+    ///
+    /// A test lever, zero in production, read live for the same reason the batch
+    /// delay is. Held inside the detached build task rather than in the request
+    /// path, because the phase is only observable to a client after `UpdateTable`
+    /// has returned.
+    pub(crate) async fn vector_allocation_phase_delay(&self) -> u64 {
+        let live: Result<Option<(String,)>, _> =
+            sqlx::query_as("SELECT value FROM settings WHERE key = $1")
+                .bind(extenddb_core::settings_keys::VECTOR_ALLOCATION_PHASE_DELAY_MS)
+                .fetch_optional(&self.pool)
+                .await;
+        match live {
+            Ok(row) => row.and_then(|(v,)| v.parse::<u64>().ok()).unwrap_or(0),
+            Err(e) => {
+                tracing::debug!("vector_allocation_phase_delay: live read failed, using 0: {e:?}");
+                0
+            }
+        }
+    }
+
     /// Whether the data database has pgvector, as probed at construction.
     ///
     /// Public so that a deployment check, and the tests that pin the
@@ -483,7 +538,14 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             ttl_worker::ttl_cleanup_worker(storage_for_ttl, metrics, token).await;
         });
 
-        // 6. Pool metrics worker - needs both catalog and data pools
+        // 6. Stuck vector build sweep
+        let storage_for_builds = self.engine.clone();
+        let token = ctx.shutdown.clone();
+        let vector_builds = tokio::spawn(async move {
+            workers::vector_stuck_build_worker(storage_for_builds, token).await;
+        });
+
+        // 7. Pool metrics worker - needs both catalog and data pools
         let catalog_pool = self.engine.pool.clone();
         let data_pool = self.engine.data_pool().clone();
         let metrics = ctx.metrics.clone();
@@ -492,7 +554,7 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             workers::pool_metrics_worker(catalog_pool, data_pool, metrics, token).await;
         });
 
-        // 7. GSI delay poller
+        // 8. GSI delay poller
         let catalog_store_for_gsi = ctx.catalog_store.clone();
         let gsi_delay = self.index_propagation_delay_cache.clone();
         let token = ctx.shutdown.clone();
@@ -506,6 +568,7 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             stream_cleanup,
             idempotency_cleanup,
             ttl,
+            vector_builds,
             pool_metrics,
             gsi_poller,
         ]
@@ -554,6 +617,16 @@ fn server_components_factory(
             }
             _ => BackendError::InitializationFailed(e.to_string()),
         })?;
+
+        // Rebuild any vector index a crash left CREATING, before serving: an index
+        // in that state is not searchable, and nothing else will repair it.
+        match crate::data::vector_index::reconcile_incomplete_vector_indexes(&engine).await {
+            Ok(n) if n > 0 => {
+                tracing::info!("Reconciled {n} incomplete vector index(es) at startup");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!("Failed to reconcile incomplete vector indexes: {e}"),
+        }
 
         // Recover control plane transitions (ignore errors)
         match engine.process_control_plane_transitions().await {

@@ -132,14 +132,14 @@ macro_rules! bind_sk_execute {
 mod data_engine;
 mod ddl;
 mod delete_item;
-mod index;
+pub(crate) mod index;
 mod put_item;
 mod query;
 mod query_scan;
 mod transactions;
 mod tx_helpers;
 mod update_item;
-pub(crate) mod vector_index;
+pub mod vector_index;
 
 pub(crate) use index::{
     delete_index_row_multi, insert_index_row_multi, item_has_index_keys, project_item_for_index,

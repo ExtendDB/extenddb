@@ -162,6 +162,7 @@ async fn scratch(pgvector: Pgvector) -> Scratch {
         include_str!("../data_migrations/001_data_schema.sql"),
         include_str!("../data_migrations/002_gsi_pending.sql"),
         include_str!("../data_migrations/003_idempotency_account_scope.sql"),
+        include_str!("../data_migrations/004_vector_index_state.sql"),
     ] {
         sqlx::raw_sql(sql)
             .execute(&catalog)
@@ -176,6 +177,13 @@ async fn scratch(pgvector: Pgvector) -> Scratch {
         .execute(&catalog)
         .await
         .expect("pin the control-plane delay to zero");
+    // And the propagation delay, for the same reason and the same way
+    // devtools/run-tests does it: these tests run no queue workers, so anything
+    // enqueued would never be applied. A test that wants the queue sets this itself.
+    sqlx::query("UPDATE settings SET value = '0' WHERE key = 'index_propagation_delay_ms'")
+        .execute(&catalog)
+        .await
+        .expect("pin the propagation delay to zero");
     sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES ($1, $2)")
         .bind(ACCOUNT)
         .bind(format!("acct-{db_name}"))
@@ -789,47 +797,92 @@ async fn switching_a_table_with_vector_indexes_to_provisioned_is_refused() {
 }
 
 #[tokio::test]
-async fn adding_a_vector_index_by_update_table_is_unsupported() {
-    let test = "adding_a_vector_index_by_update_table_is_unsupported";
+async fn update_table_creates_a_vector_index_and_backfills_what_is_already_there() {
+    let test = "update_table_creates_a_vector_index_and_backfills_what_is_already_there";
     if base_conn().is_none() {
         return skip(test);
     }
-    let s = scratch(Pgvector::Omit).await;
-    // No vector index is created here, so this must keep running on a server
-    // that has no pgvector at all: for the refusal, that is the interesting case.
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
 
     s.engine
         .create_table(ACCOUNT, create_input("t_add", vec![]))
         .await
         .expect("create a table with no vector index");
-
-    let err = s
+    let key_info = s
         .engine
+        .table_key_info(ACCOUNT, "t_add")
+        .await
+        .expect("key info");
+
+    // Written before the index exists, so it can only reach the index through the
+    // backfill rather than through the write path.
+    put(
+        &s.engine,
+        &key_info,
+        vector_item("before", None, &["1", "0"]),
+    )
+    .await;
+
+    s.engine
         .update_table(
             ACCOUNT,
             UpdateTableInput {
                 vector_index_updates: Some(vec![VectorIndexUpdate {
-                    create: Some(vector_spec("vidx", 4, Some("pk"))),
+                    create: Some(vector_spec("vidx", 2, Some("pk"))),
                     delete: None,
                 }]),
                 ..update_input("t_add")
             },
         )
         .await
-        .expect_err("this backend cannot build a vector index yet");
+        .expect("add a vector index to an existing table");
 
-    // Unsupported rather than Internal: the backend never claimed it could build
-    // one, so this is a refusal the engine reports as a client error, not a
-    // fault to page on.
-    match err {
-        StorageError::Unsupported(msg) => assert!(msg.contains("vidx"), "{msg}"),
-        other => panic!("expected Unsupported, got {other:?}"),
-    }
-
-    // Nothing may be left behind: a catalog row with no storage behind it would
-    // be an index that reports ACTIVE and answers nothing.
+    // The build is detached, which is the point: UpdateTable returns while the index
+    // is still CREATING and the table stays writable throughout.
     let id = table_id(&s.catalog, "t_add").await;
-    assert_eq!(vector_row_count(&s.catalog, &id).await, 0);
+    let table = only_index_table(&s.catalog).await;
+    let mut published = false;
+    for _ in 0..100 {
+        let status: String = sqlx::query_scalar(
+            "SELECT index_status FROM vector_indexes WHERE table_id = $1 AND index_name = 'vidx'",
+        )
+        .bind(&id)
+        .fetch_one(&s.catalog)
+        .await
+        .expect("read the index status");
+        if status == "ACTIVE" {
+            published = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(published, "the index never became ACTIVE");
+
+    // The backfilled row is there, the hold is released, and the build columns are
+    // cleared: an index that reports ACTIVE while still holding the queue would stop
+    // every later write to the table.
+    assert_eq!(
+        index_rows(&s.catalog, &table).await.len(),
+        1,
+        "the pre-existing item must be backfilled"
+    );
+    let holds: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM vector_index_holds WHERE table_id = $1")
+            .bind(&id)
+            .fetch_one(&s.catalog)
+            .await
+            .expect("count the holds");
+    assert_eq!(holds, 0, "the hold must be released after the ACTIVE flip");
+    let (backfilling, owner): (Option<bool>, Option<String>) =
+        sqlx::query_as("SELECT backfilling, build_owner FROM vector_indexes WHERE table_id = $1")
+            .bind(&id)
+            .fetch_one(&s.catalog)
+            .await
+            .expect("read the build state");
+    assert_eq!(backfilling, None, "ACTIVE must carry no Backfilling member");
+    assert_eq!(owner, None);
 
     s.cleanup().await;
 }
@@ -1778,6 +1831,673 @@ async fn a_write_sees_an_index_created_after_its_key_info_was_cached() {
         rows.len(),
         1,
         "the write must see the index the catalog holds, not the one the cache remembers"
+    );
+
+    s.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_real_build_holds_the_allocation_phase_and_the_delete_rule_follows_it() {
+    let test = "a_real_build_holds_the_allocation_phase_and_the_delete_rule_follows_it";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
+
+    // Both halves of the measured rule against a REAL build rather than a hand-set
+    // catalog row, which is what the earlier phase tests do. The lever holds the
+    // index in the resource-allocation phase long enough to act on it; the phase
+    // otherwise exists only between the catalog insert and the flip to backfilling,
+    // both inside one UpdateTable call.
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('vector_allocation_phase_delay_ms', '4000') \
+         ON CONFLICT (key) DO UPDATE SET value = '4000'",
+    )
+    .execute(&s.catalog)
+    .await
+    .expect("hold the allocation phase open");
+
+    s.engine
+        .create_table(ACCOUNT, create_input("t_phase_real", vec![]))
+        .await
+        .expect("create a table with no vector index");
+    let key_info = s
+        .engine
+        .table_key_info(ACCOUNT, "t_phase_real")
+        .await
+        .expect("key info");
+    put(&s.engine, &key_info, vector_item("seed", None, &["1", "0"])).await;
+
+    s.engine
+        .update_table(
+            ACCOUNT,
+            UpdateTableInput {
+                vector_index_updates: Some(vec![VectorIndexUpdate {
+                    create: Some(vector_spec("vidx", 2, Some("pk"))),
+                    delete: None,
+                }]),
+                ..update_input("t_phase_real")
+            },
+        )
+        .await
+        .expect("add a vector index");
+
+    // First half: still allocating, so the delete is refused with the measured
+    // wording, which is what tells a caller to retry rather than that the request was
+    // wrong.
+    let err = s
+        .engine
+        .update_table(
+            ACCOUNT,
+            UpdateTableInput {
+                vector_index_updates: delete_vector("vidx"),
+                ..update_input("t_phase_real")
+            },
+        )
+        .await
+        .expect_err("a delete during resource allocation must be refused");
+    match err {
+        StorageError::ResourceInUse(msg) => assert_eq!(
+            msg,
+            extenddb_core::types::vector_index_delete_in_allocation_phase("t_phase_real", "vidx")
+        ),
+        other => panic!("expected ResourceInUse, got {other:?}"),
+    }
+
+    // Second half: once the phase advances, the same request is accepted and the
+    // index goes away.
+    let id = table_id(&s.catalog, "t_phase_real").await;
+    for _ in 0..200 {
+        let flag: Option<bool> = sqlx::query_scalar(
+            "SELECT backfilling FROM vector_indexes WHERE table_id = $1 AND index_name = 'vidx'",
+        )
+        .bind(&id)
+        .fetch_one(&s.catalog)
+        .await
+        .expect("read the phase");
+        if flag != Some(false) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    s.engine
+        .update_table(
+            ACCOUNT,
+            UpdateTableInput {
+                vector_index_updates: delete_vector("vidx"),
+                ..update_input("t_phase_real")
+            },
+        )
+        .await
+        .expect("the same delete must be accepted once the index has left allocation");
+    assert_eq!(vector_row_count(&s.catalog, &id).await, 0);
+
+    // The table is healthy afterwards, which a leaked build hold would break.
+    put(
+        &s.engine,
+        &key_info,
+        vector_item("after", None, &["0", "1"]),
+    )
+    .await;
+
+    s.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_queued_row_whose_index_table_is_gone_is_consumed_not_retried_forever() {
+    let test = "a_queued_row_whose_index_table_is_gone_is_consumed_not_retried_forever";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
+
+    // A delay, so the write is queued rather than applied inline, which is the only
+    // way to get a row that outlives its target table.
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('index_propagation_delay_ms', '50') \
+         ON CONFLICT (key) DO UPDATE SET value = '50'",
+    )
+    .execute(&s.catalog)
+    .await
+    .expect("set a propagation delay");
+
+    s.engine
+        .create_table(
+            ACCOUNT,
+            create_input("t_orphan_row", vec![vector_spec("vidx", 2, Some("pk"))]),
+        )
+        .await
+        .expect("create a table with a vector index");
+    let id = table_id(&s.catalog, "t_orphan_row").await;
+    let key_info = s
+        .engine
+        .table_key_info(ACCOUNT, "t_orphan_row")
+        .await
+        .expect("key info");
+    let table = only_index_table(&s.catalog).await;
+
+    put(&s.engine, &key_info, vector_item("a", None, &["1", "0"])).await;
+    let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gsi_pending WHERE table_id = $1")
+        .bind(&id)
+        .fetch_one(&s.catalog)
+        .await
+        .expect("count the queued rows");
+    assert_eq!(queued, 1, "the write must be queued at a non-zero delay");
+
+    // The table goes away under the queued row, which is what a delete of the index
+    // during propagation does. Before the fix the resulting error lost its SQLSTATE,
+    // so the worker could not recognise the race, retried the same lowest-id row
+    // forever, and every row behind it in that worker's partition stopped applying:
+    // a silent quarter of the table's writes, until someone deleted the row by hand.
+    sqlx::query(&format!("DROP TABLE \"{table}\""))
+        .execute(&s.catalog)
+        .await
+        .expect("drop the index data table");
+
+    // The engine under test has no running workers, so drive the classification the
+    // way the worker does: apply the row's own context and check the error is
+    // recognisable as a vanished table rather than an opaque failure.
+    let context: serde_json::Value =
+        sqlx::query_scalar("SELECT index_context FROM gsi_pending WHERE table_id = $1")
+            .bind(&id)
+            .fetch_one(&s.catalog)
+            .await
+            .expect("read the queued context");
+    let vector_context: extenddb_storage::vector_lifecycle::VectorApplyContext =
+        serde_json::from_value(context).expect("the context must be a vector one");
+    let item = vector_item("a", None, &["1", "0"]);
+    let mut tx = s
+        .engine
+        .data_pool()
+        .begin()
+        .await
+        .expect("begin a transaction");
+    let err = extenddb_storage_postgres::apply_claimed_vector_row(
+        &mut tx,
+        &vector_context,
+        None,
+        Some(&item),
+    )
+    .await
+    .expect_err("applying into a dropped table must fail");
+    let StorageError::Internal(message) = &err else {
+        panic!("expected Internal, got {err:?}");
+    };
+    assert!(
+        message.contains("SQLSTATE 42P01"),
+        "the error must carry its SQLSTATE so the worker can recognise the race: {message}"
+    );
+
+    s.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_failed_update_table_gives_back_every_hold_it_took() {
+    let test = "a_failed_update_table_gives_back_every_hold_it_took";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
+
+    s.engine
+        .create_table(ACCOUNT, create_input("t_hold_leak", vec![]))
+        .await
+        .expect("create a table with no vector index");
+    let id = table_id(&s.catalog, "t_hold_leak").await;
+
+    // An ordinary client request that fails: one create paired with a delete of an
+    // index that does not exist. The create takes its hold first, and the hold is
+    // written to the data database, so the catalog rollback cannot undo it. Left
+    // behind, that hold stops the propagation queue claiming ANY row for this table,
+    // secondary index rows included, and nothing would ever release it because there
+    // is no catalog row to finish or delete.
+    let err = s
+        .engine
+        .update_table(
+            ACCOUNT,
+            UpdateTableInput {
+                vector_index_updates: Some(vec![
+                    VectorIndexUpdate {
+                        create: Some(vector_spec("vidx", 2, Some("pk"))),
+                        delete: None,
+                    },
+                    VectorIndexUpdate {
+                        create: None,
+                        delete: Some(DeleteVectorIndexAction {
+                            index_name: "nosuch".to_owned(),
+                        }),
+                    },
+                ]),
+                ..update_input("t_hold_leak")
+            },
+        )
+        .await
+        .expect_err("deleting an index that does not exist must fail the request");
+    assert!(matches!(err, StorageError::IndexNotFound(_)), "{err:?}");
+
+    // Nothing committed, so nothing may be held.
+    let holds: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM vector_index_holds WHERE table_id = $1")
+            .bind(&id)
+            .fetch_one(&s.catalog)
+            .await
+            .expect("count the holds");
+    assert_eq!(
+        holds, 0,
+        "a failed UpdateTable must give back the holds it took, or this table's index \
+         propagation is frozen until a restart"
+    );
+    assert_eq!(vector_row_count(&s.catalog, &id).await, 0);
+
+    s.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_stale_heartbeat_is_rebuilt_at_runtime_and_a_fresh_one_is_left_alone() {
+    let test = "a_stale_heartbeat_is_rebuilt_at_runtime_and_a_fresh_one_is_left_alone";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
+
+    s.engine
+        .create_table(
+            ACCOUNT,
+            create_input("t_stale", vec![vector_spec("vidx", 2, Some("pk"))]),
+        )
+        .await
+        .expect("create a table with a vector index");
+    let id = table_id(&s.catalog, "t_stale").await;
+    let key_info = s
+        .engine
+        .table_key_info(ACCOUNT, "t_stale")
+        .await
+        .expect("key info");
+    put(&s.engine, &key_info, vector_item("a", None, &["1", "0"])).await;
+
+    // A build that died after its first batch: CREATING, hold held, heartbeat frozen.
+    // Nothing else moves this state, so before the runtime sweep existed the table's
+    // whole index propagation stayed paused until someone restarted the process.
+    let index_id: String =
+        sqlx::query_scalar("SELECT index_id FROM vector_indexes WHERE table_id = $1")
+            .bind(&id)
+            .fetch_one(&s.catalog)
+            .await
+            .expect("read the index id");
+    sqlx::query(
+        "UPDATE vector_indexes SET index_status = 'CREATING', backfilling = true, \
+         build_heartbeat_at = NOW() - INTERVAL '1 hour' WHERE table_id = $1",
+    )
+    .bind(&id)
+    .execute(&s.catalog)
+    .await
+    .expect("simulate a dead build");
+    sqlx::query("INSERT INTO vector_index_holds (table_id, index_id) VALUES ($1, $2)")
+        .bind(&id)
+        .bind(&index_id)
+        .execute(&s.catalog)
+        .await
+        .expect("restore the hold the dead build held");
+
+    // A fresh heartbeat must be left alone: that is the question the column exists to
+    // answer, and rebuilding a healthy build would drop and repopulate a data table
+    // out from under the process writing it.
+    let rebuilt = extenddb_storage_postgres::rebuild_stuck_vector_indexes(
+        &s.engine,
+        Some(std::time::Duration::from_secs(300)),
+    )
+    .await
+    .expect("sweep");
+    assert_eq!(
+        rebuilt, 1,
+        "a build with an hour-old heartbeat must be rebuilt"
+    );
+    let status: String =
+        sqlx::query_scalar("SELECT index_status FROM vector_indexes WHERE table_id = $1")
+            .bind(&id)
+            .fetch_one(&s.catalog)
+            .await
+            .expect("read the status");
+    assert_eq!(status, "ACTIVE");
+    let holds: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM vector_index_holds WHERE table_id = $1")
+            .bind(&id)
+            .fetch_one(&s.catalog)
+            .await
+            .expect("count the holds");
+    assert_eq!(holds, 0, "the rebuild must release the hold it repaired");
+
+    // Now the other direction, on the same table: a build whose heartbeat is current
+    // belongs to a live process and must be left to it.
+    sqlx::query(
+        "UPDATE vector_indexes SET index_status = 'CREATING', backfilling = true, \
+         build_heartbeat_at = NOW() WHERE table_id = $1",
+    )
+    .bind(&id)
+    .execute(&s.catalog)
+    .await
+    .expect("simulate a live build");
+    let rebuilt = extenddb_storage_postgres::rebuild_stuck_vector_indexes(
+        &s.engine,
+        Some(std::time::Duration::from_secs(300)),
+    )
+    .await
+    .expect("sweep");
+    assert_eq!(
+        rebuilt, 0,
+        "a live build must not be rebuilt underneath its owner"
+    );
+
+    s.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_hold_with_no_building_index_is_swept_at_runtime_not_only_at_startup() {
+    let test = "a_hold_with_no_building_index_is_swept_at_runtime_not_only_at_startup";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
+
+    s.engine
+        .create_table(
+            ACCOUNT,
+            create_input("t_runtime_sweep", vec![vector_spec("vidx", 2, Some("pk"))]),
+        )
+        .await
+        .expect("create a table with an ACTIVE vector index");
+    let id = table_id(&s.catalog, "t_runtime_sweep").await;
+    let key_info = s
+        .engine
+        .table_key_info(ACCOUNT, "t_runtime_sweep")
+        .await
+        .expect("key info");
+
+    // A hold whose index is not building at all, which is what three routes leave
+    // behind: a failed catalog commit, a crash between taking the hold and committing
+    // the row, and a crash after a delete commits but before its release. None of them
+    // leaves a CREATING row, so the stuck-build sweep can never see them, and before
+    // the runtime sweep they were permanent until a restart. Backdated, because the age
+    // bound is what keeps a peer's just-taken hold safe.
+    sqlx::query(
+        "INSERT INTO vector_index_holds (table_id, index_id, created_at) \
+         VALUES ($1, 'no-such-build', NOW() - INTERVAL '1 hour')",
+    )
+    .bind(&id)
+    .execute(&s.catalog)
+    .await
+    .expect("leave an orphan hold");
+
+    // Runtime, not startup: a staleness bound is passed, and there is no CREATING
+    // index anywhere, so nothing is rebuilt and the sweep is the only thing that acts.
+    let rebuilt = extenddb_storage_postgres::rebuild_stuck_vector_indexes(
+        &s.engine,
+        Some(std::time::Duration::from_secs(300)),
+    )
+    .await
+    .expect("sweep");
+    assert_eq!(rebuilt, 0, "there is no build to rebuild");
+
+    let holds: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM vector_index_holds WHERE table_id = $1")
+            .bind(&id)
+            .fetch_one(&s.catalog)
+            .await
+            .expect("count the holds");
+    assert_eq!(
+        holds, 0,
+        "an aged hold with no building index must be swept at runtime, or this table's \
+         index propagation stays paused until a restart"
+    );
+
+    // The table works afterwards, which is the whole point of releasing it.
+    put(&s.engine, &key_info, vector_item("a", None, &["1", "0"])).await;
+
+    s.cleanup().await;
+}
+
+#[tokio::test]
+async fn deleting_an_index_mid_backfill_leaves_nothing_orphaned() {
+    let test = "deleting_an_index_mid_backfill_leaves_nothing_orphaned";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
+
+    // A slow backfill, so the delete lands while the build is genuinely running
+    // rather than after it. This is the interleaving that has three things to clean
+    // up at once: the catalog row, the queue hold, and the data table.
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('vector_backfill_batch_delay_ms', '3000') \
+         ON CONFLICT (key) DO UPDATE SET value = '3000'",
+    )
+    .execute(&s.catalog)
+    .await
+    .expect("slow the backfill down");
+
+    s.engine
+        .create_table(ACCOUNT, create_input("t_interleave", vec![]))
+        .await
+        .expect("create a table with no vector index");
+    let key_info = s
+        .engine
+        .table_key_info(ACCOUNT, "t_interleave")
+        .await
+        .expect("key info");
+    // More than one batch of items, deliberately, and derived from the batch size
+    // rather than written as a number. The shared driver pauses BETWEEN batches and
+    // breaks out on a short one before it sleeps, so a table that fits in a single
+    // batch gives no observable window at all whatever the delay is set to: the flag
+    // flips to true and then to absent within milliseconds. Retuning the batch size
+    // would otherwise silently remove the window this test exists to create.
+    let seed = extenddb_storage::vector_lifecycle::BACKFILL_BATCH + 20;
+    for i in 0..seed {
+        put(
+            &s.engine,
+            &key_info,
+            vector_item(&format!("item{i}"), None, &["1", "0"]),
+        )
+        .await;
+    }
+
+    s.engine
+        .update_table(
+            ACCOUNT,
+            UpdateTableInput {
+                vector_index_updates: Some(vec![VectorIndexUpdate {
+                    create: Some(vector_spec("vidx", 2, Some("pk"))),
+                    delete: None,
+                }]),
+                ..update_input("t_interleave")
+            },
+        )
+        .await
+        .expect("add a vector index");
+
+    let id = table_id(&s.catalog, "t_interleave").await;
+    // Wait for the build to be running rather than merely allocated, which is the
+    // phase in which a delete is accepted.
+    let mut backfilling = false;
+    for _ in 0..200 {
+        let flag: Option<bool> = sqlx::query_scalar(
+            "SELECT backfilling FROM vector_indexes WHERE table_id = $1 AND index_name = 'vidx'",
+        )
+        .bind(&id)
+        .fetch_one(&s.catalog)
+        .await
+        .expect("read the backfilling flag");
+        if flag == Some(true) {
+            backfilling = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(backfilling, "the build never reported backfilling");
+
+    s.engine
+        .update_table(
+            ACCOUNT,
+            UpdateTableInput {
+                vector_index_updates: delete_vector("vidx"),
+                ..update_input("t_interleave")
+            },
+        )
+        .await
+        .expect("a delete during the backfill phase must be accepted");
+
+    // Give the build task time to notice, then check that nothing is left behind.
+    // The build writes into a table that no longer exists, which must not resurrect
+    // the row, recreate the table, or leave the queue held.
+    tokio::time::sleep(std::time::Duration::from_millis(4000)).await;
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vector_indexes WHERE table_id = $1")
+        .bind(&id)
+        .fetch_one(&s.catalog)
+        .await
+        .expect("count the catalog rows");
+    assert_eq!(rows, 0, "the catalog row must be gone");
+    assert!(
+        vector_data_tables(&s.catalog).await.is_empty(),
+        "the data table must be dropped, not left orphaned"
+    );
+    let holds: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM vector_index_holds WHERE table_id = $1")
+            .bind(&id)
+            .fetch_one(&s.catalog)
+            .await
+            .expect("count the holds");
+    assert_eq!(
+        holds, 0,
+        "the hold must not outlive the index: it would stop every later write to this table"
+    );
+
+    // And the table itself still works, which is the point of checking the hold.
+    put(
+        &s.engine,
+        &key_info,
+        vector_item("after", None, &["0", "1"]),
+    )
+    .await;
+
+    s.cleanup().await;
+}
+
+#[tokio::test]
+async fn startup_rebuilds_a_half_built_index_and_frees_a_stale_hold() {
+    let test = "startup_rebuilds_a_half_built_index_and_frees_a_stale_hold";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
+
+    s.engine
+        .create_table(
+            ACCOUNT,
+            create_input("t_recover", vec![vector_spec("vidx", 2, Some("pk"))]),
+        )
+        .await
+        .expect("create a table with a vector index");
+    let key_info = s
+        .engine
+        .table_key_info(ACCOUNT, "t_recover")
+        .await
+        .expect("key info");
+    let id = table_id(&s.catalog, "t_recover").await;
+    let table = only_index_table(&s.catalog).await;
+
+    put(&s.engine, &key_info, vector_item("a", None, &["1", "0"])).await;
+    put(&s.engine, &key_info, vector_item("b", None, &["0", "1"])).await;
+
+    // The state a crashed build leaves: the index stuck CREATING, its data table
+    // holding some of the rows, and its hold still in place. There is no failure
+    // state on the wire for an index to sit in, so recovery is the only thing that
+    // ever moves it.
+    sqlx::query(
+        "UPDATE vector_indexes SET index_status = 'CREATING', backfilling = true \
+         WHERE table_id = $1",
+    )
+    .bind(&id)
+    .execute(&s.catalog)
+    .await
+    .expect("simulate a dead build");
+    sqlx::query(&format!("DELETE FROM \"{table}\" WHERE base_pk LIKE '%b%'"))
+        .execute(&s.catalog)
+        .await
+        .expect("leave the data table half populated");
+    let index_id: String =
+        sqlx::query_scalar("SELECT index_id FROM vector_indexes WHERE table_id = $1")
+            .bind(&id)
+            .fetch_one(&s.catalog)
+            .await
+            .expect("read the index id");
+    sqlx::query("INSERT INTO vector_index_holds (table_id, index_id) VALUES ($1, $2)")
+        .bind(&id)
+        .bind(&index_id)
+        .execute(&s.catalog)
+        .await
+        .expect("restore the hold the dead build held");
+
+    // Two holds for indexes that are not building, distinguished only by age, which
+    // is what the sweep is allowed to key on. The old one is a crash leftover:
+    // nothing will ever release it, and while it sits there the queue claims nothing
+    // for its table. The young one may belong to another front-end that has taken a
+    // hold and not yet committed its catalog row, so sweeping it would let writes
+    // reach an index whose backfill is still scanning, which is the one ordering rule
+    // the hold exists to enforce.
+    sqlx::query(
+        "INSERT INTO vector_index_holds (table_id, index_id, created_at) \
+         VALUES ('ghost-old', 'ghost-old', NOW() - INTERVAL '1 hour')",
+    )
+    .execute(&s.catalog)
+    .await
+    .expect("add an aged orphan hold");
+    sqlx::query(
+        "INSERT INTO vector_index_holds (table_id, index_id) VALUES ('ghost-new', 'ghost-new')",
+    )
+    .execute(&s.catalog)
+    .await
+    .expect("add a just-taken hold");
+
+    let rebuilt = extenddb_storage_postgres::reconcile_incomplete_vector_indexes(&s.engine)
+        .await
+        .expect("reconcile");
+    assert_eq!(rebuilt, 1, "the half-built index must be rebuilt");
+
+    // Rebuilt rather than resumed: both rows are present, and exactly once, which is
+    // what dropping and recreating the table before backfilling guarantees. Resuming
+    // would have duplicated the row that survived.
+    assert_eq!(index_rows(&s.catalog, &table).await.len(), 2);
+    let status: String =
+        sqlx::query_scalar("SELECT index_status FROM vector_indexes WHERE table_id = $1")
+            .bind(&id)
+            .fetch_one(&s.catalog)
+            .await
+            .expect("read the status");
+    assert_eq!(status, "ACTIVE");
+    let remaining: Vec<String> =
+        sqlx::query_scalar("SELECT table_id FROM vector_index_holds ORDER BY table_id")
+            .fetch_all(&s.catalog)
+            .await
+            .expect("list the holds");
+    assert_eq!(
+        remaining,
+        vec!["ghost-new".to_owned()],
+        "the rebuilt index's hold and the aged orphan must go; the just-taken hold must stay, \
+         because it may belong to a front-end whose catalog row has not committed yet"
     );
 
     s.cleanup().await;

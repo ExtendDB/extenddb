@@ -76,7 +76,12 @@ impl PostgresEngine {
             .map_err(|e| StorageError::Validation(e.to_string()))?;
         }
 
-        let sys_delay = if indexes.is_empty() {
+        // Read whenever anything can propagate, secondary or vector. Gating this on
+        // the secondary set alone made a vector-only table ignore the configured
+        // delay and apply its vector index inline, while a TransactWriteItems on the
+        // same table read the delay unconditionally and enqueued: six write sites,
+        // two answers, on a setting the differences doc says covers both index kinds.
+        let sys_delay = if indexes.is_empty() && vector_metas.is_empty() {
             0
         } else {
             self.index_propagation_delay().await

@@ -58,6 +58,25 @@ pub const VECTOR_BACKFILL_BATCH_DELAY_MS: &str = "vector_backfill_batch_delay_ms
 /// for table status. The default is 1000; zero disables the hold.
 pub const VECTOR_INDEX_MIN_CREATING_MS: &str = "vector_index_min_creating_ms";
 
+/// Milliseconds to hold a new vector index in the resource-allocation phase before
+/// its backfill starts.
+///
+/// Zero, and meant to stay zero outside tests, exactly like
+/// [`VECTOR_BACKFILL_BATCH_DELAY_MS`] above and for the same kind of reason. The
+/// service refuses a delete of an index that is still allocating resources, with a
+/// byte-exact `ResourceInUseException`, and accepts the same delete once the
+/// backfill is running. Both halves are measured behaviour, so both deserve a wire
+/// test.
+///
+/// Without this there is no deterministic way to observe the first half from a
+/// client: the allocation phase exists only between the catalog row's insert and
+/// the flip to `Backfilling: true`, both inside one `UpdateTable` call, so a test
+/// could only race it. A race that asserts a whole measured string is worse than
+/// no test, because it fails for reasons unrelated to the rule.
+///
+/// Unset, nothing waits and no branch is taken.
+pub const VECTOR_ALLOCATION_PHASE_DELAY_MS: &str = "vector_allocation_phase_delay_ms";
+
 /// Resolve a caller-supplied settings key to its canonical name.
 ///
 /// Accepting the old name keeps `extenddb settings set gsi_propagation_delay_ms 0`

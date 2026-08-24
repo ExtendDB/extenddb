@@ -310,9 +310,16 @@ async fn next_ready_wait(pool: &PgPool, worker_id: u64) -> Option<std::time::Dur
     // asynchronous GSI propagation took ~1 s regardless of the configured
     // delay. Errors are logged now so a decode or connection failure can never
     // silently degrade propagation latency again.
+    // The hold predicate has to match the claim query's. Without it, a partition
+    // whose only due rows belong to a held table reports "due now", the claim then
+    // finds nothing, and the loop re-runs on a one millisecond wait: about two
+    // thousand statements a second per worker, four workers, for as long as a
+    // backfill lasts, all of it doing no work. With it, such a partition falls
+    // through to the idle backstop, and the hold's release wakes the worker anyway.
     let secs: Option<f64> = sqlx::query_scalar(
-        "SELECT EXTRACT(EPOCH FROM (MIN(ready_at) - NOW()))::float8 FROM gsi_pending \
-         WHERE worker_partition = $1",
+        "SELECT EXTRACT(EPOCH FROM (MIN(ready_at) - NOW()))::float8 FROM gsi_pending p \
+         WHERE worker_partition = $1 \
+         AND NOT EXISTS (SELECT 1 FROM vector_index_holds h WHERE h.table_id = p.table_id)",
     )
     .bind(worker_id as i32)
     .fetch_one(pool)
@@ -364,7 +371,9 @@ async fn process_batch(worker_id: u64, q: &GsiQueue) -> Result<usize, StorageErr
         let row: Option<ClaimedRow> = sqlx::query_as(
             "SELECT id, table_id, old_item, new_item, index_context FROM gsi_pending \
              WHERE worker_partition = $1 AND ready_at <= NOW() \
-             AND table_id NOT IN (SELECT table_id FROM vector_index_holds) \
+             AND NOT EXISTS ( \
+                 SELECT 1 FROM vector_index_holds h WHERE h.table_id = gsi_pending.table_id \
+             ) \
              ORDER BY id \
              LIMIT 1 \
              FOR UPDATE SKIP LOCKED",

@@ -33,8 +33,11 @@ use crate::data::vector_table_name;
 /// similar row has the smallest value under each operator. The sign is undone
 /// after ordering, in [`report_score`].
 ///
-/// `$1` is the query vector and `{query_norm}` the caller's precomputed norm.
-fn score_expression(function: DistanceFunction, query_norm: f64) -> String {
+/// `$1` is the query vector and `${norm_param}` the caller's precomputed norm, bound
+/// rather than interpolated: a norm formatted into the statement can render as `inf`
+/// for a large query vector, which PostgreSQL then reads as a column name and the
+/// search fails with a 500 for input the service answers.
+fn score_expression(function: DistanceFunction, norm_param: usize) -> String {
     match function {
         // The CASE is a conformance requirement, not a nicety. pgvector's cosine
         // operator yields NaN when either side has zero norm, while the service
@@ -42,7 +45,7 @@ fn score_expression(function: DistanceFunction, query_norm: f64) -> String {
         // 2026-08-19), which is also what the SQLite backend produces. Removing
         // the CASE would make a zero vector sort unpredictably and report NaN.
         DistanceFunction::Cosine => format!(
-            "CASE WHEN nrm = 0 OR {query_norm} = 0 THEN 1.0 \
+            "CASE WHEN nrm = 0 OR ${norm_param} = 0 THEN 1.0 \
              ELSE (embedding <=> $1)::float8 END"
         ),
         DistanceFunction::Euclidean => "(embedding <-> $1)::float8".to_owned(),
@@ -144,9 +147,11 @@ impl VectorSearchEngine for PostgresEngine {
             // jsonb equality is well defined for these values because numbers are
             // normalised when an item is deserialised, so two equal numbers have
             // one representation.
+            // $1 vector, $2 partition, $3 limit, $4 norm, then two per filter.
+            const FIRST_FILTER_PARAM: usize = 5;
             let mut predicates = String::new();
             for i in 0..filters.len() {
-                let name_param = 4 + i * 2;
+                let name_param = FIRST_FILTER_PARAM + i * 2;
                 let value_param = name_param + 1;
                 predicates.push_str(&format!(
                     " AND item_data -> ${name_param} = ${value_param}::jsonb"
@@ -157,7 +162,7 @@ impl VectorSearchEngine for PostgresEngine {
                 "SELECT {score} AS score, embedding, item_data \
                  FROM {vec_table} WHERE part = $2{predicates} \
                  ORDER BY score ASC, base_pk ASC LIMIT $3",
-                score = score_expression(function, query_norm),
+                score = score_expression(function, 4),
             );
 
             // Bound as a typed vector rather than a text literal, so the value that
@@ -167,7 +172,8 @@ impl VectorSearchEngine for PostgresEngine {
                 // Bytes, matching the BYTEA column: the unscoped sentinel contains
                 // a NUL, so a text comparison would not even be storable.
                 .bind(partition.into_bytes())
-                .bind(top_k);
+                .bind(top_k)
+                .bind(query_norm);
             for (name, value) in &filters {
                 let value_json = serde_json::to_string(value)
                     .map_err(|e| StorageError::Internal(format!("filter value: {e}")))?;
@@ -214,7 +220,7 @@ mod tests {
         // The measured answer for a zero vector under cosine is exactly 1.0, on
         // either side. pgvector's operator returns NaN there, so the guard is what
         // makes the backend conformant rather than merely tidy.
-        let sql = score_expression(DistanceFunction::Cosine, 0.0);
+        let sql = score_expression(DistanceFunction::Cosine, 4);
         assert!(sql.contains("nrm = 0"), "{sql}");
         assert!(sql.contains("THEN 1.0"), "{sql}");
         assert!(sql.contains("<=>"), "{sql}");
@@ -222,8 +228,8 @@ mod tests {
 
     #[test]
     fn each_metric_uses_its_own_operator() {
-        assert!(score_expression(DistanceFunction::Euclidean, 1.0).contains("<->"));
-        assert!(score_expression(DistanceFunction::DotProduct, 1.0).contains("<#>"));
+        assert!(score_expression(DistanceFunction::Euclidean, 4).contains("<->"));
+        assert!(score_expression(DistanceFunction::DotProduct, 4).contains("<#>"));
     }
 
     #[test]
@@ -237,11 +243,53 @@ mod tests {
     }
 
     #[test]
-    fn a_query_norm_of_zero_is_interpolated_into_the_guard() {
-        // The norm is a computed f64 rather than a bind parameter, so the guard has
-        // to carry it literally. A formatting change that dropped it would make the
-        // zero-query case fall through to the operator and return NaN.
-        let sql = score_expression(DistanceFunction::Cosine, 0.0);
-        assert!(sql.contains("0 = 0"), "{sql}");
+    fn the_query_norm_is_a_bind_parameter_and_never_formatted_in() {
+        // A formatted norm renders as `inf` for a large query vector, and PostgreSQL
+        // reads that as a column name: `ERROR: column "inf" does not exist`, a 500
+        // for a search the service answers. Binding it also keeps the statement text
+        // identical across queries, so the plan cache is not defeated per request.
+        let sql = score_expression(DistanceFunction::Cosine, 4);
+        assert!(
+            sql.contains("$4 = 0"),
+            "the norm must be a parameter: {sql}"
+        );
+        // `1.0` is the measured cosine answer for a zero-norm vector and belongs in
+        // the statement. What must never appear is a rendered norm, whose failure mode
+        // is the token `inf`. The signature is the real guarantee, since it takes a
+        // parameter index and has no value to render; this catches a regression that
+        // reintroduced one.
+        assert!(
+            !sql.contains("inf"),
+            "a rendered norm reached the statement: {sql}"
+        );
+        assert_eq!(
+            sql.matches("1.0").count(),
+            1,
+            "the only literal is the measured zero-norm score: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_large_query_vector_does_not_overflow_the_norm() {
+        // f32 accumulation overflowed to infinity here; f64 does not. The values are
+        // ones the service accepts, so this is a search that must work rather than an
+        // edge nobody reaches.
+        let big = [1e38f32; 4];
+        let norm = big
+            .iter()
+            .map(|x| f64::from(*x) * f64::from(*x))
+            .sum::<f64>()
+            .sqrt();
+        assert!(norm.is_finite(), "norm overflowed: {norm}");
+
+        // And the other end: f32 squares of 1e-30 underflow to zero, which made the
+        // guard fire and every row score exactly 1.0, silently.
+        let tiny = [1e-30f32; 4];
+        let norm = tiny
+            .iter()
+            .map(|x| f64::from(*x) * f64::from(*x))
+            .sum::<f64>()
+            .sqrt();
+        assert!(norm > 0.0, "norm underflowed to zero: {norm}");
     }
 }

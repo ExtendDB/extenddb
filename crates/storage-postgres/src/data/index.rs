@@ -22,10 +22,21 @@ use crate::gsi_queue::{GsiApplyContext, GsiIndexDef, enqueue_gsi_pending};
 /// message. The async GSI worker keys off the code (e.g. `42P01`,
 /// undefined_table) to tell a dropped-index race apart from a real failure;
 /// `sqlx`'s `Display` only carries the human text, so the code must be kept.
-fn db_error(e: sqlx::Error) -> StorageError {
+pub(crate) fn db_error(e: sqlx::Error) -> StorageError {
+    StorageError::Internal(sqlstate_message(&e))
+}
+
+/// Render a database error with its SQLSTATE prefixed.
+///
+/// The prefix is the whole mechanism behind `is_undefined_table`: sqlx renders a
+/// database error as its message text alone, so a caller that formats with
+/// `to_string` throws the code away and every classifier downstream stops working.
+/// Shared so the vector path cannot format it differently from the GSI path, which
+/// is exactly how a dropped-table race turned into a permanently stalled worker.
+pub(crate) fn sqlstate_message(e: &sqlx::Error) -> String {
     match e.as_database_error().and_then(|d| d.code()) {
-        Some(code) => StorageError::Internal(format!("SQLSTATE {code}: {e}")),
-        None => StorageError::Internal(e.to_string()),
+        Some(code) => format!("SQLSTATE {code}: {e}"),
+        None => e.to_string(),
     }
 }
 

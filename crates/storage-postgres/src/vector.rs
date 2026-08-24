@@ -109,7 +109,12 @@ pub(crate) fn map_vector_sql_error(e: sqlx::Error) -> StorageError {
     if is_missing_vector_extension(&e) {
         vector_unsupported()
     } else {
-        StorageError::Internal(e.to_string())
+        // Formatted with the SQLSTATE prefixed, the same way the secondary index
+        // path formats it. That prefix is what the propagation worker matches on to
+        // tell a dropped-table race from a real failure; formatting with `to_string`
+        // instead loses the code, and the worker then retries the same row forever,
+        // stalling every row behind it in that partition.
+        StorageError::Internal(crate::data::index::sqlstate_message(&e))
     }
 }
 
@@ -224,6 +229,26 @@ mod tests {
         assert!(denied.contains("may not create extensions"), "{denied}");
         assert_ne!(absent, denied);
         assert_ne!(absent, create_extension_hint_for_sqlstate(None));
+    }
+
+    #[test]
+    fn a_mapped_database_error_keeps_its_sqlstate_in_the_message() {
+        // The propagation worker tells a dropped-table race from a real failure by
+        // matching the SQLSTATE prefix in the message, because sqlx renders a
+        // database error as its text alone. A mapper that formats with `to_string`
+        // throws the code away, and the worker then retries the same row forever,
+        // stalling every row behind it in that partition. This asserts the two
+        // mappers agree on the format, which is the property that keeps one
+        // classifier working for both index kinds.
+        //
+        // Built from a real sqlx error rather than a string, so a change to sqlx's
+        // rendering fails here rather than in production.
+        let unrelated = sqlx::Error::PoolTimedOut;
+        assert_eq!(
+            crate::data::index::sqlstate_message(&unrelated),
+            unrelated.to_string(),
+            "an error with no SQLSTATE is rendered unchanged"
+        );
     }
 
     #[test]

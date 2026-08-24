@@ -151,6 +151,14 @@ impl PostgresEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+            // And any vector build hold: the table is gone, so nothing will ever
+            // release it, and a stale hold blocks claims for that table id.
+            sqlx::query("DELETE FROM vector_index_holds WHERE table_id = $1")
+                .bind(table_id)
+                .execute(&mut *data_tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+
             data_tx
                 .commit()
                 .await

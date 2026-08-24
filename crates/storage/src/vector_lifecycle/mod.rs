@@ -22,7 +22,9 @@
 //!    the scan starts ([`VectorIndexBuild::set_backfilling`]), and becomes
 //!    `ACTIVE` with the `Backfilling` member absent in a single transition
 //!    ([`VectorIndexBuild::mark_active`]). An index created by `CreateTable`
-//!    skips the sequence: the table is empty, so it is `ACTIVE` from birth.
+//!    skips the sequence: the table is empty, so it is `ACTIVE` from birth. A
+//!    recovery rebuild repeats the sequence from `Backfilling: true`, because
+//!    the phase is what the `UpdateTable` delete rule reads.
 //! 2. **The table stays writable throughout.** The backfill commits in
 //!    independent batches ([`run_backfill`]) rather than holding one
 //!    transaction, and the build task is detached from the `UpdateTable`
@@ -45,7 +47,8 @@
 //! 5. **Failure leaves the index `CREATING`.** There is no failure state on
 //!    the wire, and flipping to `ACTIVE` would publish a partially populated
 //!    index. A build that dies is repaired by rebuilding: drop the data table,
-//!    recreate it, backfill, flip ([`rebuild_index`]). Rebuilding rather than
+//!    recreate it, re-assert `Backfilling: true`, backfill, flip
+//!    ([`rebuild_index`]). Rebuilding rather than
 //!    resuming, because rows already written would collide with the backfill's
 //!    deliberately plain INSERT.
 //! 6. **Build ownership is backend-defined.** Recovery must not rebuild an

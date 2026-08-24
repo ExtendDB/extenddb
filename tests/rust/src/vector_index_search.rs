@@ -1704,6 +1704,11 @@ async fn removing_a_row_during_a_backfill_does_not_skip_another() {
 /// that skipped itself and reported green when this variable was absent, which is the
 /// exact failure mode `EXTENDDB_EXPECT_VECTORS` was introduced to close.
 async fn set_backfill_delay(ms: u64) {
+    set_vector_setting("vector_backfill_batch_delay_ms", ms).await;
+}
+
+/// Write one vector test lever through the management API.
+async fn set_vector_setting(key: &str, ms: u64) {
     let user = std::env::var("EXTENDDB_ADMIN_USER").unwrap_or_else(|_| "admin".into());
     let Ok(pass) = std::env::var("EXTENDDB_ADMIN_PASSWORD") else {
         assert!(
@@ -1724,7 +1729,7 @@ async fn set_backfill_delay(ms: u64) {
         .build()
         .expect("reqwest build");
     let r = http
-        .put(format!("{base}/settings/vector_backfill_batch_delay_ms"))
+        .put(format!("{base}/settings/{key}"))
         .basic_auth(&user, Some(&pass))
         .json(&serde_json::json!({ "value": ms.to_string() }))
         .send()
@@ -1734,7 +1739,7 @@ async fn set_backfill_delay(ms: u64) {
     let body = r.text().await.unwrap_or_default();
     assert!(
         status.is_success(),
-        "setting the backfill delay failed ({status}): {body}"
+        "setting {key} failed ({status}): {body}"
     );
 }
 

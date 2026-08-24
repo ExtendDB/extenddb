@@ -119,6 +119,13 @@ impl PostgresEngine {
             for index_id in &vector_index_ids {
                 Self::drop_vector_data_table(&mut data_tx, index_id).await?;
             }
+            // Holds go with the table. A hold for a table that no longer exists
+            // would block claims for a table id that can never be released.
+            sqlx::query("DELETE FROM vector_index_holds WHERE table_id = $1")
+                .bind(&row.table_id)
+                .execute(&mut *data_tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
             Self::drop_data_table(&mut data_tx, &row.table_id).await?;
 
             // Drop any still-pending GSI propagation rows for this table in the
