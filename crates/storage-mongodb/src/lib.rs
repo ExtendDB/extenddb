@@ -103,7 +103,10 @@ fn server_components_factory(
 
         let engine = Arc::new(engine);
 
-        // Create catalog store
+        // Create one shared catalog/management client. MongoDB Client clones
+        // share the underlying pool, so max_catalog_connections limits the
+        // combined catalog and auth traffic rather than creating two
+        // independent pools with twice the configured ceiling.
         let catalog_client =
             connect_guarded(&connection_string, Some(max_catalog_connections), false)
                 .await
@@ -125,6 +128,7 @@ fn server_components_factory(
             .and_then(|d| d.get_str("value").ok().map(std::borrow::ToOwned::to_owned))
             .ok_or(BackendError::MissingEncryptionKey)?;
 
+        let auth_client = catalog_client.clone();
         let catalog_store = Arc::new(MongoCatalogStore::with_encryption_key(
             catalog_client,
             enc_key.clone(),
@@ -133,9 +137,6 @@ fn server_components_factory(
         // Create credential store. The bin layer wraps this in
         // CachedCredentialStore using the operator-configured TTL
         // before constructing the auth provider.
-        let auth_client = connect_guarded(&connection_string, Some(max_catalog_connections), false)
-            .await
-            .map_err(|e| BackendError::InitializationFailed(format!("Auth client: {e}")))?;
         let cred_store: Arc<dyn extenddb_auth::CredentialStore> =
             Arc::new(MongoCredentialStore::new(auth_client, enc_key));
 
