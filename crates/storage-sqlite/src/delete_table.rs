@@ -37,6 +37,23 @@ impl SqliteEngine {
             return Err(StorageError::DeletionProtected(row.table_arn.clone()));
         }
 
+        // A vector index with `backfilling` set is an UpdateTable build in
+        // flight (the with-table path never sets the column), and the service
+        // refuses to delete the table underneath one. The refusal is by build
+        // state rather than by any timer, so it holds for the whole backfill
+        // and clears the moment the index flips ACTIVE or its create is
+        // cancelled with a Delete action.
+        let index_build_in_flight: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM vector_indexes WHERE table_id = ? AND backfilling IS NOT NULL LIMIT 1",
+        )
+        .bind(&row.table_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        if index_build_in_flight.is_some() {
+            return Err(StorageError::IndexesInUse(input.table_name.clone()));
+        }
+
         let index_rows: Vec<IndexRow> = sqlx::query_as(&format!(
             "SELECT {INDEX_COLUMNS} FROM indexes WHERE table_id = ?"
         ))

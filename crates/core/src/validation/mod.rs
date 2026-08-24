@@ -330,11 +330,25 @@ fn validate_one_vector_index(
     }
     validate_index_name(&vi.index_name)?;
     validate_search_schema_shape(vi.search_schema.as_deref())?;
-    if vi.dimensions < 1 || vi.dimensions > 4096 {
+    // The two bounds are reported by DIFFERENT layers with different messages.
+    // Dimensions below 1 never reaches the semantic check on the service: the
+    // request model rejects it first, with the smithy-style single-fault
+    // message. Measured 2026-08-24 in us-east-1 with botocore's client-side
+    // validation disabled so Dimensions=0 reached the service:
+    //   1 validation error detected: Value '0' at
+    //   'vectorIndexes.1.member.dimensions' failed to satisfy constraint:
+    //   Member must have value greater than or equal to 1
+    if vi.dimensions < 1 {
+        return Err(DynamoDbError::ValidationException(format!(
+            "1 validation error detected: Value '{}' at \
+             '{field}.{position}.member.dimensions' failed to satisfy constraint: \
+             Member must have value greater than or equal to 1",
+            vi.dimensions
+        )));
+    }
+    if vi.dimensions > 4096 {
         // Verified against the service 2026-08-05: Dimensions=4097 and 8192
-        // both return exactly this message. The lower bound is not observable
-        // through an SDK because botocore rejects Dimensions=0 client-side, but
-        // the service text names both bounds, so it is reused here.
+        // both return exactly this message.
         return Err(DynamoDbError::ValidationException(
             "One or more parameter values were invalid: Number of dimensions must be \
              between 1 and 4096 inclusive."
@@ -389,6 +403,26 @@ fn validate_vector_indexes(input: &CreateTableInput) -> Result<(), DynamoDbError
         )));
     }
 
+    // Several indexes may share one vector attribute, but they must agree on its
+    // Dimensions: the attribute stores one vector, so two indexes declaring
+    // different sizes for it contradict each other. The service rejects the
+    // create naming the attribute; wording pinned by the ground-truth runs of
+    // 2026-08-24 (us-east-1 and eu-west-2 both answer exactly this).
+    for (i, vi) in vis.iter().enumerate() {
+        let conflicting = vis[..i].iter().any(|prior| {
+            prior.vector_attribute.attribute_name == vi.vector_attribute.attribute_name
+                && prior.dimensions != vi.dimensions
+        });
+        if conflicting {
+            return Err(DynamoDbError::ValidationException(format!(
+                "One or more parameter values were invalid: Conflicting attribute \
+                 definition for '{}'. All VectorIndexes on the same vector attribute \
+                 must use the same dimensions.",
+                vi.vector_attribute.attribute_name
+            )));
+        }
+    }
+
     Ok(())
 }
 
@@ -417,6 +451,23 @@ pub fn validate_vector_index_updates(
     };
     if updates.is_empty() {
         return Ok(());
+    }
+    // One online index action per call, enforced with the online-index
+    // machinery's own error class and wording. Pinned by the ground-truth runs
+    // of 2026-08-24 (us-east-1 and eu-west-2): two Create actions in one
+    // UpdateTable answer LimitExceededException with exactly this sentence.
+    // Counted over actions rather than elements, so an element carrying both a
+    // Create and a Delete counts as two.
+    let actions = updates
+        .iter()
+        .map(|u| usize::from(u.create.is_some()) + usize::from(u.delete.is_some()))
+        .sum::<usize>();
+    if actions > 1 {
+        return Err(DynamoDbError::LimitExceededException(
+            "Subscriber limit exceeded: Only 1 online index can be created or deleted \
+             simultaneously per table"
+                .to_owned(),
+        ));
     }
     for (position, update) in updates.iter().enumerate() {
         if let Some(create) = update.create.as_ref() {
@@ -1869,7 +1920,22 @@ mod tests {
         }];
         assert!(validate_vector_index_updates(Some(&updates), &[]).is_err());
 
-        // A well-formed create, and a delete, both pass.
+        // A well-formed single create passes, and a single delete passes; two
+        // actions in one request are refused by the one-online-action rule
+        // with the online-index machinery's own error class (pinned by the
+        // ground-truth runs of 2026-08-24).
+        let updates = vec![VectorIndexUpdate {
+            create: Some(spec(all())),
+            delete: None,
+        }];
+        assert!(validate_vector_index_updates(Some(&updates), &[]).is_ok());
+        let updates = vec![VectorIndexUpdate {
+            create: None,
+            delete: Some(DeleteVectorIndexAction {
+                index_name: "other".to_owned(),
+            }),
+        }];
+        assert!(validate_vector_index_updates(Some(&updates), &[]).is_ok());
         let updates = vec![
             VectorIndexUpdate {
                 create: Some(spec(all())),
@@ -1882,7 +1948,16 @@ mod tests {
                 }),
             },
         ];
-        assert!(validate_vector_index_updates(Some(&updates), &[]).is_ok());
+        match validate_vector_index_updates(Some(&updates), &[])
+            .expect_err("two online index actions in one call must be refused")
+        {
+            DynamoDbError::LimitExceededException(m) => assert_eq!(
+                m,
+                "Subscriber limit exceeded: Only 1 online index can be created or deleted \
+                 simultaneously per table"
+            ),
+            other => panic!("expected LimitExceededException, got {other:?}"),
+        }
     }
 
     use crate::types::{DistanceFunction, VectorAttribute, VectorIndexSpecification};
