@@ -16,11 +16,13 @@
 
 use futures::TryStreamExt;
 use futures::future::BoxFuture;
-use mongodb::bson::{Document, doc};
+use mongodb::bson::{self, Document, doc};
+use serde::de::DeserializeOwned;
 
 use extenddb_core::types::{
-    BackupDescription, BackupDetails, BackupSummary, ContinuousBackupsDescription,
-    KeySchemaElement, PointInTimeRecoveryDescription, SourceTableDetails, TableDescription,
+    BackupDescription, BackupDetails, BackupSummary, ContinuousBackupsDescription, GsiInput,
+    KeySchemaElement, LsiInput, PointInTimeRecoveryDescription, Projection, ProvisionedThroughput,
+    SourceTableDetails, TableDescription,
 };
 use extenddb_storage::BackupEngine;
 use extenddb_storage::error::StorageError;
@@ -50,6 +52,92 @@ fn now_epoch_secs() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as f64
+}
+
+fn decode_optional<T: DeserializeOwned>(
+    doc: &Document,
+    key: &str,
+) -> Result<Option<T>, StorageError> {
+    match doc.get(key) {
+        None | Some(bson::Bson::Null) => Ok(None),
+        Some(value) => bson::from_bson(value.clone())
+            .map(Some)
+            .map_err(|e| StorageError::Internal(format!("parse {key}: {e}"))),
+    }
+}
+
+fn decode_required<T: DeserializeOwned>(doc: &Document, key: &str) -> Result<T, StorageError> {
+    let value = doc
+        .get(key)
+        .ok_or_else(|| StorageError::Internal(format!("missing {key}")))?;
+    bson::from_bson(value.clone()).map_err(|e| StorageError::Internal(format!("parse {key}: {e}")))
+}
+
+fn restore_provisioned_throughput(
+    billing_mode: &str,
+    stored: Option<ProvisionedThroughput>,
+) -> Option<ProvisionedThroughput> {
+    if billing_mode == "PROVISIONED" {
+        Some(stored.unwrap_or(ProvisionedThroughput {
+            read_capacity_units: 5,
+            write_capacity_units: 5,
+        }))
+    } else {
+        None
+    }
+}
+
+impl MongoEngine {
+    async fn backfill_restored_indexes(&self, table_id: &str) -> Result<(), StorageError> {
+        let key_info = self.table_key_info_by_table_id_impl(table_id).await?;
+        let indexes_coll = self.catalog_db.collection::<Document>("indexes");
+        let mut cursor = indexes_coll
+            .find(doc! { "_id.table_id": table_id })
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        while let Some(index_doc) = cursor
+            .try_next()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?
+        {
+            let index_type = index_doc.get_str("index_type").unwrap_or("GSI");
+            if index_type != "GSI" && index_type != "LSI" {
+                continue;
+            }
+            let index_id = index_doc
+                .get_str("index_id")
+                .map_err(|_| StorageError::Internal("missing restored index_id".to_string()))?
+                .to_owned();
+            let index_key_schema: Vec<KeySchemaElement> =
+                decode_required(&index_doc, "key_schema")?;
+            let projection: Projection = decode_required(&index_doc, "projection")?;
+
+            let mut cursor_id = None;
+            loop {
+                let progress = self
+                    .backfill_gsi_batch(
+                        &key_info,
+                        &index_id,
+                        &index_key_schema,
+                        &projection,
+                        cursor_id.as_ref(),
+                        500,
+                    )
+                    .await?;
+                if progress.done {
+                    break;
+                }
+                cursor_id = progress.last_id;
+                if cursor_id.is_none() {
+                    return Err(StorageError::Internal(
+                        "restored index backfill made no progress".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl BackupEngine for MongoEngine {
@@ -109,6 +197,60 @@ impl BackupEngine for MongoEngine {
                 .unwrap_or(mongodb::bson::Bson::Null);
             let on_demand_bson = table_doc
                 .get("on_demand_throughput")
+                .cloned()
+                .unwrap_or(mongodb::bson::Bson::Null);
+
+            // Preserve secondary-index definitions separately from the base
+            // item snapshot. The base collection does not contain the index
+            // metadata needed to recreate GSI/LSI collections on restore.
+            let indexes_coll = self.catalog_db.collection::<Document>("indexes");
+            let index_cursor = indexes_coll
+                .find(doc! { "_id.table_id": &table_id })
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let index_docs: Vec<Document> = index_cursor
+                .try_collect()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let mut global_secondary_indexes = Vec::new();
+            let mut local_secondary_indexes = Vec::new();
+            for index_doc in index_docs {
+                let index_name = index_doc
+                    .get_document("_id")
+                    .and_then(|id| id.get_str("index_name"))
+                    .map_err(|_| StorageError::Internal("missing index_name".to_string()))?
+                    .to_owned();
+                let key_schema: Vec<KeySchemaElement> = decode_required(&index_doc, "key_schema")?;
+                let projection: Projection = decode_required(&index_doc, "projection")?;
+
+                match index_doc.get_str("index_type").unwrap_or("GSI") {
+                    "GSI" => {
+                        global_secondary_indexes.push(GsiInput {
+                            index_name,
+                            key_schema,
+                            projection,
+                            provisioned_throughput: decode_optional(
+                                &index_doc,
+                                "provisioned_throughput",
+                            )?,
+                        });
+                    }
+                    "LSI" => {
+                        local_secondary_indexes.push(LsiInput {
+                            index_name,
+                            key_schema,
+                            projection,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            let global_secondary_indexes_bson = bson::to_bson(&global_secondary_indexes)
+                .map_err(|e| StorageError::Internal(format!("serialize GSI metadata: {e}")))?;
+            let local_secondary_indexes_bson = bson::to_bson(&local_secondary_indexes)
+                .map_err(|e| StorageError::Internal(format!("serialize LSI metadata: {e}")))?;
+            let provisioned_throughput_bson = table_doc
+                .get("provisioned_throughput")
                 .cloned()
                 .unwrap_or(mongodb::bson::Bson::Null);
 
@@ -176,6 +318,9 @@ impl BackupEngine for MongoEngine {
                 "key_schema": key_schema_bson,
                 "attribute_definitions": attr_defs_bson,
                 "billing_mode": &billing_mode,
+                "provisioned_throughput": provisioned_throughput_bson,
+                "global_secondary_indexes": global_secondary_indexes_bson,
+                "local_secondary_indexes": local_secondary_indexes_bson,
                 "created_at": mongodb::bson::DateTime::now(),
                 "table_creation_date_time": created_at,
                 "table_class": table_class_bson,
@@ -453,6 +598,18 @@ impl BackupEngine for MongoEngine {
                 Some(extenddb_core::types::BillingMode::Provisioned)
             };
 
+            // New backups preserve these fields. Keep the old 5/5 fallback
+            // for backups created before the metadata was added, while
+            // correctly omitting provisioned throughput for on-demand tables.
+            let provisioned_throughput: Option<ProvisionedThroughput> =
+                decode_optional(&backup_doc, "provisioned_throughput")?;
+            let provisioned_throughput =
+                restore_provisioned_throughput(billing, provisioned_throughput);
+            let global_secondary_indexes: Option<Vec<GsiInput>> =
+                decode_optional(&backup_doc, "global_secondary_indexes")?;
+            let local_secondary_indexes: Option<Vec<LsiInput>> =
+                decode_optional(&backup_doc, "local_secondary_indexes")?;
+
             // Preserve the source table's TableClass / SSESpecification /
             // OnDemandThroughput settings when recreating.
             let table_class = backup_doc.get_str("table_class").ok().map(str::to_owned);
@@ -478,12 +635,9 @@ impl BackupEngine for MongoEngine {
                 key_schema,
                 attribute_definitions: attr_defs,
                 billing_mode,
-                provisioned_throughput: Some(extenddb_core::types::ProvisionedThroughput {
-                    read_capacity_units: 5,
-                    write_capacity_units: 5,
-                }),
-                global_secondary_indexes: None,
-                local_secondary_indexes: None,
+                provisioned_throughput,
+                global_secondary_indexes,
+                local_secondary_indexes,
                 stream_specification: None,
                 tags: None,
                 deletion_protection_enabled: None,
@@ -533,6 +687,11 @@ impl BackupEngine for MongoEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?
                 as i64;
+
+            // `create_table_impl` creates the restored index collections, but
+            // the base `$out` copy does not populate them. Backfill each
+            // restored GSI/LSI before exposing the table as ACTIVE.
+            self.backfill_restored_indexes(&desc.table_id).await?;
 
             // Now that the data is fully copied, record the item count and
             // release the table from CREATING. The table was created with the
@@ -669,5 +828,46 @@ impl BackupEngine for MongoEngine {
             let _ = self.delete_backup(&account_id, &backup.backup_arn).await;
             Ok(desc)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::restore_provisioned_throughput;
+    use extenddb_core::types::ProvisionedThroughput;
+
+    #[test]
+    fn restore_preserves_stored_provisioned_throughput() {
+        let stored = ProvisionedThroughput {
+            read_capacity_units: 7,
+            write_capacity_units: 9,
+        };
+        assert_eq!(
+            restore_provisioned_throughput("PROVISIONED", Some(stored.clone())),
+            Some(stored)
+        );
+    }
+
+    #[test]
+    fn restore_uses_legacy_fallback_when_capacity_metadata_is_missing() {
+        assert_eq!(
+            restore_provisioned_throughput("PROVISIONED", None),
+            Some(ProvisionedThroughput {
+                read_capacity_units: 5,
+                write_capacity_units: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn restore_drops_capacity_for_pay_per_request() {
+        let stored = ProvisionedThroughput {
+            read_capacity_units: 7,
+            write_capacity_units: 9,
+        };
+        assert_eq!(
+            restore_provisioned_throughput("PAY_PER_REQUEST", Some(stored)),
+            None
+        );
     }
 }

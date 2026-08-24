@@ -5,8 +5,9 @@
 
 use crate::test_base::*;
 use aws_sdk_dynamodb::types::{
-    AttributeDefinition, BillingMode, KeySchemaElement, KeyType, PointInTimeRecoverySpecification,
-    ScalarAttributeType,
+    AttributeDefinition, BillingMode, GlobalSecondaryIndex, KeySchemaElement, KeyType,
+    LocalSecondaryIndex, PointInTimeRecoverySpecification, Projection, ProjectionType,
+    ProvisionedThroughput, ScalarAttributeType,
 };
 
 async fn make_table(name: &str) {
@@ -208,6 +209,287 @@ async fn restore_table_from_backup() {
     wait_for_active(c, &restored).await;
     let scan = c.scan().table_name(&restored).send().await.unwrap();
     assert_eq!(scan.count(), 5);
+    let restored_description = c
+        .describe_table()
+        .table_name(&restored)
+        .send()
+        .await
+        .unwrap()
+        .table()
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        restored_description
+            .provisioned_throughput()
+            .expect("restored table throughput")
+            .read_capacity_units(),
+        Some(0),
+        "pay-per-request restore must not invent provisioned capacity"
+    );
+    assert_eq!(
+        restored_description
+            .provisioned_throughput()
+            .expect("restored table throughput")
+            .write_capacity_units(),
+        Some(0),
+        "pay-per-request restore must not invent provisioned capacity"
+    );
+
+    c.delete_table().table_name(&restored).send().await.ok();
+    c.delete_table().table_name(&table).send().await.ok();
+}
+
+#[tokio::test]
+async fn restore_preserves_table_throughput_and_secondary_indexes() {
+    let c = client();
+    let table = format!("RestoreMetadata_{}", ts());
+    let restored = format!("RestoredMetadata_{}", ts());
+
+    c.create_table()
+        .table_name(&table)
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("sk")
+                .key_type(KeyType::Range)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("sk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("gsi_pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("gsi_sk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("lsi_sk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .provisioned_throughput(
+            ProvisionedThroughput::builder()
+                .read_capacity_units(7)
+                .write_capacity_units(9)
+                .build()
+                .unwrap(),
+        )
+        .global_secondary_indexes(
+            GlobalSecondaryIndex::builder()
+                .index_name("restore_gsi")
+                .key_schema(
+                    KeySchemaElement::builder()
+                        .attribute_name("gsi_pk")
+                        .key_type(KeyType::Hash)
+                        .build()
+                        .unwrap(),
+                )
+                .key_schema(
+                    KeySchemaElement::builder()
+                        .attribute_name("gsi_sk")
+                        .key_type(KeyType::Range)
+                        .build()
+                        .unwrap(),
+                )
+                .projection(
+                    Projection::builder()
+                        .projection_type(ProjectionType::Include)
+                        .non_key_attributes("gsi_extra")
+                        .build(),
+                )
+                .provisioned_throughput(
+                    ProvisionedThroughput::builder()
+                        .read_capacity_units(11)
+                        .write_capacity_units(13)
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .local_secondary_indexes(
+            LocalSecondaryIndex::builder()
+                .index_name("restore_lsi")
+                .key_schema(
+                    KeySchemaElement::builder()
+                        .attribute_name("pk")
+                        .key_type(KeyType::Hash)
+                        .build()
+                        .unwrap(),
+                )
+                .key_schema(
+                    KeySchemaElement::builder()
+                        .attribute_name("lsi_sk")
+                        .key_type(KeyType::Range)
+                        .build()
+                        .unwrap(),
+                )
+                .projection(
+                    Projection::builder()
+                        .projection_type(ProjectionType::All)
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    wait_for_active(c, &table).await;
+
+    c.put_item()
+        .table_name(&table)
+        .item("pk", s("partition-1"))
+        .item("sk", s("sort-1"))
+        .item("gsi_pk", s("gsi-partition-1"))
+        .item("gsi_sk", s("gsi-sort-1"))
+        .item("gsi_extra", s("included-value"))
+        .item("lsi_sk", s("lsi-sort-1"))
+        .send()
+        .await
+        .unwrap();
+
+    let backup = create_backup_with_retry(c, &table, "restore-metadata").await;
+    let backup_arn = backup.backup_details().unwrap().backup_arn().to_owned();
+    c.restore_table_from_backup()
+        .target_table_name(&restored)
+        .backup_arn(&backup_arn)
+        .send()
+        .await
+        .unwrap();
+    wait_for_active(c, &restored).await;
+
+    let description = c
+        .describe_table()
+        .table_name(&restored)
+        .send()
+        .await
+        .unwrap()
+        .table()
+        .cloned()
+        .unwrap();
+    let table_throughput = description
+        .provisioned_throughput()
+        .expect("restored table throughput");
+    assert_eq!(table_throughput.read_capacity_units(), Some(7));
+    assert_eq!(table_throughput.write_capacity_units(), Some(9));
+
+    let gsi = description
+        .global_secondary_indexes()
+        .iter()
+        .find(|index| index.index_name() == Some("restore_gsi"))
+        .expect("restored GSI definition");
+    assert_eq!(
+        gsi.key_schema()[0].attribute_name(),
+        "gsi_pk",
+        "restored GSI hash key"
+    );
+    assert_eq!(
+        gsi.key_schema()[1].attribute_name(),
+        "gsi_sk",
+        "restored GSI range key"
+    );
+    assert_eq!(
+        gsi.projection().unwrap().projection_type(),
+        Some(&ProjectionType::Include),
+        "restored GSI projection type"
+    );
+    assert_eq!(
+        gsi.provisioned_throughput()
+            .expect("restored GSI throughput")
+            .read_capacity_units(),
+        Some(11)
+    );
+    assert_eq!(
+        gsi.provisioned_throughput()
+            .expect("restored GSI throughput")
+            .write_capacity_units(),
+        Some(13)
+    );
+    let lsi = description
+        .local_secondary_indexes()
+        .iter()
+        .find(|index| index.index_name() == Some("restore_lsi"))
+        .expect("restored LSI definition");
+    assert_eq!(
+        lsi.key_schema()[0].attribute_name(),
+        "pk",
+        "restored LSI hash key"
+    );
+    assert_eq!(
+        lsi.key_schema()[1].attribute_name(),
+        "lsi_sk",
+        "restored LSI range key"
+    );
+
+    let gsi_count = c
+        .query()
+        .table_name(&restored)
+        .index_name("restore_gsi")
+        .key_condition_expression("gsi_pk = :pk")
+        .expression_attribute_values(":pk", s("gsi-partition-1"))
+        .send()
+        .await
+        .unwrap()
+        .count();
+    assert_eq!(gsi_count, 1, "restored GSI should contain copied items");
+    let gsi_item = c
+        .query()
+        .table_name(&restored)
+        .index_name("restore_gsi")
+        .key_condition_expression("gsi_pk = :pk")
+        .expression_attribute_values(":pk", s("gsi-partition-1"))
+        .send()
+        .await
+        .unwrap()
+        .items()
+        .first()
+        .cloned()
+        .expect("restored GSI item");
+    let included_value = s("included-value");
+    assert_eq!(gsi_item.get("gsi_extra"), Some(&included_value));
+
+    let lsi_count = c
+        .query()
+        .table_name(&restored)
+        .index_name("restore_lsi")
+        .key_condition_expression("pk = :pk AND lsi_sk = :sk")
+        .expression_attribute_values(":pk", s("partition-1"))
+        .expression_attribute_values(":sk", s("lsi-sort-1"))
+        .send()
+        .await
+        .unwrap()
+        .count();
+    assert_eq!(lsi_count, 1, "restored LSI should contain copied items");
 
     c.delete_table().table_name(&restored).send().await.ok();
     c.delete_table().table_name(&table).send().await.ok();
