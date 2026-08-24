@@ -42,7 +42,7 @@
 //!   ≠ bytewise byte ordering across mismatched lengths)
 //! - Any operand type the analyzer doesn't yet classify
 
-use extenddb_core::expression::{CompareOp, Expr, ExpressionMaps};
+use extenddb_core::expression::{CompareOp, Expr, ExpressionMaps, PathElement};
 use extenddb_core::types::AttributeValue;
 
 /// Outcome of the pushdown analyzer.
@@ -67,7 +67,54 @@ impl Pushable {
 ///
 /// Conservative: unknown constructs return `Pushable::No`.
 pub fn is_pushable(expr: &Expr, maps: &ExpressionMaps) -> Pushable {
+    if contains_dotted_attribute(expr, maps) {
+        return Pushable::No("literal attribute name contains '.'");
+    }
     walk(expr, maps)
+}
+
+/// Return whether an expression contains a literal DynamoDB attribute name
+/// with a dot. Such a name must be read as one field in `item_data`, while a
+/// MongoDB dotted field path means nested-document traversal. The compiler
+/// cannot safely push these expressions down, so callers must use the Rust
+/// evaluator instead.
+fn contains_dotted_attribute(expr: &Expr, maps: &ExpressionMaps) -> bool {
+    match expr {
+        Expr::Path(elements) => elements.iter().any(|element| match element {
+            PathElement::Attribute(name) => {
+                let resolved = if let Some(alias) = name.strip_prefix('#') {
+                    maps.resolve_name(alias).ok()
+                } else {
+                    Some(name.as_str())
+                };
+                match resolved {
+                    Some(name) => name.contains('.'),
+                    None => true,
+                }
+            }
+            PathElement::Index(_) => false,
+        }),
+        Expr::Compare { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Arithmetic { left, right, .. } => {
+            contains_dotted_attribute(left, maps) || contains_dotted_attribute(right, maps)
+        }
+        Expr::Not(inner) => contains_dotted_attribute(inner, maps),
+        Expr::Function { args, .. } => args.iter().any(|arg| contains_dotted_attribute(arg, maps)),
+        Expr::Between { operand, low, high } => {
+            contains_dotted_attribute(operand, maps)
+                || contains_dotted_attribute(low, maps)
+                || contains_dotted_attribute(high, maps)
+        }
+        Expr::In { operand, list } => {
+            contains_dotted_attribute(operand, maps)
+                || list
+                    .iter()
+                    .any(|item| contains_dotted_attribute(item, maps))
+        }
+        Expr::Placeholder(_) => false,
+    }
 }
 
 fn walk(expr: &Expr, maps: &ExpressionMaps) -> Pushable {
@@ -287,6 +334,14 @@ mod tests {
         Expr::Path(vec![PathElement::Attribute(name.to_string())])
     }
 
+    fn aliased_maps(resolved_name: &str, value: AttributeValue) -> ExpressionMaps {
+        let mut names = HashMap::new();
+        names.insert("name".to_owned(), resolved_name.to_owned());
+        let mut values = HashMap::new();
+        values.insert(":value".to_owned(), value);
+        ExpressionMaps::new(names, values)
+    }
+
     #[test]
     fn attribute_exists_is_pushable() {
         let expr = Expr::Function {
@@ -294,6 +349,47 @@ mod tests {
             args: vec![path("a")],
         };
         assert_eq!(is_pushable(&expr, &maps_with(&[])), Pushable::Yes);
+    }
+
+    #[test]
+    fn dotted_attribute_alias_is_not_pushable() {
+        let expr = Expr::Compare {
+            left: Box::new(path("#name")),
+            op: CompareOp::Eq,
+            right: Box::new(Expr::Placeholder(":value".into())),
+        };
+        let maps = aliased_maps("a.b", AttributeValue::S("value".into()));
+
+        assert_eq!(
+            is_pushable(&expr, &maps),
+            Pushable::No("literal attribute name contains '.'")
+        );
+    }
+
+    #[test]
+    fn dotted_attribute_alias_in_function_is_not_pushable() {
+        let expr = Expr::Function {
+            name: "attribute_exists".into(),
+            args: vec![path("#name")],
+        };
+        let maps = aliased_maps("a.b", AttributeValue::S("unused".into()));
+
+        assert!(!is_pushable(&expr, &maps).is_yes());
+    }
+
+    #[test]
+    fn nested_document_path_without_literal_dot_remains_pushable() {
+        let expr = Expr::Compare {
+            left: Box::new(Expr::Path(vec![
+                PathElement::Attribute("a".into()),
+                PathElement::Attribute("b".into()),
+            ])),
+            op: CompareOp::Eq,
+            right: Box::new(Expr::Placeholder(":value".into())),
+        };
+        let maps = maps_with(&[(":value", AttributeValue::S("value".into()))]);
+
+        assert_eq!(is_pushable(&expr, &maps), Pushable::Yes);
     }
 
     #[test]
