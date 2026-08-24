@@ -47,6 +47,26 @@ impl PostgresEngine {
 
         // Fetch indexes for GSI/LSI updates (D-4: sync + async split).
         let indexes = fetch_indexes_for_table(&key_info.table_id, &self.pool).await?;
+        // Vector indexes come from the same fresh read rather than from the cached
+        // key info, and the answer decides two things: whether this write needs a
+        // transaction at all, and what maintenance runs inside it. A cached empty
+        // set would send a write down the no-maintenance fast path and silently
+        // leave an index missing a row.
+        //
+        // What this does and does not remove. The defect being designed out is the
+        // cached membership gate, and that is gone: an index takes effect the moment
+        // its catalog row commits. What remains is a window between this read and
+        // the data transaction's commit, in which an index created concurrently is
+        // missed. That window cannot be closed here, because the catalog and the
+        // data tables are different databases and no transaction spans them. It is
+        // also exactly the window the secondary indexes have, for the same reason
+        // and with the same read: parity with a GSI is the bar, and the backfill
+        // that publishes a new index is what covers writes older than it.
+        let vector_metas = crate::data::vector_index::fetch_vector_indexes_for_table(
+            &self.pool,
+            &key_info.table_id,
+        )
+        .await?;
         let sys_delay = if indexes.is_empty() {
             0
         } else {
@@ -262,10 +282,25 @@ impl PostgresEngine {
         }
         // Persist async GSI work inside the same transaction — one row per
         // async index, each honoring its own propagation delay.
-        let async_enqueued = enqueue_async_indexes(
+        let mut async_enqueued = enqueue_async_indexes(
             &mut tx,
             key_info,
             &indexes,
+            pre_mutation_item.as_ref(),
+            Some(&item),
+            sys_delay,
+        )
+        .await?;
+
+        // The pre-mutation image is already in hand here, and it is what lets the
+        // vector row move partition or disappear when the update removes the
+        // vector attribute.
+        async_enqueued += crate::data::vector_index::maintain_vector_indexes(
+            &mut tx,
+            &vector_metas,
+            &key_info.table_id,
+            &key_info.key_schema,
+            &key_info.attribute_definitions,
             pre_mutation_item.as_ref(),
             Some(&item),
             sys_delay,

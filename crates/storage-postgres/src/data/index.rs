@@ -225,10 +225,33 @@ pub(crate) async fn enqueue_async_indexes(
                 projection: idx.projection.clone(),
             },
         };
-        enqueue_gsi_pending(tx, &key_info.table_id, old_item, new_item, delay, &context).await?;
+        enqueue_gsi_pending(
+            tx,
+            &key_info.table_id,
+            old_item,
+            new_item,
+            delay,
+            &crate::gsi_queue::PendingApplyContext::Gsi(context),
+        )
+        .await?;
         enqueued += 1;
     }
     Ok(enqueued)
+}
+
+/// Enqueue one propagation row for any index kind.
+///
+/// Thin wrapper so the vector maintenance path does not have to reach into the
+/// queue module's naming, which still says "gsi" for historical reasons.
+pub(crate) async fn enqueue_pending_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table_id: &str,
+    old_item: Option<&Item>,
+    new_item: Option<&Item>,
+    delay_ms: u64,
+    context: &crate::gsi_queue::PendingApplyContext,
+) -> Result<(), StorageError> {
+    enqueue_gsi_pending(tx, table_id, old_item, new_item, delay_ms, context).await
 }
 
 /// Delete a row from an index table using base table key columns.

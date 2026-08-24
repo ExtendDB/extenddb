@@ -10,7 +10,7 @@ use extenddb_core::types::{
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{sk_column, sk_column_n};
 
-use super::{all_sort_key_info, data_table_name, index_table_name};
+use super::{all_sort_key_info, data_table_name, index_table_name, vector_table_name};
 use crate::PostgresEngine;
 
 /// Row shape returned by the table-info query: (`key_schema`, `attr_defs`, status, `table_id`, `stream_spec`).
@@ -250,6 +250,111 @@ impl PostgresEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
         }
 
+        Ok(())
+    }
+
+    /// Create the data table for one vector index.
+    ///
+    /// Column set is the SQLite backend's, with PostgreSQL types: `embedding` is
+    /// pgvector's own `vector(N)` rather than a blob, so distance, ordering and
+    /// the row limit all evaluate in the server and the wire carries k rows
+    /// instead of the whole candidate set.
+    ///
+    /// Keyed by the base item rather than by the partition, so one base item
+    /// yields at most one vector row and a re-put replaces it. A partition move
+    /// is therefore a delete followed by an insert, which is what the apply path
+    /// does unconditionally.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Unsupported`] when the server has no pgvector, so
+    /// a lost extension reports as a refusal rather than a fault.
+    pub(crate) async fn create_vector_data_table(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        index_id: &str,
+        dimensions: u32,
+        base_key_schema: &[KeySchemaElement],
+        base_attr_defs: &[AttributeDefinition],
+    ) -> Result<(), StorageError> {
+        let vec_table = vector_table_name(index_id);
+        let base_sks = all_sort_key_info(base_key_schema, base_attr_defs);
+
+        let mut col_defs = vec![
+            // `pk_to_text` of the HASH element's value, or the unscoped sentinel.
+            // Scoping happens on this column, never on the payload.
+            //
+            // BYTEA rather than TEXT, and not by preference: the shared unscoped
+            // sentinel begins with a NUL byte, deliberately, because no partition
+            // derived from item data can contain one. PostgreSQL cannot store a NUL
+            // in a text column at all, so a text column here rejects every row of
+            // every unscoped index. Bytes keep the shared value byte-identical
+            // across backends, which is what makes a write and a search agree.
+            "part BYTEA NOT NULL".to_owned(),
+            "base_pk TEXT NOT NULL".to_owned(),
+        ];
+        for (i, &(_, sk_type)) in base_sks.iter().enumerate() {
+            let _ = sk_type;
+            if i == 0 {
+                col_defs.push("base_sk_s TEXT".to_owned());
+                col_defs.push("base_sk_n NUMERIC".to_owned());
+                col_defs.push("base_sk_b BYTEA".to_owned());
+            } else {
+                let n = i + 1;
+                col_defs.push(format!("base_sk{n}_s TEXT"));
+                col_defs.push(format!("base_sk{n}_n NUMERIC"));
+                col_defs.push(format!("base_sk{n}_b BYTEA"));
+            }
+        }
+        // NOT NULL because a non-indexable item is never inserted: the apply path
+        // deletes instead, so there is no such thing as a row without a vector.
+        col_defs.push(format!("embedding vector({dimensions}) NOT NULL"));
+        // The L2 norm at write time, kept even though pgvector computes cosine
+        // itself: it is what lets the cosine expression return the measured 1.0
+        // for a zero vector, where pgvector's operator yields NaN.
+        col_defs.push("nrm DOUBLE PRECISION NOT NULL".to_owned());
+        col_defs.push("item_data JSONB NOT NULL".to_owned());
+
+        let mut pk_cols = vec!["base_pk".to_owned()];
+        for (i, &(_, sk_type)) in base_sks.iter().enumerate() {
+            pk_cols.push(format!("base_{}", sk_column_n(i, sk_type)));
+        }
+
+        let ddl = format!(
+            "CREATE TABLE {vec_table} (\n    {},\n    PRIMARY KEY ({})\n)",
+            col_defs.join(",\n    "),
+            pk_cols.join(", ")
+        );
+        sqlx::query(&ddl)
+            .execute(&mut **tx)
+            .await
+            .map_err(crate::vector::map_vector_sql_error)?;
+
+        // Every search is partition-scoped, including an unscoped index's search
+        // against the sentinel, so this index is what keeps one off a full scan.
+        // Left unnamed, as the GSI tables' ordering index is: a name built from the
+        // ids would be truncated at PostgreSQL's 63-byte identifier limit.
+        let part_idx = format!("CREATE INDEX ON {vec_table} (part)");
+        sqlx::query(&part_idx)
+            .execute(&mut **tx)
+            .await
+            .map_err(crate::vector::map_vector_sql_error)?;
+
+        // No ANN index yet: exact scan first, per ADR-0004 and the plan. Adding
+        // HNSW later is a CREATE INDEX against this same column with no table
+        // rewrite, which is why the column type is `vector(N)` from the start.
+        Ok(())
+    }
+
+    /// Drop one vector index's data table.
+    pub(crate) async fn drop_vector_data_table(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        index_id: &str,
+    ) -> Result<(), StorageError> {
+        let vec_table = vector_table_name(index_id);
+        sqlx::query(&format!("DROP TABLE IF EXISTS {vec_table}"))
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
         Ok(())
     }
 

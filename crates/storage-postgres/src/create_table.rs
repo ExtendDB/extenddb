@@ -193,6 +193,9 @@ impl PostgresEngine {
             }
         }
 
+        // Collected because each id names a data table, created after the catalog
+        // commit in the same order the rows were written.
+        let mut vector_index_ids: Vec<String> = Vec::new();
         // Insert vector index metadata. A CreateTable's table is empty, so there
         // is nothing to backfill: the index goes straight to ACTIVE with no
         // `backfilling` member, which is the state the service reports for an
@@ -273,6 +276,7 @@ impl PostgresEngine {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+                vector_index_ids.push(index_id);
             }
         }
 
@@ -355,6 +359,19 @@ impl PostgresEngine {
                         &lsi_index_ids[i],
                         &lsi.key_schema,
                         &input.attribute_definitions,
+                        &input.key_schema,
+                        &input.attribute_definitions,
+                    )
+                    .await?;
+                }
+            }
+
+            if let Some(vis) = &input.vector_indexes {
+                for (i, vi) in vis.iter().enumerate() {
+                    Self::create_vector_data_table(
+                        &mut data_tx,
+                        &vector_index_ids[i],
+                        vi.dimensions,
                         &input.key_schema,
                         &input.attribute_definitions,
                     )

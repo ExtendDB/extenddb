@@ -19,6 +19,7 @@ extenddb-storage = { workspace = true }
 extenddb-auth = { workspace = true }
 futures = { workspace = true }
 sqlx = { workspace = true }
+pgvector = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

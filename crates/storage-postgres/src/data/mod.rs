@@ -25,6 +25,23 @@ pub(crate) fn index_table_name(index_id: &str) -> String {
     format!("\"_ddb_{index_id}\"")
 }
 
+/// SQL table name for a vector index's data table.
+///
+/// Named from the index id alone, like a GSI's, and deliberately not from both
+/// ids. PostgreSQL truncates identifiers at 63 bytes, and two UUIDs plus a prefix
+/// is 82: the longer form was silently cut, which made two indexes on one table
+/// collide on 17 surviving characters of their ids.
+///
+/// The reason to want the table id in the name was to find these tables after
+/// DeleteTable cascades the catalog rows away. Both delete paths instead collect
+/// the ids before deleting the table row, which is what the GSI path already does
+/// for the same reason.
+///
+/// The id is a server-generated UUID, so no client input reaches this identifier.
+pub(crate) fn vector_table_name(index_id: &str) -> String {
+    format!("\"_ddb_vec_{index_id}\"")
+}
+
 /// Look up all RANGE key attribute definitions from the key schema (preserving order).
 pub(crate) fn all_sort_key_info<'a>(
     key_schema: &'a [KeySchemaElement],
@@ -122,6 +139,7 @@ mod query_scan;
 mod transactions;
 mod tx_helpers;
 mod update_item;
+pub(crate) mod vector_index;
 
 pub(crate) use index::{
     delete_index_row_multi, insert_index_row_multi, item_has_index_keys, project_item_for_index,

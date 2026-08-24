@@ -107,6 +107,35 @@ pub(crate) struct GsiApplyContext {
     pub(crate) index: GsiIndexDef,
 }
 
+/// What a claimed row describes: a secondary index update or a vector one.
+///
+/// Untagged, so a row written before vector indexes existed still deserializes as
+/// `Gsi`. That compatibility is load-bearing on this backend rather than
+/// theoretical: the queue is a table, so rows written by the previous version are
+/// still there across an upgrade.
+///
+/// The variants are distinguished by shape, and `Gsi` is tried first. A payload
+/// carrying both an `index` and a `vector` member would match `Gsi`, which no
+/// serializer here produces; a genuinely unreadable context is already handled as
+/// a poison row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum PendingApplyContext {
+    Gsi(GsiApplyContext),
+    Vector(extenddb_storage::vector_lifecycle::VectorApplyContext),
+}
+
+impl PendingApplyContext {
+    /// The base table's key schema, which both kinds carry and the queue needs in
+    /// order to route a row to the worker that owns its base key.
+    fn base_key_schema(&self) -> &[KeySchemaElement] {
+        match self {
+            Self::Gsi(c) => &c.base_key_schema,
+            Self::Vector(c) => &c.base_key_schema,
+        }
+    }
+}
+
 /// A row claimed from `gsi_pending`:
 /// `(id, table_id, old_item, new_item, index_context)`.
 type ClaimedRow = (
@@ -192,7 +221,7 @@ pub(crate) async fn enqueue_gsi_pending(
     old_item: Option<&Item>,
     new_item: Option<&Item>,
     delay_ms: u64,
-    context: &GsiApplyContext,
+    context: &PendingApplyContext,
 ) -> Result<(), StorageError> {
     let old_json = old_item
         .map(serde_json::to_value)
@@ -209,7 +238,7 @@ pub(crate) async fn enqueue_gsi_pending(
     // The base key is immutable over an item's lifetime; `new_item` carries it
     // for puts/updates, `old_item` for deletes.
     let worker_partition = match new_item.or(old_item) {
-        Some(item) => partition_for(&composite_pk_to_text(item, &context.base_key_schema)?),
+        Some(item) => partition_for(&composite_pk_to_text(item, context.base_key_schema())?),
         None => 0,
     };
 
@@ -324,9 +353,18 @@ async fn process_batch(worker_id: u64, q: &GsiQueue) -> Result<usize, StorageErr
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+        // The hold is what keeps a write from reaching an index whose backfill is
+        // still running: the backfill holds an older snapshot of the same item, so
+        // applying the newer write first would let the backfill overwrite it.
+        //
+        // Held per table rather than per index, which also preserves the ordering
+        // between a secondary index row and a vector row for the same item. A held
+        // table's rows simply wait; the flip to ACTIVE deletes the hold and wakes
+        // the workers.
         let row: Option<ClaimedRow> = sqlx::query_as(
             "SELECT id, table_id, old_item, new_item, index_context FROM gsi_pending \
              WHERE worker_partition = $1 AND ready_at <= NOW() \
+             AND table_id NOT IN (SELECT table_id FROM vector_index_holds) \
              ORDER BY id \
              LIMIT 1 \
              FOR UPDATE SKIP LOCKED",
@@ -387,7 +425,7 @@ async fn apply_claimed_row(
         .map(serde_json::from_value)
         .transpose()
         .map_err(|e| StorageError::Internal(e.to_string()))?;
-    let context: GsiApplyContext =
+    let context: PendingApplyContext =
         serde_json::from_value(ctx_json).map_err(|e| StorageError::Internal(e.to_string()))?;
 
     // One index per row. Guard the apply with a savepoint so a dropped-index
@@ -399,16 +437,30 @@ async fn apply_claimed_row(
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-    match apply_index(
-        tx,
-        &context.index,
-        old_item.as_ref(),
-        new_item.as_ref(),
-        &context.base_key_schema,
-        &context.attribute_definitions,
-    )
-    .await
-    {
+    let applied = match &context {
+        PendingApplyContext::Gsi(c) => {
+            apply_index(
+                tx,
+                &c.index,
+                old_item.as_ref(),
+                new_item.as_ref(),
+                &c.base_key_schema,
+                &c.attribute_definitions,
+            )
+            .await
+        }
+        PendingApplyContext::Vector(c) => {
+            crate::data::vector_index::apply_claimed_vector_row(
+                tx,
+                c,
+                old_item.as_ref(),
+                new_item.as_ref(),
+            )
+            .await
+        }
+    };
+
+    match applied {
         Ok(()) => {
             sqlx::query("RELEASE SAVEPOINT gsi_apply")
                 .execute(&mut **tx)
@@ -422,9 +474,10 @@ async fn apply_claimed_row(
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+            // Applies to both kinds: a base table or an index dropped while a
+            // row was in flight is a routine race, not a defect.
             tracing::debug!(
-                "GSI worker {worker_id}: index {} gone, skipping id={id} table={table_id}",
-                context.index.index_id
+                "index propagation worker {worker_id}: target gone, skipping id={id} table={table_id}"
             );
         }
         Err(e) => return Err(e),

@@ -58,6 +58,17 @@ impl PostgresEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+        // Vector index ids, read while the rows still exist. Deleting the table
+        // row cascades them away, and each id names a data table that has to be
+        // dropped afterwards: the same ordering the GSI path uses, and for the same
+        // reason.
+        let vector_index_ids: Vec<String> =
+            sqlx::query_scalar("SELECT index_id FROM vector_indexes WHERE table_id = $1")
+                .bind(&row.table_id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+
         // H-5 (delete): synchronous control-plane shortcut when delay < 1s.
         // When control_plane_delay_seconds is small, the poller may not run
         // before the next request, causing stale DELETING rows. Synchronous
@@ -77,9 +88,9 @@ impl PostgresEngine {
             // Note: deleting the tables row cascades to indexes and stream rows via FK CASCADE.
             // Vector index rows cascade the same way, through
             // vector_indexes_table_id_fkey, so a table with vector indexes needs
-            // no extra catalog cleanup. There are no vector data tables to drop
-            // yet: this backend records vector index metadata but does not build
-            // their storage.
+            // no extra catalog cleanup. Their data tables do need dropping, and
+            // by then the rows that named them are gone, which is why the sweep
+            // matches on the table id prefix instead of reading the catalog.
             sqlx::query("DELETE FROM tags WHERE resource_arn = $1")
                 .bind(&row.table_arn)
                 .execute(&mut *tx)
@@ -104,6 +115,9 @@ impl PostgresEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             for idx_id in &index_ids {
                 Self::drop_index_data_table(&mut data_tx, idx_id).await?;
+            }
+            for index_id in &vector_index_ids {
+                Self::drop_vector_data_table(&mut data_tx, index_id).await?;
             }
             Self::drop_data_table(&mut data_tx, &row.table_id).await?;
 

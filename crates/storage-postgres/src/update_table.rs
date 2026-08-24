@@ -67,9 +67,28 @@ impl PostgresEngine {
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
             if vector_count > 0 {
-                return Err(StorageError::Validation(
-                    extenddb_core::types::VECTOR_INDEX_REQUIRES_PAY_PER_REQUEST.to_owned(),
-                ));
+                // Two measured shapes, two strings. A plain switch reports the
+                // create-side rule; a switch that also carries VectorIndexUpdates
+                // reports its own message, measured 2026-08-19 on a switch combined
+                // with deleting the last vector index, which the service refuses
+                // even though the net state would carry none.
+                //
+                // Only those two shapes are measured. Which of the two fires for a
+                // switch combined with a vector index CREATE is unmapped, and that
+                // shape is refused earlier here anyway, so it cannot reach this
+                // choice. If the trigger turns out to be the delete specifically
+                // rather than the presence of updates, this condition is where that
+                // changes.
+                let message = if input
+                    .vector_index_updates
+                    .as_ref()
+                    .is_some_and(|u| !u.is_empty())
+                {
+                    extenddb_core::types::VECTOR_TABLE_REQUIRES_PAY_PER_REQUEST_MODE
+                } else {
+                    extenddb_core::types::VECTOR_INDEX_REQUIRES_PAY_PER_REQUEST
+                };
+                return Err(StorageError::Validation(message.to_owned()));
             }
         }
 
@@ -441,6 +460,9 @@ impl PostgresEngine {
             merged_attr_defs_for_ddl = Some(effective);
         }
 
+        // Ids of the vector indexes this request deletes, so their data tables can
+        // be dropped after the catalog commit, in the same order as the GSI drops.
+        let mut deleted_vector_index_ids: Vec<String> = Vec::new();
         // Vector index create/delete.
         //
         // Delete is implemented; Create is refused. Creating an index means
@@ -463,12 +485,8 @@ impl PostgresEngine {
                     )));
                 }
                 if let Some(delete) = &update.delete {
-                    // The index id is deliberately not selected: this backend
-                    // builds no per-index storage yet, so there is nothing to drop
-                    // by id, and reading a value only to discard it invites the
-                    // reader to think otherwise.
-                    let existing: Option<(String, Option<bool>)> = sqlx::query_as(
-                        "SELECT index_status, backfilling FROM vector_indexes \
+                    let existing: Option<(String, String, Option<bool>)> = sqlx::query_as(
+                        "SELECT index_id, index_status, backfilling FROM vector_indexes \
                          WHERE table_id = $1 AND index_name = $2",
                     )
                     .bind(&table_id)
@@ -477,7 +495,7 @@ impl PostgresEngine {
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-                    let (index_status, backfilling) = existing
+                    let (del_index_id, index_status, backfilling) = existing
                         .ok_or_else(|| StorageError::IndexNotFound(delete.index_name.clone()))?;
 
                     // Deleting an index that is still being created is
@@ -508,6 +526,7 @@ impl PostgresEngine {
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    deleted_vector_index_ids.push(del_index_id);
                 }
             }
         }
@@ -606,6 +625,38 @@ impl PostgresEngine {
                         );
                     }
                 }
+            }
+        }
+
+        // Vector data tables are dropped after the catalog commit, like the GSI
+        // ones: the catalog is the record of what exists, so it commits first and
+        // a crash in between leaves an unreferenced table rather than an index
+        // whose rows are gone.
+        for index_id in &deleted_vector_index_ids {
+            let mut data_tx = self
+                .data_pool
+                .begin()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if let Err(e) = Self::drop_vector_data_table(&mut data_tx, index_id).await {
+                tracing::warn!(
+                    "Failed to drop the data table for a deleted vector index on '{}': {e}",
+                    input.table_name,
+                );
+                continue;
+            }
+            // The queue rows for this table can outlive the index. They are
+            // tolerated by the worker (a missing table is a routine race), but
+            // removing them here saves the claim-and-skip cycle and the log noise.
+            if let Err(e) = data_tx
+                .commit()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))
+            {
+                tracing::warn!(
+                    "Failed to commit the vector data table drop on '{}': {e}",
+                    input.table_name,
+                );
             }
         }
 

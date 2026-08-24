@@ -536,6 +536,23 @@ pub const MAX_VECTOR_INDEXES_PER_TABLE: usize = 5;
 pub const VECTOR_INDEX_REQUIRES_PAY_PER_REQUEST: &str = "One or more parameter values were invalid: Vector indexes are only supported for \
      PAY_PER_REQUEST tables";
 
+/// Message the service returns when an `UpdateTable` switches a table holding
+/// vector indexes to `PROVISIONED` **and** carries `VectorIndexUpdates`.
+///
+/// Measured 2026-08-19 (probe P14) on a switch combined with deleting the last
+/// vector index, which the service refuses even though the resulting state would
+/// carry no vector index at all: net-effect evaluation applies to a combined
+/// switch and create, not to a combined switch and delete. Distinct text from
+/// [`VECTOR_INDEX_REQUIRES_PAY_PER_REQUEST`], which is what a plain switch
+/// reports.
+///
+/// The exact trigger is only partly mapped. Both shapes above are measured; which
+/// string fires for a switch combined with a vector index create is not, so a
+/// backend should emit this one for the measured shape and the plain rule
+/// elsewhere rather than guessing at the boundary.
+pub const VECTOR_TABLE_REQUIRES_PAY_PER_REQUEST_MODE: &str = "One or more parameter values were invalid: Tables with vector indexes must be in \
+     PAY_PER_REQUEST mode";
+
 /// Per-table vector index limit exceeded on `CreateTable`.
 ///
 /// The create and update paths differ in BOTH class and text for this one rule,

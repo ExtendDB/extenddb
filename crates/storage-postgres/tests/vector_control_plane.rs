@@ -22,6 +22,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use extenddb_core::expression::{self, ExpressionMaps};
+use extenddb_core::types::TableKeyInfo;
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, BillingMode, CreateTableInput, DeleteTableInput,
     DeleteVectorIndexAction, DescribeTableInput, DistanceFunction, IndexStatus, Item,
@@ -206,6 +207,17 @@ async fn scratch(pgvector: Pgvector) -> Scratch {
     }
 }
 
+/// Build a scratch environment that can hold vector data, or report why not.
+///
+/// Creating a vector index now builds a `vector(N)` data table, so the extension
+/// is a hard requirement for every test that creates one: without it the backend
+/// refuses, which is correct and is covered separately. That is the cost of the
+/// data path arriving, and it is why these tests run against the pgvector image in
+/// CI while the refusal suite keeps the plain one.
+async fn vector_scratch(test: &str) -> Option<Scratch> {
+    scratch_with_pgvector(test).await
+}
+
 /// Build a scratch database with pgvector installed, or report why not.
 ///
 /// The extension is a server package, so a PostgreSQL that does not ship it
@@ -348,10 +360,13 @@ async fn set_index_phase(catalog: &PgPool, table_id: &str, index_name: &str, bac
 
 #[tokio::test]
 async fn create_table_records_a_vector_index_as_active_and_echoes_it() {
+    let test = "create_table_records_a_vector_index_as_active_and_echoes_it";
     if base_conn().is_none() {
-        return skip("create_table_records_a_vector_index_as_active_and_echoes_it");
+        return skip(test);
     }
-    let s = scratch(Pgvector::Omit).await;
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
 
     let desc = s
         .engine
@@ -403,10 +418,13 @@ async fn create_table_records_a_vector_index_as_active_and_echoes_it() {
 
 #[tokio::test]
 async fn describe_table_reports_scoped_and_unscoped_vector_indexes() {
+    let test = "describe_table_reports_scoped_and_unscoped_vector_indexes";
     if base_conn().is_none() {
-        return skip("describe_table_reports_scoped_and_unscoped_vector_indexes");
+        return skip(test);
     }
-    let s = scratch(Pgvector::Omit).await;
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
 
     let mut input = create_input(
         "t_describe",
@@ -476,10 +494,13 @@ async fn describe_table_reports_scoped_and_unscoped_vector_indexes() {
 
 #[tokio::test]
 async fn table_key_info_carries_the_vector_index_metadata_the_write_path_needs() {
+    let test = "table_key_info_carries_the_vector_index_metadata_the_write_path_needs";
     if base_conn().is_none() {
-        return skip("table_key_info_carries_the_vector_index_metadata_the_write_path_needs");
+        return skip(test);
     }
-    let s = scratch(Pgvector::Omit).await;
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
 
     s.engine
         .create_table(
@@ -525,10 +546,13 @@ async fn table_key_info_carries_the_vector_index_metadata_the_write_path_needs()
 
 #[tokio::test]
 async fn delete_table_removes_the_vector_index_rows() {
+    let test = "delete_table_removes_the_vector_index_rows";
     if base_conn().is_none() {
-        return skip("delete_table_removes_the_vector_index_rows");
+        return skip(test);
     }
-    let s = scratch(Pgvector::Omit).await;
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
 
     s.engine
         .create_table(
@@ -559,10 +583,13 @@ async fn delete_table_removes_the_vector_index_rows() {
 
 #[tokio::test]
 async fn update_table_deletes_an_active_vector_index_once() {
+    let test = "update_table_deletes_an_active_vector_index_once";
     if base_conn().is_none() {
-        return skip("update_table_deletes_an_active_vector_index_once");
+        return skip(test);
     }
-    let s = scratch(Pgvector::Omit).await;
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
 
     s.engine
         .create_table(
@@ -623,10 +650,13 @@ async fn update_table_deletes_an_active_vector_index_once() {
 
 #[tokio::test]
 async fn deleting_a_vector_index_in_the_allocation_phase_is_refused() {
+    let test = "deleting_a_vector_index_in_the_allocation_phase_is_refused";
     if base_conn().is_none() {
-        return skip("deleting_a_vector_index_in_the_allocation_phase_is_refused");
+        return skip(test);
     }
-    let s = scratch(Pgvector::Omit).await;
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
 
     s.engine
         .create_table(
@@ -669,10 +699,13 @@ async fn deleting_a_vector_index_in_the_allocation_phase_is_refused() {
 
 #[tokio::test]
 async fn deleting_a_vector_index_during_its_backfill_is_accepted() {
+    let test = "deleting_a_vector_index_during_its_backfill_is_accepted";
     if base_conn().is_none() {
-        return skip("deleting_a_vector_index_during_its_backfill_is_accepted");
+        return skip(test);
     }
-    let s = scratch(Pgvector::Omit).await;
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
 
     s.engine
         .create_table(
@@ -703,10 +736,13 @@ async fn deleting_a_vector_index_during_its_backfill_is_accepted() {
 
 #[tokio::test]
 async fn switching_a_table_with_vector_indexes_to_provisioned_is_refused() {
+    let test = "switching_a_table_with_vector_indexes_to_provisioned_is_refused";
     if base_conn().is_none() {
-        return skip("switching_a_table_with_vector_indexes_to_provisioned_is_refused");
+        return skip(test);
     }
-    let s = scratch(Pgvector::Omit).await;
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
 
     s.engine
         .create_table(
@@ -754,10 +790,13 @@ async fn switching_a_table_with_vector_indexes_to_provisioned_is_refused() {
 
 #[tokio::test]
 async fn adding_a_vector_index_by_update_table_is_unsupported() {
+    let test = "adding_a_vector_index_by_update_table_is_unsupported";
     if base_conn().is_none() {
-        return skip("adding_a_vector_index_by_update_table_is_unsupported");
+        return skip(test);
     }
     let s = scratch(Pgvector::Omit).await;
+    // No vector index is created here, so this must keep running on a server
+    // that has no pgvector at all: for the refusal, that is the interesting case.
 
     s.engine
         .create_table(ACCOUNT, create_input("t_add", vec![]))
@@ -797,10 +836,13 @@ async fn adding_a_vector_index_by_update_table_is_unsupported() {
 
 #[tokio::test]
 async fn restoring_a_backup_that_carries_vector_indexes_is_refused() {
+    let test = "restoring_a_backup_that_carries_vector_indexes_is_refused";
     if base_conn().is_none() {
-        return skip("restoring_a_backup_that_carries_vector_indexes_is_refused");
+        return skip(test);
     }
-    let s = scratch(Pgvector::Omit).await;
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
 
     s.engine
         .create_table(
@@ -862,10 +904,13 @@ async fn restoring_a_backup_that_carries_vector_indexes_is_refused() {
 
 #[tokio::test]
 async fn a_wrong_dimension_vector_written_by_update_item_is_rejected() {
+    let test = "a_wrong_dimension_vector_written_by_update_item_is_rejected";
     if base_conn().is_none() {
-        return skip("a_wrong_dimension_vector_written_by_update_item_is_rejected");
+        return skip(test);
     }
-    let s = scratch(Pgvector::Omit).await;
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
 
     s.engine
         .create_table(
@@ -941,7 +986,9 @@ async fn describe_table_refuses_a_vector_index_whose_stored_status_is_unrecognis
     if base_conn().is_none() {
         return skip(test);
     }
-    let s = scratch(Pgvector::Omit).await;
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
 
     s.engine
         .create_table(
@@ -983,10 +1030,13 @@ async fn describe_table_refuses_a_vector_index_whose_stored_status_is_unrecognis
 
 #[tokio::test]
 async fn describe_table_reports_a_creating_index_as_backfilling() {
+    let test = "describe_table_reports_a_creating_index_as_backfilling";
     if base_conn().is_none() {
-        return skip("describe_table_reports_a_creating_index_as_backfilling");
+        return skip(test);
     }
-    let s = scratch(Pgvector::Omit).await;
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
 
     s.engine
         .create_table(
@@ -1021,10 +1071,13 @@ async fn describe_table_reports_a_creating_index_as_backfilling() {
 
 #[tokio::test]
 async fn an_empty_search_schema_is_stored_and_reported_as_absent() {
+    let test = "an_empty_search_schema_is_stored_and_reported_as_absent";
     if base_conn().is_none() {
-        return skip("an_empty_search_schema_is_stored_and_reported_as_absent");
+        return skip(test);
     }
-    let s = scratch(Pgvector::Omit).await;
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
 
     // Core accepts `SearchSchema: []` on the request, and every path downstream
     // treats it as unscoped. The service reports an absent member or a populated
@@ -1076,10 +1129,13 @@ async fn an_empty_search_schema_is_stored_and_reported_as_absent() {
 
 #[tokio::test]
 async fn a_backup_snapshot_carries_the_wire_shape_behind_a_version() {
+    let test = "a_backup_snapshot_carries_the_wire_shape_behind_a_version";
     if base_conn().is_none() {
-        return skip("a_backup_snapshot_carries_the_wire_shape_behind_a_version");
+        return skip(test);
     }
-    let s = scratch(Pgvector::Omit).await;
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
 
     s.engine
         .create_table(
@@ -1130,10 +1186,13 @@ async fn a_backup_snapshot_carries_the_wire_shape_behind_a_version() {
 
 #[tokio::test]
 async fn a_backup_taken_before_the_snapshot_column_existed_still_restores() {
+    let test = "a_backup_taken_before_the_snapshot_column_existed_still_restores";
     if base_conn().is_none() {
-        return skip("a_backup_taken_before_the_snapshot_column_existed_still_restores");
+        return skip(test);
     }
     let s = scratch(Pgvector::Omit).await;
+    // No vector index is created here, so this must keep running on a server
+    // that has no pgvector at all: for the refusal, that is the interesting case.
 
     s.engine
         .create_table(ACCOUNT, create_input("t_legacy", vec![]))
@@ -1165,10 +1224,13 @@ async fn a_backup_taken_before_the_snapshot_column_existed_still_restores() {
 
 #[tokio::test]
 async fn a_vector_index_at_the_maximum_dimension_round_trips() {
+    let test = "a_vector_index_at_the_maximum_dimension_round_trips";
     if base_conn().is_none() {
-        return skip("a_vector_index_at_the_maximum_dimension_round_trips");
+        return skip(test);
     }
-    let s = scratch(Pgvector::Omit).await;
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
 
     // 4096 is the largest dimension core accepts. The catalog column is a 32-bit
     // integer and the wire type is unsigned, so the value crosses two narrowing
@@ -1208,10 +1270,13 @@ async fn a_vector_index_at_the_maximum_dimension_round_trips() {
 
 #[tokio::test]
 async fn describe_table_refuses_a_vector_index_with_a_corrupt_payload() {
+    let test = "describe_table_refuses_a_vector_index_with_a_corrupt_payload";
     if base_conn().is_none() {
-        return skip("describe_table_refuses_a_vector_index_with_a_corrupt_payload");
+        return skip(test);
     }
-    let s = scratch(Pgvector::Omit).await;
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
 
     s.engine
         .create_table(
@@ -1257,6 +1322,463 @@ async fn describe_table_refuses_a_vector_index_with_a_corrupt_payload() {
         .await
         .expect_err("the cached key info must not silently drop the index");
     assert!(matches!(err, StorageError::Internal(_)), "{err:?}");
+
+    s.cleanup().await;
+}
+
+/// Every vector data table in the scratch database.
+///
+/// Each test has its own database, so this needs no table filter: whatever is
+/// here belongs to the table under test. Deliberately does not read the catalog,
+/// because the case worth checking is the one where the catalog rows are already
+/// gone and an orphaned data table would be invisible.
+async fn vector_data_tables(catalog: &PgPool) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT tablename FROM pg_tables WHERE schemaname = 'public' \
+         AND tablename LIKE '_ddb\\_vec\\_%' ORDER BY tablename",
+    )
+    .fetch_all(catalog)
+    .await
+    .expect("list the vector data tables")
+}
+
+#[tokio::test]
+async fn create_table_builds_the_vector_data_table_and_delete_table_sweeps_it() {
+    let test = "create_table_builds_the_vector_data_table_and_delete_table_sweeps_it";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
+
+    s.engine
+        .create_table(
+            ACCOUNT,
+            create_input("t_datatable", vec![vector_spec("vidx", 4, Some("pk"))]),
+        )
+        .await
+        .expect("create a table with a vector index");
+    let tables = vector_data_tables(&s.catalog).await;
+    assert_eq!(
+        tables.len(),
+        1,
+        "one data table per vector index: {tables:?}"
+    );
+
+    // The embedding column carries the declared dimension count, which is what
+    // makes a wrong-width write fail in the server rather than silently store.
+    let embedding_type: String = sqlx::query_scalar(
+        "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         WHERE c.relname = $1 AND a.attname = 'embedding'",
+    )
+    .bind(&tables[0])
+    .fetch_one(&s.catalog)
+    .await
+    .expect("read the embedding column type");
+    assert_eq!(embedding_type, "vector(4)");
+
+    // Partition scoping is an indexed lookup, not a scan over every row.
+    let part_indexes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes WHERE tablename = $1 AND indexdef LIKE '%(part)%'",
+    )
+    .bind(&tables[0])
+    .fetch_one(&s.catalog)
+    .await
+    .expect("count the partition indexes");
+    assert_eq!(part_indexes, 1, "the part column must be indexed");
+
+    s.engine
+        .delete_table(
+            ACCOUNT,
+            DeleteTableInput {
+                table_name: "t_datatable".to_owned(),
+            },
+        )
+        .await
+        .expect("delete the table");
+
+    // Swept by prefix, because the catalog rows that named these tables cascade
+    // away with the table row before the sweep runs.
+    assert!(
+        vector_data_tables(&s.catalog).await.is_empty(),
+        "DeleteTable must sweep the vector data tables"
+    );
+
+    s.cleanup().await;
+}
+
+#[tokio::test]
+async fn update_table_delete_drops_the_index_data_table() {
+    let test = "update_table_delete_drops_the_index_data_table";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
+
+    s.engine
+        .create_table(
+            ACCOUNT,
+            create_input(
+                "t_dropone",
+                vec![
+                    vector_spec("keep", 4, Some("pk")),
+                    vector_spec("drop", 8, Some("pk")),
+                ],
+            ),
+        )
+        .await
+        .expect("create a table with two vector indexes");
+    let id = table_id(&s.catalog, "t_dropone").await;
+    assert_eq!(vector_data_tables(&s.catalog).await.len(), 2);
+
+    s.engine
+        .update_table(
+            ACCOUNT,
+            UpdateTableInput {
+                vector_index_updates: delete_vector("drop"),
+                ..update_input("t_dropone")
+            },
+        )
+        .await
+        .expect("delete one vector index");
+
+    // One table gone, one left: an index delete must not take the survivor's
+    // storage with it, which is the failure a prefix sweep would cause here.
+    let remaining = vector_data_tables(&s.catalog).await;
+    assert_eq!(remaining.len(), 1, "{remaining:?}");
+    let keep_id: String =
+        sqlx::query_scalar("SELECT index_id FROM vector_indexes WHERE table_id = $1")
+            .bind(&id)
+            .fetch_one(&s.catalog)
+            .await
+            .expect("read the surviving index id");
+    assert!(
+        remaining[0].ends_with(&keep_id),
+        "{remaining:?} vs {keep_id}"
+    );
+
+    s.cleanup().await;
+}
+
+/// One item with a vector, and optionally a tenant for a scoped index.
+fn vector_item(pk: &str, tenant: Option<&str>, values: &[&str]) -> Item {
+    let mut item: Item = BTreeMap::from([("pk".to_owned(), AttributeValue::S(pk.to_owned()))]);
+    if let Some(tenant) = tenant {
+        item.insert("tenant".to_owned(), AttributeValue::S(tenant.to_owned()));
+    }
+    item.insert(
+        "emb".to_owned(),
+        AttributeValue::L(
+            values
+                .iter()
+                .map(|v| AttributeValue::N((*v).to_owned()))
+                .collect(),
+        ),
+    );
+    item
+}
+
+/// Write one item through the storage put path.
+async fn put(engine: &PostgresEngine, key_info: &TableKeyInfo, item: Item) {
+    let maps = ExpressionMaps::new(HashMap::new(), HashMap::new());
+    engine
+        .put_item(key_info, item, false, None, &maps, None)
+        .await
+        .expect("put an item");
+}
+
+/// Rows in a vector index's data table, as (partition bytes, payload).
+async fn index_rows(catalog: &PgPool, table: &str) -> Vec<(Vec<u8>, serde_json::Value)> {
+    sqlx::query_as(&format!(
+        "SELECT part, item_data FROM \"{table}\" ORDER BY base_pk"
+    ))
+    .fetch_all(catalog)
+    .await
+    .expect("read the index rows")
+}
+
+async fn only_index_table(catalog: &PgPool) -> String {
+    let tables = vector_data_tables(catalog).await;
+    assert_eq!(tables.len(), 1, "{tables:?}");
+    tables[0].clone()
+}
+
+#[tokio::test]
+async fn a_write_indexes_the_item_and_a_delete_removes_it() {
+    let test = "a_write_indexes_the_item_and_a_delete_removes_it";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
+
+    s.engine
+        .create_table(
+            ACCOUNT,
+            create_input("t_write_path", vec![vector_spec("vidx", 2, Some("pk"))]),
+        )
+        .await
+        .expect("create a table with a vector index");
+    let key_info = s
+        .engine
+        .table_key_info(ACCOUNT, "t_write_path")
+        .await
+        .expect("key info");
+    let table = only_index_table(&s.catalog).await;
+
+    put(&s.engine, &key_info, vector_item("a", None, &["1", "0"])).await;
+    let rows = index_rows(&s.catalog, &table).await;
+    assert_eq!(rows.len(), 1, "the write must reach the index");
+    // The payload carries the projected item with the vector attribute stripped:
+    // the vector is reconstructed from the stored column on the way out, so keeping
+    // a second copy here would let the two disagree.
+    assert!(rows[0].1.get("emb").is_none(), "{:?}", rows[0].1);
+    assert!(rows[0].1.get("pk").is_some(), "{:?}", rows[0].1);
+
+    let key: Item = BTreeMap::from([("pk".to_owned(), AttributeValue::S("a".to_owned()))]);
+    let maps = ExpressionMaps::new(HashMap::new(), HashMap::new());
+    s.engine
+        .delete_item(&key_info, &key, false, None, &maps, None)
+        .await
+        .expect("delete the item");
+    assert!(
+        index_rows(&s.catalog, &table).await.is_empty(),
+        "the delete must remove the indexed row"
+    );
+
+    s.cleanup().await;
+}
+
+#[tokio::test]
+async fn changing_the_scope_attribute_moves_the_row_rather_than_duplicating_it() {
+    let test = "changing_the_scope_attribute_moves_the_row_rather_than_duplicating_it";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
+
+    // Scoped on `tenant`, so rewriting the item with a different tenant has to move
+    // its row: the partition is part of the row, and the row is keyed by the base
+    // item, so a careless apply would leave two rows and a search would find the
+    // item in a partition it no longer belongs to.
+    let mut input = create_input("t_move", vec![vector_spec("vidx", 2, Some("tenant"))]);
+    input.attribute_definitions = string_attr("pk");
+    s.engine
+        .create_table(ACCOUNT, input)
+        .await
+        .expect("create a scoped vector index");
+    let key_info = s
+        .engine
+        .table_key_info(ACCOUNT, "t_move")
+        .await
+        .expect("key info");
+    let table = only_index_table(&s.catalog).await;
+
+    put(
+        &s.engine,
+        &key_info,
+        vector_item("a", Some("t1"), &["1", "0"]),
+    )
+    .await;
+    let first = index_rows(&s.catalog, &table).await;
+    assert_eq!(first.len(), 1);
+
+    put(
+        &s.engine,
+        &key_info,
+        vector_item("a", Some("t2"), &["1", "0"]),
+    )
+    .await;
+    let moved = index_rows(&s.catalog, &table).await;
+    assert_eq!(
+        moved.len(),
+        1,
+        "one row per base item, not one per partition"
+    );
+    assert_ne!(
+        moved[0].0, first[0].0,
+        "the row must be in the new partition"
+    );
+
+    s.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_stored_vector_that_cannot_be_indexed_leaves_the_write_alone() {
+    let test = "a_stored_vector_that_cannot_be_indexed_leaves_the_write_alone";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
+
+    s.engine
+        .create_table(
+            ACCOUNT,
+            create_input("t_poison", vec![vector_spec("vidx", 2, Some("pk"))]),
+        )
+        .await
+        .expect("create a table with a vector index");
+    let key_info = s
+        .engine
+        .table_key_info(ACCOUNT, "t_poison")
+        .await
+        .expect("key info");
+    let table = only_index_table(&s.catalog).await;
+
+    // Three components where the index declares two. Core rejects this on a live
+    // write, so the only way an item looks like this is that it predates the index,
+    // which is the case the backfill skips and counts. The write must still
+    // succeed: failing it would make every later update to that item impossible,
+    // including one that has nothing to do with the vector.
+    put(
+        &s.engine,
+        &key_info,
+        vector_item("wrongdim", None, &["1", "2", "3"]),
+    )
+    .await;
+    assert!(
+        index_rows(&s.catalog, &table).await.is_empty(),
+        "an unindexable item must not enter the index"
+    );
+
+    // And it must be removed rather than left behind, so an item that was
+    // indexable and stops being so does not keep a stale row.
+    put(&s.engine, &key_info, vector_item("x", None, &["1", "0"])).await;
+    assert_eq!(index_rows(&s.catalog, &table).await.len(), 1);
+    put(
+        &s.engine,
+        &key_info,
+        vector_item("x", None, &["1", "2", "3"]),
+    )
+    .await;
+    assert!(
+        index_rows(&s.catalog, &table).await.is_empty(),
+        "the stale row must be removed when the item stops being indexable"
+    );
+
+    s.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_write_to_a_building_index_is_queued_and_never_applied_inline() {
+    let test = "a_write_to_a_building_index_is_queued_and_never_applied_inline";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
+
+    s.engine
+        .create_table(
+            ACCOUNT,
+            create_input("t_creating_write", vec![vector_spec("vidx", 2, Some("pk"))]),
+        )
+        .await
+        .expect("create a table with a vector index");
+    let id = table_id(&s.catalog, "t_creating_write").await;
+    let key_info = s
+        .engine
+        .table_key_info(ACCOUNT, "t_creating_write")
+        .await
+        .expect("key info");
+    let table = only_index_table(&s.catalog).await;
+
+    // The propagation delay is zero in this scratch environment, so an ACTIVE index
+    // would be applied inline. A CREATING one must not be, at any delay: the
+    // backfill is scanning the base table with an older snapshot of this same item,
+    // and its deliberately plain INSERT would collide with whatever a write left
+    // behind.
+    set_index_phase(&s.catalog, &id, "vidx", true).await;
+
+    put(&s.engine, &key_info, vector_item("a", None, &["1", "0"])).await;
+
+    assert!(
+        index_rows(&s.catalog, &table).await.is_empty(),
+        "a write to a CREATING index must not be applied inline"
+    );
+    let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gsi_pending WHERE table_id = $1")
+        .bind(&id)
+        .fetch_one(&s.catalog)
+        .await
+        .expect("count the queued rows");
+    assert_eq!(queued, 1, "the write must be queued instead");
+
+    s.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_write_sees_an_index_created_after_its_key_info_was_cached() {
+    let test = "a_write_sees_an_index_created_after_its_key_info_was_cached";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
+
+    // Cache the key info while the table has no vector index at all, which is the
+    // state that used to make a write skip maintenance: the cached set was empty, so
+    // the write took a path that did no index work and reported success.
+    s.engine
+        .create_table(ACCOUNT, create_input("t_fresh", vec![]))
+        .await
+        .expect("create a plain table");
+    let stale_key_info = s
+        .engine
+        .table_key_info(ACCOUNT, "t_fresh")
+        .await
+        .expect("key info");
+    assert!(stale_key_info.vector_indexes.is_empty());
+
+    // Now add the index behind the cache's back, the way a concurrent UpdateTable
+    // would, including its data table.
+    let id = table_id(&s.catalog, "t_fresh").await;
+    let index_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO vector_indexes (table_id, index_name, index_id, dimensions, \
+         distance_function, vector_attribute, search_schema, projection, index_status, \
+         backfilling) VALUES ($1, 'vidx', $2, 2, 'COSINE', \
+         '{\"AttributeName\":\"emb\"}'::jsonb, NULL, '{\"ProjectionType\":\"ALL\"}'::jsonb, \
+         'ACTIVE', NULL)",
+    )
+    .bind(&id)
+    .bind(&index_id)
+    .execute(&s.catalog)
+    .await
+    .expect("add the index row");
+    sqlx::query(&format!(
+        "CREATE TABLE \"_ddb_vec_{index_id}\" (part BYTEA NOT NULL, base_pk TEXT NOT NULL, \
+         embedding vector(2) NOT NULL, nrm DOUBLE PRECISION NOT NULL, item_data JSONB NOT NULL, \
+         PRIMARY KEY (base_pk))"
+    ))
+    .execute(&s.catalog)
+    .await
+    .expect("create the data table");
+
+    // The stale key info is what the write is handed, deliberately.
+    put(
+        &s.engine,
+        &stale_key_info,
+        vector_item("a", None, &["1", "0"]),
+    )
+    .await;
+
+    let rows = index_rows(&s.catalog, &format!("_ddb_vec_{index_id}")).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the write must see the index the catalog holds, not the one the cache remembers"
+    );
 
     s.cleanup().await;
 }

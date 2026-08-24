@@ -73,13 +73,27 @@ impl PostgresEngine {
         idempotency: Option<IdempotencyKey<'_>>,
     ) -> Result<(), StorageError> {
         // Pre-fetch indexes for each unique table involved in the transaction.
+        //
+        // Vector indexes are read here too, once per table rather than once per op,
+        // and from the catalog rather than from the cached key info: a cached empty
+        // set would make a transaction skip an index another request has just
+        // created. One read per table also keeps a multi-op transaction from
+        // re-asking for the same answer.
         let mut table_indexes: HashMap<String, Vec<IndexMeta>> = HashMap::new();
+        let mut table_vector_metas: HashMap<
+            String,
+            Vec<(extenddb_storage::vector_lifecycle::VectorIndexMeta, String)>,
+        > = HashMap::new();
         for op in ops {
             let name = transact_op_table_name(op);
             if !table_indexes.contains_key(name) {
                 let tid = transact_op_table_id(op);
                 let indexes = fetch_indexes_for_table(tid, &self.pool).await?;
                 table_indexes.insert(name.to_owned(), indexes);
+                let vector_metas =
+                    crate::data::vector_index::fetch_vector_indexes_for_table(&self.pool, tid)
+                        .await?;
+                table_vector_metas.insert(name.to_owned(), vector_metas);
             }
         }
 
@@ -192,7 +206,24 @@ impl PostgresEngine {
                 sys_delay,
             )
             .await?;
-            if n > 0 {
+
+            // Vector maintenance for all three write kinds in one place, rather
+            // than in each branch above: this loop already visits exactly the ops
+            // that changed an item, with both images in hand, and it runs inside
+            // the same transaction. Three call sites would have been three chances
+            // to diverge on which image is passed.
+            let vector_n = crate::data::vector_index::maintain_vector_indexes(
+                &mut tx,
+                &table_vector_metas[transact_op_table_name(op)],
+                &key_info.table_id,
+                &key_info.key_schema,
+                &key_info.attribute_definitions,
+                old_item.as_ref(),
+                new_item.as_ref(),
+                sys_delay,
+            )
+            .await?;
+            if n > 0 || vector_n > 0 {
                 needs_notify = true;
             }
         }

@@ -13,7 +13,11 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        # pgvector's own image, which is postgres:16 plus the extension. The
+        # backend serves vector indexes where the extension is present, so this is
+        # what makes the positive paths reachable in CI. The novector job below
+        # keeps the refusal paths covered on a plain image.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_PASSWORD: devpass
         options: >-
@@ -182,7 +186,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_PASSWORD: devpass
         options: >-
@@ -247,13 +251,13 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
           EXTENDDB_ADMIN_USER: admin
           EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
-          # PostgreSQL implements no vector search, so this is the job where the
-          # wire refusal tests must actually run. Both vector suites adapt to
-          # whatever the backend reports, so the refusal suite could skip every
-          # assertion here and still report green. "0" asserts the backend
-          # refuses vector indexes, making those tests mandatory rather than
-          # optional, and turns a silent skip into a failure.
-          EXTENDDB_EXPECT_VECTORS: "0"
+          # PostgreSQL now serves vector search against a server with pgvector,
+          # which this job's image has. Both vector suites adapt to whatever the
+          # backend reports, so without a pinned expectation the positive suite
+          # could skip every assertion and still report green. "1" makes those
+          # tests mandatory. The refusal suite moves to the novector job, which is
+          # the only place those assertions still mean anything.
+          EXTENDDB_EXPECT_VECTORS: "1"
         run: devtools/run-tests --extenddb --rust-integration --release
 
       # The control plane for vector indexes is not reachable over the wire while
