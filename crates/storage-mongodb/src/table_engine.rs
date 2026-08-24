@@ -1546,18 +1546,13 @@ impl MongoEngine {
     /// Drop the physical collection backing one secondary index.
     async fn drop_index_collection(&self, index_id: &str) -> Result<(), StorageError> {
         let coll_name = data_collection_name(index_id);
-        let collections = self
-            .data_db
-            .list_collection_names()
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-        if collections.iter().any(|name| name == &coll_name) {
-            self.data_db
-                .collection::<Document>(&coll_name)
-                .drop()
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+        match self.data_db.collection::<Document>(&coll_name).drop().await {
+            Ok(()) => {}
+            // Collection deletion is intentionally idempotent. The collection
+            // may already be gone after a partial lifecycle cleanup.
+            Err(e) if matches!(*e.kind, mongodb::error::ErrorKind::Command(ref c) if c.code == 26) =>
+                {}
+            Err(e) => return Err(StorageError::Internal(e.to_string())),
         }
 
         Ok(())
