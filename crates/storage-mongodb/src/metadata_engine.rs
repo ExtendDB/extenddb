@@ -49,19 +49,42 @@ fn literal_ttl_value_expression(ttl_attribute: &str) -> Document {
     }
 }
 
+fn literal_ttl_epoch_expression(ttl_attribute: &str) -> Document {
+    doc! {
+        "$convert": {
+            "input": literal_ttl_value_expression(ttl_attribute),
+            "to": "long",
+            "onError": Bson::Null,
+            "onNull": Bson::Null,
+        }
+    }
+}
+
 /// Return the candidate filter and sort for the TTL sweep.
 ///
 /// Keep the normal dotted-path form for ordinary attribute names so MongoDB
 /// can use the sparse TTL lookup index. For names containing a dot, use
 /// `$getField` so the attribute name is treated literally; that path cannot be
-/// represented by MongoDB's ordinary field-path query syntax.
-fn ttl_candidate_query(ttl_attribute: &str) -> (Document, Document) {
+/// represented by MongoDB's ordinary field-path query syntax. The dotted path
+/// also performs the expiry comparison in MongoDB, so non-expired low-`_id`
+/// documents cannot starve expired documents later in the collection.
+fn ttl_candidate_query(ttl_attribute: &str, now_epoch: i64) -> (Document, Document) {
     let ttl_field = format!("item_data.{ttl_attribute}.N");
     if ttl_attribute.contains('.') {
+        let ttl_epoch = literal_ttl_epoch_expression(ttl_attribute);
         (
             doc! {
                 "$expr": {
-                    "$ne": [literal_ttl_value_expression(ttl_attribute), Bson::Null]
+                    "$let": {
+                        "vars": { "ttl": ttl_epoch },
+                        "in": {
+                            "$and": [
+                                { "$ne": ["$$ttl", Bson::Null] },
+                                { "$gte": ["$$ttl", 1] },
+                                { "$lte": ["$$ttl", now_epoch] },
+                            ]
+                        }
+                    }
                 }
             },
             doc! { "_id": 1 },
@@ -445,7 +468,7 @@ impl MetadataEngine for MongoEngine {
             // numbers are stored as strings and MongoDB must not compare them
             // lexicographically. Dotted attribute names use $getField so the
             // name remains literal instead of becoming nested path traversal.
-            let (filter, sort) = ttl_candidate_query(&ttl_attribute);
+            let (filter, sort) = ttl_candidate_query(&ttl_attribute, now_epoch);
 
             let mut cursor = data_coll
                 .find(filter)
@@ -589,11 +612,11 @@ impl MetadataEngine for MongoEngine {
 #[cfg(test)]
 mod tests {
     use super::ttl_candidate_query;
-    use mongodb::bson::doc;
+    use mongodb::bson::{Bson, doc};
 
     #[test]
     fn ttl_query_keeps_simple_attribute_on_indexed_path() {
-        let (filter, sort) = ttl_candidate_query("expires_at");
+        let (filter, sort) = ttl_candidate_query("expires_at", 1_700_000_000);
 
         assert_eq!(
             filter,
@@ -609,14 +632,25 @@ mod tests {
 
     #[test]
     fn ttl_query_reads_dotted_attribute_as_literal_field() {
-        let (filter, sort) = ttl_candidate_query("expires.at");
+        let (filter, sort) = ttl_candidate_query("expires.at", 1_700_000_000);
 
         let expr = filter.get_document("$expr").expect("$expr filter");
-        let comparison = expr.get_array("$ne").expect("$ne expression");
-        let n_value = comparison[0]
-            .as_document()
-            .expect("literal N value expression");
-        let outer_get_field = n_value.get_document("$getField").expect("outer $getField");
+        let let_expr = expr.get_document("$let").expect("$let expression");
+        let vars = let_expr.get_document("vars").expect("$let variables");
+        let ttl_convert = vars
+            .get_document("ttl")
+            .expect("converted TTL expression")
+            .get_document("$convert")
+            .expect("$convert expression");
+        assert_eq!(ttl_convert.get_str("to").ok(), Some("long"));
+        assert_eq!(ttl_convert.get("onError"), Some(&mongodb::bson::Bson::Null));
+        assert_eq!(ttl_convert.get("onNull"), Some(&mongodb::bson::Bson::Null));
+
+        let outer_get_field = ttl_convert
+            .get_document("input")
+            .expect("literal N value expression")
+            .get_document("$getField")
+            .expect("outer $getField");
         assert_eq!(outer_get_field.get_str("field").ok(), Some("N"));
 
         let attribute_value = outer_get_field
@@ -627,6 +661,22 @@ mod tests {
             .expect("inner $getField");
         assert_eq!(inner_get_field.get_str("field").ok(), Some("expires.at"));
         assert_eq!(inner_get_field.get_str("input").ok(), Some("$item_data"));
+
+        let conditions = let_expr
+            .get_document("in")
+            .expect("$let body")
+            .get_array("$and")
+            .expect("expiry conditions");
+        assert_eq!(conditions.len(), 3);
+        assert_eq!(
+            conditions[0],
+            Bson::Document(doc! { "$ne": ["$$ttl", Bson::Null] })
+        );
+        assert_eq!(conditions[1], Bson::Document(doc! { "$gte": ["$$ttl", 1] }));
+        assert_eq!(
+            conditions[2],
+            Bson::Document(doc! { "$lte": ["$$ttl", 1_700_000_000_i64] })
+        );
 
         // There is no ordinary dotted field path for this case, so use a
         // stable sort that does not reinterpret the attribute name.
