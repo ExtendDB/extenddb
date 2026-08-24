@@ -37,8 +37,8 @@ query.
 
 The refusal does not name pgvector, and that is deliberate rather than an
 oversight: the engine's capability gate is backend-agnostic by design, so it says
-only that the capability is absent, and it is the same string whichever backend is
-installed. Naming the cause is the startup log's job and the troubleshooting
+only that the capability is absent, in the same two strings whichever backend is
+installed: one for the index operations and one for a search. Naming the cause is the startup log's job and the troubleshooting
 entry's. A second refusal does name the extension, but it covers the narrower case
 of an extension that disappears after the probe said yes, so it is unreachable when
 a server started without pgvector. The consequence, which is documented in the admin

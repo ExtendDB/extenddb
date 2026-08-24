@@ -1224,7 +1224,10 @@ cargo test --workspace
 
 Vector search is the one capability a backend may decline. Declining is a
 supported end state, not a stub: the engine refuses every vector operation with a
-message naming what is missing, and no other operation is affected.
+message naming the missing capability rather than its cause, and no other operation is
+affected. The refusal deliberately does not name the environmental reason: that is the
+startup log's job and the troubleshooting entry's, which is why a backend needs no
+hook to produce it.
 
 **The opt-out is a single method.** `DataEngine::as_vector_search` returns
 `Option<&dyn VectorSearchEngine>` and defaults to `None`, so a backend that

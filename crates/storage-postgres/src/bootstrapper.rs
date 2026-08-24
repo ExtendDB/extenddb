@@ -148,10 +148,12 @@ impl PostgresBootstrapper {
 
     /// Try to install pgvector on the data database, tolerating refusal.
     ///
-    /// Init and migrate are the moments when this process holds the privileges
-    /// that `CREATE EXTENSION` needs: the data database is owned by the
-    /// application role, and pgvector is a trusted extension, so its owner can
-    /// install it without being a superuser. Serve-time code never attempts
+    /// This is an attempt, not a guarantee: pgvector's control file does not
+    /// mark the extension trusted, so `CREATE EXTENSION` is refused for a
+    /// non-superuser even on a database its role owns ("Must be superuser",
+    /// measured on a stock install). On refusal the printed hint tells the
+    /// operator to create it once as a superuser or as the database owner.
+    /// Serve-time code never attempts
     /// this, because a request path must not carry data-definition privileges it
     /// only needs once.
     ///

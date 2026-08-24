@@ -129,7 +129,7 @@ Check the version:
 
 ```bash
 ./target/release/extenddb version
-# extenddb 0.1.6
+# extenddb 0.1.8
 # catalog 0.0.3 (postgres)
 # commit abc1234
 # built 2026-04-17T12:00:00Z
