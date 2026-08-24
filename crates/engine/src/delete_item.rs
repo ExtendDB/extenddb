@@ -29,11 +29,22 @@ pub async fn handle_delete_item(
 ) -> Result<DispatchResult, DynamoDbError> {
     crate::validate_enum_fields(
         &body,
-        &[(
-            "ReturnConsumedCapacity",
-            "returnConsumedCapacity",
-            &["INDEXES", "TOTAL", "NONE"],
-        )],
+        &[
+            (
+                "ReturnConsumedCapacity",
+                "returnConsumedCapacity",
+                &["INDEXES", "TOTAL", "NONE"],
+            ),
+            // The full ReturnValues enum set: a value outside it joins the
+            // aggregate (measured: both invalid enums answer "2 validation
+            // errors detected"), while a member merely disallowed for
+            // DeleteItem falls through to validate_put_delete_return_values.
+            (
+                "ReturnValues",
+                "returnValues",
+                &["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"],
+            ),
+        ],
     )?;
     crate::validate_put_delete_return_values(&body)?;
     let input: DeleteItemInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;

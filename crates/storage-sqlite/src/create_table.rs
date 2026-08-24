@@ -467,6 +467,7 @@ impl SqliteEngine {
             .filter(|v: &Vec<_>| !v.is_empty());
 
         Ok(TableDescription {
+            restore_summary: None,
             table_name: input.table_name,
             key_schema: input.key_schema,
             attribute_definitions: input.attribute_definitions,

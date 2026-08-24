@@ -217,6 +217,44 @@ impl ConsumedCapacity {
         self
     }
 
+    /// Build a `ConsumedCapacity` for a read served by a secondary index.
+    ///
+    /// The index carries the read and the table's share is zero, with the
+    /// aggregate being their sum; that is what makes the INDEXES breakdown a
+    /// breakdown rather than a copy of the total (pinned by the ground-truth
+    /// runs of 2026-08-24, us-east-1 and eu-west-2). `is_global` selects the
+    /// map the index entry lands in.
+    pub fn read_on_index(table_name: &str, index_name: &str, cu: f64, is_global: bool) -> Self {
+        let index_arm = std::iter::once((
+            index_name.to_owned(),
+            Capacity {
+                capacity_units: cu,
+                read_capacity_units: None,
+                write_capacity_units: None,
+            },
+        ))
+        .collect();
+        let (gsi, lsi) = if is_global {
+            (Some(index_arm), None)
+        } else {
+            (None, Some(index_arm))
+        };
+        Self {
+            table_name: table_name.to_owned(),
+            capacity_units: cu,
+            read_capacity_units: None,
+            write_capacity_units: None,
+            table: Some(Capacity {
+                capacity_units: 0.0,
+                read_capacity_units: None,
+                write_capacity_units: None,
+            }),
+            global_secondary_indexes: gsi,
+            local_secondary_indexes: lsi,
+            vector_indexes: None,
+        }
+    }
+
     /// Build a `ConsumedCapacity` for a read operation with real capacity units.
     #[must_use]
     pub fn read(table_name: &str, cu: f64, indexes: bool) -> Self {
@@ -270,6 +308,33 @@ impl ConsumedCapacity {
     /// and inside the nested `Table` breakdown at INDEXES granularity.
     #[must_use]
     pub fn transact_read(table_name: &str, cu: f64, indexes: bool) -> Self {
+        Self {
+            table_name: table_name.to_owned(),
+            capacity_units: cu,
+            read_capacity_units: Some(cu),
+            write_capacity_units: None,
+            table: if indexes {
+                Some(Capacity {
+                    capacity_units: cu,
+                    read_capacity_units: Some(cu),
+                    write_capacity_units: None,
+                })
+            } else {
+                None
+            },
+            global_secondary_indexes: None,
+            local_secondary_indexes: None,
+            vector_indexes: None,
+        }
+    }
+
+    /// Build the `ConsumedCapacity` for an idempotent-replay response: the
+    /// replay re-reads the stored result transactionally, so it reports READ
+    /// capacity recomputed against the item size, never the stored write
+    /// magnitude. Measured against the service (a ~1.5KB put: first call 4
+    /// WCU, same-token replay 2 RCU with no write arm).
+    #[must_use]
+    pub fn transact_replay_read(table_name: &str, cu: f64, indexes: bool) -> Self {
         Self {
             table_name: table_name.to_owned(),
             capacity_units: cu,

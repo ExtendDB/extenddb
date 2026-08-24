@@ -37,20 +37,25 @@ pub async fn handle_update_item(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
+    // Sequential rather than aggregated, deliberately: UpdateItem stops at the
+    // FIRST invalid enum and reports one error, where PutItem and DeleteItem
+    // aggregate all of theirs (behaviour change the ground truth captured
+    // 2026-06-08; re-confirmed by the 2026-08-24 runs in both regions).
     crate::validate_enum_fields(
         &body,
-        &[
-            (
-                "ReturnValues",
-                "returnValues",
-                &["NONE", "ALL_OLD", "ALL_NEW", "UPDATED_OLD", "UPDATED_NEW"],
-            ),
-            (
-                "ReturnConsumedCapacity",
-                "returnConsumedCapacity",
-                &["INDEXES", "TOTAL", "NONE"],
-            ),
-        ],
+        &[(
+            "ReturnValues",
+            "returnValues",
+            &["NONE", "ALL_OLD", "ALL_NEW", "UPDATED_OLD", "UPDATED_NEW"],
+        )],
+    )?;
+    crate::validate_enum_fields(
+        &body,
+        &[(
+            "ReturnConsumedCapacity",
+            "returnConsumedCapacity",
+            &["INDEXES", "TOTAL", "NONE"],
+        )],
     )?;
     let input: UpdateItemInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
@@ -205,24 +210,17 @@ pub async fn handle_update_item(
     // `expression::apply_update_validated`, which every backend applies to the
     // evaluated image and which no expression form can bypass.
 
-    // Amazon DynamoDB enforces nesting depth on values that are stored as item
-    // attributes. For UpdateExpression, walk each SET action's RHS to find the
-    // EAV placeholders it references, resolve them against `maps.values`, and
-    // validate those values' depth. Condition-only EAV is left alone: real
-    // DynamoDB does not apply the nesting limit to values used solely in a
-    // ConditionExpression (verified against the service).
-    {
-        let mut placeholders: Vec<String> = Vec::new();
-        for action in &actions {
-            if let UpdateAction::Set { value, .. } = action {
-                extenddb_core::expression::collect_value_placeholders(value, &mut placeholders);
-            }
-        }
-        let stored: Vec<&extenddb_core::types::AttributeValue> = placeholders
-            .iter()
-            .filter_map(|name| maps.values.get(name))
-            .collect();
-        extenddb_core::validation::validate_attribute_values_nesting_depth(stored)?;
+    // Amazon DynamoDB enforces the nesting-depth limit on EVERY
+    // ExpressionAttributeValue, condition-only placeholders included: a
+    // 32-level value referenced solely by a ConditionExpression answers the
+    // nesting ValidationException rather than evaluating the condition.
+    // An earlier measurement had condition-only values exempt, and some
+    // regions did behave that way; re-measured 2026-08-24, both us-east-1 and
+    // eu-west-2 apply the limit to the whole map, so the per-placeholder walk
+    // this replaced is gone. A 31-level value still passes and the condition
+    // evaluates normally.
+    if let Some(values) = &input.expression_attribute_values {
+        extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
     }
 
     // Validate that no update action targets a key attribute (REQ-DATA-003)

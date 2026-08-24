@@ -1353,19 +1353,25 @@ pub fn validate_index_key_not_empty(
             let Some(value) = item.get(&ks.attribute_name) else {
                 continue;
             };
-            let empty = matches!(value, AttributeValue::S(s) if s.is_empty())
-                || matches!(value, AttributeValue::B(b) if b.is_empty());
-            if empty {
+            // The message names the offending value's kind: "string" for S,
+            // "binary" for B, in both message forms (measured; the binary
+            // wording was previously hardcoded to "string").
+            let kind = match value {
+                AttributeValue::S(s) if s.is_empty() => "string",
+                AttributeValue::B(b) if b.is_empty() => "binary",
+                _ => continue,
+            };
+            {
                 let msg = match ctx {
                     SecondaryIndexEmptyContext::Item => format!(
                         "One or more parameter values are not valid. A value specified for a secondary index key is not supported. \
-                         The AttributeValue for a key attribute cannot contain an empty string value. IndexName: {}, IndexKey: {}",
+                         The AttributeValue for a key attribute cannot contain an empty {kind} value. IndexName: {}, IndexKey: {}",
                         idx.index_name, ks.attribute_name
                     ),
-                    SecondaryIndexEmptyContext::UpdateExpression =>
+                    SecondaryIndexEmptyContext::UpdateExpression => format!(
                         "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. \
-                         The AttributeValue for a key attribute cannot contain an empty string value."
-                            .to_owned(),
+                         The AttributeValue for a key attribute cannot contain an empty {kind} value."
+                    ),
                 };
                 return Err(DynamoDbError::ValidationException(msg));
             }
@@ -1450,9 +1456,17 @@ pub fn validate_select_projection(
         && !has_projection
         && !has_attributes_to_get
     {
-        return Err(DynamoDbError::ValidationException(
-            "Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES".to_owned(),
-        ));
+        // Same envelope split as the incompatible-Select rejection above:
+        // Query carries the "1 validation error detected: " prefix, Scan does
+        // not (both measured, 2026-08-24 ground-truth runs).
+        let body = "Must specify the AttributesToGet or ProjectionExpression \
+                    when choosing to get SPECIFIC_ATTRIBUTES";
+        let msg = if is_query {
+            format!("1 validation error detected: {body}")
+        } else {
+            body.to_owned()
+        };
+        return Err(DynamoDbError::ValidationException(msg));
     }
     if matches!(select, Some(Select::AllProjectedAttributes)) && !has_index_name {
         return Err(DynamoDbError::ValidationException(

@@ -61,6 +61,15 @@ pub async fn handle_put_item(
                 "returnItemCollectionMetrics",
                 &["SIZE", "NONE"],
             ),
+            // The full ReturnValues enum set: a value outside it joins the
+            // aggregate (measured: three invalid enums answer "3 validation
+            // errors detected"), while a member merely disallowed for PutItem
+            // falls through to validate_put_delete_return_values below.
+            (
+                "ReturnValues",
+                "returnValues",
+                &["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"],
+            ),
         ],
     )?;
     crate::validate_put_delete_return_values(&body)?;
@@ -227,7 +236,12 @@ pub async fn handle_put_item(
             wcu,
             old_item.as_ref(),
             Some(new_item),
-            true,
+            // An overwrite whose projected index entry is unchanged charges
+            // no index write: an identical PutItem overwrite reports the
+            // table arm alone (measured 2026-08-24, us-east-1 and eu-west-2;
+            // an earlier measurement had put replacements charging the index
+            // regardless, which is no longer what the service does).
+            false,
             &key_info,
         ),
         None => {
