@@ -1415,6 +1415,13 @@ async fn a_tiny_query_vector_still_scores_every_hit_as_a_number() {
     // orthogonal row is exactly 1.0. A backend that treats the query as zero returns
     // 1.0 for BOTH and still passes every assertion above, which is precisely the
     // state one backend was in: it reported a ranking it had not computed.
+    //
+    // These two values are safe to pin forever, and the reason is worth stating for
+    // whoever is tempted to weaken them: they are the metric's DEFINITION at 0 and 90
+    // degrees, not an implementation's current behaviour. Cosine distance is exactly 0
+    // for a parallel pair and exactly 1 for an orthogonal one whatever the magnitudes
+    // involved, so no correct implementation can fail this, and widening the shared
+    // norm helper to f64, which is the obvious later tidy-up, changes neither number.
     let pks = hit_pks(&response);
     assert_eq!(
         pks,
@@ -1436,8 +1443,11 @@ async fn a_tiny_query_vector_still_scores_every_hit_as_a_number() {
     );
     assert!(
         (score_of("orthogonal") - 1.0).abs() < 1e-6,
-        "and orthogonal to it is exactly 1.0, by the metric rather than by the guard: \
-         got {}",
+        "and orthogonal to it is exactly 1.0 on both backends: by the metric on \
+         SQLite, which computes in f64, and by the NaN substitute on PostgreSQL, \
+         where pgvector's own f32 norm underflows and the operator divides zero by \
+         zero. Either way not by the zero-vector guard, which cannot fire because \
+         the query norm is computed in f64: got {}",
         score_of("orthogonal")
     );
 
@@ -1499,6 +1509,54 @@ async fn an_extreme_magnitude_query_scores_as_a_number_under_every_metric() {
 
         let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
     }
+}
+
+/// The other side of the tiny-vector boundary: an all-zero query vector.
+///
+/// The pair is what makes either half meaningful from outside the process. A tiny
+/// query is not a zero vector, so it must produce a computed ranking, 0 for the
+/// parallel row and 1.0 for the orthogonal one. A genuinely zero query has no
+/// direction, so every row must score the same 1.0, and the difference between the two
+/// results is what shows the zero-vector guard fires where it should and not where it
+/// should not. With only the tiny case pinned, a backend that treated every small
+/// vector as zero would still pass one test and fail the pair.
+///
+/// 1.0 is the measured service answer rather than a choice: writing and cosine
+/// searching an all-zeros vector both succeed against Amazon DynamoDB, and it defines
+/// the score involving a zero vector as exactly 1.0 on either side. The expected
+/// rejection does not exist.
+#[tokio::test]
+async fn a_zero_query_vector_scores_every_hit_as_the_zero_vector_answer() {
+    if skip_unless_supported().await {
+        return;
+    }
+    let name = table_name("pos_zero_query");
+    create_vector_table(&name, 4, "COSINE", false).await;
+
+    put_vector(&name, "parallel", None, &[1.0, 0.0, 0.0, 0.0]).await;
+    put_vector(&name, "orthogonal", None, &[0.0, 1.0, 0.0, 0.0]).await;
+    search_until_count(&name, &[1.0, 0.0, 0.0, 0.0], 10, None, 2).await;
+
+    let response = search(&name, &[0.0, 0.0, 0.0, 0.0], 10, None).await;
+    let hits = response
+        .get("SearchResults")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| panic!("no results array in: {response}"))
+        .clone();
+    assert_eq!(hits.len(), 2, "both rows must come back: {response}");
+    for hit in &hits {
+        let score = hit
+            .get("Score")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_else(|| panic!("no numeric score: {hit}"));
+        assert!(
+            (score - 1.0).abs() < 1e-6,
+            "a zero query vector has no direction, so every row is the zero-vector \
+             answer of exactly 1.0, whatever its own direction: got {score} for {hit}"
+        );
+    }
+
+    let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
 }
 
 /// The same collapse on the other path a client can reach: an index added by

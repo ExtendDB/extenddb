@@ -47,8 +47,13 @@ use crate::data::vector_table_name;
 /// that cannot be serialised for magnitudes well below `f32::MAX`, measured on 0.8.0:
 /// Euclidean overflows to `Infinity` above about 9.2e18 (its difference is doubled
 /// before squaring, so it goes first), dot product returns `-Infinity` above about
-/// 1.8e19, and cosine returns `NaN` at both ends, above about 1.8e19 and below about
-/// 3.7e-23, because it divides two values that have both overflowed or both underflowed.
+/// 1.8e19, and cosine fails at both ends, above about 1.8e19 and below about
+/// 3.7e-23. The two ends fail differently. Above, both the norms and the inner
+/// product overflow and the quotient is `NaN`. Below, 3.7e-23 is where a component's
+/// `f32` square rounds to zero, so it is the query norm that underflows while the
+/// inner product usually does not: the quotient is then an infinity that pgvector
+/// clamps, and only an exactly zero inner product gives the 0/0 that is `NaN`. The
+/// measurement below spells out what that produces.
 /// `serde_json` renders NaN and Infinity alike as `null`, so each of those reaches a
 /// client as `"Score": null` on a 200 response.
 ///

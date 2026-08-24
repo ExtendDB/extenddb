@@ -1006,7 +1006,7 @@ impl PostgresEngine {
         // Zero in production. A test sets it to hold the index in the
         // resource-allocation phase, which is the only way a client can observe that
         // phase: it otherwise exists only between the catalog row's insert and the
-        // flip below, both inside this one call.
+        // flip below, the second inside the detached task this call spawns.
         let allocation_delay =
             std::time::Duration::from_millis(self.vector_allocation_phase_delay().await);
         let ownership_pool = self.data_pool.clone();

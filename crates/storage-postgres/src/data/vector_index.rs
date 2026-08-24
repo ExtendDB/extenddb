@@ -334,11 +334,18 @@ impl<'a> VectorInsertPlan<'a> {
         let item_json =
             serde_json::to_value(&projected).map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // A plain INSERT, deliberately, where the GSI sibling upserts. Every caller
-        // reaches this through `apply_vector_index`, which deletes the base key's row
-        // first, so no live row can exist here. Keeping it plain means that if a
-        // future change ever makes that delete conditional, this fails loudly on the
-        // primary key rather than quietly replacing a row and hiding the break.
+        // A plain INSERT, deliberately, where the GSI sibling upserts. Two callers reach
+        // it and only one deletes first: the live write path through
+        // `apply_vector_index` does, the backfill does not. So the caller set is not
+        // what makes a conflict unreachable.
+        //
+        // What makes it unreachable on this backend is the inline gate in
+        // `maintain_vector_indexes`, `delay_ms == 0 && index_status == "ACTIVE"`: a
+        // write to an index that is still CREATING is always queued, so it cannot put a
+        // row here while the backfill is scanning. Keeping the INSERT plain means that
+        // if that gate is ever weakened, this fails loudly on the primary key rather
+        // than quietly replacing a row and hiding the break. The SQLite backend has no
+        // such gate, which is tech-debt item F-20.
         //
         // As bytes: the column is BYTEA because the unscoped sentinel carries a NUL,
         // which PostgreSQL rejects in a text column.

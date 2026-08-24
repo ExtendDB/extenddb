@@ -30,10 +30,18 @@ longer ours (see decision 4).
 **2. Vector support is detected at runtime and fails closed.**
 
 Whether an ExtendDB build can serve vector indexes is a property of the
-PostgreSQL server it is pointed at, not of the binary. The engine probes for the
-extension once at startup and caches the answer, and a server without it refuses
-every vector operation with a message naming the extension rather than failing
-somewhere inside a query. The consequence, which is documented in the admin
+PostgreSQL server it is pointed at, not of the binary. The PostgreSQL **backend**
+probes for the extension once at startup and caches the answer, and a server
+without it refuses every vector operation rather than failing somewhere inside a
+query.
+
+The refusal does not name pgvector, and that is deliberate rather than an
+oversight: the engine's capability gate is backend-agnostic by design, so it says
+only that the capability is absent, and it is the same string whichever backend is
+installed. Naming the cause is the startup log's job and the troubleshooting
+entry's. A second refusal does name the extension, but it covers the narrower case
+of an extension that disappears after the probe said yes, so it is unreachable when
+a server started without pgvector. The consequence, which is documented in the admin
 guide: installing pgvector under a running server needs an ExtendDB restart,
 because the probe is not re-run.
 

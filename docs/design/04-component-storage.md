@@ -838,13 +838,27 @@ backend crate: an invisible, compiles-fine failure mode. A name-keyed registry
 fixed that but kept string dispatch, which allows a class of runtime error that
 cannot exist now, because there is nothing to look up.
 
-The components factory itself is unchanged in shape, and this is the body a
-backend supplies:
+A backend supplies one `backend()` function returning that value. Its fields are
+factories, and the server-components one carries the body that used to live in the
+registration:
 
 ```rust
 // In crates/storage-postgres/src/lib.rs
-{
-    ServerComponentsRegistration {
+pub fn backend() -> extenddb_storage::Backend {
+    extenddb_storage::Backend {
+        name: "postgres",
+        bootstrapper: |config_path, cli_args| { /* ... */ },
+        storage_config: |table| { /* ... */ },
+        operations: &operations::PostgresOperationsEngine,
+        settings_store: |config| { /* ... */ },
+        diagnostics_store: |config| { /* ... */ },
+        server_components: server_components_factory,
+    }
+}
+
+// and the factory itself, a free function with the body the registry used to hold
+fn server_components_factory(config: &StorageConfig, region: &str) -> /* ... */ {
+    {
         backend: "postgres",
         factory: |config, region| {
             Box::pin(async move {
@@ -1115,13 +1129,15 @@ In `lib.rs`:
 
 ```rust
 use extenddb_storage::{
-    ServerComponents, ServerComponentsRegistration, BackendError,
+    Backend, ServerComponents, BackendError,
     StorageConfig, StorageEngine, CatalogStore,
 };
 use extenddb_auth::{BuiltinAuthProvider, CredentialStore};
 
-{
-    ServerComponentsRegistration {
+// The same shape as the PostgreSQL backend above: a `backend()` returning
+// `Backend { name, .., server_components }`, and the factory as a free function.
+fn server_components_factory(config: &StorageConfig, region: &str) -> /* ... */ {
+    {
         backend: "sqlite",
         factory: |config, region| {
             Box::pin(async move {
@@ -1218,11 +1234,20 @@ implements nothing declines by construction. A backend that participates returns
 **Fail closed, and decide it once.** Whether a backend can serve vector search may
 depend on the server it is connected to rather than on the build: the PostgreSQL
 backend probes for the pgvector extension at startup and caches the answer, then
-declines for the process lifetime if it is absent. Two rules follow from the
-engine's contract. A backend must not accept a vector index it cannot serve, and
-it must not answer a search from a partially built index. Both refusals belong at
-the storage boundary, because degrading instead produces a table that reports an
-index and returns nothing from every search.
+declines for the process lifetime if it is absent.
+
+Two refusals matter here and **neither is yours to write**. Refusing a vector index
+on a backend that cannot serve one is the engine's capability gate, which needs no
+code from a backend that simply returns `None`. Refusing to answer a search from an
+index that is still building is also the engine's, on the search path, by filtering
+to indexes that report `ACTIVE`; no backend has a status predicate in its search
+query, and adding one would duplicate a decision that already exists.
+
+**What is yours** is the case a cached answer cannot cover: re-check any
+environmental capability at the moment you persist catalog state. The PostgreSQL
+backend runs a live `SELECT NULL::vector` before recording an index, because the
+extension can be dropped after the startup probe said yes, and a catalog row with
+no storage behind it is an index that reports itself and answers nothing.
 
 **The build lifecycle is shared; the SQL is not.** `extenddb_storage::vector_lifecycle`
 owns the ordering rules for the whole build: the batched backfill, the

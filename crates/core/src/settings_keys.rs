@@ -70,8 +70,8 @@ pub const VECTOR_INDEX_MIN_CREATING_MS: &str = "vector_index_min_creating_ms";
 ///
 /// Without this there is no deterministic way to observe the first half from a
 /// client: the allocation phase exists only between the catalog row's insert and
-/// the flip to `Backfilling: true`, both inside one `UpdateTable` call, so a test
-/// could only race it. A race that asserts a whole measured string is worse than
+/// the flip to `Backfilling: true`, the second of them inside the detached build task; the window is therefore a task
+/// spawn wide, so a test could only race it. A race that asserts a whole measured string is worse than
 /// no test, because it fails for reasons unrelated to the rule.
 ///
 /// Unset, nothing waits and no branch is taken.

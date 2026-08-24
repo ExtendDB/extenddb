@@ -246,7 +246,8 @@ impl VectorSearchEngine for SqliteEngine {
             // `nrm` is deliberately not selected. The stored norm is an f32 and cannot
             // be trusted for either the zero test or the cosine denominator, so the
             // scorer recomputes both sides in f64 from the vector it already decoded.
-            // The column stays for operator inspection and for the other backend.
+            // The column stays because dropping it would need a data migration for
+            // no benefit; see the reasoning on `create_vector_data_table`.
             let sql = format!("SELECT vec, item_data FROM {vec_table} WHERE part = ?");
 
             let k = usize::try_from(top_k.max(0)).unwrap_or(0);

@@ -176,8 +176,8 @@ Managed via `extenddb settings set`. Changes take effect within 30 seconds witho
 | `log_level` | `info` | Log level: trace, debug, info, warn, error |
 | `control_plane_delay_seconds` | `5` | Delay for table status transitions (0 = instant) |
 | `allow_credential_import` | `true` | Whether `import-access-key` is allowed |
-| `vector_backfill_batch_delay_ms` | `0` | **Test-oriented.** Milliseconds to pause between batches while a vector index backfills. Zero in production. A test sets it so a write is guaranteed to land while the index is still building; the pause is outside any lock, so the table stays writable throughout either way. |
-| `vector_allocation_phase_delay_ms` | `0` | **Test-oriented.** Milliseconds to hold a new vector index in the resource-allocation phase (`CREATING` with `Backfilling: false`) before the scan starts. Zero in production. Both transitions otherwise happen inside one `UpdateTable` call, so without this a client cannot observe the phase that the delete rule turns on. |
+| `vector_backfill_batch_delay_ms` | `0` | **Test-oriented.** Milliseconds to pause between batches while a vector index backfills. Zero in production. A test sets it so a write is guaranteed to land while the index is still building. The pause is outside the batch transaction, so writes are still accepted throughout, but it does extend the per-table propagation hold: no index on that table advances while the build runs, GSIs included, and the accepted range goes up to 60 s per batch. |
+| `vector_allocation_phase_delay_ms` | `0` | **Test-oriented.** Milliseconds to hold a new vector index in the resource-allocation phase (`CREATING` with `Backfilling: false`) before the scan starts. Zero in production. Without it the phase lasts only from the `UpdateTable` transaction, which inserts the row as `CREATING` with `Backfilling: false`, until the detached build task flips the flag, which is a window no client can time reliably rather than one that cannot exist. |
 
 ```bash
 # View current settings
@@ -544,6 +544,7 @@ Check that PostgreSQL is running and the connection string in `extenddb.toml` is
 
 **Catalog version mismatch:**
 
+<!-- version-literal-ok: the block below is an example mismatch error; 1.0.0 is the value found on disk, not a version claim -->
 ```
 Error: catalog version mismatch: found 1.0.0, expected 0.0.3
 ```

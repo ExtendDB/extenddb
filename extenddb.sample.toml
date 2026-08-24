@@ -48,12 +48,18 @@
 # pool_size = 20               # Maximum concurrent database connections
                                 # for DynamoDB data operations. Default: 20.
                                 # Minimum: 10 (smaller values are clamped with
-                                # a startup warning). Total PostgreSQL
-                                # connections used: pool_size + catalog_pool_size + 1
-                                # (log-level poller: 1), plus one per vector
-                                # index build running on this server and one
-                                # while a schema migration runs. Both sit
-                                # OUTSIDE both pools, for two different reasons.
+                                # a startup warning). This value sizes TWO
+                                # pools: one against the catalog database and
+                                # one against the data database, which `init`
+                                # always creates separately. Total PostgreSQL
+                                # connections used: 2 * pool_size +
+                                # catalog_pool_size, plus one per vector index
+                                # build running on this server and one while a
+                                # schema migration runs. max_connections is
+                                # per cluster, not per database, so both pools
+                                # draw on the same budget. The build session and
+                                # the migration connection sit OUTSIDE every
+                                # pool, for two different reasons.
                                 # A build's ownership lock is SESSION-scoped, so
                                 # it needs a session that ends when the build
                                 # ends: a pooled connection returns to the pool
@@ -64,9 +70,11 @@
                                 # until COMMIT; a transaction-pooling proxy could
                                 # otherwise let the lock move between backends.
                                 # Increase for higher concurrency; ensure
-                                # PostgreSQL max_connections >= pool_size +
-                                # catalog_pool_size + 1 + the number of vector
-                                # index builds you expect to overlap.
+                                # PostgreSQL max_connections >= 2 * pool_size
+                                # + catalog_pool_size + the number of vector
+                                # index builds you expect to overlap. The
+                                # defaults already need 60 of PostgreSQL's
+                                # default 100.
 # catalog_pool_size = 20       # Maximum concurrent connections for the
                                 # management/catalog pool (authz, IAM, console).
                                 # Defaults to pool_size if not set.
