@@ -89,8 +89,8 @@ impl PostgresEngine {
             // Vector index rows cascade the same way, through
             // vector_indexes_table_id_fkey, so a table with vector indexes needs
             // no extra catalog cleanup. Their data tables do need dropping, and
-            // by then the rows that named them are gone, which is why the sweep
-            // matches on the table id prefix instead of reading the catalog.
+            // the cascade takes away the rows that name them, which is why the
+            // index ids are collected BEFORE the catalog row goes.
             sqlx::query("DELETE FROM tags WHERE resource_arn = $1")
                 .bind(&row.table_arn)
                 .execute(&mut *tx)

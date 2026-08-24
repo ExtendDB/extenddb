@@ -49,10 +49,13 @@ use super::{all_sort_key_info, vector_table_name};
 ///
 /// Returns the rows with their status, because the status decides inline versus
 /// enqueue and only this read can see it.
-pub(crate) async fn fetch_vector_indexes_for_table(
-    catalog: &sqlx::PgPool,
+pub(crate) async fn fetch_vector_indexes_for_table<'e, E>(
+    catalog: E,
     table_id: &str,
-) -> Result<Vec<(VectorIndexMeta, String)>, StorageError> {
+) -> Result<Vec<(VectorIndexMeta, String)>, StorageError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let rows: Vec<(
         String,
         i32,
@@ -105,7 +108,7 @@ pub(crate) async fn fetch_vector_indexes_for_table(
 }
 
 /// The base table's key columns for a vector data table, in insert order.
-fn base_key_columns(base_sks: &[(&str, ScalarAttributeType)]) -> Vec<String> {
+pub(crate) fn base_key_columns(base_sks: &[(&str, ScalarAttributeType)]) -> Vec<String> {
     let mut cols = vec!["base_pk".to_owned()];
     for (i, &(_, sk_type)) in base_sks.iter().enumerate() {
         let col = if i == 0 {
@@ -242,83 +245,124 @@ pub(crate) async fn insert_vector_row(
     base_key_schema: &[KeySchemaElement],
     attr_defs: &[AttributeDefinition],
 ) -> Result<(), StorageError> {
-    if !item_is_indexable(item, meta) {
-        return Ok(());
-    }
-    let Some(value) = item.get(&meta.vector_attribute_name) else {
-        return Ok(());
-    };
-    let Some(components) = vector_components(value) else {
-        tracing::warn!(
-            index_id = %meta.index_id,
-            attribute = %meta.vector_attribute_name,
-            "stored vector attribute cannot be read as a vector; leaving the item unindexed"
+    VectorInsertPlan::new(meta, base_key_schema, attr_defs)
+        .insert(tx, item)
+        .await
+}
+
+/// Everything about writing one index's rows that does not change per row: the
+/// data table's name, the base key columns, and the INSERT statement over them.
+///
+/// A backfill writes up to a full batch of rows through one plan, so the schema
+/// work and the statement text are computed once rather than per row. The write
+/// path builds a plan for its single row, which costs the same as before.
+pub(crate) struct VectorInsertPlan<'a> {
+    meta: &'a VectorIndexMeta,
+    base_key_schema: &'a [KeySchemaElement],
+    base_sks: Vec<(&'a str, ScalarAttributeType)>,
+    sql: String,
+}
+
+impl<'a> VectorInsertPlan<'a> {
+    pub(crate) fn new(
+        meta: &'a VectorIndexMeta,
+        base_key_schema: &'a [KeySchemaElement],
+        attr_defs: &'a [AttributeDefinition],
+    ) -> Self {
+        let base_sks = all_sort_key_info(base_key_schema, attr_defs);
+        let key_cols = base_key_columns(&base_sks);
+        let mut cols = vec!["part".to_owned()];
+        cols.extend(key_cols);
+        cols.extend([
+            "embedding".to_owned(),
+            "nrm".to_owned(),
+            "item_data".to_owned(),
+        ]);
+        let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("${i}")).collect();
+        let sql = format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            vector_table_name(&meta.index_id),
+            cols.join(", "),
+            placeholders.join(", ")
         );
-        return Ok(());
-    };
-    if components.len() != meta.dimensions {
-        tracing::warn!(
-            index_id = %meta.index_id,
-            found = components.len(),
-            declared = meta.dimensions,
-            "stored vector has the wrong dimension count; leaving the item unindexed"
-        );
-        return Ok(());
-    }
-
-    let vec_table = vector_table_name(&meta.index_id);
-    let base_sks = all_sort_key_info(base_key_schema, attr_defs);
-    let key_cols = base_key_columns(&base_sks);
-    let part = item_partition(item, meta)?;
-    let norm = vector_norm(&components);
-    // Projection, the always-projected SearchSchema attributes, and the stripped
-    // vector attribute are the shared payload rules, so a live-written row and a
-    // backfilled one cannot differ in shape.
-    let projected = projected_payload(item, base_key_schema, meta);
-    let item_json =
-        serde_json::to_value(&projected).map_err(|e| StorageError::Internal(e.to_string()))?;
-
-    // A plain INSERT, deliberately, where the GSI sibling upserts. Every caller
-    // reaches this through `apply_vector_index`, which deletes the base key's row
-    // first, so no live row can exist here. Keeping it plain means that if a
-    // future change ever makes that delete conditional, this fails loudly on the
-    // primary key rather than quietly replacing a row and hiding the break.
-    let mut cols = vec!["part".to_owned()];
-    cols.extend(key_cols.iter().cloned());
-    cols.extend([
-        "embedding".to_owned(),
-        "nrm".to_owned(),
-        "item_data".to_owned(),
-    ]);
-    let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("${i}")).collect();
-    let sql = format!(
-        "INSERT INTO {vec_table} ({}) VALUES ({})",
-        cols.join(", "),
-        placeholders.join(", ")
-    );
-
-    // As bytes: the column is BYTEA because the unscoped sentinel carries a NUL,
-    // which PostgreSQL rejects in a text column.
-    let mut query = sqlx::query(&sql)
-        .bind(part.into_bytes())
-        .bind(composite_pk_to_text(item, base_key_schema)?);
-    for &(sk_name, sk_type) in &base_sks {
-        if let Some(value) = item.get(sk_name) {
-            query = match parse_sk(value, sk_type)? {
-                SortKeyValue::S(s) => query.bind(s),
-                SortKeyValue::N(n) => query.bind(n),
-                SortKeyValue::B(b) => query.bind(b),
-            };
+        Self {
+            meta,
+            base_key_schema,
+            base_sks,
+            sql,
         }
     }
-    query
-        .bind(Vector::from(components))
-        .bind(f64::from(norm))
-        .bind(item_json)
-        .execute(&mut **tx)
-        .await
-        .map_err(crate::vector::map_vector_sql_error)?;
-    Ok(())
+
+    /// Write one item's row, or skip it for the reasons the doc above gives.
+    pub(crate) async fn insert(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        item: &Item,
+    ) -> Result<(), StorageError> {
+        let meta = self.meta;
+        let base_key_schema = self.base_key_schema;
+        if !item_is_indexable(item, meta) {
+            return Ok(());
+        }
+        let Some(value) = item.get(&meta.vector_attribute_name) else {
+            return Ok(());
+        };
+        let Some(components) = vector_components(value) else {
+            tracing::warn!(
+                index_id = %meta.index_id,
+                attribute = %meta.vector_attribute_name,
+                "stored vector attribute cannot be read as a vector; leaving the item unindexed"
+            );
+            return Ok(());
+        };
+        if components.len() != meta.dimensions {
+            tracing::warn!(
+                index_id = %meta.index_id,
+                found = components.len(),
+                declared = meta.dimensions,
+                "stored vector has the wrong dimension count; leaving the item unindexed"
+            );
+            return Ok(());
+        }
+
+        let part = item_partition(item, meta)?;
+        let norm = vector_norm(&components);
+        // Projection, the always-projected SearchSchema attributes, and the stripped
+        // vector attribute are the shared payload rules, so a live-written row and a
+        // backfilled one cannot differ in shape.
+        let projected = projected_payload(item, base_key_schema, meta);
+        let item_json =
+            serde_json::to_value(&projected).map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        // A plain INSERT, deliberately, where the GSI sibling upserts. Every caller
+        // reaches this through `apply_vector_index`, which deletes the base key's row
+        // first, so no live row can exist here. Keeping it plain means that if a
+        // future change ever makes that delete conditional, this fails loudly on the
+        // primary key rather than quietly replacing a row and hiding the break.
+        //
+        // As bytes: the column is BYTEA because the unscoped sentinel carries a NUL,
+        // which PostgreSQL rejects in a text column.
+        let mut query = sqlx::query(&self.sql)
+            .bind(part.into_bytes())
+            .bind(composite_pk_to_text(item, base_key_schema)?);
+        for &(sk_name, sk_type) in &self.base_sks {
+            if let Some(value) = item.get(sk_name) {
+                query = match parse_sk(value, sk_type)? {
+                    SortKeyValue::S(s) => query.bind(s),
+                    SortKeyValue::N(n) => query.bind(n),
+                    SortKeyValue::B(b) => query.bind(b),
+                };
+            }
+        }
+        query
+            .bind(Vector::from(components))
+            .bind(f64::from(norm))
+            .bind(item_json)
+            .execute(&mut **tx)
+            .await
+            .map_err(crate::vector::map_vector_sql_error)?;
+        Ok(())
+    }
 }
 
 /// Apply one claimed queue row to its vector index, from the row's own context.
@@ -487,6 +531,10 @@ impl extenddb_storage::vector_lifecycle::VectorIndexBuild for PostgresVectorBuil
         let mut skipped = 0usize;
         let mut next_cursor = None;
 
+        // One plan for the whole batch: the table name, the key columns and the
+        // statement text are the same for every row it writes.
+        let plan = VectorInsertPlan::new(&meta, &self.base_key_schema, &self.attribute_definitions);
+
         for row in &rows {
             use sqlx::Row as _;
             let pk: String = row
@@ -528,14 +576,7 @@ impl extenddb_storage::vector_lifecycle::VectorIndexBuild for PostgresVectorBuil
                 BackfillRow::Index(item) => {
                     // The classifier parsed the row already, so the item comes from
                     // it rather than being deserialised a second time.
-                    insert_vector_row(
-                        &mut tx,
-                        &meta,
-                        &item,
-                        &self.base_key_schema,
-                        &self.attribute_definitions,
-                    )
-                    .await?;
+                    plan.insert(&mut tx, &item).await?;
                     written += 1;
                 }
                 BackfillRow::Poison => skipped += 1,
@@ -739,12 +780,19 @@ fn build_owner_label() -> String {
 
 /// Namespace for ExtendDB advisory locks, so a lock taken here cannot collide
 /// with one taken by another feature that hashed a different string.
+///
+/// The namespace is only half of a lock's identity: an advisory lock is scoped to the
+/// DATABASE its session is connected to, so the same namespace and key taken on the
+/// catalog database and on the data database are two different locks and neither
+/// excludes the other. Every vector-side call site takes ownership on the data pool,
+/// which is what makes this work. Moving one of them to the catalog pool for tidiness
+/// would break mutual exclusion with no error message anywhere.
 const ADVISORY_LOCK_NAMESPACE: i32 = 0x0045_4442;
 
-/// A held build-ownership lock. Dropping it returns the connection to the pool,
-/// which releases the session-scoped lock.
-pub(crate) struct BuildOwner {
-    _conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
+/// A held build-ownership lock. Dropping it ends the session the lock lives in,
+/// which is what releases the lock.
+pub struct BuildOwner {
+    _conn: sqlx::PgConnection,
 }
 
 /// Try to take ownership of one index's build.
@@ -758,11 +806,21 @@ pub(crate) struct BuildOwner {
 ///
 /// Returns `None` when another process owns the build, which is not an error: the
 /// other process is doing the work.
-pub(crate) async fn build_ownership(data: &sqlx::PgPool, index_id: &str) -> Option<BuildOwner> {
-    let mut conn = match data.acquire().await {
+///
+/// The session is opened directly rather than taken from the data pool, for two
+/// reasons. A build lasts as long as its scan, and the data pool serves every
+/// write, so a pinned pool connection would spend the whole build competing with
+/// the writes the batched backfill exists to keep flowing. And a pooled connection
+/// cannot release this lock: the lock is session-scoped, returning a connection to
+/// the pool does not end its session, so an abandoned owner would leave the lock
+/// held on an idle pooled connection and no peer could recover that index until the
+/// connection was recycled. Its own session dies with the owner.
+pub async fn build_ownership(data: &sqlx::PgPool, index_id: &str) -> Option<BuildOwner> {
+    let options = data.connect_options();
+    let mut conn = match <sqlx::PgConnection as sqlx::Connection>::connect_with(&options).await {
         Ok(conn) => conn,
         Err(e) => {
-            tracing::warn!("could not acquire a connection for vector build ownership: {e}");
+            tracing::warn!("could not open a session for vector build ownership: {e}");
             return None;
         }
     };
@@ -772,7 +830,7 @@ pub(crate) async fn build_ownership(data: &sqlx::PgPool, index_id: &str) -> Opti
         sqlx::query_scalar("SELECT pg_try_advisory_lock($1, hashtext($2))")
             .bind(ADVISORY_LOCK_NAMESPACE)
             .bind(index_id)
-            .fetch_one(&mut *conn)
+            .fetch_one(&mut conn)
             .await;
     match taken {
         Ok(true) => Some(BuildOwner { _conn: conn }),

@@ -46,6 +46,14 @@ pub use credential_store::DbCredentialStore;
 /// it, unlike the two recovery entry points above.
 #[doc(hidden)]
 pub use data::vector_index::apply_claimed_vector_row;
+/// Try to take ownership of one vector index's build.
+///
+/// Reachable so an integration test can assert that ownership is held in a session
+/// of its own and given back when the owner is dropped, which is only observable
+/// from a second session. Hidden for the same reason as the row applier: no
+/// deployment path calls it.
+#[doc(hidden)]
+pub use data::vector_index::build_ownership;
 /// Rebuild vector index builds whose heartbeat has gone stale. The runtime half of
 /// the same repair, exported for the same reason and for its test.
 pub use data::vector_index::rebuild_stuck_vector_indexes;

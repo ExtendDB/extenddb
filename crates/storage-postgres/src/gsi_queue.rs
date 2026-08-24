@@ -73,7 +73,7 @@ fn partition_for(base_pk_text: &str) -> i32 {
 ///
 /// This occurs when an index table is dropped (table deleted) while an async
 /// GSI update is still queued. The pending row is consumed rather than retried.
-fn is_undefined_table(err: &StorageError) -> bool {
+pub(crate) fn is_undefined_table(err: &StorageError) -> bool {
     match err {
         StorageError::Internal(msg) => msg.contains(PG_UNDEFINED_TABLE),
         _ => false,

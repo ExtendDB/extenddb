@@ -67,9 +67,25 @@ impl SqliteEngine {
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
             if vector_count > 0 {
-                return Err(StorageError::Validation(
-                    extenddb_core::types::VECTOR_INDEX_REQUIRES_PAY_PER_REQUEST.to_owned(),
-                ));
+                // Two measured shapes, two strings. A plain switch reports the
+                // create-side rule; a switch that also carries VectorIndexUpdates
+                // reports its own message, measured 2026-08-19 on a switch combined
+                // with deleting the last vector index, which the service refuses
+                // even though the net state would carry none.
+                //
+                // Only those two shapes are measured. Which of the two fires for a
+                // switch combined with a vector index CREATE is unmapped, and that
+                // shape is refused by the rule below, so it cannot reach this choice.
+                let message = if input
+                    .vector_index_updates
+                    .as_ref()
+                    .is_some_and(|u| !u.is_empty())
+                {
+                    extenddb_core::types::VECTOR_TABLE_REQUIRES_PAY_PER_REQUEST_MODE
+                } else {
+                    extenddb_core::types::VECTOR_INDEX_REQUIRES_PAY_PER_REQUEST
+                };
+                return Err(StorageError::Validation(message.to_owned()));
             }
         }
 

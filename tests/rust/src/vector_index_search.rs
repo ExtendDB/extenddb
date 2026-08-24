@@ -1225,6 +1225,250 @@ async fn wait_past_allocation_phase(table: &str, index: &str) {
     panic!("vector index {index} on {table} never left the resource-allocation phase");
 }
 
+/// Switching a table that holds a vector index to PROVISIONED is refused, and the
+/// two measured shapes of that refusal carry DIFFERENT messages.
+///
+/// A plain switch reports the create-side rule. A switch that also carries
+/// `VectorIndexUpdates` reports its own message, measured on a switch combined with
+/// deleting the last vector index, which the service refuses even though the net
+/// state would hold none. Both are asserted on the whole string here, because a
+/// backend that emitted one message for both shapes would pass a substring check
+/// and still tell a caller the wrong rule. It is also the pair that had drifted
+/// between the two backends, which nothing at the wire could see until now.
+#[tokio::test]
+async fn switching_a_vector_table_to_provisioned_is_refused_with_the_measured_message() {
+    if skip_unless_supported().await {
+        return;
+    }
+    let name = table_name("vi_switch");
+    let body = format!(
+        r#"{{
+        "TableName": "{name}",
+        "AttributeDefinitions": [{{"AttributeName": "pk", "AttributeType": "S"}}],
+        "KeySchema": [{{"AttributeName": "pk", "KeyType": "HASH"}}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "VectorIndexes": [{{
+            "IndexName": "vidx",
+            "Dimensions": 2,
+            "DistanceFunction": "COSINE",
+            "VectorAttribute": {{"AttributeName": "emb"}},
+            "Projection": {{"ProjectionType": "ALL"}}
+        }}]
+    }}"#
+    );
+    let (status, text) = call("CreateTable", &body).await;
+    assert_eq!(status, 200, "CreateTable failed: {text}");
+    wait_for_active(&name).await;
+
+    // ProvisionedThroughput is supplied throughout, so a refusal cannot be
+    // attributed to a missing-throughput error instead of the rule under test.
+    let switch = format!(
+        r#""TableName": "{name}", "BillingMode": "PROVISIONED",            "ProvisionedThroughput": {{"ReadCapacityUnits": 1, "WriteCapacityUnits": 1}}"#
+    );
+
+    let (status, text) = call("UpdateTable", &format!("{{{switch}}}")).await;
+    assert_eq!(status, 400, "a plain switch must be refused: {text}");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(
+        json.pointer("/message").and_then(|v| v.as_str()),
+        Some(
+            "One or more parameter values were invalid: Vector indexes are only supported for \
+             PAY_PER_REQUEST tables"
+        ),
+        "wrong message for a plain switch: {text}"
+    );
+
+    let (status, text) = call(
+        "UpdateTable",
+        &format!(r#"{{{switch}, "VectorIndexUpdates": [{{"Delete": {{"IndexName": "vidx"}}}}]}}"#),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a switch carrying vector index updates must be refused too: {text}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(
+        json.pointer("/message").and_then(|v| v.as_str()),
+        Some(
+            "One or more parameter values were invalid: Tables with vector indexes must be in \
+             PAY_PER_REQUEST mode"
+        ),
+        "wrong message for a switch carrying vector index updates: {text}"
+    );
+
+    // The refusals changed nothing: the index is still there and the table is still
+    // on demand.
+    let (status, text) = call("DescribeTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+    assert_eq!(status, 200, "DescribeTable failed: {text}");
+    assert!(
+        text.contains("\"IndexName\":\"vidx\"") && text.contains("PAY_PER_REQUEST"),
+        "a refused switch must leave the table as it was: {text}"
+    );
+
+    let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+}
+
+/// The delayed propagation path for vector rows, end to end, on a default
+/// deployment's shape.
+///
+/// Vector maintenance used to ignore `index_propagation_delay_ms` unless the table
+/// also had a secondary index, so a vector-only table applied every write inline and
+/// no suite ever exercised the queued path for a vector row: not the delay, not the
+/// jitter, not the monotonic clamp on `ready_at`. Fixing that made the queued path
+/// the ONLY path on a vector-only table, because the default delay is non-zero, so
+/// the queue is now what every such deployment relies on.
+///
+/// Convergence is the assertion rather than absence-then-presence: a delay is a lower
+/// bound, so checking that the hit is missing immediately after the write is a race
+/// that would fail for timing reasons rather than for the behaviour under test.
+#[tokio::test]
+async fn a_vector_only_table_converges_through_the_delayed_queue() {
+    if skip_unless_supported().await {
+        return;
+    }
+    let name = table_name("vi_delayed");
+    let body = format!(
+        r#"{{
+        "TableName": "{name}",
+        "AttributeDefinitions": [{{"AttributeName": "pk", "AttributeType": "S"}}],
+        "KeySchema": [{{"AttributeName": "pk", "KeyType": "HASH"}}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "VectorIndexes": [{{
+            "IndexName": "vidx",
+            "Dimensions": 2,
+            "DistanceFunction": "COSINE",
+            "VectorAttribute": {{"AttributeName": "emb"}},
+            "Projection": {{"ProjectionType": "ALL"}}
+        }}]
+    }}"#
+    );
+    call("CreateTable", &body).await;
+    wait_for_active(&name).await;
+
+    // Well above the default, so the row really does go through the queue with a
+    // future `ready_at` rather than being applied while the write is still in flight.
+    set_vector_setting("index_propagation_delay_ms", 200).await;
+    put_vector(&name, "delayed", None, &[1.0, 0.0]).await;
+    search_until_pks(&name, &[1.0, 0.0], 5, None, &["delayed"]).await;
+
+    // Back to the default, because this setting is deployment-wide and every later
+    // test in this process would otherwise inherit it.
+    set_vector_setting("index_propagation_delay_ms", 10).await;
+    let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+}
+
+/// A query vector small enough to underflow single-precision arithmetic must still
+/// produce a NUMBER for every hit's score.
+///
+/// The search engine computes its own zero test in double precision, so a vector with
+/// components around 1e-30 is correctly treated as non-zero. pgvector's cosine
+/// operator, however, accumulates both norms in single precision, so on the same input
+/// its own norm underflows to zero and the distance comes back NaN for any stored
+/// vector that is not parallel to the query. `serde_json` renders a non-finite double
+/// as `null` rather than failing, so the response is a 200 carrying
+/// `"Score": null`, which is off-contract for a typed client deserialising a double.
+///
+/// Both stored vectors are here for a reason: the parallel one gives an infinity that
+/// the operator clamps, which is already correct, so only the orthogonal one exposes
+/// the NaN. Asserting on both is what makes this a test of the whole result set rather
+/// than of the lucky row.
+///
+/// The components are client input, narrowed to f32 by validation, so any embedding
+/// with tiny activations reaches this. It is not a hostile input and the service
+/// accepts it.
+#[tokio::test]
+async fn a_tiny_query_vector_still_scores_every_hit_as_a_number() {
+    if skip_unless_supported().await {
+        return;
+    }
+    let name = table_name("pos_tiny_query");
+    create_vector_table(&name, 4, "COSINE", false).await;
+
+    put_vector(&name, "parallel", None, &[1.0, 0.0, 0.0, 0.0]).await;
+    put_vector(&name, "orthogonal", None, &[0.0, 1.0, 0.0, 0.0]).await;
+    search_until_count(&name, &[1.0, 0.0, 0.0, 0.0], 10, None, 2).await;
+
+    let response = search(&name, &[1e-30, 0.0, 0.0, 0.0], 10, None).await;
+    let hits = response
+        .get("SearchResults")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| panic!("no results array in: {response}"))
+        .clone();
+    assert_eq!(hits.len(), 2, "both rows must come back: {response}");
+    for hit in &hits {
+        let score = hit.get("Score").unwrap_or_else(|| panic!("no score: {hit}"));
+        assert!(
+            score.is_number(),
+            "every score must be a number, not null: {hit}"
+        );
+        let score = score.as_f64().expect("a numeric score");
+        assert!(
+            score.is_finite(),
+            "a non-finite score reaches the client as null: {hit}"
+        );
+    }
+
+    let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+}
+
+/// Extreme but valid magnitudes must still score as NUMBERS, under every metric.
+///
+/// pgvector accumulates in single precision, so a query at these magnitudes overflows
+/// its accumulators even though every component is a finite f32 that validation
+/// accepts, and every metric has its own threshold and its own failure value: the
+/// Euclidean difference is doubled before squaring, so it overflows first (around
+/// 9.2e18) and gives Infinity; dot product gives negative Infinity above about 1.8e19,
+/// which the score contract negates into positive Infinity; and cosine divides two
+/// overflowed values and gives NaN. Measured on pgvector 0.8.0.
+///
+/// `serde_json` renders both NaN and Infinity as `null`, so all three reach a client as
+/// `"Score": null` on a 200 response, which no typed SDK can deserialise into a double.
+///
+/// The ordering is already correct in the overflowed cases, which is why the repair
+/// belongs in SQL next to the operator rather than in the Rust that reports the score:
+/// substituting a value after the database has ordered the rows would let a hit
+/// reported as nearer appear after one reported as farther.
+#[tokio::test]
+async fn an_extreme_magnitude_query_scores_as_a_number_under_every_metric() {
+    if skip_unless_supported().await {
+        return;
+    }
+
+    // Metric, stored vector, query vector: each pair is a measured overflow for that
+    // metric rather than a round number.
+    let cases: [(&str, [f32; 4], [f32; 4]); 3] = [
+        ("EUCLIDEAN", [1e19, 0.0, 0.0, 0.0], [-1e19, 0.0, 0.0, 0.0]),
+        ("DOT_PRODUCT", [2e19, 0.0, 0.0, 0.0], [2e19, 0.0, 0.0, 0.0]),
+        ("COSINE", [3.4e38, 1e38, 0.0, 0.0], [3.4e38, 0.0, 0.0, 0.0]),
+    ];
+
+    for (metric, stored, query) in cases {
+        let name = table_name(&format!("pos_huge_{}", metric.to_lowercase()));
+        create_vector_table(&name, 4, metric, false).await;
+        put_vector(&name, "extreme", None, &stored).await;
+        search_until_count(&name, &stored, 10, None, 1).await;
+
+        let response = search(&name, &query, 10, None).await;
+        let hit = response
+            .pointer("/SearchResults/0")
+            .unwrap_or_else(|| panic!("no hit under {metric}: {response}"));
+        let score = hit
+            .get("Score")
+            .unwrap_or_else(|| panic!("no score under {metric}: {hit}"));
+        assert!(
+            score.is_number(),
+            "{metric}: an overflowed score must not reach the client as null: {hit}"
+        );
+        assert!(
+            score.as_f64().expect("a numeric score").is_finite(),
+            "{metric}: the score must be finite, or it serialises as null: {hit}"
+        );
+
+        let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+    }
+}
+
 /// The same collapse on the other path a client can reach: an index added by
 /// UpdateTable.
 ///

@@ -871,7 +871,7 @@ async fn update_table_creates_a_vector_index_and_backfills_what_is_already_there
     let holds: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM vector_index_holds WHERE table_id = $1")
             .bind(&id)
-            .fetch_one(&s.catalog)
+            .fetch_one(s.engine.data_pool())
             .await
             .expect("count the holds");
     assert_eq!(holds, 0, "the hold must be released after the ACTIVE flip");
@@ -1385,12 +1385,12 @@ async fn describe_table_refuses_a_vector_index_with_a_corrupt_payload() {
 /// here belongs to the table under test. Deliberately does not read the catalog,
 /// because the case worth checking is the one where the catalog rows are already
 /// gone and an orphaned data table would be invisible.
-async fn vector_data_tables(catalog: &PgPool) -> Vec<String> {
+async fn vector_data_tables(data: &PgPool) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT tablename FROM pg_tables WHERE schemaname = 'public' \
          AND tablename LIKE '_ddb\\_vec\\_%' ORDER BY tablename",
     )
-    .fetch_all(catalog)
+    .fetch_all(data)
     .await
     .expect("list the vector data tables")
 }
@@ -1412,7 +1412,7 @@ async fn create_table_builds_the_vector_data_table_and_delete_table_sweeps_it() 
         )
         .await
         .expect("create a table with a vector index");
-    let tables = vector_data_tables(&s.catalog).await;
+    let tables = vector_data_tables(s.engine.data_pool()).await;
     assert_eq!(
         tables.len(),
         1,
@@ -1452,10 +1452,10 @@ async fn create_table_builds_the_vector_data_table_and_delete_table_sweeps_it() 
         .await
         .expect("delete the table");
 
-    // Swept by prefix, because the catalog rows that named these tables cascade
-    // away with the table row before the sweep runs.
+    // The ids are read before the catalog row cascades away, so the sweep knows
+    // exactly which tables to drop rather than matching a name pattern.
     assert!(
-        vector_data_tables(&s.catalog).await.is_empty(),
+        vector_data_tables(s.engine.data_pool()).await.is_empty(),
         "DeleteTable must sweep the vector data tables"
     );
 
@@ -1486,7 +1486,7 @@ async fn update_table_delete_drops_the_index_data_table() {
         .await
         .expect("create a table with two vector indexes");
     let id = table_id(&s.catalog, "t_dropone").await;
-    assert_eq!(vector_data_tables(&s.catalog).await.len(), 2);
+    assert_eq!(vector_data_tables(s.engine.data_pool()).await.len(), 2);
 
     s.engine
         .update_table(
@@ -1501,7 +1501,7 @@ async fn update_table_delete_drops_the_index_data_table() {
 
     // One table gone, one left: an index delete must not take the survivor's
     // storage with it, which is the failure a prefix sweep would cause here.
-    let remaining = vector_data_tables(&s.catalog).await;
+    let remaining = vector_data_tables(s.engine.data_pool()).await;
     assert_eq!(remaining.len(), 1, "{remaining:?}");
     let keep_id: String =
         sqlx::query_scalar("SELECT index_id FROM vector_indexes WHERE table_id = $1")
@@ -2085,7 +2085,7 @@ async fn a_failed_update_table_gives_back_every_hold_it_took() {
     let holds: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM vector_index_holds WHERE table_id = $1")
             .bind(&id)
-            .fetch_one(&s.catalog)
+            .fetch_one(s.engine.data_pool())
             .await
             .expect("count the holds");
     assert_eq!(
@@ -2143,7 +2143,7 @@ async fn a_stale_heartbeat_is_rebuilt_at_runtime_and_a_fresh_one_is_left_alone()
     sqlx::query("INSERT INTO vector_index_holds (table_id, index_id) VALUES ($1, $2)")
         .bind(&id)
         .bind(&index_id)
-        .execute(&s.catalog)
+        .execute(s.engine.data_pool())
         .await
         .expect("restore the hold the dead build held");
 
@@ -2170,7 +2170,7 @@ async fn a_stale_heartbeat_is_rebuilt_at_runtime_and_a_fresh_one_is_left_alone()
     let holds: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM vector_index_holds WHERE table_id = $1")
             .bind(&id)
-            .fetch_one(&s.catalog)
+            .fetch_one(s.engine.data_pool())
             .await
             .expect("count the holds");
     assert_eq!(holds, 0, "the rebuild must release the hold it repaired");
@@ -2234,7 +2234,7 @@ async fn a_hold_with_no_building_index_is_swept_at_runtime_not_only_at_startup()
          VALUES ($1, 'no-such-build', NOW() - INTERVAL '1 hour')",
     )
     .bind(&id)
-    .execute(&s.catalog)
+    .execute(s.engine.data_pool())
     .await
     .expect("leave an orphan hold");
 
@@ -2251,7 +2251,7 @@ async fn a_hold_with_no_building_index_is_swept_at_runtime_not_only_at_startup()
     let holds: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM vector_index_holds WHERE table_id = $1")
             .bind(&id)
-            .fetch_one(&s.catalog)
+            .fetch_one(s.engine.data_pool())
             .await
             .expect("count the holds");
     assert_eq!(
@@ -2369,13 +2369,13 @@ async fn deleting_an_index_mid_backfill_leaves_nothing_orphaned() {
         .expect("count the catalog rows");
     assert_eq!(rows, 0, "the catalog row must be gone");
     assert!(
-        vector_data_tables(&s.catalog).await.is_empty(),
+        vector_data_tables(s.engine.data_pool()).await.is_empty(),
         "the data table must be dropped, not left orphaned"
     );
     let holds: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM vector_index_holds WHERE table_id = $1")
             .bind(&id)
-            .fetch_one(&s.catalog)
+            .fetch_one(s.engine.data_pool())
             .await
             .expect("count the holds");
     assert_eq!(
@@ -2447,7 +2447,7 @@ async fn startup_rebuilds_a_half_built_index_and_frees_a_stale_hold() {
     sqlx::query("INSERT INTO vector_index_holds (table_id, index_id) VALUES ($1, $2)")
         .bind(&id)
         .bind(&index_id)
-        .execute(&s.catalog)
+        .execute(s.engine.data_pool())
         .await
         .expect("restore the hold the dead build held");
 
@@ -2462,13 +2462,13 @@ async fn startup_rebuilds_a_half_built_index_and_frees_a_stale_hold() {
         "INSERT INTO vector_index_holds (table_id, index_id, created_at) \
          VALUES ('ghost-old', 'ghost-old', NOW() - INTERVAL '1 hour')",
     )
-    .execute(&s.catalog)
+    .execute(s.engine.data_pool())
     .await
     .expect("add an aged orphan hold");
     sqlx::query(
         "INSERT INTO vector_index_holds (table_id, index_id) VALUES ('ghost-new', 'ghost-new')",
     )
-    .execute(&s.catalog)
+    .execute(s.engine.data_pool())
     .await
     .expect("add a just-taken hold");
 
@@ -2490,7 +2490,7 @@ async fn startup_rebuilds_a_half_built_index_and_frees_a_stale_hold() {
     assert_eq!(status, "ACTIVE");
     let remaining: Vec<String> =
         sqlx::query_scalar("SELECT table_id FROM vector_index_holds ORDER BY table_id")
-            .fetch_all(&s.catalog)
+            .fetch_all(s.engine.data_pool())
             .await
             .expect("list the holds");
     assert_eq!(
@@ -2700,5 +2700,81 @@ async fn losing_pgvector_after_startup_refuses_a_vector_index_rather_than_record
             .expect("look for the table");
     assert!(table.is_none(), "no table may be created");
 
+    s.cleanup().await;
+}
+
+/// Build ownership must survive as a session of its own, and must let go when the
+/// owner is dropped.
+///
+/// A build runs for as long as the scan takes, so where its session comes from is a
+/// write-path question: the data pool serves every write, and a connection pinned
+/// for the whole build is one fewer connection for the writes the build is
+/// deliberately not blocking.
+///
+/// The release half is the part a pooled connection cannot give. An advisory lock is
+/// session-scoped, and returning a pooled connection does not end its session, so the
+/// lock would stay held on an idle pooled connection after the owner is gone: the
+/// index becomes unrecoverable by any peer until that connection is recycled. This
+/// asserts release from a SEPARATE session, which is the only observer that can tell
+/// a released lock from a re-entrant one.
+#[tokio::test]
+async fn build_ownership_uses_its_own_session_and_releases_on_drop() {
+    let test = "build_ownership_uses_its_own_session_and_releases_on_drop";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
+
+    // The namespace and key are the implementation's, restated here so this test
+    // observes the lock exactly as a peer front-end would.
+    const NAMESPACE: i32 = 0x0045_4442;
+    let probe_lock = |pool: PgPool| async move {
+        let taken: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1, hashtext($2))")
+            .bind(NAMESPACE)
+            .bind("vidx-owned")
+            .fetch_one(&pool)
+            .await
+            .expect("probe the lock");
+        if taken {
+            sqlx::query("SELECT pg_advisory_unlock($1, hashtext($2))")
+                .bind(NAMESPACE)
+                .bind("vidx-owned")
+                .execute(&pool)
+                .await
+                .expect("give the probe's lock back");
+        }
+        taken
+    };
+
+    // A peer's session, one connection so a probe cannot accidentally land on the
+    // owner's own session.
+    let peer = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&format!(
+            "{}/{}",
+            base_conn().expect("base connection"),
+            s.db_name
+        ))
+        .await
+        .expect("a peer connection");
+
+    let owner = extenddb_storage_postgres::build_ownership(s.engine.data_pool(), "vidx-owned")
+        .await
+        .expect("ownership must be available on an unowned index");
+    assert!(
+        !probe_lock(peer.clone()).await,
+        "a peer must not be able to take a build another process owns"
+    );
+
+    drop(owner);
+    assert!(
+        probe_lock(peer.clone()).await,
+        "dropping the owner must end its session and release the lock, or the index \
+         cannot be recovered by any peer until the connection is recycled"
+    );
+
+    peer.close().await;
     s.cleanup().await;
 }

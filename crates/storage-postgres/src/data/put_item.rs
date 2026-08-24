@@ -9,7 +9,7 @@ use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{composite_pk_to_text, parse_sk, pk_to_text, sk_column, sk_info};
 
-use super::index::{enqueue_async_indexes, fetch_indexes_for_table, sync_indexes};
+use super::index::{enqueue_async_indexes, fetch_write_path_indexes, sync_indexes};
 use super::query::check_condition;
 use super::tx_helpers::write_stream_record_in_tx;
 use super::{data_table_name, json_to_item};
@@ -33,10 +33,11 @@ impl PostgresEngine {
         let item_json =
             serde_json::to_value(&item).map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // Fetch indexes for GSI/LSI updates (D-4: sync + async split).
-        let indexes = fetch_indexes_for_table(&key_info.table_id, &self.pool).await?;
-        // Vector indexes come from the same fresh read rather than from the cached
-        // key info, and the answer decides two things: whether this write needs a
+        // Both index families in one catalog visit (D-4: sync + async split for the
+        // secondary indexes).
+        //
+        // Vector indexes come from this fresh read rather than from the cached key
+        // info, and the answer decides two things: whether this write needs a
         // transaction at all, and what maintenance runs inside it. A cached empty
         // set would send a write down the no-maintenance fast path and silently
         // leave an index missing a row.
@@ -50,11 +51,8 @@ impl PostgresEngine {
         // also exactly the window the secondary indexes have, for the same reason
         // and with the same read: parity with a GSI is the bar, and the backfill
         // that publishes a new index is what covers writes older than it.
-        let vector_metas = crate::data::vector_index::fetch_vector_indexes_for_table(
-            &self.pool,
-            &key_info.table_id,
-        )
-        .await?;
+        let (indexes, vector_metas) =
+            fetch_write_path_indexes(&key_info.table_id, &self.pool).await?;
 
         // Index key attributes present in the item must match their declared
         // scalar type and be non-empty, matching real DynamoDB. This is up-front

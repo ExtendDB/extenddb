@@ -931,9 +931,10 @@ impl PostgresEngine {
                 );
                 continue;
             }
-            // The queue rows for this table can outlive the index. They are
-            // tolerated by the worker (a missing table is a routine race), but
-            // removing them here saves the claim-and-skip cycle and the log noise.
+            // The queue rows for this index outlive it, deliberately. The worker
+            // consumes them when it finds the data table gone, which is the route
+            // that keeps a partition moving; deleting them here would need the same
+            // transaction as the catalog change to be safe, and it is not.
             if let Err(e) = data_tx
                 .commit()
                 .await

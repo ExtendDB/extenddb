@@ -13,7 +13,7 @@ use extenddb_core::validation;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{IdempotencyKey, TransactGetOp, TransactWriteOp};
 
-use super::index::{IndexMeta, enqueue_async_indexes, fetch_indexes_for_table, sync_indexes};
+use super::index::{IndexMeta, enqueue_async_indexes, fetch_write_path_indexes, sync_indexes};
 use super::tx_helpers::{
     check_idempotency_token_in_tx, delete_item_in_tx, fetch_item_for_update, fetch_item_in_tx,
     upsert_item_in_tx, write_stream_record_in_tx,
@@ -88,11 +88,8 @@ impl PostgresEngine {
             let name = transact_op_table_name(op);
             if !table_indexes.contains_key(name) {
                 let tid = transact_op_table_id(op);
-                let indexes = fetch_indexes_for_table(tid, &self.pool).await?;
+                let (indexes, vector_metas) = fetch_write_path_indexes(tid, &self.pool).await?;
                 table_indexes.insert(name.to_owned(), indexes);
-                let vector_metas =
-                    crate::data::vector_index::fetch_vector_indexes_for_table(&self.pool, tid)
-                        .await?;
                 table_vector_metas.insert(name.to_owned(), vector_metas);
             }
         }
