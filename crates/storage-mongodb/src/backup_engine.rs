@@ -17,6 +17,7 @@
 use futures::TryStreamExt;
 use futures::future::BoxFuture;
 use mongodb::bson::{self, Document, doc};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use extenddb_core::types::{
@@ -71,6 +72,19 @@ fn decode_required<T: DeserializeOwned>(doc: &Document, key: &str) -> Result<T, 
         .get(key)
         .ok_or_else(|| StorageError::Internal(format!("missing {key}")))?;
     bson::from_bson(value.clone()).map_err(|e| StorageError::Internal(format!("parse {key}: {e}")))
+}
+
+fn insert_non_empty_array<T: Serialize>(
+    doc: &mut Document,
+    key: &str,
+    values: &[T],
+) -> Result<(), StorageError> {
+    if !values.is_empty() {
+        let value = bson::to_bson(values)
+            .map_err(|e| StorageError::Internal(format!("serialize {key}: {e}")))?;
+        doc.insert(key, value);
+    }
+    Ok(())
 }
 
 fn restore_provisioned_throughput(
@@ -245,10 +259,6 @@ impl BackupEngine for MongoEngine {
                     _ => {}
                 }
             }
-            let global_secondary_indexes_bson = bson::to_bson(&global_secondary_indexes)
-                .map_err(|e| StorageError::Internal(format!("serialize GSI metadata: {e}")))?;
-            let local_secondary_indexes_bson = bson::to_bson(&local_secondary_indexes)
-                .map_err(|e| StorageError::Internal(format!("serialize LSI metadata: {e}")))?;
             let provisioned_throughput_bson = table_doc
                 .get("provisioned_throughput")
                 .cloned()
@@ -303,7 +313,7 @@ impl BackupEngine for MongoEngine {
             // handle and stays the `_id` for compatibility with existing
             // describe/list callers.
             let backups_coll = self.catalog_db.collection::<Document>("backups");
-            let backup_meta = doc! {
+            let mut backup_meta = doc! {
                 "_id": &backup_arn,
                 "backup_id": &backup_id,
                 "backup_name": &backup_name,
@@ -319,14 +329,23 @@ impl BackupEngine for MongoEngine {
                 "attribute_definitions": attr_defs_bson,
                 "billing_mode": &billing_mode,
                 "provisioned_throughput": provisioned_throughput_bson,
-                "global_secondary_indexes": global_secondary_indexes_bson,
-                "local_secondary_indexes": local_secondary_indexes_bson,
                 "created_at": mongodb::bson::DateTime::now(),
                 "table_creation_date_time": created_at,
                 "table_class": table_class_bson,
                 "sse_specification": sse_spec_bson,
                 "on_demand_throughput": on_demand_bson,
             };
+
+            insert_non_empty_array(
+                &mut backup_meta,
+                "global_secondary_indexes",
+                &global_secondary_indexes,
+            )?;
+            insert_non_empty_array(
+                &mut backup_meta,
+                "local_secondary_indexes",
+                &local_secondary_indexes,
+            )?;
 
             backups_coll
                 .insert_one(backup_meta)
@@ -833,8 +852,18 @@ impl BackupEngine for MongoEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::restore_provisioned_throughput;
-    use extenddb_core::types::ProvisionedThroughput;
+    use super::{insert_non_empty_array, restore_provisioned_throughput};
+    use extenddb_core::types::{GsiInput, ProvisionedThroughput};
+    use mongodb::bson::Document;
+
+    #[test]
+    fn backup_omits_empty_secondary_index_metadata() {
+        let mut backup = Document::new();
+        insert_non_empty_array::<GsiInput>(&mut backup, "global_secondary_indexes", &[])
+            .expect("empty index metadata should be accepted");
+
+        assert!(!backup.contains_key("global_secondary_indexes"));
+    }
 
     #[test]
     fn restore_preserves_stored_provisioned_throughput() {
