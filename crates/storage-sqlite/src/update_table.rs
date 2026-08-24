@@ -443,6 +443,38 @@ impl SqliteEngine {
                     // The per-table count limit is enforced on the request's
                     // net effect before this loop; see above.
 
+                    // A create whose vector attribute an EXISTING index already
+                    // uses must agree with it on Dimensions: the attribute
+                    // stores one vector. Measured live 2026-08-24 (us-east-1):
+                    // the service answers the attribute-redefinition message
+                    // with both sides in the VectorIndexSchema shape, and
+                    // accepts the same attribute at the SAME dimensions.
+                    // Checked inside the transaction under the write lock, so a
+                    // concurrent create cannot slip a disagreeing sibling in.
+                    let existing_dims: Option<(i64,)> = sqlx::query_as(
+                        "SELECT dimensions FROM vector_indexes \
+                         WHERE table_id = ? AND vector_attribute = ? \
+                           AND dimensions <> ? LIMIT 1",
+                    )
+                    .bind(&table_id)
+                    .bind(
+                        serde_json::to_string(&create.vector_attribute)
+                            .map_err(|e| StorageError::Internal(e.to_string()))?,
+                    )
+                    .bind(i64::from(create.dimensions))
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    if let Some((existing,)) = existing_dims {
+                        return Err(StorageError::Validation(
+                            extenddb_core::types::vector_attribute_redefines_vector(
+                                vec_attr_name,
+                                u32::try_from(existing).unwrap_or_default(),
+                                create.dimensions,
+                            ),
+                        ));
+                    }
+
                     let dup: Option<(String,)> = sqlx::query_as(
                         "SELECT index_name FROM vector_indexes \
                          WHERE table_id = ? AND index_name = ?",
@@ -1484,6 +1516,7 @@ mod reconciler_tests {
             &ks,
             &ad,
             &["base_pk".to_owned()],
+            crate::data::vector_index::VectorRowConflict::Fail,
         )
         .await
         .expect("partial row");

@@ -65,7 +65,7 @@ pub use table::{
     VECTOR_INDEX_CREATE_IN_USE_PREFIX, VECTOR_INDEX_REQUIRES_PAY_PER_REQUEST,
     VECTOR_SEARCH_SCHEMA_UNDECLARED, VectorAttribute, VectorIndexDescription,
     VectorIndexSpecification, VectorIndexUpdate, vector_attribute_conflicting_definition,
-    vector_attribute_redefines_key,
+    vector_attribute_redefines_key, vector_attribute_redefines_vector,
 };
 pub use transaction::{
     CancellationReason, ItemResponse, TransactConditionCheck, TransactDelete, TransactGet,

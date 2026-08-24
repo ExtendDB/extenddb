@@ -310,10 +310,16 @@ fn validate_vector_index_attribute_definitions(
     Ok(())
 }
 
+/// `member_path` is the request-model path to the index element, without the
+/// trailing leaf: `vectorIndexes.{n}.member` on CreateTable and
+/// `vectorIndexUpdates.{n}.member.create` on UpdateTable, both 1-based.
+/// The `.create` segment on the update path is measured, not inferred:
+/// probed live 2026-08-24 (us-east-1) with client-side validation disabled,
+/// a `Create` with `Dimensions: 0` answers
+/// `Value '0' at 'vectorIndexUpdates.1.member.create.dimensions' ...`.
 fn validate_one_vector_index(
     vi: &crate::types::VectorIndexSpecification,
-    position: usize,
-    field: &str,
+    member_path: &str,
 ) -> Result<(), DynamoDbError> {
     // Projection is required by the service. Reported with the service's own
     // message, which numbers the offending list element from 1, not 0. Measured
@@ -321,10 +327,12 @@ fn validate_one_vector_index(
     // reached the service:
     //   Value null at 'vectorIndexes.1.member.projection' failed to satisfy
     //   constraint: Member must not be null
+    // and re-measured on the update path 2026-08-24:
+    //   Value null at 'vectorIndexUpdates.1.member.create.projection' ...
     if vi.projection.is_none() {
         return Err(DynamoDbError::ValidationException(format!(
             "1 validation error detected: Value null at \
-             '{field}.{position}.member.projection' failed to satisfy constraint: \
+             '{member_path}.projection' failed to satisfy constraint: \
              Member must not be null"
         )));
     }
@@ -341,7 +349,7 @@ fn validate_one_vector_index(
     if vi.dimensions < 1 {
         return Err(DynamoDbError::ValidationException(format!(
             "1 validation error detected: Value '{}' at \
-             '{field}.{position}.member.dimensions' failed to satisfy constraint: \
+             '{member_path}.dimensions' failed to satisfy constraint: \
              Member must have value greater than or equal to 1",
             vi.dimensions
         )));
@@ -373,7 +381,7 @@ fn validate_vector_indexes(input: &CreateTableInput) -> Result<(), DynamoDbError
     // malformed index client-side before the request is sent, so the order that
     // preserves the already-measured per-index messages is the right one to keep.
     for (position, vi) in vis.iter().enumerate() {
-        validate_one_vector_index(vi, position + 1, "vectorIndexes")?;
+        validate_one_vector_index(vi, &format!("vectorIndexes.{}.member", position + 1))?;
     }
 
     // Vector indexes are supported only on on-demand tables. Documented under
@@ -452,12 +460,33 @@ pub fn validate_vector_index_updates(
     if updates.is_empty() {
         return Ok(());
     }
+    // Per-element request-model validation FIRST, then the one-action rule.
+    // The ordering is measured, not chosen: probed live 2026-08-24
+    // (us-east-1), a two-action request carrying a malformed create (a
+    // Dimensions of 0, or a missing Projection) answers the model-layer
+    // ValidationException for the malformed element, not the subscriber
+    // limit, so the model layer runs over every element before any online
+    // rule. (The service aggregates multiple model faults into one "N
+    // validation errors detected" message; single-fault reporting here is the
+    // same deliberate divergence documented on validate_one_vector_index.)
+    for (position, update) in updates.iter().enumerate() {
+        if let Some(create) = update.create.as_ref() {
+            validate_one_vector_index(
+                create,
+                &format!("vectorIndexUpdates.{}.member.create", position + 1),
+            )?;
+            validate_vector_index_attribute_definitions(create, attribute_definitions)?;
+        }
+        if let Some(delete) = update.delete.as_ref() {
+            validate_index_name(&delete.index_name)?;
+        }
+    }
     // One online index action per call, enforced with the online-index
     // machinery's own error class and wording. Pinned by the ground-truth runs
-    // of 2026-08-24 (us-east-1 and eu-west-2): two Create actions in one
-    // UpdateTable answer LimitExceededException with exactly this sentence.
-    // Counted over actions rather than elements, so an element carrying both a
-    // Create and a Delete counts as two.
+    // of 2026-08-24 (us-east-1 and eu-west-2): two well-formed Create actions
+    // in one UpdateTable answer LimitExceededException with exactly this
+    // sentence. Counted over actions rather than elements, so an element
+    // carrying both a Create and a Delete counts as two.
     let actions = updates
         .iter()
         .map(|u| usize::from(u.create.is_some()) + usize::from(u.delete.is_some()))
@@ -468,15 +497,6 @@ pub fn validate_vector_index_updates(
              simultaneously per table"
                 .to_owned(),
         ));
-    }
-    for (position, update) in updates.iter().enumerate() {
-        if let Some(create) = update.create.as_ref() {
-            validate_one_vector_index(create, position + 1, "vectorIndexUpdates")?;
-            validate_vector_index_attribute_definitions(create, attribute_definitions)?;
-        }
-        if let Some(delete) = update.delete.as_ref() {
-            validate_index_name(&delete.index_name)?;
-        }
     }
     Ok(())
 }
@@ -1904,7 +1924,7 @@ mod tests {
             .expect_err("a malformed create must be rejected on this path as well");
         match err {
             DynamoDbError::ValidationException(m) => assert!(
-                m.contains("vectorIndexUpdates.1.member.projection"),
+                m.contains("vectorIndexUpdates.1.member.create.projection"),
                 "should name this request's field and element: {m}"
             ),
             other => panic!("expected ValidationException, got {other:?}"),

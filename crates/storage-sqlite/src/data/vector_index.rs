@@ -381,6 +381,7 @@ async fn apply_vector_index(
         base_key_schema,
         attr_defs,
         key_cols,
+        VectorRowConflict::Fail,
     )
     .await
 }
@@ -394,6 +395,26 @@ async fn apply_vector_index(
 ///
 /// A non-indexable item is a no-op rather than an error, which is what makes a
 /// backfill over a table where only some items carry the vector work.
+/// How [`insert_vector_row`] treats a primary-key conflict.
+///
+/// `Fail` is the write path's contract: every apply reaches the insert through
+/// `apply_vector_index`, which deletes the base key's row first, so a conflict
+/// there means a broken invariant and must be loud. `KeepExisting` is the
+/// BACKFILL's contract: in synchronous-visibility mode
+/// (`index_propagation_delay_ms == 0`) a base write landing mid-backfill is
+/// applied to the CREATING index inline rather than queued, and each backfill
+/// batch reads the base table LIVE under the write lock, so a row already
+/// present was written from the same or a newer base image than the one the
+/// backfill just read; keeping it is correct and inserting over it would only
+/// fail the whole build. Without this, that collision wedged the index in
+/// CREATING permanently (proven by test below).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VectorRowConflict {
+    Fail,
+    KeepExisting,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_vector_row(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table_id: &str,
@@ -402,6 +423,7 @@ pub(crate) async fn insert_vector_row(
     base_key_schema: &[KeySchemaElement],
     attr_defs: &[AttributeDefinition],
     key_cols: &[String],
+    on_conflict: VectorRowConflict,
 ) -> Result<(), StorageError> {
     if !item_is_indexable(item, meta) {
         return Ok(());
@@ -458,19 +480,23 @@ pub(crate) async fn insert_vector_row(
     let item_json = serde_json::to_string(&projected)
         .map_err(|e| StorageError::Internal(format!("serialize item: {e}")))?;
 
-    // A plain INSERT, deliberately, where the GSI sibling uses INSERT OR REPLACE.
-    // Every caller reaches this through `apply_vector_index`, which unconditionally
-    // deletes the base key's row first, so no live row can exist here and a conflict
-    // is impossible. Keeping it a plain INSERT means that if a future refactor ever
-    // makes that delete conditional, this fails loudly with a primary key violation
-    // rather than silently replacing a row and hiding the broken invariant.
+    // On the write path this stays a plain INSERT, deliberately, where the GSI
+    // sibling uses INSERT OR REPLACE: every apply reaches here through
+    // `apply_vector_index`, which unconditionally deletes the base key's row
+    // first, so a conflict means a broken invariant and must fail loudly. The
+    // backfill passes `KeepExisting` instead; see [`VectorRowConflict`] for
+    // why an existing row is the same-or-newer generation there and must win.
     let cols = std::iter::once("part".to_owned())
         .chain(key_cols.iter().cloned())
         .chain(["vec".to_owned(), "nrm".to_owned(), "item_data".to_owned()])
         .collect::<Vec<_>>();
     let placeholders = vec!["?"; cols.len()].join(", ");
+    let verb = match on_conflict {
+        VectorRowConflict::Fail => "INSERT",
+        VectorRowConflict::KeepExisting => "INSERT OR IGNORE",
+    };
     let sql = format!(
-        "INSERT INTO {vec_table} ({}) VALUES ({placeholders})",
+        "{verb} INTO {vec_table} ({}) VALUES ({placeholders})",
         cols.join(", ")
     );
     let key_binds = base_key_binds(item, base_key_schema, attr_defs)?;
@@ -627,6 +653,7 @@ async fn backfill_vector_batch(
             plan.base_key_schema,
             plan.attr_defs,
             &plan.key_cols,
+            VectorRowConflict::KeepExisting,
         )
         .await?;
         written += 1;
@@ -932,5 +959,125 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(rows, 3);
+    }
+    /// A synchronous-visibility write (`index_propagation_delay_ms == 0`)
+    /// landing mid-backfill is applied to the CREATING index inline, bypassing
+    /// the queue's CREATING-hold. When the backfill later reaches that base
+    /// key it must keep the row the inline write produced rather than fail the
+    /// whole build on the primary-key conflict: each batch reads the base
+    /// table live under the write lock, so an existing row was written from
+    /// the same or a newer base image than the one the batch just read. Before
+    /// `VectorRowConflict::KeepExisting`, this collision errored the backfill
+    /// and wedged the index in CREATING permanently.
+    #[tokio::test]
+    async fn a_synchronous_write_landing_mid_backfill_does_not_wedge_the_build() {
+        use extenddb_core::types::{
+            AttributeDefinition, KeySchemaElement, KeyType, ScalarAttributeType,
+        };
+        let engine = crate::SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::schema::apply(&engine.pool).await.expect("schema");
+
+        let ks = vec![KeySchemaElement {
+            attribute_name: "pk".to_owned(),
+            key_type: KeyType::Hash,
+        }];
+        let ad = vec![AttributeDefinition {
+            attribute_name: "pk".to_owned(),
+            attribute_type: ScalarAttributeType::S,
+        }];
+
+        let table_id = "t-inline-collision";
+        let mut tx = engine.pool.begin_with("BEGIN IMMEDIATE").await.expect("tx");
+        crate::SqliteEngine::create_data_table(&mut tx, table_id, &ks, &ad)
+            .await
+            .expect("base table");
+        crate::SqliteEngine::create_vector_data_table(&mut tx, table_id, "vidx-c", &ks, &ad)
+            .await
+            .expect("vector table");
+        // Catalog rows: a table and its index still CREATING with a build in
+        // flight, which is the state a mid-backfill write observes.
+        sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES ('a', 'a')")
+            .execute(&mut *tx)
+            .await
+            .expect("account row");
+        sqlx::query(
+            "INSERT INTO tables (account_id, table_name, key_schema, attribute_definitions, \
+             billing_mode, table_status, creation_date_time, table_arn, table_id) \
+             VALUES ('a', 't', '[]', '[]', 'PAY_PER_REQUEST', 'ACTIVE', 'now', 'arn', ?)",
+        )
+        .bind(table_id)
+        .execute(&mut *tx)
+        .await
+        .expect("table row");
+        sqlx::query(
+            "INSERT INTO vector_indexes (table_id, index_name, index_id, dimensions, \
+             distance_function, vector_attribute, search_schema, projection, index_status, \
+             backfilling) \
+             VALUES (?, 'vidx-c', 'vidx-c', 2, 'COSINE', ?, NULL, ?, 'CREATING', 1)",
+        )
+        .bind(table_id)
+        .bind(r#"{"AttributeName":"emb"}"#)
+        .bind(r#"{"ProjectionType":"ALL"}"#)
+        .execute(&mut *tx)
+        .await
+        .expect("index row");
+        let base_table = super::super::data_table_name(table_id);
+        sqlx::query(&format!(
+            "INSERT INTO {base_table} (pk, item_data) VALUES ('z', ?)"
+        ))
+        .bind(r#"{"pk":{"S":"z"},"emb":{"L":[{"N":"1"},{"N":"0"}]}}"#)
+        .execute(&mut *tx)
+        .await
+        .expect("seed base row");
+
+        // The inline write: at delay 0 maintenance applies to the CREATING
+        // index directly rather than enqueueing.
+        let item: extenddb_core::types::Item =
+            serde_json::from_str(r#"{"pk":{"S":"z"},"emb":{"L":[{"N":"1"},{"N":"0"}]}}"#)
+                .expect("item");
+        let enqueued = maintain_vector_indexes(&mut tx, table_id, &ks, &ad, None, Some(&item), 0)
+            .await
+            .expect("inline maintenance");
+        assert_eq!(
+            enqueued, 0,
+            "delay 0 must take the inline arm, not the queue"
+        );
+        tx.commit().await.expect("commit");
+
+        // The backfill now reaches the same base key and must complete rather
+        // than error on the conflict, leaving exactly one row for the key.
+        let write_lock = tokio::sync::Mutex::new(());
+        let meta = fetch_vector_indexes_for_table(
+            &mut engine.pool.begin_with("BEGIN IMMEDIATE").await.expect("tx"),
+            table_id,
+        )
+        .await
+        .expect("metas")
+        .into_iter()
+        .find(|m| m.index_id == "vidx-c")
+        .expect("meta");
+        let outcome = backfill_vector_index_in_batches(
+            &engine.pool,
+            &write_lock,
+            table_id,
+            &meta,
+            &ks,
+            &ad,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("backfill must not wedge on the inline write's row");
+        assert_eq!(outcome.skipped, 0);
+        let vec_table = super::super::vector_table_name(table_id, "vidx-c");
+        let (rows,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {vec_table}"))
+            .fetch_one(&engine.pool)
+            .await
+            .expect("count");
+        assert_eq!(
+            rows, 1,
+            "one base key must yield one index row, not a duplicate"
+        );
     }
 }
