@@ -16,10 +16,16 @@ pub struct MongoStorageConfig {
     /// `MongoDB` connection string (mongodb://...)
     pub connection_string: String,
     /// Maximum concurrent connections for data operations
-    #[serde(default = "default_max_connections")]
+    #[serde(
+        default = "default_max_connections",
+        deserialize_with = "extenddb_storage::config::string_coerce::u32"
+    )]
     pub max_connections: u32,
     /// Maximum concurrent connections for catalog/management operations
-    #[serde(default = "default_max_catalog_connections")]
+    #[serde(
+        default = "default_max_catalog_connections",
+        deserialize_with = "extenddb_storage::config::string_coerce::u32"
+    )]
     pub max_catalog_connections: u32,
 }
 
@@ -59,5 +65,47 @@ impl TryFrom<toml::Table> for MongoStorageConfig {
     fn try_from(table: toml::Table) -> Result<Self, Self::Error> {
         let value = toml::Value::Table(table);
         value.try_into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MongoStorageConfig;
+    use extenddb_storage::config::StorageConfig;
+
+    #[test]
+    fn numeric_connection_limits_accept_string_values() {
+        let config: MongoStorageConfig = toml::from_str(
+            r#"connection_string = "mongodb://localhost:27017"
+max_connections = "31"
+max_catalog_connections = "7""#,
+        )
+        .expect("string-valued connection limits must deserialize");
+
+        assert_eq!(config.max_connections(), 31);
+        assert_eq!(config.max_catalog_connections(), 7);
+    }
+
+    #[test]
+    fn numeric_connection_limits_accept_native_values() {
+        let config: MongoStorageConfig = toml::from_str(
+            r#"connection_string = "mongodb://localhost:27017"
+max_connections = 31
+max_catalog_connections = 7"#,
+        )
+        .expect("native connection limits must deserialize");
+
+        assert_eq!(config.max_connections(), 31);
+        assert_eq!(config.max_catalog_connections(), 7);
+    }
+
+    #[test]
+    fn connection_limits_have_expected_defaults() {
+        let config: MongoStorageConfig =
+            toml::from_str(r#"connection_string = "mongodb://localhost:27017""#)
+                .expect("default connection limits must deserialize");
+
+        assert_eq!(config.max_connections(), 50);
+        assert_eq!(config.max_catalog_connections(), 20);
     }
 }

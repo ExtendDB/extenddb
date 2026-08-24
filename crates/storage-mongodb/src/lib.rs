@@ -90,6 +90,7 @@ fn server_components_factory(
 > {
     let connection_string = config.connection_config().to_string();
     let max_connections = config.max_connections();
+    let max_catalog_connections = config.max_catalog_connections();
     let region = region.to_string();
     Box::pin(async move {
         // Create MongoEngine
@@ -103,12 +104,13 @@ fn server_components_factory(
         let engine = Arc::new(engine);
 
         // Create catalog store
-        let catalog_client = connect_guarded(&connection_string, None, false)
-            .await
-            .map_err(|e| BackendError::ConnectionFailed {
-                backend: "mongodb".to_string(),
-                details: format!("Failed to create catalog client: {e}"),
-            })?;
+        let catalog_client =
+            connect_guarded(&connection_string, Some(max_catalog_connections), false)
+                .await
+                .map_err(|e| BackendError::ConnectionFailed {
+                    backend: "mongodb".to_string(),
+                    details: format!("Failed to create catalog client: {e}"),
+                })?;
 
         // Load encryption key from settings collection. A missing key must be
         // a hard failure: an empty key would base64-decode to zero bytes and
@@ -131,7 +133,7 @@ fn server_components_factory(
         // Create credential store. The bin layer wraps this in
         // CachedCredentialStore using the operator-configured TTL
         // before constructing the auth provider.
-        let auth_client = connect_guarded(&connection_string, None, false)
+        let auth_client = connect_guarded(&connection_string, Some(max_catalog_connections), false)
             .await
             .map_err(|e| BackendError::InitializationFailed(format!("Auth client: {e}")))?;
         let cred_store: Arc<dyn extenddb_auth::CredentialStore> =
@@ -237,8 +239,9 @@ pub struct MongoEngine {
 /// data client: reject non-primary read preferences (they route reads to
 /// replicas and silently break `ConsistentRead=true`).
 ///
-/// `max_pool_size` is applied when provided (the data client sizes its pool;
-/// catalog/auth/bootstrapper clients pass `None`).
+/// `max_pool_size` is applied when provided. The long-lived data, catalog, and
+/// authentication clients pass their configured pool limits; short-lived CLI
+/// and bootstrapper clients pass `None`.
 ///
 /// `warn_on_no_tls` gates the no-TLS warning to the long-running server data
 /// client only. Short-lived CLI/management clients (settings, catalog checks,
