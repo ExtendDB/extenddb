@@ -353,6 +353,20 @@ impl MetadataEngine for MongoEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?
                 .ok_or_else(|| StorageError::TableNotFound(table_name.clone()))?;
 
+            // MongoDB interprets dots in an index key as nested traversal,
+            // while DynamoDB treats them as part of the attribute name. The
+            // dotted sweep uses a literal $getField expression instead, so a
+            // MongoDB field-path index here would be both incorrect and
+            // unused. Mark the expression-based sweep ready without creating
+            // that misleading index.
+            if ttl_attribute.contains('.') {
+                tables_coll
+                    .update_one(id_filter, doc! { "$set": { "ttl_index_ready": true } })
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                return Ok(());
+            }
+
             let table_id = table_doc
                 .get_str("table_id")
                 .map_err(|_| StorageError::Internal("missing table_id".to_string()))?;
@@ -418,6 +432,12 @@ impl MetadataEngine for MongoEngine {
             let table_id = table_doc
                 .get_str("table_id")
                 .map_err(|_| StorageError::Internal("missing table_id".to_string()))?;
+
+            // Dotted attributes never have a physical TTL index: MongoDB's
+            // field-path syntax would reinterpret the literal attribute name.
+            if ttl_attribute.contains('.') {
+                return Ok(());
+            }
 
             let index_name = format!("idx_ttl_{ttl_attribute}");
 

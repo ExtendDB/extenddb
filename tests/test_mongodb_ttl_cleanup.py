@@ -84,3 +84,29 @@ def test_disable_ttl_drops_physical_index(
     after = _ttl_index_state(mongodb_container, table_name, "idx_ttl_expires_at")
     assert after["ttlIndexReady"] is False
     assert after["indexExists"] is False
+
+
+def test_dotted_ttl_does_not_create_physical_index(
+    dynamodb_client, create_and_cleanup_table, mongodb_container
+):
+    """Dotted TTL attributes use the expression sweep without a Mongo index."""
+    table_name = create_and_cleanup_table()["TableDescription"]["TableName"]
+    index_name = "idx_ttl_expires.at"
+
+    dynamodb_client.update_time_to_live(
+        TableName=table_name,
+        TimeToLiveSpecification={"Enabled": True, "AttributeName": "expires.at"},
+    )
+
+    enabled = _ttl_index_state(mongodb_container, table_name, index_name)
+    assert enabled["ttlIndexReady"] is True
+    assert enabled["indexExists"] is False
+
+    dynamodb_client.update_time_to_live(
+        TableName=table_name,
+        TimeToLiveSpecification={"Enabled": False, "AttributeName": "expires.at"},
+    )
+
+    disabled = _ttl_index_state(mongodb_container, table_name, index_name)
+    assert disabled["ttlIndexReady"] is False
+    assert disabled["indexExists"] is False
