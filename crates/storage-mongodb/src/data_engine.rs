@@ -238,6 +238,14 @@ impl DataEngine for MongoEngine {
     }
 }
 
+/// Distinguishes live GSI creation, where concurrent writes are possible,
+/// from restore backfills, where the target table is still unavailable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GsiBackfillMode {
+    Live,
+    Restore,
+}
+
 impl MongoEngine {
     async fn put_item_impl(
         &self,
@@ -2891,7 +2899,10 @@ impl MongoEngine {
         projection: &Projection,
         cursor: Option<&bson::Bson>,
         batch_size: i64,
+        mode: GsiBackfillMode,
     ) -> Result<GsiBackfillProgress, StorageError> {
+        use futures::TryStreamExt;
+
         let base_coll_name = data_collection_name(&key_info.table_id);
         let base_coll = self.data_db.collection::<Document>(&base_coll_name);
         let idx_coll_name = data_collection_name(index_id);
@@ -2907,11 +2918,115 @@ impl MongoEngine {
             .limit(batch_size)
             .build();
 
-        // The base scan and index writes must share a transaction. Live item
-        // mutations update the base row and its index row in one transaction;
-        // the conditional base-document claim below additionally makes a
-        // DeleteItem race fail before the backfill can create an index row
-        // that did not exist when the delete committed.
+        // The read is intentionally outside the write transactions. The
+        // cursor batch is only a bounded work list; each live item gets its
+        // own short transaction below, so a backfill cannot hold write locks
+        // across hundreds of base documents.
+        let mut base_cursor = base_coll
+            .find(filter)
+            .with_options(opts)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        let mut docs = Vec::new();
+        while let Some(result) = base_cursor
+            .try_next()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?
+        {
+            docs.push(result);
+        }
+
+        let scanned = docs.len();
+        let last_id = docs.last().and_then(|d| d.get("_id").cloned());
+
+        // The test gate is outside any transaction. It lets an API test commit
+        // a DeleteItem after this batch has been read but before the per-item
+        // claim transaction begins, without consuming transaction lifetime.
+        if mode == GsiBackfillMode::Live {
+            self.wait_for_gsi_backfill_test_gate().await?;
+        }
+
+        for doc in &docs {
+            let item = document_to_item(doc)?;
+            if !item_has_index_keys(&item, idx_key_schema) {
+                continue;
+            }
+            self.backfill_gsi_item(
+                &base_coll,
+                &idx_coll,
+                key_info,
+                idx_key_schema,
+                projection,
+                doc,
+                &item,
+                mode,
+            )
+            .await?;
+        }
+
+        let progress = GsiBackfillProgress {
+            scanned,
+            last_id,
+            done: (scanned as i64) < batch_size,
+        };
+
+        // A short-read (fewer docs than the batch size) means we've
+        // reached the end of the base collection. Upstream flips the
+        // index to ACTIVE when that happens.
+        Ok(progress)
+    }
+
+    /// Backfill one item. Live backfills claim the exact base snapshot and
+    /// write its index row in one short transaction. Restore backfills skip
+    /// the claim because the target table remains unavailable until the copy
+    /// and all index rows are complete.
+    async fn backfill_gsi_item(
+        &self,
+        base_coll: &mongodb::Collection<Document>,
+        idx_coll: &mongodb::Collection<Document>,
+        key_info: &TableKeyInfo,
+        idx_key_schema: &[KeySchemaElement],
+        projection: &Projection,
+        doc: &Document,
+        item: &Item,
+        mode: GsiBackfillMode,
+    ) -> Result<(), StorageError> {
+        let base_id = doc
+            .get("_id")
+            .cloned()
+            .ok_or_else(|| StorageError::Internal("base document missing _id".to_owned()))?;
+        let item_data = doc
+            .get("item_data")
+            .cloned()
+            .ok_or_else(|| StorageError::Internal("base document missing item_data".to_owned()))?;
+
+        let projected = project_item(item, idx_key_schema, &key_info.key_schema, projection);
+        let idx_doc = index_document(
+            &projected,
+            idx_key_schema,
+            &key_info.key_schema,
+            &key_info.attribute_definitions,
+        )?;
+        let index_filter = index_entry_filter(
+            &projected,
+            idx_key_schema,
+            &key_info.key_schema,
+            &key_info.attribute_definitions,
+        )?;
+        let replace_opts = mongodb::options::ReplaceOptions::builder()
+            .upsert(true)
+            .build();
+
+        if mode == GsiBackfillMode::Restore {
+            idx_coll
+                .replace_one(index_filter, idx_doc)
+                .with_options(replace_opts)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            return Ok(());
+        }
+
         let mut session = self
             .client
             .start_session()
@@ -2925,123 +3040,79 @@ impl MongoEngine {
                     .build(),
             )
             .build();
-        session
-            .start_transaction()
-            .with_options(tx_options)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let batch_result: Result<GsiBackfillProgress, StorageError> = async {
-            let mut base_cursor = base_coll
-                .find(filter)
-                .with_options(opts)
-                .session(&mut session)
+        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+            session
+                .start_transaction()
+                .with_options(tx_options.clone())
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            let mut docs = Vec::new();
-            while let Some(result) = base_cursor.next(&mut session).await {
-                docs.push(result.map_err(|e| StorageError::Internal(e.to_string()))?);
-            }
-
-            let scanned = docs.len();
-            let last_id = docs.last().and_then(|d| d.get("_id").cloned());
-
-            // The test gate is deliberately between the snapshot read and
-            // the first base/index write. It lets an API test commit a
-            // DeleteItem at the exact point that used to permit a stale
-            // backfill upsert.
-            self.wait_for_gsi_backfill_test_gate().await?;
-
-            for doc in docs {
-                let item = document_to_item(&doc)?;
-                if !item_has_index_keys(&item, idx_key_schema) {
-                    continue;
-                }
-
-                let base_id = doc.get("_id").cloned().ok_or_else(|| {
-                    StorageError::Internal("base document missing _id".to_owned())
-                })?;
-                let item_data = doc.get("item_data").cloned().ok_or_else(|| {
-                    StorageError::Internal("base document missing item_data".to_owned())
-                })?;
-
-                // Claim the exact base snapshot before writing its index row.
-                // This is a real write on the base document, so a concurrent
-                // DeleteItem/UpdateItem conflicts with or precedes the claim;
-                // a read-only snapshot would not provide that guarantee.
-                let guard_token = uuid::Uuid::new_v4().to_string();
+            let guard_token = uuid::Uuid::new_v4().to_string();
+            let attempt_result: Result<bool, TxErr> = async {
                 let guard_result = base_coll
                     .update_one(
-                        doc! { "_id": &base_id, "item_data": item_data },
+                        doc! { "_id": &base_id, "item_data": item_data.clone() },
                         doc! { "$set": { "_backfill_guard": &guard_token } },
                     )
                     .session(&mut session)
                     .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    .map_err(TxErr::from)?;
                 if guard_result.matched_count == 0 {
-                    continue;
+                    return Ok(false);
                 }
 
-                let projected =
-                    project_item(&item, idx_key_schema, &key_info.key_schema, projection);
-                let idx_doc = index_document(
-                    &projected,
-                    idx_key_schema,
-                    &key_info.key_schema,
-                    &key_info.attribute_definitions,
-                )?;
-                let filter = index_entry_filter(
-                    &projected,
-                    idx_key_schema,
-                    &key_info.key_schema,
-                    &key_info.attribute_definitions,
-                )?;
-                let replace_opts = mongodb::options::ReplaceOptions::builder()
-                    .upsert(true)
-                    .build();
                 idx_coll
-                    .replace_one(filter, idx_doc)
-                    .with_options(replace_opts)
+                    .replace_one(index_filter.clone(), idx_doc.clone())
+                    .with_options(replace_opts.clone())
                     .session(&mut session)
                     .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    .map_err(TxErr::from)?;
 
-                base_coll
+                let cleanup = base_coll
                     .update_one(
                         doc! { "_id": &base_id, "_backfill_guard": &guard_token },
                         doc! { "$unset": { "_backfill_guard": "" } },
                     )
                     .session(&mut session)
                     .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-            }
+                    .map_err(TxErr::from)?;
+                if cleanup.matched_count != 1 {
+                    return Err(TxErr::Fatal(StorageError::Internal(
+                        "GSI backfill guard cleanup matched no base document".to_owned(),
+                    )));
+                }
 
-            Ok(GsiBackfillProgress {
-                scanned,
-                last_id,
-                done: (scanned as i64) < batch_size,
-            })
+                Ok(true)
+            }
+            .await;
+
+            match attempt_result {
+                Ok(true) => match session.commit_transaction().await {
+                    Ok(()) => return Ok(()),
+                    Err(e) if is_transient_write_conflict(&e) => {
+                        backoff_sleep(attempt).await;
+                    }
+                    Err(e) => return Err(StorageError::Internal(e.to_string())),
+                },
+                Ok(false) => {
+                    let _ = session.abort_transaction().await;
+                    return Ok(());
+                }
+                Err(TxErr::Transient) => {
+                    let _ = session.abort_transaction().await;
+                    backoff_sleep(attempt).await;
+                }
+                Err(TxErr::Fatal(e)) => {
+                    let _ = session.abort_transaction().await;
+                    return Err(e);
+                }
+            }
         }
-        .await;
 
-        let progress = match batch_result {
-            Ok(progress) => progress,
-            Err(error) => {
-                let _ = session.abort_transaction().await;
-                return Err(error);
-            }
-        };
-
-        session
-            .commit_transaction()
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-        // A short-read (fewer docs than the batch size) means we've
-        // reached the end of the base collection. Upstream flips the
-        // index to ACTIVE when that happens.
-        Ok(progress)
+        Err(StorageError::TransactionConflict(
+            "GSI backfill: too many concurrent write conflicts, giving up".to_owned(),
+        ))
     }
 
     /// Pause once when the test gate is armed, after a backfill batch has been
@@ -3049,62 +3120,66 @@ impl MongoEngine {
     /// controlled through the authenticated management settings API and is
     /// inert unless a test explicitly sets it to `armed`.
     async fn wait_for_gsi_backfill_test_gate(&self) -> Result<(), StorageError> {
-        use std::time::{Duration, Instant};
-
-        if !self.test_backfill_gate_enabled {
+        #[cfg(not(feature = "test-hooks"))]
+        {
             return Ok(());
         }
 
-        let settings = self.catalog_db.collection::<Document>("settings");
-        let key = extenddb_core::settings_keys::GSI_BACKFILL_TEST_GATE;
-        let armed = settings
-            .find_one(doc! { "_id": key, "value": "armed" })
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-        if armed.is_none() {
-            return Ok(());
-        }
+        #[cfg(feature = "test-hooks")]
+        {
+            use std::time::{Duration, Instant};
 
-        let claimed = settings
-            .update_one(
-                doc! { "_id": key, "value": "armed" },
-                doc! { "$set": { "value": "paused" } },
-            )
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-        if claimed.matched_count == 0 {
-            return Ok(());
-        }
-
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let state = settings
-                .find_one(doc! { "_id": key })
+            let settings = self.catalog_db.collection::<Document>("settings");
+            let key = extenddb_core::settings_keys::GSI_BACKFILL_TEST_GATE;
+            let armed = settings
+                .find_one(doc! { "_id": key, "value": "armed" })
                 .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?
-                .and_then(|d| d.get_str("value").ok().map(str::to_owned));
-            if state.as_deref() == Some("release") {
-                settings
-                    .update_one(
-                        doc! { "_id": key, "value": "release" },
-                        doc! { "$set": { "value": "idle" } },
-                    )
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if armed.is_none() {
                 return Ok(());
             }
-            if Instant::now() >= deadline {
-                let _ = settings
-                    .update_one(
-                        doc! { "_id": key, "value": "paused" },
-                        doc! { "$set": { "value": "idle" } },
-                    )
-                    .await;
-                return Err(StorageError::Internal(
-                    "timed out waiting for GSI backfill test gate release".to_owned(),
-                ));
+
+            let claimed = settings
+                .update_one(
+                    doc! { "_id": key, "value": "armed" },
+                    doc! { "$set": { "value": "paused" } },
+                )
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if claimed.matched_count == 0 {
+                return Ok(());
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let state = settings
+                    .find_one(doc! { "_id": key })
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?
+                    .and_then(|d| d.get_str("value").ok().map(str::to_owned));
+                if state.as_deref() == Some("release") {
+                    settings
+                        .update_one(
+                            doc! { "_id": key, "value": "release" },
+                            doc! { "$set": { "value": "idle" } },
+                        )
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    let _ = settings
+                        .update_one(
+                            doc! { "_id": key, "value": "paused" },
+                            doc! { "$set": { "value": "idle" } },
+                        )
+                        .await;
+                    return Err(StorageError::Internal(
+                        "timed out waiting for GSI backfill test gate release".to_owned(),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
     }
 }

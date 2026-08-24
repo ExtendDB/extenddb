@@ -14,6 +14,7 @@ use extenddb_storage::{DataEngine, MetadataEngine, StreamEngine, TableEngine, Wo
 use futures::TryStreamExt;
 
 use crate::MongoEngine;
+use crate::data_engine::GsiBackfillMode;
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(60);
 const BATCH_SIZE: usize = 100;
@@ -144,6 +145,7 @@ async fn run_gsi_backfill_job(storage: &MongoEngine, job: &Document) -> Result<(
                 &projection,
                 cursor.as_ref(),
                 GSI_BACKFILL_BATCH,
+                GsiBackfillMode::Live,
             )
             .await?;
 

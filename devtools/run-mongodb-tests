@@ -30,7 +30,7 @@
 #
 # Prerequisites:
 #   - Docker running
-#   - `cargo build --release --no-default-features --features mongodb` already done
+#   - `cargo build --release --no-default-features --features mongodb-test-hooks` already done
 #   - Python venv activated with pytest installed
 #   - `~/.extenddb/tls/` populated (from a prior `extenddb init`)
 
@@ -80,12 +80,13 @@ SERVER_LOG="$OUTPUT_DIR/server.log"
 CONTAINER_NAME="extenddb-runtests-mongo-${MONGO_PORT}"
 BINARY="./target/release/extenddb"
 
-# Enable the deterministic GSI backfill race-test gate in the server process.
-# The gate remains disabled for normal MongoDB deployments.
-export EXTENDDB_TEST_MONGODB_CONTAINER="$CONTAINER_NAME"
+# Tell the integration test binary that this runner includes MongoDB test
+# hooks. The production server has no effect from this variable; the hooks are
+# compiled only by the `mongodb-test-hooks` feature.
+export EXTENDDB_TEST_MONGODB_TEST_HOOKS=1
 
 if [[ ! -x "$BINARY" ]]; then
-    echo "error: $BINARY not found. Build first: cargo build --release --no-default-features --features mongodb" >&2
+    echo "error: $BINARY not found. Build first: cargo build --release --no-default-features --features mongodb-test-hooks" >&2
     exit 1
 fi
 

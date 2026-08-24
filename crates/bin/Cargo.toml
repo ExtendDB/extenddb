@@ -18,6 +18,8 @@ sqlite = ["extenddb-storage-sqlite"]
 # Build the SQLite backend in its zero-config, ephemeral in-memory mode.
 sqlite-memory = ["sqlite", "extenddb-storage-sqlite/memory"]
 mongodb = ["extenddb-storage-mongodb"]
+# MongoDB integration-test build with deterministic backfill coordination hooks.
+mongodb-test-hooks = ["mongodb", "extenddb-storage-mongodb/test-hooks"]
 # Developer mode: plain HTTP on loopback, open authorization (SigV4 still
 # enforced), seeded dev credential. A build-time profile for local/CI only; it
 # requires a dev backend (`sqlite`/`sqlite-memory`) and fails to build with a

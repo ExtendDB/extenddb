@@ -205,7 +205,7 @@ async fn gsi_can_be_added_to_a_table_with_no_sort_key() {
 /// makes that ordering deterministic rather than relying on timing.
 #[tokio::test]
 async fn deleting_item_during_gsi_backfill_does_not_leave_stale_index_entry() {
-    if std::env::var("EXTENDDB_TEST_MONGODB_CONTAINER").is_err() {
+    if std::env::var("EXTENDDB_TEST_MONGODB_TEST_HOOKS").is_err() {
         // This test uses the MongoDB-only management gate and is not valid
         // against PostgreSQL or real DynamoDB.
         return;
