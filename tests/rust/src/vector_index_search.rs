@@ -1080,6 +1080,151 @@ async fn an_empty_search_schema_is_reported_as_absent() {
     let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
 }
 
+/// Deleting an index that is still being created is two behaviours, and the
+/// discriminator is the `Backfilling` flag the wire already reports.
+///
+/// Measured against the service: while the index reports `Backfilling: false` it is
+/// allocating resources and the delete is refused with a byte-exact
+/// `ResourceInUseException` telling the caller to retry; once it reports
+/// `Backfilling: true` the same delete is accepted. Both halves are here because
+/// both are measured, and a backend that implemented only the acceptance would fail
+/// a client that retries exactly as the message tells it to.
+///
+/// The allocation phase is held open by a test-only settings lever. Without it that
+/// phase exists only between the catalog row's insert and the flip to backfilling,
+/// both inside one UpdateTable call, so a client could only race it, and a race
+/// asserting a whole measured string fails for reasons unrelated to the rule.
+#[tokio::test]
+async fn deleting_a_vector_index_is_refused_while_allocating_and_accepted_while_backfilling() {
+    if skip_unless_supported().await {
+        return;
+    }
+    let name = table_name("pos_phase_delete");
+    let body = format!(
+        r#"{{
+        "TableName": "{name}",
+        "AttributeDefinitions": [{{"AttributeName": "pk", "AttributeType": "S"}}],
+        "KeySchema": [{{"AttributeName": "pk", "KeyType": "HASH"}}],
+        "BillingMode": "PAY_PER_REQUEST"
+    }}"#
+    );
+    call("CreateTable", &body).await;
+    wait_for_active(&name).await;
+    put_vector(&name, "seed", None, &[1.0, 0.0]).await;
+
+    // Long enough to observe the refusal without making the test slow.
+    set_allocation_phase_delay(4000).await;
+    let delete_body = format!(
+        r#"{{"TableName": "{name}", "VectorIndexUpdates": [{{"Delete": {{"IndexName": "vidx"}}}}]}}"#
+    );
+
+    let (status, text) = call(
+        "UpdateTable",
+        &format!(
+            r#"{{
+        "TableName": "{name}",
+        "VectorIndexUpdates": [{{"Create": {{
+            "IndexName": "vidx",
+            "VectorAttribute": {{"AttributeName": "emb"}},
+            "Dimensions": 2,
+            "DistanceFunction": "COSINE",
+            "Projection": {{"ProjectionType": "ALL"}}
+        }}}}]
+    }}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "UpdateTable create failed: {text}");
+
+    // First half: still allocating, so the delete is refused. Asserted on the whole
+    // string, because the wording is what tells a caller to retry rather than that
+    // the request was wrong.
+    let (status, text) = call("UpdateTable", &delete_body).await;
+    assert_eq!(
+        status, 400,
+        "a delete during resource allocation must be refused: {text}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(
+        json.pointer("/__type").and_then(|v| v.as_str()),
+        Some("com.amazonaws.dynamodb.v20120810#ResourceInUseException"),
+        "wrong error type: {text}"
+    );
+    let expected = format!(
+        "Attempt to change a resource which is still in use: Index creation is in resource \
+         allocation phase. Retry deletion during backfilling phase or when the index is \
+         active. Table: {name} Index: vidx"
+    );
+    assert_eq!(
+        json.pointer("/message").and_then(|v| v.as_str()),
+        Some(expected.as_str()),
+        "wrong message: {text}"
+    );
+
+    // The refusal must not have half-deleted anything: the index is still reported.
+    let (status, text) = call("DescribeTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+    assert_eq!(status, 200, "DescribeTable failed: {text}");
+    assert!(
+        text.contains("\"IndexName\":\"vidx\""),
+        "the refused delete must leave the index in place: {text}"
+    );
+
+    // Second half: wait for the phase to advance past allocation, then the same
+    // request is accepted.
+    //
+    // Waiting for "no longer allocating" rather than for `Backfilling: true`
+    // specifically. The true state is not deterministically observable on a table
+    // this size: the shared driver pauses between batches, and a handful of rows is
+    // one batch, so the flag flips to true and then to absent within milliseconds.
+    // Making it observable would mean seeding more than a full batch of items purely
+    // to slow a test down. What the rule actually distinguishes is the allocation
+    // phase from everything after it, and that boundary is what this asserts.
+    wait_past_allocation_phase(&name, "vidx").await;
+    let (status, text) = call("UpdateTable", &delete_body).await;
+    assert_eq!(
+        status, 200,
+        "the same delete must be accepted once the backfill is running: {text}"
+    );
+
+    // And the table is healthy afterwards: the index is gone and writes still work,
+    // which is what a leaked build hold would break.
+    for _ in 0..100 {
+        let (_, text) = call("DescribeTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+        if !text.contains("\"IndexName\":\"vidx\"") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    put_vector(&name, "after", None, &[0.0, 1.0]).await;
+
+    set_allocation_phase_delay(0).await;
+    let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+}
+
+/// Poll until a named vector index has left the resource-allocation phase.
+///
+/// Left means anything other than `Backfilling: false`: either the scan is running
+/// or the index is already ACTIVE. Both are past the boundary the delete rule turns
+/// on, and neither is a state the refusal applies to.
+async fn wait_past_allocation_phase(table: &str, index: &str) {
+    for _ in 0..600 {
+        let (status, text) = call("DescribeTable", &format!(r#"{{"TableName": "{table}"}}"#)).await;
+        if status == 200 {
+            let d: serde_json::Value = serde_json::from_str(&text).expect("json");
+            let allocating = d["Table"]["VectorIndexes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|vi| vi["IndexName"] == index && vi["Backfilling"] == false);
+            if !allocating {
+                return;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("vector index {index} on {table} never left the resource-allocation phase");
+}
+
 /// The same collapse on the other path a client can reach: an index added by
 /// UpdateTable.
 ///
@@ -1705,6 +1850,12 @@ async fn removing_a_row_during_a_backfill_does_not_skip_another() {
 /// exact failure mode `EXTENDDB_EXPECT_VECTORS` was introduced to close.
 async fn set_backfill_delay(ms: u64) {
     set_vector_setting("vector_backfill_batch_delay_ms", ms).await;
+}
+
+/// Hold a new index in the resource-allocation phase for `ms`, so a client can
+/// observe the phase at all. Zero in production; see the settings key's own docs.
+pub(crate) async fn set_allocation_phase_delay(ms: u64) {
+    set_vector_setting("vector_allocation_phase_delay_ms", ms).await;
 }
 
 /// Write one vector test lever through the management API.
