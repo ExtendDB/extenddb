@@ -333,6 +333,12 @@ impl ConsumedCapacity {
     /// capacity recomputed against the item size, never the stored write
     /// magnitude. Measured against the service (a ~1.5KB put: first call 4
     /// WCU, same-token replay 2 RCU with no write arm).
+    ///
+    /// The magnitude is exact for Put operations, whose request carries the
+    /// full item. For Delete/Update/ConditionCheck the caller only holds the
+    /// key size, so the figure is a floor (the 1-RCU minimum in practice);
+    /// recomputing against the stored item would need a read the replay path
+    /// deliberately does not perform.
     #[must_use]
     pub fn transact_replay_read(table_name: &str, cu: f64, indexes: bool) -> Self {
         Self {

@@ -48,28 +48,28 @@ pub async fn handle_put_item(
     }
 
     // Pre-validate enum fields (report all invalid enums together)
+    // Aggregated, in the measured clause order (2026-08-24, us-east-1: three
+    // invalid enums answer "3 validation errors detected" with the clauses in
+    // this sequence). A ReturnValues member merely disallowed for PutItem
+    // passes here and falls through to validate_put_delete_return_values.
     crate::validate_enum_fields(
         &body,
         &[
-            (
-                "ReturnConsumedCapacity",
-                "returnConsumedCapacity",
-                &["INDEXES", "TOTAL", "NONE"],
-            ),
-            (
-                "ReturnItemCollectionMetrics",
-                "returnItemCollectionMetrics",
-                &["SIZE", "NONE"],
-            ),
-            // The full ReturnValues enum set: a value outside it joins the
-            // aggregate (measured: three invalid enums answer "3 validation
-            // errors detected"), while a member merely disallowed for PutItem
-            // falls through to validate_put_delete_return_values below.
-            (
-                "ReturnValues",
-                "returnValues",
-                &["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"],
-            ),
+            crate::EnumField {
+                json_name: "ReturnConsumedCapacity",
+                valid: &["INDEXES", "TOTAL", "NONE"],
+                clause: crate::EnumClause::Named("returnConsumedCapacity"),
+            },
+            crate::EnumField {
+                json_name: "ReturnValues",
+                valid: crate::RETURN_VALUES_MEMBERS,
+                clause: crate::EnumClause::Bare(crate::RETURN_VALUES_BARE_CLAUSE),
+            },
+            crate::EnumField {
+                json_name: "ReturnItemCollectionMetrics",
+                valid: &["SIZE", "NONE"],
+                clause: crate::EnumClause::Named("returnItemCollectionMetrics"),
+            },
         ],
     )?;
     crate::validate_put_delete_return_values(&body)?;

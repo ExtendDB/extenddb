@@ -27,23 +27,24 @@ pub async fn handle_delete_item(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
+    // Aggregated, in the measured clause order (2026-08-24, us-east-1: both
+    // invalid enums answer "2 validation errors detected", RCC's named clause
+    // first, then ReturnValues' bare clause). A member merely disallowed for
+    // DeleteItem passes here and falls through to
+    // validate_put_delete_return_values.
     crate::validate_enum_fields(
         &body,
         &[
-            (
-                "ReturnConsumedCapacity",
-                "returnConsumedCapacity",
-                &["INDEXES", "TOTAL", "NONE"],
-            ),
-            // The full ReturnValues enum set: a value outside it joins the
-            // aggregate (measured: both invalid enums answer "2 validation
-            // errors detected"), while a member merely disallowed for
-            // DeleteItem falls through to validate_put_delete_return_values.
-            (
-                "ReturnValues",
-                "returnValues",
-                &["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"],
-            ),
+            crate::EnumField {
+                json_name: "ReturnConsumedCapacity",
+                valid: &["INDEXES", "TOTAL", "NONE"],
+                clause: crate::EnumClause::Named("returnConsumedCapacity"),
+            },
+            crate::EnumField {
+                json_name: "ReturnValues",
+                valid: crate::RETURN_VALUES_MEMBERS,
+                clause: crate::EnumClause::Bare(crate::RETURN_VALUES_BARE_CLAUSE),
+            },
         ],
     )?;
     crate::validate_put_delete_return_values(&body)?;

@@ -39,23 +39,24 @@ pub async fn handle_update_item(
 ) -> Result<DispatchResult, DynamoDbError> {
     // Sequential rather than aggregated, deliberately: UpdateItem stops at the
     // FIRST invalid enum and reports one error, where PutItem and DeleteItem
-    // aggregate all of theirs (behaviour change the ground truth captured
-    // 2026-06-08; re-confirmed by the 2026-08-24 runs in both regions).
+    // aggregate all of theirs. Measured 2026-08-24 (us-east-1): ReturnValues
+    // and ReturnConsumedCapacity both invalid answers "1 validation error
+    // detected: " followed by ReturnValues' bare clause alone.
     crate::validate_enum_fields(
         &body,
-        &[(
-            "ReturnValues",
-            "returnValues",
-            &["NONE", "ALL_OLD", "ALL_NEW", "UPDATED_OLD", "UPDATED_NEW"],
-        )],
+        &[crate::EnumField {
+            json_name: "ReturnValues",
+            valid: crate::RETURN_VALUES_MEMBERS,
+            clause: crate::EnumClause::Bare(crate::RETURN_VALUES_BARE_CLAUSE),
+        }],
     )?;
     crate::validate_enum_fields(
         &body,
-        &[(
-            "ReturnConsumedCapacity",
-            "returnConsumedCapacity",
-            &["INDEXES", "TOTAL", "NONE"],
-        )],
+        &[crate::EnumField {
+            json_name: "ReturnConsumedCapacity",
+            valid: &["INDEXES", "TOTAL", "NONE"],
+            clause: crate::EnumClause::Named("returnConsumedCapacity"),
+        }],
     )?;
     let input: UpdateItemInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 

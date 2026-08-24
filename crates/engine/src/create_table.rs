@@ -15,11 +15,11 @@ pub async fn handle_create_table(
 ) -> Result<Value, DynamoDbError> {
     crate::validate_enum_fields(
         &body,
-        &[(
-            "BillingMode",
-            "billingMode",
-            &["PROVISIONED", "PAY_PER_REQUEST"],
-        )],
+        &[crate::EnumField {
+            json_name: "BillingMode",
+            valid: &["PROVISIONED", "PAY_PER_REQUEST"],
+            clause: crate::EnumClause::Named("billingMode"),
+        }],
     )?;
 
     let input: CreateTableInput = serde_json::from_value(body).map_err(|e| {

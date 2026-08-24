@@ -39,30 +39,31 @@ pub async fn handle_query(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
-    // Pre-scanned before typed deserialization so an invalid
-    // ReturnConsumedCapacity is named in the error even when Select is also
-    // invalid: the serde enum error alone reported whichever field
-    // deserialized first, which for Query was `select`, and the ground truth
-    // names `returnConsumedCapacity` for that request.
+    // Pre-scanned before typed deserialization, sequentially: Query stops at
+    // the FIRST invalid enum, checking ReturnConsumedCapacity ahead of Select.
+    // Measured 2026-08-24 (us-east-1): both invalid answers "1 validation
+    // error detected" naming returnConsumedCapacity alone. (Scan is the
+    // opposite on both counts: it aggregates, select-first; see handle_scan.)
     crate::validate_enum_fields(
         &body,
-        &[
-            (
-                "ReturnConsumedCapacity",
-                "returnConsumedCapacity",
-                &["INDEXES", "TOTAL", "NONE"],
-            ),
-            (
-                "Select",
-                "select",
-                &[
-                    "SPECIFIC_ATTRIBUTES",
-                    "COUNT",
-                    "ALL_ATTRIBUTES",
-                    "ALL_PROJECTED_ATTRIBUTES",
-                ],
-            ),
-        ],
+        &[crate::EnumField {
+            json_name: "ReturnConsumedCapacity",
+            valid: &["INDEXES", "TOTAL", "NONE"],
+            clause: crate::EnumClause::Named("returnConsumedCapacity"),
+        }],
+    )?;
+    crate::validate_enum_fields(
+        &body,
+        &[crate::EnumField {
+            json_name: "Select",
+            valid: &[
+                "SPECIFIC_ATTRIBUTES",
+                "COUNT",
+                "ALL_ATTRIBUTES",
+                "ALL_PROJECTED_ATTRIBUTES",
+            ],
+            clause: crate::EnumClause::Named("select"),
+        }],
     )?;
     let input: QueryInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
