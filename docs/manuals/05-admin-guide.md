@@ -495,6 +495,33 @@ curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 
 ## Troubleshooting
 
+### Vector Index Support (PostgreSQL)
+
+Vector indexes are stored in `vector(N)` columns, a type the [pgvector](https://github.com/pgvector/pgvector) extension provides, so support is a property of the PostgreSQL server rather than of the ExtendDB build. Two things follow.
+
+**`extenddb init` and `extenddb migrate` try to install it.** Both print one of:
+
+```
+--- Checking pgvector extension on the data database...
+    pgvector available; vector indexes are supported.
+```
+
+```
+--- Checking pgvector extension on the data database...
+    NOTICE: could not create the pgvector extension (...). <what to do>
+```
+
+The notice is not a failure. Initialisation and migration complete either way, and every operation other than a vector one is unaffected; the server simply refuses vector indexes. The advice depends on why it failed: a missing server package (install for example `postgresql-16-pgvector`), or a role that may not create extensions (create it once as a superuser or as the database owner).
+
+Note that the extension is installed on the **data** database, not the catalog.
+
+**Installing pgvector on a running server needs an ExtendDB restart.** The server probes for the extension once at startup and caches the answer, so a server that started without it keeps refusing vector indexes until restarted. Confirm what a running server decided by checking its startup log:
+
+```
+pgvector 0.8.0 detected on the data database; vector index storage available
+pgvector not installed on the data database; vector indexes are not supported
+```
+
 ### Server Won't Start
 
 **Port already in use:**
@@ -516,10 +543,10 @@ Check that PostgreSQL is running and the connection string in `extenddb.toml` is
 **Catalog version mismatch:**
 
 ```
-Error: catalog version mismatch: found 1.0.0, expected 0.0.2
+Error: catalog version mismatch: found 1.0.0, expected 0.0.3
 ```
 
-Run `extenddb migrate --config extenddb.toml` to upgrade the catalog schema.
+Run `extenddb migrate --config extenddb.toml` to upgrade the catalog schema. The check is exact equality in both directions, so this also appears when a binary meets a catalog a newer build already migrated; in that case upgrade the binary rather than the catalog. See the Upgrade Manual for the version history and the stop / migrate / start sequence.
 
 ### Authentication Errors
 

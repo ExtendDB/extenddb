@@ -512,18 +512,16 @@ impl SqliteEngine {
                     let vec_attr = serde_json::to_string(&create.vector_attribute)
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
                     let search_schema = create
-                        .search_schema
-                        .as_ref()
+                        .search_schema_for_storage()
                         .map(serde_json::to_string)
                         .transpose()
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
                     let projection = serde_json::to_string(&create.projection)
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
                     let dimensions = i64::from(create.dimensions);
-                    let distance = serde_json::to_string(&create.distance_function)
-                        .map_err(|e| StorageError::Internal(e.to_string()))?
-                        .trim_matches('"')
-                        .to_owned();
+                    let distance = extenddb_storage::vector_catalog::distance_function_token(
+                        create.distance_function,
+                    )?;
                     // `backfilling` starts at false rather than absent or true.
                     // Measured against the service on 2026-08-06: the member appears
                     // as false while the index exists but its backfill has not

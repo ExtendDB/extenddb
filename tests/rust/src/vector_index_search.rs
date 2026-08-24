@@ -1020,6 +1020,125 @@ async fn update_table_rejects_a_duplicate_create_and_a_missing_delete() {
     let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
 }
 
+/// An empty `SearchSchema` on the request means the same as omitting it, and must
+/// come back as an absent member rather than an empty list.
+///
+/// Amazon DynamoDB reports either an absent member or a populated one, so `[]`
+/// would be a third state a client never sees from the service. Storing it is also
+/// how two backends come to answer one request differently, which is what happened
+/// here: the collapse was added to one backend before being moved into the request
+/// path both share. This test is backend-blind, so it pins the rule for whichever
+/// backend is under it.
+#[tokio::test]
+async fn an_empty_search_schema_is_reported_as_absent() {
+    if skip_unless_supported().await {
+        return;
+    }
+    let name = table_name("pos_emptyschema");
+    let body = format!(
+        r#"{{
+        "TableName": "{name}",
+        "AttributeDefinitions": [{{"AttributeName": "pk", "AttributeType": "S"}}],
+        "KeySchema": [{{"AttributeName": "pk", "KeyType": "HASH"}}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "VectorIndexes": [{{
+            "IndexName": "vidx",
+            "Dimensions": 4,
+            "DistanceFunction": "COSINE",
+            "VectorAttribute": {{"AttributeName": "emb"}},
+            "SearchSchema": [],
+            "Projection": {{"ProjectionType": "ALL"}}
+        }}]
+    }}"#
+    );
+    let (status, text) = call("CreateTable", &body).await;
+    assert_eq!(status, 200, "CreateTable failed: {text}");
+
+    // The response echo, first: it is built from the request, so it is where an
+    // un-collapsed empty list surfaces without any storage round trip.
+    let created: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    let echoed = created
+        .pointer("/TableDescription/VectorIndexes/0")
+        .unwrap_or_else(|| panic!("no vector index in the CreateTable echo: {text}"));
+    assert!(
+        echoed.get("SearchSchema").is_none(),
+        "the echo must not report an empty SearchSchema: {echoed}"
+    );
+
+    wait_for_active(&name).await;
+    let (status, text) = call("DescribeTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+    assert_eq!(status, 200, "DescribeTable failed: {text}");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    let vidx = json
+        .pointer("/Table/VectorIndexes/0")
+        .unwrap_or_else(|| panic!("no vector index in description: {text}"));
+    assert!(
+        vidx.get("SearchSchema").is_none(),
+        "DescribeTable must report the member as absent, not as an empty list: {vidx}"
+    );
+
+    let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+}
+
+/// The same collapse on the other path a client can reach: an index added by
+/// UpdateTable.
+///
+/// Separate from the CreateTable case because the two store the index through
+/// different code, and because this one builds a real index with a lifecycle
+/// rather than one that is ACTIVE from birth, so the member has to survive the
+/// build as well as the write.
+#[tokio::test]
+async fn an_empty_search_schema_added_by_update_table_is_reported_as_absent() {
+    if skip_unless_supported().await {
+        return;
+    }
+    let name = table_name("pos_emptyschema_upd");
+    let body = format!(
+        r#"{{
+        "TableName": "{name}",
+        "AttributeDefinitions": [{{"AttributeName": "pk", "AttributeType": "S"}}],
+        "KeySchema": [{{"AttributeName": "pk", "KeyType": "HASH"}}],
+        "BillingMode": "PAY_PER_REQUEST"
+    }}"#
+    );
+    call("CreateTable", &body).await;
+    wait_for_active(&name).await;
+
+    let (status, text) = call(
+        "UpdateTable",
+        &format!(
+            r#"{{
+        "TableName": "{name}",
+        "VectorIndexUpdates": [{{"Create": {{
+            "IndexName": "vidx",
+            "VectorAttribute": {{"AttributeName": "emb"}},
+            "Dimensions": 2,
+            "DistanceFunction": "COSINE",
+            "SearchSchema": [],
+            "Projection": {{"ProjectionType": "ALL"}}
+        }}}}]
+    }}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "UpdateTable create failed: {text}");
+
+    wait_for_vector_index_active(&name, "vidx").await;
+
+    let (status, text) = call("DescribeTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+    assert_eq!(status, 200, "DescribeTable failed: {text}");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    let vidx = json
+        .pointer("/Table/VectorIndexes/0")
+        .unwrap_or_else(|| panic!("no vector index in description: {text}"));
+    assert!(
+        vidx.get("SearchSchema").is_none(),
+        "an index added by UpdateTable must report the member as absent too: {vidx}"
+    );
+
+    let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+}
+
 /// DescribeTable reports the vector index, and reports it ACTIVE with no
 /// `Backfilling` member, which is what the service does for an index created by
 /// CreateTable.

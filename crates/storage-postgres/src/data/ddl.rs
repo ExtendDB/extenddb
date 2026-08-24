@@ -325,6 +325,12 @@ impl PostgresEngine {
         let (global_secondary_indexes, local_secondary_indexes) =
             self.fetch_all_index_info(&table_id).await?;
         let has_lsi = !local_secondary_indexes.is_empty();
+        // Vector indexes ride on the cached key info too, so the engine can
+        // validate vector attributes on writes and charge vector write capacity.
+        // The update path already passes `key_info.vector_indexes` into the
+        // expression evaluator, so populating this is what turns that validation
+        // on: no call site changes.
+        let vector_indexes = self.fetch_vector_index_key_info(&table_id).await?;
 
         let key_info = TableKeyInfo {
             table_name: table_name.to_owned(),
@@ -337,10 +343,10 @@ impl PostgresEngine {
             global_secondary_indexes,
             local_secondary_indexes,
             stream_specification,
-            // Fields for features this backend does not implement, vector
-            // indexes today, take their defaults. Adding one to TableKeyInfo
-            // then does not break this build.
-            ..Default::default()
+            // Every field is populated, with no `..Default::default()` spread: a
+            // new core field should break this site and force a decision about
+            // whether the write path needs it, rather than silently defaulting.
+            vector_indexes,
         };
         // Catalog metadata that cannot describe its own sort key would make the
         // keyed read paths fall back to a partition-only lookup and return the
@@ -349,6 +355,30 @@ impl PostgresEngine {
             .validate_sort_key_definitions()
             .map_err(StorageError::Internal)?;
         Ok(key_info)
+    }
+
+    /// Fetch the vector indexes of a table in the shape the engine caches.
+    ///
+    /// Selects the whole row rather than the five columns this shape needs, so
+    /// that one row type and one decode path serve both this and the describe
+    /// path. The extra columns are two short tokens and a boolean, read only on a
+    /// key-info cache miss.
+    async fn fetch_vector_index_key_info(
+        &self,
+        table_id: &str,
+    ) -> Result<Vec<extenddb_core::types::VectorIndexKeyInfo>, StorageError> {
+        let rows: Vec<crate::table_helpers::VectorIndexRow> = sqlx::query_as(&format!(
+            "SELECT {} FROM vector_indexes WHERE table_id = $1 ORDER BY index_name",
+            crate::table_helpers::VECTOR_INDEX_COLUMNS
+        ))
+        .bind(table_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        extenddb_storage::vector_catalog::vector_index_key_info(
+            rows.into_iter().map(Into::into).collect(),
+        )
     }
 
     /// Fetch every secondary index defined on a table, split into

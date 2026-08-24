@@ -328,6 +328,42 @@ pub struct SearchSchemaElement {
     pub element_type: SearchSchemaElementType,
 }
 
+impl VectorIndexSpecification {
+    /// Collapse an empty `SearchSchema` to an absent one.
+    ///
+    /// A request may carry `SearchSchema: []`, and it means the same thing as
+    /// omitting the member: the index is unscoped and a search spans the table.
+    /// Amazon DynamoDB reports either an absent member or a populated one and
+    /// never an empty list, so storing the empty list would create a third state
+    /// that a describe echoes back and no client expects, and would let two
+    /// backends answer the same request differently depending on whether each
+    /// remembered to collapse it.
+    ///
+    /// Applied on the request paths, before any backend sees the specification,
+    /// and again by the backends themselves so that a caller reaching the storage
+    /// trait directly cannot store the third state either.
+    pub fn normalize_search_schema(&mut self) {
+        if self
+            .search_schema
+            .as_ref()
+            .is_some_and(|elements| elements.is_empty())
+        {
+            self.search_schema = None;
+        }
+    }
+
+    /// The search schema as it should be stored: absent when empty.
+    ///
+    /// The borrowing form of [`Self::normalize_search_schema`], for a caller that
+    /// is serialising rather than holding a mutable specification.
+    #[must_use]
+    pub fn search_schema_for_storage(&self) -> Option<&[SearchSchemaElement]> {
+        self.search_schema
+            .as_deref()
+            .filter(|elements| !elements.is_empty())
+    }
+}
+
 /// Vector index definition for `CreateTable` requests.
 ///
 /// A vector index is a specialized global secondary index that supports
@@ -1157,6 +1193,78 @@ mod tests {
         let odt = input.on_demand_throughput.unwrap();
         assert_eq!(odt.max_read_request_units, Some(10));
         assert_eq!(odt.max_write_request_units, Some(5));
+    }
+}
+
+#[cfg(test)]
+mod vector_search_schema_normalisation_tests {
+    use super::{
+        DistanceFunction, SearchSchemaElement, SearchSchemaElementType, VectorAttribute,
+        VectorIndexSpecification,
+    };
+
+    fn spec(search_schema: Option<Vec<SearchSchemaElement>>) -> VectorIndexSpecification {
+        VectorIndexSpecification {
+            index_name: "vidx".to_owned(),
+            dimensions: 4,
+            distance_function: DistanceFunction::Cosine,
+            vector_attribute: VectorAttribute {
+                attribute_name: "emb".to_owned(),
+            },
+            search_schema,
+            projection: None,
+        }
+    }
+
+    fn hash() -> Vec<SearchSchemaElement> {
+        vec![SearchSchemaElement {
+            attribute_name: "tenant".to_owned(),
+            element_type: SearchSchemaElementType::Hash,
+        }]
+    }
+
+    /// An empty list and an absent member mean the same thing, so only one of them
+    /// may reach storage. The service reports an absent member or a populated one
+    /// and never an empty list, so storing `[]` would make DescribeTable echo a
+    /// third state, and would let two backends differ on whether they collapsed it.
+    #[test]
+    fn an_empty_search_schema_becomes_absent() {
+        let mut empty = spec(Some(Vec::new()));
+        empty.normalize_search_schema();
+        assert_eq!(empty.search_schema, None);
+        assert_eq!(spec(Some(Vec::new())).search_schema_for_storage(), None);
+    }
+
+    #[test]
+    fn a_populated_search_schema_is_left_alone() {
+        let mut scoped = spec(Some(hash()));
+        scoped.normalize_search_schema();
+        assert_eq!(scoped.search_schema, Some(hash()));
+        assert_eq!(
+            spec(Some(hash())).search_schema_for_storage(),
+            Some(hash().as_slice())
+        );
+    }
+
+    #[test]
+    fn an_absent_search_schema_stays_absent() {
+        let mut unscoped = spec(None);
+        unscoped.normalize_search_schema();
+        assert_eq!(unscoped.search_schema, None);
+        assert_eq!(spec(None).search_schema_for_storage(), None);
+    }
+
+    /// The two forms must agree, since one is applied on the request path and the
+    /// other by the backends: a caller reaching storage directly must not be able
+    /// to store a state the request path would have collapsed.
+    #[test]
+    fn the_owning_and_borrowing_forms_agree() {
+        for schema in [None, Some(Vec::new()), Some(hash())] {
+            let mut owned = spec(schema.clone());
+            owned.normalize_search_schema();
+            let borrowed = spec(schema).search_schema_for_storage().map(<[_]>::to_vec);
+            assert_eq!(owned.search_schema, borrowed);
+        }
     }
 }
 

@@ -13,13 +13,22 @@ BEGIN;
 -- would mean storing something meaningless in a NOT NULL column. The engine
 -- supplies index_id, as it does for GSIs.
 --
+-- Every statement here is written to tolerate a replay. The runner applies a
+-- migration and records it in `schema_history` as two separate commits, so a
+-- crash in between leaves this file applied but unrecorded, and the next
+-- migrate would run it again. Without the guards that second run fails on
+-- "relation already exists" and blocks every later migration, on a deployment
+-- that is otherwise serving correctly because the version gate is satisfied.
+-- Recovering from that needs a hand-written ledger row. 001 guards every one of
+-- its tables the same way.
+--
 -- `search_schema` is nullable because the HASH element is optional (measured
 -- against the live service): with one the search is partition-scoped and
 -- SearchConditionExpression is required, without one it spans the table.
 --
 -- `backfilling` mirrors the measured lifecycle: false while CREATING before the
 -- scan starts, true while it runs, and the member is absent (NULL) once ACTIVE.
-CREATE TABLE vector_indexes (
+CREATE TABLE IF NOT EXISTS vector_indexes (
     table_id            TEXT NOT NULL,
     index_id            TEXT NOT NULL,
     index_name          TEXT NOT NULL,
@@ -55,7 +64,7 @@ CREATE TABLE vector_indexes (
         CHECK (index_status <> 'ACTIVE' OR backfilling IS NULL)
 );
 
-CREATE UNIQUE INDEX idx_vector_indexes_index_id ON vector_indexes (index_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vector_indexes_index_id ON vector_indexes (index_id);
 
 -- Snapshot of the source table's vector index configuration at backup time,
 -- the same way `key_schema` and `attribute_definitions` are snapshotted. NULL
@@ -63,7 +72,7 @@ CREATE UNIQUE INDEX idx_vector_indexes_index_id ON vector_indexes (index_id);
 -- indexes because the backend could not create them. Restore refuses a backup
 -- whose snapshot is non-empty rather than silently dropping a declared index;
 -- the snapshot also carries what a future vector-preserving restore needs.
-ALTER TABLE backups ADD COLUMN vector_indexes JSONB;
+ALTER TABLE backups ADD COLUMN IF NOT EXISTS vector_indexes JSONB;
 
 UPDATE settings SET value = '0.0.3' WHERE key = 'catalog_version';
 

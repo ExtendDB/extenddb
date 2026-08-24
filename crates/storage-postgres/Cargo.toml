@@ -7,6 +7,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[dev-dependencies]
+# The storage-level vector control-plane tests drive the engine directly against
+# a scratch database, so they need a runtime and the test macro.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
 [dependencies]
 anyhow = { workspace = true }
 extenddb-core = { workspace = true }

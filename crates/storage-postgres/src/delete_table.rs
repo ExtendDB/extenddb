@@ -75,6 +75,11 @@ impl PostgresEngine {
         if delay_secs < 1.0 {
             // Synchronous delete: remove tags, catalog row, and data tables inline.
             // Note: deleting the tables row cascades to indexes and stream rows via FK CASCADE.
+            // Vector index rows cascade the same way, through
+            // vector_indexes_table_id_fkey, so a table with vector indexes needs
+            // no extra catalog cleanup. There are no vector data tables to drop
+            // yet: this backend records vector index metadata but does not build
+            // their storage.
             sqlx::query("DELETE FROM tags WHERE resource_arn = $1")
                 .bind(&row.table_arn)
                 .execute(&mut *tx)

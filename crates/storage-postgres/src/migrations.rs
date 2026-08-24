@@ -289,3 +289,71 @@ async fn record_migration(pool: &PgPool, filename: &str) -> OpResult<()> {
     .map_err(|e| OpError::Internal(format!("Record migration: {e}")))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::CATALOG_MIGRATIONS;
+    use crate::CATALOG_VERSION;
+
+    /// The catalog version and the migration list must move together.
+    ///
+    /// A migration that creates its schema without moving the version leaves a
+    /// deployment the binary refuses to serve; moving the version without a
+    /// migration leaves one that cannot reach it. Both are caught today only by a
+    /// test that needs a live PostgreSQL and a built binary, so this is the
+    /// tripwire that fires in an ordinary `cargo test`: adding a migration file
+    /// breaks the count, which forces a decision about the version.
+    #[test]
+    fn the_migration_count_and_the_catalog_version_agree() {
+        assert_eq!(
+            CATALOG_MIGRATIONS.len(),
+            2,
+            "a catalog migration was added or removed; update CATALOG_VERSION and this count"
+        );
+        assert_eq!(CATALOG_VERSION.to_string(), "0.0.3");
+    }
+
+    /// The version the binary expects must be the version the schema writes.
+    ///
+    /// These two live in different languages and different files, so nothing but
+    /// a check like this ties them together. Without it a version bump that
+    /// forgets the SQL side produces a deployment that migrates "successfully"
+    /// and then refuses to start.
+    #[test]
+    fn the_last_migration_writes_the_expected_catalog_version() {
+        let (filename, sql) = CATALOG_MIGRATIONS
+            .last()
+            .expect("there is at least one catalog migration");
+        let expected = format!("'{}'", CATALOG_VERSION);
+        assert!(
+            sql.contains("catalog_version") && sql.contains(&expected),
+            "{filename} must set catalog_version to {expected}"
+        );
+    }
+
+    /// Each migration is registered under the filename it is stored as.
+    ///
+    /// The ledger keys on this string, so a mismatch between the registered name
+    /// and the file would record one name and look for another, and the migration
+    /// would be applied again on every run.
+    #[test]
+    fn every_migration_is_registered_under_a_sql_filename_with_its_own_contents() {
+        for (filename, sql) in CATALOG_MIGRATIONS {
+            assert!(filename.ends_with(".sql"), "{filename}");
+            assert!(!sql.trim().is_empty(), "{filename} is empty");
+        }
+        // The failure this guards is a copy-pasted `include_str!` that points one
+        // entry at another file's bytes: the ledger would then record one name
+        // while the SQL of another ran, and the missed migration would be applied
+        // again on every upgrade. Two entries sharing contents is what that looks
+        // like, so distinctness is the assertion that delivers the rationale.
+        for (i, (left_name, left_sql)) in CATALOG_MIGRATIONS.iter().enumerate() {
+            for (right_name, right_sql) in &CATALOG_MIGRATIONS[i + 1..] {
+                assert_ne!(
+                    left_sql, right_sql,
+                    "{left_name} and {right_name} embed identical SQL; check their include_str! paths"
+                );
+            }
+        }
+    }
+}

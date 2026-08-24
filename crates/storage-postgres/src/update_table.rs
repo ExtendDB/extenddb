@@ -41,6 +41,38 @@ impl PostgresEngine {
             return Err(StorageError::TableNotActive(input.table_name.clone()));
         }
 
+        // A table holding vector indexes cannot leave PAY_PER_REQUEST. Same
+        // message as CreateTable's rejection, and the same rule seen from the
+        // stored state rather than from the request, so it is checked here under
+        // the row lock where the current index set is readable.
+        //
+        // This is one of the two directions the rule has. SQLite also refuses
+        // adding a vector index when the request's net billing mode is not
+        // PAY_PER_REQUEST; that guard belongs with the create path, which this
+        // backend refuses outright for now, so porting it here would be an
+        // unreachable second refusal with different wording. It lands with the
+        // create path.
+        //
+        // Both backends count the stored rows before this request's deletes are
+        // applied, so switching to PROVISIONED and deleting the last vector index
+        // in one call is refused. The service evaluates the net effect of a
+        // request rather than its starting state, so it would probably accept
+        // that combination. Same answer on both backends, so it is a shared
+        // conformance question rather than a difference between them.
+        if matches!(input.billing_mode, Some(BillingMode::Provisioned)) {
+            let vector_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM vector_indexes WHERE table_id = $1")
+                    .bind(&table_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if vector_count > 0 {
+                return Err(StorageError::Validation(
+                    extenddb_core::types::VECTOR_INDEX_REQUIRES_PAY_PER_REQUEST.to_owned(),
+                ));
+            }
+        }
+
         // Reject ProvisionedThroughput when the effective billing mode is
         // PAY_PER_REQUEST. The effective mode is the requested billing_mode when
         // the request changes it, otherwise the table's current mode. Real
@@ -407,6 +439,77 @@ impl PostgresEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             }
             merged_attr_defs_for_ddl = Some(effective);
+        }
+
+        // Vector index create/delete.
+        //
+        // Delete is implemented; Create is refused. Creating an index means
+        // building and maintaining its data table, which this backend cannot yet
+        // do, and a catalog row with no storage behind it would be an index that
+        // reports ACTIVE and answers nothing. Refusing is the same fail-closed
+        // posture the backend takes for every other vector operation.
+        //
+        // Neither branch is reachable over the wire yet: the engine refuses
+        // vector index updates while this backend declares no vector search
+        // capability, so these paths are exercised below the wire. They are
+        // implemented now because the catalog state they act on is created here.
+        if let Some(updates) = &input.vector_index_updates {
+            for update in updates {
+                if let Some(create) = &update.create {
+                    return Err(StorageError::Unsupported(format!(
+                        "vector index '{}' cannot be created: this backend does not yet \
+                         build vector index storage",
+                        create.index_name
+                    )));
+                }
+                if let Some(delete) = &update.delete {
+                    // The index id is deliberately not selected: this backend
+                    // builds no per-index storage yet, so there is nothing to drop
+                    // by id, and reading a value only to discard it invites the
+                    // reader to think otherwise.
+                    let existing: Option<(String, Option<bool>)> = sqlx::query_as(
+                        "SELECT index_status, backfilling FROM vector_indexes \
+                         WHERE table_id = $1 AND index_name = $2",
+                    )
+                    .bind(&table_id)
+                    .bind(&delete.index_name)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+                    let (index_status, backfilling) = existing
+                        .ok_or_else(|| StorageError::IndexNotFound(delete.index_name.clone()))?;
+
+                    // Deleting an index that is still being created is
+                    // phase-dependent, and the discriminator is the same
+                    // `backfilling` flag the wire reports. While the index is
+                    // allocating resources the service refuses the delete and
+                    // asks the caller to retry; once the backfill is running it
+                    // accepts. Measured against the service on 2026-08-19.
+                    if index_status == "CREATING" && backfilling == Some(false) {
+                        return Err(StorageError::ResourceInUse(
+                            extenddb_core::types::vector_index_delete_in_allocation_phase(
+                                &input.table_name,
+                                &delete.index_name,
+                            ),
+                        ));
+                    }
+
+                    // Deleted synchronously: this backend has no observable
+                    // DELETING window, because the catalog row and the storage go
+                    // away together. The divergence from the service, which
+                    // leaves the index in DELETING long enough to observe, is a
+                    // documented one.
+                    sqlx::query(
+                        "DELETE FROM vector_indexes WHERE table_id = $1 AND index_name = $2",
+                    )
+                    .bind(&table_id)
+                    .bind(&delete.index_name)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                }
+            }
         }
 
         tx.commit()
