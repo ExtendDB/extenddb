@@ -29,6 +29,7 @@ mod table_engine;
 mod table_helpers;
 mod ttl_worker;
 mod update_table;
+mod vector;
 mod worker_store;
 mod workers;
 
@@ -107,7 +108,7 @@ use sqlx::postgres::PgPoolOptions;
 ///
 /// The tuple is the single source of truth. Use `CATALOG_VERSION.to_string()`
 /// wherever a string representation is needed.
-pub const CATALOG_VERSION: CatalogVersion = CatalogVersion::new(0, 0, 2);
+pub const CATALOG_VERSION: CatalogVersion = CatalogVersion::new(0, 0, 3);
 
 /// Minimum number of connections allowed per pool.
 ///
@@ -169,6 +170,18 @@ pub struct PostgresEngine {
     /// This is only a fallback for when the live read fails; the write path
     /// reads the setting live so a runtime change applies to the next write.
     pub index_propagation_delay_cache: Arc<std::sync::atomic::AtomicU64>,
+    /// Whether the data database has the pgvector extension, probed once at
+    /// construction.
+    ///
+    /// Vector indexes live in `vector(N)` columns, a type pgvector defines, so
+    /// the capability is a property of the server rather than of this build.
+    /// Cached rather than probed per request: a control-plane feature does not
+    /// justify a round trip on every call, and the cost of caching is that
+    /// installing pgvector on a live server needs an ExtendDB restart to be
+    /// noticed. `DataEngine::as_vector_search` stays at its `None` default until
+    /// the search path exists, so this backend still refuses vector operations
+    /// over the wire; the flag is what that decision will read.
+    pub(crate) vector_capable: bool,
 }
 
 impl PostgresEngine {
@@ -229,6 +242,20 @@ impl PostgresEngine {
             .and_then(|(v,)| v.parse::<u64>().ok())
             .unwrap_or(DEFAULT_INDEX_PROPAGATION_DELAY_MS);
 
+        // Probe the pgvector extension once, on the data database, where vector
+        // data tables live. Logged at startup either way so an operator can see
+        // which answer this process is serving without reading the catalog.
+        let vector_version = vector::probe_vector_extension(&data_pool).await;
+        let vector_capable = vector_version.is_some();
+        match &vector_version {
+            Some(version) => tracing::info!(
+                "pgvector {version} detected on the data database; vector index storage available"
+            ),
+            None => tracing::info!(
+                "pgvector not installed on the data database; vector indexes are not supported"
+            ),
+        }
+
         Ok(Self {
             pool,
             data_pool,
@@ -239,6 +266,7 @@ impl PostgresEngine {
             index_propagation_delay_cache: Arc::new(std::sync::atomic::AtomicU64::new(
                 initial_gsi_delay,
             )),
+            vector_capable,
         })
     }
 
@@ -373,6 +401,15 @@ impl PostgresEngine {
     #[must_use]
     pub fn data_pool(&self) -> &PgPool {
         &self.data_pool
+    }
+
+    /// Whether the data database has pgvector, as probed at construction.
+    ///
+    /// Public so that a deployment check, and the tests that pin the
+    /// fail-closed behaviour, can read the same answer the engine acts on.
+    #[must_use]
+    pub fn vector_capable(&self) -> bool {
+        self.vector_capable
     }
 }
 

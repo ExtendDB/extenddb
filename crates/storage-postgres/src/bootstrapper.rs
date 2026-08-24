@@ -145,6 +145,33 @@ impl PostgresBootstrapper {
     pub fn catalog_connection_url(&self) -> String {
         self.app_connection_url(&self.config.catalog_db)
     }
+
+    /// Try to install pgvector on the data database, tolerating refusal.
+    ///
+    /// Init and migrate are the moments when this process holds the privileges
+    /// that `CREATE EXTENSION` needs: the data database is owned by the
+    /// application role, and pgvector is a trusted extension, so its owner can
+    /// install it without being a superuser. Serve-time code never attempts
+    /// this, because a request path must not carry data-definition privileges it
+    /// only needs once.
+    ///
+    /// Failure is a notice, not an error. A deployment that does not want vector
+    /// indexes, or a managed PostgreSQL that does not offer pgvector, must still
+    /// initialise and upgrade normally; the server then refuses vector
+    /// operations, which is the fail-closed half of the same decision.
+    async fn try_create_vector_extension(&self, pool: &PgPool) {
+        println!("--- Checking pgvector extension on the data database...");
+        match sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
+            .execute(pool)
+            .await
+        {
+            Ok(_) => println!("    pgvector available; vector indexes are supported."),
+            Err(e) => {
+                let hint = crate::vector::create_extension_hint(&e);
+                println!("    NOTICE: could not create the pgvector extension ({e}). {hint}.");
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -231,6 +258,7 @@ impl Bootstrapper for PostgresBootstrapper {
 
     async fn run_data_migrations(&self) -> OpResult<()> {
         let pool = self.app_pool(&self.config.data_db).await?;
+        self.try_create_vector_extension(&pool).await;
         migrations::run_data_migrations(&pool).await?;
         // Programmatic migrations need the catalog pool (to enumerate index
         // tables) plus the data pool (where the `_ddb_*` tables live).

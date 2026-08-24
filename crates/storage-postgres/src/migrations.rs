@@ -7,10 +7,16 @@ use extenddb_storage::management_store::{OpError, OpResult};
 use sqlx::PgPool;
 
 /// Embedded catalog migration files, applied in order.
-pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[(
-    "001_schema.sql",
-    include_str!("../../storage-postgres/migrations/001_schema.sql"),
-)];
+pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "001_schema.sql",
+        include_str!("../../storage-postgres/migrations/001_schema.sql"),
+    ),
+    (
+        "002_vector_indexes.sql",
+        include_str!("../../storage-postgres/migrations/002_vector_indexes.sql"),
+    ),
+];
 
 /// Run catalog migrations, skipping already-applied ones.
 pub(crate) async fn run_catalog_migrations(pool: &PgPool) -> OpResult<()> {
