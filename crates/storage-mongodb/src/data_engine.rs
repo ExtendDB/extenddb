@@ -246,6 +246,15 @@ pub(crate) enum GsiBackfillMode {
     Restore,
 }
 
+/// Invariants shared by every item in one GSI backfill batch.
+pub(crate) struct GsiBackfillContext<'a> {
+    pub(crate) key_info: &'a TableKeyInfo,
+    pub(crate) index_id: &'a str,
+    pub(crate) idx_key_schema: &'a [KeySchemaElement],
+    pub(crate) projection: &'a Projection,
+    pub(crate) mode: GsiBackfillMode,
+}
+
 impl MongoEngine {
     async fn put_item_impl(
         &self,
@@ -2893,19 +2902,15 @@ impl MongoEngine {
 
     pub(crate) async fn backfill_gsi_batch(
         &self,
-        key_info: &TableKeyInfo,
-        index_id: &str,
-        idx_key_schema: &[KeySchemaElement],
-        projection: &Projection,
+        context: &GsiBackfillContext<'_>,
         cursor: Option<&bson::Bson>,
         batch_size: i64,
-        mode: GsiBackfillMode,
     ) -> Result<GsiBackfillProgress, StorageError> {
         use futures::TryStreamExt;
 
-        let base_coll_name = data_collection_name(&key_info.table_id);
+        let base_coll_name = data_collection_name(&context.key_info.table_id);
         let base_coll = self.data_db.collection::<Document>(&base_coll_name);
-        let idx_coll_name = data_collection_name(index_id);
+        let idx_coll_name = data_collection_name(context.index_id);
         let idx_coll = self.data_db.collection::<Document>(&idx_coll_name);
 
         let mut filter = Document::new();
@@ -2943,26 +2948,17 @@ impl MongoEngine {
         // The test gate is outside any transaction. It lets an API test commit
         // a DeleteItem after this batch has been read but before the per-item
         // claim transaction begins, without consuming transaction lifetime.
-        if mode == GsiBackfillMode::Live {
+        if context.mode == GsiBackfillMode::Live {
             self.wait_for_gsi_backfill_test_gate().await?;
         }
 
         for doc in &docs {
             let item = document_to_item(doc)?;
-            if !item_has_index_keys(&item, idx_key_schema) {
+            if !item_has_index_keys(&item, context.idx_key_schema) {
                 continue;
             }
-            self.backfill_gsi_item(
-                &base_coll,
-                &idx_coll,
-                key_info,
-                idx_key_schema,
-                projection,
-                doc,
-                &item,
-                mode,
-            )
-            .await?;
+            self.backfill_gsi_item(&base_coll, &idx_coll, context, doc, &item)
+                .await?;
         }
 
         let progress = GsiBackfillProgress {
@@ -2985,12 +2981,9 @@ impl MongoEngine {
         &self,
         base_coll: &mongodb::Collection<Document>,
         idx_coll: &mongodb::Collection<Document>,
-        key_info: &TableKeyInfo,
-        idx_key_schema: &[KeySchemaElement],
-        projection: &Projection,
+        context: &GsiBackfillContext<'_>,
         doc: &Document,
         item: &Item,
-        mode: GsiBackfillMode,
     ) -> Result<(), StorageError> {
         let base_id = doc
             .get("_id")
@@ -3001,24 +2994,29 @@ impl MongoEngine {
             .cloned()
             .ok_or_else(|| StorageError::Internal("base document missing item_data".to_owned()))?;
 
-        let projected = project_item(item, idx_key_schema, &key_info.key_schema, projection);
+        let projected = project_item(
+            item,
+            context.idx_key_schema,
+            &context.key_info.key_schema,
+            context.projection,
+        );
         let idx_doc = index_document(
             &projected,
-            idx_key_schema,
-            &key_info.key_schema,
-            &key_info.attribute_definitions,
+            context.idx_key_schema,
+            &context.key_info.key_schema,
+            &context.key_info.attribute_definitions,
         )?;
         let index_filter = index_entry_filter(
             &projected,
-            idx_key_schema,
-            &key_info.key_schema,
-            &key_info.attribute_definitions,
+            context.idx_key_schema,
+            &context.key_info.key_schema,
+            &context.key_info.attribute_definitions,
         )?;
         let replace_opts = mongodb::options::ReplaceOptions::builder()
             .upsert(true)
             .build();
 
-        if mode == GsiBackfillMode::Restore {
+        if context.mode == GsiBackfillMode::Restore {
             idx_coll
                 .replace_one(index_filter, idx_doc)
                 .with_options(replace_opts)
@@ -3122,7 +3120,7 @@ impl MongoEngine {
     async fn wait_for_gsi_backfill_test_gate(&self) -> Result<(), StorageError> {
         #[cfg(not(feature = "test-hooks"))]
         {
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(feature = "test-hooks")]

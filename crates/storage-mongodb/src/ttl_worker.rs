@@ -14,7 +14,7 @@ use extenddb_storage::{DataEngine, MetadataEngine, StreamEngine, TableEngine, Wo
 use futures::TryStreamExt;
 
 use crate::MongoEngine;
-use crate::data_engine::GsiBackfillMode;
+use crate::data_engine::{GsiBackfillContext, GsiBackfillMode};
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(60);
 const BATCH_SIZE: usize = 100;
@@ -133,20 +133,19 @@ async fn run_gsi_backfill_job(storage: &MongoEngine, job: &Document) -> Result<(
             non_key_attributes: None,
         });
 
+    let context = GsiBackfillContext {
+        key_info: &key_info,
+        index_id: &index_id,
+        idx_key_schema: &idx_key_schema,
+        projection: &projection,
+        mode: GsiBackfillMode::Live,
+    };
     let mut cursor = job.get("backfill_cursor").cloned();
     let indexes_coll = storage.catalog_db.collection::<Document>("indexes");
 
     loop {
         let progress = storage
-            .backfill_gsi_batch(
-                &key_info,
-                &index_id,
-                &idx_key_schema,
-                &projection,
-                cursor.as_ref(),
-                GSI_BACKFILL_BATCH,
-                GsiBackfillMode::Live,
-            )
+            .backfill_gsi_batch(&context, cursor.as_ref(), GSI_BACKFILL_BATCH)
             .await?;
 
         if progress.done {
