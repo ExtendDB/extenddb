@@ -938,8 +938,12 @@ impl MongoEngine {
                         .map(str::to_owned)
                         .ok_or_else(|| StorageError::IndexNotFound(delete.index_name.clone()))?;
 
-                    self.drop_index_collection(&index_id).await?;
-
+                    // Remove the catalog entry before dropping the physical
+                    // collection. Otherwise a concurrent Query can observe
+                    // an ACTIVE index in the catalog after its collection has
+                    // already been dropped; MongoDB treats a missing
+                    // collection as an empty result rather than a missing
+                    // resource.
                     indexes_coll
                         .delete_one(index_filter)
                         .await
@@ -947,6 +951,11 @@ impl MongoEngine {
 
                     // Invalidate cache — may still have other GSIs
                     self.gsi_cache_invalidate(&desc.table_id);
+
+                    // The physical cleanup is still reported to the caller if
+                    // it fails, but readers no longer observe the deleted
+                    // index as available while that cleanup is in progress.
+                    self.drop_index_collection(&index_id).await?;
                 }
             }
 
