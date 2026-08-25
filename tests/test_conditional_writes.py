@@ -401,33 +401,33 @@ class TestBetweenBoundsValidation:
         assert "BETWEEN" in err["Message"]
 
 
-def test_update_item_condition_only_deep_eav_accepted(
+def test_update_item_condition_only_deep_eav_rejected(
     dynamodb_client, condition_table
 ):
-    """A >32-level nested EAV referenced only by the ConditionExpression (never
-    stored by a SET action) is accepted. DynamoDB enforces the nesting limit on
-    values stored as item attributes, not on operands used solely in a
-    ConditionExpression.
+    """A >32-level nested EAV referenced only by the ConditionExpression is
+    still refused: the nesting limit covers the whole
+    ExpressionAttributeValues map on the single-item write paths, not just the
+    values a SET action stores.
 
-    Verified against real DynamoDB (us-east-1, acct 964157134968): a 33-level
-    condition-only EAV is accepted.
+    Measured 2026-08-24 (us-east-1, acct 964157134968): a 33-level
+    condition-only EAV is rejected on PutItem, DeleteItem, and UpdateItem
+    alike, and 31 levels is accepted. An earlier version of this test asserted
+    acceptance, citing a live check; re-measuring on all three operations
+    contradicts it. TransactWriteItems remains exempt (covered in
+    tests/test_item_operations.py).
     """
     # Build a 33-level-deep nested list value (exceeds the 32-level limit).
     deep = {"S": "x"}
     for _ in range(33):
         deep = {"L": [deep]}
 
-    # ':deep = :deep' is always true; the deep value is never stored.
-    dynamodb_client.update_item(
-        TableName=condition_table,
-        Key={"pk": {"S": "p"}, "sk": {"S": "s"}},
-        UpdateExpression="SET v = :new",
-        ConditionExpression=":deep = :deep",
-        ExpressionAttributeValues={":new": {"N": "1"}, ":deep": deep},
-    )
-    got = dynamodb_client.get_item(
-        TableName=condition_table,
-        Key={"pk": {"S": "p"}, "sk": {"S": "s"}},
-        ConsistentRead=True,
-    )
-    assert got["Item"]["v"]["N"] == "1"
+    with pytest.raises(ClientError) as ei:
+        dynamodb_client.update_item(
+            TableName=condition_table,
+            Key={"pk": {"S": "p"}, "sk": {"S": "s"}},
+            UpdateExpression="SET v = :new",
+            ConditionExpression=":deep = :deep",
+            ExpressionAttributeValues={":new": {"N": "1"}, ":deep": deep},
+        )
+    assert ei.value.response["Error"]["Code"] == "ValidationException"
+    assert "nested levels beyond supported limit" in ei.value.response["Error"]["Message"]

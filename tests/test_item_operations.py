@@ -509,8 +509,12 @@ class TestNestingDepth:
 
     Each `M` or `L` wrapper counts as one level; scalar leaves do not. The
     cap applies to top-level item attributes (`PutItem`, `BatchWriteItem`,
-    `TransactWriteItems.Put`) and to attribute values introduced through
-    `UpdateItem.AttributeUpdates` and `UpdateItem.ExpressionAttributeValues`.
+    `TransactWriteItems.Put`), to attribute values introduced through
+    `UpdateItem.AttributeUpdates`, and to EVERY `ExpressionAttributeValues`
+    entry on the single-item write paths -- including one referenced only by a
+    `ConditionExpression` and never stored. `TransactWriteItems` is the
+    exception: a condition-only value at the same depth is accepted there on
+    every sub-op shape (all measured 2026-08-24, us-east-1).
     """
 
     @pytest.fixture(scope="class")
@@ -650,46 +654,71 @@ class TestNestingDepth:
             )
         assert exc_info.value.response["Error"]["Code"] == "ValidationException"
 
-    def test_put_item_deep_eav_in_condition_accepted(self, dynamodb_client, nest_table):
-        """PutItem with a deep value in EAV used only by ConditionExpression is accepted.
+    def test_put_item_deep_eav_in_condition_rejected(self, dynamodb_client, nest_table):
+        """PutItem rejects a 32-level EAV even when only the condition reads it.
 
-        Amazon DynamoDB only validates depth on values that get *stored* as item
-        attributes. Condition-only EAV passes through.
+        The limit covers every ExpressionAttributeValue on the single-item write
+        paths, not just values that get stored. Measured 2026-08-24 (us-east-1):
+        32 levels is refused here, 31 is accepted (see the 31-level case below).
+        An earlier version of this test asserted acceptance; that premise was
+        never measured.
         """
         unique = "cond-pk-" + uuid.uuid4().hex[:8]
+        with pytest.raises(ClientError) as ei:
+            dynamodb_client.put_item(
+                TableName=nest_table,
+                Item={"pk": {"S": unique}},
+                ConditionExpression="attribute_not_exists(pk) OR :d = :d",
+                ExpressionAttributeValues={":d": self._deep_map(32)},
+            )
+        assert ei.value.response["Error"]["Code"] == "ValidationException"
+        assert "nested levels beyond supported limit" in ei.value.response["Error"]["Message"]
+
+    def test_put_item_deep_eav_in_condition_accepted_at_31(
+        self, dynamodb_client, nest_table
+    ):
+        """One level below the cap, a condition-only EAV is accepted."""
+        unique = "cond-pk31-" + uuid.uuid4().hex[:8]
         dynamodb_client.put_item(
             TableName=nest_table,
             Item={"pk": {"S": unique}},
             ConditionExpression="attribute_not_exists(pk) OR :d = :d",
-            ExpressionAttributeValues={":d": self._deep_map(32)},
+            ExpressionAttributeValues={":d": self._deep_map(31)},
         )
 
-    def test_delete_item_deep_eav_in_condition_accepted(self, dynamodb_client, nest_table):
-        """DeleteItem with a deep value in EAV used only by ConditionExpression is accepted."""
+    def test_delete_item_deep_eav_in_condition_rejected(self, dynamodb_client, nest_table):
+        """DeleteItem rejects a 32-level condition-only EAV, as PutItem does."""
         unique = "cond-del-" + uuid.uuid4().hex[:8]
         dynamodb_client.put_item(TableName=nest_table, Item={"pk": {"S": unique}})
-        dynamodb_client.delete_item(
-            TableName=nest_table,
-            Key={"pk": {"S": unique}},
-            ConditionExpression="attribute_exists(pk) OR :d = :d",
-            ExpressionAttributeValues={":d": self._deep_map(32)},
-        )
+        with pytest.raises(ClientError) as ei:
+            dynamodb_client.delete_item(
+                TableName=nest_table,
+                Key={"pk": {"S": unique}},
+                ConditionExpression="attribute_exists(pk) OR :d = :d",
+                ExpressionAttributeValues={":d": self._deep_map(32)},
+            )
+        assert ei.value.response["Error"]["Code"] == "ValidationException"
+        assert "nested levels beyond supported limit" in ei.value.response["Error"]["Message"]
 
-    def test_update_item_deep_eav_in_condition_accepted(self, dynamodb_client, nest_table):
-        """UpdateItem with a deep value in EAV used only by ConditionExpression is accepted.
+    def test_update_item_deep_eav_in_condition_rejected(self, dynamodb_client, nest_table):
+        """UpdateItem rejects a 32-level condition-only EAV.
 
-        The SET target is a shallow scalar; the deep `:d` is referenced only by
-        the ConditionExpression and never stored.
+        The SET target is a shallow scalar and the deep `:d` is never stored,
+        yet the request is still refused: the limit is applied to the whole
+        ExpressionAttributeValues map.
         """
         unique = "cond-upd-" + uuid.uuid4().hex[:8]
         dynamodb_client.put_item(TableName=nest_table, Item={"pk": {"S": unique}})
-        dynamodb_client.update_item(
-            TableName=nest_table,
-            Key={"pk": {"S": unique}},
-            UpdateExpression="SET myattr = :s",
-            ConditionExpression=":d = :d",
-            ExpressionAttributeValues={":s": {"S": "x"}, ":d": self._deep_map(32)},
-        )
+        with pytest.raises(ClientError) as ei:
+            dynamodb_client.update_item(
+                TableName=nest_table,
+                Key={"pk": {"S": unique}},
+                UpdateExpression="SET myattr = :s",
+                ConditionExpression=":d = :d",
+                ExpressionAttributeValues={":s": {"S": "x"}, ":d": self._deep_map(32)},
+            )
+        assert ei.value.response["Error"]["Code"] == "ValidationException"
+        assert "nested levels beyond supported limit" in ei.value.response["Error"]["Message"]
 
     def test_update_item_legacy_expected_with_deep_value_accepted(
         self, dynamodb_client, nest_table

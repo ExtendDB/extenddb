@@ -90,8 +90,9 @@ pub fn write_capacity_indexed(
 /// Returns `(gsi_units, lsi_units)` keyed by index name. Sparse-index inserts
 /// and deletes are charged from the projection that exists. When both versions
 /// project into an index, a changed key is a delete plus an insert. With an
-/// unchanged key, updates skip identical projected entries while PutItem
-/// replacements still charge the index write.
+/// unchanged key, an identical projected entry is skipped on every write path
+/// (measured: an identical PutItem overwrite reports the table arm alone, the
+/// same rule updates and deletes already followed).
 ///
 /// Index metadata is read from the cached `TableKeyInfo`, so no extra catalog
 /// round-trip is needed.
@@ -533,8 +534,12 @@ mod tests {
         assert_eq!(units, Some(2.0));
     }
 
+    /// The flag itself, both ways: `false` (every production write path)
+    /// skips an unchanged projected entry, `true` charges it. No production
+    /// caller passes `true` any more; the arm is kept so the parameter's
+    /// contract stays pinned.
     #[test]
-    fn update_skips_unchanged_projection_but_replacement_charges_it() {
+    fn charge_unchanged_projection_flag_selects_skip_or_charge() {
         let mut old = item("item", Some("index"));
         old.insert("other".to_owned(), AttributeValue::S("old".to_owned()));
         let mut new = item("item", Some("index"));

@@ -692,6 +692,24 @@ pub struct TableDescription {
     pub table_class_summary: Option<serde_json::Value>,
     #[serde(rename = "OnDemandThroughput", skip_serializing_if = "Option::is_none")]
     pub on_demand_throughput: Option<OnDemandThroughput>,
+    #[serde(rename = "RestoreSummary", skip_serializing_if = "Option::is_none")]
+    pub restore_summary: Option<RestoreSummary>,
+}
+
+/// Details of a restore reported on the restored table's description.
+///
+/// `RestoreTableFromBackup` reports the source backup and an in-progress flag
+/// on its response's `TableDescription`; the ground-truth runs of 2026-08-24
+/// (us-east-1 and eu-west-2) pin `SourceBackupArn` and
+/// `RestoreInProgress: true` there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RestoreSummary {
+    #[serde(rename = "SourceBackupArn", skip_serializing_if = "Option::is_none")]
+    pub source_backup_arn: Option<String>,
+    #[serde(rename = "RestoreDateTime")]
+    pub restore_date_time: f64,
+    #[serde(rename = "RestoreInProgress")]
+    pub restore_in_progress: bool,
 }
 
 /// `CreateTable` request body.
