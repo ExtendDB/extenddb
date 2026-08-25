@@ -765,9 +765,12 @@ and cannot emit ExtendDB stream records with the required `Service`
 user identity, so the backend maintains its own worker.
 
 `update_ttl` sets `ttl_attribute` on the table doc. `create_ttl_index`
-creates a sparse index on `item_data.{ttl_attribute}.N` and flips
-`ttl_index_ready: true`. The `ttl_cleanup_worker` (60s cadence) walks
-tables with `ttl_index_ready`, finds expired items in batches of 100
+creates a sparse index on `item_data.{ttl_attribute}.N` for ordinary
+attribute names and marks `ttl_index_ready: true`. The flag means that
+the table's TTL cleanup path is ready; dotted attribute names use the
+literal-field expression path instead of a physical index, but are also
+marked ready. The `ttl_cleanup_worker` (60s cadence) walks tables with
+`ttl_index_ready`, finds expired items in batches of 100
 per table, and issues `DataEngine::delete_item` with a re-check
 condition (`attribute_exists(ttl) AND ttl <= now`) to prevent races
 with concurrent writes. The delete carries a `StreamCapture` with
