@@ -38,10 +38,15 @@ pub async fn handle_batch_get_item(
     let input: BatchGetItemInput =
         serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
-    // Validate: RequestItems must not be empty
+    // Validate: RequestItems must not be empty. The message is the request
+    // model's length constraint (measured; note "Value at", with no value
+    // echoed). BatchWriteItem keeps its distinct required-parameter sentence,
+    // which is likewise measured.
     if input.request_items.is_empty() {
         return Err(DynamoDbError::ValidationException(
-            "The requestItems parameter is required for BatchGetItem".to_owned(),
+            "1 validation error detected: Value at 'RequestItems' failed to satisfy \
+             constraint: Member must have length greater than or equal to 1"
+                .to_owned(),
         ));
     }
 

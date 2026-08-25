@@ -37,6 +37,31 @@ pub async fn handle_scan(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
+    // Pre-scanned before typed deserialization. Scan AGGREGATES its invalid
+    // enums with Select's clause ahead of ReturnConsumedCapacity's, the
+    // opposite of Query on both counts (Query stops at the first, RCC-first).
+    // Measured 2026-08-24 (us-east-1): both invalid answers "2 validation
+    // errors detected: ... 'select' ...; ... 'returnConsumedCapacity' ...".
+    crate::validate_enum_fields(
+        &body,
+        &[
+            crate::EnumField {
+                json_name: "Select",
+                valid: &[
+                    "SPECIFIC_ATTRIBUTES",
+                    "COUNT",
+                    "ALL_ATTRIBUTES",
+                    "ALL_PROJECTED_ATTRIBUTES",
+                ],
+                clause: crate::EnumClause::Named("select"),
+            },
+            crate::EnumField {
+                json_name: "ReturnConsumedCapacity",
+                valid: &["INDEXES", "TOTAL", "NONE"],
+                clause: crate::EnumClause::Named("returnConsumedCapacity"),
+            },
+        ],
+    )?;
     let input: ScanInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     // Validate Filter/Projection expressions before the existence

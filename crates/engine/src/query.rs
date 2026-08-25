@@ -39,6 +39,32 @@ pub async fn handle_query(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
+    // Pre-scanned before typed deserialization, sequentially: Query stops at
+    // the FIRST invalid enum, checking ReturnConsumedCapacity ahead of Select.
+    // Measured 2026-08-24 (us-east-1): both invalid answers "1 validation
+    // error detected" naming returnConsumedCapacity alone. (Scan is the
+    // opposite on both counts: it aggregates, select-first; see handle_scan.)
+    crate::validate_enum_fields(
+        &body,
+        &[crate::EnumField {
+            json_name: "ReturnConsumedCapacity",
+            valid: &["INDEXES", "TOTAL", "NONE"],
+            clause: crate::EnumClause::Named("returnConsumedCapacity"),
+        }],
+    )?;
+    crate::validate_enum_fields(
+        &body,
+        &[crate::EnumField {
+            json_name: "Select",
+            valid: &[
+                "SPECIFIC_ATTRIBUTES",
+                "COUNT",
+                "ALL_ATTRIBUTES",
+                "ALL_PROJECTED_ATTRIBUTES",
+            ],
+            clause: crate::EnumClause::Named("select"),
+        }],
+    )?;
     let input: QueryInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     // P118: Fetch key_info first so we can use table_id for index lookup.
@@ -470,11 +496,25 @@ pub async fn handle_query(
         count: result.count,
         scanned_count: result.scanned_count,
         last_evaluated_key: result.last_evaluated_key,
-        consumed_capacity: capacity_helpers::read_capacity(
-            input.return_consumed_capacity,
-            &input.table_name,
-            rcu,
-        ),
+        // On an index query with INDEXES, the index carries the read and the
+        // table's arm is zero, aggregate = sum; a base-table query keeps the
+        // plain table-arm shape. TOTAL keeps the aggregate-only shape either
+        // way.
+        consumed_capacity: match (&index_info, input.return_consumed_capacity) {
+            (Some(info), extenddb_core::types::ReturnConsumedCapacity::Indexes) => {
+                Some(extenddb_core::types::ConsumedCapacity::read_on_index(
+                    &input.table_name,
+                    &info.index_name,
+                    rcu,
+                    info.index_type == extenddb_core::types::IndexType::Gsi,
+                ))
+            }
+            _ => capacity_helpers::read_capacity(
+                input.return_consumed_capacity,
+                &input.table_name,
+                rcu,
+            ),
+        },
     };
 
     let body = serialize_output(&output)?;

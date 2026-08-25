@@ -147,11 +147,27 @@ pub(crate) async fn handle_restore_table_from_backup(
         })?;
     let backup_arn = backup_arn_field(&body, &ctx.account_id)?;
 
-    let desc = ctx
+    let mut desc = ctx
         .storage
         .restore_table_from_backup(&ctx.account_id, target_table_name, &backup_arn)
         .await
         .map_err(storage_err_to_dynamo)?;
+
+    // The restore response's TableDescription reports where the data came
+    // from and that the restore is under way: SourceBackupArn and
+    // RestoreInProgress: true, pinned by the ground-truth runs of 2026-08-24
+    // (us-east-1 and eu-west-2). Set here rather than in each backend because
+    // the summary is response metadata about this call, not table state the
+    // backends persist.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or_default();
+    desc.restore_summary = Some(extenddb_core::types::RestoreSummary {
+        source_backup_arn: Some(backup_arn.clone()),
+        restore_date_time: now,
+        restore_in_progress: true,
+    });
 
     // Drop any cached negative TableKeyInfo from a prior probe so subsequent
     // requests against the restored table see it without TTL lag. Tags are
