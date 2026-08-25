@@ -36,6 +36,10 @@ rand = { workspace = true }
 axum-server = { workspace = true }
 rustls = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+# POSIX syslog is the daemon-mode log target; neither crate compiles on
+# Windows, where `serve --foreground` (stderr logging) is the only mode.
+[target.'cfg(unix)'.dependencies]
 syslog-tracing = { workspace = true }
 libc = { workspace = true }
 

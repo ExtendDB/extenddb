@@ -19,6 +19,7 @@ use std::path::PathBuf;
 
 use extenddb_config as config;
 use extenddb_storage::CancellationToken;
+#[cfg(unix)]
 use syslog_tracing::{Facility, Options, Syslog};
 use tracing_subscriber::{
     EnvFilter, Layer, fmt, fmt::writer::BoxMakeWriter, layer::SubscriberExt, reload,
@@ -232,6 +233,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     // `.without_time()` only on the syslog path.
     let (writer, with_time): (BoxMakeWriter, bool) = match log_target {
         LogTarget::Stderr => (BoxMakeWriter::new(std::io::stderr), true),
+        #[cfg(unix)]
         LogTarget::Syslog => {
             let syslog = Syslog::new(
                 c"extenddb",
@@ -244,6 +246,16 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
                 )
             })?;
             (BoxMakeWriter::new(syslog), false)
+        }
+        // POSIX syslog does not exist on this platform; daemon mode (the only
+        // caller that selects Syslog) is unix-only, so this is unreachable in
+        // practice but must still be handled for the type to be total.
+        #[cfg(not(unix))]
+        LogTarget::Syslog => {
+            anyhow::bail!(
+                "syslog logging is not supported on this platform; \
+                 run `extenddb serve --foreground` (logs to stderr)"
+            )
         }
     };
 
@@ -645,6 +657,7 @@ async fn drain_workers(shutdown: &CancellationToken, handles: Vec<tokio::task::J
 /// startup before syslog tracing is configured, and from the caller's panic
 /// hook after daemonizing (stderr is `/dev/null` there, so a panic would
 /// otherwise be invisible).
+#[cfg(unix)]
 pub fn log_to_syslog_raw(msg: &str) {
     // SAFETY: openlog/syslog are POSIX-standard C functions. The ident
     // string is a static C string literal with 'static lifetime.
@@ -658,6 +671,13 @@ pub fn log_to_syslog_raw(msg: &str) {
             libc::syslog(libc::LOG_CRIT, c"%s".as_ptr(), cmsg.as_ptr());
         }
     }
+}
+
+/// Non-unix fallback: there is no POSIX syslog and no daemonized deployment
+/// (daemon mode is unix-only), so stderr is always attached — write there.
+#[cfg(not(unix))]
+pub fn log_to_syslog_raw(msg: &str) {
+    eprintln!("{msg}");
 }
 
 /// Seed (or refresh) the developer-mode credential and return its access key id.

@@ -6,9 +6,12 @@
 use std::net::TcpListener;
 
 use clap::Args;
+#[cfg(unix)]
 use daemonize::Daemonize;
 
-use crate::serve_helpers::{check_config_permissions, verify_daemon_started};
+use crate::serve_helpers::check_config_permissions;
+#[cfg(unix)]
+use crate::serve_helpers::verify_daemon_started;
 use extenddb_config as config;
 use extenddb_config::pid_file_path;
 use extenddb_server::{BuildInfo, LogTarget, ServeParams};
@@ -202,43 +205,56 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     // can be supervised by Docker, Kubernetes, systemd Type=simple, etc.
     // Graceful shutdown on SIGINT/SIGTERM still works.
     if !args.foreground {
-        let pid_file = pid_file
-            .as_ref()
-            .expect("daemon mode always has a PID file path");
-        // The listening socket bound successfully above, which proves no live
-        // server owns this port. Any existing PID file is therefore stale (a
-        // prior run that crashed or was killed without cleanup). Remove it
-        // before daemonizing so startup verification reads the new daemon's
-        // PID rather than a dead one from a previous run.
-        let _ = std::fs::remove_file(pid_file);
-        let daemon = Daemonize::new().pid_file(pid_file);
-        match daemon.execute() {
-            daemonize::Outcome::Parent(Ok(_)) => {
-                // Parent process: wait for the PID file to appear (written by
-                // the grandchild after the double-fork), then verify the daemon
-                // is still alive. This catches crashes during early startup
-                // (bad config, missing tables, TLS cert errors).
-                return verify_daemon_started(pid_file, &bind_addr);
-            }
-            daemonize::Outcome::Parent(Err(e)) => {
-                return Err(anyhow::anyhow!("Failed to daemonize: {e}"));
-            }
-            daemonize::Outcome::Child(Ok(_)) => {
-                // Child (daemon) process: continue to start the server.
-            }
-            daemonize::Outcome::Child(Err(e)) => {
-                return Err(anyhow::anyhow!("Failed to daemonize (child): {e}"));
-            }
-        }
+        // Daemon mode (double fork, PID file, syslog) is POSIX-only. On
+        // Windows the server must be run with `--foreground` under an
+        // external supervisor (a terminal, a service wrapper, or the npm
+        // launcher, which always passes `--foreground`).
+        #[cfg(not(unix))]
+        anyhow::bail!(
+            "daemon mode is not supported on this platform; \
+             run `extenddb serve --foreground`"
+        );
 
-        // P57 Bug 3 fix: After daemonize, stderr is /dev/null. Install a panic
-        // hook that writes to syslog so panics are visible. Without this, the
-        // child process silently disappears on panic. Reuses the server crate's
-        // raw syslog writer so there is one implementation of it — tracing is
-        // unusable here because the subscriber is only set up inside `serve`.
-        std::panic::set_hook(Box::new(|info| {
-            extenddb_server::log_to_syslog_raw(&format!("extenddb panic: {info}"));
-        }));
+        #[cfg(unix)]
+        {
+            let pid_file = pid_file
+                .as_ref()
+                .expect("daemon mode always has a PID file path");
+            // The listening socket bound successfully above, which proves no live
+            // server owns this port. Any existing PID file is therefore stale (a
+            // prior run that crashed or was killed without cleanup). Remove it
+            // before daemonizing so startup verification reads the new daemon's
+            // PID rather than a dead one from a previous run.
+            let _ = std::fs::remove_file(pid_file);
+            let daemon = Daemonize::new().pid_file(pid_file);
+            match daemon.execute() {
+                daemonize::Outcome::Parent(Ok(_)) => {
+                    // Parent process: wait for the PID file to appear (written by
+                    // the grandchild after the double-fork), then verify the daemon
+                    // is still alive. This catches crashes during early startup
+                    // (bad config, missing tables, TLS cert errors).
+                    return verify_daemon_started(pid_file, &bind_addr);
+                }
+                daemonize::Outcome::Parent(Err(e)) => {
+                    return Err(anyhow::anyhow!("Failed to daemonize: {e}"));
+                }
+                daemonize::Outcome::Child(Ok(_)) => {
+                    // Child (daemon) process: continue to start the server.
+                }
+                daemonize::Outcome::Child(Err(e)) => {
+                    return Err(anyhow::anyhow!("Failed to daemonize (child): {e}"));
+                }
+            }
+
+            // P57 Bug 3 fix: After daemonize, stderr is /dev/null. Install a panic
+            // hook that writes to syslog so panics are visible. Without this, the
+            // child process silently disappears on panic. Reuses the server crate's
+            // raw syslog writer so there is one implementation of it — tracing is
+            // unusable here because the subscriber is only set up inside `serve`.
+            std::panic::set_hook(Box::new(|info| {
+                extenddb_server::log_to_syslog_raw(&format!("extenddb panic: {info}"));
+            }));
+        }
     }
 
     tokio::runtime::Builder::new_multi_thread()
