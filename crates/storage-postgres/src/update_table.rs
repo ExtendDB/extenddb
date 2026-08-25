@@ -36,6 +36,38 @@ async fn release_taken_holds(
     }
 }
 
+/// Refuse a new index whose name is already taken on this table, whatever index
+/// family holds it.
+///
+/// CreateTable enforces uniqueness across secondary and vector index names
+/// together, in one place. UpdateTable builds each family's create path
+/// separately, and each one used to consult only its own catalog table, so a GSI
+/// and a vector index could end up sharing a name on the same table, and with it
+/// a single index ARN.
+///
+/// The error wording is the existing duplicate-index message. The service's own
+/// wording for the cross-family case is not measured, so it is not claimed here.
+async fn ensure_index_name_free(
+    conn: &mut sqlx::PgConnection,
+    table_id: &str,
+    index_name: &str,
+) -> Result<(), StorageError> {
+    let taken: Option<(String,)> = sqlx::query_as(
+        "SELECT index_name FROM indexes WHERE table_id = $1 AND index_name = $2 \
+         UNION ALL \
+         SELECT index_name FROM vector_indexes WHERE table_id = $1 AND index_name = $2",
+    )
+    .bind(table_id)
+    .bind(index_name)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| StorageError::Internal(e.to_string()))?;
+    if taken.is_some() {
+        return Err(StorageError::IndexAlreadyExists(index_name.to_owned()));
+    }
+    Ok(())
+}
+
 impl PostgresEngine {
     /// Core implementation of `update_table` (REQ-CTRL-003).
     pub(crate) async fn update_table_impl(
@@ -50,9 +82,21 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // Lock the row and fetch table_id, key_schema, attribute_definitions.
-        let row: Option<(String, String, serde_json::Value, serde_json::Value)> = sqlx::query_as(
-            "SELECT table_status, table_id, key_schema, attribute_definitions FROM tables WHERE account_id = $1 AND table_name = $2 FOR UPDATE",
+        // Lock the row and fetch table_id, key_schema, attribute_definitions and
+        // the stored billing mode.
+        //
+        // `stored_billing_mode` is read once here and threaded through every
+        // later check that needs it, matching the SQLite backend. Re-querying it
+        // per check cost extra round trips and, because the row is already
+        // locked, could never return a different answer.
+        let row: Option<(
+            String,
+            String,
+            serde_json::Value,
+            serde_json::Value,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT table_status, table_id, key_schema, attribute_definitions, billing_mode FROM tables WHERE account_id = $1 AND table_name = $2 FOR UPDATE",
         )
         .bind(account_id)
         .bind(&input.table_name)
@@ -60,7 +104,7 @@ impl PostgresEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let (status, table_id, ks_json, ad_json) =
+        let (status, table_id, ks_json, ad_json, stored_billing_mode) =
             row.ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
         if status != "ACTIVE" {
             return Err(StorageError::TableNotActive(input.table_name.clone()));
@@ -136,15 +180,6 @@ impl PostgresEngine {
             .as_ref()
             .is_some_and(|updates| updates.iter().any(|u| u.create.is_some()));
         if creates_vector_index {
-            let stored_billing_mode: Option<String> = sqlx::query_scalar(
-                "SELECT billing_mode FROM tables WHERE account_id = $1 AND table_name = $2",
-            )
-            .bind(account_id)
-            .bind(&input.table_name)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?
-            .flatten();
             let net_pay_per_request = match input.billing_mode {
                 Some(mode) => mode == BillingMode::PayPerRequest,
                 None => stored_billing_mode.as_deref() == Some("PAY_PER_REQUEST"),
@@ -171,17 +206,7 @@ impl PostgresEngine {
             let effective_ppr = match input.billing_mode {
                 Some(BillingMode::PayPerRequest) => true,
                 Some(BillingMode::Provisioned) => false,
-                None => {
-                    let current_bm: Option<Option<String>> = sqlx::query_scalar(
-                        "SELECT billing_mode FROM tables WHERE account_id = $1 AND table_name = $2",
-                    )
-                    .bind(account_id)
-                    .bind(&input.table_name)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    current_bm.flatten().as_deref() == Some("PAY_PER_REQUEST")
-                }
+                None => stored_billing_mode.as_deref() == Some("PAY_PER_REQUEST"),
             };
             if effective_ppr {
                 return Err(StorageError::Validation(
@@ -390,19 +415,9 @@ impl PostgresEngine {
         if let Some(updates) = &input.global_secondary_index_updates {
             for update in updates {
                 if let Some(create) = &update.create {
-                    // Check for duplicate index name.
-                    let existing: Option<(String,)> = sqlx::query_as(
-                        "SELECT index_name FROM indexes WHERE table_id = $1 AND index_name = $2",
-                    )
-                    .bind(&table_id)
-                    .bind(&create.index_name)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-                    if existing.is_some() {
-                        return Err(StorageError::IndexAlreadyExists(create.index_name.clone()));
-                    }
+                    // Across families, not just this one: see
+                    // `ensure_index_name_free`.
+                    ensure_index_name_free(&mut tx, &table_id, &create.index_name).await?;
 
                     let gsi_ks = serde_json::to_value(&create.key_schema)
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -627,18 +642,7 @@ impl PostgresEngine {
                             ));
                         }
 
-                        let dup: Option<(String,)> = sqlx::query_as(
-                            "SELECT index_name FROM vector_indexes \
-                             WHERE table_id = $1 AND index_name = $2",
-                        )
-                        .bind(&table_id)
-                        .bind(&create.index_name)
-                        .fetch_optional(&mut *tx)
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                        if dup.is_some() {
-                            return Err(StorageError::IndexAlreadyExists(create.index_name.clone()));
-                        }
+                        ensure_index_name_free(&mut tx, &table_id, &create.index_name).await?;
 
                         let index_id = uuid::Uuid::new_v4().to_string();
                         let vec_attr = serde_json::to_value(&create.vector_attribute)

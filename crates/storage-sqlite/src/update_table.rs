@@ -22,6 +22,40 @@ use extenddb_storage::util::effective_attribute_definitions;
 
 use crate::store::SqliteEngine;
 
+/// Refuse a new index whose name is already taken on this table, whatever index
+/// family holds it.
+///
+/// CreateTable enforces uniqueness across secondary and vector index names
+/// together, in one place. UpdateTable builds each family's create path
+/// separately, and each one used to consult only its own catalog table, so a GSI
+/// and a vector index could end up sharing a name on the same table, and with it
+/// a single index ARN.
+///
+/// The error wording is the existing duplicate-index message. The service's own
+/// wording for the cross-family case is not measured, so it is not claimed here.
+async fn ensure_index_name_free(
+    conn: &mut sqlx::SqliteConnection,
+    table_id: &str,
+    index_name: &str,
+) -> Result<(), StorageError> {
+    let taken: Option<(String,)> = sqlx::query_as(
+        "SELECT index_name FROM indexes WHERE table_id = ? AND index_name = ? \
+         UNION ALL \
+         SELECT index_name FROM vector_indexes WHERE table_id = ? AND index_name = ?",
+    )
+    .bind(table_id)
+    .bind(index_name)
+    .bind(table_id)
+    .bind(index_name)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| StorageError::Internal(e.to_string()))?;
+    if taken.is_some() {
+        return Err(StorageError::IndexAlreadyExists(index_name.to_owned()));
+    }
+    Ok(())
+}
+
 impl SqliteEngine {
     pub(crate) async fn update_table_impl(
         &self,
@@ -282,17 +316,9 @@ impl SqliteEngine {
         if let Some(updates) = &input.global_secondary_index_updates {
             for update in updates {
                 if let Some(create) = &update.create {
-                    let dup: Option<(String,)> = sqlx::query_as(
-                        "SELECT index_name FROM indexes WHERE table_id = ? AND index_name = ?",
-                    )
-                    .bind(&table_id)
-                    .bind(&create.index_name)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    if dup.is_some() {
-                        return Err(StorageError::IndexAlreadyExists(create.index_name.clone()));
-                    }
+                    // Across families, not just this one: see
+                    // `ensure_index_name_free`.
+                    ensure_index_name_free(&mut tx, &table_id, &create.index_name).await?;
                     let ks = serde_json::to_string(&create.key_schema)
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
                     let proj = serde_json::to_string(&create.projection)
@@ -511,18 +537,7 @@ impl SqliteEngine {
                         ));
                     }
 
-                    let dup: Option<(String,)> = sqlx::query_as(
-                        "SELECT index_name FROM vector_indexes \
-                         WHERE table_id = ? AND index_name = ?",
-                    )
-                    .bind(&table_id)
-                    .bind(&create.index_name)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    if dup.is_some() {
-                        return Err(StorageError::IndexAlreadyExists(create.index_name.clone()));
-                    }
+                    ensure_index_name_free(&mut tx, &table_id, &create.index_name).await?;
                     let index_id = uuid::Uuid::new_v4().to_string();
                     let vec_attr = serde_json::to_string(&create.vector_attribute)
                         .map_err(|e| StorageError::Internal(e.to_string()))?;

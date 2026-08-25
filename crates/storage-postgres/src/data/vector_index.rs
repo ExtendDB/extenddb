@@ -151,6 +151,49 @@ pub(crate) async fn maintain_vector_indexes(
         return Ok(0);
     }
 
+    // Inline apply is only safe while this table's propagation queue is empty.
+    //
+    // Queue order protects queued rows against each other, never a queued row
+    // against an inline one. Once an index flips to ACTIVE and its hold goes, rows
+    // enqueued while it was CREATING drain at the same time as new writes take the
+    // inline path. A new write to an item can then apply inline, and the worker can
+    // afterwards apply an older queued row for that same item, leaving the index
+    // row permanently disagreeing with the base item until the item is written
+    // again.
+    //
+    // The probe closes the in-flight window because of WHERE it runs, and that
+    // ordering is load-bearing rather than incidental: this function is called
+    // after the base row's own write in the same transaction, so two concurrent
+    // writes to one item serialize on the base row lock. READ COMMITTED takes a
+    // fresh snapshot per statement, so the later writer's probe runs after the
+    // earlier writer committed and therefore sees the row it queued. A writer that
+    // saw CREATING and enqueued cannot be invisible to a writer that sees ACTIVE
+    // and wants to inline.
+    //
+    // A claimed but uncommitted queue row is still visible here, because the worker
+    // has not committed its delete, so this write queues behind it and the two
+    // apply in id order within one worker partition. A consumed and committed row
+    // is gone, and its writes to the index landed before these statements, so an
+    // inline apply lands last. Both interleavings are safe.
+    //
+    // Deliberately an over-approximation. A GSI row pending under a per-index delay
+    // while the global delay is zero also forces this write to queue. The queued
+    // row is ready immediately and applies in order, so the cost is eventualness,
+    // never a wrong index row. Inline only exists at delay zero, where the queue
+    // holds build-era rows and drains to empty, so the inline path resumes; there
+    // is no steady-state traffic that could strand it.
+    let queue_empty = if delay_ms == 0 && metas.iter().any(|(_, status)| status == "ACTIVE") {
+        let pending: Option<(i32,)> =
+            sqlx::query_as("SELECT 1 FROM gsi_pending WHERE table_id = $1 LIMIT 1")
+                .bind(table_id)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+        pending.is_none()
+    } else {
+        false
+    };
+
     let mut enqueued = 0usize;
     for (meta, index_status) in metas {
         // A CREATING index never takes an inline write, whatever the delay. The
@@ -158,9 +201,38 @@ pub(crate) async fn maintain_vector_indexes(
         // same item; writing the new one now would let the backfill overwrite it,
         // and its deliberately plain INSERT would collide with the row this put
         // there. The queue hold parks the row until the index is published.
-        let inline = delay_ms == 0 && index_status == "ACTIVE";
+        let inline = delay_ms == 0 && index_status == "ACTIVE" && queue_empty;
         if inline {
-            apply_vector_index(tx, meta, base_key_schema, attr_defs, old_item, new_item).await?;
+            // Guarded by a savepoint so a concurrent delete of this index cannot
+            // fail the caller's write. The data table vanishing under an inline
+            // apply is the same routine race the propagation worker already
+            // tolerates. Without the savepoint the failed statement aborts the
+            // whole write subtransaction, and the write answers
+            // InternalServerError where the service answers 200.
+            sqlx::query("SAVEPOINT vector_inline_apply")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            match apply_vector_index(tx, meta, base_key_schema, attr_defs, old_item, new_item).await
+            {
+                Ok(()) => {
+                    sqlx::query("RELEASE SAVEPOINT vector_inline_apply")
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                }
+                Err(e) if crate::gsi_queue::is_undefined_table(&e) => {
+                    sqlx::query("ROLLBACK TO SAVEPOINT vector_inline_apply")
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    tracing::debug!(
+                        index_id = %meta.index_id,
+                        "vector index data table gone during inline apply, skipping"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
             continue;
         }
         // Enqueued even when the new image carries no vector: the removal is the
@@ -626,7 +698,7 @@ impl extenddb_storage::vector_lifecycle::VectorIndexBuild for PostgresVectorBuil
         // One transition: ACTIVE, the member cleared to absent rather than false,
         // and the skip count recorded so an index that deliberately omits rows says
         // so. The build columns are cleared because ownership ends here.
-        sqlx::query(
+        let flipped = sqlx::query(
             "UPDATE vector_indexes SET index_status = 'ACTIVE', backfilling = NULL, \
              skipped_item_count = $3, build_owner = NULL, build_heartbeat_at = NULL \
              WHERE table_id = $1 AND index_id = $2",
@@ -637,6 +709,32 @@ impl extenddb_storage::vector_lifecycle::VectorIndexBuild for PostgresVectorBuil
         .execute(&self.catalog)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        if flipped.rows_affected() == 0 {
+            // No row to flip means a delete committed while this build was
+            // running. That is only a leak for a rebuild: it recreates its data
+            // table after reloading the definition, so a delete landing in
+            // between drops the table it could see and this build then recreates
+            // one nothing references. The absent catalog row is the proof the
+            // index is gone, so drop the table here rather than leaving it for an
+            // operator to find.
+            let mut tx = self
+                .data
+                .begin()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            crate::PostgresEngine::drop_vector_data_table(&mut tx, &self.index_id).await?;
+            tx.commit()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            tracing::info!(
+                index_id = %self.index_id,
+                table_id = %self.table_id,
+                "vector index was deleted while its build ran; dropped the rebuilt data table"
+            );
+            release_hold(&self.data, &self.table_id, &self.index_id).await?;
+            return Ok(());
+        }
 
         // The hold goes only after the flip has committed. Held slightly too long
         // is harmless, because the queue rows simply wait; released early would let
