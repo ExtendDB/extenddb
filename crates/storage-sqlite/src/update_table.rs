@@ -443,6 +443,38 @@ impl SqliteEngine {
                     // The per-table count limit is enforced on the request's
                     // net effect before this loop; see above.
 
+                    // A create whose vector attribute an EXISTING index already
+                    // uses must agree with it on Dimensions: the attribute
+                    // stores one vector. Measured live 2026-08-24 (us-east-1):
+                    // the service answers the attribute-redefinition message
+                    // with both sides in the VectorIndexSchema shape, and
+                    // accepts the same attribute at the SAME dimensions.
+                    // Checked inside the transaction under the write lock, so a
+                    // concurrent create cannot slip a disagreeing sibling in.
+                    let existing_dims: Option<(i64,)> = sqlx::query_as(
+                        "SELECT dimensions FROM vector_indexes \
+                         WHERE table_id = ? AND vector_attribute = ? \
+                           AND dimensions <> ? LIMIT 1",
+                    )
+                    .bind(&table_id)
+                    .bind(
+                        serde_json::to_string(&create.vector_attribute)
+                            .map_err(|e| StorageError::Internal(e.to_string()))?,
+                    )
+                    .bind(i64::from(create.dimensions))
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    if let Some((existing,)) = existing_dims {
+                        return Err(StorageError::Validation(
+                            extenddb_core::types::vector_attribute_redefines_vector(
+                                vec_attr_name,
+                                u32::try_from(existing).unwrap_or_default(),
+                                create.dimensions,
+                            ),
+                        ));
+                    }
+
                     let dup: Option<(String,)> = sqlx::query_as(
                         "SELECT index_name FROM vector_indexes \
                          WHERE table_id = ? AND index_name = ?",
@@ -735,6 +767,13 @@ impl SqliteEngine {
         let write_lock = std::sync::Arc::clone(&self.write_lock);
         let batch_delay =
             std::time::Duration::from_millis(self.vector_backfill_batch_delay().await);
+        // The floor on how long the index stays CREATING. Captured with the
+        // creation instant here rather than inside the task, so the hold
+        // measures from when the caller could first observe the index, and a
+        // live settings change mid-build does not move an in-flight deadline.
+        let min_creating =
+            std::time::Duration::from_millis(self.vector_index_min_creating_ms().await);
+        let created_at = tokio::time::Instant::now();
         let owned_table_id = table_id.to_owned();
         let owned_index_id = index_id.to_owned();
         let owned_index_name = create.index_name.clone();
@@ -789,6 +828,17 @@ impl SqliteEngine {
             .await;
             match result {
                 Ok(outcome) => {
+                    // The service's online-index machinery never finishes an
+                    // added index instantly, so the CREATING walk (`Backfilling`
+                    // false, then true, then ACTIVE with the member absent) is
+                    // always observable there. A local backfill over a small
+                    // table completes in milliseconds, which would collapse that
+                    // walk into an instant no DescribeTable poll can catch, so
+                    // the flip waits out the remainder of the configured floor.
+                    // Searches keep answering the documented not-ready rejection
+                    // and writes keep queuing behind the CREATING hold for the
+                    // duration, exactly as during a real backfill.
+                    tokio::time::sleep_until(created_at + min_creating).await;
                     // Populated, so the index can serve. `backfilling` is cleared to
                     // NULL rather than set to 0, because the service removes the
                     // member once ACTIVE and the catalog CHECK constraint enforces
@@ -922,10 +972,15 @@ impl SqliteEngine {
     /// duplicate every row it had already written before the crash, and a search
     /// would return the same item several times.
     pub(crate) async fn reconcile_incomplete_vector_indexes(&self) -> Result<usize, StorageError> {
+        // `backfilling IS NOT NULL` scopes this to UpdateTable-created indexes,
+        // the only kind whose CREATING means an interrupted backfill. An index
+        // created WITH its table (backfilling NULL) is CREATING only because
+        // its table is; the control-plane worker activates both together, and
+        // rebuilding it here would publish it ACTIVE ahead of its own table.
         let rows: Vec<(String, String, String, String)> = sqlx::query_as(
             "SELECT v.index_id, v.table_id, t.key_schema, t.attribute_definitions \
              FROM vector_indexes v JOIN tables t ON v.table_id = t.table_id \
-             WHERE v.index_status = 'CREATING'",
+             WHERE v.index_status = 'CREATING' AND v.backfilling IS NOT NULL",
         )
         .fetch_all(&self.pool)
         .await
@@ -954,11 +1009,19 @@ impl SqliteEngine {
     /// passes before invoking [`Self::recover_stuck_vector_builds`], which
     /// re-checks the registry itself at execution time.
     pub(crate) async fn stuck_vector_build_candidates(&self) -> Result<Vec<String>, StorageError> {
-        let ids: Vec<(String,)> =
-            sqlx::query_as("SELECT index_id FROM vector_indexes WHERE index_status = 'CREATING'")
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+        // `backfilling IS NOT NULL` scopes this to UpdateTable-created indexes,
+        // which are the only ones with a build task to lose. An index created
+        // WITH its table sits in CREATING (backfilling NULL) until the
+        // control-plane worker activates it beside the table; it has no task,
+        // and sweeping it here would rebuild it early and flip it ACTIVE ahead
+        // of its own table.
+        let ids: Vec<(String,)> = sqlx::query_as(
+            "SELECT index_id FROM vector_indexes \
+             WHERE index_status = 'CREATING' AND backfilling IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
         let registry = self
             .vector_builds_running
             .lock()
@@ -1453,6 +1516,7 @@ mod reconciler_tests {
             &ks,
             &ad,
             &["base_pk".to_owned()],
+            crate::data::vector_index::VectorRowConflict::Fail,
         )
         .await
         .expect("partial row");

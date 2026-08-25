@@ -347,19 +347,19 @@ fn parse_search_vector(values: &[AttributeValue]) -> Result<Vec<f32>, DynamoDbEr
             AttributeValue::N(n) => {
                 let f = n.parse::<f32>().map_err(|_| {
                     DynamoDbError::ValidationException(
-                        "Search vector contains invalid values".to_owned(),
+                        "Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute".to_owned(),
                     )
                 })?;
                 if !f.is_finite() {
                     return Err(DynamoDbError::ValidationException(
-                        "Search vector contains invalid values".to_owned(),
+                        "Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute".to_owned(),
                     ));
                 }
                 out.push(f);
             }
             _ => {
                 return Err(DynamoDbError::ValidationException(
-                    "Search vector contains invalid values".to_owned(),
+                    "Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute".to_owned(),
                 ));
             }
         }
@@ -672,7 +672,11 @@ mod tests {
         let DynamoDbError::ValidationException(msg) = err else {
             panic!("expected ValidationException");
         };
-        assert_eq!(msg, "Search vector contains invalid values");
+        assert_eq!(
+            msg,
+            "Search vector contains invalid values. All values in the search vector \
+             must be a 32-bit floating-point number attribute"
+        );
     }
 
     #[test]

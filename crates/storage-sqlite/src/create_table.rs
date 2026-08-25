@@ -195,9 +195,13 @@ impl SqliteEngine {
         }
 
         // Vector indexes. A CreateTable's table is empty, so there is nothing to
-        // backfill: the index goes straight to ACTIVE with no `backfilling`
-        // member, which is the state the service reports for an index created
-        // this way. The UpdateTable path is the one that drives a real lifecycle.
+        // backfill and no `backfilling` member is ever reported on this path.
+        // The index's status tracks the TABLE's: measured against the service
+        // (2026-08-21, eu-west-2, three runs polling at 250ms), an index created
+        // with its table reports CREATING while the table is CREATING and
+        // reaches ACTIVE in the same DescribeTable poll as the table, with no
+        // observable gap in either direction. The control-plane worker flips
+        // both in one pass; see `process_control_plane_transitions`.
         let mut vector_ids: Vec<String> = Vec::new();
         if let Some(vis) = &input.vector_indexes {
             for vi in vis {
@@ -232,7 +236,7 @@ impl SqliteEngine {
                     "INSERT INTO vector_indexes \
                      (table_id, index_name, index_id, dimensions, distance_function, \
                       vector_attribute, search_schema, projection, index_status, backfilling) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', NULL)",
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
                 )
                 .bind(&table_id)
                 .bind(&vi.index_name)
@@ -242,6 +246,7 @@ impl SqliteEngine {
                 .bind(&vec_attr)
                 .bind(&search_schema)
                 .bind(&proj)
+                .bind(initial_status)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;

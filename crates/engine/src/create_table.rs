@@ -112,6 +112,12 @@ pub(crate) fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) ->
         StorageError::IndexAlreadyExists(name) => DynamoDbError::ValidationException(format!(
             "One or more parameter values were invalid: Index already exists: {name}"
         )),
+        // The sentence AWS documents for this refusal, quoted in the vector
+        // search tutorial's readiness callout and pinned by the ground-truth
+        // runs of 2026-08-24 (us-east-1 and eu-west-2).
+        StorageError::IndexesInUse(_) => DynamoDbError::ResourceInUseException(
+            "Cannot delete table while indexes are being created, updated, or deleted.".to_owned(),
+        ),
         StorageError::LimitExceeded(msg) => DynamoDbError::LimitExceededException(msg),
         // Retryable by definition, so it maps like Connection: a 503 the SDKs
         // retry, rather than a 500 they surface.
