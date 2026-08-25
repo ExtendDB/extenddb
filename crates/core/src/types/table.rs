@@ -559,6 +559,27 @@ pub fn vector_attribute_redefines_key(
     )
 }
 
+/// The message for an UpdateTable create whose vector attribute is already
+/// used by an existing vector index with different `Dimensions`. Measured
+/// live 2026-08-24 (us-east-1): `Create vConf(emb, 16)` against a table whose
+/// `vidx0` declares `emb` at 4 answers exactly this, with both sides rendered
+/// in the `VectorIndexSchema` shape (contrast the key-redefinition sibling
+/// above, whose existing side is a key `Schema`). Same attribute with the
+/// SAME dimensions is accepted (also measured).
+#[must_use]
+pub fn vector_attribute_redefines_vector(
+    attribute_name: &str,
+    existing_dimensions: u32,
+    new_dimensions: u32,
+) -> String {
+    format!(
+        "One or more parameter values were invalid: Attributes cannot be redefined. Please check \
+         that your attribute has the same type as previously defined. Existing schema: \
+         VectorIndexSchema:[VectorAttribute: key{{{attribute_name}:L:{existing_dimensions}}}] \
+         New schema: VectorIndexSchema:[VectorAttribute: key{{{attribute_name}:L:{new_dimensions}}}]"
+    )
+}
+
 pub const VECTOR_INDEX_ALREADY_EXISTS: &str = "Attempting to create an index which already exists";
 
 /// Prefix of the message the service returns when the name is taken by an index

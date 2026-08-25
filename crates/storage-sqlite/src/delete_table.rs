@@ -65,6 +65,16 @@ impl SqliteEngine {
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+            // A vector index with `backfilling` set is an UpdateTable build in
+            // flight (the with-table path never sets the column), and the
+            // service refuses to delete the table underneath one; the refusal
+            // clears when the index flips ACTIVE or its create is cancelled.
+            // Checked INSIDE the immediate transaction rather than before it,
+            // so a build whose catalog row commits while this call is waiting
+            // on the write lock is still caught: the check and the cascade
+            // delete are atomic against a concurrent UpdateTable.
+            Self::refuse_if_index_build_in_flight(&mut tx, &row.table_id, &input.table_name)
+                .await?;
             sqlx::query("DELETE FROM tags WHERE resource_arn = ?")
                 .bind(&table_arn)
                 .execute(&mut *tx)
@@ -95,6 +105,18 @@ impl SqliteEngine {
             let transition = format_timestamp(
                 time::OffsetDateTime::now_utc() + time::Duration::seconds_f64(delay_secs),
             );
+            let _writer = self.write_lock.lock().await;
+            let mut tx = self
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            // Same in-flight-build refusal as the immediate branch, and inside
+            // the transaction that flips the table to DELETING for the same
+            // reason: without it, a build committing between an earlier check
+            // and this flip would have its table deleted underneath it.
+            Self::refuse_if_index_build_in_flight(&mut tx, &row.table_id, &input.table_name)
+                .await?;
             sqlx::query(
                 "UPDATE tables SET table_status = 'DELETING', status_transition_at = ? \
                  WHERE account_id = ? AND table_name = ?",
@@ -102,9 +124,12 @@ impl SqliteEngine {
             .bind(&transition)
             .bind(account_id)
             .bind(&input.table_name)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
             self.control_plane_notify.notify_one();
         }
 
@@ -113,5 +138,27 @@ impl SqliteEngine {
             table_status: TableStatus::Deleting,
             ..desc
         })
+    }
+
+    /// Refuse the operation while any UpdateTable-created vector index build is
+    /// in flight on the table (`backfilling IS NOT NULL`; the with-table path
+    /// never sets the column). Must be called inside a `BEGIN IMMEDIATE`
+    /// transaction so the answer is atomic with the caller's own writes.
+    async fn refuse_if_index_build_in_flight(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        table_id: &str,
+        table_name: &str,
+    ) -> Result<(), StorageError> {
+        let in_flight: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM vector_indexes WHERE table_id = ? AND backfilling IS NOT NULL LIMIT 1",
+        )
+        .bind(table_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        if in_flight.is_some() {
+            return Err(StorageError::IndexesInUse(table_name.to_owned()));
+        }
+        Ok(())
     }
 }
