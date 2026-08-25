@@ -281,6 +281,26 @@ fn validate_search_schema_attribute(
 
     let size = attribute_value_size(value);
     match element_type {
+        // An empty scalar in the HASH position rejects with the same sentence
+        // the classic secondary-index key rule uses, IndexName/IndexKey suffix
+        // included. Pinned for the empty-string case by the ground-truth runs
+        // of 2026-08-24 (us-east-1 and eu-west-2); the binary wording follows
+        // the measured classic-index message, which selects "binary" for `B`.
+        SearchSchemaElementType::Hash
+            if matches!(value, AttributeValue::S(s) if s.is_empty())
+                || matches!(value, AttributeValue::B(b) if b.is_empty()) =>
+        {
+            let kind = match value {
+                AttributeValue::B(_) => "binary",
+                _ => "string",
+            };
+            Err(invalid(format!(
+                "One or more parameter values are not valid. A value specified for a \
+                 secondary index key is not supported. The AttributeValue for a key \
+                 attribute cannot contain an empty {kind} value. \
+                 IndexName: {index_name}, IndexKey: {name}"
+            )))
+        }
         SearchSchemaElementType::Hash if size > MAX_HASH_KEY_SIZE => Err(invalid(format!(
             "One or more parameter values were invalid: Aggregate size for HASH key attributes \
              exceeds the maximum of {MAX_HASH_KEY_SIZE} bytes"

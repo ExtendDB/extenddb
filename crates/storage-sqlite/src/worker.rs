@@ -34,16 +34,44 @@ impl SqliteEngine {
         let now = format_timestamp(time::OffsetDateTime::now_utc());
         let mut transitions = Vec::new();
 
-        // CREATING → ACTIVE.
+        // CREATING → ACTIVE. The table flip and the with-table index flip below
+        // ride one transaction so no DescribeTable can observe the table ACTIVE
+        // with its own creation-time index still CREATING: measured against the
+        // service (2026-08-21, eu-west-2, three runs at 250ms), both reach
+        // ACTIVE in the same poll with no gap in either direction.
+        let mut activate_tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
         let activated: Vec<(String,)> = sqlx::query_as(
             "UPDATE tables SET table_status = 'ACTIVE', status_transition_at = NULL \
              WHERE table_status = 'CREATING' AND status_transition_at IS NOT NULL \
                AND status_transition_at <= ? RETURNING table_name",
         )
         .bind(&now)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *activate_tx)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        // Vector indexes created WITH their table (backfilling IS NULL — the
+        // UpdateTable path writes `false` from the first instant, so it is
+        // never selected here). Written as a self-healing catch-all over every
+        // ACTIVE table rather than just the rows activated above, so a crash
+        // between a past table flip and its index flip cannot strand an index
+        // in CREATING forever; re-running it is a no-op.
+        sqlx::query(
+            "UPDATE vector_indexes SET index_status = 'ACTIVE' \
+             WHERE index_status = 'CREATING' AND backfilling IS NULL \
+               AND table_id IN (SELECT table_id FROM tables WHERE table_status = 'ACTIVE')",
+        )
+        .execute(&mut *activate_tx)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        activate_tx
+            .commit()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
         for (name,) in activated {
             transitions.push((name, "CREATING → active"));
         }

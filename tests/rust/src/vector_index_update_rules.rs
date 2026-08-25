@@ -193,14 +193,19 @@ async fn switching_vector_table_to_provisioned_is_rejected() {
     delete_table(&name).await;
 }
 
-/// Deleting one index and creating another in the same request against a
-/// full table passes, in EITHER action order, because the count is evaluated
-/// on the request's net effect rather than per action. The create-first case
-/// is the discriminating one: a per-action count sees the full table before
-/// the delete has freed a slot and wrongly refuses. DynamoDB's model is a set
-/// of index changes, so list order must not decide acceptance.
+/// Deleting one index and creating another in the same request is refused,
+/// in EITHER action order: the online-index machinery accepts one action per
+/// call, so a swap must be issued as two UpdateTable calls. Measured
+/// 2026-08-24 (us-east-1): a Delete+Create pair against a live table answers
+/// `LimitExceededException` with the subscriber-limit sentence, the same
+/// refusal GSIs give. An earlier version of this test asserted the swap must
+/// PASS, reasoning from the net-effect count rule; that reasoning applied to
+/// the per-table count limit, never to the one-action rule, and was not
+/// measured. The net-effect counting in storage remains correct for the
+/// hypothetical of a request that reaches it, but no multi-action request
+/// does any more.
 #[tokio::test]
-async fn swap_on_a_full_table_is_allowed() {
+async fn swap_in_one_call_is_refused() {
     if skip_unless_supported().await {
         return;
     }
@@ -223,12 +228,15 @@ async fn swap_on_a_full_table_is_allowed() {
     }}"#
     );
     let (status, text) = call("UpdateTable", &swap).await;
-    assert_eq!(
-        status, 200,
-        "delete+create swap on a full table failed: {text}"
+    assert_error(
+        status,
+        &text,
+        "LimitExceededException",
+        "Subscriber limit exceeded: Only 1 online index can be created or deleted \
+         simultaneously per table",
     );
 
-    // Create listed BEFORE the delete: still a net swap, must still pass.
+    // Create listed BEFORE the delete: same two actions, same refusal.
     let swap_create_first = format!(
         r#"{{
         "TableName": "{name}",
@@ -245,10 +253,31 @@ async fn swap_on_a_full_table_is_allowed() {
     }}"#
     );
     let (status, text) = call("UpdateTable", &swap_create_first).await;
-    assert_eq!(
-        status, 200,
-        "create-before-delete swap on a full table failed: {text}"
+    assert_error(
+        status,
+        &text,
+        "LimitExceededException",
+        "Subscriber limit exceeded: Only 1 online index can be created or deleted \
+         simultaneously per table",
     );
+
+    // The swap expressed as two sequential calls goes through: the delete
+    // frees the slot, then the create is a single action against a table of
+    // four.
+    let drop_one = format!(
+        r#"{{
+        "TableName": "{name}",
+        "VectorIndexUpdates": [{{"Delete": {{"IndexName": "vidx0"}}}}]
+    }}"#
+    );
+    let (status, text) = call("UpdateTable", &drop_one).await;
+    assert_eq!(status, 200, "single delete failed: {text}");
+    let (status, text) = call(
+        "UpdateTable",
+        &create_update_body(&name, "vidxNew", "embNew"),
+    )
+    .await;
+    assert_eq!(status, 200, "single create after delete failed: {text}");
 
     delete_table(&name).await;
 }
