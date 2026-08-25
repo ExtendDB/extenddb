@@ -7,27 +7,40 @@
 # repository metadata: the Overview lives on the Docker Hub repository object,
 # not on any image. GHCR derives its description from the OCI labels the
 # Dockerfiles already set, so the same image reads as documented there and blank
-# on Docker Hub. That is why this exists as its own step rather than falling out
-# of a push.
+# on Docker Hub. That is why this exists as its own workflow rather than falling
+# out of a push.
 #
 # Sourced from `docker/dockerhub-overview*.md` so the published Overview is
 # reviewed like any other content and cannot drift from the repository.
 #
-# Two jobs: `validate` is credential-free and ungated, so a dead link, an
-# oversize file, or a missing Docker Hub repository is discovered on dispatch
-# without spending a reviewer approval. `publish` needs validate and carries
-# the `dockerhub` environment gate, because it uses the same credential that
-# can push images. Deliberately NOT wired into promote-image: the Overview is
+# Runs on two triggers. A push to main that changes an Overview file queues a
+# publish for exactly the image(s) whose file changed, so landing an Overview
+# edit is sufficient — nobody has to remember a follow-up dispatch (the first
+# Overview sat unpublished for two days because publishing was a separate
+# manual step). Manual dispatch remains for re-publishing without a content
+# change (e.g. after Docker Hub support intervention). Both paths still pause
+# on the `dockerhub` environment gate before anything touches the credential.
+#
+# Deliberately NOT wired into promote-image or releases: the Overview is
 # version-neutral, so a wording fix should not require a release, and a
 # release should not silently rewrite it.
 #
-# One image per dispatch rather than a matrix over both, because a Docker Hub
-# repository that does not exist yet must fail loudly for that image alone
-# instead of failing a run that also had work to do for the other.
+# validate/publish run as a fail-fast:false matrix over the planned image
+# list, so a Docker Hub repository that does not exist yet fails loudly for
+# that image alone instead of failing work the run also had to do for the
+# other. `validate` is credential-free and ungated, so a dead link, an
+# oversize file, or a missing Docker Hub repository is discovered before a
+# reviewer approval is spent. `publish` carries the `dockerhub` environment
+# gate, because it uses the same credential that can push images.
 
 name: Docker Hub description
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'docker/dockerhub-overview.md'
+      - 'docker/dockerhub-overview-dev.md'
   workflow_dispatch:
     inputs:
       image:
@@ -41,22 +54,85 @@ on:
 permissions:
   contents: read
 
+# One group for every run: publishes are quick and rare, and serializing them
+# is simpler and strictly safer than per-image groups now that one push can
+# carry both images.
 concurrency:
-  group: dockerhub-description-${{ inputs.image }}
+  group: dockerhub-description
   cancel-in-progress: false
 
 env:
   HUB_NAMESPACE: extenddb
 
 jobs:
+  # Decide which image(s) this run publishes. Dispatch: exactly the chosen
+  # image. Push: the image(s) whose Overview file changed in the push,
+  # resolved via the compare API rather than a full-history checkout. If the
+  # push range cannot be resolved (forced push, branch creation), fall back to
+  # publishing both — the PATCH is idempotent, so over-publishing is harmless
+  # and strictly better than silently skipping one.
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      images: ${{ steps.plan.outputs.images }}
+    steps:
+      - name: Resolve the image list for this run
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          INPUT_IMAGE: ${{ inputs.image }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == "workflow_dispatch" ]]; then
+            case "$INPUT_IMAGE" in
+              extenddb-postgres|extenddb-dev) ;;
+              *) echo "::error::unknown image '$INPUT_IMAGE'"; exit 1 ;;
+            esac
+            IMAGES=$(jq -cn --arg i "$INPUT_IMAGE" '[$i]')
+          else
+            CHANGED=""
+            if [[ -n "$BEFORE" && "$BEFORE" != "0000000000000000000000000000000000000000" ]]; then
+              CHANGED=$(curl -sS --fail-with-body \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${REPO}/compare/${BEFORE}...${AFTER}" \
+                | jq -r '.files[].filename' || true)
+            fi
+            IMAGES='[]'
+            if [[ -z "$CHANGED" ]]; then
+              # Unresolvable range: publish both (idempotent).
+              IMAGES='["extenddb-postgres","extenddb-dev"]'
+            else
+              grep -qx 'docker/dockerhub-overview.md' <<< "$CHANGED" \
+                && IMAGES=$(jq -c '. + ["extenddb-postgres"]' <<< "$IMAGES")
+              grep -qx 'docker/dockerhub-overview-dev.md' <<< "$CHANGED" \
+                && IMAGES=$(jq -c '. + ["extenddb-dev"]' <<< "$IMAGES")
+            fi
+            if [[ "$IMAGES" == '[]' ]]; then
+              # Paths filter should make this unreachable; fail loudly rather
+              # than publish something the push did not touch.
+              echo "::error::push matched the paths filter but no Overview file changed in ${BEFORE}...${AFTER}"
+              exit 1
+            fi
+          fi
+          echo "images=$IMAGES" >> "$GITHUB_OUTPUT"
+          echo "::notice::publishing for: $IMAGES"
+
   # Credential-free, no environment gate: everything that can be proven
   # without a secret is proven before a reviewer is asked to approve.
   validate:
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    outputs:
-      file: ${{ steps.src.outputs.file }}
-      short: ${{ steps.src.outputs.short }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.plan.outputs.images) }}
     steps:
       - name: Check out main
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -64,10 +140,13 @@ jobs:
       - name: Resolve the Overview source for this image
         id: src
         env:
-          IMAGE: ${{ inputs.image }}
+          IMAGE: ${{ matrix.image }}
         run: |
           set -euo pipefail
           # Docker Hub caps the short description at 100 characters; asserted below.
+          # This mapping is duplicated in `publish` below: matrix job outputs
+          # are last-writer-wins across the matrix, so each job derives its
+          # own rather than passing outputs between jobs.
           case "$IMAGE" in
             extenddb-postgres)
               FILE='docker/dockerhub-overview.md'
@@ -138,7 +217,7 @@ jobs:
 
       - name: The Docker Hub repository must already exist
         env:
-          IMAGE: ${{ inputs.image }}
+          IMAGE: ${{ matrix.image }}
         run: |
           set -euo pipefail
           # A 404 here means the repository has not been created yet. Say so
@@ -157,20 +236,48 @@ jobs:
   # The only job with the credential, behind the dockerhub environment gate.
   # By the time a reviewer approves, the content has already passed validation.
   publish:
-    needs: validate
+    needs: [plan, validate]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: dockerhub
-    env:
-      FILE: ${{ needs.validate.outputs.file }}
-      SHORT: ${{ needs.validate.outputs.short }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.plan.outputs.images) }}
     steps:
       - name: Check out main
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      - name: Resolve the Overview source for this image
+        id: src
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          # Same mapping as in `validate`; see the comment there for why it
+          # is duplicated rather than passed as a job output.
+          case "$IMAGE" in
+            extenddb-postgres)
+              FILE='docker/dockerhub-overview.md'
+              SHORT='DynamoDB-compatible API adapter backed by your own PostgreSQL 14+ database'
+              ;;
+            extenddb-dev)
+              FILE='docker/dockerhub-overview-dev.md'
+              SHORT='DynamoDB-compatible API over SQLite for local dev and CI. Plain HTTP, not for production.'
+              ;;
+            *)
+              echo "::error::unknown image '$IMAGE'"
+              exit 1
+              ;;
+          esac
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+
       - name: Publish the Overview
         env:
-          IMAGE: ${{ inputs.image }}
+          IMAGE: ${{ matrix.image }}
+          FILE: ${{ steps.src.outputs.file }}
+          SHORT: ${{ steps.src.outputs.short }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
@@ -200,7 +307,9 @@ jobs:
 
       - name: Verify it took effect
         env:
-          IMAGE: ${{ inputs.image }}
+          IMAGE: ${{ matrix.image }}
+          FILE: ${{ steps.src.outputs.file }}
+          SHORT: ${{ steps.src.outputs.short }}
         run: |
           set -euo pipefail
           # Read back anonymously: proves the Overview is what an unauthenticated
