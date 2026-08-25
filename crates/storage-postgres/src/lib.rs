@@ -54,6 +54,11 @@ pub use data::vector_index::apply_claimed_vector_row;
 /// deployment path calls it.
 #[doc(hidden)]
 pub use data::vector_index::build_ownership;
+/// Flip one vector index to ACTIVE the way a finished build does. Reachable so a
+/// test can drive completion against a catalog row that is already gone, and
+/// hidden for the same reason as the two entry points above.
+#[doc(hidden)]
+pub use data::vector_index::mark_vector_index_active;
 /// Rebuild vector index builds whose heartbeat has gone stale. The runtime half of
 /// the same repair, exported for the same reason and for its test.
 pub use data::vector_index::rebuild_stuck_vector_indexes;

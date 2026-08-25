@@ -1099,6 +1099,20 @@ async fn deleting_a_vector_index_is_refused_while_allocating_and_accepted_while_
     if skip_unless_supported().await {
         return;
     }
+    // Long enough to observe the refusal without making the test slow.
+    set_allocation_phase_delay(4000).await;
+    // The body runs as a task so that a panic inside it cannot skip the reset
+    // below. This lever is global and the suite is serial, so a leaked 4s
+    // allocation phase would slow every later test and make their failures point
+    // at the wrong cause.
+    let outcome = tokio::spawn(phase_dependent_delete_body()).await;
+    set_allocation_phase_delay(0).await;
+    if let Err(e) = outcome {
+        std::panic::resume_unwind(e.into_panic());
+    }
+}
+
+async fn phase_dependent_delete_body() {
     let name = table_name("pos_phase_delete");
     let body = format!(
         r#"{{
@@ -1112,8 +1126,6 @@ async fn deleting_a_vector_index_is_refused_while_allocating_and_accepted_while_
     wait_for_active(&name).await;
     put_vector(&name, "seed", None, &[1.0, 0.0]).await;
 
-    // Long enough to observe the refusal without making the test slow.
-    set_allocation_phase_delay(4000).await;
     let delete_body = format!(
         r#"{{"TableName": "{name}", "VectorIndexUpdates": [{{"Delete": {{"IndexName": "vidx"}}}}]}}"#
     );
@@ -1197,7 +1209,6 @@ async fn deleting_a_vector_index_is_refused_while_allocating_and_accepted_while_
     }
     put_vector(&name, "after", None, &[0.0, 1.0]).await;
 
-    set_allocation_phase_delay(0).await;
     let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
 }
 

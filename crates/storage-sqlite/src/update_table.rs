@@ -1906,6 +1906,21 @@ mod reconciler_tests {
             meta: None,
         };
         ops.reset_data_table().await.expect("rebuild reset");
+
+        // Positive control, and the point of it rather than a nicety. These counts
+        // compare against `sqlite_master.name`, which holds the bare name, so binding
+        // the DDL-ready name straight from `vector_table_name` can never match and
+        // every absence assertion below would pass whatever the real state was.
+        // Proving the count is 1 while the table must exist is what makes the later
+        // zeroes mean the table went away.
+        let vec_table = vector_table_lookup_name(&table_id, "vidx-1");
+        assert_eq!(
+            data_table_count(&engine.pool, &vec_table).await,
+            1,
+            "the rebuild must have recreated its data table, or the assertions below \
+             cannot tell a dropped table from a name that never matches"
+        );
+
         ops.set_backfilling().await.expect("rebuild phase flip");
 
         engine
@@ -1918,14 +1933,11 @@ mod reconciler_tests {
                 .await
                 .expect("count");
         assert_eq!(rows, 0, "the catalog row must be gone");
-        let vec_table = crate::data::vector_table_name(&table_id, "vidx-1");
-        let (tables,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?")
-                .bind(&vec_table)
-                .fetch_one(&engine.pool)
-                .await
-                .expect("count tables");
-        assert_eq!(tables, 0, "the delete must drop the index data table");
+        assert_eq!(
+            data_table_count(&engine.pool, &vec_table).await,
+            0,
+            "the delete must drop the index data table"
+        );
 
         // The rest of the rebuild now runs against a deleted index. It must fail, and
         // it must leave neither a catalog row nor a data table behind.
@@ -1935,14 +1947,9 @@ mod reconciler_tests {
         )
         .await
         .expect_err("a rebuild of a deleted index must fail rather than recreate it");
-        let (tables_after,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?")
-                .bind(&vec_table)
-                .fetch_one(&engine.pool)
-                .await
-                .expect("count tables again");
         assert_eq!(
-            tables_after, 0,
+            data_table_count(&engine.pool, &vec_table).await,
+            0,
             "an interrupted rebuild must not leave an orphan data table"
         );
         assert_eq!(
@@ -1953,6 +1960,130 @@ mod reconciler_tests {
             0,
             "nothing is left for recovery to rebuild"
         );
+    }
+
+    /// Completing a build whose index was deleted must not leave its data table.
+    ///
+    /// The sibling of the rebuild test above, at the other end of the same race. That
+    /// one has the delete arrive after `reset_data_table`, so the rebuild fails before
+    /// it can finish. This one has the build reach its completion step: the data table
+    /// it recreated exists, the catalog row is already gone, and the status flip
+    /// therefore matches no row. Without the cleanup the recreated table survives with
+    /// nothing referencing it.
+    ///
+    /// Driven by calling the completion step directly, because the alternative is
+    /// timing the window between the definition reload and the CREATE TABLE.
+    #[tokio::test]
+    async fn completing_a_build_whose_index_was_deleted_drops_the_rebuilt_table() {
+        use extenddb_storage::vector_lifecycle::VectorIndexBuild;
+
+        let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::schema::apply(&engine.pool).await.expect("schema");
+        let account = "000000000000";
+        sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
+            .bind(account)
+            .execute(&engine.pool)
+            .await
+            .expect("account");
+        let input: extenddb_core::types::CreateTableInput = serde_json::from_value(json!({
+            "TableName": "t",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .expect("input");
+        engine
+            .create_table_impl(account, input)
+            .await
+            .expect("create table");
+        let (table_id,): (String,) =
+            sqlx::query_as("SELECT table_id FROM tables WHERE table_name = 't'")
+                .fetch_one(&engine.pool)
+                .await
+                .expect("table_id");
+
+        sqlx::query(
+            "INSERT INTO vector_indexes \
+             (table_id, index_id, index_name, dimensions, distance_function, vector_attribute, \
+              projection, index_status, backfilling) \
+             VALUES (?, 'vidx-1', 'vidx', 2, 'COSINE', ?, ?, 'CREATING', 1)",
+        )
+        .bind(&table_id)
+        .bind(json!({"AttributeName": "emb"}).to_string())
+        .bind(json!({"ProjectionType": "ALL"}).to_string())
+        .execute(&engine.pool)
+        .await
+        .expect("insert a build in progress");
+
+        let mut ops = crate::data::vector_index::SqliteVectorBuild {
+            pool: engine.pool.clone(),
+            write_lock: std::sync::Arc::clone(&engine.write_lock),
+            gsi_notify: engine.gsi_notify(),
+            table_id: table_id.clone(),
+            index_id: "vidx-1".to_owned(),
+            base_key_schema: vec![extenddb_core::types::KeySchemaElement {
+                attribute_name: "pk".to_owned(),
+                key_type: extenddb_core::types::KeyType::Hash,
+            }],
+            attribute_definitions: vec![extenddb_core::types::AttributeDefinition {
+                attribute_name: "pk".to_owned(),
+                attribute_type: extenddb_core::types::ScalarAttributeType::S,
+            }],
+            meta: None,
+        };
+
+        // The build recreates its data table, exactly as a rebuild does.
+        ops.reset_data_table().await.expect("rebuild reset");
+        let vec_table = vector_table_lookup_name(&table_id, "vidx-1");
+        assert_eq!(
+            data_table_count(&engine.pool, &vec_table).await,
+            1,
+            "the build must have recreated its data table"
+        );
+
+        // The delete lands: catalog row gone, recreated data table still there.
+        sqlx::query("DELETE FROM vector_indexes WHERE table_id = ? AND index_id = 'vidx-1'")
+            .bind(&table_id)
+            .execute(&engine.pool)
+            .await
+            .expect("delete the catalog row");
+
+        ops.mark_active(0)
+            .await
+            .expect("completing a build for a deleted index must not fail");
+
+        assert_eq!(
+            data_table_count(&engine.pool, &vec_table).await,
+            0,
+            "the rebuilt data table must be dropped once the index is known to be gone"
+        );
+    }
+
+    /// The bare data-table name for a vector index, for comparing against
+    /// `sqlite_master.name`.
+    ///
+    /// `vector_table_name` returns the name already quoted, which is what its callers
+    /// interpolating into DDL and DML need. `sqlite_master.name` holds the bare name,
+    /// so a bound comparison against the quoted form matches nothing, and an absence
+    /// assertion written that way passes whatever the real state is. Written once here
+    /// so no test has to remember the difference.
+    fn vector_table_lookup_name(table_id: &str, index_id: &str) -> String {
+        crate::data::vector_table_name(table_id, index_id)
+            .trim_matches('"')
+            .to_owned()
+    }
+
+    /// How many tables carry this bare name. Zero or one.
+    async fn data_table_count(pool: &sqlx::SqlitePool, bare_name: &str) -> i64 {
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?")
+                .bind(bare_name)
+                .fetch_one(pool)
+                .await
+                .expect("count the data tables carrying this name");
+        count
     }
 
     /// One `UpdateTable` request deleting the vector index named `vidx`.

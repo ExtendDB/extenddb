@@ -479,6 +479,36 @@ pub(crate) struct PostgresVectorBuild {
     pub(crate) meta: Option<VectorIndexMeta>,
 }
 
+/// Flip one vector index to ACTIVE the way a finished build does.
+///
+/// Reachable so an integration test can drive the completion step against a
+/// catalog whose row for this index is already gone, which is the state a delete
+/// racing a rebuild leaves and the only way to reach the branch that cleans up
+/// after it. The alternative is timing the race, which does not belong in a suite.
+/// Hidden for the same reason as the other two build entry points: no deployment
+/// path calls it.
+pub async fn mark_vector_index_active(
+    catalog: &sqlx::PgPool,
+    data: &sqlx::PgPool,
+    table_id: &str,
+    index_id: &str,
+) -> Result<(), StorageError> {
+    // The fields the completion step does not read are left empty rather than
+    // invented: it works from the two ids and the two pools.
+    let mut ops = PostgresVectorBuild {
+        catalog: catalog.clone(),
+        data: data.clone(),
+        queue_notify: None,
+        table_id: table_id.to_owned(),
+        index_id: index_id.to_owned(),
+        base_key_schema: Vec::new(),
+        attribute_definitions: Vec::new(),
+        dimensions: 0,
+        meta: None,
+    };
+    extenddb_storage::vector_lifecycle::VectorIndexBuild::mark_active(&mut ops, 0).await
+}
+
 /// The backfill's position in the base table: the whole primary key.
 ///
 /// A keyset cursor rather than an offset, and the FULL key rather than the

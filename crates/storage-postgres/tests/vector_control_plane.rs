@@ -24,11 +24,12 @@ use std::collections::{BTreeMap, HashMap};
 use extenddb_core::expression::{self, ExpressionMaps};
 use extenddb_core::types::TableKeyInfo;
 use extenddb_core::types::{
-    AttributeDefinition, AttributeValue, BillingMode, CreateTableInput, DeleteTableInput,
-    DeleteVectorIndexAction, DescribeTableInput, DistanceFunction, IndexStatus, Item,
-    KeySchemaElement, KeyType, Projection, ProjectionType, ProvisionedThroughput,
-    ScalarAttributeType, SearchSchemaElement, SearchSchemaElementType, UpdateTableInput,
-    VectorAttribute, VectorIndexSpecification, VectorIndexUpdate,
+    AttributeDefinition, AttributeValue, BillingMode, CreateGsiAction, CreateTableInput,
+    DeleteTableInput, DeleteVectorIndexAction, DescribeTableInput, DistanceFunction,
+    GlobalSecondaryIndexUpdate, GsiInput, IndexStatus, Item, KeySchemaElement, KeyType, Projection,
+    ProjectionType, ProvisionedThroughput, ScalarAttributeType, SearchSchemaElement,
+    SearchSchemaElementType, UpdateTableInput, VectorAttribute, VectorIndexSpecification,
+    VectorIndexUpdate,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{BackupEngine, DataEngine, TableEngine};
@@ -2776,5 +2777,458 @@ async fn build_ownership_uses_its_own_session_and_releases_on_drop() {
     );
 
     peer.close().await;
+    s.cleanup().await;
+}
+
+/// A vector index create must not reuse a name a secondary index already holds.
+///
+/// CreateTable rejects the collision across families in one place. UpdateTable
+/// builds each family's create path separately, and the vector path used to
+/// consult only `vector_indexes`, so this pair of requests produced a table whose
+/// GSI and vector index shared one name, and with it one index ARN.
+#[tokio::test]
+async fn update_table_refuses_a_vector_index_named_like_an_existing_gsi() {
+    let test = "update_table_refuses_a_vector_index_named_like_an_existing_gsi";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
+
+    let mut input = create_input("t_name_gsi_first", vec![]);
+    input.attribute_definitions = vec![
+        AttributeDefinition {
+            attribute_name: "pk".to_owned(),
+            attribute_type: ScalarAttributeType::S,
+        },
+        AttributeDefinition {
+            attribute_name: "gsipk".to_owned(),
+            attribute_type: ScalarAttributeType::S,
+        },
+    ];
+    input.global_secondary_indexes = Some(vec![GsiInput {
+        index_name: "shared".to_owned(),
+        key_schema: hash_key("gsipk"),
+        projection: projection(ProjectionType::All),
+        provisioned_throughput: None,
+    }]);
+    s.engine
+        .create_table(ACCOUNT, input)
+        .await
+        .expect("create a table carrying a GSI named 'shared'");
+
+    let err = s
+        .engine
+        .update_table(
+            ACCOUNT,
+            UpdateTableInput {
+                vector_index_updates: Some(vec![VectorIndexUpdate {
+                    create: Some(vector_spec("shared", 2, Some("pk"))),
+                    delete: None,
+                }]),
+                ..update_input("t_name_gsi_first")
+            },
+        )
+        .await
+        .expect_err("a vector index may not take a name a GSI already holds");
+
+    match err {
+        StorageError::IndexAlreadyExists(name) => assert_eq!(name, "shared"),
+        other => panic!("expected IndexAlreadyExists, got {other:?}"),
+    }
+
+    // The refusal must not have written a half-made index on the way out.
+    let id = table_id(&s.catalog, "t_name_gsi_first").await;
+    assert_eq!(vector_row_count(&s.catalog, &id).await, 0);
+
+    s.cleanup().await;
+}
+
+/// And the mirror image: a GSI create must not reuse a vector index's name.
+#[tokio::test]
+async fn update_table_refuses_a_gsi_named_like_an_existing_vector_index() {
+    let test = "update_table_refuses_a_gsi_named_like_an_existing_vector_index";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
+
+    s.engine
+        .create_table(
+            ACCOUNT,
+            create_input(
+                "t_name_vec_first",
+                vec![vector_spec("shared", 2, Some("pk"))],
+            ),
+        )
+        .await
+        .expect("create a table carrying a vector index named 'shared'");
+
+    let err = s
+        .engine
+        .update_table(
+            ACCOUNT,
+            UpdateTableInput {
+                global_secondary_index_updates: Some(vec![GlobalSecondaryIndexUpdate {
+                    create: Some(CreateGsiAction {
+                        index_name: "shared".to_owned(),
+                        key_schema: hash_key("pk"),
+                        projection: projection(ProjectionType::All),
+                        provisioned_throughput: None,
+                    }),
+                    update: None,
+                    delete: None,
+                }]),
+                ..update_input("t_name_vec_first")
+            },
+        )
+        .await
+        .expect_err("a GSI may not take a name a vector index already holds");
+
+    match err {
+        StorageError::IndexAlreadyExists(name) => assert_eq!(name, "shared"),
+        other => panic!("expected IndexAlreadyExists, got {other:?}"),
+    }
+
+    s.cleanup().await;
+}
+
+/// An inline write whose index data table has gone must still succeed.
+///
+/// The window is a delete committing between a write's catalog read, which still
+/// lists the index, and its inline apply, by which time the data table is gone.
+/// Dropping the table directly is the same end state and is deterministic where
+/// the race is not. Before the savepoint the failed statement aborted the write's
+/// transaction, so the caller saw InternalServerError on a request the service
+/// answers normally. The propagation worker already tolerated this shape.
+#[tokio::test]
+async fn an_inline_write_survives_the_index_data_table_disappearing() {
+    let test = "an_inline_write_survives_the_index_data_table_disappearing";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
+
+    s.engine
+        .create_table(
+            ACCOUNT,
+            create_input("t_table_gone", vec![vector_spec("vidx", 2, Some("pk"))]),
+        )
+        .await
+        .expect("create a table with a vector index");
+    let key_info = s
+        .engine
+        .table_key_info(ACCOUNT, "t_table_gone")
+        .await
+        .expect("key info");
+    let table = only_index_table(&s.catalog).await;
+
+    sqlx::query(&format!("DROP TABLE \"{table}\""))
+        .execute(&s.catalog)
+        .await
+        .expect("drop the vector data table out from under the write path");
+
+    let maps = ExpressionMaps::new(HashMap::new(), HashMap::new());
+    s.engine
+        .put_item(
+            &key_info,
+            vector_item("a", None, &["1", "0"]),
+            false,
+            None,
+            &maps,
+            None,
+        )
+        .await
+        .expect("a write racing an index delete must succeed, not fail internally");
+
+    s.cleanup().await;
+}
+
+/// An item with a generation marker, so old and new images are distinguishable in
+/// the index payload. The vector attribute is stripped on the way in, so the
+/// embedding cannot serve as the marker.
+fn marked_item(pk: &str, generation: &str, values: &[&str]) -> Item {
+    let mut item = vector_item(pk, None, values);
+    item.insert("gen".to_owned(), AttributeValue::S(generation.to_owned()));
+    item
+}
+
+/// Drain every queued row for a table, oldest first, the way the worker would.
+///
+/// The engine under test runs no workers, so the rows are applied through the same
+/// entry point the worker uses, in the id order the worker claims them in.
+async fn drain_queue(engine: &PostgresEngine, catalog: &PgPool, table_id: &str) -> usize {
+    let rows: Vec<(
+        i64,
+        Option<serde_json::Value>,
+        Option<serde_json::Value>,
+        serde_json::Value,
+    )> = sqlx::query_as(
+        "SELECT id, old_item, new_item, index_context FROM gsi_pending \
+             WHERE table_id = $1 ORDER BY id",
+    )
+    .bind(table_id)
+    .fetch_all(catalog)
+    .await
+    .expect("read the queued rows");
+
+    let drained = rows.len();
+    for (id, old_json, new_json, context) in rows {
+        let vector_context: extenddb_storage::vector_lifecycle::VectorApplyContext =
+            serde_json::from_value(context).expect("a vector context");
+        let old_item: Option<Item> = old_json.map(|v| serde_json::from_value(v).expect("old item"));
+        let new_item: Option<Item> = new_json.map(|v| serde_json::from_value(v).expect("new item"));
+        let mut tx = engine.data_pool().begin().await.expect("begin");
+        extenddb_storage_postgres::apply_claimed_vector_row(
+            &mut tx,
+            &vector_context,
+            old_item.as_ref(),
+            new_item.as_ref(),
+        )
+        .await
+        .expect("apply a queued row");
+        tx.commit().await.expect("commit the applied row");
+        sqlx::query("DELETE FROM gsi_pending WHERE id = $1")
+            .bind(id)
+            .execute(catalog)
+            .await
+            .expect("consume the row");
+    }
+    drained
+}
+
+async fn queue_depth(catalog: &PgPool, table_id: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM gsi_pending WHERE table_id = $1")
+        .bind(table_id)
+        .fetch_one(catalog)
+        .await
+        .expect("count the queued rows")
+}
+
+async fn set_propagation_delay(catalog: &PgPool, ms: u64) {
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('index_propagation_delay_ms', $1) \
+         ON CONFLICT (key) DO UPDATE SET value = $1",
+    )
+    .bind(ms.to_string())
+    .execute(catalog)
+    .await
+    .expect("set the propagation delay");
+}
+
+/// A write must not apply inline while the table still has queued rows, or it
+/// overwrites its own newer image with an older queued one.
+///
+/// The window is the moment after an index flips ACTIVE and gives up its hold:
+/// rows queued while it was CREATING drain at the same time as new writes take the
+/// inline path. Queue order only ever ordered queued rows against each other. So
+/// an inline write could land the new image and the worker could then apply an
+/// older queued row for the same item, leaving the index permanently disagreeing
+/// with the base table until that item was written again.
+///
+/// The pre-flip row is produced by writing under a delay rather than by hand, so
+/// the queued context and images are the ones the write path really produces.
+#[tokio::test]
+async fn a_write_queues_behind_pending_rows_instead_of_overtaking_them() {
+    let test = "a_write_queues_behind_pending_rows_instead_of_overtaking_them";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
+
+    // A delay first, so this write queues: it stands in for a write that arrived
+    // while the index was still CREATING and was parked by the build's hold.
+    set_propagation_delay(&s.catalog, 50).await;
+    s.engine
+        .create_table(
+            ACCOUNT,
+            create_input("t_overtake", vec![vector_spec("vidx", 2, Some("pk"))]),
+        )
+        .await
+        .expect("create a table with a vector index");
+    let id = table_id(&s.catalog, "t_overtake").await;
+    let key_info = s
+        .engine
+        .table_key_info(ACCOUNT, "t_overtake")
+        .await
+        .expect("key info");
+    let table = only_index_table(&s.catalog).await;
+
+    put(&s.engine, &key_info, marked_item("x", "old", &["1", "0"])).await;
+    assert_eq!(
+        queue_depth(&s.catalog, &id).await,
+        1,
+        "the first write must be queued at a non-zero delay"
+    );
+    assert!(
+        index_rows(&s.catalog, &table).await.is_empty(),
+        "a queued write must not have reached the index yet"
+    );
+
+    // The index is ACTIVE and the delay is now zero, which is the state the inline
+    // path runs in. The queued row above is still pending.
+    set_propagation_delay(&s.catalog, 0).await;
+
+    put(&s.engine, &key_info, marked_item("x", "new", &["0", "1"])).await;
+
+    // The second write must have queued behind the first rather than applying
+    // inline ahead of it.
+    assert_eq!(
+        queue_depth(&s.catalog, &id).await,
+        2,
+        "a write must queue while the table has pending rows, not apply inline"
+    );
+    assert!(
+        index_rows(&s.catalog, &table).await.is_empty(),
+        "the second write must not have applied inline"
+    );
+
+    // Draining in order leaves the newest image, which is the property the whole
+    // gate exists to preserve. Without the gate the inline apply happened first and
+    // the older queued row overwrote it, leaving "old" here forever.
+    assert_eq!(drain_queue(&s.engine, &s.catalog, &id).await, 2);
+    let rows = index_rows(&s.catalog, &table).await;
+    assert_eq!(rows.len(), 1, "one item, one index row: {rows:?}");
+    assert_eq!(
+        rows[0].1.get("gen").and_then(|v| v.get("S")),
+        Some(&serde_json::Value::String("new".to_owned())),
+        "the index must hold the newest image after the queue drains: {:?}",
+        rows[0].1
+    );
+
+    s.cleanup().await;
+}
+
+/// The other half of the same gate: with nothing pending, a write still applies
+/// inline. Without this the fix could pass by queueing everything forever.
+#[tokio::test]
+async fn a_write_applies_inline_when_the_queue_is_empty() {
+    let test = "a_write_applies_inline_when_the_queue_is_empty";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
+
+    s.engine
+        .create_table(
+            ACCOUNT,
+            create_input("t_inline", vec![vector_spec("vidx", 2, Some("pk"))]),
+        )
+        .await
+        .expect("create a table with a vector index");
+    let id = table_id(&s.catalog, "t_inline").await;
+    let key_info = s
+        .engine
+        .table_key_info(ACCOUNT, "t_inline")
+        .await
+        .expect("key info");
+    let table = only_index_table(&s.catalog).await;
+
+    put(&s.engine, &key_info, marked_item("x", "only", &["1", "0"])).await;
+
+    assert_eq!(
+        queue_depth(&s.catalog, &id).await,
+        0,
+        "an empty queue must leave the write on the inline path"
+    );
+    let rows = index_rows(&s.catalog, &table).await;
+    assert_eq!(rows.len(), 1, "the inline write must reach the index");
+    assert_eq!(
+        rows[0].1.get("gen").and_then(|v| v.get("S")),
+        Some(&serde_json::Value::String("only".to_owned())),
+        "{:?}",
+        rows[0].1
+    );
+
+    s.cleanup().await;
+}
+
+/// Completing a build whose index was deleted must not leave its data table behind.
+///
+/// A rebuild recreates the data table after reloading the definition, so a delete
+/// committing in between drops the table it could see and the rebuild then creates
+/// one nothing references. Driven by deleting the catalog row and completing the
+/// build directly, because the alternative is timing the race.
+#[tokio::test]
+async fn completing_a_build_whose_index_was_deleted_drops_the_rebuilt_table() {
+    let test = "completing_a_build_whose_index_was_deleted_drops_the_rebuilt_table";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let Some(s) = vector_scratch(test).await else {
+        return;
+    };
+
+    s.engine
+        .create_table(
+            ACCOUNT,
+            create_input("t_orphan_table", vec![vector_spec("vidx", 2, Some("pk"))]),
+        )
+        .await
+        .expect("create a table with a vector index");
+    let id = table_id(&s.catalog, "t_orphan_table").await;
+    let table = only_index_table(&s.catalog).await;
+    let index_id = table.trim_start_matches("_ddb_vec_").to_owned();
+
+    // A hold, so the release half is observable too. This is what a real build
+    // takes for the duration of its backfill.
+    sqlx::query(
+        "INSERT INTO vector_index_holds (table_id, index_id) VALUES ($1, $2) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(&id)
+    .bind(&index_id)
+    .execute(s.engine.data_pool())
+    .await
+    .expect("take a build hold");
+
+    // The delete lands: the catalog row goes, the data table this build recreated
+    // stays, which is exactly the interleaving the fix is for.
+    sqlx::query("DELETE FROM vector_indexes WHERE table_id = $1 AND index_id = $2")
+        .bind(&id)
+        .bind(&index_id)
+        .execute(&s.catalog)
+        .await
+        .expect("delete the catalog row");
+    assert!(
+        vector_data_tables(&s.catalog).await.contains(&table),
+        "the data table must still exist before completion"
+    );
+
+    extenddb_storage_postgres::mark_vector_index_active(
+        s.engine.data_pool(),
+        s.engine.data_pool(),
+        &id,
+        &index_id,
+    )
+    .await
+    .expect("completing a build for a deleted index must not fail");
+
+    assert!(
+        !vector_data_tables(&s.catalog).await.contains(&table),
+        "the rebuilt data table must be dropped once the index is known to be gone"
+    );
+    let holds: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM vector_index_holds WHERE table_id = $1 AND index_id = $2",
+    )
+    .bind(&id)
+    .bind(&index_id)
+    .fetch_one(s.engine.data_pool())
+    .await
+    .expect("count the holds");
+    assert_eq!(
+        holds, 0,
+        "the hold must be released, or the table's propagation stays paused"
+    );
+
     s.cleanup().await;
 }
