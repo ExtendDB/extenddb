@@ -13,6 +13,18 @@ transactions on replica sets).
 
 **Minimum MongoDB version:** 7.0 (multi-document transactions, snapshot reads).
 
+**Transaction read concern:** `storage.mongodb.transaction_read_concern`
+(default `"snapshot"`) controls the read concern applied to every
+multi-document transaction this backend opens (conditional writes,
+`TransactWriteItems`, `TransactGetItems`, idempotency-token checks). Real
+MongoDB 7.0+ supports `"snapshot"` and it is the strongest isolation level,
+so it remains the default. Some MongoDB-wire-compatible servers (e.g.
+DocumentDB) do not implement `readConcern: snapshot` and reject transactions
+that request it with `CommandNotSupported` (error code 115); set this to
+`"majority"` or `"local"` to run against such targets. Doing so weakens
+isolation between concurrent transactions relative to `"snapshot"` — see
+§5.1 for what that trades away.
+
 **Read preference:** `primary` only. `MongoEngine::new` rejects connection strings
 that request `secondary`, `secondaryPreferred`, `primaryPreferred`, or `nearest` —
 DynamoDB's `ConsistentRead=true` contract requires linearizable reads, which only
@@ -427,7 +439,8 @@ drops the collection.
 `PutItem`, `DeleteItem`, and `UpdateItem` — when they carry a
 `ConditionExpression`, a `StreamCapture`, or write to a table with GSIs —
 run inside a MongoDB client session bound to a multi-document transaction
-with snapshot read concern and majority write concern. Within the session:
+with the configured `transaction_read_concern` (default `"snapshot"`) and
+majority write concern. Within the session:
 
 1. `find_one` the current document.
 2. Evaluate the DynamoDB condition in Rust
@@ -1101,6 +1114,7 @@ insert per write, inside the base write's session.
 `(pk, sk_?, base_pk, base_sk_?)` for index queries. `GetRecords`
 uses the compound `(shard_id, sequence_number)` index.
 
-**TransactWriteItems.** Multi-collection ACID transaction with
-snapshot read concern and majority write concern; up to 100 operations
+**TransactWriteItems.** Multi-collection ACID transaction with the
+configured `transaction_read_concern` (default `"snapshot"`) and
+majority write concern; up to 100 operations
 per the DDB spec. Retried on transient conflicts with jittered backoff.
