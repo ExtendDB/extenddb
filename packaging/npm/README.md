@@ -1,7 +1,7 @@
 # @extenddb/dev
 
 A DynamoDB-compatible server for local development and CI, installed from npm.
-One function call starts a real server on localhost: no Docker daemon, no JVM,
+One function call starts it on localhost: no Docker daemon, no JVM,
 no AWS account, no configuration. Any AWS SDK, CLI, or tool that talks to
 DynamoDB works against it unchanged.
 
