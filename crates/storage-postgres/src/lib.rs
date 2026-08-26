@@ -480,7 +480,7 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
 
 /// Build server components for the Postgres backend (registered in [`register`]).
 fn server_components_factory(
-    config: &dyn extenddb_storage::config::StorageConfig,
+    config: &(dyn extenddb_storage::config::StorageConfig + 'static),
     region: &str,
     // PostgreSQL bootstrap needs operator input (databases, roles, admin
     // credentials), so `bootstrap_if_uninitialized` is not honored here:

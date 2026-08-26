@@ -99,9 +99,17 @@ pub struct ServerComponentsOptions {
 ///
 /// Takes a `StorageConfig` trait object, region string, and options; returns
 /// a Future that resolves to `ServerComponents` or `BackendError`.
+///
+/// The trait object is bound `+ 'static` (rather than the reference's own
+/// elided lifetime) so factories can use [`StorageConfig::as_any`] to
+/// downcast to a concrete backend config and read backend-specific settings
+/// (e.g. the mongo backend's `transaction_read_concern`) — `Any::downcast_ref`
+/// requires the pointee to be provably `'static`, which an unannotated `&dyn
+/// StorageConfig` does not guarantee even though every real implementor owns
+/// its data.
 pub type ServerComponentsFactory =
     fn(
-        &dyn StorageConfig,
+        &(dyn StorageConfig + 'static),
         &str,
         ServerComponentsOptions,
     ) -> Pin<Box<dyn Future<Output = Result<ServerComponents, BackendError>> + Send>>;
@@ -112,7 +120,7 @@ pub type ServerComponentsFactory =
 /// [`set_backend`](crate::set_backend). Returns `BackendNotInstalled` if no
 /// backend has been installed.
 pub async fn create_server_components(
-    config: &dyn StorageConfig,
+    config: &(dyn StorageConfig + 'static),
     region: &str,
     options: ServerComponentsOptions,
 ) -> Result<ServerComponents, BackendError> {

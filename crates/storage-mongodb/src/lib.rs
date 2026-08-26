@@ -79,7 +79,7 @@ impl ServerRuntimeHooks for MongoRuntimeHooks {
 
 /// Build the assembled server components for the mongo backend (`serve`).
 fn server_components_factory(
-    config: &dyn extenddb_storage::config::StorageConfig,
+    config: &(dyn extenddb_storage::config::StorageConfig + 'static),
     region: &str,
     // MongoDB bootstrap needs operator input (databases, admin credentials), so
     // `bootstrap_if_uninitialized` is not honored here: an uninitialized catalog
@@ -91,14 +91,33 @@ fn server_components_factory(
     let connection_string = config.connection_config().to_string();
     let max_connections = config.max_connections();
     let region = region.to_string();
+    // Backend-specific settings (transaction_read_concern) aren't exposed on
+    // the generic StorageConfig trait, so downcast to the concrete mongo
+    // config. This factory is only ever invoked with a MongoStorageConfig
+    // (registered together in `register()` below), so the downcast cannot
+    // fail in practice; fall back to the field's own default rather than
+    // panicking if it ever did.
+    let raw_read_concern = config
+        .as_any()
+        .downcast_ref::<config::MongoStorageConfig>()
+        .map(|c| c.transaction_read_concern.clone())
+        .unwrap_or_else(|| "snapshot".to_string());
     Box::pin(async move {
+        let tx_read_concern = config::parse_transaction_read_concern(&raw_read_concern)
+            .map_err(BackendError::InitializationFailed)?;
+
         // Create MongoEngine
-        let engine = MongoEngine::new(&connection_string, &region, max_connections)
-            .await
-            .map_err(|e| BackendError::ConnectionFailed {
-                backend: "mongodb".to_string(),
-                details: e.to_string(),
-            })?;
+        let engine = MongoEngine::new(
+            &connection_string,
+            &region,
+            max_connections,
+            tx_read_concern,
+        )
+        .await
+        .map_err(|e| BackendError::ConnectionFailed {
+            backend: "mongodb".to_string(),
+            details: e.to_string(),
+        })?;
 
         let engine = Arc::new(engine);
 
@@ -230,6 +249,11 @@ pub struct MongoEngine {
     /// so GSI additions/removals on other ExtendDB instances converge within
     /// the TTL window.
     gsi_cache: dashmap::DashMap<String, (bool, std::time::Instant)>,
+    /// Read concern applied to every multi-document transaction this engine
+    /// opens. Defaults to `snapshot` (real MongoDB); configurable via
+    /// [`crate::config::MongoStorageConfig::transaction_read_concern`] for
+    /// MongoDB-wire-compatible backends that don't support snapshot reads.
+    tx_read_concern: mongodb::options::ReadConcern,
 }
 
 /// Build a MongoDB client from a connection string, applying the shared
@@ -290,6 +314,7 @@ impl MongoEngine {
         connection_string: &str,
         region: &str,
         max_connections: u32,
+        tx_read_concern: mongodb::options::ReadConcern,
     ) -> Result<Self, StorageError> {
         let client = connect_guarded(connection_string, Some(max_connections), true).await?;
 
@@ -302,7 +327,15 @@ impl MongoEngine {
             data_db,
             region: region.to_owned(),
             gsi_cache: dashmap::DashMap::new(),
+            tx_read_concern,
         })
+    }
+
+    /// Read concern to use for a newly-opened multi-document transaction.
+    /// See [`MongoEngine::tx_read_concern`] / `transaction_read_concern`
+    /// config for why this isn't always `snapshot`.
+    pub(crate) fn transaction_read_concern(&self) -> mongodb::options::ReadConcern {
+        self.tx_read_concern.clone()
     }
 
     /// Look up a fresh GSI-cache entry for `table_id`.

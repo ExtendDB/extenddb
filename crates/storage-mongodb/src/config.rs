@@ -21,6 +21,22 @@ pub struct MongoStorageConfig {
     /// Maximum concurrent connections for catalog/management operations
     #[serde(default = "default_max_catalog_connections")]
     pub max_catalog_connections: u32,
+    /// Read concern used for the multi-document transactions that back
+    /// conditional writes, `TransactWriteItems`, `TransactGetItems`, and the
+    /// idempotency-token path (RFC-0003). Defaults to `"snapshot"`, matching
+    /// real MongoDB's strongest isolation level.
+    ///
+    /// Some MongoDB-wire-compatible backends (e.g. DocumentDB) do not
+    /// implement `readConcern: snapshot` and reject transactions that
+    /// request it with `CommandNotSupported` (error code 115). Setting this
+    /// to `"majority"` or `"local"` lets the backend run against such
+    /// targets, at the cost of the stronger isolation snapshot reads
+    /// provide: concurrent transactions may observe a slightly different
+    /// view of the data than they would under snapshot isolation. Only
+    /// change this if the target deployment's MongoDB-compatible server
+    /// does not support snapshot reads.
+    #[serde(default = "default_transaction_read_concern")]
+    pub transaction_read_concern: String,
 }
 
 fn default_max_connections() -> u32 {
@@ -29,6 +45,34 @@ fn default_max_connections() -> u32 {
 
 fn default_max_catalog_connections() -> u32 {
     20
+}
+
+fn default_transaction_read_concern() -> String {
+    "snapshot".to_owned()
+}
+
+/// Parse [`MongoStorageConfig::transaction_read_concern`] into a driver
+/// [`mongodb::options::ReadConcern`].
+///
+/// Accepts the standard MongoDB read concern levels usable inside a
+/// transaction (`snapshot`, `majority`, `local`, `linearizable`,
+/// `available`), case-insensitively. Any other value is rejected at startup
+/// rather than silently passed through to the driver, so a typo surfaces as
+/// a clear configuration error instead of an opaque runtime failure.
+pub fn parse_transaction_read_concern(
+    value: &str,
+) -> Result<mongodb::options::ReadConcern, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "snapshot" => Ok(mongodb::options::ReadConcern::snapshot()),
+        "majority" => Ok(mongodb::options::ReadConcern::majority()),
+        "local" => Ok(mongodb::options::ReadConcern::local()),
+        "linearizable" => Ok(mongodb::options::ReadConcern::linearizable()),
+        "available" => Ok(mongodb::options::ReadConcern::available()),
+        other => Err(format!(
+            "invalid storage.mongodb.transaction_read_concern {other:?}: expected one of \
+             \"snapshot\", \"majority\", \"local\", \"linearizable\", \"available\""
+        )),
+    }
 }
 
 impl extenddb_storage::config::StorageConfig for MongoStorageConfig {

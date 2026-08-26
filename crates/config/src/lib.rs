@@ -147,7 +147,7 @@ impl StorageConfig {
     }
 
     /// Get a reference to the underlying trait object for factory calls.
-    pub fn as_trait(&self) -> &dyn extenddb_storage::config::StorageConfig {
+    pub fn as_trait(&self) -> &(dyn extenddb_storage::config::StorageConfig + 'static) {
         &*self.config
     }
 }

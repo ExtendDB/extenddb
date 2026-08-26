@@ -296,7 +296,7 @@ impl MongoEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let tx_options = mongodb::options::TransactionOptions::builder()
-            .read_concern(mongodb::options::ReadConcern::snapshot())
+            .read_concern(self.transaction_read_concern())
             .write_concern(
                 mongodb::options::WriteConcern::builder()
                     .w(mongodb::options::Acknowledgment::Majority)
@@ -508,7 +508,7 @@ impl MongoEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let tx_options = mongodb::options::TransactionOptions::builder()
-            .read_concern(mongodb::options::ReadConcern::snapshot())
+            .read_concern(self.transaction_read_concern())
             .write_concern(
                 mongodb::options::WriteConcern::builder()
                     .w(mongodb::options::Acknowledgment::Majority)
@@ -737,7 +737,7 @@ impl MongoEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let tx_options = mongodb::options::TransactionOptions::builder()
-            .read_concern(mongodb::options::ReadConcern::snapshot())
+            .read_concern(self.transaction_read_concern())
             .write_concern(
                 mongodb::options::WriteConcern::builder()
                     .w(mongodb::options::Acknowledgment::Majority)
@@ -1993,7 +1993,7 @@ impl MongoEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let tx_options = mongodb::options::TransactionOptions::builder()
-            .read_concern(mongodb::options::ReadConcern::snapshot())
+            .read_concern(self.transaction_read_concern())
             .build();
 
         session
@@ -2039,7 +2039,7 @@ impl MongoEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let tx_options = mongodb::options::TransactionOptions::builder()
-            .read_concern(mongodb::options::ReadConcern::snapshot())
+            .read_concern(self.transaction_read_concern())
             .write_concern(
                 mongodb::options::WriteConcern::builder()
                     .w(mongodb::options::Acknowledgment::Majority)
