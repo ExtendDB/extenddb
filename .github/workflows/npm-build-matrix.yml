@@ -32,12 +32,18 @@ jobs:
       fail-fast: ${{ inputs.fail-fast }}
       matrix:
         include:
+          # Linux is musl-static on purpose: a glibc-linked binary inherits
+          # the build runner's glibc floor (ubuntu-latest today means
+          # GLIBC_2.38+, which excludes Amazon Linux 2023, Ubuntu 22.04 and
+          # Debian 12 - the exact CI hosts this launcher exists for). Static
+          # musl has no floor, and the container gate below proves it by
+          # executing the binary on the oldest-libc image we care about.
           - pkg: linux-x64
             runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
           - pkg: linux-arm64
             runner: ubuntu-24.04-arm      # native arm64, no qemu
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
           - pkg: darwin-x64
             # Intel macOS runners are retired (macos-13 was the last; jobs
             # targeting it queue forever). Cross-compile from arm64 instead
@@ -84,6 +90,21 @@ jobs:
         uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install the musl toolchain (linux legs build static binaries)
+        if: contains(matrix.target, 'musl')
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q musl-tools
+          # cc-rs (bundled SQLite) and the linker both go through musl-gcc.
+          {
+            echo "CC_${TARGET_ENV}=musl-gcc"
+            echo "CARGO_TARGET_${TARGET_UPPER}_LINKER=musl-gcc"
+          } >> "$GITHUB_ENV"
+        env:
+          TARGET_ENV: ${{ matrix.target == 'x86_64-unknown-linux-musl' && 'x86_64_unknown_linux_musl' || 'aarch64_unknown_linux_musl' }}
+          TARGET_UPPER: ${{ matrix.target == 'x86_64-unknown-linux-musl' && 'X86_64_UNKNOWN_LINUX_MUSL' || 'AARCH64_UNKNOWN_LINUX_MUSL' }}
 
       - name: Rosetta 2 must be present (darwin-x64 runs on an arm64 host)
         if: matrix.pkg == 'darwin-x64'
@@ -135,6 +156,17 @@ jobs:
           set -euo pipefail
           cd packaging/npm
           node test/launcher.test.js
+
+      - name: Portability gate - the binary must run on the oldest libc we support
+        if: contains(matrix.target, 'musl')
+        run: |
+          set -euo pipefail
+          # The build host can always execute its own binary, so nothing above
+          # proves portability. amazonlinux:2 (glibc 2.26) is the oldest libc
+          # among the CI hosts this launcher targets; a static binary must run
+          # there unmodified. This gate is what failed silently in 0.1.9.
+          file "${BIN_PATH}" | grep -Eq 'static(-pie|ally)' || { echo "::error::binary is not statically linked: $(file "${BIN_PATH}")"; exit 1; }
+          docker run --rm -v "$(pwd)/${BIN_PATH}:/extenddb:ro" amazonlinux:2 /extenddb --version
 
       - name: Upload the binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
