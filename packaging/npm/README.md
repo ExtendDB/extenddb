@@ -61,17 +61,17 @@ process has exited.
 Ephemeral ports mean parallel test shards never collide. With Vitest:
 
 ```js
-// globalSetup.js
-const { start } = require("@extenddb/dev");
+// globalSetup.mjs
+import { start } from "@extenddb/dev";
 
-module.exports = async function () {
+export default async function () {
   const server = await start({ memory: true });
   process.env.DDB_ENDPOINT = server.endpoint;
   process.env.AWS_ACCESS_KEY_ID = server.credentials.accessKeyId;
   process.env.AWS_SECRET_ACCESS_KEY = server.credentials.secretAccessKey;
   process.env.AWS_REGION = server.region;
   return () => server.stop();
-};
+}
 ```
 
 Each account's data is isolated, so suites that need clean separation can use
