@@ -1,0 +1,31 @@
+# Pre-merge proof of the npm release build matrix.
+#
+# Every npm-publish failure to date surfaced only at release dispatch time,
+# after a human approval was already spent: the build matrix had never been
+# executed before a real release run. This workflow runs the exact matrix
+# (same reusable workflow, same runner labels, same build/smoke/launcher
+# steps, no publish) on every pull request that touches the release path, so
+# a retired runner label, a platform compile break, or a launcher regression
+# is caught while the change is still reviewable.
+name: npm build dry run
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/npm-publish.yml'
+      - '.github/workflows/npm-build-matrix.yml'
+      - '.github/workflows/npm-build-dryrun.yml'
+      - 'packaging/npm/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-build-dryrun-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  matrix:
+    uses: ./.github/workflows/npm-build-matrix.yml
+    with:
+      ref: ${{ github.event.pull_request.head.sha }}
