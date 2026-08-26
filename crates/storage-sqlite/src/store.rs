@@ -315,6 +315,9 @@ impl SqliteEngine {
                     "vector_index_min_creating_ms: live read failed, using {DEFAULT_MS}: {e:?}"
                 );
                 DEFAULT_MS
+            }
+        }
+    }
 
     /// Milliseconds to hold a new vector index in the resource-allocation phase.
     ///

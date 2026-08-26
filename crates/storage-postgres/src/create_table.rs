@@ -569,6 +569,10 @@ impl PostgresEngine {
             // break this site and force a decision about whether create must
             // report it, rather than silently defaulting.
             vector_indexes: vector_index_descs,
+            // A freshly created table was not restored from anything: the
+            // service reports no RestoreSummary member on it. See the field's
+            // measured provenance on `TableDescription`.
+            restore_summary: None,
         })
     }
 }

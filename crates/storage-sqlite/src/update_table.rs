@@ -600,7 +600,7 @@ impl SqliteEngine {
                     // died before its own flip is repaired by a rebuild, which
                     // re-asserts the phase before scanning.
                     if index_status == "CREATING" && backfilling == Some(false) {
-                        return Err(StorageError::ResourceInUse(
+                        return Err(StorageError::IndexesInUse(
                             extenddb_core::types::vector_index_delete_in_allocation_phase(
                                 &input.table_name,
                                 &delete.index_name,
@@ -1776,7 +1776,7 @@ mod reconciler_tests {
             .await
             .expect_err("a delete during resource allocation must be refused");
         match err {
-            extenddb_storage::error::StorageError::ResourceInUse(message) => assert_eq!(
+            extenddb_storage::error::StorageError::IndexesInUse(message) => assert_eq!(
                 message,
                 extenddb_core::types::vector_index_delete_in_allocation_phase("t", "vidx"),
                 "the refusal must carry the measured wording"

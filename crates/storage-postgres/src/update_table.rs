@@ -715,7 +715,7 @@ impl PostgresEngine {
                         // asks the caller to retry; once the backfill is running it
                         // accepts. Measured against the service on 2026-08-19.
                         if index_status == "CREATING" && backfilling == Some(false) {
-                            return Err(StorageError::ResourceInUse(
+                            return Err(StorageError::IndexesInUse(
                                 extenddb_core::types::vector_index_delete_in_allocation_phase(
                                     &input.table_name,
                                     &delete.index_name,
@@ -1013,6 +1013,13 @@ impl PostgresEngine {
         // flip below, the second inside the detached task this call spawns.
         let allocation_delay =
             std::time::Duration::from_millis(self.vector_allocation_phase_delay().await);
+        // The floor on how long the index stays CREATING, captured with the
+        // creation instant here so the hold measures from when the caller could
+        // first observe the index. The wait itself lives in the shared driver,
+        // beside the flip it delays; the SQLite backend applies the same floor.
+        let min_creating =
+            std::time::Duration::from_millis(self.vector_index_min_creating_ms().await);
+        let created_at = tokio::time::Instant::now();
         let ownership_pool = self.data_pool.clone();
         let ownership_id = index_id.to_owned();
         let hold_table_id = table_id.to_owned();
@@ -1081,6 +1088,7 @@ impl PostgresEngine {
                 &index_name,
                 extenddb_storage::vector_lifecycle::BACKFILL_BATCH,
                 batch_delay,
+                Some(created_at + min_creating),
             )
             .await;
         });

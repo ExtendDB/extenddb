@@ -689,15 +689,15 @@ async fn deleting_a_vector_index_in_the_allocation_phase_is_refused() {
         .await
         .expect_err("a delete during resource allocation must be refused");
 
-    // ResourceInUse, not Validation: the request is well formed and the resource
+    // IndexesInUse, not Validation: the request is well formed and the resource
     // exists, so the client should retry rather than change the request. The
     // whole string is the measured one, including both resource names.
     match err {
-        StorageError::ResourceInUse(msg) => assert_eq!(
+        StorageError::IndexesInUse(msg) => assert_eq!(
             msg,
             extenddb_core::types::vector_index_delete_in_allocation_phase("t_phase", "vidx")
         ),
-        other => panic!("expected ResourceInUse, got {other:?}"),
+        other => panic!("expected IndexesInUse, got {other:?}"),
     }
 
     // The refusal must not have deleted anything on the way out.
@@ -1900,11 +1900,11 @@ async fn a_real_build_holds_the_allocation_phase_and_the_delete_rule_follows_it(
         .await
         .expect_err("a delete during resource allocation must be refused");
     match err {
-        StorageError::ResourceInUse(msg) => assert_eq!(
+        StorageError::IndexesInUse(msg) => assert_eq!(
             msg,
             extenddb_core::types::vector_index_delete_in_allocation_phase("t_phase_real", "vidx")
         ),
-        other => panic!("expected ResourceInUse, got {other:?}"),
+        other => panic!("expected IndexesInUse, got {other:?}"),
     }
 
     // Second half: once the phase advances, the same request is accepted and the
