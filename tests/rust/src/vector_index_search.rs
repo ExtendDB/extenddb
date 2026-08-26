@@ -2092,8 +2092,8 @@ async fn an_invalid_written_vector_reports_the_measured_whole_strings() {
     assert_validation_message(
         status,
         &text,
-        "One or more parameter values are not valid. One or more parameter values were invalid . \
-         Invalid size for parameter emb, Expected: 4, Actual: 3. IndexName: vidx",
+        "One or more parameter values were invalid. \
+         Invalid size for parameter emb, Expected: 4, Actual: 3 IndexName: vidx",
     );
 
     // Too long: same template, different count.
@@ -2105,8 +2105,8 @@ async fn an_invalid_written_vector_reports_the_measured_whole_strings() {
     assert_validation_message(
         status,
         &text,
-        "One or more parameter values are not valid. One or more parameter values were invalid . \
-         Invalid size for parameter emb, Expected: 4, Actual: 5. IndexName: vidx",
+        "One or more parameter values were invalid. \
+         Invalid size for parameter emb, Expected: 4, Actual: 5 IndexName: vidx",
     );
 
     // Wrong attribute type: a String where the index expects a list. Sparse
@@ -2115,8 +2115,9 @@ async fn an_invalid_written_vector_reports_the_measured_whole_strings() {
     assert_validation_message(
         status,
         &text,
-        "One or more parameter values are not valid. One or more parameter values were invalid . \
-         Invalid type for parameter emb, Expected: L, Actual: S. IndexName: vidx",
+        "One or more parameter values were invalid. \
+         Invalid type for parameter emb, Expected: 32-bit floating point number list \
+         IndexName: vidx",
     );
 
     // A valid DynamoDB number that no f32 can hold. The service echoes it in its
@@ -2129,14 +2130,15 @@ async fn an_invalid_written_vector_reports_the_measured_whole_strings() {
     assert_validation_message(
         status,
         &text,
-        "One or more parameter values are not valid. One or more parameter values were invalid . \
+        "One or more parameter values were invalid. \
          Invalid value for parameter emb[1], Value: 3.5E+38 is outside valid range \
          [-3.4028235E38, 3.4028235E38]. IndexName: vidx",
     );
 
-    // A wrong-typed element INSIDE the list. Measured (probe P13) to use the
-    // SINGLE-sentence envelope, unlike every other case in this test: the
-    // envelope varies by error kind, not by nesting level.
+    // A wrong-typed element INSIDE the list. Same single-sentence envelope as
+    // every kind above since the 2026-08-27 measurement: envelopes are
+    // region-uniform (us single, eu doubled the same day) and these strings pin
+    // the us shape.
     let (status, text) = put(
         "badelem",
         r#"{"L": [{"N": "0.1"}, {"S": "x"}, {"N": "0"}, {"N": "0"}]}"#,
@@ -2175,8 +2177,8 @@ async fn an_invalid_written_vector_reports_the_measured_whole_strings() {
     assert_validation_message(
         status,
         &text,
-        "One or more parameter values are not valid. One or more parameter values were invalid . \
-         Invalid size for parameter emb, Expected: 4, Actual: 3. IndexName: vidx",
+        "One or more parameter values were invalid. \
+         Invalid size for parameter emb, Expected: 4, Actual: 3 IndexName: vidx",
     );
 
     let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
@@ -2244,8 +2246,8 @@ async fn a_transaction_reports_an_invalid_vector_per_item() {
     assert_eq!(
         reasons[1].get("Message").and_then(|m| m.as_str()),
         Some(
-            "One or more parameter values are not valid. One or more parameter values were \
-             invalid . Invalid size for parameter emb, Expected: 4, Actual: 3. IndexName: vidx"
+            "One or more parameter values were invalid. Invalid size for parameter emb, \
+             Expected: 4, Actual: 3 IndexName: vidx"
         ),
         "the per-item message must equal the PutItem refusal: {text}"
     );

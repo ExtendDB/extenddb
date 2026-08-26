@@ -26,27 +26,17 @@ fn invalid(msg: impl Into<String>) -> DynamoDbError {
     DynamoDbError::ValidationException(msg.into())
 }
 
-/// Envelope the service uses for a vector-attribute rejection whose kind states
-/// the sentence twice.
+/// Envelope the service uses for every vector-attribute write rejection.
 ///
-/// Measured byte-exact against real Amazon DynamoDB on 2026-08-19 across four
-/// captures (probes P4, P5, P9 and P10: wrong dimension count, wrong attribute
-/// type, a component out of f32 range, and the per-item TransactWriteItems
-/// cancellation reason, which repeats the PutItem wording verbatim). Both
-/// oddities are the service's own: the sentence is stated twice, in two
-/// different tenses, and there is a space before the second full stop.
-///
-/// Not universal. Probe P13 measured the element-level TYPE error using
-/// [`INVALID_PARAMETER_VALUES_ONCE`] instead, so the envelope goes with the error
-/// KIND rather than with this file. Reading the four captures above as one rule
-/// is what got it wrong once already: they are all doubled-envelope kinds.
-const INVALID_PARAMETER_VALUES_TWICE: &str =
-    "One or more parameter values are not valid. One or more parameter values were invalid .";
-
-/// Envelope for the element-level type error: one sentence, ordinary full stop.
-///
-/// Measured byte-exact on 2026-08-19 (probe P13), for both a String and a BOOL
-/// element inside the vector list.
+/// Measured byte-exact against real Amazon DynamoDB on 2026-08-27, all four
+/// kinds (wrong dimension count, wrong attribute type, a component out of f32
+/// range, and the element-level type error) in us-west-2 and us-east-1: one
+/// sentence, ordinary full stop. The envelope is region-uniform, not per kind:
+/// eu-west-1 measured the SAME DAY states the sentence twice with a space
+/// before the second full stop, for all four kinds alike. An earlier capture
+/// (2026-08-19, us-west-2) recorded the doubled envelope for three kinds and
+/// this single one for the fourth, so neither region tracks the other's
+/// history cleanly; these strings pin the us shape as measured 2026-08-27.
 const INVALID_PARAMETER_VALUES_ONCE: &str = "One or more parameter values were invalid.";
 
 /// Validate the vector-relevant attributes of an item being written against the
@@ -215,25 +205,23 @@ fn validate_vector_attribute(
     let dimensions = index.dimensions as usize;
 
     let AttributeValue::L(elements) = value else {
-        // Measured 2026-08-19 with a String in the vector position: the service
-        // names DynamoDB type tokens, "Expected: L, Actual: S", not a prose type.
-        // An earlier reading recorded "32-bit floating point number list" with no
-        // actual type at all, which the byte-exact wire capture contradicts.
+        // Measured 2026-08-27 with a String in the vector position: a prose type
+        // with no actual-type token and no full stop before IndexName. The
+        // 2026-08-19 capture recorded "Expected: L, Actual: S" here; the body
+        // changed with the envelope, and eu-west-1 still returns the old body.
         return Err(invalid(format!(
-            "{INVALID_PARAMETER_VALUES_TWICE} Invalid type for parameter {attr}, Expected: L, \
-             Actual: {}. IndexName: {index_name}",
-            attribute_type_token(value)
+            "{INVALID_PARAMETER_VALUES_ONCE} Invalid type for parameter {attr}, \
+             Expected: 32-bit floating point number list IndexName: {index_name}"
         )));
     };
 
     if elements.len() != dimensions {
-        // Punctuation matches the service exactly, verified 2026-08-19 across
-        // PutItem, UpdateItem and TransactWriteItems, for both too-short and
-        // too-long vectors: a comma after the parameter name and a full stop
-        // after the actual count.
+        // Punctuation matches the service exactly, verified 2026-08-27: a comma
+        // after the parameter name and NO full stop after the actual count. The
+        // 2026-08-19 capture had a full stop there; it left with the envelope.
         return Err(invalid(format!(
-            "{INVALID_PARAMETER_VALUES_TWICE} Invalid size for parameter {attr}, \
-             Expected: {dimensions}, Actual: {}. IndexName: {index_name}",
+            "{INVALID_PARAMETER_VALUES_ONCE} Invalid size for parameter {attr}, \
+             Expected: {dimensions}, Actual: {} IndexName: {index_name}",
             elements.len()
         )));
     }
@@ -253,18 +241,16 @@ fn validate_vector_attribute(
                         .map(format_scientific)
                         .unwrap_or_else(|_| number.clone());
                     return Err(invalid(format!(
-                        "{INVALID_PARAMETER_VALUES_TWICE} Invalid value for parameter \
+                        "{INVALID_PARAMETER_VALUES_ONCE} Invalid value for parameter \
                          {attr}[{position}], Value: {display} is outside valid range \
                          [-3.4028235E38, 3.4028235E38]. IndexName: {index_name}"
                     )));
                 }
             }
             other => {
-                // The one member of this family with a single-sentence envelope,
-                // measured 2026-08-19 (probe P13) for a String and a BOOL element.
-                // The range error immediately above is also element-level and IS
-                // doubled, so position in the item is not the discriminator: the
-                // error kind is.
+                // Measured 2026-08-27 for a String element; the 2026-08-19
+                // capture agrees on this body. Same envelope as every other kind
+                // in this family since the envelopes went region-uniform.
                 return Err(invalid(format!(
                     "{INVALID_PARAMETER_VALUES_ONCE} Invalid type for parameter \
                      {attr}[{position}], Expected: 32-bit floating point number, Actual: {}. \
@@ -476,27 +462,23 @@ mod tests {
 
     /// Exact wording, not fragments.
     ///
-    /// Re-measured against real Amazon DynamoDB on 2026-08-19 (probes P5 and P9,
-    /// three separate captures across PutItem, UpdateItem and the per-item
-    /// TransactWriteItems cancellation reason). A `PutItem` carrying three values
-    /// against a four-dimension index returns
-    /// "One or more parameter values are not valid. One or more parameter values
-    /// were invalid . Invalid size for parameter emb, Expected: 4, Actual: 3.
-    /// IndexName: vidx".
-    ///
-    /// The punctuation is load-bearing and three parts of it were wrong before:
-    /// the leading "are not valid" sentence was missing, the space before the
-    /// full stop after "invalid" was missing, and the full stop after the actual
-    /// count was missing. The fragment assertions above cannot catch a
-    /// regression in any of those, so this asserts the whole string.
+    /// Re-measured against real Amazon DynamoDB on 2026-08-27 in us-west-2 and
+    /// us-east-1: a `PutItem` carrying three values against a four-dimension
+    /// index returns "One or more parameter values were invalid. Invalid size
+    /// for parameter emb, Expected: 4, Actual: 3 IndexName: vidx". The
+    /// punctuation is load-bearing: one envelope sentence, and no full stop
+    /// between the actual count and IndexName. The 2026-08-19 capture had a
+    /// doubled envelope and a full stop there; eu-west-1 still answers that
+    /// older shape, so these strings pin the us regions as measured 2026-08-27.
+    /// The fragment assertions above cannot catch an envelope regression, so
+    /// this asserts the whole string.
     #[test]
     fn dimension_mismatch_message_matches_the_service_exactly() {
         let message = err(&item_with_vector(num_vec(&["0.1", "0.2", "0.3"])));
         assert_eq!(
             message,
-            "One or more parameter values are not valid. One or more parameter values were \
-             invalid . Invalid size for parameter ProductEmbedding, Expected: 5, Actual: 3. \
-             IndexName: ProductIndex"
+            "One or more parameter values were invalid. Invalid size for parameter \
+             ProductEmbedding, Expected: 5, Actual: 3 IndexName: ProductIndex"
         );
     }
 
@@ -508,23 +490,18 @@ mod tests {
 
     /// Asserted whole rather than by fragment.
     ///
-    /// Re-measured 2026-08-19 (probes P5 and P10, a String in the vector
-    /// position): the service names the DynamoDB type tokens rather than a prose
-    /// type, "Expected: L, Actual: S", and carries the same doubled-sentence
-    /// envelope as the size message. The earlier "32-bit floating point number
-    /// list" wording came from a 2026-08-07 reading that the byte-exact wire
-    /// capture contradicts.
-    ///
-    /// The `Actual: N` token below is extrapolated from that token table (the
-    /// captures hold `Actual: S` at attribute level and `BOOL` at element
-    /// level); the measured `S` case is pinned by the `probe_err` tests.
+    /// Re-measured 2026-08-27 (a String in the vector position, us-west-2 and
+    /// us-east-1): a prose expected type with no actual-type token and no full
+    /// stop before IndexName. The 2026-08-19 capture recorded "Expected: L,
+    /// Actual: S" with the doubled envelope, which eu-west-1 still answers; the
+    /// body travelled with the envelope, so both pin to the 2026-08-27 us shape.
     #[test]
     fn rejects_non_list_vector() {
         let message = err(&item_with_vector(AttributeValue::N("0.1".to_owned())));
         assert_eq!(
             message,
-            "One or more parameter values are not valid. One or more parameter values were \
-             invalid . Invalid type for parameter ProductEmbedding, Expected: L, Actual: N. \
+            "One or more parameter values were invalid. Invalid type for parameter \
+             ProductEmbedding, Expected: 32-bit floating point number list \
              IndexName: ProductIndex"
         );
     }
@@ -561,9 +538,9 @@ mod tests {
         let message = err(&item_with_vector(value));
         assert_eq!(
             message,
-            "One or more parameter values are not valid. One or more parameter values were \
-             invalid . Invalid value for parameter ProductEmbedding[1], Value: 1.3E+40 is \
-             outside valid range [-3.4028235E38, 3.4028235E38]. IndexName: ProductIndex"
+            "One or more parameter values were invalid. Invalid value for parameter \
+             ProductEmbedding[1], Value: 1.3E+40 is outside valid range \
+             [-3.4028235E38, 3.4028235E38]. IndexName: ProductIndex"
         );
     }
 
@@ -641,37 +618,30 @@ mod tests {
         }
     }
 
-    /// Byte-for-byte against the captured response of probe P5/P9
-    /// (`P5-put-wrong-dims`, `P9-put-3-of-4`).
+    /// Byte-for-byte against the 2026-08-27 capture (us-west-2 and us-east-1,
+    /// `wrong-dims` in `/tmp/ddbprobe/envelope-2026-08-27.jsonl`).
     #[test]
     fn wrong_dimension_count_is_byte_identical_to_the_service() {
         assert_eq!(
             probe_err(num_vec(&["0.1", "0.2", "0.3"])),
-            "One or more parameter values are not valid. One or more parameter values were \
-             invalid . Invalid size for parameter emb, Expected: 4, Actual: 3. IndexName: vidx"
+            "One or more parameter values were invalid. Invalid size for parameter emb, \
+             Expected: 4, Actual: 3 IndexName: vidx"
         );
     }
 
-    /// Byte-for-byte against `P5-put-wrong-type` / `P10-put-string-attr`.
+    /// Byte-for-byte against the 2026-08-27 capture (`wrong-type`).
     #[test]
     fn wrong_attribute_type_is_byte_identical_to_the_service() {
         assert_eq!(
             probe_err(AttributeValue::S("not-a-vector".to_owned())),
-            "One or more parameter values are not valid. One or more parameter values were \
-             invalid . Invalid type for parameter emb, Expected: L, Actual: S. IndexName: vidx"
+            "One or more parameter values were invalid. Invalid type for parameter emb, \
+             Expected: 32-bit floating point number list IndexName: vidx"
         );
     }
 
-    /// Byte-for-byte against probe P13, and the reason the two envelopes are
-    /// separate constants.
-    ///
-    /// A wrong-typed element INSIDE the list uses the SINGLE-sentence envelope,
-    /// "One or more parameter values were invalid. " with an ordinary full stop,
-    /// where the attribute-level size and type errors above and the element-level
-    /// range error below all use the doubled one. The envelope varies by error
-    /// KIND, not by nesting level, which is exactly the inference an earlier pass
-    /// got wrong: four captures happened to be doubled-envelope kinds, so the
-    /// envelope looked universal.
+    /// Byte-for-byte against the 2026-08-27 capture (`element-type`), the one
+    /// kind whose body did not change between the 2026-08-19 and 2026-08-27
+    /// measurements.
     ///
     /// Both measured actual types are asserted, because `BOOL` is the one that
     /// shows the type token is not restricted to the scalar key types.
@@ -697,15 +667,15 @@ mod tests {
         );
     }
 
-    /// Byte-for-byte against `P4-put-f32-overflow`, including the service's
-    /// `3.5E+38` normalisation of the submitted `3.5E38`.
+    /// Byte-for-byte against the 2026-08-27 capture (`out-of-range`), including
+    /// the service's `3.5E+38` normalisation of the submitted `3.5E38`.
     #[test]
     fn f32_overflow_is_byte_identical_to_the_service() {
         assert_eq!(
             probe_err(num_vec(&["0", "3.5E38", "0", "0"])),
-            "One or more parameter values are not valid. One or more parameter values were \
-             invalid . Invalid value for parameter emb[1], Value: 3.5E+38 is outside valid \
-             range [-3.4028235E38, 3.4028235E38]. IndexName: vidx"
+            "One or more parameter values were invalid. Invalid value for parameter emb[1], \
+             Value: 3.5E+38 is outside valid range [-3.4028235E38, 3.4028235E38]. \
+             IndexName: vidx"
         );
     }
 
