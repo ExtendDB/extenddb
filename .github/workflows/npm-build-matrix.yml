@@ -15,15 +15,21 @@ on:
         description: 'Commit SHA to build (callers must pass a fully resolved SHA)'
         required: true
         type: string
+      fail-fast:
+        description: 'Cancel remaining platforms when one fails (release: true; dry run: false so every platform reports)'
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 jobs:
   build:
-    # If one platform fails, cancel the rest: nothing is published either way.
+    # Release runs cancel the rest when one platform fails (nothing is
+    # published either way); the dry run sets false so every platform reports.
     strategy:
-      fail-fast: true
+      fail-fast: ${{ inputs.fail-fast }}
       matrix:
         include:
           - pkg: linux-x64
@@ -83,10 +89,13 @@ jobs:
         if: matrix.pkg == 'darwin-x64'
         run: |
           set -euo pipefail
-          # Preinstalled on GitHub's arm64 macOS images; a no-op then. If it
-          # ever disappears, fail here with a clear cause rather than letting
-          # the smoke test die with a cryptic exec format error.
-          sudo softwareupdate --install-rosetta --agree-to-license
+          # NOT preinstalled on GitHub's arm64 macOS images: the installer
+          # genuinely downloads Rosetta here. softwareupdate is network-bound
+          # and known for spurious non-zero exits, so its exit code must not
+          # gate the run; the capability probe on the next line is the real
+          # gate. Fail closed on "Rosetta cannot execute x86_64", not on a
+          # flaky installer.
+          sudo softwareupdate --install-rosetta --agree-to-license || true
           arch -x86_64 /usr/bin/true
 
       - name: Build the slim dev-mode binary
