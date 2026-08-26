@@ -203,7 +203,7 @@ pub async fn handle_update_table(
 ///
 /// A named function rather than an inline closure so every arm is reachable from
 /// a unit test. Two of them are not reachable any other way: no in-tree backend
-/// yet returns `Unsupported` or `ResourceInUse` from `update_table`, and the
+/// yet returns `Unsupported` or `IndexesInUse` from `update_table`, and the
 /// vector capability gate refuses vector requests before the backend is called
 /// at all, so a wire test cannot provoke either one today.
 fn update_table_err_to_dynamo(
@@ -235,7 +235,7 @@ fn update_table_err_to_dynamo(
         // The change is refused by the resource's current state, not by the
         // request. The backend supplies the whole message because only it knows
         // the state.
-        StorageError::ResourceInUse(msg) => DynamoDbError::ResourceInUseException(msg),
+        StorageError::IndexesInUse(msg) => DynamoDbError::ResourceInUseException(msg),
         other => {
             tracing::error!(internal_error = %other, "storage internal error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn a_resource_in_use_refusal_keeps_the_backend_message() {
         let measured = extenddb_core::types::vector_index_delete_in_allocation_phase("t", "vidx");
-        let err = update_table_err_to_dynamo(StorageError::ResourceInUse(measured.clone()), "t");
+        let err = update_table_err_to_dynamo(StorageError::IndexesInUse(measured.clone()), "t");
         match err {
             DynamoDbError::ResourceInUseException(msg) => assert_eq!(msg, measured),
             other => panic!("expected ResourceInUseException, got {other:?}"),
