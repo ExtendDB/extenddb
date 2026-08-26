@@ -17,6 +17,8 @@ This directory contains the authoritative design documents for ExtendDB (extendd
 | 09 | [Testing](09-testing.md) | Test strategy, reference suites, golden files, multi-language test suites, coverage tracking |
 | 10 | [Licenses](10-dependency-licenses.md) | Licensing summary for third-party dependencies |
 | 11 | [Scaling](11-high-availability.md) | DRAFT document on scaling ExtendDB |
+| 13 | [MongoDB Backend](13-storage-mongodb.md) | MongoDB storage backend (`extenddb-storage-mongodb` crate) |
+| 14 | [DuckDB Backend](14-storage-duckdb.md) | DuckDB storage backend: async facade, no-FK integrity, dialect mapping (`extenddb-storage-duckdb` crate) |
 
 
 ## How to Use These Docs

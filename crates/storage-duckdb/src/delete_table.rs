@@ -1,0 +1,169 @@
+// Copyright 2026 ExtendDB contributors
+// SPDX-License-Identifier: Apache-2.0
+
+//! `delete_table` implementation for `DuckDbEngine`.
+//!
+//! With `control_plane_delay_seconds < 1` the table and its data tables are
+//! dropped immediately; otherwise the table is marked DELETING with a scheduled
+//! transition that the control-plane worker completes.
+
+use crate::db;
+use extenddb_core::types::{DeleteTableInput, TableDescription, TableStatus};
+use extenddb_storage::error::StorageError;
+
+use crate::duckdb_util::format_timestamp;
+use crate::store::DuckDbEngine;
+use crate::table_helpers::{INDEX_COLUMNS, IndexRow, TABLE_COLUMNS, TableRow};
+
+impl DuckDbEngine {
+    pub(crate) async fn delete_table_impl(
+        &self,
+        account_id: &str,
+        input: DeleteTableInput,
+    ) -> Result<TableDescription, StorageError> {
+        Self::validate_account_id(account_id)?;
+
+        let row: Option<TableRow> = db::query_as(&format!(
+            "SELECT {TABLE_COLUMNS} FROM tables \
+             WHERE account_id = ? AND table_name = ? AND table_status IN ('ACTIVE', 'CREATING')"
+        ))
+        .bind(account_id)
+        .bind(&input.table_name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        let row = row.ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
+        if row.deletion_protection_enabled {
+            return Err(StorageError::DeletionProtected(row.table_arn.clone()));
+        }
+
+        let index_rows: Vec<IndexRow> = db::query_as(&format!(
+            "SELECT {INDEX_COLUMNS} FROM indexes WHERE table_id = ?"
+        ))
+        .bind(&row.table_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        let delay_secs: f64 = db::query_scalar::<String>(
+            "SELECT value FROM settings WHERE key = 'control_plane_delay_seconds'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.25);
+
+        let index_ids: Vec<String> = index_rows.iter().map(|r| r.index_id.clone()).collect();
+        let table_id = row.table_id.clone();
+        let table_arn = row.table_arn.clone();
+
+        if delay_secs < 1.0 {
+            let _writer = self.write_lock.lock().await;
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            // A vector index with `backfilling` set is an UpdateTable build in
+            // flight (the with-table path never sets the column), and the
+            // service refuses to delete the table underneath one; the refusal
+            // clears when the index flips ACTIVE or its create is cancelled.
+            // Checked INSIDE the immediate transaction rather than before it,
+            // so a build whose catalog row commits while this call is waiting
+            // on the write lock is still caught: the check and the cascade
+            // delete are atomic against a concurrent UpdateTable.
+            Self::refuse_if_index_build_in_flight(&mut tx, &row.table_id, &input.table_name)
+                .await?;
+            db::query("DELETE FROM tags WHERE resource_arn = ?")
+                .bind(&table_arn)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            // No foreign keys in DuckDB: remove indexes, stream shards/records
+            // explicitly before the table row.
+            crate::referential::delete_table_children(&mut tx, &table_id)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            db::query("DELETE FROM tables WHERE table_id = ?")
+                .bind(&table_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            for idx_id in &index_ids {
+                Self::drop_index_data_table(&mut tx, idx_id).await?;
+            }
+            Self::drop_data_table(&mut tx, &table_id).await?;
+            // Drop any still-pending GSI propagation rows for this table in the
+            // same transaction that drops the tables, so the worker doesn't
+            // waste a claim→deserialize→skip cycle on now-orphaned rows.
+            db::query("DELETE FROM gsi_pending WHERE table_id = ?")
+                .bind(&table_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+        } else {
+            let transition = format_timestamp(
+                time::OffsetDateTime::now_utc() + time::Duration::seconds_f64(delay_secs),
+            );
+            let _writer = self.write_lock.lock().await;
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            // Same in-flight-build refusal as the immediate branch, and inside
+            // the transaction that flips the table to DELETING for the same
+            // reason: without it, a build committing between an earlier check
+            // and this flip would have its table deleted underneath it.
+            Self::refuse_if_index_build_in_flight(&mut tx, &row.table_id, &input.table_name)
+                .await?;
+            db::query(
+                "UPDATE tables SET table_status = 'DELETING', status_transition_at = ? \
+                 WHERE account_id = ? AND table_name = ?",
+            )
+            .bind(&transition)
+            .bind(account_id)
+            .bind(&input.table_name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            self.control_plane_notify.notify_one();
+        }
+
+        let desc = self.build_table_description_from_row(account_id, row, index_rows)?;
+        Ok(TableDescription {
+            table_status: TableStatus::Deleting,
+            ..desc
+        })
+    }
+
+    /// Refuse the operation while any UpdateTable-created vector index build is
+    /// in flight on the table (`backfilling IS NOT NULL`; the with-table path
+    /// never sets the column). Must be called inside a `BEGIN IMMEDIATE`
+    /// transaction so the answer is atomic with the caller's own writes.
+    async fn refuse_if_index_build_in_flight(
+        tx: &mut db::Transaction,
+        table_id: &str,
+        table_name: &str,
+    ) -> Result<(), StorageError> {
+        let in_flight: Option<(i64,)> = db::query_as(
+            "SELECT 1 FROM vector_indexes WHERE table_id = ? AND backfilling IS NOT NULL LIMIT 1",
+        )
+        .bind(table_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        if in_flight.is_some() {
+            return Err(StorageError::IndexesInUse(table_name.to_owned()));
+        }
+        Ok(())
+    }
+}

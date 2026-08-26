@@ -35,6 +35,12 @@ pub struct InitArgs {
     #[arg(long)]
     sqlite_path: Option<String>,
 
+    /// DuckDB database file path (default: extenddb.duckdb). The chosen path
+    /// is written to the generated config file, so `serve` finds it without
+    /// further flags. DuckDB backend only.
+    #[arg(long)]
+    duckdb_path: Option<String>,
+
     /// PostgreSQL host (hostname, IP address, or absolute Unix socket directory path)
     #[arg(long)]
     pg_host: Option<String>,
@@ -380,5 +386,15 @@ mod tests {
     #[test]
     fn init_rejects_unknown_flags() {
         assert!(parse(&["--sqlite-pathological", "/data/x.sqlite"]).is_err());
+    }
+
+    /// `--duckdb-path` is the DuckDB backend's analogue of `--sqlite-path` and
+    /// is read by that backend's bootstrapper from the raw argv, so it must be
+    /// declared here or clap rejects it before the bootstrapper ever sees it.
+    #[test]
+    fn init_accepts_duckdb_path() {
+        let args =
+            parse(&["--backend", "duckdb", "--duckdb-path", "/data/x.duckdb"]).expect("parse");
+        assert_eq!(args.duckdb_path.as_deref(), Some("/data/x.duckdb"));
     }
 }

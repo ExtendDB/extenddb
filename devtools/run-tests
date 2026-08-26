@@ -135,9 +135,9 @@ done
 
 # --- Validate: backend name ---
 case "$BACKEND" in
-    postgres|sqlite|mongodb) ;;
+    postgres|sqlite|mongodb|duckdb) ;;
     *)
-        echo "error: --backend must be 'postgres', 'sqlite' or 'mongodb' (got: $BACKEND)"
+        echo "error: --backend must be 'postgres', 'sqlite', 'mongodb' or 'duckdb' (got: $BACKEND)"
         exit 1
         ;;
 esac
