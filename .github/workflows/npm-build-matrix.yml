@@ -1,0 +1,144 @@
+# The npm platform build matrix, shared between the release workflow
+# (npm-publish.yml) and the pull-request dry run (npm-build-dryrun.yml).
+#
+# One definition on purpose: the release path and the pre-merge proof must be
+# the same jobs on the same runner labels, or the dry run proves nothing. A
+# runner label that GitHub has retired does not fail fast -- the job queues
+# until the run is cancelled -- so the only reliable check that a label exists
+# is executing it, which the dry run does on every change to these files.
+name: npm build matrix
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Commit SHA to build (callers must pass a fully resolved SHA)'
+        required: true
+        type: string
+      fail-fast:
+        description: 'Cancel remaining platforms when one fails (release: true; dry run: false so every platform reports)'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Release runs cancel the rest when one platform fails (nothing is
+    # published either way); the dry run sets false so every platform reports.
+    strategy:
+      fail-fast: ${{ inputs.fail-fast }}
+      matrix:
+        include:
+          - pkg: linux-x64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - pkg: linux-arm64
+            runner: ubuntu-24.04-arm      # native arm64, no qemu
+            target: aarch64-unknown-linux-gnu
+          - pkg: darwin-x64
+            # Intel macOS runners are retired (macos-13 was the last; jobs
+            # targeting it queue forever). Cross-compile from arm64 instead
+            # and execute the binary under Rosetta 2, which macOS applies
+            # transparently when an x86_64 binary is spawned.
+            runner: macos-15
+            target: x86_64-apple-darwin
+          - pkg: darwin-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+          - pkg: win32-x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60          # a hung Rust build must not burn the 6h default
+    env:
+      BIN_NAME: extenddb${{ matrix.pkg == 'win32-x64' && '.exe' || '' }}
+      BIN_PATH: target/${{ matrix.target }}/release/extenddb${{ matrix.pkg == 'win32-x64' && '.exe' || '' }}
+    steps:
+      # CodeQL's actions/cache-poisoning/poisonable-step query flags the build
+      # and test steps below, because a workflow_dispatch run executes in the
+      # default branch's context (and therefore its Actions cache scope) while
+      # checking out a ref supplied at dispatch time. Two properties make that
+      # unexploitable here, neither of which the query can see:
+      #
+      #   1. The release caller's `gate` has already proved this SHA is an
+      #      ancestor of origin/main (`git merge-base --is-ancestor`), so the
+      #      code executed below is reviewed code already on main; the dry-run
+      #      caller builds pull-request code with pull-request permissions.
+      #      Poisoning either would require access that permits strictly worse
+      #      things directly.
+      #   2. Nothing in this workflow reads or writes the Actions cache at all:
+      #      there is no actions/cache step, no rust-cache, and no `cache:`
+      #      input on setup-node. There is no cache entry to poison.
+      #
+      # Keep both true if this job grows: adding a cache step here would make
+      # the finding real, and it would then need a trusted-ref guard.
+      - name: Check out the requested commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rosetta 2 must be present (darwin-x64 runs on an arm64 host)
+        if: matrix.pkg == 'darwin-x64'
+        run: |
+          set -euo pipefail
+          # NOT preinstalled on GitHub's arm64 macOS images: the installer
+          # genuinely downloads Rosetta here. softwareupdate is network-bound
+          # and known for spurious non-zero exits, so its exit code must not
+          # gate the run; the capability probe on the next line is the real
+          # gate. Fail closed on "Rosetta cannot execute x86_64", not on a
+          # flaky installer.
+          sudo softwareupdate --install-rosetta --agree-to-license || true
+          arch -x86_64 /usr/bin/true
+
+      - name: Build the slim dev-mode binary
+        # SQLite backend only, dev-mode on: the launcher's contract binary.
+        # `--locked` so the build is exactly the reviewed Cargo.lock. The
+        # explicit --target keeps the output path uniform across native and
+        # cross-compiled platforms.
+        run: cargo build --release --locked --no-default-features --features sqlite,dev-mode -p extenddb --target ${{ matrix.target }}
+
+      - name: The binary must be the target architecture
+        if: matrix.pkg == 'darwin-x64'
+        run: |
+          set -euo pipefail
+          # Cross-compiling makes "it built" weaker evidence than usual: a
+          # wrong-target binary would run fine on this host. Pin the arch.
+          file "${BIN_PATH}" | grep -q 'x86_64' || { echo "::error::expected an x86_64 binary: $(file "${BIN_PATH}")"; exit 1; }
+
+      - name: Smoke test - the binary must run on the target architecture
+        shell: bash
+        # For darwin-x64 this executes the x86_64 binary on the arm64 host,
+        # which macOS routes through Rosetta 2 transparently -- a real
+        # execution on the target instruction set, not just a compile.
+        run: |
+          set -euo pipefail
+          "${BIN_PATH}" --version
+
+      - name: Run the launcher test suite against the built binary
+        # The same suite that gates packaging/ in CI, here proving the real
+        # release binary on the real target platform, including the
+        # file-persistence and memory-mode contracts. node spawns the binary
+        # as a subprocess, so the darwin-x64 case exercises the Rosetta path
+        # end to end.
+        shell: bash
+        env:
+          EXTENDDB_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/extenddb${{ matrix.pkg == 'win32-x64' && '.exe' || '' }}
+        run: |
+          set -euo pipefail
+          cd packaging/npm
+          node test/launcher.test.js
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: bin-${{ matrix.pkg }}
+          path: ${{ env.BIN_PATH }}
+          if-no-files-found: error

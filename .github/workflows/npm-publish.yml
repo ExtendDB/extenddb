@@ -166,84 +166,13 @@ jobs:
 
   build:
     needs: gate
-    # If one platform fails, cancel the rest: nothing is published either way.
-    strategy:
-      fail-fast: true
-      matrix:
-        include:
-          - pkg: linux-x64
-            runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - pkg: linux-arm64
-            runner: ubuntu-24.04-arm      # native arm64, no qemu
-            target: aarch64-unknown-linux-gnu
-          - pkg: darwin-x64
-            runner: macos-13              # last Intel macOS runner
-            target: x86_64-apple-darwin
-          - pkg: darwin-arm64
-            runner: macos-14
-            target: aarch64-apple-darwin
-          - pkg: win32-x64
-            runner: windows-latest
-            target: x86_64-pc-windows-msvc
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60          # a hung Rust build must not burn the 6h default
-    env:
-      BIN_NAME: extenddb${{ matrix.pkg == 'win32-x64' && '.exe' || '' }}
-    steps:
-      # CodeQL's actions/cache-poisoning/poisonable-step query flags the build
-      # and test steps below, because a workflow_dispatch run executes in the
-      # default branch's context (and therefore its Actions cache scope) while
-      # checking out a ref supplied at dispatch time. Two properties make that
-      # unexploitable here, neither of which the query can see:
-      #
-      #   1. `gate` has already proved this SHA is an ancestor of origin/main
-      #      (`git merge-base --is-ancestor`), so the code executed below is
-      #      reviewed code already on main. Poisoning it would require push
-      #      access to main, which permits strictly worse things directly.
-      #   2. Nothing in this workflow reads or writes the Actions cache at all:
-      #      there is no actions/cache step, no rust-cache, and no `cache:`
-      #      input on setup-node. There is no cache entry to poison.
-      #
-      # Keep both true if this job grows: adding a cache step here would make
-      # the finding real, and it would then need a trusted-ref guard.
-      - name: Check out the tagged commit
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
-        with:
-          ref: ${{ needs.gate.outputs.sha }}
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.97.0
-
-      - name: Build the slim dev-mode binary
-        # SQLite backend only, dev-mode on: the launcher's contract binary.
-        # `--locked` so the build is exactly the reviewed Cargo.lock.
-        run: cargo build --release --locked --no-default-features --features sqlite,dev-mode -p extenddb
-
-      - name: Smoke test - the native binary must run
-        shell: bash
-        run: |
-          set -euo pipefail
-          "target/release/${BIN_NAME}" --version
-
-      - name: Run the launcher test suite against the built binary
-        # The same suite that gates packaging/ in CI, here proving the real
-        # release binary on the real target platform, including the
-        # file-persistence and memory-mode contracts.
-        shell: bash
-        env:
-          EXTENDDB_BINARY: ${{ github.workspace }}/target/release/extenddb${{ matrix.pkg == 'win32-x64' && '.exe' || '' }}
-        run: |
-          set -euo pipefail
-          cd packaging/npm
-          node test/launcher.test.js
-
-      - name: Upload the binary
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        with:
-          name: bin-${{ matrix.pkg }}
-          path: target/release/${{ env.BIN_NAME }}
-          if-no-files-found: error
+    # The matrix lives in npm-build-matrix.yml, shared with the pull-request
+    # dry run (npm-build-dryrun.yml) so the release path and the pre-merge
+    # proof are the same jobs on the same runner labels. Change the matrix
+    # there and the dry run exercises it on real runners before merge.
+    uses: ./.github/workflows/npm-build-matrix.yml
+    with:
+      ref: ${{ needs.gate.outputs.sha }}
 
   publish:
     needs: [gate, build]
