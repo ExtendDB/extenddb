@@ -17,15 +17,15 @@ npm install --save-dev @extenddb/dev
 ```
 
 ```js
-const { start } = require("@extenddb/dev");
+// quickstart.mjs -- run with: node quickstart.mjs
+import { start } from "@extenddb/dev";
+import { DynamoDBClient, ListTablesCommand } from "@aws-sdk/client-dynamodb";
 
 const server = await start({ memory: true });
 // server.endpoint    -> "http://127.0.0.1:53211" (ephemeral port)
 // server.credentials -> { accessKeyId, secretAccessKey }
 // server.region      -> "us-east-1"
 
-// Point any DynamoDB client at it:
-const { DynamoDBClient, ListTablesCommand } = require("@aws-sdk/client-dynamodb");
 const client = new DynamoDBClient({
   endpoint: server.endpoint,
   region: server.region,
@@ -35,6 +35,9 @@ await client.send(new ListTablesCommand({}));
 
 await server.stop();
 ```
+
+From CommonJS, use `const { start } = require("@extenddb/dev")` and wrap the
+calls in an async function (top-level `await` is ESM-only).
 
 ## Options
 
