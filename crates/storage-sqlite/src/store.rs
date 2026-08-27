@@ -422,3 +422,136 @@ impl SqliteEngine {
         .map_or_else(|| "(not configured)".to_owned(), |(v,)| v)
     }
 }
+
+#[cfg(test)]
+mod d1_write_lock_tests {
+    use super::SqliteEngine;
+    use serde_json::json;
+    use std::time::Duration;
+
+    async fn engine() -> SqliteEngine {
+        // 2 connections: one for the spawned writer under test, one spare, so a
+        // writer that (incorrectly) runs while the lock is held is stopped by
+        // the missing lock alone, never by pool exhaustion.
+        let engine = SqliteEngine::new(":memory:", 2, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::schema::apply(&engine.pool).await.expect("schema");
+        sqlx::query(
+            "INSERT INTO accounts (account_id, account_name) VALUES ('000000000000', 'default')",
+        )
+        .execute(&engine.pool)
+        .await
+        .expect("account");
+        engine
+    }
+
+    /// Assert the D1 invariant for one writer: while the engine write lock is
+    /// held, the writer must not complete; after release, it must.
+    ///
+    /// This is the discriminating shape for the 2026-08-27 `run-integration-sqlite`
+    /// flake (`PutItem` returning `InternalServerError`, server-side `database is
+    /// locked`): a writer outside the lock contends at the SQLite level, where a
+    /// slow commit exhausts a concurrent writer's 5s `busy_timeout`. Before the
+    /// fix, each writer below completed while the lock was held; with it, they
+    /// queue behind the lock and cannot collide.
+    async fn assert_serialized<F>(engine: &SqliteEngine, writer: F, name: &str)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let guard = engine.write_lock.lock().await;
+        let task = tokio::spawn(writer);
+        // Generous grace period: a writer that ignores the lock finishes these
+        // single-statement transactions in well under 200ms.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !task.is_finished(),
+            "{name} completed while the engine write lock was held (D1 violation)"
+        );
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap_or_else(|_| panic!("{name} did not complete after lock release"))
+            .expect("writer task panicked");
+    }
+
+    #[tokio::test]
+    async fn create_table_waits_for_the_write_lock() {
+        let engine = engine().await;
+        let e = engine.clone();
+        assert_serialized(
+            &engine,
+            async move {
+                let input: extenddb_core::types::CreateTableInput = serde_json::from_value(json!({
+                    "TableName": "d1-lock-t",
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                    "BillingMode": "PAY_PER_REQUEST"
+                }))
+                .expect("input");
+                e.create_table_impl("000000000000", input)
+                    .await
+                    .expect("create table");
+            },
+            "create_table_impl",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn idempotency_token_cleanup_waits_for_the_write_lock() {
+        let engine = engine().await;
+        let e = engine.clone();
+        assert_serialized(
+            &engine,
+            async move {
+                e.cleanup_expired_idempotency_tokens_impl(0)
+                    .await
+                    .expect("cleanup");
+            },
+            "cleanup_expired_idempotency_tokens",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn tag_resource_waits_for_the_write_lock() {
+        use extenddb_storage::MetadataEngine;
+        let engine = engine().await;
+        let e = engine.clone();
+        assert_serialized(
+            &engine,
+            async move {
+                MetadataEngine::tag_resource(
+                    &e,
+                    "arn:aws:dynamodb:us-east-1:000000000000:table/d1",
+                    &[extenddb_core::types::Tag {
+                        key: "k".to_owned(),
+                        value: "v".to_owned(),
+                    }],
+                )
+                .await
+                .expect("tag");
+            },
+            "tag_resource",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stream_record_cleanup_waits_for_the_write_lock() {
+        use extenddb_storage::StreamEngine;
+        let engine = engine().await;
+        let e = engine.clone();
+        assert_serialized(
+            &engine,
+            async move {
+                StreamEngine::cleanup_expired_stream_records(&e, 0)
+                    .await
+                    .expect("cleanup");
+            },
+            "cleanup_expired_stream_records",
+        )
+        .await;
+    }
+}
