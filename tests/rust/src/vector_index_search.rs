@@ -1020,6 +1020,615 @@ async fn update_table_rejects_a_duplicate_create_and_a_missing_delete() {
     let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
 }
 
+/// An empty `SearchSchema` on the request means the same as omitting it, and must
+/// come back as an absent member rather than an empty list.
+///
+/// Amazon DynamoDB reports either an absent member or a populated one, so `[]`
+/// would be a third state a client never sees from the service. Storing it is also
+/// how two backends come to answer one request differently, which is what happened
+/// here: the collapse was added to one backend before being moved into the request
+/// path both share. This test is backend-blind, so it pins the rule for whichever
+/// backend is under it.
+#[tokio::test]
+async fn an_empty_search_schema_is_reported_as_absent() {
+    if skip_unless_supported().await {
+        return;
+    }
+    let name = table_name("pos_emptyschema");
+    let body = format!(
+        r#"{{
+        "TableName": "{name}",
+        "AttributeDefinitions": [{{"AttributeName": "pk", "AttributeType": "S"}}],
+        "KeySchema": [{{"AttributeName": "pk", "KeyType": "HASH"}}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "VectorIndexes": [{{
+            "IndexName": "vidx",
+            "Dimensions": 4,
+            "DistanceFunction": "COSINE",
+            "VectorAttribute": {{"AttributeName": "emb"}},
+            "SearchSchema": [],
+            "Projection": {{"ProjectionType": "ALL"}}
+        }}]
+    }}"#
+    );
+    let (status, text) = call("CreateTable", &body).await;
+    assert_eq!(status, 200, "CreateTable failed: {text}");
+
+    // The response echo, first: it is built from the request, so it is where an
+    // un-collapsed empty list surfaces without any storage round trip.
+    let created: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    let echoed = created
+        .pointer("/TableDescription/VectorIndexes/0")
+        .unwrap_or_else(|| panic!("no vector index in the CreateTable echo: {text}"));
+    assert!(
+        echoed.get("SearchSchema").is_none(),
+        "the echo must not report an empty SearchSchema: {echoed}"
+    );
+
+    wait_for_active(&name).await;
+    let (status, text) = call("DescribeTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+    assert_eq!(status, 200, "DescribeTable failed: {text}");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    let vidx = json
+        .pointer("/Table/VectorIndexes/0")
+        .unwrap_or_else(|| panic!("no vector index in description: {text}"));
+    assert!(
+        vidx.get("SearchSchema").is_none(),
+        "DescribeTable must report the member as absent, not as an empty list: {vidx}"
+    );
+
+    let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+}
+
+/// Deleting an index that is still being created is two behaviours, and the
+/// discriminator is the `Backfilling` flag the wire already reports.
+///
+/// Measured against the service: while the index reports `Backfilling: false` it is
+/// allocating resources and the delete is refused with a byte-exact
+/// `ResourceInUseException` telling the caller to retry; once it reports
+/// `Backfilling: true` the same delete is accepted. Both halves are here because
+/// both are measured, and a backend that implemented only the acceptance would fail
+/// a client that retries exactly as the message tells it to.
+///
+/// The allocation phase is held open by a test-only settings lever. Without it that
+/// phase exists only between the catalog row's insert and the flip to backfilling,
+/// both inside one UpdateTable call, so a client could only race it, and a race
+/// asserting a whole measured string fails for reasons unrelated to the rule.
+#[tokio::test]
+async fn deleting_a_vector_index_is_refused_while_allocating_and_accepted_while_backfilling() {
+    if skip_unless_supported().await {
+        return;
+    }
+    // Long enough to observe the refusal without making the test slow.
+    set_allocation_phase_delay(4000).await;
+    // The body runs as a task so that a panic inside it cannot skip the reset
+    // below. This lever is global and the suite is serial, so a leaked 4s
+    // allocation phase would slow every later test and make their failures point
+    // at the wrong cause.
+    let outcome = tokio::spawn(phase_dependent_delete_body()).await;
+    set_allocation_phase_delay(0).await;
+    if let Err(e) = outcome {
+        std::panic::resume_unwind(e.into_panic());
+    }
+}
+
+async fn phase_dependent_delete_body() {
+    let name = table_name("pos_phase_delete");
+    let body = format!(
+        r#"{{
+        "TableName": "{name}",
+        "AttributeDefinitions": [{{"AttributeName": "pk", "AttributeType": "S"}}],
+        "KeySchema": [{{"AttributeName": "pk", "KeyType": "HASH"}}],
+        "BillingMode": "PAY_PER_REQUEST"
+    }}"#
+    );
+    call("CreateTable", &body).await;
+    wait_for_active(&name).await;
+    put_vector(&name, "seed", None, &[1.0, 0.0]).await;
+
+    let delete_body = format!(
+        r#"{{"TableName": "{name}", "VectorIndexUpdates": [{{"Delete": {{"IndexName": "vidx"}}}}]}}"#
+    );
+
+    let (status, text) = call(
+        "UpdateTable",
+        &format!(
+            r#"{{
+        "TableName": "{name}",
+        "VectorIndexUpdates": [{{"Create": {{
+            "IndexName": "vidx",
+            "VectorAttribute": {{"AttributeName": "emb"}},
+            "Dimensions": 2,
+            "DistanceFunction": "COSINE",
+            "Projection": {{"ProjectionType": "ALL"}}
+        }}}}]
+    }}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "UpdateTable create failed: {text}");
+
+    // First half: still allocating, so the delete is refused. Asserted on the whole
+    // string, because the wording is what tells a caller to retry rather than that
+    // the request was wrong.
+    let (status, text) = call("UpdateTable", &delete_body).await;
+    assert_eq!(
+        status, 400,
+        "a delete during resource allocation must be refused: {text}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(
+        json.pointer("/__type").and_then(|v| v.as_str()),
+        Some("com.amazonaws.dynamodb.v20120810#ResourceInUseException"),
+        "wrong error type: {text}"
+    );
+    let expected = format!(
+        "Attempt to change a resource which is still in use: Index creation is in resource \
+         allocation phase. Retry deletion during backfilling phase or when the index is \
+         active. Table: {name} Index: vidx"
+    );
+    assert_eq!(
+        json.pointer("/message").and_then(|v| v.as_str()),
+        Some(expected.as_str()),
+        "wrong message: {text}"
+    );
+
+    // The refusal must not have half-deleted anything: the index is still reported.
+    let (status, text) = call("DescribeTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+    assert_eq!(status, 200, "DescribeTable failed: {text}");
+    assert!(
+        text.contains("\"IndexName\":\"vidx\""),
+        "the refused delete must leave the index in place: {text}"
+    );
+
+    // Second half: wait for the phase to advance past allocation, then the same
+    // request is accepted.
+    //
+    // Waiting for "no longer allocating" rather than for `Backfilling: true`
+    // specifically. The true state is not deterministically observable on a table
+    // this size: the shared driver pauses between batches, and a handful of rows is
+    // one batch, so the flag flips to true and then to absent within milliseconds.
+    // Making it observable would mean seeding more than a full batch of items purely
+    // to slow a test down. What the rule actually distinguishes is the allocation
+    // phase from everything after it, and that boundary is what this asserts.
+    wait_past_allocation_phase(&name, "vidx").await;
+    let (status, text) = call("UpdateTable", &delete_body).await;
+    assert_eq!(
+        status, 200,
+        "the same delete must be accepted once the backfill is running: {text}"
+    );
+
+    // And the table is healthy afterwards: the index is gone and writes still work,
+    // which is what a leaked build hold would break.
+    for _ in 0..100 {
+        let (_, text) = call("DescribeTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+        if !text.contains("\"IndexName\":\"vidx\"") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    put_vector(&name, "after", None, &[0.0, 1.0]).await;
+
+    let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+}
+
+/// Poll until a named vector index has left the resource-allocation phase.
+///
+/// Left means anything other than `Backfilling: false`: either the scan is running
+/// or the index is already ACTIVE. Both are past the boundary the delete rule turns
+/// on, and neither is a state the refusal applies to.
+async fn wait_past_allocation_phase(table: &str, index: &str) {
+    for _ in 0..600 {
+        let (status, text) = call("DescribeTable", &format!(r#"{{"TableName": "{table}"}}"#)).await;
+        if status == 200 {
+            let d: serde_json::Value = serde_json::from_str(&text).expect("json");
+            let allocating = d["Table"]["VectorIndexes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|vi| vi["IndexName"] == index && vi["Backfilling"] == false);
+            if !allocating {
+                return;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("vector index {index} on {table} never left the resource-allocation phase");
+}
+
+/// Switching a table that holds a vector index to PROVISIONED is refused, and the
+/// two measured shapes of that refusal carry DIFFERENT messages.
+///
+/// A plain switch reports the create-side rule. A switch that also carries
+/// `VectorIndexUpdates` reports its own message, measured on a switch combined with
+/// deleting the last vector index, which the service refuses even though the net
+/// state would hold none. Both are asserted on the whole string here, because a
+/// backend that emitted one message for both shapes would pass a substring check
+/// and still tell a caller the wrong rule. It is also the pair that had drifted
+/// between the two backends, which nothing at the wire could see until now.
+#[tokio::test]
+async fn switching_a_vector_table_to_provisioned_is_refused_with_the_measured_message() {
+    if skip_unless_supported().await {
+        return;
+    }
+    let name = table_name("vi_switch");
+    let body = format!(
+        r#"{{
+        "TableName": "{name}",
+        "AttributeDefinitions": [{{"AttributeName": "pk", "AttributeType": "S"}}],
+        "KeySchema": [{{"AttributeName": "pk", "KeyType": "HASH"}}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "VectorIndexes": [{{
+            "IndexName": "vidx",
+            "Dimensions": 2,
+            "DistanceFunction": "COSINE",
+            "VectorAttribute": {{"AttributeName": "emb"}},
+            "Projection": {{"ProjectionType": "ALL"}}
+        }}]
+    }}"#
+    );
+    let (status, text) = call("CreateTable", &body).await;
+    assert_eq!(status, 200, "CreateTable failed: {text}");
+    wait_for_active(&name).await;
+
+    // ProvisionedThroughput is supplied throughout, so a refusal cannot be
+    // attributed to a missing-throughput error instead of the rule under test.
+    let switch = format!(
+        r#""TableName": "{name}", "BillingMode": "PROVISIONED",            "ProvisionedThroughput": {{"ReadCapacityUnits": 1, "WriteCapacityUnits": 1}}"#
+    );
+
+    let (status, text) = call("UpdateTable", &format!("{{{switch}}}")).await;
+    assert_eq!(status, 400, "a plain switch must be refused: {text}");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(
+        json.pointer("/message").and_then(|v| v.as_str()),
+        Some(
+            "One or more parameter values were invalid: Vector indexes are only supported for \
+             PAY_PER_REQUEST tables"
+        ),
+        "wrong message for a plain switch: {text}"
+    );
+
+    let (status, text) = call(
+        "UpdateTable",
+        &format!(r#"{{{switch}, "VectorIndexUpdates": [{{"Delete": {{"IndexName": "vidx"}}}}]}}"#),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a switch carrying vector index updates must be refused too: {text}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(
+        json.pointer("/message").and_then(|v| v.as_str()),
+        Some(
+            "One or more parameter values were invalid: Tables with vector indexes must be in \
+             PAY_PER_REQUEST mode"
+        ),
+        "wrong message for a switch carrying vector index updates: {text}"
+    );
+
+    // The refusals changed nothing: the index is still there and the table is still
+    // on demand.
+    let (status, text) = call("DescribeTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+    assert_eq!(status, 200, "DescribeTable failed: {text}");
+    assert!(
+        text.contains("\"IndexName\":\"vidx\"") && text.contains("PAY_PER_REQUEST"),
+        "a refused switch must leave the table as it was: {text}"
+    );
+
+    let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+}
+
+/// The delayed propagation path for vector rows, end to end, on a default
+/// deployment's shape.
+///
+/// Vector maintenance used to ignore `index_propagation_delay_ms` unless the table
+/// also had a secondary index, so a vector-only table applied every write inline and
+/// no suite ever exercised the queued path for a vector row: not the delay, not the
+/// jitter, not the monotonic clamp on `ready_at`. Fixing that made the queued path
+/// the ONLY path on a vector-only table, because the default delay is non-zero, so
+/// the queue is now what every such deployment relies on.
+///
+/// Convergence is the assertion rather than absence-then-presence: a delay is a lower
+/// bound, so checking that the hit is missing immediately after the write is a race
+/// that would fail for timing reasons rather than for the behaviour under test.
+#[tokio::test]
+async fn a_vector_only_table_converges_through_the_delayed_queue() {
+    if skip_unless_supported().await {
+        return;
+    }
+    let name = table_name("vi_delayed");
+    let body = format!(
+        r#"{{
+        "TableName": "{name}",
+        "AttributeDefinitions": [{{"AttributeName": "pk", "AttributeType": "S"}}],
+        "KeySchema": [{{"AttributeName": "pk", "KeyType": "HASH"}}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "VectorIndexes": [{{
+            "IndexName": "vidx",
+            "Dimensions": 2,
+            "DistanceFunction": "COSINE",
+            "VectorAttribute": {{"AttributeName": "emb"}},
+            "Projection": {{"ProjectionType": "ALL"}}
+        }}]
+    }}"#
+    );
+    call("CreateTable", &body).await;
+    wait_for_active(&name).await;
+
+    // Well above the default, so the row really does go through the queue with a
+    // future `ready_at` rather than being applied while the write is still in flight.
+    set_vector_setting("index_propagation_delay_ms", 200).await;
+    put_vector(&name, "delayed", None, &[1.0, 0.0]).await;
+    search_until_pks(&name, &[1.0, 0.0], 5, None, &["delayed"]).await;
+
+    // Back to the default, because this setting is deployment-wide and every later
+    // test in this process would otherwise inherit it.
+    set_vector_setting("index_propagation_delay_ms", 10).await;
+    let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+}
+
+/// A query vector small enough to underflow single-precision arithmetic must still
+/// produce a NUMBER for every hit's score.
+///
+/// The search engine computes its own zero test in double precision, so a vector with
+/// components around 1e-30 is correctly treated as non-zero. pgvector's cosine
+/// operator, however, accumulates both norms in single precision, so on the same input
+/// its own norm underflows to zero and the distance comes back NaN for any stored
+/// vector that is not parallel to the query. `serde_json` renders a non-finite double
+/// as `null` rather than failing, so the response is a 200 carrying
+/// `"Score": null`, which is off-contract for a typed client deserialising a double.
+///
+/// Both stored vectors are here for a reason: the parallel one gives an infinity that
+/// the operator clamps, which is already correct, so only the orthogonal one exposes
+/// the NaN. Asserting on both is what makes this a test of the whole result set rather
+/// than of the lucky row.
+///
+/// The components are client input, narrowed to f32 by validation, so any embedding
+/// with tiny activations reaches this. It is not a hostile input and the service
+/// accepts it.
+#[tokio::test]
+async fn a_tiny_query_vector_still_scores_every_hit_as_a_number() {
+    if skip_unless_supported().await {
+        return;
+    }
+    let name = table_name("pos_tiny_query");
+    create_vector_table(&name, 4, "COSINE", false).await;
+
+    put_vector(&name, "parallel", None, &[1.0, 0.0, 0.0, 0.0]).await;
+    put_vector(&name, "orthogonal", None, &[0.0, 1.0, 0.0, 0.0]).await;
+    search_until_count(&name, &[1.0, 0.0, 0.0, 0.0], 10, None, 2).await;
+
+    let response = search(&name, &[1e-30, 0.0, 0.0, 0.0], 10, None).await;
+    let hits = response
+        .get("SearchResults")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| panic!("no results array in: {response}"))
+        .clone();
+    assert_eq!(hits.len(), 2, "both rows must come back: {response}");
+    for hit in &hits {
+        let score = hit.get("Score").unwrap_or_else(|| panic!("no score: {hit}"));
+        assert!(
+            score.is_number(),
+            "every score must be a number, not null: {hit}"
+        );
+        let score = score.as_f64().expect("a numeric score");
+        assert!(
+            score.is_finite(),
+            "a non-finite score reaches the client as null: {hit}"
+        );
+    }
+
+    // The semantic half, and the only observable that distinguishes a computed
+    // ranking from the zero-vector answer. A tiny vector is not a zero vector: the
+    // row parallel to it is nearly identical, so its cosine distance is ~0, and the
+    // orthogonal row is exactly 1.0. A backend that treats the query as zero returns
+    // 1.0 for BOTH and still passes every assertion above, which is precisely the
+    // state one backend was in: it reported a ranking it had not computed.
+    //
+    // These two values are safe to pin forever, and the reason is worth stating for
+    // whoever is tempted to weaken them: they are the metric's DEFINITION at 0 and 90
+    // degrees, not an implementation's current behaviour. Cosine distance is exactly 0
+    // for a parallel pair and exactly 1 for an orthogonal one whatever the magnitudes
+    // involved, so no correct implementation can fail this, and widening the shared
+    // norm helper to f64, which is the obvious later tidy-up, changes neither number.
+    let pks = hit_pks(&response);
+    assert_eq!(
+        pks,
+        vec!["parallel", "orthogonal"],
+        "the parallel row must rank first: {response}"
+    );
+    let score_of = |pk: &str| -> f64 {
+        hits.iter()
+            .find(|h| h.pointer("/Item/pk/S").and_then(|v| v.as_str()) == Some(pk))
+            .and_then(|h| h.get("Score"))
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_else(|| panic!("no score for {pk}: {response}"))
+    };
+    assert!(
+        score_of("parallel") < 1e-6,
+        "a tiny query parallel to the stored vector is a ~0 cosine distance, not the \
+         zero-vector answer: got {}",
+        score_of("parallel")
+    );
+    assert!(
+        (score_of("orthogonal") - 1.0).abs() < 1e-6,
+        "and orthogonal to it is exactly 1.0 on both backends: by the metric on \
+         SQLite, which computes in f64, and by the NaN substitute on PostgreSQL, \
+         where pgvector's own f32 norm underflows and the operator divides zero by \
+         zero. Either way not by the zero-vector guard, which cannot fire because \
+         the query norm is computed in f64: got {}",
+        score_of("orthogonal")
+    );
+
+    let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+}
+
+/// Extreme but valid magnitudes must still score as NUMBERS, under every metric.
+///
+/// pgvector accumulates in single precision, so a query at these magnitudes overflows
+/// its accumulators even though every component is a finite f32 that validation
+/// accepts, and every metric has its own threshold and its own failure value: the
+/// Euclidean difference is doubled before squaring, so it overflows first (around
+/// 9.2e18) and gives Infinity; dot product gives negative Infinity above about 1.8e19,
+/// which the score contract negates into positive Infinity; and cosine divides two
+/// overflowed values and gives NaN. Measured on pgvector 0.8.0.
+///
+/// `serde_json` renders both NaN and Infinity as `null`, so all three reach a client as
+/// `"Score": null` on a 200 response, which no typed SDK can deserialise into a double.
+///
+/// The ordering is already correct in the overflowed cases, which is why the repair
+/// belongs in SQL next to the operator rather than in the Rust that reports the score:
+/// substituting a value after the database has ordered the rows would let a hit
+/// reported as nearer appear after one reported as farther.
+#[tokio::test]
+async fn an_extreme_magnitude_query_scores_as_a_number_under_every_metric() {
+    if skip_unless_supported().await {
+        return;
+    }
+
+    // Metric, stored vector, query vector: each pair is a measured overflow for that
+    // metric rather than a round number.
+    let cases: [(&str, [f32; 4], [f32; 4]); 3] = [
+        ("EUCLIDEAN", [1e19, 0.0, 0.0, 0.0], [-1e19, 0.0, 0.0, 0.0]),
+        ("DOT_PRODUCT", [2e19, 0.0, 0.0, 0.0], [2e19, 0.0, 0.0, 0.0]),
+        ("COSINE", [3.4e38, 1e38, 0.0, 0.0], [3.4e38, 0.0, 0.0, 0.0]),
+    ];
+
+    for (metric, stored, query) in cases {
+        let name = table_name(&format!("pos_huge_{}", metric.to_lowercase()));
+        create_vector_table(&name, 4, metric, false).await;
+        put_vector(&name, "extreme", None, &stored).await;
+        search_until_count(&name, &stored, 10, None, 1).await;
+
+        let response = search(&name, &query, 10, None).await;
+        let hit = response
+            .pointer("/SearchResults/0")
+            .unwrap_or_else(|| panic!("no hit under {metric}: {response}"));
+        let score = hit
+            .get("Score")
+            .unwrap_or_else(|| panic!("no score under {metric}: {hit}"));
+        assert!(
+            score.is_number(),
+            "{metric}: an overflowed score must not reach the client as null: {hit}"
+        );
+        assert!(
+            score.as_f64().expect("a numeric score").is_finite(),
+            "{metric}: the score must be finite, or it serialises as null: {hit}"
+        );
+
+        let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+    }
+}
+
+/// The other side of the tiny-vector boundary: an all-zero query vector.
+///
+/// The pair is what makes either half meaningful from outside the process. A tiny
+/// query is not a zero vector, so it must produce a computed ranking, 0 for the
+/// parallel row and 1.0 for the orthogonal one. A genuinely zero query has no
+/// direction, so every row must score the same 1.0, and the difference between the two
+/// results is what shows the zero-vector guard fires where it should and not where it
+/// should not. With only the tiny case pinned, a backend that treated every small
+/// vector as zero would still pass one test and fail the pair.
+///
+/// 1.0 is the measured service answer rather than a choice: writing and cosine
+/// searching an all-zeros vector both succeed against Amazon DynamoDB, and it defines
+/// the score involving a zero vector as exactly 1.0 on either side. The expected
+/// rejection does not exist.
+#[tokio::test]
+async fn a_zero_query_vector_scores_every_hit_as_the_zero_vector_answer() {
+    if skip_unless_supported().await {
+        return;
+    }
+    let name = table_name("pos_zero_query");
+    create_vector_table(&name, 4, "COSINE", false).await;
+
+    put_vector(&name, "parallel", None, &[1.0, 0.0, 0.0, 0.0]).await;
+    put_vector(&name, "orthogonal", None, &[0.0, 1.0, 0.0, 0.0]).await;
+    search_until_count(&name, &[1.0, 0.0, 0.0, 0.0], 10, None, 2).await;
+
+    let response = search(&name, &[0.0, 0.0, 0.0, 0.0], 10, None).await;
+    let hits = response
+        .get("SearchResults")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| panic!("no results array in: {response}"))
+        .clone();
+    assert_eq!(hits.len(), 2, "both rows must come back: {response}");
+    for hit in &hits {
+        let score = hit
+            .get("Score")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_else(|| panic!("no numeric score: {hit}"));
+        assert!(
+            (score - 1.0).abs() < 1e-6,
+            "a zero query vector has no direction, so every row is the zero-vector \
+             answer of exactly 1.0, whatever its own direction: got {score} for {hit}"
+        );
+    }
+
+    let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+}
+
+/// The same collapse on the other path a client can reach: an index added by
+/// UpdateTable.
+///
+/// Separate from the CreateTable case because the two store the index through
+/// different code, and because this one builds a real index with a lifecycle
+/// rather than one that is ACTIVE from birth, so the member has to survive the
+/// build as well as the write.
+#[tokio::test]
+async fn an_empty_search_schema_added_by_update_table_is_reported_as_absent() {
+    if skip_unless_supported().await {
+        return;
+    }
+    let name = table_name("pos_emptyschema_upd");
+    let body = format!(
+        r#"{{
+        "TableName": "{name}",
+        "AttributeDefinitions": [{{"AttributeName": "pk", "AttributeType": "S"}}],
+        "KeySchema": [{{"AttributeName": "pk", "KeyType": "HASH"}}],
+        "BillingMode": "PAY_PER_REQUEST"
+    }}"#
+    );
+    call("CreateTable", &body).await;
+    wait_for_active(&name).await;
+
+    let (status, text) = call(
+        "UpdateTable",
+        &format!(
+            r#"{{
+        "TableName": "{name}",
+        "VectorIndexUpdates": [{{"Create": {{
+            "IndexName": "vidx",
+            "VectorAttribute": {{"AttributeName": "emb"}},
+            "Dimensions": 2,
+            "DistanceFunction": "COSINE",
+            "SearchSchema": [],
+            "Projection": {{"ProjectionType": "ALL"}}
+        }}}}]
+    }}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "UpdateTable create failed: {text}");
+
+    wait_for_vector_index_active(&name, "vidx").await;
+
+    let (status, text) = call("DescribeTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+    assert_eq!(status, 200, "DescribeTable failed: {text}");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    let vidx = json
+        .pointer("/Table/VectorIndexes/0")
+        .unwrap_or_else(|| panic!("no vector index in description: {text}"));
+    assert!(
+        vidx.get("SearchSchema").is_none(),
+        "an index added by UpdateTable must report the member as absent too: {vidx}"
+    );
+
+    let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+}
+
 /// DescribeTable reports the vector index, and reports it ACTIVE with no
 /// `Backfilling` member, which is what the service does for an index created by
 /// CreateTable.
@@ -1585,6 +2194,17 @@ async fn removing_a_row_during_a_backfill_does_not_skip_another() {
 /// that skipped itself and reported green when this variable was absent, which is the
 /// exact failure mode `EXTENDDB_EXPECT_VECTORS` was introduced to close.
 async fn set_backfill_delay(ms: u64) {
+    set_vector_setting("vector_backfill_batch_delay_ms", ms).await;
+}
+
+/// Hold a new index in the resource-allocation phase for `ms`, so a client can
+/// observe the phase at all. Zero in production; see the settings key's own docs.
+pub(crate) async fn set_allocation_phase_delay(ms: u64) {
+    set_vector_setting("vector_allocation_phase_delay_ms", ms).await;
+}
+
+/// Write one vector test lever through the management API.
+async fn set_vector_setting(key: &str, ms: u64) {
     let user = std::env::var("EXTENDDB_ADMIN_USER").unwrap_or_else(|_| "admin".into());
     let Ok(pass) = std::env::var("EXTENDDB_ADMIN_PASSWORD") else {
         assert!(
@@ -1605,7 +2225,7 @@ async fn set_backfill_delay(ms: u64) {
         .build()
         .expect("reqwest build");
     let r = http
-        .put(format!("{base}/settings/vector_backfill_batch_delay_ms"))
+        .put(format!("{base}/settings/{key}"))
         .basic_auth(&user, Some(&pass))
         .json(&serde_json::json!({ "value": ms.to_string() }))
         .send()
@@ -1615,7 +2235,7 @@ async fn set_backfill_delay(ms: u64) {
     let body = r.text().await.unwrap_or_default();
     assert!(
         status.is_success(),
-        "setting the backfill delay failed ({status}): {body}"
+        "setting {key} failed ({status}): {body}"
     );
 }
 

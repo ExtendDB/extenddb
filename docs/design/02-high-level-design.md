@@ -365,11 +365,22 @@ The server runs on a tokio multi-thread runtime. Each incoming HTTP request is h
 All database access goes through an sqlx `PgPool`. The pool size is configurable via `storage.postgres.pool_size` in `extenddb.toml` (default: 20). When all connections are in use, new requests queue at the pool level until a connection is returned or the acquire timeout expires. If the timeout expires, the request fails with an internal server error (HTTP 500).
 
 Total connection footprint on the PostgreSQL server:
-- `pool_size` connections for DynamoDB data operations (shared by all background workers)
-- +2 for the management API (separate pool, `max_connections(2)`)
-- +1 for the log-level poller (separate pool, `max_connections(1)`)
+- `pool_size` for the catalog pool
+- `pool_size` again for the data pool, because `extenddb init` always puts the
+  catalog and the data in separate databases and the engine opens a pool against
+  each. The two collapse into one only where a deployment shares a database.
+- `catalog_pool_size` for the management pool (authorization, IAM, console),
+  which defaults to `pool_size` and has a minimum of 10
+- one session per vector index build running on the server, opened outside every
+  pool because its ownership lock is session-scoped
+- one connection while a schema migration runs, pinned outside the pools so its
+  transaction-scoped lock cannot move between backends
 
-So the total is `pool_size + 3`. The default PostgreSQL `max_connections` is 100, which comfortably supports the default pool_size of 20.
+So the total is `2 * pool_size + catalog_pool_size`, plus builds and migrations.
+There is no separate poller pool: the log-level poller borrows from the management
+pool like every other background poller. `max_connections` is per cluster rather
+than per database, so both `pool_size` pools draw on the same budget: the defaults
+need 60 of PostgreSQL's default 100.
 
 ### 6.3 Row-Level Locking
 

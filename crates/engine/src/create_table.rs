@@ -22,7 +22,7 @@ pub async fn handle_create_table(
         }],
     )?;
 
-    let input: CreateTableInput = serde_json::from_value(body).map_err(|e| {
+    let mut input: CreateTableInput = serde_json::from_value(body).map_err(|e| {
         let msg = e.to_string();
         if msg.contains("validation error detected")
             || msg.contains("parameter values were invalid")
@@ -43,6 +43,14 @@ pub async fn handle_create_table(
     })?;
 
     validate_create_table(&input, &ctx.limits)?;
+
+    // An empty SearchSchema means the same as an absent one, so it is collapsed
+    // here, once, rather than in each backend. Storing the empty list would make
+    // DescribeTable echo a state the service never reports, and would leave two
+    // backends free to disagree about it.
+    for spec in input.vector_indexes.iter_mut().flatten() {
+        spec.normalize_search_schema();
+    }
 
     crate::vector_gate::ensure_create_table_supported(
         input.vector_indexes.as_ref(),

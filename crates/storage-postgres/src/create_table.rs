@@ -193,6 +193,93 @@ impl PostgresEngine {
             }
         }
 
+        // Collected because each id names a data table, created after the catalog
+        // commit in the same order the rows were written.
+        let mut vector_index_ids: Vec<String> = Vec::new();
+        // Insert vector index metadata. A CreateTable's table is empty, so there
+        // is nothing to backfill: the index goes straight to ACTIVE with no
+        // `backfilling` member, which is the state the service reports for an
+        // index created this way. The UpdateTable path is the one that drives a
+        // real lifecycle.
+        if let Some(vis) = &input.vector_indexes {
+            // Confirm pgvector is still there before recording an index whose
+            // storage depends on it, closing the window between the startup probe
+            // and now.
+            //
+            // The invariant this gives is narrower than "storage never records a
+            // vector index it cannot back", and the difference is worth stating:
+            // the check runs only where the startup probe said the extension was
+            // present, so storage relies on the engine having already refused
+            // vector indexes on a backend that reports no capability. The
+            // alternative, probing unconditionally, is one round trip on a
+            // CreateTable that carries vector indexes and would be strictly
+            // safer here; it was not taken because it would make the
+            // control-plane tests require the extension, and they would then skip
+            // on any server without the package, including the plain PostgreSQL
+            // job in CI. Losing that coverage costs more than the invariant gains
+            // while no path can reach storage without passing the engine gate
+            // first. That dependency is itself pinned rather than assumed: the
+            // wire refusal suite runs with EXTENDDB_EXPECT_VECTORS=0 in two CI
+            // jobs, so a regression that let a vector request past the gate fails
+            // there before it could reach this un-probed path.
+            if self.vector_capable {
+                crate::vector::ensure_vector_extension_present(&self.data_pool).await?;
+            }
+            for vi in vis {
+                let vec_attr = serde_json::to_value(&vi.vector_attribute)
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                // The request paths already collapse an empty SearchSchema, so
+                // this is for a caller that reaches the storage trait directly.
+                // Same core rule either way, so the two cannot drift.
+                let search_schema = vi
+                    .search_schema_for_storage()
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let proj = vi
+                    .projection
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .map_err(|e| StorageError::Internal(e.to_string()))?
+                    .ok_or_else(|| {
+                        // Core validation requires Projection, so reaching here
+                        // means the request bypassed validation rather than that
+                        // the caller omitted it.
+                        StorageError::Internal(
+                            "vector index reached storage without a projection".to_owned(),
+                        )
+                    })?;
+                let distance = extenddb_storage::vector_catalog::distance_function_token(
+                    vi.distance_function,
+                )?;
+                let index_id = uuid::Uuid::new_v4().to_string();
+                sqlx::query(
+                    r"INSERT INTO vector_indexes
+                       (table_id, index_name, index_id, dimensions, distance_function,
+                        vector_attribute, search_schema, projection, index_status, backfilling)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'ACTIVE', NULL)",
+                )
+                .bind(&table_id)
+                .bind(&vi.index_name)
+                .bind(&index_id)
+                .bind(i32::try_from(vi.dimensions).map_err(|_| {
+                    StorageError::Internal(format!(
+                        "vector dimensions out of range: {}",
+                        vi.dimensions
+                    ))
+                })?)
+                .bind(&distance)
+                .bind(&vec_attr)
+                .bind(&search_schema)
+                .bind(&proj)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                vector_index_ids.push(index_id);
+            }
+        }
+
         // Insert tags
         if let Some(tags) = &input.tags {
             for tag in tags {
@@ -272,6 +359,19 @@ impl PostgresEngine {
                         &lsi_index_ids[i],
                         &lsi.key_schema,
                         &input.attribute_definitions,
+                        &input.key_schema,
+                        &input.attribute_definitions,
+                    )
+                    .await?;
+                }
+            }
+
+            if let Some(vis) = &input.vector_indexes {
+                for (i, vi) in vis.iter().enumerate() {
+                    Self::create_vector_data_table(
+                        &mut data_tx,
+                        &vector_index_ids[i],
+                        vi.dimensions,
                         &input.key_schema,
                         &input.attribute_definitions,
                     )
@@ -383,6 +483,39 @@ impl PostgresEngine {
             TableStatus::Creating
         };
 
+        // Echo the vector indexes just created. Built from the request rather
+        // than re-read from the catalog, which would add a round trip to say
+        // something already known. A CreateTable's table is empty, so each index
+        // is ACTIVE with no `backfilling` member.
+        let vector_index_descs: Option<Vec<extenddb_core::types::VectorIndexDescription>> = input
+            .vector_indexes
+            .as_ref()
+            .map(|vis| {
+                vis.iter()
+                    .map(|vi| extenddb_core::types::VectorIndexDescription {
+                        index_name: vi.index_name.clone(),
+                        vector_attribute: vi.vector_attribute.clone(),
+                        dimensions: vi.dimensions,
+                        // Normalised the same way the catalog row is, so the echo
+                        // and a later describe report the same thing.
+                        search_schema: vi.search_schema_for_storage().map(<[_]>::to_vec),
+                        distance_function: vi.distance_function,
+                        index_status: extenddb_core::types::IndexStatus::Active,
+                        backfilling: None,
+                        index_size_bytes: 0,
+                        item_count: 0,
+                        index_arn: index_arn(
+                            &self.region,
+                            account_id,
+                            &input.table_name,
+                            &vi.index_name,
+                        ),
+                        projection: vi.projection.clone(),
+                    })
+                    .collect()
+            })
+            .filter(|v: &Vec<_>| !v.is_empty());
+
         Ok(TableDescription {
             table_name: input.table_name,
             key_schema: input.key_schema,
@@ -430,7 +563,16 @@ impl PostgresEngine {
                 .as_ref()
                 .map(|tc| serde_json::json!({ "TableClass": tc })),
             on_demand_throughput: input.on_demand_throughput,
-            ..Default::default()
+            // Every field is populated deliberately, with no
+            // `..Default::default()` spread. This response is the complete
+            // description of what was just created, so a new core field should
+            // break this site and force a decision about whether create must
+            // report it, rather than silently defaulting.
+            vector_indexes: vector_index_descs,
+            // A freshly created table was not restored from anything: the
+            // service reports no RestoreSummary member on it. See the field's
+            // measured provenance on `TableDescription`.
+            restore_summary: None,
         })
     }
 }
