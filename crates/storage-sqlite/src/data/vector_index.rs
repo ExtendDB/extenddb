@@ -606,7 +606,7 @@ impl VectorIndexBuild for SqliteVectorBuild {
         // `backfilling` is cleared to NULL rather than set to 0, because the
         // service removes the member once ACTIVE and the catalog CHECK
         // constraint enforces that pairing.
-        sqlx::query(
+        let flipped = sqlx::query(
             "UPDATE vector_indexes SET index_status = 'ACTIVE', backfilling = NULL, \
              skipped_item_count = ? \
              WHERE table_id = ? AND index_id = ?",
@@ -617,6 +617,27 @@ impl VectorIndexBuild for SqliteVectorBuild {
         .execute(&self.pool)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        if flipped.rows_affected() == 0 {
+            // No row to flip means a delete committed while this build was
+            // running, and a rebuild recreates its data table after reading the
+            // definition back. A delete landing in between drops the table it
+            // could see, and this build then recreates one nothing references.
+            // The absent catalog row is the proof the index is gone.
+            let _writer = self.write_lock.lock().await;
+            crate::SqliteEngine::drop_vector_data_table_by_id(
+                &self.pool,
+                &self.table_id,
+                &self.index_id,
+            )
+            .await?;
+            tracing::info!(
+                index_id = %self.index_id,
+                table_id = %self.table_id,
+                "vector index was deleted while its build ran; dropped the rebuilt data table"
+            );
+            return Ok(());
+        }
         Ok(())
     }
 

@@ -196,6 +196,9 @@ Query, Scan (key conditions, filters, projections, pagination, index selection)
 ### Batch & Transactions
 BatchGetItem (100 keys), BatchWriteItem (25 ops), TransactGetItems (100 items), TransactWriteItems (100 ops)
 
+### Vector Search
+SearchVectors, and vector indexes on CreateTable and UpdateTable (cosine, Euclidean and dot product; on-demand tables only). On PostgreSQL this requires the pgvector extension on the data database; without it every vector operation is refused and nothing else is affected.
+
 ### Streams
 ListStreams, DescribeStream, GetShardIterator, GetRecords
 

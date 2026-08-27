@@ -281,6 +281,14 @@ fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> DynamoDbEr
                 DynamoDbError::ValidationException(msg)
             }
         }
+        // Not a fault, so deliberately not logged at error level: the backend
+        // never claimed the feature, and the request is invalid against this
+        // deployment rather than a server failure. Amazon DynamoDB has no
+        // "unsupported" error class, so this reports as a validation error, the
+        // same mapping CreateTable and UpdateTable use for a refused capability.
+        extenddb_storage::error::StorageError::Unsupported(msg) => {
+            DynamoDbError::ValidationException(msg)
+        }
         other => {
             tracing::error!(internal_error = %other, "backup storage error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
@@ -290,8 +298,9 @@ fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> DynamoDbEr
 
 #[cfg(test)]
 mod tests {
-    use super::backup_arn_field;
+    use super::{backup_arn_field, storage_err_to_dynamo};
     use extenddb_core::error::DynamoDbError;
+    use extenddb_storage::error::StorageError;
     use serde_json::json;
 
     const ACCOUNT: &str = "123456789012";
@@ -304,6 +313,31 @@ mod tests {
     fn own_account_arn_is_accepted() {
         let body = json!({ "BackupArn": arn(ACCOUNT) });
         assert_eq!(backup_arn_field(&body, ACCOUNT).unwrap(), arn(ACCOUNT));
+    }
+
+    /// A refusal the backend states plainly must not reach the client as a fault.
+    ///
+    /// The restore path refuses a backup whose source carried vector indexes,
+    /// because restore does not recreate them and dropping a declared index
+    /// silently is worse than refusing. Without this arm that refusal fell to the
+    /// catch-all: the client got a 500 with no reason, indistinguishable from a
+    /// broken server, and the operator got an error-level log for a request that
+    /// was answered correctly.
+    #[test]
+    fn an_unsupported_feature_is_a_validation_exception() {
+        let err = storage_err_to_dynamo(StorageError::Unsupported(
+            "restoring a table with vector indexes is not supported by this storage backend"
+                .to_owned(),
+        ));
+        match err {
+            DynamoDbError::ValidationException(msg) => {
+                assert_eq!(
+                    msg,
+                    "restoring a table with vector indexes is not supported by this storage backend"
+                );
+            }
+            other => panic!("expected ValidationException, got {other:?}"),
+        }
     }
 
     #[test]

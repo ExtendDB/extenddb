@@ -16,7 +16,6 @@ mongodb-test-hooks = ["extenddb-server/mongodb-test-hooks"]
 
 [dependencies]
 extenddb-auth = { workspace = true }
-extenddb-cache = { workspace = true }
 extenddb-core = { workspace = true }
 extenddb-engine = { workspace = true }
 extenddb-storage = { workspace = true }
