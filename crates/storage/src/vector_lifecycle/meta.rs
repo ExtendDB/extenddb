@@ -50,11 +50,14 @@ pub struct VectorIndexMeta {
 /// serialized into the pending queue row's context column.
 ///
 /// `table_id` is carried here even though the queue row has a `table_id` column of
-/// its own, because a vector data table is named from the table id *and* the index
-/// id. Reading it from the context preserves the invariant that the context alone
-/// is sufficient, rather than splitting one apply's inputs across a column and a
-/// JSON blob. Both are written from the same variable in the same statement, so
-/// they cannot disagree.
+/// its own, because a backend may need it to name the index's data table: SQLite
+/// names one from the table id *and* the index id, while PostgreSQL names one from
+/// the index id alone, since the two ids together exceed its 63-byte identifier limit
+/// and were being silently truncated into collisions. So this field is load-bearing on
+/// one backend and unread on the other, and it stays in the context regardless: the
+/// invariant worth keeping is that the context alone is sufficient to apply the row,
+/// rather than splitting one apply's inputs across a column and a JSON blob. Both are
+/// written from the same variable in the same statement, so they cannot disagree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorApplyContext {
     pub base_key_schema: Vec<KeySchemaElement>,

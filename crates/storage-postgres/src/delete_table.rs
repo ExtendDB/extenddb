@@ -58,6 +58,17 @@ impl PostgresEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+        // Vector index ids, read while the rows still exist. Deleting the table
+        // row cascades them away, and each id names a data table that has to be
+        // dropped afterwards: the same ordering the GSI path uses, and for the same
+        // reason.
+        let vector_index_ids: Vec<String> =
+            sqlx::query_scalar("SELECT index_id FROM vector_indexes WHERE table_id = $1")
+                .bind(&row.table_id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+
         // H-5 (delete): synchronous control-plane shortcut when delay < 1s.
         // When control_plane_delay_seconds is small, the poller may not run
         // before the next request, causing stale DELETING rows. Synchronous
@@ -75,6 +86,11 @@ impl PostgresEngine {
         if delay_secs < 1.0 {
             // Synchronous delete: remove tags, catalog row, and data tables inline.
             // Note: deleting the tables row cascades to indexes and stream rows via FK CASCADE.
+            // Vector index rows cascade the same way, through
+            // vector_indexes_table_id_fkey, so a table with vector indexes needs
+            // no extra catalog cleanup. Their data tables do need dropping, and
+            // the cascade takes away the rows that name them, which is why the
+            // index ids are collected BEFORE the catalog row goes.
             sqlx::query("DELETE FROM tags WHERE resource_arn = $1")
                 .bind(&row.table_arn)
                 .execute(&mut *tx)
@@ -100,6 +116,16 @@ impl PostgresEngine {
             for idx_id in &index_ids {
                 Self::drop_index_data_table(&mut data_tx, idx_id).await?;
             }
+            for index_id in &vector_index_ids {
+                Self::drop_vector_data_table(&mut data_tx, index_id).await?;
+            }
+            // Holds go with the table. A hold for a table that no longer exists
+            // would block claims for a table id that can never be released.
+            sqlx::query("DELETE FROM vector_index_holds WHERE table_id = $1")
+                .bind(&row.table_id)
+                .execute(&mut *data_tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
             Self::drop_data_table(&mut data_tx, &row.table_id).await?;
 
             // Drop any still-pending GSI propagation rows for this table in the

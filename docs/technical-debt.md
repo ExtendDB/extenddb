@@ -1,6 +1,6 @@
 # Technical Debt Tracker
 
-Last updated: 2026-08-19
+Last updated: 2026-08-20
 
 ## Categories
 
@@ -30,7 +30,9 @@ Last updated: 2026-08-19
 | F-15 | ~~TTL worker bypasses stream capture — expired item deletions don't generate REMOVE stream records~~ | `bin/cmd_serve.rs:ttl_cleanup_worker` | ~~High~~ | P26 |
 | F-16 | `transact_write_items.rs` passes `None` for `old_item` in stream capture — `OldImage` always `None` for transaction-originated stream records | `engine/transact_write_items.rs` | Medium | P27 |
 | F-17 | `validate_attribute_name_sizes` only checks top-level attribute names — nested map keys not validated | `core/validation/mod.rs` | Low | P30 |
-| F-18 | UpdateTable Delete of a vector index in the resource-allocation phase (`CREATING`, `Backfilling: false`) is accepted; Amazon DynamoDB refuses it with `ResourceInUseException` until backfilling starts. The message constant, `StorageError::ResourceInUse`, and the engine mapping arms are in place with no runtime producer; enforcement belongs in the shared lifecycle, deferred so the extraction stayed behavior-preserving | `storage-sqlite/update_table.rs` (vector delete branch), `core/types/table.rs` (`vector_index_delete_in_allocation_phase`) | Medium | vector probe P2 |
+| F-18 | ~~UpdateTable Delete of a vector index in the resource-allocation phase (`CREATING`, `Backfilling: false`) is accepted; Amazon DynamoDB refuses it with `ResourceInUseException` until backfilling starts~~ Both backends now enforce the phase rule with the measured message, and both hold the phase open under `vector_allocation_phase_delay_ms` so a client can observe it | ~~`storage-sqlite/update_table.rs` (vector delete branch), `core/types/table.rs` (`vector_index_delete_in_allocation_phase`)~~ | ~~Medium~~ | vector probe P2 |
+| F-19 | **Reachable in default configuration, no setting required.** SQLite backup does not capture vector indexes, so `CreateBackup` followed by `RestoreTableFromBackup` silently produces the table without them and reports success. Its `backups` table has no column that could carry an index set, where PostgreSQL added one specifically so it could detect the case and refuse, and neither SQLite entry point is gated by anything. That makes this the more reachable of the two vector gaps: F-20 needs `index_propagation_delay_ms` at zero, which is a test setting, and this needs nothing. Raised to High on that reachability: severity attaches to what a default configuration can reach, and the earlier Medium rested on a belief about whether operators back up vector tables rather than on any barrier in the code. Amazon DynamoDB preserves vector state through backup and restore (measured). The PostgreSQL backend refuses the restore rather than matching this, so the two backends fail differently: one refuses with a reason, one loses declared indexes quietly. Fix: capture the index set in the SQLite backup row and either restore it or refuse, matching PostgreSQL | `storage-sqlite/backup.rs:313-317` (the restore reads three columns: `key_schema`, `attribute_definitions`, `billing_mode`, none of which can carry an index), `storage-postgres/backup_engine.rs:140-149` and `:167` (captures the index set into the backup row), `:467-497` (refuses the restore) | High | PR-2 docs stage |
+| F-20 | SQLite applies vector index maintenance inline whenever `index_propagation_delay_ms` is 0, without checking the index status, so a write landing during a backfill reaches the CREATING index's data table directly, bypassing the claim-time hold that keeps queued rows behind the backfill. The shared lifecycle contract requires that hold (`storage/vector_lifecycle/mod.rs`), and PostgreSQL enforces it with `delay_ms == 0 && index_status == "ACTIVE"` plus the queue-emptiness gate. The WEDGE this item originally tracked is fixed on main: the backfill inserts with `VectorRowConflict::KeepExisting` (`INSERT OR IGNORE`), so the collision no longer errors the build (regression-tested). What remains is ordering, not liveness: an inline write to a CREATING index can be overwritten by nothing today, but once SQLite gains the ACTIVE gate it produces pre-flip queued rows, and those rows meet the same stale-overwrite race the PostgreSQL queue-emptiness gate closes. Fix: gate the inline branch on the index being ACTIVE, and it MUST land together with the queue-emptiness gate, or the change swaps one race for another | `storage-sqlite/data/vector_index.rs` (inline branch), `storage-postgres/data/vector_index.rs` (the shape to match) | Medium | PR-2 docs stage |
 
 ## Cleanup
 
@@ -61,26 +63,23 @@ Last updated: 2026-08-19
 |---|------|----------|----------|--------|
 | T-1 | `test_disable_ttl` flaky due to TTL modification cooldown | `tests/test_ttl.py` | Medium | P23 |
 | T-2 | ~~No code coverage tooling configured (Rust or Python)~~ | — | ~~Medium~~ | P25 review |
+| T-4 | Cross-family index-name collision wording is unmeasured. UpdateTable now refuses a vector index name already held by a secondary index (and the reverse) using the existing duplicate-index message, but Amazon DynamoDB's own wording for the cross-family case has not been captured. Probe: create a table with a GSI, then UpdateTable-create a vector index of the same name, and the reverse | `storage-postgres/update_table.rs`, `storage-sqlite/update_table.rs` (`ensure_index_name_free`) | Low | PR-2 review |
+| T-5 | ~~Two SQLite vector tests assert a data table is absent by binding the name returned from `vector_table_name`, which is already quoted for DDL use, so it can never match `sqlite_master.name` and the assertion passes whatever the real state is~~ Both tests now compare the bare name through one helper pair, and each carries a positive control asserting the table is present where it must be, so an absence assertion that cannot fail would itself fail (`e7fc11c`) | ~~`storage-sqlite/update_table.rs` (`a_delete_during_a_rebuild_...`)~~ | ~~Low~~ | PR-2 review |
 | T-3 | External Java tests lack `waitForGSI` helpers — 5 GSI tests fail intermittently due to propagation timing | `tests/external/` | Medium | P26 |
 
 ## Architecture
 
 | # | Item | Location | Priority | Origin |
 |---|------|----------|----------|--------|
-| A-1 | Catalog/data database separation not implemented (REQ-CAT-001/002) | `storage-postgres/src/lib.rs` | High | P40 |
+| A-1 | ~~Catalog/data database separation not implemented (REQ-CAT-001/002)~~ Implemented at the location this row cites: the runtime reads the data connection string from the catalog and opens a second pool, and the item, GSI-queue, and vector-index paths run on it. Residual: the pool selection falls back to the catalog pool when the setting is absent, so a hand-written configuration can run both roles on one database without a warning, which makes the separation enforced by `extenddb init` rather than by the code path | `storage-postgres/src/lib.rs:238-256` (the second pool and its fallback) | ~~High~~ Low | P40 |
 
 ### A-1: Catalog/Data Database Separation
 
 **Design requirement:** Two databases — catalog (`extenddb`) for metadata, data (`extenddb_data`) for user items (REQ-CAT-001, REQ-CAT-002).
 
-**Current state:** `extenddb init` correctly creates both databases and stores the data connection string in the settings table. However, the runtime (`PostgresEngine`) only opens one connection pool to the catalog database. All `_ddb_*` item tables are created in the catalog database. The `extenddb_data` database exists but sits empty. The settings table has `data_database_connection_string` and `data_database_name` but the code never reads them at runtime.
+**Current state:** Implemented on PostgreSQL. `extenddb init` creates both databases, records the data connection string in the catalog `settings` table (`storage/src/bootstrapper.rs:139`, called at `app/src/cmd_init.rs:334`), and initialises the data schema. The runtime reads that setting and opens a second pool (`storage-postgres/src/lib.rs:238-256`). Table creation, the GSI queue, the item-write paths, vector index data, and the backup and stream engines all take that pool (`create_table.rs:311`, `gsi_queue.rs`, `data/put_item.rs`, `data/vector_index.rs`, `backup_engine.rs`, `stream_engine.rs`), and `create_table.rs:300` commits catalog metadata before creating data tables. `extenddb destroy` drops both databases (`storage-postgres/src/bootstrapper.rs:725` and `:734`). SQLite co-locates catalog and data by design, which its worker module states (`storage-sqlite/src/workers.rs:11`).
 
-**What needs to change:**
-1. Open a second connection pool for the data database at startup
-2. Route item storage operations (`_ddb_*` tables) to the data pool
-3. Update transaction boundaries — catalog metadata and data writes may need coordinated commits
-4. Update GSI queue to use the data pool for item data
-5. Update `extenddb destroy` to drop both databases
+**Residual, which is a note rather than an architectural gap:** the pool selection ends in `_ => pool.clone()`, so a catalog with no `data_database_connection_string` runs both roles on one database and nothing says so. The separation is enforced by `init` rather than by the code path. That is also what the connection formula in `docs/getting-started.md` assumes: it says the collapsed shape is the only one where the two `pool_size` pools become one, and that `extenddb init` does not produce it. Fix, if wanted: warn or refuse when the setting is absent, instead of collapsing silently.
 
 ## Unenforced DynamoDB Limits
 

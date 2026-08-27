@@ -145,6 +145,68 @@ impl PostgresBootstrapper {
     pub fn catalog_connection_url(&self) -> String {
         self.app_connection_url(&self.config.catalog_db)
     }
+
+    /// Try to install pgvector on the data database, tolerating refusal.
+    ///
+    /// The attempt runs as the admin role first: pgvector's control file does
+    /// not mark the extension trusted, so a stock server refuses `CREATE
+    /// EXTENSION` from any non-superuser, even on a database its role owns
+    /// ("Must be superuser", measured on a stock install). The application role
+    /// can therefore never succeed there, and the admin credentials this command
+    /// already holds are exactly the ones that can. The application role is
+    /// still tried on admin failure, which is the shape managed platforms
+    /// allowlisting pgvector for the database owner need. Serve-time code never
+    /// attempts this, because a request path must not carry data-definition
+    /// privileges it only needs once.
+    ///
+    /// Failure is a notice, not an error. A deployment that does not want vector
+    /// indexes, or a managed PostgreSQL that does not offer pgvector, must still
+    /// initialise and upgrade normally; the server then refuses vector
+    /// operations, which is the fail-closed half of the same decision.
+    async fn try_create_vector_extension(&self, pool: &PgPool) {
+        use sqlx::Connection as _;
+
+        println!("--- Checking pgvector extension on the data database...");
+        let admin_opts = PgConnectOptions::new()
+            .host(&self.config.host)
+            .port(self.config.port)
+            .username(&self.config.admin_user)
+            .database(&self.config.data_db);
+        let admin_opts = if let Some(ref pass) = self.config.admin_password {
+            admin_opts.password(pass)
+        } else {
+            admin_opts
+        };
+        let admin_error = match sqlx::PgConnection::connect_with(&admin_opts).await {
+            Ok(mut conn) => {
+                let created = sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
+                    .execute(&mut conn)
+                    .await;
+                let _ = conn.close().await;
+                match created {
+                    Ok(_) => {
+                        println!("    pgvector available; vector indexes are supported.");
+                        return;
+                    }
+                    Err(e) => e.to_string(),
+                }
+            }
+            Err(e) => e.to_string(),
+        };
+        match sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
+            .execute(pool)
+            .await
+        {
+            Ok(_) => println!("    pgvector available; vector indexes are supported."),
+            Err(e) => {
+                let hint = crate::vector::create_extension_hint(&e);
+                println!(
+                    "    NOTICE: could not create the pgvector extension (as the admin role: \
+                     {admin_error}; as the application role: {e}). {hint}."
+                );
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -231,6 +293,7 @@ impl Bootstrapper for PostgresBootstrapper {
 
     async fn run_data_migrations(&self) -> OpResult<()> {
         let pool = self.app_pool(&self.config.data_db).await?;
+        self.try_create_vector_extension(&pool).await;
         migrations::run_data_migrations(&pool).await?;
         // Programmatic migrations need the catalog pool (to enumerate index
         // tables) plus the data pool (where the `_ddb_*` tables live).

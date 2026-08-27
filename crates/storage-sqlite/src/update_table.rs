@@ -19,9 +19,42 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::effective_attribute_definitions;
-use extenddb_storage::vector_lifecycle::VectorIndexBuild;
 
 use crate::store::SqliteEngine;
+
+/// Refuse a new index whose name is already taken on this table, whatever index
+/// family holds it.
+///
+/// CreateTable enforces uniqueness across secondary and vector index names
+/// together, in one place. UpdateTable builds each family's create path
+/// separately, and each one used to consult only its own catalog table, so a GSI
+/// and a vector index could end up sharing a name on the same table, and with it
+/// a single index ARN.
+///
+/// The error wording is the existing duplicate-index message. The service's own
+/// wording for the cross-family case is not measured, so it is not claimed here.
+async fn ensure_index_name_free(
+    conn: &mut sqlx::SqliteConnection,
+    table_id: &str,
+    index_name: &str,
+) -> Result<(), StorageError> {
+    let taken: Option<(String,)> = sqlx::query_as(
+        "SELECT index_name FROM indexes WHERE table_id = ? AND index_name = ? \
+         UNION ALL \
+         SELECT index_name FROM vector_indexes WHERE table_id = ? AND index_name = ?",
+    )
+    .bind(table_id)
+    .bind(index_name)
+    .bind(table_id)
+    .bind(index_name)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| StorageError::Internal(e.to_string()))?;
+    if taken.is_some() {
+        return Err(StorageError::IndexAlreadyExists(index_name.to_owned()));
+    }
+    Ok(())
+}
 
 impl SqliteEngine {
     pub(crate) async fn update_table_impl(
@@ -68,9 +101,25 @@ impl SqliteEngine {
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
             if vector_count > 0 {
-                return Err(StorageError::Validation(
-                    extenddb_core::types::VECTOR_INDEX_REQUIRES_PAY_PER_REQUEST.to_owned(),
-                ));
+                // Two measured shapes, two strings. A plain switch reports the
+                // create-side rule; a switch that also carries VectorIndexUpdates
+                // reports its own message, measured 2026-08-19 on a switch combined
+                // with deleting the last vector index, which the service refuses
+                // even though the net state would carry none.
+                //
+                // Only those two shapes are measured. Which of the two fires for a
+                // switch combined with a vector index CREATE is unmapped, and that
+                // shape is refused by the rule below, so it cannot reach this choice.
+                let message = if input
+                    .vector_index_updates
+                    .as_ref()
+                    .is_some_and(|u| !u.is_empty())
+                {
+                    extenddb_core::types::VECTOR_TABLE_REQUIRES_PAY_PER_REQUEST_MODE
+                } else {
+                    extenddb_core::types::VECTOR_INDEX_REQUIRES_PAY_PER_REQUEST
+                };
+                return Err(StorageError::Validation(message.to_owned()));
             }
         }
 
@@ -267,17 +316,9 @@ impl SqliteEngine {
         if let Some(updates) = &input.global_secondary_index_updates {
             for update in updates {
                 if let Some(create) = &update.create {
-                    let dup: Option<(String,)> = sqlx::query_as(
-                        "SELECT index_name FROM indexes WHERE table_id = ? AND index_name = ?",
-                    )
-                    .bind(&table_id)
-                    .bind(&create.index_name)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    if dup.is_some() {
-                        return Err(StorageError::IndexAlreadyExists(create.index_name.clone()));
-                    }
+                    // Across families, not just this one: see
+                    // `ensure_index_name_free`.
+                    ensure_index_name_free(&mut tx, &table_id, &create.index_name).await?;
                     let ks = serde_json::to_string(&create.key_schema)
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
                     let proj = serde_json::to_string(&create.projection)
@@ -496,34 +537,21 @@ impl SqliteEngine {
                         ));
                     }
 
-                    let dup: Option<(String,)> = sqlx::query_as(
-                        "SELECT index_name FROM vector_indexes \
-                         WHERE table_id = ? AND index_name = ?",
-                    )
-                    .bind(&table_id)
-                    .bind(&create.index_name)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    if dup.is_some() {
-                        return Err(StorageError::IndexAlreadyExists(create.index_name.clone()));
-                    }
+                    ensure_index_name_free(&mut tx, &table_id, &create.index_name).await?;
                     let index_id = uuid::Uuid::new_v4().to_string();
                     let vec_attr = serde_json::to_string(&create.vector_attribute)
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
                     let search_schema = create
-                        .search_schema
-                        .as_ref()
+                        .search_schema_for_storage()
                         .map(serde_json::to_string)
                         .transpose()
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
                     let projection = serde_json::to_string(&create.projection)
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
                     let dimensions = i64::from(create.dimensions);
-                    let distance = serde_json::to_string(&create.distance_function)
-                        .map_err(|e| StorageError::Internal(e.to_string()))?
-                        .trim_matches('"')
-                        .to_owned();
+                    let distance = extenddb_storage::vector_catalog::distance_function_token(
+                        create.distance_function,
+                    )?;
                     // `backfilling` starts at false rather than absent or true.
                     // Measured against the service on 2026-08-06: the member appears
                     // as false while the index exists but its backfill has not
@@ -548,8 +576,8 @@ impl SqliteEngine {
                     vec_created.push((index_id, create.clone()));
                 }
                 if let Some(delete) = &update.delete {
-                    let existing: Option<(String,)> = sqlx::query_as(
-                        "SELECT index_id FROM vector_indexes \
+                    let existing: Option<(String, String, Option<bool>)> = sqlx::query_as(
+                        "SELECT index_id, index_status, backfilling FROM vector_indexes \
                          WHERE table_id = ? AND index_name = ?",
                     )
                     .bind(&table_id)
@@ -557,8 +585,29 @@ impl SqliteEngine {
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    let (del_id,) = existing
+                    let (del_id, index_status, backfilling) = existing
                         .ok_or_else(|| StorageError::IndexNotFound(delete.index_name.clone()))?;
+
+                    // Deleting an index that is still being created is
+                    // phase-dependent, and the discriminator is the same
+                    // `backfilling` flag the wire reports. While the index is
+                    // allocating resources the service refuses the delete and asks
+                    // the caller to retry; once the backfill is running it accepts.
+                    // Measured against the service on 2026-08-19.
+                    //
+                    // The advice is followable in every state that reaches here: a
+                    // first build flips the flag as its scan starts, and a build that
+                    // died before its own flip is repaired by a rebuild, which
+                    // re-asserts the phase before scanning.
+                    if index_status == "CREATING" && backfilling == Some(false) {
+                        return Err(StorageError::IndexesInUse(
+                            extenddb_core::types::vector_index_delete_in_allocation_phase(
+                                &input.table_name,
+                                &delete.index_name,
+                            ),
+                        ));
+                    }
+
                     sqlx::query("DELETE FROM vector_indexes WHERE table_id = ? AND index_name = ?")
                         .bind(&table_id)
                         .bind(&delete.index_name)
@@ -765,11 +814,6 @@ impl SqliteEngine {
             meta: None,
         };
 
-        // The scan is about to start, so the member becomes true. Set outside the
-        // backfill transaction, otherwise no observer could see it: the whole point
-        // of the flag is to be readable while the scan is in progress.
-        ops.set_backfilling().await?;
-
         let mut meta_tx = self
             .pool
             .begin_with("BEGIN IMMEDIATE")
@@ -802,6 +846,9 @@ impl SqliteEngine {
         let min_creating =
             std::time::Duration::from_millis(self.vector_index_min_creating_ms().await);
         let created_at = tokio::time::Instant::now();
+
+        let allocation_delay =
+            std::time::Duration::from_millis(self.vector_allocation_phase_delay().await);
         let owned_index_id = index_id.to_owned();
         let owned_index_name = create.index_name.clone();
 
@@ -842,6 +889,37 @@ impl SqliteEngine {
                 }
             }
             let _deregister = Deregister(registry, owned_index_id);
+
+            // Nothing waits and no branch is taken when the lever is unset, which is
+            // the same shape the shared driver uses for its own inter-batch pause.
+            if !allocation_delay.is_zero() {
+                tokio::time::sleep(allocation_delay).await;
+            }
+            // The scan is about to start, so the member becomes true. Set outside the
+            // backfill transaction, otherwise no observer could see it: the whole
+            // point of the flag is to be readable while the scan is in progress.
+            // Inside the task rather than before the spawn, so the caller returns
+            // while the index is still allocating, which is the state the service
+            // reports first.
+            //
+            // A failure here leaves the index CREATING and allocating, which reads as
+            // undeletable until it is repaired. Nothing has to be released on the way
+            // out on this backend: the registry guard above fires on every exit path,
+            // and the propagation worker's stuck-build sweep rebuilds a CREATING index
+            // with no registry entry within one worker loop, which re-asserts the
+            // phase and unblocks both the delete and the table's queued index writes.
+            let mut ops = ops;
+            if let Err(e) =
+                extenddb_storage::vector_lifecycle::VectorIndexBuild::set_backfilling(&mut ops)
+                    .await
+            {
+                tracing::error!(
+                    index_name = %owned_index_name,
+                    "could not mark the vector index as backfilling, leaving it CREATING \
+                     for recovery: {e}"
+                );
+                return;
+            }
             extenddb_storage::vector_lifecycle::complete_build(
                 ops,
                 &owned_index_name,
@@ -1636,5 +1714,384 @@ mod reconciler_tests {
                 .await
                 .expect("status");
         assert_eq!(status, "CREATING", "the live build must be untouched");
+    }
+
+    /// The measured delete rule, both halves, on this backend.
+    ///
+    /// While an index reports `CREATING` with `Backfilling: false` it is allocating
+    /// resources and the service refuses the delete, telling the caller to retry.
+    /// Once it reports `Backfilling: true` the same request is accepted. Asserted on
+    /// the whole message, because the wording is what makes the retry advice
+    /// followable rather than merely signalling that something was wrong.
+    #[tokio::test]
+    async fn a_vector_delete_is_refused_while_allocating_and_accepted_while_backfilling() {
+        let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::schema::apply(&engine.pool).await.expect("schema");
+        let account = "000000000000";
+        sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
+            .bind(account)
+            .execute(&engine.pool)
+            .await
+            .expect("account");
+        let input: extenddb_core::types::CreateTableInput = serde_json::from_value(json!({
+            "TableName": "t",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .expect("input");
+        engine
+            .create_table_impl(account, input)
+            .await
+            .expect("create table");
+        let (table_id,): (String,) =
+            sqlx::query_as("SELECT table_id FROM tables WHERE table_name = 't'")
+                .fetch_one(&engine.pool)
+                .await
+                .expect("table_id");
+
+        sqlx::query(
+            "INSERT INTO vector_indexes \
+             (table_id, index_id, index_name, dimensions, distance_function, vector_attribute, \
+              projection, index_status, backfilling) \
+             VALUES (?, 'vidx-1', 'vidx', 2, 'COSINE', ?, ?, 'CREATING', 0)",
+        )
+        .bind(&table_id)
+        .bind(json!({"AttributeName": "emb"}).to_string())
+        .bind(json!({"ProjectionType": "ALL"}).to_string())
+        .execute(&engine.pool)
+        .await
+        .expect("insert an allocating index");
+        // The simulated CREATING window is the propagation worker's job to end, and
+        // no worker runs in this test.
+        sqlx::query("UPDATE tables SET table_status = 'ACTIVE', status_transition_at = NULL")
+            .execute(&engine.pool)
+            .await
+            .expect("activate the table");
+
+        let err = engine
+            .update_table_impl(account, delete_vidx_input())
+            .await
+            .expect_err("a delete during resource allocation must be refused");
+        match err {
+            extenddb_storage::error::StorageError::IndexesInUse(message) => assert_eq!(
+                message,
+                extenddb_core::types::vector_index_delete_in_allocation_phase("t", "vidx"),
+                "the refusal must carry the measured wording"
+            ),
+            other => panic!("expected ResourceInUse, got {other:?}"),
+        }
+        let (still_there,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM vector_indexes WHERE index_id = 'vidx-1'")
+                .fetch_one(&engine.pool)
+                .await
+                .expect("count");
+        assert_eq!(
+            still_there, 1,
+            "a refused delete must not have half-removed the index"
+        );
+
+        sqlx::query("UPDATE vector_indexes SET backfilling = 1 WHERE index_id = 'vidx-1'")
+            .execute(&engine.pool)
+            .await
+            .expect("advance to the backfilling phase");
+        engine
+            .update_table_impl(account, delete_vidx_input())
+            .await
+            .expect("the same delete must be accepted once the backfill is running");
+        let (gone,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM vector_indexes WHERE index_id = 'vidx-1'")
+                .fetch_one(&engine.pool)
+                .await
+                .expect("count");
+        assert_eq!(gone, 0, "the accepted delete must remove the catalog row");
+    }
+
+    /// A delete that lands DURING a recovery rebuild, which is a different
+    /// interleaving from a delete during a first build.
+    ///
+    /// A rebuild re-asserts `Backfilling: true` before it scans, so a delete arriving
+    /// mid-rebuild is accepted rather than refused with advice about a phase that
+    /// already passed. What must then hold is that the rebuild cannot bring the index
+    /// back: the catalog row and the data table are both gone, and the rest of the
+    /// rebuild has to fail rather than recreate either.
+    ///
+    /// The crashed state is also asserted, because it is the state a caller meets
+    /// first: a build that died before its own phase flip reads as allocating, so the
+    /// delete is refused until recovery re-asserts the phase, which is what makes the
+    /// retry advice honest instead of unfollowable.
+    #[tokio::test]
+    async fn a_delete_during_a_rebuild_is_accepted_and_the_rebuild_cannot_resurrect_the_index() {
+        use extenddb_storage::vector_lifecycle::VectorIndexBuild;
+
+        let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::schema::apply(&engine.pool).await.expect("schema");
+        let account = "000000000000";
+        sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
+            .bind(account)
+            .execute(&engine.pool)
+            .await
+            .expect("account");
+        let input: extenddb_core::types::CreateTableInput = serde_json::from_value(json!({
+            "TableName": "t",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .expect("input");
+        engine
+            .create_table_impl(account, input)
+            .await
+            .expect("create table");
+        let (table_id,): (String,) =
+            sqlx::query_as("SELECT table_id FROM tables WHERE table_name = 't'")
+                .fetch_one(&engine.pool)
+                .await
+                .expect("table_id");
+        let base_table = crate::data::data_table_name(&table_id);
+        sqlx::query(&format!(
+            "INSERT INTO {base_table} (pk, item_data) VALUES ('a', ?)"
+        ))
+        .bind(r#"{"pk":{"S":"a"},"emb":{"L":[{"N":"1"},{"N":"0"}]}}"#)
+        .execute(&engine.pool)
+        .await
+        .expect("seed an item");
+        // Same reason as the phase test: no worker runs here to end the simulated
+        // CREATING window.
+        sqlx::query("UPDATE tables SET table_status = 'ACTIVE', status_transition_at = NULL")
+            .execute(&engine.pool)
+            .await
+            .expect("activate the table");
+
+        // A build that died before its own phase flip: CREATING, allocating, no data
+        // table.
+        sqlx::query(
+            "INSERT INTO vector_indexes \
+             (table_id, index_id, index_name, dimensions, distance_function, vector_attribute, \
+              projection, index_status, backfilling) \
+             VALUES (?, 'vidx-1', 'vidx', 2, 'COSINE', ?, ?, 'CREATING', 0)",
+        )
+        .bind(&table_id)
+        .bind(json!({"AttributeName": "emb"}).to_string())
+        .bind(json!({"ProjectionType": "ALL"}).to_string())
+        .execute(&engine.pool)
+        .await
+        .expect("insert a crashed build");
+
+        engine
+            .update_table_impl(account, delete_vidx_input())
+            .await
+            .expect_err("a crashed build still reads as allocating, so the delete is refused");
+
+        // The rebuild's first two steps, in the order the shared driver runs them.
+        // Stopping here leaves exactly the state a delete can arrive in.
+        let mut ops = crate::data::vector_index::SqliteVectorBuild {
+            pool: engine.pool.clone(),
+            write_lock: std::sync::Arc::clone(&engine.write_lock),
+            gsi_notify: engine.gsi_notify(),
+            table_id: table_id.clone(),
+            index_id: "vidx-1".to_owned(),
+            base_key_schema: vec![extenddb_core::types::KeySchemaElement {
+                attribute_name: "pk".to_owned(),
+                key_type: extenddb_core::types::KeyType::Hash,
+            }],
+            attribute_definitions: vec![extenddb_core::types::AttributeDefinition {
+                attribute_name: "pk".to_owned(),
+                attribute_type: extenddb_core::types::ScalarAttributeType::S,
+            }],
+            meta: None,
+        };
+        ops.reset_data_table().await.expect("rebuild reset");
+
+        // Positive control, and the point of it rather than a nicety. These counts
+        // compare against `sqlite_master.name`, which holds the bare name, so binding
+        // the DDL-ready name straight from `vector_table_name` can never match and
+        // every absence assertion below would pass whatever the real state was.
+        // Proving the count is 1 while the table must exist is what makes the later
+        // zeroes mean the table went away.
+        let vec_table = vector_table_lookup_name(&table_id, "vidx-1");
+        assert_eq!(
+            data_table_count(&engine.pool, &vec_table).await,
+            1,
+            "the rebuild must have recreated its data table, or the assertions below \
+             cannot tell a dropped table from a name that never matches"
+        );
+
+        ops.set_backfilling().await.expect("rebuild phase flip");
+
+        engine
+            .update_table_impl(account, delete_vidx_input())
+            .await
+            .expect("a delete during a rebuild must be accepted");
+        let (rows,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM vector_indexes WHERE index_id = 'vidx-1'")
+                .fetch_one(&engine.pool)
+                .await
+                .expect("count");
+        assert_eq!(rows, 0, "the catalog row must be gone");
+        assert_eq!(
+            data_table_count(&engine.pool, &vec_table).await,
+            0,
+            "the delete must drop the index data table"
+        );
+
+        // The rest of the rebuild now runs against a deleted index. It must fail, and
+        // it must leave neither a catalog row nor a data table behind.
+        extenddb_storage::vector_lifecycle::rebuild_index(
+            &mut ops,
+            extenddb_storage::vector_lifecycle::BACKFILL_BATCH,
+        )
+        .await
+        .expect_err("a rebuild of a deleted index must fail rather than recreate it");
+        assert_eq!(
+            data_table_count(&engine.pool, &vec_table).await,
+            0,
+            "an interrupted rebuild must not leave an orphan data table"
+        );
+        assert_eq!(
+            engine
+                .reconcile_incomplete_vector_indexes()
+                .await
+                .expect("reconcile"),
+            0,
+            "nothing is left for recovery to rebuild"
+        );
+    }
+
+    /// Completing a build whose index was deleted must not leave its data table.
+    ///
+    /// The sibling of the rebuild test above, at the other end of the same race. That
+    /// one has the delete arrive after `reset_data_table`, so the rebuild fails before
+    /// it can finish. This one has the build reach its completion step: the data table
+    /// it recreated exists, the catalog row is already gone, and the status flip
+    /// therefore matches no row. Without the cleanup the recreated table survives with
+    /// nothing referencing it.
+    ///
+    /// Driven by calling the completion step directly, because the alternative is
+    /// timing the window between the definition reload and the CREATE TABLE.
+    #[tokio::test]
+    async fn completing_a_build_whose_index_was_deleted_drops_the_rebuilt_table() {
+        use extenddb_storage::vector_lifecycle::VectorIndexBuild;
+
+        let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::schema::apply(&engine.pool).await.expect("schema");
+        let account = "000000000000";
+        sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
+            .bind(account)
+            .execute(&engine.pool)
+            .await
+            .expect("account");
+        let input: extenddb_core::types::CreateTableInput = serde_json::from_value(json!({
+            "TableName": "t",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .expect("input");
+        engine
+            .create_table_impl(account, input)
+            .await
+            .expect("create table");
+        let (table_id,): (String,) =
+            sqlx::query_as("SELECT table_id FROM tables WHERE table_name = 't'")
+                .fetch_one(&engine.pool)
+                .await
+                .expect("table_id");
+
+        sqlx::query(
+            "INSERT INTO vector_indexes \
+             (table_id, index_id, index_name, dimensions, distance_function, vector_attribute, \
+              projection, index_status, backfilling) \
+             VALUES (?, 'vidx-1', 'vidx', 2, 'COSINE', ?, ?, 'CREATING', 1)",
+        )
+        .bind(&table_id)
+        .bind(json!({"AttributeName": "emb"}).to_string())
+        .bind(json!({"ProjectionType": "ALL"}).to_string())
+        .execute(&engine.pool)
+        .await
+        .expect("insert a build in progress");
+
+        let mut ops = crate::data::vector_index::SqliteVectorBuild {
+            pool: engine.pool.clone(),
+            write_lock: std::sync::Arc::clone(&engine.write_lock),
+            gsi_notify: engine.gsi_notify(),
+            table_id: table_id.clone(),
+            index_id: "vidx-1".to_owned(),
+            base_key_schema: vec![extenddb_core::types::KeySchemaElement {
+                attribute_name: "pk".to_owned(),
+                key_type: extenddb_core::types::KeyType::Hash,
+            }],
+            attribute_definitions: vec![extenddb_core::types::AttributeDefinition {
+                attribute_name: "pk".to_owned(),
+                attribute_type: extenddb_core::types::ScalarAttributeType::S,
+            }],
+            meta: None,
+        };
+
+        // The build recreates its data table, exactly as a rebuild does.
+        ops.reset_data_table().await.expect("rebuild reset");
+        let vec_table = vector_table_lookup_name(&table_id, "vidx-1");
+        assert_eq!(
+            data_table_count(&engine.pool, &vec_table).await,
+            1,
+            "the build must have recreated its data table"
+        );
+
+        // The delete lands: catalog row gone, recreated data table still there.
+        sqlx::query("DELETE FROM vector_indexes WHERE table_id = ? AND index_id = 'vidx-1'")
+            .bind(&table_id)
+            .execute(&engine.pool)
+            .await
+            .expect("delete the catalog row");
+
+        ops.mark_active(0)
+            .await
+            .expect("completing a build for a deleted index must not fail");
+
+        assert_eq!(
+            data_table_count(&engine.pool, &vec_table).await,
+            0,
+            "the rebuilt data table must be dropped once the index is known to be gone"
+        );
+    }
+
+    /// The bare data-table name for a vector index, for comparing against
+    /// `sqlite_master.name`.
+    ///
+    /// `vector_table_name` returns the name already quoted, which is what its callers
+    /// interpolating into DDL and DML need. `sqlite_master.name` holds the bare name,
+    /// so a bound comparison against the quoted form matches nothing, and an absence
+    /// assertion written that way passes whatever the real state is. Written once here
+    /// so no test has to remember the difference.
+    fn vector_table_lookup_name(table_id: &str, index_id: &str) -> String {
+        crate::data::vector_table_name(table_id, index_id)
+            .trim_matches('"')
+            .to_owned()
+    }
+
+    /// How many tables carry this bare name. Zero or one.
+    async fn data_table_count(pool: &sqlx::SqlitePool, bare_name: &str) -> i64 {
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?")
+                .bind(bare_name)
+                .fetch_one(pool)
+                .await
+                .expect("count the data tables carrying this name");
+        count
+    }
+
+    /// One `UpdateTable` request deleting the vector index named `vidx`.
+    fn delete_vidx_input() -> extenddb_core::types::UpdateTableInput {
+        serde_json::from_value(json!({
+            "TableName": "t",
+            "VectorIndexUpdates": [{"Delete": {"IndexName": "vidx"}}]
+        }))
+        .expect("delete input")
     }
 }
