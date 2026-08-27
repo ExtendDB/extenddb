@@ -262,3 +262,101 @@ async fn record_code_migration(pool: &PgPool, name: &str) -> OpResult<()> {
         .map_err(|e| OpError::Internal(format!("Record code migration: {e}")))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Tripwire (ADR-0003): pin the embedded migration counts and the catalog
+    // version. Adding a catalog migration without bumping CATALOG_VERSION fails
+    // here, forcing a deliberate version decision. The data database has no
+    // version, so its counts are pinned only to make a new data or code
+    // migration a conscious change.
+    const EXPECTED_CATALOG_MIGRATIONS: usize = 1;
+    const EXPECTED_DATA_MIGRATIONS: usize = 3;
+    const EXPECTED_DATA_CODE_MIGRATIONS: usize = 1;
+    const EXPECTED_CATALOG_VERSION: &str = "0.1.0";
+
+    // Checksum lockfile (ADR-0003 CI net): pin the sqlx checksum (SHA-384 of
+    // the file bytes) of every shipped migration. Editing an already-applied
+    // migration changes its checksum, so this fails `cargo test` in the PR
+    // runner: it catches in CI what sqlx otherwise only catches at runtime
+    // against a live database. `.gitattributes` pins *.sql to LF, so the bytes
+    // (and these checksums) are stable across platforms. To add a migration,
+    // append its (version, checksum) below using the value the assertion prints.
+    // The values are sqlx's SHA-384 migration checksums; a future sqlx bump that
+    // changed the hash algorithm would require regenerating them.
+    const CATALOG_CHECKSUMS: &[(i64, &str)] = &[(
+        1,
+        "e54990978c4a080c0744cd3f90fde86d88b7c9a871dfefe2455cb843deac1a752076125d7811e2559e6faa18e7983460",
+    )];
+    const DATA_CHECKSUMS: &[(i64, &str)] = &[
+        (
+            1,
+            "36fb3dc917923ca6f34fda2157999ad132996a937ee9893f91c260f8c09276b237c5279f750ad94af97bd6b1fd966a8f",
+        ),
+        (
+            2,
+            "8da1bcb8c9864258b0c12711b5df5090d0c1caa52a0102466a8ca94084ac56c9db385a650b34fe29a45dc942318a0100",
+        ),
+        (
+            3,
+            "f5a73cbb1bac5e979acb0952973f9d2491a44e80b4eaee175634b35e462bbd3c3090b664fc336ccd473404616bdb81aa",
+        ),
+    ];
+
+    fn assert_checksums(migrator: &Migrator, expected: &[(i64, &str)]) {
+        let actual: Vec<(i64, String)> = migrator
+            .iter()
+            .map(|m| {
+                let hex = m
+                    .checksum
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>();
+                (m.version, hex)
+            })
+            .collect();
+        let expected: Vec<(i64, String)> = expected
+            .iter()
+            .map(|(v, h)| (*v, (*h).to_owned()))
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "migration checksums changed: an already-shipped migration was edited \
+             (forbidden), or one was added/removed. If the change is intentional and \
+             the file has not shipped, update the pinned checksum(s) with the actual \
+             values shown here."
+        );
+    }
+
+    #[test]
+    fn migration_checksums_are_pinned() {
+        assert_checksums(&CATALOG_MIGRATOR, CATALOG_CHECKSUMS);
+        assert_checksums(&DATA_MIGRATOR, DATA_CHECKSUMS);
+    }
+
+    #[test]
+    fn migration_counts_and_catalog_version_are_pinned() {
+        assert_eq!(
+            CATALOG_MIGRATOR.iter().count(),
+            EXPECTED_CATALOG_MIGRATIONS,
+            "catalog migration count changed: bump CATALOG_VERSION and update EXPECTED_CATALOG_MIGRATIONS",
+        );
+        assert_eq!(
+            DATA_MIGRATOR.iter().count(),
+            EXPECTED_DATA_MIGRATIONS,
+            "data migration count changed: update EXPECTED_DATA_MIGRATIONS",
+        );
+        assert_eq!(
+            DATA_CODE_MIGRATIONS.len(),
+            EXPECTED_DATA_CODE_MIGRATIONS,
+            "data code migration count changed: update EXPECTED_DATA_CODE_MIGRATIONS",
+        );
+        assert_eq!(
+            CATALOG_VERSION.to_string(),
+            EXPECTED_CATALOG_VERSION,
+            "CATALOG_VERSION changed: update EXPECTED_CATALOG_VERSION",
+        );
+    }
+}

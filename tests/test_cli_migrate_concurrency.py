@@ -80,7 +80,7 @@ def _read_until(proc, expected, timeout=15.0):
 
 
 def _wait_for_blocked_ledger_insert(data_db, timeout=15.0):
-    """Wait until a migrator is blocked recording 002 in schema_history."""
+    """Wait until a migrator is blocked recording 002 in _sqlx_migrations."""
     import psycopg2
 
     observer = psycopg2.connect(PG_ADMIN_CONN + "/" + data_db)
@@ -96,7 +96,7 @@ def _wait_for_blocked_ledger_insert(data_db, timeout=15.0):
                         WHERE datname = %s
                           AND state = 'active'
                           AND wait_event_type = 'Lock'
-                          AND query LIKE 'INSERT INTO schema_history%%'
+                          AND query ILIKE '%%INSERT INTO _sqlx_migrations%%'
                     )
                     """,
                     (data_db,),
@@ -106,11 +106,17 @@ def _wait_for_blocked_ledger_insert(data_db, timeout=15.0):
             time.sleep(0.05)
     finally:
         observer.close()
-    raise AssertionError("migrator did not block on the schema_history insert")
+    raise AssertionError("migrator did not block on the _sqlx_migrations insert")
 
 
-def _assert_002_applied_but_unrecorded(data_db):
-    """Prove the barrier is after migration commit and before ledger commit."""
+def _assert_002_uncommitted_while_blocked(data_db):
+    """Prove sqlx holds the DDL and its ledger row in one open transaction.
+
+    The old runner committed 002's DDL before recording it, so a crash here
+    left an applied-but-unrecorded migration. sqlx applies the SQL and inserts
+    the ledger row in the same transaction: while that insert is blocked on the
+    barrier, neither is visible, and a crash rolls both back together.
+    """
     import psycopg2
 
     observer = psycopg2.connect(PG_ADMIN_CONN + "/" + data_db)
@@ -118,10 +124,10 @@ def _assert_002_applied_but_unrecorded(data_db):
     try:
         with observer.cursor() as cur:
             cur.execute("SELECT to_regclass('public.gsi_pending') IS NOT NULL")
-            assert cur.fetchone()[0] is True, "002 schema should already be committed"
+            assert cur.fetchone()[0] is False, "002 DDL must be uncommitted while blocked"
             cur.execute(
-                "SELECT count(*) FROM schema_history "
-                "WHERE filename = '002_gsi_pending.sql'"
+                "SELECT count(*) FROM _sqlx_migrations "
+                "WHERE version = 2 AND description <> 'barrier'"
             )
             assert cur.fetchone()[0] == 0, "002 ledger row should still be uncommitted"
     finally:
@@ -154,9 +160,7 @@ class TestMigrateConcurrency:
         blocker.autocommit = True
         with blocker.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS gsi_pending")
-            cur.execute(
-                "DELETE FROM schema_history WHERE filename = '002_gsi_pending.sql'"
-            )
+            cur.execute("DELETE FROM _sqlx_migrations WHERE version = 2")
 
         # Insert the ledger row without committing it. A migrator's ordinary
         # pending check cannot see this row, so it applies 002, then its own
@@ -165,7 +169,9 @@ class TestMigrateConcurrency:
         blocker.autocommit = False
         with blocker.cursor() as cur:
             cur.execute(
-                "INSERT INTO schema_history (filename) VALUES ('002_gsi_pending.sql')"
+                "INSERT INTO _sqlx_migrations "
+                "(version, description, success, checksum, execution_time) "
+                "VALUES (2, 'barrier', TRUE, '\\x00', 0)"
             )
 
         cmd = _migrate_cmd(cli_env)
@@ -178,7 +184,7 @@ class TestMigrateConcurrency:
                 stdin=subprocess.DEVNULL, bufsize=0,
             )
             _wait_for_blocked_ledger_insert(data_db)
-            _assert_002_applied_but_unrecorded(data_db)
+            _assert_002_uncommitted_while_blocked(data_db)
 
             # The first migrator now holds the migration lock at a known point.
             # The second must stop at that lock rather than reach its pending
@@ -220,13 +226,12 @@ class TestMigrateConcurrency:
         # Exactly one process applied 002. The second took its pending snapshot
         # only after the first committed the ledger row and released the lock.
         outputs = [out1[0], out2[0]]
-        applied = [o for o in outputs if "Applying 002_gsi_pending.sql" in o]
+        applied = [o for o in outputs if "Pending: 002_gsi_pending.sql" in o]
         assert len(applied) == 1, f"expected exactly one migrator to apply 002: {outputs}"
-        others = [o for o in outputs if "Applying 002_gsi_pending.sql" not in o]
+        others = [o for o in outputs if "Pending: 002_gsi_pending.sql" not in o]
         assert len(others) == 1, outputs
         assert (
             "Everything is up to date" in others[0]
-            or "002_gsi_pending.sql — already applied" in others[0]
         ), f"the second migrator should have observed 002 as done: {others[0]}"
         assert "Migration lock acquired" in out2[0], out2[0]
 
@@ -237,15 +242,19 @@ class TestMigrateConcurrency:
                 cur.execute("SELECT to_regclass('public.gsi_pending') IS NOT NULL")
                 assert cur.fetchone()[0] is True
                 cur.execute(
-                    "SELECT count(*) FROM schema_history "
-                    "WHERE filename = '002_gsi_pending.sql'"
+                    "SELECT count(*) FROM _sqlx_migrations WHERE version = 2"
                 )
                 assert cur.fetchone()[0] == 1
         finally:
             conn.close()
 
     def test_sigkill_releases_lock_and_waiting_peer_recovers(self, cli_env):
-        """A killed lock holder releases the lock and exposes the ledger gap."""
+        """A killed lock holder releases the lock; its half-done work rolls back.
+
+        Under sqlx the killed holder's migration transaction (DDL + ledger row)
+        rolls back atomically, so the recovering peer re-applies 002 from
+        scratch instead of finding it applied-but-unrecorded.
+        """
         import psycopg2
 
         _init(cli_env)
@@ -255,13 +264,13 @@ class TestMigrateConcurrency:
         blocker.autocommit = True
         with blocker.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS gsi_pending")
-            cur.execute(
-                "DELETE FROM schema_history WHERE filename = '002_gsi_pending.sql'"
-            )
+            cur.execute("DELETE FROM _sqlx_migrations WHERE version = 2")
         blocker.autocommit = False
         with blocker.cursor() as cur:
             cur.execute(
-                "INSERT INTO schema_history (filename) VALUES ('002_gsi_pending.sql')"
+                "INSERT INTO _sqlx_migrations "
+                "(version, description, success, checksum, execution_time) "
+                "VALUES (2, 'barrier', TRUE, '\\x00', 0)"
             )
 
         cmd = _migrate_cmd(cli_env)
@@ -274,7 +283,7 @@ class TestMigrateConcurrency:
                 stdin=subprocess.DEVNULL, bufsize=0,
             )
             _wait_for_blocked_ledger_insert(data_db)
-            _assert_002_applied_but_unrecorded(data_db)
+            _assert_002_uncommitted_while_blocked(data_db)
 
             peer = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -325,8 +334,7 @@ class TestMigrateConcurrency:
                 cur.execute("SELECT to_regclass('public.gsi_pending') IS NOT NULL")
                 assert cur.fetchone()[0] is True
                 cur.execute(
-                    "SELECT count(*) FROM schema_history "
-                    "WHERE filename = '002_gsi_pending.sql'"
+                    "SELECT count(*) FROM _sqlx_migrations WHERE version = 2"
                 )
                 assert cur.fetchone()[0] == 1
         finally:
