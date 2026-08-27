@@ -37,6 +37,15 @@ pub const KNOWN_KEYS: &[(&str, Validator)] = &[
         extenddb_core::settings_keys::VECTOR_BACKFILL_BATCH_DELAY_MS,
         validate_backfill_batch_delay_ms,
     ),
+    // The sibling test lever, writable for the same reason: the allocation phase of
+    // an index build exists only between two transitions inside one UpdateTable
+    // call, so the measured refusal for a delete during that phase cannot be
+    // observed from a client unless a test can hold the phase open from outside the
+    // process. Same bound, same validator.
+    (
+        extenddb_core::settings_keys::VECTOR_ALLOCATION_PHASE_DELAY_MS,
+        validate_backfill_batch_delay_ms,
+    ),
 ];
 
 /// Read-only keys that cannot be changed via the settings API.

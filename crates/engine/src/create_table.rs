@@ -22,7 +22,7 @@ pub async fn handle_create_table(
         }],
     )?;
 
-    let input: CreateTableInput = serde_json::from_value(body).map_err(|e| {
+    let mut input: CreateTableInput = serde_json::from_value(body).map_err(|e| {
         let msg = e.to_string();
         if msg.contains("validation error detected")
             || msg.contains("parameter values were invalid")
@@ -43,6 +43,14 @@ pub async fn handle_create_table(
     })?;
 
     validate_create_table(&input, &ctx.limits)?;
+
+    // An empty SearchSchema means the same as an absent one, so it is collapsed
+    // here, once, rather than in each backend. Storing the empty list would make
+    // DescribeTable echo a state the service never reports, and would leave two
+    // backends free to disagree about it.
+    for spec in input.vector_indexes.iter_mut().flatten() {
+        spec.normalize_search_schema();
+    }
 
     crate::vector_gate::ensure_create_table_supported(
         input.vector_indexes.as_ref(),
@@ -112,14 +120,12 @@ pub(crate) fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) ->
         StorageError::IndexAlreadyExists(name) => DynamoDbError::ValidationException(format!(
             "One or more parameter values were invalid: Index already exists: {name}"
         )),
-        // The sentence AWS documents for this refusal, quoted in the vector
-        // search tutorial's readiness callout and pinned by the ground-truth
-        // runs of 2026-08-24 (us-east-1 and eu-west-2).
-        StorageError::IndexesInUse(_) => DynamoDbError::ResourceInUseException(
-            "Cannot delete table while indexes are being created, updated, or deleted.".to_owned(),
-        ),
-        StorageError::LimitExceeded(msg) => DynamoDbError::LimitExceededException(msg),
-        // Retryable by definition, so it maps like Connection: a 503 the SDKs
+        // The resource exists and the request is well formed; its current state
+        // forbids the change. The backend owns the wording because it owns the
+        // state: the documented delete-table sentence and the measured
+        // phase-dependent vector refusal both arrive through this one arm.
+        StorageError::IndexesInUse(msg) => DynamoDbError::ResourceInUseException(msg),
+        StorageError::LimitExceeded(msg) => DynamoDbError::LimitExceededException(msg), // Retryable by definition, so it maps like Connection: a 503 the SDKs
         // retry, rather than a 500 they surface.
         StorageError::Transient(msg) => {
             tracing::warn!(transient_error = %msg, "transient storage error");

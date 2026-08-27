@@ -277,9 +277,12 @@ pub async fn handle_search_vectors(
     // a ProjectionExpression, and a TopK larger than the item count).
     let count = search_results.len() as i64;
 
-    // The service reports `ConsumedCapacity.VectorSearchRequestBytes`, a byte
-    // figure, not a unit figure. See `search_request_bytes` for the measured
-    // model and why exact parity is not achievable.
+    // The service reports the same figure twice, as
+    // `ConsumedCapacity.VectorSearchRequestBytes` and
+    // `ConsumedCapacity.VectorSearchUnits` (probe P8, 2026-08-19: both members on
+    // every search, always equal, under INDEXES and TOTAL alike). Both are byte
+    // figures. See `search_request_bytes` for the measured model and why exact
+    // parity is not achievable.
     //
     // `vectors_returned` is counted from the projected results rather than inferred
     // from whether the expression mentions the attribute, so an alias, a nested
@@ -300,10 +303,7 @@ pub async fn handle_search_vectors(
     );
     let consumed_capacity = match input.return_consumed_capacity {
         ReturnConsumedCapacity::None => None,
-        _ => Some(extenddb_core::types::VectorCapacity {
-            vector_search_request_bytes: Some(request_bytes),
-            vector_write_request_bytes: None,
-        }),
+        _ => Some(extenddb_core::types::VectorCapacity::search(request_bytes)),
     };
 
     let output = SearchVectorsOutput {
