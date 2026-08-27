@@ -4,29 +4,35 @@
 
 ## Current Status
 
-ExtendDB 0.0.2 is the initial release. There is no upgrade path from a previous version — all deployments are fresh installs via `extenddb init`.
+ExtendDB is at catalog version 0.1.0. Schema migrations for both PostgreSQL databases (the catalog and the data database) are handled by sqlx's built-in migrator (`sqlx::migrate!`). Each database records applied migrations, with a per-file checksum, in a table sqlx manages called `_sqlx_migrations`.
 
-Future releases will include migrations that upgrade the catalog schema in place. The migration infrastructure is built and ready; this document describes how it works and how developers should think about adding new migrations.
+Adopting sqlx is a one-time breaking change: an existing catalog created by an earlier build has no `_sqlx_migrations` table and cannot be upgraded in place. Upgrading to 0.1.0 requires `destroy` + `init`, which drops both databases. This is acceptable at v0.1 with no dependent catalogs. See [ADR-0003](../adr/0003-catalog-migration-mechanism.md) for the decision. Later migrations are additive and do not lose data.
 
 ## How Catalog Upgrades Work
 
 ### The Migration System
 
-Migrations are SQL files in `crates/storage-postgres/migrations/`, applied in filename order:
+Migrations are SQL files under two directories, applied in filename order:
 
 ```
-001_schema.sql      ← current: the complete initial schema
-002_<next>.sql      ← future: first incremental migration
+crates/storage-postgres/migrations/       ← catalog database
+  001_schema.sql
+crates/storage-postgres/data_migrations/   ← data database
+  001_data_schema.sql
+  002_gsi_pending.sql
+  003_idempotency_account_scope.sql
 ```
 
-The `schema_history` table tracks which files have been applied. When `extenddb migrate` runs, it:
+sqlx embeds these files into the binary at compile time. When `extenddb init` or `extenddb migrate` runs a migrator, sqlx:
 
-1. Reads all migration files embedded in the binary (via `include_str!`)
-2. Checks `schema_history` for each filename
-3. Applies any unapplied migrations in order
-4. Records each applied filename in `schema_history`
+1. Creates the `_sqlx_migrations` table if it does not exist.
+2. Reads the version and a checksum of each embedded file.
+3. Applies any file not yet recorded, in version order, each in its own transaction.
+4. Verifies that every already-applied file still matches its recorded checksum.
 
-Running `extenddb migrate` on an up-to-date catalog is a no-op.
+Step 4 is the safety net. If a file that already shipped is edited after it was applied, sqlx refuses to run and reports `migration <n> was previously applied but has been modified`. Editing a shipped migration is a hard error, not a silent no-op. A new schema change is always a new numbered file.
+
+Running `extenddb migrate` on an up-to-date deployment applies nothing, but still runs both migrators so the checksum check above executes. That is deliberate: it catches an edited migration file even when no new migration is pending.
 
 ### The Catalog Version
 
@@ -34,97 +40,105 @@ A single row in the `settings` table stores the catalog version:
 
 ```sql
 SELECT value FROM settings WHERE key = 'catalog_version';
--- '0.0.2'
+-- '0.1.0'
 ```
 
-The binary embeds an expected catalog version (`CATALOG_VERSION` constant in `crates/storage-postgres/src/lib.rs`). At startup, the server compares the database value against the binary's expectation. If they don't match, the server refuses to start and directs the operator to run `extenddb migrate`.
+sqlx has no knowledge of our semver, so the version is not written by a migration file. `init` and `migrate` write it in a separate step, right after the catalog migrator runs, from the compiled-in `CATALOG_VERSION` constant (`crates/storage-postgres/src/lib.rs`). This write is intentionally not atomic with the migration. If a crash lands between the migration and the version write, re-running `extenddb migrate` repairs the version (sqlx skips the already-applied migration). On a first-time `init`, the same crash leaves no version and no config file, so recovery there is `destroy` + `init`.
+
+At startup the server compares the stored `catalog_version` against the binary's `CATALOG_VERSION`. If they do not match exactly, the server refuses to start and directs the operator to run `extenddb migrate`. The gate is symmetric: an older binary against a newer catalog also refuses. It exists to stop a server serving a schema it was not built for. The data database has no separate version; it relies on its own `_sqlx_migrations` table.
 
 ### Version Semantics
 
 The catalog version follows semantic versioning:
 
-- **MAJOR**: Breaking schema changes that may require data migration or downtime
-- **MINOR**: New tables or columns (backward-compatible, additive)
-- **PATCH**: Index changes, constraint fixes, seed data updates
+- **MAJOR**: Breaking schema changes that may require data migration or downtime.
+- **MINOR**: New tables or columns (backward-compatible, additive).
+- **PATCH**: Index changes, constraint fixes, seed data updates.
+
+Pre-1.0, the project is unstable and a breaking change rides a MINOR bump (MAJOR stays 0), per standard semver. The 0.1.0 sqlx adoption is such a case: a MINOR bump that is breaking (requires re-init).
 
 ## Writing a New Migration
 
-When you need to change the catalog schema, here's the process:
+### Catalog migration
 
-### 1. Create the migration file
-
-Add a new SQL file with the next sequence number:
+1. Add a new SQL file with the next sequence number:
 
 ```
 crates/storage-postgres/migrations/002_your_feature.sql
 ```
 
-The file should be a single transaction:
+Do not wrap it in `BEGIN`/`COMMIT`. sqlx runs each migration in its own transaction. Write plain DDL:
 
 ```sql
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
--- Migration 002: Brief description of what this adds/changes.
+-- Migration 002: Brief description of what this adds.
 
-BEGIN;
-
--- Your DDL here.
 ALTER TABLE tables ADD COLUMN IF NOT EXISTS new_column TEXT;
-
--- Bump the catalog version.
-UPDATE settings SET value = '0.1.0' WHERE key = 'catalog_version';
-
-COMMIT;
 ```
 
-### 2. Register it in the migration runner
+Do not write the catalog version here. The migration runner writes it after the migrator completes.
 
-Add the file to `CATALOG_MIGRATIONS` in `crates/storage-postgres/src/migrations.rs`:
+2. Bump the catalog version constant in `crates/storage-postgres/src/lib.rs`:
 
 ```rust
-pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
-    (
-        "001_schema.sql",
-        include_str!("../../storage-postgres/migrations/001_schema.sql"),
-    ),
-    (
-        "002_your_feature.sql",
-        include_str!("../../storage-postgres/migrations/002_your_feature.sql"),
-    ),
-];
+pub const CATALOG_VERSION: CatalogVersion = CatalogVersion::new(0, 2, 0);
 ```
 
-### 3. Bump the catalog version constant
+3. Update the tripwire test in `crates/storage-postgres/src/migrations.rs` so `EXPECTED_CATALOG_MIGRATIONS` and `EXPECTED_CATALOG_VERSION` match the new count and version. The test fails if a migration is added without a matching version decision.
 
-In `crates/storage-postgres/src/lib.rs`:
+**Do not edit `001_schema.sql` or any file that already shipped.** sqlx checksums file bytes; changing an applied file is a hard error. A new column or table is always a new numbered file. sqlx applies all numbered files in order on a fresh `init`, so a new file reaches fresh installs and existing deployments through the same path.
 
-```rust
-pub const CATALOG_VERSION: CatalogVersion = CatalogVersion::new(0, 1, 0);
-```
+### Data migration
 
-This must match the version written by your migration's `UPDATE settings` statement.
+A data-schema change is a new file under `crates/storage-postgres/data_migrations/` (for example `004_your_change.sql`), plus a bump of `EXPECTED_DATA_MIGRATIONS` in the tripwire test. The data database has no version, so `CATALOG_VERSION` does not change. `extenddb migrate`, not just `init`, runs the data migrator, so existing deployments pick up the change.
 
-### 4. Update 001_schema.sql
+### Code migration
 
-The consolidated schema file is what fresh installs get. Add your new column/table/index to `001_schema.sql` as well, and update its `INSERT INTO settings` to seed the new version. This way fresh installs get the final schema in one pass, while existing deployments get there via the incremental migration.
+A change that cannot be static SQL, because it enumerates dynamically-named tables (the `_ddb_*` index tables) from the catalog or must run outside a transaction (`CREATE INDEX CONCURRENTLY`), is a programmatic "code" migration: a Rust step in `DATA_CODE_MIGRATIONS` (`crates/storage-postgres/src/migrations.rs`), tracked in the data database's `code_migrations` ledger and applied by `init` and `migrate` after the SQL migrations. Add the step name to `DATA_CODE_MIGRATIONS`, implement its match arm, and bump `EXPECTED_DATA_CODE_MIGRATIONS` in the tripwire test. Code migrations have no file checksum; the code itself is reviewed and version-controlled, and each step must be idempotent (safe to re-run).
 
 ### Design Considerations
 
-**Idempotency.** Use `IF NOT EXISTS`, `IF EXISTS`, and `ADD COLUMN IF NOT EXISTS` so migrations can be safely re-run.
+**Additive only.** Prefer new columns with defaults and new tables over dropping or renaming. There are no down migrations; a mistake is corrected by a new forward migration.
 
-**Backward compatibility.** Prefer additive changes (new columns with defaults, new tables) over destructive ones (dropping columns, renaming tables). A running server on the old binary should survive the schema change until it's restarted with the new binary.
+**Idempotent DDL.** Use `IF NOT EXISTS` and `ADD COLUMN IF NOT EXISTS`. sqlx will not re-run an applied file, but idempotent DDL is a cheap safeguard.
 
-**Transaction boundaries.** Wrap each migration in `BEGIN`/`COMMIT`. If any statement fails, the entire migration rolls back and the catalog stays at the previous version.
+**Transactions.** sqlx wraps each migration in a transaction. Do not add `BEGIN`/`COMMIT`. A statement that cannot run inside a transaction (for example `CREATE INDEX CONCURRENTLY`) needs a `-- no-transaction` directive on the first line of that migration file; use it only when a specific statement requires it.
 
-**No data migrations in DDL files.** If a schema change requires backfilling data, do it in Rust code triggered by `extenddb migrate`, not in raw SQL. This gives you error handling, progress reporting, and the ability to batch large updates.
+**Line endings.** `.gitattributes` pins `*.sql text eol=lf` so a contributor's line-ending rewrite does not change file bytes and trip a false checksum mismatch. Keep migration files LF.
 
-**Test both paths.** Every migration must be tested two ways:
-1. Fresh install (`extenddb init`) — verifies `001_schema.sql` is correct
-2. Upgrade (`extenddb migrate` on a catalog at the previous version) — verifies the incremental migration works
+**Rebuild after editing migration files.** sqlx embeds the files at compile time. `cargo` re-embeds on a content change, but a restored file with an old modification time (for example, from `mv`-ing a backup over it) is skipped by the build cache: `touch` the file or run a clean build so the binary matches the files on disk.
+
+**No data backfill in DDL files.** If a schema change requires backfilling rows, do it in Rust triggered by `extenddb migrate`, not in raw SQL, so you get error handling and batching.
 
 ## General Upgrade Procedure
 
-For future releases that include catalog changes:
+### Upgrading to 0.1.0 (adopting sqlx)
+
+This upgrade is breaking. There is no in-place path from a pre-sqlx catalog.
+
+1. **Stop the server**
+
+```bash
+extenddb stop --config extenddb.toml
+```
+
+2. **Destroy and re-initialize** (drops both databases; all tables and items are lost and must be recreated)
+
+```bash
+extenddb destroy --config extenddb.toml --yes
+extenddb init --config extenddb.toml
+```
+
+3. **Start the server**
+
+```bash
+extenddb serve --config extenddb.toml
+```
+
+### Later releases (additive migrations)
+
+For future releases that add migrations without a compatibility break:
 
 1. **Stop the server**
 
@@ -149,26 +163,23 @@ cargo build --release
 4. **Run migrations**
 
 ```bash
-extenddb migrate --config extenddb.toml
+extenddb migrate --config extenddb.toml --yes
 ```
 
-5. **Verify**
+5. **Verify and start**
 
 ```bash
 extenddb verify --config extenddb.toml
-```
-
-6. **Start the server**
-
-```bash
 extenddb serve --config extenddb.toml
 ```
 
+The server binary and the catalog are version-locked, so a schema-bumping upgrade needs every server moved to the matching version together: a brief coordinated outage (stop old servers, `migrate`, start new). Online / rolling upgrades are out of scope.
+
 ## Rollback Procedure
 
-If an upgrade fails:
+If a migration dies mid-apply, sqlx rolls back that migration's transaction completely, so it leaves no partial state and no ledger row: re-running `extenddb migrate` simply retries it. (A migration is only marked dirty, blocking further runs until resolved, if it opts out of the transaction with a `-- no-transaction` directive, which none of ours do.) If an upgrade otherwise fails:
 
-1. Stop the server
+1. Stop the server.
 2. Restore from backup:
 
 ```bash
@@ -177,15 +188,21 @@ psql -c "CREATE DATABASE extenddb_catalog OWNER extenddb;"
 psql -d extenddb_catalog -f catalog_backup_YYYYMMDD.sql
 ```
 
-3. Rebuild the previous version and start it
+3. Rebuild the previous version and start it.
 
 ## Version History
 
-### Catalog 0.0.2 (Current — Initial Release)
+> This section is the project changelog: each catalog version and what changed.
 
-Complete schema: accounts, tables, indexes, tags, streams, IAM (users, groups, roles, policies, access keys, sessions, permissions boundaries), idempotency tokens, metrics, login attempts, backups, continuous backups, TTL support, settings.
+### Catalog 0.1.0 (Current)
 
-No prior versions exist. All deployments are fresh installs.
+Adopted sqlx's migrator for both databases, replacing the homegrown filename-tracked runner. Each database now tracks applied SQL migrations, with checksums, in `_sqlx_migrations`; the old `schema_history` table is gone. Programmatic code migrations are tracked in the data database's `code_migrations` ledger. `extenddb migrate` runs both the catalog and data migrators. The catalog version is written by `init` and `migrate` after the migrator runs, not seeded inside a migration file.
+
+Breaking: upgrading from a pre-sqlx catalog requires `destroy` + `init`, which wipes both databases. Acceptable at v0.1 with no dependent catalogs.
+
+### Catalog 0.0.2 (Initial release, superseded)
+
+Complete initial schema: accounts, tables, indexes, tags, streams, IAM (users, groups, roles, policies, access keys, sessions, permissions boundaries), idempotency tokens, metrics, login attempts, backups, continuous backups, TTL support, settings. Managed by the homegrown runner and its `schema_history` table.
 
 ---
 

@@ -3,7 +3,8 @@
 
 //! `extenddb migrate` — apply catalog schema migrations (REQ-CAT-014).
 //!
-//! Reads current catalog version, runs pending migrations, and reports the result.
+//! Reads the current catalog version, runs both migrators (which validate the
+//! checksums of already-applied migrations), and reports the result.
 
 use clap::Args;
 
@@ -80,6 +81,22 @@ async fn apply_migrations(
     bootstrap: &dyn extenddb_storage::bootstrapper::Bootstrapper,
     args: &MigrateArgs,
 ) -> anyhow::Result<()> {
+    // ADR-0003: a catalog created by the pre-sqlx runner cannot be upgraded in
+    // place. Refuse with the re-init directive instead of failing later on a
+    // non-idempotent DDL re-run.
+    if bootstrap
+        .catalog_predates_sqlx()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?
+    {
+        anyhow::bail!(
+            "This catalog predates the sqlx migration system (ADR-0003). In-place \
+             upgrade is not supported. Run 'extenddb destroy' then 'extenddb init' \
+             to recreate both databases (this drops all data). See \
+             docs/manuals/07-upgrade-manual.md."
+        );
+    }
+
     // Show current catalog version.
     println!("--- Checking current catalog version...");
     let current = bootstrap
@@ -131,26 +148,9 @@ async fn apply_migrations(
         }
     }
 
-    if !catalog_pending && data_pending.is_empty() && !repair_pending {
-        println!();
-        if detected.needs_attention.is_empty() {
-            println!(
-                "Everything is up to date (catalog version {expected}). No migrations needed."
-            );
-        } else {
-            // Nothing is automatically applicable, but saying "everything is up
-            // to date" straight after a NEEDS ATTENTION line would be
-            // contradictory: those tables require a human.
-            println!(
-                "No migrations needed (catalog version {expected}), but {} item(s) above \
-                 need manual attention.",
-                detected.needs_attention.len()
-            );
-        }
-        return Ok(());
-    }
+    let has_pending = catalog_pending || !data_pending.is_empty() || repair_pending;
 
-    if !args.yes {
+    if has_pending && !args.yes {
         let mut what = Vec::new();
         if catalog_pending {
             what.push(format!("catalog {current_display} -> {expected}"));
@@ -170,16 +170,15 @@ async fn apply_migrations(
         );
     }
 
-    if catalog_pending {
-        bootstrap
-            .run_catalog_migrations()
-            .await
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    }
-
-    // Always run data migrations: the data-database ledger is idempotent
-    // (already-applied migrations are skipped) and independent of the catalog
-    // version, so an upgrade that only touched the data schema is still applied.
+    // Run both migrators unconditionally, even when nothing is pending. sqlx
+    // validates the checksum of every already-applied migration on each run, so
+    // a migration file edited after it shipped is caught loudly here instead of
+    // drifting silently. Applying is idempotent; an up-to-date run applies
+    // nothing.
+    bootstrap
+        .run_catalog_migrations()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
     bootstrap
         .run_data_migrations()
         .await
@@ -205,8 +204,21 @@ async fn apply_migrations(
     let new_display = new.as_deref().unwrap_or("none");
 
     println!();
-    println!("=== extenddb migrate complete ===");
-    println!("Catalog version: {current_display} -> {new_display}");
+    if has_pending {
+        println!("=== extenddb migrate complete ===");
+        println!("Catalog version: {current_display} -> {new_display}");
+    } else if detected.needs_attention.is_empty() {
+        println!("Everything is up to date (catalog version {expected}). No migrations applied.");
+    } else {
+        // Nothing is automatically applicable, but saying "everything is up
+        // to date" straight after a NEEDS ATTENTION line would be
+        // contradictory: those tables require a human.
+        println!(
+            "No migrations applied (catalog version {expected}), but {} item(s) above \
+             need manual attention.",
+            detected.needs_attention.len()
+        );
+    }
 
     Ok(())
 }

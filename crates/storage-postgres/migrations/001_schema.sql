@@ -1,9 +1,9 @@
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
--- Consolidated catalog schema for extenddb (catalog version 0.0.2).
--- This is the complete schema applied on fresh installs.
-
-BEGIN;
+-- Consolidated catalog schema for extenddb.
+-- This is the complete schema applied on fresh installs. The catalog version
+-- is written by the migration runner after this file applies (sqlx has no
+-- knowledge of our semver), so it is not seeded here.
 
 -- Accounts — multi-account support (REQ-AUTH-005).
 CREATE TABLE IF NOT EXISTS accounts (
@@ -67,12 +67,6 @@ CREATE TABLE IF NOT EXISTS tags (
     tag_key TEXT NOT NULL,
     tag_value TEXT NOT NULL,
     PRIMARY KEY (resource_arn, tag_key)
-);
-
--- Migration tracking.
-CREATE TABLE IF NOT EXISTS schema_history (
-    filename TEXT PRIMARY KEY,
-    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Settings (catalog version, data database connection, runtime config).
@@ -310,12 +304,9 @@ SELECT setval('stream_seq', GREATEST(
     1
 ));
 
--- Seed settings.
-INSERT INTO settings (key, value) VALUES ('catalog_version', '0.0.2')
-ON CONFLICT (key) DO NOTHING;
+-- Seed settings. The catalog version is written by the migration runner after
+-- this file applies, not seeded here.
 INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0.25')
 ON CONFLICT (key) DO NOTHING;
 INSERT INTO settings (key, value) VALUES ('index_propagation_delay_ms', '10')
 ON CONFLICT (key) DO NOTHING;
-
-COMMIT;

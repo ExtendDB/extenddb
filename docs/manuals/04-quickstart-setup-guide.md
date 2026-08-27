@@ -129,8 +129,8 @@ Check the version:
 
 ```bash
 ./target/release/extenddb version
-# extenddb 0.0.2
-# catalog 0.0.2
+# extenddb 0.1.0
+# catalog 0.1.0
 # commit abc1234
 # built 2026-04-17T12:00:00Z
 ```
@@ -171,7 +171,7 @@ Expected output:
 --- Checking catalog connection...
   OK: Connected to catalog.
 --- Checking catalog version...
-  OK: Catalog version 0.0.2
+  OK: Catalog version 0.1.0
 --- Checking data database...
   OK: Connected to data database 'extenddb_catalog_data'.
 --- Enumerating tables...

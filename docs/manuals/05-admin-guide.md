@@ -516,10 +516,10 @@ Check that PostgreSQL is running and the connection string in `extenddb.toml` is
 **Catalog version mismatch:**
 
 ```
-Error: catalog version mismatch: found 1.0.0, expected 0.0.2
+Error: catalog version mismatch: found 1.0.0, expected 0.1.0
 ```
 
-Run `extenddb migrate --config extenddb.toml` to upgrade the catalog schema.
+Run `extenddb migrate --config extenddb.toml` to upgrade the catalog schema. If `migrate` reports that the catalog predates the sqlx migration system (the 0.1.0 adoption in ADR-0003), there is no in-place upgrade: run `extenddb destroy` then `extenddb init` as described in the [upgrade manual](07-upgrade-manual.md).
 
 ### Authentication Errors
 

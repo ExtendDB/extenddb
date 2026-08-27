@@ -551,13 +551,18 @@ async fn transact_write_items(&self, input: TransactWriteInput) -> Result<...> {
 
 ### 5.6 Migrations
 
-Migrations are embedded in the binary at compile time via `include_str!` and applied in order by the
-`catalog::run_migrations` helper. Each migration is tracked in the `schema_history` table.
+Migrations are embedded in the binary at compile time via `sqlx::migrate!` and applied in order by the
+`run_catalog_migrations` / `run_data_migrations` helpers. Each migration is tracked, with a per-file
+checksum, in the sqlx-managed `_sqlx_migrations` table (ADR-0003).
 
-Migration files are numbered sequentially:
+Migration files are numbered sequentially, one tree per database:
 ```
-migrations/
-└── 001_initial_schema.sql
+migrations/                              # catalog database
+└── 001_schema.sql
+data_migrations/                         # data database
+├── 001_data_schema.sql
+├── 002_gsi_pending.sql
+└── 003_idempotency_account_scope.sql
 ```
 
 ## 6. GSI Consistency Model

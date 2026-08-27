@@ -22,7 +22,7 @@ The data database connection string is stored in the catalog's `settings` table 
 | `indexes` | GSI/LSI metadata. FK on `table_id` (UUID) with CASCADE delete. |
 | `tags` | Resource tags. PK: `(resource_arn, tag_key)`. |
 | `settings` | Key-value store for catalog version, data DB URL, and runtime settings. |
-| `schema_history` | Migration tracking. Records which SQL files have been applied. |
+| `_sqlx_migrations` | Migration tracking (sqlx-managed). Records applied migrations with a per-file checksum. |
 | `admin_users` | Admin credentials (bcrypt-hashed passwords). |
 | `iam_users` | IAM users scoped to accounts. Optional console password. |
 | `iam_groups` | IAM groups scoped to accounts. |

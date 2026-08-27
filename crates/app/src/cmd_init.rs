@@ -322,8 +322,27 @@ async fn run_init_migrations(
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
     if initialized {
+        // ADR-0003: a pre-sqlx deployment cannot be adopted in place. Without
+        // this guard, init would skip the catalog migrations below but still
+        // run the data migrator against the live pre-sqlx data database,
+        // re-executing 001's setval('stream_seq', ...) and 003's DROP TABLE
+        // idempotency_tokens on live data.
+        if bootstrapper
+            .catalog_predates_sqlx()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?
+        {
+            anyhow::bail!(
+                "This catalog predates the sqlx migration system (ADR-0003). In-place \
+                 upgrade is not supported. Run 'extenddb destroy' then 'extenddb init' \
+                 to recreate both databases (this drops all data). See \
+                 docs/manuals/07-upgrade-manual.md."
+            );
+        }
         println!("--- Catalog already initialized. Use 'extenddb migrate' for pending migrations.");
     } else {
+        // run_catalog_migrations applies the schema and writes catalog_version
+        // (the version write moved here from the migration SQL; ADR-0003).
         bootstrapper
             .run_catalog_migrations()
             .await

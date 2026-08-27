@@ -5,8 +5,6 @@
 -- stream records and idempotency tokens can be written atomically with item
 -- data within a single PostgreSQL transaction (P54 Bug 1).
 
-BEGIN;
-
 -- Stream shards — fixed shards per table, assigned by partition key hash.
 -- No FK to catalog tables (cross-database FKs are not possible).
 -- Application-level integrity ensures table_id validity.
@@ -37,9 +35,6 @@ CREATE INDEX IF NOT EXISTS idx_stream_records_created
     ON stream_records (created_at);
 
 -- Monotonic sequence for stream record ordering (CB-21).
--- Note: the idempotency check in run_data_migrations uses stream_shards
--- existence to decide whether to skip this entire migration. If stream_shards
--- is created manually without the sequence, stream_seq will not exist.
 CREATE SEQUENCE IF NOT EXISTS stream_seq START 1;
 SELECT setval('stream_seq', GREATEST(
     (EXTRACT(EPOCH FROM now()) * 1000000)::BIGINT,
@@ -55,5 +50,3 @@ CREATE TABLE IF NOT EXISTS idempotency_tokens (
 
 CREATE INDEX IF NOT EXISTS idx_idempotency_tokens_created
     ON idempotency_tokens (created_at);
-
-COMMIT;
