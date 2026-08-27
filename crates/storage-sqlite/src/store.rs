@@ -17,6 +17,17 @@
 //! `SQLITE_BUSY_SNAPSHOT` (a deferred read-then-write whose snapshot is
 //! invalidated by another pool committing) rather than surfacing it as a 500.
 //! Reads run concurrently from the pool against WAL snapshots and take no lock.
+//!
+//! "All writers" includes the control-plane paths (CreateTable's DDL, TTL
+//! metadata, tagging) and the periodic maintenance workers (table-size
+//! refresh, TTL index creation, stream-record and idempotency-token cleanup),
+//! not just the item write paths. A writer outside the lock contends at the
+//! SQLite level instead, and when its commit is slow (a large `CREATE INDEX`,
+//! a stalled fsync on a loaded CI host) a concurrent locked writer exhausts
+//! `busy_timeout` and fails an unrelated request with `database is locked`,
+//! which the engine maps to a 500. Measured 2026-08-27: an uncoordinated
+//! writer holding the file lock fails a plain `PutItem` with exactly the
+//! `InternalServerError` seen in the `run-integration-sqlite` CI flake.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
