@@ -28,6 +28,13 @@
 //! which the engine maps to a 500. Measured 2026-08-27: an uncoordinated
 //! writer holding the file lock fails a plain `PutItem` with exactly the
 //! `InternalServerError` seen in the `run-integration-sqlite` CI flake.
+//!
+//! Deliberate exclusions from the lock, so the invariant stays auditable:
+//! init-time bootstrap in this file (runs before the server serves traffic),
+//! and the management/credential stores, which write through the separate
+//! catalog pool in `lib.rs`. For a file-backed database that second pool
+//! opens the same file, so its small single-row autocommit writes carry a
+//! residual, much smaller, version of the same contention risk.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -430,9 +437,11 @@ mod d1_write_lock_tests {
     use std::time::Duration;
 
     async fn engine() -> SqliteEngine {
-        // 2 connections: one for the spawned writer under test, one spare, so a
-        // writer that (incorrectly) runs while the lock is held is stopped by
-        // the missing lock alone, never by pool exhaustion.
+        // The pool size is nominal: `SqliteEngine::new` pins in-memory
+        // databases to a single connection regardless. The tests below never
+        // hold a pool connection on the asserting side, so a writer that
+        // (incorrectly) ignores the lock is stopped by nothing at all, which
+        // is what the 200ms grace window detects.
         let engine = SqliteEngine::new(":memory:", 2, "us-east-1", 409_600)
             .await
             .expect("engine");
@@ -443,6 +452,14 @@ mod d1_write_lock_tests {
         .execute(&engine.pool)
         .await
         .expect("account");
+        // Zero control-plane delay: tables become ACTIVE at create time, since
+        // no transition poller runs inside a unit test.
+        sqlx::query(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0')",
+        )
+        .execute(&engine.pool)
+        .await
+        .expect("settings");
         engine
     }
 
@@ -482,16 +499,7 @@ mod d1_write_lock_tests {
         assert_serialized(
             &engine,
             async move {
-                let input: extenddb_core::types::CreateTableInput = serde_json::from_value(json!({
-                    "TableName": "d1-lock-t",
-                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
-                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
-                    "BillingMode": "PAY_PER_REQUEST"
-                }))
-                .expect("input");
-                e.create_table_impl("000000000000", input)
-                    .await
-                    .expect("create table");
+                create_table(&e, "d1-lock-t").await;
             },
             "create_table_impl",
         )
@@ -551,6 +559,67 @@ mod d1_write_lock_tests {
                     .expect("cleanup");
             },
             "cleanup_expired_stream_records",
+        )
+        .await;
+    }
+
+    /// Create a plain table outside the lock window, for the writers whose
+    /// pre-lock reads refuse to proceed without one.
+    async fn create_table(engine: &SqliteEngine, name: &str) {
+        let input: extenddb_core::types::CreateTableInput = serde_json::from_value(json!({
+            "TableName": name,
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .expect("input");
+        engine
+            .create_table_impl("000000000000", input)
+            .await
+            .expect("create table");
+    }
+
+    #[tokio::test]
+    async fn delete_backup_waits_for_the_write_lock() {
+        use extenddb_storage::BackupEngine;
+        let engine = engine().await;
+        create_table(&engine, "d1-bkp-t").await;
+        // The backup must exist before the lock window: delete_backup resolves
+        // it with a read first and returns early when it is missing, which
+        // would complete without ever reaching the writes under test.
+        let details = BackupEngine::create_backup(&engine, "000000000000", "d1-bkp-t", "b")
+            .await
+            .expect("backup");
+        let e = engine.clone();
+        assert_serialized(
+            &engine,
+            async move {
+                BackupEngine::delete_backup(&e, "000000000000", &details.backup_arn)
+                    .await
+                    .expect("delete backup");
+            },
+            "delete_backup",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn update_continuous_backups_waits_for_the_write_lock() {
+        use extenddb_storage::BackupEngine;
+        let engine = engine().await;
+        // The table must exist before the lock window: the pre-lock existence
+        // check returns TableNotFound otherwise, completing without reaching
+        // the write under test.
+        create_table(&engine, "d1-pitr-t").await;
+        let e = engine.clone();
+        assert_serialized(
+            &engine,
+            async move {
+                BackupEngine::update_continuous_backups(&e, "000000000000", "d1-pitr-t", true)
+                    .await
+                    .expect("update continuous backups");
+            },
+            "update_continuous_backups",
         )
         .await;
     }
