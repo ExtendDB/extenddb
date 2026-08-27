@@ -167,6 +167,13 @@ pub trait Bootstrapper: Send + Sync {
     /// Read the current catalog schema version.
     async fn read_catalog_version(&self) -> OpResult<Option<String>>;
 
+    /// True if the catalog was created by the pre-sqlx migration runner and
+    /// therefore cannot be upgraded in place (ADR-0003 requires destroy + init).
+    /// Backends without a legacy runner return false.
+    async fn catalog_predates_sqlx(&self) -> OpResult<bool> {
+        Ok(false)
+    }
+
     /// Get the expected catalog version for this binary.
     fn expected_catalog_version(&self) -> String;
 

@@ -63,7 +63,7 @@ urlencoding = { version = "2.1" }
 moka = { version = "0.12", features = ["future"] }
 
 # Database
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "json", "time", "uuid", "bigdecimal", "derive"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "json", "time", "uuid", "bigdecimal", "derive", "macros", "migrate"] }
 mongodb = "3"
 bson = "2.13"
 dashmap = "6"

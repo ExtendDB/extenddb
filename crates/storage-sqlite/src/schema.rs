@@ -5,7 +5,7 @@
 //!
 //! Mirrors the semantics of the reference PostgreSQL catalog schema
 //! (`crates/storage-postgres/migrations/001_schema.sql`, catalog version
-//! 0.0.2). Table and column names are kept identical to PostgreSQL so the
+//! 0.1.0). Table and column names are kept identical to PostgreSQL so the
 //! catalog/management stores remain portable across backends.
 //!
 //! Type mapping PostgreSQL → SQLite:

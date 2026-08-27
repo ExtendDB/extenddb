@@ -15,8 +15,6 @@
 -- acceptable for a short-lived cache. Apply data migrations during the
 -- stop / migrate / restart upgrade sequence to bound that window.
 
-BEGIN;
-
 DROP TABLE IF EXISTS idempotency_tokens;
 
 CREATE TABLE idempotency_tokens (
@@ -29,5 +27,3 @@ CREATE TABLE idempotency_tokens (
 
 CREATE INDEX idx_idempotency_tokens_created
     ON idempotency_tokens (created_at);
-
-COMMIT;

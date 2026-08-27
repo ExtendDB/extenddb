@@ -170,7 +170,7 @@ extenddb uses a dual-database architecture:
 - **Catalog database** (e.g., `extenddb_catalog`): Stores table metadata, account/user/group/role/policy definitions, access keys, settings, stream metadata, and metrics. Shared across all accounts.
 - **Data database** (e.g., `extenddb_catalog_data`): Stores user items, GSI/LSI data, and stream records. Each table gets its own PostgreSQL table.
 
-The catalog version (currently 0.0.2) is stored in the `catalog_metadata` table and checked at startup. Version mismatches prevent the server from starting — run `extenddb migrate` to upgrade.
+The catalog version (currently 0.1.0) is stored in the `settings` table and checked at startup. Version mismatches prevent the server from starting — run `extenddb migrate` to upgrade.
 
 ## Pluggable Architecture
 

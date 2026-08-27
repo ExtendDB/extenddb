@@ -733,6 +733,23 @@ impl Bootstrapper for PostgresBootstrapper {
         Ok(row.map(|(v,)| v))
     }
 
+    async fn catalog_predates_sqlx(&self) -> OpResult<bool> {
+        let pool = self.app_pool(&self.config.catalog_db).await?;
+        // Uninitialized catalog: nothing to guard (init creates the sqlx ledger).
+        if !migrations::table_exists(&pool, "settings").await? {
+            return Ok(false);
+        }
+        // The old runner tracked migrations in `schema_history`; sqlx uses
+        // `_sqlx_migrations`. An initialized catalog carrying the legacy table,
+        // or lacking the sqlx ledger, predates the sqlx migrator. Checking the
+        // catalog is sufficient: init creates both databases together (or
+        // aborts), so a pre-sqlx data database never appears without a pre-sqlx
+        // catalog, which this refuses first.
+        let has_legacy = migrations::table_exists(&pool, "schema_history").await?;
+        let has_sqlx = migrations::table_exists(&pool, "_sqlx_migrations").await?;
+        Ok(has_legacy || !has_sqlx)
+    }
+
     fn expected_catalog_version(&self) -> String {
         CATALOG_VERSION.to_string()
     }

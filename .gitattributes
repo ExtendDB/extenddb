@@ -1,2 +1,6 @@
 # Generated from upstream license texts; preserve their verbatim whitespace.
 SOFTWARE-LICENSE-NOTICES.html -whitespace linguist-generated=true
+
+# sqlx checksums migration file bytes. Pin LF so a contributor's line-ending
+# rewrite does not trip a false checksum mismatch (ADR-0003).
+*.sql text eol=lf

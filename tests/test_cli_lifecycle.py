@@ -54,11 +54,11 @@ class TestCliLifecycle:
         assert os.path.isfile(os.path.join(cli_env["tls_dir"], "key.pem"))
 
     def test_data_migrations_tracked(self, cli_env):
-        """init records every data migration in the data DB's schema_history.
+        """init records every data migration in the data DB's _sqlx_migrations.
 
-        Validates the data-migration registry: migrations are tracked (so
-        `extenddb migrate` knows what is pending and never re-runs an applied
-        one), and the GSI-pending migration is among them.
+        Validates the sqlx data-migration ledger: migrations are tracked (so
+        `extenddb migrate` never re-runs an applied one), and the GSI-pending
+        migration is among them.
         """
         import psycopg2
 
@@ -74,23 +74,27 @@ class TestCliLifecycle:
         conn = psycopg2.connect(PG_ADMIN_CONN + "/" + data_db)
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT filename FROM schema_history ORDER BY filename")
+                cur.execute("SELECT version FROM _sqlx_migrations ORDER BY version")
                 tracked = {row[0] for row in cur.fetchall()}
+                cur.execute("SELECT name FROM code_migrations ORDER BY name")
+                code_tracked = {row[0] for row in cur.fetchall()}
         finally:
             conn.close()
 
-        assert "001_data_schema.sql" in tracked, tracked
-        assert "002_gsi_pending.sql" in tracked, tracked
-        # Programmatic (code) migration for the GSI base-key index is tracked in
-        # the same ledger, so `migrate` treats it exactly like a SQL migration.
-        assert "003_gsi_base_key_index" in tracked, tracked
+        # 001_data_schema, 002_gsi_pending, 003_idempotency_account_scope.
+        assert {1, 2, 3} <= tracked, tracked
+        # The programmatic (code) migration for the GSI base-key index is
+        # tracked in its own code_migrations ledger (it is Rust code, not a
+        # checksummed SQL file), applied and skipped by `migrate` just like
+        # the SQL migrations.
+        assert "003_gsi_base_key_index" in code_tracked, code_tracked
 
     def test_migrate_applies_pending_data_migration(self, cli_env):
         """`extenddb migrate` applies a pending *data* migration on an existing
         deployment — not just catalog migrations.
 
         Regression: data migrations live in the data database's own
-        `schema_history`, independent of the catalog version. `migrate`
+        sqlx ledger (`_sqlx_migrations`), independent of the catalog version. `migrate`
         previously only ran catalog migrations and returned "up to date" when
         the catalog version matched, so a release that only added a data
         migration (e.g. `002_gsi_pending.sql`) was never applied on upgrade —
@@ -120,9 +124,7 @@ class TestCliLifecycle:
             conn.autocommit = True
             with conn.cursor() as cur:
                 cur.execute("DROP TABLE IF EXISTS gsi_pending")
-                cur.execute(
-                    "DELETE FROM schema_history WHERE filename = '002_gsi_pending.sql'"
-                )
+                cur.execute("DELETE FROM _sqlx_migrations WHERE version = 2")
                 cur.execute("SELECT to_regclass('public.gsi_pending') IS NOT NULL")
                 assert cur.fetchone()[0] is False
         finally:
@@ -150,8 +152,7 @@ class TestCliLifecycle:
                 cur.execute("SELECT to_regclass('public.gsi_pending') IS NOT NULL")
                 assert cur.fetchone()[0] is True
                 cur.execute(
-                    "SELECT EXISTS(SELECT 1 FROM schema_history "
-                    "WHERE filename = '002_gsi_pending.sql')"
+                    "SELECT EXISTS(SELECT 1 FROM _sqlx_migrations WHERE version = 2)"
                 )
                 assert cur.fetchone()[0] is True
                 # The 002 schema must carry the per-index queue columns.
@@ -200,12 +201,12 @@ class TestCliLifecycle:
             conn.autocommit = True
             with conn.cursor() as cur:
                 cur.execute(
-                    "DELETE FROM schema_history "
-                    "WHERE filename = '003_gsi_base_key_index'"
+                    "DELETE FROM code_migrations "
+                    "WHERE name = '003_gsi_base_key_index'"
                 )
                 cur.execute(
-                    "SELECT EXISTS(SELECT 1 FROM schema_history "
-                    "WHERE filename = '003_gsi_base_key_index')"
+                    "SELECT EXISTS(SELECT 1 FROM code_migrations "
+                    "WHERE name = '003_gsi_base_key_index')"
                 )
                 assert cur.fetchone()[0] is False
         finally:
@@ -232,8 +233,8 @@ class TestCliLifecycle:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT EXISTS(SELECT 1 FROM schema_history "
-                    "WHERE filename = '003_gsi_base_key_index')"
+                    "SELECT EXISTS(SELECT 1 FROM code_migrations "
+                    "WHERE name = '003_gsi_base_key_index')"
                 )
                 assert cur.fetchone()[0] is True
         finally:
@@ -247,6 +248,62 @@ class TestCliLifecycle:
         )
         assert again.returncode == 0, again.stdout + again.stderr
         assert "up to date" in again.stdout.lower(), again.stdout
+
+    def test_migrate_refuses_pre_sqlx_catalog(self, cli_env):
+        """`extenddb migrate` refuses a catalog created by the pre-sqlx runner.
+
+        ADR-0003 adopts sqlx with a re-init upgrade path (no in-place shim). A
+        catalog that predates sqlx (has `schema_history`, no `_sqlx_migrations`)
+        must not be migrated in place: `migrate` refuses and directs the operator
+        to `destroy` + `init`, rather than failing later on a non-idempotent DDL
+        re-run and leaving the catalog half-adopted.
+        """
+        import psycopg2
+
+        result = _run_extenddb(
+            "init", *_init_args(cli_env),
+            config=cli_env["config_path"],
+            env_override={"EXTENDDB_ADMIN_PASSWORD": "TestPass1!"},
+        )
+        assert result.returncode == 0
+
+        # Rewrite the catalog to look like a pre-sqlx deployment: legacy
+        # schema-history table, no sqlx ledger, old catalog version.
+        conn = psycopg2.connect(PG_ADMIN_CONN + "/" + cli_env["db_name"])
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute("DROP TABLE IF EXISTS _sqlx_migrations")
+                cur.execute(
+                    "CREATE TABLE schema_history (filename TEXT PRIMARY KEY)"
+                )
+                cur.execute(
+                    "UPDATE settings SET value = '0.0.2' WHERE key = 'catalog_version'"
+                )
+        finally:
+            conn.close()
+
+        refused = _run_extenddb(
+            "migrate", "--yes", *_pg_args(),
+            config=cli_env["config_path"],
+            check=False,
+        )
+        assert refused.returncode != 0, refused.stdout + refused.stderr
+        combined = (refused.stdout + refused.stderr).lower()
+        assert "predates" in combined, combined
+        assert "destroy" in combined and "init" in combined, combined
+
+        # The version must be left untouched (no in-place stamp), and the guard
+        # must have fired before the migrator connected: no sqlx ledger created.
+        conn = psycopg2.connect(PG_ADMIN_CONN + "/" + cli_env["db_name"])
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM settings WHERE key = 'catalog_version'")
+                assert cur.fetchone()[0] == "0.0.2"
+                cur.execute("SELECT to_regclass('public._sqlx_migrations') IS NULL")
+                assert cur.fetchone()[0] is True
+        finally:
+            conn.close()
 
     def test_init_serve_status_stop(self, cli_env):
         """Full lifecycle: init → serve → status → stop."""

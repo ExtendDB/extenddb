@@ -416,7 +416,7 @@ The catalog database stores extenddb metadata: table definitions, indexes, tags,
 
 ### 7.2 Catalog Versioning
 
-- REQ-CAT-005: The catalog carries a semver version (`major.minor.patch`). Major = breaking schema changes, minor = additive, patch = non-structural
+- REQ-CAT-005: The catalog carries a semver version (`major.minor.patch`). Major = breaking schema changes, minor = additive, patch = non-structural. Pre-1.0, breaking changes ride a minor bump (major stays 0), per standard semver for unstable releases.
 - REQ-CAT-006: The expected catalog version is a build-time constant compiled into the binary — not configurable at runtime
 - REQ-CAT-007: On startup, the server validates the catalog version matches the version compiled into the binary. Mismatch → refuse to start with a clear error directing the user to run `extenddb migrate`
 - REQ-CAT-008: `extenddb --version` prints both binary version and expected catalog version: `extenddb 0.1.0 (catalog 1.0.0)`. Binary version and catalog version are independent

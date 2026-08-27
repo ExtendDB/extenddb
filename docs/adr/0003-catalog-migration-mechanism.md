@@ -1,6 +1,6 @@
 # ADR-0003: Adopt sqlx::migrate for PostgreSQL catalog and data schema migrations
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-06-17
 - Deciders: ExtendDB CODEOWNERS
 
@@ -137,8 +137,10 @@ be recreated and reloaded after `init`.
 **Operational notes**
 
 - Migrations run only during `init` and `migrate`, never while serving.
-- If a migration dies mid-apply, sqlx marks it dirty and refuses to proceed until
-  an operator resolves it.
+- If a migration dies mid-apply, sqlx rolls back its transaction completely,
+  leaving no partial state and no ledger row, so re-running `migrate` retries it.
+  (A migration is marked dirty and blocks further runs only if it opts out with a
+  `-- no-transaction` directive, which none do.)
 - This is scoped to migration mechanics. It does not touch the separate gap in how
   ExtendDB checks columns at query time.
 - CI guardrail (follow-up): apply every migration on a fresh database and assert an
