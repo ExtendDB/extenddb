@@ -138,7 +138,7 @@ For UpdateItem, the `new_image` is not known until after `apply_update` runs ins
 
 ### Shard Model
 
-Each stream has a fixed set of shards (currently 4 shards per stream). Shard IDs are deterministic (`shardId-<table>-000000000000` through `shardId-<table>-000000000003`). Sequence numbers are monotonically increasing integers.
+Each stream has a fixed set of shards (currently 4 shards per stream). Shard IDs are deterministic (`shardId-<table>-0000000000000000` through `shardId-<table>-0000000000000003`), zero-padded to 16 digits so every shard ID meets the AWS SDKs' 28-character minimum for `ShardId`, regardless of table name length. Sequence numbers are monotonically increasing integers.
 
 ### Iterator Types
 
@@ -185,7 +185,7 @@ extenddb caches a small set of operational settings in memory to avoid per-reque
 
 | Setting | Mechanism | Refresh | Justification |
 |---------|-----------|---------|---------------|
-| `gsi_propagation_delay_ms` | `AtomicU64` | Background poller every 30s | Write-path hot path; briefly-stale value only affects GSI propagation timing |
+| `index_propagation_delay_ms` | `AtomicU64` | Background poller every 30s | Write-path hot path; briefly-stale value only affects GSI propagation timing |
 | `encryption_key` | `Arc<str>` loaded at startup | Never (immutable after `extenddb init`) | Decryption key for access key secrets; generated once, never changes |
 | `log_level` / `log_destination` | Tracing filter reload | Background poller every 30s | Observability tuning; stale value only delays log level changes |
 | `throttling_enabled` | `AtomicBool` | Background poller every 30s | Capacity management toggle; briefly-stale is safe |

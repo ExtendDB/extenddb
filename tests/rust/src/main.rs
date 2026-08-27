@@ -18,9 +18,9 @@ mod backup_restore;
 #[cfg(test)]
 mod batch_get_item;
 #[cfg(test)]
-mod batch_write_item;
-#[cfg(test)]
 mod batch_transact_authz;
+#[cfg(test)]
+mod batch_write_item;
 #[cfg(test)]
 mod binary_sort_key;
 #[cfg(test)]
@@ -54,6 +54,10 @@ mod gsi;
 #[cfg(test)]
 mod gsi_more;
 #[cfg(test)]
+mod gsi_on_hash_only_table;
+#[cfg(test)]
+mod gsi_update_table_attr_defs;
+#[cfg(test)]
 mod index_key_validation;
 #[cfg(test)]
 mod lsi;
@@ -71,6 +75,8 @@ mod query;
 mod query_more;
 #[cfg(test)]
 mod raw_http;
+#[cfg(test)]
+mod restore_active_completeness;
 #[cfg(test)]
 mod scan;
 #[cfg(test)]
@@ -90,6 +96,8 @@ mod transact_write_items;
 #[cfg(test)]
 mod transact_write_items_more;
 #[cfg(test)]
+mod transaction_key_size_validation;
+#[cfg(test)]
 mod transaction_validation;
 #[cfg(test)]
 mod ttl;
@@ -108,7 +116,18 @@ mod update_item_more;
 #[cfg(test)]
 mod update_item_number_validation;
 #[cfg(test)]
+mod update_table_attribute_definitions;
 mod update_table_billing_validation;
+#[cfg(test)]
+mod vector_index_search;
+#[cfg(test)]
+mod vector_index_unsupported;
+#[cfg(test)]
+mod vector_index_update_rules;
+#[cfg(test)]
+mod vector_index_write_capacity;
+#[cfg(test)]
+mod wording_parity_validation;
 
 fn main() {
     eprintln!("Run with `cargo test` to execute integration tests.");

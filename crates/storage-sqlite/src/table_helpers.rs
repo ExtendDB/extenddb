@@ -12,6 +12,7 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn};
+use extenddb_storage::vector_catalog::{VectorIndexCatalogRow, vector_index_descriptions};
 
 use crate::data;
 use crate::sqlite_util::parse_timestamp;
@@ -51,6 +52,53 @@ pub(crate) struct IndexRow {
     pub index_status: String,
     pub provisioned_throughput: Option<String>,
 }
+
+/// A `vector_indexes` catalog row, in `FromRow` field order.
+///
+/// Decoding stops at this struct: the rules that turn it into a wire shape are
+/// shared with the other backends in `extenddb_storage::vector_catalog`. The JSON
+/// columns are text here, so the conversion parses them into values.
+#[derive(sqlx::FromRow)]
+pub(crate) struct VectorIndexRow {
+    pub index_name: String,
+    #[allow(dead_code)]
+    pub index_id: String,
+    pub dimensions: i64,
+    pub distance_function: String,
+    pub vector_attribute: String,
+    pub search_schema: Option<String>,
+    pub projection: String,
+    pub index_status: String,
+    pub backfilling: Option<i64>,
+}
+
+impl VectorIndexRow {
+    /// Parse the text columns into the backend-neutral row the shared rules take.
+    pub(crate) fn into_catalog_row(self) -> Result<VectorIndexCatalogRow, StorageError> {
+        let json = |text: &str, column: &str| -> Result<serde_json::Value, StorageError> {
+            serde_json::from_str(text).map_err(|e| StorageError::Internal(format!("{column}: {e}")))
+        };
+        Ok(VectorIndexCatalogRow {
+            index_name: self.index_name,
+            dimensions: self.dimensions,
+            distance_function: self.distance_function,
+            vector_attribute: json(&self.vector_attribute, "vector_attribute")?,
+            search_schema: self
+                .search_schema
+                .as_deref()
+                .map(|text| json(text, "vector search_schema"))
+                .transpose()?,
+            projection: json(&self.projection, "vector projection")?,
+            index_status: self.index_status,
+            // Stored as an integer so the ACTIVE state is representable as NULL.
+            backfilling: self.backfilling.map(|b| b != 0),
+        })
+    }
+}
+
+/// Columns selected for a `VectorIndexRow`, in `FromRow` field order.
+pub(crate) const VECTOR_INDEX_COLUMNS: &str = "index_name, index_id, dimensions, \
+     distance_function, vector_attribute, search_schema, projection, index_status, backfilling";
 
 /// Columns selected for a `TableRow`, in `FromRow` field order.
 pub(crate) const TABLE_COLUMNS: &str = "table_name, key_schema, attribute_definitions, \
@@ -93,7 +141,23 @@ impl SqliteEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        self.build_table_description_from_row(account_id, row, index_rows)
+        let vector_rows: Vec<VectorIndexRow> = sqlx::query_as(&format!(
+            "SELECT {VECTOR_INDEX_COLUMNS} FROM vector_indexes WHERE table_id = ?"
+        ))
+        .bind(&row.table_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        let table_name_owned = row.table_name.clone();
+        let mut desc = self.build_table_description_from_row(account_id, row, index_rows)?;
+        let catalog_rows = vector_rows
+            .into_iter()
+            .map(VectorIndexRow::into_catalog_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        desc.vector_indexes =
+            vector_index_descriptions(&self.region, account_id, &table_name_owned, catalog_rows)?;
+        Ok(desc)
     }
 
     pub(crate) fn build_table_description_from_row(
@@ -240,6 +304,9 @@ impl SqliteEngine {
                 .on_demand_throughput
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok()),
+            // Any core field this backend does not populate takes its default, so
+            // adding one does not break this build.
+            ..Default::default()
         })
     }
 

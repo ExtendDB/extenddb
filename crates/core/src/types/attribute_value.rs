@@ -209,8 +209,12 @@ impl<'de> Visitor<'de> for AttributeValueVisitor {
                 if set.len() != arr.len() {
                     let values: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
                     let repr = values.join(", ");
+                    // The binary form names the set type, with the service's
+                    // own missing space before 'of' ("...]of type BS...") --
+                    // invariant across regions; the S and N set forms do not
+                    // name a type.
                     return Err(de::Error::custom(format!(
-                        "One or more parameter values were invalid: Input collection [{repr}] contains duplicates."
+                        "One or more parameter values were invalid: Input collection [{repr}]of type BS contains duplicates."
                     )));
                 }
                 Ok(AttributeValue::BS(set))

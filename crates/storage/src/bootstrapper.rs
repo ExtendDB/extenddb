@@ -41,6 +41,19 @@ pub struct AdminBootstrapResult {
     pub from_env: bool,
 }
 
+/// Outcome of [`Bootstrapper::repair_lost_sort_key_definitions`].
+#[derive(Debug, Default, Clone)]
+pub struct KeyDefinitionRepair {
+    /// Tables whose sort key definitions were restored, as
+    /// `table_name: attribute (TYPE)` lines. When the caller passed `apply =
+    /// false` these are the repairs that WOULD be made.
+    pub repaired: Vec<String>,
+    /// Tables that are damaged but could not be repaired automatically, because
+    /// no physical sort key column was found to read the type back from. These
+    /// need a human: guessing a type would resolve the key to the wrong column.
+    pub needs_attention: Vec<String>,
+}
+
 /// High-level bootstrap operations for storage backends.
 ///
 /// Covers the init, destroy, and migrate command paths. Implementations
@@ -65,6 +78,53 @@ pub trait Bootstrapper: Send + Sync {
 
     /// Run data schema migrations (stream tables, sequences, etc.).
     async fn run_data_migrations(&self) -> OpResult<()>;
+
+    /// Restore sort key attribute definitions that issue #259 deleted from table
+    /// metadata, reading each type back from the physical sort key column.
+    ///
+    /// Before the fix, `UpdateTable` replaced a table's stored attribute
+    /// definitions with the request's subset, so adding a GSI dropped the base
+    /// table's own key definitions and keyed reads silently returned another item
+    /// in the same partition. The write path no longer does that, but a table
+    /// damaged by an older build stays damaged, and it now fails its reads loudly
+    /// instead (see `TableKeyInfo::validate_sort_key_definitions`). This repairs
+    /// such tables so they serve correct reads again.
+    ///
+    /// With `apply` false this only detects and reports, writing nothing, so a
+    /// `migrate` run that has not been confirmed with `--yes` never mutates the
+    /// catalog. With `apply` true the repair is written.
+    ///
+    /// Idempotent: a table whose definitions are intact is left untouched, so
+    /// running it on a healthy deployment reports nothing and changes nothing.
+    ///
+    /// The default implementation repairs nothing, which is correct for a backend
+    /// that never wrote the definitions in the first place.
+    async fn repair_lost_sort_key_definitions(&self, apply: bool) -> OpResult<KeyDefinitionRepair> {
+        let _ = apply;
+        Ok(KeyDefinitionRepair::default())
+    }
+
+    /// Acquire a cross-process lock so that concurrent `migrate` runs, such as
+    /// several replicas starting at once, don't race each other applying schema
+    /// changes. Blocks until the lock is available.
+    ///
+    /// The default is a no-op, which means a backend that does not override this
+    /// gets no serialization at all. Implement it if concurrent bootstrap is a
+    /// supported deployment for your backend.
+    ///
+    /// Implementations need not be re-entrant, and callers must not acquire
+    /// twice without releasing. Every acquire must be paired with
+    /// [`Bootstrapper::release_migration_lock`], and the backend must also
+    /// release the lock if the process dies without doing so.
+    async fn acquire_migration_lock(&self) -> OpResult<()> {
+        Ok(())
+    }
+
+    /// Release the lock taken by [`Bootstrapper::acquire_migration_lock`], and
+    /// do nothing if no lock is held. Defaults to a no-op.
+    async fn release_migration_lock(&self) -> OpResult<()> {
+        Ok(())
+    }
 
     /// Filenames of data-database migrations that have not yet been applied.
     ///
@@ -213,6 +273,10 @@ pub mod helpers {
     }
 
     /// Check that a CLI arg, if provided, matches the config value.
+    ///
+    /// The error message includes both values, so this must only be used for
+    /// non-sensitive settings (hosts, ports, usernames). For secrets, use
+    /// [`check_conflict_redacted`].
     pub fn check_conflict<T: PartialEq + std::fmt::Display>(
         cli_val: Option<&T>,
         config_val: &T,
@@ -223,6 +287,25 @@ pub mod helpers {
         {
             return Err(crate::error::StorageError::Internal(format!(
                 "{flag} value '{v}' conflicts with config file value '{config_val}'"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Like [`check_conflict`], but the error message never contains either
+    /// value. Use for passwords and other secrets: the message lands on
+    /// stderr, and in a container stderr is the log stream, which is commonly
+    /// shipped to aggregators.
+    pub fn check_conflict_redacted<T: PartialEq>(
+        cli_val: Option<&T>,
+        config_val: &T,
+        flag: &str,
+    ) -> Result<(), crate::error::StorageError> {
+        if let Some(v) = cli_val
+            && v != config_val
+        {
+            return Err(crate::error::StorageError::Internal(format!(
+                "{flag} conflicts with the value in the config file (values redacted)"
             )));
         }
         Ok(())
@@ -411,6 +494,28 @@ pub mod helpers {
         }
 
         #[test]
+        fn test_check_conflict_redacted_never_leaks_either_value() {
+            let cli_secret = "hunter2-cli".to_string();
+            let config_secret = "hunter2-config".to_string();
+            let result =
+                check_conflict_redacted(Some(&cli_secret), &config_secret, "--extenddb-pass");
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("--extenddb-pass"), "flag must be named: {err}");
+            assert!(!err.contains("hunter2-cli"), "CLI secret leaked: {err}");
+            assert!(
+                !err.contains("hunter2-config"),
+                "config secret leaked: {err}"
+            );
+        }
+
+        #[test]
+        fn test_check_conflict_redacted_ok_paths() {
+            let same = "s3cret".to_string();
+            assert!(check_conflict_redacted(Some(&same), &same, "--extenddb-pass").is_ok());
+            assert!(check_conflict_redacted(None, &same, "--extenddb-pass").is_ok());
+        }
+
+        #[test]
         fn test_extract_arg_found() {
             let args = vec![
                 "program".to_string(),
@@ -463,5 +568,107 @@ pub mod helpers {
             // Should return first occurrence
             assert_eq!(extract_arg(&args, "--host"), Some("first".to_string()));
         }
+    }
+}
+
+/// Compile-time and behaviour guard for out-of-tree backends.
+///
+/// `MinimalBootstrapper` implements only the methods the trait requires. If a
+/// new required method is added, or a defaulted one loses its default, this
+/// stops compiling, which is the same breakage an out-of-tree backend crate
+/// would hit. It also pins object safety by boxing as `dyn Bootstrapper`, and
+/// checks that the defaulted migration-lock methods are usable no-ops.
+#[cfg(test)]
+mod out_of_tree_compat_tests {
+    use super::*;
+    use crate::management_store::OpResult;
+
+    struct MinimalBootstrapper;
+
+    #[async_trait]
+    impl Bootstrapper for MinimalBootstrapper {
+        async fn ensure_app_user(&self) -> OpResult<()> {
+            Ok(())
+        }
+        async fn grant_app_role_to_admin(&self) -> OpResult<()> {
+            Ok(())
+        }
+        async fn create_catalog_db(&self) -> OpResult<()> {
+            Ok(())
+        }
+        async fn create_data_db(&self) -> OpResult<()> {
+            Ok(())
+        }
+        async fn run_catalog_migrations(&self) -> OpResult<()> {
+            Ok(())
+        }
+        async fn run_data_migrations(&self) -> OpResult<()> {
+            Ok(())
+        }
+        async fn pending_data_migrations(&self) -> OpResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn record_data_connection(&self) -> OpResult<()> {
+            Ok(())
+        }
+        async fn bootstrap_encryption_key(&self) -> OpResult<()> {
+            Ok(())
+        }
+        async fn bootstrap_default_account(&self) -> OpResult<()> {
+            Ok(())
+        }
+        async fn bootstrap_admin_user(
+            &self,
+            env_user: Option<&str>,
+            _env_password: Option<&str>,
+        ) -> OpResult<AdminBootstrapResult> {
+            Ok(AdminBootstrapResult {
+                username: env_user.unwrap_or("admin").to_owned(),
+                generated_password: None,
+                already_existed: false,
+                from_env: false,
+            })
+        }
+        async fn is_catalog_initialized(&self) -> OpResult<bool> {
+            Ok(true)
+        }
+        async fn list_table_names(&self) -> OpResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn get_data_db_name(&self) -> OpResult<Option<String>> {
+            Ok(None)
+        }
+        async fn drop_databases(&self, _data_db: &str) -> OpResult<()> {
+            Ok(())
+        }
+        async fn read_catalog_version(&self) -> OpResult<Option<String>> {
+            Ok(None)
+        }
+        fn expected_catalog_version(&self) -> String {
+            "0.0.0".to_owned()
+        }
+        fn catalog_database_name(&self) -> String {
+            "minimal".to_owned()
+        }
+        fn endpoint_info(&self) -> String {
+            "in-memory".to_owned()
+        }
+        fn catalog_connection_url(&self) -> String {
+            "minimal://".to_owned()
+        }
+        fn generate_backend_config_section(&self) -> String {
+            String::new()
+        }
+    }
+
+    /// A backend that does not implement the migration lock still works, and
+    /// the defaults are no-ops rather than errors.
+    #[tokio::test]
+    async fn migration_lock_defaults_to_a_usable_no_op() {
+        let bootstrapper: Box<dyn Bootstrapper> = Box::new(MinimalBootstrapper);
+        assert!(bootstrapper.acquire_migration_lock().await.is_ok());
+        assert!(bootstrapper.release_migration_lock().await.is_ok());
+        // Releasing without acquiring must also be harmless.
+        assert!(bootstrapper.release_migration_lock().await.is_ok());
     }
 }

@@ -9,21 +9,28 @@
 //! their crate, and ships their own `extenddb-<backend>` image — with no edits to
 //! any ExtendDB core crate.
 //!
-//! In-tree backends are selected by mutually exclusive Cargo features
-//! (`postgres` is the default; `sqlite`/`sqlite-memory` build the dev/CI
-//! backend). Exactly one must be enabled: [`set_backend`] installs one backend
-//! per process, so a build with both would be ambiguous and is rejected at
-//! compile time.
+//! In-tree backends are selected by mutually exclusive Cargo features:
+//! `postgres` (the default production backend), `mongodb` (production, built with
+//! `--no-default-features --features mongodb`), and `sqlite`/`sqlite-memory` (the
+//! dev/CI backend). Exactly one must be enabled: [`set_backend`] installs one
+//! backend per process, so a build with more than one would be ambiguous and is
+//! rejected at compile time.
 
 // Exactly one backend feature must be enabled.
-#[cfg(all(feature = "postgres", feature = "sqlite"))]
+#[cfg(any(
+    all(feature = "postgres", feature = "sqlite"),
+    all(feature = "postgres", feature = "mongodb"),
+    all(feature = "sqlite", feature = "mongodb"),
+))]
 compile_error!(
-    "the `postgres` and `sqlite` features are mutually exclusive: a thin bin \
-     installs exactly one backend (build the SQLite binary with \
-     `--no-default-features --features sqlite`)"
+    "the `postgres`, `mongodb`, and `sqlite` features are mutually exclusive: a \
+     thin bin installs exactly one backend (e.g. build the MongoDB binary with \
+     `--no-default-features --features mongodb`)"
 );
-#[cfg(not(any(feature = "postgres", feature = "sqlite")))]
-compile_error!("no backend selected: enable the `postgres` (default) or `sqlite` feature");
+#[cfg(not(any(feature = "postgres", feature = "mongodb", feature = "sqlite")))]
+compile_error!(
+    "no backend selected: enable the `postgres` (default), `mongodb`, or `sqlite` feature"
+);
 
 // Developer mode relaxes the security posture (plain HTTP on loopback, open
 // authorization). It is a dev/CI-only profile and must be built only with a
@@ -31,13 +38,13 @@ compile_error!("no backend selected: enable the `postgres` (default) or `sqlite`
 // (every backend is a production backend unless proven otherwise, so a deny-list
 // would have to grow with each new one), require a known dev backend: dev-mode
 // compiles only when `sqlite` is enabled. `sqlite-memory` enables `sqlite`, so it
-// is covered too; postgres — or any future production backend — fails the build,
-// so there is no path by which a production deployment can serve in dev mode.
+// is covered too; postgres, mongodb — or any future production backend — fail the
+// build, so there is no path by which a production deployment can serve in dev mode.
 #[cfg(all(feature = "dev-mode", not(feature = "sqlite")))]
 compile_error!(
     "the `dev-mode` feature requires a dev/CI backend such as `sqlite`; it must \
-     not be built with a production backend like `postgres` (build with \
-     `--no-default-features --features sqlite-memory,dev-mode`)"
+     not be built with a production backend like `postgres` or `mongodb` (build \
+     with `--no-default-features --features sqlite-memory,dev-mode`)"
 );
 
 fn main() -> anyhow::Result<()> {
@@ -48,6 +55,8 @@ fn main() -> anyhow::Result<()> {
     extenddb_storage::set_backend(extenddb_storage_postgres::backend())?;
     #[cfg(feature = "sqlite")]
     extenddb_storage::set_backend(extenddb_storage_sqlite::backend())?;
+    #[cfg(feature = "mongodb")]
+    extenddb_storage::set_backend(extenddb_storage_mongodb::backend())?;
 
     extenddb_app::run(extenddb_app::BuildInfo {
         // Read from the bin crate so the reported version is the deployed
@@ -66,6 +75,8 @@ mod tests {
         let _ = extenddb_storage::set_backend(extenddb_storage_postgres::backend());
         #[cfg(feature = "sqlite")]
         let _ = extenddb_storage::set_backend(extenddb_storage_sqlite::backend());
+        #[cfg(feature = "mongodb")]
+        let _ = extenddb_storage::set_backend(extenddb_storage_mongodb::backend());
     }
 
     /// Zero-config serve contract: with the SQLite backend installed,

@@ -26,6 +26,7 @@ use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
 use tokio::sync::Mutex;
 
+use crate::INDEX_PROPAGATION_DELAY_QUERY;
 use crate::schema::CATALOG_VERSION;
 use crate::sqlite_util::sqlite_url;
 
@@ -40,13 +41,21 @@ pub struct SqliteEngine {
     pub(crate) control_plane_notify: Arc<tokio::sync::Notify>,
     /// Cached default GSI propagation delay (ms); refreshed by a worker and
     /// read on the write path to decide sync-vs-async index maintenance.
-    pub(crate) gsi_default_delay_ms: Arc<AtomicU64>,
+    pub(crate) index_propagation_delay_cache: Arc<AtomicU64>,
     /// Wakes the GSI propagation worker when a write enqueues into `gsi_pending`.
     pub(crate) gsi_notify: Arc<tokio::sync::Notify>,
     /// Serializes all writers (design decision D1). Held for the duration of
     /// every write transaction so condition checks and writes are atomic and
     /// `SQLITE_BUSY` cannot arise from competing writers.
     pub(crate) write_lock: Arc<Mutex<()>>,
+    /// Index ids whose asynchronous backfill task is currently alive in THIS
+    /// process. What tells a stuck `CREATING` index apart from one still
+    /// building: a catalog row can say `CREATING` forever, but only a live task
+    /// appears here, and the entry is removed by a drop guard so a panicking
+    /// task deregisters too. The GSI worker recovers any `CREATING` index with
+    /// no entry, because nothing else ever will until a restart, and until then
+    /// the per-table queue hold blocks every write's index maintenance.
+    pub(crate) vector_builds_running: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl SqliteEngine {
@@ -107,24 +116,26 @@ impl SqliteEngine {
             }
         }
 
-        let initial_gsi_delay: u64 = sqlx::query_as::<_, (String,)>(
-            "SELECT value FROM settings WHERE key = 'gsi_propagation_delay_ms'",
-        )
-        .fetch_optional(&pool)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|(v,)| v.parse::<u64>().ok())
-        .unwrap_or(10);
+        let initial_index_delay: u64 =
+            sqlx::query_as::<_, (String,)>(INDEX_PROPAGATION_DELAY_QUERY)
+                .fetch_optional(&pool)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|(v,)| v.parse::<u64>().ok())
+                .unwrap_or(10);
 
         Ok(Self {
             pool,
             region: region.to_owned(),
             max_item_size_bytes,
             control_plane_notify: Arc::new(tokio::sync::Notify::new()),
-            gsi_default_delay_ms: Arc::new(AtomicU64::new(initial_gsi_delay)),
+            index_propagation_delay_cache: Arc::new(AtomicU64::new(initial_index_delay)),
             gsi_notify: Arc::new(tokio::sync::Notify::new()),
             write_lock: Arc::new(Mutex::new(())),
+            vector_builds_running: Arc::new(
+                std::sync::Mutex::new(std::collections::HashSet::new()),
+            ),
         })
     }
 
@@ -151,7 +162,7 @@ impl SqliteEngine {
         let internal = |e: String| StorageError::Internal(e);
 
         // Schema (creates settings, accounts, admin_users, … and seeds
-        // catalog_version + gsi_propagation_delay_ms).
+        // catalog_version + index_propagation_delay_ms).
         crate::schema::apply(&self.pool)
             .await
             .map_err(|e| internal(format!("apply schema: {e:?}")))?;
@@ -232,10 +243,101 @@ impl SqliteEngine {
         Ok(if from_env { None } else { Some(password) })
     }
 
-    /// Current cached GSI propagation delay (ms); `0` means synchronous.
-    pub(crate) fn gsi_default_delay(&self) -> u64 {
-        self.gsi_default_delay_ms
-            .load(std::sync::atomic::Ordering::Relaxed)
+    /// Current secondary-index propagation delay (ms); `0` means synchronous.
+    ///
+    /// Reads the `index_propagation_delay_ms` setting live from the catalog so
+    /// out-of-process changes (`extenddb settings set`) take effect on the
+    /// next write, not up to 30 s later when the poll worker refreshes the
+    /// cache. `SQLite` is a local file, so this is an indexed point lookup with
+    /// negligible cost next to the write it precedes. On a read error the
+    /// cached value (still refreshed by the poll worker) is the fallback; on
+    /// success the cache is re-warmed so fallback reads stay fresh.
+    pub(crate) async fn index_propagation_delay(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        let live: Result<Option<(String,)>, _> = sqlx::query_as(INDEX_PROPAGATION_DELAY_QUERY)
+            .fetch_optional(&self.pool)
+            .await;
+        match live {
+            Ok(row) => {
+                // Missing row means the default, matching poll_gsi_delay.
+                let ms = row
+                    .and_then(|(v,)| v.parse::<u64>().ok())
+                    .unwrap_or(crate::DEFAULT_INDEX_PROPAGATION_DELAY_MS);
+                self.index_propagation_delay_cache
+                    .store(ms, Ordering::Relaxed);
+                ms
+            }
+            Err(e) => {
+                tracing::debug!("index_propagation_delay: live read failed, using cache: {e:?}");
+                self.index_propagation_delay_cache.load(Ordering::Relaxed)
+            }
+        }
+    }
+
+    /// Milliseconds to pause between batches of a vector index backfill.
+    ///
+    /// Read live for the same reason the propagation delay is: a test sets it with
+    /// `settings set` and needs it to apply to the next backfill, not up to 30 s
+    /// later. Zero when unset or unparseable, which is the production value, so a
+    /// malformed setting cannot slow a real backfill down.
+    pub(crate) async fn vector_backfill_batch_delay(&self) -> u64 {
+        let live: Result<Option<(String,)>, _> =
+            sqlx::query_as("SELECT value FROM settings WHERE key = ?")
+                .bind(extenddb_core::settings_keys::VECTOR_BACKFILL_BATCH_DELAY_MS)
+                .fetch_optional(&self.pool)
+                .await;
+        match live {
+            Ok(row) => row.and_then(|(v,)| v.parse::<u64>().ok()).unwrap_or(0),
+            Err(e) => {
+                tracing::debug!("vector_backfill_batch_delay: live read failed, using 0: {e:?}");
+                0
+            }
+        }
+    }
+
+    /// Minimum milliseconds an UpdateTable-created vector index stays `CREATING`
+    /// before its `ACTIVE` flip. See
+    /// [`extenddb_core::settings_keys::VECTOR_INDEX_MIN_CREATING_MS`] for why the
+    /// hold exists. Defaults to 1000 when unset or unparseable; zero disables it.
+    pub(crate) async fn vector_index_min_creating_ms(&self) -> u64 {
+        const DEFAULT_MS: u64 = 1_000;
+        let live: Result<Option<(String,)>, _> =
+            sqlx::query_as("SELECT value FROM settings WHERE key = ?")
+                .bind(extenddb_core::settings_keys::VECTOR_INDEX_MIN_CREATING_MS)
+                .fetch_optional(&self.pool)
+                .await;
+        match live {
+            Ok(row) => row
+                .and_then(|(v,)| v.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_MS),
+            Err(e) => {
+                tracing::debug!(
+                    "vector_index_min_creating_ms: live read failed, using {DEFAULT_MS}: {e:?}"
+                );
+                DEFAULT_MS
+            }
+        }
+    }
+
+    /// Milliseconds to hold a new vector index in the resource-allocation phase.
+    ///
+    /// A test lever, zero in production, read live for the same reason the batch
+    /// delay is. Held inside the detached build task rather than in the request
+    /// path, because the phase is only observable to a client after `UpdateTable`
+    /// has returned.
+    pub(crate) async fn vector_allocation_phase_delay(&self) -> u64 {
+        let live: Result<Option<(String,)>, _> =
+            sqlx::query_as("SELECT value FROM settings WHERE key = ?")
+                .bind(extenddb_core::settings_keys::VECTOR_ALLOCATION_PHASE_DELAY_MS)
+                .fetch_optional(&self.pool)
+                .await;
+        match live {
+            Ok(row) => row.and_then(|(v,)| v.parse::<u64>().ok()).unwrap_or(0),
+            Err(e) => {
+                tracing::debug!("vector_allocation_phase_delay: live read failed, using 0: {e:?}");
+                0
+            }
+        }
     }
 
     /// Handle to the GSI propagation notifier, woken after an enqueue.

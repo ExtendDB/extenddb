@@ -166,3 +166,116 @@ async fn query_binary_sort_key_between_uses_byte_order() {
 
     let _ = c.delete_table().table_name(&table).send().await;
 }
+
+#[tokio::test]
+async fn query_binary_sort_key_begins_with_uses_byte_prefix() {
+    let c = client();
+    let table = format!("BinSkBeginsWith_{}", ts());
+    create_binary_sk_table(c, &table).await;
+
+    let pk = "p";
+    seed(
+        c,
+        &table,
+        pk,
+        &[&[0x01, 0x00], &[0x01, 0xFF], &[0x02, 0x00]],
+    )
+    .await;
+
+    // begins_with(sk, [0x01]) must select exactly the two 0x01-prefixed keys,
+    // matched by raw unsigned byte prefix (not string/UTF-8 semantics), and
+    // exclude the 0x02 key.
+    let resp = c
+        .query()
+        .table_name(&table)
+        .key_condition_expression("#h = :hv AND begins_with(#r, :pfx)")
+        .expression_attribute_names("#h", "pk")
+        .expression_attribute_names("#r", "sk")
+        .expression_attribute_values(":hv", s(pk))
+        .expression_attribute_values(":pfx", bb(&[0x01]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        sk_bytes(resp.items()),
+        vec![vec![0x01, 0x00], vec![0x01, 0xFF]],
+        "begins_with on a binary sort key must match by unsigned byte prefix"
+    );
+
+    let _ = c.delete_table().table_name(&table).send().await;
+}
+
+#[tokio::test]
+async fn query_binary_sort_key_begins_with_all_ff_prefix() {
+    let c = client();
+    let table = format!("BinSkBeginsFf_{}", ts());
+    create_binary_sk_table(c, &table).await;
+
+    let pk = "p";
+    // A *multi-byte* all-0xFF prefix exercises the upper-bound edge where every
+    // prefix byte is 0xFF: a naive "increment the last byte, carrying" range
+    // end overflows past the whole prefix, so the range must have no exclusive
+    // upper bound and extend to the end of the partition. That range must still
+    // include longer keys that begin with [0xFF,0xFF] (e.g. [0xFF,0xFF,0x00])
+    // while excluding [0xFF,0x00], which shares only the first 0xFF byte.
+    seed(
+        c,
+        &table,
+        pk,
+        &[&[0xFF, 0x00], &[0xFF, 0xFF], &[0xFF, 0xFF, 0x00]],
+    )
+    .await;
+
+    let resp = c
+        .query()
+        .table_name(&table)
+        .key_condition_expression("#h = :hv AND begins_with(#r, :pfx)")
+        .expression_attribute_names("#h", "pk")
+        .expression_attribute_names("#r", "sk")
+        .expression_attribute_values(":hv", s(pk))
+        .expression_attribute_values(":pfx", bb(&[0xFF, 0xFF]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        sk_bytes(resp.items()),
+        vec![vec![0xFF, 0xFF], vec![0xFF, 0xFF, 0x00]],
+        "begins_with([0xFF,0xFF]) must match keys prefixed by 0xFF 0xFF \
+         (including longer ones) and exclude [0xFF,0x00]"
+    );
+
+    let _ = c.delete_table().table_name(&table).send().await;
+}
+
+#[tokio::test]
+async fn query_binary_sort_key_begins_with_empty_prefix() {
+    let c = client();
+    let table = format!("BinSkBeginsEmpty_{}", ts());
+    create_binary_sk_table(c, &table).await;
+
+    let pk = "p";
+    // The empty prefix is a prefix of every value, so begins_with([]) has no
+    // upper bound and must return the entire partition (lower bound "" with no
+    // exclusive end), in unsigned byte order — the same result an unbounded
+    // Query would give.
+    seed(c, &table, pk, &[&[0x00], &[0x7F], &[0xFF, 0xFF]]).await;
+
+    let resp = c
+        .query()
+        .table_name(&table)
+        .key_condition_expression("#h = :hv AND begins_with(#r, :pfx)")
+        .expression_attribute_names("#h", "pk")
+        .expression_attribute_names("#r", "sk")
+        .expression_attribute_values(":hv", s(pk))
+        .expression_attribute_values(":pfx", bb(&[]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        sk_bytes(resp.items()),
+        vec![vec![0x00], vec![0x7F], vec![0xFF, 0xFF]],
+        "begins_with([]) must return the whole partition in unsigned byte order"
+    );
+
+    let _ = c.delete_table().table_name(&table).send().await;
+}

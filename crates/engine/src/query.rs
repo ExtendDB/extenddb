@@ -11,7 +11,8 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::PathElement;
 use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
 use extenddb_core::types::{
-    IndexType, KeyType, QueryInput, QueryOutput, Select, TableKeyInfo, extract_key, item_size_bytes,
+    IndexType, KeyType, ProjectionType, QueryInput, QueryOutput, Select, TableKeyInfo, extract_key,
+    item_size_bytes,
 };
 
 use crate::OperationContext;
@@ -38,6 +39,32 @@ pub async fn handle_query(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
+    // Pre-scanned before typed deserialization, sequentially: Query stops at
+    // the FIRST invalid enum, checking ReturnConsumedCapacity ahead of Select.
+    // Measured 2026-08-24 (us-east-1): both invalid answers "1 validation
+    // error detected" naming returnConsumedCapacity alone. (Scan is the
+    // opposite on both counts: it aggregates, select-first; see handle_scan.)
+    crate::validate_enum_fields(
+        &body,
+        &[crate::EnumField {
+            json_name: "ReturnConsumedCapacity",
+            valid: &["INDEXES", "TOTAL", "NONE"],
+            clause: crate::EnumClause::Named("returnConsumedCapacity"),
+        }],
+    )?;
+    crate::validate_enum_fields(
+        &body,
+        &[crate::EnumField {
+            json_name: "Select",
+            valid: &[
+                "SPECIFIC_ATTRIBUTES",
+                "COUNT",
+                "ALL_ATTRIBUTES",
+                "ALL_PROJECTED_ATTRIBUTES",
+            ],
+            clause: crate::EnumClause::Named("select"),
+        }],
+    )?;
     let input: QueryInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     // P118: Fetch key_info first so we can use table_id for index lookup.
@@ -59,6 +86,15 @@ pub async fn handle_query(
         None
     };
 
+    // A vector index is searched only via the vector search API, never queried.
+    if let Some(ref idx) = index_info
+        && idx.index_type == IndexType::Vector
+    {
+        return Err(DynamoDbError::ValidationException(
+            "Query operation not supported on this index type".to_owned(),
+        ));
+    }
+
     // ConsistentRead is not supported on GSI queries (tenet 1: fidelity).
     if input.consistent_read == Some(true)
         && let Some(ref idx) = index_info
@@ -67,6 +103,16 @@ pub async fn handle_query(
         return Err(DynamoDbError::ValidationException(
             "Consistent reads are not supported on global secondary indexes".to_owned(),
         ));
+    }
+
+    // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (shared with Scan).
+    if let Some(ref idx) = index_info {
+        extenddb_core::validation::validate_all_attributes_index_support(
+            input.select,
+            idx.index_type == IndexType::Gsi,
+            idx.projection.projection_type == ProjectionType::All,
+            &idx.index_name,
+        )?;
     }
 
     // Validate Limit >= 1 (REQ-QUERY-001)
@@ -92,6 +138,7 @@ pub async fn handle_query(
             global_secondary_indexes: key_info.global_secondary_indexes.clone(),
             local_secondary_indexes: key_info.local_secondary_indexes.clone(),
             stream_specification: None, // Queries don't capture stream records
+            vector_indexes: key_info.vector_indexes.clone(),
         }
     } else {
         key_info.clone()
@@ -352,6 +399,7 @@ pub async fn handle_query(
             .as_ref()
             .is_some_and(|a| !a.is_empty()),
         input.index_name.is_some(),
+        extenddb_core::validation::IS_QUERY,
     )?;
 
     // When Select=ALL_PROJECTED_ATTRIBUTES, capture the index info for post-read filtering.
@@ -448,11 +496,25 @@ pub async fn handle_query(
         count: result.count,
         scanned_count: result.scanned_count,
         last_evaluated_key: result.last_evaluated_key,
-        consumed_capacity: capacity_helpers::read_capacity(
-            input.return_consumed_capacity,
-            &input.table_name,
-            rcu,
-        ),
+        // On an index query with INDEXES, the index carries the read and the
+        // table's arm is zero, aggregate = sum; a base-table query keeps the
+        // plain table-arm shape. TOTAL keeps the aggregate-only shape either
+        // way.
+        consumed_capacity: match (&index_info, input.return_consumed_capacity) {
+            (Some(info), extenddb_core::types::ReturnConsumedCapacity::Indexes) => {
+                Some(extenddb_core::types::ConsumedCapacity::read_on_index(
+                    &input.table_name,
+                    &info.index_name,
+                    rcu,
+                    info.index_type == extenddb_core::types::IndexType::Gsi,
+                ))
+            }
+            _ => capacity_helpers::read_capacity(
+                input.return_consumed_capacity,
+                &input.table_name,
+                rcu,
+            ),
+        },
     };
 
     let body = serialize_output(&output)?;

@@ -25,6 +25,15 @@ pub enum DynamoDbError {
     BackupNotFoundException(String),
     #[error("{0}")]
     ResourceInUseException(String),
+    /// A per-table or per-account limit was exceeded.
+    ///
+    /// Distinct from `ValidationException` on purpose: the service uses this
+    /// class for the vector-index count limit when the index is added through
+    /// `UpdateTable`, while `CreateTable` reports the same limit as a
+    /// `ValidationException`. Measured 2026-08-13; see
+    /// `VECTOR_INDEX_COUNT_LIMIT_UPDATE`.
+    #[error("{0}")]
+    LimitExceededException(String),
     #[error("{0}")]
     ConditionalCheckFailedException(String, Option<Item>),
     #[error("{message}")]
@@ -106,6 +115,7 @@ impl DynamoDbError {
             | Self::ResourceNotFoundException(_)
             | Self::BackupNotFoundException(_)
             | Self::ResourceInUseException(_)
+            | Self::LimitExceededException(_)
             | Self::ConditionalCheckFailedException(..)
             | Self::TransactionCanceledException { .. }
             | Self::IdempotentParameterMismatchException(_)
@@ -146,6 +156,7 @@ impl DynamoDbError {
             Self::ResourceNotFoundException(_) => "ResourceNotFoundException",
             Self::BackupNotFoundException(_) => "BackupNotFoundException",
             Self::ResourceInUseException(_) => "ResourceInUseException",
+            Self::LimitExceededException(_) => "LimitExceededException",
             Self::ConditionalCheckFailedException(..) => "ConditionalCheckFailedException",
             Self::TransactionCanceledException { .. } => "TransactionCanceledException",
             Self::IdempotentParameterMismatchException(_) => "IdempotentParameterMismatchException",
@@ -211,6 +222,7 @@ impl DynamoDbError {
             | Self::ResourceNotFoundException(m)
             | Self::BackupNotFoundException(m)
             | Self::ResourceInUseException(m)
+            | Self::LimitExceededException(m)
             | Self::ConditionalCheckFailedException(m, _)
             | Self::IdempotentParameterMismatchException(m)
             | Self::SerializationException(m)
@@ -279,6 +291,7 @@ mod tests {
             ),
             (DynamoDbError::IncompleteSignature(String::new()), 400),
             (DynamoDbError::InternalServerError(String::new()), 500),
+            (DynamoDbError::LimitExceededException(String::new()), 400),
             (
                 DynamoDbError::ItemCollectionSizeLimitExceededException(String::new()),
                 400,

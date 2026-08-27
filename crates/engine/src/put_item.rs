@@ -48,22 +48,31 @@ pub async fn handle_put_item(
     }
 
     // Pre-validate enum fields (report all invalid enums together)
+    // Aggregated, in the measured clause order (2026-08-24, us-east-1: three
+    // invalid enums answer "3 validation errors detected" with the clauses in
+    // this sequence). A ReturnValues member merely disallowed for PutItem
+    // passes here and falls through to validate_put_delete_return_values.
     crate::validate_enum_fields(
         &body,
         &[
-            ("ReturnValues", "returnValues", &["NONE", "ALL_OLD"]),
-            (
-                "ReturnConsumedCapacity",
-                "returnConsumedCapacity",
-                &["INDEXES", "TOTAL", "NONE"],
-            ),
-            (
-                "ReturnItemCollectionMetrics",
-                "returnItemCollectionMetrics",
-                &["SIZE", "NONE"],
-            ),
+            crate::EnumField {
+                json_name: "ReturnConsumedCapacity",
+                valid: &["INDEXES", "TOTAL", "NONE"],
+                clause: crate::EnumClause::Named("returnConsumedCapacity"),
+            },
+            crate::EnumField {
+                json_name: "ReturnValues",
+                valid: crate::RETURN_VALUES_MEMBERS,
+                clause: crate::EnumClause::Bare(crate::RETURN_VALUES_BARE_CLAUSE),
+            },
+            crate::EnumField {
+                json_name: "ReturnItemCollectionMetrics",
+                valid: &["SIZE", "NONE"],
+                clause: crate::EnumClause::Named("returnItemCollectionMetrics"),
+            },
         ],
     )?;
+    crate::validate_put_delete_return_values(&body)?;
 
     let input: PutItemInput = serde_json::from_value(body).map_err(|e| {
         let msg = e.to_string();
@@ -160,12 +169,30 @@ pub async fn handle_put_item(
         &key_info.attribute_definitions,
     )?;
 
+    // The nesting-depth limit applies to every ExpressionAttributeValue on the
+    // single-item write paths, condition-only placeholders included: measured
+    // 2026-08-24 (us-east-1), a 32-level value referenced solely by a
+    // ConditionExpression is rejected on PutItem, DeleteItem, and UpdateItem
+    // alike, while 31 levels is accepted. TransactWriteItems deliberately does
+    // NOT get this check: the same 32-level condition-only value is accepted
+    // inside a transaction on every sub-op shape (also measured).
+    if let Some(values) = &input.expression_attribute_values {
+        extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
+    }
+
+    extenddb_core::validation::validate_vector_write(
+        &input.item,
+        &key_info.vector_indexes,
+        &key_info.attribute_definitions,
+    )?;
+
     let return_old = input.return_values == ReturnValues::AllOld;
     let capacity_requested =
         input.return_consumed_capacity != extenddb_core::types::ReturnConsumedCapacity::None;
     let needs_index_capacity = capacity_requested
         && (!key_info.global_secondary_indexes.is_empty()
-            || !key_info.local_secondary_indexes.is_empty());
+            || !key_info.local_secondary_indexes.is_empty()
+            || !key_info.vector_indexes.is_empty());
 
     // Preserve the new item only when per-index accounting needs to compare it
     // with the replaced item after storage takes ownership.
@@ -220,7 +247,12 @@ pub async fn handle_put_item(
             wcu,
             old_item.as_ref(),
             Some(new_item),
-            true,
+            // An overwrite whose projected index entry is unchanged charges
+            // no index write: an identical PutItem overwrite reports the
+            // table arm alone (measured 2026-08-24, us-east-1 and eu-west-2;
+            // an earlier measurement had put replacements charging the index
+            // regardless, which is no longer what the service does).
+            false,
             &key_info,
         ),
         None => {

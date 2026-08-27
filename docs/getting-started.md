@@ -27,9 +27,18 @@ The scripts report missing dependencies and exit — they never install
 software on your behalf. After the script completes, continue from
 [Step 2: Initialize the deployment](#2-initialize-the-deployment) below.
 
+## Quick start with Docker Compose
+
+If you have Docker, the fastest way to get a local ExtendDB stack running is with
+the included `docker-compose.yml`. It wires the official image to a PostgreSQL
+container and handles initialization automatically — no build or manual init required.
+See [Local Development with Docker Compose](local-dev-docker-compose.md).
+
 ## Prerequisites
 
-- PostgreSQL 14+ running locally (see `docs/local-postgres-setup.md`)
+- **Storage backend** (one of):
+  - PostgreSQL 14+ running locally (see `docs/local-postgres-setup.md`)
+  - MongoDB 7.0+ with replica set (see `docs/local-mongodb-setup.md`)
 - Rust toolchain (1.88+)
 - AWS CLI v2 (for testing)
 - Python 3.10+ with virtual environment (see [Python Environment Setup](../README.md#python-environment-setup) in the README)
@@ -37,8 +46,18 @@ software on your behalf. After the script completes, continue from
 ## 1. Build extenddb
 
 ```bash
+# PostgreSQL backend (default)
 cargo build --release
+
+# MongoDB backend
+# (backends are mutually exclusive; disable the default postgres feature)
+cargo build --release --no-default-features --features mongodb
 ```
+
+Each build produces a single-backend binary. The `postgres`, `mongodb`, and
+`sqlite` features are mutually exclusive — a build enabling more than one is
+rejected at compile time — so to run two backends, build one binary per
+backend.
 
 The binary is at `target/release/extenddb`.
 
@@ -47,15 +66,17 @@ The binary is at `target/release/extenddb`.
 Run `extenddb init` to create the catalog and data databases:
 
 ```bash
+# PostgreSQL (default)
 ./target/release/extenddb init
+
+# MongoDB
+./target/release/extenddb init --backend mongodb
 ```
 
 This will:
-- Create a `extenddb` PostgreSQL user (if it doesn't exist)
 - Create the `extenddb_catalog` database (catalog metadata)
-- Create the `extenddb` database (user item data)
-- Run schema migrations
-- Generate an AES-256-GCM encryption key (for future access key storage)
+- Create the data database (user item data)
+- Generate an AES-256-GCM encryption key (for access key storage)
 - Create a default account and print the account ID
 - Create an `admin` user and print the credentials once
 - Generate a self-signed TLS certificate at `~/.extenddb/tls/`
@@ -121,16 +142,20 @@ location is configured (default `extenddb.sqlite`):
 path = "extenddb.sqlite"   # or ":memory:" for an ephemeral in-memory database
 ```
 
-At serve time the path can be overridden with `--sqlite-path`. The resolution
-order is: the `--sqlite-path` flag, then `[storage.sqlite].path` in the config,
-then the default `extenddb.sqlite`:
+At init time the path can be chosen with `--sqlite-path`, which also writes it
+into the generated config. At serve time the path comes from
+`[storage.sqlite].path` in the config, or the `EXTENDDB__STORAGE__SQLITE__PATH`
+environment variable, which overrides the config:
 
 ```bash
-./target/release/extenddb serve --config extenddb.toml --sqlite-path /data/extenddb.sqlite
+./target/release/extenddb init --backend sqlite --sqlite-path /data/extenddb.sqlite
+./target/release/extenddb serve --config extenddb.toml
+# or, overriding at serve time:
+EXTENDDB__STORAGE__SQLITE__PATH=/data/other.sqlite ./target/release/extenddb serve --config extenddb.toml
 ```
 
-Use `:memory:` (in the config or via `--sqlite-path`) for an ephemeral database
-that is discarded on shutdown.
+Use `:memory:` (in the config, the environment variable, or `init
+--sqlite-path`) for an ephemeral database that is discarded on shutdown.
 
 ### Generating a self-signed certificate manually
 
@@ -174,7 +199,7 @@ You should see all checks pass:
 --- Checking catalog connection...
   OK: Connected to catalog.
 --- Checking catalog version...
-  OK: Catalog version 0.0.2
+  OK: Catalog version 0.0.3
 --- Checking data database...
   OK: Connected to data database 'extenddb_catalog_data'.
 --- Enumerating tables...
@@ -186,11 +211,12 @@ You should see all checks pass:
 
 ## 4. Start the server
 
-extenddb runs as a daemon (background process) and logs to syslog. On startup it prints a banner to stdout confirming the version, catalog version, and bind address, then forks to background.
+extenddb runs as a daemon (background process) and logs to syslog. On startup it prints a two-line banner to stdout, the version, catalog version and bind address followed by the storage backend and its redacted connection string, then forks to background. It says "starting", not "listening": the socket is not accepting connections yet at that point.
 
 ```bash
 ./target/release/extenddb serve --config extenddb.toml
-# extenddb 0.0.2 (catalog 0.0.2) listening on 127.0.0.1:18443
+# extenddb 0.1.10 (catalog 0.0.3) starting on 127.0.0.1:18443
+#   storage: postgres (postgresql://extenddb:***@localhost:5432/extenddb_catalog)
 ```
 
 Check status (includes the daemon PID):
@@ -276,11 +302,11 @@ GSI updates are applied asynchronously with a configurable delay, simulating rea
 ```bash
 # Set system-wide default to 0 for synchronous GSI updates (fast tests)
 ./target/release/extenddb settings --config extenddb.toml set \
-    gsi_propagation_delay_ms 0
+    index_propagation_delay_ms 0
 
 # Set to 50ms for more realistic eventual consistency
 ./target/release/extenddb settings --config extenddb.toml set \
-    gsi_propagation_delay_ms 50
+    index_propagation_delay_ms 50
 ```
 
 ### Throttling
@@ -1213,7 +1239,7 @@ extenddb supports running external test suites (e.g., Java/JUnit, Python/pytest)
 # External suites expect synchronous GSI behavior (matching real DynamoDB's
 # typical sub-millisecond propagation). The async GSI path is tested
 # separately by the extenddb-specific test_gsi_async.py suite.
-./target/release/extenddb settings --config extenddb.toml set gsi_propagation_delay_ms 0
+./target/release/extenddb settings --config extenddb.toml set index_propagation_delay_ms 0
 
 # Run all registered suites
 python3 devtools/run-external-tests
@@ -1267,8 +1293,8 @@ Each runner requires its tools to be installed. The runner checks prerequisites 
 
 ```bash
 ./target/release/extenddb version
-# extenddb 0.0.2
-# catalog 0.0.2
+# extenddb 0.1.10
+# catalog 0.0.3 (postgres)
 # commit abc1234
 # built 2026-04-17T12:00:00Z
 ```
@@ -1293,15 +1319,15 @@ The `--yes` flag is required to confirm destruction. Without it, the command exi
 
 ### Connection pool size
 
-The `storage.postgres.pool_size` setting (default: 20, minimum: 10) controls the maximum number of concurrent PostgreSQL connections used for DynamoDB data operations. Each in-flight request that touches the database holds one connection for the duration of its transaction. Values below 10 are clamped at startup with a warning.
+The `storage.postgres.pool_size` setting (default: 20, minimum: 10) sizes the connections used for DynamoDB data operations. It sizes **two** pools, not one: a deployment created by `extenddb init` keeps its catalog and its data in separate databases, and the engine opens a pool of `pool_size` against each. Both count against the same server-wide `max_connections`, because that limit is per cluster rather than per database. Each in-flight request that touches the database holds one connection for the duration of its transaction. Values below 10 are clamped at startup with a warning.
 
 The `storage.postgres.catalog_pool_size` setting controls the maximum number of concurrent connections for the management/catalog pool (authorization queries, IAM operations, console). Defaults to `pool_size` if not set, minimum: 10. With auth enabled (`provider = "builtin"`), each DynamoDB request makes concurrent authorization queries against this pool — size it to match expected concurrency. Values below 10 are clamped at startup with a warning.
 
 **When to increase:** If you see elevated latency under concurrent load, the pool may be saturated. Requests queue at the pool level when all connections are in use. Increase `pool_size` (and `catalog_pool_size` if auth is enabled) to allow more concurrent transactions.
 
-**Relationship to PostgreSQL `max_connections`:** The total connection footprint is `pool_size + catalog_pool_size + 1` (the extra 1 is for the log-level poller). PostgreSQL's default `max_connections` is 100. Ensure `pool_size + catalog_pool_size + 1` does not exceed your PostgreSQL `max_connections` setting.
+**Relationship to PostgreSQL `max_connections`:** The total connection footprint is `2 * pool_size + catalog_pool_size`, plus one connection per vector index build running on the server and one while a schema migration runs. The doubled term is the catalog pool and the data pool, both sized by `pool_size`; the third pool is the management pool sized by `catalog_pool_size`. A deployment whose catalog and data share one database is the only shape where the two `pool_size` pools collapse into one, and `extenddb init` does not produce it. Those extra sessions are opened outside both pools on purpose, for two different reasons. A build's ownership lock is session-scoped, so it needs a session that ends when the build does: a pooled connection would return to the pool still holding the lock. The migration lock is transaction-scoped, and needs a pinned connection because its explicit transaction has to retain one PostgreSQL backend until COMMIT, which is what stops a transaction-pooling proxy from letting the lock move between backends. PostgreSQL's default `max_connections` is 100, and the default pool sizes already need 60 of it. Ensure `2 * pool_size + catalog_pool_size`, plus the number of vector index builds you expect to overlap, does not exceed your PostgreSQL `max_connections` setting.
 
-**Example:** To support 50 concurrent data operations with auth enabled, set both pools to 50 in `extenddb.toml` and ensure PostgreSQL allows at least 101 connections.
+**Example:** To support 50 concurrent data operations with auth enabled, set both pools to 50 in `extenddb.toml`. That configuration can open 150 connections, so PostgreSQL needs `max_connections` raised to at least 150 plus headroom for overlapping vector index builds. The default of 100 is not enough for it: an operator who sizes for 100 here meets `FATAL: sorry, too many clients already` at exactly the concurrency the setting was chosen to support.
 
 ```toml
 [storage.postgres]

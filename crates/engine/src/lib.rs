@@ -29,6 +29,7 @@ mod put_item;
 mod query;
 mod read_helpers;
 mod scan;
+mod search_vectors;
 pub mod stream_capture;
 mod streams;
 mod tagging;
@@ -38,6 +39,7 @@ mod transact_write_items;
 mod ttl;
 mod update_item;
 mod update_table;
+mod vector_gate;
 
 pub use batch_get_item::handle_batch_get_item;
 pub use batch_write_item::handle_batch_write_item;
@@ -53,6 +55,7 @@ pub use list_tables::handle_list_tables;
 pub use put_item::handle_put_item;
 pub use query::handle_query;
 pub use scan::handle_scan;
+pub use search_vectors::handle_search_vectors;
 pub use streams::{
     handle_describe_stream, handle_get_records, handle_get_shard_iterator, handle_list_streams,
 };
@@ -91,6 +94,7 @@ pub fn is_known_operation(operation: &str) -> bool {
             | "UpdateItem"
             | "Query"
             | "Scan"
+            | "SearchVectors"
             | "BatchGetItem"
             | "BatchWriteItem"
             | "TransactGetItems"
@@ -167,28 +171,67 @@ pub(crate) fn deserialize_error(e: serde_json::Error) -> DynamoDbError {
     }
 }
 
-/// Pre-validate enum fields in a JSON body and return a combined error if multiple are invalid.
-///
-/// `DynamoDB` reports all invalid enum fields together rather than stopping at the first.
-/// Each entry is `(json_field_name, api_field_name, valid_values)`.
+/// One enum field for [`validate_enum_fields`]: where to find it in the JSON
+/// body, what values are members, and how the service renders a violation.
+pub(crate) struct EnumField<'a> {
+    pub json_name: &'a str,
+    pub valid: &'a [&'a str],
+    pub clause: EnumClause<'a>,
+}
+
+/// How the service renders one enum violation inside the
+/// "N validation errors detected" envelope.
+pub(crate) enum EnumClause<'a> {
+    /// The common form: `Value 'X' at 'field' failed to satisfy constraint:
+    /// Member must satisfy enum value set: [...]`.
+    Named(&'a str),
+    /// A verbatim clause with no value or field prefix. `ReturnValues` is the
+    /// measured case: the service reports it as a bare
+    /// `Failed to satisfy constraint: Member must satisfy enum value set:
+    /// [ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]` -- no field name,
+    /// and the displayed set carries the service's own `UPDATE_NEW` typo.
+    /// Measured 2026-08-24 (us-east-1) on PutItem, DeleteItem, and UpdateItem
+    /// alike, so the text is reproduced verbatim rather than derived.
+    Bare(&'a str),
+}
+
+/// The bare clause the service renders for a `ReturnValues` enum violation.
+/// See [`EnumClause::Bare`] for why the set below does not match the accepted
+/// member list.
+pub(crate) const RETURN_VALUES_BARE_CLAUSE: &str = "Failed to satisfy constraint: \
+     Member must satisfy enum value set: [ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]";
+
+/// The `ReturnValues` members the service actually accepts (the displayed set
+/// in [`RETURN_VALUES_BARE_CLAUSE`] is NOT this list).
+pub(crate) const RETURN_VALUES_MEMBERS: &[&str] =
+    &["NONE", "ALL_OLD", "ALL_NEW", "UPDATED_OLD", "UPDATED_NEW"];
+
+/// Pre-validate enum fields in a JSON body and return a combined error if
+/// multiple are invalid, in the order listed. Whether an operation aggregates
+/// its enum violations or stops at the first is per operation on the service
+/// (PutItem/DeleteItem/Scan aggregate; UpdateItem and Query stop at the
+/// first), so callers choose by passing one list or several sequential calls.
 pub(crate) fn validate_enum_fields(
     body: &serde_json::Value,
-    fields: &[(&str, &str, &[&str])],
+    fields: &[EnumField<'_>],
 ) -> Result<(), DynamoDbError> {
     let Some(obj) = body.as_object() else {
         return Ok(());
     };
     let mut errors: Vec<String> = Vec::new();
-    for &(json_name, api_name, valid) in fields {
-        if let Some(val) = obj.get(json_name)
+    for field in fields {
+        if let Some(val) = obj.get(field.json_name)
             && let Some(s) = val.as_str()
-            && !valid.contains(&s)
+            && !field.valid.contains(&s)
         {
-            errors.push(format!(
-                "Value '{s}' at '{api_name}' failed to satisfy constraint: \
+            errors.push(match field.clause {
+                EnumClause::Named(api_name) => format!(
+                    "Value '{s}' at '{api_name}' failed to satisfy constraint: \
                          Member must satisfy enum value set: [{}]",
-                valid.join(", ")
-            ));
+                    field.valid.join(", ")
+                ),
+                EnumClause::Bare(clause) => clause.to_owned(),
+            });
         }
     }
     if errors.is_empty() {
@@ -201,6 +244,37 @@ pub(crate) fn validate_enum_fields(
         errors.join("; ")
     );
     Err(DynamoDbError::ValidationException(msg))
+}
+
+/// Validate the `ReturnValues` field for `PutItem` / `DeleteItem`, which accept
+/// only `NONE` or `ALL_OLD`. Matches real DynamoDB's two distinct messages:
+///
+/// - A value that IS a valid `ReturnValues` enum member but is not allowed for
+///   these operations (e.g. `UPDATED_OLD`) → `ReturnValues can only be ALL_OLD
+///   or NONE`.
+/// - A value that is not a `ReturnValues` enum member at all (e.g. `GARBAGE`) →
+///   the generic constraint error listing the full enum set.
+pub(crate) fn validate_put_delete_return_values(
+    body: &serde_json::Value,
+) -> Result<(), DynamoDbError> {
+    // Full ReturnValues enum set, in the order real DynamoDB reports it.
+    const ALL: &[&str] = &["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"];
+    if let Some(rv) = body.get("ReturnValues").and_then(serde_json::Value::as_str) {
+        if rv == "NONE" || rv == "ALL_OLD" {
+            return Ok(());
+        }
+        if ALL.contains(&rv) {
+            return Err(DynamoDbError::ValidationException(
+                "ReturnValues can only be ALL_OLD or NONE".to_owned(),
+            ));
+        }
+        return Err(DynamoDbError::ValidationException(format!(
+            "1 validation error detected: Value '{rv}' at 'returnValues' failed to satisfy \
+             constraint: Member must satisfy enum value set: [{}]",
+            ALL.join(", ")
+        )));
+    }
+    Ok(())
 }
 ///
 /// Populated by engine handlers so the server layer can record capacity,
@@ -336,6 +410,7 @@ pub async fn dispatch(
         "UpdateItem" => handle_update_item(body, ctx).await,
         "Query" => handle_query(body, ctx).await,
         "Scan" => handle_scan(body, ctx).await,
+        "SearchVectors" => handle_search_vectors(body, ctx).await,
         "BatchGetItem" => handle_batch_get_item(body, ctx).await,
         "BatchWriteItem" => handle_batch_write_item(body, ctx).await,
         "TransactGetItems" => handle_transact_get_items(body, ctx).await,

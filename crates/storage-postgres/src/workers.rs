@@ -14,6 +14,22 @@ use extenddb_storage::{CancellationToken, DataEngine, MetadataEngine, StreamEngi
 use sqlx::PgPool;
 
 use crate::PostgresEngine;
+/// Read the propagation-delay setting through the settings store, preferring the
+/// canonical key and falling back to the pre-rename one. See
+/// `INDEX_PROPAGATION_DELAY_QUERY` for why the old name is still honoured.
+async fn read_index_propagation_delay<S: SettingsStore + ?Sized>(
+    settings: &S,
+) -> extenddb_storage::management_store::OpResult<Option<String>> {
+    if let Some(v) = settings
+        .get_setting(extenddb_core::settings_keys::INDEX_PROPAGATION_DELAY_MS)
+        .await?
+    {
+        return Ok(Some(v));
+    }
+    settings
+        .get_setting(extenddb_core::settings_keys::LEGACY_GSI_PROPAGATION_DELAY_MS)
+        .await
+}
 
 pub(crate) async fn poll_control_plane_transitions<S: SettingsStore + ?Sized>(
     storage: Arc<PostgresEngine>,
@@ -175,7 +191,7 @@ pub(crate) async fn poll_gsi_delay<S: SettingsStore + ?Sized>(
     const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
     while tick(&token, POLL_INTERVAL).await {
-        match store.get_setting("gsi_propagation_delay_ms").await {
+        match read_index_propagation_delay(store.as_ref()).await {
             Ok(Some(val)) => {
                 if let Ok(ms) = val.parse::<u64>() {
                     gsi_delay.store(ms, std::sync::atomic::Ordering::Relaxed);
@@ -183,11 +199,48 @@ pub(crate) async fn poll_gsi_delay<S: SettingsStore + ?Sized>(
             }
             Ok(None) => {
                 // Setting removed - revert to default
-                gsi_delay.store(10, std::sync::atomic::Ordering::Relaxed);
+                gsi_delay.store(
+                    crate::DEFAULT_INDEX_PROPAGATION_DELAY_MS,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
             Err(e) => {
-                tracing::debug!("Failed to query gsi_propagation_delay_ms: {e:?}");
+                tracing::debug!("Failed to query index_propagation_delay_ms: {e:?}");
             }
+        }
+    }
+}
+
+/// Rebuild vector index builds that have stopped making progress.
+///
+/// The advisory lock answers "is someone building this?", and nothing else answers
+/// "is that someone alive?". A build that dies after its first batch leaves its
+/// index CREATING with its queue hold in place, which stops the table's whole index
+/// propagation, so without this the only exit is a restart.
+///
+/// Ownership is taken per index inside the rebuild, so this is safe to run on every
+/// front-end: a healthy build holds its lock and renews its heartbeat, and is
+/// therefore neither selected nor rebuildable.
+pub(crate) async fn vector_stuck_build_worker(
+    engine: Arc<crate::PostgresEngine>,
+    token: CancellationToken,
+) {
+    // Long next to a heartbeat renewed every batch, so a slow batch cannot be
+    // mistaken for a dead build. The cost of waiting is a paused queue for one
+    // table; the cost of being wrong is rebuilding an index that was fine.
+    const POLL_INTERVAL: Duration = Duration::from_secs(60);
+    const STALE_AFTER: Duration = Duration::from_secs(300);
+
+    while tick(&token, POLL_INTERVAL).await {
+        match crate::data::vector_index::rebuild_stuck_vector_indexes(&engine, Some(STALE_AFTER))
+            .await
+        {
+            Ok(0) => {}
+            Ok(n) => tracing::warn!(
+                rebuilt = n,
+                "rebuilt vector index build(s) whose heartbeat had gone stale"
+            ),
+            Err(e) => tracing::error!("stuck vector build sweep failed: {e}"),
         }
     }
 }

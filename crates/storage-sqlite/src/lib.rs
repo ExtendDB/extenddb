@@ -42,8 +42,29 @@ mod stream;
 mod table_engine;
 mod table_helpers;
 mod update_table;
+mod vector_bench;
+mod vector_search;
 mod worker;
 mod workers;
+
+/// Default secondary-index propagation delay (milliseconds) when the
+/// `index_propagation_delay_ms` setting is absent. Mirrors the value seeded by
+/// the catalog schema, and is the single definition used by both the live read
+/// on the write path and the background refresh worker.
+pub(crate) const DEFAULT_INDEX_PROPAGATION_DELAY_MS: u64 = 10;
+
+/// Read the propagation-delay setting, preferring the canonical key and falling back
+/// to the pre-rename one.
+///
+/// A catalog created before the rename holds the operator's value under the old name,
+/// and the server refuses to start on a catalog-version mismatch rather than migrating,
+/// so no upgrade step ever rewrites that row. Reading past it would silently reset a
+/// configured delay to the default; since 0 means synchronous, the silent change would
+/// be from strict to eventually consistent. `ORDER BY ... DESC` makes the preference
+/// deterministic when both rows exist.
+pub(crate) const INDEX_PROPAGATION_DELAY_QUERY: &str = "SELECT value FROM settings \
+     WHERE key IN ('index_propagation_delay_ms', 'gsi_propagation_delay_ms') \
+     ORDER BY key = 'index_propagation_delay_ms' DESC LIMIT 1";
 
 pub use bootstrapper::SqliteBootstrapper;
 pub use catalog_store::SqliteCatalogStore;
@@ -225,6 +246,17 @@ fn sqlite_server_components_factory(
             Ok(n) if n > 0 => tracing::info!("Reconciled {n} incomplete GSI(s) at startup"),
             Ok(_) => {}
             Err(e) => tracing::error!("Failed to reconcile incomplete GSIs: {e}"),
+        }
+
+        // Same for a vector index. A separate pass rather than a shared one, because
+        // the two live in different catalog tables and are built by different code;
+        // a failure to reconcile one must not skip the other.
+        match engine.reconcile_incomplete_vector_indexes().await {
+            Ok(n) if n > 0 => {
+                tracing::info!("Reconciled {n} incomplete vector index(es) at startup");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!("Failed to reconcile incomplete vector indexes: {e}"),
         }
 
         let control_plane_notify = engine.control_plane_notify();

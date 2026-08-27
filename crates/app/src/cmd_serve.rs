@@ -6,9 +6,12 @@
 use std::net::TcpListener;
 
 use clap::Args;
+#[cfg(unix)]
 use daemonize::Daemonize;
 
-use crate::serve_helpers::{check_config_permissions, verify_daemon_started};
+use crate::serve_helpers::check_config_permissions;
+#[cfg(unix)]
+use crate::serve_helpers::verify_daemon_started;
 use extenddb_config as config;
 use extenddb_config::pid_file_path;
 use extenddb_server::{BuildInfo, LogTarget, ServeParams};
@@ -99,6 +102,15 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
 
     // Dev mode serves plain HTTP with relaxed authorization; confine it to
     // loopback so it can never be exposed off-host.
+    //
+    // A container is the one case where a loopback bind is not the right lever.
+    // Inside a network namespace, binding 0.0.0.0 is not exposure: what a
+    // container publishes is decided by the port mapping on the host, so the
+    // image must bind 0.0.0.0 and containment moves to `-p 127.0.0.1:...`.
+    // `EXTENDDB_DEV_ALLOW_ANY_BIND=1` is that escape hatch, set by the dev
+    // image and nothing else. It is read only when `dev-mode` is compiled in,
+    // so a production build has no such lever at all: `postgres` and `mongodb`
+    // cannot enable `dev-mode` (see the compile_error in the bin crate).
     if cfg!(feature = "dev-mode") {
         let host = app_config.server.bind_addr.trim();
         let loopback = host == "localhost"
@@ -106,10 +118,21 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
                 .parse::<std::net::IpAddr>()
                 .map(|ip| ip.is_loopback())
                 .unwrap_or(false);
-        if !loopback {
+        let allow_any_bind = std::env::var("EXTENDDB_DEV_ALLOW_ANY_BIND")
+            .is_ok_and(|v| matches!(v.trim(), "1" | "true"));
+        if !loopback && !allow_any_bind {
             anyhow::bail!(
                 "dev-mode builds may only bind to loopback (127.0.0.1, ::1, localhost); \
-                 got server.bind_addr = '{host}'"
+                 got server.bind_addr = '{host}'. Set EXTENDDB_DEV_ALLOW_ANY_BIND=1 only \
+                 inside a container, where the published port decides exposure."
+            );
+        }
+        if !loopback && allow_any_bind {
+            tracing::warn!(
+                bind_addr = host,
+                "dev-mode is binding a non-loopback address: plain HTTP with relaxed \
+                 authorization. Publish it on loopback only (-p 127.0.0.1:PORT:PORT) and \
+                 never expose it to a shared network."
             );
         }
     }
@@ -182,43 +205,56 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     // can be supervised by Docker, Kubernetes, systemd Type=simple, etc.
     // Graceful shutdown on SIGINT/SIGTERM still works.
     if !args.foreground {
-        let pid_file = pid_file
-            .as_ref()
-            .expect("daemon mode always has a PID file path");
-        // The listening socket bound successfully above, which proves no live
-        // server owns this port. Any existing PID file is therefore stale (a
-        // prior run that crashed or was killed without cleanup). Remove it
-        // before daemonizing so startup verification reads the new daemon's
-        // PID rather than a dead one from a previous run.
-        let _ = std::fs::remove_file(pid_file);
-        let daemon = Daemonize::new().pid_file(pid_file);
-        match daemon.execute() {
-            daemonize::Outcome::Parent(Ok(_)) => {
-                // Parent process: wait for the PID file to appear (written by
-                // the grandchild after the double-fork), then verify the daemon
-                // is still alive. This catches crashes during early startup
-                // (bad config, missing tables, TLS cert errors).
-                return verify_daemon_started(pid_file, &bind_addr);
-            }
-            daemonize::Outcome::Parent(Err(e)) => {
-                return Err(anyhow::anyhow!("Failed to daemonize: {e}"));
-            }
-            daemonize::Outcome::Child(Ok(_)) => {
-                // Child (daemon) process: continue to start the server.
-            }
-            daemonize::Outcome::Child(Err(e)) => {
-                return Err(anyhow::anyhow!("Failed to daemonize (child): {e}"));
-            }
-        }
+        // Daemon mode (double fork, PID file, syslog) is POSIX-only. On
+        // Windows the server must be run with `--foreground` under an
+        // external supervisor (a terminal, a service wrapper, or the npm
+        // launcher, which always passes `--foreground`).
+        #[cfg(not(unix))]
+        anyhow::bail!(
+            "daemon mode is not supported on this platform; \
+             run `extenddb serve --foreground`"
+        );
 
-        // P57 Bug 3 fix: After daemonize, stderr is /dev/null. Install a panic
-        // hook that writes to syslog so panics are visible. Without this, the
-        // child process silently disappears on panic. Reuses the server crate's
-        // raw syslog writer so there is one implementation of it — tracing is
-        // unusable here because the subscriber is only set up inside `serve`.
-        std::panic::set_hook(Box::new(|info| {
-            extenddb_server::log_to_syslog_raw(&format!("extenddb panic: {info}"));
-        }));
+        #[cfg(unix)]
+        {
+            let pid_file = pid_file
+                .as_ref()
+                .expect("daemon mode always has a PID file path");
+            // The listening socket bound successfully above, which proves no live
+            // server owns this port. Any existing PID file is therefore stale (a
+            // prior run that crashed or was killed without cleanup). Remove it
+            // before daemonizing so startup verification reads the new daemon's
+            // PID rather than a dead one from a previous run.
+            let _ = std::fs::remove_file(pid_file);
+            let daemon = Daemonize::new().pid_file(pid_file);
+            match daemon.execute() {
+                daemonize::Outcome::Parent(Ok(_)) => {
+                    // Parent process: wait for the PID file to appear (written by
+                    // the grandchild after the double-fork), then verify the daemon
+                    // is still alive. This catches crashes during early startup
+                    // (bad config, missing tables, TLS cert errors).
+                    return verify_daemon_started(pid_file, &bind_addr);
+                }
+                daemonize::Outcome::Parent(Err(e)) => {
+                    return Err(anyhow::anyhow!("Failed to daemonize: {e}"));
+                }
+                daemonize::Outcome::Child(Ok(_)) => {
+                    // Child (daemon) process: continue to start the server.
+                }
+                daemonize::Outcome::Child(Err(e)) => {
+                    return Err(anyhow::anyhow!("Failed to daemonize (child): {e}"));
+                }
+            }
+
+            // P57 Bug 3 fix: After daemonize, stderr is /dev/null. Install a panic
+            // hook that writes to syslog so panics are visible. Without this, the
+            // child process silently disappears on panic. Reuses the server crate's
+            // raw syslog writer so there is one implementation of it — tracing is
+            // unusable here because the subscriber is only set up inside `serve`.
+            std::panic::set_hook(Box::new(|info| {
+                extenddb_server::log_to_syslog_raw(&format!("extenddb panic: {info}"));
+            }));
+        }
     }
 
     tokio::runtime::Builder::new_multi_thread()

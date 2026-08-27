@@ -29,6 +29,12 @@ pub struct InitArgs {
     #[arg(long)]
     catalog_db: Option<String>,
 
+    /// SQLite database file path (default: extenddb.sqlite). The chosen path
+    /// is written to the generated config file, so `serve` finds it without
+    /// further flags. SQLite backend only.
+    #[arg(long)]
+    sqlite_path: Option<String>,
+
     /// PostgreSQL host (hostname, IP address, or absolute Unix socket directory path)
     #[arg(long)]
     pg_host: Option<String>,
@@ -42,6 +48,7 @@ pub struct InitArgs {
     pg_user: Option<String>,
 
     /// PostgreSQL admin password (required for remote/Aurora connections).
+    /// Prefer `EXTENDDB_PG_PASSWORD` to keep the value out of process arguments.
     #[arg(long)]
     pg_pass: Option<String>,
 
@@ -49,7 +56,8 @@ pub struct InitArgs {
     #[arg(long)]
     extenddb_user: Option<String>,
 
-    /// extenddb application password
+    /// extenddb application password.
+    /// Prefer `EXTENDDB_APP_PASSWORD` to keep the value out of process arguments.
     #[arg(long)]
     extenddb_pass: Option<String>,
 
@@ -160,8 +168,21 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
         return Ok(255);
     }
 
-    // Collect CLI args for backend-specific parsing
-    let cli_args: Vec<String> = std::env::args().collect();
+    // Collect CLI args for backend-specific parsing. Environment-sourced
+    // secrets are appended only to this in-process copy, not OS-visible argv.
+    let mut cli_args: Vec<String> = std::env::args().collect();
+    crate::util::append_secret_arg(
+        &mut cli_args,
+        "--pg-pass",
+        std::env::var_os("EXTENDDB_PG_PASSWORD"),
+        "EXTENDDB_PG_PASSWORD",
+    )?;
+    crate::util::append_secret_arg(
+        &mut cli_args,
+        "--extenddb-pass",
+        std::env::var_os("EXTENDDB_APP_PASSWORD"),
+        "EXTENDDB_APP_PASSWORD",
+    )?;
 
     // Extract bind_addr from CLI args
     let bind_addr =
@@ -203,32 +224,21 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
-    // Check if catalog is already initialized.
-    let initialized = bootstrapper
-        .is_catalog_initialized()
+    // Take the same lock `migrate` uses around the schema work below, so an
+    // init cannot race a migrate running on another replica and fail on a
+    // duplicate pg_type entry from concurrent `CREATE TABLE IF NOT EXISTS`.
+    // Two concurrent inits cannot get this far: the second aborts earlier, at
+    // `create_catalog_db`, because the database already exists. The catalog
+    // database does exist by this point, so the lock connection can be opened.
+    bootstrapper
+        .acquire_migration_lock()
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-
-    if initialized {
-        println!("--- Catalog already initialized. Use 'extenddb migrate' for pending migrations.");
-    } else {
-        bootstrapper
-            .run_catalog_migrations()
-            .await
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let migration_result = run_init_migrations(bootstrapper.as_ref()).await;
+    if let Err(e) = bootstrapper.release_migration_lock().await {
+        tracing::warn!("Failed to release migration lock: {e:?}");
     }
-
-    // Record data database connection in catalog.
-    bootstrapper
-        .record_data_connection()
-        .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-
-    // Initialize data database schema.
-    bootstrapper
-        .run_data_migrations()
-        .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    migration_result?;
 
     bootstrapper
         .bootstrap_encryption_key()
@@ -300,7 +310,75 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
     Ok(0)
 }
 
+/// Apply the catalog and data schema while the migration lock is held. Split out
+/// of `run` so that the lock is released on every path, including errors.
+async fn run_init_migrations(
+    bootstrapper: &dyn extenddb_storage::bootstrapper::Bootstrapper,
+) -> anyhow::Result<()> {
+    // Check if catalog is already initialized.
+    let initialized = bootstrapper
+        .is_catalog_initialized()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
+    if initialized {
+        println!("--- Catalog already initialized. Use 'extenddb migrate' for pending migrations.");
+    } else {
+        bootstrapper
+            .run_catalog_migrations()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    }
+
+    // Record data database connection in catalog.
+    bootstrapper
+        .record_data_connection()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
+    // Initialize data database schema.
+    bootstrapper
+        .run_data_migrations()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
+    Ok(())
+}
+
 /// Extract a CLI argument value by flag name.
 fn extract_arg(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InitArgs;
+    use clap::Args as _;
+    use clap::FromArgMatches as _;
+
+    fn parse(args: &[&str]) -> Result<InitArgs, clap::Error> {
+        let cmd = InitArgs::augment_args(clap::Command::new("init"));
+        let matches =
+            cmd.try_get_matches_from(std::iter::once("init").chain(args.iter().copied()))?;
+        InitArgs::from_arg_matches(&matches)
+    }
+
+    /// Regression test for issue #267: `--sqlite-path` was documented and read
+    /// by the SQLite bootstrapper via `extract_arg`, but never declared to
+    /// clap, so every invocation was rejected with "unexpected argument"
+    /// before the bootstrapper could run.
+    #[test]
+    fn init_accepts_sqlite_path() {
+        let args =
+            parse(&["--backend", "sqlite", "--sqlite-path", "/data/x.sqlite"]).expect("parse");
+        assert_eq!(args.sqlite_path.as_deref(), Some("/data/x.sqlite"));
+    }
+
+    /// The control: an actually-unknown flag must still be rejected, proving
+    /// the test above discriminates on the declaration rather than on clap
+    /// somehow accepting arbitrary arguments.
+    #[test]
+    fn init_rejects_unknown_flags() {
+        assert!(parse(&["--sqlite-pathological", "/data/x.sqlite"]).is_err());
+    }
 }

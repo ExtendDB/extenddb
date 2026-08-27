@@ -105,7 +105,22 @@ fn resolve_target(args: &HealthcheckArgs) -> anyhow::Result<Target> {
             .map_err(|e| anyhow::anyhow!("Failed to load config '{}': {e}", args.config))?;
         (probe_host(&cfg.server.bind_addr), cfg.server.port)
     } else {
-        ("127.0.0.1".to_owned(), DEFAULT_PORT)
+        // Zero-config (the dev container case): the server derives its address
+        // from `EXTENDDB__SERVER__*` environment overrides on built-in
+        // defaults, so the probe must honour the same overrides or a server
+        // moved with `EXTENDDB__SERVER__PORT` serves correctly while sitting
+        // unhealthy forever. An unparseable port is reported rather than
+        // defaulted: `serve` would refuse the same value, so a silently
+        // "healthy" default-port probe would mask the real failure.
+        let host = std::env::var("EXTENDDB__SERVER__BIND_ADDR")
+            .map_or_else(|_| "127.0.0.1".to_owned(), |b| probe_host(&b));
+        let port = match std::env::var("EXTENDDB__SERVER__PORT") {
+            Ok(v) => v.trim().parse::<u16>().map_err(|e| {
+                anyhow::anyhow!("EXTENDDB__SERVER__PORT '{v}' is not a valid port: {e}")
+            })?,
+            Err(_) => DEFAULT_PORT,
+        };
+        (host, port)
     };
     Ok(Target {
         host,
@@ -132,9 +147,10 @@ fn probe_host(bind_addr: &str) -> String {
 
 /// Parse `[scheme://]host[:port][/path]` into a [`Target`].
 ///
-/// The scheme and path are accepted and then ignored. The probe always speaks
-/// TLS, because the server has no plaintext mode, and always requests
-/// `/health`.
+/// The scheme and path are accepted and then ignored: the transport is decided
+/// by the build, not the URL. A production build always speaks TLS because the
+/// server has no plaintext mode; a `dev-mode` build always speaks plain HTTP
+/// because that server has no TLS. Always requests `/health`.
 fn parse_endpoint(endpoint: &str) -> anyhow::Result<Target> {
     let ep = endpoint.trim();
     let rest = ep
@@ -244,6 +260,18 @@ impl Write for DeadlineStream {
 fn probe(target: &Target) -> anyhow::Result<u16> {
     let deadline = Instant::now() + TIMEOUT;
 
+    // A dev-mode build serves plain HTTP, so probing it over TLS fails the
+    // handshake and reports a healthy server as unhealthy. Production builds
+    // have no plaintext mode, so this branch does not exist in them: it is
+    // compiled out, and `postgres`/`mongodb` cannot enable `dev-mode`.
+    if cfg!(feature = "dev-mode") {
+        let tcp = connect(target, deadline)?;
+        let mut tcp = DeadlineStream::new(tcp, deadline);
+        tcp.write_all(http_request(target).as_bytes())
+            .map_err(|e| anyhow::anyhow!("Failed to send request: {e}"))?;
+        return read_status(&mut tcp);
+    }
+
     // rustls 0.23 requires an explicit CryptoProvider. Installing it is
     // idempotent, so ignore the error if one is already installed.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -262,18 +290,23 @@ fn probe(target: &Target) -> anyhow::Result<u16> {
     let tcp = connect(target, deadline)?;
     let mut tcp = DeadlineStream::new(tcp, deadline);
 
-    let authority = target.authority();
-    let request = format!("GET /health HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
-
     let mut tls = rustls::Stream::new(&mut conn, &mut tcp);
-    tls.write_all(request.as_bytes())
+    tls.write_all(http_request(target).as_bytes())
         .map_err(|e| anyhow::anyhow!("Failed to send request: {e}"))?;
 
+    read_status(&mut tls)
+}
+
+/// The `/health` request. `Connection: close` lets the read finish on EOF.
+fn http_request(target: &Target) -> String {
+    let authority = target.authority();
+    format!("GET /health HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n")
+}
+
+/// Read a response and return its HTTP status code.
+fn read_status(stream: &mut impl Read) -> anyhow::Result<u16> {
     let mut response = Vec::new();
-    match (&mut tls)
-        .take(MAX_RESPONSE_BYTES)
-        .read_to_end(&mut response)
-    {
+    match stream.take(MAX_RESPONSE_BYTES).read_to_end(&mut response) {
         Ok(_) => {}
         // We asked for `Connection: close`, so the server closing the
         // connection after the response is expected.

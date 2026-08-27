@@ -21,9 +21,7 @@ use extenddb_storage::util::{
     encode_netstring_composite, parse_sk, pk_to_text, sk_column, sk_column_n, sk_info,
 };
 
-use super::query::{
-    build_key, build_sk_sql, execute_dynamic_query, resolve_expr_to_av, sk_condition_bind_values,
-};
+use super::query::{build_key, build_sk_sql_and_binds, execute_dynamic_query, resolve_expr_to_av};
 use super::{
     BoundValue, all_sort_key_info, data_table_name, index_table_name, json_to_item, sk_bound,
 };
@@ -79,9 +77,11 @@ impl SqliteEngine {
 
         // Primary sort-key condition.
         if let (Some(sk_cond), Some((_, sk_type))) = (&key_condition.sk_condition, sk_info_val) {
-            sql.push_str(&build_sk_sql(sk_cond, sk_column(sk_type)));
-            for v in sk_condition_bind_values(sk_cond, sk_type, maps)? {
-                binds.push(sk_bound(&v));
+            let (sk_sql, sk_binds) =
+                build_sk_sql_and_binds(sk_cond, sk_column(sk_type), sk_type, maps)?;
+            sql.push_str(&sk_sql);
+            for v in &sk_binds {
+                binds.push(sk_bound(v));
             }
         }
 
@@ -126,8 +126,16 @@ impl SqliteEngine {
             let sk_col = sk_column(sk_type);
             if let Some((_, base_type)) = &base_sk_info {
                 let base_col = format!("base_{}", sk_column(*base_type));
-                let base_dir = if is_lsi { dir } else { "ASC" };
-                let _ = write!(sql, " ORDER BY {sk_col} {dir}, {base_col} {base_dir}");
+                if is_lsi {
+                    let _ = write!(sql, " ORDER BY {sk_col} {dir}, {base_col} {dir}");
+                } else {
+                    // GSI: order by the full base primary key after the index SK
+                    // so the ordering matches the pagination tie-breaker exactly.
+                    // Ordering by base SK alone leaves rows that share an index SK
+                    // and a base SK in an arbitrary order, which no
+                    // ExclusiveStartKey can resume from deterministically.
+                    let _ = write!(sql, " ORDER BY {sk_col} {dir}, base_pk ASC, {base_col} ASC");
+                }
             } else if index_name.is_some() {
                 let _ = write!(sql, " ORDER BY {sk_col} {dir}, base_pk ASC");
             } else {
@@ -356,18 +364,43 @@ fn append_query_pagination(
 
         if let Some((base_name, base_type)) = base_sk_info {
             let base_col = format!("base_{}", sk_column(*base_type));
-            let base_cmp = if is_lsi { cmp } else { ">" };
-            let _ = write!(
-                sql,
-                " AND ({sk_col} {cmp} ? OR ({sk_col} = ? AND {base_col} {base_cmp} ?))"
-            );
             let sk_bv = sk_bv.unwrap_or(BoundValue::Text(String::new()));
-            binds.push(sk_bv.clone());
-            binds.push(sk_bv);
-            if let Some(v) = start_key.get(base_name.as_str()) {
-                binds.push(sk_bound(&parse_sk(v, *base_type)?));
+            let base_sk_bv = if let Some(v) = start_key.get(base_name.as_str()) {
+                sk_bound(&parse_sk(v, *base_type)?)
             } else {
-                binds.push(BoundValue::Text(String::new()));
+                BoundValue::Text(String::new())
+            };
+
+            if is_lsi {
+                // LSI: every row shares the queried partition key, so the base
+                // table's sort key alone identifies a row uniquely, and it is a
+                // user-visible sort dimension so it follows ScanIndexForward.
+                let _ = write!(
+                    sql,
+                    " AND ({sk_col} {cmp} ? OR ({sk_col} = ? AND {base_col} {cmp} ?))"
+                );
+                binds.push(sk_bv.clone());
+                binds.push(sk_bv);
+                binds.push(base_sk_bv);
+            } else {
+                // GSI: the tie-breaker must be the FULL base primary key. Rows
+                // in a GSI partition are unique on (index SK, base PK, base SK),
+                // not on (index SK, base SK): many base partitions can project
+                // the same index SK and the same base SK. Comparing base SK
+                // alone made a page-two query return nothing whenever the rows
+                // sharing an index SK also shared a base SK, so a paginating
+                // client silently stopped after page one.
+                let base_pk_bv = BoundValue::Text(base_pk_from_start_key(start_key, key_info)?);
+                let _ = write!(
+                    sql,
+                    " AND ({sk_col} {cmp} ? OR ({sk_col} = ? AND (base_pk > ? \
+                     OR (base_pk = ? AND {base_col} > ?))))"
+                );
+                binds.push(sk_bv.clone());
+                binds.push(sk_bv);
+                binds.push(base_pk_bv.clone());
+                binds.push(base_pk_bv);
+                binds.push(base_sk_bv);
             }
         } else if is_index {
             let _ = write!(

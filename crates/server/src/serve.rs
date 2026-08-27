@@ -19,6 +19,7 @@ use std::path::PathBuf;
 
 use extenddb_config as config;
 use extenddb_storage::CancellationToken;
+#[cfg(unix)]
 use syslog_tracing::{Facility, Options, Syslog};
 use tracing_subscriber::{
     EnvFilter, Layer, fmt, fmt::writer::BoxMakeWriter, layer::SubscriberExt, reload,
@@ -232,6 +233,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     // `.without_time()` only on the syslog path.
     let (writer, with_time): (BoxMakeWriter, bool) = match log_target {
         LogTarget::Stderr => (BoxMakeWriter::new(std::io::stderr), true),
+        #[cfg(unix)]
         LogTarget::Syslog => {
             let syslog = Syslog::new(
                 c"extenddb",
@@ -244,6 +246,16 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
                 )
             })?;
             (BoxMakeWriter::new(syslog), false)
+        }
+        // POSIX syslog does not exist on this platform; daemon mode (the only
+        // caller that selects Syslog) is unix-only, so this is unreachable in
+        // practice but must still be handled for the type to be total.
+        #[cfg(not(unix))]
+        LogTarget::Syslog => {
+            anyhow::bail!(
+                "syslog logging is not supported on this platform; \
+                 run `extenddb serve --foreground` (logs to stderr)"
+            )
         }
     };
 
@@ -289,7 +301,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         let dev_access_key = seed_dev_credential(catalog_store.as_ref()).await?;
         tracing::warn!(
             "DEVELOPER MODE active — plain HTTP, authorization open (SigV4 still \
-             enforced), loopback only. Storage: {}. Signing credential: {dev_access_key}",
+             enforced). Storage: {}. Signing credential: {dev_access_key}",
             config::redact_password(app_config.storage.connection_config()),
         );
     }
@@ -430,28 +442,30 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         Ok(resolved)
     };
 
-    // Build effective path lists: new config takes precedence over deprecated.
-    let mut import_paths_raw = app_config.import_config.paths.clone();
-    let mut export_paths_raw = app_config.export_config.paths.clone();
-    if let Some(ref legacy) = app_config.import_export_root {
-        if import_paths_raw.is_empty() {
-            import_paths_raw.push(legacy.clone());
-        }
-        if export_paths_raw.is_empty() {
-            export_paths_raw.push(legacy.clone());
-        }
-        if !app_config.import_config.paths.is_empty() && !app_config.export_config.paths.is_empty()
-        {
-            tracing::warn!(
-                "Both import_export_root and [import]/[export] sections configured; import_export_root is ignored"
-            );
-        }
+    // Build effective path lists: a populated section wins, and the deprecated
+    // import_export_root fills only a list a section left empty. Which surface
+    // won decides what the diagnostics should say, so it is recorded.
+    let effective = crate::import_export_paths::EffectivePaths::resolve(
+        &app_config.import_config.paths,
+        &app_config.export_config.paths,
+        app_config.import_export_root.as_deref(),
+    );
+    for notice in effective.legacy_notices() {
+        tracing::warn!("{notice}");
     }
 
     let import_paths: Arc<[Arc<std::path::PathBuf>]> =
-        Arc::from(resolve_paths(&import_paths_raw, "import")?);
+        Arc::from(resolve_paths(&effective.import, "import")?);
     let export_paths: Arc<[Arc<std::path::PathBuf>]> =
-        Arc::from(resolve_paths(&export_paths_raw, "export")?);
+        Arc::from(resolve_paths(&effective.export, "export")?);
+
+    for notice in crate::import_export_paths::overlap_notices(
+        &import_paths,
+        &export_paths,
+        effective.overlap_is_inherent(),
+    ) {
+        tracing::warn!("{notice}");
+    }
 
     if import_paths.is_empty() {
         tracing::info!("Import disabled (no [import] paths configured)");
@@ -643,6 +657,7 @@ async fn drain_workers(shutdown: &CancellationToken, handles: Vec<tokio::task::J
 /// startup before syslog tracing is configured, and from the caller's panic
 /// hook after daemonizing (stderr is `/dev/null` there, so a panic would
 /// otherwise be invisible).
+#[cfg(unix)]
 pub fn log_to_syslog_raw(msg: &str) {
     // SAFETY: openlog/syslog are POSIX-standard C functions. The ident
     // string is a static C string literal with 'static lifetime.
@@ -656,6 +671,13 @@ pub fn log_to_syslog_raw(msg: &str) {
             libc::syslog(libc::LOG_CRIT, c"%s".as_ptr(), cmsg.as_ptr());
         }
     }
+}
+
+/// Non-unix fallback: there is no POSIX syslog and no daemonized deployment
+/// (daemon mode is unix-only), so stderr is always attached — write there.
+#[cfg(not(unix))]
+pub fn log_to_syslog_raw(msg: &str) {
+    eprintln!("{msg}");
 }
 
 /// Seed (or refresh) the developer-mode credential and return its access key id.

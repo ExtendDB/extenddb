@@ -9,7 +9,7 @@ use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{composite_pk_to_text, parse_sk, pk_to_text, sk_column, sk_info};
 
-use super::index::{enqueue_async_indexes, fetch_indexes_for_table, sync_indexes};
+use super::index::{enqueue_async_indexes, fetch_write_path_indexes, sync_indexes};
 use super::query::check_condition;
 use super::tx_helpers::write_stream_record_in_tx;
 use super::{data_table_name, json_to_item};
@@ -33,8 +33,26 @@ impl PostgresEngine {
         let item_json =
             serde_json::to_value(&item).map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // Fetch indexes for GSI/LSI updates (D-4: sync + async split).
-        let indexes = fetch_indexes_for_table(&key_info.table_id, &self.pool).await?;
+        // Both index families in one catalog visit (D-4: sync + async split for the
+        // secondary indexes).
+        //
+        // Vector indexes come from this fresh read rather than from the cached key
+        // info, and the answer decides two things: whether this write needs a
+        // transaction at all, and what maintenance runs inside it. A cached empty
+        // set would send a write down the no-maintenance fast path and silently
+        // leave an index missing a row.
+        //
+        // What this does and does not remove. The defect being designed out is the
+        // cached membership gate, and that is gone: an index takes effect the moment
+        // its catalog row commits. What remains is a window between this read and
+        // the data transaction's commit, in which an index created concurrently is
+        // missed. That window cannot be closed here, because the catalog and the
+        // data tables are different databases and no transaction spans them. It is
+        // also exactly the window the secondary indexes have, for the same reason
+        // and with the same read: parity with a GSI is the bar, and the backfill
+        // that publishes a new index is what covers writes older than it.
+        let (indexes, vector_metas) =
+            fetch_write_path_indexes(&key_info.table_id, &self.pool).await?;
 
         // Index key attributes present in the item must match their declared
         // scalar type and be non-empty, matching real DynamoDB. This is up-front
@@ -56,15 +74,23 @@ impl PostgresEngine {
             .map_err(|e| StorageError::Validation(e.to_string()))?;
         }
 
-        let sys_delay = if indexes.is_empty() {
+        // Read whenever anything can propagate, secondary or vector. Gating this on
+        // the secondary set alone made a vector-only table ignore the configured
+        // delay and apply its vector index inline, while a TransactWriteItems on the
+        // same table read the delay unconditionally and enqueued: six write sites,
+        // two answers, on a setting the differences doc says covers both index kinds.
+        let sys_delay = if indexes.is_empty() && vector_metas.is_empty() {
             0
         } else {
-            self.gsi_default_delay_ms
-                .load(std::sync::atomic::Ordering::Relaxed)
+            self.index_propagation_delay().await
         };
 
         // When there's a condition, return_old, indexes, or stream capture, we need a transaction
-        let needs_tx = condition.is_some() || return_old || !indexes.is_empty() || stream.is_some();
+        let needs_tx = condition.is_some()
+            || return_old
+            || !indexes.is_empty()
+            || !vector_metas.is_empty()
+            || stream.is_some();
 
         if let Some((sk_name, sk_type)) =
             sk_info(&key_info.key_schema, &key_info.attribute_definitions)
@@ -168,11 +194,35 @@ impl PostgresEngine {
                 }
                 // Persist async GSI work inside the same transaction — one row
                 // per async index, each honoring its own propagation delay.
-                let async_enqueued = enqueue_async_indexes(
+                let mut async_enqueued = enqueue_async_indexes(
                     &mut tx,
                     key_info,
                     &indexes,
                     old_item_for_idx.as_ref(),
+                    Some(&item),
+                    sys_delay,
+                )
+                .await?;
+
+                // Vector indexes, read fresh from the catalog rather than from the
+                // cached key info, so a write cannot miss an index that was just
+                // created. The old image is needed even when no secondary index
+                // wanted it: the vector row is keyed by the base item, so a
+                // partition move is a delete of the previous row.
+                let old_for_vectors = match old_item_for_idx {
+                    Some(ref oi) => Some(oi.clone()),
+                    None => old
+                        .as_ref()
+                        .map(|(v,)| json_to_item(v.clone()))
+                        .transpose()?,
+                };
+                async_enqueued += crate::data::vector_index::maintain_vector_indexes(
+                    &mut tx,
+                    &vector_metas,
+                    &key_info.table_id,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                    old_for_vectors.as_ref(),
                     Some(&item),
                     sys_delay,
                 )
@@ -312,11 +362,35 @@ impl PostgresEngine {
                 }
                 // Persist async GSI work inside the same transaction — one row
                 // per async index, each honoring its own propagation delay.
-                let async_enqueued = enqueue_async_indexes(
+                let mut async_enqueued = enqueue_async_indexes(
                     &mut tx,
                     key_info,
                     &indexes,
                     old_item_for_idx.as_ref(),
+                    Some(&item),
+                    sys_delay,
+                )
+                .await?;
+
+                // Vector indexes, read fresh from the catalog rather than from the
+                // cached key info, so a write cannot miss an index that was just
+                // created. The old image is needed even when no secondary index
+                // wanted it: the vector row is keyed by the base item, so a
+                // partition move is a delete of the previous row.
+                let old_for_vectors = match old_item_for_idx {
+                    Some(ref oi) => Some(oi.clone()),
+                    None => old
+                        .as_ref()
+                        .map(|(v,)| json_to_item(v.clone()))
+                        .transpose()?,
+                };
+                async_enqueued += crate::data::vector_index::maintain_vector_indexes(
+                    &mut tx,
+                    &vector_metas,
+                    &key_info.table_id,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                    old_for_vectors.as_ref(),
                     Some(&item),
                     sys_delay,
                 )

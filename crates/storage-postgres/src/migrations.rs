@@ -7,10 +7,16 @@ use extenddb_storage::management_store::{OpError, OpResult};
 use sqlx::PgPool;
 
 /// Embedded catalog migration files, applied in order.
-pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[(
-    "001_schema.sql",
-    include_str!("../../storage-postgres/migrations/001_schema.sql"),
-)];
+pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "001_schema.sql",
+        include_str!("../../storage-postgres/migrations/001_schema.sql"),
+    ),
+    (
+        "002_vector_indexes.sql",
+        include_str!("../../storage-postgres/migrations/002_vector_indexes.sql"),
+    ),
+];
 
 /// Run catalog migrations, skipping already-applied ones.
 pub(crate) async fn run_catalog_migrations(pool: &PgPool) -> OpResult<()> {
@@ -25,6 +31,14 @@ pub(crate) async fn run_catalog_migrations(pool: &PgPool) -> OpResult<()> {
             .execute(pool)
             .await
             .map_err(|e| OpError::Internal(format!("Migration {filename} failed: {e}")))?;
+        // TODO(#221): applying this SQL and recording it are separate commits.
+        // A crash here can leave a migration applied but unrecorded. Catalog 001
+        // is normally shielded from replay by its version write, data 001 has an
+        // adoption guard, and data 002 is repeatable, but those are narrow
+        // recovery properties: catalog 001 is not idempotent and replaying data
+        // 003 drops the token table. The sqlx adoption must remove the files'
+        // own BEGIN/COMMIT and commit each ledger row with its migration before
+        // another migration lands.
         record_migration(pool, filename).await?;
     }
     println!("    Migrations applied.");
@@ -46,6 +60,10 @@ pub(crate) const DATA_MIGRATIONS: &[(&str, &str)] = &[
     (
         "003_idempotency_account_scope.sql",
         include_str!("../../storage-postgres/data_migrations/003_idempotency_account_scope.sql"),
+    ),
+    (
+        "004_vector_index_state.sql",
+        include_str!("../../storage-postgres/data_migrations/004_vector_index_state.sql"),
     ),
 ];
 
@@ -91,9 +109,113 @@ pub(crate) async fn run_data_migrations(pool: &PgPool) -> OpResult<()> {
             .execute(pool)
             .await
             .map_err(|e| OpError::Internal(format!("Data migration {filename} failed: {e}")))?;
+        // TODO(#221): applying this SQL and recording it are separate commits.
+        // A crash here can leave a migration applied but unrecorded. Catalog 001
+        // is normally shielded from replay by its version write, data 001 has an
+        // adoption guard, and data 002 is repeatable, but those are narrow
+        // recovery properties: catalog 001 is not idempotent and replaying data
+        // 003 drops the token table. The sqlx adoption must remove the files'
+        // own BEGIN/COMMIT and commit each ledger row with its migration before
+        // another migration lands.
         record_migration(pool, filename).await?;
     }
     println!("    Data migrations applied.");
+    Ok(())
+}
+
+/// Programmatic ("code") data migrations, tracked in `schema_history` alongside
+/// the SQL migrations. Unlike a static `.sql` file, these enumerate the
+/// dynamically-named index tables (`_ddb_<id>`) from the catalog and must run
+/// outside a transaction (they use `CREATE INDEX CONCURRENTLY`), so they cannot
+/// be expressed as SQL in [`DATA_MIGRATIONS`]. Applied by `extenddb migrate`
+/// after the SQL migrations, so the operator controls when the change happens.
+pub(crate) const DATA_CODE_MIGRATIONS: &[&str] = &["003_gsi_base_key_index"];
+
+/// Run programmatic data migrations, skipping already-applied ones.
+///
+/// Needs the catalog pool (to enumerate index tables and their base key schema)
+/// and the data pool (where the `_ddb_*` tables and the `schema_history` ledger
+/// live). Each step is recorded in `schema_history` and skipped on later runs,
+/// exactly like the SQL migrations.
+pub(crate) async fn run_data_code_migrations(
+    catalog_pool: &PgPool,
+    data_pool: &PgPool,
+) -> OpResult<()> {
+    for name in DATA_CODE_MIGRATIONS {
+        if is_migration_applied(data_pool, name).await? {
+            println!("    {name} — already applied, skipping.");
+            continue;
+        }
+        println!("    Applying {name}...");
+        match *name {
+            "003_gsi_base_key_index" => {
+                ensure_gsi_base_key_indexes(catalog_pool, data_pool).await?;
+            }
+            other => {
+                return Err(OpError::Internal(format!(
+                    "Unknown data code migration: {other}"
+                )));
+            }
+        }
+        record_migration(data_pool, name).await?;
+    }
+    Ok(())
+}
+
+/// Create the base-table-key index on every existing GSI/LSI table.
+///
+/// During GSI propagation each index table (`_ddb_<id>`) is looked up back to
+/// its base item via `WHERE base_pk = $1 AND base_sk_* = $2`; without a leading
+/// `(base_pk, base_sk_*)` index that is a sequential scan. New tables get this
+/// index at creation time (see `ddl.rs`); this migration adds it to tables
+/// created before the index existed. `CREATE INDEX CONCURRENTLY IF NOT EXISTS`
+/// is idempotent and does not block concurrent writes.
+async fn ensure_gsi_base_key_indexes(catalog_pool: &PgPool, data_pool: &PgPool) -> OpResult<()> {
+    use extenddb_core::types::{AttributeDefinition, KeySchemaElement};
+    use extenddb_storage::util::{sk_column, sk_column_n};
+
+    // Enumerate every index and its base table key schema from the catalog.
+    let rows: Vec<(String, serde_json::Value, serde_json::Value)> = sqlx::query_as(
+        "SELECT i.index_id, t.key_schema, t.attribute_definitions \
+         FROM indexes i \
+         JOIN tables t ON i.table_id = t.table_id",
+    )
+    .fetch_all(catalog_pool)
+    .await
+    .map_err(|e| OpError::Internal(format!("Enumerate indexes: {e}")))?;
+
+    for (index_id, ks_json, ad_json) in rows {
+        let base_ks: Vec<KeySchemaElement> =
+            serde_json::from_value(ks_json).map_err(|e| OpError::Internal(e.to_string()))?;
+        let attr_defs: Vec<AttributeDefinition> =
+            serde_json::from_value(ad_json).map_err(|e| OpError::Internal(e.to_string()))?;
+
+        let base_sks = crate::data::all_sort_key_info(&base_ks, &attr_defs);
+        let idx_table = crate::data::index_table_name(&index_id);
+        let idx_name = format!("_ddb_{index_id}_base_key_idx");
+
+        let mut base_key_cols = vec!["base_pk".to_owned()];
+        for (i, &(_, sk_type)) in base_sks.iter().enumerate() {
+            let col = if i == 0 {
+                format!("base_{}", sk_column(sk_type))
+            } else {
+                format!("base_{}", sk_column_n(i, sk_type))
+            };
+            base_key_cols.push(col);
+        }
+
+        // CONCURRENTLY cannot run inside a transaction, so execute on the pool.
+        let sql = format!(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS \"{}\" ON {} ({})",
+            idx_name,
+            idx_table,
+            base_key_cols.join(", ")
+        );
+        sqlx::query(&sql)
+            .execute(data_pool)
+            .await
+            .map_err(|e| OpError::Internal(format!("Base key index on {idx_table}: {e}")))?;
+    }
     Ok(())
 }
 
@@ -134,6 +256,12 @@ pub(crate) async fn pending_data_migrations(pool: &PgPool) -> OpResult<Vec<Strin
         }
         pending.push((*filename).to_owned());
     }
+    // Code migrations are tracked in the same data-database ledger.
+    for name in DATA_CODE_MIGRATIONS {
+        if !is_migration_applied(pool, name).await? {
+            pending.push((*name).to_owned());
+        }
+    }
     Ok(pending)
 }
 
@@ -164,4 +292,72 @@ async fn record_migration(pool: &PgPool, filename: &str) -> OpResult<()> {
     .await
     .map_err(|e| OpError::Internal(format!("Record migration: {e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CATALOG_MIGRATIONS;
+    use crate::CATALOG_VERSION;
+
+    /// The catalog version and the migration list must move together.
+    ///
+    /// A migration that creates its schema without moving the version leaves a
+    /// deployment the binary refuses to serve; moving the version without a
+    /// migration leaves one that cannot reach it. Both are caught today only by a
+    /// test that needs a live PostgreSQL and a built binary, so this is the
+    /// tripwire that fires in an ordinary `cargo test`: adding a migration file
+    /// breaks the count, which forces a decision about the version.
+    #[test]
+    fn the_migration_count_and_the_catalog_version_agree() {
+        assert_eq!(
+            CATALOG_MIGRATIONS.len(),
+            2,
+            "a catalog migration was added or removed; update CATALOG_VERSION and this count"
+        );
+        assert_eq!(CATALOG_VERSION.to_string(), "0.0.3");
+    }
+
+    /// The version the binary expects must be the version the schema writes.
+    ///
+    /// These two live in different languages and different files, so nothing but
+    /// a check like this ties them together. Without it a version bump that
+    /// forgets the SQL side produces a deployment that migrates "successfully"
+    /// and then refuses to start.
+    #[test]
+    fn the_last_migration_writes_the_expected_catalog_version() {
+        let (filename, sql) = CATALOG_MIGRATIONS
+            .last()
+            .expect("there is at least one catalog migration");
+        let expected = format!("'{}'", CATALOG_VERSION);
+        assert!(
+            sql.contains("catalog_version") && sql.contains(&expected),
+            "{filename} must set catalog_version to {expected}"
+        );
+    }
+
+    /// Each migration is registered under the filename it is stored as.
+    ///
+    /// The ledger keys on this string, so a mismatch between the registered name
+    /// and the file would record one name and look for another, and the migration
+    /// would be applied again on every run.
+    #[test]
+    fn every_migration_is_registered_under_a_sql_filename_with_its_own_contents() {
+        for (filename, sql) in CATALOG_MIGRATIONS {
+            assert!(filename.ends_with(".sql"), "{filename}");
+            assert!(!sql.trim().is_empty(), "{filename} is empty");
+        }
+        // The failure this guards is a copy-pasted `include_str!` that points one
+        // entry at another file's bytes: the ledger would then record one name
+        // while the SQL of another ran, and the missed migration would be applied
+        // again on every upgrade. Two entries sharing contents is what that looks
+        // like, so distinctness is the assertion that delivers the rationale.
+        for (i, (left_name, left_sql)) in CATALOG_MIGRATIONS.iter().enumerate() {
+            for (right_name, right_sql) in &CATALOG_MIGRATIONS[i + 1..] {
+                assert_ne!(
+                    left_sql, right_sql,
+                    "{left_name} and {right_name} embed identical SQL; check their include_str! paths"
+                );
+            }
+        }
+    }
 }
