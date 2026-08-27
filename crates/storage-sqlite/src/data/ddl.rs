@@ -102,8 +102,19 @@ impl SqliteEngine {
     ///
     /// `part` is the search-schema HASH value when one is declared, and a single
     /// constant otherwise, so an unscoped index is one partition rather than a
-    /// separate code path. `nrm` is the vector's precomputed L2 norm, so cosine
-    /// costs one dot product at query time instead of two passes.
+    /// separate code path.
+    ///
+    /// `nrm` holds the vector's precomputed L2 norm and **this backend's search path
+    /// no longer reads it**. It is an `f32` from the shared norm helper, which
+    /// overflows and underflows inside the range of components validation accepts, so
+    /// the scorer recomputes both norms in `f64` from the vector it has already
+    /// decoded. The column is still written, and kept rather than dropped because
+    /// removing it would need a data migration for no benefit.
+    ///
+    /// The same column name is load-bearing on the PostgreSQL backend, which is the
+    /// asymmetry to know about: its zero test runs in SQL, where the stored vector's
+    /// norm cannot be recomputed, so it reads `nrm` and its scoring expression
+    /// compensates for the `f32` range separately.
     ///
     /// # Safety (SQL injection)
     /// `index_id` is a server-generated UUID and column names are constants, so
@@ -405,45 +416,28 @@ impl SqliteEngine {
 
     /// Fetch the vector indexes of a table in the shape the engine caches.
     ///
-    /// Note what this cannot carry: `VectorIndexKeyInfo` has no distance
-    /// function, so a search still reads the catalog for it. Widening that
-    /// type would remove the last per-search catalog read.
+    /// Selects the whole row rather than the five columns this shape needs, so
+    /// that one row type and one decode path serve both this and the describe
+    /// path. The extra columns are two short tokens and an integer, read only on
+    /// a key-info cache miss.
     async fn fetch_vector_index_key_info(
         &self,
         table_id: &str,
     ) -> Result<Vec<extenddb_core::types::VectorIndexKeyInfo>, StorageError> {
-        let rows: Vec<(String, i64, String, Option<String>, String)> = sqlx::query_as(
-            "SELECT index_name, dimensions, vector_attribute, search_schema, projection \
-             FROM vector_indexes WHERE table_id = ?",
-        )
+        let rows: Vec<crate::table_helpers::VectorIndexRow> = sqlx::query_as(&format!(
+            "SELECT {} FROM vector_indexes WHERE table_id = ? ORDER BY index_name",
+            crate::table_helpers::VECTOR_INDEX_COLUMNS
+        ))
         .bind(table_id)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let mut out = Vec::with_capacity(rows.len());
-        for (index_name, dimensions, vector_attribute, search_schema, projection) in rows {
-            let attr: extenddb_core::types::VectorAttribute =
-                serde_json::from_str(&vector_attribute)
-                    .map_err(|e| StorageError::Internal(format!("vector_attribute: {e}")))?;
-            let search_schema = match search_schema.as_deref() {
-                Some(json) => serde_json::from_str(json)
-                    .map_err(|e| StorageError::Internal(format!("search_schema: {e}")))?,
-                None => Vec::new(),
-            };
-            let projection: extenddb_core::types::Projection = serde_json::from_str(&projection)
-                .map_err(|e| StorageError::Internal(format!("vector projection: {e}")))?;
-            out.push(extenddb_core::types::VectorIndexKeyInfo {
-                index_name,
-                dimensions: u32::try_from(dimensions).map_err(|_| {
-                    StorageError::Internal(format!("vector dimensions out of range: {dimensions}"))
-                })?,
-                vector_attribute_name: attr.attribute_name,
-                search_schema,
-                projection,
-            });
-        }
-        Ok(out)
+        let catalog_rows = rows
+            .into_iter()
+            .map(crate::table_helpers::VectorIndexRow::into_catalog_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        extenddb_storage::vector_catalog::vector_index_key_info(catalog_rows)
     }
 
     /// Fetch every secondary index defined on a table, split into

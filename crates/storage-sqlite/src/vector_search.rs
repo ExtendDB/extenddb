@@ -48,28 +48,58 @@ fn decode_vector(bytes: &[u8], dimensions: usize) -> Result<Vec<f32>, StorageErr
         .collect())
 }
 
+/// The Euclidean norm of a vector, in double precision.
+///
+/// Not the shared `vector_norm`, which returns an `f32` and is what the stored `nrm`
+/// column holds: squaring an `f32` component in `f32` overflows above about 1.8e19 and
+/// underflows below about 1e-22, both well inside the range of components validation
+/// accepts, so the stored norm is unusable for deciding whether a vector is zero.
+fn norm_f64(components: &[f32]) -> f64 {
+    components
+        .iter()
+        .map(|x| f64::from(*x) * f64::from(*x))
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// The inner product of two vectors, in double precision.
+fn dot_f64(a: &[f32], b: &[f32]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum()
+}
+
 /// Score one candidate under the index's distance function.
 ///
 /// Cosine and Euclidean are distances, so smaller is more similar; dot product is
 /// a similarity, so larger is. The caller must not compare scores across
 /// functions, which is why the output reports which one was used.
-fn score(
-    function: DistanceFunction,
-    query: &[f32],
-    query_norm: f32,
-    candidate: &[f32],
-    candidate_norm: f32,
-) -> f64 {
+///
+/// Every accumulation is `f64`, and that is a correctness requirement rather than
+/// precision hygiene. In `f32` these overflow for components validation accepts, and
+/// the result was a score that cannot be serialised at all: a Euclidean difference is
+/// doubled before squaring, so `1e19` against `-1e19` gave `inf`; a dot product of
+/// `2e19` gave `inf`; and cosine at `3.4e38` divided two overflowed values and gave
+/// `NaN`. `serde_json` renders both as `null`, so a client received `"Score": null` on
+/// a 200 response. Widened, the worst case in the whole domain is 4096 components at
+/// `f32::MAX` squared, which is 4.7e80 and finite, so no clamping is needed here: the
+/// values are simply correct. The PostgreSQL backend cannot do this, because the
+/// arithmetic happens inside pgvector, so it bounds the result in SQL instead.
+fn score(function: DistanceFunction, query: &[f32], candidate: &[f32]) -> f64 {
     match function {
         DistanceFunction::Cosine => {
+            let query_norm = norm_f64(query);
+            let candidate_norm = norm_f64(candidate);
             if query_norm == 0.0 || candidate_norm == 0.0 {
                 // Undefined angle. Reported as maximally distant rather than as
                 // an error, matching how a zero vector is treated elsewhere.
+                //
+                // Genuinely zero, not merely small: the norms above are computed in
+                // f64 for exactly this decision. With an f32 norm a vector of 1e-30
+                // components read as zero, so every row scored 1.0 and the search
+                // silently returned a ranking it had not computed.
                 return 1.0;
-            }
-            let mut dot = 0.0f32;
-            for i in 0..query.len() {
-                dot += query[i] * candidate[i];
             }
             // Clamped because the quotient can exceed 1 by a float epsilon when the
             // vectors are identical, which made an exact self-match report a
@@ -77,24 +107,20 @@ fn score(
             // vector). Cosine distance has domain [0, 2], so a consumer that
             // clamps, or takes a square root of the score, sees a value the metric
             // cannot produce. The service returned +1.49e-08 for the same query.
-            let similarity = (dot / (query_norm * candidate_norm)).clamp(-1.0, 1.0);
-            f64::from(1.0 - similarity)
+            let similarity =
+                (dot_f64(query, candidate) / (query_norm * candidate_norm)).clamp(-1.0, 1.0);
+            1.0 - similarity
         }
-        DistanceFunction::Euclidean => {
-            let mut sum = 0.0f32;
-            for i in 0..query.len() {
-                let d = query[i] - candidate[i];
-                sum += d * d;
-            }
-            f64::from(sum.sqrt())
-        }
-        DistanceFunction::DotProduct => {
-            let mut dot = 0.0f32;
-            for i in 0..query.len() {
-                dot += query[i] * candidate[i];
-            }
-            f64::from(dot)
-        }
+        DistanceFunction::Euclidean => query
+            .iter()
+            .zip(candidate)
+            .map(|(x, y)| {
+                let d = f64::from(*x) - f64::from(*y);
+                d * d
+            })
+            .sum::<f64>()
+            .sqrt(),
+        DistanceFunction::DotProduct => dot_f64(query, candidate),
     }
 }
 
@@ -217,13 +243,12 @@ impl VectorSearchEngine for SqliteEngine {
             }
 
             let vec_table = vector_table_name(&table_id, &index_id);
-            let sql = format!("SELECT vec, nrm, item_data FROM {vec_table} WHERE part = ?");
-
-            let mut query_norm = 0.0f32;
-            for x in &query_vector {
-                query_norm += x * x;
-            }
-            let query_norm = query_norm.sqrt();
+            // `nrm` is deliberately not selected. The stored norm is an f32 and cannot
+            // be trusted for either the zero test or the cosine denominator, so the
+            // scorer recomputes both sides in f64 from the vector it already decoded.
+            // The column stays because dropping it would need a data migration for
+            // no benefit; see the reasoning on `create_vector_data_table`.
+            let sql = format!("SELECT vec, item_data FROM {vec_table} WHERE part = ?");
 
             let k = usize::try_from(top_k.max(0)).unwrap_or(0);
             let mut top = TopK::new(k, function);
@@ -232,11 +257,11 @@ impl VectorSearchEngine for SqliteEngine {
             // not allocate proportionally to its size. This is the reason the
             // row-per-vector layout was chosen over a packed blob per partition.
             use futures::TryStreamExt;
-            let mut stream = sqlx::query_as::<_, (Vec<u8>, f64, String)>(&sql)
+            let mut stream = sqlx::query_as::<_, (Vec<u8>, String)>(&sql)
                 .bind(&partition)
                 .fetch(&self.pool);
 
-            while let Some((blob, norm, item_json)) = stream
+            while let Some((blob, item_json)) = stream
                 .try_next()
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?
@@ -256,15 +281,7 @@ impl VectorSearchEngine for SqliteEngine {
                     continue;
                 }
 
-                #[allow(clippy::cast_possible_truncation)]
-                let candidate_norm = norm as f32;
-                let candidate_score = score(
-                    function,
-                    &query_vector,
-                    query_norm,
-                    &candidate,
-                    candidate_norm,
-                );
+                let candidate_score = score(function, &query_vector, &candidate);
                 top.offer(candidate_score, item, candidate);
             }
 
@@ -303,8 +320,7 @@ mod tests {
     #[test]
     fn cosine_of_identical_vectors_is_zero() {
         let v = [1.0f32, 2.0, 3.0];
-        let n = (14.0f32).sqrt();
-        let s = score(DistanceFunction::Cosine, &v, n, &v, n);
+        let s = score(DistanceFunction::Cosine, &v, &v);
         assert!(s.abs() < 1e-6, "expected ~0.0, got {s}");
     }
 
@@ -335,11 +351,10 @@ mod tests {
                 s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
                 v.push(((s >> 33) as f32 / u32::MAX as f32) - 0.5);
             }
-            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm == 0.0 {
+            if norm_f64(&v) == 0.0 {
                 continue;
             }
-            let d = score(DistanceFunction::Cosine, &v, norm, &v, norm);
+            let d = score(DistanceFunction::Cosine, &v, &v);
             assert!(
                 d >= 0.0,
                 "cosine distance left its domain for a self-match: {d} (dim {dim})"
@@ -348,24 +363,73 @@ mod tests {
         }
     }
 
-    /// The clamp must hold even when the norms handed in understate the true ones,
-    /// which is the mechanism that pushed the quotient above 1 in the first place:
-    /// `norm * norm` can be strictly less than `sum(x*x)` in f32.
+    /// Every metric returns a FINITE score for the extremes of the input domain.
+    ///
+    /// This replaces a test that forced the cosine clamp by handing in a norm 1% below
+    /// the true one. That mechanism is gone: the scorer computes both norms itself now,
+    /// so a caller cannot understate them, and the clamp is exercised by the self-match
+    /// property above instead.
+    ///
+    /// These are the magnitudes at which single-precision accumulation broke, measured
+    /// before the widening: `1e19` against `-1e19` gave `inf` under Euclidean, because
+    /// the difference is doubled before squaring; `2e19` gave `inf` under dot product;
+    /// and `3.4e38` gave `NaN` under cosine, dividing two overflowed values. Each
+    /// reached a client as `"Score": null` on a 200 response, because that is how
+    /// `serde_json` renders a non-finite double.
+    ///
+    /// The JSON rendering is asserted rather than only `is_finite`, because null is what
+    /// the client actually saw and it is what a regression would reintroduce.
     #[test]
-    fn cosine_clamps_when_the_supplied_norms_understate() {
-        let v = [0.6f32, 0.8];
-        // Deliberately 1% low, far beyond any real rounding error, so the
-        // unclamped expression would return roughly -0.02.
-        let understated = 0.99f32;
-        let d = score(DistanceFunction::Cosine, &v, understated, &v, understated);
-        assert!(d >= 0.0, "expected the clamp to hold, got {d}");
+    fn every_metric_scores_the_extremes_of_the_domain_as_a_finite_number() {
+        let cases = [
+            (
+                DistanceFunction::Euclidean,
+                [1e19f32, 0.0, 0.0, 0.0],
+                [-1e19f32, 0.0, 0.0, 0.0],
+            ),
+            (
+                DistanceFunction::DotProduct,
+                [2e19f32, 0.0, 0.0, 0.0],
+                [2e19f32, 0.0, 0.0, 0.0],
+            ),
+            (
+                DistanceFunction::Cosine,
+                [3.4e38f32, 1e38, 0.0, 0.0],
+                [3.4e38f32, 0.0, 0.0, 0.0],
+            ),
+        ];
+        for (function, query, candidate) in cases {
+            let s = score(function, &query, &candidate);
+            assert!(
+                s.is_finite(),
+                "{function:?} produced a non-finite score: {s}"
+            );
+            assert_ne!(
+                serde_json::to_string(&s).expect("serialise the score"),
+                "null",
+                "{function:?} produced a score that serialises as null: {s}"
+            );
+        }
+
+        // The other end: components small enough that their f32 squares underflow must
+        // NOT read as a zero vector, or the guard fires and every row scores 1.0.
+        let tiny = [1e-30f32, 0.0, 0.0, 0.0];
+        assert!(
+            score(DistanceFunction::Cosine, &tiny, &[1.0, 0.0, 0.0, 0.0]) < 1e-9,
+            "a tiny vector parallel to the candidate is a near-zero distance, not the \
+             zero-vector answer"
+        );
+        assert!(
+            (score(DistanceFunction::Cosine, &tiny, &[0.0, 1.0, 0.0, 0.0]) - 1.0).abs() < 1e-9,
+            "and orthogonal to it is exactly 1.0, by the metric rather than by the guard"
+        );
     }
 
     #[test]
     fn cosine_of_opposite_vectors_is_two() {
         let a = [1.0f32, 0.0];
         let b = [-1.0f32, 0.0];
-        let s = score(DistanceFunction::Cosine, &a, 1.0, &b, 1.0);
+        let s = score(DistanceFunction::Cosine, &a, &b);
         assert!((s - 2.0).abs() < 1e-6, "expected ~2.0, got {s}");
     }
 
@@ -373,14 +437,14 @@ mod tests {
     fn a_zero_vector_is_maximally_distant_rather_than_an_error() {
         let a = [1.0f32, 0.0];
         let z = [0.0f32, 0.0];
-        assert!((score(DistanceFunction::Cosine, &a, 1.0, &z, 0.0) - 1.0).abs() < 1e-6);
+        assert!((score(DistanceFunction::Cosine, &a, &z) - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn euclidean_is_the_straight_line_distance() {
         let a = [0.0f32, 0.0];
         let b = [3.0f32, 4.0];
-        let s = score(DistanceFunction::Euclidean, &a, 0.0, &b, 5.0);
+        let s = score(DistanceFunction::Euclidean, &a, &b);
         assert!((s - 5.0).abs() < 1e-6, "expected 5.0, got {s}");
     }
 
@@ -388,7 +452,7 @@ mod tests {
     fn dot_product_is_reported_raw_and_can_be_negative() {
         let a = [1.0f32, 0.0];
         let b = [-2.0f32, 0.0];
-        let s = score(DistanceFunction::DotProduct, &a, 1.0, &b, 2.0);
+        let s = score(DistanceFunction::DotProduct, &a, &b);
         assert!((s + 2.0).abs() < 1e-6, "expected -2.0, got {s}");
     }
 

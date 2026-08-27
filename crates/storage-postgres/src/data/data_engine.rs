@@ -13,6 +13,23 @@ use futures::future::BoxFuture;
 use crate::PostgresEngine;
 
 impl DataEngine for PostgresEngine {
+    /// Declares vector support only where the server can actually serve it.
+    ///
+    /// `Some(self)` compiles only because `PostgresEngine` implements
+    /// `VectorSearchEngine`, so this cannot claim a capability that does not
+    /// exist in the build. The runtime half is the probe: vector storage needs
+    /// pgvector, which is a property of the PostgreSQL server rather than of this
+    /// binary, so the same build serves vector indexes against a server that has
+    /// the extension and refuses them, byte-identically to before, against one
+    /// that does not.
+    ///
+    /// The answer is the startup probe's, cached, so a request pays nothing for
+    /// it. Installing pgvector on a running server therefore needs a restart to
+    /// be noticed, which the admin guide says.
+    fn as_vector_search(&self) -> Option<&dyn extenddb_storage::VectorSearchEngine> {
+        self.vector_capable.then_some(self)
+    }
+
     fn put_item(
         &self,
         key_info: &TableKeyInfo,

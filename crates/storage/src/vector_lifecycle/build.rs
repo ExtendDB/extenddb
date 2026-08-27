@@ -48,9 +48,10 @@ pub trait VectorIndexBuild: Send {
     /// `Backfilling: true`.
     ///
     /// Called by the backend's create path after the data table exists and
-    /// before [`complete_build`] is spawned, and set outside the backfill
-    /// transaction, otherwise no observer could see it: the whole point of the
-    /// flag is to be readable while the scan is in progress.
+    /// before [`complete_build`] is spawned, and by [`rebuild_index`] before a
+    /// recovery scan, and set outside the backfill transaction, otherwise no
+    /// observer could see it: the whole point of the flag is to be readable
+    /// while the scan is in progress.
     fn set_backfilling(&mut self) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Publish the index: `ACTIVE`, the `Backfilling` member cleared to absent
@@ -229,11 +230,8 @@ pub async fn complete_build<B: VectorIndexBuild>(
 /// queue rows become claimable (startup reconciliation runs before the workers
 /// exist; runtime recovery notifies once after a whole sweep).
 ///
-/// One deliberate exception to the status sequence in the module docs: a
-/// rebuild does not re-assert `Backfilling: true`, so an index whose build died
-/// before its own `set_backfilling` call is rebuilt while DescribeTable still
-/// reports `false`. This matches the pre-extraction behavior; the flip to
-/// `ACTIVE` clears the member either way.
+/// Recovery re-asserts the scanning phase before rebuilding, so the status
+/// sequence in the module docs holds for a rebuild as well as a first build.
 ///
 /// # Errors
 /// Unlike [`complete_build`], every failure propagates, including the terminal
@@ -244,6 +242,7 @@ pub async fn rebuild_index<B: VectorIndexBuild>(
     batch_size: i64,
 ) -> Result<usize, StorageError> {
     ops.reset_data_table().await?;
+    ops.set_backfilling().await?;
     let outcome = run_backfill(ops, batch_size, Duration::ZERO).await?;
     ops.mark_active(outcome.skipped).await?;
     Ok(outcome.written)
@@ -261,6 +260,7 @@ mod tests {
     struct Script {
         batches: Vec<Result<BatchOutcome<u32>, StorageError>>,
         flip_fails: bool,
+        backfilling_fails: bool,
         log: Vec<String>,
     }
 
@@ -291,11 +291,11 @@ mod tests {
         }
 
         async fn set_backfilling(&mut self) -> Result<(), StorageError> {
-            self.0
-                .lock()
-                .unwrap()
-                .log
-                .push("set_backfilling".to_owned());
+            let mut s = self.0.lock().unwrap();
+            s.log.push("set_backfilling".to_owned());
+            if s.backfilling_fails {
+                return Err(StorageError::Internal("phase flip failed".to_owned()));
+            }
             Ok(())
         }
 
@@ -427,11 +427,13 @@ mod tests {
             mock.log(),
             vec![
                 "reset",
+                "set_backfilling",
                 "batch(cursor=None, limit=500)",
                 "mark_active(skipped=1)",
             ],
             "the reset precedes the scan, or already-written rows collide with \
-             the backfill's plain INSERT"
+             the backfill's plain INSERT, and the scanning phase is re-asserted \
+             before the scan so the phase is readable while the rebuild runs"
         );
 
         let failing = MockBuild::default();
@@ -447,6 +449,41 @@ mod tests {
         assert!(
             matches!(err, StorageError::Internal(_)),
             "the repair loop must see the flip failure: {err:?}"
+        );
+    }
+
+    /// A rebuild re-asserts the scanning phase, and asserts it BEFORE scanning.
+    ///
+    /// The phase is not cosmetic: the `UpdateTable` delete rule refuses a delete
+    /// while an index reports `CREATING` with `Backfilling: false` and tells the
+    /// caller to retry once backfilling starts. A rebuild that left the flag
+    /// false would make that advice unfollowable for the whole rebuild, because
+    /// the only remaining transitions are `ACTIVE` or another failure. Asserting
+    /// it before the scan is what makes it readable while the scan runs.
+    ///
+    /// The failure propagates with the index still `CREATING`, so the repair
+    /// loop retries the whole rebuild rather than scanning under a phase it
+    /// could not publish.
+    #[tokio::test]
+    async fn rebuild_index_reasserts_the_scanning_phase_and_propagates_its_failure() {
+        let mock = MockBuild::default();
+        {
+            let mut s = mock.0.lock().unwrap();
+            s.batches = vec![Ok(batch(1, 0, 0, None))];
+            s.backfilling_fails = true;
+        }
+        let mut ops = mock.clone();
+        let err = rebuild_index(&mut ops, 500)
+            .await
+            .expect_err("phase flip failure");
+        assert!(
+            matches!(err, StorageError::Internal(_)),
+            "the repair loop must see the phase failure: {err:?}"
+        );
+        assert_eq!(
+            mock.log(),
+            vec!["reset", "set_backfilling"],
+            "neither the scan nor the publish may run once the phase flip failed"
         );
     }
 }

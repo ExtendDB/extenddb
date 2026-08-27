@@ -27,7 +27,8 @@ pub async fn handle_update_table(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
-    let input: UpdateTableInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    let mut input: UpdateTableInput =
+        serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     if input.table_name.is_empty() {
         return Err(DynamoDbError::ValidationException(
@@ -45,6 +46,13 @@ pub async fn handle_update_table(
         input.vector_index_updates.as_ref(),
         input.attribute_definitions.as_deref().unwrap_or_default(),
     )?;
+    // Same collapse CreateTable applies, for the same reason: an index added by
+    // either path must reach every backend in one shape.
+    for update in input.vector_index_updates.iter_mut().flatten() {
+        if let Some(create) = update.create.as_mut() {
+            create.normalize_search_schema();
+        }
+    }
 
     let has_gsi_updates = input
         .global_secondary_index_updates
