@@ -281,3 +281,71 @@ async fn swap_in_one_call_is_refused() {
 
     delete_table(&name).await;
 }
+
+/// Adding a vector index to a table that is already PROVISIONED is refused, and
+/// the refusal is evaluated on the request's NET billing mode.
+///
+/// Measured 2026-08-19 (probe P12) against a live PROVISIONED table. Two facts,
+/// both asserted here:
+///
+///  * `UpdateTable` with a vector-index Create and no `BillingMode` member is
+///    refused with the same whole string `CreateTable` returns, so one constant
+///    serves both paths and both directions of the rule.
+///  * The same request plus `BillingMode: PAY_PER_REQUEST` is accepted. The check
+///    reads the request's net state, not the table's stored mode, which is the
+///    same net-effect evaluation the index-count limit uses.
+///
+/// The accepted case is the discriminating one: a guard written against the
+/// stored mode passes the refusal half and wrongly refuses this half.
+#[tokio::test]
+async fn adding_a_vector_index_to_a_provisioned_table_is_rejected() {
+    if skip_unless_supported().await {
+        return;
+    }
+    let name = table_name("vupd-prov-add");
+    let create = format!(
+        r#"{{
+        "TableName": "{name}",
+        "AttributeDefinitions": [{{"AttributeName": "pk", "AttributeType": "S"}}],
+        "KeySchema": [{{"AttributeName": "pk", "KeyType": "HASH"}}],
+        "BillingMode": "PROVISIONED",
+        "ProvisionedThroughput": {{"ReadCapacityUnits": 1, "WriteCapacityUnits": 1}}
+    }}"#
+    );
+    let (status, text) = call("CreateTable", &create).await;
+    assert_eq!(status, 200, "provisioned setup table failed: {text}");
+    wait_for_active(&name).await;
+
+    let (status, text) = call("UpdateTable", &create_update_body(&name, "vidx", "emb")).await;
+    assert_error(
+        status,
+        &text,
+        "ValidationException",
+        "One or more parameter values were invalid: Vector indexes are only supported for \
+         PAY_PER_REQUEST tables",
+    );
+
+    // The net-state case: switch to on-demand and create the index in one call.
+    let combined = format!(
+        r#"{{
+        "TableName": "{name}",
+        "BillingMode": "PAY_PER_REQUEST",
+        "VectorIndexUpdates": [{{"Create": {{
+            "IndexName": "vidx",
+            "VectorAttribute": {{"AttributeName": "emb"}},
+            "Dimensions": 4,
+            "DistanceFunction": "COSINE",
+            "Projection": {{"ProjectionType": "ALL"}}
+        }}}}]
+    }}"#
+    );
+    let (status, text) = call("UpdateTable", &combined).await;
+    assert_eq!(
+        status, 200,
+        "a switch to PAY_PER_REQUEST and a create in one request must be accepted: {text}"
+    );
+
+    // Wait the index out before deleting, so the table is not left mid-build.
+    wait_for_vector_index_active(&name, "vidx").await;
+    delete_table(&name).await;
+}
