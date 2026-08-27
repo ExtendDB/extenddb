@@ -103,7 +103,7 @@ pub(crate) struct GsiApplyContext {
 #[serde(untagged)]
 pub(crate) enum PendingApplyContext {
     Gsi(GsiApplyContext),
-    Vector(super::vector_index::VectorApplyContext),
+    Vector(extenddb_storage::vector_lifecycle::VectorApplyContext),
 }
 
 impl PendingApplyContext {
@@ -560,11 +560,11 @@ pub(crate) async fn apply_claimed_row(
 #[cfg(test)]
 mod pending_context_tests {
     use super::{GsiApplyContext, GsiIndexDef, PendingApplyContext};
-    use crate::data::vector_index::{VectorApplyContext, VectorIndexMeta};
     use extenddb_core::types::{
         AttributeDefinition, KeySchemaElement, KeyType, Projection, ProjectionType,
         ScalarAttributeType,
     };
+    use extenddb_storage::vector_lifecycle::{VectorApplyContext, VectorIndexMeta};
 
     /// A context written by a build that predates vector rows, verbatim. It must
     /// still deserialize.

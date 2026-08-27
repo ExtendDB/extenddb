@@ -1,6 +1,6 @@
 # ADR-0005: Index-build lifecycle stays in the backend until a second backend needs it
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-14
 - Deciders: @LeeroyHannigan
 
@@ -115,6 +115,18 @@ the next open is the layer below the property this pins.
 - Follow-up created: the PostgreSQL GSI divergences confirmed above (the
   all-0xFF bound defect in particular) are pre-existing defects independent of
   this decision and need their own issues.
+
+## Outcome (2026-08-19)
+
+The condition this decision waited on arrived: the PostgreSQL backend is the
+second implementor of `VectorSearchEngine`, and the extraction landed as the
+first step of that port, exactly as the Decision section prescribes. The
+lifecycle now lives in `crates/storage/src/vector_lifecycle/` (the
+`VectorIndexBuild` primitives trait plus the shared backfill, publish, and
+rebuild drivers), with the SQLite backend rewired as the first implementor and
+its pre-existing vector tests, unchanged, as the acceptance gate. The
+procedural commitment above stands: reviewers reject any second copy of the
+lifecycle, which now means any backend logic that bypasses the shared module.
 
 ---
 

@@ -14,12 +14,14 @@ pub enum StorageError {
     IndexNotFound(String),
     #[error("Index already exists: {0}")]
     IndexAlreadyExists(String),
-    /// `DeleteTable` arrived while an online index operation (an
-    /// UpdateTable-created vector index still backfilling) was in progress on
-    /// the table. Maps to `ResourceInUseException` with the sentence AWS
-    /// documents in the vector search tutorial's readiness callout: "Cannot
-    /// delete table while indexes are being created, updated, or deleted."
-    #[error("Indexes are being created, updated, or deleted on table: {0}")]
+    /// A change refused because an index on the resource is mid-transition.
+    /// Carries the whole client-facing message, because the state, and
+    /// therefore the wording, is known only to the backend that holds it: a
+    /// DeleteTable refused while indexes build carries the sentence AWS
+    /// documents for that case, and a vector index deleted while its creation
+    /// is still allocating resources carries the measured phase-dependent
+    /// refusal (2026-08-19). Maps to `ResourceInUseException` verbatim.
+    #[error("{0}")]
     IndexesInUse(String),
     #[error("Deletion protection enabled: {0}")]
     DeletionProtected(String),

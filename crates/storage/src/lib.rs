@@ -20,6 +20,7 @@ pub mod operations;
 pub mod server_components;
 pub mod settings_store;
 pub mod transact;
+pub mod vector_lifecycle;
 
 pub use backend::{Backend, BackendAlreadySet, backend_name, set_backend, try_backend};
 

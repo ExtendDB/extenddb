@@ -73,8 +73,7 @@ impl SqliteEngine {
             // so a build whose catalog row commits while this call is waiting
             // on the write lock is still caught: the check and the cascade
             // delete are atomic against a concurrent UpdateTable.
-            Self::refuse_if_index_build_in_flight(&mut tx, &row.table_id, &input.table_name)
-                .await?;
+            Self::refuse_if_index_build_in_flight(&mut tx, &row.table_id).await?;
             sqlx::query("DELETE FROM tags WHERE resource_arn = ?")
                 .bind(&table_arn)
                 .execute(&mut *tx)
@@ -115,8 +114,7 @@ impl SqliteEngine {
             // the transaction that flips the table to DELETING for the same
             // reason: without it, a build committing between an earlier check
             // and this flip would have its table deleted underneath it.
-            Self::refuse_if_index_build_in_flight(&mut tx, &row.table_id, &input.table_name)
-                .await?;
+            Self::refuse_if_index_build_in_flight(&mut tx, &row.table_id).await?;
             sqlx::query(
                 "UPDATE tables SET table_status = 'DELETING', status_transition_at = ? \
                  WHERE account_id = ? AND table_name = ?",
@@ -147,7 +145,6 @@ impl SqliteEngine {
     async fn refuse_if_index_build_in_flight(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         table_id: &str,
-        table_name: &str,
     ) -> Result<(), StorageError> {
         let in_flight: Option<(i64,)> = sqlx::query_as(
             "SELECT 1 FROM vector_indexes WHERE table_id = ? AND backfilling IS NOT NULL LIMIT 1",
@@ -157,7 +154,16 @@ impl SqliteEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
         if in_flight.is_some() {
-            return Err(StorageError::IndexesInUse(table_name.to_owned()));
+            // The sentence AWS documents for this refusal, quoted in the vector
+            // search tutorial's readiness callout and pinned by the ground-truth
+            // runs of 2026-08-24 (us-east-1 and eu-west-2). Composed here rather
+            // than in the engine map because the variant carries the whole
+            // client-facing message: only the backend knows which in-use state
+            // it refused for.
+            return Err(StorageError::IndexesInUse(
+                "Cannot delete table while indexes are being created, updated, or deleted."
+                    .to_owned(),
+            ));
         }
         Ok(())
     }
