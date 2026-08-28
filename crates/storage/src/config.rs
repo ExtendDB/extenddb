@@ -23,6 +23,19 @@ pub trait StorageConfig: Send + Sync + std::fmt::Debug {
     /// Clone this config into a boxed trait object.
     fn clone_box(&self) -> Box<dyn StorageConfig>;
 
+    /// Set the server instance identifier for this backend.
+    ///
+    /// Called by the server before constructing the storage engine, passing
+    /// a stable unique identifier for this server process (typically the
+    /// bind address, e.g. "192.168.1.1:18443"). Backends that need per-instance
+    /// identity (e.g. for HLC node IDs) implement this; others can ignore it.
+    fn set_instance_id(&mut self, _instance_id: &str) {}
+
+    /// Return the instance identifier set via `set_instance_id`, if any.
+    fn instance_id(&self) -> Option<&str> {
+        None
+    }
+
     /// Enable downcasting to specific storage engine config types to allow
     /// access to engine-specific configuration (e.g. `keyspace_prefix` for
     /// the Cassandra backend).

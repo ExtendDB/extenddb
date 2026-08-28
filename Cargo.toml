@@ -9,6 +9,7 @@ members = [
     "crates/storage",
     "crates/config",
     "crates/storage-postgres",
+    "crates/storage-cassandra",
     "crates/storage-mongodb",
     "crates/storage-sqlite",
     "crates/auth",
@@ -30,8 +31,9 @@ extenddb-cache = { path = "crates/cache" }
 extenddb-engine = { path = "crates/engine" }
 extenddb-storage = { path = "crates/storage" }
 extenddb-config = { path = "crates/config" }
-extenddb-storage-postgres = { path = "crates/storage-postgres" }
+extenddb-storage-cassandra = { path = "crates/storage-cassandra" }
 extenddb-storage-mongodb = { path = "crates/storage-mongodb" }
+extenddb-storage-postgres = { path = "crates/storage-postgres" }
 extenddb-storage-sqlite = { path = "crates/storage-sqlite" }
 extenddb-auth = { path = "crates/auth" }
 extenddb-server = { path = "crates/server" }
@@ -63,6 +65,7 @@ urlencoding = { version = "2.1" }
 moka = { version = "0.12", features = ["future"] }
 
 # Database
+cdrs-tokio = { version = "9.0", features = ["derive"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "json", "time", "uuid", "bigdecimal", "derive"] }
 # Vector column type for the PostgreSQL backend. The `sqlx` feature gives a typed
 # `Vector` that encodes and decodes pgvector's binary format, so embeddings keep
@@ -82,6 +85,7 @@ aes-gcm = "0.10"
 rand = "0.9"
 
 # Time
+chrono = "0.4"
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 
 # TLS

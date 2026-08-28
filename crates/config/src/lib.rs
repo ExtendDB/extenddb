@@ -150,6 +150,11 @@ impl StorageConfig {
     pub fn as_trait(&self) -> &dyn extenddb_storage::config::StorageConfig {
         &*self.config
     }
+
+    /// Set the instance identifier on the underlying config.
+    pub fn set_instance_id(&mut self, instance_id: &str) {
+        self.config.set_instance_id(instance_id);
+    }
 }
 
 impl<'de> serde::Deserialize<'de> for StorageConfig {

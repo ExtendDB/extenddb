@@ -11,25 +11,29 @@
 //!
 //! In-tree backends are selected by mutually exclusive Cargo features:
 //! `postgres` (the default production backend), `mongodb` (production, built with
-//! `--no-default-features --features mongodb`), and `sqlite`/`sqlite-memory` (the
-//! dev/CI backend). Exactly one must be enabled: [`set_backend`] installs one
+//! `--no-default-features --features mongodb`), `cassandra`, and `sqlite`/`sqlite-memory`
+//! (the dev/CI backend). Exactly one must be enabled: [`set_backend`] installs one
 //! backend per process, so a build with more than one would be ambiguous and is
 //! rejected at compile time.
 
 // Exactly one backend feature must be enabled.
 #[cfg(any(
-    all(feature = "postgres", feature = "sqlite"),
+    all(feature = "postgres", feature = "cassandra"),
     all(feature = "postgres", feature = "mongodb"),
+    all(feature = "postgres", feature = "sqlite"),
+    all(feature = "sqlite", feature = "cassandra"),
     all(feature = "sqlite", feature = "mongodb"),
+    all(feature = "cassandra", feature = "mongodb"),
 ))]
 compile_error!(
-    "the `postgres`, `mongodb`, and `sqlite` features are mutually exclusive: a \
-     thin bin installs exactly one backend (e.g. build the MongoDB binary with \
-     `--no-default-features --features mongodb`)"
+    "the `postgres`, `mongodb`, `sqlite`, and `cassandra` features are mutually exclusive: \
+     a thin bin installs exactly one backend (e.g. build the MongoDB binary with \
+     `--no-default-features --features mongodb)"
 );
-#[cfg(not(any(feature = "postgres", feature = "mongodb", feature = "sqlite")))]
+
+#[cfg(not(any(feature = "postgres", feature = "mongodb", feature = "sqlite", feature = "cassandra")))]
 compile_error!(
-    "no backend selected: enable the `postgres` (default), `mongodb`, or `sqlite` feature"
+    "no backend selected: enable the `postgres` (default), `mongodb`, `sqlite` or `cassandra` feature"
 );
 
 // Developer mode relaxes the security posture (plain HTTP on loopback, open
@@ -51,12 +55,14 @@ fn main() -> anyhow::Result<()> {
     // Install the compiled-in backend before dispatch. The compiler checks this
     // call; there is no link-time auto-registration and no name to resolve, so a
     // missing or mistyped backend cannot become a runtime error.
+    #[cfg(feature = "cassandra")]
+    extenddb_storage::set_backend(extenddb_storage_cassandra::backend())?;
+    #[cfg(feature = "mongodb")]
+    extenddb_storage::set_backend(extenddb_storage_mongodb::backend())?;
     #[cfg(feature = "postgres")]
     extenddb_storage::set_backend(extenddb_storage_postgres::backend())?;
     #[cfg(feature = "sqlite")]
     extenddb_storage::set_backend(extenddb_storage_sqlite::backend())?;
-    #[cfg(feature = "mongodb")]
-    extenddb_storage::set_backend(extenddb_storage_mongodb::backend())?;
 
     extenddb_app::run(extenddb_app::BuildInfo {
         // Read from the bin crate so the reported version is the deployed
@@ -71,12 +77,14 @@ fn main() -> anyhow::Result<()> {
 mod tests {
     /// Install this binary's backend once for the test process.
     fn install_backend() {
+        #[cfg(feature = "cassandra")]
+        let _ = extenddb_storage::set_backend(extenddb_storage_cassandra::backend());
+        #[cfg(feature = "mongodb")]
+        let _ = extenddb_storage::set_backend(extenddb_storage_mongodb::backend());
         #[cfg(feature = "postgres")]
         let _ = extenddb_storage::set_backend(extenddb_storage_postgres::backend());
         #[cfg(feature = "sqlite")]
         let _ = extenddb_storage::set_backend(extenddb_storage_sqlite::backend());
-        #[cfg(feature = "mongodb")]
-        let _ = extenddb_storage::set_backend(extenddb_storage_mongodb::backend());
     }
 
     /// Zero-config serve contract: with the SQLite backend installed,

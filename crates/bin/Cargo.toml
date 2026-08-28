@@ -14,6 +14,7 @@ path = "src/main.rs"
 [features]
 default = ["postgres"]
 postgres = ["extenddb-storage-postgres"]
+cassandra = ["extenddb-storage-cassandra"]
 sqlite = ["extenddb-storage-sqlite"]
 # Build the SQLite backend in its zero-config, ephemeral in-memory mode.
 sqlite-memory = ["sqlite", "extenddb-storage-sqlite/memory"]
@@ -27,8 +28,9 @@ dev-mode = ["extenddb-app/dev-mode"]
 [dependencies]
 extenddb-app = { workspace = true }
 extenddb-storage = { workspace = true }
-extenddb-storage-postgres = { workspace = true, optional = true }
+extenddb-storage-cassandra = { workspace = true, optional = true }
 extenddb-storage-mongodb = { workspace = true, optional = true }
+extenddb-storage-postgres = { workspace = true, optional = true }
 extenddb-storage-sqlite = { workspace = true, optional = true }
 anyhow = { workspace = true }
 extenddb-config = { workspace = true }
