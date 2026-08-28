@@ -26,8 +26,7 @@ impl CassandraCatalogStore {
         } else {
             let catalog_keyspace = self.catalog_keyspace();
             let query = format!(
-                "SELECT value FROM {}.settings WHERE key = 'encryption_key'",
-                catalog_keyspace
+                "SELECT value FROM {catalog_keyspace}.settings WHERE key = 'encryption_key'"
             );
 
             let row = crate::cassandra_util::query_optional(
@@ -51,9 +50,8 @@ impl CassandraCatalogStore {
 
         let catalog_keyspace = self.catalog_keyspace();
         let insert_query = format!(
-            "INSERT INTO {}.access_keys (access_key_id, account_id, user_name, secret_key_encrypted, is_active, created_at) \
-             VALUES (?, ?, ?, ?, true, toTimestamp(now()))",
-            catalog_keyspace
+            "INSERT INTO {catalog_keyspace}.access_keys (access_key_id, account_id, user_name, secret_key_encrypted, is_active, created_at) \
+             VALUES (?, ?, ?, ?, true, toTimestamp(now()))"
         );
 
         let encrypted_blob = cdrs_tokio::types::blob::Blob::new(encrypted);
@@ -90,9 +88,8 @@ impl CassandraCatalogStore {
 
         // Check if key exists and belongs to the correct account/user
         let check_query = format!(
-            "SELECT access_key_id, account_id, user_name FROM {}.access_keys \
-             WHERE access_key_id = ?",
-            catalog_keyspace
+            "SELECT access_key_id, account_id, user_name FROM {catalog_keyspace}.access_keys \
+             WHERE access_key_id = ?"
         );
 
         let row = crate::cassandra_util::query_optional(
@@ -120,8 +117,7 @@ impl CassandraCatalogStore {
 
         // Delete the key (by PRIMARY KEY only)
         let delete_query = format!(
-            "DELETE FROM {}.access_keys WHERE access_key_id = ?",
-            catalog_keyspace
+            "DELETE FROM {catalog_keyspace}.access_keys WHERE access_key_id = ?"
         );
 
         crate::cassandra_util::execute(
@@ -140,9 +136,8 @@ impl CassandraCatalogStore {
     ) -> OpResult<Vec<(String, bool, time::OffsetDateTime)>> {
         let catalog_keyspace = self.catalog_keyspace();
         let query = format!(
-            "SELECT access_key_id, is_active, created_at FROM {}.access_keys \
-             WHERE account_id = ? AND user_name = ? ALLOW FILTERING",
-            catalog_keyspace
+            "SELECT access_key_id, is_active, created_at FROM {catalog_keyspace}.access_keys \
+             WHERE account_id = ? AND user_name = ? ALLOW FILTERING"
         );
 
         let rows = crate::cassandra_util::query_rows(
@@ -190,8 +185,7 @@ impl CassandraCatalogStore {
         } else {
             let catalog_keyspace = self.catalog_keyspace();
             let query = format!(
-                "SELECT value FROM {}.settings WHERE key = 'encryption_key'",
-                catalog_keyspace
+                "SELECT value FROM {catalog_keyspace}.settings WHERE key = 'encryption_key'"
             );
 
             let row = crate::cassandra_util::query_optional(
@@ -260,8 +254,8 @@ impl CassandraCatalogStore {
             self.catalog_keyspace()
         );
 
-        let session_tags_json = session_tags.as_ref().map(|v| v.to_string());
-        let session_policy_json = session_policy.as_ref().map(|v| v.to_string());
+        let session_tags_json = session_tags.as_ref().map(std::string::ToString::to_string);
+        let session_policy_json = session_policy.as_ref().map(std::string::ToString::to_string);
         let expires_ms = expires_at.unix_timestamp() * 1000 + i64::from(expires_at.millisecond());
 
         crate::cassandra_util::execute(

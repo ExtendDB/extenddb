@@ -107,8 +107,7 @@ impl CassandraCatalogStore {
             .await
             .ok()
             .and_then(|r| r.response_body().ok())
-            .map(|b| !b.into_rows().unwrap_or_default().is_empty())
-            .unwrap_or(false);
+            .is_some_and(|b| !b.into_rows().unwrap_or_default().is_empty());
 
         if exists_result {
             // Keyspace exists but may have been created by a concurrent caller that
@@ -153,7 +152,7 @@ impl CassandraCatalogStore {
     /// Drop an account keyspace (idempotent).
     pub(crate) async fn drop_account_keyspace(&self, account_id: &str) -> OpResult<()> {
         let keyspace_name = self.account_keyspace(account_id);
-        let cql = format!("DROP KEYSPACE IF EXISTS {}", keyspace_name);
+        let cql = format!("DROP KEYSPACE IF EXISTS {keyspace_name}");
 
         self.session.query(cql).await.map_err(|e| {
             tracing::error!("Failed to drop account keyspace {}: {}", keyspace_name, e);
@@ -167,8 +166,7 @@ impl CassandraCatalogStore {
     pub(crate) async fn account_exists(&self, account_id: &str) -> Result<bool, OpError> {
         let catalog_keyspace = self.catalog_keyspace();
         let query = format!(
-            "SELECT account_id FROM {}.accounts WHERE account_id = ?",
-            catalog_keyspace
+            "SELECT account_id FROM {catalog_keyspace}.accounts WHERE account_id = ?"
         );
 
         let rows = crate::cassandra_util::query_rows(
@@ -190,8 +188,7 @@ impl CassandraCatalogStore {
     ) -> Result<bool, OpError> {
         let catalog_keyspace = self.catalog_keyspace();
         let query = format!(
-            "SELECT user_name FROM {}.iam_users WHERE account_id = ? AND user_name = ?",
-            catalog_keyspace
+            "SELECT user_name FROM {catalog_keyspace}.iam_users WHERE account_id = ? AND user_name = ?"
         );
 
         let rows = crate::cassandra_util::query_rows(
@@ -215,8 +212,7 @@ impl extenddb_storage::management_store::SettingsStore for CassandraCatalogStore
         let catalog_keyspace = self.catalog_keyspace();
         Box::pin(async move {
             let query = format!(
-                "SELECT value FROM {}.settings WHERE key = ?",
-                catalog_keyspace
+                "SELECT value FROM {catalog_keyspace}.settings WHERE key = ?"
             );
 
             let row = crate::cassandra_util::query_optional(
@@ -244,8 +240,7 @@ impl extenddb_storage::management_store::SettingsStore for CassandraCatalogStore
         let catalog_keyspace = self.catalog_keyspace();
         Box::pin(async move {
             let query = format!(
-                "INSERT INTO {}.settings (key, value) VALUES (?, ?)",
-                catalog_keyspace
+                "INSERT INTO {catalog_keyspace}.settings (key, value) VALUES (?, ?)"
             );
 
             crate::cassandra_util::execute(
@@ -262,7 +257,7 @@ impl extenddb_storage::management_store::SettingsStore for CassandraCatalogStore
         let session = self.session.clone();
         let catalog_keyspace = self.catalog_keyspace();
         Box::pin(async move {
-            let query = format!("SELECT key, value FROM {}.settings", catalog_keyspace);
+            let query = format!("SELECT key, value FROM {catalog_keyspace}.settings");
 
             let rows = crate::cassandra_util::query_rows(
                 &session,
@@ -291,7 +286,7 @@ impl extenddb_storage::management_store::SettingsStore for CassandraCatalogStore
     }
 
     fn cached_encryption_key(&self) -> Option<String> {
-        self.encryption_key.as_ref().map(|k| k.to_string())
+        self.encryption_key.as_ref().map(std::string::ToString::to_string)
     }
 }
 
@@ -302,7 +297,7 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for CassandraCatalogStore {
         let session = self.session.clone();
         let catalog_keyspace = self.catalog_keyspace();
         Box::pin(async move {
-            let query = format!("SELECT COUNT(*) FROM {}.tables", catalog_keyspace);
+            let query = format!("SELECT COUNT(*) FROM {catalog_keyspace}.tables");
             let result = session.query(&query).await.map_err(|e| {
                 extenddb_storage::diagnostics::DiagError::QueryFailed(e.to_string())
             })?;
@@ -327,7 +322,7 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for CassandraCatalogStore {
         let session = self.session.clone();
         let catalog_keyspace = self.catalog_keyspace();
         Box::pin(async move {
-            let query = format!("SELECT COUNT(*) FROM {}.indexes", catalog_keyspace);
+            let query = format!("SELECT COUNT(*) FROM {catalog_keyspace}.indexes");
             let result = session.query(&query).await.map_err(|e| {
                 extenddb_storage::diagnostics::DiagError::QueryFailed(e.to_string())
             })?;
@@ -358,13 +353,11 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for CassandraCatalogStore {
             // For Cassandra, we test connection to account keyspaces
             // Get a sample account keyspace name from accounts table
             let query = format!(
-                "SELECT account_id FROM {}.accounts LIMIT 1",
-                catalog_keyspace
+                "SELECT account_id FROM {catalog_keyspace}.accounts LIMIT 1"
             );
             let result = session.query(&query).await.map_err(|e| {
                 extenddb_storage::diagnostics::DiagError::QueryFailed(format!(
-                    "Failed to query accounts: {}",
-                    e
+                    "Failed to query accounts: {e}"
                 ))
             })?;
 
@@ -379,14 +372,13 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for CassandraCatalogStore {
                     })?;
 
                     // Test connection to account keyspace by querying schema_history
-                    let account_keyspace = format!("{}_account_{}", keyspace_prefix, account_id);
+                    let account_keyspace = format!("{keyspace_prefix}_account_{account_id}");
                     let test_query =
-                        format!("SELECT COUNT(*) FROM {}.schema_history", account_keyspace);
+                        format!("SELECT COUNT(*) FROM {account_keyspace}.schema_history");
 
                     session.query(&test_query).await.map_err(|e| {
                         extenddb_storage::diagnostics::DiagError::ConnectionFailed(format!(
-                            "Failed to query account keyspace {}: {}",
-                            account_keyspace, e
+                            "Failed to query account keyspace {account_keyspace}: {e}"
                         ))
                     })?;
 
@@ -453,6 +445,6 @@ impl MetricsStore for CassandraCatalogStore {
 
 impl extenddb_storage::CatalogStore for CassandraCatalogStore {
     fn cached_encryption_key(&self) -> Option<String> {
-        self.encryption_key.as_ref().map(|k| k.to_string())
+        self.encryption_key.as_ref().map(std::string::ToString::to_string)
     }
 }

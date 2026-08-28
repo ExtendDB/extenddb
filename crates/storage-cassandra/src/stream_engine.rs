@@ -469,7 +469,7 @@ impl StreamEngine for CassandraEngine {
         let seq = self
             .hlc
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .generate();
         Box::pin(async move { Ok(seq) })
     }
@@ -543,8 +543,7 @@ impl StreamEngine for CassandraEngine {
                 .response_body()
                 .map_err(|e| StorageError::Internal(e.to_string()))?
                 .into_rows()
-                .map(|r| !r.is_empty())
-                .unwrap_or(false);
+                .is_some_and(|r| !r.is_empty());
 
             if !found {
                 return Err(StorageError::TableNotFound(format!(

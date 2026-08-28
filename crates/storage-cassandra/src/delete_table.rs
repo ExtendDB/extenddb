@@ -19,8 +19,7 @@ impl CassandraEngine {
 
         // Fetch table metadata before deletion
         let table_query = format!(
-            "SELECT * FROM {}.tables WHERE account_id = ? AND table_name = ?",
-            catalog_keyspace
+            "SELECT * FROM {catalog_keyspace}.tables WHERE account_id = ? AND table_name = ?"
         );
 
         let table_result = self
@@ -30,7 +29,7 @@ impl CassandraEngine {
                 cdrs_tokio::query_values!(account_id, input.table_name.as_str()),
             )
             .await
-            .map_err(|e| StorageError::Internal(format!("Query table: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Query table: {e}")))?;
 
         let table_body = table_result
             .response_body()
@@ -52,25 +51,24 @@ impl CassandraEngine {
         if deletion_protection {
             let table_arn: String = table_row
                 .get_r_by_name("table_arn")
-                .map_err(|e| StorageError::Internal(format!("Parse table_arn: {}", e)))?;
+                .map_err(|e| StorageError::Internal(format!("Parse table_arn: {e}")))?;
             return Err(StorageError::DeletionProtected(table_arn));
         }
 
         let table_id: String = table_row
             .get_r_by_name("table_id")
-            .map_err(|e| StorageError::Internal(format!("Parse table_id: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Parse table_id: {e}")))?;
 
         // Fetch indexes for response
         let index_query = format!(
-            "SELECT * FROM {}.indexes WHERE table_id = ?",
-            catalog_keyspace
+            "SELECT * FROM {catalog_keyspace}.indexes WHERE table_id = ?"
         );
 
         let index_result = self
             .session
             .query_with_values(&index_query, cdrs_tokio::query_values!(table_id.as_str()))
             .await
-            .map_err(|e| StorageError::Internal(format!("Query indexes: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Query indexes: {e}")))?;
 
         let index_body = index_result
             .response_body()
@@ -93,7 +91,7 @@ impl CassandraEngine {
         for idx_row in &index_rows {
             let index_id: String = idx_row
                 .get_r_by_name("index_id")
-                .map_err(|e| StorageError::Internal(format!("Parse index_id: {}", e)))?;
+                .map_err(|e| StorageError::Internal(format!("Parse index_id: {e}")))?;
             self.drop_index_data_table(&account_keyspace, &index_id)
                 .await
                 .map_err(|e| StorageError::Internal(format!("Drop index table: {e}")))?;
@@ -101,8 +99,7 @@ impl CassandraEngine {
 
         // Delete catalog entries (indexes first due to FK)
         let delete_indexes_query = format!(
-            "DELETE FROM {}.indexes WHERE table_id = ?",
-            catalog_keyspace
+            "DELETE FROM {catalog_keyspace}.indexes WHERE table_id = ?"
         );
         self.session
             .query_with_values(
@@ -110,13 +107,12 @@ impl CassandraEngine {
                 cdrs_tokio::query_values!(table_id.as_str()),
             )
             .await
-            .map_err(|e| StorageError::Internal(format!("Delete indexes: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Delete indexes: {e}")))?;
 
         // Delete table-scoped continuous-backup configuration so recreating the
         // same table name does not inherit stale PITR state.
         let delete_continuous_backup_query = format!(
-            "DELETE FROM {}.continuous_backups WHERE account_id = ? AND table_name = ?",
-            catalog_keyspace
+            "DELETE FROM {catalog_keyspace}.continuous_backups WHERE account_id = ? AND table_name = ?"
         );
         self.session
             .query_with_values(
@@ -128,8 +124,7 @@ impl CassandraEngine {
 
         // Delete table catalog entry
         let delete_table_query = format!(
-            "DELETE FROM {}.tables WHERE account_id = ? AND table_name = ?",
-            catalog_keyspace
+            "DELETE FROM {catalog_keyspace}.tables WHERE account_id = ? AND table_name = ?"
         );
         self.session
             .query_with_values(
@@ -137,7 +132,7 @@ impl CassandraEngine {
                 cdrs_tokio::query_values!(account_id, input.table_name.as_str()),
             )
             .await
-            .map_err(|e| StorageError::Internal(format!("Delete table: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Delete table: {e}")))?;
 
         Ok(description)
     }

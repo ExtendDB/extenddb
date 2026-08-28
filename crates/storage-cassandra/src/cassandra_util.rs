@@ -18,7 +18,9 @@ pub type CassandraSession = Session<
 >;
 
 /// Trait for errors that can be constructed from database operation failures.
-/// Implemented by OpError, StorageError, and DynamoDbError.
+/// Implemented by [`extenddb_storage::management_store::OpError`],
+/// [`extenddb_storage::error::StorageError`], and
+/// [`extenddb_core::error::DynamoDbError`].
 pub trait FromDbError: Sized {
     fn db_error(msg: String) -> Self;
 }
@@ -43,12 +45,14 @@ impl FromDbError for extenddb_core::error::DynamoDbError {
 
 /// Check if an error is a unique constraint violation.
 /// For Cassandra, this is always false in stub implementations.
+#[must_use]
 pub fn is_unique_violation(_err: &cdrs_tokio::error::Error) -> bool {
     false
 }
 
 /// Check if an error is a foreign key constraint violation.
 /// For Cassandra, this is always false in stub implementations.
+#[must_use]
 pub fn is_fk_violation(_err: &cdrs_tokio::error::Error) -> bool {
     false
 }
@@ -59,16 +63,8 @@ pub fn is_fk_violation(_err: &cdrs_tokio::error::Error) -> bool {
 
 /// Execute a query and return all rows with standardized error handling.
 ///
-/// Generic over error type - works with OpError, StorageError, or DynamoDbError.
-///
-/// # Arguments
-/// * `session` - Cassandra session
-/// * `query` - CQL query string
-/// * `values` - Query parameters
-/// * `context` - Context string for error logging (e.g., "list_access_keys")
-///
-/// # Returns
-/// Vec of rows, or error if query fails
+/// # Errors
+/// Returns an error if the Cassandra query fails or the response cannot be parsed.
 pub async fn query_rows<E: FromDbError>(
     session: &Arc<CassandraSession>,
     query: &str,
@@ -93,17 +89,10 @@ pub async fn query_rows<E: FromDbError>(
 
 /// Execute a query and return the first row, if any.
 ///
-/// Generic over error type - works with OpError, StorageError, or DynamoDbError.
-/// Similar to sqlx::query().fetch_optional().
+/// Similar to `sqlx::query().fetch_optional()`.
 ///
-/// # Arguments
-/// * `session` - Cassandra session
-/// * `query` - CQL query string
-/// * `values` - Query parameters
-/// * `context` - Context string for error logging
-///
-/// # Returns
-/// Option<Row>, or error if query fails
+/// # Errors
+/// Returns an error if the Cassandra query fails or the response cannot be parsed.
 pub async fn query_optional<E: FromDbError>(
     session: &Arc<CassandraSession>,
     query: &str,
@@ -116,16 +105,8 @@ pub async fn query_optional<E: FromDbError>(
 
 /// Execute a non-query statement (INSERT/UPDATE/DELETE).
 ///
-/// Generic over error type - works with OpError, StorageError, or DynamoDbError.
-///
-/// # Arguments
-/// * `session` - Cassandra session
-/// * `query` - CQL statement
-/// * `values` - Query parameters
-/// * `context` - Context string for error logging
-///
-/// # Returns
-/// Ok(()) if successful, error if query fails
+/// # Errors
+/// Returns an error if the Cassandra statement fails.
 pub async fn execute<E: FromDbError>(
     session: &Arc<CassandraSession>,
     query: &str,
@@ -147,18 +128,10 @@ pub async fn execute<E: FromDbError>(
 // Type Conversion Helpers
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Extract a typed column value from a Row with standardized error handling.
+/// Extract a typed column value from a `Row` with standardized error handling.
 ///
-/// Generic over error type - works with OpError, StorageError, or DynamoDbError.
-/// The return type T must be specified at the call site.
-///
-/// # Arguments
-/// * `row` - Row to extract from
-/// * `column` - Column name
-/// * `context` - Context string for error logging
-///
-/// # Returns
-/// Typed value T, or error if parsing fails
+/// # Errors
+/// Returns an error if the column cannot be extracted or parsed as type `T`.
 ///
 /// # Example
 /// ```ignore
@@ -176,18 +149,12 @@ where
     })
 }
 
-/// Convert Cassandra timestamp (milliseconds) to OffsetDateTime.
+/// Convert a Cassandra timestamp (milliseconds since Unix epoch) to [`time::OffsetDateTime`].
 ///
-/// Generic over error type - works with OpError, StorageError, or DynamoDbError.
-/// Cassandra stores timestamps as milliseconds since Unix epoch.
-/// This helper divides by 1000 and converts to OffsetDateTime.
+/// Cassandra stores timestamps as milliseconds; this divides by 1000 before converting.
 ///
-/// # Arguments
-/// * `millis` - Timestamp in milliseconds
-/// * `context` - Context string for error logging
-///
-/// # Returns
-/// OffsetDateTime, or error if conversion fails
+/// # Errors
+/// Returns an error if the timestamp value is out of range.
 pub fn timestamp_to_datetime<E: FromDbError>(
     millis: i64,
     context: &str,
@@ -198,18 +165,12 @@ pub fn timestamp_to_datetime<E: FromDbError>(
     })
 }
 
-/// Extract a timestamp column and convert to OffsetDateTime.
+/// Extract a timestamp column and convert to [`time::OffsetDateTime`].
 ///
-/// Generic over error type - works with OpError, StorageError, or DynamoDbError.
-/// Convenience helper combining get_column + timestamp_to_datetime.
+/// Convenience helper combining `get_column` + `timestamp_to_datetime`.
 ///
-/// # Arguments
-/// * `row` - Row to extract from
-/// * `column` - Column name
-/// * `context` - Context string for error logging
-///
-/// # Returns
-/// OffsetDateTime, or error if extraction/conversion fails
+/// # Errors
+/// Returns an error if the column cannot be extracted or the timestamp is out of range.
 ///
 /// # Example
 /// ```ignore
@@ -224,28 +185,18 @@ pub fn get_timestamp<E: FromDbError>(
     timestamp_to_datetime(millis, context)
 }
 
-/// Map rows to Vec<T> with a mapper function, collecting errors.
+/// Map rows to `Vec<T>` with a mapper function, collecting errors.
 ///
-/// Generic over error type - works with OpError, StorageError, or DynamoDbError.
-/// Reduces boilerplate when transforming Vec<Row> to Vec<SomeType>.
-///
-/// # Arguments
-/// * `rows` - Rows to map
-/// * `mapper` - Function to transform each row
-/// * `context` - Context string for error logging
-///
-/// # Returns
-/// Vec<T>, or error if any mapping fails
+/// # Errors
+/// Returns an error if any row fails to map.
 ///
 /// # Example
 /// ```ignore
 /// let users = map_rows(rows, |row| {
-///     Ok((
-///         get_column(&row, "user_name", "list_users")?,
-///         get_column(&row, "email", "list_users")?,
-///     ))
+///     Ok(get_column(&row, "user_name", "list_users")?)
 /// }, "list_users")?;
 /// ```
+#[allow(clippy::needless_pass_by_value)] // Vec<Row> matches query_rows return type; &[Row] would require .as_slice() at 28 call sites
 pub fn map_rows<T, F, E: FromDbError>(
     rows: Vec<Row>,
     mapper: F,
@@ -257,10 +208,29 @@ where
     rows.iter().map(mapper).collect()
 }
 
-/// Execute an LWT statement and return whether it was applied.
+/// Convert millisecond timestamp to seconds as `f64` (for `creation_date_time` fields).
+#[allow(clippy::cast_precision_loss)]
+pub fn millis_to_seconds_f64(timestamp_millis: i64) -> f64 {
+    timestamp_millis as f64 / 1_000.0
+}
+
+/// Return the current time as milliseconds since Unix epoch as `i64`.
+///
+/// `SystemTime::as_millis()` returns `u128`; this cast is safe for all
+/// timestamps within the range of `i64` (until year 292,277,026).
+#[allow(clippy::cast_possible_truncation)]
+pub fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
 ///
 /// Parses the `[applied]` column from the Cassandra LWT response.
 /// Use for `INSERT ... IF NOT EXISTS` and `UPDATE ... IF ...` statements.
+///
+/// # Errors
+/// Returns an error if the Cassandra statement fails or the response cannot be parsed.
 pub async fn apply_lwt<E: FromDbError>(
     session: &Arc<CassandraSession>,
     query: &str,

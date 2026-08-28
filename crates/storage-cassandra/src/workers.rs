@@ -92,6 +92,7 @@ pub(crate) async fn poll_transaction_recovery(
     loop {
         tokio::time::sleep(scan_interval).await;
 
+        #[allow(clippy::cast_possible_truncation)]
         let cutoff = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -257,6 +258,8 @@ async fn gsi_process_batch(
 
     let keyspaces = list_account_keyspaces(engine).await?;
     let mut total = 0usize;
+    #[allow(clippy::cast_possible_truncation)]
+    let worker_id_i32 = worker_id as i32;
 
     for keyspace in &keyspaces {
         let query = format!(
@@ -270,7 +273,7 @@ async fn gsi_process_batch(
         let rows = match crate::cassandra_util::query_rows::<extenddb_storage::error::StorageError>(
             &engine.session,
             &query,
-            query_values!(worker_id as i32),
+            query_values!(worker_id_i32),
             "gsi_worker",
         )
         .await
@@ -341,7 +344,7 @@ async fn gsi_process_batch(
             crate::cassandra_util::execute(
                 &engine.session,
                 &delete_cql,
-                query_values!(worker_id as i32, ready_at, id),
+                query_values!(worker_id_i32, ready_at, id),
                 "gsi_worker_delete",
             )
             .await?;

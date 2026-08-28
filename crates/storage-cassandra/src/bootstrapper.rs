@@ -82,7 +82,7 @@ impl CassandraBootstrapper {
         )
         .exists()
         {
-            println!("--- Loading defaults from {}", config_path);
+            println!("--- Loading defaults from {config_path}");
 
             // Parse Cassandra config from file
             let config_content = std::fs::read_to_string(config_path)
@@ -109,7 +109,7 @@ impl CassandraBootstrapper {
             if let Some(ref cli_cp) = cassandra_contact_points {
                 let cli_list: Vec<&str> = cli_cp.split(',').collect();
                 let config_list: Vec<&str> =
-                    config.contact_points.iter().map(|s| s.as_str()).collect();
+                    config.contact_points.iter().map(std::string::String::as_str).collect();
                 if cli_list != config_list {
                     return Err(StorageError::Internal(format!(
                         "--cassandra-contact-points '{}' conflicts with config file contact points '{}'",
@@ -144,8 +144,7 @@ impl CassandraBootstrapper {
             if let Some(ref cli_rf) = replication_factor {
                 let cli_rf_val = cli_rf.parse::<u32>().map_err(|_| {
                     StorageError::Internal(format!(
-                        "Invalid --replication-factor '{}': must be a positive integer",
-                        cli_rf
+                        "Invalid --replication-factor '{cli_rf}': must be a positive integer"
                     ))
                 })?;
                 if cli_rf_val != config.replication_factor {
@@ -178,14 +177,12 @@ impl CassandraBootstrapper {
 
         // CLI args override config (or use config values if no CLI arg provided)
         let resolved_contact_points = cassandra_contact_points
-            .map(|cp| cp.split(',').map(|s| s.to_string()).collect())
-            .unwrap_or(contact_points);
+            .map_or(contact_points, |cp| cp.split(',').map(std::string::ToString::to_string).collect());
         let resolved_admin_user = cassandra_user
             .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "cassandra".to_owned()));
         let resolved_keyspace_prefix = keyspace_prefix.unwrap_or(prefix);
         let resolved_replication_factor = replication_factor
-            .map(|rf| rf.parse::<u32>().unwrap_or(1))
-            .unwrap_or(rf_from_config);
+            .map_or(rf_from_config, |rf| rf.parse::<u32>().unwrap_or(1));
         let resolved_app_user = extenddb_user.unwrap_or(user);
         let resolved_app_password = extenddb_pass.unwrap_or(password);
 
@@ -209,7 +206,7 @@ impl CassandraBootstrapper {
             admin_password: cassandra_pass.clone(),
             app_user: resolved_app_user,
             app_password: resolved_app_password,
-            catalog_db: format!("{}_catalog", resolved_keyspace_prefix),
+            catalog_db: format!("{resolved_keyspace_prefix}_catalog"),
             data_db: String::new(), // Not used for Cassandra
         };
 
@@ -250,9 +247,8 @@ impl Bootstrapper for CassandraBootstrapper {
             .await
             .ok()
             .and_then(|frame| frame.response_body().ok())
-            .and_then(|body| body.into_rows())
-            .map(|rows| !rows.is_empty())
-            .unwrap_or(false);
+            .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
+            .is_some_and(|rows| !rows.is_empty());
 
         if exists {
             println!("    User '{user}' already exists.");
@@ -273,14 +269,13 @@ impl Bootstrapper for CassandraBootstrapper {
 
         // Create user with password
         let create_cql = format!(
-            "CREATE ROLE IF NOT EXISTS '{}' WITH PASSWORD = '{}' AND LOGIN = true",
-            user, password
+            "CREATE ROLE IF NOT EXISTS '{user}' WITH PASSWORD = '{password}' AND LOGIN = true"
         );
         self.engine
             .session()
             .query(create_cql)
             .await
-            .map_err(|e| OpError::Internal(format!("Create user: {}", e)))?;
+            .map_err(|e| OpError::Internal(format!("Create user: {e}")))?;
 
         println!("    Created user '{user}'.");
         Ok(())
@@ -307,9 +302,8 @@ impl Bootstrapper for CassandraBootstrapper {
             .await
             .ok()
             .and_then(|frame| frame.response_body().ok())
-            .and_then(|body| body.into_rows())
-            .map(|rows| !rows.is_empty())
-            .unwrap_or(false);
+            .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
+            .is_some_and(|rows| !rows.is_empty());
 
         if already_granted {
             return Ok(());
@@ -330,7 +324,7 @@ impl Bootstrapper for CassandraBootstrapper {
 
     async fn create_catalog_db(&self) -> OpResult<()> {
         let keyspace = self.engine.catalog_keyspace();
-        println!("--- Creating catalog keyspace '{}'...", keyspace);
+        println!("--- Creating catalog keyspace '{keyspace}'...");
 
         if self
             .engine
@@ -414,8 +408,7 @@ impl Bootstrapper for CassandraBootstrapper {
 
         // Check if key already exists
         let check_cql = format!(
-            "SELECT value FROM {}.settings WHERE key = 'encryption_key'",
-            keyspace
+            "SELECT value FROM {keyspace}.settings WHERE key = 'encryption_key'"
         );
         let exists = self
             .engine
@@ -424,9 +417,8 @@ impl Bootstrapper for CassandraBootstrapper {
             .await
             .ok()
             .and_then(|frame| frame.response_body().ok())
-            .and_then(|body| body.into_rows())
-            .map(|rows| !rows.is_empty())
-            .unwrap_or(false);
+            .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
+            .is_some_and(|rows| !rows.is_empty());
 
         if exists {
             println!("--- Encryption key already exists, skipping.");
@@ -437,8 +429,7 @@ impl Bootstrapper for CassandraBootstrapper {
 
         // Store key
         let insert_cql = format!(
-            "INSERT INTO {}.settings (key, value) VALUES (?, ?)",
-            keyspace
+            "INSERT INTO {keyspace}.settings (key, value) VALUES (?, ?)"
         );
         self.engine
             .session()
@@ -457,7 +448,7 @@ impl Bootstrapper for CassandraBootstrapper {
         let keyspace = self.engine.catalog_keyspace();
 
         // Check if any accounts exist
-        let check_cql = format!("SELECT account_id FROM {}.accounts LIMIT 1", keyspace);
+        let check_cql = format!("SELECT account_id FROM {keyspace}.accounts LIMIT 1");
         let has_accounts = self
             .engine
             .session()
@@ -465,9 +456,8 @@ impl Bootstrapper for CassandraBootstrapper {
             .await
             .ok()
             .and_then(|frame| frame.response_body().ok())
-            .and_then(|body| body.into_rows())
-            .map(|rows| !rows.is_empty())
-            .unwrap_or(false);
+            .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
+            .is_some_and(|rows| !rows.is_empty());
 
         if has_accounts {
             println!("--- Default account already exists, skipping.");
@@ -480,8 +470,7 @@ impl Bootstrapper for CassandraBootstrapper {
         let account_name = "default";
 
         let insert_cql = format!(
-            "INSERT INTO {}.accounts (account_id, account_name, created_at) VALUES (?, ?, toTimestamp(now()))",
-            keyspace
+            "INSERT INTO {keyspace}.accounts (account_id, account_name, created_at) VALUES (?, ?, toTimestamp(now()))"
         );
 
         self.engine
@@ -522,8 +511,7 @@ impl Bootstrapper for CassandraBootstrapper {
 
         // Check if user exists
         let check_cql = format!(
-            "SELECT admin_name FROM {}.admin_users WHERE admin_name = ?",
-            keyspace
+            "SELECT admin_name FROM {keyspace}.admin_users WHERE admin_name = ?"
         );
         let exists = self
             .engine
@@ -532,9 +520,8 @@ impl Bootstrapper for CassandraBootstrapper {
             .await
             .ok()
             .and_then(|frame| frame.response_body().ok())
-            .and_then(|body| body.into_rows())
-            .map(|rows| !rows.is_empty())
-            .unwrap_or(false);
+            .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
+            .is_some_and(|rows| !rows.is_empty());
 
         if exists {
             println!("--- Admin user '{username}' already exists, skipping.");
@@ -560,8 +547,7 @@ impl Bootstrapper for CassandraBootstrapper {
 
         // Insert admin user
         let insert_cql = format!(
-            "INSERT INTO {}.admin_users (admin_name, password_hash) VALUES (?, ?)",
-            keyspace
+            "INSERT INTO {keyspace}.admin_users (admin_name, password_hash) VALUES (?, ?)"
         );
 
         self.engine
@@ -592,14 +578,13 @@ impl Bootstrapper for CassandraBootstrapper {
         let keyspace = self.engine.catalog_keyspace();
 
         let cql = format!(
-            "SELECT table_name FROM {}.tables ORDER BY table_name",
-            keyspace
+            "SELECT table_name FROM {keyspace}.tables ORDER BY table_name"
         );
         let rows = match self.engine.session().query(cql).await {
             Ok(frame) => frame
                 .response_body()
                 .ok()
-                .and_then(|body| body.into_rows())
+                .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
                 .unwrap_or_default(),
             Err(_) => return Ok(Vec::new()),
         };
@@ -653,7 +638,7 @@ impl Bootstrapper for CassandraBootstrapper {
             .collect();
 
         for keyspace in keyspaces {
-            println!("    Dropping keyspace: {}", keyspace);
+            println!("    Dropping keyspace: {keyspace}");
             self.engine
                 .drop_keyspace(&keyspace)
                 .await
@@ -672,8 +657,7 @@ impl Bootstrapper for CassandraBootstrapper {
         }
 
         let query = format!(
-            "SELECT value FROM {}.settings WHERE key = 'catalog_version'",
-            keyspace
+            "SELECT value FROM {keyspace}.settings WHERE key = 'catalog_version'"
         );
         let version = self
             .engine
@@ -682,7 +666,7 @@ impl Bootstrapper for CassandraBootstrapper {
             .await
             .ok()
             .and_then(|frame| frame.response_body().ok())
-            .and_then(|body| body.into_rows())
+            .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
             .and_then(|mut rows| rows.pop())
             .and_then(|row| TryFromRowTrait::try_from_row(row).ok())
             .map(|r: SettingRow| r.value);

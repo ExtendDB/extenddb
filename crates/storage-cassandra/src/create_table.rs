@@ -122,8 +122,7 @@ impl CassandraEngine {
         // Read control_plane_delay_seconds from settings
         let catalog_keyspace = self.catalog_keyspace();
         let delay_query = format!(
-            "SELECT value FROM {}.settings WHERE key = ?",
-            catalog_keyspace
+            "SELECT value FROM {catalog_keyspace}.settings WHERE key = ?"
         );
         let delay_seconds: f64 = self
             .session
@@ -134,7 +133,7 @@ impl CassandraEngine {
             .await
             .ok()
             .and_then(|frame| frame.response_body().ok())
-            .and_then(|body| body.into_rows())
+            .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
             .and_then(|rows| rows.first().cloned())
             .and_then(|row| {
                 use cdrs_tokio::types::IntoRustByName;
@@ -150,8 +149,9 @@ impl CassandraEngine {
         } else if delay_seconds == 0.0 {
             ("ACTIVE", None)
         } else {
-            let transition_at = chrono::Utc::now()
-                + chrono::Duration::milliseconds((delay_seconds * 1000.0) as i64);
+            #[allow(clippy::cast_possible_truncation)]
+            let delay_ms = (delay_seconds * 1000.0) as i64;
+            let transition_at = chrono::Utc::now() + chrono::Duration::milliseconds(delay_ms);
             ("CREATING", Some(transition_at.timestamp_millis()))
         };
 
@@ -161,18 +161,16 @@ impl CassandraEngine {
         let account_keyspace = self.account_keyspace(account_id);
         if !self.keyspace_exists(&account_keyspace).await? {
             return Err(StorageError::Internal(format!(
-                "Account keyspace '{}' does not exist. Account must be provisioned first.",
-                account_keyspace
+                "Account keyspace '{account_keyspace}' does not exist. Account must be provisioned first."
             )));
         }
 
         // Insert table metadata with LWT (IF NOT EXISTS)
         let insert_table_cql = format!(
-            "INSERT INTO {}.tables (account_id, table_name, table_id, table_arn, key_schema, \
+            "INSERT INTO {catalog_keyspace}.tables (account_id, table_name, table_id, table_arn, key_schema, \
              attribute_definitions, billing_mode, provisioned_throughput, stream_specification, \
              table_status, created_at, deletion_protection_enabled, status_transition_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS",
-            catalog_keyspace
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
         );
 
         let result = self
@@ -204,19 +202,19 @@ impl CassandraEngine {
             .await
             .map_err(|e| {
                 tracing::error!("create_table insert table: {e}");
-                StorageError::Internal(format!("Failed to insert table: {}", e))
+                StorageError::Internal(format!("Failed to insert table: {e}"))
             })?;
 
         // Check if LWT succeeded
         let body = result
             .response_body()
-            .map_err(|e| StorageError::Internal(format!("Failed to get response body: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Failed to get response body: {e}")))?;
 
         if let Some(rows) = body.into_rows()
             && let Some(row) = rows.first() {
                 use cdrs_tokio::types::IntoRustByName;
                 let applied: bool = row.get_r_by_name("[applied]").map_err(|e| {
-                    StorageError::Internal(format!("Failed to parse [applied]: {}", e))
+                    StorageError::Internal(format!("Failed to parse [applied]: {e}"))
                 })?;
 
                 if !applied {
@@ -249,10 +247,9 @@ impl CassandraEngine {
 
                 let index_id = uuid::Uuid::new_v4().to_string();
                 let insert_index_cql = format!(
-                    "INSERT INTO {}.indexes (table_id, index_name, index_id, index_type, \
+                    "INSERT INTO {catalog_keyspace}.indexes (table_id, index_name, index_id, index_type, \
                      key_schema, projection, index_status, provisioned_throughput) \
-                     VALUES (?, ?, ?, 'GSI', ?, ?, 'ACTIVE', ?)",
-                    catalog_keyspace
+                     VALUES (?, ?, ?, 'GSI', ?, ?, 'ACTIVE', ?)"
                 );
 
                 self.session
@@ -273,7 +270,7 @@ impl CassandraEngine {
                     .await
                     .map_err(|e| {
                         tracing::error!("create_table insert GSI: {e}");
-                        StorageError::Internal(format!("Failed to insert GSI: {}", e))
+                        StorageError::Internal(format!("Failed to insert GSI: {e}"))
                     })?;
 
                 gsi_index_ids.push(index_id);
@@ -291,10 +288,9 @@ impl CassandraEngine {
 
                 let index_id = uuid::Uuid::new_v4().to_string();
                 let insert_index_cql = format!(
-                    "INSERT INTO {}.indexes (table_id, index_name, index_id, index_type, \
+                    "INSERT INTO {catalog_keyspace}.indexes (table_id, index_name, index_id, index_type, \
                      key_schema, projection, index_status, provisioned_throughput) \
-                     VALUES (?, ?, ?, 'LSI', ?, ?, 'ACTIVE', ?)",
-                    catalog_keyspace
+                     VALUES (?, ?, ?, 'LSI', ?, ?, 'ACTIVE', ?)"
                 );
 
                 self.session
@@ -312,7 +308,7 @@ impl CassandraEngine {
                     .await
                     .map_err(|e| {
                         tracing::error!("create_table insert LSI: {e}");
-                        StorageError::Internal(format!("Failed to insert LSI: {}", e))
+                        StorageError::Internal(format!("Failed to insert LSI: {e}"))
                     })?;
 
                 lsi_index_ids.push(index_id);
@@ -323,8 +319,7 @@ impl CassandraEngine {
         if let Some(tags) = &input.tags {
             for tag in tags {
                 let insert_tag_cql = format!(
-                    "INSERT INTO {}.tags (resource_arn, tag_key, tag_value) VALUES (?, ?, ?)",
-                    catalog_keyspace
+                    "INSERT INTO {catalog_keyspace}.tags (resource_arn, tag_key, tag_value) VALUES (?, ?, ?)"
                 );
 
                 self.session
@@ -337,7 +332,7 @@ impl CassandraEngine {
                         ),
                     )
                     .await
-                    .map_err(|e| StorageError::Internal(format!("Failed to insert tag: {}", e)))?;
+                    .map_err(|e| StorageError::Internal(format!("Failed to insert tag: {e}")))?;
             }
         }
 
@@ -457,7 +452,9 @@ impl CassandraEngine {
         let billing_mode_summary = if billing_mode == BillingMode::PayPerRequest {
             Some(BillingModeSummary {
                 billing_mode: BillingMode::PayPerRequest,
-                last_update_to_pay_per_request_date_time: Some(creation_timestamp as f64 / 1000.0),
+                last_update_to_pay_per_request_date_time: Some(
+                    crate::cassandra_util::millis_to_seconds_f64(creation_timestamp),
+                ),
             })
         } else {
             None
@@ -483,7 +480,7 @@ impl CassandraEngine {
             key_schema: input.key_schema,
             attribute_definitions: input.attribute_definitions,
             table_status: response_status,
-            creation_date_time: creation_timestamp as f64 / 1000.0,
+            creation_date_time: crate::cassandra_util::millis_to_seconds_f64(creation_timestamp),
             table_size_bytes: 0,
             item_count: 0,
             table_arn,

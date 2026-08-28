@@ -51,7 +51,7 @@ enum PaginationBinds {
 /// Compute upper bound for begins_with on strings.
 /// Appends the maximum Unicode codepoint to create an exclusive upper bound.
 fn string_upper_bound(prefix: &str) -> String {
-    format!("{}\u{10FFFF}", prefix)
+    format!("{prefix}\u{10FFFF}")
 }
 
 /// Compute upper bound for begins_with on binary data.
@@ -139,8 +139,7 @@ impl CassandraEngine {
         let account_keyspace = self.account_keyspace(&key_info.account_id);
 
         let mut query = format!(
-            "SELECT item_data FROM {}.{} WHERE pk = ?",
-            account_keyspace, table_name
+            "SELECT item_data FROM {account_keyspace}.{table_name} WHERE pk = ?"
         );
 
         // Step 4: Add sort key condition if present
@@ -163,7 +162,7 @@ impl CassandraEngine {
                         CompareOp::Ge => ">=",
                     };
 
-                    query.push_str(&format!(" AND {} {} ?", sk_col, op_str));
+                    query.push_str(&format!(" AND {sk_col} {op_str} ?"));
 
                     // Resolve and parse SK value
                     let sk_av = resolve_expr_to_av(value, _maps)?;
@@ -171,7 +170,7 @@ impl CassandraEngine {
                     Some((sk_col, vec![sk_val]))
                 }
                 SortKeyCondition::Between { low, high, .. } => {
-                    query.push_str(&format!(" AND {} >= ? AND {} <= ?", sk_col, sk_col));
+                    query.push_str(&format!(" AND {sk_col} >= ? AND {sk_col} <= ?"));
 
                     // Resolve and parse both bounds
                     let low_av = resolve_expr_to_av(low, _maps)?;
@@ -181,7 +180,7 @@ impl CassandraEngine {
                     Some((sk_col, vec![low_sk, high_sk]))
                 }
                 SortKeyCondition::BeginsWith { prefix, .. } => {
-                    query.push_str(&format!(" AND {} >= ? AND {} < ?", sk_col, sk_col));
+                    query.push_str(&format!(" AND {sk_col} >= ? AND {sk_col} < ?"));
 
                     // Resolve prefix
                     let prefix_av = resolve_expr_to_av(prefix, _maps)?;
@@ -229,7 +228,7 @@ impl CassandraEngine {
                         // Simple pagination - add to query now
                         let sk_col = sk_column(sk_type);
                         let cmp = if forward { ">" } else { "<" };
-                        query.push_str(&format!(" AND {} {} ?", sk_col, cmp));
+                        query.push_str(&format!(" AND {sk_col} {cmp} ?"));
                     }
                     // else: two-query logic will handle it below
                     Some(sk_val)
@@ -262,13 +261,13 @@ impl CassandraEngine {
             if let Some((_, sk_type)) = sk_info_opt {
                 let sk_col = sk_column(sk_type);
                 let direction = if forward { "ASC" } else { "DESC" };
-                query.push_str(&format!(" ORDER BY {} {}", sk_col, direction));
+                query.push_str(&format!(" ORDER BY {sk_col} {direction}"));
             }
 
             // Step 6: Add LIMIT (fetch limit + 1 to detect pagination)
             // Default limit is 1,000,000 per DynamoDB behavior
             let fetch_limit = limit.map_or(1_000_001, |l| l.max(0) + 1);
-            query.push_str(&format!(" LIMIT {}", fetch_limit));
+            query.push_str(&format!(" LIMIT {fetch_limit}"));
         }
 
         tracing::debug!(
@@ -440,8 +439,7 @@ impl CassandraEngine {
                     let cmp = if forward { ">" } else { "<" };
                     let dir = if forward { "ASC" } else { "DESC" };
                     let query1 = format!(
-                        "{} AND {} = ? AND base_pk {} ? ORDER BY {} {}, base_pk {} LIMIT {}",
-                        query, sk_col, cmp, sk_col, dir, dir, fetch_limit
+                        "{query} AND {sk_col} = ? AND base_pk {cmp} ? ORDER BY {sk_col} {dir}, base_pk {dir} LIMIT {fetch_limit}"
                     );
 
                     let rows1 = query_with_pk_sk_pk(
@@ -518,8 +516,8 @@ impl CassandraEngine {
             }
 
             // Query 2: next SK values (only if we haven't reached limit yet)
-            if all_rows.len() < fetch_limit && sk_info_opt.is_some() && start_sk.is_some() {
-                let start_sk = start_sk.unwrap(); // Safe: checked is_some()
+            if all_rows.len() < fetch_limit && sk_info_opt.is_some() {
+                if let Some(start_sk) = start_sk {
                 let remaining = fetch_limit - all_rows.len();
                 let query2 = if let Some((_, sk_type)) = sk_info_opt {
                     let sk_col = sk_column(sk_type);
@@ -528,8 +526,7 @@ impl CassandraEngine {
                         let base_sk_col = format!("base_{}", sk_column(*base_sk_type));
                         let dir = if forward { "ASC" } else { "DESC" };
                         format!(
-                            " ORDER BY {} {}, base_pk {}, {} {} LIMIT {}",
-                            sk_col, dir, dir, base_sk_col, dir, remaining
+                            " ORDER BY {sk_col} {dir}, base_pk {dir}, {base_sk_col} {dir} LIMIT {remaining}"
                         )
                     } else {
                         format!(
@@ -540,7 +537,7 @@ impl CassandraEngine {
                             remaining
                         )
                     };
-                    format!("{} AND {} {} ?{}", query, sk_col, cmp, order_clause)
+                    format!("{query} AND {sk_col} {cmp} ?{order_clause}")
                 } else {
                     // Hash-only index
                     let order_clause = if let Some((_, base_sk_type)) = &base_sk_info_val {
@@ -559,7 +556,7 @@ impl CassandraEngine {
                             remaining
                         )
                     };
-                    format!("{} AND base_pk > ?{}", query, order_clause)
+                    format!("{query} AND base_pk > ?{order_clause}")
                 };
 
                 let rows2 = match &pagination_binds {
@@ -595,6 +592,7 @@ impl CassandraEngine {
                     _ => Vec::new(),
                 };
                 all_rows.extend(rows2);
+                } // end if let Some(start_sk)
             }
 
             all_rows
@@ -660,21 +658,30 @@ impl CassandraEngine {
                 }
                 (None, None) => {
                     // Check if this is hash-only index with pagination
-                    if is_hash_only_index && exclusive_start_key.is_some() {
-                        let start_key = exclusive_start_key.unwrap();
-                        let base_pk_attr = &key_info.base_key_schema[0].attribute_name;
-                        if let Some(base_pk_val) = start_key.get(base_pk_attr) {
-                            let base_pk_text = pk_to_text(base_pk_val)?.into_owned();
+                    if is_hash_only_index {
+                        if let Some(start_key) = exclusive_start_key {
+                            let base_pk_attr = &key_info.base_key_schema[0].attribute_name;
+                            if let Some(base_pk_val) = start_key.get(base_pk_attr) {
+                                let base_pk_text = pk_to_text(base_pk_val)?.into_owned();
+                                cassandra_util::query_rows(
+                                    &self.session_arc(),
+                                    &query,
+                                    cdrs_tokio::query_values!(pk_text.as_str(), base_pk_text.as_str()),
+                                    "query",
+                                )
+                                .await?
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            // PK-only query without pagination (original behavior)
                             cassandra_util::query_rows(
                                 &self.session_arc(),
                                 &query,
-                                cdrs_tokio::query_values!(pk_text.as_str(), base_pk_text.as_str()),
+                                cdrs_tokio::query_values!(pk_text.as_str()),
                                 "query",
                             )
                             .await?
-                        } else {
-                            // No base_pk in start key, no more results
-                            Vec::new()
                         }
                     } else {
                         // PK-only query without pagination (original behavior)
@@ -686,7 +693,7 @@ impl CassandraEngine {
                         )
                         .await?
                     }
-                }
+                } // end (None, None) arm
             }; // End of single-query match
 
             rows_result

@@ -27,9 +27,8 @@ impl CassandraCatalogStore {
 
         // Using natural UPSERT semantics (ADR-0004)
         let insert_query = format!(
-            "INSERT INTO {}.iam_policies (account_id, principal_type, principal_name, policy_name, policy_document, created_at) \
-             VALUES (?, ?, ?, ?, ?, toTimestamp(now()))",
-            catalog_keyspace
+            "INSERT INTO {catalog_keyspace}.iam_policies (account_id, principal_type, principal_name, policy_name, policy_document, created_at) \
+             VALUES (?, ?, ?, ?, ?, toTimestamp(now()))"
         );
 
         let doc_str = document.to_string();
@@ -60,9 +59,8 @@ impl CassandraCatalogStore {
 
         // Check if policy exists
         let check_query = format!(
-            "SELECT policy_name FROM {}.iam_policies \
-             WHERE account_id = ? AND principal_type = ? AND principal_name = ? AND policy_name = ?",
-            catalog_keyspace
+            "SELECT policy_name FROM {catalog_keyspace}.iam_policies \
+             WHERE account_id = ? AND principal_type = ? AND principal_name = ? AND policy_name = ?"
         );
 
         if crate::cassandra_util::query_optional(
@@ -78,9 +76,8 @@ impl CassandraCatalogStore {
         }
 
         let delete_query = format!(
-            "DELETE FROM {}.iam_policies \
-             WHERE account_id = ? AND principal_type = ? AND principal_name = ? AND policy_name = ?",
-            catalog_keyspace
+            "DELETE FROM {catalog_keyspace}.iam_policies \
+             WHERE account_id = ? AND principal_type = ? AND principal_name = ? AND policy_name = ?"
         );
 
         crate::cassandra_util::execute(
@@ -100,9 +97,8 @@ impl CassandraCatalogStore {
     ) -> OpResult<Vec<(String, serde_json::Value, time::OffsetDateTime)>> {
         let catalog_keyspace = self.catalog_keyspace();
         let query = format!(
-            "SELECT policy_name, policy_document, created_at FROM {}.iam_policies \
-             WHERE account_id = ? AND principal_type = ? AND principal_name = ?",
-            catalog_keyspace
+            "SELECT policy_name, policy_document, created_at FROM {catalog_keyspace}.iam_policies \
+             WHERE account_id = ? AND principal_type = ? AND principal_name = ?"
         );
 
         let rows = crate::cassandra_util::query_rows(
@@ -153,9 +149,8 @@ impl CassandraCatalogStore {
 
         // Using natural UPSERT semantics
         let insert_query = format!(
-            "INSERT INTO {}.iam_permissions_boundaries (account_id, principal_type, principal_name, policy_document) \
-             VALUES (?, ?, ?, ?)",
-            catalog_keyspace
+            "INSERT INTO {catalog_keyspace}.iam_permissions_boundaries (account_id, principal_type, principal_name, policy_document) \
+             VALUES (?, ?, ?, ?)"
         );
 
         let doc_str = document.to_string();
@@ -177,9 +172,8 @@ impl CassandraCatalogStore {
     ) -> OpResult<Option<serde_json::Value>> {
         let catalog_keyspace = self.catalog_keyspace();
         let query = format!(
-            "SELECT policy_document FROM {}.iam_permissions_boundaries \
-             WHERE account_id = ? AND principal_type = ? AND principal_name = ?",
-            catalog_keyspace
+            "SELECT policy_document FROM {catalog_keyspace}.iam_permissions_boundaries \
+             WHERE account_id = ? AND principal_type = ? AND principal_name = ?"
         );
 
         let row = crate::cassandra_util::query_optional(
@@ -214,9 +208,8 @@ impl CassandraCatalogStore {
 
         // Check if boundary exists
         let check_query = format!(
-            "SELECT principal_name FROM {}.iam_permissions_boundaries \
-             WHERE account_id = ? AND principal_type = ? AND principal_name = ?",
-            catalog_keyspace
+            "SELECT principal_name FROM {catalog_keyspace}.iam_permissions_boundaries \
+             WHERE account_id = ? AND principal_type = ? AND principal_name = ?"
         );
 
         if crate::cassandra_util::query_optional(
@@ -232,9 +225,8 @@ impl CassandraCatalogStore {
         }
 
         let delete_query = format!(
-            "DELETE FROM {}.iam_permissions_boundaries \
-             WHERE account_id = ? AND principal_type = ? AND principal_name = ?",
-            catalog_keyspace
+            "DELETE FROM {catalog_keyspace}.iam_permissions_boundaries \
+             WHERE account_id = ? AND principal_type = ? AND principal_name = ?"
         );
 
         crate::cassandra_util::execute(

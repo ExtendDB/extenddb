@@ -59,13 +59,11 @@ impl TableEngine for CassandraEngine {
             // Fetch limit + 1 to determine if there are more results
             let query = if let Some(ref _start) = input.exclusive_start_table_name {
                 format!(
-                    "SELECT table_name FROM {}.tables WHERE account_id = ? AND table_name > ? ORDER BY table_name LIMIT ?",
-                    catalog_keyspace
+                    "SELECT table_name FROM {catalog_keyspace}.tables WHERE account_id = ? AND table_name > ? ORDER BY table_name LIMIT ?"
                 )
             } else {
                 format!(
-                    "SELECT table_name FROM {}.tables WHERE account_id = ? ORDER BY table_name LIMIT ?",
-                    catalog_keyspace
+                    "SELECT table_name FROM {catalog_keyspace}.tables WHERE account_id = ? ORDER BY table_name LIMIT ?"
                 )
             };
 
@@ -86,7 +84,7 @@ impl TableEngine for CassandraEngine {
             };
 
             let response =
-                result.map_err(|e| StorageError::Internal(format!("Query tables: {}", e)))?;
+                result.map_err(|e| StorageError::Internal(format!("Query tables: {e}")))?;
             let body = response
                 .response_body()
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -97,6 +95,7 @@ impl TableEngine for CassandraEngine {
                 .filter_map(|row| row.get_r_by_name("table_name").ok())
                 .collect();
 
+            #[allow(clippy::cast_sign_loss)]
             let last_evaluated_table_name = if names.len() > limit as usize {
                 names.pop()
             } else {

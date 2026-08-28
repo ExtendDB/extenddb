@@ -22,9 +22,8 @@ impl AuthorizationStore for CassandraCatalogStore {
         let catalog_keyspace = self.catalog_keyspace();
         Box::pin(async move {
             let query = format!(
-                "SELECT policy_document FROM {}.iam_policies \
-                 WHERE account_id = ? AND principal_type = 'user' AND principal_name = ?",
-                catalog_keyspace
+                "SELECT policy_document FROM {catalog_keyspace}.iam_policies \
+                 WHERE account_id = ? AND principal_type = 'user' AND principal_name = ?"
             );
             let result = session
                 .query_with_values(
@@ -70,9 +69,8 @@ impl AuthorizationStore for CassandraCatalogStore {
             // TODO: Consider denormalizing to iam_user_groups table for scale
             // See notes/performance-considerations.md
             let groups_query = format!(
-                "SELECT group_name FROM {}.iam_group_members \
-                 WHERE account_id = ? AND user_name = ? ALLOW FILTERING",
-                catalog_keyspace
+                "SELECT group_name FROM {catalog_keyspace}.iam_group_members \
+                 WHERE account_id = ? AND user_name = ? ALLOW FILTERING"
             );
             let groups_result = session
                 .query_with_values(
@@ -101,9 +99,8 @@ impl AuthorizationStore for CassandraCatalogStore {
                 })?;
 
                 let policy_query = format!(
-                    "SELECT policy_document FROM {}.iam_policies \
-                     WHERE account_id = ? AND principal_type = 'group' AND principal_name = ?",
-                    catalog_keyspace
+                    "SELECT policy_document FROM {catalog_keyspace}.iam_policies \
+                     WHERE account_id = ? AND principal_type = 'group' AND principal_name = ?"
                 );
                 let policy_result = session
                     .query_with_values(
@@ -150,9 +147,8 @@ impl AuthorizationStore for CassandraCatalogStore {
         let catalog_keyspace = self.catalog_keyspace();
         Box::pin(async move {
             let query = format!(
-                "SELECT policy_document FROM {}.iam_permissions_boundaries \
-                 WHERE account_id = ? AND principal_type = 'user' AND principal_name = ?",
-                catalog_keyspace
+                "SELECT policy_document FROM {catalog_keyspace}.iam_permissions_boundaries \
+                 WHERE account_id = ? AND principal_type = 'user' AND principal_name = ?"
             );
             let result = session
                 .query_with_values(
@@ -194,9 +190,8 @@ impl AuthorizationStore for CassandraCatalogStore {
         let catalog_keyspace = self.catalog_keyspace();
         Box::pin(async move {
             let query = format!(
-                "SELECT policy_document FROM {}.iam_policies \
-                 WHERE account_id = ? AND principal_type = 'role' AND principal_name = ?",
-                catalog_keyspace
+                "SELECT policy_document FROM {catalog_keyspace}.iam_policies \
+                 WHERE account_id = ? AND principal_type = 'role' AND principal_name = ?"
             );
             let rows = crate::cassandra_util::query_rows(
                 &session,
@@ -227,9 +222,8 @@ impl AuthorizationStore for CassandraCatalogStore {
         let catalog_keyspace = self.catalog_keyspace();
         Box::pin(async move {
             let query = format!(
-                "SELECT policy_document FROM {}.iam_permissions_boundaries \
-                 WHERE account_id = ? AND principal_type = 'role' AND principal_name = ?",
-                catalog_keyspace
+                "SELECT policy_document FROM {catalog_keyspace}.iam_permissions_boundaries \
+                 WHERE account_id = ? AND principal_type = 'role' AND principal_name = ?"
             );
             let row = crate::cassandra_util::query_optional(
                 &session,
@@ -267,9 +261,8 @@ impl AuthorizationStore for CassandraCatalogStore {
 
         Box::pin(async move {
             let query = format!(
-                "SELECT session_policy, session_tags FROM {}.iam_sessions \
-                 WHERE account_id = ? AND role_name = ? AND session_name = ? ALLOW FILTERING",
-                catalog_keyspace
+                "SELECT session_policy, session_tags FROM {catalog_keyspace}.iam_sessions \
+                 WHERE account_id = ? AND role_name = ? AND session_name = ? ALLOW FILTERING"
             );
 
             let result = session
@@ -345,9 +338,8 @@ impl AuthorizationStore for CassandraCatalogStore {
 
         Box::pin(async move {
             let query = format!(
-                "SELECT tag_key, tag_value FROM {}.iam_user_tags \
-                 WHERE account_id = ? AND user_name = ?",
-                catalog_keyspace
+                "SELECT tag_key, tag_value FROM {catalog_keyspace}.iam_user_tags \
+                 WHERE account_id = ? AND user_name = ?"
             );
 
             let result = session
@@ -400,9 +392,8 @@ impl AuthorizationStore for CassandraCatalogStore {
 
         Box::pin(async move {
             let query = format!(
-                "SELECT tag_key, tag_value FROM {}.iam_role_tags \
-                 WHERE account_id = ? AND role_name = ?",
-                catalog_keyspace
+                "SELECT tag_key, tag_value FROM {catalog_keyspace}.iam_role_tags \
+                 WHERE account_id = ? AND role_name = ?"
             );
 
             let result = session
@@ -450,8 +441,7 @@ impl AuthorizationStore for CassandraCatalogStore {
 
         Box::pin(async move {
             let query = format!(
-                "SELECT tag_key, tag_value FROM {}.tags WHERE resource_arn = ?",
-                catalog_keyspace
+                "SELECT tag_key, tag_value FROM {catalog_keyspace}.tags WHERE resource_arn = ?"
             );
 
             let result = session

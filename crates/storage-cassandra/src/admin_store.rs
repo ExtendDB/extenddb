@@ -15,8 +15,7 @@ async fn admin_exists(
     admin_name: &str,
 ) -> OpResult<bool> {
     let query = format!(
-        "SELECT admin_name FROM {}.admin_users WHERE admin_name = ?",
-        catalog_keyspace
+        "SELECT admin_name FROM {catalog_keyspace}.admin_users WHERE admin_name = ?"
     );
     let row = crate::cassandra_util::query_optional(
         session,
@@ -36,9 +35,8 @@ impl extenddb_storage::management_store::AdminStore for CassandraCatalogStore {
         let catalog_keyspace = self.catalog_keyspace();
         Box::pin(async move {
             let query = format!(
-                "INSERT INTO {}.admin_users (admin_name, password_hash, created_at) \
-                 VALUES (?, ?, toTimestamp(now())) IF NOT EXISTS",
-                catalog_keyspace
+                "INSERT INTO {catalog_keyspace}.admin_users (admin_name, password_hash, created_at) \
+                 VALUES (?, ?, toTimestamp(now())) IF NOT EXISTS"
             );
 
             let result = session
@@ -79,8 +77,7 @@ impl extenddb_storage::management_store::AdminStore for CassandraCatalogStore {
         let catalog_keyspace = self.catalog_keyspace();
         Box::pin(async move {
             let query = format!(
-                "SELECT admin_name, created_at FROM {}.admin_users",
-                catalog_keyspace
+                "SELECT admin_name, created_at FROM {catalog_keyspace}.admin_users"
             );
             let rows = crate::cassandra_util::query_rows(
                 &session,
@@ -123,8 +120,7 @@ impl extenddb_storage::management_store::AdminStore for CassandraCatalogStore {
             }
 
             let query = format!(
-                "DELETE FROM {}.admin_users WHERE admin_name = ?",
-                catalog_keyspace
+                "DELETE FROM {catalog_keyspace}.admin_users WHERE admin_name = ?"
             );
             crate::cassandra_util::execute(
                 &session,
@@ -151,8 +147,7 @@ impl extenddb_storage::management_store::AdminStore for CassandraCatalogStore {
             }
 
             let query = format!(
-                "UPDATE {}.admin_users SET password_hash = ? WHERE admin_name = ?",
-                catalog_keyspace
+                "UPDATE {catalog_keyspace}.admin_users SET password_hash = ? WHERE admin_name = ?"
             );
             crate::cassandra_util::execute(
                 &session,
@@ -175,8 +170,7 @@ impl extenddb_storage::management_store::AdminStore for CassandraCatalogStore {
         let catalog_keyspace = self.catalog_keyspace();
         Box::pin(async move {
             let query = format!(
-                "SELECT password_hash FROM {}.admin_users WHERE admin_name = ?",
-                catalog_keyspace
+                "SELECT password_hash FROM {catalog_keyspace}.admin_users WHERE admin_name = ?"
             );
 
             let row = crate::cassandra_util::query_optional(

@@ -102,10 +102,9 @@ impl CassandraEngine {
         items_blob: &str,
     ) -> Result<(), StorageError> {
         let query = format!(
-            "INSERT INTO {}.transaction_ledger \
+            "INSERT INTO {keyspace}.transaction_ledger \
              (txn_id, state, started_at, client_token, request_fingerprint, items_blob) \
-             VALUES (?, ?, ?, ?, ?, ?) IF NOT EXISTS",
-            keyspace
+             VALUES (?, ?, ?, ?, ?, ?) IF NOT EXISTS"
         );
 
         let result = self
@@ -154,8 +153,7 @@ impl CassandraEngine {
         new_state: TransactionState,
     ) -> Result<(), StorageError> {
         let query = format!(
-            "UPDATE {}.transaction_ledger SET state = ? WHERE txn_id = ?",
-            keyspace
+            "UPDATE {keyspace}.transaction_ledger SET state = ? WHERE txn_id = ?"
         );
 
         self.session
@@ -188,8 +186,7 @@ impl CassandraEngine {
         let blob = serde_json::to_string(ops)
             .map_err(|e| StorageError::Internal(format!("serialize ledger ops: {e}")))?;
         let query = format!(
-            "UPDATE {}.transaction_ledger SET items_blob = ? WHERE txn_id = ?",
-            keyspace
+            "UPDATE {keyspace}.transaction_ledger SET items_blob = ? WHERE txn_id = ?"
         );
         self.session
             .query_with_values(
@@ -212,8 +209,7 @@ impl CassandraEngine {
     ) -> Result<Option<LedgerEntry>, StorageError> {
         let query = format!(
             "SELECT txn_id, state, started_at, client_token, request_fingerprint, items_blob \
-             FROM {}.transaction_ledger WHERE txn_id = ?",
-            keyspace
+             FROM {keyspace}.transaction_ledger WHERE txn_id = ?"
         );
 
         let row = query_optional::<StorageError>(
@@ -255,8 +251,7 @@ impl CassandraEngine {
     ) -> Result<Vec<LedgerEntry>, StorageError> {
         let query = format!(
             "SELECT txn_id, state, started_at, client_token, request_fingerprint, items_blob \
-             FROM {}.transaction_ledger WHERE started_at < ? ALLOW FILTERING",
-            keyspace
+             FROM {keyspace}.transaction_ledger WHERE started_at < ? ALLOW FILTERING"
         );
 
         let rows = query_rows::<StorageError>(
@@ -298,8 +293,7 @@ impl CassandraEngine {
         txn_id: Uuid,
     ) -> Result<(), StorageError> {
         let query = format!(
-            "DELETE FROM {}.transaction_ledger WHERE txn_id = ?",
-            keyspace
+            "DELETE FROM {keyspace}.transaction_ledger WHERE txn_id = ?"
         );
 
         self.session

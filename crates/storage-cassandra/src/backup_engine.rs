@@ -45,10 +45,6 @@ fn backup_id() -> String {
     format!("{}-{suffix:08x}", epoch_millis())
 }
 
-fn epoch_seconds(timestamp_millis: i64) -> f64 {
-    timestamp_millis as f64 / 1_000.0
-}
-
 fn bucket_count(item_count: i64) -> i64 {
     if item_count <= 0 {
         0
@@ -134,7 +130,7 @@ impl StoredBackup {
             backup_status: self.backup_status.clone(),
             backup_type: self.backup_type.clone(),
             backup_size_bytes: self.backup_size_bytes,
-            backup_creation_date_time: epoch_seconds(self.created_at),
+            backup_creation_date_time: crate::cassandra_util::millis_to_seconds_f64(self.created_at),
         }
     }
 
@@ -147,7 +143,7 @@ impl StoredBackup {
             backup_status: self.backup_status.clone(),
             backup_type: self.backup_type.clone(),
             backup_size_bytes: self.backup_size_bytes,
-            backup_creation_date_time: epoch_seconds(self.created_at),
+            backup_creation_date_time: crate::cassandra_util::millis_to_seconds_f64(self.created_at),
         }
     }
 
@@ -164,7 +160,7 @@ impl StoredBackup {
                 item_count: self.item_count,
                 table_size_bytes: self.backup_size_bytes,
                 billing_mode: Some(self.billing_mode.clone()),
-                table_creation_date_time: epoch_seconds(self.table_created_at),
+                table_creation_date_time: crate::cassandra_util::millis_to_seconds_f64(self.table_created_at),
             },
         })
     }
@@ -221,12 +217,13 @@ impl CassandraEngine {
     ) -> Result<(), StorageError> {
         let account_keyspace = self.account_keyspace(account_id);
         let query = format!(
-            "DELETE FROM {}.backup_items WHERE backup_arn = ? AND bucket = ?",
-            account_keyspace
+            "DELETE FROM {account_keyspace}.backup_items WHERE backup_arn = ? AND bucket = ?"
         );
         for bucket in 0..bucket_count(item_count) {
+            #[allow(clippy::cast_possible_truncation)]
+            let bucket_i32 = bucket as i32;
             self.session
-                .query_with_values(&query, cdrs_tokio::query_values!(backup_arn, bucket as i32))
+                .query_with_values(&query, cdrs_tokio::query_values!(backup_arn, bucket_i32))
                 .await
                 .map_err(|e| StorageError::Internal(format!("Delete backup payload: {e}")))?;
         }
@@ -236,8 +233,7 @@ impl CassandraEngine {
     async fn remove_backup_index_rows(&self, backup: &StoredBackup) -> Result<(), StorageError> {
         let catalog = self.catalog_keyspace();
         let by_account = format!(
-            "DELETE FROM {}.backups_by_account WHERE account_id = ? AND created_at = ? AND backup_arn = ?",
-            catalog
+            "DELETE FROM {catalog}.backups_by_account WHERE account_id = ? AND created_at = ? AND backup_arn = ?"
         );
         self.session
             .query_with_values(
@@ -252,8 +248,7 @@ impl CassandraEngine {
             .map_err(|e| StorageError::Internal(format!("Delete account backup index: {e}")))?;
 
         let by_table = format!(
-            "DELETE FROM {}.backups_by_table WHERE account_id = ? AND table_name = ? AND created_at = ? AND backup_arn = ?",
-            catalog
+            "DELETE FROM {catalog}.backups_by_table WHERE account_id = ? AND table_name = ? AND created_at = ? AND backup_arn = ?"
         );
         self.session
             .query_with_values(
@@ -361,6 +356,7 @@ impl BackupEngine for CassandraEngine {
                 id = backup_id()
             );
             let created_at = chrono::Utc::now().timestamp_millis();
+            #[allow(clippy::cast_possible_truncation)]
             let table_created_at = (table.creation_date_time * 1_000.0) as i64;
             let billing_mode = if table.billing_mode_summary.is_some() {
                 "PAY_PER_REQUEST"
@@ -386,8 +382,7 @@ impl BackupEngine for CassandraEngine {
 
             let catalog = self.catalog_keyspace();
             let insert_metadata = format!(
-                "INSERT INTO {}.backups_by_arn (backup_arn, account_id, backup_name, table_id, table_name, table_arn, backup_status, backup_type, backup_size_bytes, item_count, key_schema, attribute_definitions, billing_mode, provisioned_throughput, stream_specification, table_created_at, created_at) VALUES (?, ?, ?, ?, ?, ?, 'CREATING', 'USER', ?, 0, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS",
-                catalog
+                "INSERT INTO {catalog}.backups_by_arn (backup_arn, account_id, backup_name, table_id, table_name, table_arn, backup_status, backup_type, backup_size_bytes, item_count, key_schema, attribute_definitions, billing_mode, provisioned_throughput, stream_specification, table_created_at, created_at) VALUES (?, ?, ?, ?, ?, ?, 'CREATING', 'USER', ?, 0, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
             );
             self.session
                 .query_with_values(
@@ -414,8 +409,7 @@ impl BackupEngine for CassandraEngine {
 
             let account_keyspace = self.account_keyspace(&account_id);
             let insert_item = format!(
-                "INSERT INTO {}.backup_items (backup_arn, bucket, item_index, item_data) VALUES (?, ?, ?, ?)",
-                account_keyspace
+                "INSERT INTO {account_keyspace}.backup_items (backup_arn, bucket, item_index, item_data) VALUES (?, ?, ?, ?)"
             );
             let mut item_count = 0_i64;
             let mut payload_size = 0_i64;
@@ -438,12 +432,14 @@ impl BackupEngine for CassandraEngine {
                             StorageError::Internal(format!("Serialize backup item: {e}"))
                         })?;
                         let bucket = item_count / BACKUP_ITEMS_PER_BUCKET;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let bucket_i32 = bucket as i32;
                         self.session
                             .query_with_values(
                                 &insert_item,
                                 cdrs_tokio::query_values!(
                                     backup_arn.as_str(),
-                                    bucket as i32,
+                                    bucket_i32,
                                     item_count,
                                     item_data.as_str()
                                 ),
@@ -453,7 +449,9 @@ impl BackupEngine for CassandraEngine {
                                 StorageError::Internal(format!("Write backup item: {e}"))
                             })?;
                         item_count += 1;
-                        payload_size = payload_size.saturating_add(item_data.len() as i64);
+                        #[allow(clippy::cast_possible_wrap)]
+                        let item_len = item_data.len() as i64;
+                        payload_size = payload_size.saturating_add(item_len);
                     }
                     match next_key {
                         Some(key) => start_key = Some(key),
@@ -469,8 +467,7 @@ impl BackupEngine for CassandraEngine {
                     .cleanup_backup_payload(&account_id, &backup_arn, item_count)
                     .await;
                 let delete_metadata = format!(
-                    "DELETE FROM {}.backups_by_arn WHERE account_id = ? AND backup_arn = ?",
-                    catalog
+                    "DELETE FROM {catalog}.backups_by_arn WHERE account_id = ? AND backup_arn = ?"
                 );
                 let _ = self
                     .session
@@ -484,16 +481,13 @@ impl BackupEngine for CassandraEngine {
 
             let backup_size_bytes = table.table_size_bytes.max(payload_size);
             let insert_by_account = format!(
-                "INSERT INTO {}.backups_by_account (account_id, created_at, backup_arn, backup_name, table_id, table_name, table_arn, backup_size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                catalog
+                "INSERT INTO {catalog}.backups_by_account (account_id, created_at, backup_arn, backup_name, table_id, table_name, table_arn, backup_size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
             );
             let insert_by_table = format!(
-                "INSERT INTO {}.backups_by_table (account_id, table_name, created_at, backup_arn, backup_name, table_id, table_arn, backup_size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                catalog
+                "INSERT INTO {catalog}.backups_by_table (account_id, table_name, created_at, backup_arn, backup_name, table_id, table_arn, backup_size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
             );
             let publish = format!(
-                "UPDATE {}.backups_by_arn SET backup_status = 'AVAILABLE', backup_size_bytes = ?, item_count = ? WHERE account_id = ? AND backup_arn = ?",
-                catalog
+                "UPDATE {catalog}.backups_by_arn SET backup_status = 'AVAILABLE', backup_size_bytes = ?, item_count = ? WHERE account_id = ? AND backup_arn = ?"
             );
             // Publication is a fixed three-statement operation. A logged batch
             // prevents readers from observing list rows without the matching
@@ -556,8 +550,7 @@ impl BackupEngine for CassandraEngine {
                     .cleanup_backup_payload(&account_id, &backup_arn, item_count)
                     .await;
                 let delete_metadata = format!(
-                    "DELETE FROM {}.backups_by_arn WHERE account_id = ? AND backup_arn = ?",
-                    catalog
+                    "DELETE FROM {catalog}.backups_by_arn WHERE account_id = ? AND backup_arn = ?"
                 );
                 let _ = self
                     .session
@@ -575,7 +568,7 @@ impl BackupEngine for CassandraEngine {
                 backup_status: "AVAILABLE".to_owned(),
                 backup_type: "USER".to_owned(),
                 backup_size_bytes,
-                backup_creation_date_time: epoch_seconds(created_at),
+                backup_creation_date_time: crate::cassandra_util::millis_to_seconds_f64(created_at),
             })
         })
     }
@@ -606,8 +599,7 @@ impl BackupEngine for CassandraEngine {
             let catalog = self.catalog_keyspace();
             let (query, result) = if let Some(table_name) = table_name.as_deref() {
                 let query = format!(
-                    "SELECT backup_arn, backup_name, table_name, table_arn, backup_size_bytes, created_at FROM {}.backups_by_table WHERE account_id = ? AND table_name = ?",
-                    catalog
+                    "SELECT backup_arn, backup_name, table_name, table_arn, backup_size_bytes, created_at FROM {catalog}.backups_by_table WHERE account_id = ? AND table_name = ?"
                 );
                 let result = self
                     .session
@@ -619,8 +611,7 @@ impl BackupEngine for CassandraEngine {
                 (query, result)
             } else {
                 let query = format!(
-                    "SELECT backup_arn, backup_name, table_name, table_arn, backup_size_bytes, created_at FROM {}.backups_by_account WHERE account_id = ?",
-                    catalog
+                    "SELECT backup_arn, backup_name, table_name, table_arn, backup_size_bytes, created_at FROM {catalog}.backups_by_account WHERE account_id = ?"
                 );
                 let result = self
                     .session
@@ -790,17 +781,18 @@ impl BackupEngine for CassandraEngine {
             let restore_result: Result<(i64, i64), StorageError> = async {
                 let account_keyspace = self.account_keyspace(&account_id);
                 let query = format!(
-                    "SELECT item_data FROM {}.backup_items WHERE backup_arn = ? AND bucket = ?",
-                    account_keyspace
+                    "SELECT item_data FROM {account_keyspace}.backup_items WHERE backup_arn = ? AND bucket = ?"
                 );
                 let mut restored_count = 0_i64;
                 let mut restored_size = 0_i64;
                 for bucket in 0..bucket_count(backup.item_count) {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let bucket_i32 = bucket as i32;
                     let rows = self
                         .session
                         .query_with_values(
                             &query,
-                            cdrs_tokio::query_values!(backup_arn.as_str(), bucket as i32),
+                            cdrs_tokio::query_values!(backup_arn.as_str(), bucket_i32),
                         )
                         .await
                         .map_err(|e| StorageError::Internal(format!("Read backup payload: {e}")))?
@@ -818,7 +810,9 @@ impl BackupEngine for CassandraEngine {
                         self.put_item_impl(&key_info, item, false, None, &Default::default(), None)
                             .await?;
                         restored_count += 1;
-                        restored_size = restored_size.saturating_add(item_data.len() as i64);
+                        #[allow(clippy::cast_possible_wrap)]
+                        let item_len = item_data.len() as i64;
+                        restored_size = restored_size.saturating_add(item_len);
                     }
                 }
                 if restored_count != backup.item_count {
@@ -901,6 +895,7 @@ impl BackupEngine for CassandraEngine {
                     value.ok()
                 })
                 .unwrap_or(false);
+            #[allow(clippy::cast_precision_loss)]
             let now = epoch_millis() as f64 / 1_000.0;
             Ok(ContinuousBackupsDescription {
                 continuous_backups_status: "ENABLED".to_owned(),

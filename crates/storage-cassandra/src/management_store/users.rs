@@ -25,7 +25,7 @@ impl CassandraCatalogStore {
 
         let account_id = account_id.to_owned();
         let user_name = user_name.to_owned();
-        let password_hash = password_hash.map(|s| s.to_owned());
+        let password_hash = password_hash.map(std::borrow::ToOwned::to_owned);
 
         // Seed self-service policy document
         let self_service_policy = serde_json::json!({
@@ -44,9 +44,8 @@ impl CassandraCatalogStore {
 
         // Use LWT to atomically create the user, preventing duplicate names.
         let user_query = format!(
-            "INSERT INTO {}.iam_users (account_id, user_name, user_arn, password_hash, created_at) \
-             VALUES (?, ?, ?, ?, toTimestamp(now())) IF NOT EXISTS",
-            catalog_keyspace
+            "INSERT INTO {catalog_keyspace}.iam_users (account_id, user_name, user_arn, password_hash, created_at) \
+             VALUES (?, ?, ?, ?, toTimestamp(now())) IF NOT EXISTS"
         );
 
         let applied = crate::cassandra_util::apply_lwt(
@@ -68,9 +67,8 @@ impl CassandraCatalogStore {
 
         // User was created; now insert the self-service policy.
         let policy_query = format!(
-            "INSERT INTO {}.iam_policies (account_id, principal_type, principal_name, policy_name, policy_document, created_at) \
-             VALUES (?, 'user', ?, 'SelfServicePolicy', ?, toTimestamp(now()))",
-            catalog_keyspace
+            "INSERT INTO {catalog_keyspace}.iam_policies (account_id, principal_type, principal_name, policy_name, policy_document, created_at) \
+             VALUES (?, 'user', ?, 'SelfServicePolicy', ?, toTimestamp(now()))"
         );
 
         session
@@ -99,8 +97,7 @@ impl CassandraCatalogStore {
 
         let catalog_keyspace = self.catalog_keyspace();
         let delete_query = format!(
-            "DELETE FROM {}.iam_users WHERE account_id = ? AND user_name = ?",
-            catalog_keyspace
+            "DELETE FROM {catalog_keyspace}.iam_users WHERE account_id = ? AND user_name = ?"
         );
 
         crate::cassandra_util::execute(
@@ -119,8 +116,7 @@ impl CassandraCatalogStore {
         let catalog_keyspace = self.catalog_keyspace();
         let query = format!(
             "SELECT account_id, user_name, user_arn, password_hash, created_at \
-             FROM {}.iam_users WHERE account_id = ?",
-            catalog_keyspace
+             FROM {catalog_keyspace}.iam_users WHERE account_id = ?"
         );
 
         let rows = crate::cassandra_util::query_rows(
@@ -167,9 +163,8 @@ impl CassandraCatalogStore {
 
         // Get access keys
         let keys_query = format!(
-            "SELECT access_key_id, is_active FROM {}.access_keys \
-             WHERE account_id = ? AND user_name = ? ALLOW FILTERING",
-            catalog_keyspace
+            "SELECT access_key_id, is_active FROM {catalog_keyspace}.access_keys \
+             WHERE account_id = ? AND user_name = ? ALLOW FILTERING"
         );
 
         let keys_rows = crate::cassandra_util::query_rows(
@@ -195,9 +190,8 @@ impl CassandraCatalogStore {
 
         // Get policies
         let policies_query = format!(
-            "SELECT policy_name FROM {}.iam_policies \
-             WHERE account_id = ? AND principal_type = 'user' AND principal_name = ?",
-            catalog_keyspace
+            "SELECT policy_name FROM {catalog_keyspace}.iam_policies \
+             WHERE account_id = ? AND principal_type = 'user' AND principal_name = ?"
         );
 
         let policies_rows = crate::cassandra_util::query_rows(
@@ -220,9 +214,8 @@ impl CassandraCatalogStore {
 
         // Get tags
         let tags_query = format!(
-            "SELECT tag_key, tag_value FROM {}.iam_user_tags \
-             WHERE account_id = ? AND user_name = ?",
-            catalog_keyspace
+            "SELECT tag_key, tag_value FROM {catalog_keyspace}.iam_user_tags \
+             WHERE account_id = ? AND user_name = ?"
         );
 
         let tags_rows = crate::cassandra_util::query_rows(
@@ -248,9 +241,8 @@ impl CassandraCatalogStore {
 
         // Get groups
         let groups_query = format!(
-            "SELECT group_name FROM {}.iam_group_members \
-             WHERE account_id = ? AND user_name = ? ALLOW FILTERING",
-            catalog_keyspace
+            "SELECT group_name FROM {catalog_keyspace}.iam_group_members \
+             WHERE account_id = ? AND user_name = ? ALLOW FILTERING"
         );
 
         let groups_rows = crate::cassandra_util::query_rows(
@@ -287,9 +279,8 @@ impl CassandraCatalogStore {
     ) -> OpResult<bool> {
         let catalog_keyspace = self.catalog_keyspace();
         let query = format!(
-            "SELECT password_hash FROM {}.iam_users \
-             WHERE account_id = ? AND user_name = ?",
-            catalog_keyspace
+            "SELECT password_hash FROM {catalog_keyspace}.iam_users \
+             WHERE account_id = ? AND user_name = ?"
         );
 
         let row = crate::cassandra_util::query_optional(
@@ -331,8 +322,7 @@ impl CassandraCatalogStore {
 
         let catalog_keyspace = self.catalog_keyspace();
         let update_query = format!(
-            "UPDATE {}.iam_users SET password_hash = ? WHERE account_id = ? AND user_name = ?",
-            catalog_keyspace
+            "UPDATE {catalog_keyspace}.iam_users SET password_hash = ? WHERE account_id = ? AND user_name = ?"
         );
 
         crate::cassandra_util::execute(
@@ -362,8 +352,7 @@ impl CassandraCatalogStore {
         // Insert tags (using natural UPSERT semantics - ADR-0004)
         for (key, value) in tags {
             let insert_query = format!(
-                "INSERT INTO {}.iam_user_tags (account_id, user_name, tag_key, tag_value) VALUES (?, ?, ?, ?)",
-                catalog_keyspace
+                "INSERT INTO {catalog_keyspace}.iam_user_tags (account_id, user_name, tag_key, tag_value) VALUES (?, ?, ?, ?)"
             );
 
             crate::cassandra_util::execute(
@@ -388,8 +377,7 @@ impl CassandraCatalogStore {
 
         for key in tag_keys {
             let delete_query = format!(
-                "DELETE FROM {}.iam_user_tags WHERE account_id = ? AND user_name = ? AND tag_key = ?",
-                catalog_keyspace
+                "DELETE FROM {catalog_keyspace}.iam_user_tags WHERE account_id = ? AND user_name = ? AND tag_key = ?"
             );
 
             crate::cassandra_util::execute(
@@ -411,9 +399,8 @@ impl CassandraCatalogStore {
     ) -> OpResult<Vec<(String, String)>> {
         let catalog_keyspace = self.catalog_keyspace();
         let query = format!(
-            "SELECT tag_key, tag_value FROM {}.iam_user_tags \
-             WHERE account_id = ? AND user_name = ?",
-            catalog_keyspace
+            "SELECT tag_key, tag_value FROM {catalog_keyspace}.iam_user_tags \
+             WHERE account_id = ? AND user_name = ?"
         );
 
         let rows = crate::cassandra_util::query_rows(

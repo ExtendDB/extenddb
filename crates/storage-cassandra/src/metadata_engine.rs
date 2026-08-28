@@ -36,8 +36,7 @@ impl MetadataEngine for CassandraEngine {
         Box::pin(async move {
             for tag in &tags {
                 let query = format!(
-                    "INSERT INTO {}.tags (resource_arn, tag_key, tag_value) VALUES (?, ?, ?)",
-                    catalog
+                    "INSERT INTO {catalog}.tags (resource_arn, tag_key, tag_value) VALUES (?, ?, ?)"
                 );
                 self.session_arc()
                     .query_with_values(
@@ -69,8 +68,7 @@ impl MetadataEngine for CassandraEngine {
         Box::pin(async move {
             for key in &tag_keys {
                 let query = format!(
-                    "DELETE FROM {}.tags WHERE resource_arn = ? AND tag_key = ?",
-                    catalog
+                    "DELETE FROM {catalog}.tags WHERE resource_arn = ? AND tag_key = ?"
                 );
                 self.session_arc()
                     .query_with_values(
@@ -92,8 +90,7 @@ impl MetadataEngine for CassandraEngine {
         let catalog = self.catalog_keyspace();
         Box::pin(async move {
             let query = format!(
-                "SELECT tag_key, tag_value FROM {}.tags WHERE resource_arn = ?",
-                catalog
+                "SELECT tag_key, tag_value FROM {catalog}.tags WHERE resource_arn = ?"
             );
             let result = self
                 .session_arc()

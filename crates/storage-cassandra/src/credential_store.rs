@@ -116,8 +116,7 @@ impl CassandraCredentialStore {
         let catalog_keyspace = self.catalog_keyspace();
         let query = format!(
             "SELECT secret_key_encrypted, account_id, user_name, is_active \
-             FROM {}.access_keys WHERE access_key_id = ?",
-            catalog_keyspace
+             FROM {catalog_keyspace}.access_keys WHERE access_key_id = ?"
         );
 
         let result = self
@@ -192,8 +191,7 @@ impl CassandraCredentialStore {
         let query = format!(
             "SELECT secret_key_encrypted, account_id, role_name, session_name, \
                  session_token, expires_at \
-                 FROM {}.iam_sessions WHERE access_key_id = ? ALLOW FILTERING",
-            catalog_keyspace
+                 FROM {catalog_keyspace}.iam_sessions WHERE access_key_id = ? ALLOW FILTERING"
         );
 
         let result = self
