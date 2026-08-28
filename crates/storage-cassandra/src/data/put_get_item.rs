@@ -403,14 +403,13 @@ impl CassandraEngine {
                 .response_body()
                 .map_err(|e| StorageError::Internal(format!("Parse response: {}", e)))?;
 
-            if let Some(rows) = body.into_rows() {
-                if let Some(row) = rows.into_iter().next() {
+            if let Some(rows) = body.into_rows()
+                && let Some(row) = rows.into_iter().next() {
                     let item_data: String = row
                         .get_r_by_name("item_data")
                         .map_err(|e| StorageError::Internal(format!("Parse item_data: {}", e)))?;
                     return Ok(Some(json_to_item(item_data)?));
                 }
-            }
 
             Ok(None)
         } else {
@@ -430,14 +429,13 @@ impl CassandraEngine {
                 .response_body()
                 .map_err(|e| StorageError::Internal(format!("Parse response: {}", e)))?;
 
-            if let Some(rows) = body.into_rows() {
-                if let Some(row) = rows.into_iter().next() {
+            if let Some(rows) = body.into_rows()
+                && let Some(row) = rows.into_iter().next() {
                     let item_data: String = row
                         .get_r_by_name("item_data")
                         .map_err(|e| StorageError::Internal(format!("Parse item_data: {}", e)))?;
                     return Ok(Some(json_to_item(item_data)?));
                 }
-            }
 
             Ok(None)
         }

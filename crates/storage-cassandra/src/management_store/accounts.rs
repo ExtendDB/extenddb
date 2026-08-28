@@ -408,7 +408,7 @@ impl CassandraCatalogStore {
         let query =
             format!("SELECT value FROM {keyspace}.settings WHERE key = 'default_account_id'");
         let rows = crate::cassandra_util::query_rows::<extenddb_storage::error::StorageError>(
-            &self.session(),
+            self.session(),
             &query,
             cdrs_tokio::query_values!(),
             "default_account_id",

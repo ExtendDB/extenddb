@@ -117,9 +117,7 @@ impl extenddb_storage::config::StorageConfig for CassandraStorageConfig {
     fn connection_config(&self) -> &str {
         // Return JDBC-style connection string: host1,host2/keyspace_prefix
         // This allows factories to parse both contact points and keyspace
-        self.cached_connection_string
-            .as_ref()
-            .map(|s| s.as_str())
+        self.cached_connection_string.as_deref()
             .unwrap_or("(no connection string)")
     }
 

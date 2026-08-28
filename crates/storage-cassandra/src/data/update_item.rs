@@ -106,7 +106,7 @@ impl CassandraEngine {
                     ]));
                 }
                 let item_data: String =
-                    crate::cassandra_util::get_column(&row, "item_data", "update_item")?;
+                    crate::cassandra_util::get_column(row, "item_data", "update_item")?;
                 Some(json_to_item(item_data)?)
             } else {
                 None

@@ -306,8 +306,8 @@ impl AuthorizationStore for CassandraCatalogStore {
             let session_tags_text: Option<String> = row.get_r_by_name("session_tags").ok();
             let mut session_tags = Vec::new();
 
-            if let Some(tags_text) = session_tags_text {
-                if let Ok(tags_val) = serde_json::from_str::<serde_json::Value>(&tags_text) {
+            if let Some(tags_text) = session_tags_text
+                && let Ok(tags_val) = serde_json::from_str::<serde_json::Value>(&tags_text) {
                     if let Some(arr) = tags_val.as_array() {
                         for tag in arr {
                             if let (Some(k), Some(v)) = (
@@ -325,7 +325,6 @@ impl AuthorizationStore for CassandraCatalogStore {
                         }
                     }
                 }
-            }
 
             Ok(Some(SessionData {
                 session_policy,

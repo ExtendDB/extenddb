@@ -498,7 +498,7 @@ impl CassandraEngine {
                             &self.session_arc(),
                             &query1,
                             &pk_text,
-                            &base_pk_text,
+                            base_pk_text,
                             base_sk,
                             "same_sk",
                         )

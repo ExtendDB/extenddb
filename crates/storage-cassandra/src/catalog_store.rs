@@ -107,7 +107,7 @@ impl CassandraCatalogStore {
             .await
             .ok()
             .and_then(|r| r.response_body().ok())
-            .map(|b| b.into_rows().unwrap_or_default().len() > 0)
+            .map(|b| !b.into_rows().unwrap_or_default().is_empty())
             .unwrap_or(false);
 
         if exists_result {
@@ -311,14 +311,13 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for CassandraCatalogStore {
                 extenddb_storage::diagnostics::DiagError::QueryFailed(e.to_string())
             })?;
 
-            if let Some(rows) = body.into_rows() {
-                if let Some(row) = rows.first() {
+            if let Some(rows) = body.into_rows()
+                && let Some(row) = rows.first() {
                     let count: i64 = row.get_r_by_name("count").map_err(|e| {
                         extenddb_storage::diagnostics::DiagError::QueryFailed(e.to_string())
                     })?;
                     return Ok(count);
                 }
-            }
 
             Ok(0)
         })
@@ -337,14 +336,13 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for CassandraCatalogStore {
                 extenddb_storage::diagnostics::DiagError::QueryFailed(e.to_string())
             })?;
 
-            if let Some(rows) = body.into_rows() {
-                if let Some(row) = rows.first() {
+            if let Some(rows) = body.into_rows()
+                && let Some(row) = rows.first() {
                     let count: i64 = row.get_r_by_name("count").map_err(|e| {
                         extenddb_storage::diagnostics::DiagError::QueryFailed(e.to_string())
                     })?;
                     return Ok(count);
                 }
-            }
 
             Ok(0)
         })
@@ -374,8 +372,8 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for CassandraCatalogStore {
                 extenddb_storage::diagnostics::DiagError::QueryFailed(e.to_string())
             })?;
 
-            if let Some(rows) = body.into_rows() {
-                if let Some(row) = rows.first() {
+            if let Some(rows) = body.into_rows()
+                && let Some(row) = rows.first() {
                     let account_id: String = row.get_r_by_name("account_id").map_err(|e| {
                         extenddb_storage::diagnostics::DiagError::QueryFailed(e.to_string())
                     })?;
@@ -394,7 +392,6 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for CassandraCatalogStore {
 
                     return Ok(account_keyspace);
                 }
-            }
 
             // No accounts exist yet - that's okay, just return a message
             Ok("No account keyspaces exist yet".to_string())

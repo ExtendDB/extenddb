@@ -175,9 +175,9 @@ impl CassandraEngine {
                     )
                     .await?;
                     let has_label = label_row
-                        .and_then(|r| {
+                        .map(|r| {
                             let v: Option<String> = r.get_by_name("stream_label").ok().flatten();
-                            Some(v.is_some())
+                            v.is_some()
                         })
                         .unwrap_or(false);
                     if !has_label {
@@ -236,7 +236,7 @@ impl CassandraEngine {
                     let pt_json = create
                         .provisioned_throughput
                         .as_ref()
-                        .map(|pt| serde_json::to_string(pt))
+                        .map(serde_json::to_string)
                         .transpose()
                         .map_err(|e| StorageError::Internal(e.to_string()))?
                         .unwrap_or_default();

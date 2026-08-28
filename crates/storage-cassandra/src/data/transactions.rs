@@ -88,14 +88,13 @@ impl CassandraEngine {
 
         // Check for prepared transactions in Phase 1 data
         for (i, result) in phase1_results.iter().enumerate() {
-            if let Some((_, _, prepared_txn_id)) = result {
-                if prepared_txn_id.is_some() {
+            if let Some((_, _, prepared_txn_id)) = result
+                && prepared_txn_id.is_some() {
                     // Item is in a prepared transaction - conflict
                     let mut reasons = vec![CancellationReason::none(); ops.len()];
                     reasons[i] = transaction_conflict_reason();
                     return Err(StorageError::TransactionCanceled(reasons));
                 }
-            }
         }
 
         // Phase 2: Verify timestamps haven't changed
@@ -850,13 +849,12 @@ impl CassandraEngine {
                 .get_by_name("partition_max_delete_timestamp")
                 .ok()
                 .flatten();
-            if let Some(max_ts) = max_ts {
-                if txn_timestamp <= max_ts {
+            if let Some(max_ts) = max_ts
+                && txn_timestamp <= max_ts {
                     return Err(CancellationReason::validation_error(
                         "Item was deleted at a later timestamp".to_owned(),
                     ));
                 }
-            }
         }
 
         Ok(())
@@ -1295,7 +1293,7 @@ impl CassandraEngine {
 
         let table = data_table_name(&op.table_id);
         let txn_id_bytes = Bytes::new(txn_id.as_bytes().to_vec());
-        let sk = ledger_sk(&op)?;
+        let sk = ledger_sk(op)?;
 
         match op.op.as_str() {
             "PUT" | "UPDATE" => {
@@ -1438,7 +1436,7 @@ impl CassandraEngine {
 
         let table = data_table_name(&op.table_id);
         let txn_id_bytes = Bytes::new(txn_id.as_bytes().to_vec());
-        let sk = ledger_sk(&op)?;
+        let sk = ledger_sk(op)?;
 
         let (delete_result, update_query) = if let Some((sk_val, sk_col)) = &sk {
             let dq = format!(
@@ -1538,15 +1536,14 @@ fn check_lwt_applied(result: &Envelope, context: &str) -> Result<(), Cancellatio
         CancellationReason::validation_error("Database error".to_owned())
     })?;
 
-    if let Some(rows) = body.into_rows() {
-        if let Some(row) = rows.first() {
-            let applied: bool = get_column::<bool, StorageError>(&row, "[applied]", context)
+    if let Some(rows) = body.into_rows()
+        && let Some(row) = rows.first() {
+            let applied: bool = get_column::<bool, StorageError>(row, "[applied]", context)
                 .map_err(|_| transaction_conflict_reason())?;
             if !applied {
                 return Err(transaction_conflict_reason());
             }
         }
-    }
 
     Ok(())
 }

@@ -132,9 +132,9 @@ impl CassandraEngine {
             StorageError::Internal("Database error".to_owned())
         })?;
 
-        if let Some(rows) = body.into_rows() {
-            if let Some(row) = rows.first() {
-                let applied: bool = get_column(&row, "[applied]", "write_ledger_entry")?;
+        if let Some(rows) = body.into_rows()
+            && let Some(row) = rows.first() {
+                let applied: bool = get_column(row, "[applied]", "write_ledger_entry")?;
                 if !applied {
                     tracing::error!("write_ledger_entry: transaction ID already exists");
                     return Err(StorageError::Internal(
@@ -142,7 +142,6 @@ impl CassandraEngine {
                     ));
                 }
             }
-        }
 
         Ok(())
     }
