@@ -111,13 +111,15 @@ pub async fn handle_get_shard_iterator(
                     "SequenceNumber is required for AT_SEQUENCE_NUMBER iterator type".to_owned(),
                 )
             })?;
-            let n = raw.parse::<u64>().map_err(|_| {
+            let n = raw.parse::<u128>().map_err(|_| {
                 DynamoDbError::ValidationException("Invalid SequenceNumber".to_owned())
             })?;
             // n == 0: sequence 0 is the first possible record, so "at 0"
             // means "read from the beginning" — same as TRIM_HORIZON.
             if n > 0 {
-                format!("{:021}", n - 1)
+                // Pad to the same width as the input so lexicographic order
+                // matches numeric order against stored sequence numbers.
+                format!("{:0>width$}", n - 1, width = raw.len())
             } else {
                 String::new()
             }
