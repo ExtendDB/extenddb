@@ -231,8 +231,8 @@ pub fn sync_indexes(
         let base_sks = all_sort_key_info(base_key_schema, attr_defs);
 
         // Delete old index row if the old item had index keys
-        if let Some(old) = old_item {
-            if item_has_index_keys(old, &idx.key_schema) {
+        if let Some(old) = old_item
+            && item_has_index_keys(old, &idx.key_schema) {
                 delete_index_row_multi(
                     batch,
                     account_keyspace,
@@ -244,11 +244,10 @@ pub fn sync_indexes(
                     &base_sks,
                 )?;
             }
-        }
 
         // Insert new index row if the new item has index keys
-        if let Some(new) = new_item {
-            if item_has_index_keys(new, &idx.key_schema) {
+        if let Some(new) = new_item
+            && item_has_index_keys(new, &idx.key_schema) {
                 let projected =
                     project_item_for_index(new, &idx.key_schema, base_key_schema, &idx.projection);
                 insert_index_row_multi(
@@ -263,7 +262,6 @@ pub fn sync_indexes(
                     &base_sks,
                 )?;
             }
-        }
     }
     Ok(())
 }

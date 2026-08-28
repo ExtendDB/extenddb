@@ -13,18 +13,18 @@ use crate::CassandraEngine;
 impl MetadataEngine for CassandraEngine {
     fn describe_ttl(
         &self,
-        account_id: &str,
-        table_name: &str,
+        _account_id: &str,
+        _table_name: &str,
     ) -> BoxFuture<'_, Result<TimeToLiveDescription, StorageError>> {
         Box::pin(async move { todo!("describe_ttl not implemented") })
     }
 
     fn update_ttl(
         &self,
-        account_id: &str,
-        table_name: &str,
-        attribute_name: &str,
-        enabled: bool,
+        _account_id: &str,
+        _table_name: &str,
+        _attribute_name: &str,
+        _enabled: bool,
     ) -> BoxFuture<'_, Result<(), StorageError>> {
         Box::pin(async move { todo!("update_ttl not implemented") })
     }
@@ -123,7 +123,7 @@ impl MetadataEngine for CassandraEngine {
 
     fn tables_with_ttl(
         &self,
-        account_id: &str,
+        _account_id: &str,
     ) -> BoxFuture<'_, Result<Vec<(String, String)>, StorageError>> {
         Box::pin(async move { todo!("tables_with_ttl not implemented") })
     }
@@ -142,42 +142,42 @@ impl MetadataEngine for CassandraEngine {
 
     fn create_ttl_index(
         &self,
-        account_id: &str,
-        table_name: &str,
-        ttl_attribute: &str,
+        _account_id: &str,
+        _table_name: &str,
+        _ttl_attribute: &str,
     ) -> BoxFuture<'_, Result<(), StorageError>> {
         Box::pin(async move { todo!("create_ttl_index not implemented") })
     }
 
     fn drop_ttl_index(
         &self,
-        account_id: &str,
-        table_name: &str,
+        _account_id: &str,
+        _table_name: &str,
     ) -> BoxFuture<'_, Result<(), StorageError>> {
         Box::pin(async move { todo!("drop_ttl_index not implemented") })
     }
 
     fn find_expired_items_indexed(
         &self,
-        account_id: &str,
-        table_name: &str,
-        ttl_attribute: &str,
-        limit: usize,
+        _account_id: &str,
+        _table_name: &str,
+        _ttl_attribute: &str,
+        _limit: usize,
     ) -> BoxFuture<'_, Result<Vec<Item>, StorageError>> {
         Box::pin(async move { todo!("find_expired_items_indexed not implemented") })
     }
 
     fn refresh_table_size(
         &self,
-        account_id: &str,
-        table_name: &str,
+        _account_id: &str,
+        _table_name: &str,
     ) -> BoxFuture<'_, Result<(), StorageError>> {
         Box::pin(async move { todo!("refresh_table_size not implemented") })
     }
 
     fn list_active_table_names(
         &self,
-        account_id: &str,
+        _account_id: &str,
     ) -> BoxFuture<'_, Result<Vec<String>, StorageError>> {
         Box::pin(async move { todo!("list_active_table_names not implemented") })
     }

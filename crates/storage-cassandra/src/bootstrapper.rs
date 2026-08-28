@@ -133,14 +133,13 @@ impl CassandraBootstrapper {
                 "--extenddb-pass",
             )?;
 
-            if let Some(ref cli_prefix) = keyspace_prefix {
-                if cli_prefix != &config.keyspace_prefix {
+            if let Some(ref cli_prefix) = keyspace_prefix
+                && cli_prefix != &config.keyspace_prefix {
                     return Err(StorageError::Internal(format!(
                         "--keyspace-prefix '{}' conflicts with config file keyspace prefix '{}'",
                         cli_prefix, config.keyspace_prefix
                     )));
                 }
-            }
 
             if let Some(ref cli_rf) = replication_factor {
                 let cli_rf_val = cli_rf.parse::<u32>().map_err(|_| {

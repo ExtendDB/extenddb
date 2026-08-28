@@ -212,8 +212,8 @@ impl CassandraEngine {
             .response_body()
             .map_err(|e| StorageError::Internal(format!("Failed to get response body: {}", e)))?;
 
-        if let Some(rows) = body.into_rows() {
-            if let Some(row) = rows.first() {
+        if let Some(rows) = body.into_rows()
+            && let Some(row) = rows.first() {
                 use cdrs_tokio::types::IntoRustByName;
                 let applied: bool = row.get_r_by_name("[applied]").map_err(|e| {
                     StorageError::Internal(format!("Failed to parse [applied]: {}", e))
@@ -223,7 +223,6 @@ impl CassandraEngine {
                     return Err(StorageError::TableAlreadyExists(input.table_name.clone()));
                 }
             }
-        }
 
         // Insert GSI metadata
         let mut gsi_index_ids: Vec<String> = Vec::new();

@@ -73,14 +73,13 @@ impl OperationsEngine for CassandraOperationsEngine {
         }
 
         // Check first character (cannot be digit)
-        if let Some(first_char) = name.chars().next() {
-            if first_char.is_ascii_digit() {
+        if let Some(first_char) = name.chars().next()
+            && first_char.is_ascii_digit() {
                 return Err(StorageError::Internal(format!(
                     "{} '{}' cannot start with a digit",
                     label, name
                 )));
             }
-        }
 
         // Check all characters (alphanumeric + underscore only)
         if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
