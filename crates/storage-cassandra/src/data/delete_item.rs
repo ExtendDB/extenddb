@@ -35,11 +35,13 @@ impl CassandraEngine {
         let pk_text = composite_pk_to_text(key, &key_info.key_schema)?;
 
         let catalog_keyspace = self.catalog_keyspace();
-        let indexes = fetch_indexes_for_table(&key_info.table_id, &self.session, &catalog_keyspace).await?;
+        let indexes =
+            fetch_indexes_for_table(&key_info.table_id, &self.session, &catalog_keyspace).await?;
         let sys_delay = if indexes.is_empty() {
             0
         } else {
-            self.gsi_default_delay_ms.load(std::sync::atomic::Ordering::Relaxed)
+            self.gsi_default_delay_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
         };
 
         if let Some((sk_name, sk_type)) =
@@ -175,20 +177,23 @@ impl CassandraEngine {
                         old_item_opt.as_ref(),
                         None,
                         sys_delay,
-                    ).await?
+                    )
+                    .await?
                 } else {
                     0
                 };
 
                 if let Some(stmt) = stream_stmt {
-                    batch = batch.add_query(
-                        stmt,
-                        cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
-                    );
+                    batch =
+                        batch.add_query(stmt, cdrs_tokio::query::QueryValues::SimpleValues(vec![]));
                 }
 
                 self.session
-                    .batch(batch.build().map_err(|e| StorageError::Internal(e.to_string()))?)
+                    .batch(
+                        batch
+                            .build()
+                            .map_err(|e| StorageError::Internal(e.to_string()))?,
+                    )
                     .await
                     .map_err(|e| StorageError::Internal(format!("Batch execution: {}", e)))?;
 
@@ -319,20 +324,23 @@ impl CassandraEngine {
                         old_item_opt.as_ref(),
                         None,
                         sys_delay,
-                    ).await?
+                    )
+                    .await?
                 } else {
                     0
                 };
 
                 if let Some(stmt) = stream_stmt {
-                    batch = batch.add_query(
-                        stmt,
-                        cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
-                    );
+                    batch =
+                        batch.add_query(stmt, cdrs_tokio::query::QueryValues::SimpleValues(vec![]));
                 }
 
                 self.session
-                    .batch(batch.build().map_err(|e| StorageError::Internal(e.to_string()))?)
+                    .batch(
+                        batch
+                            .build()
+                            .map_err(|e| StorageError::Internal(e.to_string()))?,
+                    )
                     .await
                     .map_err(|e| StorageError::Internal(format!("Batch execution: {}", e)))?;
 
@@ -371,10 +379,7 @@ impl CassandraEngine {
 
         let result = self
             .session
-            .query_with_values(
-                &query_null,
-                cdrs_tokio::query_values!(now_ms, pk),
-            )
+            .query_with_values(&query_null, cdrs_tokio::query_values!(now_ms, pk))
             .await
             .map_err(|e| {
                 tracing::error!("update_partition_max_delete_timestamp (null): {e}");

@@ -118,7 +118,8 @@ pub(crate) async fn poll_transaction_recovery(
             for entry in entries {
                 tracing::info!(
                     "transaction_recovery: recovering txn {} (state={}) in {keyspace}",
-                    entry.txn_id, entry.state
+                    entry.txn_id,
+                    entry.state
                 );
                 if let Err(e) = engine.recover_transaction(keyspace, entry.txn_id).await {
                     tracing::warn!(
@@ -132,15 +133,21 @@ pub(crate) async fn poll_transaction_recovery(
 }
 
 /// List all account keyspaces for this engine (keyspaces matching `{prefix}_account_*`).
-async fn list_account_keyspaces(engine: &CassandraEngine) -> Result<Vec<String>, extenddb_storage::error::StorageError> {
+async fn list_account_keyspaces(
+    engine: &CassandraEngine,
+) -> Result<Vec<String>, extenddb_storage::error::StorageError> {
     let prefix = format!("{}_account_", engine.keyspace_prefix);
     let rows = engine
         .session
         .query("SELECT keyspace_name FROM system_schema.keyspaces")
         .await
-        .map_err(|e| extenddb_storage::error::StorageError::Internal(format!("list keyspaces: {e}")))?
+        .map_err(|e| {
+            extenddb_storage::error::StorageError::Internal(format!("list keyspaces: {e}"))
+        })?
         .response_body()
-        .map_err(|e| extenddb_storage::error::StorageError::Internal(format!("list keyspaces body: {e}")))?
+        .map_err(|e| {
+            extenddb_storage::error::StorageError::Internal(format!("list keyspaces body: {e}"))
+        })?
         .into_rows()
         .unwrap_or_default();
 
@@ -175,7 +182,8 @@ pub struct GsiWorkerGuard {
 
 impl Drop for GsiWorkerGuard {
     fn drop(&mut self) {
-        self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -194,7 +202,11 @@ pub fn spawn_gsi_workers(engine: Arc<CassandraEngine>) -> GsiWorkerGuard {
     GsiWorkerGuard { shutdown }
 }
 
-async fn gsi_worker(worker_id: u64, engine: Arc<CassandraEngine>, shutdown: Arc<std::sync::atomic::AtomicBool>) {
+async fn gsi_worker(
+    worker_id: u64,
+    engine: Arc<CassandraEngine>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+) {
     const MAX_IDLE: Duration = Duration::from_secs(1);
 
     tracing::debug!("GSI worker {worker_id} started");
@@ -225,10 +237,7 @@ async fn gsi_worker(worker_id: u64, engine: Arc<CassandraEngine>, shutdown: Arc<
 }
 
 /// Time until the earliest not-yet-due row in this partition becomes eligible.
-async fn gsi_next_ready_wait(
-    worker_id: u64,
-    engine: &CassandraEngine,
-) -> Option<Duration> {
+async fn gsi_next_ready_wait(worker_id: u64, engine: &CassandraEngine) -> Option<Duration> {
     // We need to find the minimum ready_at across all account keyspaces.
     // For simplicity, use MAX_IDLE as the wait — the worker will re-check
     // promptly. A more precise implementation would query each keyspace.
@@ -269,17 +278,17 @@ async fn gsi_process_batch(
         {
             Ok(rows) => rows,
             Err(ref e) if is_table_not_found(e) => {
-                tracing::warn!("GSI worker {worker_id}: {keyspace}.gsi_pending not found, skipping keyspace");
+                tracing::warn!(
+                    "GSI worker {worker_id}: {keyspace}.gsi_pending not found, skipping keyspace"
+                );
                 continue;
             }
             Err(e) => return Err(e),
         };
 
         for row in rows {
-            let ready_at: i64 =
-                crate::cassandra_util::get_column(&row, "ready_at", "gsi_worker")?;
-            let id: uuid::Uuid =
-                crate::cassandra_util::get_column(&row, "id", "gsi_worker")?;
+            let ready_at: i64 = crate::cassandra_util::get_column(&row, "ready_at", "gsi_worker")?;
+            let id: uuid::Uuid = crate::cassandra_util::get_column(&row, "id", "gsi_worker")?;
             let table_id: String =
                 crate::cassandra_util::get_column(&row, "table_id", "gsi_worker")?;
             let old_json: Option<String> = row.get_by_name("old_item").ok().flatten();
@@ -295,9 +304,8 @@ async fn gsi_process_batch(
                 .map(|s| serde_json::from_str(&s))
                 .transpose()
                 .map_err(|e| extenddb_storage::error::StorageError::Internal(e.to_string()))?;
-            let context: crate::gsi_queue::GsiApplyContext =
-                serde_json::from_str(&ctx_json)
-                    .map_err(|e| extenddb_storage::error::StorageError::Internal(e.to_string()))?;
+            let context: crate::gsi_queue::GsiApplyContext = serde_json::from_str(&ctx_json)
+                .map_err(|e| extenddb_storage::error::StorageError::Internal(e.to_string()))?;
 
             // Apply the index update. If the index table is gone (table deleted),
             // log and skip — the row is still deleted below.
@@ -386,8 +394,12 @@ async fn gsi_apply_index(
 
     if let Some(new) = new_item {
         if item_has_index_keys(new, &idx.key_schema) {
-            let projected =
-                project_item_for_index(new, &idx.key_schema, &context.base_key_schema, &idx.projection);
+            let projected = project_item_for_index(
+                new,
+                &idx.key_schema,
+                &context.base_key_schema,
+                &idx.projection,
+            );
             insert_index_row_multi(
                 &mut batch,
                 account_keyspace,
@@ -407,11 +419,9 @@ async fn gsi_apply_index(
         .build()
         .map_err(|e| extenddb_storage::error::StorageError::Internal(e.to_string()))?;
     if !built.request.queries.is_empty() {
-        engine
-            .session
-            .batch(built)
-            .await
-            .map_err(|e| extenddb_storage::error::StorageError::Internal(format!("gsi_apply: {e}")))?;
+        engine.session.batch(built).await.map_err(|e| {
+            extenddb_storage::error::StorageError::Internal(format!("gsi_apply: {e}"))
+        })?;
     }
 
     Ok(())

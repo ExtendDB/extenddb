@@ -13,8 +13,8 @@
 
 use extenddb_core::types::{AttributeDefinition, KeySchemaElement, Projection};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
 use std::sync::Arc;
+use tokio::sync::Notify;
 
 /// Number of worker partitions. Fixed: changing while the queue is non-empty
 /// would split a key's rows across workers.

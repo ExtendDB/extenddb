@@ -55,7 +55,8 @@ impl CassandraEngine {
         let sys_delay = if indexes.is_empty() {
             0
         } else {
-            self.gsi_default_delay_ms.load(std::sync::atomic::Ordering::Relaxed)
+            self.gsi_default_delay_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
         };
 
         // Fetch existing item (including prepared_txn_id for transaction conflict detection)
@@ -276,14 +277,16 @@ impl CassandraEngine {
                 };
 
                 if let Some(stmt) = stream_stmt {
-                    batch = batch.add_query(
-                        stmt,
-                        cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
-                    );
+                    batch =
+                        batch.add_query(stmt, cdrs_tokio::query::QueryValues::SimpleValues(vec![]));
                 }
 
                 self.session
-                    .batch(batch.build().map_err(|e| StorageError::Internal(e.to_string()))?)
+                    .batch(
+                        batch
+                            .build()
+                            .map_err(|e| StorageError::Internal(e.to_string()))?,
+                    )
                     .await
                     .map_err(|e| StorageError::Internal(format!("Batch execution: {}", e)))?;
 
@@ -357,14 +360,16 @@ impl CassandraEngine {
                 };
 
                 if let Some(stmt) = stream_stmt {
-                    batch = batch.add_query(
-                        stmt,
-                        cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
-                    );
+                    batch =
+                        batch.add_query(stmt, cdrs_tokio::query::QueryValues::SimpleValues(vec![]));
                 }
 
                 self.session
-                    .batch(batch.build().map_err(|e| StorageError::Internal(e.to_string()))?)
+                    .batch(
+                        batch
+                            .build()
+                            .map_err(|e| StorageError::Internal(e.to_string()))?,
+                    )
                     .await
                     .map_err(|e| StorageError::Internal(format!("Batch execution: {}", e)))?;
 

@@ -53,13 +53,10 @@ impl CassandraEngine {
         // Note: values are interpolated rather than bound because Cassandra LOGGED BATCH
         // does not support parameterized statements spanning multiple tables.
         // All interpolated values are server-generated (UUIDs, timestamps, label from chrono).
-        self.session
-            .query(&batch)
-            .await
-            .map_err(|e| {
-                tracing::error!("init_stream_shards batch: {e}");
-                StorageError::Internal(format!("Failed to initialize stream shards: {e}"))
-            })?;
+        self.session.query(&batch).await.map_err(|e| {
+            tracing::error!("init_stream_shards batch: {e}");
+            StorageError::Internal(format!("Failed to initialize stream shards: {e}"))
+        })?;
 
         Ok(label)
     }
@@ -351,7 +348,15 @@ impl CassandraEngine {
             .as_ref()
             .is_some_and(|s| s.stream_enabled)
         {
-            Some(self.init_stream_shards(account_id, &input.table_name, &account_keyspace, &table_id).await?)
+            Some(
+                self.init_stream_shards(
+                    account_id,
+                    &input.table_name,
+                    &account_keyspace,
+                    &table_id,
+                )
+                .await?,
+            )
         } else {
             None
         };

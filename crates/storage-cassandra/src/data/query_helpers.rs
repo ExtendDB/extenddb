@@ -108,24 +108,92 @@ pub(super) async fn query_with_pk_sk_pk_sk(
 ) -> Result<Vec<Row>, StorageError> {
     use cdrs_tokio::query_values;
     match (idx_sk, base_sk) {
-        (SortKeyValue::S(isk), SortKeyValue::S(bsk)) =>
-            cassandra_util::query_rows(session, query, query_values!(pk, isk.as_str(), base_pk, bsk.as_str()), label).await,
-        (SortKeyValue::S(isk), SortKeyValue::N(bsk)) =>
-            cassandra_util::query_rows(session, query, query_values!(pk, isk.as_str(), base_pk, super::decimal_to_value(bsk)), label).await,
-        (SortKeyValue::S(isk), SortKeyValue::B(bsk)) =>
-            cassandra_util::query_rows(session, query, query_values!(pk, isk.as_str(), base_pk, bsk.to_vec()), label).await,
-        (SortKeyValue::N(isk), SortKeyValue::S(bsk)) =>
-            cassandra_util::query_rows(session, query, query_values!(pk, super::decimal_to_value(isk), base_pk, bsk.as_str()), label).await,
-        (SortKeyValue::N(isk), SortKeyValue::N(bsk)) =>
-            cassandra_util::query_rows(session, query, query_values!(pk, super::decimal_to_value(isk), base_pk, super::decimal_to_value(bsk)), label).await,
-        (SortKeyValue::N(isk), SortKeyValue::B(bsk)) =>
-            cassandra_util::query_rows(session, query, query_values!(pk, super::decimal_to_value(isk), base_pk, bsk.to_vec()), label).await,
-        (SortKeyValue::B(isk), SortKeyValue::S(bsk)) =>
-            cassandra_util::query_rows(session, query, query_values!(pk, isk.to_vec(), base_pk, bsk.as_str()), label).await,
-        (SortKeyValue::B(isk), SortKeyValue::N(bsk)) =>
-            cassandra_util::query_rows(session, query, query_values!(pk, isk.to_vec(), base_pk, super::decimal_to_value(bsk)), label).await,
-        (SortKeyValue::B(isk), SortKeyValue::B(bsk)) =>
-            cassandra_util::query_rows(session, query, query_values!(pk, isk.to_vec(), base_pk, bsk.to_vec()), label).await,
+        (SortKeyValue::S(isk), SortKeyValue::S(bsk)) => {
+            cassandra_util::query_rows(
+                session,
+                query,
+                query_values!(pk, isk.as_str(), base_pk, bsk.as_str()),
+                label,
+            )
+            .await
+        }
+        (SortKeyValue::S(isk), SortKeyValue::N(bsk)) => {
+            cassandra_util::query_rows(
+                session,
+                query,
+                query_values!(pk, isk.as_str(), base_pk, super::decimal_to_value(bsk)),
+                label,
+            )
+            .await
+        }
+        (SortKeyValue::S(isk), SortKeyValue::B(bsk)) => {
+            cassandra_util::query_rows(
+                session,
+                query,
+                query_values!(pk, isk.as_str(), base_pk, bsk.to_vec()),
+                label,
+            )
+            .await
+        }
+        (SortKeyValue::N(isk), SortKeyValue::S(bsk)) => {
+            cassandra_util::query_rows(
+                session,
+                query,
+                query_values!(pk, super::decimal_to_value(isk), base_pk, bsk.as_str()),
+                label,
+            )
+            .await
+        }
+        (SortKeyValue::N(isk), SortKeyValue::N(bsk)) => {
+            cassandra_util::query_rows(
+                session,
+                query,
+                query_values!(
+                    pk,
+                    super::decimal_to_value(isk),
+                    base_pk,
+                    super::decimal_to_value(bsk)
+                ),
+                label,
+            )
+            .await
+        }
+        (SortKeyValue::N(isk), SortKeyValue::B(bsk)) => {
+            cassandra_util::query_rows(
+                session,
+                query,
+                query_values!(pk, super::decimal_to_value(isk), base_pk, bsk.to_vec()),
+                label,
+            )
+            .await
+        }
+        (SortKeyValue::B(isk), SortKeyValue::S(bsk)) => {
+            cassandra_util::query_rows(
+                session,
+                query,
+                query_values!(pk, isk.to_vec(), base_pk, bsk.as_str()),
+                label,
+            )
+            .await
+        }
+        (SortKeyValue::B(isk), SortKeyValue::N(bsk)) => {
+            cassandra_util::query_rows(
+                session,
+                query,
+                query_values!(pk, isk.to_vec(), base_pk, super::decimal_to_value(bsk)),
+                label,
+            )
+            .await
+        }
+        (SortKeyValue::B(isk), SortKeyValue::B(bsk)) => {
+            cassandra_util::query_rows(
+                session,
+                query,
+                query_values!(pk, isk.to_vec(), base_pk, bsk.to_vec()),
+                label,
+            )
+            .await
+        }
     }
 }
 
@@ -140,9 +208,33 @@ pub(super) async fn query_with_pk_sk_pk(
     label: &str,
 ) -> Result<Vec<Row>, StorageError> {
     match sk {
-        SortKeyValue::S(s) => cassandra_util::query_rows(session, query, cdrs_tokio::query_values!(pk, s.as_str(), base_pk), label).await,
-        SortKeyValue::N(n) => cassandra_util::query_rows(session, query, cdrs_tokio::query_values!(pk, super::decimal_to_value(n), base_pk), label).await,
-        SortKeyValue::B(b) => cassandra_util::query_rows(session, query, cdrs_tokio::query_values!(pk, b.to_vec(), base_pk), label).await,
+        SortKeyValue::S(s) => {
+            cassandra_util::query_rows(
+                session,
+                query,
+                cdrs_tokio::query_values!(pk, s.as_str(), base_pk),
+                label,
+            )
+            .await
+        }
+        SortKeyValue::N(n) => {
+            cassandra_util::query_rows(
+                session,
+                query,
+                cdrs_tokio::query_values!(pk, super::decimal_to_value(n), base_pk),
+                label,
+            )
+            .await
+        }
+        SortKeyValue::B(b) => {
+            cassandra_util::query_rows(
+                session,
+                query,
+                cdrs_tokio::query_values!(pk, b.to_vec(), base_pk),
+                label,
+            )
+            .await
+        }
     }
 }
 

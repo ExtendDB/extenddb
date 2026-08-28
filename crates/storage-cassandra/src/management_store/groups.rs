@@ -35,7 +35,9 @@ impl CassandraCatalogStore {
         .await?;
 
         if !applied {
-            return Err(OpError::AlreadyExists("IAM group already exists".to_owned()));
+            return Err(OpError::AlreadyExists(
+                "IAM group already exists".to_owned(),
+            ));
         }
 
         Ok(())

@@ -10,9 +10,7 @@ use extenddb_core::expression::{Expr, ExpressionMaps};
 use extenddb_core::types::{Item, TableKeyInfo};
 use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{
-    composite_pk_to_text, parse_sk, pk_to_text, sk_column, sk_info,
-};
+use extenddb_storage::util::{composite_pk_to_text, parse_sk, pk_to_text, sk_column, sk_info};
 
 use super::ddl::data_table_name;
 use super::{json_to_item, query_with_pk_sk, query_with_pk_sk_item};
@@ -82,9 +80,9 @@ impl CassandraEngine {
 
             let (old_item_opt, has_prepared_txn) = if let Some(rows) = body.into_rows() {
                 if let Some(row) = rows.into_iter().next() {
-                    let item_data: String = row.get_r_by_name("item_data").map_err(|e| {
-                        StorageError::Internal(format!("Parse item_data: {}", e))
-                    })?;
+                    let item_data: String = row
+                        .get_r_by_name("item_data")
+                        .map_err(|e| StorageError::Internal(format!("Parse item_data: {}", e)))?;
                     let prepared_txn_id: Option<uuid::Uuid> =
                         row.get_by_name("prepared_txn_id").ok().flatten();
                     (Some(json_to_item(item_data)?), prepared_txn_id.is_some())
@@ -187,20 +185,23 @@ impl CassandraEngine {
                         old_item_opt.as_ref(),
                         Some(&item),
                         sys_delay,
-                    ).await?
+                    )
+                    .await?
                 } else {
                     0
                 };
 
                 if let Some(stmt) = stream_stmt {
-                    batch = batch.add_query(
-                        stmt,
-                        cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
-                    );
+                    batch =
+                        batch.add_query(stmt, cdrs_tokio::query::QueryValues::SimpleValues(vec![]));
                 }
 
                 self.session
-                    .batch(batch.build().map_err(|e| StorageError::Internal(e.to_string()))?)
+                    .batch(
+                        batch
+                            .build()
+                            .map_err(|e| StorageError::Internal(e.to_string()))?,
+                    )
                     .await
                     .map_err(|e| StorageError::Internal(format!("Batch execution: {}", e)))?;
 
@@ -234,9 +235,9 @@ impl CassandraEngine {
 
             let (old_item_opt, has_prepared_txn) = if let Some(rows) = body.into_rows() {
                 if let Some(row) = rows.into_iter().next() {
-                    let item_data: String = row.get_r_by_name("item_data").map_err(|e| {
-                        StorageError::Internal(format!("Parse item_data: {}", e))
-                    })?;
+                    let item_data: String = row
+                        .get_r_by_name("item_data")
+                        .map_err(|e| StorageError::Internal(format!("Parse item_data: {}", e)))?;
                     let prepared_txn_id: Option<uuid::Uuid> =
                         row.get_by_name("prepared_txn_id").ok().flatten();
                     (Some(json_to_item(item_data)?), prepared_txn_id.is_some())
@@ -337,20 +338,23 @@ impl CassandraEngine {
                         old_item_opt.as_ref(),
                         Some(&item),
                         sys_delay,
-                    ).await?
+                    )
+                    .await?
                 } else {
                     0
                 };
 
                 if let Some(stmt) = stream_stmt {
-                    batch = batch.add_query(
-                        stmt,
-                        cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
-                    );
+                    batch =
+                        batch.add_query(stmt, cdrs_tokio::query::QueryValues::SimpleValues(vec![]));
                 }
 
                 self.session
-                    .batch(batch.build().map_err(|e| StorageError::Internal(e.to_string()))?)
+                    .batch(
+                        batch
+                            .build()
+                            .map_err(|e| StorageError::Internal(e.to_string()))?,
+                    )
                     .await
                     .map_err(|e| StorageError::Internal(format!("Batch execution: {}", e)))?;
 

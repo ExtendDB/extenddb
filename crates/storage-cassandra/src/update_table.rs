@@ -41,8 +41,7 @@ impl CassandraEngine {
         if status != "ACTIVE" {
             return Err(StorageError::TableNotActive(input.table_name.clone()));
         }
-        let table_id: String =
-            crate::cassandra_util::get_column(&row, "table_id", "update_table")?;
+        let table_id: String = crate::cassandra_util::get_column(&row, "table_id", "update_table")?;
         let ks_json: String =
             crate::cassandra_util::get_column(&row, "key_schema", "update_table")?;
         let ad_json: String =
@@ -61,8 +60,14 @@ impl CassandraEngine {
                 let (cur_rcu, cur_wcu) = current_pt_str
                     .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
                     .map(|v| {
-                        let rcu = v.get("ReadCapacityUnits").and_then(|x| x.as_i64()).unwrap_or(0);
-                        let wcu = v.get("WriteCapacityUnits").and_then(|x| x.as_i64()).unwrap_or(0);
+                        let rcu = v
+                            .get("ReadCapacityUnits")
+                            .and_then(|x| x.as_i64())
+                            .unwrap_or(0);
+                        let wcu = v
+                            .get("WriteCapacityUnits")
+                            .and_then(|x| x.as_i64())
+                            .unwrap_or(0);
                         (rcu, wcu)
                     })
                     .unwrap_or((0, 0));
@@ -114,8 +119,8 @@ impl CassandraEngine {
         }
 
         if let Some(pt) = &input.provisioned_throughput {
-            let pt_json = serde_json::to_string(pt)
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let pt_json =
+                serde_json::to_string(pt).map_err(|e| StorageError::Internal(e.to_string()))?;
             add_update!("provisioned_throughput", pt_json.as_str());
         }
 
@@ -128,8 +133,8 @@ impl CassandraEngine {
         }
 
         if let Some(odt) = &input.on_demand_throughput {
-            let odt_json = serde_json::to_string(odt)
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let odt_json =
+                serde_json::to_string(odt).map_err(|e| StorageError::Internal(e.to_string()))?;
             add_update!("on_demand_throughput", odt_json.as_str());
         }
 
@@ -138,8 +143,8 @@ impl CassandraEngine {
         let mut needs_shard_init = false;
         let mut needs_label_restore = false;
         if let Some(spec) = &input.stream_specification {
-            let spec_json = serde_json::to_string(spec)
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let spec_json =
+                serde_json::to_string(spec).map_err(|e| StorageError::Internal(e.to_string()))?;
             add_update!("stream_specification", spec_json.as_str());
 
             if spec.stream_enabled {
@@ -215,10 +220,7 @@ impl CassandraEngine {
                             "SELECT index_name FROM {catalog_ks}.indexes \
                              WHERE table_id = ? AND index_name = ? ALLOW FILTERING"
                         ),
-                        cdrs_tokio::query_values!(
-                            table_id.as_str(),
-                            create.index_name.as_str()
-                        ),
+                        cdrs_tokio::query_values!(table_id.as_str(), create.index_name.as_str()),
                         "update_table gsi duplicate check",
                     )
                     .await?;
@@ -271,16 +273,16 @@ impl CassandraEngine {
                             "SELECT index_id FROM {catalog_ks}.indexes \
                              WHERE table_id = ? AND index_name = ? ALLOW FILTERING"
                         ),
-                        cdrs_tokio::query_values!(
-                            table_id.as_str(),
-                            delete.index_name.as_str()
-                        ),
+                        cdrs_tokio::query_values!(table_id.as_str(), delete.index_name.as_str()),
                         "update_table gsi delete check",
                     )
                     .await?
                     .ok_or_else(|| StorageError::IndexNotFound(delete.index_name.clone()))?;
-                    let index_id: String =
-                        crate::cassandra_util::get_column(&existing, "index_id", "update_table gsi delete")?;
+                    let index_id: String = crate::cassandra_util::get_column(
+                        &existing,
+                        "index_id",
+                        "update_table gsi delete",
+                    )?;
 
                     batch = batch.add_query(
                         format!(
