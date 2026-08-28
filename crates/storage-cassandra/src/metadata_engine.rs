@@ -40,7 +40,14 @@ impl MetadataEngine for CassandraEngine {
                     catalog
                 );
                 self.session_arc()
-                    .query_with_values(&query, cdrs_tokio::query_values!(arn.as_str(), tag.key.as_str(), tag.value.as_str()))
+                    .query_with_values(
+                        &query,
+                        cdrs_tokio::query_values!(
+                            arn.as_str(),
+                            tag.key.as_str(),
+                            tag.value.as_str()
+                        ),
+                    )
                     .await
                     .map_err(|e| {
                         tracing::error!("tag_resource: {e}");
@@ -66,7 +73,10 @@ impl MetadataEngine for CassandraEngine {
                     catalog
                 );
                 self.session_arc()
-                    .query_with_values(&query, cdrs_tokio::query_values!(arn.as_str(), key.as_str()))
+                    .query_with_values(
+                        &query,
+                        cdrs_tokio::query_values!(arn.as_str(), key.as_str()),
+                    )
                     .await
                     .map_err(|e| {
                         tracing::error!("untag_resource: {e}");
@@ -85,7 +95,8 @@ impl MetadataEngine for CassandraEngine {
                 "SELECT tag_key, tag_value FROM {}.tags WHERE resource_arn = ?",
                 catalog
             );
-            let result = self.session_arc()
+            let result = self
+                .session_arc()
                 .query_with_values(&query, cdrs_tokio::query_values!(arn.as_str()))
                 .await
                 .map_err(|e| {
@@ -102,7 +113,8 @@ impl MetadataEngine for CassandraEngine {
             let mut tags = Vec::with_capacity(rows.len());
             for row in rows {
                 let key: String = crate::cassandra_util::get_column(&row, "tag_key", "list_tags")?;
-                let value: String = crate::cassandra_util::get_column(&row, "tag_value", "list_tags")?;
+                let value: String =
+                    crate::cassandra_util::get_column(&row, "tag_value", "list_tags")?;
                 tags.push(Tag { key, value });
             }
             Ok(tags)

@@ -25,7 +25,8 @@ impl SortKeyValueExt for SortKeyValue {
 
 use super::ddl::data_table_name;
 use super::query_helpers::{
-    query_with_pk_pk_sk, query_with_pk_sk, query_with_pk_sk_pk, query_with_pk_sk_pk_sk, query_with_pk_sk_sk, query_with_pk_sk_sk_sk,
+    query_with_pk_pk_sk, query_with_pk_sk, query_with_pk_sk_pk, query_with_pk_sk_pk_sk,
+    query_with_pk_sk_sk, query_with_pk_sk_sk_sk,
 };
 use super::{json_to_item, resolve_expr_to_av};
 use crate::CassandraEngine;
@@ -528,8 +529,7 @@ impl CassandraEngine {
                         let dir = if forward { "ASC" } else { "DESC" };
                         format!(
                             " ORDER BY {} {}, base_pk {}, {} {} LIMIT {}",
-                            sk_col, dir, dir, base_sk_col, dir,
-                            remaining
+                            sk_col, dir, dir, base_sk_col, dir, remaining
                         )
                     } else {
                         format!(

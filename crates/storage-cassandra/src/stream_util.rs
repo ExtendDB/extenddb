@@ -241,13 +241,19 @@ mod tests {
     fn test_sequence_numeric() {
         let mut clock = HybridClock::new(9999);
         let seq = clock.generate();
-        assert!(seq.chars().all(|c| c.is_ascii_digit()), "sequence must be numeric: {seq}");
+        assert!(
+            seq.chars().all(|c| c.is_ascii_digit()),
+            "sequence must be numeric: {seq}"
+        );
     }
 
     #[test]
     fn test_node_id_range() {
         let id = HybridClock::derive_node_id("localhost:9042");
-        assert!((1..=9999).contains(&id), "node_id must be in 1..=9999, got {id}");
+        assert!(
+            (1..=9999).contains(&id),
+            "node_id must be in 1..=9999, got {id}"
+        );
     }
 
     #[test]
@@ -269,6 +275,9 @@ mod tests {
     #[test]
     fn test_assign_shard_id_format() {
         let s = assign_shard_id("pk", "my-table-id");
-        assert!(s.starts_with("shardId-my-table-id-"), "unexpected format: {s}");
+        assert!(
+            s.starts_with("shardId-my-table-id-"),
+            "unexpected format: {s}"
+        );
     }
 }

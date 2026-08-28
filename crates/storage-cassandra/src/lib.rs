@@ -27,8 +27,8 @@ pub mod operations;
 mod stream_engine;
 pub mod stream_util;
 pub mod table_engine;
-mod update_table;
 mod table_helpers;
+mod update_table;
 mod worker_store;
 pub mod workers;
 
@@ -80,15 +80,20 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
         // Read the initial GSI delay immediately so the atomic is correct from
         // the first request, not after the first 30s sleep.
         let gsi_delay = self.engine.gsi_default_delay_ms.clone();
-        if let Ok(Some(val)) = ctx.catalog_store.get_setting("gsi_propagation_delay_ms").await {
+        if let Ok(Some(val)) = ctx
+            .catalog_store
+            .get_setting("gsi_propagation_delay_ms")
+            .await
+        {
             if let Ok(ms) = val.parse::<u64>() {
                 gsi_delay.store(ms, std::sync::atomic::Ordering::Relaxed);
             }
         }
         let catalog_store_for_gsi = ctx.catalog_store.clone();
-        let gsi_delay_poller = tokio::spawn(async move {
-            workers::poll_gsi_delay(catalog_store_for_gsi, gsi_delay).await
-        });
+        let gsi_delay_poller =
+            tokio::spawn(
+                async move { workers::poll_gsi_delay(catalog_store_for_gsi, gsi_delay).await },
+            );
 
         // GSI propagation workers (one per partition).
         let guard = workers::spawn_gsi_workers(self.engine.clone());
@@ -136,8 +141,13 @@ pub fn backend() -> extenddb_storage::Backend {
             Box::pin(async move {
                 let catalog_store = make_catalog_store_from_connection_string(&connection_string)
                     .await
-                    .map_err(extenddb_storage::settings_store::SettingsStoreError::ConnectionFailed)?;
-                Ok(Box::new(catalog_store) as Box<dyn extenddb_storage::management_store::SettingsStore>)
+                    .map_err(
+                        extenddb_storage::settings_store::SettingsStoreError::ConnectionFailed,
+                    )?;
+                Ok(Box::new(catalog_store)
+                    as Box<
+                        dyn extenddb_storage::management_store::SettingsStore,
+                    >)
             })
         },
         diagnostics_store: |connection_string| {
@@ -146,7 +156,8 @@ pub fn backend() -> extenddb_storage::Backend {
                 let catalog_store = make_catalog_store_from_connection_string(&connection_string)
                     .await
                     .map_err(extenddb_storage::diagnostics_store::DiagnosticsStoreError::ConnectionFailed)?;
-                Ok(Box::new(catalog_store) as Box<dyn extenddb_storage::diagnostics::DiagnosticsStore>)
+                Ok(Box::new(catalog_store)
+                    as Box<dyn extenddb_storage::diagnostics::DiagnosticsStore>)
             })
         },
         server_components: server_components_factory,
@@ -240,9 +251,8 @@ fn server_components_factory(
 
         // Load encryption key from catalog.
         let catalog_keyspace = format!("{}_catalog", cassandra_config.keyspace_prefix);
-        let enc_key_query = format!(
-            "SELECT value FROM {catalog_keyspace}.settings WHERE key = 'encryption_key'"
-        );
+        let enc_key_query =
+            format!("SELECT value FROM {catalog_keyspace}.settings WHERE key = 'encryption_key'");
         let enc_key_result = engine.session.query(&enc_key_query).await.map_err(|e| {
             BackendError::InitializationFailed(format!("Failed to load encryption key: {e}"))
         })?;

@@ -98,7 +98,8 @@ impl CassandraCatalogStore {
         let keyspace_name = self.account_keyspace(account_id);
 
         // Check if keyspace already exists to avoid re-running migrations on every call.
-        let exists_result = self.session
+        let exists_result = self
+            .session
             .query_with_values(
                 "SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = ?",
                 cdrs_tokio::query_values!(keyspace_name.as_str()),
@@ -116,7 +117,11 @@ impl CassandraCatalogStore {
             return crate::migrations::run_data_migrations(&self.session, &keyspace_name)
                 .await
                 .map_err(|e| {
-                    tracing::error!("Failed to run data migrations for {}: {:?}", keyspace_name, e);
+                    tracing::error!(
+                        "Failed to run data migrations for {}: {:?}",
+                        keyspace_name,
+                        e
+                    );
                     OpError::Internal("Failed to initialize account storage".to_owned())
                 });
         }
@@ -134,7 +139,11 @@ impl CassandraCatalogStore {
         crate::migrations::run_data_migrations(&self.session, &keyspace_name)
             .await
             .map_err(|e| {
-                tracing::error!("Failed to run data migrations for {}: {:?}", keyspace_name, e);
+                tracing::error!(
+                    "Failed to run data migrations for {}: {:?}",
+                    keyspace_name,
+                    e
+                );
                 OpError::Internal("Failed to initialize account storage".to_owned())
             })?;
 

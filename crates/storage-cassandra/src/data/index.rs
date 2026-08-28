@@ -309,8 +309,8 @@ pub(crate) async fn enqueue_async_indexes(
             },
         };
 
-        let context_json = serde_json::to_string(&context)
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let context_json =
+            serde_json::to_string(&context).map_err(|e| StorageError::Internal(e.to_string()))?;
         let old_json = old_item
             .map(serde_json::to_string)
             .transpose()
@@ -480,7 +480,8 @@ pub(crate) fn insert_index_row_multi(
         serde_json::to_string(projected).map_err(|e| StorageError::Internal(e.to_string()))?;
 
     let mut cols = vec!["pk".to_owned()];
-    let mut values: Vec<cdrs_tokio::types::value::Value> = vec![cdrs_tokio::types::value::Value::from(idx_pk_text.as_str())];
+    let mut values: Vec<cdrs_tokio::types::value::Value> =
+        vec![cdrs_tokio::types::value::Value::from(idx_pk_text.as_str())];
 
     // Index SK values
     for (i, &(sk_name, sk_type)) in idx_sks.iter().enumerate() {
@@ -532,9 +533,9 @@ pub(crate) fn sk_to_value(sk: &SortKeyValue) -> cdrs_tokio::types::value::Value 
     match sk {
         SortKeyValue::S(s) => s.as_str().into(),
         SortKeyValue::N(n) => super::decimal_to_value(n),
-        SortKeyValue::B(b) => cdrs_tokio::types::value::Value::from(
-            cdrs_tokio::types::blob::Blob::new(b.to_vec()),
-        ),
+        SortKeyValue::B(b) => {
+            cdrs_tokio::types::value::Value::from(cdrs_tokio::types::blob::Blob::new(b.to_vec()))
+        }
     }
 }
 

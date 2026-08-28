@@ -72,7 +72,9 @@ impl CassandraEngine {
             control_plane_notify: Arc::new(tokio::sync::Notify::new()),
             gsi_default_delay_ms: Arc::new(std::sync::atomic::AtomicU64::new(1000)), // Default 1 second
             gsi_queue: crate::gsi_queue::GsiQueue::new(),
-            hlc: crate::stream_util::new_shared_hlc(config.instance_id.as_deref().unwrap_or("default")),
+            hlc: crate::stream_util::new_shared_hlc(
+                config.instance_id.as_deref().unwrap_or("default"),
+            ),
             stream_retention_seconds: 108_000, // 30 hours; overridden by spawn_workers (Step 7)
         })
     }

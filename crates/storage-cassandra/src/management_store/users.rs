@@ -3,9 +3,9 @@
 
 //! User management operations for `CassandraCatalogStore`.
 
+use crate::catalog_store::CassandraCatalogStore;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_storage::management_store::{OpError, OpResult, UserDetail};
-use crate::catalog_store::CassandraCatalogStore;
 
 impl CassandraCatalogStore {
     pub(crate) async fn create_user_impl(

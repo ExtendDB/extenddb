@@ -405,9 +405,8 @@ impl CassandraCatalogStore {
 
     pub(crate) async fn get_default_account_id_impl(&self) -> OpResult<Option<String>> {
         let keyspace = self.catalog_keyspace();
-        let query = format!(
-            "SELECT value FROM {keyspace}.settings WHERE key = 'default_account_id'"
-        );
+        let query =
+            format!("SELECT value FROM {keyspace}.settings WHERE key = 'default_account_id'");
         let rows = crate::cassandra_util::query_rows::<extenddb_storage::error::StorageError>(
             &self.session(),
             &query,
@@ -419,16 +418,13 @@ impl CassandraCatalogStore {
             tracing::error!("default_account_id: {e}");
             extenddb_storage::management_store::OpError::Internal("Database error".to_owned())
         })?;
-        Ok(rows
-            .into_iter()
-            .next()
-            .and_then(|row| {
-                crate::cassandra_util::get_column::<String, extenddb_storage::error::StorageError>(
-                    &row,
-                    "value",
-                    "default_account_id",
-                )
-                .ok()
-            }))
+        Ok(rows.into_iter().next().and_then(|row| {
+            crate::cassandra_util::get_column::<String, extenddb_storage::error::StorageError>(
+                &row,
+                "value",
+                "default_account_id",
+            )
+            .ok()
+        }))
     }
 }

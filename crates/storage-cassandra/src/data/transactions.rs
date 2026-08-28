@@ -289,7 +289,10 @@ impl CassandraEngine {
             }
             Err(reasons) => {
                 // T4.4: ROLLBACK phase
-                tracing::debug!("transact_write: PREPARE failed ({} reasons), rolling back txn {txn_id}", reasons.len());
+                tracing::debug!(
+                    "transact_write: PREPARE failed ({} reasons), rolling back txn {txn_id}",
+                    reasons.len()
+                );
                 self.execute_rollback_phase(&account_keyspace, ops, txn_id)
                     .await?;
                 Err(StorageError::TransactionCanceled(reasons))
@@ -312,7 +315,10 @@ impl CassandraEngine {
         let mut any_failed = false;
 
         for op in ops {
-            match self.prepare_single_operation(op, txn_id, txn_timestamp).await {
+            match self
+                .prepare_single_operation(op, txn_id, txn_timestamp)
+                .await
+            {
                 Ok(item_data) => {
                     reasons.push(CancellationReason::none());
                     computed.push(item_data);
@@ -325,7 +331,11 @@ impl CassandraEngine {
             }
         }
 
-        if any_failed { Err(reasons) } else { Ok(computed) }
+        if any_failed {
+            Err(reasons)
+        } else {
+            Ok(computed)
+        }
     }
 
     /// Prepare a single transactional operation.
@@ -636,29 +646,28 @@ impl CassandraEngine {
                     }
                 };
                 let pk = composite_pk_to_text(key, &key_info.key_schema)?;
-                let (sk_col, sk_val) =
-                    if let Some((sk_name, sk_type)) =
-                        sk_info(&key_info.key_schema, &key_info.attribute_definitions)
-                    {
-                        let sk_value = key.get(sk_name).ok_or_else(|| {
-                            StorageError::Internal("missing sort key".to_owned())
-                        })?;
-                        let sk = parse_sk(sk_value, sk_type)?;
-                        let col = sk_column(sk_type).to_owned();
-                        // Store as the text representation used in Cassandra queries.
-                        // sk_col ("sk_s"/"sk_n"/"sk_b") encodes the type; no separate type tag needed.
-                        let val = match &sk {
-                            SortKeyValue::S(s) => s.clone(),
-                            SortKeyValue::N(n) => n.to_string(),
-                            SortKeyValue::B(b) => {
-                                use base64::Engine as _;
-                                base64::engine::general_purpose::STANDARD.encode(b)
-                            }
-                        };
-                        (Some(col), Some(val))
-                    } else {
-                        (None, None)
+                let (sk_col, sk_val) = if let Some((sk_name, sk_type)) =
+                    sk_info(&key_info.key_schema, &key_info.attribute_definitions)
+                {
+                    let sk_value = key
+                        .get(sk_name)
+                        .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?;
+                    let sk = parse_sk(sk_value, sk_type)?;
+                    let col = sk_column(sk_type).to_owned();
+                    // Store as the text representation used in Cassandra queries.
+                    // sk_col ("sk_s"/"sk_n"/"sk_b") encodes the type; no separate type tag needed.
+                    let val = match &sk {
+                        SortKeyValue::S(s) => s.clone(),
+                        SortKeyValue::N(n) => n.to_string(),
+                        SortKeyValue::B(b) => {
+                            use base64::Engine as _;
+                            base64::engine::general_purpose::STANDARD.encode(b)
+                        }
                     };
+                    (Some(col), Some(val))
+                } else {
+                    (None, None)
+                };
                 // For PUT, item_data is known immediately.
                 // For UPDATE, item_data is filled in after PREPARE (update_ledger_blob).
                 // For DELETE and CHECK, item_data is never needed.
@@ -1245,7 +1254,10 @@ impl CassandraEngine {
         match state {
             Some(TransactionState::Committing) => {
                 for op in &ops {
-                    if let Err(e) = self.recover_commit_op(keyspace, op, txn_id, txn_timestamp).await {
+                    if let Err(e) = self
+                        .recover_commit_op(keyspace, op, txn_id, txn_timestamp)
+                        .await
+                    {
                         tracing::error!("recover_transaction commit op {txn_id}: {e}");
                         return Err(e);
                     }
@@ -1289,7 +1301,8 @@ impl CassandraEngine {
             "PUT" | "UPDATE" => {
                 let item_data = op.item_data.as_deref().ok_or_else(|| {
                     StorageError::Internal(format!(
-                        "ledger op {} missing item_data for {}", op.op, txn_id
+                        "ledger op {} missing item_data for {}",
+                        op.op, txn_id
                     ))
                 })?;
 
@@ -1300,18 +1313,30 @@ impl CassandraEngine {
                          IF prepared_txn_id = ?",
                     );
                     query_with_item_ts_pk_sk_txnid(
-                        &self.session, &query, item_data, txn_timestamp,
-                        &op.pk, sk_val, txn_id_bytes,
-                    ).await
+                        &self.session,
+                        &query,
+                        item_data,
+                        txn_timestamp,
+                        &op.pk,
+                        sk_val,
+                        txn_id_bytes,
+                    )
+                    .await
                 } else {
                     let query = format!(
                         "UPDATE {keyspace}.{table} SET item_data = ?, prepared_txn_id = NULL, \
                          last_committed_txn_timestamp = ? WHERE pk = ? IF prepared_txn_id = ?",
                     );
                     self.session
-                        .query_with_values(&query, cdrs_tokio::query_values!(
-                            item_data, txn_timestamp, op.pk.as_str(), txn_id_bytes
-                        ))
+                        .query_with_values(
+                            &query,
+                            cdrs_tokio::query_values!(
+                                item_data,
+                                txn_timestamp,
+                                op.pk.as_str(),
+                                txn_id_bytes
+                            ),
+                        )
                         .await
                         .map_err(|e| StorageError::Internal(e.to_string()))
                 }
@@ -1330,24 +1355,36 @@ impl CassandraEngine {
                     "UPDATE {keyspace}.{table} SET partition_max_delete_timestamp = ? \
                      WHERE pk = ? IF partition_max_delete_timestamp = null",
                 );
-                let r1 = self.session
-                    .query_with_values(&update_null, cdrs_tokio::query_values!(txn_timestamp, op.pk.as_str()))
+                let r1 = self
+                    .session
+                    .query_with_values(
+                        &update_null,
+                        cdrs_tokio::query_values!(txn_timestamp, op.pk.as_str()),
+                    )
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))
-                    .map_err(|e| { tracing::error!("recover_commit_op delete max_ts null: {e}"); e })?;
+                    .map_err(|e| {
+                        tracing::error!("recover_commit_op delete max_ts null: {e}");
+                        e
+                    })?;
 
                 if check_lwt_applied(&r1, "recover_commit delete max_ts null").is_err() {
                     let update_cmp = format!(
                         "UPDATE {keyspace}.{table} SET partition_max_delete_timestamp = ? \
                          WHERE pk = ? IF partition_max_delete_timestamp < ?",
                     );
-                    let _ = self.session
-                        .query_with_values(&update_cmp, cdrs_tokio::query_values!(
-                            txn_timestamp, op.pk.as_str(), txn_timestamp
-                        ))
+                    let _ = self
+                        .session
+                        .query_with_values(
+                            &update_cmp,
+                            cdrs_tokio::query_values!(txn_timestamp, op.pk.as_str(), txn_timestamp),
+                        )
                         .await
                         .map_err(|e| StorageError::Internal(e.to_string()))
-                        .map_err(|e| { tracing::error!("recover_commit_op delete max_ts cmp: {e}"); e })?;
+                        .map_err(|e| {
+                            tracing::error!("recover_commit_op delete max_ts cmp: {e}");
+                            e
+                        })?;
                 }
 
                 // Step 2: delete the row
@@ -1356,13 +1393,17 @@ impl CassandraEngine {
                         "DELETE FROM {keyspace}.{table} WHERE pk = ? AND {sk_col} = ? \
                          IF prepared_txn_id = ?",
                     );
-                    query_with_pk_sk_txnid(&self.session, &query, &op.pk, sk_val, txn_id_bytes).await
+                    query_with_pk_sk_txnid(&self.session, &query, &op.pk, sk_val, txn_id_bytes)
+                        .await
                 } else {
                     let query = format!(
                         "DELETE FROM {keyspace}.{table} WHERE pk = ? IF prepared_txn_id = ?",
                     );
                     self.session
-                        .query_with_values(&query, cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes))
+                        .query_with_values(
+                            &query,
+                            cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes),
+                        )
                         .await
                         .map_err(|e| StorageError::Internal(e.to_string()))
                 }
@@ -1374,7 +1415,9 @@ impl CassandraEngine {
                 let _ = check_lwt_applied(&result, "recover_commit DELETE");
                 Ok(())
             }
-            other => Err(StorageError::Internal(format!("unknown op in ledger: {other}"))),
+            other => Err(StorageError::Internal(format!(
+                "unknown op in ledger: {other}"
+            ))),
         }
     }
 
@@ -1406,12 +1449,13 @@ impl CassandraEngine {
                 "UPDATE {keyspace}.{table} SET prepared_txn_id = null \
                  WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ?",
             );
-            let dr = query_with_pk_sk_txnid(
-                &self.session, &dq, &op.pk, sk_val, txn_id_bytes.clone(),
-            ).await.map_err(|e| {
-                tracing::error!("recover_rollback_op delete: {e}");
-                StorageError::Internal("Database error".to_owned())
-            })?;
+            let dr =
+                query_with_pk_sk_txnid(&self.session, &dq, &op.pk, sk_val, txn_id_bytes.clone())
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("recover_rollback_op delete: {e}");
+                        StorageError::Internal("Database error".to_owned())
+                    })?;
             (dr, uq)
         } else {
             let dq = format!(
@@ -1422,11 +1466,18 @@ impl CassandraEngine {
                 "UPDATE {keyspace}.{table} SET prepared_txn_id = null \
                  WHERE pk = ? IF prepared_txn_id = ?",
             );
-            let dr = self.session
-                .query_with_values(&dq, cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes.clone()))
+            let dr = self
+                .session
+                .query_with_values(
+                    &dq,
+                    cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes.clone()),
+                )
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
-                .map_err(|e| { tracing::error!("recover_rollback_op delete: {e}"); e })?;
+                .map_err(|e| {
+                    tracing::error!("recover_rollback_op delete: {e}");
+                    e
+                })?;
             (dr, uq)
         };
 
@@ -1435,11 +1486,14 @@ impl CassandraEngine {
         }
 
         // Item was pre-existing - clear the transaction marker
-        let result = if let Some((sk_val, sk_col)) = &sk {
+        let result = if let Some((sk_val, _sk_col)) = &sk {
             query_with_pk_sk_txnid(&self.session, &update_query, &op.pk, sk_val, txn_id_bytes).await
         } else {
             self.session
-                .query_with_values(&update_query, cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes))
+                .query_with_values(
+                    &update_query,
+                    cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes),
+                )
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
         }
@@ -1498,7 +1552,9 @@ fn check_lwt_applied(result: &Envelope, context: &str) -> Result<(), Cancellatio
 }
 
 /// Extract sort key from a `LedgerOp` as `Option<(SortKeyValue, col_name)>`.
-fn ledger_sk(op: &crate::data::transaction_ledger::LedgerOp) -> Result<Option<(SortKeyValue, String)>, StorageError> {
+fn ledger_sk(
+    op: &crate::data::transaction_ledger::LedgerOp,
+) -> Result<Option<(SortKeyValue, String)>, StorageError> {
     match (&op.sk_col, &op.sk_val) {
         (Some(col), Some(val)) => Ok(Some((ledger_sk_to_sort_key(col, val)?, col.clone()))),
         _ => Ok(None),
@@ -1512,9 +1568,9 @@ fn ledger_sk_to_sort_key(sk_col: &str, sk_val: &str) -> Result<SortKeyValue, Sto
     match sk_col {
         "sk_s" => Ok(SortKeyValue::S(sk_val.to_owned())),
         "sk_n" => {
-            let d = sk_val
-                .parse::<bigdecimal::BigDecimal>()
-                .map_err(|e| StorageError::Internal(format!("invalid numeric sk in ledger: {e}")))?;
+            let d = sk_val.parse::<bigdecimal::BigDecimal>().map_err(|e| {
+                StorageError::Internal(format!("invalid numeric sk in ledger: {e}"))
+            })?;
             Ok(SortKeyValue::N(d))
         }
         "sk_b" => {
@@ -1524,6 +1580,8 @@ fn ledger_sk_to_sort_key(sk_col: &str, sk_val: &str) -> Result<SortKeyValue, Sto
                 .map_err(|e| StorageError::Internal(format!("invalid binary sk in ledger: {e}")))?;
             Ok(SortKeyValue::B(b))
         }
-        other => Err(StorageError::Internal(format!("unknown sk_col in ledger: {other}"))),
+        other => Err(StorageError::Internal(format!(
+            "unknown sk_col in ledger: {other}"
+        ))),
     }
 }

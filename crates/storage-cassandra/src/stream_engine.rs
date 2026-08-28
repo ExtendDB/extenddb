@@ -33,9 +33,7 @@ impl CassandraEngine {
         })?;
 
         let catalog_keyspace = self.catalog_keyspace();
-        let query = format!(
-            "SELECT account_id FROM {catalog_keyspace}.tables WHERE table_id = ?"
-        );
+        let query = format!("SELECT account_id FROM {catalog_keyspace}.tables WHERE table_id = ?");
         let result = self
             .session
             .query_with_values(&query, cdrs_tokio::query_values!(table_id))
@@ -50,7 +48,9 @@ impl CassandraEngine {
             .unwrap_or_default()
             .into_iter()
             .next()
-            .ok_or_else(|| StorageError::TableNotFound(format!("No table found for shard {shard_id}")))?
+            .ok_or_else(|| {
+                StorageError::TableNotFound(format!("No table found for shard {shard_id}"))
+            })?
             .get_r_by_name("account_id")
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -66,17 +66,16 @@ impl CassandraEngine {
         shard_id: &str,
         caller_account_id: &str,
     ) -> Result<String, StorageError> {
-        let without_prefix = shard_id.strip_prefix("shardId-").ok_or_else(|| {
-            StorageError::Validation("Invalid ShardIterator".to_owned())
-        })?;
-        let table_id = without_prefix.rsplitn(2, '-').nth(1).ok_or_else(|| {
-            StorageError::Validation("Invalid ShardIterator".to_owned())
-        })?;
+        let without_prefix = shard_id
+            .strip_prefix("shardId-")
+            .ok_or_else(|| StorageError::Validation("Invalid ShardIterator".to_owned()))?;
+        let table_id = without_prefix
+            .rsplitn(2, '-')
+            .nth(1)
+            .ok_or_else(|| StorageError::Validation("Invalid ShardIterator".to_owned()))?;
 
         let catalog_keyspace = self.catalog_keyspace();
-        let query = format!(
-            "SELECT account_id FROM {catalog_keyspace}.tables WHERE table_id = ?"
-        );
+        let query = format!("SELECT account_id FROM {catalog_keyspace}.tables WHERE table_id = ?");
         let result = self
             .session
             .query_with_values(&query, cdrs_tokio::query_values!(table_id))
@@ -157,7 +156,10 @@ impl StreamEngine for CassandraEngine {
 
             let result = if let Some(ref after) = after_sequence {
                 self.session
-                    .query_with_values(&query, cdrs_tokio::query_values!(shard_id.as_str(), after.as_str()))
+                    .query_with_values(
+                        &query,
+                        cdrs_tokio::query_values!(shard_id.as_str(), after.as_str()),
+                    )
                     .await
             } else {
                 self.session
@@ -238,10 +240,8 @@ impl StreamEngine for CassandraEngine {
             let ks_json: String = row
                 .get_r_by_name("key_schema")
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let stream_spec_json: Option<String> = row
-                .get_by_name("stream_specification")
-                .ok()
-                .flatten();
+            let stream_spec_json: Option<String> =
+                row.get_by_name("stream_specification").ok().flatten();
             let table_status: String = row
                 .get_r_by_name("table_status")
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -288,10 +288,7 @@ impl StreamEngine for CassandraEngine {
                     .await
             } else {
                 self.session
-                    .query_with_values(
-                        &shard_query,
-                        cdrs_tokio::query_values!(table_id.as_str()),
-                    )
+                    .query_with_values(&shard_query, cdrs_tokio::query_values!(table_id.as_str()))
                     .await
             }
             .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -306,7 +303,9 @@ impl StreamEngine for CassandraEngine {
             let limit_usize = limit_val as usize;
             let last_shard = if shard_rows.len() > limit_usize {
                 let row = &shard_rows[limit_usize - 1];
-                let id: String = row.get_r_by_name("shard_id").map_err(|e| StorageError::Internal(e.to_string()))?;
+                let id: String = row
+                    .get_r_by_name("shard_id")
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
                 Some(id)
             } else {
                 None
@@ -316,10 +315,16 @@ impl StreamEngine for CassandraEngine {
                 .into_iter()
                 .take(limit_usize)
                 .map(|row| {
-                    let shard_id: String = row.get_r_by_name("shard_id").map_err(|e| StorageError::Internal(e.to_string()))?;
-                    let parent_shard_id: Option<String> = row.get_by_name("parent_shard_id").ok().flatten();
-                    let starting: String = row.get_r_by_name("starting_sequence_number").map_err(|e| StorageError::Internal(e.to_string()))?;
-                    let ending: Option<String> = row.get_by_name("ending_sequence_number").ok().flatten();
+                    let shard_id: String = row
+                        .get_r_by_name("shard_id")
+                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    let parent_shard_id: Option<String> =
+                        row.get_by_name("parent_shard_id").ok().flatten();
+                    let starting: String = row
+                        .get_r_by_name("starting_sequence_number")
+                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    let ending: Option<String> =
+                        row.get_by_name("ending_sequence_number").ok().flatten();
                     Ok(Shard {
                         shard_id,
                         parent_shard_id,
@@ -409,14 +414,15 @@ impl StreamEngine for CassandraEngine {
 
             // Sort for stable pagination (table_name, stream_label)
             summaries.sort_by(|a, b| {
-                a.table_name.cmp(&b.table_name).then(a.stream_label.cmp(&b.stream_label))
+                a.table_name
+                    .cmp(&b.table_name)
+                    .then(a.stream_label.cmp(&b.stream_label))
             });
 
             // Apply cursor
             if let Some((start_table, start_label)) = start_cursor {
-                summaries.retain(|s| {
-                    (&s.table_name, &s.stream_label) > (&start_table, &start_label)
-                });
+                summaries
+                    .retain(|s| (&s.table_name, &s.stream_label) > (&start_table, &start_label));
             }
 
             #[allow(clippy::cast_sign_loss)]
@@ -461,7 +467,11 @@ impl StreamEngine for CassandraEngine {
     }
 
     fn next_sequence_number(&self, _shard_id: &str) -> BoxFuture<'_, Result<String, StorageError>> {
-        let seq = self.hlc.lock().unwrap_or_else(|e| e.into_inner()).generate();
+        let seq = self
+            .hlc
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generate();
         Box::pin(async move { Ok(seq) })
     }
 
@@ -570,9 +580,10 @@ impl StreamEngine for CassandraEngine {
                 .into_rows()
                 .unwrap_or_default();
 
-            Ok(rows.into_iter().next().map(|row| {
-                row.get_r_by_name("sequence_number").unwrap_or_default()
-            }))
+            Ok(rows
+                .into_iter()
+                .next()
+                .map(|row| row.get_r_by_name("sequence_number").unwrap_or_default()))
         })
     }
 }
