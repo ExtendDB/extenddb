@@ -663,6 +663,21 @@ pub fn vector_index_delete_in_allocation_phase(table_name: &str, index_name: &st
     )
 }
 
+/// Refusal for a Query naming a vector index. Measured 2026-08-20; note the
+/// trailing period, which the Scan variant does not have.
+pub const VECTOR_INDEX_QUERY_NOT_SUPPORTED: &str =
+    "Query operation not supported on this index type.";
+
+/// Refusal for a Scan naming a vector index that is past its backfill.
+/// Measured 2026-08-20.
+pub const VECTOR_INDEX_SCAN_NOT_SUPPORTED: &str = "Scan operation not supported on this index type";
+
+/// Prefix of the Scan refusal while a vector index is still backfilling;
+/// continues with the index name. The service reuses the GSI wording even
+/// though the index is a vector index. Measured 2026-08-20.
+pub const VECTOR_INDEX_BACKFILLING_SCAN_PREFIX: &str =
+    "Cannot read from backfilling global secondary index: ";
+
 impl VectorIndexDescription {
     /// Reject a description whose reported state the service would never produce.
     ///
