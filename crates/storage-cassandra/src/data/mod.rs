@@ -67,7 +67,9 @@ pub(crate) fn bigdecimal_to_cql_decimal(
     n: &bigdecimal::BigDecimal,
 ) -> cdrs_tokio::types::decimal::Decimal {
     let (unscaled, scale) = n.as_bigint_and_exponent();
-    cdrs_tokio::types::decimal::Decimal::new(unscaled, scale as i32)
+    #[allow(clippy::cast_possible_truncation)]
+    let scale_i32 = scale as i32;
+    cdrs_tokio::types::decimal::Decimal::new(unscaled, scale_i32)
 }
 
 /// Bind a DynamoDB numeric value (`BigDecimal`) as a Cassandra `decimal` bound
@@ -102,11 +104,11 @@ pub(crate) async fn query_with_pk_sk(
         }
         SortKeyValue::B(b) => {
             session
-                .query_with_values(query, cdrs_tokio::query_values!(pk, b.to_vec()))
+                .query_with_values(query, cdrs_tokio::query_values!(pk, b.clone()))
                 .await
         }
     }
-    .map_err(|e| StorageError::Internal(format!("Query failed: {}", e)))
+    .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
 }
 
 /// Execute a query with pk, sort key, and item_data, returning the result.
@@ -135,11 +137,11 @@ pub(crate) async fn query_with_pk_sk_item(
         }
         SortKeyValue::B(b) => {
             session
-                .query_with_values(query, cdrs_tokio::query_values!(pk, b.to_vec(), item_text))
+                .query_with_values(query, cdrs_tokio::query_values!(pk, b.clone(), item_text))
                 .await
         }
     }
-    .map_err(|e| StorageError::Internal(format!("Query failed: {}", e)))
+    .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
 }
 
 /// Execute a query with `(pk, sk, txn_id_bytes)` bound parameters.
@@ -168,11 +170,11 @@ pub(crate) async fn query_with_pk_sk_txnid(
         }
         SortKeyValue::B(b) => {
             session
-                .query_with_values(query, cdrs_tokio::query_values!(pk, b.to_vec(), txn_id))
+                .query_with_values(query, cdrs_tokio::query_values!(pk, b.clone(), txn_id))
                 .await
         }
     }
-    .map_err(|e| StorageError::Internal(format!("Query failed: {}", e)))
+    .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
 }
 
 /// Execute a query with `(txn_id_bytes, txn_timestamp, pk, sk)` bound parameters.
@@ -207,12 +209,12 @@ pub(crate) async fn query_with_txnid_ts_pk_sk(
             session
                 .query_with_values(
                     query,
-                    cdrs_tokio::query_values!(txn_id, txn_timestamp, pk, b.to_vec()),
+                    cdrs_tokio::query_values!(txn_id, txn_timestamp, pk, b.clone()),
                 )
                 .await
         }
     }
-    .map_err(|e| StorageError::Internal(format!("Query failed: {}", e)))
+    .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
 }
 
 /// Execute a query with `(pk, sk, item_text, txn_id_bytes, txn_timestamp)` bound parameters.
@@ -254,12 +256,12 @@ pub(crate) async fn query_with_pk_sk_item_txnid_ts(
             session
                 .query_with_values(
                     query,
-                    cdrs_tokio::query_values!(pk, b.to_vec(), item_text, txn_id, txn_timestamp),
+                    cdrs_tokio::query_values!(pk, b.clone(), item_text, txn_id, txn_timestamp),
                 )
                 .await
         }
     }
-    .map_err(|e| StorageError::Internal(format!("Query failed: {}", e)))
+    .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
 }
 
 /// Execute a query with `(item_text, txn_timestamp, pk, sk, txn_id_bytes)` bound parameters.
@@ -301,12 +303,12 @@ pub(crate) async fn query_with_item_ts_pk_sk_txnid(
             session
                 .query_with_values(
                     query,
-                    cdrs_tokio::query_values!(item_text, txn_timestamp, pk, b.to_vec(), txn_id),
+                    cdrs_tokio::query_values!(item_text, txn_timestamp, pk, b.clone(), txn_id),
                 )
                 .await
         }
     }
-    .map_err(|e| StorageError::Internal(format!("Query failed: {}", e)))
+    .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
 }
 
 /// Execute a SELECT query by primary key (pk only, or pk + sort key).
@@ -324,19 +326,17 @@ pub(crate) async fn select_by_pk(
 ) -> Result<Option<cdrs_tokio::types::rows::Row>, StorageError> {
     let result = if let (Some(sk), Some(sk_col)) = (sk, sk_col) {
         let query = format!(
-            "SELECT {} FROM {}.{} WHERE pk = ? AND {} = ?",
-            columns, keyspace, table, sk_col
+            "SELECT {columns} FROM {keyspace}.{table} WHERE pk = ? AND {sk_col} = ?"
         );
         query_with_pk_sk(session, &query, pk, sk).await
     } else {
         let query = format!(
-            "SELECT {} FROM {}.{} WHERE pk = ?",
-            columns, keyspace, table
+            "SELECT {columns} FROM {keyspace}.{table} WHERE pk = ?"
         );
         session
             .query_with_values(&query, cdrs_tokio::query_values!(pk))
             .await
-            .map_err(|e| StorageError::Internal(format!("Query failed: {}", e)))
+            .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
     }?;
 
     let rows = result

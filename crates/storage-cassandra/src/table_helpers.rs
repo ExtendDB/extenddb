@@ -28,8 +28,7 @@ impl CassandraEngine {
 
         // Query table metadata
         let table_query = format!(
-            "SELECT * FROM {}.tables WHERE account_id = ? AND table_name = ?",
-            catalog_keyspace
+            "SELECT * FROM {catalog_keyspace}.tables WHERE account_id = ? AND table_name = ?"
         );
 
         let table_result = self
@@ -39,7 +38,7 @@ impl CassandraEngine {
                 cdrs_tokio::query_values!(account_id, table_name),
             )
             .await
-            .map_err(|e| StorageError::Internal(format!("Query tables failed: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Query tables failed: {e}")))?;
 
         let table_body = table_result
             .response_body()
@@ -56,19 +55,18 @@ impl CassandraEngine {
         // Extract table_id for index query
         let table_id: String = table_row
             .get_r_by_name("table_id")
-            .map_err(|e| StorageError::Internal(format!("Parse table_id: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Parse table_id: {e}")))?;
 
         // Query indexes
         let index_query = format!(
-            "SELECT * FROM {}.indexes WHERE table_id = ?",
-            catalog_keyspace
+            "SELECT * FROM {catalog_keyspace}.indexes WHERE table_id = ?"
         );
 
         let index_result = self
             .session
             .query_with_values(&index_query, cdrs_tokio::query_values!(table_id.as_str()))
             .await
-            .map_err(|e| StorageError::Internal(format!("Query indexes failed: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Query indexes failed: {e}")))?;
 
         let index_body = index_result
             .response_body()
@@ -89,23 +87,23 @@ impl CassandraEngine {
         // Parse table fields
         let table_name: String = table_row
             .get_r_by_name("table_name")
-            .map_err(|e| StorageError::Internal(format!("Parse table_name: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Parse table_name: {e}")))?;
 
         let key_schema_str: String = table_row
             .get_r_by_name("key_schema")
-            .map_err(|e| StorageError::Internal(format!("Parse key_schema: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Parse key_schema: {e}")))?;
         let key_schema = serde_json::from_str(&key_schema_str)
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let attr_defs_str: String = table_row
             .get_r_by_name("attribute_definitions")
-            .map_err(|e| StorageError::Internal(format!("Parse attribute_definitions: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Parse attribute_definitions: {e}")))?;
         let attr_defs = serde_json::from_str(&attr_defs_str)
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let billing_mode_str: String = table_row
             .get_r_by_name("billing_mode")
-            .map_err(|e| StorageError::Internal(format!("Parse billing_mode: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Parse billing_mode: {e}")))?;
 
         let pt_str: Option<String> = table_row.get_r_by_name("provisioned_throughput").ok();
         let (rcu, wcu) = if let Some(ref s) = pt_str {
@@ -123,7 +121,7 @@ impl CassandraEngine {
 
         let table_status_str: String = table_row
             .get_r_by_name("table_status")
-            .map_err(|e| StorageError::Internal(format!("Parse table_status: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Parse table_status: {e}")))?;
         let table_status = match table_status_str.as_str() {
             "ACTIVE" => TableStatus::Active,
             "CREATING" => TableStatus::Creating,
@@ -131,26 +129,25 @@ impl CassandraEngine {
             "UPDATING" => TableStatus::Updating,
             other => {
                 return Err(StorageError::Internal(format!(
-                    "unknown table status in database: {}",
-                    other
+                    "unknown table status in database: {other}"
                 )));
             }
         };
 
         let creation_timestamp: i64 = table_row
             .get_r_by_name("created_at")
-            .map_err(|e| StorageError::Internal(format!("Parse created_at: {}", e)))?;
-        let creation_epoch = creation_timestamp as f64 / 1000.0;
+            .map_err(|e| StorageError::Internal(format!("Parse created_at: {e}")))?;
+        let creation_epoch = crate::cassandra_util::millis_to_seconds_f64(creation_timestamp);
 
         let table_size_bytes: i64 = table_row.get_r_by_name("table_size_bytes").unwrap_or(0);
         let item_count: i64 = table_row.get_r_by_name("item_count").unwrap_or(0);
 
         let table_arn: String = table_row
             .get_r_by_name("table_arn")
-            .map_err(|e| StorageError::Internal(format!("Parse table_arn: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Parse table_arn: {e}")))?;
         let table_id: String = table_row
             .get_r_by_name("table_id")
-            .map_err(|e| StorageError::Internal(format!("Parse table_id: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Parse table_id: {e}")))?;
 
         let deletion_protection_enabled: bool = table_row
             .get_r_by_name("deletion_protection_enabled")
@@ -172,26 +169,26 @@ impl CassandraEngine {
         for row in index_rows {
             let index_name: String = row
                 .get_r_by_name("index_name")
-                .map_err(|e| StorageError::Internal(format!("Parse index_name: {}", e)))?;
+                .map_err(|e| StorageError::Internal(format!("Parse index_name: {e}")))?;
             let index_type: String = row
                 .get_r_by_name("index_type")
-                .map_err(|e| StorageError::Internal(format!("Parse index_type: {}", e)))?;
+                .map_err(|e| StorageError::Internal(format!("Parse index_type: {e}")))?;
 
             let ks_str: String = row
                 .get_r_by_name("key_schema")
-                .map_err(|e| StorageError::Internal(format!("Parse key_schema: {}", e)))?;
+                .map_err(|e| StorageError::Internal(format!("Parse key_schema: {e}")))?;
             let ks =
                 serde_json::from_str(&ks_str).map_err(|e| StorageError::Internal(e.to_string()))?;
 
             let proj_str: String = row
                 .get_r_by_name("projection")
-                .map_err(|e| StorageError::Internal(format!("Parse projection: {}", e)))?;
+                .map_err(|e| StorageError::Internal(format!("Parse projection: {e}")))?;
             let proj = serde_json::from_str(&proj_str)
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
             let index_status: String = row
                 .get_r_by_name("index_status")
-                .map_err(|e| StorageError::Internal(format!("Parse index_status: {}", e)))?;
+                .map_err(|e| StorageError::Internal(format!("Parse index_status: {e}")))?;
 
             if index_type == "GSI" {
                 let pt_str: Option<String> = row.get_r_by_name("provisioned_throughput").ok();

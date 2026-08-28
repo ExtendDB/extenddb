@@ -16,8 +16,7 @@ impl CassandraCatalogStore {
     ) -> OpResult<()> {
         let catalog_keyspace = self.catalog_keyspace();
         let query = format!(
-            "INSERT INTO {}.accounts (account_id, account_name, created_at) VALUES (?, ?, toTimestamp(now())) IF NOT EXISTS",
-            catalog_keyspace
+            "INSERT INTO {catalog_keyspace}.accounts (account_id, account_name, created_at) VALUES (?, ?, toTimestamp(now())) IF NOT EXISTS"
         );
 
         let result = self
@@ -67,8 +66,7 @@ impl CassandraCatalogStore {
 
         // Check if account has tables
         let tables_query = format!(
-            "SELECT table_name FROM {}.tables WHERE account_id = ? LIMIT 1",
-            catalog_keyspace
+            "SELECT table_name FROM {catalog_keyspace}.tables WHERE account_id = ? LIMIT 1"
         );
 
         let has_tables = crate::cassandra_util::query_optional(
@@ -90,8 +88,7 @@ impl CassandraCatalogStore {
         // keyspace that stores their payload. Remove every denormalized and
         // authoritative catalog row before dropping that keyspace.
         let backup_query = format!(
-            "SELECT backup_arn, table_name, created_at FROM {}.backups_by_account WHERE account_id = ?",
-            catalog_keyspace
+            "SELECT backup_arn, table_name, created_at FROM {catalog_keyspace}.backups_by_account WHERE account_id = ?"
         );
         let backup_rows = crate::cassandra_util::query_rows::<OpError>(
             self.session(),
@@ -113,8 +110,7 @@ impl CassandraCatalogStore {
             crate::cassandra_util::execute::<OpError>(
                 self.session(),
                 &format!(
-                    "DELETE FROM {}.backups_by_table WHERE account_id = ? AND table_name = ? AND created_at = ? AND backup_arn = ?",
-                    catalog_keyspace
+                    "DELETE FROM {catalog_keyspace}.backups_by_table WHERE account_id = ? AND table_name = ? AND created_at = ? AND backup_arn = ?"
                 ),
                 cdrs_tokio::query_values!(account_id, table_name, created_at, backup_arn.as_str()),
                 "delete_account_table_backup",
@@ -123,8 +119,7 @@ impl CassandraCatalogStore {
             crate::cassandra_util::execute::<OpError>(
                 self.session(),
                 &format!(
-                    "DELETE FROM {}.backups_by_arn WHERE account_id = ? AND backup_arn = ?",
-                    catalog_keyspace
+                    "DELETE FROM {catalog_keyspace}.backups_by_arn WHERE account_id = ? AND backup_arn = ?"
                 ),
                 cdrs_tokio::query_values!(account_id, backup_arn),
                 "delete_account_backup",
@@ -134,8 +129,7 @@ impl CassandraCatalogStore {
         crate::cassandra_util::execute::<OpError>(
             self.session(),
             &format!(
-                "DELETE FROM {}.backups_by_account WHERE account_id = ?",
-                catalog_keyspace
+                "DELETE FROM {catalog_keyspace}.backups_by_account WHERE account_id = ?"
             ),
             cdrs_tokio::query_values!(account_id),
             "delete_account_backup_index",
@@ -144,8 +138,7 @@ impl CassandraCatalogStore {
         crate::cassandra_util::execute::<OpError>(
             self.session(),
             &format!(
-                "DELETE FROM {}.continuous_backups WHERE account_id = ?",
-                catalog_keyspace
+                "DELETE FROM {catalog_keyspace}.continuous_backups WHERE account_id = ?"
             ),
             cdrs_tokio::query_values!(account_id),
             "delete_account_continuous_backups",
@@ -154,8 +147,7 @@ impl CassandraCatalogStore {
 
         // Delete account from catalog
         let delete_query = format!(
-            "DELETE FROM {}.accounts WHERE account_id = ?",
-            catalog_keyspace
+            "DELETE FROM {catalog_keyspace}.accounts WHERE account_id = ?"
         );
 
         crate::cassandra_util::execute(
@@ -175,8 +167,7 @@ impl CassandraCatalogStore {
     pub(crate) async fn list_all_accounts_impl(&self) -> OpResult<Vec<(String, String)>> {
         let catalog_keyspace = self.catalog_keyspace();
         let query = format!(
-            "SELECT account_id, account_name FROM {}.accounts",
-            catalog_keyspace
+            "SELECT account_id, account_name FROM {catalog_keyspace}.accounts"
         );
 
         let rows = crate::cassandra_util::query_rows(
@@ -208,8 +199,7 @@ impl CassandraCatalogStore {
     ) -> OpResult<Vec<(String, String, time::OffsetDateTime)>> {
         let catalog_keyspace = self.catalog_keyspace();
         let query = format!(
-            "SELECT account_id, account_name, created_at FROM {}.accounts",
-            catalog_keyspace
+            "SELECT account_id, account_name, created_at FROM {catalog_keyspace}.accounts"
         );
 
         let rows = crate::cassandra_util::query_rows(
@@ -243,8 +233,7 @@ impl CassandraCatalogStore {
     ) -> OpResult<Vec<(String, String)>> {
         let catalog_keyspace = self.catalog_keyspace();
         let query = format!(
-            "SELECT account_id, account_name FROM {}.accounts WHERE account_id = ?",
-            catalog_keyspace
+            "SELECT account_id, account_name FROM {catalog_keyspace}.accounts WHERE account_id = ?"
         );
 
         let rows = crate::cassandra_util::query_rows(
@@ -276,8 +265,7 @@ impl CassandraCatalogStore {
 
         // Get account name
         let account_query = format!(
-            "SELECT account_name FROM {}.accounts WHERE account_id = ?",
-            catalog_keyspace
+            "SELECT account_name FROM {catalog_keyspace}.accounts WHERE account_id = ?"
         );
 
         let account_row = crate::cassandra_util::query_optional(
@@ -297,8 +285,7 @@ impl CassandraCatalogStore {
 
         // Get users
         let users_query = format!(
-            "SELECT user_name FROM {}.iam_users WHERE account_id = ?",
-            catalog_keyspace
+            "SELECT user_name FROM {catalog_keyspace}.iam_users WHERE account_id = ?"
         );
 
         let users_rows = crate::cassandra_util::query_rows(
@@ -321,8 +308,7 @@ impl CassandraCatalogStore {
 
         // Get groups
         let groups_query = format!(
-            "SELECT group_name FROM {}.iam_groups WHERE account_id = ?",
-            catalog_keyspace
+            "SELECT group_name FROM {catalog_keyspace}.iam_groups WHERE account_id = ?"
         );
 
         let groups_rows = crate::cassandra_util::query_rows(
@@ -345,8 +331,7 @@ impl CassandraCatalogStore {
 
         // Get roles
         let roles_query = format!(
-            "SELECT role_name FROM {}.iam_roles WHERE account_id = ?",
-            catalog_keyspace
+            "SELECT role_name FROM {catalog_keyspace}.iam_roles WHERE account_id = ?"
         );
 
         let roles_rows = crate::cassandra_util::query_rows(
@@ -379,7 +364,7 @@ impl CassandraCatalogStore {
         let catalog_keyspace = self.catalog_keyspace();
 
         // Count accounts
-        let accounts_query = format!("SELECT account_id FROM {}.accounts", catalog_keyspace);
+        let accounts_query = format!("SELECT account_id FROM {catalog_keyspace}.accounts");
         let accounts_rows = crate::cassandra_util::query_rows(
             self.session(),
             &accounts_query,
@@ -387,10 +372,11 @@ impl CassandraCatalogStore {
             "dashboard_counts",
         )
         .await?;
+        #[allow(clippy::cast_possible_wrap)]
         let account_count = accounts_rows.len() as i64;
 
         // Count admins
-        let admins_query = format!("SELECT admin_name FROM {}.admin_users", catalog_keyspace);
+        let admins_query = format!("SELECT admin_name FROM {catalog_keyspace}.admin_users");
         let admins_rows = crate::cassandra_util::query_rows(
             self.session(),
             &admins_query,
@@ -398,6 +384,7 @@ impl CassandraCatalogStore {
             "dashboard_counts",
         )
         .await?;
+        #[allow(clippy::cast_possible_wrap)]
         let admin_count = admins_rows.len() as i64;
 
         Ok((account_count, admin_count))

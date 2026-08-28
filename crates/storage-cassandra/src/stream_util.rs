@@ -104,7 +104,7 @@ pub fn new_shared_hlc(instance_id: &str) -> SharedHlc {
 pub fn assign_shard_id(partition_key: &str, table_id: &str) -> String {
     let hash = crc32fast::hash(partition_key.as_bytes());
     let idx = (hash as usize) % SHARDS_PER_STREAM as usize;
-    format!("shardId-{}-{:012}", table_id, idx)
+    format!("shardId-{table_id}-{idx:012}")
 }
 
 /// Zero sequence number used as the starting point for new shards.
@@ -181,7 +181,7 @@ pub fn stream_record_statement(
         .unwrap_or_default();
 
     let shard_id = assign_shard_id(&pk_str, table_id);
-    let sequence_number = hlc.lock().unwrap_or_else(|e| e.into_inner()).generate();
+    let sequence_number = hlc.lock().unwrap_or_else(std::sync::PoisonError::into_inner).generate();
 
     let record = StreamRecord {
         event_id: uuid::Uuid::new_v4().to_string(),

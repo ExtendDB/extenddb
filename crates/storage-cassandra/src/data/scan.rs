@@ -67,12 +67,12 @@ use crate::cassandra_util::{self, CassandraSession};
 /// (single segment covers the entire ring, so no token predicate is needed).
 fn segment_token_bounds(segment: Option<i64>, total_segments: Option<i64>) -> Option<(i64, i64)> {
     let (seg, total) = match (segment, total_segments) {
-        (Some(s), Some(t)) if t > 1 && s >= 0 && s < t => (s as i128, t as i128),
+        (Some(s), Some(t)) if t > 1 && s >= 0 && s < t => (i128::from(s), i128::from(t)),
         _ => return None,
     };
 
-    let min = i64::MIN as i128;
-    let max = i64::MAX as i128;
+    let min = i128::from(i64::MIN);
+    let max = i128::from(i64::MAX);
     let ring = max - min + 1; // 2^64
     let span = ring / total;
 
@@ -83,6 +83,7 @@ fn segment_token_bounds(segment: Option<i64>, total_segments: Option<i64>) -> Op
         min + span * (seg + 1) - 1
     };
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     Some((lower as i64, upper as i64))
 }
 

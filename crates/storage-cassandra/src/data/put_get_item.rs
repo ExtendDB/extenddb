@@ -67,8 +67,7 @@ impl CassandraEngine {
 
             // Read old item including prepared_txn_id for transaction conflict detection
             let select_query = format!(
-                "SELECT item_data, prepared_txn_id FROM {}.{} WHERE pk = ? AND {} = ?",
-                data_keyspace, ddb_table, sk_col
+                "SELECT item_data, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?"
             );
 
             let old_result =
@@ -76,13 +75,13 @@ impl CassandraEngine {
 
             let body = old_result
                 .response_body()
-                .map_err(|e| StorageError::Internal(format!("Parse response: {}", e)))?;
+                .map_err(|e| StorageError::Internal(format!("Parse response: {e}")))?;
 
             let (old_item_opt, has_prepared_txn) = if let Some(rows) = body.into_rows() {
                 if let Some(row) = rows.into_iter().next() {
                     let item_data: String = row
                         .get_r_by_name("item_data")
-                        .map_err(|e| StorageError::Internal(format!("Parse item_data: {}", e)))?;
+                        .map_err(|e| StorageError::Internal(format!("Parse item_data: {e}")))?;
                     let prepared_txn_id: Option<uuid::Uuid> =
                         row.get_by_name("prepared_txn_id").ok().flatten();
                     (Some(json_to_item(item_data)?), prepared_txn_id.is_some())
@@ -136,8 +135,7 @@ impl CassandraEngine {
             if indexes.is_empty() && stream_stmt.is_none() {
                 // Fast path: no batch needed.
                 let insert_query = format!(
-                    "INSERT INTO {}.{} (pk, {}, item_data) VALUES (?, ?, ?)",
-                    data_keyspace, ddb_table, sk_col
+                    "INSERT INTO {data_keyspace}.{ddb_table} (pk, {sk_col}, item_data) VALUES (?, ?, ?)"
                 );
                 query_with_pk_sk_item(
                     &self.session,
@@ -150,8 +148,7 @@ impl CassandraEngine {
             } else {
                 // LOGGED BATCH: item insert + optional index updates + optional stream record.
                 let insert_cql = format!(
-                    "INSERT INTO {}.{} (pk, {}, item_data) VALUES (?, ?, ?)",
-                    data_keyspace, ddb_table, sk_col
+                    "INSERT INTO {data_keyspace}.{ddb_table} (pk, {sk_col}, item_data) VALUES (?, ?, ?)"
                 );
                 let insert_qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
                     cdrs_tokio::types::value::Value::from(pk_text.as_str()),
@@ -203,7 +200,7 @@ impl CassandraEngine {
                             .map_err(|e| StorageError::Internal(e.to_string()))?,
                     )
                     .await
-                    .map_err(|e| StorageError::Internal(format!("Batch execution: {}", e)))?;
+                    .map_err(|e| StorageError::Internal(format!("Batch execution: {e}")))?;
 
                 if async_enqueued > 0 {
                     self.gsi_queue.notify_workers();
@@ -216,8 +213,7 @@ impl CassandraEngine {
 
             // Read old item including prepared_txn_id for transaction conflict detection
             let select_query = format!(
-                "SELECT item_data, prepared_txn_id FROM {}.{} WHERE pk = ?",
-                data_keyspace, ddb_table
+                "SELECT item_data, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ?"
             );
 
             let old_result = self
@@ -227,17 +223,17 @@ impl CassandraEngine {
                     cdrs_tokio::query_values!(pk_text.as_ref() as &str),
                 )
                 .await
-                .map_err(|e| StorageError::Internal(format!("Select for put_item: {}", e)))?;
+                .map_err(|e| StorageError::Internal(format!("Select for put_item: {e}")))?;
 
             let body = old_result
                 .response_body()
-                .map_err(|e| StorageError::Internal(format!("Parse response: {}", e)))?;
+                .map_err(|e| StorageError::Internal(format!("Parse response: {e}")))?;
 
             let (old_item_opt, has_prepared_txn) = if let Some(rows) = body.into_rows() {
                 if let Some(row) = rows.into_iter().next() {
                     let item_data: String = row
                         .get_r_by_name("item_data")
-                        .map_err(|e| StorageError::Internal(format!("Parse item_data: {}", e)))?;
+                        .map_err(|e| StorageError::Internal(format!("Parse item_data: {e}")))?;
                     let prepared_txn_id: Option<uuid::Uuid> =
                         row.get_by_name("prepared_txn_id").ok().flatten();
                     (Some(json_to_item(item_data)?), prepared_txn_id.is_some())
@@ -291,8 +287,7 @@ impl CassandraEngine {
             if indexes.is_empty() && stream_stmt.is_none() {
                 // Fast path: no batch needed.
                 let insert_query = format!(
-                    "INSERT INTO {}.{} (pk, item_data) VALUES (?, ?)",
-                    data_keyspace, ddb_table
+                    "INSERT INTO {data_keyspace}.{ddb_table} (pk, item_data) VALUES (?, ?)"
                 );
                 self.session
                     .query_with_values(
@@ -300,12 +295,11 @@ impl CassandraEngine {
                         cdrs_tokio::query_values!(pk_text.as_ref() as &str, item_text.as_str()),
                     )
                     .await
-                    .map_err(|e| StorageError::Internal(format!("Insert item: {}", e)))?;
+                    .map_err(|e| StorageError::Internal(format!("Insert item: {e}")))?;
             } else {
                 // LOGGED BATCH: item insert + optional index updates + optional stream record.
                 let insert_cql = format!(
-                    "INSERT INTO {}.{} (pk, item_data) VALUES (?, ?)",
-                    data_keyspace, ddb_table
+                    "INSERT INTO {data_keyspace}.{ddb_table} (pk, item_data) VALUES (?, ?)"
                 );
                 let insert_qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
                     cdrs_tokio::types::value::Value::from(pk_text.as_str()),
@@ -356,7 +350,7 @@ impl CassandraEngine {
                             .map_err(|e| StorageError::Internal(e.to_string()))?,
                     )
                     .await
-                    .map_err(|e| StorageError::Internal(format!("Batch execution: {}", e)))?;
+                    .map_err(|e| StorageError::Internal(format!("Batch execution: {e}")))?;
 
                 if async_enqueued > 0 {
                     self.gsi_queue.notify_workers();
@@ -393,21 +387,20 @@ impl CassandraEngine {
             let sk_col = sk_column(sk_type);
 
             let query = format!(
-                "SELECT item_data FROM {}.{} WHERE pk = ? AND {} = ?",
-                data_keyspace, ddb_table, sk_col
+                "SELECT item_data FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?"
             );
 
             let result = query_with_pk_sk(&self.session, &query, pk_text.as_ref(), &sk).await?;
 
             let body = result
                 .response_body()
-                .map_err(|e| StorageError::Internal(format!("Parse response: {}", e)))?;
+                .map_err(|e| StorageError::Internal(format!("Parse response: {e}")))?;
 
             if let Some(rows) = body.into_rows()
                 && let Some(row) = rows.into_iter().next() {
                     let item_data: String = row
                         .get_r_by_name("item_data")
-                        .map_err(|e| StorageError::Internal(format!("Parse item_data: {}", e)))?;
+                        .map_err(|e| StorageError::Internal(format!("Parse item_data: {e}")))?;
                     return Ok(Some(json_to_item(item_data)?));
                 }
 
@@ -415,25 +408,24 @@ impl CassandraEngine {
         } else {
             // PK-only table
             let query = format!(
-                "SELECT item_data FROM {}.{} WHERE pk = ?",
-                data_keyspace, ddb_table
+                "SELECT item_data FROM {data_keyspace}.{ddb_table} WHERE pk = ?"
             );
 
             let result = self
                 .session
                 .query_with_values(&query, cdrs_tokio::query_values!(pk_text.as_ref() as &str))
                 .await
-                .map_err(|e| StorageError::Internal(format!("Get item: {}", e)))?;
+                .map_err(|e| StorageError::Internal(format!("Get item: {e}")))?;
 
             let body = result
                 .response_body()
-                .map_err(|e| StorageError::Internal(format!("Parse response: {}", e)))?;
+                .map_err(|e| StorageError::Internal(format!("Parse response: {e}")))?;
 
             if let Some(rows) = body.into_rows()
                 && let Some(row) = rows.into_iter().next() {
                     let item_data: String = row
                         .get_r_by_name("item_data")
-                        .map_err(|e| StorageError::Internal(format!("Parse item_data: {}", e)))?;
+                        .map_err(|e| StorageError::Internal(format!("Parse item_data: {e}")))?;
                     return Ok(Some(json_to_item(item_data)?));
                 }
 

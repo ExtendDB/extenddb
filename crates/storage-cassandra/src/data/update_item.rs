@@ -79,15 +79,14 @@ impl CassandraEngine {
             let sk_col = sk_column(sk_type);
 
             let select_query = format!(
-                "SELECT item_data, prepared_txn_id FROM {}.{} WHERE pk = ? AND {} = ?",
-                data_keyspace, ddb_table, sk_col
+                "SELECT item_data, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?"
             );
 
             let result = query_with_pk_sk(&self.session, &select_query, &pk_text, &sk).await?;
 
             let body = result
                 .response_body()
-                .map_err(|e| StorageError::Internal(format!("Parse response: {}", e)))?;
+                .map_err(|e| StorageError::Internal(format!("Parse response: {e}")))?;
 
             let rows = body.into_rows().unwrap_or_default();
             if let Some(row) = rows.first() {
@@ -113,8 +112,7 @@ impl CassandraEngine {
             }
         } else {
             let select_query = format!(
-                "SELECT item_data, prepared_txn_id FROM {}.{} WHERE pk = ?",
-                data_keyspace, ddb_table
+                "SELECT item_data, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ?"
             );
 
             let row = crate::cassandra_util::query_optional(
@@ -217,8 +215,7 @@ impl CassandraEngine {
             let sk_col = sk_column(sk_type);
 
             let update_cql = format!(
-                "UPDATE {}.{} SET item_data = ? WHERE pk = ? AND {} = ?",
-                data_keyspace, ddb_table, sk_col
+                "UPDATE {data_keyspace}.{ddb_table} SET item_data = ? WHERE pk = ? AND {sk_col} = ?"
             );
 
             let stream_stmt = stream.and_then(|cap| {
@@ -288,7 +285,7 @@ impl CassandraEngine {
                             .map_err(|e| StorageError::Internal(e.to_string()))?,
                     )
                     .await
-                    .map_err(|e| StorageError::Internal(format!("Batch execution: {}", e)))?;
+                    .map_err(|e| StorageError::Internal(format!("Batch execution: {e}")))?;
 
                 if async_enqueued > 0 {
                     self.gsi_queue.notify_workers();
@@ -296,8 +293,7 @@ impl CassandraEngine {
             }
         } else {
             let update_cql = format!(
-                "UPDATE {}.{} SET item_data = ? WHERE pk = ?",
-                data_keyspace, ddb_table
+                "UPDATE {data_keyspace}.{ddb_table} SET item_data = ? WHERE pk = ?"
             );
 
             let stream_stmt = stream.and_then(|cap| {
@@ -371,7 +367,7 @@ impl CassandraEngine {
                             .map_err(|e| StorageError::Internal(e.to_string()))?,
                     )
                     .await
-                    .map_err(|e| StorageError::Internal(format!("Batch execution: {}", e)))?;
+                    .map_err(|e| StorageError::Internal(format!("Batch execution: {e}")))?;
 
                 if async_enqueued > 0 {
                     self.gsi_queue.notify_workers();

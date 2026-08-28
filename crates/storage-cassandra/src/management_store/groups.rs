@@ -21,9 +21,8 @@ impl CassandraCatalogStore {
         let catalog_keyspace = self.catalog_keyspace();
         let group_arn = format!("arn:aws:iam::{account_id}:group/{group_name}");
         let insert_query = format!(
-            "INSERT INTO {}.iam_groups (account_id, group_name, group_arn, created_at) \
-             VALUES (?, ?, ?, toTimestamp(now())) IF NOT EXISTS",
-            catalog_keyspace
+            "INSERT INTO {catalog_keyspace}.iam_groups (account_id, group_name, group_arn, created_at) \
+             VALUES (?, ?, ?, toTimestamp(now())) IF NOT EXISTS"
         );
 
         let applied = crate::cassandra_util::apply_lwt(
@@ -54,8 +53,7 @@ impl CassandraCatalogStore {
 
         let catalog_keyspace = self.catalog_keyspace();
         let delete_query = format!(
-            "DELETE FROM {}.iam_groups WHERE account_id = ? AND group_name = ?",
-            catalog_keyspace
+            "DELETE FROM {catalog_keyspace}.iam_groups WHERE account_id = ? AND group_name = ?"
         );
 
         crate::cassandra_util::execute(
@@ -74,8 +72,7 @@ impl CassandraCatalogStore {
         let catalog_keyspace = self.catalog_keyspace();
         let query = format!(
             "SELECT account_id, group_name, group_arn, created_at \
-             FROM {}.iam_groups WHERE account_id = ?",
-            catalog_keyspace
+             FROM {catalog_keyspace}.iam_groups WHERE account_id = ?"
         );
 
         let rows = crate::cassandra_util::query_rows(
@@ -117,8 +114,7 @@ impl CassandraCatalogStore {
 
         // Get members
         let members_query = format!(
-            "SELECT user_name FROM {}.iam_group_members WHERE account_id = ? AND group_name = ?",
-            catalog_keyspace
+            "SELECT user_name FROM {catalog_keyspace}.iam_group_members WHERE account_id = ? AND group_name = ?"
         );
 
         let members_rows = crate::cassandra_util::query_rows(
@@ -141,9 +137,8 @@ impl CassandraCatalogStore {
 
         // Get policies
         let policies_query = format!(
-            "SELECT policy_name FROM {}.iam_policies \
-             WHERE account_id = ? AND principal_type = 'group' AND principal_name = ?",
-            catalog_keyspace
+            "SELECT policy_name FROM {catalog_keyspace}.iam_policies \
+             WHERE account_id = ? AND principal_type = 'group' AND principal_name = ?"
         );
 
         let policies_rows = crate::cassandra_util::query_rows(
@@ -166,8 +161,7 @@ impl CassandraCatalogStore {
 
         // Get all users in account
         let all_users_query = format!(
-            "SELECT user_name FROM {}.iam_users WHERE account_id = ?",
-            catalog_keyspace
+            "SELECT user_name FROM {catalog_keyspace}.iam_users WHERE account_id = ?"
         );
 
         let all_users_rows = crate::cassandra_util::query_rows(
@@ -212,8 +206,7 @@ impl CassandraCatalogStore {
 
         let catalog_keyspace = self.catalog_keyspace();
         let insert_query = format!(
-            "INSERT INTO {}.iam_group_members (account_id, group_name, user_name) VALUES (?, ?, ?) IF NOT EXISTS",
-            catalog_keyspace
+            "INSERT INTO {catalog_keyspace}.iam_group_members (account_id, group_name, user_name) VALUES (?, ?, ?) IF NOT EXISTS"
         );
 
         let applied = crate::cassandra_util::apply_lwt(
@@ -243,9 +236,8 @@ impl CassandraCatalogStore {
 
         // Check if membership exists
         let check_query = format!(
-            "SELECT user_name FROM {}.iam_group_members \
-             WHERE account_id = ? AND group_name = ? AND user_name = ?",
-            catalog_keyspace
+            "SELECT user_name FROM {catalog_keyspace}.iam_group_members \
+             WHERE account_id = ? AND group_name = ? AND user_name = ?"
         );
 
         if crate::cassandra_util::query_optional(
@@ -261,8 +253,7 @@ impl CassandraCatalogStore {
         }
 
         let delete_query = format!(
-            "DELETE FROM {}.iam_group_members WHERE account_id = ? AND group_name = ? AND user_name = ?",
-            catalog_keyspace
+            "DELETE FROM {catalog_keyspace}.iam_group_members WHERE account_id = ? AND group_name = ? AND user_name = ?"
         );
 
         crate::cassandra_util::execute(
@@ -278,8 +269,7 @@ impl CassandraCatalogStore {
     async fn group_exists(&self, account_id: &str, group_name: &str) -> Result<bool, OpError> {
         let catalog_keyspace = self.catalog_keyspace();
         let query = format!(
-            "SELECT group_name FROM {}.iam_groups WHERE account_id = ? AND group_name = ?",
-            catalog_keyspace
+            "SELECT group_name FROM {catalog_keyspace}.iam_groups WHERE account_id = ? AND group_name = ?"
         );
 
         let rows = crate::cassandra_util::query_rows(

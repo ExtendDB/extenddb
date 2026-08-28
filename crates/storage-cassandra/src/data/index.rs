@@ -114,7 +114,7 @@ pub async fn fetch_index_by_name(
     let row = rows
         .into_iter()
         .next()
-        .ok_or_else(|| StorageError::IndexNotFound(format!("Index {} not found", index_name)))?;
+        .ok_or_else(|| StorageError::IndexNotFound(format!("Index {index_name} not found")))?;
 
     let index_id: String = get_column(&row, "index_id", "fetch_index_by_name")?;
     let index_type: String = get_column(&row, "index_type", "fetch_index_by_name")?;
@@ -198,6 +198,7 @@ pub(crate) fn item_has_index_keys(item: &Item, index_ks: &[KeySchemaElement]) ->
 pub(super) fn effective_delay(idx: &IndexMeta, system_default: u64) -> u64 {
     match idx.propagation_delay_ms {
         Some(0) => 0,
+        #[allow(clippy::cast_sign_loss)]
         Some(ms) if ms > 0 => ms as u64,
         Some(_) => system_default, // Negative values treated as "use system default".
         None => system_default,
@@ -345,10 +346,8 @@ pub(crate) async fn enqueue_async_indexes(
                 .unwrap_or(0)
         };
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let now_ms = crate::cassandra_util::now_millis();
+        #[allow(clippy::cast_possible_wrap)]
         let jittered_ms = now_ms + jitter_delay_ms(delay) as i64;
         // Clamp: ready_at must be >= last_ready_at + 1 to preserve causal ordering
         // across concurrent ExtendDB instances. last_ready_at is updated atomically
@@ -532,7 +531,7 @@ pub(crate) fn sk_to_value(sk: &SortKeyValue) -> cdrs_tokio::types::value::Value 
         SortKeyValue::S(s) => s.as_str().into(),
         SortKeyValue::N(n) => super::decimal_to_value(n),
         SortKeyValue::B(b) => {
-            cdrs_tokio::types::value::Value::from(cdrs_tokio::types::blob::Blob::new(b.to_vec()))
+            cdrs_tokio::types::value::Value::from(cdrs_tokio::types::blob::Blob::new(b.clone()))
         }
     }
 }
@@ -553,8 +552,7 @@ pub(crate) async fn delete_indexes_for_table(
 ) -> Result<Vec<String>, StorageError> {
     // Collect index IDs
     let index_query = format!(
-        "SELECT index_id FROM {}.indexes WHERE table_id = ?",
-        catalog_keyspace
+        "SELECT index_id FROM {catalog_keyspace}.indexes WHERE table_id = ?"
     );
 
     let rows = query_rows(
@@ -573,8 +571,7 @@ pub(crate) async fn delete_indexes_for_table(
 
     // Delete index metadata from catalog
     let delete_query = format!(
-        "DELETE FROM {}.indexes WHERE table_id = ?",
-        catalog_keyspace
+        "DELETE FROM {catalog_keyspace}.indexes WHERE table_id = ?"
     );
 
     crate::cassandra_util::execute(
@@ -610,8 +607,7 @@ pub(crate) async fn delete_index_by_name(
 ) -> Result<String, StorageError> {
     // Get index_id first
     let query = format!(
-        "SELECT index_id FROM {}.indexes WHERE table_id = ? AND index_name = ?",
-        catalog_keyspace
+        "SELECT index_id FROM {catalog_keyspace}.indexes WHERE table_id = ? AND index_name = ?"
     );
 
     let row = crate::cassandra_util::query_optional(
@@ -627,8 +623,7 @@ pub(crate) async fn delete_index_by_name(
 
     // Delete from catalog
     let delete_query = format!(
-        "DELETE FROM {}.indexes WHERE table_id = ? AND index_name = ?",
-        catalog_keyspace
+        "DELETE FROM {catalog_keyspace}.indexes WHERE table_id = ? AND index_name = ?"
     );
 
     crate::cassandra_util::execute(

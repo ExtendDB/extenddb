@@ -59,18 +59,17 @@ impl CassandraEngine {
             if is_provisioned {
                 let (cur_rcu, cur_wcu) = current_pt_str
                     .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                    .map(|v| {
+                    .map_or((0, 0), |v| {
                         let rcu = v
                             .get("ReadCapacityUnits")
-                            .and_then(|x| x.as_i64())
+                            .and_then(serde_json::Value::as_i64)
                             .unwrap_or(0);
                         let wcu = v
                             .get("WriteCapacityUnits")
-                            .and_then(|x| x.as_i64())
+                            .and_then(serde_json::Value::as_i64)
                             .unwrap_or(0);
                         (rcu, wcu)
-                    })
-                    .unwrap_or((0, 0));
+                    });
                 if cur_rcu == pt.read_capacity_units && cur_wcu == pt.write_capacity_units {
                     return Err(StorageError::NoOpUpdate(format!(
                         "The provisioned throughput for the table will not change. \
@@ -175,11 +174,10 @@ impl CassandraEngine {
                     )
                     .await?;
                     let has_label = label_row
-                        .map(|r| {
+                        .is_some_and(|r| {
                             let v: Option<String> = r.get_by_name("stream_label").ok().flatten();
                             v.is_some()
-                        })
-                        .unwrap_or(false);
+                        });
                     if !has_label {
                         needs_label_restore = true;
                         let label = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();

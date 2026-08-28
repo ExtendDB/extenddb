@@ -40,7 +40,7 @@ pub(super) async fn query_with_pk_sk(
             cassandra_util::query_rows(
                 session,
                 query,
-                cdrs_tokio::query_values!(pk, b.to_vec()),
+                cdrs_tokio::query_values!(pk, b.clone()),
                 label,
             )
             .await
@@ -84,7 +84,7 @@ pub(super) async fn query_with_pk_sk_sk(
             cassandra_util::query_rows(
                 session,
                 query,
-                cdrs_tokio::query_values!(pk, b1.to_vec(), b2.to_vec()),
+                cdrs_tokio::query_values!(pk, b1.clone(), b2.clone()),
                 label,
             )
             .await
@@ -130,7 +130,7 @@ pub(super) async fn query_with_pk_sk_pk_sk(
             cassandra_util::query_rows(
                 session,
                 query,
-                query_values!(pk, isk.as_str(), base_pk, bsk.to_vec()),
+                query_values!(pk, isk.as_str(), base_pk, bsk.clone()),
                 label,
             )
             .await
@@ -162,7 +162,7 @@ pub(super) async fn query_with_pk_sk_pk_sk(
             cassandra_util::query_rows(
                 session,
                 query,
-                query_values!(pk, super::decimal_to_value(isk), base_pk, bsk.to_vec()),
+                query_values!(pk, super::decimal_to_value(isk), base_pk, bsk.clone()),
                 label,
             )
             .await
@@ -171,7 +171,7 @@ pub(super) async fn query_with_pk_sk_pk_sk(
             cassandra_util::query_rows(
                 session,
                 query,
-                query_values!(pk, isk.to_vec(), base_pk, bsk.as_str()),
+                query_values!(pk, isk.clone(), base_pk, bsk.as_str()),
                 label,
             )
             .await
@@ -180,7 +180,7 @@ pub(super) async fn query_with_pk_sk_pk_sk(
             cassandra_util::query_rows(
                 session,
                 query,
-                query_values!(pk, isk.to_vec(), base_pk, super::decimal_to_value(bsk)),
+                query_values!(pk, isk.clone(), base_pk, super::decimal_to_value(bsk)),
                 label,
             )
             .await
@@ -189,7 +189,7 @@ pub(super) async fn query_with_pk_sk_pk_sk(
             cassandra_util::query_rows(
                 session,
                 query,
-                query_values!(pk, isk.to_vec(), base_pk, bsk.to_vec()),
+                query_values!(pk, isk.clone(), base_pk, bsk.clone()),
                 label,
             )
             .await
@@ -230,7 +230,7 @@ pub(super) async fn query_with_pk_sk_pk(
             cassandra_util::query_rows(
                 session,
                 query,
-                cdrs_tokio::query_values!(pk, b.to_vec(), base_pk),
+                cdrs_tokio::query_values!(pk, b.clone(), base_pk),
                 label,
             )
             .await
@@ -270,7 +270,7 @@ pub(super) async fn query_with_pk_pk_sk(
             cassandra_util::query_rows(
                 session,
                 query,
-                cdrs_tokio::query_values!(pk, base_pk, b.to_vec()),
+                cdrs_tokio::query_values!(pk, base_pk, b.clone()),
                 label,
             )
             .await
@@ -316,7 +316,7 @@ pub(super) async fn query_with_pk_sk_sk_sk(
             cassandra_util::query_rows(
                 session,
                 query,
-                cdrs_tokio::query_values!(pk, b1.to_vec(), b2.to_vec(), b3.to_vec()),
+                cdrs_tokio::query_values!(pk, b1.clone(), b2.clone(), b3.clone()),
                 label,
             )
             .await

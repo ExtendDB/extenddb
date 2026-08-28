@@ -15,12 +15,12 @@ use crate::CassandraEngine;
 
 /// CQL table name for a DynamoDB table in an account keyspace.
 pub(crate) fn data_table_name(table_id: &str) -> String {
-    format!("items_{}", table_id.replace("-", "_"))
+    format!("items_{}", table_id.replace('-', "_"))
 }
 
 /// CQL table name for a GSI/LSI data table.
 pub fn index_table_name(index_id: &str) -> String {
-    format!("index_{}", index_id.replace("-", "_"))
+    format!("index_{}", index_id.replace('-', "_"))
 }
 
 /// Look up all RANGE key attribute definitions from the key schema (preserving order).
@@ -59,19 +59,18 @@ impl CassandraEngine {
 
         let query = format!(
             "SELECT key_schema, attribute_definitions, table_status, table_id, stream_specification \
-             FROM {}.tables WHERE account_id = ? AND table_name = ?",
-            catalog_keyspace
+             FROM {catalog_keyspace}.tables WHERE account_id = ? AND table_name = ?"
         );
 
         let result = self
             .session
             .query_with_values(&query, cdrs_tokio::query_values!(account_id, table_name))
             .await
-            .map_err(|e| StorageError::Internal(format!("Query table: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Query table: {e}")))?;
 
         let body = result
             .response_body()
-            .map_err(|e| StorageError::Internal(format!("Parse response: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Parse response: {e}")))?;
 
         let rows = body
             .into_rows()
@@ -84,16 +83,16 @@ impl CassandraEngine {
 
         let ks_text: String = row
             .get_r_by_name("key_schema")
-            .map_err(|e| StorageError::Internal(format!("Parse key_schema: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Parse key_schema: {e}")))?;
         let ad_text: String = row
             .get_r_by_name("attribute_definitions")
-            .map_err(|e| StorageError::Internal(format!("Parse attribute_definitions: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Parse attribute_definitions: {e}")))?;
         let status: String = row
             .get_r_by_name("table_status")
-            .map_err(|e| StorageError::Internal(format!("Parse table_status: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Parse table_status: {e}")))?;
         let table_id: String = row
             .get_r_by_name("table_id")
-            .map_err(|e| StorageError::Internal(format!("Parse table_id: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Parse table_id: {e}")))?;
         let stream_spec_text: Option<String> =
             row.get_by_name("stream_specification").ok().flatten();
 
@@ -180,7 +179,7 @@ impl CassandraEngine {
             // Hash-only table (no clustering columns)
             // partition_max_delete_timestamp is a regular column (not STATIC) since there's only one row per partition
             format!(
-                "CREATE TABLE {}.{} (\
+                "CREATE TABLE {account_keyspace}.{ddb_table} (\
                     pk text PRIMARY KEY, \
                     partition_max_delete_timestamp bigint, \
                     item_data text, \
@@ -188,14 +187,13 @@ impl CassandraEngine {
                     prepared_txn_timestamp bigint, \
                     last_committed_txn_timestamp bigint, \
                     created_to_prepare boolean\
-                )",
-                account_keyspace, ddb_table
+                )"
             )
         } else if sk_infos.len() == 1 {
             // Single sort key - use typed columns
             let sk_col = sk_column(sk_infos[0].1);
             format!(
-                "CREATE TABLE {}.{} (\
+                "CREATE TABLE {account_keyspace}.{ddb_table} (\
                     pk text, \
                     partition_max_delete_timestamp bigint STATIC, \
                     sk_s text, \
@@ -206,9 +204,8 @@ impl CassandraEngine {
                     prepared_txn_timestamp bigint, \
                     last_committed_txn_timestamp bigint, \
                     created_to_prepare boolean, \
-                    PRIMARY KEY (pk, {})\
-                )",
-                account_keyspace, ddb_table, sk_col
+                    PRIMARY KEY (pk, {sk_col})\
+                )"
             )
         } else {
             // Multi-part RANGE key
@@ -224,9 +221,9 @@ impl CassandraEngine {
                     col_defs.push("sk_b blob".to_owned());
                 } else {
                     let n = i + 1;
-                    col_defs.push(format!("sk{}_s text", n));
-                    col_defs.push(format!("sk{}_n decimal", n));
-                    col_defs.push(format!("sk{}_b blob", n));
+                    col_defs.push(format!("sk{n}_s text"));
+                    col_defs.push(format!("sk{n}_n decimal"));
+                    col_defs.push(format!("sk{n}_b blob"));
                 }
                 pk_cols.push(col);
             }
@@ -249,7 +246,7 @@ impl CassandraEngine {
         self.session
             .query(&ddl)
             .await
-            .map_err(|e| StorageError::Internal(format!("Failed to create data table: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Failed to create data table: {e}")))?;
 
         Ok(())
     }
@@ -261,12 +258,12 @@ impl CassandraEngine {
         table_id: &str,
     ) -> Result<(), StorageError> {
         let ddb_table = data_table_name(table_id);
-        let ddl = format!("DROP TABLE IF EXISTS {}.{}", account_keyspace, ddb_table);
+        let ddl = format!("DROP TABLE IF EXISTS {account_keyspace}.{ddb_table}");
 
         self.session
             .query(&ddl)
             .await
-            .map_err(|e| StorageError::Internal(format!("Failed to drop data table: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Failed to drop data table: {e}")))?;
 
         Ok(())
     }
@@ -278,10 +275,10 @@ impl CassandraEngine {
         index_id: &str,
     ) -> Result<(), StorageError> {
         let idx_table = index_table_name(index_id);
-        let ddl = format!("DROP TABLE IF EXISTS {}.{}", account_keyspace, idx_table);
+        let ddl = format!("DROP TABLE IF EXISTS {account_keyspace}.{idx_table}");
 
         self.session.query(&ddl).await.map_err(|e| {
-            StorageError::Internal(format!("Failed to drop index data table: {}", e))
+            StorageError::Internal(format!("Failed to drop index data table: {e}"))
         })?;
 
         Ok(())
@@ -325,9 +322,9 @@ impl CassandraEngine {
                 col_defs.push("sk_b blob".to_owned());
             } else {
                 let n = i + 1;
-                col_defs.push(format!("sk{}_s text", n));
-                col_defs.push(format!("sk{}_n decimal", n));
-                col_defs.push(format!("sk{}_b blob", n));
+                col_defs.push(format!("sk{n}_s text"));
+                col_defs.push(format!("sk{n}_n decimal"));
+                col_defs.push(format!("sk{n}_b blob"));
             }
         }
 
@@ -340,9 +337,9 @@ impl CassandraEngine {
                 col_defs.push("base_sk_b blob".to_owned());
             } else {
                 let n = i + 1;
-                col_defs.push(format!("base_sk{}_s text", n));
-                col_defs.push(format!("base_sk{}_n decimal", n));
-                col_defs.push(format!("base_sk{}_b blob", n));
+                col_defs.push(format!("base_sk{n}_s text"));
+                col_defs.push(format!("base_sk{n}_n decimal"));
+                col_defs.push(format!("base_sk{n}_b blob"));
             }
         }
 
@@ -387,7 +384,7 @@ impl CassandraEngine {
         self.session
             .query(&ddl)
             .await
-            .map_err(|e| StorageError::Internal(format!("Failed to create index table: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Failed to create index table: {e}")))?;
 
         Ok(())
     }

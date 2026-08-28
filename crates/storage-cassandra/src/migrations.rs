@@ -81,7 +81,7 @@ pub async fn run_catalog_migrations(
 
     // Set keyspace context for all subsequent queries
     session
-        .query(format!("USE {}", keyspace))
+        .query(format!("USE {keyspace}"))
         .await
         .map_err(|e| OpError::Internal(format!("Failed to USE keyspace: {e}")))?;
 
@@ -104,7 +104,7 @@ pub async fn run_data_migrations(session: &Arc<CassandraSession>, keyspace: &str
 
     // Set keyspace context for all subsequent queries
     session
-        .query(format!("USE {}", keyspace))
+        .query(format!("USE {keyspace}"))
         .await
         .map_err(|e| OpError::Internal(format!("Failed to USE keyspace: {e}")))?;
 
@@ -134,9 +134,8 @@ pub(crate) async fn table_exists(
         .await
         .ok()
         .and_then(|frame| frame.response_body().ok())
-        .and_then(|body| body.into_rows())
-        .map(|rows| !rows.is_empty())
-        .unwrap_or(false);
+        .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
+        .is_some_and(|rows| !rows.is_empty());
     Ok(exists)
 }
 
@@ -149,7 +148,7 @@ pub(crate) async fn pending_data_migrations(
     catalog_keyspace: &str,
     account_keyspace_fn: impl Fn(&str) -> String,
 ) -> OpResult<Vec<String>> {
-    let query = format!("SELECT account_id FROM {}.accounts", catalog_keyspace);
+    let query = format!("SELECT account_id FROM {catalog_keyspace}.accounts");
     let rows = crate::cassandra_util::query_rows::<OpError>(
         &Arc::clone(session),
         &query,
@@ -183,11 +182,10 @@ async fn is_migration_applied(
         .strip_prefix("V")
         .and_then(|s| s.split("__").next())
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| OpError::Internal(format!("Invalid migration filename: {}", filename)))?;
+        .ok_or_else(|| OpError::Internal(format!("Invalid migration filename: {filename}")))?;
 
     let check_cql = format!(
-        "SELECT version FROM {}.schema_history WHERE version = ?",
-        keyspace
+        "SELECT version FROM {keyspace}.schema_history WHERE version = ?"
     );
 
     let applied = session
@@ -195,9 +193,8 @@ async fn is_migration_applied(
         .await
         .ok()
         .and_then(|frame| frame.response_body().ok())
-        .and_then(|body| body.into_rows())
-        .map(|rows| !rows.is_empty())
-        .unwrap_or(false);
+        .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
+        .is_some_and(|rows| !rows.is_empty());
 
     Ok(applied)
 }
@@ -229,7 +226,7 @@ async fn record_migration(
         .strip_prefix("V")
         .and_then(|s| s.split("__").next())
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| OpError::Internal(format!("Invalid migration filename: {}", filename)))?;
+        .ok_or_else(|| OpError::Internal(format!("Invalid migration filename: {filename}")))?;
 
     let description = filename
         .split("__")
@@ -238,8 +235,7 @@ async fn record_migration(
         .unwrap_or("unknown");
 
     let record_cql = format!(
-        "INSERT INTO {}.schema_history (version, description, applied_at) VALUES (?, ?, toTimestamp(now()))",
-        keyspace
+        "INSERT INTO {keyspace}.schema_history (version, description, applied_at) VALUES (?, ?, toTimestamp(now()))"
     );
 
     session

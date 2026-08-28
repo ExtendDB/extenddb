@@ -28,8 +28,7 @@ impl OperationsEngine for CassandraOperationsEngine {
         let parts: Vec<&str> = first_contact.split(':').collect();
         if parts.len() != 2 {
             return Err(StorageError::Internal(format!(
-                "Invalid Cassandra contact point format: '{}'. Expected 'host:port'",
-                first_contact
+                "Invalid Cassandra contact point format: '{first_contact}'. Expected 'host:port'"
             )));
         }
 
@@ -42,7 +41,7 @@ impl OperationsEngine for CassandraOperationsEngine {
         Ok(ConnectionParts {
             host,
             port,
-            database: format!("{}_catalog", keyspace),
+            database: format!("{keyspace}_catalog"),
             user: String::new(),
             password: String::new(),
         })
@@ -62,13 +61,12 @@ impl OperationsEngine for CassandraOperationsEngine {
         // - Case-insensitive (stored lowercase unless quoted)
 
         if name.is_empty() {
-            return Err(StorageError::Internal(format!("{} cannot be empty", label)));
+            return Err(StorageError::Internal(format!("{label} cannot be empty")));
         }
 
         if name.len() > 48 {
             return Err(StorageError::Internal(format!(
-                "{} '{}' exceeds maximum length of 48 characters",
-                label, name
+                "{label} '{name}' exceeds maximum length of 48 characters"
             )));
         }
 
@@ -76,16 +74,14 @@ impl OperationsEngine for CassandraOperationsEngine {
         if let Some(first_char) = name.chars().next()
             && first_char.is_ascii_digit() {
                 return Err(StorageError::Internal(format!(
-                    "{} '{}' cannot start with a digit",
-                    label, name
+                    "{label} '{name}' cannot start with a digit"
                 )));
             }
 
         // Check all characters (alphanumeric + underscore only)
         if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(StorageError::Internal(format!(
-                "{} '{}' contains invalid characters. Only alphanumeric and underscore allowed",
-                label, name
+                "{label} '{name}' contains invalid characters. Only alphanumeric and underscore allowed"
             )));
         }
 

@@ -246,10 +246,7 @@ impl CassandraEngine {
 
         // Generate unique transaction ID
         let txn_id = Uuid::new_v4();
-        let started_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let started_at = crate::cassandra_util::now_millis();
 
         // Build initial ledger ops (pk/sk known; item_data for UPDATE filled in after PREPARE)
         let mut ledger_ops = Self::initial_ledger_ops(ops)?;
@@ -703,8 +700,7 @@ impl CassandraEngine {
         fingerprint: &str,
     ) -> Result<(), StorageError> {
         let select_query = format!(
-            "SELECT fingerprint FROM {}.idempotency_tokens_by_account WHERE account_id = ? AND \"token\" = ?",
-            keyspace
+            "SELECT fingerprint FROM {keyspace}.idempotency_tokens_by_account WHERE account_id = ? AND \"token\" = ?"
         );
 
         let row = query_optional::<StorageError>(
@@ -726,14 +722,10 @@ impl CassandraEngine {
 
         // Insert with LWT to handle concurrent requests racing on the same token.
         let insert_query = format!(
-            "INSERT INTO {}.idempotency_tokens_by_account (account_id, \"token\", fingerprint, created_at) \
-             VALUES (?, ?, ?, ?) IF NOT EXISTS",
-            keyspace
+            "INSERT INTO {keyspace}.idempotency_tokens_by_account (account_id, \"token\", fingerprint, created_at) \
+             VALUES (?, ?, ?, ?) IF NOT EXISTS"
         );
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let now = crate::cassandra_util::now_millis();
 
         let result = self
             .session
@@ -753,7 +745,7 @@ impl CassandraEngine {
         let applied: bool = result
             .response_body()
             .ok()
-            .and_then(|b| b.into_rows())
+            .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
             .and_then(|mut rows| rows.drain(..).next())
             .and_then(|row| row.get_r_by_name("[applied]").ok())
             .unwrap_or(true);
@@ -825,8 +817,7 @@ impl CassandraEngine {
             .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
 
         let query = format!(
-            "SELECT partition_max_delete_timestamp FROM {}.{} WHERE pk = ? LIMIT 1",
-            account_keyspace, table_name
+            "SELECT partition_max_delete_timestamp FROM {account_keyspace}.{table_name} WHERE pk = ? LIMIT 1"
         );
 
         let result = self
@@ -894,16 +885,14 @@ impl CassandraEngine {
                     .map_err(|e| CancellationReason::validation_error(e.to_string()))?
                     .to_string();
                 let query = format!(
-                    "INSERT INTO {}.{} (pk, {}, item_data, prepared_txn_id, prepared_txn_timestamp, created_to_prepare) \
-                     VALUES (?, ?, ?, ?, ?, true) IF NOT EXISTS",
-                    keyspace, ddb_table, sk_col
+                    "INSERT INTO {keyspace}.{ddb_table} (pk, {sk_col}, item_data, prepared_txn_id, prepared_txn_timestamp, created_to_prepare) \
+                     VALUES (?, ?, ?, ?, ?, true) IF NOT EXISTS"
                 );
                 query_with_pk_sk_item_txnid_ts(&self.session, &query, pk_text.as_str(), &sk, &item_text, txn_id_bytes, txn_timestamp).await
             } else {
                 let query = format!(
-                    "UPDATE {}.{} SET prepared_txn_id = ?, prepared_txn_timestamp = ? \
-                     WHERE pk = ? AND {} = ? IF prepared_txn_id = null",
-                    keyspace, ddb_table, sk_col
+                    "UPDATE {keyspace}.{ddb_table} SET prepared_txn_id = ?, prepared_txn_timestamp = ? \
+                     WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = null"
                 );
                 query_with_txnid_ts_pk_sk(&self.session, &query, txn_id_bytes, txn_timestamp, pk_text.as_str(), &sk).await
             }
@@ -912,9 +901,8 @@ impl CassandraEngine {
                 .map_err(|e| CancellationReason::validation_error(e.to_string()))?
                 .to_string();
             let query = format!(
-                "INSERT INTO {}.{} (pk, item_data, prepared_txn_id, prepared_txn_timestamp, created_to_prepare) \
-                 VALUES (?, ?, ?, ?, true) IF NOT EXISTS",
-                keyspace, ddb_table
+                "INSERT INTO {keyspace}.{ddb_table} (pk, item_data, prepared_txn_id, prepared_txn_timestamp, created_to_prepare) \
+                 VALUES (?, ?, ?, ?, true) IF NOT EXISTS"
             );
             self.session
                 .query_with_values(&query, cdrs_tokio::query_values!(pk_text.as_str(), item_text, txn_id_bytes, txn_timestamp))
@@ -922,9 +910,8 @@ impl CassandraEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))
         } else {
             let query = format!(
-                "UPDATE {}.{} SET prepared_txn_id = ?, prepared_txn_timestamp = ? \
-                 WHERE pk = ? IF prepared_txn_id = null",
-                keyspace, ddb_table
+                "UPDATE {keyspace}.{ddb_table} SET prepared_txn_id = ?, prepared_txn_timestamp = ? \
+                 WHERE pk = ? IF prepared_txn_id = null"
             );
             self.session
                 .query_with_values(&query, cdrs_tokio::query_values!(txn_id_bytes, txn_timestamp, pk_text.as_str()))
@@ -983,9 +970,8 @@ impl CassandraEngine {
                 // Step 1: Update partition_max_delete_timestamp
                 // First, try to update if it's null (most common case - first delete in partition)
                 let update_max_ts_null_query = format!(
-                    "UPDATE {}.{} SET partition_max_delete_timestamp = ? WHERE pk = ? \
-                     IF partition_max_delete_timestamp = null",
-                    keyspace, ddb_table
+                    "UPDATE {keyspace}.{ddb_table} SET partition_max_delete_timestamp = ? WHERE pk = ? \
+                     IF partition_max_delete_timestamp = null"
                 );
 
                 let result = self
@@ -1005,9 +991,8 @@ impl CassandraEngine {
                 // If that failed (column already has a value), try updating only if our timestamp is higher
                 if !check_lwt_applied(&result, "partition_max update").is_ok() {
                     let update_max_ts_query = format!(
-                        "UPDATE {}.{} SET partition_max_delete_timestamp = ? WHERE pk = ? \
-                         IF partition_max_delete_timestamp < ?",
-                        keyspace, ddb_table
+                        "UPDATE {keyspace}.{ddb_table} SET partition_max_delete_timestamp = ? WHERE pk = ? \
+                         IF partition_max_delete_timestamp < ?"
                     );
 
                     let _result2 = self
@@ -1040,8 +1025,7 @@ impl CassandraEngine {
                     let sk = parse_sk(sk_value, sk_type)?;
                     let sk_col = sk_column(sk_type);
                     let delete_query = format!(
-                        "DELETE FROM {}.{} WHERE pk = ? AND {} = ? IF prepared_txn_id = ?",
-                        keyspace, ddb_table, sk_col
+                        "DELETE FROM {keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ?"
                     );
                     query_with_pk_sk_txnid(
                         &self.session,
@@ -1053,8 +1037,7 @@ impl CassandraEngine {
                     .await
                 } else {
                     let delete_query = format!(
-                        "DELETE FROM {}.{} WHERE pk = ? IF prepared_txn_id = ?",
-                        keyspace, ddb_table
+                        "DELETE FROM {keyspace}.{ddb_table} WHERE pk = ? IF prepared_txn_id = ?"
                     );
                     self.session
                         .query_with_values(
@@ -1101,16 +1084,14 @@ impl CassandraEngine {
             let sk_col = sk_column(sk_type);
 
             let query = format!(
-                "UPDATE {}.{} SET item_data = ?, prepared_txn_id = NULL, last_committed_txn_timestamp = ? \
-                 WHERE pk = ? AND {} = ? IF prepared_txn_id = ?",
-                keyspace, ddb_table, sk_col
+                "UPDATE {keyspace}.{ddb_table} SET item_data = ?, prepared_txn_id = NULL, last_committed_txn_timestamp = ? \
+                 WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ?"
             );
             query_with_item_ts_pk_sk_txnid(&self.session, &query, &item_text, txn_timestamp, pk_text.as_str(), &sk, txn_id_bytes).await
         } else {
             let query = format!(
-                "UPDATE {}.{} SET item_data = ?, prepared_txn_id = NULL, last_committed_txn_timestamp = ? \
-                 WHERE pk = ? IF prepared_txn_id = ?",
-                keyspace, ddb_table
+                "UPDATE {keyspace}.{ddb_table} SET item_data = ?, prepared_txn_id = NULL, last_committed_txn_timestamp = ? \
+                 WHERE pk = ? IF prepared_txn_id = ?"
             );
             self.session
                 .query_with_values(&query, cdrs_tokio::query_values!(item_text, txn_timestamp, pk_text.as_str(), txn_id_bytes))
@@ -1179,12 +1160,10 @@ impl CassandraEngine {
             let sk_col = sk_column(sk_type);
 
             let delete_query = format!(
-                "DELETE FROM {}.{} WHERE pk = ? AND {} = ? IF prepared_txn_id = ? AND created_to_prepare = true",
-                keyspace, ddb_table, sk_col
+                "DELETE FROM {keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ? AND created_to_prepare = true"
             );
             let update_query = format!(
-                "UPDATE {}.{} SET prepared_txn_id = null WHERE pk = ? AND {} = ? IF prepared_txn_id = ?",
-                keyspace, ddb_table, sk_col
+                "UPDATE {keyspace}.{ddb_table} SET prepared_txn_id = null WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ?"
             );
 
             let dr = query_with_pk_sk_txnid(&self.session, &delete_query, pk_text.as_str(), &sk, txn_id_bytes.clone())
@@ -1196,12 +1175,10 @@ impl CassandraEngine {
             query_with_pk_sk_txnid(&self.session, &update_query, pk_text.as_str(), &sk, txn_id_bytes).await
         } else {
             let delete_query = format!(
-                "DELETE FROM {}.{} WHERE pk = ? IF prepared_txn_id = ? AND created_to_prepare = true",
-                keyspace, ddb_table
+                "DELETE FROM {keyspace}.{ddb_table} WHERE pk = ? IF prepared_txn_id = ? AND created_to_prepare = true"
             );
             let update_query = format!(
-                "UPDATE {}.{} SET prepared_txn_id = null WHERE pk = ? IF prepared_txn_id = ?",
-                keyspace, ddb_table
+                "UPDATE {keyspace}.{ddb_table} SET prepared_txn_id = null WHERE pk = ? IF prepared_txn_id = ?"
             );
 
             let dr = self.session

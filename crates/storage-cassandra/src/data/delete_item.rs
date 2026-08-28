@@ -56,8 +56,7 @@ impl CassandraEngine {
 
             // Always read to check prepared_txn_id for transaction conflict detection.
             let select_query = format!(
-                "SELECT item_data, prepared_txn_id FROM {}.{} WHERE pk = ? AND {} = ?",
-                data_keyspace, ddb_table, sk_col
+                "SELECT item_data, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?"
             );
 
             let old_result =
@@ -65,7 +64,7 @@ impl CassandraEngine {
 
             let body = old_result
                 .response_body()
-                .map_err(|e| StorageError::Internal(format!("Parse response: {}", e)))?;
+                .map_err(|e| StorageError::Internal(format!("Parse response: {e}")))?;
 
             let (old_item_opt, has_prepared_txn) = if let Some(rows) = body.into_rows() {
                 if let Some(row) = rows.into_iter().next() {
@@ -117,8 +116,7 @@ impl CassandraEngine {
 
             // Delete the item (with index updates if needed).
             let delete_cql = format!(
-                "DELETE FROM {}.{} WHERE pk = ? AND {} = ?",
-                data_keyspace, ddb_table, sk_col
+                "DELETE FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?"
             );
 
             // Update partition_max_delete_timestamp before the batch (must precede delete).
@@ -195,7 +193,7 @@ impl CassandraEngine {
                             .map_err(|e| StorageError::Internal(e.to_string()))?,
                     )
                     .await
-                    .map_err(|e| StorageError::Internal(format!("Batch execution: {}", e)))?;
+                    .map_err(|e| StorageError::Internal(format!("Batch execution: {e}")))?;
 
                 if async_enqueued > 0 {
                     self.gsi_queue.notify_workers();
@@ -208,8 +206,7 @@ impl CassandraEngine {
 
             // Always read to check prepared_txn_id for transaction conflict detection
             let select_query = format!(
-                "SELECT item_data, prepared_txn_id FROM {}.{} WHERE pk = ?",
-                data_keyspace, ddb_table
+                "SELECT item_data, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ?"
             );
 
             let row = crate::cassandra_util::query_optional(
@@ -265,7 +262,7 @@ impl CassandraEngine {
             }
 
             // Delete the item (with index updates if needed).
-            let delete_cql = format!("DELETE FROM {}.{} WHERE pk = ?", data_keyspace, ddb_table);
+            let delete_cql = format!("DELETE FROM {data_keyspace}.{ddb_table} WHERE pk = ?");
 
             // Update partition_max_delete_timestamp before the batch (must precede delete).
             if old_item_opt.is_some() {
@@ -292,7 +289,7 @@ impl CassandraEngine {
                 self.session
                     .query_with_values(&delete_cql, cdrs_tokio::query_values!(pk_text.as_str()))
                     .await
-                    .map_err(|e| StorageError::Internal(format!("Delete failed: {}", e)))?;
+                    .map_err(|e| StorageError::Internal(format!("Delete failed: {e}")))?;
             } else {
                 let delete_qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
                     cdrs_tokio::types::value::Value::from(pk_text.as_str()),
@@ -342,7 +339,7 @@ impl CassandraEngine {
                             .map_err(|e| StorageError::Internal(e.to_string()))?,
                     )
                     .await
-                    .map_err(|e| StorageError::Internal(format!("Batch execution: {}", e)))?;
+                    .map_err(|e| StorageError::Internal(format!("Batch execution: {e}")))?;
 
                 if async_enqueued > 0 {
                     self.gsi_queue.notify_workers();
@@ -365,16 +362,12 @@ impl CassandraEngine {
         table: &str,
         pk: &str,
     ) -> Result<(), StorageError> {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let now_ms = crate::cassandra_util::now_millis();
 
         // Step 1: Try to set if null
         let query_null = format!(
-            "UPDATE {}.{} SET partition_max_delete_timestamp = ? WHERE pk = ? \
-             IF partition_max_delete_timestamp = null",
-            keyspace, table
+            "UPDATE {keyspace}.{table} SET partition_max_delete_timestamp = ? WHERE pk = ? \
+             IF partition_max_delete_timestamp = null"
         );
 
         let result = self
@@ -390,7 +383,7 @@ impl CassandraEngine {
         let applied = result
             .response_body()
             .ok()
-            .and_then(|body| body.into_rows())
+            .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
             .and_then(|rows| rows.into_iter().next())
             .and_then(|row| {
                 use cdrs_tokio::types::IntoRustByName;
@@ -402,9 +395,8 @@ impl CassandraEngine {
         if !applied {
             // Step 2: Column already has a value - update only if ours is higher
             let query_compare = format!(
-                "UPDATE {}.{} SET partition_max_delete_timestamp = ? WHERE pk = ? \
-                 IF partition_max_delete_timestamp < ?",
-                keyspace, table
+                "UPDATE {keyspace}.{table} SET partition_max_delete_timestamp = ? WHERE pk = ? \
+                 IF partition_max_delete_timestamp < ?"
             );
 
             self.session

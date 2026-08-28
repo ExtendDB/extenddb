@@ -47,35 +47,33 @@ impl CassandraEngine {
         // CREATING → ACTIVE
         // Note: Cassandra requires ALLOW FILTERING for non-key columns in WHERE clause
         let query = format!(
-            "SELECT account_id, table_name, table_id FROM {}.tables \
+            "SELECT account_id, table_name, table_id FROM {catalog_keyspace}.tables \
              WHERE table_status = 'CREATING' AND status_transition_at <= toTimestamp(now()) \
-             ALLOW FILTERING",
-            catalog_keyspace
+             ALLOW FILTERING"
         );
 
         let result = self.session.query(&query).await.map_err(|e| {
-            StorageError::Internal(format!("Failed to query CREATING tables: {}", e))
+            StorageError::Internal(format!("Failed to query CREATING tables: {e}"))
         })?;
 
         let body = result.response_body().map_err(|e| {
-            StorageError::Internal(format!("Failed to parse CREATING tables response: {}", e))
+            StorageError::Internal(format!("Failed to parse CREATING tables response: {e}"))
         })?;
 
         let rows = body.into_rows().unwrap_or_default();
 
         for row in rows {
             let account_id: String = row.get_r_by_name("account_id").map_err(|e| {
-                StorageError::Internal(format!("Failed to parse account_id: {}", e))
+                StorageError::Internal(format!("Failed to parse account_id: {e}"))
             })?;
             let table_name: String = row.get_r_by_name("table_name").map_err(|e| {
-                StorageError::Internal(format!("Failed to parse table_name: {}", e))
+                StorageError::Internal(format!("Failed to parse table_name: {e}"))
             })?;
 
             // Update to ACTIVE (PRIMARY KEY is account_id, table_name)
             let update = format!(
-                "UPDATE {}.tables SET table_status = 'ACTIVE', status_transition_at = null \
-                 WHERE account_id = ? AND table_name = ?",
-                catalog_keyspace
+                "UPDATE {catalog_keyspace}.tables SET table_status = 'ACTIVE', status_transition_at = null \
+                 WHERE account_id = ? AND table_name = ?"
             );
             self.session
                 .query_with_values(
@@ -83,52 +81,50 @@ impl CassandraEngine {
                     cdrs_tokio::query_values!(account_id.as_str(), table_name.as_str()),
                 )
                 .await
-                .map_err(|e| StorageError::Internal(format!("Failed to activate table: {}", e)))?;
+                .map_err(|e| StorageError::Internal(format!("Failed to activate table: {e}")))?;
 
             transitions.push((table_name, "CREATING → active"));
         }
 
         // DELETING → remove row (with tags and data table cleanup)
         let query = format!(
-            "SELECT account_id, table_name, table_arn, table_id FROM {}.tables \
+            "SELECT account_id, table_name, table_arn, table_id FROM {catalog_keyspace}.tables \
              WHERE table_status = 'DELETING' AND status_transition_at <= toTimestamp(now()) \
-             ALLOW FILTERING",
-            catalog_keyspace
+             ALLOW FILTERING"
         );
 
         let result = self.session.query(&query).await.map_err(|e| {
-            StorageError::Internal(format!("Failed to query DELETING tables: {}", e))
+            StorageError::Internal(format!("Failed to query DELETING tables: {e}"))
         })?;
 
         let body = result.response_body().map_err(|e| {
-            StorageError::Internal(format!("Failed to parse DELETING tables response: {}", e))
+            StorageError::Internal(format!("Failed to parse DELETING tables response: {e}"))
         })?;
 
         let rows = body.into_rows().unwrap_or_default();
 
         for row in rows {
             let account_id: String = row.get_r_by_name("account_id").map_err(|e| {
-                StorageError::Internal(format!("Failed to parse account_id: {}", e))
+                StorageError::Internal(format!("Failed to parse account_id: {e}"))
             })?;
             let table_name: String = row.get_r_by_name("table_name").map_err(|e| {
-                StorageError::Internal(format!("Failed to parse table_name: {}", e))
+                StorageError::Internal(format!("Failed to parse table_name: {e}"))
             })?;
             let table_arn: String = row
                 .get_r_by_name("table_arn")
-                .map_err(|e| StorageError::Internal(format!("Failed to parse table_arn: {}", e)))?;
+                .map_err(|e| StorageError::Internal(format!("Failed to parse table_arn: {e}")))?;
             let table_id: String = row
                 .get_r_by_name("table_id")
-                .map_err(|e| StorageError::Internal(format!("Failed to parse table_id: {}", e)))?;
+                .map_err(|e| StorageError::Internal(format!("Failed to parse table_id: {e}")))?;
 
             // Delete tags
             let tag_delete = format!(
-                "DELETE FROM {}.tags WHERE resource_arn = ?",
-                catalog_keyspace
+                "DELETE FROM {catalog_keyspace}.tags WHERE resource_arn = ?"
             );
             self.session
                 .query_with_values(&tag_delete, cdrs_tokio::query_values!(table_arn.as_str()))
                 .await
-                .map_err(|e| StorageError::Internal(format!("Failed to delete tags: {}", e)))?;
+                .map_err(|e| StorageError::Internal(format!("Failed to delete tags: {e}")))?;
 
             // Delete indexes (catalog + data tables)
             let account_keyspace = self.account_keyspace(&account_id);
@@ -142,8 +138,7 @@ impl CassandraEngine {
             .await?;
 
             let continuous_backup_delete = format!(
-                "DELETE FROM {}.continuous_backups WHERE account_id = ? AND table_name = ?",
-                catalog_keyspace
+                "DELETE FROM {catalog_keyspace}.continuous_backups WHERE account_id = ? AND table_name = ?"
             );
             self.session
                 .query_with_values(
@@ -157,8 +152,7 @@ impl CassandraEngine {
 
             // Delete table row (PRIMARY KEY is account_id, table_name)
             let table_delete = format!(
-                "DELETE FROM {}.tables WHERE account_id = ? AND table_name = ?",
-                catalog_keyspace
+                "DELETE FROM {catalog_keyspace}.tables WHERE account_id = ? AND table_name = ?"
             );
             self.session
                 .query_with_values(
@@ -166,7 +160,7 @@ impl CassandraEngine {
                     cdrs_tokio::query_values!(account_id.as_str(), table_name.as_str()),
                 )
                 .await
-                .map_err(|e| StorageError::Internal(format!("Failed to delete table: {}", e)))?;
+                .map_err(|e| StorageError::Internal(format!("Failed to delete table: {e}")))?;
 
             // Drop base table in account keyspace
             self.drop_data_table(&account_keyspace, &table_id).await?;

@@ -107,7 +107,7 @@ impl CassandraEngine {
 
         // Build cluster config
         let cluster_config = node_builder.build().await.map_err(|e| {
-            StorageError::Connection(format!("Failed to build cluster config: {}", e))
+            StorageError::Connection(format!("Failed to build cluster config: {e}"))
         })?;
 
         // Create session with round-robin load balancing
@@ -131,11 +131,10 @@ impl CassandraEngine {
                 let err_str = e.to_string();
                 if err_str.contains("authentication") || err_str.contains("Authentication") {
                     StorageError::Connection(format!(
-                        "Authentication failed: {}. Verify username/password in config.",
-                        e
+                        "Authentication failed: {e}. Verify username/password in config."
                     ))
                 } else {
-                    StorageError::Connection(format!("Failed to build session: {}", e))
+                    StorageError::Connection(format!("Failed to build session: {e}"))
                 }
             })?;
 
@@ -172,19 +171,19 @@ impl CassandraEngine {
         self.session
             .query(cql)
             .await
-            .map_err(|e| StorageError::Internal(format!("Failed to create keyspace: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Failed to create keyspace: {e}")))?;
 
         Ok(())
     }
 
     /// Drop a keyspace.
     pub async fn drop_keyspace(&self, keyspace_name: &str) -> Result<(), StorageError> {
-        let cql = format!("DROP KEYSPACE IF EXISTS {}", keyspace_name);
+        let cql = format!("DROP KEYSPACE IF EXISTS {keyspace_name}");
 
         self.session
             .query(cql)
             .await
-            .map_err(|e| StorageError::Internal(format!("Failed to drop keyspace: {}", e)))?;
+            .map_err(|e| StorageError::Internal(format!("Failed to drop keyspace: {e}")))?;
 
         Ok(())
     }
@@ -197,9 +196,9 @@ impl CassandraEngine {
             .session
             .query_with_values(cql, query_values!(keyspace_name))
             .await
-            .map_err(|e| StorageError::Internal(format!("Failed to query keyspaces: {}", e)))?
+            .map_err(|e| StorageError::Internal(format!("Failed to query keyspaces: {e}")))?
             .response_body()
-            .map_err(|e| StorageError::Internal(format!("Failed to get response body: {}", e)))?
+            .map_err(|e| StorageError::Internal(format!("Failed to get response body: {e}")))?
             .into_rows()
             .ok_or_else(|| StorageError::Internal("Failed to parse rows".to_string()))?;
 
