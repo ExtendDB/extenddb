@@ -233,36 +233,38 @@ pub fn sync_indexes(
 
         // Delete old index row if the old item had index keys
         if let Some(old) = old_item
-            && item_has_index_keys(old, &idx.key_schema) {
-                delete_index_row_multi(
-                    batch,
-                    account_keyspace,
-                    &idx_table,
-                    old,
-                    &idx.key_schema,
-                    base_key_schema,
-                    &idx_sks,
-                    &base_sks,
-                )?;
-            }
+            && item_has_index_keys(old, &idx.key_schema)
+        {
+            delete_index_row_multi(
+                batch,
+                account_keyspace,
+                &idx_table,
+                old,
+                &idx.key_schema,
+                base_key_schema,
+                &idx_sks,
+                &base_sks,
+            )?;
+        }
 
         // Insert new index row if the new item has index keys
         if let Some(new) = new_item
-            && item_has_index_keys(new, &idx.key_schema) {
-                let projected =
-                    project_item_for_index(new, &idx.key_schema, base_key_schema, &idx.projection);
-                insert_index_row_multi(
-                    batch,
-                    account_keyspace,
-                    &idx_table,
-                    new,
-                    &projected,
-                    &idx.key_schema,
-                    base_key_schema,
-                    &idx_sks,
-                    &base_sks,
-                )?;
-            }
+            && item_has_index_keys(new, &idx.key_schema)
+        {
+            let projected =
+                project_item_for_index(new, &idx.key_schema, base_key_schema, &idx.projection);
+            insert_index_row_multi(
+                batch,
+                account_keyspace,
+                &idx_table,
+                new,
+                &projected,
+                &idx.key_schema,
+                base_key_schema,
+                &idx_sks,
+                &base_sks,
+            )?;
+        }
     }
     Ok(())
 }
@@ -551,9 +553,7 @@ pub(crate) async fn delete_indexes_for_table(
     engine: &crate::CassandraEngine,
 ) -> Result<Vec<String>, StorageError> {
     // Collect index IDs
-    let index_query = format!(
-        "SELECT index_id FROM {catalog_keyspace}.indexes WHERE table_id = ?"
-    );
+    let index_query = format!("SELECT index_id FROM {catalog_keyspace}.indexes WHERE table_id = ?");
 
     let rows = query_rows(
         session,
@@ -570,9 +570,7 @@ pub(crate) async fn delete_indexes_for_table(
     }
 
     // Delete index metadata from catalog
-    let delete_query = format!(
-        "DELETE FROM {catalog_keyspace}.indexes WHERE table_id = ?"
-    );
+    let delete_query = format!("DELETE FROM {catalog_keyspace}.indexes WHERE table_id = ?");
 
     crate::cassandra_util::execute(
         session,
@@ -590,56 +588,6 @@ pub(crate) async fn delete_indexes_for_table(
     }
 
     Ok(index_ids)
-}
-
-/// Delete a specific index by name for a table.
-///
-/// Called by `update_table` when a GSI is deleted via UpdateTable API.
-///
-/// Returns the index_id that was deleted.
-pub(crate) async fn delete_index_by_name(
-    session: &Arc<CassandraSession>,
-    catalog_keyspace: &str,
-    account_keyspace: &str,
-    table_id: &str,
-    index_name: &str,
-    engine: &crate::CassandraEngine,
-) -> Result<String, StorageError> {
-    // Get index_id first
-    let query = format!(
-        "SELECT index_id FROM {catalog_keyspace}.indexes WHERE table_id = ? AND index_name = ?"
-    );
-
-    let row = crate::cassandra_util::query_optional(
-        session,
-        &query,
-        query_values!(table_id, index_name),
-        "delete_index_by_name",
-    )
-    .await?
-    .ok_or_else(|| StorageError::IndexNotFound(index_name.to_owned()))?;
-
-    let index_id: String = get_column(&row, "index_id", "delete_index_by_name")?;
-
-    // Delete from catalog
-    let delete_query = format!(
-        "DELETE FROM {catalog_keyspace}.indexes WHERE table_id = ? AND index_name = ?"
-    );
-
-    crate::cassandra_util::execute(
-        session,
-        &delete_query,
-        query_values!(table_id, index_name),
-        "delete_index_by_name",
-    )
-    .await?;
-
-    // Drop index data table
-    engine
-        .drop_index_data_table(account_keyspace, &index_id)
-        .await?;
-
-    Ok(index_id)
 }
 
 #[cfg(test)]
