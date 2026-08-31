@@ -15,11 +15,18 @@ pub async fn handle_create_table(
 ) -> Result<Value, DynamoDbError> {
     crate::validate_enum_fields(
         &body,
-        &[crate::EnumField {
-            json_name: "BillingMode",
-            valid: &["PROVISIONED", "PAY_PER_REQUEST"],
-            clause: crate::EnumClause::Named("billingMode"),
-        }],
+        &[
+            crate::EnumField {
+                json_name: "BillingMode",
+                valid: &["PROVISIONED", "PAY_PER_REQUEST"],
+                clause: crate::EnumClause::Named("billingMode"),
+            },
+            crate::EnumField {
+                json_name: "TableThroughputMode",
+                valid: &["PROVISIONED", "PAY_PER_REQUEST"],
+                clause: crate::EnumClause::Named("tableThroughputMode"),
+            },
+        ],
     )?;
 
     let mut input: CreateTableInput = serde_json::from_value(body).map_err(|e| {
@@ -41,6 +48,7 @@ pub async fn handle_create_table(
             ))
         }
     })?;
+    input.resolve_table_throughput_mode();
 
     validate_create_table(&input, &ctx.limits)?;
 
@@ -61,7 +69,7 @@ pub async fn handle_create_table(
     // Kept for the post-condition check below, since `input` is moved into the
     // backend call.
     let requested_vector_indexes = input.vector_indexes.clone();
-    let table_desc = ctx
+    let mut table_desc = ctx
         .storage
         .create_table(&ctx.account_id, input)
         .await
@@ -95,6 +103,7 @@ pub async fn handle_create_table(
     );
     ctx.auth_cache.invalidate_resource_tags(&arn).await;
 
+    table_desc.populate_table_throughput_mode_summary();
     let output = CreateTableOutput {
         table_description: table_desc,
     };
