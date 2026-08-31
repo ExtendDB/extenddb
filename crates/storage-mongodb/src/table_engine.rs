@@ -572,6 +572,9 @@ impl MongoEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+        // The table is already DELETING, so data-plane readers are rejected;
+        // unlike individual index deletion, physical cleanup can safely occur
+        // before deleting the catalog metadata.
         // Drop each physical GSI/LSI collection before deleting its catalog
         // metadata. The index documents are stored separately from the table
         // document, so dropping the base collection alone does not remove
