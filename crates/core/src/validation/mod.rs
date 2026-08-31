@@ -2159,6 +2159,7 @@ mod tests {
             key_schema,
             attribute_definitions: attr_defs,
             billing_mode: Some(BillingMode::PayPerRequest),
+            table_throughput_mode: None,
             provisioned_throughput: None,
             global_secondary_indexes: None,
             local_secondary_indexes: None,
