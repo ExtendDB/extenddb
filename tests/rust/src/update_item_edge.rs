@@ -48,11 +48,19 @@ async fn update_with_nested_map() {
 }
 
 #[tokio::test]
-async fn update_literal_dotted_attribute_with_alias() {
+async fn update_literal_dotted_attribute_and_nested_path_with_alias() {
     let c = client();
     let t = tables().await;
     let mut item = create_item(&t.simple_key_string);
     item.insert("a.b".into(), s("before"));
+    item.insert(
+        "a".into(),
+        map_val(
+            [("b".to_string(), s("nested-before"))]
+                .into_iter()
+                .collect(),
+        ),
+    );
     let key = get_key(&t.simple_key_string, &item);
 
     c.put_item()
@@ -80,7 +88,19 @@ async fn update_literal_dotted_attribute_with_alias() {
         .send()
         .await
         .unwrap();
-    assert_eq!(get.item().unwrap().get("a.b").unwrap().as_s().unwrap(), "after");
+    let item = get.item().unwrap();
+    assert_eq!(item.get("a.b").unwrap().as_s().unwrap(), "after");
+    assert_eq!(
+        item.get("a")
+            .unwrap()
+            .as_m()
+            .unwrap()
+            .get("b")
+            .unwrap()
+            .as_s()
+            .unwrap(),
+        "nested-before"
+    );
 }
 
 #[tokio::test]
