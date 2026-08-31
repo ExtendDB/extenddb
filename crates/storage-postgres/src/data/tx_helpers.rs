@@ -142,8 +142,9 @@ pub(super) async fn upsert_item_in_tx(
 /// transactions writing the same NEW item can both read "absent" and both
 /// pass their condition checks. This helper is the atomic arbiter for that
 /// create race: `ON CONFLICT DO NOTHING` blocks on a concurrent uncommitted
-/// insert and reports zero rows affected when the other writer wins, letting
-/// the caller re-read (now lockable) committed state and re-evaluate its
+/// insert; if that writer commits it reports zero rows affected (we lost), and
+/// if that writer aborts our insert proceeds and wins. A loser's caller then
+/// re-reads the now-committed (and lockable) state and re-evaluates its
 /// condition instead of silently overwriting the winner.
 pub(super) async fn insert_item_if_absent_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,

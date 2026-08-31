@@ -22,7 +22,7 @@ use crate::PostgresEngine;
 
 /// Bound on insert retries when a transactional write to a nonexistent item
 /// keeps losing the create race to writers that then roll back. Mirrors the
-/// same bound on the non-transactional UpdateItem path (update_item.rs).
+/// same bound on the non-transactional `UpdateItem` path (`update_item.rs`).
 const MAX_CREATE_RACE_ATTEMPTS: u32 = 5;
 
 impl PostgresEngine {
@@ -379,8 +379,9 @@ async fn execute_transact_write_op(
             } else {
                 // No row existed for the read above to lock, so a concurrent
                 // transaction may create the item first. Arbitrate with an
-                // atomic insert-if-absent. On losing, re-read FOR UPDATE
-                // (blocks until the winner commits or aborts) and re-evaluate
+                // atomic insert-if-absent. On losing, re-read FOR UPDATE (the
+                // arbiter insert already waited out the winner, so its row is
+                // committed and lockable) and re-evaluate
                 // the condition against the winner's committed item, so an
                 // `attribute_not_exists` racer cancels with
                 // ConditionalCheckFailed instead of silently overwriting the
@@ -415,13 +416,18 @@ async fn execute_transact_write_op(
                         existing = Some(winner);
                         break;
                     }
-                    // Winner rolled back: the row is gone again, retry the insert.
+                    // No committed winner is visible: the conflicting insert was
+                    // followed by a delete before our re-read. Retry the insert.
                     if attempt >= MAX_CREATE_RACE_ATTEMPTS {
-                        return Err(TxnOpError::Storage(StorageError::Internal(format!(
-                            "transactional Put could not create the item after {attempt} \
-                             attempts: a concurrent writer repeatedly created and rolled \
-                             back the row"
-                        ))));
+                        // Sustained create-then-delete churn. Surface as a
+                        // canceled transaction with a TransactionConflict
+                        // reason, the DDB-canonical contention shape, never a
+                        // 500 (matches the MongoDB backend's exhaustion path).
+                        return Err(TxnOpError::Cancel(CancellationReason {
+                            code: "TransactionConflict".to_owned(),
+                            message: Some("Transaction is ongoing for the item".to_owned()),
+                            item: None,
+                        }));
                     }
                 }
             }
@@ -465,9 +471,19 @@ async fn execute_transact_write_op(
                 *return_values_on_ccf,
                 existing.as_ref(),
             )?;
-            delete_item_in_tx(tx, key_info, key)
-                .await
-                .map_err(TxnOpError::Storage)?;
+            // Only delete a row the locking read actually saw (and locked).
+            // When the read found nothing there is nothing to lock, so a
+            // concurrent transaction can create and commit the item before our
+            // DELETE runs; its fresh READ COMMITTED snapshot would then see
+            // and kill the winner's row with no stream record and orphaned
+            // index rows. Deleting a nonexistent item is a no-op in the real
+            // service, so skipping the write is the faithful serialization
+            // (this delete simply ordered before the concurrent create).
+            if existing.is_some() {
+                delete_item_in_tx(tx, key_info, key)
+                    .await
+                    .map_err(TxnOpError::Storage)?;
+            }
             if !indexes.is_empty() {
                 sync_indexes(
                     tx,
@@ -591,13 +607,16 @@ async fn execute_transact_write_op(
                         existing = Some(winner);
                         break;
                     }
-                    // Winner rolled back: the row is gone again, retry the insert.
+                    // No committed winner is visible: the conflicting insert was
+                    // followed by a delete before our re-read. Retry the insert.
                     if attempt >= MAX_CREATE_RACE_ATTEMPTS {
-                        return Err(TxnOpError::Storage(StorageError::Internal(format!(
-                            "transactional Update could not create the item after {attempt} \
-                             attempts: a concurrent writer repeatedly created and rolled \
-                             back the row"
-                        ))));
+                        // Sustained create-then-delete churn. Same
+                        // TransactionConflict cancellation as the Put arm.
+                        return Err(TxnOpError::Cancel(CancellationReason {
+                            code: "TransactionConflict".to_owned(),
+                            message: Some("Transaction is ongoing for the item".to_owned()),
+                            item: None,
+                        }));
                     }
                 }
             }

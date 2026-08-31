@@ -92,9 +92,10 @@ mod transact_get_items;
 #[cfg(test)]
 mod transact_key_validation;
 #[cfg(test)]
+mod transact_write_concurrency;
+#[cfg(test)]
 mod transact_write_items;
 #[cfg(test)]
-mod transact_write_concurrency;
 mod transact_write_items_more;
 #[cfg(test)]
 mod transaction_key_size_validation;
