@@ -90,23 +90,110 @@ impl CassandraCatalogStore {
     }
 
     pub(crate) async fn delete_user_impl(&self, account_id: &str, user_name: &str) -> OpResult<()> {
-        // Check if user exists
         if !self.user_exists(account_id, user_name).await? {
             return Err(OpError::NotFound("IAM user not found".to_owned()));
         }
 
-        let catalog_keyspace = self.catalog_keyspace();
-        let delete_query = format!(
-            "DELETE FROM {catalog_keyspace}.iam_users WHERE account_id = ? AND user_name = ?"
-        );
+        let ks = self.catalog_keyspace();
+        let session = self.session();
 
-        crate::cassandra_util::execute(
-            self.session(),
-            &delete_query,
+        // Gather all keys needed for cascade deletes before building the batch.
+        let key_ids: Vec<String> = crate::cassandra_util::query_rows(
+            session,
+            &format!(
+                "SELECT access_key_id FROM {ks}.access_keys \
+                 WHERE account_id = ? AND user_name = ? ALLOW FILTERING"
+            ),
             cdrs_tokio::query_values!(account_id, user_name),
-            "delete_user",
+            "delete_user access_keys",
         )
-        .await
+        .await?
+        .into_iter()
+        .map(|row| crate::cassandra_util::get_column(&row, "access_key_id", "delete_user"))
+        .collect::<Result<_, _>>()?;
+
+        let policy_names: Vec<String> = crate::cassandra_util::query_rows(
+            session,
+            &format!(
+                "SELECT policy_name FROM {ks}.iam_policies \
+                 WHERE account_id = ? AND principal_type = 'user' AND principal_name = ?"
+            ),
+            cdrs_tokio::query_values!(account_id, user_name),
+            "delete_user policies",
+        )
+        .await?
+        .into_iter()
+        .map(|row| crate::cassandra_util::get_column(&row, "policy_name", "delete_user"))
+        .collect::<Result<_, _>>()?;
+
+        let group_names: Vec<String> = crate::cassandra_util::query_rows(
+            session,
+            &format!(
+                "SELECT group_name FROM {ks}.iam_group_members \
+                 WHERE account_id = ? AND user_name = ? ALLOW FILTERING"
+            ),
+            cdrs_tokio::query_values!(account_id, user_name),
+            "delete_user groups",
+        )
+        .await?
+        .into_iter()
+        .map(|row| crate::cassandra_util::get_column(&row, "group_name", "delete_user"))
+        .collect::<Result<_, _>>()?;
+
+        // Build one logged batch with all cascade deletes.
+        let user_av = cdrs_tokio::query::QueryValues::SimpleValues(vec![
+            cdrs_tokio::types::value::Value::from(account_id),
+            cdrs_tokio::types::value::Value::from(user_name),
+        ]);
+        let mut batch = cdrs_tokio::query::BatchQueryBuilder::new()
+            .with_consistency(cdrs_tokio::consistency::Consistency::LocalQuorum)
+            .add_query(
+                format!("DELETE FROM {ks}.iam_users WHERE account_id = ? AND user_name = ?"),
+                user_av.clone(),
+            )
+            .add_query(
+                format!("DELETE FROM {ks}.iam_user_tags WHERE account_id = ? AND user_name = ?"),
+                user_av,
+            );
+        for key_id in &key_ids {
+            batch = batch.add_query(
+                format!("DELETE FROM {ks}.access_keys WHERE access_key_id = ?"),
+                cdrs_tokio::query_values!(key_id.as_str()),
+            );
+        }
+        for policy_name in &policy_names {
+            batch = batch.add_query(
+                format!(
+                    "DELETE FROM {ks}.iam_policies \
+                     WHERE account_id = ? AND principal_type = 'user' \
+                     AND principal_name = ? AND policy_name = ?"
+                ),
+                cdrs_tokio::query_values!(account_id, user_name, policy_name.as_str()),
+            );
+        }
+        for group_name in &group_names {
+            batch = batch.add_query(
+                format!(
+                    "DELETE FROM {ks}.iam_group_members \
+                     WHERE account_id = ? AND group_name = ? AND user_name = ?"
+                ),
+                cdrs_tokio::query_values!(account_id, group_name.as_str(), user_name),
+            );
+        }
+
+        session
+            .batch(
+                batch
+                    .build()
+                    .map_err(|e| OpError::Internal(e.to_string()))?,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!("delete_user batch: {e}");
+                OpError::Internal("Database error".to_owned())
+            })?;
+
+        Ok(())
     }
 
     pub(crate) async fn list_users_impl(
