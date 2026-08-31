@@ -1,0 +1,30 @@
+{
+  "_comment": "Source of truth for what every registry must serve. Append one release entry per shipped container version; the drift-verification cron (verify-released-artifacts) fails if any registry disagrees. 'rekor: false' marks pre-transparency-log releases (<= 0.1.6). A release-level 'registries' list narrows scope (dev 0.1.7 shipped to Docker Hub only).",
+  "public_key": "extenddb-signing.pub.pem",
+  "images": {
+    "extenddb-postgres": {
+      "registries": [
+        "docker.io/extenddb/extenddb-postgres",
+        "ghcr.io/extenddb/extenddb-postgres",
+        "public.ecr.aws/extenddb/extenddb-postgres"
+      ],
+      "releases": [
+        { "version": "0.1.5", "digest": "sha256:4890886b1a1fb8fc7e01f7288846ace06abb3b1fbadcf7f9be48ce9b08109721", "rekor": false },
+        { "version": "0.1.6", "digest": "sha256:6c7c12f3fd09ed099b90b18a77171cc19509ba7eabebc5d908521d8988cb56cf", "rekor": false },
+        { "version": "0.1.8", "digest": "sha256:ccca5497715656e9f020b15a9598896e280d3641b1720a00aa82fb2ae1ad435d", "rekor": true }
+      ]
+    },
+    "extenddb-dev": {
+      "registries": [
+        "docker.io/extenddb/extenddb-dev",
+        "ghcr.io/extenddb/extenddb-dev",
+        "public.ecr.aws/extenddb/extenddb-dev"
+      ],
+      "releases": [
+        { "version": "0.1.7", "digest": "sha256:91a38aae5bf25b14c09a77301c228d3e83c48d951067580d537b221e7d041ee3", "rekor": true,
+          "registries": [ "docker.io/extenddb/extenddb-dev" ] },
+        { "version": "0.1.8", "digest": "sha256:01a9eb24e96e14585ca9b48166a938aa90145e85f50fbf1df26014631ad6235a", "rekor": true }
+      ]
+    }
+  }
+}

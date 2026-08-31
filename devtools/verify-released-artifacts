@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Continuous drift verification: every released artifact, on every registry
+# it shipped to, must still be exactly what was released.
+#
+# Reads docker/released-artifacts.json and asserts, entirely through
+# ANONYMOUS reads (what users see, with nothing to steal):
+#
+#   1. every released version tag resolves to its recorded digest
+#   2. the Cosign signature tag exists and cryptographically VERIFIES
+#      against the committed release public key (with the transparency log
+#      for releases that have entries; --insecure-ignore-tlog only for the
+#      two pre-Rekor releases)
+#   3. `latest` on each registry points at the highest release shipped to
+#      that registry (the forward-only invariant, audited)
+#
+# Failure semantics: DRIFT (reachable and wrong) and UNREACHABLE (still
+# failing after retries) both exit nonzero, but are labeled separately —
+# a registry outage is not a security event. Transient errors are absorbed
+# by bounded retries so a blip cannot cry wolf.
+#
+# Gates nothing, fixes nothing, writes nothing. Output is the signal.
+
+set -uo pipefail
+exec < /dev/null
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$(cd "$SCRIPT_DIR/.." && pwd)"
+
+MANIFEST=docker/released-artifacts.json
+for tool in crane cosign jq; do
+  command -v "$tool" >/dev/null || { echo "error: $tool is required" >&2; exit 2; }
+done
+PUBKEY=$(jq -r .public_key "$MANIFEST")
+[[ -s "$PUBKEY" ]] || { echo "error: public key $PUBKEY missing" >&2; exit 2; }
+
+DRIFT=0
+UNREACHABLE=0
+
+# Bounded-retry digest read. Prints digest; rc 0 = read, rc 9 = definitely
+# absent, rc 1 = unreachable after retries.
+read_digest() {
+  local ref="$1" out
+  for _ in 1 2 3; do
+    if out=$(crane digest "$ref" 2>&1); then
+      if [[ "$out" =~ ^sha256:[0-9a-f]{64}$ ]]; then printf '%s' "$out"; return 0; fi
+    elif grep -qiE 'manifest unknown|name unknown|not found' <<< "$out"; then
+      return 9
+    fi
+    sleep 10
+  done
+  return 1
+}
+
+check() { # check <label> <ref> <expected-digest>
+  local label="$1" ref="$2" want="$3" got rc
+  got=$(read_digest "$ref"); rc=$?
+  case $rc in
+    0) if [[ "$got" == "$want" ]]; then echo "  OK          $label"
+       else echo "  DRIFT       $label -> $got (expected $want)"; DRIFT=1; fi ;;
+    9) echo "  DRIFT       $label -> MISSING"; DRIFT=1 ;;
+    *) echo "  UNREACHABLE $label"; UNREACHABLE=1 ;;
+  esac
+}
+
+echo "drift verification $(date -u +%FT%TZ) — manifest $(jq -r '.images | to_entries | map("\(.key):\(.value.releases | length)") | join(", ")' "$MANIFEST")"
+
+for image in $(jq -r '.images | keys[]' "$MANIFEST"); do
+  default_regs=$(jq -r --arg i "$image" '.images[$i].registries[]' "$MANIFEST")
+  n=$(jq -r --arg i "$image" '.images[$i].releases | length' "$MANIFEST")
+  for idx in $(seq 0 $((n-1))); do
+    version=$(jq -r --arg i "$image" --argjson x "$idx" '.images[$i].releases[$x].version' "$MANIFEST")
+    digest=$(jq -r --arg i "$image" --argjson x "$idx" '.images[$i].releases[$x].digest' "$MANIFEST")
+    rekor=$(jq -r --arg i "$image" --argjson x "$idx" '.images[$i].releases[$x].rekor' "$MANIFEST")
+    regs=$(jq -r --arg i "$image" --argjson x "$idx" '.images[$i].releases[$x].registries // empty | .[]' "$MANIFEST")
+    [[ -z "$regs" ]] && regs="$default_regs"
+    sig_tag="sha256-${digest#sha256:}.sig"
+    for reg in $regs; do
+      check "$reg:$version" "$reg:$version" "$digest"
+      # Signature: existence via check is insufficient — it must verify.
+      got=$(read_digest "$reg:$sig_tag"); rc=$?
+      if [[ $rc == 9 ]]; then echo "  DRIFT       $reg:$sig_tag -> MISSING"; DRIFT=1; continue
+      elif [[ $rc != 0 ]]; then echo "  UNREACHABLE $reg:$sig_tag"; UNREACHABLE=1; continue; fi
+      # Plain string, not an array: empty-array expansion under set -u is
+      # an error on bash < 5.1, and the flag contains no whitespace.
+      TLOG_FLAG=""
+      [[ "$rekor" == "false" ]] && TLOG_FLAG="--insecure-ignore-tlog=true"
+      ok=false
+      for _ in 1 2 3; do
+        # shellcheck disable=SC2086
+        if cosign verify --key "$PUBKEY" $TLOG_FLAG "$reg@$digest" >/dev/null 2>&1; then ok=true; break; fi
+        sleep 10
+      done
+      if $ok; then echo "  OK          $reg:$sig_tag (verifies$([[ "$rekor" == "true" ]] && echo ' + rekor'))"
+      else echo "  DRIFT       $reg:$sig_tag present but DOES NOT VERIFY"; DRIFT=1; fi
+    done
+  done
+  # latest: highest release shipped to each registry.
+  for reg in $default_regs; do
+    want=$(jq -r --arg i "$image" --arg r "$reg" '
+      .images[$i] as $img
+      | [$img.releases[] | select((.registries // $img.registries) | index($r))]
+      | sort_by(.version | split(".") | map(tonumber)) | last | .digest // empty' "$MANIFEST")
+    [[ -z "$want" ]] && continue
+    check "$reg:latest" "$reg:latest" "$want"
+  done
+done
+
+echo
+if (( DRIFT )); then echo "RESULT: DRIFT DETECTED"; exit 1
+elif (( UNREACHABLE )); then echo "RESULT: REGISTRIES UNREACHABLE (no confirmed drift)"; exit 3
+else echo "RESULT: all released artifacts intact"; exit 0; fi

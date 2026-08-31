@@ -1,0 +1,102 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Continuous drift verification for released container artifacts.
+#
+# Daily, and on demand: every released version tag, signature, and `latest`
+# on every registry must still be exactly what was released, per
+# docker/released-artifacts.json. All checks are ANONYMOUS reads — this
+# verifies what users see, holds no credentials, and needs no environment.
+# Logic lives in devtools/verify-released-artifacts so it runs identically
+# on a workstation.
+#
+# Alerting: scheduled-run failure emails go only to the workflow author, so
+# drift instead creates (or comments on) a 'registry-drift' issue with the
+# failing report, and a clean run closes any open ones. DRIFT (reachable
+# and wrong) and UNREACHABLE (registry errors after retries) are labeled
+# distinctly — an outage is not a security event.
+
+name: registry-drift
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write        # drift alerting only; no registry credentials exist here
+
+concurrency:
+  group: registry-drift
+  cancel-in-progress: false
+
+env:
+  COSIGN_VERSION: v3.1.3
+  COSIGN_SHA256: 4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71
+  CRANE_VERSION: v0.21.9
+  CRANE_SHA256: 5c16d8ddb971cb1d5e6ed8b1e743da8224414eeba2c2762d8f1a61b2f095699e
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install pinned crane and cosign (checksum-verified)
+        run: |
+          set -euo pipefail
+          curl -sSfL -o /tmp/crane.tgz \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_SHA256}  /tmp/crane.tgz" | sha256sum --check --strict
+          tar -xzf /tmp/crane.tgz -C /tmp crane
+          sudo install -m 0755 /tmp/crane /usr/local/bin/crane
+          curl -sSfL -o /tmp/cosign \
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+          echo "${COSIGN_SHA256}  /tmp/cosign" | sha256sum --check --strict
+          sudo install -m 0755 /tmp/cosign /usr/local/bin/cosign
+
+      - name: Verify all released artifacts (anonymous)
+        id: verify
+        run: |
+          set +e
+          ./devtools/verify-released-artifacts | tee /tmp/report.txt
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Alert on drift or persistent unreachability
+        if: steps.verify.outputs.rc != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RC: ${{ steps.verify.outputs.rc }}
+        run: |
+          set -euo pipefail
+          KIND=$([[ "$RC" == "1" ]] && echo "DRIFT DETECTED" || echo "registries unreachable")
+          TITLE="registry-drift: $KIND"
+          BODY_FILE=/tmp/issue.md
+          {
+            echo "Automated report from the registry-drift verification run: $KIND"
+            echo
+            echo '```'
+            cat /tmp/report.txt
+            echo '```'
+            echo
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > "$BODY_FILE"
+          EXISTING=$(gh issue list --label registry-drift --state open --json number --jq '.[0].number // empty')
+          if [[ -n "$EXISTING" ]]; then
+            gh issue comment "$EXISTING" --body-file "$BODY_FILE"
+          else
+            gh issue create --title "$TITLE" --label registry-drift --body-file "$BODY_FILE"
+          fi
+          exit 1
+
+      - name: Close drift issues on a clean run
+        if: steps.verify.outputs.rc == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for n in $(gh issue list --label registry-drift --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Clean verification run: all released artifacts intact again. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          done
