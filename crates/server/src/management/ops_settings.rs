@@ -37,6 +37,7 @@ pub const KNOWN_KEYS: &[(&str, Validator)] = &[
         extenddb_core::settings_keys::VECTOR_BACKFILL_BATCH_DELAY_MS,
         validate_backfill_batch_delay_ms,
     ),
+    #[cfg(feature = "mongodb-test-hooks")]
     (
         extenddb_core::settings_keys::GSI_BACKFILL_TEST_GATE,
         validate_backfill_test_gate,

@@ -246,6 +246,10 @@ pub(crate) enum GsiBackfillMode {
     Restore,
 }
 
+fn uses_live_backfill_transaction(mode: GsiBackfillMode) -> bool {
+    matches!(mode, GsiBackfillMode::Live)
+}
+
 /// Invariants shared by every item in one GSI backfill batch.
 pub(crate) struct GsiBackfillContext<'a> {
     pub(crate) key_info: &'a TableKeyInfo,
@@ -3020,7 +3024,7 @@ impl MongoEngine {
             .upsert(true)
             .build();
 
-        if context.mode == GsiBackfillMode::Restore {
+        if !uses_live_backfill_transaction(context.mode) {
             idx_coll
                 .replace_one(index_filter, idx_doc)
                 .with_options(replace_opts)
@@ -3694,6 +3698,12 @@ fn project_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_backfill_skips_live_claim_transaction() {
+        assert!(!uses_live_backfill_transaction(GsiBackfillMode::Restore));
+        assert!(uses_live_backfill_transaction(GsiBackfillMode::Live));
+    }
 
     #[test]
     fn between_low_gt_high_string() {
