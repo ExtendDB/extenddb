@@ -99,20 +99,29 @@ runs:
         }
 
         # settle(): post-WRITE assertion with a bounded settle window. ECR
-        # Public exhibits read-after-write lag (observed live: a copy's own
-        # log confirms the write, the immediate read 404s, and the tag is
-        # visible seconds later — this failed the v0.1.8 dev propagation).
-        # Retrying is ONLY correct after our own write; state DECISIONS
-        # (exists/absent/verify) stay strict single probes.
+        # Public exhibits read-after-write lag in BOTH directions:
+        #   * a newly created tag reads as absent for a few seconds
+        #     (failed the v0.1.8 dev propagation), and
+        #   * an OVERWRITTEN tag — `latest` moving to a new release — keeps
+        #     reading as the PREVIOUS digest for a few seconds (failed the
+        #     v0.1.10 dev propagation, after correctly writing every tag).
+        # So a mismatch immediately after our own write is not evidence of a
+        # wrong artifact; it is the stale value we just replaced. Both cases
+        # therefore retry inside the window and only fail once it expires,
+        # reporting the last value seen. Retrying is ONLY correct after our
+        # own write: state DECISIONS (exists/absent, verify-before-tag) stay
+        # strict single probes, so nothing here weakens the fail-closed
+        # guarantees.
         settle() {
-          local ref="$1" want="$2" got rc
+          local ref="$1" want="$2" got rc last='(never read)'
           for _ in 1 2 3 4 5 6; do
             set +e; got=$(probe "$ref"); rc=$?; set -e
             [[ $rc == 0 && "$got" == "$want" ]] && return 0
-            [[ $rc == 0 && "$got" != "$want" ]] && { echo "::error::${ref} resolves to ${got}, expected ${want}" >&2; return 1; }
+            [[ $rc == 0 ]] && last="$got"
+            [[ $rc == 9 ]] && last='MISSING'
             sleep 5
           done
-          echo "::error::${ref} not visible with expected digest after settle window" >&2
+          echo "::error::${ref} did not settle on ${want} within the window; last seen ${last}" >&2
           return 1
         }
 
