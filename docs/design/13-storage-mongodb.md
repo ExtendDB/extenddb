@@ -870,6 +870,11 @@ max_connections = 50
 max_catalog_connections = 20
 ```
 
+The data-operation client uses `max_connections`. Catalog and authentication
+traffic share the client configured by `max_catalog_connections`; this is one
+combined limit rather than one independent pool per store, so it must cover
+the expected management and authorization concurrency together.
+
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MongoStorageConfig {

@@ -139,8 +139,14 @@ backend = "mongodb"
 
 [storage.mongodb]
 connection_string = "mongodb://localhost:27017/?replicaSet=rs0"
-# max_pool_size = 20
+# max_connections = 50
+# max_catalog_connections = 20
 ```
+
+`max_connections` limits data-operation connections. The catalog and
+authentication clients share a separate pool controlled by
+`max_catalog_connections`, so size that value for their combined management
+and authorization concurrency.
 
 Or via environment variable:
 ```bash
