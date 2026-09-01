@@ -84,9 +84,10 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
             .catalog_store
             .get_setting("gsi_propagation_delay_ms")
             .await
-            && let Ok(ms) = val.parse::<u64>() {
-                gsi_delay.store(ms, std::sync::atomic::Ordering::Relaxed);
-            }
+            && let Ok(ms) = val.parse::<u64>()
+        {
+            gsi_delay.store(ms, std::sync::atomic::Ordering::Relaxed);
+        }
         let catalog_store_for_gsi = ctx.catalog_store.clone();
         let gsi_delay_poller =
             tokio::spawn(

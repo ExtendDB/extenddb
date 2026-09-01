@@ -173,11 +173,10 @@ impl CassandraEngine {
                         "update_table stream_label check",
                     )
                     .await?;
-                    let has_label = label_row
-                        .is_some_and(|r| {
-                            let v: Option<String> = r.get_by_name("stream_label").ok().flatten();
-                            v.is_some()
-                        });
+                    let has_label = label_row.is_some_and(|r| {
+                        let v: Option<String> = r.get_by_name("stream_label").ok().flatten();
+                        v.is_some()
+                    });
                     if !has_label {
                         needs_label_restore = true;
                         let label = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();

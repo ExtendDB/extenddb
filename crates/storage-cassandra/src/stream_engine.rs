@@ -28,9 +28,12 @@ impl CassandraEngine {
         let without_prefix = shard_id.strip_prefix("shardId-").ok_or_else(|| {
             StorageError::Internal(format!("Invalid shard_id format: {shard_id}"))
         })?;
-        let table_id = without_prefix.rsplit_once('-').map(|x| x.0).ok_or_else(|| {
-            StorageError::Internal(format!("Invalid shard_id format: {shard_id}"))
-        })?;
+        let table_id = without_prefix
+            .rsplit_once('-')
+            .map(|x| x.0)
+            .ok_or_else(|| {
+                StorageError::Internal(format!("Invalid shard_id format: {shard_id}"))
+            })?;
 
         let catalog_keyspace = self.catalog_keyspace();
         let query = format!("SELECT account_id FROM {catalog_keyspace}.tables WHERE table_id = ?");
@@ -69,7 +72,9 @@ impl CassandraEngine {
         let without_prefix = shard_id
             .strip_prefix("shardId-")
             .ok_or_else(|| StorageError::Validation("Invalid ShardIterator".to_owned()))?;
-        let table_id = without_prefix.rsplit_once('-').map(|x| x.0)
+        let table_id = without_prefix
+            .rsplit_once('-')
+            .map(|x| x.0)
             .ok_or_else(|| StorageError::Validation("Invalid ShardIterator".to_owned()))?;
 
         let catalog_keyspace = self.catalog_keyspace();
@@ -400,9 +405,10 @@ impl StreamEngine for CassandraEngine {
                     let label: Option<String> = row.get_by_name("stream_label").ok().flatten();
                     let label = label?; // skip tables without streams
                     if let Some(ref filter_tn) = table_name
-                        && &tn != filter_tn {
-                            return None;
-                        }
+                        && &tn != filter_tn
+                    {
+                        return None;
+                    }
                     Some(StreamSummary {
                         stream_arn: stream_arn(&self.region, &account_id, &tn, &label),
                         stream_label: label,

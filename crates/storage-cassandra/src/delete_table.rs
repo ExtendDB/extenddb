@@ -60,9 +60,7 @@ impl CassandraEngine {
             .map_err(|e| StorageError::Internal(format!("Parse table_id: {e}")))?;
 
         // Fetch indexes for response
-        let index_query = format!(
-            "SELECT * FROM {catalog_keyspace}.indexes WHERE table_id = ?"
-        );
+        let index_query = format!("SELECT * FROM {catalog_keyspace}.indexes WHERE table_id = ?");
 
         let index_result = self
             .session
@@ -98,9 +96,8 @@ impl CassandraEngine {
         }
 
         // Delete catalog entries (indexes first due to FK)
-        let delete_indexes_query = format!(
-            "DELETE FROM {catalog_keyspace}.indexes WHERE table_id = ?"
-        );
+        let delete_indexes_query =
+            format!("DELETE FROM {catalog_keyspace}.indexes WHERE table_id = ?");
         self.session
             .query_with_values(
                 &delete_indexes_query,

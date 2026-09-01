@@ -165,9 +165,8 @@ impl CassandraCatalogStore {
     /// Check if an account exists. Used to emulate foreign key checks.
     pub(crate) async fn account_exists(&self, account_id: &str) -> Result<bool, OpError> {
         let catalog_keyspace = self.catalog_keyspace();
-        let query = format!(
-            "SELECT account_id FROM {catalog_keyspace}.accounts WHERE account_id = ?"
-        );
+        let query =
+            format!("SELECT account_id FROM {catalog_keyspace}.accounts WHERE account_id = ?");
 
         let rows = crate::cassandra_util::query_rows(
             &self.session,
@@ -211,9 +210,7 @@ impl extenddb_storage::management_store::SettingsStore for CassandraCatalogStore
         let session = self.session.clone();
         let catalog_keyspace = self.catalog_keyspace();
         Box::pin(async move {
-            let query = format!(
-                "SELECT value FROM {catalog_keyspace}.settings WHERE key = ?"
-            );
+            let query = format!("SELECT value FROM {catalog_keyspace}.settings WHERE key = ?");
 
             let row = crate::cassandra_util::query_optional(
                 &session,
@@ -239,9 +236,8 @@ impl extenddb_storage::management_store::SettingsStore for CassandraCatalogStore
         let session = self.session.clone();
         let catalog_keyspace = self.catalog_keyspace();
         Box::pin(async move {
-            let query = format!(
-                "INSERT INTO {catalog_keyspace}.settings (key, value) VALUES (?, ?)"
-            );
+            let query =
+                format!("INSERT INTO {catalog_keyspace}.settings (key, value) VALUES (?, ?)");
 
             crate::cassandra_util::execute(
                 &session,
@@ -286,7 +282,9 @@ impl extenddb_storage::management_store::SettingsStore for CassandraCatalogStore
     }
 
     fn cached_encryption_key(&self) -> Option<String> {
-        self.encryption_key.as_ref().map(std::string::ToString::to_string)
+        self.encryption_key
+            .as_ref()
+            .map(std::string::ToString::to_string)
     }
 }
 
@@ -307,12 +305,13 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for CassandraCatalogStore {
             })?;
 
             if let Some(rows) = body.into_rows()
-                && let Some(row) = rows.first() {
-                    let count: i64 = row.get_r_by_name("count").map_err(|e| {
-                        extenddb_storage::diagnostics::DiagError::QueryFailed(e.to_string())
-                    })?;
-                    return Ok(count);
-                }
+                && let Some(row) = rows.first()
+            {
+                let count: i64 = row.get_r_by_name("count").map_err(|e| {
+                    extenddb_storage::diagnostics::DiagError::QueryFailed(e.to_string())
+                })?;
+                return Ok(count);
+            }
 
             Ok(0)
         })
@@ -332,12 +331,13 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for CassandraCatalogStore {
             })?;
 
             if let Some(rows) = body.into_rows()
-                && let Some(row) = rows.first() {
-                    let count: i64 = row.get_r_by_name("count").map_err(|e| {
-                        extenddb_storage::diagnostics::DiagError::QueryFailed(e.to_string())
-                    })?;
-                    return Ok(count);
-                }
+                && let Some(row) = rows.first()
+            {
+                let count: i64 = row.get_r_by_name("count").map_err(|e| {
+                    extenddb_storage::diagnostics::DiagError::QueryFailed(e.to_string())
+                })?;
+                return Ok(count);
+            }
 
             Ok(0)
         })
@@ -352,9 +352,7 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for CassandraCatalogStore {
         Box::pin(async move {
             // For Cassandra, we test connection to account keyspaces
             // Get a sample account keyspace name from accounts table
-            let query = format!(
-                "SELECT account_id FROM {catalog_keyspace}.accounts LIMIT 1"
-            );
+            let query = format!("SELECT account_id FROM {catalog_keyspace}.accounts LIMIT 1");
             let result = session.query(&query).await.map_err(|e| {
                 extenddb_storage::diagnostics::DiagError::QueryFailed(format!(
                     "Failed to query accounts: {e}"
@@ -366,24 +364,24 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for CassandraCatalogStore {
             })?;
 
             if let Some(rows) = body.into_rows()
-                && let Some(row) = rows.first() {
-                    let account_id: String = row.get_r_by_name("account_id").map_err(|e| {
-                        extenddb_storage::diagnostics::DiagError::QueryFailed(e.to_string())
-                    })?;
+                && let Some(row) = rows.first()
+            {
+                let account_id: String = row.get_r_by_name("account_id").map_err(|e| {
+                    extenddb_storage::diagnostics::DiagError::QueryFailed(e.to_string())
+                })?;
 
-                    // Test connection to account keyspace by querying schema_history
-                    let account_keyspace = format!("{keyspace_prefix}_account_{account_id}");
-                    let test_query =
-                        format!("SELECT COUNT(*) FROM {account_keyspace}.schema_history");
+                // Test connection to account keyspace by querying schema_history
+                let account_keyspace = format!("{keyspace_prefix}_account_{account_id}");
+                let test_query = format!("SELECT COUNT(*) FROM {account_keyspace}.schema_history");
 
-                    session.query(&test_query).await.map_err(|e| {
-                        extenddb_storage::diagnostics::DiagError::ConnectionFailed(format!(
-                            "Failed to query account keyspace {account_keyspace}: {e}"
-                        ))
-                    })?;
+                session.query(&test_query).await.map_err(|e| {
+                    extenddb_storage::diagnostics::DiagError::ConnectionFailed(format!(
+                        "Failed to query account keyspace {account_keyspace}: {e}"
+                    ))
+                })?;
 
-                    return Ok(account_keyspace);
-                }
+                return Ok(account_keyspace);
+            }
 
             // No accounts exist yet - that's okay, just return a message
             Ok("No account keyspaces exist yet".to_string())
@@ -445,6 +443,8 @@ impl MetricsStore for CassandraCatalogStore {
 
 impl extenddb_storage::CatalogStore for CassandraCatalogStore {
     fn cached_encryption_key(&self) -> Option<String> {
-        self.encryption_key.as_ref().map(std::string::ToString::to_string)
+        self.encryption_key
+            .as_ref()
+            .map(std::string::ToString::to_string)
     }
 }

@@ -108,8 +108,11 @@ impl CassandraBootstrapper {
             // Check for conflicts between CLI args and config values
             if let Some(ref cli_cp) = cassandra_contact_points {
                 let cli_list: Vec<&str> = cli_cp.split(',').collect();
-                let config_list: Vec<&str> =
-                    config.contact_points.iter().map(std::string::String::as_str).collect();
+                let config_list: Vec<&str> = config
+                    .contact_points
+                    .iter()
+                    .map(std::string::String::as_str)
+                    .collect();
                 if cli_list != config_list {
                     return Err(StorageError::Internal(format!(
                         "--cassandra-contact-points '{}' conflicts with config file contact points '{}'",
@@ -134,12 +137,13 @@ impl CassandraBootstrapper {
             )?;
 
             if let Some(ref cli_prefix) = keyspace_prefix
-                && cli_prefix != &config.keyspace_prefix {
-                    return Err(StorageError::Internal(format!(
-                        "--keyspace-prefix '{}' conflicts with config file keyspace prefix '{}'",
-                        cli_prefix, config.keyspace_prefix
-                    )));
-                }
+                && cli_prefix != &config.keyspace_prefix
+            {
+                return Err(StorageError::Internal(format!(
+                    "--keyspace-prefix '{}' conflicts with config file keyspace prefix '{}'",
+                    cli_prefix, config.keyspace_prefix
+                )));
+            }
 
             if let Some(ref cli_rf) = replication_factor {
                 let cli_rf_val = cli_rf.parse::<u32>().map_err(|_| {
@@ -176,13 +180,16 @@ impl CassandraBootstrapper {
         };
 
         // CLI args override config (or use config values if no CLI arg provided)
-        let resolved_contact_points = cassandra_contact_points
-            .map_or(contact_points, |cp| cp.split(',').map(std::string::ToString::to_string).collect());
+        let resolved_contact_points = cassandra_contact_points.map_or(contact_points, |cp| {
+            cp.split(',')
+                .map(std::string::ToString::to_string)
+                .collect()
+        });
         let resolved_admin_user = cassandra_user
             .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "cassandra".to_owned()));
         let resolved_keyspace_prefix = keyspace_prefix.unwrap_or(prefix);
-        let resolved_replication_factor = replication_factor
-            .map_or(rf_from_config, |rf| rf.parse::<u32>().unwrap_or(1));
+        let resolved_replication_factor =
+            replication_factor.map_or(rf_from_config, |rf| rf.parse::<u32>().unwrap_or(1));
         let resolved_app_user = extenddb_user.unwrap_or(user);
         let resolved_app_password = extenddb_pass.unwrap_or(password);
 
@@ -407,9 +414,8 @@ impl Bootstrapper for CassandraBootstrapper {
         println!("--- Generating AES-256-GCM encryption key...");
 
         // Check if key already exists
-        let check_cql = format!(
-            "SELECT value FROM {keyspace}.settings WHERE key = 'encryption_key'"
-        );
+        let check_cql =
+            format!("SELECT value FROM {keyspace}.settings WHERE key = 'encryption_key'");
         let exists = self
             .engine
             .session()
@@ -428,9 +434,7 @@ impl Bootstrapper for CassandraBootstrapper {
         let key_b64 = generate_encryption_key();
 
         // Store key
-        let insert_cql = format!(
-            "INSERT INTO {keyspace}.settings (key, value) VALUES (?, ?)"
-        );
+        let insert_cql = format!("INSERT INTO {keyspace}.settings (key, value) VALUES (?, ?)");
         self.engine
             .session()
             .query_with_values(
@@ -510,9 +514,8 @@ impl Bootstrapper for CassandraBootstrapper {
         let from_env = env_user.is_some() && env_password.is_some();
 
         // Check if user exists
-        let check_cql = format!(
-            "SELECT admin_name FROM {keyspace}.admin_users WHERE admin_name = ?"
-        );
+        let check_cql =
+            format!("SELECT admin_name FROM {keyspace}.admin_users WHERE admin_name = ?");
         let exists = self
             .engine
             .session()
@@ -546,9 +549,8 @@ impl Bootstrapper for CassandraBootstrapper {
         let password_hash = hash_password_async(password.clone()).await?;
 
         // Insert admin user
-        let insert_cql = format!(
-            "INSERT INTO {keyspace}.admin_users (admin_name, password_hash) VALUES (?, ?)"
-        );
+        let insert_cql =
+            format!("INSERT INTO {keyspace}.admin_users (admin_name, password_hash) VALUES (?, ?)");
 
         self.engine
             .session()
@@ -577,9 +579,7 @@ impl Bootstrapper for CassandraBootstrapper {
     async fn list_table_names(&self) -> OpResult<Vec<String>> {
         let keyspace = self.engine.catalog_keyspace();
 
-        let cql = format!(
-            "SELECT table_name FROM {keyspace}.tables ORDER BY table_name"
-        );
+        let cql = format!("SELECT table_name FROM {keyspace}.tables ORDER BY table_name");
         let rows = match self.engine.session().query(cql).await {
             Ok(frame) => frame
                 .response_body()
@@ -656,9 +656,7 @@ impl Bootstrapper for CassandraBootstrapper {
             return Ok(None);
         }
 
-        let query = format!(
-            "SELECT value FROM {keyspace}.settings WHERE key = 'catalog_version'"
-        );
+        let query = format!("SELECT value FROM {keyspace}.settings WHERE key = 'catalog_version'");
         let version = self
             .engine
             .session()

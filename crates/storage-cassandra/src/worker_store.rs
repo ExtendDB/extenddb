@@ -52,9 +52,10 @@ impl CassandraEngine {
              ALLOW FILTERING"
         );
 
-        let result = self.session.query(&query).await.map_err(|e| {
-            StorageError::Internal(format!("Failed to query CREATING tables: {e}"))
-        })?;
+        let result =
+            self.session.query(&query).await.map_err(|e| {
+                StorageError::Internal(format!("Failed to query CREATING tables: {e}"))
+            })?;
 
         let body = result.response_body().map_err(|e| {
             StorageError::Internal(format!("Failed to parse CREATING tables response: {e}"))
@@ -63,12 +64,12 @@ impl CassandraEngine {
         let rows = body.into_rows().unwrap_or_default();
 
         for row in rows {
-            let account_id: String = row.get_r_by_name("account_id").map_err(|e| {
-                StorageError::Internal(format!("Failed to parse account_id: {e}"))
-            })?;
-            let table_name: String = row.get_r_by_name("table_name").map_err(|e| {
-                StorageError::Internal(format!("Failed to parse table_name: {e}"))
-            })?;
+            let account_id: String = row
+                .get_r_by_name("account_id")
+                .map_err(|e| StorageError::Internal(format!("Failed to parse account_id: {e}")))?;
+            let table_name: String = row
+                .get_r_by_name("table_name")
+                .map_err(|e| StorageError::Internal(format!("Failed to parse table_name: {e}")))?;
 
             // Update to ACTIVE (PRIMARY KEY is account_id, table_name)
             let update = format!(
@@ -93,9 +94,10 @@ impl CassandraEngine {
              ALLOW FILTERING"
         );
 
-        let result = self.session.query(&query).await.map_err(|e| {
-            StorageError::Internal(format!("Failed to query DELETING tables: {e}"))
-        })?;
+        let result =
+            self.session.query(&query).await.map_err(|e| {
+                StorageError::Internal(format!("Failed to query DELETING tables: {e}"))
+            })?;
 
         let body = result.response_body().map_err(|e| {
             StorageError::Internal(format!("Failed to parse DELETING tables response: {e}"))
@@ -104,12 +106,12 @@ impl CassandraEngine {
         let rows = body.into_rows().unwrap_or_default();
 
         for row in rows {
-            let account_id: String = row.get_r_by_name("account_id").map_err(|e| {
-                StorageError::Internal(format!("Failed to parse account_id: {e}"))
-            })?;
-            let table_name: String = row.get_r_by_name("table_name").map_err(|e| {
-                StorageError::Internal(format!("Failed to parse table_name: {e}"))
-            })?;
+            let account_id: String = row
+                .get_r_by_name("account_id")
+                .map_err(|e| StorageError::Internal(format!("Failed to parse account_id: {e}")))?;
+            let table_name: String = row
+                .get_r_by_name("table_name")
+                .map_err(|e| StorageError::Internal(format!("Failed to parse table_name: {e}")))?;
             let table_arn: String = row
                 .get_r_by_name("table_arn")
                 .map_err(|e| StorageError::Internal(format!("Failed to parse table_arn: {e}")))?;
@@ -118,9 +120,7 @@ impl CassandraEngine {
                 .map_err(|e| StorageError::Internal(format!("Failed to parse table_id: {e}")))?;
 
             // Delete tags
-            let tag_delete = format!(
-                "DELETE FROM {catalog_keyspace}.tags WHERE resource_arn = ?"
-            );
+            let tag_delete = format!("DELETE FROM {catalog_keyspace}.tags WHERE resource_arn = ?");
             self.session
                 .query_with_values(&tag_delete, cdrs_tokio::query_values!(table_arn.as_str()))
                 .await

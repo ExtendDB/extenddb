@@ -277,9 +277,10 @@ impl CassandraEngine {
         let idx_table = index_table_name(index_id);
         let ddl = format!("DROP TABLE IF EXISTS {account_keyspace}.{idx_table}");
 
-        self.session.query(&ddl).await.map_err(|e| {
-            StorageError::Internal(format!("Failed to drop index data table: {e}"))
-        })?;
+        self.session
+            .query(&ddl)
+            .await
+            .map_err(|e| StorageError::Internal(format!("Failed to drop index data table: {e}")))?;
 
         Ok(())
     }

@@ -181,7 +181,10 @@ pub fn stream_record_statement(
         .unwrap_or_default();
 
     let shard_id = assign_shard_id(&pk_str, table_id);
-    let sequence_number = hlc.lock().unwrap_or_else(std::sync::PoisonError::into_inner).generate();
+    let sequence_number = hlc
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .generate();
 
     let record = StreamRecord {
         event_id: uuid::Uuid::new_v4().to_string(),

@@ -157,9 +157,10 @@ async fn list_account_keyspaces(
     for row in rows {
         let name: Result<String, _> = row.get_r_by_name("keyspace_name");
         if let Ok(name) = name
-            && name.starts_with(&prefix) {
-                keyspaces.push(name);
-            }
+            && name.starts_with(&prefix)
+        {
+            keyspaces.push(name);
+        }
     }
     Ok(keyspaces)
 }
@@ -380,39 +381,41 @@ async fn gsi_apply_index(
     let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
 
     if let Some(old) = old_item
-        && item_has_index_keys(old, &idx.key_schema) {
-            delete_index_row_multi(
-                &mut batch,
-                account_keyspace,
-                &idx_table,
-                old,
-                &idx.key_schema,
-                &context.base_key_schema,
-                &idx_sks,
-                &base_sks,
-            )?;
-        }
+        && item_has_index_keys(old, &idx.key_schema)
+    {
+        delete_index_row_multi(
+            &mut batch,
+            account_keyspace,
+            &idx_table,
+            old,
+            &idx.key_schema,
+            &context.base_key_schema,
+            &idx_sks,
+            &base_sks,
+        )?;
+    }
 
     if let Some(new) = new_item
-        && item_has_index_keys(new, &idx.key_schema) {
-            let projected = project_item_for_index(
-                new,
-                &idx.key_schema,
-                &context.base_key_schema,
-                &idx.projection,
-            );
-            insert_index_row_multi(
-                &mut batch,
-                account_keyspace,
-                &idx_table,
-                new,
-                &projected,
-                &idx.key_schema,
-                &context.base_key_schema,
-                &idx_sks,
-                &base_sks,
-            )?;
-        }
+        && item_has_index_keys(new, &idx.key_schema)
+    {
+        let projected = project_item_for_index(
+            new,
+            &idx.key_schema,
+            &context.base_key_schema,
+            &idx.projection,
+        );
+        insert_index_row_multi(
+            &mut batch,
+            account_keyspace,
+            &idx_table,
+            new,
+            &projected,
+            &idx.key_schema,
+            &context.base_key_schema,
+            &idx_sks,
+            &base_sks,
+        )?;
+    }
 
     // Only execute if there's something to do.
     let built = batch

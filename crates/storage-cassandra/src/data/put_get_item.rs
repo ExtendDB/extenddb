@@ -397,19 +397,18 @@ impl CassandraEngine {
                 .map_err(|e| StorageError::Internal(format!("Parse response: {e}")))?;
 
             if let Some(rows) = body.into_rows()
-                && let Some(row) = rows.into_iter().next() {
-                    let item_data: String = row
-                        .get_r_by_name("item_data")
-                        .map_err(|e| StorageError::Internal(format!("Parse item_data: {e}")))?;
-                    return Ok(Some(json_to_item(item_data)?));
-                }
+                && let Some(row) = rows.into_iter().next()
+            {
+                let item_data: String = row
+                    .get_r_by_name("item_data")
+                    .map_err(|e| StorageError::Internal(format!("Parse item_data: {e}")))?;
+                return Ok(Some(json_to_item(item_data)?));
+            }
 
             Ok(None)
         } else {
             // PK-only table
-            let query = format!(
-                "SELECT item_data FROM {data_keyspace}.{ddb_table} WHERE pk = ?"
-            );
+            let query = format!("SELECT item_data FROM {data_keyspace}.{ddb_table} WHERE pk = ?");
 
             let result = self
                 .session
@@ -422,12 +421,13 @@ impl CassandraEngine {
                 .map_err(|e| StorageError::Internal(format!("Parse response: {e}")))?;
 
             if let Some(rows) = body.into_rows()
-                && let Some(row) = rows.into_iter().next() {
-                    let item_data: String = row
-                        .get_r_by_name("item_data")
-                        .map_err(|e| StorageError::Internal(format!("Parse item_data: {e}")))?;
-                    return Ok(Some(json_to_item(item_data)?));
-                }
+                && let Some(row) = rows.into_iter().next()
+            {
+                let item_data: String = row
+                    .get_r_by_name("item_data")
+                    .map_err(|e| StorageError::Internal(format!("Parse item_data: {e}")))?;
+                return Ok(Some(json_to_item(item_data)?));
+            }
 
             Ok(None)
         }
