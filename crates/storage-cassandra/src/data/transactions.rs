@@ -1086,13 +1086,13 @@ impl CassandraEngine {
             let sk_col = sk_column(sk_type);
 
             let query = format!(
-                "UPDATE {keyspace}.{ddb_table} SET item_data = ?, prepared_txn_id = NULL, last_committed_txn_timestamp = ? \
+                "UPDATE {keyspace}.{ddb_table} SET item_data = ?, prepared_txn_id = NULL, version = version + 1, last_committed_txn_timestamp = ? \
                  WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ?"
             );
             query_with_item_ts_pk_sk_txnid(&self.session, &query, &item_text, txn_timestamp, pk_text.as_str(), &sk, txn_id_bytes).await
         } else {
             let query = format!(
-                "UPDATE {keyspace}.{ddb_table} SET item_data = ?, prepared_txn_id = NULL, last_committed_txn_timestamp = ? \
+                "UPDATE {keyspace}.{ddb_table} SET item_data = ?, prepared_txn_id = NULL, version = version + 1, last_committed_txn_timestamp = ? \
                  WHERE pk = ? IF prepared_txn_id = ?"
             );
             self.session
@@ -1286,8 +1286,8 @@ impl CassandraEngine {
                 let result = if let Some((sk_val, sk_col)) = &sk {
                     let query = format!(
                         "UPDATE {keyspace}.{table} SET item_data = ?, prepared_txn_id = NULL, \
-                         last_committed_txn_timestamp = ? WHERE pk = ? AND {sk_col} = ? \
-                         IF prepared_txn_id = ?",
+                         version = version + 1, last_committed_txn_timestamp = ? \
+                         WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ?",
                     );
                     query_with_item_ts_pk_sk_txnid(
                         &self.session,
@@ -1302,7 +1302,8 @@ impl CassandraEngine {
                 } else {
                     let query = format!(
                         "UPDATE {keyspace}.{table} SET item_data = ?, prepared_txn_id = NULL, \
-                         last_committed_txn_timestamp = ? WHERE pk = ? IF prepared_txn_id = ?",
+                         version = version + 1, last_committed_txn_timestamp = ? \
+                         WHERE pk = ? IF prepared_txn_id = ?",
                     );
                     self.session
                         .query_with_values(

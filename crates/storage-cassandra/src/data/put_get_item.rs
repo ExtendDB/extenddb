@@ -54,6 +54,32 @@ impl CassandraEngine {
 
         // Always use read-then-write path to check prepared_txn_id for transaction safety.
         // This ensures non-transactional writes cannot corrupt in-flight transactions.
+        //
+        // Exception: attribute_not_exists(<key>) maps directly to INSERT IF NOT EXISTS,
+        // which is atomic without a prior read.
+
+        // Collect key attribute names for attribute_not_exists detection.
+        let key_attr_names: Vec<&str> = key_info
+            .key_schema
+            .iter()
+            .map(|k| k.attribute_name.as_str())
+            .collect();
+
+        if is_attribute_not_exists_key(condition, &key_attr_names) {
+            return self
+                .put_item_if_not_exists(
+                    key_info,
+                    item,
+                    stream,
+                    &data_keyspace,
+                    &ddb_table,
+                    &pk_text,
+                    &item_text,
+                    &indexes,
+                    sys_delay,
+                )
+                .await;
+        }
 
         if let Some((sk_name, sk_type)) =
             sk_info(&key_info.key_schema, &key_info.attribute_definitions)
@@ -361,6 +387,150 @@ impl CassandraEngine {
         }
     }
 
+    /// Atomic `put_item` for the `attribute_not_exists(<key>)` condition.
+    ///
+    /// Uses `INSERT ... IF NOT EXISTS` — no prior read needed. Returns
+    /// `ConditionFailed` (with no old item, since the item didn't exist) if
+    /// another writer got there first.
+    #[allow(clippy::too_many_arguments)]
+    async fn put_item_if_not_exists(
+        &self,
+        key_info: &TableKeyInfo,
+        item: Item,
+        stream: Option<&StreamCapture>,
+        data_keyspace: &str,
+        ddb_table: &str,
+        pk_text: &str,
+        item_text: &str,
+        indexes: &[super::index::IndexMeta],
+        sys_delay: u64,
+    ) -> Result<Option<Item>, StorageError> {
+        use cdrs_tokio::types::IntoRustByName as _;
+
+        let (insert_cql, insert_qv) = if let Some((sk_name, sk_type)) =
+            sk_info(&key_info.key_schema, &key_info.attribute_definitions)
+        {
+            let sk_value = item
+                .get(sk_name)
+                .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?;
+            let sk = parse_sk(sk_value, sk_type)?;
+            let sk_col = sk_column(sk_type);
+            let cql = format!(
+                "INSERT INTO {data_keyspace}.{ddb_table} (pk, {sk_col}, item_data, version) \
+                     VALUES (?, ?, ?, 1) IF NOT EXISTS"
+            );
+            let qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                cdrs_tokio::types::value::Value::from(pk_text),
+                super::index::sk_to_value(&sk),
+                item_text.into(),
+            ]);
+            (cql, qv)
+        } else {
+            let cql = format!(
+                "INSERT INTO {data_keyspace}.{ddb_table} (pk, item_data, version) \
+                     VALUES (?, ?, 1) IF NOT EXISTS"
+            );
+            let qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                cdrs_tokio::types::value::Value::from(pk_text),
+                item_text.into(),
+            ]);
+            (cql, qv)
+        };
+
+        let result = self
+            .session
+            .query_with_values(&insert_cql, insert_qv)
+            .await
+            .map_err(|e| StorageError::Internal(format!("put_item_if_not_exists: {e}")))?;
+
+        let body = result
+            .response_body()
+            .map_err(|e| StorageError::Internal(format!("put_item_if_not_exists: {e}")))?;
+
+        let rows = body.into_rows().unwrap_or_default();
+        let row = rows.into_iter().next();
+
+        let applied: bool = row
+            .as_ref()
+            .and_then(|r| r.get_r_by_name("[applied]").ok())
+            .unwrap_or(true);
+
+        if !applied {
+            // The LWT response includes the existing row — parse item_data from it.
+            let existing = row
+                .as_ref()
+                .and_then(|r| {
+                    use cdrs_tokio::types::IntoRustByName as _;
+                    r.get_r_by_name("item_data").ok()
+                })
+                .and_then(|s: String| json_to_item(s).ok());
+            return Err(StorageError::ConditionFailed(existing));
+        }
+
+        // INSERT applied — fire index/stream updates if needed.
+        if !indexes.is_empty() || stream.is_some() {
+            let stream_stmt = stream.and_then(|cap| {
+                stream_record_statement(
+                    data_keyspace,
+                    &key_info.table_id,
+                    key_info,
+                    None,
+                    Some(&item),
+                    cap,
+                    &self.hlc,
+                    self.stream_retention_seconds,
+                )
+            });
+
+            let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+
+            if !indexes.is_empty() {
+                super::index::sync_indexes(
+                    &mut batch,
+                    data_keyspace,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                    indexes,
+                    None,
+                    Some(&item),
+                    sys_delay,
+                )?;
+            }
+
+            let async_enqueued = if !indexes.is_empty() {
+                super::index::enqueue_async_indexes(
+                    &self.session,
+                    &mut batch,
+                    data_keyspace,
+                    key_info,
+                    indexes,
+                    None,
+                    Some(&item),
+                    sys_delay,
+                )
+                .await?
+            } else {
+                0
+            };
+
+            if let Some(stmt) = stream_stmt {
+                batch = batch.add_query(stmt, cdrs_tokio::query::QueryValues::SimpleValues(vec![]));
+            }
+
+            if let Ok(built) = batch.build() {
+                self.session.batch(built).await.map_err(|e| {
+                    StorageError::Internal(format!("put_item_if_not_exists batch: {e}"))
+                })?;
+            }
+
+            if async_enqueued > 0 {
+                self.gsi_queue.notify_workers();
+            }
+        }
+
+        Ok(None) // return_old is always None — item didn't exist
+    }
+
     /// Implementation of `DataEngine::get_item`.
     pub(crate) async fn get_item_impl(
         &self,
@@ -432,4 +602,32 @@ impl CassandraEngine {
             Ok(None)
         }
     }
+}
+
+/// Returns `true` if `condition` is exactly `attribute_not_exists(<key_attr>)` where
+/// `<key_attr>` resolves to one of the names in `key_attr_names` after applying
+/// expression name substitutions from `maps`.
+///
+/// This is the only condition we can map directly to `INSERT ... IF NOT EXISTS`,
+/// which is atomic without a prior read.
+pub(crate) fn is_attribute_not_exists_key(
+    condition: Option<&Expr>,
+    key_attr_names: &[&str],
+) -> bool {
+    let Some(Expr::Function { name, args }) = condition else {
+        return false;
+    };
+    if name != "attribute_not_exists" || args.len() != 1 {
+        return false;
+    }
+    let Expr::Path(path) = &args[0] else {
+        return false;
+    };
+    if path.len() != 1 {
+        return false;
+    }
+    let extenddb_core::expression::PathElement::Attribute(attr) = &path[0] else {
+        return false;
+    };
+    key_attr_names.contains(&attr.as_str())
 }

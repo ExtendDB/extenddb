@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS tables (
     provisioned_throughput text,
     on_demand_throughput text,
     table_class text,
+    sse_specification text,
     stream_specification text,
     table_size_bytes bigint,
     item_count bigint,
