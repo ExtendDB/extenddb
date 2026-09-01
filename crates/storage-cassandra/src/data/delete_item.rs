@@ -115,9 +115,8 @@ impl CassandraEngine {
             }
 
             // Delete the item (with index updates if needed).
-            let delete_cql = format!(
-                "DELETE FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?"
-            );
+            let delete_cql =
+                format!("DELETE FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?");
 
             // Update partition_max_delete_timestamp before the batch (must precede delete).
             if old_item_opt.is_some() {

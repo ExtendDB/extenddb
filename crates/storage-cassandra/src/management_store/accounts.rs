@@ -128,27 +128,21 @@ impl CassandraCatalogStore {
         }
         crate::cassandra_util::execute::<OpError>(
             self.session(),
-            &format!(
-                "DELETE FROM {catalog_keyspace}.backups_by_account WHERE account_id = ?"
-            ),
+            &format!("DELETE FROM {catalog_keyspace}.backups_by_account WHERE account_id = ?"),
             cdrs_tokio::query_values!(account_id),
             "delete_account_backup_index",
         )
         .await?;
         crate::cassandra_util::execute::<OpError>(
             self.session(),
-            &format!(
-                "DELETE FROM {catalog_keyspace}.continuous_backups WHERE account_id = ?"
-            ),
+            &format!("DELETE FROM {catalog_keyspace}.continuous_backups WHERE account_id = ?"),
             cdrs_tokio::query_values!(account_id),
             "delete_account_continuous_backups",
         )
         .await?;
 
         // Delete account from catalog
-        let delete_query = format!(
-            "DELETE FROM {catalog_keyspace}.accounts WHERE account_id = ?"
-        );
+        let delete_query = format!("DELETE FROM {catalog_keyspace}.accounts WHERE account_id = ?");
 
         crate::cassandra_util::execute(
             self.session(),
@@ -166,9 +160,7 @@ impl CassandraCatalogStore {
 
     pub(crate) async fn list_all_accounts_impl(&self) -> OpResult<Vec<(String, String)>> {
         let catalog_keyspace = self.catalog_keyspace();
-        let query = format!(
-            "SELECT account_id, account_name FROM {catalog_keyspace}.accounts"
-        );
+        let query = format!("SELECT account_id, account_name FROM {catalog_keyspace}.accounts");
 
         let rows = crate::cassandra_util::query_rows(
             self.session(),
@@ -198,9 +190,8 @@ impl CassandraCatalogStore {
         &self,
     ) -> OpResult<Vec<(String, String, time::OffsetDateTime)>> {
         let catalog_keyspace = self.catalog_keyspace();
-        let query = format!(
-            "SELECT account_id, account_name, created_at FROM {catalog_keyspace}.accounts"
-        );
+        let query =
+            format!("SELECT account_id, account_name, created_at FROM {catalog_keyspace}.accounts");
 
         let rows = crate::cassandra_util::query_rows(
             self.session(),
@@ -264,9 +255,8 @@ impl CassandraCatalogStore {
         let catalog_keyspace = self.catalog_keyspace();
 
         // Get account name
-        let account_query = format!(
-            "SELECT account_name FROM {catalog_keyspace}.accounts WHERE account_id = ?"
-        );
+        let account_query =
+            format!("SELECT account_name FROM {catalog_keyspace}.accounts WHERE account_id = ?");
 
         let account_row = crate::cassandra_util::query_optional(
             self.session(),
@@ -284,9 +274,8 @@ impl CassandraCatalogStore {
             crate::cassandra_util::get_column(&row, "account_name", "get_account_detail")?;
 
         // Get users
-        let users_query = format!(
-            "SELECT user_name FROM {catalog_keyspace}.iam_users WHERE account_id = ?"
-        );
+        let users_query =
+            format!("SELECT user_name FROM {catalog_keyspace}.iam_users WHERE account_id = ?");
 
         let users_rows = crate::cassandra_util::query_rows(
             self.session(),
@@ -307,9 +296,8 @@ impl CassandraCatalogStore {
         users.sort();
 
         // Get groups
-        let groups_query = format!(
-            "SELECT group_name FROM {catalog_keyspace}.iam_groups WHERE account_id = ?"
-        );
+        let groups_query =
+            format!("SELECT group_name FROM {catalog_keyspace}.iam_groups WHERE account_id = ?");
 
         let groups_rows = crate::cassandra_util::query_rows(
             self.session(),
@@ -330,9 +318,8 @@ impl CassandraCatalogStore {
         groups.sort();
 
         // Get roles
-        let roles_query = format!(
-            "SELECT role_name FROM {catalog_keyspace}.iam_roles WHERE account_id = ?"
-        );
+        let roles_query =
+            format!("SELECT role_name FROM {catalog_keyspace}.iam_roles WHERE account_id = ?");
 
         let roles_rows = crate::cassandra_util::query_rows(
             self.session(),

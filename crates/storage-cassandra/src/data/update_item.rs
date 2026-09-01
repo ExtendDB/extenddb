@@ -292,9 +292,8 @@ impl CassandraEngine {
                 }
             }
         } else {
-            let update_cql = format!(
-                "UPDATE {data_keyspace}.{ddb_table} SET item_data = ? WHERE pk = ?"
-            );
+            let update_cql =
+                format!("UPDATE {data_keyspace}.{ddb_table} SET item_data = ? WHERE pk = ?");
 
             let stream_stmt = stream.and_then(|cap| {
                 stream_record_statement(

@@ -14,9 +14,8 @@ async fn admin_exists(
     catalog_keyspace: &str,
     admin_name: &str,
 ) -> OpResult<bool> {
-    let query = format!(
-        "SELECT admin_name FROM {catalog_keyspace}.admin_users WHERE admin_name = ?"
-    );
+    let query =
+        format!("SELECT admin_name FROM {catalog_keyspace}.admin_users WHERE admin_name = ?");
     let row = crate::cassandra_util::query_optional(
         session,
         &query,
@@ -76,9 +75,8 @@ impl extenddb_storage::management_store::AdminStore for CassandraCatalogStore {
         let session = self.session().clone();
         let catalog_keyspace = self.catalog_keyspace();
         Box::pin(async move {
-            let query = format!(
-                "SELECT admin_name, created_at FROM {catalog_keyspace}.admin_users"
-            );
+            let query =
+                format!("SELECT admin_name, created_at FROM {catalog_keyspace}.admin_users");
             let rows = crate::cassandra_util::query_rows(
                 &session,
                 &query,
@@ -119,9 +117,7 @@ impl extenddb_storage::management_store::AdminStore for CassandraCatalogStore {
                 return Err(OpError::NotFound("Admin user not found".to_owned()));
             }
 
-            let query = format!(
-                "DELETE FROM {catalog_keyspace}.admin_users WHERE admin_name = ?"
-            );
+            let query = format!("DELETE FROM {catalog_keyspace}.admin_users WHERE admin_name = ?");
             crate::cassandra_util::execute(
                 &session,
                 &query,

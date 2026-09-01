@@ -130,7 +130,9 @@ impl StoredBackup {
             backup_status: self.backup_status.clone(),
             backup_type: self.backup_type.clone(),
             backup_size_bytes: self.backup_size_bytes,
-            backup_creation_date_time: crate::cassandra_util::millis_to_seconds_f64(self.created_at),
+            backup_creation_date_time: crate::cassandra_util::millis_to_seconds_f64(
+                self.created_at,
+            ),
         }
     }
 
@@ -143,7 +145,9 @@ impl StoredBackup {
             backup_status: self.backup_status.clone(),
             backup_type: self.backup_type.clone(),
             backup_size_bytes: self.backup_size_bytes,
-            backup_creation_date_time: crate::cassandra_util::millis_to_seconds_f64(self.created_at),
+            backup_creation_date_time: crate::cassandra_util::millis_to_seconds_f64(
+                self.created_at,
+            ),
         }
     }
 
@@ -160,7 +164,9 @@ impl StoredBackup {
                 item_count: self.item_count,
                 table_size_bytes: self.backup_size_bytes,
                 billing_mode: Some(self.billing_mode.clone()),
-                table_creation_date_time: crate::cassandra_util::millis_to_seconds_f64(self.table_created_at),
+                table_creation_date_time: crate::cassandra_util::millis_to_seconds_f64(
+                    self.table_created_at,
+                ),
             },
         })
     }

@@ -184,9 +184,7 @@ async fn is_migration_applied(
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| OpError::Internal(format!("Invalid migration filename: {filename}")))?;
 
-    let check_cql = format!(
-        "SELECT version FROM {keyspace}.schema_history WHERE version = ?"
-    );
+    let check_cql = format!("SELECT version FROM {keyspace}.schema_history WHERE version = ?");
 
     let applied = session
         .query_with_values(check_cql, cdrs_tokio::query_values!(version))

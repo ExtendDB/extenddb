@@ -132,15 +132,16 @@ impl CassandraEngine {
         })?;
 
         if let Some(rows) = body.into_rows()
-            && let Some(row) = rows.first() {
-                let applied: bool = get_column(row, "[applied]", "write_ledger_entry")?;
-                if !applied {
-                    tracing::error!("write_ledger_entry: transaction ID already exists");
-                    return Err(StorageError::Internal(
-                        "Transaction ID already exists".to_owned(),
-                    ));
-                }
+            && let Some(row) = rows.first()
+        {
+            let applied: bool = get_column(row, "[applied]", "write_ledger_entry")?;
+            if !applied {
+                tracing::error!("write_ledger_entry: transaction ID already exists");
+                return Err(StorageError::Internal(
+                    "Transaction ID already exists".to_owned(),
+                ));
             }
+        }
 
         Ok(())
     }
@@ -152,9 +153,7 @@ impl CassandraEngine {
         txn_id: Uuid,
         new_state: TransactionState,
     ) -> Result<(), StorageError> {
-        let query = format!(
-            "UPDATE {keyspace}.transaction_ledger SET state = ? WHERE txn_id = ?"
-        );
+        let query = format!("UPDATE {keyspace}.transaction_ledger SET state = ? WHERE txn_id = ?");
 
         self.session
             .query_with_values(
@@ -185,9 +184,8 @@ impl CassandraEngine {
     ) -> Result<(), StorageError> {
         let blob = serde_json::to_string(ops)
             .map_err(|e| StorageError::Internal(format!("serialize ledger ops: {e}")))?;
-        let query = format!(
-            "UPDATE {keyspace}.transaction_ledger SET items_blob = ? WHERE txn_id = ?"
-        );
+        let query =
+            format!("UPDATE {keyspace}.transaction_ledger SET items_blob = ? WHERE txn_id = ?");
         self.session
             .query_with_values(
                 &query,
@@ -292,9 +290,7 @@ impl CassandraEngine {
         keyspace: &str,
         txn_id: Uuid,
     ) -> Result<(), StorageError> {
-        let query = format!(
-            "DELETE FROM {keyspace}.transaction_ledger WHERE txn_id = ?"
-        );
+        let query = format!("DELETE FROM {keyspace}.transaction_ledger WHERE txn_id = ?");
 
         self.session
             .query_with_values(

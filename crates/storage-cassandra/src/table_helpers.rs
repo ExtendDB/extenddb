@@ -58,9 +58,7 @@ impl CassandraEngine {
             .map_err(|e| StorageError::Internal(format!("Parse table_id: {e}")))?;
 
         // Query indexes
-        let index_query = format!(
-            "SELECT * FROM {catalog_keyspace}.indexes WHERE table_id = ?"
-        );
+        let index_query = format!("SELECT * FROM {catalog_keyspace}.indexes WHERE table_id = ?");
 
         let index_result = self
             .session

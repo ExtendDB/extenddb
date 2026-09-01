@@ -300,24 +300,25 @@ impl AuthorizationStore for CassandraCatalogStore {
             let mut session_tags = Vec::new();
 
             if let Some(tags_text) = session_tags_text
-                && let Ok(tags_val) = serde_json::from_str::<serde_json::Value>(&tags_text) {
-                    if let Some(arr) = tags_val.as_array() {
-                        for tag in arr {
-                            if let (Some(k), Some(v)) = (
-                                tag.get("Key").and_then(|k| k.as_str()),
-                                tag.get("Value").and_then(|v| v.as_str()),
-                            ) {
-                                session_tags.push((k.to_owned(), v.to_owned()));
-                            }
+                && let Ok(tags_val) = serde_json::from_str::<serde_json::Value>(&tags_text)
+            {
+                if let Some(arr) = tags_val.as_array() {
+                    for tag in arr {
+                        if let (Some(k), Some(v)) = (
+                            tag.get("Key").and_then(|k| k.as_str()),
+                            tag.get("Value").and_then(|v| v.as_str()),
+                        ) {
+                            session_tags.push((k.to_owned(), v.to_owned()));
                         }
-                    } else if let Some(obj) = tags_val.as_object() {
-                        for (k, v) in obj {
-                            if let Some(v_str) = v.as_str() {
-                                session_tags.push((k.clone(), v_str.to_owned()));
-                            }
+                    }
+                } else if let Some(obj) = tags_val.as_object() {
+                    for (k, v) in obj {
+                        if let Some(v_str) = v.as_str() {
+                            session_tags.push((k.clone(), v_str.to_owned()));
                         }
                     }
                 }
+            }
 
             Ok(Some(SessionData {
                 session_policy,

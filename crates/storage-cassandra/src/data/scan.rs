@@ -381,10 +381,11 @@ impl crate::CassandraEngine {
         binds.push(Value::from(base_pk_text));
 
         if let Some((base_sk_name, base_sk_type)) = base_sk_info_opt
-            && let Some(av) = start_key.get(base_sk_name) {
-                cols.push(format!("base_{}", sk_column(base_sk_type)));
-                binds.push(sk_to_value(&parse_sk(av, base_sk_type)?));
-            }
+            && let Some(av) = start_key.get(base_sk_name)
+        {
+            cols.push(format!("base_{}", sk_column(base_sk_type)));
+            binds.push(sk_to_value(&parse_sk(av, base_sk_type)?));
+        }
 
         Ok(Some((format_clustering_comparison(&cols), binds)))
     }

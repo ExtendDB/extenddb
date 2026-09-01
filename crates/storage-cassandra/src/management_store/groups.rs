@@ -160,9 +160,8 @@ impl CassandraCatalogStore {
         policies.sort();
 
         // Get all users in account
-        let all_users_query = format!(
-            "SELECT user_name FROM {catalog_keyspace}.iam_users WHERE account_id = ?"
-        );
+        let all_users_query =
+            format!("SELECT user_name FROM {catalog_keyspace}.iam_users WHERE account_id = ?");
 
         let all_users_rows = crate::cassandra_util::query_rows(
             self.session(),

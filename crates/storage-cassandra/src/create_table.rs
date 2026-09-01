@@ -121,9 +121,7 @@ impl CassandraEngine {
 
         // Read control_plane_delay_seconds from settings
         let catalog_keyspace = self.catalog_keyspace();
-        let delay_query = format!(
-            "SELECT value FROM {catalog_keyspace}.settings WHERE key = ?"
-        );
+        let delay_query = format!("SELECT value FROM {catalog_keyspace}.settings WHERE key = ?");
         let delay_seconds: f64 = self
             .session
             .query_with_values(
@@ -211,16 +209,17 @@ impl CassandraEngine {
             .map_err(|e| StorageError::Internal(format!("Failed to get response body: {e}")))?;
 
         if let Some(rows) = body.into_rows()
-            && let Some(row) = rows.first() {
-                use cdrs_tokio::types::IntoRustByName;
-                let applied: bool = row.get_r_by_name("[applied]").map_err(|e| {
-                    StorageError::Internal(format!("Failed to parse [applied]: {e}"))
-                })?;
+            && let Some(row) = rows.first()
+        {
+            use cdrs_tokio::types::IntoRustByName;
+            let applied: bool = row
+                .get_r_by_name("[applied]")
+                .map_err(|e| StorageError::Internal(format!("Failed to parse [applied]: {e}")))?;
 
-                if !applied {
-                    return Err(StorageError::TableAlreadyExists(input.table_name.clone()));
-                }
+            if !applied {
+                return Err(StorageError::TableAlreadyExists(input.table_name.clone()));
             }
+        }
 
         // Insert GSI metadata
         let mut gsi_index_ids: Vec<String> = Vec::new();

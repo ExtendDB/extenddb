@@ -67,9 +67,8 @@ impl MetadataEngine for CassandraEngine {
         let catalog = self.catalog_keyspace();
         Box::pin(async move {
             for key in &tag_keys {
-                let query = format!(
-                    "DELETE FROM {catalog}.tags WHERE resource_arn = ? AND tag_key = ?"
-                );
+                let query =
+                    format!("DELETE FROM {catalog}.tags WHERE resource_arn = ? AND tag_key = ?");
                 self.session_arc()
                     .query_with_values(
                         &query,
@@ -89,9 +88,8 @@ impl MetadataEngine for CassandraEngine {
         let arn = arn.to_string();
         let catalog = self.catalog_keyspace();
         Box::pin(async move {
-            let query = format!(
-                "SELECT tag_key, tag_value FROM {catalog}.tags WHERE resource_arn = ?"
-            );
+            let query =
+                format!("SELECT tag_key, tag_value FROM {catalog}.tags WHERE resource_arn = ?");
             let result = self
                 .session_arc()
                 .query_with_values(&query, cdrs_tokio::query_values!(arn.as_str()))

@@ -89,12 +89,13 @@ impl CassandraEngine {
         // Check for prepared transactions in Phase 1 data
         for (i, result) in phase1_results.iter().enumerate() {
             if let Some((_, _, prepared_txn_id)) = result
-                && prepared_txn_id.is_some() {
-                    // Item is in a prepared transaction - conflict
-                    let mut reasons = vec![CancellationReason::none(); ops.len()];
-                    reasons[i] = transaction_conflict_reason();
-                    return Err(StorageError::TransactionCanceled(reasons));
-                }
+                && prepared_txn_id.is_some()
+            {
+                // Item is in a prepared transaction - conflict
+                let mut reasons = vec![CancellationReason::none(); ops.len()];
+                reasons[i] = transaction_conflict_reason();
+                return Err(StorageError::TransactionCanceled(reasons));
+            }
         }
 
         // Phase 2: Verify timestamps haven't changed
@@ -841,11 +842,12 @@ impl CassandraEngine {
                 .ok()
                 .flatten();
             if let Some(max_ts) = max_ts
-                && txn_timestamp <= max_ts {
-                    return Err(CancellationReason::validation_error(
-                        "Item was deleted at a later timestamp".to_owned(),
-                    ));
-                }
+                && txn_timestamp <= max_ts
+            {
+                return Err(CancellationReason::validation_error(
+                    "Item was deleted at a later timestamp".to_owned(),
+                ));
+            }
         }
 
         Ok(())
@@ -1514,13 +1516,14 @@ fn check_lwt_applied(result: &Envelope, context: &str) -> Result<(), Cancellatio
     })?;
 
     if let Some(rows) = body.into_rows()
-        && let Some(row) = rows.first() {
-            let applied: bool = get_column::<bool, StorageError>(row, "[applied]", context)
-                .map_err(|_| transaction_conflict_reason())?;
-            if !applied {
-                return Err(transaction_conflict_reason());
-            }
+        && let Some(row) = rows.first()
+    {
+        let applied: bool = get_column::<bool, StorageError>(row, "[applied]", context)
+            .map_err(|_| transaction_conflict_reason())?;
+        if !applied {
+            return Err(transaction_conflict_reason());
         }
+    }
 
     Ok(())
 }
