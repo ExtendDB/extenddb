@@ -172,16 +172,7 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         println!("{banner_line2}");
     }
     if cfg!(feature = "dev-mode") {
-        let msg = format!(
-            "  DEVELOPER MODE: plain HTTP on loopback, authorization open \
-             (SigV4 still enforced). Serving storage: {}. Not for production.",
-            config::redact_password(app_config.storage.connection_config()),
-        );
-        if args.foreground {
-            eprintln!("{msg}");
-        } else {
-            println!("{msg}");
-        }
+        print_dev_mode_banner(&app_config, args.foreground)?;
     }
 
     // D-3: A PID file lets `extenddb status` and `extenddb stop` find the
@@ -269,6 +260,49 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
                 })
                 .with_dev_mode(cfg!(feature = "dev-mode")),
         ))
+}
+
+/// Print the developer-mode banner lines: the mode notice, the credentials to
+/// sign with, and an advisory when an ambient `AWS_ACCESS_KEY_ID` would not
+/// verify.
+///
+/// Resolving here (not just in `serve()`) fails fast on a misconfigured
+/// `EXTENDDB_DEV_*` pair before daemonizing, and gives the invoking user the
+/// credentials without digging through logs. The built-in example pair is
+/// printed in full: it is public AWS documentation, not a secret. An
+/// operator-supplied secret is never printed.
+fn print_dev_mode_banner(app_config: &config::AppConfig, foreground: bool) -> anyhow::Result<()> {
+    use extenddb_server::dev_credentials;
+
+    let dev_creds = dev_credentials::resolve()?;
+    let mut lines = vec![
+        format!(
+            "  DEVELOPER MODE: plain HTTP on loopback, authorization open \
+             (SigV4 still enforced). Serving storage: {}. Not for production.",
+            config::redact_password(app_config.storage.connection_config()),
+        ),
+        format!(
+            "  Sign requests with: {}",
+            dev_credentials::describe(&dev_creds)
+        ),
+    ];
+    if let Some(ignored) = dev_credentials::ignored_aws_env_key(&dev_creds) {
+        lines.push(format!(
+            "  Note: AWS_ACCESS_KEY_ID is set but not adopted; requests signed with \
+             '{ignored}' will be rejected. Set EXTENDDB_DEV_ACCESS_KEY_ID and \
+             EXTENDDB_DEV_SECRET_ACCESS_KEY to seed an additional credential."
+        ));
+    }
+    // Same stream split as the main banner: stdout for the daemon parent,
+    // stderr in foreground mode so supervisors capture one stream.
+    for msg in lines {
+        if foreground {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
