@@ -12,6 +12,7 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn};
+use extenddb_storage::vector_catalog::{VectorIndexCatalogRow, vector_index_descriptions};
 
 use crate::data;
 use crate::sqlite_util::parse_timestamp;
@@ -53,6 +54,10 @@ pub(crate) struct IndexRow {
 }
 
 /// A `vector_indexes` catalog row, in `FromRow` field order.
+///
+/// Decoding stops at this struct: the rules that turn it into a wire shape are
+/// shared with the other backends in `extenddb_storage::vector_catalog`. The JSON
+/// columns are text here, so the conversion parses them into values.
 #[derive(sqlx::FromRow)]
 pub(crate) struct VectorIndexRow {
     pub index_name: String,
@@ -65,6 +70,30 @@ pub(crate) struct VectorIndexRow {
     pub projection: String,
     pub index_status: String,
     pub backfilling: Option<i64>,
+}
+
+impl VectorIndexRow {
+    /// Parse the text columns into the backend-neutral row the shared rules take.
+    pub(crate) fn into_catalog_row(self) -> Result<VectorIndexCatalogRow, StorageError> {
+        let json = |text: &str, column: &str| -> Result<serde_json::Value, StorageError> {
+            serde_json::from_str(text).map_err(|e| StorageError::Internal(format!("{column}: {e}")))
+        };
+        Ok(VectorIndexCatalogRow {
+            index_name: self.index_name,
+            dimensions: self.dimensions,
+            distance_function: self.distance_function,
+            vector_attribute: json(&self.vector_attribute, "vector_attribute")?,
+            search_schema: self
+                .search_schema
+                .as_deref()
+                .map(|text| json(text, "vector search_schema"))
+                .transpose()?,
+            projection: json(&self.projection, "vector projection")?,
+            index_status: self.index_status,
+            // Stored as an integer so the ACTIVE state is representable as NULL.
+            backfilling: self.backfilling.map(|b| b != 0),
+        })
+    }
 }
 
 /// Columns selected for a `VectorIndexRow`, in `FromRow` field order.
@@ -122,8 +151,12 @@ impl SqliteEngine {
 
         let table_name_owned = row.table_name.clone();
         let mut desc = self.build_table_description_from_row(account_id, row, index_rows)?;
+        let catalog_rows = vector_rows
+            .into_iter()
+            .map(VectorIndexRow::into_catalog_row)
+            .collect::<Result<Vec<_>, _>>()?;
         desc.vector_indexes =
-            self.vector_index_descriptions(account_id, &table_name_owned, vector_rows)?;
+            vector_index_descriptions(&self.region, account_id, &table_name_owned, catalog_rows)?;
         Ok(desc)
     }
 
@@ -256,6 +289,7 @@ impl SqliteEngine {
                 last_decrease_date_time: None,
             },
             billing_mode_summary,
+            table_throughput_mode_summary: None,
             global_secondary_indexes: (!gsis.is_empty()).then_some(gsis),
             local_secondary_indexes: (!lsis.is_empty()).then_some(lsis),
             stream_specification: stream_spec,
@@ -275,63 +309,6 @@ impl SqliteEngine {
             // adding one does not break this build.
             ..Default::default()
         })
-    }
-
-    /// Build the vector index descriptions for a table.
-    ///
-    /// Separate from `build_table_description_from_row` so the shared builder
-    /// keeps one signature for every caller. Applied on the describe path, which
-    /// is where a client reads an index definition in order to search it.
-    pub(crate) fn vector_index_descriptions(
-        &self,
-        account_id: &str,
-        table_name: &str,
-        vector_rows: Vec<VectorIndexRow>,
-    ) -> Result<Option<Vec<extenddb_core::types::VectorIndexDescription>>, StorageError> {
-        let mut vector_index_descs: Vec<extenddb_core::types::VectorIndexDescription> = Vec::new();
-        for vi in vector_rows {
-            // Deliberately fails rather than defaulting on a bad parse: a vector
-            // index we cannot describe faithfully must not be reported as if we
-            // could, because a client uses the description to build a search.
-            let vector_attribute = parse_json(&vi.vector_attribute, "vector_attribute")?;
-            let search_schema = vi
-                .search_schema
-                .as_deref()
-                .map(|s| parse_json(s, "vector search_schema"))
-                .transpose()?;
-            let projection = parse_json(&vi.projection, "vector projection")?;
-            let distance_function = parse_json(
-                &format!("\"{}\"", vi.distance_function),
-                "distance_function",
-            )?;
-            let index_status = parse_json(&format!("\"{}\"", vi.index_status), "vector status")?;
-            let desc = extenddb_core::types::VectorIndexDescription {
-                index_name: vi.index_name.clone(),
-                vector_attribute,
-                dimensions: u32::try_from(vi.dimensions).map_err(|_| {
-                    StorageError::Internal(format!(
-                        "vector dimensions out of range: {}",
-                        vi.dimensions
-                    ))
-                })?,
-                search_schema,
-                distance_function,
-                index_status,
-                backfilling: vi.backfilling.map(|b| b != 0),
-                index_size_bytes: 0,
-                item_count: 0,
-                index_arn: index_arn(&self.region, account_id, table_name, &vi.index_name),
-                projection: Some(projection),
-            };
-            // The readiness rule is core's, applied here so a backend bug cannot
-            // emit a description the wire contract forbids. Cheaper to catch on
-            // the way out than to debug from a client.
-            desc.validate_readiness()
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            vector_index_descs.push(desc);
-        }
-
-        Ok((!vector_index_descs.is_empty()).then_some(vector_index_descs))
     }
 
     /// Backfill existing base-table items into a newly created GSI, batched to

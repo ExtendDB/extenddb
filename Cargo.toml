@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.8"
+version = "0.1.10"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -64,6 +64,10 @@ moka = { version = "0.12", features = ["future"] }
 
 # Database
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "json", "time", "uuid", "bigdecimal", "derive"] }
+# Vector column type for the PostgreSQL backend. The `sqlx` feature gives a typed
+# `Vector` that encodes and decodes pgvector's binary format, so embeddings keep
+# f32 bit-exactness instead of going through a hand-written text parser.
+pgvector = { version = "0.4", default-features = false, features = ["sqlx"] }
 mongodb = "3"
 bson = "2.13"
 dashmap = "6"

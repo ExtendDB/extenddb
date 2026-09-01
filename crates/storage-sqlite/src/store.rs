@@ -295,6 +295,51 @@ impl SqliteEngine {
         }
     }
 
+    /// Minimum milliseconds an UpdateTable-created vector index stays `CREATING`
+    /// before its `ACTIVE` flip. See
+    /// [`extenddb_core::settings_keys::VECTOR_INDEX_MIN_CREATING_MS`] for why the
+    /// hold exists. Defaults to 1000 when unset or unparseable; zero disables it.
+    pub(crate) async fn vector_index_min_creating_ms(&self) -> u64 {
+        const DEFAULT_MS: u64 = 1_000;
+        let live: Result<Option<(String,)>, _> =
+            sqlx::query_as("SELECT value FROM settings WHERE key = ?")
+                .bind(extenddb_core::settings_keys::VECTOR_INDEX_MIN_CREATING_MS)
+                .fetch_optional(&self.pool)
+                .await;
+        match live {
+            Ok(row) => row
+                .and_then(|(v,)| v.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_MS),
+            Err(e) => {
+                tracing::debug!(
+                    "vector_index_min_creating_ms: live read failed, using {DEFAULT_MS}: {e:?}"
+                );
+                DEFAULT_MS
+            }
+        }
+    }
+
+    /// Milliseconds to hold a new vector index in the resource-allocation phase.
+    ///
+    /// A test lever, zero in production, read live for the same reason the batch
+    /// delay is. Held inside the detached build task rather than in the request
+    /// path, because the phase is only observable to a client after `UpdateTable`
+    /// has returned.
+    pub(crate) async fn vector_allocation_phase_delay(&self) -> u64 {
+        let live: Result<Option<(String,)>, _> =
+            sqlx::query_as("SELECT value FROM settings WHERE key = ?")
+                .bind(extenddb_core::settings_keys::VECTOR_ALLOCATION_PHASE_DELAY_MS)
+                .fetch_optional(&self.pool)
+                .await;
+        match live {
+            Ok(row) => row.and_then(|(v,)| v.parse::<u64>().ok()).unwrap_or(0),
+            Err(e) => {
+                tracing::debug!("vector_allocation_phase_delay: live read failed, using 0: {e:?}");
+                0
+            }
+        }
+    }
+
     /// Handle to the GSI propagation notifier, woken after an enqueue.
     pub(crate) fn gsi_notify(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.gsi_notify)

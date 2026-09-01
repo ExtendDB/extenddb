@@ -14,6 +14,15 @@ pub enum StorageError {
     IndexNotFound(String),
     #[error("Index already exists: {0}")]
     IndexAlreadyExists(String),
+    /// A change refused because an index on the resource is mid-transition.
+    /// Carries the whole client-facing message, because the state, and
+    /// therefore the wording, is known only to the backend that holds it: a
+    /// DeleteTable refused while indexes build carries the sentence AWS
+    /// documents for that case, and a vector index deleted while its creation
+    /// is still allocating resources carries the measured phase-dependent
+    /// refusal (2026-08-19). Maps to `ResourceInUseException` verbatim.
+    #[error("{0}")]
+    IndexesInUse(String),
     #[error("Deletion protection enabled: {0}")]
     DeletionProtected(String),
     #[error("Condition check failed")]

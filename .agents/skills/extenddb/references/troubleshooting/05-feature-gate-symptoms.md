@@ -39,3 +39,25 @@ paths = ["/path/to/exports"]
 ```
 
 **Source:** `docs/troubleshooting.md`, section "`Export is disabled. Configure [export] paths in extenddb.toml to enable.`", last synced 2026-05-12.
+
+### Vector indexes are not supported by this storage backend
+
+<a name="vector-unsupported"></a>
+
+**Error text:**
+```
+Vector indexes are not supported by this storage backend
+SearchVectors is not supported by this storage backend
+```
+
+**Cause:** Vector indexes need the pgvector extension on the PostgreSQL **data**
+database. Support is a property of the server, not of the ExtendDB build, and the
+server probes for the extension once at startup and caches the answer.
+
+**Fix:** Install the extension for the server version (for example
+`postgresql-16-pgvector`), run `CREATE EXTENSION vector;` on the data database, then
+**restart ExtendDB**, because the probe result is cached at startup. The startup log
+line `pgvector ... detected` or `pgvector not installed ...` says which answer the
+running server is serving.
+
+**Source:** `docs/troubleshooting.md`, section "`Vector indexes are not supported by this storage backend`", last synced 2026-08-20.

@@ -250,7 +250,7 @@ Key PostgreSQL settings for extenddb workloads:
 - `shared_buffers`: 25% of available RAM
 - `effective_cache_size`: 75% of available RAM
 - `work_mem`: 64MB (for sort operations in Query/Scan)
-- `max_connections`: ≥ extenddb pool_size + 10
+- `max_connections`: ≥ `2 * pool_size + catalog_pool_size`, plus one per vector index build you expect to overlap and one during a schema migration. `pool_size` sizes both the catalog and the data pool, and `max_connections` is per cluster, so the default pool sizes need 60 of PostgreSQL's default 100
 
 ### Monitoring Queries
 

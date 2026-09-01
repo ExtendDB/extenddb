@@ -25,3 +25,6 @@ extenddb.toml.bak
 extenddb-*.toml
 extenddb-*.toml.bak
 extenddb-*.toml.keep
+
+# Local wire-test instance
+.gw-instance/

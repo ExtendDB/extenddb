@@ -33,45 +33,16 @@
 //! the removal is the point: an item that loses its vector attribute must leave the
 //! index, and skipping the enqueue would leave the stale row in place forever.
 
-use serde::{Deserialize, Serialize};
-
 use extenddb_core::types::{AttributeDefinition, Item, KeySchemaElement, SearchSchemaElementType};
 use extenddb_core::validation::{vector_components, vector_norm};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::pk_to_text;
+use extenddb_storage::vector_lifecycle::{
+    BackfillRow, BatchOutcome, VectorApplyContext, VectorIndexBuild, VectorIndexMeta,
+    classify_backfill_row, item_is_indexable, item_partition, projected_payload,
+};
 
 use super::{BoundValue, all_sort_key_info, sk_bound, vector_table_name};
-use crate::vector_search::partition_value;
-
-/// A vector index as the write path needs it.
-///
-/// Serializable because the asynchronous path snapshots it verbatim into the
-/// pending row's [`VectorApplyContext`]. The write path and the worker therefore
-/// apply from the *same* description of the index, which is the property that stops
-/// a queued write from being reinterpreted under a later definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct VectorIndexMeta {
-    pub index_id: String,
-    pub dimensions: usize,
-    pub vector_attribute_name: String,
-    /// The index's projection, applied to the stored row exactly as the GSI path
-    /// applies its own. Not applying it was an unexplained divergence from the
-    /// sibling, and it made a search return attributes the index does not project.
-    pub projection: extenddb_core::types::Projection,
-    /// The single HASH element's attribute name, when the index declares one.
-    /// `None` means the index is unscoped and every row shares one partition.
-    pub hash_attribute_name: Option<String>,
-    /// Every attribute named by the SearchSchema, HASH and INLINE_FILTER alike.
-    ///
-    /// These are projected regardless of `ProjectionType`, which is the documented
-    /// rule for a vector index and is NOT GSI `KEYS_ONLY` semantics: `KEYS_ONLY`
-    /// on a vector index projects the base primary key, the vector attribute and
-    /// the inline filter attributes. Withholding them is not merely a reporting
-    /// difference, it breaks search: the filter is evaluated against the stored
-    /// payload, so a missing filter attribute makes every row fail the predicate
-    /// and a filtered search match nothing.
-    pub search_schema_attribute_names: Vec<String>,
-}
 
 /// Load the vector indexes of a table.
 ///
@@ -129,38 +100,6 @@ pub(crate) async fn fetch_vector_indexes_for_table(
     Ok(out)
 }
 
-/// Whether an item belongs in a vector index.
-///
-/// It must carry the vector attribute, and the HASH attribute when the index
-/// declares one: without the latter the row could not be placed in a partition,
-/// and putting it in the unscoped partition would make it visible to searches of
-/// every other partition. Not an error, exactly as a GSI silently omits an item
-/// missing its index key.
-fn item_is_indexable(item: &Item, meta: &VectorIndexMeta) -> bool {
-    if !item.contains_key(&meta.vector_attribute_name) {
-        return false;
-    }
-    match &meta.hash_attribute_name {
-        Some(name) => item.contains_key(name),
-        None => true,
-    }
-}
-
-/// The partition column value for an item under one index.
-fn item_partition(item: &Item, meta: &VectorIndexMeta) -> Result<String, StorageError> {
-    match &meta.hash_attribute_name {
-        Some(name) => {
-            let value = item.get(name).ok_or_else(|| {
-                StorageError::Internal(
-                    "indexable check passed but the hash attribute is absent".to_owned(),
-                )
-            })?;
-            partition_value(Some((name.as_str(), value)))
-        }
-        None => partition_value(None),
-    }
-}
-
 /// Base-key bind values for a row, in key-schema order.
 fn base_key_binds(
     item: &Item,
@@ -200,27 +139,6 @@ fn base_key_columns(
         ));
     }
     cols
-}
-
-/// Everything the propagation worker needs to apply one vector index update,
-/// serialized into `gsi_pending.index_context`.
-///
-/// `table_id` is carried here even though the queue row has a `table_id` column of
-/// its own, because a vector data table is named from the table id *and* the index
-/// id. Reading it from the context preserves the invariant that the context alone
-/// is sufficient, rather than splitting one apply's inputs across a column and a
-/// JSON blob. Both are written from the same variable in the same statement, so
-/// they cannot disagree.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct VectorApplyContext {
-    pub(crate) base_key_schema: Vec<KeySchemaElement>,
-    pub(crate) attribute_definitions: Vec<AttributeDefinition>,
-    pub(crate) table_id: String,
-    /// Deliberately named `vector` rather than `index`: it is the field whose
-    /// presence lets the untagged `PendingApplyContext` tell a vector row from a
-    /// GSI row by shape alone. See that type for why the discriminant is a shape
-    /// and not a tag.
-    pub(crate) vector: VectorIndexMeta,
 }
 
 /// Maintain every vector index on a table for one item write.
@@ -381,6 +299,7 @@ async fn apply_vector_index(
         base_key_schema,
         attr_defs,
         key_cols,
+        VectorRowConflict::Fail,
     )
     .await
 }
@@ -394,6 +313,26 @@ async fn apply_vector_index(
 ///
 /// A non-indexable item is a no-op rather than an error, which is what makes a
 /// backfill over a table where only some items carry the vector work.
+/// How [`insert_vector_row`] treats a primary-key conflict.
+///
+/// `Fail` is the write path's contract: every apply reaches the insert through
+/// `apply_vector_index`, which deletes the base key's row first, so a conflict
+/// there means a broken invariant and must be loud. `KeepExisting` is the
+/// BACKFILL's contract: in synchronous-visibility mode
+/// (`index_propagation_delay_ms == 0`) a base write landing mid-backfill is
+/// applied to the CREATING index inline rather than queued, and each backfill
+/// batch reads the base table LIVE under the write lock, so a row already
+/// present was written from the same or a newer base image than the one the
+/// backfill just read; keeping it is correct and inserting over it would only
+/// fail the whole build. Without this, that collision wedged the index in
+/// CREATING permanently (proven by test below).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VectorRowConflict {
+    Fail,
+    KeepExisting,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_vector_row(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table_id: &str,
@@ -402,6 +341,7 @@ pub(crate) async fn insert_vector_row(
     base_key_schema: &[KeySchemaElement],
     attr_defs: &[AttributeDefinition],
     key_cols: &[String],
+    on_conflict: VectorRowConflict,
 ) -> Result<(), StorageError> {
     if !item_is_indexable(item, meta) {
         return Ok(());
@@ -433,44 +373,30 @@ pub(crate) async fn insert_vector_row(
     }
     let norm = vector_norm(&components);
     let part = item_partition(item, meta)?;
-    // Projected exactly as the GSI sibling projects, so a search returns what
-    // the index declares and no more.
-    let mut projected =
-        super::index::project_item_for_index(item, &[], base_key_schema, &meta.projection);
-    // The SearchSchema attributes are always projected, whatever the
-    // ProjectionType. See `search_schema_attribute_names` for why: the inline
-    // filter is evaluated against this payload, so dropping the attribute would
-    // silently turn every filtered search into a zero-result search.
-    for name in &meta.search_schema_attribute_names {
-        if !projected.contains_key(name)
-            && let Some(v) = item.get(name)
-        {
-            projected.insert(name.clone(), v.clone());
-        }
-    }
-    // The vector itself is not kept in the payload: it is already in the `vec`
-    // column as `f32`, which is the width the service validates against, and the
-    // search path rebuilds the attribute from those bits. Keeping a verbatim
-    // decimal copy here duplicated 10 to 15 KB per row at 1024 dimensions and
-    // would have returned the client's original precision where the service
-    // returns the narrowed value.
-    projected.remove(&meta.vector_attribute_name);
+    // Projection, the always-projected SearchSchema attributes, and the stripped
+    // vector attribute are the shared payload rules: see `projected_payload` for
+    // why each holds.
+    let projected = projected_payload(item, base_key_schema, meta);
     let item_json = serde_json::to_string(&projected)
         .map_err(|e| StorageError::Internal(format!("serialize item: {e}")))?;
 
-    // A plain INSERT, deliberately, where the GSI sibling uses INSERT OR REPLACE.
-    // Every caller reaches this through `apply_vector_index`, which unconditionally
-    // deletes the base key's row first, so no live row can exist here and a conflict
-    // is impossible. Keeping it a plain INSERT means that if a future refactor ever
-    // makes that delete conditional, this fails loudly with a primary key violation
-    // rather than silently replacing a row and hiding the broken invariant.
+    // On the write path this stays a plain INSERT, deliberately, where the GSI
+    // sibling uses INSERT OR REPLACE: every apply reaches here through
+    // `apply_vector_index`, which unconditionally deletes the base key's row
+    // first, so a conflict means a broken invariant and must fail loudly. The
+    // backfill passes `KeepExisting` instead; see [`VectorRowConflict`] for
+    // why an existing row is the same-or-newer generation there and must win.
     let cols = std::iter::once("part".to_owned())
         .chain(key_cols.iter().cloned())
         .chain(["vec".to_owned(), "nrm".to_owned(), "item_data".to_owned()])
         .collect::<Vec<_>>();
     let placeholders = vec!["?"; cols.len()].join(", ");
+    let verb = match on_conflict {
+        VectorRowConflict::Fail => "INSERT",
+        VectorRowConflict::KeepExisting => "INSERT OR IGNORE",
+    };
     let sql = format!(
-        "INSERT INTO {vec_table} ({}) VALUES ({placeholders})",
+        "{verb} INTO {vec_table} ({}) VALUES ({placeholders})",
         cols.join(", ")
     );
     let key_binds = base_key_binds(item, base_key_schema, attr_defs)?;
@@ -524,8 +450,8 @@ impl<'a> BackfillPlan<'a> {
 
 /// Backfill one batch of existing rows into the vector index.
 ///
-/// Returns `(written, fetched, last_rowid)`. `fetched` distinguishes a short read
-/// (the end) from a full one, and `last_rowid` is the cursor to resume from.
+/// Returns a [`BatchOutcome`] whose `fetched` distinguishes a short read (the end)
+/// from a full one, and whose `cursor` is the rowid to resume from.
 ///
 /// Pagination is by KEY, not by `OFFSET`. Offset anchors on a position, so removing any
 /// already-scanned row shifts every later position by one and the next batch skips a
@@ -549,24 +475,16 @@ impl<'a> BackfillPlan<'a> {
 ///
 /// It was unreachable while the whole backfill ran in one transaction, and became
 /// reachable the moment batches started committing independently.
-/// One batch's outcome: rows indexed, rows skipped as poison, rows fetched
-/// (for termination), and the cursor for the next batch.
-struct BatchOutcome {
-    written: usize,
-    skipped: usize,
-    fetched: i64,
-    last_rowid: i64,
-}
-
 async fn backfill_vector_batch(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     plan: &BackfillPlan<'_>,
     limit: i64,
-    after_rowid: i64,
-) -> Result<BatchOutcome, StorageError> {
+    after_rowid: Option<i64>,
+) -> Result<BatchOutcome<i64>, StorageError> {
     let base_table = super::data_table_name(plan.table_id);
     // `rowid > ?` with 0 as the initial cursor: every real rowid is positive, so
     // the first batch needs no separate query shape.
+    let after_rowid = after_rowid.unwrap_or(0);
     let sql =
         format!("SELECT rowid, item_data FROM {base_table} WHERE rowid > ? ORDER BY rowid LIMIT ?");
     let rows: Vec<(i64, String)> = sqlx::query_as(&sql)
@@ -576,134 +494,198 @@ async fn backfill_vector_batch(
         .await
         .map_err(crate::sqlite_util::map_sqlx_err)?;
     let fetched = i64::try_from(rows.len()).unwrap_or(limit);
-    let last_rowid = rows.last().map_or(after_rowid, |(rid, _)| *rid);
+    let cursor = rows.last().map(|(rid, _)| *rid);
     let mut written = 0usize;
     let mut skipped = 0usize;
     for (rowid, item_json) in rows {
-        // Poison classification. The live write path treats a malformed vector
-        // as an invariant violation and errors loudly, because core validation
-        // ran before storage was reached. That reasoning is FALSE here: rows
-        // written before the index existed never passed vector validation, so
-        // a malformed or wrong-dimension vector in the base table is expected
-        // input for a backfill, not a bug. Propagating it wedged the build in
-        // an infinite recovery loop: the error left the index CREATING, the
-        // watchdog re-ran the rebuild, and the same row failed again, forever,
-        // while the CREATING hold also froze every queued index write for the
-        // table. A row whose stored bytes cannot enter the index is skipped
-        // and counted instead, exactly as a GSI omits an item whose key
-        // attribute has the wrong type. Transient failures (the INSERT itself
-        // erroring) still propagate: those are retryable and must not drop
-        // rows.
-        let Ok(item) = serde_json::from_str::<Item>(&item_json) else {
-            tracing::warn!(
-                rowid,
-                index = %plan.meta.index_id,
-                "backfill: stored item is unparseable; skipping row"
-            );
-            skipped += 1;
-            continue;
-        };
-        if !item_is_indexable(&item, plan.meta) {
-            continue;
+        // Poison classification lives in the shared lifecycle
+        // (`classify_backfill_row`), so the two producers of a vector row and
+        // every backend skip and count the same rows. Transient failures (the
+        // INSERT below erroring) still propagate: those are retryable and must
+        // not drop rows.
+        match classify_backfill_row(&item_json, plan.meta, &rowid) {
+            BackfillRow::Poison => skipped += 1,
+            BackfillRow::Omit => {}
+            BackfillRow::Index(item) => {
+                insert_vector_row(
+                    tx,
+                    plan.table_id,
+                    plan.meta,
+                    &item,
+                    plan.base_key_schema,
+                    plan.attr_defs,
+                    &plan.key_cols,
+                    VectorRowConflict::KeepExisting,
+                )
+                .await?;
+                written += 1;
+            }
         }
-        let vector_ok = item
-            .get(&plan.meta.vector_attribute_name)
-            .and_then(vector_components)
-            .is_some_and(|c| c.len() == plan.meta.dimensions);
-        if !vector_ok {
-            tracing::warn!(
-                rowid,
-                index = %plan.meta.index_id,
-                "backfill: vector attribute malformed or wrong dimension; skipping row"
-            );
-            skipped += 1;
-            continue;
-        }
-        insert_vector_row(
-            tx,
-            plan.table_id,
-            plan.meta,
-            &item,
-            plan.base_key_schema,
-            plan.attr_defs,
-            &plan.key_cols,
-        )
-        .await?;
-        written += 1;
     }
     Ok(BatchOutcome {
         written,
         skipped,
         fetched,
-        last_rowid,
+        cursor,
     })
 }
 
-/// A completed backfill: rows indexed and rows skipped as poison. `skipped`
-/// is recorded on the catalog row so an ACTIVE index that deliberately omits
-/// rows says so, rather than the omission being indistinguishable from a bug.
-pub(crate) struct BackfillOutcome {
-    pub(crate) written: usize,
-    pub(crate) skipped: usize,
+/// The SQLite implementation of the shared build-lifecycle primitives
+/// (`extenddb_storage::vector_lifecycle`).
+///
+/// One value describes one index under construction. The shared drivers
+/// (`run_backfill`, `complete_build`, `rebuild_index`) own the ordering rules;
+/// this type owns the SQL: each batch takes the engine write lock and a
+/// `BEGIN IMMEDIATE` transaction and releases both before it returns, which is
+/// what lets the base table stay writable while the index builds.
+///
+/// `meta` starts `None` on the recovery path: the definition is read from the
+/// catalog inside `reset_data_table`'s transaction, because the request that
+/// created the index is long gone. The create path loads it up front.
+pub(crate) struct SqliteVectorBuild {
+    pub(crate) pool: sqlx::SqlitePool,
+    pub(crate) write_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    pub(crate) gsi_notify: std::sync::Arc<tokio::sync::Notify>,
+    pub(crate) table_id: String,
+    pub(crate) index_id: String,
+    pub(crate) base_key_schema: Vec<KeySchemaElement>,
+    pub(crate) attribute_definitions: Vec<AttributeDefinition>,
+    pub(crate) meta: Option<VectorIndexMeta>,
 }
 
-/// Backfill the index in independently committed batches, releasing SQLite's write
-/// lock between them.
-///
-/// This is what lets the base table stay writable while an index builds, which is how
-/// the service behaves: the table remains ACTIVE and accepts writes throughout, and
-/// only the index reports CREATING. Holding one transaction for the whole backfill
-/// would block every write until it finished.
-///
-/// Releasing the lock is also what creates the ordering hazard this design has to
-/// answer. A write landing mid-backfill is enqueued, and if it were applied before the
-/// backfill wrote its older snapshot of the same item, the index would converge on the
-/// stale generation. The queue worker therefore refuses to claim any row for a table
-/// whose vector index is still CREATING, so those writes accumulate and are applied
-/// only after this returns and the index flips to ACTIVE.
-///
-/// A crash part-way leaves the index in CREATING with some rows written, which
-/// `reconcile_incomplete_vector_indexes` repairs at startup by rebuilding it.
-pub(crate) async fn backfill_vector_index_in_batches(
-    pool: &sqlx::SqlitePool,
-    write_lock: &tokio::sync::Mutex<()>,
-    table_id: &str,
-    meta: &VectorIndexMeta,
-    base_key_schema: &[KeySchemaElement],
-    attr_defs: &[AttributeDefinition],
-    batch_delay: std::time::Duration,
-) -> Result<BackfillOutcome, StorageError> {
-    const BATCH: i64 = 500;
-    let plan = BackfillPlan::new(table_id, meta, base_key_schema, attr_defs);
-    let mut cursor: i64 = 0;
-    let mut written = 0usize;
-    let mut skipped = 0usize;
-    loop {
-        let outcome = {
-            let _writer = write_lock.lock().await;
-            let mut tx = pool
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .map_err(crate::sqlite_util::map_sqlx_err)?;
-            let result = backfill_vector_batch(&mut tx, &plan, BATCH, cursor).await?;
-            tx.commit()
-                .await
-                .map_err(crate::sqlite_util::map_sqlx_err)?;
-            result
-        };
-        written += outcome.written;
-        skipped += outcome.skipped;
-        if outcome.fetched < BATCH {
-            break;
-        }
-        cursor = outcome.last_rowid;
-        // Outside the lock, so a write can actually proceed during the pause. Zero in
-        // production; a test sets it so a write is guaranteed to land mid-backfill.
-        if !batch_delay.is_zero() {
-            tokio::time::sleep(batch_delay).await;
-        }
+impl VectorIndexBuild for SqliteVectorBuild {
+    /// `rowid`, not the primary key: unique whatever the key layout, and valid
+    /// because every write is `INSERT ... ON CONFLICT DO UPDATE`, which never
+    /// reassigns one. See `backfill_vector_batch` for the full argument.
+    type Cursor = i64;
+
+    async fn backfill_batch(
+        &mut self,
+        cursor: Option<i64>,
+        limit: i64,
+    ) -> Result<BatchOutcome<i64>, StorageError> {
+        let meta = self.meta.as_ref().ok_or_else(|| {
+            StorageError::Internal(
+                "vector backfill started before the index definition was loaded".to_owned(),
+            )
+        })?;
+        let plan = BackfillPlan::new(
+            &self.table_id,
+            meta,
+            &self.base_key_schema,
+            &self.attribute_definitions,
+        );
+        // Lock and transaction are scoped to the batch and released before this
+        // returns, so the driver's inter-batch pause really lets a write through.
+        let _writer = self.write_lock.lock().await;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(crate::sqlite_util::map_sqlx_err)?;
+        let outcome = backfill_vector_batch(&mut tx, &plan, limit, cursor).await?;
+        tx.commit()
+            .await
+            .map_err(crate::sqlite_util::map_sqlx_err)?;
+        Ok(outcome)
     }
-    Ok(BackfillOutcome { written, skipped })
+
+    async fn set_backfilling(&mut self) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE vector_indexes SET backfilling = 1 WHERE table_id = ? AND index_id = ?",
+        )
+        .bind(&self.table_id)
+        .bind(&self.index_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn mark_active(&mut self, skipped: usize) -> Result<(), StorageError> {
+        // `backfilling` is cleared to NULL rather than set to 0, because the
+        // service removes the member once ACTIVE and the catalog CHECK
+        // constraint enforces that pairing.
+        let flipped = sqlx::query(
+            "UPDATE vector_indexes SET index_status = 'ACTIVE', backfilling = NULL, \
+             skipped_item_count = ? \
+             WHERE table_id = ? AND index_id = ?",
+        )
+        .bind(i64::try_from(skipped).unwrap_or(i64::MAX))
+        .bind(&self.table_id)
+        .bind(&self.index_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        if flipped.rows_affected() == 0 {
+            // No row to flip means a delete committed while this build was
+            // running, and a rebuild recreates its data table after reading the
+            // definition back. A delete landing in between drops the table it
+            // could see, and this build then recreates one nothing references.
+            // The absent catalog row is the proof the index is gone.
+            let _writer = self.write_lock.lock().await;
+            crate::SqliteEngine::drop_vector_data_table_by_id(
+                &self.pool,
+                &self.table_id,
+                &self.index_id,
+            )
+            .await?;
+            tracing::info!(
+                index_id = %self.index_id,
+                table_id = %self.table_id,
+                "vector index was deleted while its build ran; dropped the rebuilt data table"
+            );
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    async fn reset_data_table(&mut self) -> Result<(), StorageError> {
+        // Drop and recreate under the lock; the definition is read from the
+        // catalog rather than reconstructed, because the request that created
+        // it is long gone.
+        let _writer = self.write_lock.lock().await;
+        crate::SqliteEngine::drop_vector_data_table_by_id(
+            &self.pool,
+            &self.table_id,
+            &self.index_id,
+        )
+        .await?;
+        let mut data_tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        crate::SqliteEngine::create_vector_data_table(
+            &mut data_tx,
+            &self.table_id,
+            &self.index_id,
+            &self.base_key_schema,
+            &self.attribute_definitions,
+        )
+        .await?;
+        let meta = fetch_vector_indexes_for_table(&mut data_tx, &self.table_id)
+            .await?
+            .into_iter()
+            .find(|m| m.index_id == self.index_id)
+            .ok_or_else(|| {
+                StorageError::Internal(format!(
+                    "vector index {} was selected as CREATING but has no catalog row",
+                    self.index_id
+                ))
+            })?;
+        data_tx
+            .commit()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        self.meta = Some(meta);
+        Ok(())
+    }
+
+    fn notify_active(&mut self) {
+        self.gsi_notify.notify_waiters();
+    }
 }
 
 #[cfg(test)]
@@ -801,7 +783,7 @@ mod tests {
         };
         let plan = BackfillPlan::new(table_id, &meta, &ks, &ad);
 
-        let mut cursor: i64 = 0;
+        let mut cursor: Option<i64> = None;
         let mut written = 0usize;
         loop {
             let outcome = backfill_vector_batch(&mut tx, &plan, 3, cursor)
@@ -811,7 +793,7 @@ mod tests {
             if outcome.fetched < 3 {
                 break;
             }
-            cursor = outcome.last_rowid;
+            cursor = outcome.cursor;
         }
         tx.commit().await.expect("commit");
 
@@ -916,7 +898,7 @@ mod tests {
         };
         let plan = BackfillPlan::new(table_id, &meta, &ks, &ad);
 
-        let outcome = backfill_vector_batch(&mut tx, &plan, 100, 0)
+        let outcome = backfill_vector_batch(&mut tx, &plan, 100, None)
             .await
             .expect("a batch containing poison rows must still complete");
         tx.commit().await.expect("commit");
@@ -932,5 +914,132 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(rows, 3);
+    }
+    /// A synchronous-visibility write (`index_propagation_delay_ms == 0`)
+    /// landing mid-backfill is applied to the CREATING index inline, bypassing
+    /// the queue's CREATING-hold. When the backfill later reaches that base
+    /// key it must keep the row the inline write produced rather than fail the
+    /// whole build on the primary-key conflict: each batch reads the base
+    /// table live under the write lock, so an existing row was written from
+    /// the same or a newer base image than the one the batch just read. Before
+    /// `VectorRowConflict::KeepExisting`, this collision errored the backfill
+    /// and wedged the index in CREATING permanently.
+    #[tokio::test]
+    async fn a_synchronous_write_landing_mid_backfill_does_not_wedge_the_build() {
+        use extenddb_core::types::{
+            AttributeDefinition, KeySchemaElement, KeyType, ScalarAttributeType,
+        };
+        let engine = crate::SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::schema::apply(&engine.pool).await.expect("schema");
+
+        let ks = vec![KeySchemaElement {
+            attribute_name: "pk".to_owned(),
+            key_type: KeyType::Hash,
+        }];
+        let ad = vec![AttributeDefinition {
+            attribute_name: "pk".to_owned(),
+            attribute_type: ScalarAttributeType::S,
+        }];
+
+        let table_id = "t-inline-collision";
+        let mut tx = engine.pool.begin_with("BEGIN IMMEDIATE").await.expect("tx");
+        crate::SqliteEngine::create_data_table(&mut tx, table_id, &ks, &ad)
+            .await
+            .expect("base table");
+        crate::SqliteEngine::create_vector_data_table(&mut tx, table_id, "vidx-c", &ks, &ad)
+            .await
+            .expect("vector table");
+        // Catalog rows: a table and its index still CREATING with a build in
+        // flight, which is the state a mid-backfill write observes.
+        sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES ('a', 'a')")
+            .execute(&mut *tx)
+            .await
+            .expect("account row");
+        sqlx::query(
+            "INSERT INTO tables (account_id, table_name, key_schema, attribute_definitions, \
+             billing_mode, table_status, creation_date_time, table_arn, table_id) \
+             VALUES ('a', 't', '[]', '[]', 'PAY_PER_REQUEST', 'ACTIVE', 'now', 'arn', ?)",
+        )
+        .bind(table_id)
+        .execute(&mut *tx)
+        .await
+        .expect("table row");
+        sqlx::query(
+            "INSERT INTO vector_indexes (table_id, index_name, index_id, dimensions, \
+             distance_function, vector_attribute, search_schema, projection, index_status, \
+             backfilling) \
+             VALUES (?, 'vidx-c', 'vidx-c', 2, 'COSINE', ?, NULL, ?, 'CREATING', 1)",
+        )
+        .bind(table_id)
+        .bind(r#"{"AttributeName":"emb"}"#)
+        .bind(r#"{"ProjectionType":"ALL"}"#)
+        .execute(&mut *tx)
+        .await
+        .expect("index row");
+        let base_table = super::super::data_table_name(table_id);
+        sqlx::query(&format!(
+            "INSERT INTO {base_table} (pk, item_data) VALUES ('z', ?)"
+        ))
+        .bind(r#"{"pk":{"S":"z"},"emb":{"L":[{"N":"1"},{"N":"0"}]}}"#)
+        .execute(&mut *tx)
+        .await
+        .expect("seed base row");
+
+        // The inline write: at delay 0 maintenance applies to the CREATING
+        // index directly rather than enqueueing.
+        let item: extenddb_core::types::Item =
+            serde_json::from_str(r#"{"pk":{"S":"z"},"emb":{"L":[{"N":"1"},{"N":"0"}]}}"#)
+                .expect("item");
+        let enqueued = maintain_vector_indexes(&mut tx, table_id, &ks, &ad, None, Some(&item), 0)
+            .await
+            .expect("inline maintenance");
+        assert_eq!(
+            enqueued, 0,
+            "delay 0 must take the inline arm, not the queue"
+        );
+        tx.commit().await.expect("commit");
+
+        // The backfill now reaches the same base key and must complete rather
+        // than error on the conflict, leaving exactly one row for the key.
+        let meta = fetch_vector_indexes_for_table(
+            &mut engine.pool.begin_with("BEGIN IMMEDIATE").await.expect("tx"),
+            table_id,
+        )
+        .await
+        .expect("metas")
+        .into_iter()
+        .find(|m| m.index_id == "vidx-c")
+        .expect("meta");
+        // Driven through the shared driver over the backend hooks, which is the
+        // production path since the lifecycle extraction.
+        let mut ops = SqliteVectorBuild {
+            pool: engine.pool.clone(),
+            write_lock: std::sync::Arc::clone(&engine.write_lock),
+            gsi_notify: engine.gsi_notify(),
+            table_id: table_id.to_owned(),
+            index_id: "vidx-c".to_owned(),
+            base_key_schema: ks.clone(),
+            attribute_definitions: ad.clone(),
+            meta: Some(meta),
+        };
+        let outcome = extenddb_storage::vector_lifecycle::run_backfill(
+            &mut ops,
+            extenddb_storage::vector_lifecycle::BACKFILL_BATCH,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("backfill must not wedge on the inline write's row");
+        assert_eq!(outcome.skipped, 0);
+        let vec_table = super::super::vector_table_name(table_id, "vidx-c");
+        let (rows,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {vec_table}"))
+            .fetch_one(&engine.pool)
+            .await
+            .expect("count");
+        assert_eq!(
+            rows, 1,
+            "one base key must yield one index row, not a duplicate"
+        );
     }
 }

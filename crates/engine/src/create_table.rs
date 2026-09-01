@@ -15,14 +15,21 @@ pub async fn handle_create_table(
 ) -> Result<Value, DynamoDbError> {
     crate::validate_enum_fields(
         &body,
-        &[crate::EnumField {
-            json_name: "BillingMode",
-            valid: &["PROVISIONED", "PAY_PER_REQUEST"],
-            clause: crate::EnumClause::Named("billingMode"),
-        }],
+        &[
+            crate::EnumField {
+                json_name: "BillingMode",
+                valid: &["PROVISIONED", "PAY_PER_REQUEST"],
+                clause: crate::EnumClause::Named("billingMode"),
+            },
+            crate::EnumField {
+                json_name: "TableThroughputMode",
+                valid: &["PROVISIONED", "PAY_PER_REQUEST"],
+                clause: crate::EnumClause::Named("tableThroughputMode"),
+            },
+        ],
     )?;
 
-    let input: CreateTableInput = serde_json::from_value(body).map_err(|e| {
+    let mut input: CreateTableInput = serde_json::from_value(body).map_err(|e| {
         let msg = e.to_string();
         if msg.contains("validation error detected")
             || msg.contains("parameter values were invalid")
@@ -41,8 +48,17 @@ pub async fn handle_create_table(
             ))
         }
     })?;
+    input.resolve_table_throughput_mode();
 
     validate_create_table(&input, &ctx.limits)?;
+
+    // An empty SearchSchema means the same as an absent one, so it is collapsed
+    // here, once, rather than in each backend. Storing the empty list would make
+    // DescribeTable echo a state the service never reports, and would leave two
+    // backends free to disagree about it.
+    for spec in input.vector_indexes.iter_mut().flatten() {
+        spec.normalize_search_schema();
+    }
 
     crate::vector_gate::ensure_create_table_supported(
         input.vector_indexes.as_ref(),
@@ -53,7 +69,7 @@ pub async fn handle_create_table(
     // Kept for the post-condition check below, since `input` is moved into the
     // backend call.
     let requested_vector_indexes = input.vector_indexes.clone();
-    let table_desc = ctx
+    let mut table_desc = ctx
         .storage
         .create_table(&ctx.account_id, input)
         .await
@@ -87,6 +103,7 @@ pub async fn handle_create_table(
     );
     ctx.auth_cache.invalidate_resource_tags(&arn).await;
 
+    table_desc.populate_table_throughput_mode_summary();
     let output = CreateTableOutput {
         table_description: table_desc,
     };
@@ -112,8 +129,12 @@ pub(crate) fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) ->
         StorageError::IndexAlreadyExists(name) => DynamoDbError::ValidationException(format!(
             "One or more parameter values were invalid: Index already exists: {name}"
         )),
-        StorageError::LimitExceeded(msg) => DynamoDbError::LimitExceededException(msg),
-        // Retryable by definition, so it maps like Connection: a 503 the SDKs
+        // The resource exists and the request is well formed; its current state
+        // forbids the change. The backend owns the wording because it owns the
+        // state: the documented delete-table sentence and the measured
+        // phase-dependent vector refusal both arrive through this one arm.
+        StorageError::IndexesInUse(msg) => DynamoDbError::ResourceInUseException(msg),
+        StorageError::LimitExceeded(msg) => DynamoDbError::LimitExceededException(msg), // Retryable by definition, so it maps like Connection: a 503 the SDKs
         // retry, rather than a 500 they surface.
         StorageError::Transient(msg) => {
             tracing::warn!(transient_error = %msg, "transient storage error");
