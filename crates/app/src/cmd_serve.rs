@@ -159,16 +159,10 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     // The wordmark is pure 7-bit ASCII on purpose: it renders identically in
     // dumb terminals, container log viewers, and syslog-adjacent collectors
     // that mangle wide Unicode. It prints once per boot, never per request.
-    let wordmark = concat!(
-        "    ______     __                 ______  ____\n",
-        "   / ____/  __/ /____  ____  ____/ / __ \\/ __ )\n",
-        "  / __/ | |/_/ __/ _ \\/ __ \\/ __  / / / / __  |\n",
-        " / /____>  </ /_/  __/ / / / /_/ / /_/ / /_/ /\n",
-        "/_____/_/|_|\\__/\\___/_/ /_/\\__,_/_____/_____/\n",
-        "\n",
-        "  DynamoDB-compatible: any SDK, CLI, or tool, unchanged.\n",
-        "\n",
-    );
+    // Color is applied only when the destination stream is an interactive
+    // terminal (and NO_COLOR/TERM=dumb are respected), so pipes, `docker
+    // logs`, and supervisors always receive the plain form.
+    let wordmark = render_wordmark(banner_colors_enabled(args.foreground));
     let banner_line1 = format!(
         "extenddb {} (catalog {}) starting on {}",
         build.version, catalog_version, bind_addr,
@@ -276,6 +270,66 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
                 })
                 .with_dev_mode(cfg!(feature = "dev-mode")),
         ))
+}
+
+/// The five wordmark rows (figlet slant), without trailing newlines.
+const WORDMARK_LINES: [&str; 5] = [
+    "    ______     __                 ______  ____",
+    "   / ____/  __/ /____  ____  ____/ / __ \\/ __ )",
+    "  / __/ | |/_/ __/ _ \\/ __ \\/ __  / / / / __  |",
+    " / /____>  </ /_/  __/ / / / /_/ / /_/ / /_/ /",
+    "/_____/_/|_|\\__/\\___/_/ /_/\\__,_/_____/_____/",
+];
+const TAGLINE: &str = "  DynamoDB-compatible: any SDK, CLI, or tool, unchanged.";
+
+/// Whether the banner's destination stream is an interactive terminal that
+/// wants color: never for pipes and `docker logs`, and both the NO_COLOR
+/// convention (<https://no-color.org>) and `TERM=dumb` opt out.
+fn banner_colors_enabled(foreground: bool) -> bool {
+    use std::io::IsTerminal;
+
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if std::env::var("TERM").is_ok_and(|t| t == "dumb") {
+        return false;
+    }
+    // Match the banner's stream split: stderr in foreground mode, stdout for
+    // the daemon parent.
+    if foreground {
+        std::io::stderr().is_terminal()
+    } else {
+        std::io::stdout().is_terminal()
+    }
+}
+
+/// Render the wordmark block: five art rows, a blank line, the tagline, and a
+/// closing blank line. With color, the rows fade gold to deep orange
+/// (256-color codes, an ANSI level every interactive terminal supports) and
+/// the tagline dims; without, the output is byte-identical to the historical
+/// plain form.
+fn render_wordmark(color: bool) -> String {
+    // Gold fading to deep orange, one shade per row.
+    const ROW_COLORS: [u8; 5] = [220, 214, 208, 202, 166];
+
+    let mut out = String::new();
+    for (i, line) in WORDMARK_LINES.iter().enumerate() {
+        if color {
+            out.push_str(&format!("\x1b[38;5;{}m{line}\x1b[0m\n", ROW_COLORS[i]));
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.push('\n');
+    if color {
+        out.push_str(&format!("\x1b[2m{TAGLINE}\x1b[0m\n"));
+    } else {
+        out.push_str(TAGLINE);
+        out.push('\n');
+    }
+    out.push('\n');
+    out
 }
 
 /// Print the developer-mode banner lines: the mode notice, the credentials to
