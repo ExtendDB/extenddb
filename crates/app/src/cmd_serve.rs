@@ -155,6 +155,20 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     // it to stderr so a process supervisor receives banner and tracing logs
     // on the same stream — mixing stdout and stderr makes container log
     // capture noisier than necessary.
+    //
+    // The wordmark is pure 7-bit ASCII on purpose: it renders identically in
+    // dumb terminals, container log viewers, and syslog-adjacent collectors
+    // that mangle wide Unicode. It prints once per boot, never per request.
+    let wordmark = concat!(
+        "    ______     __                 ______  ____\n",
+        "   / ____/  __/ /____  ____  ____/ / __ \\/ __ )\n",
+        "  / __/ | |/_/ __/ _ \\/ __ \\/ __  / / / / __  |\n",
+        " / /____>  </ /_/  __/ / / / /_/ / /_/ / /_/ /\n",
+        "/_____/_/|_|\\__/\\___/_/ /_/\\__,_/_____/_____/\n",
+        "\n",
+        "  DynamoDB-compatible: any SDK, CLI, or tool, unchanged.\n",
+        "\n",
+    );
     let banner_line1 = format!(
         "extenddb {} (catalog {}) starting on {}",
         build.version, catalog_version, bind_addr,
@@ -165,9 +179,11 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         config::redact_password(app_config.storage.connection_config()),
     );
     if args.foreground {
+        eprint!("{wordmark}");
         eprintln!("{banner_line1}");
         eprintln!("{banner_line2}");
     } else {
+        print!("{wordmark}");
         println!("{banner_line1}");
         println!("{banner_line2}");
     }
