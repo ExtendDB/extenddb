@@ -58,6 +58,10 @@ pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
         "V003__account_scoped_idempotency.cql",
         include_str!("../migrations/catalog/V003__account_scoped_idempotency.cql"),
     ),
+    (
+        "V004__ttl_generation.cql",
+        include_str!("../migrations/catalog/V004__ttl_generation.cql"),
+    ),
 ];
 
 /// Embedded data migration files, applied in order.
@@ -69,6 +73,10 @@ pub(crate) const DATA_MIGRATIONS: &[(&str, &str)] = &[
     (
         "V002__backup_items.cql",
         include_str!("../migrations/data/V002__backup_items.cql"),
+    ),
+    (
+        "V003__ttl_expirations.cql",
+        include_str!("../migrations/data/V003__ttl_expirations.cql"),
     ),
 ];
 
@@ -91,7 +99,7 @@ pub async fn run_catalog_migrations(
             continue;
         }
         println!("    Applying {filename}...");
-        execute_migration(session, sql).await?;
+        execute_migration(session, sql, keyspace).await?;
         record_migration(session, keyspace, filename).await?;
     }
     println!("    Migrations applied.");
@@ -114,7 +122,7 @@ pub async fn run_data_migrations(session: &Arc<CassandraSession>, keyspace: &str
             continue;
         }
         println!("    Applying {filename}...");
-        execute_migration(session, sql).await?;
+        execute_migration(session, sql, keyspace).await?;
         record_migration(session, keyspace, filename).await?;
     }
     println!("    Data migrations applied.");
@@ -184,9 +192,7 @@ async fn is_migration_applied(
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| OpError::Internal(format!("Invalid migration filename: {filename}")))?;
 
-    let check_cql = format!(
-        "SELECT version FROM {keyspace}.schema_history WHERE version = ?"
-    );
+    let check_cql = format!("SELECT version FROM {keyspace}.schema_history WHERE version = ?");
 
     let applied = session
         .query_with_values(check_cql, cdrs_tokio::query_values!(version))
@@ -200,8 +206,13 @@ async fn is_migration_applied(
 }
 
 /// Execute a migration by splitting on semicolons and running each statement.
-async fn execute_migration(session: &Arc<CassandraSession>, sql: &str) -> OpResult<()> {
-    for statement in sql.split(';').filter(|s| !s.trim().is_empty()) {
+async fn execute_migration(
+    session: &Arc<CassandraSession>,
+    sql: &str,
+    keyspace: &str,
+) -> OpResult<()> {
+    let qualified = sql.replace("{{keyspace}}", keyspace);
+    for statement in qualified.split(';').filter(|s| !s.trim().is_empty()) {
         let stmt = statement.trim();
         if stmt.is_empty() {
             continue;

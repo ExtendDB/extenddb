@@ -36,6 +36,9 @@ impl CassandraEngine {
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
     ) -> Result<(Option<Item>, Option<Item>), StorageError> {
+        // Fence a request that resumes after its expiring TTL claim: all cells in
+        // its batch retain this start timestamp and lose to later transaction state.
+        let mutation_timestamp = chrono::Utc::now().timestamp_micros();
         let data_keyspace = self.account_keyspace(&key_info.account_id);
         let ddb_table = data_table_name(&key_info.table_id);
 
@@ -52,6 +55,9 @@ impl CassandraEngine {
             &catalog_keyspace,
         )
         .await?;
+        let ttl_config = self
+            .ttl_config_for_table(&key_info.account_id, &key_info.table_name)
+            .await?;
         let sys_delay = if indexes.is_empty() {
             0
         } else {
@@ -104,9 +110,8 @@ impl CassandraEngine {
                         },
                     ]));
                 }
-                let item_data: String =
-                    crate::cassandra_util::get_column(row, "item_data", "update_item")?;
-                Some(json_to_item(item_data)?)
+                let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+                item_data.map(json_to_item).transpose()?
             } else {
                 None
             }
@@ -138,9 +143,8 @@ impl CassandraEngine {
                         },
                     ]));
                 }
-                let item_data: String =
-                    crate::cassandra_util::get_column(&row, "item_data", "update_item")?;
-                Some(json_to_item(item_data)?)
+                let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+                item_data.map(json_to_item).transpose()?
             } else {
                 None
             }
@@ -156,7 +160,7 @@ impl CassandraEngine {
 
         // Only capture pre-mutation item when the item already existed; for upserts
         // (item_existed == false) there is no old image to record.
-        let pre_mutation_item = if (!indexes.is_empty() || stream.is_some()) && item_existed {
+        let pre_mutation_item = if item_existed {
             Some(item.clone())
         } else {
             None
@@ -191,6 +195,13 @@ impl CassandraEngine {
 
         let new_item = if return_new { Some(item.clone()) } else { None };
 
+        let ttl_claim = if ttl_config.is_some() {
+            self.acquire_ttl_mutation_claim(key_info, key, pre_mutation_item.as_ref())
+                .await?
+        } else {
+            None
+        };
+
         // Write the updated item back
         let item_json =
             serde_json::to_value(&item).map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -215,7 +226,9 @@ impl CassandraEngine {
             let sk_col = sk_column(sk_type);
 
             let update_cql = format!(
-                "UPDATE {data_keyspace}.{ddb_table} SET item_data = ? WHERE pk = ? AND {sk_col} = ?"
+                "UPDATE {}.{} SET item_data = ?, prepared_txn_id = null, \
+                 prepared_txn_timestamp = null WHERE pk = ? AND {} = ?",
+                data_keyspace, ddb_table, sk_col
             );
 
             let stream_stmt = stream.and_then(|cap| {
@@ -231,7 +244,12 @@ impl CassandraEngine {
                 )
             });
 
-            if indexes.is_empty() && stream_stmt.is_none() {
+            if indexes.is_empty()
+                && stream_stmt.is_none()
+                && ttl_config.is_none()
+                && ttl_claim.is_none()
+                && !super::ttl::reconciliation_outbox_required()
+            {
                 query_with_pk_sk_item(&self.session, &update_cql, &pk_text, &sk, &item_json_str)
                     .await?;
             } else {
@@ -240,9 +258,11 @@ impl CassandraEngine {
                     cdrs_tokio::types::value::Value::from(pk_text.as_ref() as &str),
                     super::index::sk_to_value(&sk),
                 ]);
-                let mut batch = BatchQueryBuilder::new()
-                    .with_consistency(Consistency::LocalQuorum)
-                    .add_query(update_cql, update_qv);
+                let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+                if ttl_claim.is_some() {
+                    batch = batch.with_timestamp(mutation_timestamp);
+                }
+                batch = batch.add_query(update_cql, update_qv);
 
                 if !indexes.is_empty() {
                     super::index::sync_indexes(
@@ -273,19 +293,45 @@ impl CassandraEngine {
                     0
                 };
 
+                super::ttl::add_ttl_reconciliation_mutation(
+                    &mut batch,
+                    &data_keyspace,
+                    key_info,
+                    &item,
+                )?;
+
+                if let Some(config) = ttl_config.as_ref() {
+                    super::ttl::add_ttl_queue_mutations(
+                        &mut batch,
+                        &data_keyspace,
+                        key_info,
+                        &config.attribute,
+                        config.generation,
+                        pre_mutation_item.as_ref(),
+                        Some(&item),
+                    )?;
+                }
+
                 if let Some(stmt) = stream_stmt {
                     batch =
                         batch.add_query(stmt, cdrs_tokio::query::QueryValues::SimpleValues(vec![]));
                 }
 
-                self.session
-                    .batch(
-                        batch
-                            .build()
-                            .map_err(|e| StorageError::Internal(e.to_string()))?,
-                    )
-                    .await
-                    .map_err(|e| StorageError::Internal(format!("Batch execution: {e}")))?;
+                let built = match batch.build() {
+                    Ok(built) => built,
+                    Err(error) => {
+                        self.release_ttl_mutation_claim(key_info, key, ttl_claim)
+                            .await;
+                        return Err(StorageError::Internal(error.to_string()));
+                    }
+                };
+                if let Err(error) = self.session.batch(built).await {
+                    self.release_ttl_mutation_claim(key_info, key, ttl_claim)
+                        .await;
+                    return Err(StorageError::Internal(format!("Batch execution: {error}")));
+                }
+                self.release_ttl_mutation_claim(key_info, key, ttl_claim)
+                    .await;
 
                 if async_enqueued > 0 {
                     self.gsi_queue.notify_workers();
@@ -293,7 +339,9 @@ impl CassandraEngine {
             }
         } else {
             let update_cql = format!(
-                "UPDATE {data_keyspace}.{ddb_table} SET item_data = ? WHERE pk = ?"
+                "UPDATE {}.{} SET item_data = ?, prepared_txn_id = null, \
+                 prepared_txn_timestamp = null WHERE pk = ?",
+                data_keyspace, ddb_table
             );
 
             let stream_stmt = stream.and_then(|cap| {
@@ -309,7 +357,12 @@ impl CassandraEngine {
                 )
             });
 
-            if indexes.is_empty() && stream_stmt.is_none() {
+            if indexes.is_empty()
+                && stream_stmt.is_none()
+                && ttl_config.is_none()
+                && ttl_claim.is_none()
+                && !super::ttl::reconciliation_outbox_required()
+            {
                 crate::cassandra_util::execute(
                     &self.session,
                     &update_cql,
@@ -322,9 +375,11 @@ impl CassandraEngine {
                     item_json_str.as_str().into(),
                     cdrs_tokio::types::value::Value::from(pk_text.as_ref() as &str),
                 ]);
-                let mut batch = BatchQueryBuilder::new()
-                    .with_consistency(Consistency::LocalQuorum)
-                    .add_query(update_cql, update_qv);
+                let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+                if ttl_claim.is_some() {
+                    batch = batch.with_timestamp(mutation_timestamp);
+                }
+                batch = batch.add_query(update_cql, update_qv);
 
                 if !indexes.is_empty() {
                     super::index::sync_indexes(
@@ -355,19 +410,45 @@ impl CassandraEngine {
                     0
                 };
 
+                super::ttl::add_ttl_reconciliation_mutation(
+                    &mut batch,
+                    &data_keyspace,
+                    key_info,
+                    &item,
+                )?;
+
+                if let Some(config) = ttl_config.as_ref() {
+                    super::ttl::add_ttl_queue_mutations(
+                        &mut batch,
+                        &data_keyspace,
+                        key_info,
+                        &config.attribute,
+                        config.generation,
+                        pre_mutation_item.as_ref(),
+                        Some(&item),
+                    )?;
+                }
+
                 if let Some(stmt) = stream_stmt {
                     batch =
                         batch.add_query(stmt, cdrs_tokio::query::QueryValues::SimpleValues(vec![]));
                 }
 
-                self.session
-                    .batch(
-                        batch
-                            .build()
-                            .map_err(|e| StorageError::Internal(e.to_string()))?,
-                    )
-                    .await
-                    .map_err(|e| StorageError::Internal(format!("Batch execution: {e}")))?;
+                let built = match batch.build() {
+                    Ok(built) => built,
+                    Err(error) => {
+                        self.release_ttl_mutation_claim(key_info, key, ttl_claim)
+                            .await;
+                        return Err(StorageError::Internal(error.to_string()));
+                    }
+                };
+                if let Err(error) = self.session.batch(built).await {
+                    self.release_ttl_mutation_claim(key_info, key, ttl_claim)
+                        .await;
+                    return Err(StorageError::Internal(format!("Batch execution: {error}")));
+                }
+                self.release_ttl_mutation_claim(key_info, key, ttl_claim)
+                    .await;
 
                 if async_enqueued > 0 {
                     self.gsi_queue.notify_workers();
@@ -375,6 +456,12 @@ impl CassandraEngine {
             }
         }
 
+        if let Err(error) = self.reconcile_ttl_item(key_info, &item).await {
+            tracing::warn!(
+                table = %key_info.table_name,
+                "deferred post-commit TTL reconciliation for UpdateItem: {error}"
+            );
+        }
         Ok((old_item, new_item))
     }
 }

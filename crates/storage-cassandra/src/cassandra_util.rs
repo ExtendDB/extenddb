@@ -17,6 +17,30 @@ pub type CassandraSession = Session<
     RoundRobinLoadBalancingStrategy<TransportTcp, TcpConnectionManager>,
 >;
 
+/// Execute a lightweight transaction with explicit regional quorum and serial
+/// consistency. TTL claims and lifecycle metadata use this rather than the
+/// driver's default consistency.
+pub async fn query_lwt(
+    session: &CassandraSession,
+    query: &str,
+    values: QueryValues,
+) -> Result<cdrs_tokio::frame::Envelope, extenddb_storage::error::StorageError> {
+    use cdrs_tokio::consistency::Consistency;
+    use cdrs_tokio::statement::StatementParamsBuilder;
+
+    let params = StatementParamsBuilder::new()
+        .with_consistency(Consistency::LocalQuorum)
+        .with_serial_consistency(Consistency::LocalSerial)
+        .with_values(values)
+        .build();
+    session
+        .query_with_params(query, params)
+        .await
+        .map_err(|error| {
+            extenddb_storage::error::StorageError::Internal(format!("LWT query failed: {error}"))
+        })
+}
+
 /// Trait for errors that can be constructed from database operation failures.
 /// Implemented by [`extenddb_storage::management_store::OpError`],
 /// [`extenddb_storage::error::StorageError`], and

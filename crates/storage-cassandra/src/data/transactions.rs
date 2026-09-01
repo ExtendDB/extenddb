@@ -89,12 +89,13 @@ impl CassandraEngine {
         // Check for prepared transactions in Phase 1 data
         for (i, result) in phase1_results.iter().enumerate() {
             if let Some((_, _, prepared_txn_id)) = result
-                && prepared_txn_id.is_some() {
-                    // Item is in a prepared transaction - conflict
-                    let mut reasons = vec![CancellationReason::none(); ops.len()];
-                    reasons[i] = transaction_conflict_reason();
-                    return Err(StorageError::TransactionCanceled(reasons));
-                }
+                && prepared_txn_id.is_some()
+            {
+                // Item is in a prepared transaction - conflict
+                let mut reasons = vec![CancellationReason::none(); ops.len()];
+                reasons[i] = transaction_conflict_reason();
+                return Err(StorageError::TransactionCanceled(reasons));
+            }
         }
 
         // Phase 2: Verify timestamps haven't changed
@@ -157,7 +158,10 @@ impl CassandraEngine {
             return Ok(None);
         };
 
-        let item_data: String = get_column(&row, "item_data", "read_item_with_metadata")?;
+        let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+        let Some(item_data) = item_data else {
+            return Ok(None);
+        };
         let item: Item =
             serde_json::from_str(&item_data).map_err(|e| StorageError::Internal(e.to_string()))?;
         let last_committed: Option<i64> = row
@@ -181,7 +185,7 @@ impl CassandraEngine {
             &self.session,
             &keyspace,
             &table,
-            "last_committed_txn_timestamp, prepared_txn_id",
+            "item_data, last_committed_txn_timestamp, prepared_txn_id",
             pk_text.as_str(),
             sk.as_ref(),
             sk_col.as_deref(),
@@ -196,6 +200,10 @@ impl CassandraEngine {
             .ok()
             .flatten();
         let prepared_txn_id: Option<uuid::Uuid> = row.get_by_name("prepared_txn_id").ok().flatten();
+        let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+        if item_data.is_none() && prepared_txn_id.is_none() {
+            return Ok(None);
+        }
         Ok(Some((last_committed.unwrap_or(0), prepared_txn_id)))
     }
 
@@ -552,6 +560,20 @@ impl CassandraEngine {
                 .await?;
         }
 
+        for op in ops {
+            match op {
+                TransactWriteOp::Put { key_info, item, .. } => {
+                    self.reconcile_ttl_item(key_info, item).await?;
+                }
+                TransactWriteOp::Update { key_info, key, .. } => {
+                    if let Some(item) = self.get_item_impl(key_info, key).await? {
+                        self.reconcile_ttl_item(key_info, &item).await?;
+                    }
+                }
+                TransactWriteOp::Delete { .. } | TransactWriteOp::ConditionCheck { .. } => {}
+            }
+        }
+
         // Delete transaction from ledger
         self.delete_ledger_entry(account_keyspace, txn_id).await?;
 
@@ -797,7 +819,10 @@ impl CassandraEngine {
             return Ok(None);
         };
 
-        let item_data: String = get_column(&row, "item_data", "fetch_item_for_transaction")?;
+        let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+        let Some(item_data) = item_data else {
+            return Ok(None);
+        };
         Ok(Some(
             serde_json::from_str(&item_data).map_err(|e| StorageError::Internal(e.to_string()))?,
         ))
@@ -841,11 +866,12 @@ impl CassandraEngine {
                 .ok()
                 .flatten();
             if let Some(max_ts) = max_ts
-                && txn_timestamp <= max_ts {
-                    return Err(CancellationReason::validation_error(
-                        "Item was deleted at a later timestamp".to_owned(),
-                    ));
-                }
+                && txn_timestamp <= max_ts
+            {
+                return Err(CancellationReason::validation_error(
+                    "Item was deleted at a later timestamp".to_owned(),
+                ));
+            }
         }
 
         Ok(())
@@ -1237,6 +1263,14 @@ impl CassandraEngine {
                         return Err(e);
                     }
                 }
+                for op in &ops {
+                    if matches!(op.op.as_str(), "PUT" | "UPDATE") {
+                        if let Some(item_data) = op.item_data.as_deref() {
+                            self.reconcile_ttl_item_by_table_id(&op.table_id, item_data)
+                                .await?;
+                        }
+                    }
+                }
             }
             // PREPARING or CANCELLING (or unknown) → rollback
             _ => {
@@ -1514,13 +1548,14 @@ fn check_lwt_applied(result: &Envelope, context: &str) -> Result<(), Cancellatio
     })?;
 
     if let Some(rows) = body.into_rows()
-        && let Some(row) = rows.first() {
-            let applied: bool = get_column::<bool, StorageError>(row, "[applied]", context)
-                .map_err(|_| transaction_conflict_reason())?;
-            if !applied {
-                return Err(transaction_conflict_reason());
-            }
+        && let Some(row) = rows.first()
+    {
+        let applied: bool = get_column::<bool, StorageError>(row, "[applied]", context)
+            .map_err(|_| transaction_conflict_reason())?;
+        if !applied {
+            return Err(transaction_conflict_reason());
         }
+    }
 
     Ok(())
 }

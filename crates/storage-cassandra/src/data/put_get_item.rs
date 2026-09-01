@@ -28,6 +28,10 @@ impl CassandraEngine {
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
     ) -> Result<Option<Item>, StorageError> {
+        // Keep every mutation in this request at its start timestamp. If an expiring
+        // TTL row claim lapses while the request is paused, a later transaction's
+        // ownership and item cells win over this stale batch by Cassandra timestamp.
+        let mutation_timestamp = chrono::Utc::now().timestamp_micros();
         let data_keyspace = self.account_keyspace(&key_info.account_id);
         let catalog_keyspace = self.catalog_keyspace();
         let ddb_table = data_table_name(&key_info.table_id);
@@ -45,6 +49,9 @@ impl CassandraEngine {
             &catalog_keyspace,
         )
         .await?;
+        let ttl_config = self
+            .ttl_config_for_table(&key_info.account_id, &key_info.table_name)
+            .await?;
         let sys_delay = if indexes.is_empty() {
             0
         } else {
@@ -79,12 +86,13 @@ impl CassandraEngine {
 
             let (old_item_opt, has_prepared_txn) = if let Some(rows) = body.into_rows() {
                 if let Some(row) = rows.into_iter().next() {
-                    let item_data: String = row
-                        .get_r_by_name("item_data")
-                        .map_err(|e| StorageError::Internal(format!("Parse item_data: {e}")))?;
+                    let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
                     let prepared_txn_id: Option<uuid::Uuid> =
                         row.get_by_name("prepared_txn_id").ok().flatten();
-                    (Some(json_to_item(item_data)?), prepared_txn_id.is_some())
+                    (
+                        item_data.map(json_to_item).transpose()?,
+                        prepared_txn_id.is_some(),
+                    )
                 } else {
                     (None, false)
                 }
@@ -119,6 +127,13 @@ impl CassandraEngine {
                 Err(e) => return Err(e),
             }
 
+            let ttl_claim = if ttl_config.is_some() {
+                self.acquire_ttl_mutation_claim(key_info, &item, old_item_opt.as_ref())
+                    .await?
+            } else {
+                None
+            };
+
             let stream_stmt = stream.and_then(|cap| {
                 stream_record_statement(
                     &data_keyspace,
@@ -132,10 +147,18 @@ impl CassandraEngine {
                 )
             });
 
-            if indexes.is_empty() && stream_stmt.is_none() {
+            if indexes.is_empty()
+                && stream_stmt.is_none()
+                && ttl_config.is_none()
+                && ttl_claim.is_none()
+                && !super::ttl::reconciliation_outbox_required()
+            {
                 // Fast path: no batch needed.
                 let insert_query = format!(
-                    "INSERT INTO {data_keyspace}.{ddb_table} (pk, {sk_col}, item_data) VALUES (?, ?, ?)"
+                    "INSERT INTO {}.{} \
+                     (pk, {}, item_data, prepared_txn_id, prepared_txn_timestamp) \
+                     VALUES (?, ?, ?, null, null)",
+                    data_keyspace, ddb_table, sk_col
                 );
                 query_with_pk_sk_item(
                     &self.session,
@@ -148,16 +171,21 @@ impl CassandraEngine {
             } else {
                 // LOGGED BATCH: item insert + optional index updates + optional stream record.
                 let insert_cql = format!(
-                    "INSERT INTO {data_keyspace}.{ddb_table} (pk, {sk_col}, item_data) VALUES (?, ?, ?)"
+                    "INSERT INTO {}.{} \
+                     (pk, {}, item_data, prepared_txn_id, prepared_txn_timestamp) \
+                     VALUES (?, ?, ?, null, null)",
+                    data_keyspace, ddb_table, sk_col
                 );
                 let insert_qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
                     cdrs_tokio::types::value::Value::from(pk_text.as_str()),
                     super::index::sk_to_value(&sk),
                     item_text.as_str().into(),
                 ]);
-                let mut batch = BatchQueryBuilder::new()
-                    .with_consistency(Consistency::LocalQuorum)
-                    .add_query(insert_cql, insert_qv);
+                let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+                if ttl_claim.is_some() {
+                    batch = batch.with_timestamp(mutation_timestamp);
+                }
+                batch = batch.add_query(insert_cql, insert_qv);
 
                 if !indexes.is_empty() {
                     super::index::sync_indexes(
@@ -188,25 +216,57 @@ impl CassandraEngine {
                     0
                 };
 
+                super::ttl::add_ttl_reconciliation_mutation(
+                    &mut batch,
+                    &data_keyspace,
+                    key_info,
+                    &item,
+                )?;
+
+                if let Some(config) = ttl_config.as_ref() {
+                    super::ttl::add_ttl_queue_mutations(
+                        &mut batch,
+                        &data_keyspace,
+                        key_info,
+                        &config.attribute,
+                        config.generation,
+                        old_item_opt.as_ref(),
+                        Some(&item),
+                    )?;
+                }
+
                 if let Some(stmt) = stream_stmt {
                     batch =
                         batch.add_query(stmt, cdrs_tokio::query::QueryValues::SimpleValues(vec![]));
                 }
 
-                self.session
-                    .batch(
-                        batch
-                            .build()
-                            .map_err(|e| StorageError::Internal(e.to_string()))?,
-                    )
-                    .await
-                    .map_err(|e| StorageError::Internal(format!("Batch execution: {e}")))?;
+                let built = match batch.build() {
+                    Ok(built) => built,
+                    Err(error) => {
+                        self.release_ttl_mutation_claim(key_info, &item, ttl_claim)
+                            .await;
+                        return Err(StorageError::Internal(error.to_string()));
+                    }
+                };
+                if let Err(error) = self.session.batch(built).await {
+                    self.release_ttl_mutation_claim(key_info, &item, ttl_claim)
+                        .await;
+                    return Err(StorageError::Internal(format!("Batch execution: {error}")));
+                }
+                self.release_ttl_mutation_claim(key_info, &item, ttl_claim)
+                    .await;
 
                 if async_enqueued > 0 {
                     self.gsi_queue.notify_workers();
                 }
             }
 
+            if let Err(error) = self.reconcile_ttl_item(key_info, &item).await {
+                tracing::warn!(
+                    table = %key_info.table_name,
+                    "deferred post-commit TTL reconciliation for PutItem: {error}"
+                );
+            }
             Ok(if return_old { old_item_opt } else { None })
         } else {
             // PK-only table (no sort key)
@@ -231,12 +291,13 @@ impl CassandraEngine {
 
             let (old_item_opt, has_prepared_txn) = if let Some(rows) = body.into_rows() {
                 if let Some(row) = rows.into_iter().next() {
-                    let item_data: String = row
-                        .get_r_by_name("item_data")
-                        .map_err(|e| StorageError::Internal(format!("Parse item_data: {e}")))?;
+                    let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
                     let prepared_txn_id: Option<uuid::Uuid> =
                         row.get_by_name("prepared_txn_id").ok().flatten();
-                    (Some(json_to_item(item_data)?), prepared_txn_id.is_some())
+                    (
+                        item_data.map(json_to_item).transpose()?,
+                        prepared_txn_id.is_some(),
+                    )
                 } else {
                     (None, false)
                 }
@@ -271,6 +332,13 @@ impl CassandraEngine {
                 Err(e) => return Err(e),
             }
 
+            let ttl_claim = if ttl_config.is_some() {
+                self.acquire_ttl_mutation_claim(key_info, &item, old_item_opt.as_ref())
+                    .await?
+            } else {
+                None
+            };
+
             let stream_stmt = stream.and_then(|cap| {
                 stream_record_statement(
                     &data_keyspace,
@@ -284,10 +352,18 @@ impl CassandraEngine {
                 )
             });
 
-            if indexes.is_empty() && stream_stmt.is_none() {
+            if indexes.is_empty()
+                && stream_stmt.is_none()
+                && ttl_config.is_none()
+                && ttl_claim.is_none()
+                && !super::ttl::reconciliation_outbox_required()
+            {
                 // Fast path: no batch needed.
                 let insert_query = format!(
-                    "INSERT INTO {data_keyspace}.{ddb_table} (pk, item_data) VALUES (?, ?)"
+                    "INSERT INTO {}.{} \
+                     (pk, item_data, prepared_txn_id, prepared_txn_timestamp) \
+                     VALUES (?, ?, null, null)",
+                    data_keyspace, ddb_table
                 );
                 self.session
                     .query_with_values(
@@ -299,15 +375,20 @@ impl CassandraEngine {
             } else {
                 // LOGGED BATCH: item insert + optional index updates + optional stream record.
                 let insert_cql = format!(
-                    "INSERT INTO {data_keyspace}.{ddb_table} (pk, item_data) VALUES (?, ?)"
+                    "INSERT INTO {}.{} \
+                     (pk, item_data, prepared_txn_id, prepared_txn_timestamp) \
+                     VALUES (?, ?, null, null)",
+                    data_keyspace, ddb_table
                 );
                 let insert_qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
                     cdrs_tokio::types::value::Value::from(pk_text.as_str()),
                     item_text.as_str().into(),
                 ]);
-                let mut batch = BatchQueryBuilder::new()
-                    .with_consistency(Consistency::LocalQuorum)
-                    .add_query(insert_cql, insert_qv);
+                let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+                if ttl_claim.is_some() {
+                    batch = batch.with_timestamp(mutation_timestamp);
+                }
+                batch = batch.add_query(insert_cql, insert_qv);
 
                 if !indexes.is_empty() {
                     super::index::sync_indexes(
@@ -338,25 +419,57 @@ impl CassandraEngine {
                     0
                 };
 
+                super::ttl::add_ttl_reconciliation_mutation(
+                    &mut batch,
+                    &data_keyspace,
+                    key_info,
+                    &item,
+                )?;
+
+                if let Some(config) = ttl_config.as_ref() {
+                    super::ttl::add_ttl_queue_mutations(
+                        &mut batch,
+                        &data_keyspace,
+                        key_info,
+                        &config.attribute,
+                        config.generation,
+                        old_item_opt.as_ref(),
+                        Some(&item),
+                    )?;
+                }
+
                 if let Some(stmt) = stream_stmt {
                     batch =
                         batch.add_query(stmt, cdrs_tokio::query::QueryValues::SimpleValues(vec![]));
                 }
 
-                self.session
-                    .batch(
-                        batch
-                            .build()
-                            .map_err(|e| StorageError::Internal(e.to_string()))?,
-                    )
-                    .await
-                    .map_err(|e| StorageError::Internal(format!("Batch execution: {e}")))?;
+                let built = match batch.build() {
+                    Ok(built) => built,
+                    Err(error) => {
+                        self.release_ttl_mutation_claim(key_info, &item, ttl_claim)
+                            .await;
+                        return Err(StorageError::Internal(error.to_string()));
+                    }
+                };
+                if let Err(error) = self.session.batch(built).await {
+                    self.release_ttl_mutation_claim(key_info, &item, ttl_claim)
+                        .await;
+                    return Err(StorageError::Internal(format!("Batch execution: {error}")));
+                }
+                self.release_ttl_mutation_claim(key_info, &item, ttl_claim)
+                    .await;
 
                 if async_enqueued > 0 {
                     self.gsi_queue.notify_workers();
                 }
             }
 
+            if let Err(error) = self.reconcile_ttl_item(key_info, &item).await {
+                tracing::warn!(
+                    table = %key_info.table_name,
+                    "deferred post-commit TTL reconciliation for PutItem: {error}"
+                );
+            }
             Ok(if return_old { old_item_opt } else { None })
         }
     }
@@ -396,20 +509,17 @@ impl CassandraEngine {
                 .response_body()
                 .map_err(|e| StorageError::Internal(format!("Parse response: {e}")))?;
 
-            if let Some(rows) = body.into_rows()
-                && let Some(row) = rows.into_iter().next() {
-                    let item_data: String = row
-                        .get_r_by_name("item_data")
-                        .map_err(|e| StorageError::Internal(format!("Parse item_data: {e}")))?;
-                    return Ok(Some(json_to_item(item_data)?));
+            if let Some(rows) = body.into_rows() {
+                if let Some(row) = rows.into_iter().next() {
+                    let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+                    return item_data.map(json_to_item).transpose();
                 }
+            }
 
             Ok(None)
         } else {
             // PK-only table
-            let query = format!(
-                "SELECT item_data FROM {data_keyspace}.{ddb_table} WHERE pk = ?"
-            );
+            let query = format!("SELECT item_data FROM {data_keyspace}.{ddb_table} WHERE pk = ?");
 
             let result = self
                 .session
@@ -421,13 +531,12 @@ impl CassandraEngine {
                 .response_body()
                 .map_err(|e| StorageError::Internal(format!("Parse response: {e}")))?;
 
-            if let Some(rows) = body.into_rows()
-                && let Some(row) = rows.into_iter().next() {
-                    let item_data: String = row
-                        .get_r_by_name("item_data")
-                        .map_err(|e| StorageError::Internal(format!("Parse item_data: {e}")))?;
-                    return Ok(Some(json_to_item(item_data)?));
+            if let Some(rows) = body.into_rows() {
+                if let Some(row) = rows.into_iter().next() {
+                    let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+                    return item_data.map(json_to_item).transpose();
                 }
+            }
 
             Ok(None)
         }

@@ -28,6 +28,7 @@ mod stream_engine;
 pub mod stream_util;
 pub mod table_engine;
 mod table_helpers;
+pub mod ttl_worker;
 mod update_table;
 mod worker_store;
 pub mod workers;
@@ -84,9 +85,10 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
             .catalog_store
             .get_setting("gsi_propagation_delay_ms")
             .await
-            && let Ok(ms) = val.parse::<u64>() {
-                gsi_delay.store(ms, std::sync::atomic::Ordering::Relaxed);
-            }
+            && let Ok(ms) = val.parse::<u64>()
+        {
+            gsi_delay.store(ms, std::sync::atomic::Ordering::Relaxed);
+        }
         let catalog_store_for_gsi = ctx.catalog_store.clone();
         let gsi_delay_poller =
             tokio::spawn(
@@ -97,7 +99,19 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
         let guard = workers::spawn_gsi_workers(self.engine.clone());
         let _ = self.gsi_worker_guard.set(guard);
 
-        vec![control_plane, transaction_recovery, gsi_delay_poller]
+        let ttl_engine = self.engine.clone();
+        let ttl_metrics = ctx.metrics.clone();
+        let ttl_shutdown = ctx.shutdown.clone();
+        let ttl_cleanup = tokio::spawn(async move {
+            ttl_worker::ttl_cleanup_worker(ttl_engine, ttl_metrics, ttl_shutdown).await
+        });
+
+        vec![
+            control_plane,
+            transaction_recovery,
+            gsi_delay_poller,
+            ttl_cleanup,
+        ]
     }
 
     fn backend_info(&self) -> Option<String> {

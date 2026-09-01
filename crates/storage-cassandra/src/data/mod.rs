@@ -23,6 +23,7 @@ mod query_helpers;
 mod scan;
 pub mod transaction_ledger;
 mod transactions;
+pub(crate) mod ttl;
 mod update_item;
 
 use condition::check_condition;
@@ -325,14 +326,11 @@ pub(crate) async fn select_by_pk(
     sk_col: Option<&str>,
 ) -> Result<Option<cdrs_tokio::types::rows::Row>, StorageError> {
     let result = if let (Some(sk), Some(sk_col)) = (sk, sk_col) {
-        let query = format!(
-            "SELECT {columns} FROM {keyspace}.{table} WHERE pk = ? AND {sk_col} = ?"
-        );
+        let query =
+            format!("SELECT {columns} FROM {keyspace}.{table} WHERE pk = ? AND {sk_col} = ?");
         query_with_pk_sk(session, &query, pk, sk).await
     } else {
-        let query = format!(
-            "SELECT {columns} FROM {keyspace}.{table} WHERE pk = ?"
-        );
+        let query = format!("SELECT {columns} FROM {keyspace}.{table} WHERE pk = ?");
         session
             .query_with_values(&query, cdrs_tokio::query_values!(pk))
             .await

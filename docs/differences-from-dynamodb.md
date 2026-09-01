@@ -51,6 +51,7 @@ adaptation when switching between ExtendDB and the real service.
 | TTL attribute name | Any UTF-8 string (1–255 bytes) | Restricted to `[a-zA-Z0-9._-]+` (1–255 bytes). Names with spaces, quotes, or other special characters are rejected. This eliminates SQL injection risk in the TTL expression index. |
 | TTL deletion | Background process, items deleted within 48 hours of expiry | Background worker with indexed sweep, configurable target via `ttl_deletion_target_seconds` (default: 300s) |
 | TTL stream records | REMOVE events with `userIdentity: {type: "Service", principalId: "dynamodb.amazonaws.com"}` | Supported — TTL deletions generate REMOVE stream records with the same `userIdentity` |
+| Cassandra TTL with asynchronous GSIs | Supported | Not currently supported. The Cassandra backend rejects TTL enable when any GSI has a nonzero effective propagation delay; base tables, LSIs, and synchronous GSIs are supported. See [ADR-0010](adr/0010-cassandra-ttl-expiration-queue.md). |
 | TTL modification cooldown | Enforces a cooldown period between enable/disable changes ("Time to live has been modified multiple times within a fixed interval") | No cooldown — TTL can be enabled and disabled immediately. Intentional divergence for faster local development. |
 
 ## Tagging

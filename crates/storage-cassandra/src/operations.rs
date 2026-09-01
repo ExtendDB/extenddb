@@ -72,11 +72,12 @@ impl OperationsEngine for CassandraOperationsEngine {
 
         // Check first character (cannot be digit)
         if let Some(first_char) = name.chars().next()
-            && first_char.is_ascii_digit() {
-                return Err(StorageError::Internal(format!(
-                    "{label} '{name}' cannot start with a digit"
-                )));
-            }
+            && first_char.is_ascii_digit()
+        {
+            return Err(StorageError::Internal(format!(
+                "{label} '{name}' cannot start with a digit"
+            )));
+        }
 
         // Check all characters (alphanumeric + underscore only)
         if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -89,7 +90,7 @@ impl OperationsEngine for CassandraOperationsEngine {
     }
 
     fn catalog_version(&self) -> String {
-        "0.0.1".to_string()
+        "0.0.4".to_string()
     }
 
     fn is_sensitive_key(&self, key: &str) -> bool {

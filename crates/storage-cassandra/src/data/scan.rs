@@ -49,6 +49,7 @@
 //! the "token range pagination" approach approved in the workplan.
 
 use cdrs_tokio::query::QueryValues;
+use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::value::Value;
 use extenddb_core::types::{Item, ScalarAttributeType, TableKeyInfo};
 use extenddb_storage::error::StorageError;
@@ -221,9 +222,9 @@ impl crate::CassandraEngine {
         // Parse item_data JSON into items.
         let items: Vec<Item> = rows
             .into_iter()
-            .map(|row| {
-                let json_str: String = cassandra_util::get_column(&row, "item_data", "scan parse")?;
-                json_to_item(json_str)
+            .filter_map(|row| {
+                let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+                item_data.map(json_to_item)
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -381,10 +382,11 @@ impl crate::CassandraEngine {
         binds.push(Value::from(base_pk_text));
 
         if let Some((base_sk_name, base_sk_type)) = base_sk_info_opt
-            && let Some(av) = start_key.get(base_sk_name) {
-                cols.push(format!("base_{}", sk_column(base_sk_type)));
-                binds.push(sk_to_value(&parse_sk(av, base_sk_type)?));
-            }
+            && let Some(av) = start_key.get(base_sk_name)
+        {
+            cols.push(format!("base_{}", sk_column(base_sk_type)));
+            binds.push(sk_to_value(&parse_sk(av, base_sk_type)?));
+        }
 
         Ok(Some((format_clustering_comparison(&cols), binds)))
     }

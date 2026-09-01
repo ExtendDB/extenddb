@@ -60,9 +60,7 @@ impl CassandraEngine {
             .map_err(|e| StorageError::Internal(format!("Parse table_id: {e}")))?;
 
         // Fetch indexes for response
-        let index_query = format!(
-            "SELECT * FROM {catalog_keyspace}.indexes WHERE table_id = ?"
-        );
+        let index_query = format!("SELECT * FROM {catalog_keyspace}.indexes WHERE table_id = ?");
 
         let index_result = self
             .session
@@ -83,6 +81,8 @@ impl CassandraEngine {
         // Delete physical tables from the owning account keyspace. Catalog
         // metadata and user data intentionally live in different keyspaces.
         let account_keyspace = self.account_keyspace(account_id);
+        self.clear_ttl_entries_for_table_id(account_id, &table_id)
+            .await?;
         self.drop_data_table(&account_keyspace, &table_id)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -98,9 +98,8 @@ impl CassandraEngine {
         }
 
         // Delete catalog entries (indexes first due to FK)
-        let delete_indexes_query = format!(
-            "DELETE FROM {catalog_keyspace}.indexes WHERE table_id = ?"
-        );
+        let delete_indexes_query =
+            format!("DELETE FROM {catalog_keyspace}.indexes WHERE table_id = ?");
         self.session
             .query_with_values(
                 &delete_indexes_query,

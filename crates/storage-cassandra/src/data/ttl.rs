@@ -1,0 +1,853 @@
+// Copyright 2026 ExtendDB contributors
+// SPDX-License-Identifier: Apache-2.0
+
+//! Cassandra TTL expiration queue helpers.
+//!
+//! DynamoDB TTL cannot use Cassandra native row TTL because native expiry
+//! bypasses secondary-index cleanup and DynamoDB Streams. Valid timestamps are
+//! indexed into day-bucketed, 64-way sharded partitions and are deleted through
+//! the normal item mutation path.
+
+use cdrs_tokio::query::BatchQueryBuilder;
+use extenddb_core::types::{AttributeValue, Item, TableKeyInfo};
+use extenddb_storage::error::StorageError;
+
+use crate::CassandraEngine;
+
+pub(crate) const TTL_SHARDS: i32 = 64;
+pub(crate) const TTL_BUCKET_SECONDS: i64 = 86_400;
+const TTL_QUEUE_TABLE: &str = "ttl_expirations";
+const TTL_BUCKET_TABLE: &str = "ttl_expiration_buckets";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TtlConfig {
+    pub attribute: String,
+    pub generation: uuid::Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TtlEntry {
+    pub bucket: i64,
+    pub expires_at: i64,
+    pub shard: i32,
+    pub key_hash: String,
+    pub key_data: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TtlWorkState {
+    Pending,
+    Claimed,
+    EffectsApplied,
+}
+
+impl TtlWorkState {
+    pub(crate) fn parse(value: Option<&str>) -> Self {
+        match value {
+            Some("CLAIMED") => Self::Claimed,
+            Some("EFFECTS_APPLIED") => Self::EffectsApplied,
+            _ => Self::Pending,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TtlStreamPlan {
+    pub event_id: String,
+    pub sequence_number: String,
+    pub created_at_ms: i64,
+    pub region: String,
+    pub view_type: extenddb_core::types::StreamViewType,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TtlWorkData {
+    pub old_item: Item,
+    pub delete_timestamp_ms: i64,
+    pub stream: Option<TtlStreamPlan>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TtlWorkRow {
+    pub entry: TtlEntry,
+    pub state: TtlWorkState,
+    pub work_id: Option<uuid::Uuid>,
+    pub work_data: Option<TtlWorkData>,
+}
+
+pub(crate) fn ttl_epoch_seconds(item: &Item, attribute: &str) -> Option<i64> {
+    match item.get(attribute) {
+        Some(AttributeValue::N(value)) => value.parse::<i64>().ok().filter(|value| *value > 0),
+
+        _ => None,
+    }
+}
+
+pub(crate) fn entry_for_item(
+    key_info: &TableKeyInfo,
+    item: &Item,
+    ttl_attribute: &str,
+) -> Result<Option<TtlEntry>, StorageError> {
+    let Some(expires_at) = ttl_epoch_seconds(item, ttl_attribute) else {
+        return Ok(None);
+    };
+
+    let mut key = Item::new();
+    for element in &key_info.key_schema {
+        let value = item.get(&element.attribute_name).ok_or_else(|| {
+            StorageError::Internal(format!(
+                "TTL item missing key attribute {}",
+                element.attribute_name
+            ))
+        })?;
+        key.insert(element.attribute_name.clone(), value.clone());
+    }
+
+    let key_data = serde_json::to_string(&key)
+        .map_err(|error| StorageError::Internal(format!("Serialize TTL key: {error}")))?;
+    let hash = crc32fast::hash(key_data.as_bytes());
+
+    Ok(Some(TtlEntry {
+        bucket: expires_at / TTL_BUCKET_SECONDS,
+        expires_at,
+        shard: (hash % TTL_SHARDS as u32) as i32,
+        key_hash: format!("{hash:08x}"),
+        key_data,
+    }))
+}
+
+fn same_queue_key(left: &TtlEntry, right: &TtlEntry) -> bool {
+    left.bucket == right.bucket
+        && left.expires_at == right.expires_at
+        && left.shard == right.shard
+        && left.key_hash == right.key_hash
+        && left.key_data == right.key_data
+}
+
+pub(crate) fn add_ttl_queue_mutations(
+    batch: &mut BatchQueryBuilder,
+    account_keyspace: &str,
+    key_info: &TableKeyInfo,
+    ttl_attribute: &str,
+    generation: uuid::Uuid,
+    old_item: Option<&Item>,
+    new_item: Option<&Item>,
+) -> Result<(), StorageError> {
+    let old_entry = old_item
+        .map(|item| entry_for_item(key_info, item, ttl_attribute))
+        .transpose()?
+        .flatten();
+    let new_entry = new_item
+        .map(|item| entry_for_item(key_info, item, ttl_attribute))
+        .transpose()?
+        .flatten();
+    let unchanged = matches!(
+        (&old_entry, &new_entry),
+        (Some(old), Some(new)) if same_queue_key(old, new)
+    );
+
+    if let Some(old) = old_entry.filter(|_| !unchanged) {
+        let cql = format!(
+            "DELETE FROM {account_keyspace}.{TTL_QUEUE_TABLE} \
+             WHERE table_id = ? AND generation = ? AND bucket = ? AND shard = ? \
+             AND expires_at = ? AND key_hash = ? AND key_data = ?"
+        );
+        let values = cdrs_tokio::query_values!(
+            key_info.table_id.as_str(),
+            cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
+            old.bucket,
+            old.shard,
+            old.expires_at,
+            old.key_hash.as_str(),
+            old.key_data.as_str()
+        );
+        let previous = std::mem::replace(batch, BatchQueryBuilder::new());
+        *batch = previous.add_query(cql, values);
+    }
+
+    if let Some(new) = new_entry {
+        let bucket_cql = format!(
+            "INSERT INTO {account_keyspace}.{TTL_BUCKET_TABLE} \
+             (table_id, generation, bucket, shard) VALUES (?, ?, ?, ?)"
+        );
+        let previous = std::mem::replace(batch, BatchQueryBuilder::new());
+        *batch = previous.add_query(
+            bucket_cql,
+            cdrs_tokio::query_values!(
+                key_info.table_id.as_str(),
+                cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
+                new.bucket,
+                new.shard
+            ),
+        );
+
+        let entry_cql = format!(
+            "INSERT INTO {account_keyspace}.{TTL_QUEUE_TABLE} \
+             (table_id, generation, bucket, shard, expires_at, key_hash, key_data, \
+              state, work_id, work_data) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', null, null)"
+        );
+        let previous = std::mem::replace(batch, BatchQueryBuilder::new());
+        *batch = previous.add_query(
+            entry_cql,
+            cdrs_tokio::query_values!(
+                key_info.table_id.as_str(),
+                cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
+                new.bucket,
+                new.shard,
+                new.expires_at,
+                new.key_hash.as_str(),
+                new.key_data.as_str()
+            ),
+        );
+    }
+
+    Ok(())
+}
+
+pub(crate) fn reconciliation_outbox_required() -> bool {
+    true
+}
+
+pub(crate) fn add_ttl_reconciliation_mutation(
+    batch: &mut BatchQueryBuilder,
+    account_keyspace: &str,
+    key_info: &TableKeyInfo,
+    item: &Item,
+) -> Result<(), StorageError> {
+    let mut key = Item::new();
+    for element in &key_info.key_schema {
+        let value = item.get(&element.attribute_name).ok_or_else(|| {
+            StorageError::Internal(format!(
+                "TTL reconciliation item missing key attribute {}",
+                element.attribute_name
+            ))
+        })?;
+        key.insert(element.attribute_name.clone(), value.clone());
+    }
+    let key_data = serde_json::to_string(&key).map_err(|error| {
+        StorageError::Internal(format!("Serialize TTL reconciliation key: {error}"))
+    })?;
+    let partition = (crc32fast::hash(key_data.as_bytes()) % TTL_SHARDS as u32) as i32;
+    let cql = format!(
+        "INSERT INTO {account_keyspace}.ttl_reconcile_pending \
+         (worker_partition, id, table_id, account_id, table_name, key_data) \
+         VALUES (?, now(), ?, ?, ?, ?)"
+    );
+    let previous = std::mem::replace(batch, BatchQueryBuilder::new());
+    *batch = previous.add_query(
+        cql,
+        cdrs_tokio::query_values!(
+            partition,
+            key_info.table_id.as_str(),
+            key_info.account_id.as_str(),
+            key_info.table_name.as_str(),
+            key_data.as_str()
+        ),
+    );
+    Ok(())
+}
+
+pub(crate) async fn insert_ttl_entry(
+    engine: &CassandraEngine,
+    account_keyspace: &str,
+    table_id: &str,
+    generation: uuid::Uuid,
+    entry: &TtlEntry,
+) -> Result<(), StorageError> {
+    let generation_bytes = cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec());
+    let bucket_cql = format!(
+        "INSERT INTO {account_keyspace}.{TTL_BUCKET_TABLE} \
+         (table_id, generation, bucket, shard) VALUES (?, ?, ?, ?)"
+    );
+    engine
+        .session
+        .query_with_values(
+            &bucket_cql,
+            cdrs_tokio::query_values!(
+                table_id,
+                generation_bytes.clone(),
+                entry.bucket,
+                entry.shard
+            ),
+        )
+        .await
+        .map_err(|error| StorageError::Internal(format!("Insert TTL bucket: {error}")))?;
+
+    let entry_cql = format!(
+        "INSERT INTO {account_keyspace}.{TTL_QUEUE_TABLE} \
+         (table_id, generation, bucket, shard, expires_at, key_hash, key_data, state) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING') IF NOT EXISTS"
+    );
+    let result = crate::cassandra_util::query_lwt(
+        &engine.session,
+        &entry_cql,
+        cdrs_tokio::query_values!(
+            table_id,
+            generation_bytes,
+            entry.bucket,
+            entry.shard,
+            entry.expires_at,
+            entry.key_hash.as_str(),
+            entry.key_data.as_str()
+        ),
+    )
+    .await?;
+    let rows = result
+        .response_body()
+        .map_err(|error| StorageError::Internal(format!("Parse TTL reconcile LWT: {error}")))?
+        .into_rows()
+        .unwrap_or_default();
+    let Some(row) = rows.first() else {
+        return Err(StorageError::Internal(
+            "TTL reconcile LWT returned no result".to_owned(),
+        ));
+    };
+    use cdrs_tokio::types::IntoRustByName;
+    let applied: bool = row
+        .get_r_by_name("[applied]")
+        .map_err(|error| StorageError::Internal(format!("Parse TTL reconcile result: {error}")))?;
+    if applied {
+        return Ok(());
+    }
+    let state: Option<String> = row.get_by_name("state").ok().flatten();
+    if state.as_deref() == Some("PENDING") {
+        return Ok(());
+    }
+    Err(StorageError::Internal(
+        "TTL reconciliation deferred by in-flight expiration work".to_owned(),
+    ))
+}
+
+pub(crate) async fn claim_ttl_work(
+    engine: &CassandraEngine,
+    account_keyspace: &str,
+    table_id: &str,
+    generation: uuid::Uuid,
+    entry: &TtlEntry,
+    work_id: uuid::Uuid,
+    work_data: &TtlWorkData,
+) -> Result<bool, StorageError> {
+    let cql = format!(
+        "UPDATE {account_keyspace}.{TTL_QUEUE_TABLE} SET state = 'CLAIMED', \
+         work_id = ?, work_data = ? WHERE table_id = ? AND generation = ? \
+         AND bucket = ? AND shard = ? AND expires_at = ? AND key_hash = ? \
+         AND key_data = ? IF state = 'PENDING'"
+    );
+    let work_json = serde_json::to_string(work_data)
+        .map_err(|error| StorageError::Internal(format!("Serialize TTL work: {error}")))?;
+    let result = crate::cassandra_util::query_lwt(
+        &engine.session,
+        &cql,
+        cdrs_tokio::query_values!(
+            cdrs_tokio::types::value::Bytes::new(work_id.as_bytes().to_vec()),
+            work_json.as_str(),
+            table_id,
+            cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
+            entry.bucket,
+            entry.shard,
+            entry.expires_at,
+            entry.key_hash.as_str(),
+            entry.key_data.as_str()
+        ),
+    )
+    .await?;
+    work_lwt_applied(&result)
+}
+
+pub(crate) async fn mark_ttl_effects_applied(
+    engine: &CassandraEngine,
+    account_keyspace: &str,
+    table_id: &str,
+    generation: uuid::Uuid,
+    row: &TtlWorkRow,
+) -> Result<bool, StorageError> {
+    let Some(work_id) = row.work_id else {
+        return Ok(false);
+    };
+    let cql = format!(
+        "UPDATE {account_keyspace}.{TTL_QUEUE_TABLE} SET state = 'EFFECTS_APPLIED' \
+         WHERE table_id = ? AND generation = ? AND bucket = ? AND shard = ? \
+         AND expires_at = ? AND key_hash = ? AND key_data = ? \
+         IF state = 'CLAIMED' AND work_id = ?"
+    );
+    let result = crate::cassandra_util::query_lwt(
+        &engine.session,
+        &cql,
+        cdrs_tokio::query_values!(
+            table_id,
+            cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
+            row.entry.bucket,
+            row.entry.shard,
+            row.entry.expires_at,
+            row.entry.key_hash.as_str(),
+            row.entry.key_data.as_str(),
+            cdrs_tokio::types::value::Bytes::new(work_id.as_bytes().to_vec())
+        ),
+    )
+    .await?;
+    work_lwt_applied(&result)
+}
+
+pub(crate) async fn complete_ttl_work(
+    engine: &CassandraEngine,
+    account_keyspace: &str,
+    table_id: &str,
+    generation: uuid::Uuid,
+    row: &TtlWorkRow,
+) -> Result<bool, StorageError> {
+    let Some(work_id) = row.work_id else {
+        return Ok(false);
+    };
+    let cql = format!(
+        "DELETE FROM {account_keyspace}.{TTL_QUEUE_TABLE} WHERE table_id = ? \
+         AND generation = ? AND bucket = ? AND shard = ? AND expires_at = ? \
+         AND key_hash = ? AND key_data = ? IF state = 'EFFECTS_APPLIED' AND work_id = ?"
+    );
+    let result = crate::cassandra_util::query_lwt(
+        &engine.session,
+        &cql,
+        cdrs_tokio::query_values!(
+            table_id,
+            cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
+            row.entry.bucket,
+            row.entry.shard,
+            row.entry.expires_at,
+            row.entry.key_hash.as_str(),
+            row.entry.key_data.as_str(),
+            cdrs_tokio::types::value::Bytes::new(work_id.as_bytes().to_vec())
+        ),
+    )
+    .await?;
+    work_lwt_applied(&result)
+}
+
+pub(crate) async fn retire_pending_ttl_work(
+    engine: &CassandraEngine,
+    account_keyspace: &str,
+    table_id: &str,
+    generation: uuid::Uuid,
+    entry: &TtlEntry,
+) -> Result<bool, StorageError> {
+    let cql = format!(
+        "DELETE FROM {account_keyspace}.{TTL_QUEUE_TABLE} WHERE table_id = ? \
+         AND generation = ? AND bucket = ? AND shard = ? AND expires_at = ? \
+         AND key_hash = ? AND key_data = ? IF state = 'PENDING'"
+    );
+    let result = crate::cassandra_util::query_lwt(
+        &engine.session,
+        &cql,
+        cdrs_tokio::query_values!(
+            table_id,
+            cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
+            entry.bucket,
+            entry.shard,
+            entry.expires_at,
+            entry.key_hash.as_str(),
+            entry.key_data.as_str()
+        ),
+    )
+    .await?;
+    work_lwt_applied(&result)
+}
+
+pub(crate) async fn abort_claimed_ttl_work(
+    engine: &CassandraEngine,
+    account_keyspace: &str,
+    table_id: &str,
+    generation: uuid::Uuid,
+    row: &TtlWorkRow,
+) -> Result<bool, StorageError> {
+    let Some(work_id) = row.work_id else {
+        return Ok(false);
+    };
+    let cql = format!(
+        "DELETE FROM {account_keyspace}.{TTL_QUEUE_TABLE} WHERE table_id = ? \
+     AND generation = ? AND bucket = ? AND shard = ? AND expires_at = ? \
+     AND key_hash = ? AND key_data = ? IF state = 'CLAIMED' AND work_id = ?"
+    );
+    let result = crate::cassandra_util::query_lwt(
+        &engine.session,
+        &cql,
+        cdrs_tokio::query_values!(
+            table_id,
+            cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
+            row.entry.bucket,
+            row.entry.shard,
+            row.entry.expires_at,
+            row.entry.key_hash.as_str(),
+            row.entry.key_data.as_str(),
+            cdrs_tokio::types::value::Bytes::new(work_id.as_bytes().to_vec())
+        ),
+    )
+    .await?;
+    work_lwt_applied(&result)
+}
+
+fn work_lwt_applied(result: &cdrs_tokio::frame::Envelope) -> Result<bool, StorageError> {
+    use cdrs_tokio::types::IntoRustByName;
+
+    let rows = result
+        .response_body()
+        .map_err(|error| StorageError::Internal(format!("Parse TTL work LWT: {error}")))?
+        .into_rows()
+        .unwrap_or_default();
+    let Some(row) = rows.first() else {
+        return Err(StorageError::Internal(
+            "TTL work LWT returned no result".to_owned(),
+        ));
+    };
+    row.get_r_by_name("[applied]")
+        .map_err(|error| StorageError::Internal(format!("Parse TTL work result: {error}")))
+}
+
+pub(crate) async fn load_due_ttl_work(
+    engine: &CassandraEngine,
+    account_keyspace: &str,
+    table_id: &str,
+    generation: uuid::Uuid,
+    now: i64,
+    limit: usize,
+) -> Result<Vec<TtlWorkRow>, StorageError> {
+    use cdrs_tokio::types::IntoRustByName;
+
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let generation_bytes = cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec());
+    let current_bucket = now / TTL_BUCKET_SECONDS;
+    let bucket_query = format!(
+        "SELECT bucket, shard FROM {account_keyspace}.{TTL_BUCKET_TABLE} \
+         WHERE table_id = ? AND generation = ? AND bucket <= ?"
+    );
+    let bucket_rows = crate::cassandra_util::query_rows(
+        &engine.session,
+        &bucket_query,
+        cdrs_tokio::query_values!(table_id, generation_bytes.clone(), current_bucket),
+        "load_due_ttl_buckets",
+    )
+    .await?;
+    let mut partitions: Vec<(i64, i32)> = Vec::with_capacity(bucket_rows.len());
+    for row in bucket_rows {
+        partitions.push((
+            crate::cassandra_util::get_column(&row, "bucket", "load_due_ttl_buckets")?,
+            crate::cassandra_util::get_column(&row, "shard", "load_due_ttl_buckets")?,
+        ));
+    }
+    if !partitions.is_empty() {
+        let partition_count = partitions.len();
+        partitions.rotate_left(((now / 60) as usize) % partition_count);
+    }
+
+    let mut work = Vec::with_capacity(limit);
+    for (index, (bucket, shard)) in partitions.iter().enumerate() {
+        let remaining = limit - work.len();
+        if remaining == 0 {
+            break;
+        }
+        let partitions_left = partitions.len() - index;
+        let partition_limit = remaining.div_ceil(partitions_left).max(1);
+        let query = format!(
+            "SELECT expires_at, key_hash, key_data, state, work_id, work_data \
+             FROM {account_keyspace}.{TTL_QUEUE_TABLE} WHERE table_id = ? \
+             AND generation = ? AND bucket = ? AND shard = ? AND expires_at <= ? \
+             LIMIT {partition_limit}"
+        );
+        let rows = crate::cassandra_util::query_rows(
+            &engine.session,
+            &query,
+            cdrs_tokio::query_values!(table_id, generation_bytes.clone(), *bucket, *shard, now),
+            "load_due_ttl_work",
+        )
+        .await?;
+        for row in rows {
+            let state: Option<String> = row.get_by_name("state").ok().flatten();
+            let work_id: Option<uuid::Uuid> = row.get_by_name("work_id").ok().flatten();
+            let work_data: Option<String> = row.get_by_name("work_data").ok().flatten();
+            work.push(TtlWorkRow {
+                entry: TtlEntry {
+                    bucket: *bucket,
+                    shard: *shard,
+                    expires_at: crate::cassandra_util::get_column(
+                        &row,
+                        "expires_at",
+                        "load_due_ttl_work",
+                    )?,
+                    key_hash: crate::cassandra_util::get_column(
+                        &row,
+                        "key_hash",
+                        "load_due_ttl_work",
+                    )?,
+                    key_data: crate::cassandra_util::get_column(
+                        &row,
+                        "key_data",
+                        "load_due_ttl_work",
+                    )?,
+                },
+                state: TtlWorkState::parse(state.as_deref()),
+                work_id,
+                work_data: work_data
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()
+                    .map_err(|error| {
+                        StorageError::Internal(format!("Parse TTL work data: {error}"))
+                    })?,
+            });
+        }
+    }
+    Ok(work)
+}
+
+pub(crate) async fn delete_ttl_entry(
+    engine: &CassandraEngine,
+    account_keyspace: &str,
+    table_id: &str,
+    generation: uuid::Uuid,
+
+    entry: &TtlEntry,
+) -> Result<(), StorageError> {
+    let cql = format!(
+        "DELETE FROM {account_keyspace}.{TTL_QUEUE_TABLE} \
+         WHERE table_id = ? AND generation = ? AND bucket = ? AND shard = ? \
+         AND expires_at = ? AND key_hash = ? AND key_data = ?"
+    );
+    engine
+        .session
+        .query_with_values(
+            &cql,
+            cdrs_tokio::query_values!(
+                table_id,
+                cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
+                entry.bucket,
+                entry.shard,
+                entry.expires_at,
+                entry.key_hash.as_str(),
+                entry.key_data.as_str()
+            ),
+        )
+        .await
+        .map_err(|error| StorageError::Internal(format!("Delete TTL entry: {error}")))?;
+    Ok(())
+}
+
+pub(crate) async fn has_inflight_ttl_work(
+    engine: &CassandraEngine,
+    account_keyspace: &str,
+    table_id: &str,
+    generation: uuid::Uuid,
+) -> Result<bool, StorageError> {
+    use cdrs_tokio::types::IntoRustByName;
+
+    let generation_bytes = cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec());
+    let buckets = crate::cassandra_util::query_rows(
+        &engine.session,
+        &format!(
+            "SELECT bucket, shard FROM {account_keyspace}.{TTL_BUCKET_TABLE} \
+             WHERE table_id = ? AND generation = ?"
+        ),
+        cdrs_tokio::query_values!(table_id, generation_bytes.clone()),
+        "has_inflight_ttl_work_buckets",
+    )
+    .await?;
+    for bucket_row in buckets {
+        let bucket: i64 =
+            crate::cassandra_util::get_column(&bucket_row, "bucket", "has_inflight_ttl_work")?;
+        let shard: i32 =
+            crate::cassandra_util::get_column(&bucket_row, "shard", "has_inflight_ttl_work")?;
+        let rows = crate::cassandra_util::query_rows(
+            &engine.session,
+            &format!(
+                "SELECT state FROM {account_keyspace}.{TTL_QUEUE_TABLE} WHERE table_id = ? \
+                 AND generation = ? AND bucket = ? AND shard = ?"
+            ),
+            cdrs_tokio::query_values!(table_id, generation_bytes.clone(), bucket, shard),
+            "has_inflight_ttl_work",
+        )
+        .await?;
+        for row in rows {
+            let state: Option<String> = row.get_by_name("state").ok().flatten();
+            if matches!(state.as_deref(), Some("CLAIMED" | "EFFECTS_APPLIED")) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) async fn clear_ttl_generation(
+    engine: &CassandraEngine,
+    account_keyspace: &str,
+    table_id: &str,
+    generation: uuid::Uuid,
+) -> Result<(), StorageError> {
+    let bucket_query = format!(
+        "SELECT bucket, shard FROM {account_keyspace}.{TTL_BUCKET_TABLE} \
+         WHERE table_id = ? AND generation = ?"
+    );
+    let generation_bytes = cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec());
+    let rows = crate::cassandra_util::query_rows(
+        &engine.session,
+        &bucket_query,
+        cdrs_tokio::query_values!(table_id, generation_bytes.clone()),
+        "clear_ttl_generation",
+    )
+    .await?;
+    for row in rows {
+        let bucket: i64 =
+            crate::cassandra_util::get_column(&row, "bucket", "clear_ttl_generation")?;
+        let shard: i32 = crate::cassandra_util::get_column(&row, "shard", "clear_ttl_generation")?;
+        let delete = format!(
+            "DELETE FROM {account_keyspace}.{TTL_QUEUE_TABLE} WHERE table_id = ? \
+             AND generation = ? AND bucket = ? AND shard = ?"
+        );
+        engine
+            .session
+            .query_with_values(
+                &delete,
+                cdrs_tokio::query_values!(table_id, generation_bytes.clone(), bucket, shard),
+            )
+            .await
+            .map_err(|error| {
+                StorageError::Internal(format!("Clear TTL generation partition: {error}"))
+            })?;
+    }
+    let delete_buckets = format!(
+        "DELETE FROM {account_keyspace}.{TTL_BUCKET_TABLE} WHERE table_id = ? AND generation = ?"
+    );
+    engine
+        .session
+        .query_with_values(
+            &delete_buckets,
+            cdrs_tokio::query_values!(table_id, generation_bytes),
+        )
+        .await
+        .map_err(|error| {
+            StorageError::Internal(format!("Clear TTL generation buckets: {error}"))
+        })?;
+    Ok(())
+}
+
+pub(crate) async fn clear_ttl_entries(
+    engine: &CassandraEngine,
+    account_keyspace: &str,
+    table_id: &str,
+) -> Result<(), StorageError> {
+    let bucket_query = format!(
+        "SELECT generation, bucket, shard FROM {account_keyspace}.{TTL_BUCKET_TABLE} \
+         WHERE table_id = ?"
+    );
+    let rows = crate::cassandra_util::query_rows(
+        &engine.session,
+        &bucket_query,
+        cdrs_tokio::query_values!(table_id),
+        "clear_ttl_entries",
+    )
+    .await?;
+    for row in rows {
+        let generation: uuid::Uuid =
+            crate::cassandra_util::get_column(&row, "generation", "clear_ttl_entries")?;
+        let bucket: i64 = crate::cassandra_util::get_column(&row, "bucket", "clear_ttl_entries")?;
+        let shard: i32 = crate::cassandra_util::get_column(&row, "shard", "clear_ttl_entries")?;
+        let delete = format!(
+            "DELETE FROM {account_keyspace}.{TTL_QUEUE_TABLE} \
+             WHERE table_id = ? AND generation = ? AND bucket = ? AND shard = ?"
+        );
+        engine
+            .session
+            .query_with_values(
+                &delete,
+                cdrs_tokio::query_values!(
+                    table_id,
+                    cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
+                    bucket,
+                    shard
+                ),
+            )
+            .await
+            .map_err(|error| StorageError::Internal(format!("Clear TTL partition: {error}")))?;
+    }
+    let delete_buckets =
+        format!("DELETE FROM {account_keyspace}.{TTL_BUCKET_TABLE} WHERE table_id = ?");
+    engine
+        .session
+        .query_with_values(&delete_buckets, cdrs_tokio::query_values!(table_id))
+        .await
+        .map_err(|error| StorageError::Internal(format!("Clear TTL buckets: {error}")))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use extenddb_core::types::{
+        AttributeDefinition, KeySchemaElement, KeyType, ScalarAttributeType,
+    };
+
+    fn key_info() -> TableKeyInfo {
+        TableKeyInfo {
+            table_name: "table".to_owned(),
+            account_id: "123456789012".to_owned(),
+            table_id: "table-id".to_owned(),
+            key_schema: vec![KeySchemaElement {
+                attribute_name: "id".to_owned(),
+                key_type: KeyType::Hash,
+            }],
+            base_key_schema: vec![KeySchemaElement {
+                attribute_name: "id".to_owned(),
+                key_type: KeyType::Hash,
+            }],
+            attribute_definitions: vec![AttributeDefinition {
+                attribute_name: "id".to_owned(),
+                attribute_type: ScalarAttributeType::S,
+            }],
+            has_lsi: false,
+            global_secondary_indexes: Vec::new(),
+            local_secondary_indexes: Vec::new(),
+            vector_indexes: Vec::new(),
+            stream_specification: None,
+        }
+    }
+
+    #[test]
+    fn ttl_epoch_accepts_only_positive_integral_numbers() {
+        let mut item = Item::new();
+        for (value, expected) in [("123", Some(123)), ("0", None), ("-1", None), ("1.5", None)] {
+            item.insert("ttl".to_owned(), AttributeValue::N(value.to_owned()));
+            assert_eq!(ttl_epoch_seconds(&item, "ttl"), expected);
+        }
+        item.insert("ttl".to_owned(), AttributeValue::S("123".to_owned()));
+        assert_eq!(ttl_epoch_seconds(&item, "ttl"), None);
+    }
+
+    #[test]
+    fn ttl_entry_is_stable_and_bounded_to_a_shard() {
+        let mut item = Item::new();
+        item.insert("id".to_owned(), AttributeValue::S("a".to_owned()));
+        item.insert("ttl".to_owned(), AttributeValue::N("123".to_owned()));
+        let first = entry_for_item(&key_info(), &item, "ttl").unwrap().unwrap();
+        let second = entry_for_item(&key_info(), &item, "ttl").unwrap().unwrap();
+        assert_eq!(first, second);
+        assert!((0..TTL_SHARDS).contains(&first.shard));
+        assert_eq!(first.bucket, first.expires_at / TTL_BUCKET_SECONDS);
+    }
+
+    #[test]
+    fn unchanged_ttl_does_not_delete_and_reinsert_same_queue_key() {
+        let key_info = key_info();
+        let mut item = Item::new();
+        item.insert("id".to_owned(), AttributeValue::S("a".to_owned()));
+        item.insert("ttl".to_owned(), AttributeValue::N("123".to_owned()));
+        let mut batch = BatchQueryBuilder::new();
+        add_ttl_queue_mutations(
+            &mut batch,
+            "account_keyspace",
+            &key_info,
+            "ttl",
+            uuid::Uuid::new_v4(),
+            Some(&item),
+            Some(&item),
+        )
+        .unwrap();
+        let built = batch.build().unwrap();
+        assert_eq!(built.request.queries.len(), 2);
+    }
+}

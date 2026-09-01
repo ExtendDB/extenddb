@@ -110,6 +110,13 @@ pub fn assign_shard_id(partition_key: &str, table_id: &str) -> String {
 /// Zero sequence number used as the starting point for new shards.
 pub const ZERO_SEQUENCE: &str = "00000000000000000000000"; // 23 zeros
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StreamRecordIdentity {
+    pub event_id: String,
+    pub sequence_number: String,
+    pub created_at_ms: i64,
+}
+
 /// Build a CQL INSERT statement for a stream record to be included in a LOGGED BATCH.
 ///
 /// Returns `None` if no record should be written (both old and new items are absent,
@@ -137,6 +144,33 @@ pub fn stream_record_statement(
     new_item: Option<&Item>,
     capture: &StreamCapture,
     hlc: &Arc<Mutex<HybridClock>>,
+    retention_seconds: u32,
+) -> Option<String> {
+    let identity = StreamRecordIdentity {
+        event_id: uuid::Uuid::new_v4().to_string(),
+        sequence_number: hlc.lock().unwrap_or_else(|e| e.into_inner()).generate(),
+        created_at_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    stream_record_statement_with_identity(
+        account_keyspace,
+        table_id,
+        key_info,
+        old_item,
+        new_item,
+        capture,
+        &identity,
+        retention_seconds,
+    )
+}
+
+pub fn stream_record_statement_with_identity(
+    account_keyspace: &str,
+    table_id: &str,
+    key_info: &TableKeyInfo,
+    old_item: Option<&Item>,
+    new_item: Option<&Item>,
+    capture: &StreamCapture,
+    identity: &StreamRecordIdentity,
     retention_seconds: u32,
 ) -> Option<String> {
     let source = new_item.or(old_item)?;
@@ -181,20 +215,19 @@ pub fn stream_record_statement(
         .unwrap_or_default();
 
     let shard_id = assign_shard_id(&pk_str, table_id);
-    let sequence_number = hlc.lock().unwrap_or_else(std::sync::PoisonError::into_inner).generate();
 
     let record = StreamRecord {
-        event_id: uuid::Uuid::new_v4().to_string(),
+        event_id: identity.event_id.clone(),
         event_name: event,
         event_version: "1.1".to_owned(),
         event_source: "aws:dynamodb".to_owned(),
         aws_region: capture.region.to_string(),
         dynamodb: StreamRecordData {
-            approximate_creation_date_time: chrono::Utc::now().timestamp(),
+            approximate_creation_date_time: identity.created_at_ms / 1_000,
             keys,
             new_image,
             old_image,
-            sequence_number,
+            sequence_number: identity.sequence_number.clone(),
             size_bytes: size,
             stream_view_type: capture.view_type,
         },
@@ -204,7 +237,7 @@ pub fn stream_record_statement(
     let record_json = serde_json::to_string(&record).ok()?;
     let event_name = format!("{:?}", record.event_name);
     let seq = &record.dynamodb.sequence_number;
-    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now_ms = identity.created_at_ms;
 
     Some(format!(
         "INSERT INTO {account_keyspace}.stream_records \
