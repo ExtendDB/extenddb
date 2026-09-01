@@ -6,7 +6,7 @@
 use cdrs_tokio::types::value::Value;
 use extenddb_core::types::{
     BillingMode, BillingModeSummary, CreateTableInput, GsiDescription, LsiDescription,
-    ProvisionedThroughputDescription, TableDescription, TableStatus,
+    ProvisionedThroughputDescription, SseDescription, SseType, TableDescription, TableStatus,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn, table_arn};
@@ -119,6 +119,20 @@ impl CassandraEngine {
 
         let deletion_protection = input.deletion_protection_enabled.unwrap_or(false);
 
+        let table_class_str = input.table_class.clone();
+        let sse_json = input
+            .sse_specification
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let on_demand_json = input
+            .on_demand_throughput
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
         // Read control_plane_delay_seconds from settings
         let catalog_keyspace = self.catalog_keyspace();
         let delay_query = format!("SELECT value FROM {catalog_keyspace}.settings WHERE key = ?");
@@ -167,8 +181,9 @@ impl CassandraEngine {
         let insert_table_cql = format!(
             "INSERT INTO {catalog_keyspace}.tables (account_id, table_name, table_id, table_arn, key_schema, \
              attribute_definitions, billing_mode, provisioned_throughput, stream_specification, \
+             table_class, sse_specification, on_demand_throughput, \
              table_status, created_at, deletion_protection_enabled, status_transition_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
         );
 
         let result = self
@@ -188,6 +203,18 @@ impl CassandraEngine {
                         None => Value::NotSet,
                     },
                     match stream_json.as_ref() {
+                        Some(v) => Value::from(v.to_string().as_str()),
+                        None => Value::NotSet,
+                    },
+                    match table_class_str.as_deref() {
+                        Some(v) => Value::from(v),
+                        None => Value::NotSet,
+                    },
+                    match sse_json.as_ref() {
+                        Some(v) => Value::from(v.to_string().as_str()),
+                        None => Value::NotSet,
+                    },
+                    match on_demand_json.as_ref() {
                         Some(v) => Value::from(v.to_string().as_str()),
                         None => Value::NotSet,
                     },
@@ -498,9 +525,29 @@ impl CassandraEngine {
             latest_stream_arn,
             latest_stream_label: stream_label,
             deletion_protection_enabled: input.deletion_protection_enabled.unwrap_or(false),
-            sse_description: None,
-            table_class_summary: None,
-            on_demand_throughput: None,
+            sse_description: input.sse_specification.as_ref().and_then(|spec| {
+                let enabled = spec
+                    .get("Enabled")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                if enabled {
+                    Some(SseDescription {
+                        status: "ENABLED".to_string(),
+                        sse_type: Some(SseType::KMS),
+                        kms_master_key_arn: Some(format!(
+                            "arn:aws:kms:{}:{}:key/default",
+                            self.region, account_id
+                        )),
+                    })
+                } else {
+                    None
+                }
+            }),
+            table_class_summary: input
+                .table_class
+                .as_ref()
+                .map(|tc| serde_json::json!({ "TableClass": tc })),
+            on_demand_throughput: input.on_demand_throughput,
             restore_summary: None,
             vector_indexes: None,
         })
