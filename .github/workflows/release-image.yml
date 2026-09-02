@@ -195,8 +195,15 @@ jobs:
         # A stale SOFTWARE-LICENSE-NOTICES.html matters far more in a
         # distributed image than in source. The script pins cargo-about itself
         # and refuses to run against any other version.
+        env:
+          LICENSE_BACKEND: ${{ steps.meta.outputs.license_backend }}
         run: |
           set -euo pipefail
+          if [[ "$LICENSE_BACKEND" == mongodb ]] \
+              && ! grep -q -- '--backend' devtools/generate-software-license-notices; then
+            echo "::error::tagged commit does not contain MongoDB image license support; use a tag created after MongoDB container support was merged"
+            exit 1
+          fi
           cargo install --locked --version 0.9.0 --features cli cargo-about
           ./devtools/generate-software-license-notices --check \
             --backend '${{ steps.meta.outputs.license_backend }}'

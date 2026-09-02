@@ -92,7 +92,8 @@ echo "  image:   $EXTENDDB_MONGODB_IMAGE"
 if [[ "$PREBUILT_IMAGE" == true ]]; then
     compose up -d --no-build
 else
-    compose up -d --build
+    compose build
+    compose up -d --no-build
 fi
 
 APP_CONTAINER=$(compose ps -q extenddb)
@@ -111,7 +112,7 @@ if [[ "$BOOTSTRAP_EXIT" != 0 ]]; then
     exit 1
 fi
 
-docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'rs.status().myState' | grep -q 1
+docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'rs.status().myState' | grep -qx 1
 wait_for_health "$APP_CONTAINER"
 HOST_PORT=$(host_port "$APP_CONTAINER")
 
@@ -124,9 +125,11 @@ for container_id in "$BOOTSTRAP_CONTAINER" "$APP_CONTAINER"; do
 done
 
 docker exec "$APP_CONTAINER" /bin/sh -ec '
-    ! command -v postgres >/dev/null 2>&1
+    ! command -v mongod >/dev/null 2>&1
+    ! command -v mongosh >/dev/null 2>&1
     test "$(stat -c %u:%g /var/lib/extenddb)" = 10001:10001
     test "$(stat -c %a /var/lib/extenddb/extenddb.toml)" = 600
+    test "$(stat -c %a /var/lib/extenddb/.extenddb/tls/key.pem)" = 600
 '
 
 echo "=== Provisioning API credentials and exercising DynamoDB operations ==="

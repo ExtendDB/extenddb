@@ -87,6 +87,11 @@ as part of every serving replica.
 For users who want MongoDB and ExtendDB launched together locally, the
 repository provides an optional reference stack:
 
+This stack is for local development only. Its bundled MongoDB intentionally
+has authentication disabled and is not suitable for production or for any
+network that contains untrusted containers. Use MongoDB authentication and a
+managed or self-managed secured replica set for production.
+
 ```bash
 export EXTENDDB_VERSION="$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')"
 export VCS_REF="$(git rev-parse --short=12 HEAD)"
