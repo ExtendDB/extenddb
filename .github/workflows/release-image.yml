@@ -1,4 +1,4 @@
-# Publishes an immutable, commit-addressed CANDIDATE of the ExtendDB PostgreSQL
+# Publishes an immutable, commit-addressed CANDIDATE of an ExtendDB backend
 # container image to Docker Hub, for linux/amd64 and linux/arm64.
 #
 # This workflow never creates the version tag or `latest` (promotion is
@@ -50,11 +50,9 @@
 #   Required reviewers: the candidate push must be approved before it happens.
 #   Secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN (Docker Hub PAT, Read/Write).
 #
-# When a second backend image exists, this becomes `on: workflow_call` with
-# inputs for the image repository, Dockerfile and build args, plus one thin
-# caller per backend. Deliberately not a matrix across backends: a partial
-# failure would publish one backend's candidate and not the other under the
-# same release.
+# The backend is a dispatch choice rather than a matrix: a partial failure
+# must not publish one backend's candidate and not the other under the same
+# release.
 
 name: release-image
 
@@ -64,6 +62,13 @@ on:
       tag:
         description: 'Existing version tag to build a candidate for, e.g. v0.1.3'
         required: true
+      image:
+        description: 'Which backend image to build'
+        type: choice
+        options:
+          - extenddb-postgres
+          - extenddb-mongodb
+        default: extenddb-postgres
 
 # Nothing is committed, so no write scope on the repo is needed.
 permissions:
@@ -72,11 +77,10 @@ permissions:
 # Two releases must never race. The group names the image, so a future second
 # backend does not serialise behind this one for no reason.
 concurrency:
-  group: release-image-extenddb-postgres
+  group: release-image-${{ inputs.image }}
   cancel-in-progress: false
 
 env:
-  IMAGE_REPO: extenddb/extenddb-postgres
   # Pinned AWS CLI for runners that lack it (the smoke test needs `aws`).
   # Checksums are for awscli-exe-linux-<arch>-2.31.6.zip, recorded when the pin
   # was reviewed; bump the version and both checksums together.
@@ -92,6 +96,12 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       sha: ${{ steps.meta.outputs.sha }}
       build_date: ${{ steps.meta.outputs.build_date }}
+      image: ${{ steps.meta.outputs.image }}
+      image_repo: ${{ steps.meta.outputs.image_repo }}
+      dockerfile: ${{ steps.meta.outputs.dockerfile }}
+      license_backend: ${{ steps.meta.outputs.license_backend }}
+      smoke_script: ${{ steps.meta.outputs.smoke_script }}
+      smoke_env: ${{ steps.meta.outputs.smoke_env }}
     steps:
       - name: Check out main (the reviewed workflow's own ref)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -104,6 +114,7 @@ jobs:
           # Dispatch inputs are untrusted; they reach the shell only through the
           # environment, never by interpolation into the script source.
           RAW_TAG: ${{ inputs.tag }}
+          RAW_IMAGE: ${{ inputs.image }}
         run: |
           set -euo pipefail
 
@@ -114,6 +125,27 @@ jobs:
             exit 1
           fi
           VERSION="${RAW_TAG#v}"
+
+          case "$RAW_IMAGE" in
+            extenddb-postgres)
+              IMAGE_REPO='extenddb/extenddb-postgres'
+              DOCKERFILE='Dockerfile'
+              LICENSE_BACKEND='postgres'
+              SMOKE_SCRIPT='./ci/smoke-test-container.sh'
+              SMOKE_ENV='EXTENDDB_IMAGE'
+              ;;
+            extenddb-mongodb)
+              IMAGE_REPO='extenddb/extenddb-mongodb'
+              DOCKERFILE='Dockerfile.mongodb'
+              LICENSE_BACKEND='mongodb'
+              SMOKE_SCRIPT='./ci/smoke-test-mongodb-container.sh'
+              SMOKE_ENV='EXTENDDB_MONGODB_IMAGE'
+              ;;
+            *)
+              echo "::error::image '$RAW_IMAGE' is not in the allowlist"
+              exit 1
+              ;;
+          esac
 
           # 2. The tag must already exist; this workflow never creates tags.
           git fetch --no-tags origin "refs/tags/${RAW_TAG}:refs/tags/${RAW_TAG}" \
@@ -146,6 +178,12 @@ jobs:
             echo "version=$VERSION"
             echo "sha=$SHA"
             echo "build_date=$BUILD_DATE"
+            echo "image=$RAW_IMAGE"
+            echo "image_repo=$IMAGE_REPO"
+            echo "dockerfile=$DOCKERFILE"
+            echo "license_backend=$LICENSE_BACKEND"
+            echo "smoke_script=$SMOKE_SCRIPT"
+            echo "smoke_env=$SMOKE_ENV"
           } >> "$GITHUB_OUTPUT"
 
       - name: Check out the tagged commit for the licence gate
@@ -160,7 +198,8 @@ jobs:
         run: |
           set -euo pipefail
           cargo install --locked --version 0.9.0 --features cli cargo-about
-          ./devtools/generate-software-license-notices --check
+          ./devtools/generate-software-license-notices --check \
+            --backend '${{ steps.meta.outputs.license_backend }}'
 
   build:
     needs: gate
@@ -215,10 +254,11 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
         with:
           context: .
+          file: ${{ needs.gate.outputs.dockerfile }}
           platforms: ${{ matrix.platform }}
           load: true             # into the local store, so it can be tested first
           push: false
-          tags: ${{ env.IMAGE_REPO }}:sha-${{ needs.gate.outputs.sha }}-${{ matrix.arch }}
+          tags: ${{ needs.gate.outputs.image_repo }}:sha-${{ needs.gate.outputs.sha }}-${{ matrix.arch }}
           build-args: |
             VERSION=${{ needs.gate.outputs.version }}
             VCS_REF=${{ needs.gate.outputs.sha }}
@@ -232,7 +272,7 @@ jobs:
         run: |
           set -euo pipefail
           ACTUAL=$(docker image inspect \
-            '${{ env.IMAGE_REPO }}:sha-${{ needs.gate.outputs.sha }}-${{ matrix.arch }}' \
+            '${{ needs.gate.outputs.image_repo }}:sha-${{ needs.gate.outputs.sha }}-${{ matrix.arch }}' \
             --format '{{.Architecture}}')
           [[ "$ACTUAL" == "${{ matrix.arch }}" ]] \
             || { echo "::error::expected ${{ matrix.arch }}, image reports $ACTUAL"; exit 1; }
@@ -243,15 +283,23 @@ jobs:
         # `compose up --no-build`, and asserts every container is running this
         # exact image ID.
         env:
-          EXTENDDB_IMAGE: ${{ env.IMAGE_REPO }}:sha-${{ needs.gate.outputs.sha }}-${{ matrix.arch }}
-        run: ./ci/smoke-test-container.sh
+          IMAGE: ${{ needs.gate.outputs.image_repo }}:sha-${{ needs.gate.outputs.sha }}-${{ matrix.arch }}
+          SMOKE_ENV: ${{ needs.gate.outputs.smoke_env }}
+          SMOKE_SCRIPT: ${{ needs.gate.outputs.smoke_script }}
+        run: |
+          set -euo pipefail
+          if [[ "$SMOKE_ENV" == 'EXTENDDB_MONGODB_IMAGE' ]]; then
+            EXTENDDB_MONGODB_IMAGE="$IMAGE" "$SMOKE_SCRIPT"
+          else
+            EXTENDDB_IMAGE="$IMAGE" "$SMOKE_SCRIPT"
+          fi
 
       - name: Save the tested image as an artifact
         # docker save preserves the image ID, so what publish pushes is exactly
         # what passed the smoke test above.
         run: |
           set -euo pipefail
-          docker save '${{ env.IMAGE_REPO }}:sha-${{ needs.gate.outputs.sha }}-${{ matrix.arch }}' \
+          docker save '${{ needs.gate.outputs.image_repo }}:sha-${{ needs.gate.outputs.sha }}-${{ matrix.arch }}' \
             | gzip > "image-${{ matrix.arch }}.tar.gz"
           ls -lh "image-${{ matrix.arch }}.tar.gz"
 
@@ -268,6 +316,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: dockerhub       # approval 1: publish + sign (the only job with Docker Hub secrets)
+    env:
+      IMAGE_REPO: ${{ needs.gate.outputs.image_repo }}
     # Signing rides the publish approval (release owner decision 2026-08-18);
     # propagation is the next job, under the ghcr environment's own gate.
     outputs:
@@ -293,7 +343,7 @@ jobs:
         run: |
           set -euo pipefail
           for f in images/image-*.tar.gz; do gunzip -c "$f" | docker load; done
-          docker image ls '${{ env.IMAGE_REPO }}'
+          docker image ls '${{ needs.gate.outputs.image_repo }}'
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
@@ -387,7 +437,7 @@ jobs:
         id: sign
         uses: ./.github/actions/sign-image
         with:
-          image-repo: ${{ env.IMAGE_REPO }}
+          image-repo: ${{ needs.gate.outputs.image_repo }}
           digest: ${{ steps.push.outputs.digest }}
           release-tag: v${{ needs.gate.outputs.version }}
           key-arn: arn:aws:kms:us-east-1:975306274793:key/654ab7f4-4a11-45e1-a313-3a6989f3721c
@@ -400,7 +450,7 @@ jobs:
             echo ""
             echo "| field | value |"
             echo "|---|---|"
-            echo "| candidate | \`${{ env.IMAGE_REPO }}:${{ steps.push.outputs.candidate }}\` |"
+            echo "| candidate | \`${{ needs.gate.outputs.image_repo }}:${{ steps.push.outputs.candidate }}\` |"
             echo "| index digest | \`${{ steps.push.outputs.digest }}\` |"
             echo "| platforms | linux/amd64, linux/arm64 |"
             echo "| version (from tag) | \`${{ needs.gate.outputs.version }}\` |"
@@ -429,6 +479,9 @@ jobs:
       packages: write   # GHCR
       id-token: write   # ECR (OIDC role)
     env:
+      IMAGE_REPO: ${{ needs.gate.outputs.image_repo }}
+      GHCR_REPO: ghcr.io/extenddb/${{ needs.gate.outputs.image }}
+      ECR_REPO: public.ecr.aws/extenddb/${{ needs.gate.outputs.image }}
       DIGEST: ${{ needs.publish-candidate.outputs.digest }}
       CANDIDATE: ${{ needs.publish-candidate.outputs.candidate }}
       SIG_TAG: ${{ needs.publish-candidate.outputs.sig-tag }}
@@ -450,7 +503,7 @@ jobs:
         uses: ./.github/actions/copy-artifact
         with:
           src-repo: ${{ env.IMAGE_REPO }}
-          dst-repo: ghcr.io/extenddb/extenddb-postgres
+          dst-repo: ${{ env.GHCR_REPO }}
           tag: ${{ env.CANDIDATE }}
           digest: ${{ env.DIGEST }}
           by-digest: 'true'
@@ -459,7 +512,7 @@ jobs:
         uses: ./.github/actions/copy-artifact
         with:
           src-repo: ${{ env.IMAGE_REPO }}
-          dst-repo: ghcr.io/extenddb/extenddb-postgres
+          dst-repo: ${{ env.GHCR_REPO }}
           tag: ${{ env.SIG_TAG }}
           digest: ${{ env.SIG_DIGEST }}
           by-digest: 'false'
@@ -481,7 +534,7 @@ jobs:
         uses: ./.github/actions/copy-artifact
         with:
           src-repo: ${{ env.IMAGE_REPO }}
-          dst-repo: public.ecr.aws/extenddb/extenddb-postgres
+          dst-repo: ${{ env.ECR_REPO }}
           tag: ${{ env.CANDIDATE }}
           digest: ${{ env.DIGEST }}
           by-digest: 'true'
@@ -490,7 +543,7 @@ jobs:
         uses: ./.github/actions/copy-artifact
         with:
           src-repo: ${{ env.IMAGE_REPO }}
-          dst-repo: public.ecr.aws/extenddb/extenddb-postgres
+          dst-repo: ${{ env.ECR_REPO }}
           tag: ${{ env.SIG_TAG }}
           digest: ${{ env.SIG_DIGEST }}
           by-digest: 'false'
