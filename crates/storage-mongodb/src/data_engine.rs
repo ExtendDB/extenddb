@@ -1756,6 +1756,7 @@ impl MongoEngine {
             return Ok(());
         }
 
+        let cache_generation = self.gsi_cache_generation(&key_info.table_id);
         let indexes_coll = self.catalog_db.collection::<Document>("indexes");
         let mut cursor = indexes_coll
             .find(doc! { "_id.table_id": &key_info.table_id })
@@ -1848,7 +1849,7 @@ impl MongoEngine {
             }
         }
 
-        self.gsi_cache_set(&key_info.table_id, found_any);
+        self.gsi_cache_set_if_generation(&key_info.table_id, cache_generation, found_any);
         Ok(())
     }
 
