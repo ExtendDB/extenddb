@@ -21,9 +21,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use extenddb_core::types::{
-    BackupDescription, BackupDetails, BackupSummary, ContinuousBackupsDescription, GsiInput,
-    KeySchemaElement, LsiInput, PointInTimeRecoveryDescription, Projection, ProvisionedThroughput,
-    SourceTableDetails, TableDescription,
+    AttributeDefinition, BackupDescription, BackupDetails, BackupSummary,
+    ContinuousBackupsDescription, GsiInput, KeySchemaElement, LsiInput,
+    PointInTimeRecoveryDescription, Projection, ProvisionedThroughput, SourceTableDetails,
+    TableDescription,
 };
 use extenddb_storage::BackupEngine;
 use extenddb_storage::error::StorageError;
@@ -173,6 +174,10 @@ impl BackupEngine for MongoEngine {
                 .try_collect()
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let attribute_definitions: Vec<AttributeDefinition> = bson::from_bson(
+                mongodb::bson::Bson::Array(attr_defs_bson.clone()),
+            )
+            .map_err(|e| StorageError::Internal(format!("parse attribute_definitions: {e}")))?;
             let mut global_secondary_indexes = Vec::new();
             let mut local_secondary_indexes = Vec::new();
             for index_doc in index_docs {
@@ -183,6 +188,23 @@ impl BackupEngine for MongoEngine {
                     .to_owned();
                 let key_schema: Vec<KeySchemaElement> = decode_required(&index_doc, "key_schema")?;
                 let projection: Projection = decode_required(&index_doc, "projection")?;
+
+                if matches!(
+                    index_doc.get_str("index_type").unwrap_or("GSI"),
+                    "GSI" | "LSI"
+                ) {
+                    for key in &key_schema {
+                        if !attribute_definitions
+                            .iter()
+                            .any(|definition| definition.attribute_name == key.attribute_name)
+                        {
+                            return Err(StorageError::Validation(format!(
+                                "Cannot create backup for table '{table_name}': index '{index_name}' references key attribute '{}' missing from attribute_definitions",
+                                key.attribute_name
+                            )));
+                        }
+                    }
+                }
 
                 match index_doc.get_str("index_type").unwrap_or("GSI") {
                     "GSI" => {
