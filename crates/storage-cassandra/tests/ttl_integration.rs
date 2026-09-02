@@ -1,146 +1,17 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Integration tests for MetadataEngine tag operations.
+//! Integration tests for Cassandra TTL against a live Cassandra.
+//!
+//! Requires Cassandra on 127.0.0.1:9042. There is no Cassandra CI workflow, so
+//! these are run locally.
 
 #[path = "common/mod.rs"]
 mod helpers;
 
-use extenddb_core::types::Tag;
 use extenddb_storage::MetadataEngine;
 
 use crate::helpers::setup_engine;
-
-#[tokio::test]
-async fn test_tag_and_list_tags() {
-    let engine = setup_engine().await;
-    let arn = format!(
-        "arn:aws:dynamodb:us-east-1:123456789012:table/test-{}",
-        uuid::Uuid::new_v4().simple()
-    );
-
-    let tags = vec![
-        Tag {
-            key: "env".to_string(),
-            value: "test".to_string(),
-        },
-        Tag {
-            key: "owner".to_string(),
-            value: "alice".to_string(),
-        },
-    ];
-
-    engine
-        .tag_resource(&arn, &tags)
-        .await
-        .expect("tag_resource should succeed");
-
-    let result = engine
-        .list_tags(&arn)
-        .await
-        .expect("list_tags should succeed");
-    assert_eq!(result.len(), 2);
-    // Cassandra returns in clustering key order
-    assert_eq!(result[0].key, "env");
-    assert_eq!(result[0].value, "test");
-    assert_eq!(result[1].key, "owner");
-    assert_eq!(result[1].value, "alice");
-}
-
-#[tokio::test]
-async fn test_tag_resource_upserts() {
-    let engine = setup_engine().await;
-    let arn = format!(
-        "arn:aws:dynamodb:us-east-1:123456789012:table/test-{}",
-        uuid::Uuid::new_v4().simple()
-    );
-
-    engine
-        .tag_resource(
-            &arn,
-            &[Tag {
-                key: "env".to_string(),
-                value: "staging".to_string(),
-            }],
-        )
-        .await
-        .expect("first tag_resource should succeed");
-
-    // Overwrite with new value
-    engine
-        .tag_resource(
-            &arn,
-            &[Tag {
-                key: "env".to_string(),
-                value: "prod".to_string(),
-            }],
-        )
-        .await
-        .expect("second tag_resource should succeed");
-
-    let result = engine
-        .list_tags(&arn)
-        .await
-        .expect("list_tags should succeed");
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].value, "prod");
-}
-
-#[tokio::test]
-async fn test_untag_resource() {
-    let engine = setup_engine().await;
-    let arn = format!(
-        "arn:aws:dynamodb:us-east-1:123456789012:table/test-{}",
-        uuid::Uuid::new_v4().simple()
-    );
-
-    let tags = vec![
-        Tag {
-            key: "a".to_string(),
-            value: "1".to_string(),
-        },
-        Tag {
-            key: "b".to_string(),
-            value: "2".to_string(),
-        },
-        Tag {
-            key: "c".to_string(),
-            value: "3".to_string(),
-        },
-    ];
-    engine
-        .tag_resource(&arn, &tags)
-        .await
-        .expect("tag_resource should succeed");
-
-    engine
-        .untag_resource(&arn, &["a".to_string(), "c".to_string()])
-        .await
-        .expect("untag_resource should succeed");
-
-    let result = engine
-        .list_tags(&arn)
-        .await
-        .expect("list_tags should succeed");
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].key, "b");
-    assert_eq!(result[0].value, "2");
-}
-
-#[tokio::test]
-async fn test_list_tags_empty() {
-    let engine = setup_engine().await;
-    let arn = format!(
-        "arn:aws:dynamodb:us-east-1:123456789012:table/test-{}",
-        uuid::Uuid::new_v4().simple()
-    );
-
-    let result = engine
-        .list_tags(&arn)
-        .await
-        .expect("list_tags should succeed");
-    assert!(result.is_empty());
-}
 
 async fn activate_tables(engine: &extenddb_storage_cassandra::CassandraEngine) {
     tokio::time::sleep(std::time::Duration::from_millis(350)).await;
@@ -685,6 +556,21 @@ async fn test_ttl_sweep_emits_service_remove_stream_record() {
         "dynamodb.amazonaws.com"
     );
     assert_eq!(record["dynamodb"]["OldImage"]["id"]["S"], "ttl-stream-item");
+
+    // A worker that published the record but never completed the exact base
+    // delete would satisfy everything above.
+    let mut key = extenddb_core::types::Item::new();
+    key.insert(
+        "id".to_owned(),
+        extenddb_core::types::AttributeValue::S("ttl-stream-item".to_owned()),
+    );
+    assert!(
+        extenddb_storage::DataEngine::get_item(engine.as_ref(), &key_info, &key)
+            .await
+            .unwrap()
+            .is_none(),
+        "the retried sweep must also complete the base-row delete"
+    );
 }
 
 #[tokio::test]
@@ -989,7 +875,22 @@ async fn test_concurrent_ordinary_writes_on_ttl_table_both_succeed() {
         .await
         .expect("read after contended writes")
         .expect("one of the writes is durable");
-    assert!(matches!(stored.get("value"), Some(AttributeValue::S(_))));
+    let expected: Vec<String> = std::iter::once("a".to_owned())
+        .chain(std::iter::once("b".to_owned()))
+        .chain((0..8).map(|index| format!("wave-{index}")))
+        .collect();
+    let stored_value = match stored.get("value") {
+        Some(AttributeValue::S(value)) => value.clone(),
+        other => panic!("expected a string value, got {other:?}"),
+    };
+    assert!(
+        expected.contains(&stored_value),
+        "the durable value must be one an actual writer wrote, got {stored_value:?}"
+    );
+    assert!(
+        stored.contains_key("expires_at"),
+        "the winning write must have kept the TTL attribute"
+    );
 }
 
 /// Manufacture a durable queue row in `state` owning `work_id`, and put the
@@ -1347,6 +1248,21 @@ async fn test_drained_past_bucket_registration_is_retired() {
     extenddb_storage_cassandra::ttl_worker::sweep_once(&engine, &metrics).await;
     extenddb_storage_cassandra::ttl_worker::sweep_once(&engine, &metrics).await;
 
+    // Retirement is only correct if the partition really drained. Assert the
+    // item and its queue row are gone first, so a sweep that retired the
+    // registration while leaving work behind fails here rather than passing.
+    let mut key = extenddb_core::types::Item::new();
+    key.insert(
+        "id".to_owned(),
+        extenddb_core::types::AttributeValue::S("drain".to_owned()),
+    );
+    assert!(
+        extenddb_storage::DataEngine::get_item(&engine, &table.key_info, &key)
+            .await
+            .unwrap()
+            .is_none(),
+        "the expired item must have been deleted by the sweep"
+    );
     assert_eq!(
         ttl_bucket_count(
             &engine,
@@ -1752,7 +1668,7 @@ async fn test_ttl_reconciles_same_expiry_after_queue_only_claim() {
     engine
         .put_item(
             &table.key_info,
-            recreated,
+            recreated.clone(),
             false,
             None,
             &Default::default(),
@@ -1760,6 +1676,18 @@ async fn test_ttl_reconciles_same_expiry_after_queue_only_claim() {
         )
         .await
         .expect("worker releases orphaned exact work owner before retiring queue work");
+    // Prove the recreation is durable and unclaimed, not merely accepted.
+    let stored = engine
+        .get_item(&table.key_info, &key)
+        .await
+        .unwrap()
+        .expect("the recreated item must be durable");
+    assert_eq!(stored.get("expires_at"), recreated.get("expires_at"));
+    assert_eq!(
+        base_row_owner(&engine, &table.key_info, &recreated).await,
+        None,
+        "the orphaned exact owner must have been released"
+    );
 }
 
 #[tokio::test]
@@ -1826,6 +1754,17 @@ async fn test_ttl_update_recreates_logically_absent_item() {
         )
         .await
         .expect("TTL UpdateItem creates an absent row through an exact claim");
+    // Without this the test would pass on a no-op first update followed by a
+    // no-op delete, which is the failure it exists to catch.
+    let created = engine
+        .get_item(&table.key_info, &key)
+        .await
+        .unwrap()
+        .expect("the first update must have created the item");
+    assert_eq!(
+        created.get("value"),
+        Some(&AttributeValue::S("first".to_owned()))
+    );
     engine
         .delete_item(
             &table.key_info,
@@ -1837,6 +1776,14 @@ async fn test_ttl_update_recreates_logically_absent_item() {
         )
         .await
         .unwrap();
+    assert!(
+        engine
+            .get_item(&table.key_info, &key)
+            .await
+            .unwrap()
+            .is_none(),
+        "the delete must have removed it before the recreation is exercised"
+    );
 
     let recreate_maps = ExpressionMaps::new(
         std::collections::HashMap::new(),
@@ -1922,12 +1869,15 @@ async fn test_conditional_put_recreates_metadata_only_row() {
         )
         .await
         .expect("conditional put treats metadata-only row as absent");
-    assert!(
-        engine
-            .get_item(&table.key_info, &key)
-            .await
-            .unwrap()
-            .is_some()
+    let stored = engine
+        .get_item(&table.key_info, &key)
+        .await
+        .unwrap()
+        .expect("the conditional put must be durable");
+    assert_eq!(
+        stored.get("value"),
+        Some(&AttributeValue::S("new".to_owned())),
+        "a surviving stale row would satisfy a bare is_some() check"
     );
 }
 

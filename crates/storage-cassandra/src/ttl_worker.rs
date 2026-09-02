@@ -66,27 +66,56 @@ pub async fn reconcile_pending_once(
                 Err(error) => return Err(error),
             };
             for row in rows {
-                let id: uuid::Uuid = row.get_r_by_name("id").map_err(|error| {
-                    StorageError::Internal(format!("Parse TTL outbox id: {error}"))
-                })?;
-                let table_id: String =
-                    crate::cassandra_util::get_column(&row, "table_id", "ttl_reconcile_pending")?;
-                let account_id: String =
-                    crate::cassandra_util::get_column(&row, "account_id", "ttl_reconcile_pending")?;
-                let table_name: String =
-                    crate::cassandra_util::get_column(&row, "table_name", "ttl_reconcile_pending")?;
-                let key_data: String =
-                    crate::cassandra_util::get_column(&row, "key_data", "ttl_reconcile_pending")?;
-                let key: extenddb_core::types::Item =
-                    serde_json::from_str(&key_data).map_err(|error| {
-                        StorageError::Internal(format!("Parse TTL outbox key: {error}"))
+                // A single unusable row must not abort the pass. This outbox is
+                // the durable guarantee that an item reaches the queue at all,
+                // so propagating a per-row failure would starve reconciliation
+                // for every other item — and those items would never expire.
+                // Each failure is confined to its row, which is left in place
+                // for the next cycle.
+                let parsed = (|| -> Result<_, StorageError> {
+                    let id: uuid::Uuid = row.get_r_by_name("id").map_err(|error| {
+                        StorageError::Internal(format!("Parse TTL outbox id: {error}"))
                     })?;
+                    let table_id: String = crate::cassandra_util::get_column(
+                        &row,
+                        "table_id",
+                        "ttl_reconcile_pending",
+                    )?;
+                    let account_id: String = crate::cassandra_util::get_column(
+                        &row,
+                        "account_id",
+                        "ttl_reconcile_pending",
+                    )?;
+                    let table_name: String = crate::cassandra_util::get_column(
+                        &row,
+                        "table_name",
+                        "ttl_reconcile_pending",
+                    )?;
+                    let key_data: String = crate::cassandra_util::get_column(
+                        &row,
+                        "key_data",
+                        "ttl_reconcile_pending",
+                    )?;
+                    let key: extenddb_core::types::Item =
+                        serde_json::from_str(&key_data).map_err(|error| {
+                            StorageError::Internal(format!("Parse TTL outbox key: {error}"))
+                        })?;
+                    Ok((id, table_id, account_id, table_name, key))
+                })();
+                let (id, table_id, account_id, table_name, key) = match parsed {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        tracing::warn!("TTL worker: unreadable outbox row skipped: {error}");
+                        continue;
+                    }
+                };
 
                 let reconcile = match storage.fetch_table_key_info(&account_id, &table_name).await {
                     Ok(key_info) if key_info.table_id == table_id => {
-                        match storage.get_item_quorum(&key_info, &key).await? {
-                            Some(item) => storage.reconcile_ttl_item(&key_info, &item).await,
-                            None => Ok(()),
+                        match storage.get_item_quorum(&key_info, &key).await {
+                            Ok(Some(item)) => storage.reconcile_ttl_item(&key_info, &item).await,
+                            Ok(None) => Ok(()),
+                            Err(error) => Err(error),
                         }
                     }
                     Ok(_) | Err(StorageError::TableNotFound(_)) => Ok(()),

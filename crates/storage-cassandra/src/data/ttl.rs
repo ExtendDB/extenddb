@@ -1032,8 +1032,75 @@ mod tests {
             Some(&item),
         )
         .unwrap();
-        let built = batch.build().unwrap();
-        assert_eq!(built.request.queries.len(), 2);
+        let statements = built_statements(batch);
+        // The point of the test is the absence of the DELETE: re-deleting and
+        // re-inserting the same queue key would let a writer erase expiration
+        // work that a sweep had already claimed.
+        assert!(
+            !statements.iter().any(|cql| cql.contains("DELETE")),
+            "an unchanged TTL must not delete its own queue entry: {statements:?}"
+        );
+        assert_eq!(
+            statements.len(),
+            2,
+            "expected only the bucket and entry upserts: {statements:?}"
+        );
+        assert!(
+            statements[0].contains(&format!("INSERT INTO account_keyspace.{TTL_BUCKET_TABLE}"))
+        );
+        assert!(statements[1].contains(&format!("INSERT INTO account_keyspace.{TTL_QUEUE_TABLE}")));
+    }
+
+    /// A changed TTL value must retire the old queue key as well as register the
+    /// new one, otherwise the old entry outlives the change.
+    #[test]
+    fn changed_ttl_retires_the_previous_queue_key() {
+        let key_info = key_info();
+        let mut old = Item::new();
+        old.insert("id".to_owned(), AttributeValue::S("a".to_owned()));
+        old.insert("ttl".to_owned(), AttributeValue::N("123".to_owned()));
+        let mut new = old.clone();
+        new.insert("ttl".to_owned(), AttributeValue::N("456".to_owned()));
+
+        let mut batch = BatchQueryBuilder::new();
+        add_ttl_queue_mutations(
+            &mut batch,
+            "account_keyspace",
+            &key_info,
+            "ttl",
+            uuid::Uuid::new_v4(),
+            Some(&old),
+            Some(&new),
+        )
+        .unwrap();
+        let statements = built_statements(batch);
+        assert_eq!(statements.len(), 3, "{statements:?}");
+        assert!(
+            statements[0].contains(&format!("DELETE FROM account_keyspace.{TTL_QUEUE_TABLE}")),
+            "the previous queue key must be deleted first: {statements:?}"
+        );
+        assert!(
+            statements[1].contains(&format!("INSERT INTO account_keyspace.{TTL_BUCKET_TABLE}"))
+        );
+        assert!(statements[2].contains(&format!("INSERT INTO account_keyspace.{TTL_QUEUE_TABLE}")));
+    }
+
+    fn built_statements(batch: BatchQueryBuilder) -> Vec<String> {
+        use cdrs_tokio::frame::message_batch::BatchQuerySubj;
+
+        batch
+            .build()
+            .unwrap()
+            .request
+            .queries
+            .into_iter()
+            .map(|query| match query.subject {
+                BatchQuerySubj::QueryString(cql) => cql.to_string(),
+                BatchQuerySubj::PreparedId(_) => {
+                    panic!("TTL queue mutations are built as CQL strings")
+                }
+            })
+            .collect()
     }
 
     /// Every TTL claim and the exact base-row delete condition on
