@@ -15,7 +15,6 @@ dev-mode = ["extenddb-config/dev-mode"]
 
 [dependencies]
 extenddb-auth = { workspace = true }
-extenddb-cache = { workspace = true }
 extenddb-core = { workspace = true }
 extenddb-engine = { workspace = true }
 extenddb-storage = { workspace = true }

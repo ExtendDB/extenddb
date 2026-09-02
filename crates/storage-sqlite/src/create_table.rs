@@ -207,9 +207,12 @@ impl SqliteEngine {
             for vi in vis {
                 let vec_attr = serde_json::to_string(&vi.vector_attribute)
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
+                // An empty SearchSchema is stored as absent: it means the same as
+                // omitting the member, and the service never reports an empty
+                // list. The request paths collapse it too; this covers a caller
+                // that reaches the storage trait directly.
                 let search_schema = vi
-                    .search_schema
-                    .as_ref()
+                    .search_schema_for_storage()
                     .map(serde_json::to_string)
                     .transpose()
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -227,10 +230,9 @@ impl SqliteEngine {
                             "vector index reached storage without a projection".to_owned(),
                         )
                     })?;
-                let distance = serde_json::to_string(&vi.distance_function)
-                    .map_err(|e| StorageError::Internal(e.to_string()))?
-                    .trim_matches('"')
-                    .to_owned();
+                let distance = extenddb_storage::vector_catalog::distance_function_token(
+                    vi.distance_function,
+                )?;
                 let index_id = uuid::Uuid::new_v4().to_string();
                 sqlx::query(
                     "INSERT INTO vector_indexes \
@@ -453,7 +455,7 @@ impl SqliteEngine {
                         index_name: vi.index_name.clone(),
                         vector_attribute: vi.vector_attribute.clone(),
                         dimensions: vi.dimensions,
-                        search_schema: vi.search_schema.clone(),
+                        search_schema: vi.search_schema_for_storage().map(<[_]>::to_vec),
                         distance_function: vi.distance_function,
                         index_status: extenddb_core::types::IndexStatus::Active,
                         backfilling: None,

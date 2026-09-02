@@ -4,8 +4,10 @@
 //! Backend factory infrastructure for creating server components.
 //!
 //! This module provides the factory pattern for creating storage backends.
-//! Backends register themselves via the inventory crate, allowing `cmd_serve`
-//! to remain backend-agnostic.
+//! A binary serves exactly one backend, installed from its thin `main` via
+//! [`crate::set_backend`]; this factory is reached through the installed
+//! [`crate::Backend`] value, which is what keeps `cmd_serve` backend-agnostic
+//! without a registry to look anything up in.
 
 use std::future::Future;
 use std::pin::Pin;

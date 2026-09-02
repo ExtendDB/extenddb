@@ -13,7 +13,11 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        # pgvector's own image, which is postgres:16 plus the extension. The
+        # backend serves vector indexes where the extension is present, so this is
+        # what makes the positive paths reachable in CI. The novector job below
+        # keeps the refusal paths covered on a plain image.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_PASSWORD: devpass
         options: >-
@@ -182,7 +186,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_PASSWORD: devpass
         options: >-
@@ -247,14 +251,96 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
           EXTENDDB_ADMIN_USER: admin
           EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
-          # PostgreSQL implements no vector search, so this is the job where the
-          # wire refusal tests must actually run. Both vector suites adapt to
-          # whatever the backend reports, so the refusal suite could skip every
-          # assertion here and still report green. "0" asserts the backend
-          # refuses vector indexes, making those tests mandatory rather than
-          # optional, and turns a silent skip into a failure.
-          EXTENDDB_EXPECT_VECTORS: "0"
+          # PostgreSQL now serves vector search against a server with pgvector,
+          # which this job's image has. Both vector suites adapt to whatever the
+          # backend reports, so without a pinned expectation the positive suite
+          # could skip every assertion and still report green. "1" makes those
+          # tests mandatory. The refusal suite moves to the novector job, which is
+          # the only place those assertions still mean anything.
+          EXTENDDB_EXPECT_VECTORS: "1"
         run: devtools/run-tests --extenddb --rust-integration --release
+
+      # The control plane for vector indexes is not reachable over the wire while
+      # this backend declares no vector search capability, so its tests drive the
+      # storage layer directly against this job's PostgreSQL. They build their own
+      # throwaway databases; the connection string is the server, not a database.
+      - name: Run PostgreSQL storage-level tests
+        env:
+          EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
+        run: cargo test --release -p extenddb-storage-postgres --test vector_control_plane
+
+  # The runtime-detection proof: the same binary, against a PostgreSQL with no
+  # pgvector, must refuse vector indexes over the wire. Today the job above runs
+  # on a plain image too, so this looks like a duplicate of it; it is not, because
+  # that job moves to the pgvector image when the search path lands and its
+  # EXTENDDB_EXPECT_VECTORS flips to "1". Without this job the refusal surface
+  # would stop being tested at exactly that point.
+  run-rust-integration-postgres-novector:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: devpass
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Initialize ExtendDB
+        id: init
+        run: |
+          output=$(./target/release/extenddb init --config extenddb.toml \
+            --pg-host 127.0.0.1 --pg-port 5432 --pg-user postgres --pg-pass devpass 2>&1)
+          echo "$output"
+          echo "admin_password=$(echo "$output" | grep -oP 'Password: \K\S+')" >> "$GITHUB_OUTPUT"
+
+      - name: Start ExtendDB
+        run: |
+          ./target/release/extenddb serve --config extenddb.toml --foreground --write-pid-file &
+          for i in $(seq 1 30); do
+            if curl -sk https://127.0.0.1:18443/health | grep -q healthy; then
+              echo "Server ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server failed to start"
+          exit 1
+
+      - name: Run the vector refusal suite
+        env:
+          EXTENDDB_TEST_ENDPOINT: https://127.0.0.1:18443
+          AWS_DEFAULT_REGION: us-east-1
+          EXTENDDB_ADMIN_USER: admin
+          EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
+          # "0" makes the refusal assertions mandatory: the suite adapts to what
+          # the backend reports, so without this it could skip every assertion
+          # and still report green.
+          EXTENDDB_EXPECT_VECTORS: "0"
+        run: >-
+          devtools/run-tests --extenddb --rust-integration --release
+          --filter vector_index_unsupported
+
+      # No storage-level step here on purpose. Those tests build their own
+      # extension-free scratch databases, so they behave identically on either
+      # image and the job above already runs them; repeating them here would buy
+      # a second release build and no coverage.
   run-rust-integration-sqlite:
     runs-on: ubuntu-latest
 
@@ -323,6 +409,7 @@ jobs:
         run-integration-sqlite,
         run-integration-dev-mode,
         run-rust-integration,
+        run-rust-integration-postgres-novector,
         run-rust-integration-sqlite,
       ]
     if: always()
@@ -332,6 +419,7 @@ jobs:
              [ "${{ needs.run-integration-sqlite.result }}" != "success" ] || \
              [ "${{ needs.run-integration-dev-mode.result }}" != "success" ] || \
              [ "${{ needs.run-rust-integration.result }}" != "success" ] || \
+             [ "${{ needs.run-rust-integration-postgres-novector.result }}" != "success" ] || \
              [ "${{ needs.run-rust-integration-sqlite.result }}" != "success" ]; then
             exit 1
           fi

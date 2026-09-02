@@ -1,6 +1,6 @@
 # ADR-0004: Vector search is an exact scan over one row per vector
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-06
 - Deciders: @LeeroyHannigan
 

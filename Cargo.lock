@@ -1107,7 +1107,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "extenddb-app",
@@ -1120,14 +1120,13 @@ dependencies = [
 
 [[package]]
 name = "extenddb-app"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "clap",
  "daemonize",
  "extenddb-auth",
- "extenddb-cache",
  "extenddb-config",
  "extenddb-core",
  "extenddb-engine",
@@ -1148,7 +1147,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-auth"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "async-trait",
  "axum",
@@ -1168,7 +1167,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-cache"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "futures",
  "moka",
@@ -1179,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-config"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "config",
@@ -1192,7 +1191,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-core"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base64 0.22.1",
  "bigdecimal",
@@ -1205,7 +1204,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-engine"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base64 0.22.1",
  "crc32fast",
@@ -1224,7 +1223,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-server"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1260,7 +1259,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -1284,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-mongodb"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1314,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-postgres"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1326,6 +1325,7 @@ dependencies = [
  "extenddb-core",
  "extenddb-storage",
  "futures",
+ "pgvector",
  "rand 0.9.4",
  "serde",
  "serde_json",
@@ -1341,7 +1341,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-sqlite"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -2668,6 +2668,15 @@ checksum = "89815c69d36021a140146f26659a81d6c2afa33d216d736dd4be5381a7362220"
 dependencies = [
  "pest",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "pgvector"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3673cba5b9a124916096a423b806a9f29620972c6c97b08db5f2053e9428b481"
+dependencies = [
+ "sqlx",
 ]
 
 [[package]]

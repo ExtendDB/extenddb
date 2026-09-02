@@ -13,7 +13,8 @@ use crate::limits::LimitsConfig;
 use crate::types::{
     AttributeDefinition, AttributeValue, BillingMode, CreateTableInput, DeleteItemInput,
     GetItemInput, Item, KeySchemaElement, KeyType, MAX_VECTOR_INDEXES_PER_TABLE, PutItemInput,
-    ReturnValues, ScalarAttributeType, Select, UpdateItemInput, item_size_bytes,
+    ReturnValues, ScalarAttributeType, Select, UpdateItemInput, VECTOR_INDEX_COUNT_LIMIT_CREATE,
+    VECTOR_INDEX_REQUIRES_PAY_PER_REQUEST, item_size_bytes,
 };
 
 /// Validate a table name per Virtual `DynamoDB` rules.
@@ -389,15 +390,14 @@ fn validate_vector_indexes(input: &CreateTableInput) -> Result<(), DynamoDbError
     // vector index capacity mode as on-demand only. `BillingMode` defaults to
     // PROVISIONED when absent, so an omitted BillingMode is a rejection too.
     //
-    // Wording measured against the service on 2026-08-11; the earlier text was a
-    // reasonable paraphrase but not what the service says.
+    // Wording measured against the service on 2026-08-11 and held in the
+    // constant, which the UpdateTable paths share: the service returns one
+    // string for every direction of this rule.
     if !vis.is_empty()
         && input.billing_mode.unwrap_or(BillingMode::Provisioned) != BillingMode::PayPerRequest
     {
         return Err(DynamoDbError::ValidationException(
-            "One or more parameter values were invalid: Vector indexes are only supported \
-             for PAY_PER_REQUEST tables"
-                .to_owned(),
+            VECTOR_INDEX_REQUIRES_PAY_PER_REQUEST.to_owned(),
         ));
     }
 
@@ -405,10 +405,9 @@ fn validate_vector_indexes(input: &CreateTableInput) -> Result<(), DynamoDbError
     // echo the offending count here, unlike its SearchSchema messages, so neither
     // does this.
     if vis.len() > MAX_VECTOR_INDEXES_PER_TABLE {
-        return Err(DynamoDbError::ValidationException(format!(
-            "One or more parameter values were invalid: VectorIndex count exceeds the \
-             per-table limit of {MAX_VECTOR_INDEXES_PER_TABLE}"
-        )));
+        return Err(DynamoDbError::ValidationException(
+            VECTOR_INDEX_COUNT_LIMIT_CREATE.to_owned(),
+        ));
     }
 
     // Several indexes may share one vector attribute, but they must agree on its
@@ -2336,6 +2335,18 @@ mod tests {
         let err = validate_vector_indexes(&input).expect_err("one over the cap is refused");
         assert_eq!(
             format!("{err}"),
+            format!(
+                "One or more parameter values were invalid: VectorIndex count exceeds the \
+                 per-table limit of {MAX_VECTOR_INDEXES_PER_TABLE}"
+            )
+        );
+
+        // Both messages are now taken from the shared constants rather than
+        // inlined here, and the count constant spells its limit out as a literal.
+        // Assert the two agree, so raising the limit cannot leave the message
+        // stating the old one.
+        assert_eq!(
+            VECTOR_INDEX_COUNT_LIMIT_CREATE,
             format!(
                 "One or more parameter values were invalid: VectorIndex count exceeds the \
                  per-table limit of {MAX_VECTOR_INDEXES_PER_TABLE}"

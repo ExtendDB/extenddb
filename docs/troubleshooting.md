@@ -850,6 +850,46 @@ If the problem persists, check for long-running queries or connection leaks with
 
 ---
 
+### `Vector indexes are not supported by this storage backend`
+
+**Error text:**
+```
+Vector indexes are not supported by this storage backend
+```
+
+Also `SearchVectors is not supported by this storage backend` for a search request.
+
+**Cause:** Vector indexes are stored in `vector(N)` columns, a type the
+[pgvector](https://github.com/pgvector/pgvector) extension provides, so support is a
+property of the PostgreSQL server rather than of the ExtendDB build. The server probes
+for the extension once at startup and refuses every vector operation for the rest of
+its life if it was absent. Other operations are unaffected.
+
+**Fix:** Confirm what the running server decided, by looking for one of these lines in
+its startup log:
+
+```
+pgvector 0.8.0 detected on the data database; vector index storage available
+pgvector not installed on the data database; vector indexes are not supported
+```
+
+If it is absent, install the extension for your server version (for example
+`postgresql-16-pgvector`), then create it on the **data** database, not the catalog:
+
+```sql
+CREATE EXTENSION vector;
+```
+
+`extenddb init` and `extenddb migrate` both attempt this and print a notice rather than
+failing when they cannot; a role without permission to create extensions needs a
+superuser or the database owner to run it once.
+
+**Then restart ExtendDB.** The probe result is cached at startup, so a server that
+started without the extension keeps refusing vector operations until it is restarted,
+even after the extension exists.
+
+---
+
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
