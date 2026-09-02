@@ -116,9 +116,8 @@ impl CassandraCatalogStore {
         }
 
         // Delete the key (by PRIMARY KEY only)
-        let delete_query = format!(
-            "DELETE FROM {catalog_keyspace}.access_keys WHERE access_key_id = ?"
-        );
+        let delete_query =
+            format!("DELETE FROM {catalog_keyspace}.access_keys WHERE access_key_id = ?");
 
         crate::cassandra_util::execute(
             self.session(),
@@ -255,7 +254,9 @@ impl CassandraCatalogStore {
         );
 
         let session_tags_json = session_tags.as_ref().map(std::string::ToString::to_string);
-        let session_policy_json = session_policy.as_ref().map(std::string::ToString::to_string);
+        let session_policy_json = session_policy
+            .as_ref()
+            .map(std::string::ToString::to_string);
         let expires_ms = expires_at.unix_timestamp() * 1000 + i64::from(expires_at.millisecond());
 
         crate::cassandra_util::execute(

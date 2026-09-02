@@ -545,7 +545,7 @@ async fn test_ttl_sweep_emits_service_remove_stream_record() {
     use extenddb_storage::{DataEngine, TableEngine};
 
     let engine = Arc::new(setup_engine().await);
-    let account = crate::helpers::TestAccount::new(&engine, "extenddb_test").await;
+    let account = crate::helpers::TestAccount::new(&engine, "extenddb_ttl_test").await;
     let table_name = "TtlStream";
     engine
         .create_table(
@@ -1307,4 +1307,279 @@ async fn test_ttl_reconciles_same_expiry_after_queue_only_claim() {
         )
         .await
         .expect("worker releases orphaned exact work owner before retiring queue work");
+}
+
+#[tokio::test]
+async fn test_ttl_update_recreates_logically_absent_item() {
+    use extenddb_core::expression::{Expr, ExpressionMaps, PathElement, UpdateAction};
+    use extenddb_core::types::{AttributeValue, Item};
+    use extenddb_storage::DataEngine;
+
+    let engine = setup_engine().await;
+    let table = crate::helpers::TestTable::new(&engine, "TtlUpdateAbsent", false).await;
+    activate_tables(&engine).await;
+    engine
+        .update_ttl(
+            &table.key_info.account_id,
+            &table.key_info.table_name,
+            "expires_at",
+            true,
+        )
+        .await
+        .unwrap();
+    engine
+        .create_ttl_index(
+            &table.key_info.account_id,
+            &table.key_info.table_name,
+            "expires_at",
+        )
+        .await
+        .unwrap();
+
+    let mut key = Item::new();
+    key.insert("id".to_owned(), AttributeValue::S("absent".to_owned()));
+    let future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3_600;
+    let actions = vec![
+        UpdateAction::Set {
+            path: vec![PathElement::Attribute("value".to_owned())],
+            value: Expr::Placeholder("value".to_owned()),
+        },
+        UpdateAction::Set {
+            path: vec![PathElement::Attribute("expires_at".to_owned())],
+            value: Expr::Placeholder("expires".to_owned()),
+        },
+    ];
+    let maps = ExpressionMaps::new(
+        std::collections::HashMap::new(),
+        std::collections::HashMap::from([
+            ("value".to_owned(), AttributeValue::S("first".to_owned())),
+            ("expires".to_owned(), AttributeValue::N(future.to_string())),
+        ]),
+    );
+    engine
+        .update_item(
+            &table.key_info,
+            &key,
+            &actions,
+            false,
+            false,
+            None,
+            &maps,
+            None,
+        )
+        .await
+        .expect("TTL UpdateItem creates an absent row through an exact claim");
+    engine
+        .delete_item(
+            &table.key_info,
+            &key,
+            false,
+            None,
+            &Default::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let recreate_maps = ExpressionMaps::new(
+        std::collections::HashMap::new(),
+        std::collections::HashMap::from([
+            ("value".to_owned(), AttributeValue::S("second".to_owned())),
+            ("expires".to_owned(), AttributeValue::N(future.to_string())),
+        ]),
+    );
+    engine
+        .update_item(
+            &table.key_info,
+            &key,
+            &actions,
+            false,
+            false,
+            None,
+            &recreate_maps,
+            None,
+        )
+        .await
+        .expect("TTL UpdateItem recreates a row that retains partition metadata");
+    let item = engine
+        .get_item(&table.key_info, &key)
+        .await
+        .unwrap()
+        .expect("recreated item exists");
+    assert_eq!(
+        item.get("value"),
+        Some(&AttributeValue::S("second".to_owned()))
+    );
+}
+
+#[tokio::test]
+async fn test_conditional_put_recreates_metadata_only_row() {
+    use extenddb_core::expression::{Expr, PathElement};
+    use extenddb_core::types::{AttributeValue, Item};
+    use extenddb_storage::DataEngine;
+
+    let engine = setup_engine().await;
+    let table = crate::helpers::TestTable::new(&engine, "ConditionalPutMetadata", false).await;
+    activate_tables(&engine).await;
+    let mut item = Item::new();
+    item.insert("id".to_owned(), AttributeValue::S("key".to_owned()));
+    item.insert("value".to_owned(), AttributeValue::S("old".to_owned()));
+    engine
+        .put_item(
+            &table.key_info,
+            item.clone(),
+            false,
+            None,
+            &Default::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut key = Item::new();
+    key.insert("id".to_owned(), AttributeValue::S("key".to_owned()));
+    engine
+        .delete_item(
+            &table.key_info,
+            &key,
+            false,
+            None,
+            &Default::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    item.insert("value".to_owned(), AttributeValue::S("new".to_owned()));
+    let condition = Expr::Function {
+        name: "attribute_not_exists".to_owned(),
+        args: vec![Expr::Path(vec![PathElement::Attribute("id".to_owned())])],
+    };
+    engine
+        .put_item(
+            &table.key_info,
+            item,
+            false,
+            Some(&condition),
+            &Default::default(),
+            None,
+        )
+        .await
+        .expect("conditional put treats metadata-only row as absent");
+    assert!(
+        engine
+            .get_item(&table.key_info, &key)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn test_non_ttl_put_does_not_enqueue_ttl_reconciliation() {
+    use extenddb_core::types::{AttributeValue, Item};
+    use extenddb_storage::DataEngine;
+
+    let engine = setup_engine().await;
+    let table = crate::helpers::TestTable::new(&engine, "NonTtlPutFastPath", false).await;
+    activate_tables(&engine).await;
+    let mut item = Item::new();
+    item.insert("id".to_owned(), AttributeValue::S("key".to_owned()));
+    engine
+        .put_item(
+            &table.key_info,
+            item,
+            false,
+            None,
+            &Default::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ttl_outbox_count(&engine, &table.key_info.account_id).await,
+        0,
+        "non-TTL PutItem must not create permanent TTL journal traffic"
+    );
+}
+
+#[tokio::test]
+async fn test_ttl_enabled_table_rejects_new_async_gsi() {
+    use extenddb_core::types::{
+        AttributeDefinition, CreateGsiAction, GlobalSecondaryIndexUpdate, KeySchemaElement,
+        KeyType, Projection, ProjectionType, ScalarAttributeType, UpdateTableInput,
+    };
+    use extenddb_storage::TableEngine;
+    use extenddb_storage::error::StorageError;
+
+    let engine = setup_engine().await;
+    let table = crate::helpers::TestTable::new(&engine, "TtlRejectLaterGsi", false).await;
+    activate_tables(&engine).await;
+    engine
+        .update_ttl(
+            &table.key_info.account_id,
+            &table.key_info.table_name,
+            "expires_at",
+            true,
+        )
+        .await
+        .unwrap();
+    engine
+        .create_ttl_index(
+            &table.key_info.account_id,
+            &table.key_info.table_name,
+            "expires_at",
+        )
+        .await
+        .unwrap();
+
+    let result = engine
+        .update_table(
+            &table.key_info.account_id,
+            UpdateTableInput {
+                table_name: table.key_info.table_name.clone(),
+                billing_mode: None,
+                provisioned_throughput: None,
+                deletion_protection_enabled: None,
+                global_secondary_index_updates: Some(vec![GlobalSecondaryIndexUpdate {
+                    create: Some(CreateGsiAction {
+                        index_name: "StatusIndex".to_owned(),
+                        key_schema: vec![KeySchemaElement {
+                            attribute_name: "status".to_owned(),
+                            key_type: KeyType::Hash,
+                        }],
+                        projection: Projection {
+                            projection_type: ProjectionType::All,
+                            non_key_attributes: None,
+                        },
+                        provisioned_throughput: None,
+                    }),
+                    update: None,
+                    delete: None,
+                }]),
+                attribute_definitions: Some(vec![
+                    AttributeDefinition {
+                        attribute_name: "id".to_owned(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "status".to_owned(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                ]),
+                stream_specification: None,
+                table_class: None,
+                on_demand_throughput: None,
+                vector_index_updates: None,
+            },
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(StorageError::Validation(message))
+            if message.contains("asynchronously propagated GSI")
+    ));
 }

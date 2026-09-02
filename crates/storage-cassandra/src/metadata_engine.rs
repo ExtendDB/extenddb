@@ -110,6 +110,30 @@ impl CassandraEngine {
             .await
     }
 
+    pub(crate) async fn acquire_ttl_control_lease(
+        &self,
+        account_id: &str,
+        table_name: &str,
+    ) -> Result<Option<uuid::Uuid>, StorageError> {
+        let owner = uuid::Uuid::new_v4();
+        let query = format!(
+            "UPDATE {}.tables USING TTL 900 SET ttl_sweep_owner = ? \
+             WHERE account_id = ? AND table_name = ? IF ttl_sweep_owner = null \
+             AND table_status = 'ACTIVE'",
+            self.catalog_keyspace()
+        );
+        let result = crate::cassandra_util::query_lwt(
+            &self.session,
+            &query,
+            cdrs_tokio::query_values!(
+                cdrs_tokio::types::value::Bytes::new(owner.as_bytes().to_vec()),
+                account_id,
+                table_name
+            ),
+        )
+        .await?;
+        Ok(metadata_lwt_applied(&result)?.then_some(owner))
+    }
     pub(crate) async fn acquire_ttl_sweep_lease(
         &self,
         account_id: &str,

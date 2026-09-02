@@ -9,6 +9,26 @@ DynamoDB TTL is more than storage expiry. Removing an expired item must also rem
 
 Cassandra also cannot atomically combine a Paxos condition on the base item with queue, index, and stream mutations in other partitions. The PostgreSQL backend is therefore a semantic reference, not an implementation whose ACID internals can be reproduced exactly.
 
+## Options considered
+
+### Cassandra native TTL
+
+This is operationally simple, but Cassandra would remove the base row without cleaning ExtendDB's secondary-index tables or writing the DynamoDB-compatible service `REMOVE` stream record. It does not meet the external contract.
+
+### A backend-wide durable mutation protocol
+
+Every Put, Update, Delete, transaction, index mutation, and stream mutation could be represented as one durable operation with a commit token and replay state. That is the most complete answer to Cassandra's cross-partition atomicity limits, and it would also improve non-TTL failure handling.
+
+It is also a much larger storage-engine redesign. It changes every write path, adds permanent journal traffic and recovery machinery to tables that do not use TTL, and needs its own migration, capacity, compaction, and operational model. Shipping that redesign as part of TTL would make the first Cassandra TTL release harder to review and risk unrelated behavior that already works.
+
+### A TTL-specific durable state machine
+
+This keeps the durable protocol at the boundary that needs it: TTL queue reconciliation and expiration deletion. Once TTL is enabled, ordinary writes take the same exact row claim used by deletion and commit the base row, TTL queue/outbox, synchronous index changes, and stream record in one logged batch. The deletion worker persists its own retry phases and deterministic stream identity.
+
+This does not solve every Cassandra write-path limitation. In particular, a write that started before TTL was enabled cannot be retroactively joined to the new TTL generation. Enabling TTL on a table that is already serving writes therefore requires those writes to be briefly quiesced until enable/backfill completes. New tables can enable TTL before accepting traffic and do not have this transition window.
+
+We chose this option because it gives the supported TTL lifecycle a bounded, testable recovery protocol without pretending to solve the whole backend. It leaves the broader mutation journal as a separate design that can be evaluated on its own merits.
+
 ## Decision
 
 Use a generation-fenced, durable TTL-specific state machine.
@@ -16,6 +36,7 @@ Use a generation-fenced, durable TTL-specific state machine.
 * Maintain `ttl_expiration_buckets` and `ttl_expirations` in every account keyspace. Queue partitions use table ID, TTL-enable generation, day bucket, and one of 64 deterministic key shards. Entries are ordered by expiration time and key.
 * Accept only positive integral DynamoDB `N` values as epoch seconds. Missing, non-numeric, fractional, zero, and negative values are not queued.
 * Allocate a fresh generation on every enable. Backfill the active generation synchronously and publish `ttl_index_ready` only after reconciliation. Disable, re-enable, cleanup, and sweeps are fenced by the exact attribute and generation.
+* Before enabling TTL on a table that is already accepting writes, quiesce writes that began under the disabled generation until enable and synchronous backfill return. Once enabled, all ordinary writes enter the exact-claim logged-batch path. Enabling TTL before opening a new table to traffic avoids this operational step.
 * Record ordinary Put/Update reconciliation in a durable key-only `ttl_reconcile_pending` outbox in the same logged batch as the base mutation. The worker point-reads the committed item and idempotently inserts its current queue entry. A conflict with claimed TTL work remains retryable; the outbox is removed only after reconciliation succeeds.
 * Reconcile transaction Put/Update results before deleting their recovery ledger. COMMITTING recovery repeats reconciliation from the persisted ledger payload.
 * Represent deletion work as `PENDING`, `CLAIMED`, and `EFFECTS_APPLIED`. A claim persists the old item image, a stable delete timestamp, a work UUID, and an optional deterministic stream plan.
@@ -44,3 +65,16 @@ Use a generation-fenced, durable TTL-specific state machine.
 * Enable performs a synchronous table scan. Very large tables will require a durable background backfill before this path is suitable at scale.
 * The worker processes bounded batches, so large expiration backlogs drain gradually.
 * LWT claims and lifecycle leases add Cassandra coordination cost to TTL-enabled tables.
+* Cassandra coordinators and ExtendDB hosts must have synchronized clocks, and data/control-plane requests must have deadlines well below the 900-second claim/lease lifetime. The first version does not implement a durable journal for an ordinary request suspended beyond that lease; deployments that cannot enforce those bounds need the broader mutation protocol described above.
+
+### Production use
+
+This version is suitable for production when the deployment stays inside the supported envelope:
+
+* enable TTL before opening a new table to writes, or briefly quiesce an existing table while enable/backfill completes;
+* use no GSI with a nonzero propagation delay on a TTL-enabled table;
+* size and monitor the expiration backlog, Cassandra LWT latency, and worker health;
+* keep Cassandra coordinators and ExtendDB hosts time-synchronized, with request and control-plane deadlines well below the 900-second claim/lease lifetime; and
+* accept DynamoDB-style eventual expiration plus the documented brief internal effects-before-delete window.
+
+Within that envelope, item renewal, crash recovery, generation changes, synchronous index cleanup, transaction reconciliation, and deterministic stream removal are covered by durable state and real-Cassandra tests. This is not yet a claim of unrestricted DynamoDB parity for every Cassandra table configuration.

@@ -42,14 +42,18 @@ impl CassandraEngine {
         key: &Item,
         expected_item: Option<&Item>,
     ) -> Result<Option<uuid::Uuid>, StorageError> {
-        let Some(expected_item) = expected_item else {
-            return Ok(None);
-        };
         let claim = uuid::Uuid::new_v4();
-        if self
-            .claim_ttl_item(key_info, key, expected_item, claim, Some(900))
-            .await?
-        {
+        let applied = match expected_item {
+            Some(expected_item) => {
+                self.claim_ttl_item(key_info, key, expected_item, claim, Some(900))
+                    .await?
+            }
+            None => {
+                self.claim_absent_ttl_item(key_info, key, claim, Some(900))
+                    .await?
+            }
+        };
+        if applied {
             Ok(Some(claim))
         } else {
             Err(StorageError::TransactionCanceled(vec![
@@ -84,9 +88,6 @@ impl CassandraEngine {
         allowed_prepared_txn_id: Option<uuid::Uuid>,
         expected_claimed_item: Option<&Item>,
     ) -> Result<Option<Item>, StorageError> {
-        // Fence a request that resumes after its expiring TTL claim: its tombstones
-        // retain this start timestamp and cannot erase later transaction ownership.
-        let mutation_timestamp = chrono::Utc::now().timestamp_micros();
         let data_keyspace = self.account_keyspace(&key_info.account_id);
         let ddb_table = data_table_name(&key_info.table_id);
 
@@ -187,6 +188,9 @@ impl CassandraEngine {
             } else {
                 None
             };
+            // Chosen after the authoritative image/claim so this mutation is newer
+            // than the image it owns, but older than any owner that can follow expiry.
+            let mutation_timestamp = chrono::Utc::now().timestamp_micros();
 
             // Delete the item (with index updates if needed).
             let delete_cql =
@@ -376,6 +380,9 @@ impl CassandraEngine {
             } else {
                 None
             };
+            // Chosen after the authoritative image/claim so this mutation is newer
+            // than the image it owns, but older than any owner that can follow expiry.
+            let mutation_timestamp = chrono::Utc::now().timestamp_micros();
 
             // Delete the item (with index updates if needed).
             let delete_cql = format!("DELETE FROM {data_keyspace}.{ddb_table} WHERE pk = ?");
@@ -700,6 +707,65 @@ impl CassandraEngine {
             )
             .await?
         };
+        ttl_lwt_applied(&result)
+    }
+
+    async fn claim_absent_ttl_item(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        claim: uuid::Uuid,
+        ttl_seconds: Option<u32>,
+    ) -> Result<bool, StorageError> {
+        let keyspace = self.account_keyspace(&key_info.account_id);
+        let table = data_table_name(&key_info.table_id);
+        let pk = composite_pk_to_text(key, &key_info.key_schema)?;
+        let claim_bytes = cdrs_tokio::types::value::Bytes::new(claim.as_bytes().to_vec());
+        let claimed_at = chrono::Utc::now().timestamp_millis();
+        let using_ttl = ttl_seconds
+            .map(|seconds| format!("USING TTL {seconds} "))
+            .unwrap_or_default();
+
+        let result = if let Some((sk_name, sk_type)) =
+            sk_info(&key_info.key_schema, &key_info.attribute_definitions)
+        {
+            let sk = parse_sk(
+                key.get(sk_name)
+                    .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?,
+                sk_type,
+            )?;
+            let query = format!(
+                "UPDATE {keyspace}.{table} {using_ttl}\
+                 SET prepared_txn_id = ?, prepared_txn_timestamp = ? \
+                 WHERE pk = ? AND {} = ? \
+                 IF prepared_txn_id = null AND item_data = null",
+                sk_column(sk_type)
+            );
+            crate::cassandra_util::query_lwt(
+                &self.session,
+                &query,
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                    cdrs_tokio::types::value::Value::from(claim_bytes),
+                    cdrs_tokio::types::value::Value::from(claimed_at),
+                    cdrs_tokio::types::value::Value::from(pk.as_str()),
+                    super::index::sk_to_value(&sk),
+                ]),
+            )
+            .await
+        } else {
+            let query = format!(
+                "UPDATE {keyspace}.{table} {using_ttl}\
+                 SET prepared_txn_id = ?, prepared_txn_timestamp = ? \
+                 WHERE pk = ? IF prepared_txn_id = null AND item_data = null"
+            );
+            crate::cassandra_util::query_lwt(
+                &self.session,
+                &query,
+                cdrs_tokio::query_values!(claim_bytes, claimed_at, pk.as_str()),
+            )
+            .await
+        }
+        .map_err(|error| StorageError::Internal(format!("Claim absent TTL item: {error}")))?;
         ttl_lwt_applied(&result)
     }
 

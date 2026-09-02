@@ -173,11 +173,10 @@ impl CassandraEngine {
                         "update_table stream_label check",
                     )
                     .await?;
-                    let has_label = label_row
-                        .is_some_and(|r| {
-                            let v: Option<String> = r.get_by_name("stream_label").ok().flatten();
-                            v.is_some()
-                        });
+                    let has_label = label_row.is_some_and(|r| {
+                        let v: Option<String> = r.get_by_name("stream_label").ok().flatten();
+                        v.is_some()
+                    });
                     if !has_label {
                         needs_label_restore = true;
                         let label = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
@@ -301,6 +300,33 @@ impl CassandraEngine {
             base_attr_defs = Vec::new();
         }
 
+        let ttl_control_owner = if !gsi_creates.is_empty()
+            && self
+                .gsi_default_delay_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                != 0
+        {
+            let owner = self
+                .acquire_ttl_control_lease(account_id, &input.table_name)
+                .await?
+                .ok_or_else(|| StorageError::TableNotActive(input.table_name.clone()))?;
+            if self
+                .ttl_config_for_table(account_id, &input.table_name)
+                .await?
+                .is_some()
+            {
+                self.release_ttl_sweep_lease(account_id, &input.table_name, owner)
+                    .await?;
+                return Err(StorageError::Validation(
+                    "Cannot create an asynchronously propagated GSI while TTL is enabled"
+                        .to_owned(),
+                ));
+            }
+            Some(owner)
+        } else {
+            None
+        };
+
         // Execute the catalog batch atomically.
         if batch_has_statements {
             self.session
@@ -357,7 +383,13 @@ impl CassandraEngine {
             }
         }
 
-        self.build_table_description(account_id, &input.table_name)
-            .await
+        let result = self
+            .build_table_description(account_id, &input.table_name)
+            .await;
+        if let Some(owner) = ttl_control_owner {
+            self.release_ttl_sweep_lease(account_id, &input.table_name, owner)
+                .await?;
+        }
+        result
     }
 }

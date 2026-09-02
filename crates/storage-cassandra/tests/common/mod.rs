@@ -20,7 +20,7 @@ pub fn test_config() -> CassandraStorageConfig {
         contact_points: vec!["127.0.0.1:9042".to_string()],
         username: Some("cassandra".to_string()),
         password: Some("cassandra".to_string()),
-        keyspace_prefix: "extenddb_test".to_string(),
+        keyspace_prefix: "extenddb_ttl_test".to_string(),
         datacenter: "datacenter1".to_string(),
         replication_factor: 1,
         max_connections: 5,
@@ -46,8 +46,8 @@ pub async fn ensure_test_account(
     engine: &CassandraEngine,
     account_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let account_keyspace = format!("extenddb_test_account_{}", account_id);
-    let catalog_keyspace = "extenddb_test_catalog";
+    let account_keyspace = format!("extenddb_ttl_test_account_{}", account_id);
+    let catalog_keyspace = "extenddb_ttl_test_catalog";
 
     // Create and migrate the catalog keyspace if it doesn't exist yet.
     if !engine.keyspace_exists(catalog_keyspace).await? {
@@ -536,8 +536,8 @@ impl Drop for TestTable {
         let table_name = self.key_info.table_name.clone();
         let owns_keyspace = self.owns_keyspace;
         tokio::spawn(async move {
-            let catalog_keyspace = "extenddb_test_catalog";
-            let account_keyspace = format!("extenddb_test_account_{}", account_id);
+            let catalog_keyspace = "extenddb_ttl_test_catalog";
+            let account_keyspace = format!("extenddb_ttl_test_account_{}", account_id);
 
             if owns_keyspace {
                 // Drop the entire account keyspace.
@@ -722,7 +722,7 @@ pub async fn put_item_then_lock(
         .await
         .expect("Initial put_item should succeed");
 
-    let account_keyspace = format!("extenddb_test_account_{}", table.key_info.account_id);
+    let account_keyspace = format!("extenddb_ttl_test_account_{}", table.key_info.account_id);
     let data_table = format!("items_{}", table.key_info.table_id.replace("-", "_"));
     let fake_txn_id = uuid::Uuid::new_v4();
 

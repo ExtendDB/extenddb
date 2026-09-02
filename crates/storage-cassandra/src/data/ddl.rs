@@ -183,6 +183,7 @@ impl CassandraEngine {
                     pk text PRIMARY KEY, \
                     partition_max_delete_timestamp bigint, \
                     item_data text, \
+                    version bigint, \
                     prepared_txn_id uuid, \
                     prepared_txn_timestamp bigint, \
                     last_committed_txn_timestamp bigint, \
@@ -200,6 +201,7 @@ impl CassandraEngine {
                     sk_n decimal, \
                     sk_b blob, \
                     item_data text, \
+                    version bigint, \
                     prepared_txn_id uuid, \
                     prepared_txn_timestamp bigint, \
                     last_committed_txn_timestamp bigint, \
@@ -229,6 +231,7 @@ impl CassandraEngine {
             }
             col_defs.push("partition_max_delete_timestamp bigint STATIC".to_owned());
             col_defs.push("item_data text".to_owned());
+            col_defs.push("version bigint".to_owned());
             col_defs.push("prepared_txn_id uuid".to_owned());
             col_defs.push("prepared_txn_timestamp bigint".to_owned());
             col_defs.push("last_committed_txn_timestamp bigint".to_owned());
@@ -277,9 +280,10 @@ impl CassandraEngine {
         let idx_table = index_table_name(index_id);
         let ddl = format!("DROP TABLE IF EXISTS {account_keyspace}.{idx_table}");
 
-        self.session.query(&ddl).await.map_err(|e| {
-            StorageError::Internal(format!("Failed to drop index data table: {e}"))
-        })?;
+        self.session
+            .query(&ddl)
+            .await
+            .map_err(|e| StorageError::Internal(format!("Failed to drop index data table: {e}")))?;
 
         Ok(())
     }

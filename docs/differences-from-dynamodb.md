@@ -52,6 +52,8 @@ adaptation when switching between ExtendDB and the real service.
 | TTL deletion | Background process, items deleted within 48 hours of expiry | Background worker with indexed sweep, configurable target via `ttl_deletion_target_seconds` (default: 300s) |
 | TTL stream records | REMOVE events with `userIdentity: {type: "Service", principalId: "dynamodb.amazonaws.com"}` | Supported — TTL deletions generate REMOVE stream records with the same `userIdentity` |
 | Cassandra TTL with asynchronous GSIs | Supported | Not currently supported. The Cassandra backend rejects TTL enable when any GSI has a nonzero effective propagation delay; base tables, LSIs, and synchronous GSIs are supported. See [ADR-0010](adr/0010-cassandra-ttl-expiration-queue.md). |
+| Enabling Cassandra TTL on a live table | No application write quiescence required | Writes that began while TTL was disabled must be quiesced until enable and synchronous backfill complete. Prefer enabling TTL before opening a new table to traffic. Once enabled, writes use the durable exact-claim path. |
+| Cassandra TTL operational bounds | Managed by the service | Cassandra coordinators and ExtendDB hosts must be time-synchronized. Request and control-plane deadlines must stay well below the 900-second claim/lease lifetime. |
 | TTL modification cooldown | Enforces a cooldown period between enable/disable changes ("Time to live has been modified multiple times within a fixed interval") | No cooldown — TTL can be enabled and disabled immediately. Intentional divergence for faster local development. |
 
 ## Tagging

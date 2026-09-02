@@ -271,6 +271,7 @@ async fn process_ttl_work_row(
                 }
             }
             Some(item) => {
+                storage.release_ttl_claim(key_info, &key, work_id).await?;
                 if crate::data::ttl::abort_claimed_ttl_work(
                     storage,
                     &account_keyspace,
@@ -335,6 +336,7 @@ async fn process_ttl_work_row(
                 .await?
         }
         Some(item) => {
+            storage.release_ttl_claim(key_info, &key, work_id).await?;
             if crate::data::ttl::complete_ttl_work(
                 storage,
                 &account_keyspace,

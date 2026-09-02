@@ -204,10 +204,6 @@ pub(crate) fn add_ttl_queue_mutations(
     Ok(())
 }
 
-pub(crate) fn reconciliation_outbox_required() -> bool {
-    true
-}
-
 pub(crate) fn add_ttl_reconciliation_mutation(
     batch: &mut BatchQueryBuilder,
     account_keyspace: &str,

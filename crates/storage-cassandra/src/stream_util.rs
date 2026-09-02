@@ -148,7 +148,10 @@ pub fn stream_record_statement(
 ) -> Option<String> {
     let identity = StreamRecordIdentity {
         event_id: uuid::Uuid::new_v4().to_string(),
-        sequence_number: hlc.lock().unwrap_or_else(|e| e.into_inner()).generate(),
+        sequence_number: hlc
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generate(),
         created_at_ms: chrono::Utc::now().timestamp_millis(),
     };
     stream_record_statement_with_identity(

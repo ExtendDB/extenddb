@@ -6,7 +6,7 @@
 use cdrs_tokio::types::{IntoRustByName, rows::Row};
 use extenddb_core::types::{
     BillingMode, BillingModeSummary, GsiDescription, LsiDescription,
-    ProvisionedThroughputDescription, TableDescription, TableStatus,
+    ProvisionedThroughputDescription, SseDescription, SseType, TableDescription, TableStatus,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn};
@@ -58,9 +58,7 @@ impl CassandraEngine {
             .map_err(|e| StorageError::Internal(format!("Parse table_id: {e}")))?;
 
         // Query indexes
-        let index_query = format!(
-            "SELECT * FROM {catalog_keyspace}.indexes WHERE table_id = ?"
-        );
+        let index_query = format!("SELECT * FROM {catalog_keyspace}.indexes WHERE table_id = ?");
 
         let index_result = self
             .session
@@ -156,6 +154,11 @@ impl CassandraEngine {
         let stream_label: Option<String> = table_row.get_r_by_name("stream_label").ok();
 
         let table_class: Option<String> = table_row.get_by_name("table_class").ok().flatten();
+        let sse_specification: Option<serde_json::Value> = table_row
+            .get_by_name("sse_specification")
+            .ok()
+            .flatten()
+            .and_then(|s: String| serde_json::from_str(&s).ok());
         let on_demand_throughput: Option<extenddb_core::types::OnDemandThroughput> = table_row
             .get_by_name("on_demand_throughput")
             .ok()
@@ -253,7 +256,24 @@ impl CassandraEngine {
             latest_stream_arn,
             latest_stream_label: stream_label,
             deletion_protection_enabled,
-            sse_description: None,
+            sse_description: sse_specification.as_ref().and_then(|spec| {
+                let enabled = spec
+                    .get("Enabled")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                if enabled {
+                    Some(SseDescription {
+                        status: "ENABLED".to_string(),
+                        sse_type: Some(SseType::KMS),
+                        kms_master_key_arn: Some(format!(
+                            "arn:aws:kms:{}:{}:key/default",
+                            self.region, account_id
+                        )),
+                    })
+                } else {
+                    None
+                }
+            }),
             table_class_summary: table_class.map(|tc| serde_json::json!({"TableClass": tc})),
             on_demand_throughput,
             restore_summary: None,

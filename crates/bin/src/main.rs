@@ -31,7 +31,12 @@ compile_error!(
      `--no-default-features --features mongodb)"
 );
 
-#[cfg(not(any(feature = "postgres", feature = "mongodb", feature = "sqlite", feature = "cassandra")))]
+#[cfg(not(any(
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "sqlite",
+    feature = "cassandra"
+)))]
 compile_error!(
     "no backend selected: enable the `postgres` (default), `mongodb`, `sqlite` or `cassandra` feature"
 );
