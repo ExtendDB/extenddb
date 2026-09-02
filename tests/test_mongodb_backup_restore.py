@@ -10,7 +10,9 @@ of the MongoDB implementation; other backends retain the shared API tests.
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 import time
 
 import pytest
@@ -44,6 +46,34 @@ def _create_backup(client, table_name: str, backup_name: str) -> str:
             ):
                 raise
             time.sleep(0.2)
+
+
+def _remove_legacy_capacity_metadata(container: str, backup_arn: str) -> None:
+    """Make a real backup document look like one from before throughput capture."""
+    script = """
+const backupArn = %s;
+const backups = db.getSiblingDB("extenddb_catalog").backups;
+const result = backups.updateOne(
+  { _id: backupArn },
+  { $unset: { provisioned_throughput: "" } },
+);
+if (result.matchedCount !== 1) {
+  throw new Error(`backup not found: ${backupArn}`);
+}
+if (backups.findOne({ _id: backupArn }).provisioned_throughput !== undefined) {
+  throw new Error(`provisioned_throughput was not removed: ${backupArn}`);
+}
+""" % json.dumps(backup_arn)
+    result = subprocess.run(
+        ["docker", "exec", container, "mongosh", "--quiet", "--eval", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, (
+        "failed to remove legacy backup metadata: "
+        f"{result.stdout}\n{result.stderr}"
+    )
 
 
 def _cleanup(client, *table_names: str) -> None:
@@ -200,6 +230,82 @@ def test_restore_preserves_provisioned_throughput_and_secondary_indexes(
         )
         assert query["Count"] == 1
         assert query["Items"][0]["gsi_extra"] == {"S": "included-value"}
+    finally:
+        _cleanup(dynamodb_client, restored, source)
+        if backup_arn:
+            dynamodb_client.delete_backup(BackupArn=backup_arn)
+
+
+def test_restore_legacy_backup_falls_back_and_populates_lsi(
+    dynamodb_client, unique_table_name, mongodb_container
+):
+    """A pre-throughput backup still restores and its LSI remains queryable."""
+    source = unique_table_name
+    restored = f"{source}-restored"
+    dynamodb_client.create_table(
+        TableName=source,
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "lsi_sk", "AttributeType": "S"},
+        ],
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        ProvisionedThroughput={"ReadCapacityUnits": 7, "WriteCapacityUnits": 9},
+        LocalSecondaryIndexes=[
+            {
+                "IndexName": "legacy_lsi",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "lsi_sk", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+    )
+    wait_for_active(dynamodb_client, source)
+
+    backup_arn = None
+    try:
+        dynamodb_client.put_item(
+            TableName=source,
+            Item={
+                "pk": {"S": "partition-1"},
+                "sk": {"S": "sort-1"},
+                "lsi_sk": {"S": "lsi-sort-1"},
+                "value": {"S": "legacy-value"},
+            },
+        )
+        backup_arn = _create_backup(dynamodb_client, source, f"{source}-backup")
+        _remove_legacy_capacity_metadata(mongodb_container, backup_arn)
+
+        dynamodb_client.restore_table_from_backup(
+            TargetTableName=restored,
+            BackupArn=backup_arn,
+        )
+        wait_for_active(dynamodb_client, restored)
+
+        table = dynamodb_client.describe_table(TableName=restored)["Table"]
+        assert table["ProvisionedThroughput"]["ReadCapacityUnits"] == 5
+        assert table["ProvisionedThroughput"]["WriteCapacityUnits"] == 5
+        assert any(
+            index["IndexName"] == "legacy_lsi"
+            for index in table["LocalSecondaryIndexes"]
+        )
+
+        query = dynamodb_client.query(
+            TableName=restored,
+            IndexName="legacy_lsi",
+            KeyConditionExpression="pk = :pk AND lsi_sk = :lsi_sk",
+            ExpressionAttributeValues={
+                ":pk": {"S": "partition-1"},
+                ":lsi_sk": {"S": "lsi-sort-1"},
+            },
+        )
+        assert query["Count"] == 1
+        assert query["Items"][0]["value"] == {"S": "legacy-value"}
     finally:
         _cleanup(dynamodb_client, restored, source)
         if backup_arn:
