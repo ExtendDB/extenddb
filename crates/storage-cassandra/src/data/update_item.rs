@@ -89,15 +89,31 @@ impl CassandraEngine {
 
         for attempt in 0..=OCC_MAX_RETRIES {
             // --- READ ---
-            let (old_json, version) = self
+            let read = self
                 .occ_read(
                     &data_keyspace,
                     &ddb_table,
                     &pk_text,
                     sk_opt.as_ref(),
                     sk_col_opt,
+                    ttl_config.is_some(),
                 )
-                .await?;
+                .await;
+            let (old_json, version) = match read {
+                Ok(read) => read,
+                // Another owner holds the row. On a TTL-enabled table that is
+                // transient, so treat it like a lost OCC race and re-read.
+                Err(StorageError::TransactionConflict(message)) => {
+                    if attempt == OCC_MAX_RETRIES {
+                        return Err(StorageError::TransactionConflict(message));
+                    }
+                    let window_ms = OCC_BASE_DELAY_MS * (1u64 << attempt.min(OCC_EXP_CAP));
+                    let sleep_ms = rand::random::<u64>() % window_ms.max(1);
+                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
 
             let item_existed = old_json.is_some();
             let mut item = old_json.clone().unwrap_or_else(|| key.clone());
@@ -142,8 +158,24 @@ impl CassandraEngine {
             let item_json_str = item_json.to_string();
 
             let ttl_claim = if ttl_config.is_some() {
-                self.acquire_ttl_mutation_claim(key_info, key, pre_mutation_item.as_ref())
-                    .await?
+                match self
+                    .acquire_ttl_mutation_claim(key_info, key, pre_mutation_item.as_ref())
+                    .await
+                {
+                    Ok(claim) => claim,
+                    // Losing the claim is the same class of event as losing the
+                    // OCC race: the image moved, so re-read and rebuild rather
+                    // than failing the caller's write.
+                    Err(StorageError::TransactionConflict(_)) => {
+                        if attempt < OCC_MAX_RETRIES {
+                            let window_ms = OCC_BASE_DELAY_MS * (1u64 << attempt.min(OCC_EXP_CAP));
+                            let sleep_ms = rand::random::<u64>() % window_ms.max(1);
+                            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
             } else {
                 None
             };
@@ -195,7 +227,7 @@ impl CassandraEngine {
             }
         }
 
-        Err(StorageError::Internal(
+        Err(StorageError::TransactionConflict(
             "update_item: too many concurrent writers on this item".to_owned(),
         ))
     }
@@ -213,6 +245,7 @@ impl CassandraEngine {
         pk_text: &str,
         sk: Option<&extenddb_storage::util::SortKeyValue>,
         sk_col: Option<&'static str>,
+        ttl_enabled: bool,
     ) -> Result<(Option<Item>, Option<i64>), StorageError> {
         use cdrs_tokio::types::IntoRustByName as _;
 
@@ -247,13 +280,7 @@ impl CassandraEngine {
 
         let prepared_txn_id: Option<uuid::Uuid> = row.get_by_name("prepared_txn_id").ok().flatten();
         if prepared_txn_id.is_some() {
-            return Err(StorageError::TransactionCanceled(vec![
-                extenddb_core::types::CancellationReason {
-                    code: "TransactionConflict".to_owned(),
-                    message: Some("Item is being modified by a concurrent transaction".to_owned()),
-                    item: None,
-                },
-            ]));
+            return Err(super::delete_item::concurrent_owner_error(ttl_enabled));
         }
 
         // Static partition metadata can produce a physical row with no logical item.

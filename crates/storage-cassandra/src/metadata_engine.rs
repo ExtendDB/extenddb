@@ -11,6 +11,10 @@ use futures::future::BoxFuture;
 
 use crate::CassandraEngine;
 
+/// Bounded retries for a TTL lifecycle change that collides with a sweep lease.
+const TTL_CONTROL_MAX_RETRIES: u32 = 4;
+const TTL_CONTROL_RETRY_DELAY_MS: u64 = 25;
+
 impl CassandraEngine {
     pub(crate) async fn ttl_config_for_table(
         &self,
@@ -259,6 +263,13 @@ impl CassandraEngine {
         Ok(pending)
     }
 
+    /// Finish retiring a TTL generation.
+    ///
+    /// Drains any work that was already claimed when the generation was retired,
+    /// then removes the generation's `PENDING` rows. The
+    /// `ttl_cleanup_generation` marker is cleared only once nothing is left, so
+    /// a partial pass is retried by the worker instead of stranding durable
+    /// state.
     pub(crate) async fn complete_ttl_cleanup(
         &self,
         account_id: &str,
@@ -266,13 +277,22 @@ impl CassandraEngine {
         table_id: &str,
         generation: uuid::Uuid,
     ) -> Result<(), StorageError> {
-        crate::data::ttl::clear_ttl_generation(
+        crate::ttl_worker::drain_retired_generation(self, account_id, table_name, generation)
+            .await?;
+        let fully_drained = crate::data::ttl::clear_ttl_generation(
             self,
             &self.account_keyspace(account_id),
             table_id,
             generation,
         )
         .await?;
+        if !fully_drained {
+            tracing::info!(
+                table = %table_name,
+                "TTL generation cleanup still has in-flight work; will retry"
+            );
+            return Ok(());
+        }
         let query = format!(
             "UPDATE {}.tables SET ttl_cleanup_generation = null \
              WHERE account_id = ? AND table_name = ? IF ttl_cleanup_generation = ?",
@@ -289,6 +309,76 @@ impl CassandraEngine {
         )
         .await?;
         let _ = metadata_lwt_applied(&result)?;
+        Ok(())
+    }
+
+    /// Read the current item for a key, but only when the table has TTL enabled.
+    ///
+    /// Used by the transaction commit path to capture the pre-commit image it
+    /// needs in order to retire the item's previous expiration entry.
+    pub(crate) async fn pre_commit_ttl_image(
+        &self,
+        key_info: &extenddb_core::types::TableKeyInfo,
+        key: &Item,
+    ) -> Result<Option<Item>, StorageError> {
+        if self
+            .ttl_config_for_table(&key_info.account_id, &key_info.table_name)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.get_item_impl(key_info, key).await
+    }
+
+    /// Move an item's expiration entry from the queue key implied by `old` to
+    /// the one implied by `new`.
+    ///
+    /// A stale entry is only removed while it is still `PENDING`. If expiration
+    /// work has already claimed it, the claim is left alone: the worker
+    /// revalidates the item image and retires its own work.
+    pub(crate) async fn reconcile_ttl_transition(
+        &self,
+        key_info: &extenddb_core::types::TableKeyInfo,
+        old: Option<&Item>,
+        new: Option<&Item>,
+    ) -> Result<(), StorageError> {
+        let Some(config) = self
+            .ttl_config_for_table(&key_info.account_id, &key_info.table_name)
+            .await?
+        else {
+            return Ok(());
+        };
+        let account_keyspace = self.account_keyspace(&key_info.account_id);
+        let old_entry = old
+            .map(|item| crate::data::ttl::entry_for_item(key_info, item, &config.attribute))
+            .transpose()?
+            .flatten();
+        let new_entry = new
+            .map(|item| crate::data::ttl::entry_for_item(key_info, item, &config.attribute))
+            .transpose()?
+            .flatten();
+
+        if let Some(old_entry) = old_entry.filter(|old| Some(old) != new_entry.as_ref()) {
+            crate::data::ttl::retire_pending_ttl_work(
+                self,
+                &account_keyspace,
+                &key_info.table_id,
+                config.generation,
+                &old_entry,
+            )
+            .await?;
+        }
+        if let Some(new_entry) = new_entry {
+            crate::data::ttl::insert_ttl_entry(
+                self,
+                &account_keyspace,
+                &key_info.table_id,
+                config.generation,
+                &new_entry,
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -345,6 +435,72 @@ impl CassandraEngine {
             StorageError::Internal(format!("Parse recovered TTL item: {error}"))
         })?;
         self.reconcile_ttl_item(&key_info, &item).await
+    }
+
+    /// Scan the table and register an expiration entry for every item that
+    /// carries a valid TTL timestamp, then publish the generation as ready.
+    ///
+    /// Runs under the caller's control lease. The scan has no durable cursor, so
+    /// a failure restarts it from the beginning on the next cycle; entry inserts
+    /// are conditional, so repeating the scan is idempotent.
+    async fn backfill_ttl_queue(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        ttl_attribute: &str,
+        config: &crate::data::ttl::TtlConfig,
+    ) -> Result<(), StorageError> {
+        let key_info = self.fetch_table_key_info(account_id, table_name).await?;
+        let account_keyspace = self.account_keyspace(account_id);
+
+        let mut start_key = None;
+        loop {
+            if self.ttl_config_for_table(account_id, table_name).await? != Some(config.clone()) {
+                return Ok(());
+            }
+            let (items, next_key) = self
+                .scan_impl(&key_info, Some(1_000), start_key.as_ref(), None, None, None)
+                .await?;
+            for item in items {
+                if let Some(entry) =
+                    crate::data::ttl::entry_for_item(&key_info, &item, ttl_attribute)?
+                {
+                    crate::data::ttl::insert_ttl_entry(
+                        self,
+                        &account_keyspace,
+                        &key_info.table_id,
+                        config.generation,
+                        &entry,
+                    )
+                    .await?;
+                }
+            }
+            match next_key {
+                Some(key) => start_key = Some(key),
+                None => break,
+            }
+        }
+
+        let query = format!(
+            "UPDATE {}.tables SET ttl_index_ready = true \
+                 WHERE account_id = ? AND table_name = ? \
+                 IF ttl_attribute = ? AND ttl_generation = ? AND table_status = 'ACTIVE'",
+            self.catalog_keyspace()
+        );
+        let ready_result = crate::cassandra_util::query_lwt(
+            &self.session,
+            &query,
+            cdrs_tokio::query_values!(
+                account_id,
+                table_name,
+                ttl_attribute,
+                cdrs_tokio::types::value::Bytes::new(config.generation.as_bytes().to_vec())
+            ),
+        )
+        .await
+        .map_err(|error| StorageError::Internal(format!("Mark TTL queue ready: {error}")))?;
+        let _ = metadata_lwt_applied(&ready_result)?;
+        Ok(())
     }
 
     async fn account_ids(&self) -> Result<Vec<String>, StorageError> {
@@ -496,18 +652,10 @@ impl MetadataEngine for CassandraEngine {
 
             let generation = uuid::Uuid::new_v4();
             let cleanup_generation = previous_generation.unwrap_or(generation);
-            if !enabled
-                && previous_generation.is_some()
-                && crate::data::ttl::has_inflight_ttl_work(
-                    self,
-                    &self.account_keyspace(&account_id),
-                    &table_id,
-                    cleanup_generation,
-                )
-                .await?
-            {
-                return Err(StorageError::TableNotActive(table_name));
-            }
+            // Work that is already claimed is not a reason to refuse the
+            // change. Disabling records `ttl_cleanup_generation` and the
+            // cleanup pass drains that work before removing the generation, so
+            // the caller does not have to observe or retry around it.
             let query = if enabled {
                 format!(
                     "UPDATE {}.tables SET ttl_attribute = ?, ttl_generation = ?, \
@@ -526,48 +674,60 @@ impl MetadataEngine for CassandraEngine {
                     self.catalog_keyspace()
                 )
             };
-            let result = if enabled {
-                crate::cassandra_util::query_lwt(
-                    &self.session,
-                    &query,
-                    cdrs_tokio::query_values!(
-                        attribute_name.as_str(),
-                        cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
-                        account_id.as_str(),
-                        table_name.as_str()
-                    ),
+            let values = if enabled {
+                cdrs_tokio::query_values!(
+                    attribute_name.as_str(),
+                    cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
+                    account_id.as_str(),
+                    table_name.as_str()
                 )
-                .await
             } else {
-                crate::cassandra_util::query_lwt(
-                    &self.session,
-                    &query,
-                    cdrs_tokio::query_values!(
-                        cdrs_tokio::types::value::Bytes::new(
-                            cleanup_generation.as_bytes().to_vec()
-                        ),
-                        account_id.as_str(),
-                        table_name.as_str(),
-                        attribute_name.as_str(),
-                        cdrs_tokio::types::value::Bytes::new(
-                            cleanup_generation.as_bytes().to_vec()
-                        )
-                    ),
+                cdrs_tokio::query_values!(
+                    cdrs_tokio::types::value::Bytes::new(cleanup_generation.as_bytes().to_vec()),
+                    account_id.as_str(),
+                    table_name.as_str(),
+                    attribute_name.as_str(),
+                    cdrs_tokio::types::value::Bytes::new(cleanup_generation.as_bytes().to_vec())
                 )
-                .await
             };
-            let result = result?;
-            let applied = result
-                .response_body()
-                .ok()
-                .and_then(|body| body.into_rows())
-                .and_then(|rows| rows.into_iter().next())
-                .and_then(|row| {
-                    let applied: Result<bool, _> = row.get_r_by_name("[applied]");
-                    applied.ok()
-                })
-                .unwrap_or(false);
+
+            // A sweep holds `ttl_sweep_owner` for the duration of one batch, and
+            // a sweep starts every scan interval for every TTL-enabled table, so
+            // colliding with one is routine. Retry briefly rather than making
+            // the caller absorb a lease collision as a table-state error.
+            let mut applied = false;
+            let mut sweep_in_progress = false;
+            for attempt in 0..=TTL_CONTROL_MAX_RETRIES {
+                let result =
+                    crate::cassandra_util::query_lwt(&self.session, &query, values.clone()).await?;
+                let row = result
+                    .response_body()
+                    .ok()
+                    .and_then(|body| body.into_rows())
+                    .and_then(|rows| rows.into_iter().next());
+                let Some(row) = row else { break };
+                applied = row.get_r_by_name("[applied]").unwrap_or(false);
+                if applied {
+                    break;
+                }
+                let sweep_owner: Option<uuid::Uuid> =
+                    row.get_by_name("ttl_sweep_owner").ok().flatten();
+                sweep_in_progress = sweep_owner.is_some();
+                if !sweep_in_progress || attempt == TTL_CONTROL_MAX_RETRIES {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    TTL_CONTROL_RETRY_DELAY_MS * u64::from(attempt + 1),
+                ))
+                .await;
+            }
             if !applied {
+                if sweep_in_progress {
+                    return Err(StorageError::IndexesInUse(format!(
+                        "Time to live for table {table_name} cannot be changed while an \
+                         expiration sweep is in progress. Retry the request."
+                    )));
+                }
                 let row = crate::cassandra_util::query_optional(
                     &self.session,
                     &status_query,
@@ -732,59 +892,24 @@ impl MetadataEngine for CassandraEngine {
             if config.attribute != ttl_attribute {
                 return Ok(());
             }
-            let key_info = self.fetch_table_key_info(&account_id, &table_name).await?;
-            let account_keyspace = self.account_keyspace(&account_id);
-
-            let mut start_key = None;
-            loop {
-                if self.ttl_config_for_table(&account_id, &table_name).await?
-                    != Some(config.clone())
-                {
-                    return Ok(());
-                }
-                let (items, next_key) = self
-                    .scan_impl(&key_info, Some(1_000), start_key.as_ref(), None, None, None)
-                    .await?;
-                for item in items {
-                    if let Some(entry) =
-                        crate::data::ttl::entry_for_item(&key_info, &item, &ttl_attribute)?
-                    {
-                        crate::data::ttl::insert_ttl_entry(
-                            self,
-                            &account_keyspace,
-                            &key_info.table_id,
-                            config.generation,
-                            &entry,
-                        )
-                        .await?;
-                    }
-                }
-                match next_key {
-                    Some(key) => start_key = Some(key),
-                    None => break,
-                }
-            }
-
-            let query = format!(
-                "UPDATE {}.tables SET ttl_index_ready = true \
-                 WHERE account_id = ? AND table_name = ? \
-                 IF ttl_attribute = ? AND ttl_generation = ? AND table_status = 'ACTIVE'",
-                self.catalog_keyspace()
-            );
-            let ready_result = crate::cassandra_util::query_lwt(
-                &self.session,
-                &query,
-                cdrs_tokio::query_values!(
-                    account_id.as_str(),
-                    table_name.as_str(),
-                    ttl_attribute.as_str(),
-                    cdrs_tokio::types::value::Bytes::new(config.generation.as_bytes().to_vec())
-                ),
-            )
-            .await
-            .map_err(|error| StorageError::Internal(format!("Mark TTL queue ready: {error}")))?;
-            let _ = metadata_lwt_applied(&ready_result)?;
-            Ok(())
+            // The backfill is a full table scan. Take the table's control lease
+            // so one host scans it at a time: the enable request and every
+            // host's retry pass all land here, and without the lease they would
+            // each rescan the whole table. Returning early is safe — whoever
+            // holds the lease publishes `ttl_index_ready`.
+            let Some(owner) = self
+                .acquire_ttl_control_lease(&account_id, &table_name)
+                .await?
+            else {
+                return Ok(());
+            };
+            let result = self
+                .backfill_ttl_queue(&account_id, &table_name, &ttl_attribute, &config)
+                .await;
+            let _ = self
+                .release_ttl_sweep_lease(&account_id, &table_name, owner)
+                .await;
+            result
         })
     }
 

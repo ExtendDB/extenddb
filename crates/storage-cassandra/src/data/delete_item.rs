@@ -18,8 +18,67 @@ use super::{json_to_item, query_with_pk_sk};
 use crate::CassandraEngine;
 use crate::stream_util::stream_record_statement;
 
+/// Lifetime of the base-row claim an ordinary request holds while it commits
+/// its logged batch. A request that is suspended for longer than this loses
+/// its claim; `mutation_timestamp` is captured before the claim is taken so a
+/// resumed request cannot overwrite state that a later owner committed.
+pub(crate) const TTL_REQUEST_CLAIM_SECONDS: u32 = 120;
+
+/// Lifetime of the base-row claim the expiration worker holds across its
+/// deletion phases. This is bounded on purpose: `delete_ttl_base_exact`
+/// conditions on both the work UUID *and* the exact item image, so an expired
+/// claim can never let stale work delete a renewed item. An unbounded claim,
+/// by contrast, blocks every write to the key forever if the queue row that
+/// drives recovery is lost.
+pub(crate) const TTL_WORK_CLAIM_SECONDS: u32 = 900;
+
+/// Bounded retries for acquiring a base-row claim. Contention is expected to
+/// be short-lived (a claim is held for the duration of one logged batch), so
+/// a few jittered attempts turn a client-visible conflict back into ordinary
+/// last-writer-wins.
+pub(crate) const TTL_CLAIM_MAX_RETRIES: u32 = 8;
+const TTL_CLAIM_BASE_DELAY_MS: u64 = 4;
+const TTL_CLAIM_EXP_CAP: u32 = 6;
+
+/// Sleep for a jittered, exponentially widening window before retrying a
+/// contended claim.
+pub(crate) async fn ttl_claim_backoff(attempt: u32) {
+    let window_ms = TTL_CLAIM_BASE_DELAY_MS * (1u64 << attempt.min(TTL_CLAIM_EXP_CAP));
+    let sleep_ms = rand::random::<u64>() % window_ms.max(1);
+    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+}
+
+/// The error a single-item write reports when another owner holds the base row.
+///
+/// On a TTL-enabled table `prepared_txn_id` is ambiguous: it may be a two-phase
+/// commit prepare, another ordinary writer's claim, or the expiration worker's
+/// claim. All three are short-lived, so the write reports the retryable
+/// [`StorageError::TransactionConflict`] and the retry wrappers re-read and try
+/// again. Only after those retries is the conflict surfaced, as DynamoDB's
+/// `TransactionConflictException` (RFC-0003 §4.3).
+///
+/// Without TTL the only possible owner is a real transaction, and the existing
+/// `TransactionCanceledException` behaviour is preserved.
+pub(crate) fn concurrent_owner_error(ttl_enabled: bool) -> StorageError {
+    if ttl_enabled {
+        return StorageError::TransactionConflict(
+            "Item is being modified by a concurrent operation".to_owned(),
+        );
+    }
+    StorageError::TransactionCanceled(vec![extenddb_core::types::CancellationReason {
+        code: "TransactionConflict".to_owned(),
+        message: Some("Item is being modified by a concurrent transaction".to_owned()),
+        item: None,
+    }])
+}
+
 impl CassandraEngine {
     /// Implementation of `DataEngine::delete_item`.
+    ///
+    /// On a TTL-enabled table the base-row claim can be lost to a concurrent
+    /// writer. That is ordinary contention, not a client error, so the whole
+    /// read-claim-commit sequence is retried against a freshly read image
+    /// before the conflict is surfaced.
     pub(crate) async fn delete_item_impl(
         &self,
         key_info: &TableKeyInfo,
@@ -29,12 +88,34 @@ impl CassandraEngine {
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
     ) -> Result<Option<Item>, StorageError> {
-        self.delete_item_impl_inner(
-            key_info, key, return_old, condition, maps, stream, None, None,
-        )
-        .await
+        for attempt in 0..=TTL_CLAIM_MAX_RETRIES {
+            match self
+                .delete_item_impl_inner(
+                    key_info, key, return_old, condition, maps, stream, None, None,
+                )
+                .await
+            {
+                Err(StorageError::TransactionConflict(message))
+                    if attempt == TTL_CLAIM_MAX_RETRIES =>
+                {
+                    return Err(StorageError::TransactionConflict(message));
+                }
+                Err(StorageError::TransactionConflict(_)) => ttl_claim_backoff(attempt).await,
+                other => return other,
+            }
+        }
+        unreachable!("loop returns on the final attempt")
     }
 
+    /// Take the exact base-row claim that serializes an ordinary write against
+    /// TTL expiration of the same item.
+    ///
+    /// Returns [`StorageError::TransactionConflict`] when the claim is already
+    /// held or the image moved under us. That maps to DynamoDB's
+    /// `TransactionConflictException` (RFC-0003 §4.3) rather than
+    /// `TransactionCanceledException`, which single-item writes do not have.
+    /// Callers own the retry, because a moved image invalidates the batch they
+    /// have already built and they must re-read to rebuild it.
     #[doc(hidden)]
     pub async fn acquire_ttl_mutation_claim(
         &self,
@@ -45,27 +126,31 @@ impl CassandraEngine {
         let claim = uuid::Uuid::new_v4();
         let applied = match expected_item {
             Some(expected_item) => {
-                self.claim_ttl_item(key_info, key, expected_item, claim, Some(900))
-                    .await?
+                self.claim_ttl_item(
+                    key_info,
+                    key,
+                    expected_item,
+                    claim,
+                    Some(TTL_REQUEST_CLAIM_SECONDS),
+                )
+                .await?
             }
             None => {
-                self.claim_absent_ttl_item(key_info, key, claim, Some(900))
+                self.claim_absent_ttl_item(key_info, key, claim, Some(TTL_REQUEST_CLAIM_SECONDS))
                     .await?
             }
         };
         if applied {
             Ok(Some(claim))
         } else {
-            Err(StorageError::TransactionCanceled(vec![
-                extenddb_core::types::CancellationReason {
-                    code: "TransactionConflict".to_owned(),
-                    message: Some("Item is being modified by a concurrent operation".to_owned()),
-                    item: None,
-                },
-            ]))
+            Err(StorageError::TransactionConflict(
+                "Item is being modified by a concurrent operation".to_owned(),
+            ))
         }
     }
 
+    /// Release an exact claim. Retried once, because a dropped release makes
+    /// the key unwritable until the claim's TTL expires.
     #[doc(hidden)]
     pub async fn release_ttl_mutation_claim(
         &self,
@@ -73,10 +158,21 @@ impl CassandraEngine {
         key: &Item,
         claim: Option<uuid::Uuid>,
     ) {
-        if let Some(claim) = claim {
-            let _ = self.release_ttl_claim(key_info, key, claim).await;
+        let Some(claim) = claim else { return };
+        if self.release_ttl_claim(key_info, key, claim).await.is_ok() {
+            return;
+        }
+        if let Err(error) = self.release_ttl_claim(key_info, key, claim).await {
+            tracing::warn!(
+                table = %key_info.table_name,
+                "TTL claim release failed; the key is unwritable for up to {TTL_REQUEST_CLAIM_SECONDS}s: {error}"
+            );
         }
     }
+    /// The transaction and TTL paths both need to drive a delete with an
+    /// explicitly permitted owner and an expected image, so this carries more
+    /// parameters than the lint allows.
+    #[allow(clippy::too_many_arguments)]
     async fn delete_item_impl_inner(
         &self,
         key_info: &TableKeyInfo,
@@ -148,15 +244,7 @@ impl CassandraEngine {
                     return Err(StorageError::ConditionFailed(old_item_opt));
                 }
             } else if prepared_txn_id_opt.is_some() {
-                return Err(StorageError::TransactionCanceled(vec![
-                    extenddb_core::types::CancellationReason {
-                        code: "TransactionConflict".to_owned(),
-                        message: Some(
-                            "Item is being modified by a concurrent transaction".to_owned(),
-                        ),
-                        item: None,
-                    },
-                ]));
+                return Err(concurrent_owner_error(ttl_config.is_some()));
             }
 
             // Evaluate condition against existing item (or empty if doesn't exist)
@@ -188,8 +276,11 @@ impl CassandraEngine {
             } else {
                 None
             };
-            // Chosen after the authoritative image/claim so this mutation is newer
-            // than the image it owns, but older than any owner that can follow expiry.
+            // Pinned here, immediately after the claim and before any further
+            // await, so it is strictly newer than the image this request owns
+            // yet strictly older than anything a later owner commits. A request
+            // suspended past its claim lifetime therefore loses to that later
+            // owner instead of overwriting it.
             let mutation_timestamp = chrono::Utc::now().timestamp_micros();
 
             // Delete the item (with index updates if needed).
@@ -340,15 +431,7 @@ impl CassandraEngine {
                     return Err(StorageError::ConditionFailed(old_item_opt));
                 }
             } else if prepared_txn_id_opt.is_some() {
-                return Err(StorageError::TransactionCanceled(vec![
-                    extenddb_core::types::CancellationReason {
-                        code: "TransactionConflict".to_owned(),
-                        message: Some(
-                            "Item is being modified by a concurrent transaction".to_owned(),
-                        ),
-                        item: None,
-                    },
-                ]));
+                return Err(concurrent_owner_error(ttl_config.is_some()));
             }
 
             // Evaluate condition against existing item (or empty if doesn't exist)
@@ -380,8 +463,11 @@ impl CassandraEngine {
             } else {
                 None
             };
-            // Chosen after the authoritative image/claim so this mutation is newer
-            // than the image it owns, but older than any owner that can follow expiry.
+            // Pinned here, immediately after the claim and before any further
+            // await, so it is strictly newer than the image this request owns
+            // yet strictly older than anything a later owner commits. A request
+            // suspended past its claim lifetime therefore loses to that later
+            // owner instead of overwriting it.
             let mutation_timestamp = chrono::Utc::now().timestamp_micros();
 
             // Delete the item (with index updates if needed).
@@ -511,7 +597,13 @@ impl CassandraEngine {
         work_id: uuid::Uuid,
     ) -> Result<bool, StorageError> {
         if self
-            .claim_ttl_item(key_info, key, expected_item, work_id, None)
+            .claim_ttl_item(
+                key_info,
+                key,
+                expected_item,
+                work_id,
+                Some(TTL_WORK_CLAIM_SECONDS),
+            )
             .await?
         {
             return Ok(true);

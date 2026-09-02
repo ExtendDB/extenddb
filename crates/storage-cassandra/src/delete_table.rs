@@ -80,12 +80,17 @@ impl CassandraEngine {
 
         // Delete physical tables from the owning account keyspace. Catalog
         // metadata and user data intentionally live in different keyspaces.
+        //
+        // The base table is dropped *before* the TTL queue is cleared. Clearing
+        // first would leave a still-live, still-TTL-enabled table whose items
+        // have no expiration entries and nothing to rebuild them if the drop
+        // below fails.
         let account_keyspace = self.account_keyspace(account_id);
-        self.clear_ttl_entries_for_table_id(account_id, &table_id)
-            .await?;
         self.drop_data_table(&account_keyspace, &table_id)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
+        self.clear_ttl_entries_for_table_id(account_id, &table_id)
+            .await?;
 
         // Delete index data tables
         for idx_row in &index_rows {

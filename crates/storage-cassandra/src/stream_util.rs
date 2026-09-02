@@ -166,6 +166,11 @@ pub fn stream_record_statement(
     )
 }
 
+/// Build a stream record statement with a caller-supplied event identity.
+///
+/// TTL expiration persists its identity before applying effects so that a retry
+/// rewrites the same record instead of publishing a second visible `REMOVE`.
+#[allow(clippy::too_many_arguments)]
 pub fn stream_record_statement_with_identity(
     account_keyspace: &str,
     table_id: &str,

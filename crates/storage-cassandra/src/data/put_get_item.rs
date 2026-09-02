@@ -19,7 +19,40 @@ use crate::stream_util::stream_record_statement;
 
 impl CassandraEngine {
     /// Implementation of `DataEngine::put_item`.
+    ///
+    /// On a TTL-enabled table the base-row claim can be lost to a concurrent
+    /// writer. That is ordinary contention, not a client error, so the whole
+    /// read-claim-commit sequence is retried against a freshly read image
+    /// before the conflict is surfaced.
     pub(crate) async fn put_item_impl(
+        &self,
+        key_info: &TableKeyInfo,
+        item: Item,
+        return_old: bool,
+        condition: Option<&Expr>,
+        maps: &ExpressionMaps,
+        stream: Option<&StreamCapture>,
+    ) -> Result<Option<Item>, StorageError> {
+        use super::delete_item::{TTL_CLAIM_MAX_RETRIES, ttl_claim_backoff};
+
+        for attempt in 0..=TTL_CLAIM_MAX_RETRIES {
+            match self
+                .put_item_impl_inner(key_info, item.clone(), return_old, condition, maps, stream)
+                .await
+            {
+                Err(StorageError::TransactionConflict(message))
+                    if attempt == TTL_CLAIM_MAX_RETRIES =>
+                {
+                    return Err(StorageError::TransactionConflict(message));
+                }
+                Err(StorageError::TransactionConflict(_)) => ttl_claim_backoff(attempt).await,
+                other => return other,
+            }
+        }
+        unreachable!("loop returns on the final attempt")
+    }
+
+    async fn put_item_impl_inner(
         &self,
         key_info: &TableKeyInfo,
         item: Item,
@@ -81,7 +114,6 @@ impl CassandraEngine {
                     &item_text,
                     &indexes,
                     sys_delay,
-                    ttl_config.as_ref(),
                 )
                 .await;
         }
@@ -126,15 +158,9 @@ impl CassandraEngine {
 
             // Reject if item is part of an in-flight transaction
             if has_prepared_txn {
-                return Err(StorageError::TransactionCanceled(vec![
-                    extenddb_core::types::CancellationReason {
-                        code: "TransactionConflict".to_owned(),
-                        message: Some(
-                            "Item is being modified by a concurrent transaction".to_owned(),
-                        ),
-                        item: None,
-                    },
-                ]));
+                return Err(super::delete_item::concurrent_owner_error(
+                    ttl_config.is_some(),
+                ));
             }
 
             // Evaluate condition against existing item (or empty if doesn't exist)
@@ -257,7 +283,11 @@ impl CassandraEngine {
                         .await
                     {
                         Ok(claim) => claim,
-                        Err(StorageError::TransactionCanceled(_)) if key_not_exists_condition => {
+                        // An absent-row claim that cannot be taken means the row
+                        // now exists, which is exactly what this condition
+                        // forbids. Report the condition failure rather than
+                        // retrying a write that can never apply.
+                        Err(StorageError::TransactionConflict(_)) if key_not_exists_condition => {
                             return Err(StorageError::ConditionFailed(old_item_opt));
                         }
                         Err(error) => return Err(error),
@@ -336,15 +366,9 @@ impl CassandraEngine {
 
             // Reject if item is part of an in-flight transaction
             if has_prepared_txn {
-                return Err(StorageError::TransactionCanceled(vec![
-                    extenddb_core::types::CancellationReason {
-                        code: "TransactionConflict".to_owned(),
-                        message: Some(
-                            "Item is being modified by a concurrent transaction".to_owned(),
-                        ),
-                        item: None,
-                    },
-                ]));
+                return Err(super::delete_item::concurrent_owner_error(
+                    ttl_config.is_some(),
+                ));
             }
 
             // Evaluate condition
@@ -465,7 +489,11 @@ impl CassandraEngine {
                         .await
                     {
                         Ok(claim) => claim,
-                        Err(StorageError::TransactionCanceled(_)) if key_not_exists_condition => {
+                        // An absent-row claim that cannot be taken means the row
+                        // now exists, which is exactly what this condition
+                        // forbids. Report the condition failure rather than
+                        // retrying a write that can never apply.
+                        Err(StorageError::TransactionConflict(_)) if key_not_exists_condition => {
                             return Err(StorageError::ConditionFailed(old_item_opt));
                         }
                         Err(error) => return Err(error),
@@ -514,6 +542,12 @@ impl CassandraEngine {
     /// row are treated as logically absent. Returns `ConditionFailed` if another
     /// writer creates the item first.
     #[allow(clippy::too_many_arguments)]
+    /// Insert an item only if its key does not exist.
+    ///
+    /// Reached only when TTL is disabled: a TTL-enabled table cannot use this
+    /// fast path, because absence has to be established by the exact base-row
+    /// claim instead of by `IF NOT EXISTS`. There is therefore no TTL queue or
+    /// reconciliation work to do here.
     async fn put_item_if_not_exists(
         &self,
         key_info: &TableKeyInfo,
@@ -525,7 +559,6 @@ impl CassandraEngine {
         item_text: &str,
         indexes: &[super::index::IndexMeta],
         sys_delay: u64,
-        ttl_config: Option<&super::ttl::TtlConfig>,
     ) -> Result<Option<Item>, StorageError> {
         use cdrs_tokio::types::IntoRustByName as _;
 
@@ -605,12 +638,6 @@ impl CassandraEngine {
             )
         });
         if indexes.is_empty() && stream_stmt.is_none() {
-            if let Err(error) = self.reconcile_ttl_item(key_info, &item).await {
-                tracing::warn!(
-                    table = %key_info.table_name,
-                    "deferred post-commit TTL reconciliation for PutItem: {error}"
-                );
-            }
             return Ok(None);
         }
         let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
@@ -644,17 +671,6 @@ impl CassandraEngine {
             0
         };
 
-        if let Some(config) = ttl_config {
-            super::ttl::add_ttl_queue_mutations(
-                &mut batch,
-                data_keyspace,
-                key_info,
-                &config.attribute,
-                config.generation,
-                None,
-                Some(&item),
-            )?;
-        }
         if let Some(stmt) = stream_stmt {
             batch = batch.add_query(stmt, cdrs_tokio::query::QueryValues::SimpleValues(vec![]));
         }
@@ -669,13 +685,6 @@ impl CassandraEngine {
         if async_enqueued > 0 {
             self.gsi_queue.notify_workers();
         }
-        if let Err(error) = self.reconcile_ttl_item(key_info, &item).await {
-            tracing::warn!(
-                table = %key_info.table_name,
-                "deferred post-commit TTL reconciliation for PutItem: {error}"
-            );
-        }
-
         Ok(None) // return_old is always None — item didn't exist
     }
 
@@ -714,11 +723,11 @@ impl CassandraEngine {
                 .response_body()
                 .map_err(|e| StorageError::Internal(format!("Parse response: {e}")))?;
 
-            if let Some(rows) = body.into_rows() {
-                if let Some(row) = rows.into_iter().next() {
-                    let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
-                    return item_data.map(json_to_item).transpose();
-                }
+            if let Some(rows) = body.into_rows()
+                && let Some(row) = rows.into_iter().next()
+            {
+                let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+                return item_data.map(json_to_item).transpose();
             }
 
             Ok(None)
@@ -736,11 +745,11 @@ impl CassandraEngine {
                 .response_body()
                 .map_err(|e| StorageError::Internal(format!("Parse response: {e}")))?;
 
-            if let Some(rows) = body.into_rows() {
-                if let Some(row) = rows.into_iter().next() {
-                    let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
-                    return item_data.map(json_to_item).transpose();
-                }
+            if let Some(rows) = body.into_rows()
+                && let Some(row) = rows.into_iter().next()
+            {
+                let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+                return item_data.map(json_to_item).transpose();
             }
 
             Ok(None)

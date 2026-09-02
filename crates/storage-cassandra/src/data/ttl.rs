@@ -42,11 +42,19 @@ pub(crate) enum TtlWorkState {
 }
 
 impl TtlWorkState {
-    pub(crate) fn parse(value: Option<&str>) -> Self {
+    /// Parse a persisted state string.
+    ///
+    /// An unrecognised value is an error rather than a silent downgrade to
+    /// `PENDING`: a row written by a newer state machine must not be re-claimed
+    /// and re-executed by an older one.
+    pub(crate) fn parse(value: Option<&str>) -> Result<Self, StorageError> {
         match value {
-            Some("CLAIMED") => Self::Claimed,
-            Some("EFFECTS_APPLIED") => Self::EffectsApplied,
-            _ => Self::Pending,
+            Some("CLAIMED") => Ok(Self::Claimed),
+            Some("EFFECTS_APPLIED") => Ok(Self::EffectsApplied),
+            Some("PENDING") | None => Ok(Self::Pending),
+            Some(other) => Err(StorageError::Internal(format!(
+                "Unknown TTL work state {other:?}"
+            ))),
         }
     }
 }
@@ -496,6 +504,57 @@ fn work_lwt_applied(result: &cdrs_tokio::frame::Envelope) -> Result<bool, Storag
         .map_err(|error| StorageError::Internal(format!("Parse TTL work result: {error}")))
 }
 
+/// Remove a `(bucket, shard)` registration from the bucket registry.
+///
+/// `guard_timestamp` must be a microsecond timestamp captured *before* the
+/// caller observed the partition to be empty. Passing it makes the delete lose
+/// to any queue insert that commits afterwards: every insert re-registers the
+/// bucket in the same logged batch as the entry, and that insert carries a
+/// later coordinator timestamp, so an entry can never be left behind with its
+/// registration deleted. `None` skips the guard and is only correct when the
+/// generation is being retired and no further inserts can target it.
+async fn retire_bucket_registration(
+    engine: &CassandraEngine,
+    account_keyspace: &str,
+    table_id: &str,
+    generation: uuid::Uuid,
+    bucket: i64,
+    shard: i32,
+    guard_timestamp: Option<i64>,
+) -> Result<(), StorageError> {
+    let using = guard_timestamp
+        .map(|timestamp| format!(" USING TIMESTAMP {timestamp}"))
+        .unwrap_or_default();
+    let cql = format!(
+        "DELETE FROM {account_keyspace}.{TTL_BUCKET_TABLE}{using} \
+         WHERE table_id = ? AND generation = ? AND bucket = ? AND shard = ?"
+    );
+    engine
+        .session
+        .query_with_values(
+            &cql,
+            cdrs_tokio::query_values!(
+                table_id,
+                cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
+                bucket,
+                shard
+            ),
+        )
+        .await
+        .map_err(|error| {
+            StorageError::Internal(format!("Retire TTL bucket registration: {error}"))
+        })?;
+    Ok(())
+}
+
+/// Upper bound on registry partitions a single sweep cycle will visit.
+///
+/// The registry holds one row per `(day bucket, shard)` ever written, so
+/// without a cap the per-cycle query fan-out grows linearly with the age of
+/// the table. Partitions are rotated between cycles, so capping bounds the
+/// cost of a cycle without starving any partition.
+const TTL_MAX_PARTITIONS_PER_CYCLE: usize = 512;
+
 pub(crate) async fn load_due_ttl_work(
     engine: &CassandraEngine,
     account_keyspace: &str,
@@ -509,6 +568,9 @@ pub(crate) async fn load_due_ttl_work(
     if limit == 0 {
         return Ok(Vec::new());
     }
+    // Captured before the emptiness observations below, so it can safely guard
+    // the retirement of any partition this cycle finds drained.
+    let retire_guard = chrono::Utc::now().timestamp_micros();
     let generation_bytes = cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec());
     let current_bucket = now / TTL_BUCKET_SECONDS;
     let bucket_query = format!(
@@ -532,6 +594,7 @@ pub(crate) async fn load_due_ttl_work(
     if !partitions.is_empty() {
         let partition_count = partitions.len();
         partitions.rotate_left(((now / 60) as usize) % partition_count);
+        partitions.truncate(TTL_MAX_PARTITIONS_PER_CYCLE);
     }
 
     let mut work = Vec::with_capacity(limit);
@@ -555,6 +618,23 @@ pub(crate) async fn load_due_ttl_work(
             "load_due_ttl_work",
         )
         .await?;
+        // A fully past day bucket that yields nothing is drained: every entry
+        // it could ever hold is already due, so an empty read means the
+        // partition is empty rather than not-yet-due. Retire the registration
+        // so the fan-out above stops growing with the age of the table.
+        if rows.is_empty() && *bucket < current_bucket {
+            retire_bucket_registration(
+                engine,
+                account_keyspace,
+                table_id,
+                generation,
+                *bucket,
+                *shard,
+                Some(retire_guard),
+            )
+            .await?;
+            continue;
+        }
         for row in rows {
             let state: Option<String> = row.get_by_name("state").ok().flatten();
             let work_id: Option<uuid::Uuid> = row.get_by_name("work_id").ok().flatten();
@@ -579,7 +659,7 @@ pub(crate) async fn load_due_ttl_work(
                         "load_due_ttl_work",
                     )?,
                 },
-                state: TtlWorkState::parse(state.as_deref()),
+                state: TtlWorkState::parse(state.as_deref())?,
                 work_id,
                 work_data: work_data
                     .map(|value| serde_json::from_str(&value))
@@ -625,101 +705,188 @@ pub(crate) async fn delete_ttl_entry(
     Ok(())
 }
 
-pub(crate) async fn has_inflight_ttl_work(
+/// Load every queue row for a generation regardless of due time, in any state.
+///
+/// Used to drain a retired generation: unlike [`load_due_ttl_work`] this does
+/// not filter by `expires_at`, because cleanup has to account for work that was
+/// claimed before the generation was retired.
+pub(crate) async fn load_generation_work(
     engine: &CassandraEngine,
     account_keyspace: &str,
     table_id: &str,
     generation: uuid::Uuid,
-) -> Result<bool, StorageError> {
+    limit: usize,
+) -> Result<Vec<TtlWorkRow>, StorageError> {
     use cdrs_tokio::types::IntoRustByName;
 
     let generation_bytes = cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec());
-    let buckets = crate::cassandra_util::query_rows(
+    let mut work = Vec::new();
+    for (bucket, shard) in
+        generation_partitions(engine, account_keyspace, table_id, generation).await?
+    {
+        if work.len() >= limit {
+            break;
+        }
+        let rows = crate::cassandra_util::query_rows(
+            &engine.session,
+            &format!(
+                "SELECT expires_at, key_hash, key_data, state, work_id, work_data \
+                 FROM {account_keyspace}.{TTL_QUEUE_TABLE} WHERE table_id = ? \
+                 AND generation = ? AND bucket = ? AND shard = ?"
+            ),
+            cdrs_tokio::query_values!(table_id, generation_bytes.clone(), bucket, shard),
+            "load_generation_work",
+        )
+        .await?;
+        for row in rows {
+            let state: Option<String> = row.get_by_name("state").ok().flatten();
+            let work_id: Option<uuid::Uuid> = row.get_by_name("work_id").ok().flatten();
+            let work_data: Option<String> = row.get_by_name("work_data").ok().flatten();
+            work.push(TtlWorkRow {
+                entry: TtlEntry {
+                    bucket,
+                    shard,
+                    expires_at: crate::cassandra_util::get_column(
+                        &row,
+                        "expires_at",
+                        "load_generation_work",
+                    )?,
+                    key_hash: crate::cassandra_util::get_column(
+                        &row,
+                        "key_hash",
+                        "load_generation_work",
+                    )?,
+                    key_data: crate::cassandra_util::get_column(
+                        &row,
+                        "key_data",
+                        "load_generation_work",
+                    )?,
+                },
+                state: TtlWorkState::parse(state.as_deref())?,
+                work_id,
+                work_data: work_data
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()
+                    .map_err(|error| {
+                        StorageError::Internal(format!("Parse TTL work data: {error}"))
+                    })?,
+            });
+        }
+    }
+    Ok(work)
+}
+
+/// List the `(bucket, shard)` partitions registered for a generation.
+async fn generation_partitions(
+    engine: &CassandraEngine,
+    account_keyspace: &str,
+    table_id: &str,
+    generation: uuid::Uuid,
+) -> Result<Vec<(i64, i32)>, StorageError> {
+    let rows = crate::cassandra_util::query_rows(
         &engine.session,
         &format!(
             "SELECT bucket, shard FROM {account_keyspace}.{TTL_BUCKET_TABLE} \
              WHERE table_id = ? AND generation = ?"
         ),
-        cdrs_tokio::query_values!(table_id, generation_bytes.clone()),
-        "has_inflight_ttl_work_buckets",
+        cdrs_tokio::query_values!(
+            table_id,
+            cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec())
+        ),
+        "generation_partitions",
     )
     .await?;
-    for bucket_row in buckets {
-        let bucket: i64 =
-            crate::cassandra_util::get_column(&bucket_row, "bucket", "has_inflight_ttl_work")?;
-        let shard: i32 =
-            crate::cassandra_util::get_column(&bucket_row, "shard", "has_inflight_ttl_work")?;
-        let rows = crate::cassandra_util::query_rows(
-            &engine.session,
-            &format!(
-                "SELECT state FROM {account_keyspace}.{TTL_QUEUE_TABLE} WHERE table_id = ? \
-                 AND generation = ? AND bucket = ? AND shard = ?"
-            ),
-            cdrs_tokio::query_values!(table_id, generation_bytes.clone(), bucket, shard),
-            "has_inflight_ttl_work",
-        )
-        .await?;
-        for row in rows {
-            let state: Option<String> = row.get_by_name("state").ok().flatten();
-            if matches!(state.as_deref(), Some("CLAIMED" | "EFFECTS_APPLIED")) {
-                return Ok(true);
-            }
-        }
+    let mut partitions = Vec::with_capacity(rows.len());
+    for row in rows {
+        partitions.push((
+            crate::cassandra_util::get_column(&row, "bucket", "generation_partitions")?,
+            crate::cassandra_util::get_column(&row, "shard", "generation_partitions")?,
+        ));
     }
-    Ok(false)
+    Ok(partitions)
 }
 
+/// Remove a retired generation's queue rows.
+///
+/// Only `PENDING` rows are removed. A row in `CLAIMED` or `EFFECTS_APPLIED`
+/// owns durable state — a base-row claim, and possibly already-applied index
+/// and stream effects — so deleting it would strand that state with nothing
+/// left to drive recovery. Those rows are left in place and reported by the
+/// `false` return, which keeps `ttl_cleanup_generation` set so the worker
+/// drains them and retries.
 pub(crate) async fn clear_ttl_generation(
     engine: &CassandraEngine,
     account_keyspace: &str,
     table_id: &str,
     generation: uuid::Uuid,
-) -> Result<(), StorageError> {
-    let bucket_query = format!(
-        "SELECT bucket, shard FROM {account_keyspace}.{TTL_BUCKET_TABLE} \
-         WHERE table_id = ? AND generation = ?"
-    );
+) -> Result<bool, StorageError> {
     let generation_bytes = cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec());
-    let rows = crate::cassandra_util::query_rows(
-        &engine.session,
-        &bucket_query,
-        cdrs_tokio::query_values!(table_id, generation_bytes.clone()),
-        "clear_ttl_generation",
-    )
-    .await?;
-    for row in rows {
-        let bucket: i64 =
-            crate::cassandra_util::get_column(&row, "bucket", "clear_ttl_generation")?;
-        let shard: i32 = crate::cassandra_util::get_column(&row, "shard", "clear_ttl_generation")?;
-        let delete = format!(
-            "DELETE FROM {account_keyspace}.{TTL_QUEUE_TABLE} WHERE table_id = ? \
-             AND generation = ? AND bucket = ? AND shard = ?"
-        );
-        engine
-            .session
-            .query_with_values(
-                &delete,
-                cdrs_tokio::query_values!(table_id, generation_bytes.clone(), bucket, shard),
-            )
-            .await
-            .map_err(|error| {
-                StorageError::Internal(format!("Clear TTL generation partition: {error}"))
-            })?;
-    }
-    let delete_buckets = format!(
-        "DELETE FROM {account_keyspace}.{TTL_BUCKET_TABLE} WHERE table_id = ? AND generation = ?"
-    );
-    engine
-        .session
-        .query_with_values(
-            &delete_buckets,
-            cdrs_tokio::query_values!(table_id, generation_bytes),
+    let mut fully_drained = true;
+    for (bucket, shard) in
+        generation_partitions(engine, account_keyspace, table_id, generation).await?
+    {
+        let rows = crate::cassandra_util::query_rows(
+            &engine.session,
+            &format!(
+                "SELECT expires_at, key_hash, key_data, state \
+                 FROM {account_keyspace}.{TTL_QUEUE_TABLE} WHERE table_id = ? \
+                 AND generation = ? AND bucket = ? AND shard = ?"
+            ),
+            cdrs_tokio::query_values!(table_id, generation_bytes.clone(), bucket, shard),
+            "clear_ttl_generation",
         )
-        .await
-        .map_err(|error| {
-            StorageError::Internal(format!("Clear TTL generation buckets: {error}"))
-        })?;
-    Ok(())
+        .await?;
+        let mut partition_drained = true;
+        for row in rows {
+            use cdrs_tokio::types::IntoRustByName;
+            let state: Option<String> = row.get_by_name("state").ok().flatten();
+            if TtlWorkState::parse(state.as_deref())? != TtlWorkState::Pending {
+                partition_drained = false;
+                fully_drained = false;
+                continue;
+            }
+            let entry = TtlEntry {
+                bucket,
+                shard,
+                expires_at: crate::cassandra_util::get_column(
+                    &row,
+                    "expires_at",
+                    "clear_ttl_generation",
+                )?,
+                key_hash: crate::cassandra_util::get_column(
+                    &row,
+                    "key_hash",
+                    "clear_ttl_generation",
+                )?,
+                key_data: crate::cassandra_util::get_column(
+                    &row,
+                    "key_data",
+                    "clear_ttl_generation",
+                )?,
+            };
+            if !retire_pending_ttl_work(engine, account_keyspace, table_id, generation, &entry)
+                .await?
+            {
+                // Claimed between the read and the delete; leave it for the
+                // drain pass.
+                partition_drained = false;
+                fully_drained = false;
+            }
+        }
+        if partition_drained {
+            retire_bucket_registration(
+                engine,
+                account_keyspace,
+                table_id,
+                generation,
+                bucket,
+                shard,
+                None,
+            )
+            .await?;
+        }
+    }
+    Ok(fully_drained)
 }
 
 pub(crate) async fn clear_ttl_entries(
@@ -845,5 +1012,53 @@ mod tests {
         .unwrap();
         let built = batch.build().unwrap();
         assert_eq!(built.request.queries.len(), 2);
+    }
+
+    /// Every TTL claim and the exact base-row delete condition on
+    /// `item_data = ?`, where the expected value is produced by re-serialising
+    /// an item that was parsed out of the stored string. That only works while
+    /// re-serialising a stored form reproduces it byte for byte, so an
+    /// accidental change to `AttributeValue`'s serde representation would
+    /// silently stop TTL deleting anything and start failing writes with
+    /// `TransactionConflict`. This asserts the invariant directly rather than
+    /// leaving it to a live Cassandra test to notice.
+    ///
+    /// The stored form is whatever the write path produced, so the property
+    /// under test is that serialisation is canonical: a value that has been
+    /// serialised once is unchanged by every later round trip. Note that this
+    /// means the first serialisation *does* normalise — `N: "1.500"` is stored
+    /// as `1.5` — which is why the claim compares against the stored form and
+    /// never against a client-supplied string.
+    #[test]
+    fn stored_item_json_round_trips_byte_for_byte() {
+        let submitted = [
+            r#"{"id":{"S":"a"}}"#,
+            r#"{"id":{"S":""}}"#,
+            r#"{"id":{"S":"a"},"n":{"N":"0"}}"#,
+            r#"{"id":{"S":"a"},"n":{"N":"-1"}}"#,
+            r#"{"id":{"S":"a"},"n":{"N":"1.500"}}"#,
+            r#"{"id":{"S":"a"},"n":{"N":"1e3"}}"#,
+            r#"{"id":{"S":"a"},"n":{"N":"123456789012345678901234567890"}}"#,
+            r#"{"b":{"B":"aGVsbG8="},"id":{"S":"a"}}"#,
+            r#"{"bool":{"BOOL":true},"id":{"S":"a"},"null":{"NULL":true}}"#,
+            r#"{"id":{"S":"a"},"l":{"L":[{"S":"x"},{"N":"1"}]}}"#,
+            r#"{"id":{"S":"a"},"m":{"M":{"a":{"S":"x"},"b":{"N":"2"}}}}"#,
+            r#"{"id":{"S":"a"},"ss":{"SS":["a","b"]}}"#,
+            r#"{"id":{"S":"a"},"unicode":{"S":"héllo → 世界"}}"#,
+        ];
+        for original in submitted {
+            let parsed: Item = serde_json::from_str(original)
+                .unwrap_or_else(|error| panic!("parse {original}: {error}"));
+            // What the write path persists into `item_data`.
+            let stored = serde_json::to_string(&parsed).expect("serialize item");
+            // What a claim or exact delete reconstructs from it.
+            let reloaded: Item = serde_json::from_str(&stored)
+                .unwrap_or_else(|error| panic!("parse stored {stored}: {error}"));
+            let expected = serde_json::to_string(&reloaded).expect("serialize reloaded item");
+            assert_eq!(
+                expected, stored,
+                "item_data round trip is not byte-stable for {original}"
+            );
+        }
     }
 }

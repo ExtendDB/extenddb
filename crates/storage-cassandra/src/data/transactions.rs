@@ -553,6 +553,27 @@ impl CassandraEngine {
         self.update_ledger_state(account_keyspace, txn_id, TransactionState::Committing)
             .await?;
 
+        // Capture the pre-commit image of every item on a TTL-enabled table.
+        // Reconciliation needs it to retire the expiration entry the item had
+        // *before* this transaction: unlike an ordinary write, a transactional
+        // write cannot carry the queue delete in the same batch as the base
+        // mutation, so without this a changed or removed TTL leaves its old
+        // entry behind until that entry's original due time.
+        let mut pre_commit_images: Vec<Option<Item>> = Vec::with_capacity(ops.len());
+        for op in ops {
+            let image = match op {
+                TransactWriteOp::Put { key_info, item, .. } => {
+                    self.pre_commit_ttl_image(key_info, item).await?
+                }
+                TransactWriteOp::Update { key_info, key, .. }
+                | TransactWriteOp::Delete { key_info, key, .. } => {
+                    self.pre_commit_ttl_image(key_info, key).await?
+                }
+                TransactWriteOp::ConditionCheck { .. } => None,
+            };
+            pre_commit_images.push(image);
+        }
+
         // TODO: Execute COMMIT operations for each item in parallel
         // For now, sequential execution
         for op in ops {
@@ -560,17 +581,22 @@ impl CassandraEngine {
                 .await?;
         }
 
-        for op in ops {
+        for (op, old_image) in ops.iter().zip(&pre_commit_images) {
             match op {
                 TransactWriteOp::Put { key_info, item, .. } => {
-                    self.reconcile_ttl_item(key_info, item).await?;
+                    self.reconcile_ttl_transition(key_info, old_image.as_ref(), Some(item))
+                        .await?;
                 }
                 TransactWriteOp::Update { key_info, key, .. } => {
-                    if let Some(item) = self.get_item_impl(key_info, key).await? {
-                        self.reconcile_ttl_item(key_info, &item).await?;
-                    }
+                    let new_image = self.get_item_impl(key_info, key).await?;
+                    self.reconcile_ttl_transition(key_info, old_image.as_ref(), new_image.as_ref())
+                        .await?;
                 }
-                TransactWriteOp::Delete { .. } | TransactWriteOp::ConditionCheck { .. } => {}
+                TransactWriteOp::Delete { key_info, .. } => {
+                    self.reconcile_ttl_transition(key_info, old_image.as_ref(), None)
+                        .await?;
+                }
+                TransactWriteOp::ConditionCheck { .. } => {}
             }
         }
 
@@ -1264,11 +1290,19 @@ impl CassandraEngine {
                     }
                 }
                 for op in &ops {
-                    if matches!(op.op.as_str(), "PUT" | "UPDATE") {
-                        if let Some(item_data) = op.item_data.as_deref() {
-                            self.reconcile_ttl_item_by_table_id(&op.table_id, item_data)
-                                .await?;
-                        }
+                    if matches!(op.op.as_str(), "PUT" | "UPDATE")
+                        && let Some(item_data) = op.item_data.as_deref()
+                    {
+                        // Recovery can only re-register the committed image:
+                        // the ledger does not persist the pre-commit image,
+                        // so a transaction that crashes between COMMIT and
+                        // reconciliation can leave the item's previous
+                        // expiration entry in the queue. That entry is
+                        // harmless — the worker revalidates the item before
+                        // deleting anything and retires the entry when it
+                        // comes due — but it is queue garbage until then.
+                        self.reconcile_ttl_item_by_table_id(&op.table_id, item_data)
+                            .await?;
                     }
                 }
             }

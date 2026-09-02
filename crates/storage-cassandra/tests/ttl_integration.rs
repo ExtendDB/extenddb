@@ -338,7 +338,7 @@ async fn test_ttl_metadata_enable_disable_and_listing() {
         .await;
     assert!(matches!(
         blocked_disable,
-        Err(StorageError::TableNotActive(_))
+        Err(StorageError::IndexesInUse(_))
     ));
     engine
         .release_ttl_sweep_lease(
@@ -823,7 +823,7 @@ async fn test_ttl_claim_serializes_delayed_writer() {
         .await;
     assert!(matches!(
         second_claim,
-        Err(StorageError::TransactionCanceled(_))
+        Err(StorageError::TransactionConflict(_))
     ));
 
     let mut renewed = old.clone();
@@ -841,9 +841,12 @@ async fn test_ttl_claim_serializes_delayed_writer() {
             None,
         )
         .await;
+    // The write retries the claim on a jittered backoff before giving up, and
+    // surfaces DynamoDB's canonical single-item conflict error rather than
+    // TransactionCanceledException, which PutItem does not have.
     assert!(matches!(
         blocked_write,
-        Err(StorageError::TransactionCanceled(_))
+        Err(StorageError::TransactionConflict(_))
     ));
 
     engine
@@ -904,6 +907,89 @@ async fn test_ttl_claim_serializes_delayed_writer() {
         )
         .await
         .expect("successful delete releases its exact TTL claim immediately");
+}
+
+/// Two ordinary writers contending for the same key on a TTL-enabled table must
+/// both succeed: the base-row claim is an internal serialisation device, not a
+/// client-visible failure mode. DynamoDB has no conflict error for concurrent
+/// unconditional `PutItem`s, so losing the claim has to be retried internally
+/// against a freshly read image rather than surfaced.
+#[tokio::test]
+async fn test_concurrent_ordinary_writes_on_ttl_table_both_succeed() {
+    use extenddb_core::types::{AttributeValue, Item};
+    use extenddb_storage::DataEngine;
+
+    let engine = std::sync::Arc::new(setup_engine().await);
+    let table = crate::helpers::TestTable::new(&engine, "TtlConcurrentPut", false).await;
+    activate_tables(&engine).await;
+    engine
+        .update_ttl(
+            &table.key_info.account_id,
+            &table.key_info.table_name,
+            "expires_at",
+            true,
+        )
+        .await
+        .unwrap();
+    engine
+        .create_ttl_index(
+            &table.key_info.account_id,
+            &table.key_info.table_name,
+            "expires_at",
+        )
+        .await
+        .unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let write = |value: &str| {
+        let engine = engine.clone();
+        let key_info = table.key_info.clone();
+        let value = value.to_owned();
+        async move {
+            let mut item = Item::new();
+            item.insert("id".to_owned(), AttributeValue::S("contended".to_owned()));
+            item.insert(
+                "expires_at".to_owned(),
+                AttributeValue::N((now + 3_600).to_string()),
+            );
+            item.insert("value".to_owned(), AttributeValue::S(value));
+            engine
+                .put_item(&key_info, item, false, None, &Default::default(), None)
+                .await
+        }
+    };
+
+    let (first, second) = tokio::join!(write("a"), write("b"));
+    first.expect("first concurrent write succeeds");
+    second.expect("second concurrent write succeeds");
+
+    // Sustained contention, so the collision is hit on the pre-read as well as
+    // on the claim LWT. Every writer must still succeed.
+    let mut wave = Vec::new();
+    for index in 0..8 {
+        wave.push(write(&format!("wave-{index}")));
+    }
+    for (index, result) in futures::future::join_all(wave)
+        .await
+        .into_iter()
+        .enumerate()
+    {
+        result.unwrap_or_else(|error| {
+            panic!("contended write {index} must not surface a conflict: {error}")
+        });
+    }
+
+    let mut key = Item::new();
+    key.insert("id".to_owned(), AttributeValue::S("contended".to_owned()));
+    let stored = engine
+        .get_item(&table.key_info, &key)
+        .await
+        .expect("read after contended writes")
+        .expect("one of the writes is durable");
+    assert!(matches!(stored.get("value"), Some(AttributeValue::S(_))));
 }
 
 #[tokio::test]

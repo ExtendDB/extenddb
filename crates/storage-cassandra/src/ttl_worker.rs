@@ -14,6 +14,9 @@ use crate::CassandraEngine;
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(60);
 const BATCH_SIZE: usize = 100;
+/// Rows drained per cleanup pass for a retired generation. Cleanup is retried
+/// every cycle until the generation is empty, so this only bounds one pass.
+const DRAIN_BATCH_SIZE: usize = 100;
 
 pub(crate) async fn ttl_cleanup_worker(
     storage: Arc<CassandraEngine>,
@@ -118,6 +121,99 @@ pub async fn reconcile_pending_once(
     Ok(processed)
 }
 
+/// Finish or abort work that was already claimed when a TTL generation was
+/// retired.
+///
+/// Disabling TTL, or re-enabling it under a new generation, must not simply
+/// delete the old generation's queue rows: a claimed row owns a base-row claim,
+/// and an `EFFECTS_APPLIED` row additionally owns index deletions and a
+/// published `REMOVE` record. The rule is decided by how much is already
+/// durable:
+///
+/// * `CLAIMED` — nothing externally visible has happened yet, so release the
+///   claim and drop the work. Disabling TTL stops the deletion.
+/// * `EFFECTS_APPLIED` — index and stream effects are already durable, so the
+///   base delete must still be completed, otherwise a live item is left with
+///   its index rows removed. If the image has since changed, the writer that
+///   changed it rewrote its own index rows, so the work is simply completed.
+///
+/// `PENDING` rows are left to `clear_ttl_generation`.
+pub(crate) async fn drain_retired_generation(
+    storage: &CassandraEngine,
+    account_id: &str,
+    table_name: &str,
+    generation: uuid::Uuid,
+) -> Result<(), StorageError> {
+    use crate::data::ttl::TtlWorkState;
+
+    let key_info = match storage.fetch_table_key_info(account_id, table_name).await {
+        Ok(key_info) => key_info,
+        // The table is gone; its whole keyspace-level queue is removed by the
+        // table-deletion path instead.
+        Err(StorageError::TableNotFound(_)) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let account_keyspace = storage.account_keyspace(account_id);
+    let work = crate::data::ttl::load_generation_work(
+        storage,
+        &account_keyspace,
+        &key_info.table_id,
+        generation,
+        DRAIN_BATCH_SIZE,
+    )
+    .await?;
+
+    for row in work {
+        if row.state == TtlWorkState::Pending {
+            continue;
+        }
+        let Some(work_id) = row.work_id else {
+            continue;
+        };
+        let Some(work_data) = row.work_data.clone() else {
+            continue;
+        };
+        let key: extenddb_core::types::Item = serde_json::from_str(&row.entry.key_data)
+            .map_err(|error| StorageError::Internal(format!("Parse TTL work key: {error}")))?;
+
+        if row.state == TtlWorkState::Claimed {
+            storage.release_ttl_claim(&key_info, &key, work_id).await?;
+            let _ = crate::data::ttl::abort_claimed_ttl_work(
+                storage,
+                &account_keyspace,
+                &key_info.table_id,
+                generation,
+                &row,
+            )
+            .await?;
+            continue;
+        }
+
+        // EFFECTS_APPLIED.
+        let current = storage.get_item_impl(&key_info, &key).await?;
+        if current.as_ref() == Some(&work_data.old_item)
+            && storage
+                .ensure_ttl_work_claim(&key_info, &key, &work_data.old_item, work_id)
+                .await?
+        {
+            storage
+                .delete_ttl_base_exact(&key_info, &key, &work_data.old_item, work_id)
+                .await?;
+        } else {
+            storage.release_ttl_claim(&key_info, &key, work_id).await?;
+        }
+        let _ = crate::data::ttl::complete_ttl_work(
+            storage,
+            &account_keyspace,
+            &key_info.table_id,
+            generation,
+            &row,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 async fn retry_pending_cleanup(storage: &CassandraEngine) {
     let pending = match storage.pending_ttl_cleanups().await {
         Ok(pending) => pending,
@@ -136,6 +232,10 @@ async fn retry_pending_cleanup(storage: &CassandraEngine) {
     }
 }
 
+/// Retry the queue backfill for any TTL-enabled table that is not yet ready.
+///
+/// `create_ttl_index` takes the table's control lease internally, so a table is
+/// scanned by one host at a time even though every host runs this pass.
 async fn retry_pending_indexes(storage: &CassandraEngine) {
     let Ok(enabled) = MetadataEngine::all_tables_with_ttl(storage).await else {
         return;
@@ -149,14 +249,11 @@ async fn retry_pending_indexes(storage: &CassandraEngine) {
         .collect();
 
     for (account_id, table_name, attribute) in &enabled {
-        if !ready_set.contains(&(account_id.as_str(), table_name.as_str())) {
-            if let Err(error) =
+        if !ready_set.contains(&(account_id.as_str(), table_name.as_str()))
+            && let Err(error) =
                 MetadataEngine::create_ttl_index(storage, account_id, table_name, attribute).await
-            {
-                tracing::debug!(
-                    "TTL worker: queue backfill retry failed for {table_name}: {error}"
-                );
-            }
+        {
+            tracing::debug!("TTL worker: queue backfill retry failed for {table_name}: {error}");
         }
     }
 }
