@@ -243,6 +243,7 @@ impl DataEngine for MongoEngine {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GsiBackfillMode {
     Live,
+    #[allow(dead_code)]
     Restore,
 }
 
@@ -2958,16 +2959,69 @@ impl MongoEngine {
         // a DeleteItem after this batch has been read but before the per-item
         // claim transaction begins, without consuming transaction lifetime.
         if context.mode == GsiBackfillMode::Live {
-            self.wait_for_gsi_backfill_test_gate().await?;
+            self.wait_for_gsi_backfill_test_gate(&context.key_info.table_name)
+                .await?;
         }
 
+        let mut skipped_items = 0usize;
         for doc in &docs {
-            let item = document_to_item(doc)?;
+            let item = match document_to_item(doc) {
+                Ok(item) => item,
+                Err(error) => {
+                    skipped_items += 1;
+                    tracing::debug!(
+                        index_id = %context.index_id,
+                        error = %error,
+                        "GSI backfill: skipping malformed source item"
+                    );
+                    continue;
+                }
+            };
             if !item_has_index_keys(&item, context.idx_key_schema) {
                 continue;
             }
-            self.backfill_gsi_item(&base_coll, &idx_coll, context, doc, &item)
-                .await?;
+
+            let index_refs = [extenddb_core::validation::IndexKeyRef {
+                index_name: context.index_id,
+                key_schema: context.idx_key_schema,
+            }];
+            if let Err(error) = extenddb_core::validation::validate_index_keys(
+                &item,
+                &index_refs,
+                &context.key_info.attribute_definitions,
+            ) {
+                skipped_items += 1;
+                tracing::debug!(
+                    index_id = %context.index_id,
+                    error = %error,
+                    "GSI backfill: skipping source item with invalid index keys"
+                );
+                continue;
+            }
+
+            match self
+                .backfill_gsi_item(&base_coll, &idx_coll, context, doc, &item)
+                .await
+            {
+                Ok(()) => {}
+                Err(StorageError::Validation(error)) => {
+                    skipped_items += 1;
+                    tracing::debug!(
+                        index_id = %context.index_id,
+                        error = %error,
+                        "GSI backfill: skipping source item that cannot be indexed"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        if skipped_items > 0 {
+            tracing::warn!(
+                index_id = %context.index_id,
+                skipped_items,
+                "GSI backfill: skipped malformed or non-conforming source items"
+            );
         }
 
         let progress = GsiBackfillProgress {
@@ -3126,9 +3180,10 @@ impl MongoEngine {
     /// read but before it claims or writes any base/index rows. The gate is
     /// controlled through the authenticated management settings API and is
     /// inert unless a test explicitly sets it to `armed`.
-    async fn wait_for_gsi_backfill_test_gate(&self) -> Result<(), StorageError> {
+    async fn wait_for_gsi_backfill_test_gate(&self, table_name: &str) -> Result<(), StorageError> {
         #[cfg(not(feature = "test-hooks"))]
         {
+            let _ = table_name;
             Ok(())
         }
 
@@ -3137,9 +3192,12 @@ impl MongoEngine {
             use std::time::{Duration, Instant};
 
             let settings = self.catalog_db.collection::<Document>("settings");
-            let key = extenddb_core::settings_keys::GSI_BACKFILL_TEST_GATE;
+            let key = format!(
+                "{}:{table_name}",
+                extenddb_core::settings_keys::GSI_BACKFILL_TEST_GATE
+            );
             let armed = settings
-                .find_one(doc! { "_id": key, "value": "armed" })
+                .find_one(doc! { "_id": &key, "value": "armed" })
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             if armed.is_none() {
@@ -3148,7 +3206,7 @@ impl MongoEngine {
 
             let claimed = settings
                 .update_one(
-                    doc! { "_id": key, "value": "armed" },
+                    doc! { "_id": &key, "value": "armed" },
                     doc! { "$set": { "value": "paused" } },
                 )
                 .await
@@ -3160,7 +3218,7 @@ impl MongoEngine {
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 let state = settings
-                    .find_one(doc! { "_id": key })
+                    .find_one(doc! { "_id": &key })
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?
                     .and_then(|d| d.get_str("value").ok().map(str::to_owned));
@@ -3177,7 +3235,7 @@ impl MongoEngine {
                 if Instant::now() >= deadline {
                     let _ = settings
                         .update_one(
-                            doc! { "_id": key, "value": "paused" },
+                            doc! { "_id": &key, "value": "paused" },
                             doc! { "$set": { "value": "idle" } },
                         )
                         .await;

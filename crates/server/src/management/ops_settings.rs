@@ -37,11 +37,6 @@ pub const KNOWN_KEYS: &[(&str, Validator)] = &[
         extenddb_core::settings_keys::VECTOR_BACKFILL_BATCH_DELAY_MS,
         validate_backfill_batch_delay_ms,
     ),
-    #[cfg(feature = "mongodb-test-hooks")]
-    (
-        extenddb_core::settings_keys::GSI_BACKFILL_TEST_GATE,
-        validate_backfill_test_gate,
-    ),
 ];
 
 /// Read-only keys that cannot be changed via the settings API.
@@ -70,11 +65,27 @@ fn validate_backfill_batch_delay_ms(value: &str) -> Result<(), &'static str> {
     }
 }
 
+#[cfg(feature = "mongodb-test-hooks")]
 fn validate_backfill_test_gate(value: &str) -> Result<(), &'static str> {
     match value {
         "armed" | "paused" | "release" | "idle" => Ok(()),
         _ => Err("must be one of: armed, paused, release, idle"),
     }
+}
+
+#[cfg(feature = "mongodb-test-hooks")]
+fn is_table_scoped_backfill_gate_key(key: &str) -> bool {
+    let Some(table_name) = key
+        .strip_prefix(extenddb_core::settings_keys::GSI_BACKFILL_TEST_GATE)
+        .and_then(|suffix| suffix.strip_prefix(':'))
+    else {
+        return false;
+    };
+
+    !table_name.is_empty()
+        && table_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn validate_bool(value: &str) -> Result<(), &'static str> {
@@ -119,8 +130,16 @@ pub async fn set_setting(
         return Err(OpError::Validation(format!("Setting '{key}' is read-only")));
     }
 
-    let known = KNOWN_KEYS.iter().find(|(k, _)| *k == key);
-    if let Some((_, validator)) = known {
+    let known = KNOWN_KEYS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, validator)| *validator);
+    #[cfg(feature = "mongodb-test-hooks")]
+    let known = known.or_else(|| {
+        is_table_scoped_backfill_gate_key(key).then_some(validate_backfill_test_gate as Validator)
+    });
+
+    if let Some(validator) = known {
         validator(value).map_err(|reason| {
             OpError::Validation(format!("Invalid value for '{key}': {reason}"))
         })?;

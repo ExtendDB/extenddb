@@ -46,9 +46,12 @@ pub const VECTOR_BACKFILL_BATCH_DELAY_MS: &str = "vector_backfill_batch_delay_ms
 
 /// Test-only gate for the MongoDB GSI backfill race tests.
 ///
-/// A MongoDB test-hook build uses the values `armed`, `paused`, `release`, and
-/// `idle` to coordinate an external API test at the read-before-index-write
-/// boundary. Production MongoDB builds do not compile the hook.
+/// A MongoDB test-hook build uses keys of the form
+/// `gsi_backfill_test_gate:<table-name>` and the values `armed`, `paused`,
+/// `release`, and `idle` to coordinate an external API test at the
+/// read-before-index-write boundary. The table suffix keeps parallel backfills
+/// from claiming one another's gate. Production MongoDB builds do not compile
+/// the hook.
 pub const GSI_BACKFILL_TEST_GATE: &str = "gsi_backfill_test_gate";
 
 /// Resolve a caller-supplied settings key to its canonical name.

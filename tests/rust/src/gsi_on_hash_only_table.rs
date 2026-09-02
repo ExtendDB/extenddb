@@ -21,6 +21,10 @@ use std::time::Duration;
 
 const GSI_BACKFILL_TEST_GATE: &str = "gsi_backfill_test_gate";
 
+fn backfill_gate_key(table_name: &str) -> String {
+    format!("{GSI_BACKFILL_TEST_GATE}:{table_name}")
+}
+
 fn management_client() -> (reqwest::Client, String, String, String) {
     let endpoint = std::env::var("EXTENDDB_TEST_ENDPOINT")
         .expect("MongoDB GSI race test requires EXTENDDB_TEST_ENDPOINT");
@@ -39,10 +43,13 @@ fn management_client() -> (reqwest::Client, String, String, String) {
     )
 }
 
-async fn set_backfill_gate(value: &str) {
+async fn set_backfill_gate(table_name: &str, value: &str) {
     let (http, base, user, password) = management_client();
     let response = http
-        .put(format!("{base}/settings/{GSI_BACKFILL_TEST_GATE}"))
+        .put(format!(
+            "{base}/settings/{}",
+            backfill_gate_key(table_name)
+        ))
         .basic_auth(user, Some(password))
         .json(&serde_json::json!({ "value": value }))
         .send()
@@ -53,11 +60,14 @@ async fn set_backfill_gate(value: &str) {
     assert!(status.is_success(), "setting GSI backfill gate failed: {status}: {body}");
 }
 
-async fn wait_for_backfill_gate(value: &str) -> bool {
+async fn wait_for_backfill_gate(table_name: &str, value: &str) -> bool {
     let (http, base, user, password) = management_client();
     for _ in 0..120 {
         let response = http
-            .get(format!("{base}/settings/{GSI_BACKFILL_TEST_GATE}"))
+            .get(format!(
+                "{base}/settings/{}",
+                backfill_gate_key(table_name)
+            ))
             .basic_auth(&user, Some(&password))
             .send()
             .await;
@@ -247,7 +257,7 @@ async fn deleting_item_during_gsi_backfill_does_not_leave_stale_index_entry() {
     // Arm the gate before creating the index. Backfill will publish `paused`
     // after reading its base batch and wait for `release` before any index
     // write or base-document guard.
-    set_backfill_gate("armed").await;
+    set_backfill_gate(&table, "armed").await;
 
     c.update_table()
         .table_name(&table)
@@ -284,10 +294,10 @@ async fn deleting_item_during_gsi_backfill_does_not_leave_stale_index_entry() {
         .await
         .expect("GSI creation must succeed");
 
-    if !wait_for_backfill_gate("paused").await {
+    if !wait_for_backfill_gate(&table, "paused").await {
         // Release first so a diagnostic failure cannot leave the background
         // worker blocked for the remainder of the suite.
-        set_backfill_gate("release").await;
+        set_backfill_gate(&table, "release").await;
         panic!("backfill did not reach its deterministic pause");
     }
 
@@ -302,7 +312,7 @@ async fn deleting_item_during_gsi_backfill_does_not_leave_stale_index_entry() {
 
     // Always release the worker after the API operation so a failed assertion
     // cannot leave the server's background worker paused.
-    set_backfill_gate("release").await;
+    set_backfill_gate(&table, "release").await;
     delete_result.expect("DeleteItem during GSI backfill must succeed");
 
     let item = c
