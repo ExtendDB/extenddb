@@ -622,17 +622,35 @@ pub(crate) async fn load_due_ttl_work(
         // it could ever hold is already due, so an empty read means the
         // partition is empty rather than not-yet-due. Retire the registration
         // so the fan-out above stops growing with the age of the table.
+        //
+        // The scan above runs at the driver's default consistency, where a
+        // replica that has not caught up reads as empty. Retiring on that read
+        // would orphan any entry it missed — the entry's own insert is older
+        // than the guard timestamp, so the guard would not save it, and the item
+        // would then never expire. Confirm at LOCAL_QUORUM first.
         if rows.is_empty() && *bucket < current_bucket {
-            retire_bucket_registration(
-                engine,
-                account_keyspace,
-                table_id,
-                generation,
-                *bucket,
-                *shard,
-                Some(retire_guard),
+            let confirm = crate::cassandra_util::query_rows_quorum(
+                &engine.session,
+                &format!(
+                    "SELECT key_hash FROM {account_keyspace}.{TTL_QUEUE_TABLE} \
+                     WHERE table_id = ? AND generation = ? AND bucket = ? AND shard = ? LIMIT 1"
+                ),
+                cdrs_tokio::query_values!(table_id, generation_bytes.clone(), *bucket, *shard),
+                "confirm_drained_ttl_bucket",
             )
             .await?;
+            if confirm.is_empty() {
+                retire_bucket_registration(
+                    engine,
+                    account_keyspace,
+                    table_id,
+                    generation,
+                    *bucket,
+                    *shard,
+                    Some(retire_guard),
+                )
+                .await?;
+            }
             continue;
         }
         for row in rows {
@@ -727,7 +745,9 @@ pub(crate) async fn load_generation_work(
         if work.len() >= limit {
             break;
         }
-        let rows = crate::cassandra_util::query_rows(
+        // Quorum: work this read misses would be abandoned holding a base-row
+        // claim, and the generation would be reported drained when it is not.
+        let rows = crate::cassandra_util::query_rows_quorum(
             &engine.session,
             &format!(
                 "SELECT expires_at, key_hash, key_data, state, work_id, work_data \
@@ -825,7 +845,9 @@ pub(crate) async fn clear_ttl_generation(
     for (bucket, shard) in
         generation_partitions(engine, account_keyspace, table_id, generation).await?
     {
-        let rows = crate::cassandra_util::query_rows(
+        // Quorum: `partition_drained` below decides whether to delete the bucket
+        // registration and whether the generation can be reported fully drained.
+        let rows = crate::cassandra_util::query_rows_quorum(
             &engine.session,
             &format!(
                 "SELECT expires_at, key_hash, key_data, state \

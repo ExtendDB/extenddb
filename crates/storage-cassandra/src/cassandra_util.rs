@@ -111,6 +111,42 @@ pub async fn query_rows<E: FromDbError>(
     Ok(body.into_rows().unwrap_or_default())
 }
 
+/// Execute a query at `LOCAL_QUORUM` and return all rows.
+///
+/// [`query_rows`] uses the driver's default consistency, which is `ONE`. Use
+/// this instead wherever an *empty* result is treated as authoritative and acted
+/// on destructively: at `ONE` a replica that has not yet received a write reads
+/// as empty, and a decision made on that read cannot be undone by a timestamp
+/// guard, because the write it missed is older than the guard.
+pub async fn query_rows_quorum<E: FromDbError>(
+    session: &Arc<CassandraSession>,
+    query: &str,
+    values: QueryValues,
+    context: &str,
+) -> Result<Vec<Row>, E> {
+    use cdrs_tokio::consistency::Consistency;
+    use cdrs_tokio::statement::StatementParamsBuilder;
+
+    let params = StatementParamsBuilder::new()
+        .with_consistency(Consistency::LocalQuorum)
+        .with_values(values)
+        .build();
+    let result = session
+        .query_with_params(query, params)
+        .await
+        .map_err(|e| {
+            tracing::error!("{context} quorum query failed: {e}");
+            E::db_error(format!("{context}: {e}"))
+        })?;
+
+    let body = result.response_body().map_err(|e| {
+        tracing::error!("{context} response_body failed: {e}");
+        E::db_error(format!("{context} response_body: {e}"))
+    })?;
+
+    Ok(body.into_rows().unwrap_or_default())
+}
+
 /// Execute a query and return the first row, if any.
 ///
 /// Similar to `sqlx::query().fetch_optional()`.
