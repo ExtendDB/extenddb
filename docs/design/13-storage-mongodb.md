@@ -16,14 +16,13 @@ transactions on replica sets).
 **Transaction read concern:** `storage.mongodb.transaction_read_concern`
 (default `"snapshot"`) controls the read concern applied to every
 multi-document transaction this backend opens (conditional writes,
-`TransactWriteItems`, `TransactGetItems`, idempotency-token checks). Real
-MongoDB 7.0+ supports `"snapshot"` and it is the strongest isolation level,
-so it remains the default. Some MongoDB-wire-compatible servers (e.g.
-DocumentDB) do not implement `readConcern: snapshot` and reject transactions
-that request it with `CommandNotSupported` (error code 115); set this to
-`"majority"` or `"local"` to run against such targets. Doing so weakens
-isolation between concurrent transactions relative to `"snapshot"` — see
-§5.1 for what that trades away.
+`TransactWriteItems`, `TransactGetItems`, idempotency-token checks). The only
+accepted values are `"snapshot"`, `"majority"`, and `"local"`. Snapshot is
+the default and fidelity-preserving mode. Some MongoDB-wire-compatible
+servers (e.g. DocumentDB) reject `readConcern: snapshot` transactions with
+`CommandNotSupported` (error code 115); `"majority"` or `"local"` can be used
+for those targets, but neither provides snapshot's single point-in-time view.
+Local may also observe data that is later rolled back after failover.
 
 **Read preference:** `primary` only. `MongoEngine::new` rejects connection strings
 that request `secondary`, `secondaryPreferred`, `primaryPreferred`, or `nearest` —
@@ -417,12 +416,11 @@ filters existing rows by `created_at` age < 600 000 ms so retention is
 correct regardless of TTL-monitor timing.
 
 The unique index closes a race window: two concurrent `TransactWriteItems`
-calls with the same token both take snapshot reads that miss the other's
-uncommitted insert; without the constraint, both would commit and the
-operation would execute twice. With it, the second inserter fails
-`E11000` and the write path resolves the winner by re-reading (still
-subject to the age filter — if the winner has just expired, the retry
-does a fresh insert).
+calls with the same token can both miss the other's uncommitted insert;
+without the constraint, both would commit and the operation would execute
+twice. With it, the second inserter fails `E11000` and the write path resolves
+the winner by re-reading (still subject to the age filter — if the winner has
+just expired, the retry does a fresh insert).
 
 ### 4.7 `_backup_{backup_id}`
 
@@ -452,11 +450,14 @@ majority write concern. Within the session:
    per-shard sequence-number `$inc` — also in the same session.
 6. Commit.
 
-All five happen on the same session, so a concurrent conflicting writer
-manifests as a WriteConflict at commit — which the caller retries — not
-as a stale-read anomaly. The pre-image loaded in step 1 is reused for
-`ReturnValuesOnConditionCheckFailure = ALL_OLD` and for `OldImage` on any
-attached stream capture; no follow-up read is needed.
+In snapshot mode, all steps observe one point-in-time view, so a concurrent
+conflicting writer manifests as a WriteConflict at commit — which the caller
+retries — rather than as a stale-read anomaly. Majority and local retain the
+transaction's atomic commit but weaken those snapshot semantics; reads within
+the transaction are not guaranteed to share one point-in-time view. Local may
+also read data that is later rolled back after failover. The pre-image loaded
+in step 1 is reused for `ReturnValuesOnConditionCheckFailure = ALL_OLD` and
+for `OldImage` on any attached stream capture; no follow-up read is needed.
 
 Update-as-insert (the pre-image was `None`) emits an `INSERT` stream
 event with no `OldImage`, not a `MODIFY` with a fabricated key-only stub.
@@ -739,14 +740,14 @@ body, and either commits, aborts and retries (transient), or aborts and
 returns (fatal). Retries sleep with jittered exponential backoff
 (`backoff_sleep`, base 50 µs).
 
-**UpdateItem's OCC guard on top.** Even inside the transaction snapshot,
-`UpdateItem` uses a `_v` version filter. The transaction guarantees the
-snapshot the update was computed from; the versioned replace_one
-guarantees the write only commits if the row's `_v` still matches what
-we read. If `matched_count == 0` the attempt returns `Stale` (a distinct
-signal from `Transient`) and the loop restarts. The native fast path
-always emits `$inc: {_v: 1}` so a concurrent slow-path update racing
-against a stale snapshot fails its filter and retries.
+**UpdateItem's OCC guard on top.** `UpdateItem` uses a `_v` version filter.
+In snapshot mode, the transaction supplies the point-in-time view used to
+compute the update. Under every accepted read concern, the versioned
+`replace_one` ensures the write commits only if the row's `_v` still matches
+what was read. If `matched_count == 0` the attempt returns `Stale` (a distinct
+signal from `Transient`) and the loop restarts. The native fast path always
+emits `$inc: {_v: 1}` so a concurrent slow-path update racing against a stale
+read fails its filter and retries.
 
 **Exhaustion behavior.** Single-item retry exhaustion returns
 `StorageError::Internal` (rare in practice; the retry ceiling is high).
@@ -1067,7 +1068,7 @@ The backend implements every trait in `extenddb-storage`:
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Conditional writes | Read + evaluate + write inside a MongoDB transaction session | Snapshot atomicity delivers DDB's contract; pre-image reused for `ReturnValuesOnConditionCheckFailure = ALL_OLD` and `OldImage`. |
+| Conditional writes | Read + evaluate + write inside a MongoDB transaction session | Snapshot mode delivers DDB's isolation contract; pre-image reused for `ReturnValuesOnConditionCheckFailure = ALL_OLD` and `OldImage`. |
 | Filter pushdown | Analyzer-gated fast path; `is_pushable` certifies a subset | Compiler in `condition.rs` handles broader syntax than production uses; the analyzer is the correctness boundary. |
 | GSI live sync | Synchronous inline within the base write's session, gated by a 60s-TTL cache | Strongly-consistent GSI reads; no Change Stream recovery. |
 | GSI async backfill | `CREATING` → `ACTIVE` via `gsi_backfill_worker` with persistent `backfill_cursor` | Matches DDB's async UpdateTable contract; restart-safe. |
@@ -1080,8 +1081,8 @@ The backend implements every trait in `extenddb-storage`:
 | Stream shard ID | `shardId-{table_id}-{i:012}` | Cross-tenant isolation on same-named tables. |
 | Stream retention | 24h TTL index on `stream_records.created_at` + hourly cleanup worker | Primary enforcement at storage; worker is defense in depth. |
 | WriteConflict handling | Retry with jittered exponential backoff (50 attempts); TWI exhaustion → `TransactionCanceled` with synthetic `TransactionConflict` reasons | Bounded tail latency; DDB-canonical error surface. |
-| UpdateItem concurrency | Snapshot txn + `_v` version filter + retry; native fast-path always `$inc: {_v: 1}` | Prevents lost updates; fast path stays safe against a concurrent slow path. |
-| Idempotency retention | Unique `(account_id, token)` index + 540s TTL + 600 ms data-plane age filter | Race safety under snapshot isolation; ≤10-min worst-case retention regardless of TTL-monitor cadence. |
+| UpdateItem concurrency | Configured transaction read concern + `_v` version filter + retry; native fast-path always `$inc: {_v: 1}` | Prevents lost updates; snapshot mode additionally supplies a point-in-time read view. |
+| Idempotency retention | Unique `(account_id, token)` index + 540s TTL + 600 ms data-plane age filter | Unique-index race safety under every accepted read concern; ≤10-min worst-case retention regardless of TTL-monitor cadence. |
 | Backups | Per-backup collection via server-side `$out` aggregation | No per-item driver traffic; metadata schema decoupled from collection name. |
 | Parallel scan | Application-side `crc32(pk) % segments` + lazy cursor | Rare feature; server-side bucketing would tax every write. Lazy iteration prevents item-drops under hot-key skew. |
 | Read preference | `primary` enforced at engine startup | `ConsistentRead=true` requires linearizable reads. |

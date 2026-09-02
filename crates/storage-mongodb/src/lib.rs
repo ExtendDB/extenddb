@@ -93,16 +93,20 @@ fn server_components_factory(
     let region = region.to_string();
     // Backend-specific settings (transaction_read_concern) aren't exposed on
     // the generic StorageConfig trait, so downcast to the concrete mongo
-    // config. This factory is only ever invoked with a MongoStorageConfig
-    // (registered together in `register()` below), so the downcast cannot
-    // fail in practice; fall back to the field's own default rather than
-    // panicking if it ever did.
+    // config registered alongside this factory.
     let raw_read_concern = config
         .as_any()
         .downcast_ref::<config::MongoStorageConfig>()
         .map(|c| c.transaction_read_concern.clone())
-        .unwrap_or_else(|| "snapshot".to_string());
+        .ok_or_else(|| {
+            BackendError::InitializationFailed(
+                "MongoDB server component factory received a non-MongoStorageConfig; \
+                 backend registration invariant violated"
+                    .to_owned(),
+            )
+        });
     Box::pin(async move {
+        let raw_read_concern = raw_read_concern?;
         let tx_read_concern = config::parse_transaction_read_concern(&raw_read_concern)
             .map_err(BackendError::InitializationFailed)?;
 

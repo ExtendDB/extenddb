@@ -68,14 +68,15 @@
 # transaction_read_concern = "snapshot"
                                 # Read concern for the multi-document transactions
                                 # backing conditional writes, TransactWriteItems,
-                                # TransactGetItems, and idempotency tokens. Defaults
-                                # to "snapshot" (real MongoDB's strongest isolation).
+                                # TransactGetItems, and idempotency tokens. Accepted
+                                # values: "snapshot", "majority", and "local".
+                                # "snapshot" is the default, fidelity-preserving mode.
                                 # Some MongoDB-wire-compatible backends (e.g.
                                 # DocumentDB) reject "snapshot" transactions with
                                 # CommandNotSupported (115); set this to "majority"
-                                # or "local" to run against those targets. Weakens
-                                # isolation between concurrent transactions — only
-                                # change this if the target server requires it.
+                                # or "local" only when required. Both lose the
+                                # single point-in-time guarantee; "local" may read
+                                # data later rolled back after failover.
 
 [auth]
 # provider = "builtin"          # Auth provider:

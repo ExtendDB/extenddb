@@ -12,6 +12,7 @@ use serde::Deserialize;
 /// process on any serialize path. Matches the postgres backend, which derives
 /// only `Debug, Clone, Deserialize`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MongoStorageConfig {
     /// `MongoDB` connection string (mongodb://...)
     pub connection_string: String,
@@ -54,23 +55,21 @@ fn default_transaction_read_concern() -> String {
 /// Parse [`MongoStorageConfig::transaction_read_concern`] into a driver
 /// [`mongodb::options::ReadConcern`].
 ///
-/// Accepts the standard MongoDB read concern levels usable inside a
-/// transaction (`snapshot`, `majority`, `local`, `linearizable`,
-/// `available`), case-insensitively. Any other value is rejected at startup
-/// rather than silently passed through to the driver, so a typo surfaces as
-/// a clear configuration error instead of an opaque runtime failure.
-pub fn parse_transaction_read_concern(
+/// Accepts the MongoDB read concern levels valid inside a multi-document
+/// transaction (`snapshot`, `majority`, `local`), case-insensitively. Any
+/// other value is rejected at startup rather than silently passed through to
+/// the driver, so a typo surfaces as a clear configuration error instead of
+/// an opaque runtime failure.
+pub(crate) fn parse_transaction_read_concern(
     value: &str,
 ) -> Result<mongodb::options::ReadConcern, String> {
     match value.to_ascii_lowercase().as_str() {
         "snapshot" => Ok(mongodb::options::ReadConcern::snapshot()),
         "majority" => Ok(mongodb::options::ReadConcern::majority()),
         "local" => Ok(mongodb::options::ReadConcern::local()),
-        "linearizable" => Ok(mongodb::options::ReadConcern::linearizable()),
-        "available" => Ok(mongodb::options::ReadConcern::available()),
         other => Err(format!(
             "invalid storage.mongodb.transaction_read_concern {other:?}: expected one of \
-             \"snapshot\", \"majority\", \"local\", \"linearizable\", \"available\""
+             \"snapshot\", \"majority\", \"local\""
         )),
     }
 }
@@ -103,5 +102,61 @@ impl TryFrom<toml::Table> for MongoStorageConfig {
     fn try_from(table: toml::Table) -> Result<Self, Self::Error> {
         let value = toml::Value::Table(table);
         value.try_into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserialization_applies_transaction_defaults() {
+        let config: MongoStorageConfig =
+            toml::from_str(r#"connection_string = "mongodb://localhost:27017""#)
+                .expect("minimal MongoDB config must deserialize");
+
+        assert_eq!(config.max_connections, 50);
+        assert_eq!(config.max_catalog_connections, 20);
+        assert_eq!(config.transaction_read_concern, "snapshot");
+    }
+
+    #[test]
+    fn transaction_read_concern_accepts_supported_values_case_insensitively() {
+        for (value, expected) in [
+            ("snapshot", mongodb::options::ReadConcern::snapshot()),
+            ("MAJORITY", mongodb::options::ReadConcern::majority()),
+            ("LoCaL", mongodb::options::ReadConcern::local()),
+        ] {
+            assert_eq!(
+                parse_transaction_read_concern(value),
+                Ok(expected),
+                "{value} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn transaction_read_concern_rejects_values_invalid_for_transactions() {
+        for value in ["linearizable", "available", "garbage"] {
+            assert_eq!(
+                parse_transaction_read_concern(value),
+                Err(format!(
+                    "invalid storage.mongodb.transaction_read_concern {value:?}: expected one of \
+                     \"snapshot\", \"majority\", \"local\""
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn deserialization_rejects_unknown_fields() {
+        let error = toml::from_str::<MongoStorageConfig>(
+            r#"connection_string = "mongodb://localhost:27017"
+transaction_read_concerm = "majority""#,
+        )
+        .expect_err("a typoed MongoDB config field must be rejected");
+
+        assert!(error.to_string().contains("unknown field"));
+        assert!(error.to_string().contains("transaction_read_concerm"));
     }
 }
