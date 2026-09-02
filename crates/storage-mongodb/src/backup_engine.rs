@@ -101,59 +101,6 @@ fn restore_provisioned_throughput(
     }
 }
 
-impl MongoEngine {
-    async fn backfill_restored_indexes(&self, table_id: &str) -> Result<(), StorageError> {
-        let key_info = self.table_key_info_by_table_id_impl(table_id).await?;
-        let indexes_coll = self.catalog_db.collection::<Document>("indexes");
-        let mut cursor = indexes_coll
-            .find(doc! { "_id.table_id": table_id })
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-        while let Some(index_doc) = cursor
-            .try_next()
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?
-        {
-            let index_type = index_doc.get_str("index_type").unwrap_or("GSI");
-            if index_type != "GSI" && index_type != "LSI" {
-                continue;
-            }
-            let index_id = index_doc
-                .get_str("index_id")
-                .map_err(|_| StorageError::Internal("missing restored index_id".to_string()))?
-                .to_owned();
-            let index_key_schema: Vec<KeySchemaElement> =
-                decode_required(&index_doc, "key_schema")?;
-            let projection: Projection = decode_required(&index_doc, "projection")?;
-
-            let mut cursor_id = None;
-            loop {
-                let progress = self
-                    .backfill_gsi_batch(
-                        &key_info,
-                        &index_id,
-                        &index_key_schema,
-                        &projection,
-                        cursor_id.as_ref(),
-                        500,
-                    )
-                    .await?;
-                if progress.done {
-                    break;
-                }
-                cursor_id = progress.last_id;
-                if cursor_id.is_none() {
-                    return Err(StorageError::Internal(
-                        "restored index backfill made no progress".to_string(),
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
 impl BackupEngine for MongoEngine {
     fn create_backup(
         &self,
@@ -707,25 +654,15 @@ impl BackupEngine for MongoEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?
                 as i64;
 
-            // `create_table_impl` creates the restored index collections, but
-            // the base `$out` copy does not populate them. Backfill each
-            // restored GSI/LSI before exposing the table as ACTIVE.
-            self.backfill_restored_indexes(&desc.table_id).await?;
-
-            // Now that the data is fully copied, record the item count and
-            // release the table from CREATING. The table was created with the
-            // transition deferred (no scheduled flip), so this is the first
-            // point at which it can become ACTIVE — which is exactly the
-            // ordering we want: ACTIVE now implies the copy is complete.
-            //
-            // No control-plane delay is applied: unlike CreateTable (whose real
-            // work is instant and needs a synthetic delay to make CREATING
-            // observable), the copy is itself the CREATING window. `desc`
-            // (returned to the caller) carries CREATING from create_table_impl,
-            // matching DynamoDB, which reports CREATING while a restore runs.
+            // The base `$out` copy is complete, but restored secondary-index
+            // collections are still empty. Mark the table as pending restore
+            // completion and leave its indexes CREATING so the shared worker
+            // can backfill them in bounded, restartable batches.
             let status_update = doc! {
-                "$set": { "item_count": item_count, "table_status": "ACTIVE" },
-                "$unset": { "status_transition_at": "" },
+                "$set": {
+                    "item_count": item_count,
+                    "restore_backfill_pending": true,
+                },
             };
             let tables_coll = self.catalog_db.collection::<Document>("tables");
             tables_coll
@@ -735,6 +672,11 @@ impl BackupEngine for MongoEngine {
                 )
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+            // The table remains CREATING until the worker has populated every
+            // restored index. `desc` therefore reports CREATING, matching the
+            // DynamoDB restore lifecycle while allowing the request to return
+            // before potentially hundreds of thousands of index writes finish.
 
             Ok(desc)
         })
