@@ -992,6 +992,373 @@ async fn test_concurrent_ordinary_writes_on_ttl_table_both_succeed() {
     assert!(matches!(stored.get("value"), Some(AttributeValue::S(_))));
 }
 
+/// Manufacture a durable queue row in `state` owning `work_id`, and put the
+/// matching exact claim on the base row, as a crashed worker would leave them.
+/// Returns the queue row's clustering key.
+async fn forge_ttl_work(
+    engine: &extenddb_storage_cassandra::CassandraEngine,
+    key_info: &extenddb_core::types::TableKeyInfo,
+    old_item: &extenddb_core::types::Item,
+    state: &str,
+    work_id: uuid::Uuid,
+) -> (uuid::Uuid, i64, i32, i64, String, String) {
+    use cdrs_tokio::types::IntoRustByName;
+
+    let generation = ttl_generation(engine, &key_info.account_id, &key_info.table_name).await;
+    let keyspace = engine.account_keyspace(&key_info.account_id);
+    let bucket_row = engine
+        .session_arc()
+        .query_with_values(
+            &format!(
+                "SELECT bucket, shard FROM {keyspace}.ttl_expiration_buckets \
+                 WHERE table_id = ? AND generation = ?"
+            ),
+            cdrs_tokio::query_values!(key_info.table_id.as_str(), generation),
+        )
+        .await
+        .unwrap()
+        .response_body()
+        .unwrap()
+        .into_rows()
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+        .expect("TTL bucket for active generation");
+    let bucket: i64 = bucket_row.get_r_by_name("bucket").unwrap();
+    let shard: i32 = bucket_row.get_r_by_name("shard").unwrap();
+
+    let queue_row = engine
+        .session_arc()
+        .query_with_values(
+            &format!(
+                "SELECT expires_at, key_hash, key_data FROM {keyspace}.ttl_expirations \
+                 WHERE table_id = ? AND generation = ? AND bucket = ? AND shard = ?"
+            ),
+            cdrs_tokio::query_values!(key_info.table_id.as_str(), generation, bucket, shard),
+        )
+        .await
+        .unwrap()
+        .response_body()
+        .unwrap()
+        .into_rows()
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+        .expect("pending TTL entry");
+    let expires_at: i64 = queue_row.get_r_by_name("expires_at").unwrap();
+    let key_hash: String = queue_row.get_r_by_name("key_hash").unwrap();
+    let key_data: String = queue_row.get_r_by_name("key_data").unwrap();
+
+    let work_data = serde_json::json!({
+        "old_item": old_item,
+        "delete_timestamp_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64,
+        "stream": null
+    })
+    .to_string();
+    engine
+        .session_arc()
+        .query_with_values(
+            &format!(
+                "UPDATE {keyspace}.ttl_expirations SET state = ?, work_id = ?, work_data = ? \
+                 WHERE table_id = ? AND generation = ? AND bucket = ? AND shard = ? \
+                 AND expires_at = ? AND key_hash = ? AND key_data = ?"
+            ),
+            cdrs_tokio::query_values!(
+                state,
+                work_id,
+                work_data.as_str(),
+                key_info.table_id.as_str(),
+                generation,
+                bucket,
+                shard,
+                expires_at,
+                key_hash.as_str(),
+                key_data.as_str()
+            ),
+        )
+        .await
+        .unwrap();
+
+    let data_table = format!("items_{}", key_info.table_id.replace('-', "_"));
+    let pk = extenddb_storage::util::composite_pk_to_text(old_item, &key_info.key_schema).unwrap();
+    engine
+        .session_arc()
+        .query_with_values(
+            &format!("UPDATE {keyspace}.{data_table} SET prepared_txn_id = ? WHERE pk = ?"),
+            cdrs_tokio::query_values!(work_id, pk.as_str()),
+        )
+        .await
+        .unwrap();
+
+    (generation, bucket, shard, expires_at, key_hash, key_data)
+}
+
+async fn base_row_owner(
+    engine: &extenddb_storage_cassandra::CassandraEngine,
+    key_info: &extenddb_core::types::TableKeyInfo,
+    item: &extenddb_core::types::Item,
+) -> Option<uuid::Uuid> {
+    use cdrs_tokio::types::IntoRustByName;
+    let keyspace = engine.account_keyspace(&key_info.account_id);
+    let data_table = format!("items_{}", key_info.table_id.replace('-', "_"));
+    let pk = extenddb_storage::util::composite_pk_to_text(item, &key_info.key_schema).unwrap();
+    engine
+        .session_arc()
+        .query_with_values(
+            &format!("SELECT prepared_txn_id FROM {keyspace}.{data_table} WHERE pk = ?"),
+            cdrs_tokio::query_values!(pk.as_str()),
+        )
+        .await
+        .unwrap()
+        .response_body()
+        .unwrap()
+        .into_rows()
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+        .and_then(|row| row.get_by_name("prepared_txn_id").ok().flatten())
+}
+
+async fn ttl_queue_row_count(
+    engine: &extenddb_storage_cassandra::CassandraEngine,
+    account_id: &str,
+    table_id: &str,
+    generation: uuid::Uuid,
+    bucket: i64,
+    shard: i32,
+) -> usize {
+    let keyspace = engine.account_keyspace(account_id);
+    engine
+        .session_arc()
+        .query_with_values(
+            &format!(
+                "SELECT key_hash FROM {keyspace}.ttl_expirations WHERE table_id = ? \
+                 AND generation = ? AND bucket = ? AND shard = ?"
+            ),
+            cdrs_tokio::query_values!(table_id, generation, bucket, shard),
+        )
+        .await
+        .unwrap()
+        .response_body()
+        .unwrap()
+        .into_rows()
+        .unwrap_or_default()
+        .len()
+}
+
+/// Set up a TTL-enabled table holding one already-expired item.
+async fn ttl_table_with_expired_item(
+    engine: &extenddb_storage_cassandra::CassandraEngine,
+    table_name: &str,
+    age_seconds: i64,
+) -> (crate::helpers::TestTable, extenddb_core::types::Item) {
+    use extenddb_core::types::{AttributeValue, Item};
+    use extenddb_storage::DataEngine;
+
+    let table = crate::helpers::TestTable::new(engine, table_name, false).await;
+    activate_tables(engine).await;
+    engine
+        .update_ttl(
+            &table.key_info.account_id,
+            &table.key_info.table_name,
+            "expires_at",
+            true,
+        )
+        .await
+        .unwrap();
+    engine
+        .create_ttl_index(
+            &table.key_info.account_id,
+            &table.key_info.table_name,
+            "expires_at",
+        )
+        .await
+        .unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let mut item = Item::new();
+    item.insert("id".to_owned(), AttributeValue::S("drain".to_owned()));
+    item.insert(
+        "expires_at".to_owned(),
+        AttributeValue::N((now - age_seconds).to_string()),
+    );
+    engine
+        .put_item(
+            &table.key_info,
+            item.clone(),
+            false,
+            None,
+            &Default::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    (table, item)
+}
+
+/// Retiring a generation must not delete a CLAIMED row and walk away: that would
+/// strand the base-row claim it owns. Nothing externally visible has happened
+/// yet, so the claim is released and the work abandoned — disabling TTL stops
+/// the deletion rather than completing it.
+#[tokio::test]
+async fn test_disable_drains_claimed_work_and_releases_its_claim() {
+    use extenddb_storage::DataEngine;
+
+    let engine = setup_engine().await;
+    let (table, item) = ttl_table_with_expired_item(&engine, "TtlDrainClaimed", 10).await;
+
+    let work_id = uuid::Uuid::new_v4();
+    let (generation, bucket, shard, ..) =
+        forge_ttl_work(&engine, &table.key_info, &item, "CLAIMED", work_id).await;
+    assert_eq!(
+        base_row_owner(&engine, &table.key_info, &item).await,
+        Some(work_id),
+        "precondition: the forged claim is held"
+    );
+
+    engine
+        .update_ttl(
+            &table.key_info.account_id,
+            &table.key_info.table_name,
+            "expires_at",
+            false,
+        )
+        .await
+        .expect("disable succeeds even with claimed work in flight");
+
+    assert_eq!(
+        base_row_owner(&engine, &table.key_info, &item).await,
+        None,
+        "draining a CLAIMED row must release the base-row claim it owned"
+    );
+    assert_eq!(
+        ttl_queue_row_count(
+            &engine,
+            &table.key_info.account_id,
+            &table.key_info.table_id,
+            generation,
+            bucket,
+            shard
+        )
+        .await,
+        0,
+        "the abandoned queue row must be removed"
+    );
+
+    let mut key = extenddb_core::types::Item::new();
+    key.insert(
+        "id".to_owned(),
+        extenddb_core::types::AttributeValue::S("drain".to_owned()),
+    );
+    assert!(
+        engine
+            .get_item(&table.key_info, &key)
+            .await
+            .unwrap()
+            .is_some(),
+        "disabling TTL must stop the deletion, not complete it"
+    );
+}
+
+/// The one phase that must go forward. At EFFECTS_APPLIED the index rows are
+/// already deleted and the REMOVE record already published, so abandoning the
+/// work would leave a live item with a missing index. Cleanup completes the base
+/// delete instead.
+#[tokio::test]
+async fn test_disable_completes_effects_applied_work() {
+    use extenddb_storage::DataEngine;
+
+    let engine = setup_engine().await;
+    let (table, item) = ttl_table_with_expired_item(&engine, "TtlDrainEffects", 10).await;
+
+    let work_id = uuid::Uuid::new_v4();
+    let (generation, bucket, shard, ..) =
+        forge_ttl_work(&engine, &table.key_info, &item, "EFFECTS_APPLIED", work_id).await;
+
+    engine
+        .update_ttl(
+            &table.key_info.account_id,
+            &table.key_info.table_name,
+            "expires_at",
+            false,
+        )
+        .await
+        .expect("disable succeeds with effects-applied work in flight");
+
+    let mut key = extenddb_core::types::Item::new();
+    key.insert(
+        "id".to_owned(),
+        extenddb_core::types::AttributeValue::S("drain".to_owned()),
+    );
+    assert!(
+        engine
+            .get_item(&table.key_info, &key)
+            .await
+            .unwrap()
+            .is_none(),
+        "EFFECTS_APPLIED work must complete its base delete, not be abandoned"
+    );
+    assert_eq!(
+        ttl_queue_row_count(
+            &engine,
+            &table.key_info.account_id,
+            &table.key_info.table_id,
+            generation,
+            bucket,
+            shard
+        )
+        .await,
+        0,
+        "the completed queue row must be removed"
+    );
+}
+
+/// A bucket registration is retired once its day is fully past and its partition
+/// is confirmed empty at quorum, so per-cycle sweep fan-out stops growing with
+/// the age of the table.
+#[tokio::test]
+async fn test_drained_past_bucket_registration_is_retired() {
+    use extenddb_core::metrics::MetricsCollector;
+
+    let engine = setup_engine().await;
+    // Two days old, so the entry lands in a bucket strictly before today's.
+    let (table, _item) =
+        ttl_table_with_expired_item(&engine, "TtlBucketRetire", 2 * 86_400 + 60).await;
+
+    let metrics = MetricsCollector::new();
+    assert!(
+        ttl_bucket_count(
+            &engine,
+            &table.key_info.account_id,
+            &table.key_info.table_id
+        )
+        .await
+            > 0,
+        "precondition: the past bucket is registered"
+    );
+
+    // First sweep deletes the item; the second observes the drained partition.
+    extenddb_storage_cassandra::ttl_worker::sweep_once(&engine, &metrics).await;
+    extenddb_storage_cassandra::ttl_worker::sweep_once(&engine, &metrics).await;
+
+    assert_eq!(
+        ttl_bucket_count(
+            &engine,
+            &table.key_info.account_id,
+            &table.key_info.table_id
+        )
+        .await,
+        0,
+        "a drained past bucket's registration must be retired"
+    );
+}
+
 #[tokio::test]
 async fn test_ttl_sweep_removes_synchronous_gsi_entry() {
     use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, PathElement};

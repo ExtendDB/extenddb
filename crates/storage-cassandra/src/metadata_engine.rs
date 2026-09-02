@@ -328,7 +328,7 @@ impl CassandraEngine {
         {
             return Ok(None);
         }
-        self.get_item_impl(key_info, key).await
+        self.get_item_quorum(key_info, key).await
     }
 
     /// Move an item's expiration entry from the queue key implied by `old` to
@@ -1042,7 +1042,7 @@ impl MetadataEngine for CassandraEngine {
                     let key: Item = serde_json::from_str(&entry.key_data).map_err(|error| {
                         StorageError::Internal(format!("Parse TTL key: {error}"))
                     })?;
-                    let current = self.get_item_impl(&key_info, &key).await?;
+                    let current = self.get_item_quorum(&key_info, &key).await?;
                     if let Some(item) = current.filter(|item| {
                         crate::data::ttl::ttl_epoch_seconds(item, &ttl_attribute)
                             == Some(entry.expires_at)

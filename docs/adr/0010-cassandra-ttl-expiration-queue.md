@@ -43,6 +43,7 @@ Use a generation-fenced, durable TTL-specific state machine.
 * Serialize TTL deletion with ordinary and transactional writes through the base row's `prepared_txn_id` LWT field at `LOCAL_QUORUM`/`LOCAL_SERIAL`. Both the worker's claim and an ordinary request's claim are time-bounded, and a request's logged batch is stamped with a timestamp pinned immediately after its claim, so a request that resumes after its claim expired loses to any owner that committed in the meantime rather than overwriting it. Successful requests conditionally release only their exact owner.
 * Treat contention for that claim as contention, not as a client error. A blocked writer retries against a freshly read image on a jittered backoff, and only reports `TransactionConflictException` once those retries are exhausted, per RFC-0003 §4.3. Ordinary concurrent writes to one key therefore remain last-writer-wins.
 * Apply synchronous index deletion and the deterministic stream write while the exact base owner blocks writers. Transition the queue row to `EFFECTS_APPLIED`, then delete the base row with an LWT requiring the exact work UUID and item image, and finally conditionally complete the queue work.
+* Read at `LOCAL_QUORUM` wherever an empty or absent result is treated as authoritative and acted on destructively — retiring queue work, dropping an outbox row, or retiring a bucket registration. The default read consistency is `ONE`, at which a lagging replica reads as absent; acting on that would leave an item with no expiration entry and therefore never expiring. Claim and delete LWTs re-verify the exact image and so tolerate a stale read, but decisions about *absence* have nothing to condition on.
 * Persist stream event ID, sequence number, timestamp, region, and view type. Retrying side effects overwrites the same stream row rather than creating a second externally visible `REMOVE` event.
 * If a stale queue snapshot differs from the current item, conditionally retire that exact work before reconciling the current image. If an old-timestamp delete leaves no item but the permanent work owner survives, recovery conditionally releases that exact UUID before retiring or completing the queue row.
 * Use a generation-bound table sweep lease and renew it while processing. TTL lifecycle changes and index creation that could invalidate a live sweep take the same lease, retry briefly when a sweep holds it, and report `ResourceInUseException` only after that.
@@ -82,7 +83,7 @@ Each phase is idempotent and is entered only from durable state. `work_id` is th
 * TTL-enabled writes cost more than non-TTL writes: one extra catalog read, one claim LWT, one release LWT, and a logged batch instead of a single statement. Non-TTL tables keep the existing fast paths.
 * TTL cannot currently be enabled on a table with asynchronously propagated GSIs. Supporting that combination requires versioned, conditionally applied GSI mutations or an equivalent causal replay protocol.
 * Enable performs a synchronous table scan under the table's control lease, and the `UpdateTimeToLive` call awaits it. Very large tables will require a durable, checkpointed background backfill before this path is suitable at scale.
-* Expiration throughput is bounded by design: one exclusive sweep lease per table, one bounded batch per scan interval. See *Operating envelope* for the resulting rate.
+* Expiration throughput is bounded by design: one exclusive sweep lease per table, one bounded batch per scan interval. The resulting rate matches the other backends; the lease removes the duplicated work they do rather than reducing throughput.
 * LWT claims and lifecycle leases add Cassandra coordination cost to TTL-enabled tables.
 * Cassandra coordinators and ExtendDB hosts must have synchronized clocks, and data-plane requests must have deadlines well below the request claim lifetime.
 * Claims and the exact base delete condition on `item_data` string equality, so the persisted JSON encoding of an item is part of the protocol. A unit test pins that encoding as canonical; a version column would be a more robust fence and is a candidate follow-up.
@@ -94,21 +95,58 @@ This version is suitable for production when the deployment stays inside the sup
 * enable TTL before opening a new table to writes, or briefly quiesce an existing table while enable/backfill completes;
 * use no GSI with a nonzero propagation delay on a TTL-enabled table;
 * serve writes for a given table from one Cassandra datacenter, because all claims and lifecycle LWTs use `LOCAL_QUORUM`/`LOCAL_SERIAL` and are therefore linearizable only within a datacenter;
-* stay under roughly 100 expirations per table per scan interval — one host wins each table's sweep lease per cycle and processes one bounded batch, so cluster-wide steady-state expiration is about 100 items per table per minute regardless of fleet size, and a table expiring faster than that accumulates backlog;
+* stay under roughly 100 expirations per table per minute. This is the shared TTL worker's rate, not a Cassandra property — every backend uses a 100-item batch per 60-second cycle and none of them gain throughput from a larger fleet (see *Parity with the PostgreSQL backend*). A table expiring faster than that accumulates backlog;
 * size and monitor the expiration backlog, Cassandra LWT latency, and worker health;
 * keep Cassandra coordinators and ExtendDB hosts time-synchronized, with request deadlines well below the request claim lifetime; and
 * accept DynamoDB-style eventual expiration plus the documented brief internal effects-before-delete window.
 
 Within that envelope, item renewal, crash recovery, generation changes, synchronous index cleanup, transaction reconciliation, ordinary write contention, and deterministic stream removal are covered by durable state and real-Cassandra tests. This is not yet a claim of unrestricted DynamoDB parity for every Cassandra table configuration.
 
+### Parity with the PostgreSQL backend
+
+The bar for this feature is the production readiness of the PostgreSQL TTL implementation. Most of what looks like a Cassandra limitation is in fact the shared TTL design, and it is worth separating the two so that reviewers and operators know which items are Cassandra's to answer.
+
+**Shared with PostgreSQL — same behaviour, same code path or same shared handler:**
+
+| Behaviour | Evidence |
+| --- | --- |
+| ~100 expirations per table per minute, and no increase with fleet size | Both backends use `SCAN_INTERVAL = 60s` and `BATCH_SIZE = 100`. PostgreSQL runs without a lease but every host issues the same `ORDER BY ttl LIMIT 100` query, so hosts contend for the same rows and the loser's delete fails its TTL condition. |
+| `UpdateTimeToLive` blocks instead of returning immediately | The shared handler awaits `create_ttl_index` on every backend. |
+| No `ENABLING`/`DISABLING` status | `TimeToLiveStatus` has only two variants; both backends derive status from catalog presence. |
+| No five-year cutoff on old timestamps | PostgreSQL matches on `BETWEEN 1 AND now`; Cassandra accepts any positive `i64`. |
+| TTL deletion bypasses write-capacity accounting and throttling | Both workers call the storage layer directly, below the request capacity path. |
+| No caching of TTL configuration | Neither backend caches it. Cassandra pays a per-write catalog read because it needs the configuration on the write path at all; PostgreSQL does not need it, because expiry is derived from the item by a database index. |
+
+**Where Cassandra is stricter than PostgreSQL:**
+
+| Behaviour | Detail |
+| --- | --- |
+| Fractional TTL values | Cassandra ignores `N: "1.5"`. PostgreSQL casts the stored text to `BIGINT` in both the expression index and the sweep query, so a fractional value can raise a runtime error rather than being ignored. |
+| Backfill restart safety | A failed Cassandra backfill loses only its scan position; entries already registered survive because inserts are conditional. A failed PostgreSQL `CREATE INDEX CONCURRENTLY` can leave an invalid index of the same name, after which `IF NOT EXISTS` no-ops and `ttl_index_ready` is set anyway. |
+| Duplicate sweep work | Cassandra's per-table lease means the work is done once. PostgreSQL hosts each read the same candidate rows every cycle. |
+
+**Genuinely Cassandra-specific, and why:**
+
+| Gap | Cause | Fixable here? |
+| --- | --- | --- |
+| Deletion is a crash-recoverable saga, not one atomic transaction, so a brief internal effects-before-delete window exists | Cassandra cannot combine a Paxos condition on the base row with mutations in other partitions. PostgreSQL does base delete, index cleanup, stream record, and async-index enqueue in one `BEGIN`/`COMMIT`. | No — this is the fundamental blocker. It is what the queue, the claims, and the state machine exist to compensate for. |
+| TTL cannot be enabled alongside an asynchronously propagated GSI | The async GSI queue has no version-conditional replay fence, so an old TTL delete could overtake a recreated item's insert. PostgreSQL enqueues async GSI cleanup inside the delete transaction, so it has no such race. | No — needs versioned, conditionally applied GSI mutations. This is the one *functional* restriction relative to PostgreSQL. |
+| Enabling TTL on a live table needs writes quiesced | Expiry is derived from a durable queue that must be backfilled, and a write that began before enable cannot join the new generation. PostgreSQL's `CREATE INDEX CONCURRENTLY` covers live writes with no transition window. | No — needs a durable background backfill that admits pre-enable writes. |
+| Writes on a TTL-enabled table cost an extra catalog read, two LWTs, and a logged batch | The claim protocol is on the write path. PostgreSQL writes touch nothing TTL-related. | Partly — the claim's marginal value is now small enough that removing it from the ordinary write path is a live proposal. |
+| Writes for a table must be served from one datacenter | All claims and lifecycle LWTs use `LOCAL_QUORUM`/`LOCAL_SERIAL`. | No — global serial consistency would cost cross-region Paxos on every write. |
+| The claim and exact delete fence on `item_data` string equality | There is no version column to condition on. | Yes, as a follow-up: add a monotonic version column. |
+| Transaction *recovery* reconciles insert-only | The ledger does not persist the pre-commit image. | Yes, as a follow-up: persist it. |
+
+The summary: with this change, Cassandra TTL matches PostgreSQL on every shared behaviour, is stricter on two, and differs on a set of items that all trace back to the absence of cross-partition atomic conditional writes. The only *functional* capability PostgreSQL has and Cassandra does not is TTL alongside asynchronously propagated GSIs.
+
 ### Known gaps
 
 Deliberately out of scope for this change, in rough priority order:
 
-* **Expiration throughput does not scale horizontally.** The sweep lease is per table. Sharding it, so several hosts drain disjoint key shards of one table concurrently, is the natural next step.
+* **Expiration throughput does not scale horizontally.** The sweep lease is per table even though the queue is already sharded 64 ways by key and those shards are disjoint partitions. Leasing per `(table, shard)` would allow up to 64 concurrent workers per table with no change to the claim protocol, because every queue transition is already conditional on the exact work UUID. This is the highest-value follow-up, and it would take Cassandra past the PostgreSQL rate rather than merely matching it.
 * **The backfill has no durable cursor.** A failure restarts the scan from the beginning, and the `UpdateTimeToLive` call blocks for its duration instead of reporting `ENABLING`.
-* **`DescribeTimeToLive` has no `ENABLING`/`DISABLING` state.** A table reports `ENABLED` from the moment the attribute is set, including while its queue is still being backfilled.
-* **No five-year cutoff.** DynamoDB ignores a TTL timestamp more than five years in the past; here any positive timestamp is queued and expired.
-* **Transaction recovery reconciles insert-only.** The ledger does not persist the pre-commit image, so a transaction that crashes between COMMIT and reconciliation can leave the item's previous queue entry behind until it comes due. It is inert — the worker revalidates the item before deleting anything — but it is queue garbage.
+* **TTL alongside asynchronously propagated GSIs**, per the table above.
 * **`item_data` equality as the fence.** A monotonic version column would remove the dependency on a stable JSON encoding and stop shipping whole items as LWT condition values.
-* **Catalog reads are uncached.** TTL configuration is read from the catalog on every write, on top of the index read the write path already performs.
+* **Transaction recovery reconciles insert-only**, so a transaction that crashes between COMMIT and reconciliation can leave the item's previous queue entry behind until it comes due. It is inert — the worker revalidates the item before deleting anything — but it is queue garbage.
+* **Catalog reads are uncached.** TTL configuration is read on every write, on top of the index read the write path already performs.
+* **Recovery-path test coverage.** The transitions this change introduced — draining a retired generation, retiring a drained bucket registration, an expired worker claim — are reasoned about but not yet covered by tests.

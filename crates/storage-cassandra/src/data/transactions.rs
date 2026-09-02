@@ -588,7 +588,7 @@ impl CassandraEngine {
                         .await?;
                 }
                 TransactWriteOp::Update { key_info, key, .. } => {
-                    let new_image = self.get_item_impl(key_info, key).await?;
+                    let new_image = self.get_item_quorum(key_info, key).await?;
                     self.reconcile_ttl_transition(key_info, old_image.as_ref(), new_image.as_ref())
                         .await?;
                 }

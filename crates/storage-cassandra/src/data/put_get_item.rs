@@ -689,6 +689,68 @@ impl CassandraEngine {
     }
 
     /// Implementation of `DataEngine::get_item`.
+    /// Read an item at `LOCAL_QUORUM`.
+    ///
+    /// [`Self::get_item_impl`] reads at the driver's default consistency, which is
+    /// correct for an eventually-consistent `GetItem` but not for a TTL decision:
+    /// the expiration worker and the reconciliation outbox both treat `None` as
+    /// authoritative and act on it destructively — retiring queue work, or
+    /// dropping an outbox row — and a lagging replica reads as `None` for an item
+    /// that exists. Acting on that would leave the item with no expiration entry
+    /// and therefore never expiring.
+    ///
+    /// All TTL writes commit at `LOCAL_QUORUM`, so a `LOCAL_QUORUM` read
+    /// intersects them and cannot miss a committed item.
+    pub(crate) async fn get_item_quorum(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+    ) -> Result<Option<Item>, StorageError> {
+        let data_keyspace = self.account_keyspace(&key_info.account_id);
+        let ddb_table = data_table_name(&key_info.table_id);
+        let pk_text = composite_pk_to_text(key, &key_info.key_schema)?;
+
+        let (query, values) = if let Some((sk_name, sk_type)) =
+            sk_info(&key_info.key_schema, &key_info.attribute_definitions)
+        {
+            let sk_value = key
+                .get(sk_name)
+                .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?;
+            let sk = parse_sk(sk_value, sk_type)?;
+            let sk_col = sk_column(sk_type);
+            (
+                format!(
+                    "SELECT item_data FROM {data_keyspace}.{ddb_table} \
+                     WHERE pk = ? AND {sk_col} = ?"
+                ),
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                    cdrs_tokio::types::value::Value::from(pk_text.as_str()),
+                    super::index::sk_to_value(&sk),
+                ]),
+            )
+        } else {
+            (
+                format!("SELECT item_data FROM {data_keyspace}.{ddb_table} WHERE pk = ?"),
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                    cdrs_tokio::types::value::Value::from(pk_text.as_str()),
+                ]),
+            )
+        };
+
+        let rows = crate::cassandra_util::query_rows_quorum(
+            &self.session,
+            &query,
+            values,
+            "get_item_quorum",
+        )
+        .await?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+        item_data.map(json_to_item).transpose()
+    }
+
     pub(crate) async fn get_item_impl(
         &self,
         key_info: &TableKeyInfo,

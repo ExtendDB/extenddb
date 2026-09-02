@@ -84,7 +84,7 @@ pub async fn reconcile_pending_once(
 
                 let reconcile = match storage.fetch_table_key_info(&account_id, &table_name).await {
                     Ok(key_info) if key_info.table_id == table_id => {
-                        match storage.get_item_impl(&key_info, &key).await? {
+                        match storage.get_item_quorum(&key_info, &key).await? {
                             Some(item) => storage.reconcile_ttl_item(&key_info, &item).await,
                             None => Ok(()),
                         }
@@ -190,7 +190,7 @@ pub(crate) async fn drain_retired_generation(
         }
 
         // EFFECTS_APPLIED.
-        let current = storage.get_item_impl(&key_info, &key).await?;
+        let current = storage.get_item_quorum(&key_info, &key).await?;
         if current.as_ref() == Some(&work_data.old_item)
             && storage
                 .ensure_ttl_work_claim(&key_info, &key, &work_data.old_item, work_id)
@@ -271,7 +271,7 @@ async fn process_ttl_work_row(
         .map_err(|error| StorageError::Internal(format!("Parse TTL work key: {error}")))?;
 
     if work.state == TtlWorkState::Pending {
-        let Some(current) = storage.get_item_impl(key_info, &key).await? else {
+        let Some(current) = storage.get_item_quorum(key_info, &key).await? else {
             let _ = crate::data::ttl::retire_pending_ttl_work(
                 storage,
                 &account_keyspace,
@@ -357,7 +357,7 @@ async fn process_ttl_work_row(
     };
 
     if work.state == TtlWorkState::Claimed {
-        let current = storage.get_item_impl(key_info, &key).await?;
+        let current = storage.get_item_quorum(key_info, &key).await?;
         match current {
             Some(ref item) if item == &work_data.old_item => {
                 if !storage
@@ -419,7 +419,7 @@ async fn process_ttl_work_row(
         work.state = TtlWorkState::EffectsApplied;
     }
 
-    let current = storage.get_item_impl(key_info, &key).await?;
+    let current = storage.get_item_quorum(key_info, &key).await?;
     let deleted = match current {
         Some(ref item) if item == &work_data.old_item => {
             if !storage
