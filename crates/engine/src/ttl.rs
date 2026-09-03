@@ -84,6 +84,16 @@ pub async fn handle_update_time_to_live(
         ));
     }
 
+    // Resolve the old attribute before committing the disable. If the catalog
+    // is inconsistent, fail without leaving a partially applied request.
+    let ttl_attribute_to_drop = if !input.time_to_live_specification.enabled {
+        Some(current.attribute_name.clone().ok_or_else(|| {
+            DynamoDbError::InternalServerError("TTL attribute is missing".to_owned())
+        })?)
+    } else {
+        None
+    };
+
     ctx.storage
         .update_ttl(
             &ctx.account_id,
@@ -111,13 +121,11 @@ pub async fn handle_update_time_to_live(
     } else {
         // Disable path: metadata already updated (sweeper won't pick up this table).
         // Drop the index. Safe because sweeper checks ttl_index_ready which is now FALSE.
-        let ttl_attribute = current.attribute_name.as_deref().ok_or_else(|| {
-            DynamoDbError::InternalServerError("TTL attribute is missing".to_owned())
-        })?;
-        if let Err(e) = ctx
-            .storage
-            .drop_ttl_index(&ctx.account_id, &input.table_name, ttl_attribute)
-            .await
+        if let Some(ttl_attribute) = ttl_attribute_to_drop.as_deref()
+            && let Err(e) = ctx
+                .storage
+                .drop_ttl_index(&ctx.account_id, &input.table_name, ttl_attribute)
+                .await
         {
             tracing::warn!("TTL index drop failed for {}: {e}", input.table_name);
         }
