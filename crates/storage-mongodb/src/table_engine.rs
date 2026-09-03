@@ -928,26 +928,21 @@ impl MongoEngine {
                     let indexes_coll = self.catalog_db.collection::<Document>("indexes");
                     let index_filter = doc! { "_id": { "table_id": &desc.table_id, "index_name": &delete.index_name } };
                     let index_doc = indexes_coll
-                        .find_one(index_filter.clone())
+                        .find_one_and_delete(index_filter)
                         .await
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
                     let index_id = index_doc
-                        .as_ref()
-                        .and_then(|doc| doc.get_str("index_id").ok())
-                        .map(str::to_owned)
+                        .and_then(|doc| doc.get_str("index_id").ok().map(str::to_owned))
                         .ok_or_else(|| StorageError::IndexNotFound(delete.index_name.clone()))?;
 
-                    // Remove the catalog entry before dropping the physical
-                    // collection. Otherwise a concurrent Query can observe
-                    // an ACTIVE index in the catalog after its collection has
-                    // already been dropped; MongoDB treats a missing
-                    // collection as an empty result rather than a missing
-                    // resource.
-                    indexes_coll
-                        .delete_one(index_filter)
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    // Atomically remove the catalog entry before dropping the
+                    // physical collection. Otherwise a concurrent Query can
+                    // observe an ACTIVE index in the catalog after its
+                    // collection has already been dropped; MongoDB treats a
+                    // missing collection as an empty result rather than a
+                    // missing resource. A concurrent delete that loses this
+                    // atomic claim gets IndexNotFound above.
 
                     // Invalidate cache — may still have other GSIs
                     self.gsi_cache_invalidate(&desc.table_id);

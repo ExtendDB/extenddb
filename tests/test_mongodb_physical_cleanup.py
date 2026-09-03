@@ -11,6 +11,7 @@ tests are skipped for PostgreSQL and real-DynamoDB runs.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import subprocess
@@ -18,6 +19,7 @@ import time
 
 import pytest
 import requests
+from botocore.exceptions import ClientError
 
 from conftest import wait_for_active, wait_for_deleted
 
@@ -215,6 +217,37 @@ def test_update_table_gsi_delete_drops_physical_collection(
             GlobalSecondaryIndexUpdates=[{"Delete": {"IndexName": "gsi1"}}],
         )
 
+        remaining = _physical_collections_exist(mongodb_container, physical["indexId"])
+        assert remaining[f"_ddb_{physical['indexId']}"] is False
+    finally:
+        _cleanup_table(dynamodb_client, unique_table_name)
+
+
+def test_concurrent_gsi_deletes_have_one_winner(
+    dynamodb_client, unique_table_name, mongodb_container
+):
+    """Concurrent deletion requests must not both report success."""
+    _create_gsi_table(dynamodb_client, unique_table_name)
+    wait_for_active(dynamodb_client, unique_table_name)
+
+    try:
+        physical = _physical_ids(mongodb_container, unique_table_name, "gsi1")
+
+        def delete_gsi() -> str:
+            try:
+                dynamodb_client.update_table(
+                    TableName=unique_table_name,
+                    GlobalSecondaryIndexUpdates=[{"Delete": {"IndexName": "gsi1"}}],
+                )
+            except ClientError as error:
+                return error.response["Error"]["Code"]
+            return "success"
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda _: delete_gsi(), range(2)))
+
+        assert results.count("success") == 1, results
+        assert results.count("ResourceNotFoundException") == 1, results
         remaining = _physical_collections_exist(mongodb_container, physical["indexId"])
         assert remaining[f"_ddb_{physical['indexId']}"] is False
     finally:
