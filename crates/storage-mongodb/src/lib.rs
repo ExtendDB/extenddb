@@ -254,10 +254,7 @@ pub(crate) async fn connect_guarded(
     max_pool_size: Option<u32>,
     warn_on_no_tls: bool,
 ) -> Result<mongodb::Client, StorageError> {
-    let mut options = mongodb::options::ClientOptions::parse(connection_string)
-        .await
-        .map_err(|e| StorageError::Connection(e.to_string()))?;
-    apply_max_pool_size(&mut options, max_pool_size);
+    let options = client_options_with_pool_size(connection_string, max_pool_size).await?;
 
     if let Some(sel) = options.selection_criteria.as_ref() {
         use mongodb::options::{ReadPreference, SelectionCriteria};
@@ -279,12 +276,24 @@ pub(crate) async fn connect_guarded(
     if warn_on_no_tls && !matches!(options.tls, Some(mongodb::options::Tls::Enabled(_))) {
         tracing::warn!(
             "MongoDB connection is not using TLS; credentials and data will \
-             traverse the network in cleartext. Enable TLS with `?tls=true` \
+                 traverse the network in cleartext. Enable TLS with `?tls=true` \
              in the connection string, or use a `mongodb+srv://` URI."
         );
     }
 
     mongodb::Client::with_options(options).map_err(|e| StorageError::Connection(e.to_string()))
+}
+
+async fn client_options_with_pool_size(
+    connection_string: &str,
+    max_pool_size: Option<u32>,
+) -> Result<mongodb::options::ClientOptions, StorageError> {
+    let mut options = mongodb::options::ClientOptions::parse(connection_string)
+        .await
+        .map_err(|e| StorageError::Connection(e.to_string()))?;
+    apply_max_pool_size(&mut options, max_pool_size);
+
+    Ok(options)
 }
 
 fn apply_max_pool_size(options: &mut mongodb::options::ClientOptions, max_pool_size: Option<u32>) {
@@ -356,17 +365,25 @@ impl MongoEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::apply_max_pool_size;
+    use super::client_options_with_pool_size;
 
     #[tokio::test]
     async fn absent_pool_override_preserves_uri_max_pool_size() {
-        let mut options =
-            mongodb::options::ClientOptions::parse("mongodb://localhost:27017/?maxPoolSize=100")
+        let options =
+            client_options_with_pool_size("mongodb://localhost:27017/?maxPoolSize=100", None)
                 .await
                 .expect("MongoDB URI must parse");
 
-        apply_max_pool_size(&mut options, None);
-
         assert_eq!(options.max_pool_size, Some(100));
+    }
+
+    #[tokio::test]
+    async fn configured_pool_override_reaches_client_options() {
+        let options =
+            client_options_with_pool_size("mongodb://localhost:27017/?maxPoolSize=100", Some(20))
+                .await
+                .expect("MongoDB URI must parse");
+
+        assert_eq!(options.max_pool_size, Some(20));
     }
 }
