@@ -15,8 +15,8 @@ use extenddb_core::types::{
     PointInTimeRecoveryDescription, ProvisionedThroughput, SourceTableDetails, TableDescription,
     TableKeyInfo,
 };
+use extenddb_storage::BackupEngine;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{BackupEngine, TableEngine};
 use futures::future::BoxFuture;
 
 use crate::data::{data_table_name, upsert_item_in_tx};
@@ -355,7 +355,13 @@ impl BackupEngine for SqliteEngine {
                 ..Default::default()
             };
 
-            let desc = self.create_table(&account_id, create_input).await?;
+            // `defer_active`: the target is written CREATING with no scheduled
+            // transition, so the control-plane worker cannot report it ACTIVE
+            // while the copy below is still running. The explicit ACTIVE update
+            // after the copy commits is the only flip.
+            let desc = self
+                .create_table_impl(&account_id, create_input, true)
+                .await?;
             let key_info = TableKeyInfo {
                 table_name: target_table_name.clone(),
                 account_id: account_id.clone(),
