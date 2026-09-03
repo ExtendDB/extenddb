@@ -10,6 +10,7 @@ use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::value::Value;
 use extenddb_core::types::{BillingMode, TableDescription, UpdateTableInput};
 use extenddb_storage::error::StorageError;
+use extenddb_storage::util::effective_attribute_definitions;
 
 use crate::CassandraEngine;
 use crate::cassandra_util::query_optional;
@@ -197,16 +198,36 @@ impl CassandraEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             base_attr_defs = serde_json::from_str(&ad_json)
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+            // Collect existing index key schemas so we can compute the merged
+            // attribute_definitions after we know all creates/deletes.
+            let mut surviving_index_key_schemas: Vec<Vec<extenddb_core::types::KeySchemaElement>> = {
+                let rows = crate::cassandra_util::query_rows::<StorageError>(
+                    &self.session,
+                    &format!("SELECT key_schema FROM {catalog_ks}.indexes WHERE table_id = ?"),
+                    cdrs_tokio::query_values!(table_id.as_str()),
+                    "update_table fetch index schemas",
+                )
+                .await?;
+                rows.into_iter()
+                    .filter_map(|row| {
+                        let ks_text: String =
+                            crate::cassandra_util::get_column::<String, StorageError>(
+                                &row,
+                                "key_schema",
+                                "update_table fetch index schemas",
+                            )
+                            .ok()?;
+                        serde_json::from_str(&ks_text).ok()
+                    })
+                    .collect()
+            };
+
+            // effective_attr_defs for DDL (create_index_data_table) — uses the
+            // merged set computed after the loop.
             let effective_attr_defs = input
                 .attribute_definitions
                 .as_deref()
                 .unwrap_or(&base_attr_defs);
-
-            if let Some(new_ad) = &input.attribute_definitions {
-                let new_ad_json = serde_json::to_string(new_ad)
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                add_update!("attribute_definitions", new_ad_json.as_str());
-            }
 
             for update in updates {
                 if let Some(create) = &update.create {
@@ -254,8 +275,8 @@ impl CassandraEngine {
                             Value::from(pt_json.as_str()),
                         ]),
                     );
-                    batch_has_statements = true;
                     gsi_creates.push((index_id, create.index_name.clone()));
+                    surviving_index_key_schemas.push(create.key_schema.clone());
 
                     // Create the data table after the batch commits (DDL can't be batched).
                     // Store what we need for post-batch DDL.
@@ -267,7 +288,7 @@ impl CassandraEngine {
                     let existing = query_optional(
                         &self.session,
                         &format!(
-                            "SELECT index_id FROM {catalog_ks}.indexes \
+                            "SELECT index_id, key_schema FROM {catalog_ks}.indexes \
                              WHERE table_id = ? AND index_name = ? ALLOW FILTERING"
                         ),
                         cdrs_tokio::query_values!(table_id.as_str(), delete.index_name.as_str()),
@@ -280,6 +301,24 @@ impl CassandraEngine {
                         "index_id",
                         "update_table gsi delete",
                     )?;
+                    // Remove this index's key schema from the surviving set.
+                    if let Ok(ks_text) = crate::cassandra_util::get_column::<String, StorageError>(
+                        &existing,
+                        "key_schema",
+                        "update_table gsi delete ks",
+                    ) {
+                        if let Ok(del_ks) = serde_json::from_str::<
+                            Vec<extenddb_core::types::KeySchemaElement>,
+                        >(&ks_text)
+                        {
+                            if let Some(pos) = surviving_index_key_schemas
+                                .iter()
+                                .position(|s| *s == del_ks)
+                            {
+                                surviving_index_key_schemas.remove(pos);
+                            }
+                        }
+                    }
 
                     batch = batch.add_query(
                         format!(
@@ -291,10 +330,21 @@ impl CassandraEngine {
                             Value::from(delete.index_name.as_str()),
                         ]),
                     );
-                    batch_has_statements = true;
                     gsi_deletes.push(index_id);
                 }
             }
+
+            // Write the merged attribute_definitions now that we know all surviving
+            // index key schemas (existing + created - deleted).
+            let merged_attr_defs = effective_attribute_definitions(
+                &base_attr_defs,
+                input.attribute_definitions.as_deref().unwrap_or(&[]),
+                &base_key_schema,
+                &surviving_index_key_schemas,
+            );
+            let merged_ad_json = serde_json::to_string(&merged_attr_defs)
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            add_update!("attribute_definitions", merged_ad_json.as_str());
         } else {
             base_key_schema = Vec::new();
             base_attr_defs = Vec::new();

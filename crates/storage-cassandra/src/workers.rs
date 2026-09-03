@@ -12,7 +12,7 @@ use extenddb_storage::management_store::SettingsStore;
 
 use crate::CassandraEngine;
 
-/// Poll `gsi_propagation_delay_ms` from settings every 30 seconds and update
+/// Poll `index_propagation_delay_ms` from settings every 30 seconds and update
 /// the in-memory atomic used by put_item/update_item/delete_item.
 pub(crate) async fn poll_gsi_delay<S: SettingsStore + ?Sized>(
     store: Arc<S>,
@@ -23,17 +23,25 @@ pub(crate) async fn poll_gsi_delay<S: SettingsStore + ?Sized>(
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
 
-        match store.get_setting("gsi_propagation_delay_ms").await {
+        match store.get_setting("index_propagation_delay_ms").await {
             Ok(Some(val)) => {
                 if let Ok(ms) = val.parse::<u64>() {
                     gsi_delay.store(ms, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             Ok(None) => {
-                gsi_delay.store(10, std::sync::atomic::Ordering::Relaxed);
+                // Fall back to legacy key name, then to the canonical default.
+                let ms = store
+                    .get_setting("gsi_propagation_delay_ms")
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(10);
+                gsi_delay.store(ms, std::sync::atomic::Ordering::Relaxed);
             }
             Err(e) => {
-                tracing::debug!("Failed to query gsi_propagation_delay_ms: {e:?}");
+                tracing::debug!("Failed to query index_propagation_delay_ms: {e:?}");
             }
         }
     }
