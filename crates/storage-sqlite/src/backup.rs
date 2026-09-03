@@ -270,6 +270,12 @@ impl BackupEngine for SqliteEngine {
             // reported missing here and the writes below never run.
             let desc = self.describe_backup(&account_id, &backup_arn).await?;
 
+            // D1: every writer holds the engine write lock. The item delete
+            // below is a bulk statement (one row per backed-up item), which is
+            // exactly the slow-commit shape that can hold the SQLite file lock
+            // past a concurrent locked writer's busy_timeout.
+            let _writer = self.write_lock.lock().await;
+
             // The account predicate is repeated on both writes rather than
             // relying on the lookup above, so the statements are correct on
             // their own terms.
@@ -488,17 +494,22 @@ impl BackupEngine for SqliteEngine {
             if !exists {
                 return Err(StorageError::TableNotFound(table_name));
             }
-            sqlx::query(
-                "INSERT INTO continuous_backups (account_id, table_name, pitr_enabled) \
-                 VALUES (?, ?, ?) \
-                 ON CONFLICT (account_id, table_name) DO UPDATE SET pitr_enabled = excluded.pitr_enabled",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .bind(pitr_enabled)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            {
+                // D1: every writer holds the engine write lock. Scoped so the
+                // read-only describe below runs after release.
+                let _writer = self.write_lock.lock().await;
+                sqlx::query(
+                    "INSERT INTO continuous_backups (account_id, table_name, pitr_enabled) \
+                     VALUES (?, ?, ?) \
+                     ON CONFLICT (account_id, table_name) DO UPDATE SET pitr_enabled = excluded.pitr_enabled",
+                )
+                .bind(&account_id)
+                .bind(&table_name)
+                .bind(pitr_enabled)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            }
             self.describe_continuous_backups(&account_id, &table_name)
                 .await
         })

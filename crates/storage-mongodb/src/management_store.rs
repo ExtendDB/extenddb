@@ -80,7 +80,7 @@ impl ManagementStore for MongoCatalogStore {
         Box::pin(async move {
             let tables_coll = self.catalog_db().collection::<Document>("tables");
             let has_tables = tables_coll
-                .count_documents(doc! { "account_id": &account_id })
+                .count_documents(doc! { "_id.account_id": &account_id })
                 .await
                 .map_err(|e| {
                     tracing::error!("delete_account check tables: {e}");

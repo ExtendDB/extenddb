@@ -219,6 +219,8 @@ impl SqliteEngine {
         &self,
         max_age_seconds: i64,
     ) -> Result<u64, StorageError> {
+        // D1: every writer holds the engine write lock.
+        let _writer = self.write_lock.lock().await;
         let cutoff = format_timestamp(
             time::OffsetDateTime::now_utc() - time::Duration::seconds(max_age_seconds),
         );
