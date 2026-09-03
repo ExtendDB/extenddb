@@ -86,7 +86,10 @@
 [storage.mongodb]
 # MongoDB connection string. Requires a replica set (even single-node).
 # connection_string = "mongodb://localhost:27017/?replicaSet=rs0"
-# max_pool_size = 20           # Maximum concurrent connections to MongoDB.
+# max_connections = 50         # Maximum concurrent data-operation connections.
+# max_catalog_connections = 20 # Shared catalog/auth pool for management and
+                                # authorization traffic; size for their combined
+                                # concurrency.
 
 [auth]
 # provider = "builtin"          # Auth provider:

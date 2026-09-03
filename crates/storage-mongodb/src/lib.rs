@@ -89,7 +89,8 @@ fn server_components_factory(
     Box<dyn std::future::Future<Output = Result<ServerComponents, BackendError>> + Send>,
 > {
     let connection_string = config.connection_config().to_string();
-    let max_connections = config.max_connections();
+    let max_connections = config.max_connections_override();
+    let max_catalog_connections = config.max_catalog_connections_override();
     let region = region.to_string();
     Box::pin(async move {
         // Create MongoEngine
@@ -102,8 +103,11 @@ fn server_components_factory(
 
         let engine = Arc::new(engine);
 
-        // Create catalog store
-        let catalog_client = connect_guarded(&connection_string, None, false)
+        // Create one shared catalog/management client. MongoDB Client clones
+        // share the underlying pool, so max_catalog_connections limits the
+        // combined catalog and auth traffic rather than creating two
+        // independent pools with twice the configured ceiling.
+        let catalog_client = connect_guarded(&connection_string, max_catalog_connections, false)
             .await
             .map_err(|e| BackendError::ConnectionFailed {
                 backend: "mongodb".to_string(),
@@ -123,6 +127,7 @@ fn server_components_factory(
             .and_then(|d| d.get_str("value").ok().map(std::borrow::ToOwned::to_owned))
             .ok_or(BackendError::MissingEncryptionKey)?;
 
+        let auth_client = catalog_client.clone();
         let catalog_store = Arc::new(MongoCatalogStore::with_encryption_key(
             catalog_client,
             enc_key.clone(),
@@ -131,9 +136,6 @@ fn server_components_factory(
         // Create credential store. The bin layer wraps this in
         // CachedCredentialStore using the operator-configured TTL
         // before constructing the auth provider.
-        let auth_client = connect_guarded(&connection_string, None, false)
-            .await
-            .map_err(|e| BackendError::InitializationFailed(format!("Auth client: {e}")))?;
         let cred_store: Arc<dyn extenddb_auth::CredentialStore> =
             Arc::new(MongoCredentialStore::new(auth_client, enc_key));
 
@@ -237,8 +239,10 @@ pub struct MongoEngine {
 /// data client: reject non-primary read preferences (they route reads to
 /// replicas and silently break `ConsistentRead=true`).
 ///
-/// `max_pool_size` is applied when provided (the data client sizes its pool;
-/// catalog/auth/bootstrapper clients pass `None`).
+/// `max_pool_size` is applied when provided. The long-lived data, catalog, and
+/// authentication clients pass their explicitly configured pool limits;
+/// short-lived CLI and bootstrapper clients pass `None`, preserving any URI
+/// option.
 ///
 /// `warn_on_no_tls` gates the no-TLS warning to the long-running server data
 /// client only. Short-lived CLI/management clients (settings, catalog checks,
@@ -250,12 +254,7 @@ pub(crate) async fn connect_guarded(
     max_pool_size: Option<u32>,
     warn_on_no_tls: bool,
 ) -> Result<mongodb::Client, StorageError> {
-    let mut options = mongodb::options::ClientOptions::parse(connection_string)
-        .await
-        .map_err(|e| StorageError::Connection(e.to_string()))?;
-    if let Some(n) = max_pool_size {
-        options.max_pool_size = Some(n);
-    }
+    let options = client_options_with_pool_size(connection_string, max_pool_size).await?;
 
     if let Some(sel) = options.selection_criteria.as_ref() {
         use mongodb::options::{ReadPreference, SelectionCriteria};
@@ -277,7 +276,7 @@ pub(crate) async fn connect_guarded(
     if warn_on_no_tls && !matches!(options.tls, Some(mongodb::options::Tls::Enabled(_))) {
         tracing::warn!(
             "MongoDB connection is not using TLS; credentials and data will \
-             traverse the network in cleartext. Enable TLS with `?tls=true` \
+                 traverse the network in cleartext. Enable TLS with `?tls=true` \
              in the connection string, or use a `mongodb+srv://` URI."
         );
     }
@@ -285,13 +284,31 @@ pub(crate) async fn connect_guarded(
     mongodb::Client::with_options(options).map_err(|e| StorageError::Connection(e.to_string()))
 }
 
+async fn client_options_with_pool_size(
+    connection_string: &str,
+    max_pool_size: Option<u32>,
+) -> Result<mongodb::options::ClientOptions, StorageError> {
+    let mut options = mongodb::options::ClientOptions::parse(connection_string)
+        .await
+        .map_err(|e| StorageError::Connection(e.to_string()))?;
+    apply_max_pool_size(&mut options, max_pool_size);
+
+    Ok(options)
+}
+
+fn apply_max_pool_size(options: &mut mongodb::options::ClientOptions, max_pool_size: Option<u32>) {
+    if let Some(n) = max_pool_size {
+        options.max_pool_size = Some(n);
+    }
+}
+
 impl MongoEngine {
     pub async fn new(
         connection_string: &str,
         region: &str,
-        max_connections: u32,
+        max_connections: Option<u32>,
     ) -> Result<Self, StorageError> {
-        let client = connect_guarded(connection_string, Some(max_connections), true).await?;
+        let client = connect_guarded(connection_string, max_connections, true).await?;
 
         let catalog_db = client.database("extenddb_catalog");
         let data_db = client.database("extenddb_data");
@@ -343,5 +360,30 @@ impl MongoEngine {
             )));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::client_options_with_pool_size;
+
+    #[tokio::test]
+    async fn absent_pool_override_preserves_uri_max_pool_size() {
+        let options =
+            client_options_with_pool_size("mongodb://localhost:27017/?maxPoolSize=100", None)
+                .await
+                .expect("MongoDB URI must parse");
+
+        assert_eq!(options.max_pool_size, Some(100));
+    }
+
+    #[tokio::test]
+    async fn configured_pool_override_reaches_client_options() {
+        let options =
+            client_options_with_pool_size("mongodb://localhost:27017/?maxPoolSize=100", Some(20))
+                .await
+                .expect("MongoDB URI must parse");
+
+        assert_eq!(options.max_pool_size, Some(20));
     }
 }
