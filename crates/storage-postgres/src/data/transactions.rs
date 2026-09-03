@@ -13,12 +13,17 @@ use extenddb_core::validation;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{IdempotencyKey, TransactGetOp, TransactWriteOp};
 
-use super::index::{IndexMeta, enqueue_async_indexes, fetch_indexes_for_table, sync_indexes};
+use super::index::{IndexMeta, enqueue_async_indexes, fetch_write_path_indexes, sync_indexes};
 use super::tx_helpers::{
     check_idempotency_token_in_tx, delete_item_in_tx, fetch_item_for_update, fetch_item_in_tx,
-    upsert_item_in_tx, write_stream_record_in_tx,
+    insert_item_if_absent_in_tx, upsert_item_in_tx, write_stream_record_in_tx,
 };
 use crate::PostgresEngine;
+
+/// Bound on insert retries when a transactional write to a nonexistent item
+/// keeps losing the create race to writers that then roll back. Mirrors the
+/// same bound on the non-transactional `UpdateItem` path (`update_item.rs`).
+const MAX_CREATE_RACE_ATTEMPTS: u32 = 5;
 
 impl PostgresEngine {
     /// Implementation of `DataEngine::transact_get_items`.
@@ -73,13 +78,24 @@ impl PostgresEngine {
         idempotency: Option<IdempotencyKey<'_>>,
     ) -> Result<(), StorageError> {
         // Pre-fetch indexes for each unique table involved in the transaction.
+        //
+        // Vector indexes are read here too, once per table rather than once per op,
+        // and from the catalog rather than from the cached key info: a cached empty
+        // set would make a transaction skip an index another request has just
+        // created. One read per table also keeps a multi-op transaction from
+        // re-asking for the same answer.
         let mut table_indexes: HashMap<String, Vec<IndexMeta>> = HashMap::new();
+        let mut table_vector_metas: HashMap<
+            String,
+            Vec<(extenddb_storage::vector_lifecycle::VectorIndexMeta, String)>,
+        > = HashMap::new();
         for op in ops {
             let name = transact_op_table_name(op);
             if !table_indexes.contains_key(name) {
                 let tid = transact_op_table_id(op);
-                let indexes = fetch_indexes_for_table(tid, &self.pool).await?;
+                let (indexes, vector_metas) = fetch_write_path_indexes(tid, &self.pool).await?;
                 table_indexes.insert(name.to_owned(), indexes);
+                table_vector_metas.insert(name.to_owned(), vector_metas);
             }
         }
 
@@ -192,7 +208,24 @@ impl PostgresEngine {
                 sys_delay,
             )
             .await?;
-            if n > 0 {
+
+            // Vector maintenance for all three write kinds in one place, rather
+            // than in each branch above: this loop already visits exactly the ops
+            // that changed an item, with both images in hand, and it runs inside
+            // the same transaction. Three call sites would have been three chances
+            // to diverge on which image is passed.
+            let vector_n = crate::data::vector_index::maintain_vector_indexes(
+                &mut tx,
+                &table_vector_metas[transact_op_table_name(op)],
+                &key_info.table_id,
+                &key_info.key_schema,
+                &key_info.attribute_definitions,
+                old_item.as_ref(),
+                new_item.as_ref(),
+                sys_delay,
+            )
+            .await?;
+            if n > 0 || vector_n > 0 {
                 needs_notify = true;
             }
         }
@@ -326,7 +359,7 @@ async fn execute_transact_write_op(
                 validation::SecondaryIndexEmptyContext::Item,
             )
             .map_err(|e| TxnOpError::Validation(e.to_string()))?;
-            let existing = fetch_item_for_update(tx, key_info, item)
+            let mut existing = fetch_item_for_update(tx, key_info, item)
                 .await
                 .map_err(TxnOpError::Storage)?;
             let empty = Item::new();
@@ -337,9 +370,67 @@ async fn execute_transact_write_op(
                 *return_values_on_ccf,
                 existing.as_ref(),
             )?;
-            upsert_item_in_tx(tx, key_info, item)
-                .await
-                .map_err(TxnOpError::Storage)?;
+            if existing.is_some() {
+                // The locking read above holds the row: no concurrent writer can
+                // slip between the condition check and this write.
+                upsert_item_in_tx(tx, key_info, item)
+                    .await
+                    .map_err(TxnOpError::Storage)?;
+            } else {
+                // No row existed for the read above to lock, so a concurrent
+                // transaction may create the item first. Arbitrate with an
+                // atomic insert-if-absent. On losing, re-read FOR UPDATE (the
+                // arbiter insert already waited out the winner, so its row is
+                // committed and lockable) and re-evaluate
+                // the condition against the winner's committed item, so an
+                // `attribute_not_exists` racer cancels with
+                // ConditionalCheckFailed instead of silently overwriting the
+                // winner, and `sync_indexes` sees the winner as the old item
+                // instead of colliding on a bare index insert. Same race, same
+                // shape, as the measured fix on the non-transactional
+                // UpdateItem path.
+                let mut attempt: u32 = 0;
+                loop {
+                    attempt += 1;
+                    if insert_item_if_absent_in_tx(tx, key_info, item)
+                        .await
+                        .map_err(TxnOpError::Storage)?
+                    {
+                        break;
+                    }
+                    let winner = fetch_item_for_update(tx, key_info, item)
+                        .await
+                        .map_err(TxnOpError::Storage)?;
+                    if let Some(winner) = winner {
+                        eval_condition(
+                            *condition,
+                            &winner,
+                            maps,
+                            *return_values_on_ccf,
+                            Some(&winner),
+                        )?;
+                        // The re-read locked the winner's row; safe to overwrite.
+                        upsert_item_in_tx(tx, key_info, item)
+                            .await
+                            .map_err(TxnOpError::Storage)?;
+                        existing = Some(winner);
+                        break;
+                    }
+                    // No committed winner is visible: the conflicting insert was
+                    // followed by a delete before our re-read. Retry the insert.
+                    if attempt >= MAX_CREATE_RACE_ATTEMPTS {
+                        // Sustained create-then-delete churn. Surface as a
+                        // canceled transaction with a TransactionConflict
+                        // reason, the DDB-canonical contention shape, never a
+                        // 500 (matches the MongoDB backend's exhaustion path).
+                        return Err(TxnOpError::Cancel(CancellationReason {
+                            code: "TransactionConflict".to_owned(),
+                            message: Some("Transaction is ongoing for the item".to_owned()),
+                            item: None,
+                        }));
+                    }
+                }
+            }
             if !indexes.is_empty() {
                 sync_indexes(
                     tx,
@@ -380,9 +471,19 @@ async fn execute_transact_write_op(
                 *return_values_on_ccf,
                 existing.as_ref(),
             )?;
-            delete_item_in_tx(tx, key_info, key)
-                .await
-                .map_err(TxnOpError::Storage)?;
+            // Only delete a row the locking read actually saw (and locked).
+            // When the read found nothing there is nothing to lock, so a
+            // concurrent transaction can create and commit the item before our
+            // DELETE runs; its fresh READ COMMITTED snapshot would then see
+            // and kill the winner's row with no stream record and orphaned
+            // index rows. Deleting a nonexistent item is a no-op in the real
+            // service, so skipping the write is the faithful serialization
+            // (this delete simply ordered before the concurrent create).
+            if existing.is_some() {
+                delete_item_in_tx(tx, key_info, key)
+                    .await
+                    .map_err(TxnOpError::Storage)?;
+            }
             if !indexes.is_empty() {
                 sync_indexes(
                     tx,
@@ -413,52 +514,112 @@ async fn execute_transact_write_op(
                 &key_info.attribute_definitions,
             )
             .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
-            let existing = fetch_item_for_update(tx, key_info, key)
+            let mut existing = fetch_item_for_update(tx, key_info, key)
                 .await
                 .map_err(TxnOpError::Storage)?;
-            let mut item = existing.clone().unwrap_or_else(|| (*key).clone());
-            // Evaluate condition against empty item if non-existent (DynamoDB semantics)
-            let condition_item = if existing.is_some() {
-                &item
-            } else {
-                &std::collections::BTreeMap::new()
+            // Compute and validate the post-update item from a given base.
+            // Runs once on the fast path, and again when a create race is
+            // lost and the loser's expression must re-apply on top of the
+            // winner's committed item (the merge semantics measured against
+            // the real service on the non-transactional UpdateItem path).
+            let idx_refs = index_key_refs(indexes);
+            let compute_item = |base: Option<&Item>| -> Result<Item, TxnOpError> {
+                let mut item = base.cloned().unwrap_or_else(|| (*key).clone());
+                expression::apply_update_validated(
+                    actions,
+                    &mut item,
+                    maps,
+                    &key_info.vector_indexes,
+                    &key_info.attribute_definitions,
+                )
+                .map_err(|e| {
+                    TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+                })?;
+                // Validate post-update item size
+                validation::validate_item_size(&item, max_item_size_bytes).map_err(|e| {
+                    TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+                })?;
+                // Secondary-index key validation on the post-update item: a type
+                // mismatch is a cancellation reason; setting an index key to an
+                // empty value is a top-level ValidationException.
+                validation::validate_index_key_types(
+                    &item,
+                    &idx_refs,
+                    &key_info.attribute_definitions,
+                )
+                .map_err(|e| {
+                    TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+                })?;
+                validation::validate_index_key_not_empty(
+                    &item,
+                    &idx_refs,
+                    validation::SecondaryIndexEmptyContext::UpdateExpression,
+                )
+                .map_err(|e| TxnOpError::Validation(e.to_string()))?;
+                Ok(item)
             };
+            // Evaluate condition against empty item if non-existent (DynamoDB semantics)
+            let empty = Item::new();
             eval_condition(
                 *condition,
-                condition_item,
+                existing.as_ref().unwrap_or(&empty),
                 maps,
                 *return_values_on_ccf,
                 existing.as_ref(),
             )?;
-            expression::apply_update_validated(
-                actions,
-                &mut item,
-                maps,
-                &key_info.vector_indexes,
-                &key_info.attribute_definitions,
-            )
-            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
-            // Validate post-update item size
-            validation::validate_item_size(&item, max_item_size_bytes).map_err(|e| {
-                TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
-            })?;
-            // Secondary-index key validation on the post-update item: a type
-            // mismatch is a cancellation reason; setting an index key to an
-            // empty value is a top-level ValidationException.
-            let idx_refs = index_key_refs(indexes);
-            validation::validate_index_key_types(&item, &idx_refs, &key_info.attribute_definitions)
-                .map_err(|e| {
-                    TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
-                })?;
-            validation::validate_index_key_not_empty(
-                &item,
-                &idx_refs,
-                validation::SecondaryIndexEmptyContext::UpdateExpression,
-            )
-            .map_err(|e| TxnOpError::Validation(e.to_string()))?;
-            upsert_item_in_tx(tx, key_info, &item)
-                .await
-                .map_err(TxnOpError::Storage)?;
+            let mut item = compute_item(existing.as_ref())?;
+            if existing.is_some() {
+                // The locking read above holds the row: no concurrent writer can
+                // slip between the condition check and this write.
+                upsert_item_in_tx(tx, key_info, &item)
+                    .await
+                    .map_err(TxnOpError::Storage)?;
+            } else {
+                // Same create race as the transactional Put above: no row
+                // existed to lock, so arbitrate with insert-if-absent and, on
+                // losing, re-evaluate the condition against the winner and
+                // re-apply the update expression on top of its item.
+                let mut attempt: u32 = 0;
+                loop {
+                    attempt += 1;
+                    if insert_item_if_absent_in_tx(tx, key_info, &item)
+                        .await
+                        .map_err(TxnOpError::Storage)?
+                    {
+                        break;
+                    }
+                    let winner = fetch_item_for_update(tx, key_info, key)
+                        .await
+                        .map_err(TxnOpError::Storage)?;
+                    if let Some(winner) = winner {
+                        eval_condition(
+                            *condition,
+                            &winner,
+                            maps,
+                            *return_values_on_ccf,
+                            Some(&winner),
+                        )?;
+                        item = compute_item(Some(&winner))?;
+                        // The re-read locked the winner's row; safe to overwrite.
+                        upsert_item_in_tx(tx, key_info, &item)
+                            .await
+                            .map_err(TxnOpError::Storage)?;
+                        existing = Some(winner);
+                        break;
+                    }
+                    // No committed winner is visible: the conflicting insert was
+                    // followed by a delete before our re-read. Retry the insert.
+                    if attempt >= MAX_CREATE_RACE_ATTEMPTS {
+                        // Sustained create-then-delete churn. Same
+                        // TransactionConflict cancellation as the Put arm.
+                        return Err(TxnOpError::Cancel(CancellationReason {
+                            code: "TransactionConflict".to_owned(),
+                            message: Some("Transaction is ongoing for the item".to_owned()),
+                            item: None,
+                        }));
+                    }
+                }
+            }
             if !indexes.is_empty() {
                 sync_indexes(
                     tx,

@@ -211,6 +211,40 @@ pub(crate) async fn poll_gsi_delay<S: SettingsStore + ?Sized>(
     }
 }
 
+/// Rebuild vector index builds that have stopped making progress.
+///
+/// The advisory lock answers "is someone building this?", and nothing else answers
+/// "is that someone alive?". A build that dies after its first batch leaves its
+/// index CREATING with its queue hold in place, which stops the table's whole index
+/// propagation, so without this the only exit is a restart.
+///
+/// Ownership is taken per index inside the rebuild, so this is safe to run on every
+/// front-end: a healthy build holds its lock and renews its heartbeat, and is
+/// therefore neither selected nor rebuildable.
+pub(crate) async fn vector_stuck_build_worker(
+    engine: Arc<crate::PostgresEngine>,
+    token: CancellationToken,
+) {
+    // Long next to a heartbeat renewed every batch, so a slow batch cannot be
+    // mistaken for a dead build. The cost of waiting is a paused queue for one
+    // table; the cost of being wrong is rebuilding an index that was fine.
+    const POLL_INTERVAL: Duration = Duration::from_secs(60);
+    const STALE_AFTER: Duration = Duration::from_secs(300);
+
+    while tick(&token, POLL_INTERVAL).await {
+        match crate::data::vector_index::rebuild_stuck_vector_indexes(&engine, Some(STALE_AFTER))
+            .await
+        {
+            Ok(0) => {}
+            Ok(n) => tracing::warn!(
+                rebuilt = n,
+                "rebuilt vector index build(s) whose heartbeat had gone stale"
+            ),
+            Err(e) => tracing::error!("stuck vector build sweep failed: {e}"),
+        }
+    }
+}
+
 pub(crate) async fn pool_metrics_worker(
     catalog_pool: PgPool,
     data_pool: PgPool,

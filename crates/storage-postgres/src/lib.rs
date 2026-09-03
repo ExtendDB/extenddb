@@ -29,6 +29,8 @@ mod table_engine;
 mod table_helpers;
 mod ttl_worker;
 mod update_table;
+mod vector;
+mod vector_search;
 mod worker_store;
 mod workers;
 
@@ -37,6 +39,32 @@ pub use catalog_store::PostgresCatalogStore;
 pub use config::PostgresStorageConfig;
 pub use config::parse_connection_string;
 pub use credential_store::DbCredentialStore;
+/// Apply one queued vector row from its own context.
+///
+/// Reachable so an integration test can drive the classification the propagation
+/// worker performs, and hidden because starting or running a deployment never calls
+/// it, unlike the two recovery entry points above.
+#[doc(hidden)]
+pub use data::vector_index::apply_claimed_vector_row;
+/// Try to take ownership of one vector index's build.
+///
+/// Reachable so an integration test can assert that ownership is held in a session
+/// of its own and given back when the owner is dropped, which is only observable
+/// from a second session. Hidden for the same reason as the row applier: no
+/// deployment path calls it.
+#[doc(hidden)]
+pub use data::vector_index::build_ownership;
+/// Flip one vector index to ACTIVE the way a finished build does. Reachable so a
+/// test can drive completion against a catalog row that is already gone, and
+/// hidden for the same reason as the two entry points above.
+#[doc(hidden)]
+pub use data::vector_index::mark_vector_index_active;
+/// Rebuild vector index builds whose heartbeat has gone stale. The runtime half of
+/// the same repair, exported for the same reason and for its test.
+pub use data::vector_index::rebuild_stuck_vector_indexes;
+/// Rebuild vector indexes a crash left mid-build. A startup step, exported because
+/// it is part of bringing a deployment up rather than an internal detail.
+pub use data::vector_index::reconcile_incomplete_vector_indexes;
 
 /// The `PostgreSQL` storage backend.
 ///
@@ -107,7 +135,7 @@ use sqlx::postgres::PgPoolOptions;
 ///
 /// The tuple is the single source of truth. Use `CATALOG_VERSION.to_string()`
 /// wherever a string representation is needed.
-pub const CATALOG_VERSION: CatalogVersion = CatalogVersion::new(0, 0, 2);
+pub const CATALOG_VERSION: CatalogVersion = CatalogVersion::new(0, 0, 3);
 
 /// Minimum number of connections allowed per pool.
 ///
@@ -169,6 +197,18 @@ pub struct PostgresEngine {
     /// This is only a fallback for when the live read fails; the write path
     /// reads the setting live so a runtime change applies to the next write.
     pub index_propagation_delay_cache: Arc<std::sync::atomic::AtomicU64>,
+    /// Whether the data database has the pgvector extension, probed once at
+    /// construction.
+    ///
+    /// Vector indexes live in `vector(N)` columns, a type pgvector defines, so
+    /// the capability is a property of the server rather than of this build.
+    /// Cached rather than probed per request: a control-plane feature does not
+    /// justify a round trip on every call, and the cost of caching is that
+    /// installing pgvector on a live server needs an ExtendDB restart to be
+    /// noticed. `DataEngine::as_vector_search` stays at its `None` default until
+    /// the search path exists, so this backend still refuses vector operations
+    /// over the wire; the flag is what that decision will read.
+    pub(crate) vector_capable: bool,
 }
 
 impl PostgresEngine {
@@ -229,6 +269,20 @@ impl PostgresEngine {
             .and_then(|(v,)| v.parse::<u64>().ok())
             .unwrap_or(DEFAULT_INDEX_PROPAGATION_DELAY_MS);
 
+        // Probe the pgvector extension once, on the data database, where vector
+        // data tables live. Logged at startup either way so an operator can see
+        // which answer this process is serving without reading the catalog.
+        let vector_version = vector::probe_vector_extension(&data_pool).await;
+        let vector_capable = vector_version.is_some();
+        match &vector_version {
+            Some(version) => tracing::info!(
+                "pgvector {version} detected on the data database; vector index storage available"
+            ),
+            None => tracing::info!(
+                "pgvector not installed on the data database; vector indexes are not supported"
+            ),
+        }
+
         Ok(Self {
             pool,
             data_pool,
@@ -239,6 +293,7 @@ impl PostgresEngine {
             index_propagation_delay_cache: Arc::new(std::sync::atomic::AtomicU64::new(
                 initial_gsi_delay,
             )),
+            vector_capable,
         })
     }
 
@@ -374,6 +429,82 @@ impl PostgresEngine {
     pub fn data_pool(&self) -> &PgPool {
         &self.data_pool
     }
+
+    /// Milliseconds to pause between vector backfill batches.
+    ///
+    /// Read live for the same reason the propagation delay is: a test sets it with
+    /// `settings set` and needs it to apply to the next backfill rather than up to
+    /// 30 s later. Zero when unset or unparseable, which is the production value,
+    /// so a malformed setting cannot slow a real backfill down.
+    pub(crate) async fn vector_backfill_batch_delay(&self) -> u64 {
+        let live: Result<Option<(String,)>, _> =
+            sqlx::query_as("SELECT value FROM settings WHERE key = $1")
+                .bind(extenddb_core::settings_keys::VECTOR_BACKFILL_BATCH_DELAY_MS)
+                .fetch_optional(&self.pool)
+                .await;
+        match live {
+            Ok(row) => row.and_then(|(v,)| v.parse::<u64>().ok()).unwrap_or(0),
+            Err(e) => {
+                tracing::debug!("vector_backfill_batch_delay: live read failed, using 0: {e:?}");
+                0
+            }
+        }
+    }
+
+    /// Minimum milliseconds an UpdateTable-created vector index stays `CREATING`
+    /// before its `ACTIVE` flip. See
+    /// [`extenddb_core::settings_keys::VECTOR_INDEX_MIN_CREATING_MS`] for why the
+    /// hold exists; the SQLite backend applies the same floor. Defaults to 1000
+    /// when unset or unparseable; zero disables it.
+    pub(crate) async fn vector_index_min_creating_ms(&self) -> u64 {
+        const DEFAULT_MS: u64 = 1_000;
+        let live: Result<Option<(String,)>, _> =
+            sqlx::query_as("SELECT value FROM settings WHERE key = $1")
+                .bind(extenddb_core::settings_keys::VECTOR_INDEX_MIN_CREATING_MS)
+                .fetch_optional(&self.pool)
+                .await;
+        match live {
+            Ok(row) => row
+                .and_then(|(v,)| v.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_MS),
+            Err(e) => {
+                tracing::debug!(
+                    "vector_index_min_creating_ms: live read failed, using {DEFAULT_MS}: {e:?}"
+                );
+                DEFAULT_MS
+            }
+        }
+    }
+
+    /// Milliseconds to hold a new vector index in the resource-allocation phase.
+    ///
+    /// A test lever, zero in production, read live for the same reason the batch
+    /// delay is. Held inside the detached build task rather than in the request
+    /// path, because the phase is only observable to a client after `UpdateTable`
+    /// has returned.
+    pub(crate) async fn vector_allocation_phase_delay(&self) -> u64 {
+        let live: Result<Option<(String,)>, _> =
+            sqlx::query_as("SELECT value FROM settings WHERE key = $1")
+                .bind(extenddb_core::settings_keys::VECTOR_ALLOCATION_PHASE_DELAY_MS)
+                .fetch_optional(&self.pool)
+                .await;
+        match live {
+            Ok(row) => row.and_then(|(v,)| v.parse::<u64>().ok()).unwrap_or(0),
+            Err(e) => {
+                tracing::debug!("vector_allocation_phase_delay: live read failed, using 0: {e:?}");
+                0
+            }
+        }
+    }
+
+    /// Whether the data database has pgvector, as probed at construction.
+    ///
+    /// Public so that a deployment check, and the tests that pin the
+    /// fail-closed behaviour, can read the same answer the engine acts on.
+    #[must_use]
+    pub fn vector_capable(&self) -> bool {
+        self.vector_capable
+    }
 }
 
 // ============================================================================
@@ -445,7 +576,14 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             ttl_worker::ttl_cleanup_worker(storage_for_ttl, metrics, token).await;
         });
 
-        // 6. Pool metrics worker - needs both catalog and data pools
+        // 6. Stuck vector build sweep
+        let storage_for_builds = self.engine.clone();
+        let token = ctx.shutdown.clone();
+        let vector_builds = tokio::spawn(async move {
+            workers::vector_stuck_build_worker(storage_for_builds, token).await;
+        });
+
+        // 7. Pool metrics worker - needs both catalog and data pools
         let catalog_pool = self.engine.pool.clone();
         let data_pool = self.engine.data_pool().clone();
         let metrics = ctx.metrics.clone();
@@ -454,7 +592,7 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             workers::pool_metrics_worker(catalog_pool, data_pool, metrics, token).await;
         });
 
-        // 7. GSI delay poller
+        // 8. GSI delay poller
         let catalog_store_for_gsi = ctx.catalog_store.clone();
         let gsi_delay = self.index_propagation_delay_cache.clone();
         let token = ctx.shutdown.clone();
@@ -468,6 +606,7 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             stream_cleanup,
             idempotency_cleanup,
             ttl,
+            vector_builds,
             pool_metrics,
             gsi_poller,
         ]
@@ -516,6 +655,16 @@ fn server_components_factory(
             }
             _ => BackendError::InitializationFailed(e.to_string()),
         })?;
+
+        // Rebuild any vector index a crash left CREATING, before serving: an index
+        // in that state is not searchable, and nothing else will repair it.
+        match crate::data::vector_index::reconcile_incomplete_vector_indexes(&engine).await {
+            Ok(n) if n > 0 => {
+                tracing::info!("Reconciled {n} incomplete vector index(es) at startup");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!("Failed to reconcile incomplete vector indexes: {e}"),
+        }
 
         // Recover control plane transitions (ignore errors)
         match engine.process_control_plane_transitions().await {

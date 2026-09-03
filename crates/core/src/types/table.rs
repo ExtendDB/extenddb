@@ -218,6 +218,34 @@ pub struct BillingModeSummary {
     pub last_update_to_pay_per_request_date_time: Option<f64>,
 }
 
+/// Summary of the table's throughput mode, a mirror of [`BillingModeSummary`].
+///
+/// Measured 2026-08-21 against Amazon DynamoDB: table descriptions carry this
+/// member exactly when they carry `BillingModeSummary`, with the same mode and
+/// an identical `LastUpdateToPayPerRequestDateTime`. Derive it from the
+/// billing-mode summary rather than assembling it independently, so the two
+/// members cannot disagree.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TableThroughputModeSummary {
+    #[serde(rename = "TableThroughputMode")]
+    pub table_throughput_mode: BillingMode,
+    #[serde(
+        rename = "LastUpdateToPayPerRequestDateTime",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_update_to_pay_per_request_date_time: Option<f64>,
+}
+
+impl From<&BillingModeSummary> for TableThroughputModeSummary {
+    fn from(summary: &BillingModeSummary) -> Self {
+        Self {
+            table_throughput_mode: summary.billing_mode,
+            last_update_to_pay_per_request_date_time: summary
+                .last_update_to_pay_per_request_date_time,
+        }
+    }
+}
+
 /// A key-value tag attached to a Virtual `DynamoDB` resource.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tag {
@@ -326,6 +354,42 @@ pub struct SearchSchemaElement {
     pub attribute_name: String,
     #[serde(rename = "SearchSchemaElementType")]
     pub element_type: SearchSchemaElementType,
+}
+
+impl VectorIndexSpecification {
+    /// Collapse an empty `SearchSchema` to an absent one.
+    ///
+    /// A request may carry `SearchSchema: []`, and it means the same thing as
+    /// omitting the member: the index is unscoped and a search spans the table.
+    /// Amazon DynamoDB reports either an absent member or a populated one and
+    /// never an empty list, so storing the empty list would create a third state
+    /// that a describe echoes back and no client expects, and would let two
+    /// backends answer the same request differently depending on whether each
+    /// remembered to collapse it.
+    ///
+    /// Applied on the request paths, before any backend sees the specification,
+    /// and again by the backends themselves so that a caller reaching the storage
+    /// trait directly cannot store the third state either.
+    pub fn normalize_search_schema(&mut self) {
+        if self
+            .search_schema
+            .as_ref()
+            .is_some_and(|elements| elements.is_empty())
+        {
+            self.search_schema = None;
+        }
+    }
+
+    /// The search schema as it should be stored: absent when empty.
+    ///
+    /// The borrowing form of [`Self::normalize_search_schema`], for a caller that
+    /// is serialising rather than holding a mutable specification.
+    #[must_use]
+    pub fn search_schema_for_storage(&self) -> Option<&[SearchSchemaElement]> {
+        self.search_schema
+            .as_deref()
+            .filter(|elements| !elements.is_empty())
+    }
 }
 
 /// Vector index definition for `CreateTable` requests.
@@ -500,6 +564,23 @@ pub const MAX_VECTOR_INDEXES_PER_TABLE: usize = 5;
 pub const VECTOR_INDEX_REQUIRES_PAY_PER_REQUEST: &str = "One or more parameter values were invalid: Vector indexes are only supported for \
      PAY_PER_REQUEST tables";
 
+/// Message the service returns when an `UpdateTable` switches a table holding
+/// vector indexes to `PROVISIONED` **and** carries `VectorIndexUpdates`.
+///
+/// Measured 2026-08-19 (probe P14) on a switch combined with deleting the last
+/// vector index, which the service refuses even though the resulting state would
+/// carry no vector index at all: net-effect evaluation applies to a combined
+/// switch and create, not to a combined switch and delete. Distinct text from
+/// [`VECTOR_INDEX_REQUIRES_PAY_PER_REQUEST`], which is what a plain switch
+/// reports.
+///
+/// The exact trigger is only partly mapped. Both shapes above are measured; which
+/// string fires for a switch combined with a vector index create is not, so a
+/// backend should emit this one for the measured shape and the plain rule
+/// elsewhere rather than guessing at the boundary.
+pub const VECTOR_TABLE_REQUIRES_PAY_PER_REQUEST_MODE: &str = "One or more parameter values were invalid: Tables with vector indexes must be in \
+     PAY_PER_REQUEST mode";
+
 /// Per-table vector index limit exceeded on `CreateTable`.
 ///
 /// The create and update paths differ in BOTH class and text for this one rule,
@@ -559,6 +640,27 @@ pub fn vector_attribute_redefines_key(
     )
 }
 
+/// The message for an UpdateTable create whose vector attribute is already
+/// used by an existing vector index with different `Dimensions`. Measured
+/// live 2026-08-24 (us-east-1): `Create vConf(emb, 16)` against a table whose
+/// `vidx0` declares `emb` at 4 answers exactly this, with both sides rendered
+/// in the `VectorIndexSchema` shape (contrast the key-redefinition sibling
+/// above, whose existing side is a key `Schema`). Same attribute with the
+/// SAME dimensions is accepted (also measured).
+#[must_use]
+pub fn vector_attribute_redefines_vector(
+    attribute_name: &str,
+    existing_dimensions: u32,
+    new_dimensions: u32,
+) -> String {
+    format!(
+        "One or more parameter values were invalid: Attributes cannot be redefined. Please check \
+         that your attribute has the same type as previously defined. Existing schema: \
+         VectorIndexSchema:[VectorAttribute: key{{{attribute_name}:L:{existing_dimensions}}}] \
+         New schema: VectorIndexSchema:[VectorAttribute: key{{{attribute_name}:L:{new_dimensions}}}]"
+    )
+}
+
 pub const VECTOR_INDEX_ALREADY_EXISTS: &str = "Attempting to create an index which already exists";
 
 /// Prefix of the message the service returns when the name is taken by an index
@@ -567,6 +669,42 @@ pub const VECTOR_INDEX_ALREADY_EXISTS: &str = "Attempting to create an index whi
 /// "  Table: {table} Index: {index}" with two spaces after the full stop.
 pub const VECTOR_INDEX_CREATE_IN_USE_PREFIX: &str =
     "Attempt to change a resource which is still in use: Index is being created.";
+
+/// Message the service returns when a vector index is deleted while its creation
+/// is still in the resource-allocation phase.
+///
+/// Measured byte-exact on 2026-08-19 (probe P2), carried as a
+/// `ResourceInUseException` with HTTP 400. Deleting a `CREATING` vector index is
+/// phase-dependent: refused while the index reports `Backfilling: false`,
+/// accepted once it reports `Backfilling: true`, which is why the text tells the
+/// caller to retry rather than that the request was wrong.
+///
+/// A function rather than a bare constant because the service names both
+/// resources, separated by a single space and with no comma:
+/// "... is active. Table: t Index: i".
+#[must_use]
+pub fn vector_index_delete_in_allocation_phase(table_name: &str, index_name: &str) -> String {
+    format!(
+        "Attempt to change a resource which is still in use: Index creation is in resource \
+         allocation phase. Retry deletion during backfilling phase or when the index is active. \
+         Table: {table_name} Index: {index_name}"
+    )
+}
+
+/// Refusal for a Query naming a vector index. Measured 2026-08-20; note the
+/// trailing period, which the Scan variant does not have.
+pub const VECTOR_INDEX_QUERY_NOT_SUPPORTED: &str =
+    "Query operation not supported on this index type.";
+
+/// Refusal for a Scan naming a vector index that is past its backfill.
+/// Measured 2026-08-20.
+pub const VECTOR_INDEX_SCAN_NOT_SUPPORTED: &str = "Scan operation not supported on this index type";
+
+/// Prefix of the Scan refusal while a vector index is still backfilling;
+/// continues with the index name. The service reuses the GSI wording even
+/// though the index is a vector index. Measured 2026-08-20.
+pub const VECTOR_INDEX_BACKFILLING_SCAN_PREFIX: &str =
+    "Cannot read from backfilling global secondary index: ";
 
 impl VectorIndexDescription {
     /// Reject a description whose reported state the service would never produce.
@@ -630,6 +768,16 @@ impl TableDescription {
         }
         Ok(())
     }
+
+    /// Populate `TableThroughputModeSummary` as an exact mirror of
+    /// `BillingModeSummary`.
+    ///
+    /// Called on every path that hands a description to a client, so the
+    /// measured invariant (both members together, always agreeing) holds
+    /// centrally instead of each backend assembling the mirror itself.
+    pub fn populate_table_throughput_mode_summary(&mut self) {
+        self.table_throughput_mode_summary = self.billing_mode_summary.as_ref().map(Into::into);
+    }
 }
 
 /// Full description of a Virtual `DynamoDB` table, returned by `CreateTable`,
@@ -663,6 +811,14 @@ pub struct TableDescription {
     pub provisioned_throughput: ProvisionedThroughputDescription,
     #[serde(rename = "BillingModeSummary", skip_serializing_if = "Option::is_none")]
     pub billing_mode_summary: Option<BillingModeSummary>,
+    /// Populated by the engine via `populate_table_throughput_mode_summary()`
+    /// on every path that emits a description. Backends leave this `None` and
+    /// must not assemble it independently.
+    #[serde(
+        rename = "TableThroughputModeSummary",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub table_throughput_mode_summary: Option<TableThroughputModeSummary>,
     #[serde(
         rename = "GlobalSecondaryIndexes",
         skip_serializing_if = "Option::is_none"
@@ -723,6 +879,8 @@ pub struct CreateTableInput {
     pub attribute_definitions: Vec<AttributeDefinition>,
     #[serde(rename = "BillingMode")]
     pub billing_mode: Option<BillingMode>,
+    #[serde(rename = "TableThroughputMode")]
+    pub table_throughput_mode: Option<BillingMode>,
     #[serde(rename = "ProvisionedThroughput")]
     pub provisioned_throughput: Option<ProvisionedThroughput>,
     #[serde(rename = "GlobalSecondaryIndexes")]
@@ -750,6 +908,21 @@ pub struct CreateTableInput {
 pub struct CreateTableOutput {
     #[serde(rename = "TableDescription")]
     pub table_description: TableDescription,
+}
+
+impl CreateTableInput {
+    /// Resolve `TableThroughputMode` into the billing-mode slot.
+    ///
+    /// Measured 2026-08-21 against Amazon DynamoDB: `BillingMode` wins when
+    /// both members are present (a conflict is not refused), and
+    /// `TableThroughputMode` applies only when `BillingMode` is absent. Every
+    /// downstream validation message phrases the mode as `BillingMode` either
+    /// way, which resolving here reproduces without further changes. The
+    /// member is consumed, so the storage layer only ever sees the resolved
+    /// `billing_mode`.
+    pub fn resolve_table_throughput_mode(&mut self) {
+        self.billing_mode = self.billing_mode.or(self.table_throughput_mode.take());
+    }
 }
 
 /// `DeleteTable` request body.
@@ -854,6 +1027,8 @@ pub struct UpdateTableInput {
     pub table_name: String,
     #[serde(rename = "BillingMode")]
     pub billing_mode: Option<BillingMode>,
+    #[serde(rename = "TableThroughputMode")]
+    pub table_throughput_mode: Option<BillingMode>,
     #[serde(rename = "ProvisionedThroughput")]
     pub provisioned_throughput: Option<ProvisionedThroughput>,
     #[serde(rename = "DeletionProtectionEnabled")]
@@ -880,6 +1055,18 @@ pub struct UpdateTableInput {
 pub struct UpdateTableOutput {
     #[serde(rename = "TableDescription")]
     pub table_description: TableDescription,
+}
+
+impl UpdateTableInput {
+    /// Resolve `TableThroughputMode` into the billing-mode slot.
+    ///
+    /// Same measured rule as [`CreateTableInput::resolve_table_throughput_mode`]:
+    /// `BillingMode` wins when both members are present, no conflict refusal.
+    /// The member is consumed, so the storage layer only ever sees the
+    /// resolved `billing_mode`.
+    pub fn resolve_table_throughput_mode(&mut self) {
+        self.billing_mode = self.billing_mode.or(self.table_throughput_mode.take());
+    }
 }
 
 // --- TTL ---
@@ -1008,27 +1195,56 @@ pub struct DescribeLimitsOutput {
 mod tests {
     use super::*;
 
-    /// `TableThroughputMode` is not a member of DynamoDB's CreateTable request:
-    /// the model has `BillingMode` only (verified against aws-sdk-dynamodb 1.119.0,
-    /// where the field does not appear at all). An earlier version of this type
-    /// accepted it as an alias, which meant a request that produced a
-    /// PAY_PER_REQUEST table here would be ignored by AWS and produce a
-    /// PROVISIONED table there: an accept-direction divergence, where code written
-    /// against ExtendDB breaks against the real service. Under AWS JSON 1.0 an
-    /// unknown member is ignored, which is what must happen here.
+    /// `TableThroughputMode` is accepted and honoured by Amazon DynamoDB as a
+    /// fallback alias of `BillingMode` (measured 2026-08-21: CreateTable with
+    /// only `TableThroughputMode: PAY_PER_REQUEST` returns 200 with a
+    /// PAY_PER_REQUEST `BillingModeSummary`, on plain and vector-indexed tables
+    /// alike). An earlier version of this type deliberately ignored the member
+    /// because it does not exist in the SDK model (checked against
+    /// aws-sdk-dynamodb 1.119.0, where it still does not appear); that reasoning
+    /// was sound, but the SDK model lagged the service, and the measurement
+    /// supersedes it. Do not re-remove the member on SDK-model grounds.
     #[test]
-    fn create_table_ignores_the_unknown_table_throughput_mode_member() {
+    fn create_table_honours_the_table_throughput_mode_member() {
         let json = r#"{
             "TableName": "t",
             "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
             "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
             "TableThroughputMode": "PAY_PER_REQUEST"
         }"#;
-        let input: CreateTableInput = serde_json::from_str(json).unwrap();
+        let mut input: CreateTableInput = serde_json::from_str(json).unwrap();
         assert_eq!(
-            input.billing_mode, None,
-            "an unknown member must be ignored, not treated as BillingMode"
+            input.table_throughput_mode,
+            Some(BillingMode::PayPerRequest)
         );
+        assert_eq!(input.billing_mode, None, "the member is not BillingMode");
+        input.resolve_table_throughput_mode();
+        assert_eq!(
+            input.billing_mode,
+            Some(BillingMode::PayPerRequest),
+            "alone, the member must resolve into the billing-mode slot"
+        );
+        assert_eq!(
+            input.table_throughput_mode, None,
+            "resolution consumes the member; storage sees only billing_mode"
+        );
+    }
+
+    /// Measured 2026-08-21: when both members are present, `BillingMode` wins
+    /// whatever the other member says. A conflict is not refused.
+    #[test]
+    fn create_table_billing_mode_wins_over_table_throughput_mode() {
+        let json = r#"{
+            "TableName": "t",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PROVISIONED",
+            "TableThroughputMode": "PAY_PER_REQUEST"
+        }"#;
+        let mut input: CreateTableInput = serde_json::from_str(json).unwrap();
+        input.resolve_table_throughput_mode();
+        assert_eq!(input.billing_mode, Some(BillingMode::Provisioned));
+        assert_eq!(input.table_throughput_mode, None);
     }
 
     #[test]
@@ -1043,14 +1259,65 @@ mod tests {
         assert_eq!(input.billing_mode, Some(BillingMode::PayPerRequest));
     }
 
+    /// The UpdateTable twin of the CreateTable test above: the member is
+    /// honoured as a fallback alias, resolved by the same measured rule.
     #[test]
-    fn update_table_ignores_the_unknown_table_throughput_mode_member() {
+    fn update_table_honours_the_table_throughput_mode_member() {
         let json = r#"{"TableName": "t", "TableThroughputMode": "PROVISIONED"}"#;
-        let input: UpdateTableInput = serde_json::from_str(json).unwrap();
+        let mut input: UpdateTableInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.billing_mode, None);
+        input.resolve_table_throughput_mode();
+        assert_eq!(input.billing_mode, Some(BillingMode::Provisioned));
+        assert_eq!(input.table_throughput_mode, None);
+    }
+
+    #[test]
+    fn update_table_billing_mode_wins_over_table_throughput_mode() {
+        let json = r#"{"TableName": "t", "BillingMode": "PAY_PER_REQUEST",
+                       "TableThroughputMode": "PROVISIONED"}"#;
+        let mut input: UpdateTableInput = serde_json::from_str(json).unwrap();
+        input.resolve_table_throughput_mode();
+        assert_eq!(input.billing_mode, Some(BillingMode::PayPerRequest));
         assert_eq!(
-            input.billing_mode, None,
-            "an unknown member must be ignored"
+            input.table_throughput_mode, None,
+            "the losing member is still consumed"
         );
+    }
+
+    /// The mirror is a pure function of the billing-mode summary: same mode,
+    /// same timestamp, absent when the sibling is absent.
+    #[test]
+    fn table_throughput_mode_summary_mirrors_billing_mode_summary() {
+        let mut desc = TableDescription {
+            billing_mode_summary: Some(BillingModeSummary {
+                billing_mode: BillingMode::PayPerRequest,
+                last_update_to_pay_per_request_date_time: Some(1787276378.446),
+            }),
+            ..Default::default()
+        };
+        desc.populate_table_throughput_mode_summary();
+        let ttms = desc.table_throughput_mode_summary.as_ref().unwrap();
+        assert_eq!(ttms.table_throughput_mode, BillingMode::PayPerRequest);
+        assert_eq!(
+            ttms.last_update_to_pay_per_request_date_time,
+            Some(1787276378.446)
+        );
+
+        desc.billing_mode_summary = None;
+        desc.populate_table_throughput_mode_summary();
+        assert_eq!(desc.table_throughput_mode_summary, None);
+    }
+
+    /// Wire shape: the timestamp member is omitted, not null, when absent,
+    /// matching the sibling summary's serialisation.
+    #[test]
+    fn table_throughput_mode_summary_omits_absent_timestamp() {
+        let json = serde_json::to_string(&TableThroughputModeSummary {
+            table_throughput_mode: BillingMode::PayPerRequest,
+            last_update_to_pay_per_request_date_time: None,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"TableThroughputMode":"PAY_PER_REQUEST"}"#);
     }
 
     #[test]
@@ -1115,6 +1382,78 @@ mod tests {
         let odt = input.on_demand_throughput.unwrap();
         assert_eq!(odt.max_read_request_units, Some(10));
         assert_eq!(odt.max_write_request_units, Some(5));
+    }
+}
+
+#[cfg(test)]
+mod vector_search_schema_normalisation_tests {
+    use super::{
+        DistanceFunction, SearchSchemaElement, SearchSchemaElementType, VectorAttribute,
+        VectorIndexSpecification,
+    };
+
+    fn spec(search_schema: Option<Vec<SearchSchemaElement>>) -> VectorIndexSpecification {
+        VectorIndexSpecification {
+            index_name: "vidx".to_owned(),
+            dimensions: 4,
+            distance_function: DistanceFunction::Cosine,
+            vector_attribute: VectorAttribute {
+                attribute_name: "emb".to_owned(),
+            },
+            search_schema,
+            projection: None,
+        }
+    }
+
+    fn hash() -> Vec<SearchSchemaElement> {
+        vec![SearchSchemaElement {
+            attribute_name: "tenant".to_owned(),
+            element_type: SearchSchemaElementType::Hash,
+        }]
+    }
+
+    /// An empty list and an absent member mean the same thing, so only one of them
+    /// may reach storage. The service reports an absent member or a populated one
+    /// and never an empty list, so storing `[]` would make DescribeTable echo a
+    /// third state, and would let two backends differ on whether they collapsed it.
+    #[test]
+    fn an_empty_search_schema_becomes_absent() {
+        let mut empty = spec(Some(Vec::new()));
+        empty.normalize_search_schema();
+        assert_eq!(empty.search_schema, None);
+        assert_eq!(spec(Some(Vec::new())).search_schema_for_storage(), None);
+    }
+
+    #[test]
+    fn a_populated_search_schema_is_left_alone() {
+        let mut scoped = spec(Some(hash()));
+        scoped.normalize_search_schema();
+        assert_eq!(scoped.search_schema, Some(hash()));
+        assert_eq!(
+            spec(Some(hash())).search_schema_for_storage(),
+            Some(hash().as_slice())
+        );
+    }
+
+    #[test]
+    fn an_absent_search_schema_stays_absent() {
+        let mut unscoped = spec(None);
+        unscoped.normalize_search_schema();
+        assert_eq!(unscoped.search_schema, None);
+        assert_eq!(spec(None).search_schema_for_storage(), None);
+    }
+
+    /// The two forms must agree, since one is applied on the request path and the
+    /// other by the backends: a caller reaching storage directly must not be able
+    /// to store a state the request path would have collapsed.
+    #[test]
+    fn the_owning_and_borrowing_forms_agree() {
+        for schema in [None, Some(Vec::new()), Some(hash())] {
+            let mut owned = spec(schema.clone());
+            owned.normalize_search_schema();
+            let borrowed = spec(schema).search_schema_for_storage().map(<[_]>::to_vec);
+            assert_eq!(owned.search_schema, borrowed);
+        }
     }
 }
 

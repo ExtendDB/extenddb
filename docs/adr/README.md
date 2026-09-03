@@ -32,5 +32,7 @@ decision, write a new ADR.
 |---|-------|--------|
 | [0001](0001-documentation-format.md) | Documentation format — Markdown over LaTeX | Accepted |
 | [0002](0002-sql-injection-defense.md) | SQL injection defense | Accepted |
-| [0003](0003-catalog-migration-mechanism.md) | Adopt sqlx::migrate for PostgreSQL catalog and data schema migrations | Proposed |
-| [0004](0004-vector-search-exact-scan.md) | Vector search is an exact scan over one row per vector | Proposed |
+| [0003](0003-catalog-migration-mechanism.md) | Adopt sqlx::migrate for PostgreSQL catalog and data schema migrations | Accepted |
+| [0004](0004-vector-search-exact-scan.md) | Vector search is an exact scan over one row per vector | Accepted |
+| [0005](0005-index-build-lifecycle-ownership.md) | Index-build lifecycle stays in the backend until a second backend needs it | Accepted |
+| [0006](0006-pgvector-storage-and-scoring.md) | Vector storage on PostgreSQL uses pgvector's type, and the engine decides what it cannot compute | Accepted |
