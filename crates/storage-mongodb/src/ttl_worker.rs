@@ -14,6 +14,7 @@ use extenddb_storage::{DataEngine, MetadataEngine, StreamEngine, TableEngine, Wo
 use futures::TryStreamExt;
 
 use crate::MongoEngine;
+use crate::data_engine::{GsiBackfillContext, GsiBackfillMode};
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(60);
 const BATCH_SIZE: usize = 100;
@@ -65,17 +66,20 @@ pub(crate) async fn stream_record_cleanup_worker(storage: Arc<MongoEngine>) {
 /// Live writes during the backfill window continue to route through
 /// `sync_indexes` / `sync_indexes_in_session`, which write to
 /// CREATING indexes too (indexes catalog membership, not status, is
-/// what gates the write path). All writes are upserts on the same
-/// `_id` shape, so a base item touched by both the backfill and a
-/// concurrent write converges regardless of interleaving —
-/// RFC-0003 §2.4.
+/// what gates the write path). Both paths use a transaction over the
+/// base and index rows, so a concurrent mutation serializes with or
+/// aborts the backfill rather than being overwritten by a stale upsert
+/// — RFC-0003 §2.4.
 pub(crate) async fn gsi_backfill_worker(storage: Arc<MongoEngine>) {
     loop {
         tokio::time::sleep(GSI_BACKFILL_INTERVAL).await;
 
         let indexes_coll = storage.catalog_db.collection::<Document>("indexes");
         let cursor = match indexes_coll
-            .find(doc! { "index_status": "CREATING", "index_type": "GSI" })
+            .find(doc! {
+                "index_status": "CREATING",
+                "index_type": { "$in": ["GSI", "LSI"] },
+            })
             .await
         {
             Ok(c) => c,
@@ -100,6 +104,8 @@ pub(crate) async fn gsi_backfill_worker(storage: Arc<MongoEngine>) {
                 );
             }
         }
+
+        finish_ready_restores(&storage).await;
     }
 }
 
@@ -132,19 +138,29 @@ async fn run_gsi_backfill_job(storage: &MongoEngine, job: &Document) -> Result<(
             non_key_attributes: None,
         });
 
+    let mode = match job.get_str("backfill_mode").unwrap_or("live") {
+        "restore" => GsiBackfillMode::Restore,
+        "live" => GsiBackfillMode::Live,
+        other => {
+            return Err(StorageError::Internal(format!(
+                "unknown GSI backfill mode: {other}"
+            )));
+        }
+    };
+
+    let context = GsiBackfillContext {
+        key_info: &key_info,
+        index_id: &index_id,
+        idx_key_schema: &idx_key_schema,
+        projection: &projection,
+        mode,
+    };
     let mut cursor = job.get("backfill_cursor").cloned();
     let indexes_coll = storage.catalog_db.collection::<Document>("indexes");
 
     loop {
         let progress = storage
-            .backfill_gsi_batch(
-                &key_info,
-                &index_id,
-                &idx_key_schema,
-                &projection,
-                cursor.as_ref(),
-                GSI_BACKFILL_BATCH,
-            )
+            .backfill_gsi_batch(&context, cursor.as_ref(), GSI_BACKFILL_BATCH)
             .await?;
 
         if progress.done {
@@ -187,6 +203,88 @@ async fn run_gsi_backfill_job(storage: &MongoEngine, job: &Document) -> Result<(
                  non-final batch; index remains CREATING and will be retried",
             );
             return Ok(());
+        }
+    }
+}
+
+/// Complete restored tables after every restored GSI/LSI has been populated.
+/// The restore request records `restore_backfill_pending` only after the base
+/// `$out` copy succeeds, so this remains safe to retry after a process restart
+/// or a client disconnect during index backfill.
+async fn finish_ready_restores(storage: &MongoEngine) {
+    let tables_coll = storage.catalog_db.collection::<Document>("tables");
+    let mut cursor = match tables_coll
+        .find(doc! {
+            "table_status": "CREATING",
+            "restore_backfill_pending": true,
+        })
+        .await
+    {
+        Ok(cursor) => cursor,
+        Err(error) => {
+            tracing::warn!("GSI backfill worker: restore scan failed: {error}");
+            return;
+        }
+    };
+
+    loop {
+        let table = match cursor.try_next().await {
+            Ok(Some(table)) => table,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!("GSI backfill worker: restore scan failed: {error}");
+                break;
+            }
+        };
+        let Some(table_id) = table.get_str("table_id").ok() else {
+            tracing::warn!("GSI backfill worker: restore table is missing table_id");
+            continue;
+        };
+
+        let indexes_coll = storage.catalog_db.collection::<Document>("indexes");
+        let pending = match indexes_coll
+            .find_one(doc! {
+                "_id.table_id": table_id,
+                "index_status": "CREATING",
+            })
+            .await
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                tracing::warn!(
+                    "GSI backfill worker: restore index scan failed for table_id={table_id}: {error}"
+                );
+                continue;
+            }
+        };
+        if pending.is_some() {
+            continue;
+        }
+
+        match tables_coll
+            .update_one(
+                doc! {
+                    "table_id": table_id,
+                    "table_status": "CREATING",
+                    "restore_backfill_pending": true,
+                },
+                doc! {
+                    "$set": { "table_status": "ACTIVE" },
+                    "$unset": {
+                        "status_transition_at": "",
+                        "restore_backfill_pending": "",
+                    },
+                },
+            )
+            .await
+        {
+            Ok(result) if result.matched_count == 1 => {
+                tracing::info!("GSI backfill worker: restored table_id={table_id} ACTIVE");
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                "GSI backfill worker: restore activation failed for table_id={table_id}: {error}"
+            ),
         }
     }
 }

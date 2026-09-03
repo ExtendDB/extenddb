@@ -30,7 +30,7 @@
 #
 # Prerequisites:
 #   - Docker running
-#   - `cargo build --release --no-default-features --features mongodb` already done
+#   - `cargo build --release --no-default-features --features mongodb-test-hooks` already done
 #   - Python venv activated with pytest installed
 #   - `~/.extenddb/tls/` populated (from a prior `extenddb init`)
 
@@ -80,8 +80,23 @@ SERVER_LOG="$OUTPUT_DIR/server.log"
 CONTAINER_NAME="extenddb-runtests-mongo-${MONGO_PORT}"
 BINARY="./target/release/extenddb"
 
+# Tell the integration test binary that this runner includes MongoDB test
+# hooks. The production server has no effect from this variable; the hooks are
+# compiled only by the `mongodb-test-hooks` feature.
+export EXTENDDB_TEST_MONGODB_TEST_HOOKS=1
+
 if [[ ! -x "$BINARY" ]]; then
-    echo "error: $BINARY not found. Build first: cargo build --release --no-default-features --features mongodb" >&2
+    echo "error: $BINARY not found. Build first: cargo build --release --no-default-features --features mongodb-test-hooks" >&2
+    exit 1
+fi
+
+# The GSI race test requires the hook-enabled binary. Check the compiled
+# capability before starting Docker or ExtendDB so a plain `mongodb` binary
+# fails with the build error instead of timing out while waiting for a gate
+# that was compiled out.
+if ! "$BINARY" version 2>/dev/null | grep -q '^test-hooks enabled$'; then
+    echo "error: $BINARY does not include MongoDB test hooks; rebuild with:" >&2
+    echo "  cargo build --release --no-default-features --features mongodb-test-hooks" >&2
     exit 1
 fi
 
@@ -241,6 +256,8 @@ echo ""
 export EXTENDDB_TEST_ENDPOINT="https://127.0.0.1:$BIND_PORT"
 export EXTENDDB_ADMIN_USER=admin
 export EXTENDDB_ADMIN_PASSWORD="$ADMIN_PASSWORD"
+# MongoDB-only tests use the runner's container for backend-specific checks.
+export EXTENDDB_TEST_MONGODB_CONTAINER="$CONTAINER_NAME"
 
 # Some tests read EXTENDDB_CONFIG to invoke `extenddb settings` against
 # the running instance. Without this, they fall back to `./extenddb.toml`
