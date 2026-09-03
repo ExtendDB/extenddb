@@ -11,8 +11,9 @@
 //!
 //! In-tree backends are selected by mutually exclusive Cargo features:
 //! `postgres` (the default production backend), `mongodb` (production, built with
-//! `--no-default-features --features mongodb`), and `sqlite`/`sqlite-memory` (the
-//! dev/CI backend). Exactly one must be enabled: [`set_backend`] installs one
+//! `--no-default-features --features mongodb`), `sqlite`/`sqlite-memory` (the
+//! dev/CI backend), and `duckdb`/`duckdb-memory` (embedded, columnar). Exactly
+//! one must be enabled: [`set_backend`] installs one
 //! backend per process, so a build with more than one would be ambiguous and is
 //! rejected at compile time.
 
@@ -20,16 +21,24 @@
 #[cfg(any(
     all(feature = "postgres", feature = "sqlite"),
     all(feature = "postgres", feature = "mongodb"),
+    all(feature = "postgres", feature = "duckdb"),
     all(feature = "sqlite", feature = "mongodb"),
+    all(feature = "sqlite", feature = "duckdb"),
+    all(feature = "mongodb", feature = "duckdb"),
 ))]
 compile_error!(
-    "the `postgres`, `mongodb`, and `sqlite` features are mutually exclusive: a \
+    "the `postgres`, `mongodb`, `sqlite`, and `duckdb` features are mutually exclusive: a \
      thin bin installs exactly one backend (e.g. build the MongoDB binary with \
      `--no-default-features --features mongodb`)"
 );
-#[cfg(not(any(feature = "postgres", feature = "mongodb", feature = "sqlite")))]
+#[cfg(not(any(
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "sqlite",
+    feature = "duckdb"
+)))]
 compile_error!(
-    "no backend selected: enable the `postgres` (default), `mongodb`, or `sqlite` feature"
+    "no backend selected: enable the `postgres` (default), `mongodb`, `sqlite`, or `duckdb` feature"
 );
 
 // Developer mode relaxes the security posture (plain HTTP on loopback, open
@@ -37,14 +46,16 @@ compile_error!(
 // dev/CI-suitable backend. Rather than denying each production backend by name
 // (every backend is a production backend unless proven otherwise, so a deny-list
 // would have to grow with each new one), require a known dev backend: dev-mode
-// compiles only when `sqlite` is enabled. `sqlite-memory` enables `sqlite`, so it
-// is covered too; postgres, mongodb — or any future production backend — fail the
-// build, so there is no path by which a production deployment can serve in dev mode.
-#[cfg(all(feature = "dev-mode", not(feature = "sqlite")))]
+// compiles only when `sqlite` or `duckdb` is enabled (both embedded, both with an
+// in-memory mode). `sqlite-memory` / `duckdb-memory` enable their base feature,
+// so they are covered too; postgres, mongodb — or any future production backend —
+// fail the build, so there is no path by which a production deployment can serve
+// in dev mode.
+#[cfg(all(feature = "dev-mode", not(any(feature = "sqlite", feature = "duckdb"))))]
 compile_error!(
-    "the `dev-mode` feature requires a dev/CI backend such as `sqlite`; it must \
-     not be built with a production backend like `postgres` or `mongodb` (build \
-     with `--no-default-features --features sqlite-memory,dev-mode`)"
+    "the `dev-mode` feature requires a dev/CI backend such as `sqlite` or `duckdb`; \
+     it must not be built with a production backend like `postgres` or `mongodb` \
+     (build with `--no-default-features --features sqlite-memory,dev-mode`)"
 );
 
 fn main() -> anyhow::Result<()> {
@@ -57,6 +68,8 @@ fn main() -> anyhow::Result<()> {
     extenddb_storage::set_backend(extenddb_storage_sqlite::backend())?;
     #[cfg(feature = "mongodb")]
     extenddb_storage::set_backend(extenddb_storage_mongodb::backend())?;
+    #[cfg(feature = "duckdb")]
+    extenddb_storage::set_backend(extenddb_storage_duckdb::backend())?;
 
     extenddb_app::run(extenddb_app::BuildInfo {
         // Read from the bin crate so the reported version is the deployed
@@ -77,6 +90,8 @@ mod tests {
         let _ = extenddb_storage::set_backend(extenddb_storage_sqlite::backend());
         #[cfg(feature = "mongodb")]
         let _ = extenddb_storage::set_backend(extenddb_storage_mongodb::backend());
+        #[cfg(feature = "duckdb")]
+        let _ = extenddb_storage::set_backend(extenddb_storage_duckdb::backend());
     }
 
     /// Zero-config serve contract: with the SQLite backend installed,
@@ -100,6 +115,28 @@ mod tests {
             assert!(
                 path.ends_with("extenddb.sqlite"),
                 "default file path should be extenddb.sqlite, got: {path}"
+            );
+        }
+    }
+
+    /// Zero-config serve contract for the DuckDB backend, mirroring the SQLite
+    /// one: built-in defaults load with no config file, bind to loopback, and
+    /// select the backend's default database path.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn builtin_defaults_load_for_duckdb_and_bind_loopback() {
+        install_backend();
+        let cfg = extenddb_config::load_builtin_defaults()
+            .expect("duckdb storage config has no required fields");
+        assert_eq!(cfg.server.bind_addr, "127.0.0.1");
+        assert_eq!(cfg.server.port, 18443);
+        let path = cfg.storage.connection_config();
+        if cfg!(feature = "duckdb-memory") {
+            assert_eq!(path, ":memory:");
+        } else {
+            assert!(
+                path.ends_with("extenddb.duckdb"),
+                "default file path should be extenddb.duckdb, got: {path}"
             );
         }
     }

@@ -29,7 +29,7 @@
 # run_dir = "~/.extenddb/run"  # Directory for PID file (~ is expanded to $HOME)
 
 [storage]
-# backend = "postgres"         # Storage backend: "postgres" (default), "mongodb", or "sqlite".
+# backend = "postgres"         # Storage backend: "postgres" (default), "mongodb", "sqlite", or "duckdb".
 
 # --- SQLite backend (developer mode) ---
 # Select with `extenddb init --backend sqlite`. The database path can be given
@@ -39,6 +39,15 @@
 # Use ":memory:" for an ephemeral in-memory database (data lost on shutdown).
 # [storage.sqlite]
 # path = "extenddb.sqlite"
+
+# --- DuckDB backend (embedded, columnar) ---
+# Select with `extenddb init --backend duckdb`. The database path can be given
+# at init time (`extenddb init --duckdb-path <path>`, written into this file)
+# or set here. At serve time, the EXTENDDB__STORAGE__DUCKDB__PATH environment
+# variable overrides this value.
+# Use ":memory:" for an ephemeral in-memory database (data lost on shutdown).
+# [storage.duckdb]
+# path = "extenddb.duckdb"
 
 [storage.postgres]
 # Connection string points to the CATALOG database.
