@@ -90,7 +90,7 @@ impl OperationsEngine for CassandraOperationsEngine {
     }
 
     fn catalog_version(&self) -> String {
-        "0.0.4".to_string()
+        "0.0.1".to_string()
     }
 
     fn is_sensitive_key(&self, key: &str) -> bool {

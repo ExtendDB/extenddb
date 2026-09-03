@@ -132,6 +132,16 @@ fn same_queue_key(left: &TtlEntry, right: &TtlEntry) -> bool {
         && left.key_data == right.key_data
 }
 
+/// Append a statement to a batch held behind a mutable reference.
+///
+/// `BatchQueryBuilder::add_query` consumes the builder, so appending through a
+/// `&mut` needs a swap. Doing that inline at each call site buried the statements
+/// being built.
+fn push_query(batch: &mut BatchQueryBuilder, cql: String, values: cdrs_tokio::query::QueryValues) {
+    let previous = std::mem::replace(batch, BatchQueryBuilder::new());
+    *batch = previous.add_query(cql, values);
+}
+
 pub(crate) fn add_ttl_queue_mutations(
     batch: &mut BatchQueryBuilder,
     account_keyspace: &str,
@@ -169,8 +179,7 @@ pub(crate) fn add_ttl_queue_mutations(
             old.key_hash.as_str(),
             old.key_data.as_str()
         );
-        let previous = std::mem::replace(batch, BatchQueryBuilder::new());
-        *batch = previous.add_query(cql, values);
+        push_query(batch, cql, values);
     }
 
     if let Some(new) = new_entry {
@@ -178,8 +187,8 @@ pub(crate) fn add_ttl_queue_mutations(
             "INSERT INTO {account_keyspace}.{TTL_BUCKET_TABLE} \
              (table_id, generation, bucket, shard) VALUES (?, ?, ?, ?)"
         );
-        let previous = std::mem::replace(batch, BatchQueryBuilder::new());
-        *batch = previous.add_query(
+        push_query(
+            batch,
             bucket_cql,
             cdrs_tokio::query_values!(
                 key_info.table_id.as_str(),
@@ -194,8 +203,8 @@ pub(crate) fn add_ttl_queue_mutations(
              (table_id, generation, bucket, shard, expires_at, key_hash, key_data, \
               state, work_id, work_data) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', null, null)"
         );
-        let previous = std::mem::replace(batch, BatchQueryBuilder::new());
-        *batch = previous.add_query(
+        push_query(
+            batch,
             entry_cql,
             cdrs_tokio::query_values!(
                 key_info.table_id.as_str(),
@@ -237,8 +246,8 @@ pub(crate) fn add_ttl_reconciliation_mutation(
          (worker_partition, id, table_id, account_id, table_name, key_data) \
          VALUES (?, now(), ?, ?, ?, ?)"
     );
-    let previous = std::mem::replace(batch, BatchQueryBuilder::new());
-    *batch = previous.add_query(
+    push_query(
+        batch,
         cql,
         cdrs_tokio::query_values!(
             partition,

@@ -19,7 +19,7 @@ use crate::config::CassandraStorageConfig;
 use crate::engine::CassandraEngine;
 use crate::migrations;
 
-const CATALOG_VERSION: &str = "0.0.4";
+const CATALOG_VERSION: &str = "0.0.3";
 
 // Helper structs for parsing Cassandra rows
 #[derive(Debug, Clone, TryFromRow)]
