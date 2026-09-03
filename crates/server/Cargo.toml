@@ -7,6 +7,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+mongodb-test-hooks = []
+
 [dependencies]
 extenddb-cache = { workspace = true }
 extenddb-core = { workspace = true }

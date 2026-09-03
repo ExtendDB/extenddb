@@ -8,7 +8,7 @@
 use futures::TryStreamExt;
 use futures::future::BoxFuture;
 use mongodb::IndexModel;
-use mongodb::bson::{Document, doc};
+use mongodb::bson::{Bson, Document, doc};
 use mongodb::options::IndexOptions;
 
 use extenddb_core::types::{Item, Tag, TimeToLiveDescription, TimeToLiveStatus};
@@ -30,6 +30,76 @@ fn extract_id_fields(doc: &Document) -> (String, String) {
         .unwrap_or_default()
         .to_owned();
     (account_id, table_name)
+}
+
+/// Build the expression that reads a DynamoDB attribute from `item_data` as a
+/// literal field name. MongoDB normally interprets dots in a query field path
+/// as nested-document traversal, but DynamoDB permits dots in attribute names.
+fn literal_ttl_value_expression(ttl_attribute: &str) -> Document {
+    doc! {
+        "$getField": {
+            "field": "N",
+            "input": {
+                "$getField": {
+                    "field": ttl_attribute,
+                    "input": "$item_data",
+                }
+            }
+        }
+    }
+}
+
+fn literal_ttl_epoch_expression(ttl_attribute: &str) -> Document {
+    doc! {
+        "$convert": {
+            "input": literal_ttl_value_expression(ttl_attribute),
+            "to": "long",
+            "onError": Bson::Null,
+            "onNull": Bson::Null,
+        }
+    }
+}
+
+/// Return the candidate filter and sort for the TTL sweep.
+///
+/// Keep the normal dotted-path form for ordinary attribute names so MongoDB
+/// can use the sparse TTL lookup index. For names containing a dot, use
+/// `$getField` so the attribute name is treated literally; that path cannot be
+/// represented by MongoDB's ordinary field-path query syntax. The dotted path
+/// also performs the expiry comparison in MongoDB, so non-expired low-`_id`
+/// documents cannot starve expired documents later in the collection.
+fn ttl_candidate_query(ttl_attribute: &str, now_epoch: i64) -> (Document, Document) {
+    let ttl_field = format!("item_data.{ttl_attribute}.N");
+    if ttl_attribute.contains('.') {
+        let ttl_epoch = literal_ttl_epoch_expression(ttl_attribute);
+        (
+            doc! {
+                "$expr": {
+                    "$let": {
+                        "vars": { "ttl": ttl_epoch },
+                        "in": {
+                            "$and": [
+                                { "$ne": ["$$ttl", Bson::Null] },
+                                { "$gte": ["$$ttl", 1] },
+                                { "$lte": ["$$ttl", now_epoch] },
+                            ]
+                        }
+                    }
+                }
+            },
+            doc! { "_id": 1 },
+        )
+    } else {
+        (
+            doc! {
+                &ttl_field: {
+                    "$exists": true,
+                    "$ne": Bson::Null,
+                }
+            },
+            doc! { &ttl_field: 1 },
+        )
+    }
 }
 
 impl MetadataEngine for MongoEngine {
@@ -283,6 +353,20 @@ impl MetadataEngine for MongoEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?
                 .ok_or_else(|| StorageError::TableNotFound(table_name.clone()))?;
 
+            // MongoDB interprets dots in an index key as nested traversal,
+            // while DynamoDB treats them as part of the attribute name. The
+            // dotted sweep uses a literal $getField expression instead, so a
+            // MongoDB field-path index here would be both incorrect and
+            // unused. Mark the expression-based sweep ready without creating
+            // that misleading index.
+            if ttl_attribute.contains('.') {
+                tables_coll
+                    .update_one(id_filter, doc! { "$set": { "ttl_index_ready": true } })
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                return Ok(());
+            }
+
             let table_id = table_doc
                 .get_str("table_id")
                 .map_err(|_| StorageError::Internal("missing table_id".to_string()))?;
@@ -321,9 +405,11 @@ impl MetadataEngine for MongoEngine {
         &self,
         account_id: &str,
         table_name: &str,
+        ttl_attribute: &str,
     ) -> BoxFuture<'_, Result<(), StorageError>> {
         let account_id = account_id.to_string();
         let table_name = table_name.to_string();
+        let ttl_attribute = ttl_attribute.to_string();
         Box::pin(async move {
             let tables_coll = self.catalog_db.collection::<Document>("tables");
             let id_filter =
@@ -343,21 +429,32 @@ impl MetadataEngine for MongoEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?
                 .ok_or_else(|| StorageError::TableNotFound(table_name.clone()))?;
-
             let table_id = table_doc
                 .get_str("table_id")
                 .map_err(|_| StorageError::Internal("missing table_id".to_string()))?;
 
-            let ttl_attribute = table_doc.get_str("ttl_attribute").unwrap_or_default();
             let index_name = format!("idx_ttl_{ttl_attribute}");
 
             let coll_name = data_collection_name(table_id);
             let data_coll = self.data_db.collection::<Document>(&coll_name);
 
-            data_coll
-                .drop_index(index_name)
-                .await
-                .map_err(|e| StorageError::Internal(format!("TTL index drop failed: {e}")))?;
+            // Dotted attributes no longer create physical indexes because
+            // MongoDB would reinterpret their names as nested paths. Older
+            // deployments did create `idx_ttl_<attribute>` anyway, so still
+            // attempt to remove that legacy index. A current dotted table has
+            // no index to drop; MongoDB reports IndexNotFound (code 27), which
+            // is the desired idempotent outcome here.
+            if let Err(e) = data_coll.drop_index(index_name).await {
+                let index_missing = matches!(
+                    *e.kind,
+                    mongodb::error::ErrorKind::Command(ref command) if command.code == 27
+                );
+                if !index_missing {
+                    return Err(StorageError::Internal(format!(
+                        "TTL index drop failed: {e}"
+                    )));
+                }
+            }
 
             Ok(())
         })
@@ -393,20 +490,16 @@ impl MetadataEngine for MongoEngine {
                 .unwrap_or_default()
                 .as_secs() as i64;
 
-            let ttl_field = format!("item_data.{ttl_attribute}.N");
-
-            // Find items where TTL attribute N value is between 1 and now (expired)
-            // DynamoDB stores numbers as strings in the N field
-            let filter = doc! {
-                &ttl_field: {
-                    "$exists": true,
-                    "$ne": mongodb::bson::Bson::Null,
-                }
-            };
+            // Find items that have a non-null DynamoDB N value. The Rust
+            // re-check below applies the actual expiry window because DynamoDB
+            // numbers are stored as strings and MongoDB must not compare them
+            // lexicographically. Dotted attribute names use $getField so the
+            // name remains literal instead of becoming nested path traversal.
+            let (filter, sort) = ttl_candidate_query(&ttl_attribute, now_epoch);
 
             let mut cursor = data_coll
                 .find(filter)
-                .sort(doc! { &ttl_field: 1 })
+                .sort(sort)
                 .limit(limit as i64 * 2) // over-fetch since we filter in app
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -540,5 +633,80 @@ impl MetadataEngine for MongoEngine {
             }
             Ok(results)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ttl_candidate_query;
+    use mongodb::bson::{Bson, doc};
+
+    #[test]
+    fn ttl_query_keeps_simple_attribute_on_indexed_path() {
+        let (filter, sort) = ttl_candidate_query("expires_at", 1_700_000_000);
+
+        assert_eq!(
+            filter,
+            doc! {
+                "item_data.expires_at.N": {
+                    "$exists": true,
+                    "$ne": mongodb::bson::Bson::Null,
+                }
+            }
+        );
+        assert_eq!(sort, doc! { "item_data.expires_at.N": 1 });
+    }
+
+    #[test]
+    fn ttl_query_reads_dotted_attribute_as_literal_field() {
+        let (filter, sort) = ttl_candidate_query("expires.at", 1_700_000_000);
+
+        let expr = filter.get_document("$expr").expect("$expr filter");
+        let let_expr = expr.get_document("$let").expect("$let expression");
+        let vars = let_expr.get_document("vars").expect("$let variables");
+        let ttl_convert = vars
+            .get_document("ttl")
+            .expect("converted TTL expression")
+            .get_document("$convert")
+            .expect("$convert expression");
+        assert_eq!(ttl_convert.get_str("to").ok(), Some("long"));
+        assert_eq!(ttl_convert.get("onError"), Some(&mongodb::bson::Bson::Null));
+        assert_eq!(ttl_convert.get("onNull"), Some(&mongodb::bson::Bson::Null));
+
+        let outer_get_field = ttl_convert
+            .get_document("input")
+            .expect("literal N value expression")
+            .get_document("$getField")
+            .expect("outer $getField");
+        assert_eq!(outer_get_field.get_str("field").ok(), Some("N"));
+
+        let attribute_value = outer_get_field
+            .get_document("input")
+            .expect("attribute value expression");
+        let inner_get_field = attribute_value
+            .get_document("$getField")
+            .expect("inner $getField");
+        assert_eq!(inner_get_field.get_str("field").ok(), Some("expires.at"));
+        assert_eq!(inner_get_field.get_str("input").ok(), Some("$item_data"));
+
+        let conditions = let_expr
+            .get_document("in")
+            .expect("$let body")
+            .get_array("$and")
+            .expect("expiry conditions");
+        assert_eq!(conditions.len(), 3);
+        assert_eq!(
+            conditions[0],
+            Bson::Document(doc! { "$ne": ["$$ttl", Bson::Null] })
+        );
+        assert_eq!(conditions[1], Bson::Document(doc! { "$gte": ["$$ttl", 1] }));
+        assert_eq!(
+            conditions[2],
+            Bson::Document(doc! { "$lte": ["$$ttl", 1_700_000_000_i64] })
+        );
+
+        // There is no ordinary dotted field path for this case, so use a
+        // stable sort that does not reinterpret the attribute name.
+        assert_eq!(sort, doc! { "_id": 1 });
     }
 }

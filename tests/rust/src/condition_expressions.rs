@@ -146,6 +146,47 @@ async fn condition_equals_string() {
 }
 
 #[tokio::test]
+async fn condition_literal_dotted_attribute_with_alias() {
+    let c = client();
+    let t = tables().await;
+    let mut item = create_item(&t.simple_key_string);
+    item.insert("a.b".into(), s("before"));
+    let key = get_key(&t.simple_key_string, &item);
+
+    c.put_item()
+        .table_name(&t.simple_key_string)
+        .set_item(Some(item))
+        .send()
+        .await
+        .unwrap();
+
+    c.update_item()
+        .table_name(&t.simple_key_string)
+        .set_key(Some(key.clone()))
+        .update_expression("SET marker = :marker")
+        .condition_expression("#dot = :expected")
+        .expression_attribute_names("#dot", "a.b")
+        .expression_attribute_values(":expected", s("before"))
+        .expression_attribute_values(":marker", s("condition-passed"))
+        .send()
+        .await
+        .unwrap();
+
+    let get = c
+        .get_item()
+        .table_name(&t.simple_key_string)
+        .set_key(Some(key))
+        .consistent_read(true)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        get.item().unwrap().get("marker").unwrap().as_s().unwrap(),
+        "condition-passed"
+    );
+}
+
+#[tokio::test]
 async fn condition_not_equals() {
     let c = client();
     let t = tables().await;

@@ -14,6 +14,7 @@ use extenddb_storage::{DataEngine, MetadataEngine, StreamEngine, TableEngine, Wo
 use futures::TryStreamExt;
 
 use crate::MongoEngine;
+use crate::data_engine::{GsiBackfillContext, GsiBackfillMode};
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(60);
 const BATCH_SIZE: usize = 100;
@@ -65,10 +66,10 @@ pub(crate) async fn stream_record_cleanup_worker(storage: Arc<MongoEngine>) {
 /// Live writes during the backfill window continue to route through
 /// `sync_indexes` / `sync_indexes_in_session`, which write to
 /// CREATING indexes too (indexes catalog membership, not status, is
-/// what gates the write path). All writes are upserts on the same
-/// `_id` shape, so a base item touched by both the backfill and a
-/// concurrent write converges regardless of interleaving —
-/// RFC-0003 §2.4.
+/// what gates the write path). Both paths use a transaction over the
+/// base and index rows, so a concurrent mutation serializes with or
+/// aborts the backfill rather than being overwritten by a stale upsert
+/// — RFC-0003 §2.4.
 pub(crate) async fn gsi_backfill_worker(storage: Arc<MongoEngine>) {
     loop {
         tokio::time::sleep(GSI_BACKFILL_INTERVAL).await;
@@ -132,19 +133,19 @@ async fn run_gsi_backfill_job(storage: &MongoEngine, job: &Document) -> Result<(
             non_key_attributes: None,
         });
 
+    let context = GsiBackfillContext {
+        key_info: &key_info,
+        index_id: &index_id,
+        idx_key_schema: &idx_key_schema,
+        projection: &projection,
+        mode: GsiBackfillMode::Live,
+    };
     let mut cursor = job.get("backfill_cursor").cloned();
     let indexes_coll = storage.catalog_db.collection::<Document>("indexes");
 
     loop {
         let progress = storage
-            .backfill_gsi_batch(
-                &key_info,
-                &index_id,
-                &idx_key_schema,
-                &projection,
-                cursor.as_ref(),
-                GSI_BACKFILL_BATCH,
-            )
+            .backfill_gsi_batch(&context, cursor.as_ref(), GSI_BACKFILL_BATCH)
             .await?;
 
         if progress.done {
