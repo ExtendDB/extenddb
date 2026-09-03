@@ -296,17 +296,29 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     let cred_store = components.credential_store;
     let runtime_hooks = components.runtime_hooks;
 
-    // Dev mode: adopt the credential the SDK will sign with (from the standard
-    // AWS_* env) and verify against it. Seeded here so it works for both
-    // file-backed and bootstrap-on-serve (in-memory) deployments. SigV4
-    // verification is unchanged; only the IAM policy decision is opened.
+    // Dev mode: seed the credentials the SDK may sign with and verify against
+    // them (see `dev_credentials` for the vending contract). Seeded here so it
+    // works for both file-backed and bootstrap-on-serve (in-memory)
+    // deployments. SigV4 verification is unchanged; only the IAM policy
+    // decision is opened.
     if dev_mode {
-        let dev_access_key = seed_dev_credential(catalog_store.as_ref()).await?;
+        let dev_creds = crate::dev_credentials::resolve()?;
+        crate::dev_credentials::seed(catalog_store.as_ref(), cred_store.as_ref(), &dev_creds)
+            .await?;
         tracing::warn!(
             "DEVELOPER MODE active — plain HTTP, authorization open (SigV4 still \
-             enforced). Storage: {}. Signing credential: {dev_access_key}",
+             enforced). Storage: {}. Signing credentials: {}",
             config::redact_password(app_config.storage.connection_config()),
+            crate::dev_credentials::describe(&dev_creds),
         );
+        if let Some(ignored) = crate::dev_credentials::ignored_aws_env_key(&dev_creds) {
+            tracing::warn!(
+                "AWS_ACCESS_KEY_ID is set in the environment but dev mode does not adopt \
+                 it; requests signed with '{ignored}' will get UnrecognizedClientException. \
+                 Set EXTENDDB_DEV_ACCESS_KEY_ID and EXTENDDB_DEV_SECRET_ACCESS_KEY to seed \
+                 an additional credential, or sign with the built-in example pair."
+            );
+        }
     }
 
     // Build SwrCacheConfig values from the [auth.cache] TOML section.
@@ -681,78 +693,4 @@ pub fn log_to_syslog_raw(msg: &str) {
 #[cfg(not(unix))]
 pub fn log_to_syslog_raw(msg: &str) {
     eprintln!("{msg}");
-}
-
-/// Seed (or refresh) the developer-mode credential and return its access key id.
-///
-/// Dev mode verifies SigV4 exactly like production, so the server must know the
-/// credential the SDK signs with. To stay a drop-in for local development:
-///
-///  * If `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` are set in the server's
-///    environment, the server **adopts and verifies against them**. In the
-///    common CI case the SDK and the co-located server read the same env, so
-///    the user changes nothing but the endpoint URL.
-///  * Otherwise it seeds AWS's documented example credential as a well-known
-///    default the user can point any SDK at.
-///
-/// This mirrors the admin-credential pattern (env-or-default), differing only in
-/// that the default is well-known rather than randomly generated, because an SDK
-/// must know the credential up front (it cannot read a printed banner). Seeding
-/// goes through the generic management surface, so it is backend-agnostic.
-async fn seed_dev_credential(
-    catalog_store: &dyn extenddb_storage::CatalogStore,
-) -> anyhow::Result<String> {
-    use extenddb_storage::management_store::OpError;
-
-    // AWS's documented example credential (recognised everywhere and allowlisted
-    // by secret scanners): the zero-config default users point their SDK at.
-    const DEFAULT_ACCESS_KEY_ID: &str = "AKIAIOSFODNN7EXAMPLE";
-    const DEFAULT_SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
-
-    let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_ACCESS_KEY_ID.to_owned());
-    let secret = std::env::var("AWS_SECRET_ACCESS_KEY")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_SECRET.to_owned());
-
-    // The access-key prefix is a credential-type discriminator across the auth
-    // layer: `AKIA*` = long-lived IAM user keys, `ASIA*` = temporary role
-    // session credentials (they carry `is_session`, are subject to
-    // ExpiredTokenException, and are invalidated with their role). The dev
-    // credential is a long-lived key on a *user*, so require the AKIA shape; an
-    // ASIA-shaped key here would be a user credential the rest of the system
-    // treats as a role session credential (e.g. user-delete invalidation
-    // matches `AKIA*`, not `ASIA*`).
-    if !access_key_id.starts_with("AKIA") {
-        anyhow::bail!(
-            "dev credential AWS_ACCESS_KEY_ID must be AKIA-shaped (got '{access_key_id}'); \
-             use e.g. AKIAIOSFODNN7EXAMPLE, or unset it to use the default."
-        );
-    }
-
-    // Attach the dev user to the deployment's recorded default account (set at
-    // bootstrap) rather than inferring it from account-list ordering.
-    let account_id = catalog_store
-        .default_account_id()
-        .await
-        .map_err(|e| anyhow::anyhow!("dev mode: failed to read default account: {e:?}"))?
-        .ok_or_else(|| {
-            anyhow::anyhow!("dev mode: no default account recorded (catalog not bootstrapped)")
-        })?;
-
-    match catalog_store.create_user(&account_id, "dev", None).await {
-        Ok(()) | Err(OpError::AlreadyExists(_)) => {}
-        Err(e) => anyhow::bail!("dev mode: failed to create dev user: {e:?}"),
-    }
-    match catalog_store
-        .import_access_key(&account_id, "dev", &access_key_id, &secret)
-        .await
-    {
-        Ok(()) | Err(OpError::AlreadyExists(_)) => {}
-        Err(e) => anyhow::bail!("dev mode: failed to import dev credential: {e:?}"),
-    }
-    Ok(access_key_id)
 }

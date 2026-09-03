@@ -135,6 +135,60 @@ pub(super) async fn upsert_item_in_tx(
     Ok(())
 }
 
+/// Insert an item within a transaction only when its row does not exist yet,
+/// returning whether the insert won.
+///
+/// `fetch_item_for_update` cannot lock a row that does not exist, so two
+/// transactions writing the same NEW item can both read "absent" and both
+/// pass their condition checks. This helper is the atomic arbiter for that
+/// create race: `ON CONFLICT DO NOTHING` blocks on a concurrent uncommitted
+/// insert; if that writer commits it reports zero rows affected (we lost), and
+/// if that writer aborts our insert proceeds and wins. A loser's caller then
+/// re-reads the now-committed (and lockable) state and re-evaluates its
+/// condition instead of silently overwriting the winner.
+pub(super) async fn insert_item_if_absent_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    key_info: &TableKeyInfo,
+    item: &Item,
+) -> Result<bool, StorageError> {
+    let ddb_table = data_table_name(&key_info.table_id);
+    let pk_name = &key_info.key_schema[0].attribute_name;
+    let pk_value = item
+        .get(pk_name)
+        .ok_or_else(|| StorageError::Internal("missing partition key".to_owned()))?;
+    let pk_text = pk_to_text(pk_value)?;
+    let item_json =
+        serde_json::to_value(item).map_err(|e| StorageError::Internal(e.to_string()))?;
+
+    let rows_affected = if let Some((sk_name, sk_type)) =
+        sk_info(&key_info.key_schema, &key_info.attribute_definitions)
+    {
+        let sk_value = item
+            .get(sk_name)
+            .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?;
+        let sk = parse_sk(sk_value, sk_type)?;
+        let sk_col = sk_column(sk_type);
+        let sql = format!(
+            "INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES ($1, $2, $3) \
+             ON CONFLICT (pk, {sk_col}) DO NOTHING"
+        );
+        bind_sk_execute!(&sql, pk_text.as_ref(), &sk, &item_json, &mut **tx)?.rows_affected()
+    } else {
+        let sql = format!(
+            "INSERT INTO {ddb_table} (pk, item_data) VALUES ($1, $2) \
+             ON CONFLICT (pk) DO NOTHING"
+        );
+        sqlx::query(&sql)
+            .bind(pk_text.as_ref())
+            .bind(&item_json)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .rows_affected()
+    };
+    Ok(rows_affected == 1)
+}
+
 /// Delete an item by key within a transaction.
 pub(super) async fn delete_item_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
