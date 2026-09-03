@@ -119,6 +119,58 @@ async fn enable_ttl_with_dotted_attribute_name() {
 }
 
 #[tokio::test]
+async fn expired_item_with_dotted_ttl_attribute_is_deleted() {
+    let c = client();
+    let name = create_ttl_table(c).await;
+    c.update_time_to_live()
+        .table_name(&name)
+        .time_to_live_specification(
+            TimeToLiveSpecification::builder()
+                .enabled(true)
+                .attribute_name("expires.at")
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let past_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .saturating_sub(3600);
+    c.put_item()
+        .table_name(&name)
+        .item("pk", s("dotted-ttl-item"))
+        .item("expires.at", n(past_epoch as i64))
+        .send()
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        let response = c
+            .get_item()
+            .table_name(&name)
+            .key("pk", s("dotted-ttl-item"))
+            .consistent_read(true)
+            .send()
+            .await
+            .unwrap();
+        let item = response.item();
+        if item.is_none() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "TTL worker did not delete the expired dotted attribute item"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+#[tokio::test]
 async fn disable_ttl() {
     let c = client();
     let name = create_ttl_table(c).await;
