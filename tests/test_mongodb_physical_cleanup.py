@@ -14,10 +14,14 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 
 import pytest
+import requests
 
 from conftest import wait_for_active, wait_for_deleted
+
+GSI_BACKFILL_TEST_GATE = "gsi_backfill_test_gate"
 
 
 @pytest.fixture()
@@ -90,6 +94,59 @@ print(JSON.stringify(result));
     return _mongo_eval(container, javascript)
 
 
+def _backfill_gate_url(table_name: str) -> str:
+    endpoint = os.environ.get("EXTENDDB_TEST_ENDPOINT", "").strip()
+    if not endpoint:
+        pytest.skip("requires EXTENDDB_TEST_ENDPOINT")
+    gate_key = f"{GSI_BACKFILL_TEST_GATE}:{table_name}"
+    return f"{endpoint.rstrip('/')}/management/settings/{gate_key}"
+
+
+def _set_backfill_gate(table_name: str, value: str) -> None:
+    user = os.environ.get("EXTENDDB_ADMIN_USER", "admin")
+    password = os.environ.get("EXTENDDB_ADMIN_PASSWORD", "").strip()
+    if not password:
+        pytest.fail("EXTENDDB_ADMIN_PASSWORD is required for the backfill gate")
+    response = requests.put(
+        _backfill_gate_url(table_name),
+        auth=(user, password),
+        json={"value": value},
+        timeout=30,
+        verify=False,
+    )
+    if not response.ok:
+        pytest.fail(f"setting GSI backfill gate failed: {response.status_code}: {response.text}")
+
+
+def _wait_for_backfill_gate(table_name: str, value: str, timeout: float = 30.0) -> bool:
+    user = os.environ.get("EXTENDDB_ADMIN_USER", "admin")
+    password = os.environ.get("EXTENDDB_ADMIN_PASSWORD", "").strip()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        response = requests.get(
+            _backfill_gate_url(table_name),
+            auth=(user, password),
+            timeout=30,
+            verify=False,
+        )
+        if response.ok and response.json().get("value") == value:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _wait_for_physical_collection_absent(
+    container: str, index_id: str, timeout: float = 30.0
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        present = _physical_collections_exist(container, index_id)
+        if not present[f"_ddb_{index_id}"]:
+            return
+        time.sleep(0.1)
+    pytest.fail(f"physical index collection _ddb_{index_id} was not removed")
+
+
 def _create_gsi_table(client, table_name: str) -> None:
     client.create_table(
         TableName=table_name,
@@ -110,6 +167,15 @@ def _create_gsi_table(client, table_name: str) -> None:
             }
         ],
         ProvisionedThroughput={"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
+    )
+
+
+def _create_hash_only_table(client, table_name: str) -> None:
+    client.create_table(
+        TableName=table_name,
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        BillingMode="PAY_PER_REQUEST",
     )
 
 
@@ -141,6 +207,74 @@ def test_update_table_gsi_delete_drops_physical_collection(
         remaining = _physical_collections_exist(mongodb_container, physical["indexId"])
         assert remaining[f"_ddb_{physical['indexId']}"] is False
     finally:
+        _cleanup_table(dynamodb_client, unique_table_name)
+
+
+def test_deleting_gsi_during_backfill_drops_orphaned_collection(
+    dynamodb_client, unique_table_name, mongodb_container
+):
+    """Deleting a backfilling GSI must not leave its physical collection behind."""
+    if os.environ.get("EXTENDDB_TEST_MONGODB_TEST_HOOKS") != "1":
+        pytest.skip("requires the MongoDB test-hook build")
+
+    _create_hash_only_table(dynamodb_client, unique_table_name)
+    wait_for_active(dynamodb_client, unique_table_name)
+    gate_armed = False
+
+    try:
+        dynamodb_client.put_item(
+            TableName=unique_table_name,
+            Item={"pk": {"S": "item-1"}, "gsi_pk": {"S": "value-1"}},
+        )
+        _set_backfill_gate(unique_table_name, "armed")
+        gate_armed = True
+
+        dynamodb_client.update_table(
+            TableName=unique_table_name,
+            AttributeDefinitions=[
+                {"AttributeName": "gsi_pk", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexUpdates=[
+                {
+                    "Create": {
+                        "IndexName": "gsi1",
+                        "KeySchema": [{"AttributeName": "gsi_pk", "KeyType": "HASH"}],
+                        "Projection": {"ProjectionType": "ALL"},
+                    }
+                }
+            ],
+        )
+
+        assert _wait_for_backfill_gate(unique_table_name, "paused"), (
+            "backfill did not reach its deterministic pause"
+        )
+        physical = _physical_ids(mongodb_container, unique_table_name, "gsi1")
+        assert physical["indexCollectionExists"]
+
+        dynamodb_client.update_table(
+            TableName=unique_table_name,
+            GlobalSecondaryIndexUpdates=[{"Delete": {"IndexName": "gsi1"}}],
+        )
+
+        # Releasing the worker lets it finish the batch. Its catalog cursor
+        # update must observe that the index document was deleted, then remove
+        # the collection that the batch upsert may have recreated.
+        _set_backfill_gate(unique_table_name, "release")
+        gate_armed = False
+
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            description = dynamodb_client.describe_table(TableName=unique_table_name)
+            if not description["Table"].get("GlobalSecondaryIndexes"):
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("deleted Global Secondary Index remained in the table description")
+
+        _wait_for_physical_collection_absent(mongodb_container, physical["indexId"])
+    finally:
+        if gate_armed:
+            _set_backfill_gate(unique_table_name, "release")
         _cleanup_table(dynamodb_client, unique_table_name)
 
 

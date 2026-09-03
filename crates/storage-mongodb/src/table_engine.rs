@@ -1549,7 +1549,7 @@ impl MongoEngine {
     }
 
     /// Drop the physical collection backing one secondary index.
-    async fn drop_index_collection(&self, index_id: &str) -> Result<(), StorageError> {
+    pub(crate) async fn drop_index_collection(&self, index_id: &str) -> Result<(), StorageError> {
         let coll_name = data_collection_name(index_id);
         match self.data_db.collection::<Document>(&coll_name).drop().await {
             Ok(()) => {}

@@ -150,7 +150,7 @@ async fn run_gsi_backfill_job(storage: &MongoEngine, job: &Document) -> Result<(
 
         if progress.done {
             // Full-scan complete. Flip to ACTIVE and drop the cursor.
-            indexes_coll
+            let result = indexes_coll
                 .update_one(
                     doc! { "index_id": &index_id, "index_status": "CREATING" },
                     doc! {
@@ -160,6 +160,13 @@ async fn run_gsi_backfill_job(storage: &MongoEngine, job: &Document) -> Result<(
                 )
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if result.matched_count == 0 {
+                tracing::info!(
+                    "GSI backfill worker: index_id={index_id} was deleted during backfill; dropping orphan collection"
+                );
+                storage.drop_index_collection(&index_id).await?;
+                return Ok(());
+            }
             tracing::info!(
                 "GSI backfill worker: index_id={index_id} ACTIVE (last batch scanned {} docs)",
                 progress.scanned,
@@ -168,13 +175,20 @@ async fn run_gsi_backfill_job(storage: &MongoEngine, job: &Document) -> Result<(
         }
 
         if let Some(ref last_id) = progress.last_id {
-            indexes_coll
+            let result = indexes_coll
                 .update_one(
-                    doc! { "index_id": &index_id },
+                    doc! { "index_id": &index_id, "index_status": "CREATING" },
                     doc! { "$set": { "backfill_cursor": last_id.clone() } },
                 )
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if result.matched_count == 0 {
+                tracing::info!(
+                    "GSI backfill worker: index_id={index_id} was deleted during backfill; dropping orphan collection"
+                );
+                storage.drop_index_collection(&index_id).await?;
+                return Ok(());
+            }
             cursor = Some(last_id.clone());
         } else {
             // Empty batch but the scan did not report completion. This
