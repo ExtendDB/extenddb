@@ -567,11 +567,7 @@ impl MongoEngine {
 
         // Drop the data collection
         let coll_name = data_collection_name(&desc.table_id);
-        self.data_db
-            .collection::<Document>(&coll_name)
-            .drop()
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        self.drop_collection_if_exists(&coll_name).await?;
 
         // The table is already DELETING, so data-plane readers are rejected;
         // unlike individual index deletion, physical cleanup can safely occur
@@ -1551,10 +1547,14 @@ impl MongoEngine {
     /// Drop the physical collection backing one secondary index.
     pub(crate) async fn drop_index_collection(&self, index_id: &str) -> Result<(), StorageError> {
         let coll_name = data_collection_name(index_id);
-        match self.data_db.collection::<Document>(&coll_name).drop().await {
+        self.drop_collection_if_exists(&coll_name).await
+    }
+
+    /// Drop a physical collection, treating an already-missing namespace as
+    /// successful so lifecycle retries can continue their cleanup.
+    async fn drop_collection_if_exists(&self, coll_name: &str) -> Result<(), StorageError> {
+        match self.data_db.collection::<Document>(coll_name).drop().await {
             Ok(()) => {}
-            // Collection deletion is intentionally idempotent. The collection
-            // may already be gone after a partial lifecycle cleanup.
             Err(e) if matches!(*e.kind, mongodb::error::ErrorKind::Command(ref c) if c.code == 26) =>
                 {}
             Err(e) => return Err(StorageError::Internal(e.to_string())),

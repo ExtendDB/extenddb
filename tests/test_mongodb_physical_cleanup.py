@@ -94,6 +94,17 @@ print(JSON.stringify(result));
     return _mongo_eval(container, javascript)
 
 
+def _drop_physical_collection(container: str, collection_id: str) -> None:
+    collection_literal = json.dumps(f"_ddb_{collection_id}")
+    javascript = f"""
+const data = db.getSiblingDB("extenddb_data");
+const dropped = data.getCollection({collection_literal}).drop();
+print(JSON.stringify({{dropped}}));
+"""
+    result = _mongo_eval(container, javascript)
+    assert result["dropped"], f"could not drop physical collection {collection_id}"
+
+
 def _backfill_gate_url(table_name: str) -> str:
     endpoint = os.environ.get("EXTENDDB_TEST_ENDPOINT", "").strip()
     if not endpoint:
@@ -297,3 +308,32 @@ def test_delete_table_drops_physical_table_and_index_collections(
     )
     assert remaining[f"_ddb_{physical['tableId']}"] is False
     assert remaining[f"_ddb_{physical['indexId']}"] is False
+
+
+def test_delete_table_tolerates_missing_physical_base_collection(
+    dynamodb_client, unique_table_name, mongodb_container
+):
+    """DeleteTable must succeed when its base collection is already absent."""
+    _create_gsi_table(dynamodb_client, unique_table_name)
+    wait_for_active(dynamodb_client, unique_table_name)
+
+    try:
+        physical = _physical_ids(mongodb_container, unique_table_name, "gsi1")
+        assert physical["tableCollectionExists"]
+        assert physical["indexCollectionExists"]
+
+        # Simulate a partial cleanup that removed the base collection before a
+        # retry reached DeleteTable. The catalog and index collection remain,
+        # so the request must continue through the rest of lifecycle cleanup.
+        _drop_physical_collection(mongodb_container, physical["tableId"])
+
+        dynamodb_client.delete_table(TableName=unique_table_name)
+        wait_for_deleted(dynamodb_client, unique_table_name)
+
+        remaining = _physical_collections_exist(
+            mongodb_container, physical["tableId"], physical["indexId"]
+        )
+        assert remaining[f"_ddb_{physical['tableId']}"] is False
+        assert remaining[f"_ddb_{physical['indexId']}"] is False
+    finally:
+        _cleanup_table(dynamodb_client, unique_table_name)
