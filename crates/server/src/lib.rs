@@ -11,6 +11,7 @@
 pub(crate) mod authorization;
 pub mod authz_cache;
 pub mod console;
+pub mod dev_credentials;
 mod handler;
 mod import_export_paths;
 pub mod key_info_cache;
