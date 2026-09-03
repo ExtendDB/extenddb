@@ -11,15 +11,19 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::PathElement;
 use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
 use extenddb_core::types::{
-    IndexType, KeyType, ProjectionType, QueryInput, QueryOutput, Select, TableKeyInfo, extract_key,
-    item_size_bytes,
+    IndexType, KeyType, ProjectionType, QueryInput, QueryOutput, Select, TableKeyInfo,
+    VECTOR_INDEX_QUERY_NOT_SUPPORTED, extract_key, item_size_bytes,
 };
+use extenddb_storage::error::StorageError;
 
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
-use crate::index_helpers::{combined_lek_key_schema, validate_query_exclusive_start_key};
+use crate::index_helpers::{
+    VectorIndexReadRefusal, classify_unresolved_index_read, combined_lek_key_schema,
+    validate_query_exclusive_start_key,
+};
 use crate::legacy_filter::{desugar_filter, desugar_key_conditions};
 use crate::read_helpers::apply_post_read;
 use crate::serialize_output;
@@ -75,30 +79,48 @@ pub async fn handle_query(
 
     // GSI/LSI: resolve index metadata if querying a secondary index.
     // Uses table_id from pre-fetched key_info to skip redundant table lookup (P118 #4).
-    let index_info = if let Some(ref idx_name) = input.index_name {
-        Some(
-            ctx.storage
+    // A vector index is not a row in the `indexes` catalog, so a not-found
+    // result is re-resolved against the vector index metadata before the
+    // name is treated as absent.
+    let (index_info, vector_index_named) = match input.index_name {
+        Some(ref idx_name) => {
+            match ctx
+                .storage
                 .index_info_by_table_id(&key_info.table_id, idx_name)
                 .await
-                .map_err(storage_err_to_dynamo)?,
-        )
-    } else {
-        None
+            {
+                // Defense in depth: no in-tree backend stores a vector index in
+                // `indexes`, but if one ever surfaces here it must be refused,
+                // not sent down the GSI/LSI data path.
+                Ok(info) if info.index_type == IndexType::Vector => (None, true),
+                Ok(info) => (Some(info), false),
+                Err(err @ StorageError::IndexNotFound(_)) => {
+                    match classify_unresolved_index_read(ctx, &key_info, idx_name).await? {
+                        VectorIndexReadRefusal::NotFound => {
+                            return Err(storage_err_to_dynamo(err));
+                        }
+                        // Query refuses a backfilling vector index with the same
+                        // message as an active one (measured 2026-08-20; Scan
+                        // differs). The refusal itself fires further down, after
+                        // the KeyConditionExpression checks.
+                        VectorIndexReadRefusal::Backfilling
+                        | VectorIndexReadRefusal::NotSupported => (None, true),
+                    }
+                }
+                Err(err) => return Err(storage_err_to_dynamo(err)),
+            }
+        }
+        None => (None, false),
     };
 
-    // A vector index is searched only via the vector search API, never queried.
-    if let Some(ref idx) = index_info
-        && idx.index_type == IndexType::Vector
-    {
-        return Err(DynamoDbError::ValidationException(
-            "Query operation not supported on this index type".to_owned(),
-        ));
-    }
-
     // ConsistentRead is not supported on GSI queries (tenet 1: fidelity).
+    // Measured 2026-08-20: it fires for a vector index too, with the same
+    // wording, and before the vector-index refusal.
     if input.consistent_read == Some(true)
-        && let Some(ref idx) = index_info
-        && idx.index_type == IndexType::Gsi
+        && (vector_index_named
+            || index_info
+                .as_ref()
+                .is_some_and(|idx| idx.index_type == IndexType::Gsi))
     {
         return Err(DynamoDbError::ValidationException(
             "Consistent reads are not supported on global secondary indexes".to_owned(),
@@ -231,6 +253,15 @@ pub async fn handle_query(
                 .to_owned(),
         ));
     };
+
+    // A vector index is searched only via the vector search API, never
+    // queried. Measured 2026-08-20: the service refuses after the
+    // KeyConditionExpression presence and syntax checks, hence below the parse.
+    if vector_index_named {
+        return Err(DynamoDbError::ValidationException(
+            VECTOR_INDEX_QUERY_NOT_SUPPORTED.to_owned(),
+        ));
+    }
 
     // Use legacy maps for key condition resolution if KeyConditions was used
     let effective_maps = if let Some(ref kc_maps) = legacy_kc_maps {
