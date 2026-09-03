@@ -172,14 +172,17 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         backend,
         config::redact_password(app_config.storage.connection_config()),
     );
+    let startup_warnings = render_startup_warnings(&app_config.storage.startup_warnings());
     if args.foreground {
         eprint!("{wordmark}");
         eprintln!("{banner_line1}");
         eprintln!("{banner_line2}");
+        eprint!("{startup_warnings}");
     } else {
         print!("{wordmark}");
         println!("{banner_line1}");
         println!("{banner_line2}");
+        print!("{startup_warnings}");
     }
     if cfg!(feature = "dev-mode") {
         print_dev_mode_banner(&app_config, args.foreground)?;
@@ -332,6 +335,21 @@ fn render_wordmark(color: bool) -> String {
     out
 }
 
+fn render_startup_warnings(warnings: &[extenddb_storage::config::StartupWarning]) -> String {
+    let mut out = String::new();
+    for warning in warnings {
+        out.push_str("\n  WARNING: ");
+        out.push_str(&warning.title);
+        out.push('\n');
+        for detail in &warning.details {
+            out.push_str("  ");
+            out.push_str(detail);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Print the developer-mode banner lines: the mode notice, the credentials to
 /// sign with, and an advisory when an ambient `AWS_ACCESS_KEY_ID` would not
 /// verify.
@@ -377,8 +395,9 @@ fn print_dev_mode_banner(app_config: &config::AppConfig, foreground: bool) -> an
 
 #[cfg(test)]
 mod tests {
-    use super::ServeArgs;
+    use super::{ServeArgs, render_startup_warnings};
     use clap::Parser;
+    use extenddb_storage::config::StartupWarning;
 
     /// Test wrapper so clap has a top-level `Parser` to drive `ServeArgs`.
     #[derive(Parser)]
@@ -437,5 +456,22 @@ mod tests {
         // Guard against accidental future renames silently dropping the flag.
         let result = TestCli::try_parse_from(["extenddb-serve", "--daemon-off"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn startup_warning_banner_is_prominent_and_actionable() {
+        let rendered = render_startup_warnings(&[StartupWarning {
+            title: "transaction_read_concern = \"majority\" (default: \"snapshot\").".to_owned(),
+            details: vec![
+                "Transactions run below DynamoDB isolation.".to_owned(),
+                "Writes remain atomic and durable.".to_owned(),
+                "Remove the setting to restore full DynamoDB transaction semantics.".to_owned(),
+            ],
+        }]);
+
+        assert!(rendered.starts_with("\n  WARNING: transaction_read_concern"));
+        assert!(rendered.contains("below DynamoDB isolation"));
+        assert!(rendered.contains("Writes remain atomic and durable"));
+        assert!(rendered.contains("restore full DynamoDB transaction semantics"));
     }
 }

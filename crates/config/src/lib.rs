@@ -146,6 +146,11 @@ impl StorageConfig {
         self.config.max_catalog_connections()
     }
 
+    /// Get operator-facing warnings for non-default storage settings.
+    pub fn startup_warnings(&self) -> Vec<extenddb_storage::config::StartupWarning> {
+        self.config.startup_warnings()
+    }
+
     /// Get a reference to the underlying trait object for factory calls.
     pub fn as_trait(&self) -> &(dyn extenddb_storage::config::StorageConfig + 'static) {
         &*self.config

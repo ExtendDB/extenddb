@@ -87,6 +87,33 @@ impl extenddb_storage::config::StorageConfig for MongoStorageConfig {
         self.max_catalog_connections
     }
 
+    fn startup_warnings(&self) -> Vec<extenddb_storage::config::StartupWarning> {
+        let concern = self.transaction_read_concern.to_ascii_lowercase();
+        match concern.as_str() {
+            "snapshot" => return Vec::new(),
+            "majority" | "local" => {}
+            _ => return Vec::new(),
+        }
+
+        let mut details = vec![
+            "Transactions run below DynamoDB isolation: reads inside a transaction".to_owned(),
+            "are not point-in-time consistent, and TransactGetItems may not return".to_owned(),
+            "a consistent snapshot. Writes remain atomic and durable. Remove the".to_owned(),
+            "setting to restore full DynamoDB transaction semantics.".to_owned(),
+        ];
+        if concern == "local" {
+            details.insert(
+                3,
+                "With local reads, observed data may later roll back during failover.".to_owned(),
+            );
+        }
+
+        vec![extenddb_storage::config::StartupWarning {
+            title: format!("transaction_read_concern = {concern:?} (default: \"snapshot\")."),
+            details,
+        }]
+    }
+
     fn clone_box(&self) -> Box<dyn extenddb_storage::config::StorageConfig> {
         Box::new(self.clone())
     }
@@ -108,6 +135,7 @@ impl TryFrom<toml::Table> for MongoStorageConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use extenddb_storage::config::StorageConfig as _;
 
     #[test]
     fn deserialization_applies_transaction_defaults() {
@@ -158,5 +186,37 @@ transaction_read_concerm = "majority""#,
 
         assert!(error.to_string().contains("unknown field"));
         assert!(error.to_string().contains("transaction_read_concerm"));
+    }
+
+    #[test]
+    fn snapshot_read_concern_has_no_startup_warning() {
+        let config: MongoStorageConfig =
+            toml::from_str(r#"connection_string = "mongodb://localhost:27017""#)
+                .expect("minimal MongoDB config must deserialize");
+
+        assert!(config.startup_warnings().is_empty());
+    }
+
+    #[test]
+    fn weaker_read_concerns_have_startup_warnings() {
+        for concern in ["MAJORITY", "local"] {
+            let config: MongoStorageConfig = toml::from_str(&format!(
+                r#"connection_string = "mongodb://localhost:27017"
+transaction_read_concern = "{concern}""#
+            ))
+            .expect("supported MongoDB config must deserialize");
+
+            let warnings = config.startup_warnings();
+            assert_eq!(warnings.len(), 1);
+            let message = warnings[0].log_message();
+            assert!(message.contains(&concern.to_ascii_lowercase()));
+            assert!(message.contains("not point-in-time consistent"));
+            assert!(message.contains("Writes remain atomic and durable"));
+            assert!(message.contains("restore full DynamoDB transaction semantics"));
+            assert_eq!(
+                message.contains("roll back during failover"),
+                concern == "local"
+            );
+        }
     }
 }

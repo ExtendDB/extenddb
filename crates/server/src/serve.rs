@@ -276,6 +276,10 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         .try_init()
         .map_err(|e| anyhow::anyhow!("Failed to initialize tracing: {e}"))?;
 
+    for warning in app_config.storage.startup_warnings() {
+        tracing::warn!("{}", warning.log_message());
+    }
+
     // Create server components via factory pattern. Dev mode asks the backend
     // to bootstrap an uninitialized catalog at serve time (zero-config use).
     let mut component_options =
