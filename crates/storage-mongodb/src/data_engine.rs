@@ -36,8 +36,9 @@ use crate::pushdown::{Pushable, is_pushable};
 use extenddb_core::types::{Projection, ProjectionType};
 
 /// Resolve a single-component update path for the native MongoDB fast path.
-/// Literal attribute names containing dots cannot be represented safely by
-/// MongoDB's ordinary update paths, so they must use the Rust/session path.
+/// Literal attribute names containing dots or beginning with `$` cannot be
+/// represented safely by MongoDB's ordinary update paths, so they must use
+/// the Rust/session path.
 fn native_attribute_name(path: &[PathElement], maps: &ExpressionMaps) -> Option<String> {
     if path.len() != 1 {
         return None;
@@ -46,7 +47,7 @@ fn native_attribute_name(path: &[PathElement], maps: &ExpressionMaps) -> Option<
         return None;
     };
     let attr_name = resolve_name_ref(raw_name, maps).ok()?;
-    (!attr_name.contains('.')).then(|| attr_name.into_owned())
+    (!attr_name.contains('.') && !attr_name.starts_with('$')).then(|| attr_name.into_owned())
 }
 
 impl DataEngine for MongoEngine {
@@ -3893,6 +3894,16 @@ mod tests {
     fn native_update_rejects_dotted_literal_attribute_names() {
         let mut names = std::collections::HashMap::new();
         names.insert("name".to_owned(), "a.b".to_owned());
+        let maps = ExpressionMaps::new(names, std::collections::HashMap::new());
+        let path = vec![PathElement::Attribute("#name".to_owned())];
+
+        assert_eq!(native_attribute_name(&path, &maps), None);
+    }
+
+    #[test]
+    fn native_update_rejects_dollar_prefixed_literal_attribute_names() {
+        let mut names = std::collections::HashMap::new();
+        names.insert("name".to_owned(), "$foo".to_owned());
         let maps = ExpressionMaps::new(names, std::collections::HashMap::new());
         let path = vec![PathElement::Attribute("#name".to_owned())];
 

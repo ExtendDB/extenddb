@@ -104,6 +104,45 @@ async fn update_literal_dotted_attribute_and_nested_path_with_alias() {
 }
 
 #[tokio::test]
+async fn update_literal_dollar_prefixed_attribute_with_alias() {
+    let c = client();
+    let t = tables().await;
+    let mut item = create_item(&t.simple_key_string);
+    item.insert("$foo".into(), s("before"));
+    let key = get_key(&t.simple_key_string, &item);
+
+    c.put_item()
+        .table_name(&t.simple_key_string)
+        .set_item(Some(item))
+        .send()
+        .await
+        .unwrap();
+
+    c.update_item()
+        .table_name(&t.simple_key_string)
+        .set_key(Some(key.clone()))
+        .update_expression("SET #dollar = :after")
+        .expression_attribute_names("#dollar", "$foo")
+        .expression_attribute_values(":after", s("after"))
+        .send()
+        .await
+        .unwrap();
+
+    let get = c
+        .get_item()
+        .table_name(&t.simple_key_string)
+        .set_key(Some(key))
+        .consistent_read(true)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        get.item().unwrap().get("$foo").unwrap().as_s().unwrap(),
+        "after"
+    );
+}
+
+#[tokio::test]
 async fn update_with_nested_list() {
     let c = client();
     let t = tables().await;
