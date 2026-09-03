@@ -20,6 +20,18 @@ pub trait StorageConfig: Send + Sync + std::fmt::Debug {
     /// Maximum concurrent connections for catalog/management operations.
     fn max_catalog_connections(&self) -> u32;
 
+    /// Explicit data-pool override, if the backend distinguishes an omitted
+    /// setting from its effective default.
+    fn max_connections_override(&self) -> Option<u32> {
+        Some(self.max_connections())
+    }
+
+    /// Explicit catalog-pool override, if the backend distinguishes an
+    /// omitted setting from its effective default.
+    fn max_catalog_connections_override(&self) -> Option<u32> {
+        Some(self.max_catalog_connections())
+    }
+
     /// Clone this config into a boxed trait object.
     fn clone_box(&self) -> Box<dyn StorageConfig>;
 

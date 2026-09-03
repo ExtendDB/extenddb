@@ -89,8 +89,8 @@ fn server_components_factory(
     Box<dyn std::future::Future<Output = Result<ServerComponents, BackendError>> + Send>,
 > {
     let connection_string = config.connection_config().to_string();
-    let max_connections = config.max_connections();
-    let max_catalog_connections = config.max_catalog_connections();
+    let max_connections = config.max_connections_override();
+    let max_catalog_connections = config.max_catalog_connections_override();
     let region = region.to_string();
     Box::pin(async move {
         // Create MongoEngine
@@ -107,13 +107,12 @@ fn server_components_factory(
         // share the underlying pool, so max_catalog_connections limits the
         // combined catalog and auth traffic rather than creating two
         // independent pools with twice the configured ceiling.
-        let catalog_client =
-            connect_guarded(&connection_string, Some(max_catalog_connections), false)
-                .await
-                .map_err(|e| BackendError::ConnectionFailed {
-                    backend: "mongodb".to_string(),
-                    details: format!("Failed to create catalog client: {e}"),
-                })?;
+        let catalog_client = connect_guarded(&connection_string, max_catalog_connections, false)
+            .await
+            .map_err(|e| BackendError::ConnectionFailed {
+                backend: "mongodb".to_string(),
+                details: format!("Failed to create catalog client: {e}"),
+            })?;
 
         // Load encryption key from settings collection. A missing key must be
         // a hard failure: an empty key would base64-decode to zero bytes and
@@ -241,8 +240,9 @@ pub struct MongoEngine {
 /// replicas and silently break `ConsistentRead=true`).
 ///
 /// `max_pool_size` is applied when provided. The long-lived data, catalog, and
-/// authentication clients pass their configured pool limits; short-lived CLI
-/// and bootstrapper clients pass `None`.
+/// authentication clients pass their explicitly configured pool limits;
+/// short-lived CLI and bootstrapper clients pass `None`, preserving any URI
+/// option.
 ///
 /// `warn_on_no_tls` gates the no-TLS warning to the long-running server data
 /// client only. Short-lived CLI/management clients (settings, catalog checks,
@@ -257,9 +257,7 @@ pub(crate) async fn connect_guarded(
     let mut options = mongodb::options::ClientOptions::parse(connection_string)
         .await
         .map_err(|e| StorageError::Connection(e.to_string()))?;
-    if let Some(n) = max_pool_size {
-        options.max_pool_size = Some(n);
-    }
+    apply_max_pool_size(&mut options, max_pool_size);
 
     if let Some(sel) = options.selection_criteria.as_ref() {
         use mongodb::options::{ReadPreference, SelectionCriteria};
@@ -289,13 +287,19 @@ pub(crate) async fn connect_guarded(
     mongodb::Client::with_options(options).map_err(|e| StorageError::Connection(e.to_string()))
 }
 
+fn apply_max_pool_size(options: &mut mongodb::options::ClientOptions, max_pool_size: Option<u32>) {
+    if let Some(n) = max_pool_size {
+        options.max_pool_size = Some(n);
+    }
+}
+
 impl MongoEngine {
     pub async fn new(
         connection_string: &str,
         region: &str,
-        max_connections: u32,
+        max_connections: Option<u32>,
     ) -> Result<Self, StorageError> {
-        let client = connect_guarded(connection_string, Some(max_connections), true).await?;
+        let client = connect_guarded(connection_string, max_connections, true).await?;
 
         let catalog_db = client.database("extenddb_catalog");
         let data_db = client.database("extenddb_data");
@@ -347,5 +351,22 @@ impl MongoEngine {
             )));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_max_pool_size;
+
+    #[tokio::test]
+    async fn absent_pool_override_preserves_uri_max_pool_size() {
+        let mut options =
+            mongodb::options::ClientOptions::parse("mongodb://localhost:27017/?maxPoolSize=100")
+                .await
+                .expect("MongoDB URI must parse");
+
+        apply_max_pool_size(&mut options, None);
+
+        assert_eq!(options.max_pool_size, Some(100));
     }
 }
