@@ -361,6 +361,8 @@ impl StreamEngine for SqliteEngine {
         retention_hours: i64,
     ) -> BoxFuture<'_, Result<u64, StorageError>> {
         Box::pin(async move {
+            // D1: every writer holds the engine write lock.
+            let _writer = self.write_lock.lock().await;
             let cutoff = format_timestamp(
                 time::OffsetDateTime::now_utc() - time::Duration::hours(retention_hours),
             );

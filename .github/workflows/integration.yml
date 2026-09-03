@@ -79,6 +79,14 @@ jobs:
           EXTENDDB_TEST_PG_ADMIN_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
         run: devtools/run-tests --extenddb --pytest --comprehensive --parallel --filter "not import_export"
 
+      # run-tests restarts the server daemonized to apply the import/export
+      # config, and a daemonized server logs to syslog, not the job log. Without
+      # this dump, the storage error behind a client-visible 500 leaves no
+      # evidence anywhere in CI.
+      - name: Dump server syslog on failure
+        if: failure()
+        run: sudo journalctl -t extenddb --no-pager -n 500 || true
+
   run-integration-sqlite:
     runs-on: ubuntu-latest
     steps:
@@ -129,6 +137,12 @@ jobs:
           EXTENDDB_ADMIN_USER: admin
           EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
         run: devtools/run-tests --extenddb --pytest --comprehensive --parallel --filter "not import_export"
+
+      # Same rationale as the postgres job: the daemonized server logs to
+      # syslog, so this dump is the only server-side evidence on failure.
+      - name: Dump server syslog on failure
+        if: failure()
+        run: sudo journalctl -t extenddb --no-pager -n 500 || true
 
   run-integration-dev-mode:
     # dev-mode was shipped with no CI coverage at all, which is how the batch and
@@ -269,6 +283,12 @@ jobs:
           EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
         run: cargo test --release -p extenddb-storage-postgres --test vector_control_plane
 
+      # The daemonized server logs to syslog; dump it so server-side failures
+      # are diagnosable from the job log.
+      - name: Dump server syslog on failure
+        if: failure()
+        run: sudo journalctl -t extenddb --no-pager -n 500 || true
+
   # The runtime-detection proof: the same binary, against a PostgreSQL with no
   # pgvector, must refuse vector indexes over the wire. Today the job above runs
   # on a plain image too, so this looks like a duplicate of it; it is not, because
@@ -337,6 +357,12 @@ jobs:
           devtools/run-tests --extenddb --rust-integration --release
           --filter vector_index_unsupported
 
+      # The daemonized server logs to syslog; dump it so server-side failures
+      # are diagnosable from the job log.
+      - name: Dump server syslog on failure
+        if: failure()
+        run: sudo journalctl -t extenddb --no-pager -n 500 || true
+
       # No storage-level step here on purpose. Those tests build their own
       # extension-free scratch databases, so they behave identically on either
       # image and the job above already runs them; repeating them here would buy
@@ -400,6 +426,12 @@ jobs:
           # expectation turns that skip into a failure.
           EXTENDDB_EXPECT_VECTORS: "1"
         run: devtools/run-tests --extenddb --rust-integration --release
+
+      # The daemonized server logs to syslog; dump it so server-side failures
+      # are diagnosable from the job log.
+      - name: Dump server syslog on failure
+        if: failure()
+        run: sudo journalctl -t extenddb --no-pager -n 500 || true
 
   integration:
     runs-on: ubuntu-latest

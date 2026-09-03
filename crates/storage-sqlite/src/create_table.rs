@@ -26,6 +26,12 @@ impl SqliteEngine {
         input: CreateTableInput,
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
+        // D1: every writer holds the engine write lock. This method runs two
+        // write transactions (catalog rows, then data-table DDL); without the
+        // lock they contend with data-plane writers at the SQLite level, and a
+        // slow DDL commit can exhaust a concurrent writer's busy_timeout,
+        // surfacing as a 500 on an unrelated request.
+        let _writer = self.write_lock.lock().await;
         let table_id = uuid::Uuid::new_v4().to_string();
         let table_arn = table_arn(&self.region, account_id, &input.table_name);
         let billing_mode = input.billing_mode.unwrap_or(BillingMode::Provisioned);
