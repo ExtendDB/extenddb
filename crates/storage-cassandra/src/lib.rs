@@ -80,13 +80,23 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
         // Read the initial GSI delay immediately so the atomic is correct from
         // the first request, not after the first 30s sleep.
         let gsi_delay = self.engine.gsi_default_delay_ms.clone();
-        if let Ok(Some(val)) = ctx
+        let initial_delay = match ctx
             .catalog_store
-            .get_setting("gsi_propagation_delay_ms")
+            .get_setting("index_propagation_delay_ms")
             .await
-            && let Ok(ms) = val.parse::<u64>()
         {
-            gsi_delay.store(ms, std::sync::atomic::Ordering::Relaxed);
+            Ok(Some(v)) => Some(v),
+            _ => ctx
+                .catalog_store
+                .get_setting("gsi_propagation_delay_ms")
+                .await
+                .ok()
+                .flatten(),
+        };
+        if let Some(val) = initial_delay {
+            if let Ok(ms) = val.parse::<u64>() {
+                gsi_delay.store(ms, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         let catalog_store_for_gsi = ctx.catalog_store.clone();
         let gsi_delay_poller =

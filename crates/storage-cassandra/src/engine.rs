@@ -70,7 +70,7 @@ impl CassandraEngine {
             replication_factor: config.replication_factor,
             datacenter: config.datacenter.clone(),
             control_plane_notify: Arc::new(tokio::sync::Notify::new()),
-            gsi_default_delay_ms: Arc::new(std::sync::atomic::AtomicU64::new(1000)), // Default 1 second
+            gsi_default_delay_ms: Arc::new(std::sync::atomic::AtomicU64::new(10)), // Default 10ms
             gsi_queue: crate::gsi_queue::GsiQueue::new(),
             hlc: crate::stream_util::new_shared_hlc(
                 config.instance_id.as_deref().unwrap_or("default"),
