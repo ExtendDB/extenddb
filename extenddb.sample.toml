@@ -87,6 +87,18 @@
 # MongoDB connection string. Requires a replica set (even single-node).
 # connection_string = "mongodb://localhost:27017/?replicaSet=rs0"
 # max_pool_size = 20           # Maximum concurrent connections to MongoDB.
+# transaction_read_concern = "snapshot"
+                                # Read concern for the multi-document transactions
+                                # backing conditional writes, TransactWriteItems,
+                                # TransactGetItems, and idempotency tokens. Accepted
+                                # values: "snapshot", "majority", and "local".
+                                # "snapshot" is the default, fidelity-preserving mode.
+                                # Some MongoDB-wire-compatible backends (e.g.
+                                # DocumentDB) reject "snapshot" transactions with
+                                # CommandNotSupported (115); set this to "majority"
+                                # or "local" only when required. Both lose the
+                                # single point-in-time guarantee; "local" may read
+                                # data later rolled back after failover.
 
 [auth]
 # provider = "builtin"          # Auth provider:

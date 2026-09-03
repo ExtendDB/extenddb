@@ -14,6 +14,7 @@ adaptation when switching between ExtendDB and the real service.
 | PartiQL | ExecuteStatement, BatchExecuteStatement | Not implemented (returns UnknownOperationException) |
 | Numeric precision on partition/sort keys (MongoDB backend only) | 38 significant digits | 34 significant digits (BSON Decimal128). Values that exceed this precision are rejected at write and query time with a ValidationException rather than silently downcast. PostgreSQL backend supports the full 38 digits. |
 | Inverted numeric `BETWEEN` on a sort key (MongoDB backend only) | ValidationException ("The BETWEEN operator requires upper bound to be greater than or equal to lower bound") | Same error in all practical cases. The inversion guard compares bounds via `f64`, so a `KeyConditionExpression` `BETWEEN` whose bounds are inverted only beyond f64's ~15–17 significant digits (e.g. `BETWEEN 10000000000000002 AND 10000000000000001`) is not rejected and returns an empty result set instead. Valid ranges are never wrongly rejected. |
+| Transaction read concern (MongoDB backend only) | No user-configurable equivalent | `snapshot` is the default, fidelity-preserving mode. With `majority` or `local`, `TransactGetItems` is not guaranteed a single point-in-time snapshot and transaction condition reads have weaker isolation. With `local`, a condition can be evaluated against data that is later rolled back after failover. |
 
 ## Authentication and Authorization (AWS IAM/STS auth surface used by DynamoDB)
 
