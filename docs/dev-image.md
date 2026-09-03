@@ -27,12 +27,18 @@ zero-friction local use:
 - **Plain HTTP.** No TLS, so SDKs need no custom trust store.
 - **A seeded, well-known credential.** The server seeds AWS's documented
   example key pair (`AKIAIOSFODNN7EXAMPLE` /
-  `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`) on startup and prints it in the
-  logs; sign requests with it. It is recognised by secret scanners as an
-  example credential, so committing it in test fixtures is safe. To use a
-  different key, pass `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` to the
-  container. Authorization is open: whoever holds the credential can do
-  everything.
+  `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`) on every startup and prints it
+  in the logs; sign requests with it. It is recognised by secret scanners as
+  an example credential, so committing it in test fixtures is safe. To seed
+  one additional key pair, pass `EXTENDDB_DEV_ACCESS_KEY_ID` and
+  `EXTENDDB_DEV_SECRET_ACCESS_KEY` to the container (the key id must start
+  with `AKIA`; its secret is never printed). The example pair keeps working
+  alongside it, so tools that hardcode it (NoSQL Workbench, the launchers)
+  are unaffected by the override. The standard `AWS_*` variables are ignored
+  by the server, so real or SSO credentials in the environment are never
+  copied into the dev catalog; a startup notice calls out an
+  `AWS_ACCESS_KEY_ID` that would not verify. Authorization is open: whoever
+  holds a seeded credential can do everything.
 
 Because of that, the server must not be reachable from other machines. The
 image binds `0.0.0.0` **inside** the container (required for port publishing to

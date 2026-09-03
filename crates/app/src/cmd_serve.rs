@@ -155,6 +155,14 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     // it to stderr so a process supervisor receives banner and tracing logs
     // on the same stream — mixing stdout and stderr makes container log
     // capture noisier than necessary.
+    //
+    // The wordmark is pure 7-bit ASCII on purpose: it renders identically in
+    // dumb terminals, container log viewers, and syslog-adjacent collectors
+    // that mangle wide Unicode. It prints once per boot, never per request.
+    // Color is applied only when the destination stream is an interactive
+    // terminal (and NO_COLOR/TERM=dumb are respected), so pipes, `docker
+    // logs`, and supervisors always receive the plain form.
+    let wordmark = render_wordmark(banner_colors_enabled(args.foreground));
     let banner_line1 = format!(
         "extenddb {} (catalog {}) starting on {}",
         build.version, catalog_version, bind_addr,
@@ -165,23 +173,16 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         config::redact_password(app_config.storage.connection_config()),
     );
     if args.foreground {
+        eprint!("{wordmark}");
         eprintln!("{banner_line1}");
         eprintln!("{banner_line2}");
     } else {
+        print!("{wordmark}");
         println!("{banner_line1}");
         println!("{banner_line2}");
     }
     if cfg!(feature = "dev-mode") {
-        let msg = format!(
-            "  DEVELOPER MODE: plain HTTP on loopback, authorization open \
-             (SigV4 still enforced). Serving storage: {}. Not for production.",
-            config::redact_password(app_config.storage.connection_config()),
-        );
-        if args.foreground {
-            eprintln!("{msg}");
-        } else {
-            println!("{msg}");
-        }
+        print_dev_mode_banner(&app_config, args.foreground)?;
     }
 
     // D-3: A PID file lets `extenddb status` and `extenddb stop` find the
@@ -269,6 +270,109 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
                 })
                 .with_dev_mode(cfg!(feature = "dev-mode")),
         ))
+}
+
+/// The five wordmark rows (figlet slant), without trailing newlines.
+const WORDMARK_LINES: [&str; 5] = [
+    "    ______     __                 ______  ____",
+    "   / ____/  __/ /____  ____  ____/ / __ \\/ __ )",
+    "  / __/ | |/_/ __/ _ \\/ __ \\/ __  / / / / __  |",
+    " / /____>  </ /_/  __/ / / / /_/ / /_/ / /_/ /",
+    "/_____/_/|_|\\__/\\___/_/ /_/\\__,_/_____/_____/",
+];
+const TAGLINE: &str = "  DynamoDB-compatible: any SDK, CLI, or tool, unchanged.";
+
+/// Whether the banner's destination stream is an interactive terminal that
+/// wants color: never for pipes and `docker logs`, and both the NO_COLOR
+/// convention (<https://no-color.org>) and `TERM=dumb` opt out.
+fn banner_colors_enabled(foreground: bool) -> bool {
+    use std::io::IsTerminal;
+
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if std::env::var("TERM").is_ok_and(|t| t == "dumb") {
+        return false;
+    }
+    // Match the banner's stream split: stderr in foreground mode, stdout for
+    // the daemon parent.
+    if foreground {
+        std::io::stderr().is_terminal()
+    } else {
+        std::io::stdout().is_terminal()
+    }
+}
+
+/// Render the wordmark block: five art rows, a blank line, the tagline, and a
+/// closing blank line. With color, the rows fade gold to deep orange
+/// (256-color codes, an ANSI level every interactive terminal supports) and
+/// the tagline dims; without, the output is byte-identical to the historical
+/// plain form.
+fn render_wordmark(color: bool) -> String {
+    // Gold fading to deep orange, one shade per row.
+    const ROW_COLORS: [u8; 5] = [220, 214, 208, 202, 166];
+
+    let mut out = String::new();
+    for (i, line) in WORDMARK_LINES.iter().enumerate() {
+        if color {
+            out.push_str(&format!("\x1b[38;5;{}m{line}\x1b[0m\n", ROW_COLORS[i]));
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.push('\n');
+    if color {
+        out.push_str(&format!("\x1b[2m{TAGLINE}\x1b[0m\n"));
+    } else {
+        out.push_str(TAGLINE);
+        out.push('\n');
+    }
+    out.push('\n');
+    out
+}
+
+/// Print the developer-mode banner lines: the mode notice, the credentials to
+/// sign with, and an advisory when an ambient `AWS_ACCESS_KEY_ID` would not
+/// verify.
+///
+/// Resolving here (not just in `serve()`) fails fast on a misconfigured
+/// `EXTENDDB_DEV_*` pair before daemonizing, and gives the invoking user the
+/// credentials without digging through logs. The built-in example pair is
+/// printed in full: it is public AWS documentation, not a secret. An
+/// operator-supplied secret is never printed.
+fn print_dev_mode_banner(app_config: &config::AppConfig, foreground: bool) -> anyhow::Result<()> {
+    use extenddb_server::dev_credentials;
+
+    let dev_creds = dev_credentials::resolve()?;
+    let mut lines = vec![
+        format!(
+            "  DEVELOPER MODE: plain HTTP on loopback, authorization open \
+             (SigV4 still enforced). Serving storage: {}. Not for production.",
+            config::redact_password(app_config.storage.connection_config()),
+        ),
+        format!(
+            "  Sign requests with: {}",
+            dev_credentials::describe(&dev_creds)
+        ),
+    ];
+    if let Some(ignored) = dev_credentials::ignored_aws_env_key(&dev_creds) {
+        lines.push(format!(
+            "  Note: AWS_ACCESS_KEY_ID is set but not adopted; requests signed with \
+             '{ignored}' will be rejected. Set EXTENDDB_DEV_ACCESS_KEY_ID and \
+             EXTENDDB_DEV_SECRET_ACCESS_KEY to seed an additional credential."
+        ));
+    }
+    // Same stream split as the main banner: stdout for the daemon parent,
+    // stderr in foreground mode so supervisors capture one stream.
+    for msg in lines {
+        if foreground {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
