@@ -433,21 +433,28 @@ impl MetadataEngine for MongoEngine {
                 .get_str("table_id")
                 .map_err(|_| StorageError::Internal("missing table_id".to_string()))?;
 
-            // Dotted attributes never have a physical TTL index: MongoDB's
-            // field-path syntax would reinterpret the literal attribute name.
-            if ttl_attribute.contains('.') {
-                return Ok(());
-            }
-
             let index_name = format!("idx_ttl_{ttl_attribute}");
 
             let coll_name = data_collection_name(table_id);
             let data_coll = self.data_db.collection::<Document>(&coll_name);
 
-            data_coll
-                .drop_index(index_name)
-                .await
-                .map_err(|e| StorageError::Internal(format!("TTL index drop failed: {e}")))?;
+            // Dotted attributes no longer create physical indexes because
+            // MongoDB would reinterpret their names as nested paths. Older
+            // deployments did create `idx_ttl_<attribute>` anyway, so still
+            // attempt to remove that legacy index. A current dotted table has
+            // no index to drop; MongoDB reports IndexNotFound (code 27), which
+            // is the desired idempotent outcome here.
+            if let Err(e) = data_coll.drop_index(index_name).await {
+                let index_missing = matches!(
+                    *e.kind,
+                    mongodb::error::ErrorKind::Command(ref command) if command.code == 27
+                );
+                if !index_missing {
+                    return Err(StorageError::Internal(format!(
+                        "TTL index drop failed: {e}"
+                    )));
+                }
+            }
 
             Ok(())
         })
