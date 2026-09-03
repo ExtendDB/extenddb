@@ -7,6 +7,7 @@
 use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, UpdateAction};
 use extenddb_core::types::{Item, TableKeyInfo};
 use extenddb_storage::error::StorageError;
+use extenddb_storage::util::pk_to_text;
 use extenddb_storage::{DataEngine, IdempotencyKey, StreamCapture, TransactGetOp, TransactWriteOp};
 use futures::future::BoxFuture;
 
@@ -176,6 +177,38 @@ impl DataEngine for PostgresEngine {
                 index_name.as_deref(),
             )
             .await
+        })
+    }
+
+    fn scan_key_in_segment(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        segment: i64,
+        total_segments: i64,
+        _index_name: Option<&str>,
+    ) -> BoxFuture<'_, Result<bool, StorageError>> {
+        // Same hashtext-based assignment the scan predicate uses
+        // ((hashtext(pk)::bigint & 2147483647) % total = seg), evaluated for
+        // the candidate key. `key_info` is scan-shaped, so `key_schema[0]` is
+        // the pk of whichever table (data or index) the scan targets, matching
+        // the `pk` column the predicate hashes. Bigint bitmask instead of
+        // abs() per CB-20 / SP-SCN-002 (hashtext() == i32::MIN).
+        let pk_name = key_info.key_schema[0].attribute_name.clone();
+        let key = key.clone();
+        Box::pin(async move {
+            let Some(pk_value) = key.get(&pk_name) else {
+                // Schema validation upstream already rejects this shape.
+                return Ok(false);
+            };
+            let pk_text = pk_to_text(pk_value)?;
+            sqlx::query_scalar("SELECT (hashtext($1)::bigint & 2147483647) % $2 = $3")
+                .bind(pk_text.as_ref())
+                .bind(total_segments)
+                .bind(segment)
+                .fetch_one(&self.data_pool)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))
         })
     }
 
