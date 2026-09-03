@@ -844,7 +844,6 @@ pub struct MongoEngine {
     catalog_db: mongodb::Database,
     data_db: mongodb::Database,
     region: String,
-    max_connections: u32,
     gsi_cache: dashmap::DashMap<String, (bool, std::time::Instant)>,
 }
 
@@ -852,9 +851,10 @@ const GSI_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 ```
 
 `MongoEngine::new` parses the connection string, rejects non-primary
-read preferences, then constructs the client with `max_pool_size =
-max_connections`. `catalog_db` and `data_db` are lightweight handles
-against the single shared client.
+read preferences, then constructs the shared data client. An explicitly
+configured `max_connections` value overrides the URI's `maxPoolSize`; when it
+is omitted, the URI remains authoritative. `catalog_db` and `data_db` are
+lightweight handles against that shared client.
 
 `gsi_cache` entries carry the observation time so a stale entry
 (`elapsed() > GSI_CACHE_TTL`) is treated as a miss and re-read from the
@@ -866,23 +866,34 @@ another ExtendDB instance sharing the catalog.
 ```toml
 [storage.mongodb]
 connection_string = "mongodb://localhost:27017/?replicaSet=rs0"
-max_connections = 50
-max_catalog_connections = 20
+# max_connections = 50           # Optional data-client pool override
+# max_catalog_connections = 20   # Optional management/authentication override
 ```
 
-The data-operation client uses `max_connections`. Catalog and authentication
-traffic share the client configured by `max_catalog_connections`; this is one
-combined limit rather than one independent pool per store, so it must cover
-the expected management and authorization concurrency together.
+Both pool settings are optional and must be at least `1` when supplied. If a
+setting is omitted, the MongoDB connection string's `maxPoolSize` remains in
+force.
+
+The shared data client, configured by `max_connections`, carries table and item
+operations as well as metadata, backup, and background-worker traffic. The
+MongoEngine's catalog handles also use this client, so catalog reads performed
+by table, metadata, backup, time-to-live, stream-cleanup, and index-backfill
+code consume this pool.
+
+The separate shared management client, configured by
+`max_catalog_connections`, carries management-store, credential, and
+authorization traffic. Catalog and authentication stores clone this client,
+so this is one combined limit rather than one independent pool per store; it
+must cover the expected management and authentication concurrency together.
 
 ```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MongoStorageConfig {
     pub connection_string: String,
-    #[serde(default = "default_max_connections")]
-    pub max_connections: u32,
-    #[serde(default = "default_max_catalog_connections")]
-    pub max_catalog_connections: u32,
+    #[serde(default, deserialize_with = "positive_opt_u32")]
+    pub max_connections: Option<u32>,
+    #[serde(default, deserialize_with = "positive_opt_u32")]
+    pub max_catalog_connections: Option<u32>,
 }
 ```
 
