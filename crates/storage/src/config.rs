@@ -113,6 +113,18 @@ pub mod string_coerce {
             .transpose()
     }
 
+    /// Deserialize an optional positive `u32` from a number, its string form,
+    /// or absence. A present value must be at least one.
+    pub fn positive_opt_u32<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<u32>, D::Error> {
+        let value = opt_u32(deserializer)?;
+        if value == Some(0) {
+            return Err(D::Error::custom("value must be at least 1"));
+        }
+        Ok(value)
+    }
+
     /// Deserialize a `bool` from either a boolean or its string form
     /// (`"true"`/`"false"`).
     ///

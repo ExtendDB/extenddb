@@ -18,13 +18,13 @@ pub struct MongoStorageConfig {
     /// Maximum concurrent connections for data operations
     #[serde(
         default,
-        deserialize_with = "extenddb_storage::config::string_coerce::opt_u32"
+        deserialize_with = "extenddb_storage::config::string_coerce::positive_opt_u32"
     )]
     pub max_connections: Option<u32>,
     /// Maximum concurrent connections for catalog/management operations
     #[serde(
         default,
-        deserialize_with = "extenddb_storage::config::string_coerce::opt_u32"
+        deserialize_with = "extenddb_storage::config::string_coerce::positive_opt_u32"
     )]
     pub max_catalog_connections: Option<u32>,
 }
@@ -111,5 +111,27 @@ max_catalog_connections = 7"#,
         assert_eq!(config.max_catalog_connections_override(), None);
         assert_eq!(config.max_connections(), 50);
         assert_eq!(config.max_catalog_connections(), 20);
+    }
+
+    #[test]
+    fn zero_data_connection_limit_is_rejected_at_deserialization() {
+        let error = toml::from_str::<MongoStorageConfig>(
+            r#"connection_string = "mongodb://localhost:27017"
+max_connections = 0"#,
+        )
+        .expect_err("zero data connection limit must be rejected");
+
+        assert!(error.to_string().contains("at least 1"));
+    }
+
+    #[test]
+    fn zero_catalog_connection_limit_is_rejected_at_deserialization() {
+        let error = toml::from_str::<MongoStorageConfig>(
+            r#"connection_string = "mongodb://localhost:27017"
+max_catalog_connections = "0""#,
+        )
+        .expect_err("zero catalog connection limit must be rejected");
+
+        assert!(error.to_string().contains("at least 1"));
     }
 }
