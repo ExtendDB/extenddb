@@ -218,6 +218,68 @@ pub fn backend() -> extenddb_storage::Backend {
 /// index updates on tables where GSIs were added out-of-band.
 const GSI_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Per-process cache of whether a table has any GSIs.
+///
+/// The generation map prevents a slow catalog observation from overwriting a
+/// newer local mutation. For example, a write can observe no indexes while an
+/// UpdateTable concurrently creates one; the observation must not publish
+/// `false` after the create has published `true`.
+#[derive(Default)]
+struct GsiCache {
+    entries: dashmap::DashMap<String, (bool, std::time::Instant)>,
+    generations: dashmap::DashMap<String, u64>,
+}
+
+impl GsiCache {
+    fn get_fresh(&self, table_id: &str) -> Option<bool> {
+        let entry = self.entries.get(table_id)?;
+        let (has_gsi, inserted) = *entry;
+        if inserted.elapsed() <= GSI_CACHE_TTL {
+            Some(has_gsi)
+        } else {
+            None
+        }
+    }
+
+    /// Return the generation that a catalog observation should validate
+    /// before publishing its result.
+    fn generation(&self, table_id: &str) -> u64 {
+        self.generations
+            .get(table_id)
+            .map(|generation| *generation)
+            .unwrap_or(0)
+    }
+
+    /// Record a local catalog mutation and advance the generation.
+    fn set(&self, table_id: &str, has_gsi: bool) {
+        let mut generation = self.generations.entry(table_id.to_owned()).or_insert(0);
+        *generation = generation.saturating_add(1);
+        self.entries
+            .insert(table_id.to_owned(), (has_gsi, std::time::Instant::now()));
+    }
+
+    /// Publish a catalog observation only if no newer local mutation occurred
+    /// while the observation was in flight.
+    fn set_if_generation(&self, table_id: &str, expected_generation: u64, has_gsi: bool) -> bool {
+        let generation = self.generations.entry(table_id.to_owned()).or_insert(0);
+        if *generation != expected_generation {
+            return false;
+        }
+
+        self.entries
+            .insert(table_id.to_owned(), (has_gsi, std::time::Instant::now()));
+        true
+    }
+
+    /// Remove a cache entry and advance its generation so in-flight catalog
+    /// observations cannot repopulate it with stale data.
+    fn invalidate(&self, table_id: &str) {
+        let mut generation = self.generations.entry(table_id.to_owned()).or_insert(0);
+        *generation = generation.saturating_add(1);
+        self.entries.remove(table_id);
+    }
+}
+
 /// `MongoDB` storage backend.
 pub struct MongoEngine {
     client: mongodb::Client,
@@ -229,7 +291,7 @@ pub struct MongoEngine {
     /// [`GSI_CACHE_TTL`] are treated as misses and re-read from the catalog,
     /// so GSI additions/removals on other ExtendDB instances converge within
     /// the TTL window.
-    gsi_cache: dashmap::DashMap<String, (bool, std::time::Instant)>,
+    gsi_cache: GsiCache,
 }
 
 /// Build a MongoDB client from a connection string, applying the shared
@@ -301,7 +363,7 @@ impl MongoEngine {
             catalog_db,
             data_db,
             region: region.to_owned(),
-            gsi_cache: dashmap::DashMap::new(),
+            gsi_cache: GsiCache::default(),
         })
     }
 
@@ -311,24 +373,33 @@ impl MongoEngine {
     /// [`GSI_CACHE_TTL`], `None` otherwise (either no entry or expired).
     /// Callers that get `None` must fall back to reading the catalog.
     pub(crate) fn gsi_cache_get_fresh(&self, table_id: &str) -> Option<bool> {
-        let entry = self.gsi_cache.get(table_id)?;
-        let (has_gsi, inserted) = *entry;
-        if inserted.elapsed() <= GSI_CACHE_TTL {
-            Some(has_gsi)
-        } else {
-            None
-        }
+        self.gsi_cache.get_fresh(table_id)
+    }
+
+    /// Return the generation for an in-flight catalog observation.
+    pub(crate) fn gsi_cache_generation(&self, table_id: &str) -> u64 {
+        self.gsi_cache.generation(table_id)
     }
 
     /// Record a fresh GSI-cache observation for `table_id`.
     pub(crate) fn gsi_cache_set(&self, table_id: &str, has_gsi: bool) {
+        self.gsi_cache.set(table_id, has_gsi);
+    }
+
+    /// Publish a catalog observation only if no local mutation superseded it.
+    pub(crate) fn gsi_cache_set_if_generation(
+        &self,
+        table_id: &str,
+        expected_generation: u64,
+        has_gsi: bool,
+    ) -> bool {
         self.gsi_cache
-            .insert(table_id.to_owned(), (has_gsi, std::time::Instant::now()));
+            .set_if_generation(table_id, expected_generation, has_gsi)
     }
 
     /// Remove a GSI-cache entry (e.g., on GSI drop or table delete).
     pub(crate) fn gsi_cache_invalidate(&self, table_id: &str) {
-        self.gsi_cache.remove(table_id);
+        self.gsi_cache.invalidate(table_id);
     }
 
     /// Validate `account_id` against injection attacks.
@@ -343,5 +414,33 @@ impl MongoEngine {
             )));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GsiCache;
+
+    #[test]
+    fn stale_observation_cannot_overwrite_newer_mutation() {
+        let cache = GsiCache::default();
+        let observed_generation = cache.generation("table-1");
+
+        cache.set("table-1", true);
+
+        assert!(!cache.set_if_generation("table-1", observed_generation, false));
+        assert_eq!(cache.get_fresh("table-1"), Some(true));
+    }
+
+    #[test]
+    fn invalidation_blocks_in_flight_observation() {
+        let cache = GsiCache::default();
+
+        cache.set("table-1", true);
+        let observed_generation = cache.generation("table-1");
+        cache.invalidate("table-1");
+
+        assert!(!cache.set_if_generation("table-1", observed_generation, true));
+        assert_eq!(cache.get_fresh("table-1"), None);
     }
 }

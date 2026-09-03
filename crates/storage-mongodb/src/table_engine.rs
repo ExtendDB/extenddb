@@ -567,16 +567,24 @@ impl MongoEngine {
 
         // Drop the data collection
         let coll_name = data_collection_name(&desc.table_id);
-        self.data_db
-            .collection::<Document>(&coll_name)
-            .drop()
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        self.drop_collection_if_exists(&coll_name).await?;
 
-        // Delete index entries
+        // The table is already DELETING, so data-plane readers are rejected;
+        // unlike individual index deletion, physical cleanup can safely occur
+        // before deleting the catalog metadata.
+        // Drop each physical GSI/LSI collection before deleting its catalog
+        // metadata. The index documents are stored separately from the table
+        // document, so dropping the base collection alone does not remove
+        // `_ddb_<index_id>` collections.
+        self.drop_index_collections_for_table(&desc.table_id)
+            .await?;
+
+        // Tags are keyed by the table ARN rather than table_id. Remove them
+        // before deleting the table metadata so a table recreated with the
+        // same name cannot inherit the previous table's tags.
         self.catalog_db
-            .collection::<Document>("indexes")
-            .delete_many(doc! { "_id.table_id": &desc.table_id })
+            .collection::<Document>("tags")
+            .delete_many(doc! { "resource_arn": &desc.table_arn })
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -917,17 +925,32 @@ impl MongoEngine {
                     let desc = self
                         .describe_table_impl(account_id, &input.table_name)
                         .await?;
-                    let result = self.catalog_db.collection::<Document>("indexes")
-                        .delete_one(doc! { "_id": { "table_id": &desc.table_id, "index_name": &delete.index_name } })
+                    let indexes_coll = self.catalog_db.collection::<Document>("indexes");
+                    let index_filter = doc! { "_id": { "table_id": &desc.table_id, "index_name": &delete.index_name } };
+                    let index_doc = indexes_coll
+                        .find_one_and_delete(index_filter)
                         .await
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-                    if result.deleted_count == 0 {
-                        return Err(StorageError::IndexNotFound(delete.index_name.clone()));
-                    }
+                    let index_id = index_doc
+                        .and_then(|doc| doc.get_str("index_id").ok().map(str::to_owned))
+                        .ok_or_else(|| StorageError::IndexNotFound(delete.index_name.clone()))?;
+
+                    // Atomically remove the catalog entry before dropping the
+                    // physical collection. Otherwise a concurrent Query can
+                    // observe an ACTIVE index in the catalog after its
+                    // collection has already been dropped; MongoDB treats a
+                    // missing collection as an empty result rather than a
+                    // missing resource. A concurrent delete that loses this
+                    // atomic claim gets IndexNotFound above.
 
                     // Invalidate cache — may still have other GSIs
                     self.gsi_cache_invalidate(&desc.table_id);
+
+                    // The physical cleanup is still reported to the caller if
+                    // it fails, but readers no longer observe the deleted
+                    // index as available while that cleanup is in progress.
+                    self.drop_index_collection(&index_id).await?;
                 }
             }
 
@@ -1512,6 +1535,60 @@ impl MongoEngine {
         coll.create_index(IndexModel::builder().keys(keys).options(opts).build())
             .await
             .map_err(|e| StorageError::Internal(format!("index-coll index: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Drop the physical collection backing one secondary index.
+    pub(crate) async fn drop_index_collection(&self, index_id: &str) -> Result<(), StorageError> {
+        let coll_name = data_collection_name(index_id);
+        self.drop_collection_if_exists(&coll_name).await
+    }
+
+    /// Drop a physical collection, treating an already-missing namespace as
+    /// successful so lifecycle retries can continue their cleanup.
+    async fn drop_collection_if_exists(&self, coll_name: &str) -> Result<(), StorageError> {
+        match self.data_db.collection::<Document>(coll_name).drop().await {
+            Ok(()) => {}
+            Err(e) if matches!(*e.kind, mongodb::error::ErrorKind::Command(ref c) if c.code == 26) =>
+                {}
+            Err(e) => return Err(StorageError::Internal(e.to_string())),
+        }
+
+        Ok(())
+    }
+
+    /// Drop all physical secondary-index collections for a table before its
+    /// catalog index documents are removed.
+    async fn drop_index_collections_for_table(&self, table_id: &str) -> Result<(), StorageError> {
+        use futures::TryStreamExt;
+
+        let indexes_coll = self.catalog_db.collection::<Document>("indexes");
+        let mut cursor = indexes_coll
+            .find(doc! { "_id.table_id": table_id })
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        let mut index_ids = Vec::new();
+        while let Some(index_doc) = cursor
+            .try_next()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?
+        {
+            let index_id = index_doc.get_str("index_id").map_err(|_| {
+                StorageError::Internal("index document missing index_id".to_owned())
+            })?;
+            index_ids.push(index_id.to_owned());
+        }
+
+        for index_id in index_ids {
+            self.drop_index_collection(&index_id).await?;
+        }
+
+        indexes_coll
+            .delete_many(doc! { "_id.table_id": table_id })
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         Ok(())
     }
