@@ -49,6 +49,7 @@
 //! the "token range pagination" approach approved in the workplan.
 
 use cdrs_tokio::query::QueryValues;
+use cdrs_tokio::types::blob::Blob;
 use cdrs_tokio::types::value::Value;
 use extenddb_core::types::{Item, ScalarAttributeType, TableKeyInfo};
 use extenddb_storage::error::StorageError;
@@ -94,7 +95,7 @@ fn sk_to_value(sk: &SortKeyValue) -> Value {
     match sk {
         SortKeyValue::S(s) => Value::from(s.as_str()),
         SortKeyValue::N(n) => super::decimal_to_value(n),
-        SortKeyValue::B(b) => Value::from(b.clone()),
+        SortKeyValue::B(b) => Value::from(Blob::new(b.clone())),
     }
 }
 
