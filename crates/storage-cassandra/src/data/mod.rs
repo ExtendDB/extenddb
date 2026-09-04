@@ -7,6 +7,7 @@ use cdrs_tokio::cluster::TcpConnectionManager;
 use cdrs_tokio::cluster::session::Session;
 use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
 use cdrs_tokio::transport::TransportTcp;
+use cdrs_tokio::types::blob::Blob;
 use extenddb_core::expression::ExpressionMaps;
 use extenddb_core::types::Item;
 use extenddb_storage::error::StorageError;
@@ -104,13 +105,12 @@ pub(crate) async fn query_with_pk_sk(
         }
         SortKeyValue::B(b) => {
             session
-                .query_with_values(query, cdrs_tokio::query_values!(pk, b.clone()))
+                .query_with_values(query, cdrs_tokio::query_values!(pk, Blob::new(b.clone())))
                 .await
         }
     }
     .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
 }
-
 /// Execute a query with pk, sort key, and item_data, returning the result.
 ///
 /// Helper for INSERT/UPDATE operations.
@@ -137,7 +137,7 @@ pub(crate) async fn query_with_pk_sk_item(
         }
         SortKeyValue::B(b) => {
             session
-                .query_with_values(query, cdrs_tokio::query_values!(pk, b.clone(), item_text))
+                .query_with_values(query, cdrs_tokio::query_values!(pk, Blob::new(b.clone()), item_text))
                 .await
         }
     }
@@ -170,7 +170,7 @@ pub(crate) async fn query_with_pk_sk_txnid(
         }
         SortKeyValue::B(b) => {
             session
-                .query_with_values(query, cdrs_tokio::query_values!(pk, b.clone(), txn_id))
+                .query_with_values(query, cdrs_tokio::query_values!(pk, Blob::new(b.clone()), txn_id))
                 .await
         }
     }
@@ -209,7 +209,7 @@ pub(crate) async fn query_with_txnid_ts_pk_sk(
             session
                 .query_with_values(
                     query,
-                    cdrs_tokio::query_values!(txn_id, txn_timestamp, pk, b.clone()),
+                    cdrs_tokio::query_values!(txn_id, txn_timestamp, pk, Blob::new(b.clone())),
                 )
                 .await
         }
@@ -256,7 +256,7 @@ pub(crate) async fn query_with_pk_sk_item_txnid_ts(
             session
                 .query_with_values(
                     query,
-                    cdrs_tokio::query_values!(pk, b.clone(), item_text, txn_id, txn_timestamp),
+                    cdrs_tokio::query_values!(pk, Blob::new(b.clone()), item_text, txn_id, txn_timestamp),
                 )
                 .await
         }
@@ -303,7 +303,7 @@ pub(crate) async fn query_with_item_ts_pk_sk_txnid(
             session
                 .query_with_values(
                     query,
-                    cdrs_tokio::query_values!(item_text, txn_timestamp, pk, b.clone(), txn_id),
+                    cdrs_tokio::query_values!(item_text, txn_timestamp, pk, Blob::new(b.clone()), txn_id),
                 )
                 .await
         }

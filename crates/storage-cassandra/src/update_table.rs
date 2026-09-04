@@ -85,6 +85,22 @@ impl CassandraEngine {
             }
         }
 
+        // Reject ProvisionedThroughput when the effective billing mode is PAY_PER_REQUEST.
+        // Covers the case where BillingMode is omitted but the table is already PAY_PER_REQUEST.
+        if input.provisioned_throughput.is_some() {
+            let stored_bm: Option<String> = row.get_by_name("billing_mode").ok().flatten();
+            let effective_ppr = match input.billing_mode {
+                Some(BillingMode::PayPerRequest) => true,
+                Some(BillingMode::Provisioned) => false,
+                None => stored_bm.as_deref() == Some("PAY_PER_REQUEST"),
+            };
+            if effective_ppr {
+                return Err(StorageError::Validation(
+                    "One or more parameter values were invalid: Neither ReadCapacityUnits nor WriteCapacityUnits can be specified when BillingMode is PAY_PER_REQUEST".to_owned(),
+                ));
+            }
+        }
+
         // Build a LOGGED BATCH for all catalog column updates on `tables`.
         // All statements touch the same partition (account_id, table_name) so
         // they are atomic. Reads (no-op check, shard existence) happen before

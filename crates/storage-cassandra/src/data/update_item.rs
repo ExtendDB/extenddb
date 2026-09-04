@@ -118,7 +118,7 @@ impl CassandraEngine {
                 Err(e) => return Err(e),
             }
 
-            let old_item = if return_old { Some(item.clone()) } else { None };
+            let old_item = if return_old && item_existed { Some(item.clone()) } else { None };
             let pre_mutation_item = if (!indexes.is_empty() || stream.is_some()) && item_existed {
                 Some(item.clone())
             } else {

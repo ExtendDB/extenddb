@@ -290,8 +290,14 @@ impl CassandraEngine {
                     "transact_write: PREPARE failed ({} reasons), rolling back txn {txn_id}",
                     reasons.len()
                 );
-                self.execute_rollback_phase(&account_keyspace, ops, txn_id)
-                    .await?;
+                if let Err(e) = self
+                    .execute_rollback_phase(&account_keyspace, ops, txn_id)
+                    .await
+                {
+                    // Rollback failures are recoverable by the background worker.
+                    // Do not replace the original cancellation error.
+                    tracing::error!("transact_write: rollback failed for txn {txn_id}: {e}");
+                }
                 Err(StorageError::TransactionCanceled(reasons))
             }
         }
@@ -1201,9 +1207,7 @@ impl CassandraEngine {
             StorageError::Internal("Database error".to_owned())
         })?;
 
-        check_lwt_applied(&delete_result, "rollback update").map_err(|_| {
-            StorageError::Internal("Transaction conflict during rollback".to_owned())
-        })?;
+        check_lwt_applied(&delete_result, "rollback update").unwrap_or(());
         Ok(())
     }
 
