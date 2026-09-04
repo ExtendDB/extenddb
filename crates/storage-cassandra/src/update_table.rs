@@ -8,7 +8,9 @@ use cdrs_tokio::query::BatchQueryBuilder;
 use cdrs_tokio::query::QueryValues;
 use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::value::Value;
-use extenddb_core::types::{BillingMode, TableDescription, UpdateTableInput};
+use extenddb_core::types::{
+    AttributeDefinition, BillingMode, KeySchemaElement, TableDescription, UpdateTableInput,
+};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::effective_attribute_definitions;
 
@@ -350,6 +352,100 @@ impl CassandraEngine {
             base_attr_defs = Vec::new();
         }
 
+        // The table's TTL control lease fences index creation against the TTL
+        // lifecycle. It is needed in two cases:
+        //
+        // * an asynchronously propagated GSI is being created — holding the
+        //   lease stops TTL being enabled underneath it, which the TTL design
+        //   does not admit; and
+        // * TTL is already enabled — holding the lease keeps the expiration
+        //   sweep out of the window between the catalog publishing the new
+        //   index as ACTIVE and its data table actually existing. Without it a
+        //   sweep can take a base-row claim and then fail applying index
+        //   effects against a table that is not there yet.
+        let creating_async_gsi = !gsi_creates.is_empty()
+            && self
+                .gsi_default_delay_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                != 0;
+        let ttl_enabled = self
+            .ttl_config_for_table(account_id, &input.table_name)
+            .await?
+            .is_some();
+        let ttl_control_owner = if !gsi_creates.is_empty() && (creating_async_gsi || ttl_enabled) {
+            let owner = self
+                .acquire_ttl_control_lease(account_id, &input.table_name)
+                .await?
+                .ok_or_else(|| {
+                    StorageError::IndexesInUse(format!(
+                        "Index changes for table {} cannot be applied while an expiration \
+                         sweep is in progress. Retry the request.",
+                        input.table_name
+                    ))
+                })?;
+            if creating_async_gsi && ttl_enabled {
+                self.release_ttl_sweep_lease(account_id, &input.table_name, owner)
+                    .await?;
+                return Err(StorageError::Validation(
+                    "Cannot create an asynchronously propagated GSI while TTL is enabled"
+                        .to_owned(),
+                ));
+            }
+            Some(owner)
+        } else {
+            None
+        };
+
+        // Everything below runs under that lease, so it is released on every
+        // path rather than only on success.
+        let outcome = self
+            .apply_table_update(
+                account_id,
+                &input,
+                batch,
+                batch_has_statements,
+                needs_shard_init,
+                needs_label_restore,
+                &table_id,
+                &gsi_creates,
+                &gsi_deletes,
+                &base_key_schema,
+                &base_attr_defs,
+            )
+            .await;
+        if let Some(owner) = ttl_control_owner
+            && let Err(error) = self
+                .release_ttl_sweep_lease(account_id, &input.table_name, owner)
+                .await
+        {
+            tracing::warn!(
+                table = %input.table_name,
+                "TTL control lease release failed; TTL lifecycle changes are blocked \
+                 until it expires: {error}"
+            );
+        }
+        outcome
+    }
+
+    /// Apply the catalog batch and the post-batch DDL for `update_table`.
+    ///
+    /// Split out so the caller can hold the TTL control lease across it and
+    /// release it on every path.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_table_update(
+        &self,
+        account_id: &str,
+        input: &UpdateTableInput,
+        batch: BatchQueryBuilder,
+        batch_has_statements: bool,
+        needs_shard_init: bool,
+        needs_label_restore: bool,
+        table_id: &str,
+        gsi_creates: &[(String, String)],
+        gsi_deletes: &[String],
+        base_key_schema: &[KeySchemaElement],
+        base_attr_defs: &[AttributeDefinition],
+    ) -> Result<TableDescription, StorageError> {
         // Execute the catalog batch atomically.
         if batch_has_statements {
             self.session
@@ -368,7 +464,7 @@ impl CassandraEngine {
         // Post-batch: shard init (has its own internal batch across two keyspaces).
         if needs_shard_init {
             let account_ks = self.account_keyspace(account_id);
-            self.init_stream_shards(account_id, &input.table_name, &account_ks, &table_id)
+            self.init_stream_shards(account_id, &input.table_name, &account_ks, table_id)
                 .await?;
         }
         let _ = needs_label_restore; // handled inside the batch above
@@ -378,7 +474,7 @@ impl CassandraEngine {
             let effective_attr_defs = input
                 .attribute_definitions
                 .as_deref()
-                .unwrap_or(&base_attr_defs);
+                .unwrap_or(base_attr_defs);
             let account_ks = self.account_keyspace(account_id);
 
             let mut create_idx = 0usize;
@@ -393,8 +489,8 @@ impl CassandraEngine {
                         index_id,
                         &create.key_schema,
                         effective_attr_defs,
-                        &base_key_schema,
-                        &base_attr_defs,
+                        base_key_schema,
+                        base_attr_defs,
                     )
                     .await?;
                 }

@@ -128,6 +128,8 @@ impl CassandraEngine {
 
             // Delete indexes (catalog + data tables)
             let account_keyspace = self.account_keyspace(&account_id);
+            self.clear_ttl_entries_for_table_id(&account_id, &table_id)
+                .await?;
             crate::data::index::delete_indexes_for_table(
                 &self.session_arc(),
                 &catalog_keyspace,

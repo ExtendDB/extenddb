@@ -49,6 +49,7 @@
 //! the "token range pagination" approach approved in the workplan.
 
 use cdrs_tokio::query::QueryValues;
+use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::value::Value;
 use extenddb_core::types::{Item, ScalarAttributeType, TableKeyInfo};
 use extenddb_storage::error::StorageError;
@@ -221,9 +222,9 @@ impl crate::CassandraEngine {
         // Parse item_data JSON into items.
         let items: Vec<Item> = rows
             .into_iter()
-            .map(|row| {
-                let json_str: String = cassandra_util::get_column(&row, "item_data", "scan parse")?;
-                json_to_item(json_str)
+            .filter_map(|row| {
+                let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+                item_data.map(json_to_item)
             })
             .collect::<Result<Vec<_>, _>>()?;
 

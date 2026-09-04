@@ -195,7 +195,7 @@ pub(crate) fn item_has_index_keys(item: &Item, index_ks: &[KeySchemaElement]) ->
 /// Compute the effective propagation delay for an index.
 ///
 /// Per-GSI setting overrides the system default. `Some(0)` = sync, `None` = use default.
-pub(super) fn effective_delay(idx: &IndexMeta, system_default: u64) -> u64 {
+pub(crate) fn effective_delay(idx: &IndexMeta, system_default: u64) -> u64 {
     match idx.propagation_delay_ms {
         Some(0) => 0,
         #[allow(clippy::cast_sign_loss)]

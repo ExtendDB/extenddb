@@ -36,3 +36,4 @@ decision, write a new ADR.
 | [0004](0004-vector-search-exact-scan.md) | Vector search is an exact scan over one row per vector | Accepted |
 | [0005](0005-index-build-lifecycle-ownership.md) | Index-build lifecycle stays in the backend until a second backend needs it | Accepted |
 | [0006](0006-pgvector-storage-and-scoring.md) | Vector storage on PostgreSQL uses pgvector's type, and the engine decides what it cannot compute | Accepted |
+| [0010](0010-cassandra-ttl-expiration-queue.md) | Durable sharded expiration queue for Cassandra TTL | Accepted |

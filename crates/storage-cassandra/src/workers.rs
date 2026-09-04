@@ -142,7 +142,7 @@ pub(crate) async fn poll_transaction_recovery(
 }
 
 /// List all account keyspaces for this engine (keyspaces matching `{prefix}_account_*`).
-async fn list_account_keyspaces(
+pub(crate) async fn list_account_keyspaces(
     engine: &CassandraEngine,
 ) -> Result<Vec<String>, extenddb_storage::error::StorageError> {
     let prefix = format!("{}_account_", engine.keyspace_prefix);
@@ -439,7 +439,7 @@ async fn gsi_apply_index(
 }
 
 /// Returns true if the error indicates the index table no longer exists.
-fn is_table_not_found(err: &extenddb_storage::error::StorageError) -> bool {
+pub(crate) fn is_table_not_found(err: &extenddb_storage::error::StorageError) -> bool {
     match err {
         extenddb_storage::error::StorageError::Internal(msg) => {
             msg.contains("unconfigured table") || msg.contains("does not exist")

@@ -158,7 +158,10 @@ impl CassandraEngine {
             return Ok(None);
         };
 
-        let item_data: String = get_column(&row, "item_data", "read_item_with_metadata")?;
+        let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+        let Some(item_data) = item_data else {
+            return Ok(None);
+        };
         let item: Item =
             serde_json::from_str(&item_data).map_err(|e| StorageError::Internal(e.to_string()))?;
         let last_committed: Option<i64> = row
@@ -182,7 +185,7 @@ impl CassandraEngine {
             &self.session,
             &keyspace,
             &table,
-            "last_committed_txn_timestamp, prepared_txn_id",
+            "item_data, last_committed_txn_timestamp, prepared_txn_id",
             pk_text.as_str(),
             sk.as_ref(),
             sk_col.as_deref(),
@@ -197,6 +200,10 @@ impl CassandraEngine {
             .ok()
             .flatten();
         let prepared_txn_id: Option<uuid::Uuid> = row.get_by_name("prepared_txn_id").ok().flatten();
+        let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+        if item_data.is_none() && prepared_txn_id.is_none() {
+            return Ok(None);
+        }
         Ok(Some((last_committed.unwrap_or(0), prepared_txn_id)))
     }
 
@@ -546,11 +553,51 @@ impl CassandraEngine {
         self.update_ledger_state(account_keyspace, txn_id, TransactionState::Committing)
             .await?;
 
+        // Capture the pre-commit image of every item on a TTL-enabled table.
+        // Reconciliation needs it to retire the expiration entry the item had
+        // *before* this transaction: unlike an ordinary write, a transactional
+        // write cannot carry the queue delete in the same batch as the base
+        // mutation, so without this a changed or removed TTL leaves its old
+        // entry behind until that entry's original due time.
+        let mut pre_commit_images: Vec<Option<Item>> = Vec::with_capacity(ops.len());
+        for op in ops {
+            let image = match op {
+                TransactWriteOp::Put { key_info, item, .. } => {
+                    self.pre_commit_ttl_image(key_info, item).await?
+                }
+                TransactWriteOp::Update { key_info, key, .. }
+                | TransactWriteOp::Delete { key_info, key, .. } => {
+                    self.pre_commit_ttl_image(key_info, key).await?
+                }
+                TransactWriteOp::ConditionCheck { .. } => None,
+            };
+            pre_commit_images.push(image);
+        }
+
         // TODO: Execute COMMIT operations for each item in parallel
         // For now, sequential execution
         for op in ops {
             self.commit_single_operation(op, txn_id, txn_timestamp)
                 .await?;
+        }
+
+        for (op, old_image) in ops.iter().zip(&pre_commit_images) {
+            match op {
+                TransactWriteOp::Put { key_info, item, .. } => {
+                    self.reconcile_ttl_transition(key_info, old_image.as_ref(), Some(item))
+                        .await?;
+                }
+                TransactWriteOp::Update { key_info, key, .. } => {
+                    let new_image = self.get_item_quorum(key_info, key).await?;
+                    self.reconcile_ttl_transition(key_info, old_image.as_ref(), new_image.as_ref())
+                        .await?;
+                }
+                TransactWriteOp::Delete { key_info, .. } => {
+                    self.reconcile_ttl_transition(key_info, old_image.as_ref(), None)
+                        .await?;
+                }
+                TransactWriteOp::ConditionCheck { .. } => {}
+            }
         }
 
         // Delete transaction from ledger
@@ -798,7 +845,10 @@ impl CassandraEngine {
             return Ok(None);
         };
 
-        let item_data: String = get_column(&row, "item_data", "fetch_item_for_transaction")?;
+        let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+        let Some(item_data) = item_data else {
+            return Ok(None);
+        };
         Ok(Some(
             serde_json::from_str(&item_data).map_err(|e| StorageError::Internal(e.to_string()))?,
         ))
@@ -1237,6 +1287,22 @@ impl CassandraEngine {
                     {
                         tracing::error!("recover_transaction commit op {txn_id}: {e}");
                         return Err(e);
+                    }
+                }
+                for op in &ops {
+                    if matches!(op.op.as_str(), "PUT" | "UPDATE")
+                        && let Some(item_data) = op.item_data.as_deref()
+                    {
+                        // Recovery can only re-register the committed image:
+                        // the ledger does not persist the pre-commit image,
+                        // so a transaction that crashes between COMMIT and
+                        // reconciliation can leave the item's previous
+                        // expiration entry in the queue. That entry is
+                        // harmless — the worker revalidates the item before
+                        // deleting anything and retires the entry when it
+                        // comes due — but it is queue garbage until then.
+                        self.reconcile_ttl_item_by_table_id(&op.table_id, item_data)
+                            .await?;
                     }
                 }
             }

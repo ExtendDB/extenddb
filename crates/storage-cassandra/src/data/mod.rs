@@ -23,6 +23,7 @@ mod query_helpers;
 mod scan;
 pub mod transaction_ledger;
 mod transactions;
+pub(crate) mod ttl;
 mod update_item;
 
 use condition::check_condition;
