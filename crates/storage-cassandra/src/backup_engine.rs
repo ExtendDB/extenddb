@@ -766,6 +766,7 @@ impl BackupEngine for CassandraEngine {
                 table_class: None,
                 on_demand_throughput: None,
                 vector_indexes: None,
+                table_throughput_mode: None,
             };
             let description = self
                 .create_table_for_restore_impl(&account_id, create_input)

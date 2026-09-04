@@ -519,6 +519,7 @@ impl CassandraEngine {
                 last_decrease_date_time: None,
             },
             billing_mode_summary,
+            table_throughput_mode_summary: None,
             global_secondary_indexes: gsis,
             local_secondary_indexes: lsis,
             stream_specification: input.stream_specification,
