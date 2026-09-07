@@ -66,10 +66,13 @@ pub(crate) async fn stream_record_cleanup_worker(storage: Arc<MongoEngine>) {
 /// Live writes during the backfill window continue to route through
 /// `sync_indexes` / `sync_indexes_in_session`, which write to
 /// CREATING indexes too (indexes catalog membership, not status, is
-/// what gates the write path). Both paths use a transaction over the
-/// base and index rows, so a concurrent mutation serializes with or
-/// aborts the backfill rather than being overwritten by a stale upsert
-/// — RFC-0003 §2.4.
+/// what gates the write path). When index metadata is present, the base
+/// write and its index update share one transaction, so a concurrent
+/// mutation serializes with or aborts the backfill rather than being
+/// overwritten by a stale upsert — RFC-0003 §2.4. Unconditional writes
+/// use a sessionless fast path only when the generation-checked cache
+/// says the table has no indexes; an invalidated in-flight observation
+/// cannot publish that stale no-index result.
 pub(crate) async fn gsi_backfill_worker(storage: Arc<MongoEngine>) {
     loop {
         tokio::time::sleep(GSI_BACKFILL_INTERVAL).await;
