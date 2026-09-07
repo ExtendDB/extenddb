@@ -659,6 +659,13 @@ impl BackupEngine for MongoEngine {
             let src_coll = self.data_db.collection::<Document>(&src_coll_name);
             let new_coll_name = data_collection_name(&desc.table_id);
 
+            // The test-hook gate holds the restore after its CREATING index
+            // metadata exists but before the base `$out` copy begins. This
+            // lets the integration test force a worker tick through the
+            // dangerous pre-copy window.
+            self.wait_for_gsi_backfill_test_gate(&target_table_name)
+                .await?;
+
             let pipeline = vec![doc! { "$out": &new_coll_name }];
             let out_cursor = src_coll
                 .aggregate(pipeline)

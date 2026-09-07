@@ -63,7 +63,9 @@ pub(crate) async fn stream_record_cleanup_worker(storage: Arc<MongoEngine>) {
 /// index to `ACTIVE`. Restart-safe: the cursor is persisted after
 /// every batch so a mid-backfill crash resumes where it left off.
 ///
-/// Live writes during the backfill window continue to route through
+/// Restore jobs are held until the restore request has finished its `$out`
+/// copy and marks the table `restore_backfill_pending`. Live writes during the
+/// backfill window continue to route through
 /// `sync_indexes` / `sync_indexes_in_session`, which write to
 /// CREATING indexes too (indexes catalog membership, not status, is
 /// what gates the write path). Both paths use a transaction over the
@@ -148,6 +150,15 @@ async fn run_gsi_backfill_job(storage: &MongoEngine, job: &Document) -> Result<(
         }
     };
 
+    // Restore creates its index catalog rows before copying the base data.
+    // Until the copy has finished, a CREATING restore index must not be
+    // treated as an ordinary backfill job: scanning the still-empty target
+    // collection would report completion and permanently activate an empty
+    // index. The restore request sets this flag only after `$out` succeeds.
+    if mode == GsiBackfillMode::Restore && !restore_backfill_is_ready(storage, &table_id).await? {
+        return Ok(());
+    }
+
     let context = GsiBackfillContext {
         key_info: &key_info,
         index_id: &index_id,
@@ -205,6 +216,22 @@ async fn run_gsi_backfill_job(storage: &MongoEngine, job: &Document) -> Result<(
             return Ok(());
         }
     }
+}
+
+async fn restore_backfill_is_ready(
+    storage: &MongoEngine,
+    table_id: &str,
+) -> Result<bool, StorageError> {
+    let tables_coll = storage.catalog_db.collection::<Document>("tables");
+    let table = tables_coll
+        .find_one(doc! {
+            "table_id": table_id,
+            "table_status": "CREATING",
+            "restore_backfill_pending": true,
+        })
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+    Ok(table.is_some())
 }
 
 /// Complete restored tables after every restored GSI/LSI has been populated.

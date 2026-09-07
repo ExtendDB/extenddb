@@ -3180,7 +3180,10 @@ impl MongoEngine {
     /// read but before it claims or writes any base/index rows. The gate is
     /// controlled through the authenticated management settings API and is
     /// inert unless a test explicitly sets it to `armed`.
-    async fn wait_for_gsi_backfill_test_gate(&self, table_name: &str) -> Result<(), StorageError> {
+    pub(crate) async fn wait_for_gsi_backfill_test_gate(
+        &self,
+        table_name: &str,
+    ) -> Result<(), StorageError> {
         #[cfg(not(feature = "test-hooks"))]
         {
             let _ = table_name;
