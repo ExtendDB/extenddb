@@ -329,6 +329,11 @@ impl MongoEngine {
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
             let new_doc =
                 item_to_document(&item, &key_info.key_schema, &key_info.attribute_definitions)?;
+            // Capture before the transaction's first database operation. If
+            // UpdateTable invalidates the cache while this transaction is in
+            // flight, the guarded publish below must not overwrite the newer
+            // generation with a stale `false` observation.
+            let cache_generation = self.gsi_cache_generation(&key_info.table_id);
             session
                 .start_transaction()
                 .with_options(tx_options.clone())
@@ -414,6 +419,7 @@ impl MongoEngine {
                     key_info,
                     old_item.as_ref(),
                     Some(&item),
+                    cache_generation,
                     &mut session,
                 )
                 .await?;
@@ -539,6 +545,9 @@ impl MongoEngine {
             .build();
 
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+            // Capture before the transaction's first database operation so a
+            // concurrent catalog mutation cannot be hidden by the snapshot.
+            let cache_generation = self.gsi_cache_generation(&key_info.table_id);
             session
                 .start_transaction()
                 .with_options(tx_options.clone())
@@ -592,6 +601,7 @@ impl MongoEngine {
                         key_info,
                         deleted_item.as_ref(),
                         None,
+                        cache_generation,
                         &mut session,
                     )
                     .await?;
@@ -768,6 +778,10 @@ impl MongoEngine {
             .build();
 
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+            // Capture before the transaction's first database operation. A
+            // later UpdateTable must invalidate this observation rather than
+            // allowing a stale no-index result to be published.
+            let cache_generation = self.gsi_cache_generation(&key_info.table_id);
             session
                 .start_transaction()
                 .with_options(tx_options.clone())
@@ -892,6 +906,7 @@ impl MongoEngine {
                     key_info,
                     pre_image.as_ref(),
                     Some(&new_item),
+                    cache_generation,
                     &mut session,
                 )
                 .await?;
@@ -1751,13 +1766,13 @@ impl MongoEngine {
         key_info: &TableKeyInfo,
         old_item: Option<&Item>,
         new_item: Option<&Item>,
+        cache_generation: u64,
         session: &mut mongodb::ClientSession,
     ) -> Result<(), StorageError> {
         if let Some(false) = self.gsi_cache_get_fresh(&key_info.table_id) {
             return Ok(());
         }
 
-        let cache_generation = self.gsi_cache_generation(&key_info.table_id);
         let indexes_coll = self.catalog_db.collection::<Document>("indexes");
         let mut cursor = indexes_coll
             .find(doc! { "_id.table_id": &key_info.table_id })
@@ -2335,6 +2350,7 @@ impl MongoEngine {
                 // stale index entries when this write changes or removes a
                 // GSI key attribute, and (c) supply OldImage to any attached
                 // stream capture.
+                let cache_generation = self.gsi_cache_generation(&key_info.table_id);
                 let existing_doc = coll
                     .find_one(key_filter.clone())
                     .session(&mut *session)
@@ -2387,6 +2403,7 @@ impl MongoEngine {
                     key_info,
                     existing_item.as_ref(),
                     Some(item),
+                    cache_generation,
                     &mut *session,
                 )
                 .await
@@ -2431,6 +2448,7 @@ impl MongoEngine {
                 // Always fetch the pre-image. Needed for condition evaluation,
                 // stale-index deletion in sync_indexes_in_session, and OldImage
                 // capture for any attached stream.
+                let cache_generation = self.gsi_cache_generation(&key_info.table_id);
                 let existing_doc = coll
                     .find_one(key_filter.clone())
                     .session(&mut *session)
@@ -2468,9 +2486,15 @@ impl MongoEngine {
 
                 // Propagate to secondary indexes and the stream within the
                 // same transaction session.
-                self.sync_indexes_in_session(key_info, existing_item.as_ref(), None, &mut *session)
-                    .await
-                    .map_err(TransactOpError::Storage)?;
+                self.sync_indexes_in_session(
+                    key_info,
+                    existing_item.as_ref(),
+                    None,
+                    cache_generation,
+                    &mut *session,
+                )
+                .await
+                .map_err(TransactOpError::Storage)?;
                 if let Some(capture) = stream {
                     // DDB semantics: a delete on a non-existent key is a
                     // no-op, and no stream record is emitted. Guard on
@@ -2514,6 +2538,7 @@ impl MongoEngine {
                     pk_filter(key, &key_info.key_schema, &key_info.attribute_definitions)
                         .map_err(TransactOpError::Storage)?;
 
+                let cache_generation = self.gsi_cache_generation(&key_info.table_id);
                 let existing_doc = coll
                     .find_one(key_filter.clone())
                     .session(&mut *session)
@@ -2610,6 +2635,7 @@ impl MongoEngine {
                     key_info,
                     existing_item.as_ref(),
                     Some(&item),
+                    cache_generation,
                     &mut *session,
                 )
                 .await
