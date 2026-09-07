@@ -3,6 +3,26 @@
 
 //! Storage configuration trait and registry for storage backends.
 
+/// Operator-facing warning emitted during server startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupWarning {
+    /// Short warning headline shown prominently in the startup banner.
+    pub title: String,
+    /// Supporting lines describing the impact and remediation.
+    pub details: Vec<String>,
+}
+
+impl StartupWarning {
+    /// Render the warning as a single line suitable for structured logs.
+    #[must_use]
+    pub fn log_message(&self) -> String {
+        std::iter::once(self.title.as_str())
+            .chain(self.details.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 /// Configuration interface for storage backends.
 ///
 /// Each backend implements this trait to expose connection parameters
@@ -19,6 +39,13 @@ pub trait StorageConfig: Send + Sync + std::fmt::Debug {
 
     /// Maximum concurrent connections for catalog/management operations.
     fn max_catalog_connections(&self) -> u32;
+
+    /// Operator-facing warnings for non-default or compatibility settings.
+    ///
+    /// The default keeps existing and third-party backends source-compatible.
+    fn startup_warnings(&self) -> Vec<StartupWarning> {
+        Vec::new()
+    }
 
     /// Clone this config into a boxed trait object.
     fn clone_box(&self) -> Box<dyn StorageConfig>;
