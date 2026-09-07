@@ -35,6 +35,31 @@ use crate::pushdown::{Pushable, is_pushable};
 
 use extenddb_core::types::{Projection, ProjectionType};
 
+#[derive(Clone, Copy)]
+enum TransactionKind {
+    ReadOnly,
+    Write,
+}
+
+fn transaction_options(
+    read_concern: mongodb::options::ReadConcern,
+    kind: TransactionKind,
+) -> mongodb::options::TransactionOptions {
+    match kind {
+        TransactionKind::ReadOnly => mongodb::options::TransactionOptions::builder()
+            .read_concern(read_concern)
+            .build(),
+        TransactionKind::Write => mongodb::options::TransactionOptions::builder()
+            .read_concern(read_concern)
+            .write_concern(
+                mongodb::options::WriteConcern::builder()
+                    .w(mongodb::options::Acknowledgment::Majority)
+                    .build(),
+            )
+            .build(),
+    }
+}
+
 impl DataEngine for MongoEngine {
     fn put_item(
         &self,
@@ -261,6 +286,14 @@ pub(crate) struct GsiBackfillContext<'a> {
 }
 
 impl MongoEngine {
+    fn read_transaction_options(&self) -> mongodb::options::TransactionOptions {
+        transaction_options(self.transaction_read_concern(), TransactionKind::ReadOnly)
+    }
+
+    fn write_transaction_options(&self) -> mongodb::options::TransactionOptions {
+        transaction_options(self.transaction_read_concern(), TransactionKind::Write)
+    }
+
     async fn put_item_impl(
         &self,
         key_info: &TableKeyInfo,
@@ -317,14 +350,7 @@ impl MongoEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let tx_options = mongodb::options::TransactionOptions::builder()
-            .read_concern(mongodb::options::ReadConcern::snapshot())
-            .write_concern(
-                mongodb::options::WriteConcern::builder()
-                    .w(mongodb::options::Acknowledgment::Majority)
-                    .build(),
-            )
-            .build();
+        let tx_options = self.write_transaction_options();
 
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
             let new_doc =
@@ -535,14 +561,7 @@ impl MongoEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let tx_options = mongodb::options::TransactionOptions::builder()
-            .read_concern(mongodb::options::ReadConcern::snapshot())
-            .write_concern(
-                mongodb::options::WriteConcern::builder()
-                    .w(mongodb::options::Acknowledgment::Majority)
-                    .build(),
-            )
-            .build();
+        let tx_options = self.write_transaction_options();
 
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
             // Capture before the transaction's first database operation so a
@@ -768,14 +787,7 @@ impl MongoEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let tx_options = mongodb::options::TransactionOptions::builder()
-            .read_concern(mongodb::options::ReadConcern::snapshot())
-            .write_concern(
-                mongodb::options::WriteConcern::builder()
-                    .w(mongodb::options::Acknowledgment::Majority)
-                    .build(),
-            )
-            .build();
+        let tx_options = self.write_transaction_options();
 
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
             // Capture before the transaction's first database operation. A
@@ -2023,16 +2035,14 @@ impl MongoEngine {
             return Err(StorageError::TransactionCanceled(reasons));
         }
 
-        // Use a MongoDB session with snapshot read concern for consistent reads
+        // Use a MongoDB session with the configured transaction read concern.
         let mut session = self
             .client
             .start_session()
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let tx_options = mongodb::options::TransactionOptions::builder()
-            .read_concern(mongodb::options::ReadConcern::snapshot())
-            .build();
+        let tx_options = self.read_transaction_options();
 
         session
             .start_transaction()
@@ -2076,14 +2086,7 @@ impl MongoEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let tx_options = mongodb::options::TransactionOptions::builder()
-            .read_concern(mongodb::options::ReadConcern::snapshot())
-            .write_concern(
-                mongodb::options::WriteConcern::builder()
-                    .w(mongodb::options::Acknowledgment::Majority)
-                    .build(),
-            )
-            .build();
+        let tx_options = self.write_transaction_options();
 
         // Outcome of one attempt at running the whole idempotency check
         // + op fan-out + commit. `Retry` means MongoDB aborted the txn
@@ -3788,6 +3791,39 @@ mod tests {
     fn restore_backfill_skips_live_claim_transaction() {
         assert!(!uses_live_backfill_transaction(GsiBackfillMode::Restore));
         assert!(uses_live_backfill_transaction(GsiBackfillMode::Live));
+    }
+
+    #[test]
+    fn configured_read_concern_reaches_read_and_write_transaction_options() {
+        let config: crate::config::MongoStorageConfig = toml::from_str(
+            r#"connection_string = "mongodb://localhost:27017"
+transaction_read_concern = "majority""#,
+        )
+        .expect("configured read concern must deserialize");
+        let configured =
+            crate::config::parse_transaction_read_concern(&config.transaction_read_concern)
+                .expect("configured read concern must parse");
+
+        let read_options = transaction_options(configured.clone(), TransactionKind::ReadOnly);
+        assert_eq!(
+            read_options.read_concern,
+            Some(mongodb::options::ReadConcern::majority())
+        );
+        assert_eq!(read_options.write_concern, None);
+
+        let write_options = transaction_options(configured, TransactionKind::Write);
+        assert_eq!(
+            write_options.read_concern,
+            Some(mongodb::options::ReadConcern::majority())
+        );
+        assert_eq!(
+            write_options.write_concern,
+            Some(
+                mongodb::options::WriteConcern::builder()
+                    .w(mongodb::options::Acknowledgment::Majority)
+                    .build()
+            )
+        );
     }
 
     #[test]
