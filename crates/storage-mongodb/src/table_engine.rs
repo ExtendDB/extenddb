@@ -333,15 +333,20 @@ impl MongoEngine {
                     .transpose()
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-                let index_doc = doc! {
+                let index_status = if defer_active { "CREATING" } else { "ACTIVE" };
+                let backfill_mode = if defer_active { Some("restore") } else { None };
+                let mut index_doc = doc! {
                     "_id": { "table_id": &table_id, "index_name": &gsi.index_name },
                     "index_id": &index_id,
                     "index_type": "GSI",
                     "key_schema": key_schema_bson,
                     "projection": projection_bson,
-                    "index_status": "ACTIVE",
+                    "index_status": index_status,
                     "provisioned_throughput": index_pt_bson.unwrap_or(bson::Bson::Null),
                 };
+                if let Some(mode) = backfill_mode {
+                    index_doc.insert("backfill_mode", mode);
+                }
 
                 self.catalog_db
                     .collection::<Document>("indexes")
@@ -361,7 +366,7 @@ impl MongoEngine {
                     index_name: gsi.index_name.clone(),
                     key_schema: gsi.key_schema.clone(),
                     projection: gsi.projection.clone(),
-                    index_status: "ACTIVE".to_string(),
+                    index_status: index_status.to_string(),
                     provisioned_throughput: gsi.provisioned_throughput.as_ref().map(|pt| {
                         ProvisionedThroughputDescription {
                             read_capacity_units: pt.read_capacity_units,
@@ -394,15 +399,20 @@ impl MongoEngine {
                 let projection_bson = bson::to_bson(&lsi.projection)
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-                let index_doc = doc! {
+                let index_status = if defer_active { "CREATING" } else { "ACTIVE" };
+                let backfill_mode = if defer_active { Some("restore") } else { None };
+                let mut index_doc = doc! {
                     "_id": { "table_id": &table_id, "index_name": &lsi.index_name },
                     "index_id": &index_id,
                     "index_type": "LSI",
                     "key_schema": key_schema_bson,
                     "projection": projection_bson,
-                    "index_status": "ACTIVE",
+                    "index_status": index_status,
                     "provisioned_throughput": bson::Bson::Null,
                 };
+                if let Some(mode) = backfill_mode {
+                    index_doc.insert("backfill_mode", mode);
+                }
 
                 self.catalog_db
                     .collection::<Document>("indexes")
