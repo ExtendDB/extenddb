@@ -35,10 +35,11 @@ use crate::workers;
 /// its package version, so the thin `main` passes them in. Surfaced by
 /// `extenddb version`, the startup banner, and the console version string.
 ///
-/// All fields are `&'static str` because every value originates from a compile
-/// time `env!` and is baked into the binary. Declaring the true lifetime up
-/// front means the values can later be stored beyond the call (in a struct, a
-/// metrics label, a spawned task) without a breaking signature change.
+/// String fields are `&'static str` because every value originates from a
+/// compile-time `env!` and is baked into the binary. Declaring the true
+/// lifetime up front means the values can later be stored beyond the call (in
+/// a struct, a metrics label, a spawned task) without a breaking signature
+/// change.
 #[derive(Debug, Clone, Copy)]
 pub struct BuildInfo {
     /// Package version of the deployed binary (e.g. `env!("CARGO_PKG_VERSION")`
@@ -48,6 +49,8 @@ pub struct BuildInfo {
     pub git_hash: &'static str,
     /// Build timestamp (e.g. `env!("EXTENDDB_BUILD_TIME")`).
     pub build_time: &'static str,
+    /// Whether deterministic MongoDB backfill test hooks are compiled in.
+    pub test_hooks_enabled: bool,
 }
 
 /// Where the server writes its log output.
@@ -275,6 +278,10 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         .with(fmt_layer)
         .try_init()
         .map_err(|e| anyhow::anyhow!("Failed to initialize tracing: {e}"))?;
+
+    for warning in app_config.storage.startup_warnings() {
+        tracing::warn!("{}", warning.log_message());
+    }
 
     // Create server components via factory pattern. Dev mode asks the backend
     // to bootstrap an uninitialized catalog at serve time (zero-config use).

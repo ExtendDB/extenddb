@@ -35,6 +35,31 @@ use crate::pushdown::{Pushable, is_pushable};
 
 use extenddb_core::types::{Projection, ProjectionType};
 
+#[derive(Clone, Copy)]
+enum TransactionKind {
+    ReadOnly,
+    Write,
+}
+
+fn transaction_options(
+    read_concern: mongodb::options::ReadConcern,
+    kind: TransactionKind,
+) -> mongodb::options::TransactionOptions {
+    match kind {
+        TransactionKind::ReadOnly => mongodb::options::TransactionOptions::builder()
+            .read_concern(read_concern)
+            .build(),
+        TransactionKind::Write => mongodb::options::TransactionOptions::builder()
+            .read_concern(read_concern)
+            .write_concern(
+                mongodb::options::WriteConcern::builder()
+                    .w(mongodb::options::Acknowledgment::Majority)
+                    .build(),
+            )
+            .build(),
+    }
+}
+
 impl DataEngine for MongoEngine {
     fn put_item(
         &self,
@@ -238,7 +263,85 @@ impl DataEngine for MongoEngine {
     }
 }
 
+/// Distinguishes live GSI creation, where concurrent writes are possible,
+/// from restore backfills, where the target table is still unavailable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GsiBackfillMode {
+    Live,
+    #[allow(dead_code)]
+    Restore,
+}
+
+fn uses_live_backfill_transaction(mode: GsiBackfillMode) -> bool {
+    matches!(mode, GsiBackfillMode::Live)
+}
+
+/// Invariants shared by every item in one GSI backfill batch.
+pub(crate) struct GsiBackfillContext<'a> {
+    pub(crate) key_info: &'a TableKeyInfo,
+    pub(crate) index_id: &'a str,
+    pub(crate) idx_key_schema: &'a [KeySchemaElement],
+    pub(crate) projection: &'a Projection,
+    pub(crate) mode: GsiBackfillMode,
+}
+
+#[async_trait::async_trait]
+trait GsiIndexWriter: Send + Sync {
+    async fn replace(
+        &self,
+        filter: Document,
+        replacement: Document,
+        options: mongodb::options::ReplaceOptions,
+    ) -> Result<(), StorageError>;
+
+    async fn replace_in_session(
+        &self,
+        filter: Document,
+        replacement: Document,
+        options: mongodb::options::ReplaceOptions,
+        session: &mut mongodb::ClientSession,
+    ) -> Result<(), StorageError>;
+}
+
+#[async_trait::async_trait]
+impl GsiIndexWriter for mongodb::Collection<Document> {
+    async fn replace(
+        &self,
+        filter: Document,
+        replacement: Document,
+        options: mongodb::options::ReplaceOptions,
+    ) -> Result<(), StorageError> {
+        self.replace_one(filter, replacement)
+            .with_options(options)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn replace_in_session(
+        &self,
+        filter: Document,
+        replacement: Document,
+        options: mongodb::options::ReplaceOptions,
+        session: &mut mongodb::ClientSession,
+    ) -> Result<(), StorageError> {
+        self.replace_one(filter, replacement)
+            .with_options(options)
+            .session(session)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        Ok(())
+    }
+}
 impl MongoEngine {
+    fn read_transaction_options(&self) -> mongodb::options::TransactionOptions {
+        transaction_options(self.transaction_read_concern(), TransactionKind::ReadOnly)
+    }
+
+    fn write_transaction_options(&self) -> mongodb::options::TransactionOptions {
+        transaction_options(self.transaction_read_concern(), TransactionKind::Write)
+    }
+
     async fn put_item_impl(
         &self,
         key_info: &TableKeyInfo,
@@ -295,18 +398,16 @@ impl MongoEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let tx_options = mongodb::options::TransactionOptions::builder()
-            .read_concern(mongodb::options::ReadConcern::snapshot())
-            .write_concern(
-                mongodb::options::WriteConcern::builder()
-                    .w(mongodb::options::Acknowledgment::Majority)
-                    .build(),
-            )
-            .build();
+        let tx_options = self.write_transaction_options();
 
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
             let new_doc =
                 item_to_document(&item, &key_info.key_schema, &key_info.attribute_definitions)?;
+            // Capture before the transaction's first database operation. If
+            // UpdateTable invalidates the cache while this transaction is in
+            // flight, the guarded publish below must not overwrite the newer
+            // generation with a stale `false` observation.
+            let cache_generation = self.gsi_cache_generation(&key_info.table_id);
             session
                 .start_transaction()
                 .with_options(tx_options.clone())
@@ -392,6 +493,7 @@ impl MongoEngine {
                     key_info,
                     old_item.as_ref(),
                     Some(&item),
+                    cache_generation,
                     &mut session,
                 )
                 .await?;
@@ -507,16 +609,12 @@ impl MongoEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let tx_options = mongodb::options::TransactionOptions::builder()
-            .read_concern(mongodb::options::ReadConcern::snapshot())
-            .write_concern(
-                mongodb::options::WriteConcern::builder()
-                    .w(mongodb::options::Acknowledgment::Majority)
-                    .build(),
-            )
-            .build();
+        let tx_options = self.write_transaction_options();
 
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+            // Capture before the transaction's first database operation so a
+            // concurrent catalog mutation cannot be hidden by the snapshot.
+            let cache_generation = self.gsi_cache_generation(&key_info.table_id);
             session
                 .start_transaction()
                 .with_options(tx_options.clone())
@@ -570,6 +668,7 @@ impl MongoEngine {
                         key_info,
                         deleted_item.as_ref(),
                         None,
+                        cache_generation,
                         &mut session,
                     )
                     .await?;
@@ -736,16 +835,13 @@ impl MongoEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let tx_options = mongodb::options::TransactionOptions::builder()
-            .read_concern(mongodb::options::ReadConcern::snapshot())
-            .write_concern(
-                mongodb::options::WriteConcern::builder()
-                    .w(mongodb::options::Acknowledgment::Majority)
-                    .build(),
-            )
-            .build();
+        let tx_options = self.write_transaction_options();
 
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+            // Capture before the transaction's first database operation. A
+            // later UpdateTable must invalidate this observation rather than
+            // allowing a stale no-index result to be published.
+            let cache_generation = self.gsi_cache_generation(&key_info.table_id);
             session
                 .start_transaction()
                 .with_options(tx_options.clone())
@@ -870,6 +966,7 @@ impl MongoEngine {
                     key_info,
                     pre_image.as_ref(),
                     Some(&new_item),
+                    cache_generation,
                     &mut session,
                 )
                 .await?;
@@ -1729,6 +1826,7 @@ impl MongoEngine {
         key_info: &TableKeyInfo,
         old_item: Option<&Item>,
         new_item: Option<&Item>,
+        cache_generation: u64,
         session: &mut mongodb::ClientSession,
     ) -> Result<(), StorageError> {
         if let Some(false) = self.gsi_cache_get_fresh(&key_info.table_id) {
@@ -1827,7 +1925,7 @@ impl MongoEngine {
             }
         }
 
-        self.gsi_cache_set(&key_info.table_id, found_any);
+        self.gsi_cache_set_if_generation(&key_info.table_id, cache_generation, found_any);
         Ok(())
     }
 
@@ -1985,16 +2083,14 @@ impl MongoEngine {
             return Err(StorageError::TransactionCanceled(reasons));
         }
 
-        // Use a MongoDB session with snapshot read concern for consistent reads
+        // Use a MongoDB session with the configured transaction read concern.
         let mut session = self
             .client
             .start_session()
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let tx_options = mongodb::options::TransactionOptions::builder()
-            .read_concern(mongodb::options::ReadConcern::snapshot())
-            .build();
+        let tx_options = self.read_transaction_options();
 
         session
             .start_transaction()
@@ -2038,14 +2134,7 @@ impl MongoEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let tx_options = mongodb::options::TransactionOptions::builder()
-            .read_concern(mongodb::options::ReadConcern::snapshot())
-            .write_concern(
-                mongodb::options::WriteConcern::builder()
-                    .w(mongodb::options::Acknowledgment::Majority)
-                    .build(),
-            )
-            .build();
+        let tx_options = self.write_transaction_options();
 
         // Outcome of one attempt at running the whole idempotency check
         // + op fan-out + commit. `Retry` means MongoDB aborted the txn
@@ -2074,6 +2163,15 @@ impl MongoEngine {
                 token: t.as_str(),
                 fingerprint: f.as_str(),
             });
+            // Capture every operation's cache generation before starting the
+            // transaction. The first operation inside the transaction may
+            // establish a snapshot that hides an intervening UpdateTable;
+            // the guarded cache publication must compare against the
+            // pre-transaction generation instead.
+            let cache_generations: Vec<u64> = ops
+                .iter()
+                .map(|op| self.gsi_cache_generation(op.table_id()))
+                .collect();
             session
                 .start_transaction()
                 .with_options(tx_options.clone())
@@ -2184,9 +2282,9 @@ impl MongoEngine {
                 let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());
                 let mut any_failed = false;
 
-                for op in ops {
+                for (op, cache_generation) in ops.iter().zip(cache_generations.iter().copied()) {
                     match self
-                        .execute_transact_write_op_in_session(op, &mut session)
+                        .execute_transact_write_op_in_session(op, cache_generation, &mut session)
                         .await
                     {
                         Ok(()) => reasons.push(CancellationReason::none()),
@@ -2253,6 +2351,7 @@ impl MongoEngine {
     async fn execute_transact_write_op_in_session(
         &self,
         op: &OwnedTransactWriteOp,
+        cache_generation: u64,
         session: &mut mongodb::ClientSession,
     ) -> Result<(), TransactOpError> {
         use extenddb_core::types::CancellationReason;
@@ -2364,6 +2463,7 @@ impl MongoEngine {
                     key_info,
                     existing_item.as_ref(),
                     Some(item),
+                    cache_generation,
                     &mut *session,
                 )
                 .await
@@ -2445,9 +2545,15 @@ impl MongoEngine {
 
                 // Propagate to secondary indexes and the stream within the
                 // same transaction session.
-                self.sync_indexes_in_session(key_info, existing_item.as_ref(), None, &mut *session)
-                    .await
-                    .map_err(TransactOpError::Storage)?;
+                self.sync_indexes_in_session(
+                    key_info,
+                    existing_item.as_ref(),
+                    None,
+                    cache_generation,
+                    &mut *session,
+                )
+                .await
+                .map_err(TransactOpError::Storage)?;
                 if let Some(capture) = stream {
                     // DDB semantics: a delete on a non-existent key is a
                     // no-op, and no stream record is emitted. Guard on
@@ -2587,6 +2693,7 @@ impl MongoEngine {
                     key_info,
                     existing_item.as_ref(),
                     Some(&item),
+                    cache_generation,
                     &mut *session,
                 )
                 .await
@@ -2885,18 +2992,15 @@ impl MongoEngine {
 
     pub(crate) async fn backfill_gsi_batch(
         &self,
-        key_info: &TableKeyInfo,
-        index_id: &str,
-        idx_key_schema: &[KeySchemaElement],
-        projection: &Projection,
+        context: &GsiBackfillContext<'_>,
         cursor: Option<&bson::Bson>,
         batch_size: i64,
     ) -> Result<GsiBackfillProgress, StorageError> {
         use futures::TryStreamExt;
 
-        let base_coll_name = data_collection_name(&key_info.table_id);
+        let base_coll_name = data_collection_name(&context.key_info.table_id);
         let base_coll = self.data_db.collection::<Document>(&base_coll_name);
-        let idx_coll_name = data_collection_name(index_id);
+        let idx_coll_name = data_collection_name(context.index_id);
         let idx_coll = self.data_db.collection::<Document>(&idx_coll_name);
 
         let mut filter = Document::new();
@@ -2907,59 +3011,329 @@ impl MongoEngine {
         let opts = mongodb::options::FindOptions::builder()
             .sort(doc! { "_id": 1 })
             .limit(batch_size)
+            // The batch is read outside the per-item write transactions, but
+            // must not include a document that can later be rolled back after
+            // its index write is majority-committed during a primary stepdown.
+            .read_concern(mongodb::options::ReadConcern::majority())
             .build();
 
-        let base_cursor = base_coll
+        // The read is intentionally outside the write transactions. The
+        // cursor batch is only a bounded work list; each live item gets its
+        // own short transaction below, so a backfill cannot hold write locks
+        // across hundreds of base documents.
+        let mut base_cursor = base_coll
             .find(filter)
             .with_options(opts)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let docs: Vec<Document> = base_cursor
-            .try_collect()
+        let mut docs = Vec::new();
+        while let Some(result) = base_cursor
+            .try_next()
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            .map_err(|e| StorageError::Internal(e.to_string()))?
+        {
+            docs.push(result);
+        }
 
         let scanned = docs.len();
         let last_id = docs.last().and_then(|d| d.get("_id").cloned());
 
-        for doc in docs {
-            let item = document_to_item(&doc)?;
-            if !item_has_index_keys(&item, idx_key_schema) {
+        // The test gate is outside any transaction. It lets an API test commit
+        // a DeleteItem after this batch has been read but before the per-item
+        // claim transaction begins, without consuming transaction lifetime.
+        if context.mode == GsiBackfillMode::Live {
+            self.wait_for_gsi_backfill_test_gate(&context.key_info.table_name)
+                .await?;
+        }
+
+        let mut skipped_items = 0usize;
+        for doc in &docs {
+            let item = match document_to_item(doc) {
+                Ok(item) => item,
+                Err(error) => {
+                    skipped_items += 1;
+                    tracing::debug!(
+                        index_id = %context.index_id,
+                        error = %error,
+                        "GSI backfill: skipping malformed source item"
+                    );
+                    continue;
+                }
+            };
+            if !item_has_index_keys(&item, context.idx_key_schema) {
                 continue;
             }
 
-            let projected = project_item(&item, idx_key_schema, &key_info.key_schema, projection);
-            let idx_doc = index_document(
-                &projected,
-                idx_key_schema,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )?;
-            let filter = index_entry_filter(
-                &projected,
-                idx_key_schema,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )?;
-            let opts = mongodb::options::ReplaceOptions::builder()
-                .upsert(true)
-                .build();
-            idx_coll
-                .replace_one(filter, idx_doc)
-                .with_options(opts)
+            let index_refs = [extenddb_core::validation::IndexKeyRef {
+                index_name: context.index_id,
+                key_schema: context.idx_key_schema,
+            }];
+            if let Err(error) = extenddb_core::validation::validate_index_keys(
+                &item,
+                &index_refs,
+                &context.key_info.attribute_definitions,
+            ) {
+                skipped_items += 1;
+                tracing::debug!(
+                    index_id = %context.index_id,
+                    error = %error,
+                    "GSI backfill: skipping source item with invalid index keys"
+                );
+                continue;
+            }
+
+            match self
+                .backfill_gsi_item(&base_coll, &idx_coll, context, doc, &item)
                 .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            {
+                Ok(()) => {}
+                Err(StorageError::Validation(error)) => {
+                    skipped_items += 1;
+                    tracing::debug!(
+                        index_id = %context.index_id,
+                        error = %error,
+                        "GSI backfill: skipping source item that cannot be indexed"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
         }
+
+        if skipped_items > 0 {
+            tracing::warn!(
+                index_id = %context.index_id,
+                skipped_items,
+                "GSI backfill: skipped malformed or non-conforming source items"
+            );
+        }
+
+        let progress = GsiBackfillProgress {
+            scanned,
+            last_id,
+            done: (scanned as i64) < batch_size,
+        };
 
         // A short-read (fewer docs than the batch size) means we've
         // reached the end of the base collection. Upstream flips the
         // index to ACTIVE when that happens.
-        Ok(GsiBackfillProgress {
-            scanned,
-            last_id,
-            done: (scanned as i64) < batch_size,
-        })
+        Ok(progress)
+    }
+
+    /// Backfill one item. Live backfills claim the exact base snapshot and
+    /// write its index row in one short transaction. Restore backfills skip
+    /// the claim because the target table remains unavailable until the copy
+    /// and all index rows are complete.
+    async fn backfill_gsi_item<W: GsiIndexWriter>(
+        &self,
+        base_coll: &mongodb::Collection<Document>,
+        idx_coll: &W,
+        context: &GsiBackfillContext<'_>,
+        doc: &Document,
+        item: &Item,
+    ) -> Result<(), StorageError> {
+        let base_id = doc
+            .get("_id")
+            .cloned()
+            .ok_or_else(|| StorageError::Internal("base document missing _id".to_owned()))?;
+        let item_data = doc
+            .get("item_data")
+            .cloned()
+            .ok_or_else(|| StorageError::Internal("base document missing item_data".to_owned()))?;
+
+        let projected = project_item(
+            item,
+            context.idx_key_schema,
+            &context.key_info.key_schema,
+            context.projection,
+        );
+        let idx_doc = index_document(
+            &projected,
+            context.idx_key_schema,
+            &context.key_info.key_schema,
+            &context.key_info.attribute_definitions,
+        )?;
+        let index_filter = index_entry_filter(
+            &projected,
+            context.idx_key_schema,
+            &context.key_info.key_schema,
+            &context.key_info.attribute_definitions,
+        )?;
+        let replace_opts = mongodb::options::ReplaceOptions::builder()
+            .upsert(true)
+            .build();
+
+        if !uses_live_backfill_transaction(context.mode) {
+            idx_coll
+                .replace(index_filter, idx_doc, replace_opts)
+                .await?;
+            return Ok(());
+        }
+
+        let mut session = self
+            .client
+            .start_session()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let tx_options = mongodb::options::TransactionOptions::builder()
+            .read_concern(mongodb::options::ReadConcern::snapshot())
+            .write_concern(
+                mongodb::options::WriteConcern::builder()
+                    .w(mongodb::options::Acknowledgment::Majority)
+                    .build(),
+            )
+            .build();
+
+        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+            session
+                .start_transaction()
+                .with_options(tx_options.clone())
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+            let guard_token = uuid::Uuid::new_v4().to_string();
+            let attempt_result: Result<bool, TxErr> = async {
+                let guard_result = base_coll
+                    .update_one(
+                        doc! { "_id": &base_id, "item_data": item_data.clone() },
+                        doc! { "$set": { "_backfill_guard": &guard_token } },
+                    )
+                    .session(&mut session)
+                    .await
+                    .map_err(TxErr::from)?;
+                if guard_result.matched_count == 0 {
+                    return Ok(false);
+                }
+
+                idx_coll
+                    .replace_in_session(
+                        index_filter.clone(),
+                        idx_doc.clone(),
+                        replace_opts.clone(),
+                        &mut session,
+                    )
+                    .await
+                    .map_err(TxErr::from)?;
+
+                let cleanup = base_coll
+                    .update_one(
+                        doc! { "_id": &base_id, "_backfill_guard": &guard_token },
+                        doc! { "$unset": { "_backfill_guard": "" } },
+                    )
+                    .session(&mut session)
+                    .await
+                    .map_err(TxErr::from)?;
+                if cleanup.matched_count != 1 {
+                    return Err(TxErr::Fatal(StorageError::Internal(
+                        "GSI backfill guard cleanup matched no base document".to_owned(),
+                    )));
+                }
+
+                Ok(true)
+            }
+            .await;
+
+            match attempt_result {
+                Ok(true) => match session.commit_transaction().await {
+                    Ok(()) => return Ok(()),
+                    Err(e) if is_transient_write_conflict(&e) => {
+                        backoff_sleep(attempt).await;
+                    }
+                    Err(e) => return Err(StorageError::Internal(e.to_string())),
+                },
+                Ok(false) => {
+                    let _ = session.abort_transaction().await;
+                    return Ok(());
+                }
+                Err(TxErr::Transient) => {
+                    let _ = session.abort_transaction().await;
+                    backoff_sleep(attempt).await;
+                }
+                Err(TxErr::Fatal(e)) => {
+                    let _ = session.abort_transaction().await;
+                    return Err(e);
+                }
+            }
+        }
+
+        Err(StorageError::TransactionConflict(
+            "GSI backfill: too many concurrent write conflicts, giving up".to_owned(),
+        ))
+    }
+
+    /// Pause once when the test gate is armed, after a backfill batch has been
+    /// read but before it claims or writes any base/index rows. The gate is
+    /// controlled through the authenticated management settings API and is
+    /// inert unless a test explicitly sets it to `armed`.
+    pub(crate) async fn wait_for_gsi_backfill_test_gate(
+        &self,
+        table_name: &str,
+    ) -> Result<(), StorageError> {
+        #[cfg(not(feature = "test-hooks"))]
+        {
+            let _ = table_name;
+            Ok(())
+        }
+
+        #[cfg(feature = "test-hooks")]
+        {
+            use std::time::{Duration, Instant};
+
+            let settings = self.catalog_db.collection::<Document>("settings");
+            let key = format!(
+                "{}:{table_name}",
+                extenddb_core::settings_keys::GSI_BACKFILL_TEST_GATE
+            );
+            let armed = settings
+                .find_one(doc! { "_id": &key, "value": "armed" })
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if armed.is_none() {
+                return Ok(());
+            }
+
+            let claimed = settings
+                .update_one(
+                    doc! { "_id": &key, "value": "armed" },
+                    doc! { "$set": { "value": "paused" } },
+                )
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if claimed.matched_count == 0 {
+                return Ok(());
+            }
+
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let state = settings
+                    .find_one(doc! { "_id": &key })
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?
+                    .and_then(|d| d.get_str("value").ok().map(str::to_owned));
+                if state.as_deref() == Some("release") {
+                    settings
+                        .update_one(
+                            doc! { "_id": key, "value": "release" },
+                            doc! { "$set": { "value": "idle" } },
+                        )
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    let _ = settings
+                        .update_one(
+                            doc! { "_id": &key, "value": "paused" },
+                            doc! { "$set": { "value": "idle" } },
+                        )
+                        .await;
+                    return Err(StorageError::Internal(
+                        "timed out waiting for GSI backfill test gate release".to_owned(),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
     }
 }
 
@@ -3151,6 +3525,17 @@ enum OwnedTransactWriteOp {
         maps: ExpressionMaps,
         return_values_on_ccf: ReturnValuesOnConditionCheckFailure,
     },
+}
+
+impl OwnedTransactWriteOp {
+    fn table_id(&self) -> &str {
+        match self {
+            Self::Put { key_info, .. }
+            | Self::Delete { key_info, .. }
+            | Self::Update { key_info, .. }
+            | Self::ConditionCheck { key_info, .. } => &key_info.table_id,
+        }
+    }
 }
 
 fn clone_transact_write_op(op: &TransactWriteOp<'_>) -> OwnedTransactWriteOp {
@@ -3471,6 +3856,142 @@ fn project_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct RecordingGsiIndexWriter {
+        direct_writes: AtomicUsize,
+        transactional_writes: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl GsiIndexWriter for RecordingGsiIndexWriter {
+        async fn replace(
+            &self,
+            _filter: Document,
+            _replacement: Document,
+            _options: mongodb::options::ReplaceOptions,
+        ) -> Result<(), StorageError> {
+            self.direct_writes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn replace_in_session(
+            &self,
+            _filter: Document,
+            _replacement: Document,
+            _options: mongodb::options::ReplaceOptions,
+            _session: &mut mongodb::ClientSession,
+        ) -> Result<(), StorageError> {
+            self.transactional_writes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_backfill_writes_index_without_live_claim_transaction() {
+        let client = mongodb::Client::with_uri_str("mongodb://localhost:27017")
+            .await
+            .expect("MongoDB URI must parse without connecting");
+        let engine = MongoEngine {
+            client: client.clone(),
+            catalog_db: client.database("extenddb_catalog"),
+            data_db: client.database("extenddb_data"),
+            region: "us-east-1".to_owned(),
+            gsi_cache: Default::default(),
+            tx_read_concern: mongodb::options::ReadConcern::snapshot(),
+        };
+        let base_coll = engine.data_db.collection::<Document>("base");
+        let key_schema = vec![KeySchemaElement {
+            attribute_name: "pk".to_owned(),
+            key_type: extenddb_core::types::KeyType::Hash,
+        }];
+        let idx_key_schema = vec![KeySchemaElement {
+            attribute_name: "gsi".to_owned(),
+            key_type: extenddb_core::types::KeyType::Hash,
+        }];
+        let key_info = TableKeyInfo {
+            table_id: "restore-test-table".to_owned(),
+            key_schema: key_schema.clone(),
+            base_key_schema: key_schema.clone(),
+            attribute_definitions: vec![
+                extenddb_core::types::AttributeDefinition {
+                    attribute_name: "pk".to_owned(),
+                    attribute_type: ScalarAttributeType::S,
+                },
+                extenddb_core::types::AttributeDefinition {
+                    attribute_name: "gsi".to_owned(),
+                    attribute_type: ScalarAttributeType::S,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S("partition-1".to_owned()));
+        item.insert("gsi".to_owned(), AttributeValue::S("index-1".to_owned()));
+        let base_doc =
+            item_to_document(&item, &key_info.key_schema, &key_info.attribute_definitions)
+                .expect("test item must convert to a base document");
+        let projection = Projection {
+            projection_type: ProjectionType::All,
+            non_key_attributes: None,
+        };
+        let context = GsiBackfillContext {
+            key_info: &key_info,
+            index_id: "restore-test-index",
+            idx_key_schema: &idx_key_schema,
+            projection: &projection,
+            mode: GsiBackfillMode::Restore,
+        };
+        let writer = RecordingGsiIndexWriter::default();
+
+        engine
+            .backfill_gsi_item(&base_coll, &writer, &context, &base_doc, &item)
+            .await
+            .expect("Restore backfill must write through the direct path");
+
+        assert_eq!(writer.direct_writes.load(Ordering::Relaxed), 1);
+        assert_eq!(writer.transactional_writes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn configured_read_concern_reaches_read_and_write_transaction_options() {
+        let config: crate::config::MongoStorageConfig = toml::from_str(
+            r#"connection_string = "mongodb://localhost:27017"
+transaction_read_concern = "majority""#,
+        )
+        .expect("configured read concern must deserialize");
+        let configured =
+            crate::config::parse_transaction_read_concern(&config.transaction_read_concern)
+                .expect("configured read concern must parse");
+
+        let read_options = transaction_options(configured.clone(), TransactionKind::ReadOnly);
+        assert_eq!(
+            read_options.read_concern,
+            Some(mongodb::options::ReadConcern::majority())
+        );
+        assert_eq!(read_options.write_concern, None);
+
+        let write_options = transaction_options(configured, TransactionKind::Write);
+        assert_eq!(
+            write_options.read_concern,
+            Some(mongodb::options::ReadConcern::majority())
+        );
+        assert_eq!(
+            write_options.write_concern,
+            Some(
+                mongodb::options::WriteConcern::builder()
+                    .w(mongodb::options::Acknowledgment::Majority)
+                    .build()
+            )
+        );
+    }
+
+    #[test]
+    fn restore_backfill_skips_live_claim_transaction() {
+        assert!(!uses_live_backfill_transaction(GsiBackfillMode::Restore));
+        assert!(uses_live_backfill_transaction(GsiBackfillMode::Live));
+    }
 
     #[test]
     fn between_low_gt_high_string() {
