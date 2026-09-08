@@ -107,6 +107,24 @@ print(JSON.stringify({{dropped}}));
     assert result["dropped"], f"could not drop physical collection {collection_id}"
 
 
+def _mark_catalog_index_active(container: str, table_name: str, index_name: str) -> None:
+    table_literal = json.dumps(table_name)
+    index_literal = json.dumps(index_name)
+    javascript = f"""
+const catalog = db.getSiblingDB("extenddb_catalog");
+const table = catalog.tables.findOne({{"_id.table_name": {table_literal}}});
+if (!table) throw new Error("table not found");
+const result = catalog.indexes.updateOne(
+  {{"_id.table_id": table.table_id, "_id.index_name": {index_literal}}},
+  {{$set: {{index_status: "ACTIVE"}}}},
+);
+if (result.matchedCount !== 1) throw new Error("index not found");
+print(JSON.stringify({{updated: result.modifiedCount === 1}}));
+"""
+    result = _mongo_eval(container, javascript)
+    assert result["updated"], "could not advance catalog index status"
+
+
 def _backfill_gate_url(table_name: str) -> str:
     endpoint = os.environ.get("EXTENDDB_TEST_ENDPOINT", "").strip()
     if not endpoint:
@@ -316,6 +334,74 @@ def test_deleting_gsi_during_backfill_drops_orphaned_collection(
             pytest.fail("deleted Global Secondary Index remained in the table description")
 
         _wait_for_physical_collection_absent(mongodb_container, physical["indexId"])
+    finally:
+        if gate_armed:
+            _set_backfill_gate(unique_table_name, "release")
+        _cleanup_table(dynamodb_client, unique_table_name)
+
+
+def test_backfill_race_does_not_drop_index_still_in_catalog(
+    dynamodb_client, unique_table_name, mongodb_container
+):
+    """A status race must retain a collection whose catalog row still exists."""
+    if os.environ.get("EXTENDDB_TEST_MONGODB_TEST_HOOKS") != "1":
+        pytest.skip("requires the MongoDB test-hook build")
+
+    _create_hash_only_table(dynamodb_client, unique_table_name)
+    wait_for_active(dynamodb_client, unique_table_name)
+    gate_armed = False
+
+    try:
+        dynamodb_client.put_item(
+            TableName=unique_table_name,
+            Item={"pk": {"S": "item-1"}, "gsi_pk": {"S": "value-1"}},
+        )
+        _set_backfill_gate(unique_table_name, "armed")
+        gate_armed = True
+
+        dynamodb_client.update_table(
+            TableName=unique_table_name,
+            AttributeDefinitions=[
+                {"AttributeName": "gsi_pk", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexUpdates=[
+                {
+                    "Create": {
+                        "IndexName": "gsi1",
+                        "KeySchema": [{"AttributeName": "gsi_pk", "KeyType": "HASH"}],
+                        "Projection": {"ProjectionType": "ALL"},
+                    }
+                }
+            ],
+        )
+
+        assert _wait_for_backfill_gate(unique_table_name, "paused"), (
+            "backfill did not reach its deterministic pause"
+        )
+        physical = _physical_ids(mongodb_container, unique_table_name, "gsi1")
+        assert physical["indexCollectionExists"]
+
+        # Simulate another worker winning the catalog status update while this
+        # worker still owns the already-created physical collection.
+        _mark_catalog_index_active(mongodb_container, unique_table_name, "gsi1")
+
+        _set_backfill_gate(unique_table_name, "release")
+        assert _wait_for_backfill_gate(unique_table_name, "idle"), (
+            "backfill did not leave its deterministic pause"
+        )
+        gate_armed = False
+        # Give the released worker time to attempt its cursor update and run
+        # the zero-match catalog recheck before inspecting the collection.
+        time.sleep(1.0)
+
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            remaining = _physical_collections_exist(mongodb_container, physical["indexId"])
+            if remaining[f"_ddb_{physical['indexId']}"]:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("backfill deleted an index collection whose catalog row still exists")
     finally:
         if gate_armed:
             _set_backfill_gate(unique_table_name, "release")

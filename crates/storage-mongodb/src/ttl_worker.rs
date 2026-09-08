@@ -161,10 +161,8 @@ async fn run_gsi_backfill_job(storage: &MongoEngine, job: &Document) -> Result<(
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             if result.matched_count == 0 {
-                tracing::info!(
-                    "GSI backfill worker: index_id={index_id} was deleted during backfill; dropping orphan collection"
-                );
-                storage.drop_index_collection(&index_id).await?;
+                drop_index_collection_if_catalog_entry_missing(storage, &indexes_coll, &index_id)
+                    .await?;
                 return Ok(());
             }
             tracing::info!(
@@ -183,10 +181,8 @@ async fn run_gsi_backfill_job(storage: &MongoEngine, job: &Document) -> Result<(
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             if result.matched_count == 0 {
-                tracing::info!(
-                    "GSI backfill worker: index_id={index_id} was deleted during backfill; dropping orphan collection"
-                );
-                storage.drop_index_collection(&index_id).await?;
+                drop_index_collection_if_catalog_entry_missing(storage, &indexes_coll, &index_id)
+                    .await?;
                 return Ok(());
             }
             cursor = Some(last_id.clone());
@@ -204,6 +200,28 @@ async fn run_gsi_backfill_job(storage: &MongoEngine, job: &Document) -> Result<(
             return Ok(());
         }
     }
+}
+
+async fn drop_index_collection_if_catalog_entry_missing(
+    storage: &MongoEngine,
+    indexes_coll: &mongodb::Collection<Document>,
+    index_id: &str,
+) -> Result<(), StorageError> {
+    let catalog_entry = indexes_coll
+        .find_one(doc! { "index_id": index_id })
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+    if catalog_entry.is_none() {
+        tracing::info!(
+            "GSI backfill worker: index_id={index_id} was deleted during backfill; dropping orphan collection"
+        );
+        storage.drop_index_collection(index_id).await?;
+    } else {
+        tracing::info!(
+            "GSI backfill worker: index_id={index_id} changed state during backfill; retaining collection"
+        );
+    }
+    Ok(())
 }
 
 async fn retry_pending_indexes(storage: &MongoEngine) {
