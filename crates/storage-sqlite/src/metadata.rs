@@ -90,6 +90,8 @@ impl MetadataEngine for SqliteEngine {
         let table_name = table_name.to_owned();
         let attribute_name = attribute_name.to_owned();
         Box::pin(async move {
+            // D1: every writer holds the engine write lock.
+            let _writer = self.write_lock.lock().await;
             let ttl_val: Option<&str> = if enabled { Some(&attribute_name) } else { None };
             let result = sqlx::query(
                 "UPDATE tables SET ttl_attribute = ?, ttl_index_ready = 0 \
@@ -123,6 +125,8 @@ impl MetadataEngine for SqliteEngine {
         let arn = arn.to_owned();
         let tags = tags.to_vec();
         Box::pin(async move {
+            // D1: every writer holds the engine write lock.
+            let _writer = self.write_lock.lock().await;
             for tag in &tags {
                 sqlx::query(
                     "INSERT INTO tags (resource_arn, tag_key, tag_value) VALUES (?, ?, ?) \
@@ -147,6 +151,8 @@ impl MetadataEngine for SqliteEngine {
         let arn = arn.to_owned();
         let tag_keys = tag_keys.to_vec();
         Box::pin(async move {
+            // D1: every writer holds the engine write lock.
+            let _writer = self.write_lock.lock().await;
             for key in &tag_keys {
                 sqlx::query("DELETE FROM tags WHERE resource_arn = ? AND tag_key = ?")
                     .bind(&arn)
@@ -232,6 +238,11 @@ impl MetadataEngine for SqliteEngine {
         let ttl_attribute = ttl_attribute.to_owned();
         Box::pin(async move {
             Self::validate_account_id(&account_id)?;
+            // D1: every writer holds the engine write lock. CREATE INDEX over a
+            // populated data table is the slowest single statement this backend
+            // issues; unserialized it can hold the SQLite write lock past a
+            // concurrent writer's busy_timeout.
+            let _writer = self.write_lock.lock().await;
             let table_id = self.table_id_for(&account_id, &table_name).await?;
             let data_table = data::data_table_name(&table_id);
 
@@ -270,6 +281,8 @@ impl MetadataEngine for SqliteEngine {
         let table_name = table_name.to_owned();
         Box::pin(async move {
             Self::validate_account_id(&account_id)?;
+            // D1: every writer holds the engine write lock.
+            let _writer = self.write_lock.lock().await;
             let table_id = self.table_id_for(&account_id, &table_name).await?;
             sqlx::query(
                 "UPDATE tables SET ttl_index_ready = 0 WHERE account_id = ? AND table_name = ?",
@@ -345,6 +358,8 @@ impl MetadataEngine for SqliteEngine {
         let table_name = table_name.to_owned();
         Box::pin(async move {
             Self::validate_account_id(&account_id)?;
+            // D1: every writer holds the engine write lock.
+            let _writer = self.write_lock.lock().await;
             let table_id = self.table_id_for(&account_id, &table_name).await?;
             let data_table = data::data_table_name(&table_id);
             let (item_count, table_size): (i64, i64) = sqlx::query_as(&format!(

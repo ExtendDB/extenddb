@@ -17,6 +17,24 @@
 //! `SQLITE_BUSY_SNAPSHOT` (a deferred read-then-write whose snapshot is
 //! invalidated by another pool committing) rather than surfacing it as a 500.
 //! Reads run concurrently from the pool against WAL snapshots and take no lock.
+//!
+//! "All writers" includes the control-plane paths (CreateTable's DDL, TTL
+//! metadata, tagging) and the periodic maintenance workers (table-size
+//! refresh, TTL index creation, stream-record and idempotency-token cleanup),
+//! not just the item write paths. A writer outside the lock contends at the
+//! SQLite level instead, and when its commit is slow (a large `CREATE INDEX`,
+//! a stalled fsync on a loaded CI host) a concurrent locked writer exhausts
+//! `busy_timeout` and fails an unrelated request with `database is locked`,
+//! which the engine maps to a 500. Measured 2026-08-27: an uncoordinated
+//! writer holding the file lock fails a plain `PutItem` with exactly the
+//! `InternalServerError` seen in the `run-integration-sqlite` CI flake.
+//!
+//! Deliberate exclusions from the lock, so the invariant stays auditable:
+//! init-time bootstrap in this file (runs before the server serves traffic),
+//! and the management/credential stores, which write through the separate
+//! catalog pool in `lib.rs`. For a file-backed database that second pool
+//! opens the same file, so its small single-row autocommit writes carry a
+//! residual, much smaller, version of the same contention risk.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -409,5 +427,200 @@ impl SqliteEngine {
         .ok()
         .flatten()
         .map_or_else(|| "(not configured)".to_owned(), |(v,)| v)
+    }
+}
+
+#[cfg(test)]
+mod d1_write_lock_tests {
+    use super::SqliteEngine;
+    use serde_json::json;
+    use std::time::Duration;
+
+    async fn engine() -> SqliteEngine {
+        // The pool size is nominal: `SqliteEngine::new` pins in-memory
+        // databases to a single connection regardless. The tests below never
+        // hold a pool connection on the asserting side, so a writer that
+        // (incorrectly) ignores the lock is stopped by nothing at all, which
+        // is what the 200ms grace window detects.
+        let engine = SqliteEngine::new(":memory:", 2, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::schema::apply(&engine.pool).await.expect("schema");
+        sqlx::query(
+            "INSERT INTO accounts (account_id, account_name) VALUES ('000000000000', 'default')",
+        )
+        .execute(&engine.pool)
+        .await
+        .expect("account");
+        // Zero control-plane delay: tables become ACTIVE at create time, since
+        // no transition poller runs inside a unit test.
+        sqlx::query(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0')",
+        )
+        .execute(&engine.pool)
+        .await
+        .expect("settings");
+        engine
+    }
+
+    /// Assert the D1 invariant for one writer: while the engine write lock is
+    /// held, the writer must not complete; after release, it must.
+    ///
+    /// This is the discriminating shape for the 2026-08-27 `run-integration-sqlite`
+    /// flake (`PutItem` returning `InternalServerError`, server-side `database is
+    /// locked`): a writer outside the lock contends at the SQLite level, where a
+    /// slow commit exhausts a concurrent writer's 5s `busy_timeout`. Before the
+    /// fix, each writer below completed while the lock was held; with it, they
+    /// queue behind the lock and cannot collide.
+    async fn assert_serialized<F>(engine: &SqliteEngine, writer: F, name: &str)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let guard = engine.write_lock.lock().await;
+        let task = tokio::spawn(writer);
+        // Generous grace period: a writer that ignores the lock finishes these
+        // single-statement transactions in well under 200ms.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !task.is_finished(),
+            "{name} completed while the engine write lock was held (D1 violation)"
+        );
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap_or_else(|_| panic!("{name} did not complete after lock release"))
+            .expect("writer task panicked");
+    }
+
+    #[tokio::test]
+    async fn create_table_waits_for_the_write_lock() {
+        let engine = engine().await;
+        let e = engine.clone();
+        assert_serialized(
+            &engine,
+            async move {
+                create_table(&e, "d1-lock-t").await;
+            },
+            "create_table_impl",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn idempotency_token_cleanup_waits_for_the_write_lock() {
+        let engine = engine().await;
+        let e = engine.clone();
+        assert_serialized(
+            &engine,
+            async move {
+                e.cleanup_expired_idempotency_tokens_impl(0)
+                    .await
+                    .expect("cleanup");
+            },
+            "cleanup_expired_idempotency_tokens",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn tag_resource_waits_for_the_write_lock() {
+        use extenddb_storage::MetadataEngine;
+        let engine = engine().await;
+        let e = engine.clone();
+        assert_serialized(
+            &engine,
+            async move {
+                MetadataEngine::tag_resource(
+                    &e,
+                    "arn:aws:dynamodb:us-east-1:000000000000:table/d1",
+                    &[extenddb_core::types::Tag {
+                        key: "k".to_owned(),
+                        value: "v".to_owned(),
+                    }],
+                )
+                .await
+                .expect("tag");
+            },
+            "tag_resource",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stream_record_cleanup_waits_for_the_write_lock() {
+        use extenddb_storage::StreamEngine;
+        let engine = engine().await;
+        let e = engine.clone();
+        assert_serialized(
+            &engine,
+            async move {
+                StreamEngine::cleanup_expired_stream_records(&e, 0)
+                    .await
+                    .expect("cleanup");
+            },
+            "cleanup_expired_stream_records",
+        )
+        .await;
+    }
+
+    /// Create a plain table outside the lock window, for the writers whose
+    /// pre-lock reads refuse to proceed without one.
+    async fn create_table(engine: &SqliteEngine, name: &str) {
+        let input: extenddb_core::types::CreateTableInput = serde_json::from_value(json!({
+            "TableName": name,
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .expect("input");
+        engine
+            .create_table_impl("000000000000", input)
+            .await
+            .expect("create table");
+    }
+
+    #[tokio::test]
+    async fn delete_backup_waits_for_the_write_lock() {
+        use extenddb_storage::BackupEngine;
+        let engine = engine().await;
+        create_table(&engine, "d1-bkp-t").await;
+        // The backup must exist before the lock window: delete_backup resolves
+        // it with a read first and returns early when it is missing, which
+        // would complete without ever reaching the writes under test.
+        let details = BackupEngine::create_backup(&engine, "000000000000", "d1-bkp-t", "b")
+            .await
+            .expect("backup");
+        let e = engine.clone();
+        assert_serialized(
+            &engine,
+            async move {
+                BackupEngine::delete_backup(&e, "000000000000", &details.backup_arn)
+                    .await
+                    .expect("delete backup");
+            },
+            "delete_backup",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn update_continuous_backups_waits_for_the_write_lock() {
+        use extenddb_storage::BackupEngine;
+        let engine = engine().await;
+        // The table must exist before the lock window: the pre-lock existence
+        // check returns TableNotFound otherwise, completing without reaching
+        // the write under test.
+        create_table(&engine, "d1-pitr-t").await;
+        let e = engine.clone();
+        assert_serialized(
+            &engine,
+            async move {
+                BackupEngine::update_continuous_backups(&e, "000000000000", "d1-pitr-t", true)
+                    .await
+                    .expect("update continuous backups");
+            },
+            "update_continuous_backups",
+        )
+        .await;
     }
 }
