@@ -146,6 +146,16 @@ impl StorageConfig {
         self.config.max_catalog_connections()
     }
 
+    /// Get the explicit data-pool override, if one was configured.
+    pub fn max_connections_override(&self) -> Option<u32> {
+        self.config.max_connections_override()
+    }
+
+    /// Get the explicit catalog-pool override, if one was configured.
+    pub fn max_catalog_connections_override(&self) -> Option<u32> {
+        self.config.max_catalog_connections_override()
+    }
+
     /// Get a reference to the underlying trait object for factory calls.
     pub fn as_trait(&self) -> &dyn extenddb_storage::config::StorageConfig {
         &*self.config
