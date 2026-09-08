@@ -20,8 +20,10 @@ use crate::stream_util::stream_record_statement;
 
 /// Lifetime of the base-row claim an ordinary request holds while it commits
 /// its logged batch. A request that is suspended for longer than this loses
-/// its claim; `mutation_timestamp` is captured before the claim is taken so a
-/// resumed request cannot overwrite state that a later owner committed.
+/// its claim; `mutation_timestamp` is pinned immediately after the claim is
+/// taken, so a resumed request's cells lose to anything a later owner commits
+/// via Paxos (its item cells can still beat the older stored image, which is
+/// why EFFECTS_APPLYING recovery fences on the owner rather than the image).
 pub(crate) const TTL_REQUEST_CLAIM_SECONDS: u32 = 120;
 
 /// Lifetime of the base-row claim the expiration worker holds across its
@@ -190,11 +192,11 @@ impl CassandraEngine {
         let pk_text = composite_pk_to_text(key, &key_info.key_schema)?;
 
         let catalog_keyspace = self.catalog_keyspace();
-        let indexes =
-            fetch_indexes_for_table(&key_info.table_id, &self.session, &catalog_keyspace).await?;
-        let ttl_config = self
-            .ttl_config_for_table(&key_info.account_id, &key_info.table_name)
-            .await?;
+        // Both are catalog reads with no data dependency; overlap them.
+        let (indexes, ttl_config) = futures::try_join!(
+            fetch_indexes_for_table(&key_info.table_id, &self.session, &catalog_keyspace),
+            self.ttl_config_for_table(&key_info.account_id, &key_info.table_name),
+        )?;
         let sys_delay = if indexes.is_empty() {
             0
         } else {
@@ -288,14 +290,19 @@ impl CassandraEngine {
                 format!("DELETE FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?");
 
             // Update partition_max_delete_timestamp before the batch (must precede delete).
-            if old_item_opt.is_some() {
-                self.update_partition_max_delete_timestamp_at(
-                    &data_keyspace,
-                    &ddb_table,
-                    &pk_text,
-                    mutation_timestamp / 1_000,
-                )
-                .await?;
+            if old_item_opt.is_some()
+                && let Err(error) = self
+                    .update_partition_max_delete_timestamp_at(
+                        &data_keyspace,
+                        &ddb_table,
+                        &pk_text,
+                        mutation_timestamp / 1_000,
+                    )
+                    .await
+            {
+                self.release_ttl_mutation_claim(key_info, key, ttl_claim)
+                    .await;
+                return Err(error);
             }
 
             let stream_stmt = old_item_opt.as_ref().and_then(|_| {
@@ -331,8 +338,8 @@ impl CassandraEngine {
                 }
                 batch = batch.add_query(delete_cql, delete_qv);
 
-                if !indexes.is_empty() {
-                    super::index::sync_indexes(
+                if !indexes.is_empty()
+                    && let Err(error) = super::index::sync_indexes(
                         &mut batch,
                         &data_keyspace,
                         &key_info.key_schema,
@@ -341,11 +348,15 @@ impl CassandraEngine {
                         old_item_opt.as_ref(),
                         None,
                         sys_delay,
-                    )?;
+                    )
+                {
+                    self.release_ttl_mutation_claim(key_info, key, ttl_claim)
+                        .await;
+                    return Err(error);
                 }
 
                 let async_enqueued = if !indexes.is_empty() {
-                    super::index::enqueue_async_indexes(
+                    match super::index::enqueue_async_indexes(
                         &self.session,
                         &mut batch,
                         &data_keyspace,
@@ -355,13 +366,21 @@ impl CassandraEngine {
                         None,
                         sys_delay,
                     )
-                    .await?
+                    .await
+                    {
+                        Ok(enqueued) => enqueued,
+                        Err(error) => {
+                            self.release_ttl_mutation_claim(key_info, key, ttl_claim)
+                                .await;
+                            return Err(error);
+                        }
+                    }
                 } else {
                     0
                 };
 
-                if let Some(config) = ttl_config.as_ref() {
-                    super::ttl::add_ttl_queue_mutations(
+                if let Some(config) = ttl_config.as_ref()
+                    && let Err(error) = super::ttl::add_ttl_queue_mutations(
                         &mut batch,
                         &data_keyspace,
                         key_info,
@@ -369,7 +388,11 @@ impl CassandraEngine {
                         config.generation,
                         old_item_opt.as_ref(),
                         None,
-                    )?;
+                    )
+                {
+                    self.release_ttl_mutation_claim(key_info, key, ttl_claim)
+                        .await;
+                    return Err(error);
                 }
 
                 if let Some(stmt) = stream_stmt {
@@ -390,8 +413,10 @@ impl CassandraEngine {
                         .await;
                     return Err(StorageError::Internal(format!("Batch execution: {error}")));
                 }
-                self.release_ttl_mutation_claim(key_info, key, ttl_claim)
-                    .await;
+                // The row tombstone carries the pinned timestamp, which
+                // releases the claim whenever the local clock is not behind the
+                // coordinator's; the detached exact release covers the residue.
+                self.spawn_release_ttl_claim(key_info, key, ttl_claim);
 
                 if async_enqueued > 0 {
                     self.gsi_queue.notify_workers();
@@ -474,14 +499,19 @@ impl CassandraEngine {
             let delete_cql = format!("DELETE FROM {data_keyspace}.{ddb_table} WHERE pk = ?");
 
             // Update partition_max_delete_timestamp before the batch (must precede delete).
-            if old_item_opt.is_some() {
-                self.update_partition_max_delete_timestamp_at(
-                    &data_keyspace,
-                    &ddb_table,
-                    &pk_text,
-                    mutation_timestamp / 1_000,
-                )
-                .await?;
+            if old_item_opt.is_some()
+                && let Err(error) = self
+                    .update_partition_max_delete_timestamp_at(
+                        &data_keyspace,
+                        &ddb_table,
+                        &pk_text,
+                        mutation_timestamp / 1_000,
+                    )
+                    .await
+            {
+                self.release_ttl_mutation_claim(key_info, key, ttl_claim)
+                    .await;
+                return Err(error);
             }
 
             let stream_stmt = old_item_opt.as_ref().and_then(|_| {
@@ -518,8 +548,8 @@ impl CassandraEngine {
                 }
                 batch = batch.add_query(delete_cql, delete_qv);
 
-                if !indexes.is_empty() {
-                    super::index::sync_indexes(
+                if !indexes.is_empty()
+                    && let Err(error) = super::index::sync_indexes(
                         &mut batch,
                         &data_keyspace,
                         &key_info.key_schema,
@@ -528,11 +558,15 @@ impl CassandraEngine {
                         old_item_opt.as_ref(),
                         None,
                         sys_delay,
-                    )?;
+                    )
+                {
+                    self.release_ttl_mutation_claim(key_info, key, ttl_claim)
+                        .await;
+                    return Err(error);
                 }
 
                 let async_enqueued = if !indexes.is_empty() {
-                    super::index::enqueue_async_indexes(
+                    match super::index::enqueue_async_indexes(
                         &self.session,
                         &mut batch,
                         &data_keyspace,
@@ -542,13 +576,21 @@ impl CassandraEngine {
                         None,
                         sys_delay,
                     )
-                    .await?
+                    .await
+                    {
+                        Ok(enqueued) => enqueued,
+                        Err(error) => {
+                            self.release_ttl_mutation_claim(key_info, key, ttl_claim)
+                                .await;
+                            return Err(error);
+                        }
+                    }
                 } else {
                     0
                 };
 
-                if let Some(config) = ttl_config.as_ref() {
-                    super::ttl::add_ttl_queue_mutations(
+                if let Some(config) = ttl_config.as_ref()
+                    && let Err(error) = super::ttl::add_ttl_queue_mutations(
                         &mut batch,
                         &data_keyspace,
                         key_info,
@@ -556,7 +598,11 @@ impl CassandraEngine {
                         config.generation,
                         old_item_opt.as_ref(),
                         None,
-                    )?;
+                    )
+                {
+                    self.release_ttl_mutation_claim(key_info, key, ttl_claim)
+                        .await;
+                    return Err(error);
                 }
 
                 if let Some(stmt) = stream_stmt {
@@ -577,8 +623,10 @@ impl CassandraEngine {
                         .await;
                     return Err(StorageError::Internal(format!("Batch execution: {error}")));
                 }
-                self.release_ttl_mutation_claim(key_info, key, ttl_claim)
-                    .await;
+                // The row tombstone carries the pinned timestamp, which
+                // releases the claim whenever the local clock is not behind the
+                // coordinator's; the detached exact release covers the residue.
+                self.spawn_release_ttl_claim(key_info, key, ttl_claim);
 
                 if async_enqueued > 0 {
                     self.gsi_queue.notify_workers();
@@ -651,6 +699,198 @@ impl CassandraEngine {
         Ok(owner == Some(work_id) && item_data.as_deref() == Some(expected.as_str()))
     }
 
+    /// Promote the exact expiration worker owner and item image to a
+    /// non-expiring fence immediately before persisting must-complete intent.
+    /// Once the queue reaches `EFFECTS_APPLYING`, recovery owns releasing this
+    /// fence after effects and the exact base delete complete.
+    pub(crate) async fn seal_ttl_work_claim(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        expected_item: &Item,
+        work_id: uuid::Uuid,
+    ) -> Result<bool, StorageError> {
+        let keyspace = self.account_keyspace(&key_info.account_id);
+        let table = data_table_name(&key_info.table_id);
+        let pk = composite_pk_to_text(key, &key_info.key_schema)?;
+        let expected = serde_json::to_string(expected_item)
+            .map_err(|error| StorageError::Internal(error.to_string()))?;
+        let owner = cdrs_tokio::types::value::Bytes::new(work_id.as_bytes().to_vec());
+        let claimed_at = chrono::Utc::now().timestamp_millis();
+        let result = if let Some((sk_name, sk_type)) =
+            sk_info(&key_info.key_schema, &key_info.attribute_definitions)
+        {
+            let sk = parse_sk(
+                key.get(sk_name)
+                    .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?,
+                sk_type,
+            )?;
+            crate::cassandra_util::query_lwt(
+                &self.session,
+                &format!(
+                    "UPDATE {keyspace}.{table} \
+                     SET prepared_txn_id = ?, prepared_txn_timestamp = ? \
+                     WHERE pk = ? AND {} = ? \
+                     IF prepared_txn_id = ? AND item_data = ?",
+                    sk_column(sk_type)
+                ),
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                    cdrs_tokio::types::value::Value::from(owner.clone()),
+                    cdrs_tokio::types::value::Value::from(claimed_at),
+                    cdrs_tokio::types::value::Value::from(pk.as_str()),
+                    super::index::sk_to_value(&sk),
+                    cdrs_tokio::types::value::Value::from(owner),
+                    cdrs_tokio::types::value::Value::from(expected.as_str()),
+                ]),
+            )
+            .await?
+        } else {
+            crate::cassandra_util::query_lwt(
+                &self.session,
+                &format!(
+                    "UPDATE {keyspace}.{table} \
+                     SET prepared_txn_id = ?, prepared_txn_timestamp = ? \
+                     WHERE pk = ? IF prepared_txn_id = ? AND item_data = ?"
+                ),
+                cdrs_tokio::query_values!(
+                    owner.clone(),
+                    claimed_at,
+                    pk.as_str(),
+                    owner,
+                    expected.as_str()
+                ),
+            )
+            .await?
+        };
+        ttl_lwt_applied(&result)
+    }
+
+    /// Whether the base row's exact owner is `work_id`, read at `LOCAL_QUORUM`.
+    ///
+    /// The image is deliberately not compared: `EFFECTS_APPLYING` recovery is
+    /// fenced on ownership alone, because a stale writer's batch can legally
+    /// change the image under a sealed owner.
+    pub(crate) async fn base_row_owned_by(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        work_id: uuid::Uuid,
+    ) -> Result<bool, StorageError> {
+        let keyspace = self.account_keyspace(&key_info.account_id);
+        let table = data_table_name(&key_info.table_id);
+        let pk = composite_pk_to_text(key, &key_info.key_schema)?;
+        let (query, values) = if let Some((sk_name, sk_type)) =
+            sk_info(&key_info.key_schema, &key_info.attribute_definitions)
+        {
+            let sk = parse_sk(
+                key.get(sk_name)
+                    .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?,
+                sk_type,
+            )?;
+            (
+                format!(
+                    "SELECT prepared_txn_id FROM {keyspace}.{table} \
+                     WHERE pk = ? AND {} = ?",
+                    sk_column(sk_type)
+                ),
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                    cdrs_tokio::types::value::Value::from(pk.as_str()),
+                    super::index::sk_to_value(&sk),
+                ]),
+            )
+        } else {
+            (
+                format!("SELECT prepared_txn_id FROM {keyspace}.{table} WHERE pk = ?"),
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                    cdrs_tokio::types::value::Value::from(pk.as_str()),
+                ]),
+            )
+        };
+        let rows = crate::cassandra_util::query_rows_quorum(
+            &self.session,
+            &query,
+            values,
+            "base_row_owned_by",
+        )
+        .await?;
+        let owner: Option<uuid::Uuid> = rows
+            .first()
+            .and_then(|row| row.get_by_name("prepared_txn_id").ok().flatten());
+        Ok(owner == Some(work_id))
+    }
+
+    /// Rebuild the synchronous index rows for a live item.
+    ///
+    /// Used when recovery replays a TTL delete's effects and then discovers the
+    /// base item was re-created by a writer whose cells predate the replayed
+    /// index tombstones: the item is live, but any index row sharing a key with
+    /// the old image has been deleted. Re-upserting from the current image at a
+    /// timestamp strictly above the recorded effects timestamp restores it.
+    /// Purely an index operation — no stream record, no queue mutation.
+    pub(crate) async fn restore_sync_indexes_for_item(
+        &self,
+        key_info: &TableKeyInfo,
+        item: &Item,
+        effects_timestamp_ms: i64,
+    ) -> Result<(), StorageError> {
+        let account_keyspace = self.account_keyspace(&key_info.account_id);
+        // Quorum: a stale replica omitting an index here would be read as
+        // "nothing to restore", and this is the last chance to restore it
+        // before the sealed owner is released.
+        let indexes = super::index::fetch_indexes_for_table_quorum(
+            &key_info.table_id,
+            &self.session,
+            &self.catalog_keyspace(),
+        )
+        .await?;
+        if indexes.is_empty() {
+            return Ok(());
+        }
+        let default_delay = self
+            .gsi_default_delay_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // Strictly above the replayed effects tombstones by construction:
+        // both sides derive from the same recorded value, so ordering does not
+        // depend on which coordinator assigns wall-clock timestamps. max()
+        // with now-derived micros keeps it also above any older write.
+        let restore_timestamp =
+            (effects_timestamp_ms * 1_000 + 1).max(chrono::Utc::now().timestamp_micros());
+        let mut batch = BatchQueryBuilder::new()
+            .with_consistency(Consistency::LocalQuorum)
+            .with_timestamp(restore_timestamp);
+        // old = None: this is a pure re-upsert of the current image's rows.
+        super::index::sync_indexes(
+            &mut batch,
+            &account_keyspace,
+            &key_info.key_schema,
+            &key_info.attribute_definitions,
+            &indexes,
+            None,
+            Some(item),
+            default_delay,
+        )?;
+        super::index::enqueue_async_indexes(
+            &self.session,
+            &mut batch,
+            &account_keyspace,
+            key_info,
+            &indexes,
+            None,
+            Some(item),
+            default_delay,
+        )
+        .await?;
+        let built = batch
+            .build()
+            .map_err(|error| StorageError::Internal(error.to_string()))?;
+        self.session
+            .batch(built)
+            .await
+            .map_err(|error| StorageError::Internal(format!("Restore sync indexes: {error}")))?;
+        self.gsi_queue.notify_workers();
+        Ok(())
+    }
+
     pub(crate) async fn apply_ttl_delete_effects(
         &self,
         key_info: &TableKeyInfo,
@@ -676,7 +916,13 @@ impl CassandraEngine {
         let default_delay = self
             .gsi_default_delay_ms
             .load(std::sync::atomic::Ordering::Relaxed);
-        let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+        // Stamped with the RECORDED delete timestamp so every replay writes
+        // identical cells at an identical timestamp, and so restoration (which
+        // stamps strictly above this) beats these tombstones by construction
+        // rather than by cross-coordinator clock luck.
+        let mut batch = BatchQueryBuilder::new()
+            .with_consistency(Consistency::LocalQuorum)
+            .with_timestamp(delete_timestamp_ms * 1_000);
         let mut has_effects = !indexes.is_empty();
         if !indexes.is_empty() {
             super::index::sync_indexes(
@@ -922,6 +1168,83 @@ impl CassandraEngine {
         }
         .map_err(|error| StorageError::Internal(format!("Claim TTL item: {error}")))?;
         ttl_lwt_applied(&result)
+    }
+
+    /// Fire the exact conditional release off the request's latency path.
+    ///
+    /// A successful batch already wrote `prepared_txn_id = null` at its pinned
+    /// timestamp, which releases the claim whenever the pinned clock is not
+    /// behind the coordinator clock that stamped the claim cells. Clock
+    /// synchronization bounds that skew but does not order two clocks at
+    /// microsecond precision, so a trailing application clock could leave the
+    /// claim cells in place and the key unwritable until the claim's TTL. This
+    /// detached exact release closes that residue without putting a Paxos
+    /// round back on the request; if the in-batch nulls already won, the
+    /// condition simply does not match.
+    pub(crate) fn spawn_release_ttl_claim(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        claim: Option<uuid::Uuid>,
+    ) {
+        let Some(claim) = claim else { return };
+        let keyspace = self.account_keyspace(&key_info.account_id);
+        let table = data_table_name(&key_info.table_id);
+        let Ok(pk) = composite_pk_to_text(key, &key_info.key_schema) else {
+            return;
+        };
+        let claim_bytes = cdrs_tokio::types::value::Bytes::new(claim.as_bytes().to_vec());
+        let (query, values) = if let Some((sk_name, sk_type)) =
+            sk_info(&key_info.key_schema, &key_info.attribute_definitions)
+        {
+            let Some(sk_value) = key.get(sk_name) else {
+                return;
+            };
+            let Ok(sk) = parse_sk(sk_value, sk_type) else {
+                return;
+            };
+            (
+                format!(
+                    "UPDATE {keyspace}.{table} SET prepared_txn_id = null, \
+                     prepared_txn_timestamp = null WHERE pk = ? AND {} = ? \
+                     IF prepared_txn_id = ?",
+                    sk_column(sk_type)
+                ),
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                    cdrs_tokio::types::value::Value::from(pk.as_str()),
+                    super::index::sk_to_value(&sk),
+                    cdrs_tokio::types::value::Value::from(claim_bytes),
+                ]),
+            )
+        } else {
+            (
+                format!(
+                    "UPDATE {keyspace}.{table} SET prepared_txn_id = null, \
+                     prepared_txn_timestamp = null WHERE pk = ? IF prepared_txn_id = ?"
+                ),
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                    cdrs_tokio::types::value::Value::from(pk.as_str()),
+                    cdrs_tokio::types::value::Value::from(claim_bytes),
+                ]),
+            )
+        };
+        // Bounded: if the fleet of in-flight releases is saturated (degraded
+        // LWT latency), drop this one rather than queueing without limit. The
+        // claim's own TTL bounds the residue, so dropping is safe.
+        let Ok(permit) = self.ttl_release_permits.clone().try_acquire_owned() else {
+            return;
+        };
+        let session = self.session_arc();
+        tokio::spawn(async move {
+            // Failure is benign: either the in-batch nulls already released, or
+            // the claim's own TTL bounds the residue.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                crate::cassandra_util::query_lwt(&session, &query, values),
+            )
+            .await;
+            drop(permit);
+        });
     }
 
     pub(crate) async fn release_ttl_claim(

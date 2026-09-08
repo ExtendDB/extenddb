@@ -38,6 +38,8 @@ pub(crate) struct TtlEntry {
 pub(crate) enum TtlWorkState {
     Pending,
     Claimed,
+    ClaimAborting,
+    EffectsApplying,
     EffectsApplied,
 }
 
@@ -50,6 +52,8 @@ impl TtlWorkState {
     pub(crate) fn parse(value: Option<&str>) -> Result<Self, StorageError> {
         match value {
             Some("CLAIMED") => Ok(Self::Claimed),
+            Some("CLAIM_ABORTING") => Ok(Self::ClaimAborting),
+            Some("EFFECTS_APPLYING") => Ok(Self::EffectsApplying),
             Some("EFFECTS_APPLIED") => Ok(Self::EffectsApplied),
             Some("PENDING") | None => Ok(Self::Pending),
             Some(other) => Err(StorageError::Internal(format!(
@@ -221,12 +225,34 @@ pub(crate) fn add_ttl_queue_mutations(
     Ok(())
 }
 
+/// Add the durable reconciliation-outbox row for a write, when one is needed.
+///
+/// The outbox is not a duplicate of the in-batch queue mutations. The queue
+/// table takes concurrent Paxos writes from the expiration worker: a worker
+/// that claimed the same queue key can supersede the batch's insert by cell
+/// timestamp, and its abort path row-deletes with a tombstone that erases the
+/// batch's insert outright. If the worker then crashes before its compensating
+/// reconcile, the item is left with no expiration entry and nothing else would
+/// ever rebuild one. The outbox row survives until a quorum-authoritative
+/// reconciliation restores both the bucket registration and queue row.
+/// Destroyers first write a separate non-dischargeable inflight marker; after
+/// a definitive LWT response they hand it to this normal outbox before removing
+/// the marker, so an ambiguous late destroy can never outlive its obligation.
+///
+/// A write whose item carries no valid TTL adds nothing to the queue, so there
+/// is nothing to repair and no row is written. The old entry, if any, is only
+/// ever *removed* by this write, and a lost removal is inert: the sweep
+/// revalidates the item before deleting anything and retires the stale entry.
 pub(crate) fn add_ttl_reconciliation_mutation(
     batch: &mut BatchQueryBuilder,
     account_keyspace: &str,
     key_info: &TableKeyInfo,
+    ttl_attribute: &str,
     item: &Item,
 ) -> Result<(), StorageError> {
+    if ttl_epoch_seconds(item, ttl_attribute).is_none() {
+        return Ok(());
+    }
     let mut key = Item::new();
     for element in &key_info.key_schema {
         let value = item.get(&element.attribute_name).ok_or_else(|| {
@@ -260,6 +286,180 @@ pub(crate) fn add_ttl_reconciliation_mutation(
     Ok(())
 }
 
+/// Durably record that `key` may need its queue entry rebuilt before an
+/// active-generation queue-row destroy is attempted.
+///
+/// The marker is acknowledged at `LOCAL_QUORUM` before the destroy starts. It
+/// is not age-dischargeable: an ambiguous LWT error or process crash leaves it
+/// behind, and the worker repeatedly reconciles its key so even an arbitrarily
+/// late destroy is repaired on a later pass. After a definitive applied
+/// true/false response, [`TtlRepairGuard::complete`] first writes a normal
+/// dischargeable outbox record at quorum and only then removes this marker.
+pub(crate) async fn record_ttl_repair(
+    engine: &CassandraEngine,
+    account_keyspace: &str,
+    key_info: &TableKeyInfo,
+    generation: uuid::Uuid,
+    key_data: &str,
+) -> Result<TtlRepairGuard, StorageError> {
+    let worker_partition = (crc32fast::hash(key_data.as_bytes()) % TTL_SHARDS as u32) as i32;
+    // Per-attempt on purpose: a marker shared between two concurrent destroy
+    // attempts would let one attempt's definitive completion delete the marker
+    // guarding the other's still-ambiguous LWT — and a late retire can land on
+    // a re-created PENDING row, so "same condition already read false" does not
+    // make the second attempt harmless. Markers accumulate one per *ambiguous
+    // incident*, not per write, and are surfaced by the repair worker's metric.
+    let repair_id = uuid::Uuid::new_v4();
+
+    // The registry row and the marker are one LOGGED batch at LOCAL_QUORUM:
+    // one round trip, both mutations durable together, so every acknowledged
+    // marker is discoverable without scanning empty partitions. Re-writing the
+    // registry row with each marker (it is a single-cell upsert) is what makes
+    // account deletion + same-id recreation safe in a multi-host fleet — a
+    // process-lifetime "already registered" cache on any one host would go
+    // stale the moment another host dropped and recreated the keyspace.
+    let batch = cdrs_tokio::query::BatchQueryBuilder::new()
+        .with_consistency(cdrs_tokio::consistency::Consistency::LocalQuorum)
+        .add_query(
+            format!(
+                "INSERT INTO {account_keyspace}.ttl_repair_inflight_partitions \
+                 (worker_partition) VALUES (?)"
+            ),
+            cdrs_tokio::query_values!(worker_partition),
+        )
+        .add_query(
+            format!(
+                "INSERT INTO {account_keyspace}.ttl_repair_inflight \
+                 (worker_partition, repair_id, table_id, account_id, table_name, generation, key_data, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, toTimestamp(now()))"
+            ),
+            cdrs_tokio::query_values!(
+                worker_partition,
+                cdrs_tokio::types::value::Bytes::new(repair_id.as_bytes().to_vec()),
+                key_info.table_id.as_str(),
+                key_info.account_id.as_str(),
+                key_info.table_name.as_str(),
+                cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
+                key_data
+            ),
+        );
+    let built = batch
+        .build()
+        .map_err(|error| StorageError::Internal(format!("Build TTL repair batch: {error}")))?;
+    engine
+        .session
+        .batch(built)
+        .await
+        .map_err(|error| StorageError::Internal(format!("Record TTL repair inflight: {error}")))?;
+
+    Ok(TtlRepairGuard {
+        worker_partition,
+        repair_id,
+        table_id: key_info.table_id.clone(),
+        account_id: key_info.account_id.clone(),
+        table_name: key_info.table_name.clone(),
+        key_data: key_data.to_owned(),
+    })
+}
+
+/// A durable marker for one queue-row destroy attempt.
+#[must_use = "a definitive destroy result must complete the repair handoff"]
+pub(crate) struct TtlRepairGuard {
+    worker_partition: i32,
+    repair_id: uuid::Uuid,
+    table_id: String,
+    account_id: String,
+    table_name: String,
+    key_data: String,
+}
+
+impl TtlRepairGuard {
+    /// Hand a definitively completed destroy to the normal reconciliation
+    /// outbox, then remove the non-dischargeable inflight marker.
+    ///
+    /// The ordering is the safety property: every crash point leaves at least
+    /// one quorum-durable obligation. If marker deletion fails, both records
+    /// remain and reconciliation is merely repeated.
+    pub(crate) async fn complete(
+        self,
+        engine: &CassandraEngine,
+        account_keyspace: &str,
+    ) -> Result<(), StorageError> {
+        crate::cassandra_util::execute_quorum(
+            &engine.session,
+            &format!(
+                "INSERT INTO {account_keyspace}.ttl_reconcile_pending \
+                 (worker_partition, id, table_id, account_id, table_name, key_data) \
+                 VALUES (?, now(), ?, ?, ?, ?)"
+            ),
+            cdrs_tokio::query_values!(
+                self.worker_partition,
+                self.table_id.as_str(),
+                self.account_id.as_str(),
+                self.table_name.as_str(),
+                self.key_data.as_str()
+            ),
+            "complete TTL repair outbox handoff",
+        )
+        .await?;
+
+        crate::cassandra_util::execute_quorum(
+            &engine.session,
+            &format!(
+                "DELETE FROM {account_keyspace}.ttl_repair_inflight \
+                 WHERE worker_partition = ? AND repair_id = ?"
+            ),
+            cdrs_tokio::query_values!(
+                self.worker_partition,
+                cdrs_tokio::types::value::Bytes::new(self.repair_id.as_bytes().to_vec())
+            ),
+            "complete TTL repair inflight marker",
+        )
+        .await
+    }
+}
+
+async fn ensure_ttl_bucket_registration(
+    engine: &CassandraEngine,
+    account_keyspace: &str,
+    table_id: &str,
+    generation: uuid::Uuid,
+    entry: &TtlEntry,
+) -> Result<(), StorageError> {
+    let generation_bytes = cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec());
+    crate::cassandra_util::execute_quorum(
+        &engine.session,
+        &format!(
+            "INSERT INTO {account_keyspace}.{TTL_BUCKET_TABLE} \
+             (table_id, generation, bucket, shard) VALUES (?, ?, ?, ?)"
+        ),
+        cdrs_tokio::query_values!(
+            table_id,
+            generation_bytes.clone(),
+            entry.bucket,
+            entry.shard
+        ),
+        "restore TTL bucket registration",
+    )
+    .await?;
+    let visible = crate::cassandra_util::query_rows_quorum(
+        &engine.session,
+        &format!(
+            "SELECT shard FROM {account_keyspace}.{TTL_BUCKET_TABLE} \
+             WHERE table_id = ? AND generation = ? AND bucket = ? AND shard = ?"
+        ),
+        cdrs_tokio::query_values!(table_id, generation_bytes, entry.bucket, entry.shard),
+        "confirm restored TTL bucket registration",
+    )
+    .await?;
+    if visible.is_empty() {
+        return Err(StorageError::Transient(
+            "TTL bucket restoration is not yet visible at quorum".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn insert_ttl_entry(
     engine: &CassandraEngine,
     account_keyspace: &str,
@@ -268,23 +468,49 @@ pub(crate) async fn insert_ttl_entry(
     entry: &TtlEntry,
 ) -> Result<(), StorageError> {
     let generation_bytes = cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec());
-    let bucket_cql = format!(
-        "INSERT INTO {account_keyspace}.{TTL_BUCKET_TABLE} \
-         (table_id, generation, bucket, shard) VALUES (?, ?, ?, ?)"
-    );
-    engine
-        .session
-        .query_with_values(
-            &bucket_cql,
-            cdrs_tokio::query_values!(
-                table_id,
-                generation_bytes.clone(),
-                entry.bucket,
-                entry.shard
-            ),
-        )
-        .await
-        .map_err(|error| StorageError::Internal(format!("Insert TTL bucket: {error}")))?;
+
+    // Restore discoverability before the fast path, then confirm it again after
+    // the queue row is known durable so a concurrent empty-partition retirement
+    // cannot be the last mutation.
+    ensure_ttl_bucket_registration(engine, account_keyspace, table_id, generation, entry).await?;
+
+    // Common case after restoring discoverability: the entry is already there
+    // because the write's own logged batch inserted it. A plain quorum read
+    // avoids Paxos when that row is still PENDING.
+    let existing = crate::cassandra_util::query_rows_quorum(
+        &engine.session,
+        &format!(
+            "SELECT state FROM {account_keyspace}.{TTL_QUEUE_TABLE} \
+             WHERE table_id = ? AND generation = ? AND bucket = ? AND shard = ? \
+             AND expires_at = ? AND key_hash = ? AND key_data = ?"
+        ),
+        cdrs_tokio::query_values!(
+            table_id,
+            generation_bytes.clone(),
+            entry.bucket,
+            entry.shard,
+            entry.expires_at,
+            entry.key_hash.as_str(),
+            entry.key_data.as_str()
+        ),
+        "ttl_reconcile_precheck",
+    )
+    .await?;
+    if let Some(row) = existing.first() {
+        use cdrs_tokio::types::IntoRustByName;
+        let state: Option<String> = row.get_by_name("state").ok().flatten();
+        if TtlWorkState::parse(state.as_deref())? == TtlWorkState::Pending {
+            ensure_ttl_bucket_registration(engine, account_keyspace, table_id, generation, entry)
+                .await?;
+            return Ok(());
+        }
+        // Claimed work owns this key and may row-delete it while crashing
+        // before its compensating reconcile. Reporting success here would
+        // remove the outbox row that repairs exactly that, so stay retryable.
+        return Err(StorageError::Transient(
+            "TTL reconciliation deferred by in-flight expiration work".to_owned(),
+        ));
+    }
 
     let entry_cql = format!(
         "INSERT INTO {account_keyspace}.{TTL_QUEUE_TABLE} \
@@ -320,13 +546,17 @@ pub(crate) async fn insert_ttl_entry(
         .get_r_by_name("[applied]")
         .map_err(|error| StorageError::Internal(format!("Parse TTL reconcile result: {error}")))?;
     if applied {
+        ensure_ttl_bucket_registration(engine, account_keyspace, table_id, generation, entry)
+            .await?;
         return Ok(());
     }
     let state: Option<String> = row.get_by_name("state").ok().flatten();
     if state.as_deref() == Some("PENDING") {
+        ensure_ttl_bucket_registration(engine, account_keyspace, table_id, generation, entry)
+            .await?;
         return Ok(());
     }
-    Err(StorageError::Internal(
+    Err(StorageError::Transient(
         "TTL reconciliation deferred by in-flight expiration work".to_owned(),
     ))
 }
@@ -367,6 +597,40 @@ pub(crate) async fn claim_ttl_work(
     work_lwt_applied(&result)
 }
 
+pub(crate) async fn mark_ttl_effects_applying(
+    engine: &CassandraEngine,
+    account_keyspace: &str,
+    table_id: &str,
+    generation: uuid::Uuid,
+    row: &TtlWorkRow,
+) -> Result<bool, StorageError> {
+    let Some(work_id) = row.work_id else {
+        return Ok(false);
+    };
+    let cql = format!(
+        "UPDATE {account_keyspace}.{TTL_QUEUE_TABLE} SET state = 'EFFECTS_APPLYING' \
+         WHERE table_id = ? AND generation = ? AND bucket = ? AND shard = ? \
+         AND expires_at = ? AND key_hash = ? AND key_data = ? \
+         IF state = 'CLAIMED' AND work_id = ?"
+    );
+    let result = crate::cassandra_util::query_lwt(
+        &engine.session,
+        &cql,
+        cdrs_tokio::query_values!(
+            table_id,
+            cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
+            row.entry.bucket,
+            row.entry.shard,
+            row.entry.expires_at,
+            row.entry.key_hash.as_str(),
+            row.entry.key_data.as_str(),
+            cdrs_tokio::types::value::Bytes::new(work_id.as_bytes().to_vec())
+        ),
+    )
+    .await?;
+    work_lwt_applied(&result)
+}
+
 pub(crate) async fn mark_ttl_effects_applied(
     engine: &CassandraEngine,
     account_keyspace: &str,
@@ -381,7 +645,7 @@ pub(crate) async fn mark_ttl_effects_applied(
         "UPDATE {account_keyspace}.{TTL_QUEUE_TABLE} SET state = 'EFFECTS_APPLIED' \
          WHERE table_id = ? AND generation = ? AND bucket = ? AND shard = ? \
          AND expires_at = ? AND key_hash = ? AND key_data = ? \
-         IF state = 'CLAIMED' AND work_id = ?"
+         IF state = 'EFFECTS_APPLYING' AND work_id = ?"
     );
     let result = crate::cassandra_util::query_lwt(
         &engine.session,
@@ -434,7 +698,73 @@ pub(crate) async fn complete_ttl_work(
     work_lwt_applied(&result)
 }
 
+/// Complete active-generation work under a durable repair handoff.
+///
+/// Retired generations may call [`complete_ttl_work`] directly because active
+/// writers cannot insert into those generation partitions.
+pub(crate) async fn complete_live_ttl_work(
+    engine: &CassandraEngine,
+    account_keyspace: &str,
+    key_info: &TableKeyInfo,
+    generation: uuid::Uuid,
+    row: &TtlWorkRow,
+) -> Result<bool, StorageError> {
+    let guard = record_ttl_repair(
+        engine,
+        account_keyspace,
+        key_info,
+        generation,
+        &row.entry.key_data,
+    )
+    .await?;
+    let applied = complete_ttl_work(
+        engine,
+        account_keyspace,
+        &key_info.table_id,
+        generation,
+        row,
+    )
+    .await?;
+    guard.complete(engine, account_keyspace).await?;
+    Ok(applied)
+}
+
 pub(crate) async fn retire_pending_ttl_work(
+    engine: &CassandraEngine,
+    account_keyspace: &str,
+    key_info: &TableKeyInfo,
+    generation: uuid::Uuid,
+    entry: &TtlEntry,
+) -> Result<bool, StorageError> {
+    // The quorum-durable inflight marker remains if the LWT result is
+    // ambiguous. A definitive true/false result is handed to the normal outbox
+    // before the marker is removed.
+    let guard = record_ttl_repair(
+        engine,
+        account_keyspace,
+        key_info,
+        generation,
+        &entry.key_data,
+    )
+    .await?;
+    let applied = retire_pending_row(
+        engine,
+        account_keyspace,
+        &key_info.table_id,
+        generation,
+        entry,
+    )
+    .await?;
+    guard.complete(engine, account_keyspace).await?;
+    Ok(applied)
+}
+
+/// The raw conditional retire, without the repair record. Only correct for a
+/// retired generation: current-config writers never insert into its partition
+/// (the generation is part of the partition key), and a stale-config writer's
+/// own outbox row reconciles into the current generation regardless of what
+/// happens to its dead row here.
+async fn retire_pending_row(
     engine: &CassandraEngine,
     account_keyspace: &str,
     table_id: &str,
@@ -463,7 +793,7 @@ pub(crate) async fn retire_pending_ttl_work(
     work_lwt_applied(&result)
 }
 
-pub(crate) async fn abort_claimed_ttl_work(
+pub(crate) async fn mark_ttl_claim_aborting(
     engine: &CassandraEngine,
     account_keyspace: &str,
     table_id: &str,
@@ -474,9 +804,10 @@ pub(crate) async fn abort_claimed_ttl_work(
         return Ok(false);
     };
     let cql = format!(
-        "DELETE FROM {account_keyspace}.{TTL_QUEUE_TABLE} WHERE table_id = ? \
-     AND generation = ? AND bucket = ? AND shard = ? AND expires_at = ? \
-     AND key_hash = ? AND key_data = ? IF state = 'CLAIMED' AND work_id = ?"
+        "UPDATE {account_keyspace}.{TTL_QUEUE_TABLE} SET state = 'CLAIM_ABORTING' \
+         WHERE table_id = ? AND generation = ? AND bucket = ? AND shard = ? \
+         AND expires_at = ? AND key_hash = ? AND key_data = ? \
+         IF state = 'CLAIMED' AND work_id = ?"
     );
     let result = crate::cassandra_util::query_lwt(
         &engine.session,
@@ -494,6 +825,50 @@ pub(crate) async fn abort_claimed_ttl_work(
     )
     .await?;
     work_lwt_applied(&result)
+}
+
+pub(crate) async fn abort_claimed_ttl_work(
+    engine: &CassandraEngine,
+    account_keyspace: &str,
+    key_info: &TableKeyInfo,
+    generation: uuid::Uuid,
+    row: &TtlWorkRow,
+) -> Result<bool, StorageError> {
+    let Some(work_id) = row.work_id else {
+        return Ok(false);
+    };
+    let table_id = key_info.table_id.as_str();
+    let guard = record_ttl_repair(
+        engine,
+        account_keyspace,
+        key_info,
+        generation,
+        &row.entry.key_data,
+    )
+    .await?;
+    let cql = format!(
+        "DELETE FROM {account_keyspace}.{TTL_QUEUE_TABLE} WHERE table_id = ? \
+     AND generation = ? AND bucket = ? AND shard = ? AND expires_at = ? \
+     AND key_hash = ? AND key_data = ? IF state = 'CLAIM_ABORTING' AND work_id = ?"
+    );
+    let result = crate::cassandra_util::query_lwt(
+        &engine.session,
+        &cql,
+        cdrs_tokio::query_values!(
+            table_id,
+            cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
+            row.entry.bucket,
+            row.entry.shard,
+            row.entry.expires_at,
+            row.entry.key_hash.as_str(),
+            row.entry.key_data.as_str(),
+            cdrs_tokio::types::value::Bytes::new(work_id.as_bytes().to_vec())
+        ),
+    )
+    .await?;
+    let applied = work_lwt_applied(&result)?;
+    guard.complete(engine, account_keyspace).await?;
+    Ok(applied)
 }
 
 fn work_lwt_applied(result: &cdrs_tokio::frame::Envelope) -> Result<bool, StorageError> {
@@ -538,22 +913,18 @@ async fn retire_bucket_registration(
         "DELETE FROM {account_keyspace}.{TTL_BUCKET_TABLE}{using} \
          WHERE table_id = ? AND generation = ? AND bucket = ? AND shard = ?"
     );
-    engine
-        .session
-        .query_with_values(
-            &cql,
-            cdrs_tokio::query_values!(
-                table_id,
-                cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
-                bucket,
-                shard
-            ),
-        )
-        .await
-        .map_err(|error| {
-            StorageError::Internal(format!("Retire TTL bucket registration: {error}"))
-        })?;
-    Ok(())
+    crate::cassandra_util::execute_quorum(
+        &engine.session,
+        &cql,
+        cdrs_tokio::query_values!(
+            table_id,
+            cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
+            bucket,
+            shard
+        ),
+        "retire TTL bucket registration",
+    )
+    .await
 }
 
 /// Upper bound on registry partitions a single sweep cycle will visit.
@@ -620,46 +991,28 @@ pub(crate) async fn load_due_ttl_work(
              AND generation = ? AND bucket = ? AND shard = ? AND expires_at <= ? \
              LIMIT {partition_limit}"
         );
-        let rows = crate::cassandra_util::query_rows(
+        let rows = crate::cassandra_util::query_rows_quorum(
             &engine.session,
             &query,
             cdrs_tokio::query_values!(table_id, generation_bytes.clone(), *bucket, *shard, now),
             "load_due_ttl_work",
         )
         .await?;
-        // A fully past day bucket that yields nothing is drained: every entry
-        // it could ever hold is already due, so an empty read means the
-        // partition is empty rather than not-yet-due. Retire the registration
-        // so the fan-out above stops growing with the age of the table.
-        //
-        // The scan above runs at the driver's default consistency, where a
-        // replica that has not caught up reads as empty. Retiring on that read
-        // would orphan any entry it missed — the entry's own insert is older
-        // than the guard timestamp, so the guard would not save it, and the item
-        // would then never expire. Confirm at LOCAL_QUORUM first.
+        // A fully past day bucket that yields nothing at LOCAL_QUORUM is
+        // drained: every entry it could hold is already due. The guarded
+        // retirement timestamp was captured before this authoritative read, and
+        // reconciliation performs a final bucket restore after queue durability.
         if rows.is_empty() && *bucket < current_bucket {
-            let confirm = crate::cassandra_util::query_rows_quorum(
-                &engine.session,
-                &format!(
-                    "SELECT key_hash FROM {account_keyspace}.{TTL_QUEUE_TABLE} \
-                     WHERE table_id = ? AND generation = ? AND bucket = ? AND shard = ? LIMIT 1"
-                ),
-                cdrs_tokio::query_values!(table_id, generation_bytes.clone(), *bucket, *shard),
-                "confirm_drained_ttl_bucket",
+            retire_bucket_registration(
+                engine,
+                account_keyspace,
+                table_id,
+                generation,
+                *bucket,
+                *shard,
+                Some(retire_guard),
             )
             .await?;
-            if confirm.is_empty() {
-                retire_bucket_registration(
-                    engine,
-                    account_keyspace,
-                    table_id,
-                    generation,
-                    *bucket,
-                    *shard,
-                    Some(retire_guard),
-                )
-                .await?;
-            }
             continue;
         }
         for row in rows {
@@ -698,38 +1051,6 @@ pub(crate) async fn load_due_ttl_work(
         }
     }
     Ok(work)
-}
-
-pub(crate) async fn delete_ttl_entry(
-    engine: &CassandraEngine,
-    account_keyspace: &str,
-    table_id: &str,
-    generation: uuid::Uuid,
-
-    entry: &TtlEntry,
-) -> Result<(), StorageError> {
-    let cql = format!(
-        "DELETE FROM {account_keyspace}.{TTL_QUEUE_TABLE} \
-         WHERE table_id = ? AND generation = ? AND bucket = ? AND shard = ? \
-         AND expires_at = ? AND key_hash = ? AND key_data = ?"
-    );
-    engine
-        .session
-        .query_with_values(
-            &cql,
-            cdrs_tokio::query_values!(
-                table_id,
-                cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
-                entry.bucket,
-                entry.shard,
-                entry.expires_at,
-                entry.key_hash.as_str(),
-                entry.key_data.as_str()
-            ),
-        )
-        .await
-        .map_err(|error| StorageError::Internal(format!("Delete TTL entry: {error}")))?;
-    Ok(())
 }
 
 /// Load every queue row for a generation regardless of due time, in any state.
@@ -812,7 +1133,7 @@ async fn generation_partitions(
     table_id: &str,
     generation: uuid::Uuid,
 ) -> Result<Vec<(i64, i32)>, StorageError> {
-    let rows = crate::cassandra_util::query_rows(
+    let rows = crate::cassandra_util::query_rows_quorum(
         &engine.session,
         &format!(
             "SELECT bucket, shard FROM {account_keyspace}.{TTL_BUCKET_TABLE} \
@@ -837,12 +1158,13 @@ async fn generation_partitions(
 
 /// Remove a retired generation's queue rows.
 ///
-/// Only `PENDING` rows are removed. A row in `CLAIMED` or `EFFECTS_APPLIED`
-/// owns durable state — a base-row claim, and possibly already-applied index
-/// and stream effects — so deleting it would strand that state with nothing
-/// left to drive recovery. Those rows are left in place and reported by the
-/// `false` return, which keeps `ttl_cleanup_generation` set so the worker
-/// drains them and retries.
+/// Only `PENDING` rows are removed. A row in `CLAIMED`, `CLAIM_ABORTING`,
+/// `EFFECTS_APPLYING`, or `EFFECTS_APPLIED` owns durable state — a base-row
+/// claim, and possibly must-complete or already-applied index and stream
+/// effects — so deleting it would strand that state with nothing left to
+/// drive recovery. Those rows are left in place and reported by the `false`
+/// return, which keeps `ttl_cleanup_generation` set so the worker drains
+/// them and retries.
 pub(crate) async fn clear_ttl_generation(
     engine: &CassandraEngine,
     account_keyspace: &str,
@@ -895,9 +1217,7 @@ pub(crate) async fn clear_ttl_generation(
                     "clear_ttl_generation",
                 )?,
             };
-            if !retire_pending_ttl_work(engine, account_keyspace, table_id, generation, &entry)
-                .await?
-            {
+            if !retire_pending_row(engine, account_keyspace, table_id, generation, &entry).await? {
                 // Claimed between the read and the delete; leave it for the
                 // drain pass.
                 partition_drained = false;

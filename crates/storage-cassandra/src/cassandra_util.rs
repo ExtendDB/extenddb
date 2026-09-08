@@ -184,6 +184,36 @@ pub async fn execute<E: FromDbError>(
     Ok(())
 }
 
+/// Execute a non-query statement at `LOCAL_QUORUM`.
+///
+/// Use this for writes that are prerequisites for a later quorum operation or
+/// whose loss would make an absence decision unsafe.
+///
+/// # Errors
+/// Returns an error if Cassandra does not acknowledge the statement at quorum.
+pub async fn execute_quorum<E: FromDbError>(
+    session: &Arc<CassandraSession>,
+    query: &str,
+    values: QueryValues,
+    context: &str,
+) -> Result<(), E> {
+    use cdrs_tokio::consistency::Consistency;
+    use cdrs_tokio::statement::StatementParamsBuilder;
+
+    let params = StatementParamsBuilder::new()
+        .with_consistency(Consistency::LocalQuorum)
+        .with_values(values)
+        .build();
+    session
+        .query_with_params(query, params)
+        .await
+        .map_err(|error| {
+            tracing::error!("{context} quorum execute failed: {error}");
+            E::db_error(format!("{context}: {error}"))
+        })?;
+    Ok(())
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Type Conversion Helpers
 // ══════════════════════════════════════════════════════════════════════════════

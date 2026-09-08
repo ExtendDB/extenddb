@@ -105,12 +105,18 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
         let ttl_cleanup = tokio::spawn(async move {
             ttl_worker::ttl_cleanup_worker(ttl_engine, ttl_metrics, ttl_shutdown).await
         });
+        let ttl_repair_engine = self.engine.clone();
+        let ttl_repair_shutdown = ctx.shutdown.clone();
+        let ttl_repair = tokio::spawn(async move {
+            ttl_worker::ttl_repair_worker(ttl_repair_engine, ttl_repair_shutdown).await
+        });
 
         vec![
             control_plane,
             transaction_recovery,
             gsi_delay_poller,
             ttl_cleanup,
+            ttl_repair,
         ]
     }
 

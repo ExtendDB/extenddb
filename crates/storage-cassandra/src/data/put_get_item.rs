@@ -72,15 +72,15 @@ impl CassandraEngine {
         let item_text = item_json.to_string();
 
         // Fetch indexes for GSI/LSI updates
-        let indexes = super::index::fetch_indexes_for_table(
-            &key_info.table_id,
-            &self.session,
-            &catalog_keyspace,
-        )
-        .await?;
-        let ttl_config = self
-            .ttl_config_for_table(&key_info.account_id, &key_info.table_name)
-            .await?;
+        // Both are catalog reads with no data dependency; overlap them.
+        let (indexes, ttl_config) = futures::try_join!(
+            super::index::fetch_indexes_for_table(
+                &key_info.table_id,
+                &self.session,
+                &catalog_keyspace,
+            ),
+            self.ttl_config_for_table(&key_info.account_id, &key_info.table_name),
+        )?;
         let sys_delay = if indexes.is_empty() {
             0
         } else {
@@ -208,12 +208,25 @@ impl CassandraEngine {
                 .await?;
             } else {
                 // LOGGED BATCH: item insert + optional index updates + optional stream record.
-                let insert_cql = format!(
-                    "INSERT INTO {}.{} \
-                     (pk, {}, item_data) \
-                     VALUES (?, ?, ?)",
-                    data_keyspace, ddb_table, sk_col
-                );
+                // On a claimed row the base write also clears the claim columns.
+                // The batch timestamp is pinned after claim acquisition, so these
+                // nulls lose to any newer owner's Paxos cells exactly as the item
+                // cells do — no separate release round trip is needed on success.
+                let insert_cql = if ttl_config.is_some() {
+                    format!(
+                        "INSERT INTO {}.{} \
+                         (pk, {}, item_data, prepared_txn_id, prepared_txn_timestamp) \
+                         VALUES (?, ?, ?, null, null)",
+                        data_keyspace, ddb_table, sk_col
+                    )
+                } else {
+                    format!(
+                        "INSERT INTO {}.{} \
+                         (pk, {}, item_data) \
+                         VALUES (?, ?, ?)",
+                        data_keyspace, ddb_table, sk_col
+                    )
+                };
                 let insert_qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
                     cdrs_tokio::types::value::Value::from(pk_text.as_str()),
                     super::index::sk_to_value(&sk),
@@ -257,6 +270,7 @@ impl CassandraEngine {
                         &mut batch,
                         &data_keyspace,
                         key_info,
+                        &config.attribute,
                         &item,
                     )?;
                     super::ttl::add_ttl_queue_mutations(
@@ -312,20 +326,16 @@ impl CassandraEngine {
                         .await;
                     return Err(StorageError::Internal(format!("Batch execution: {error}")));
                 }
-                self.release_ttl_mutation_claim(key_info, &item, ttl_claim)
-                    .await;
+                // The batch itself released the claim at its pinned timestamp;
+                // the detached exact release covers a trailing local clock
+                // without costing the request a Paxos round.
+                self.spawn_release_ttl_claim(key_info, &item, ttl_claim);
 
                 if async_enqueued > 0 {
                     self.gsi_queue.notify_workers();
                 }
             }
 
-            if let Err(error) = self.reconcile_ttl_item(key_info, &item).await {
-                tracing::warn!(
-                    table = %key_info.table_name,
-                    "deferred post-commit TTL reconciliation for PutItem: {error}"
-                );
-            }
             Ok(if return_old { old_item_opt } else { None })
         } else {
             // PK-only table (no sort key)
@@ -415,12 +425,23 @@ impl CassandraEngine {
                     .map_err(|e| StorageError::Internal(format!("Insert item: {e}")))?;
             } else {
                 // LOGGED BATCH: item insert + optional index updates + optional stream record.
-                let insert_cql = format!(
-                    "INSERT INTO {}.{} \
-                     (pk, item_data) \
-                     VALUES (?, ?)",
-                    data_keyspace, ddb_table
-                );
+                // On a claimed row the base write also clears the claim columns
+                // (see the sort-key path for the timestamp reasoning).
+                let insert_cql = if ttl_config.is_some() {
+                    format!(
+                        "INSERT INTO {}.{} \
+                         (pk, item_data, prepared_txn_id, prepared_txn_timestamp) \
+                         VALUES (?, ?, null, null)",
+                        data_keyspace, ddb_table
+                    )
+                } else {
+                    format!(
+                        "INSERT INTO {}.{} \
+                         (pk, item_data) \
+                         VALUES (?, ?)",
+                        data_keyspace, ddb_table
+                    )
+                };
                 let insert_qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
                     cdrs_tokio::types::value::Value::from(pk_text.as_str()),
                     item_text.as_str().into(),
@@ -463,6 +484,7 @@ impl CassandraEngine {
                         &mut batch,
                         &data_keyspace,
                         key_info,
+                        &config.attribute,
                         &item,
                     )?;
                     super::ttl::add_ttl_queue_mutations(
@@ -518,20 +540,16 @@ impl CassandraEngine {
                         .await;
                     return Err(StorageError::Internal(format!("Batch execution: {error}")));
                 }
-                self.release_ttl_mutation_claim(key_info, &item, ttl_claim)
-                    .await;
+                // The batch itself released the claim at its pinned timestamp;
+                // the detached exact release covers a trailing local clock
+                // without costing the request a Paxos round.
+                self.spawn_release_ttl_claim(key_info, &item, ttl_claim);
 
                 if async_enqueued > 0 {
                     self.gsi_queue.notify_workers();
                 }
             }
 
-            if let Err(error) = self.reconcile_ttl_item(key_info, &item).await {
-                tracing::warn!(
-                    table = %key_info.table_name,
-                    "deferred post-commit TTL reconciliation for PutItem: {error}"
-                );
-            }
             Ok(if return_old { old_item_opt } else { None })
         }
     }

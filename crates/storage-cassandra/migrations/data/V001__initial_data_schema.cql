@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS gsi_pending (
 -- `ttl_expiration_buckets` registers which (day bucket, key shard) partitions of
 -- `ttl_expirations` hold work, so a sweep can find due partitions without
 -- scanning. Queue rows carry the durable deletion state machine: PENDING,
--- CLAIMED, EFFECTS_APPLIED.
+-- CLAIMED, CLAIM_ABORTING, EFFECTS_APPLYING, EFFECTS_APPLIED.
 CREATE TABLE IF NOT EXISTS ttl_expiration_buckets (
     table_id text,
     generation uuid,
@@ -100,3 +100,24 @@ CREATE TABLE IF NOT EXISTS ttl_reconcile_pending (
     key_data text,
     PRIMARY KEY ((worker_partition), id)
 ) WITH CLUSTERING ORDER BY (id ASC);
+
+-- A repair marker is written at LOCAL_QUORUM before an active-generation queue
+-- row can be conditionally destroyed. It remains here while the destroy outcome
+-- is ambiguous. A definitive destroy response is handed off to
+-- ttl_reconcile_pending before this marker is removed. The registry is bounded
+-- to the 64 worker partitions and avoids 64 empty reads on every worker pass.
+CREATE TABLE IF NOT EXISTS ttl_repair_inflight_partitions (
+    worker_partition int PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS ttl_repair_inflight (
+    worker_partition int,
+    repair_id uuid,
+    table_id text,
+    account_id text,
+    table_name text,
+    generation uuid,
+    key_data text,
+    created_at timestamp,
+    PRIMARY KEY ((worker_partition), repair_id)
+);

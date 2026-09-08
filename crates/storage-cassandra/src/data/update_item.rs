@@ -51,15 +51,15 @@ impl CassandraEngine {
         let pk_text = pk_to_text(pk_value)?;
 
         let catalog_keyspace = self.catalog_keyspace();
-        let indexes = super::index::fetch_indexes_for_table(
-            &key_info.table_id,
-            &self.session,
-            &catalog_keyspace,
-        )
-        .await?;
-        let ttl_config = self
-            .ttl_config_for_table(&key_info.account_id, &key_info.table_name)
-            .await?;
+        // Both are catalog reads with no data dependency; overlap them.
+        let (indexes, ttl_config) = futures::try_join!(
+            super::index::fetch_indexes_for_table(
+                &key_info.table_id,
+                &self.session,
+                &catalog_keyspace,
+            ),
+            self.ttl_config_for_table(&key_info.account_id, &key_info.table_name),
+        )?;
         let sys_delay = if indexes.is_empty() {
             0
         } else {
@@ -204,18 +204,19 @@ impl CassandraEngine {
                     mutation_timestamp,
                 )
                 .await;
-            // Exact conditional release is required on both success and every error.
-            self.release_ttl_mutation_claim(key_info, key, ttl_claim)
-                .await;
+            // On success the claimed path's batch cleared the claim columns at
+            // its pinned timestamp; the detached exact release covers a
+            // trailing local clock. A failed write may still hold the claim,
+            // so it releases synchronously.
+            if write_result.is_err() {
+                self.release_ttl_mutation_claim(key_info, key, ttl_claim)
+                    .await;
+            } else {
+                self.spawn_release_ttl_claim(key_info, key, ttl_claim);
+            }
             let applied = write_result?;
 
             if applied {
-                if let Err(error) = self.reconcile_ttl_item(key_info, &item).await {
-                    tracing::warn!(
-                        table = %key_info.table_name,
-                        "deferred post-commit TTL reconciliation for UpdateItem: {error}"
-                    );
-                }
                 return Ok((old_item, new_item));
             }
 
@@ -475,11 +476,12 @@ impl CassandraEngine {
             0
         };
 
-        if ttl_claim.is_some() {
+        if let (Some(_), Some(attribute)) = (ttl_claim, ttl_attribute) {
             super::ttl::add_ttl_reconciliation_mutation(
                 &mut batch,
                 data_keyspace,
                 key_info,
+                attribute,
                 new_item,
             )?;
         }

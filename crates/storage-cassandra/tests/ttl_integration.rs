@@ -90,6 +90,47 @@ async fn ttl_outbox_count(
     count
 }
 
+async fn ttl_inflight_repair_count(
+    engine: &extenddb_storage_cassandra::CassandraEngine,
+    account_id: &str,
+) -> usize {
+    let keyspace = engine.account_keyspace(account_id);
+    let registry = engine
+        .session_arc()
+        .query_with_values(
+            &format!("SELECT worker_partition FROM {keyspace}.ttl_repair_inflight_partitions"),
+            cdrs_tokio::query_values!(),
+        )
+        .await
+        .unwrap()
+        .response_body()
+        .unwrap()
+        .into_rows()
+        .unwrap_or_default();
+    let mut count = 0usize;
+    for row in registry {
+        use cdrs_tokio::types::IntoRustByName;
+        let partition: i32 = row.get_r_by_name("worker_partition").unwrap();
+        count += engine
+            .session_arc()
+            .query_with_values(
+                &format!(
+                    "SELECT repair_id FROM {keyspace}.ttl_repair_inflight \
+                     WHERE worker_partition = ?"
+                ),
+                cdrs_tokio::query_values!(partition),
+            )
+            .await
+            .unwrap()
+            .response_body()
+            .unwrap()
+            .into_rows()
+            .unwrap_or_default()
+            .len();
+    }
+    count
+}
+
 #[tokio::test]
 async fn test_ttl_metadata_enable_disable_and_listing() {
     use extenddb_core::types::{AttributeValue, TimeToLiveStatus};
@@ -363,7 +404,7 @@ async fn test_ttl_queue_sweep_and_stale_candidate_protection() {
         .expect("move TTL into future");
 
     assert!(ttl_outbox_count(&engine, &table.key_info.account_id).await > 0);
-    extenddb_storage_cassandra::ttl_worker::reconcile_pending_once(&engine, 1_000)
+    extenddb_storage_cassandra::ttl_worker::reconcile_pending_older_than(&engine, 1_000, -60)
         .await
         .expect("drain TTL reconciliation outbox");
     assert_eq!(
@@ -401,6 +442,11 @@ async fn test_ttl_queue_sweep_and_stale_candidate_protection() {
             assert!(current.is_some(), "{id} should survive TTL sweep");
         }
     }
+    assert_eq!(
+        ttl_inflight_repair_count(&engine, &table.key_info.account_id).await,
+        0,
+        "definitive queue destroys must hand off and remove their inflight markers"
+    );
 }
 
 #[tokio::test]
@@ -1167,6 +1213,579 @@ async fn test_disable_drains_claimed_work_and_releases_its_claim() {
     );
 }
 
+/// The durable must-complete boundary is entered before effects. Cleanup must
+/// replay an `EFFECTS_APPLYING` row idempotently and finish the base delete;
+/// treating it like `CLAIMED` would permit a crash-after-effects inconsistency.
+#[tokio::test]
+async fn test_disable_completes_effects_applying_work() {
+    use extenddb_storage::DataEngine;
+
+    let engine = setup_engine().await;
+    let (table, item) = ttl_table_with_expired_item(&engine, "TtlDrainApplying", 10).await;
+    let work_id = uuid::Uuid::new_v4();
+    let (generation, bucket, shard, ..) =
+        forge_ttl_work(&engine, &table.key_info, &item, "EFFECTS_APPLYING", work_id).await;
+
+    engine
+        .update_ttl(
+            &table.key_info.account_id,
+            &table.key_info.table_name,
+            "expires_at",
+            false,
+        )
+        .await
+        .expect("disable completes effects-applying work");
+
+    let mut key = extenddb_core::types::Item::new();
+    key.insert(
+        "id".to_owned(),
+        extenddb_core::types::AttributeValue::S("drain".to_owned()),
+    );
+    assert!(
+        engine
+            .get_item(&table.key_info, &key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        ttl_queue_row_count(
+            &engine,
+            &table.key_info.account_id,
+            &table.key_info.table_id,
+            generation,
+            bucket,
+            shard,
+        )
+        .await,
+        0
+    );
+}
+
+/// A marker partition holding more than one scan page must still be fully
+/// traversed within a bounded number of passes: the resume cursor makes a
+/// 300-marker partition drain in exactly two passes here, where a fixed or
+/// random page could starve markers indefinitely.
+#[tokio::test]
+async fn test_inflight_marker_traversal_covers_beyond_one_page() {
+    let engine = setup_engine().await;
+    let table = crate::helpers::TestTable::new(&engine, "TtlMarkerTraversal", false).await;
+    activate_tables(&engine).await;
+    let keyspace = engine.account_keyspace(&table.key_info.account_id);
+
+    // 300 markers in one worker partition, all naming a table that does not
+    // exist — quorum metadata proves them terminal, so each visit deletes one.
+    let partition: i32 = 7;
+    engine
+        .session_arc()
+        .query_with_values(
+            &format!(
+                "INSERT INTO {keyspace}.ttl_repair_inflight_partitions (worker_partition) \
+                 VALUES (?)"
+            ),
+            cdrs_tokio::query_values!(partition),
+        )
+        .await
+        .unwrap();
+    for index in 0..300 {
+        engine
+            .session_arc()
+            .query_with_values(
+                &format!(
+                    "INSERT INTO {keyspace}.ttl_repair_inflight \
+                     (worker_partition, repair_id, table_id, account_id, table_name, \
+                      generation, key_data, created_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, toTimestamp(now()))"
+                ),
+                cdrs_tokio::query_values!(
+                    partition,
+                    uuid::Uuid::new_v4(),
+                    format!("gone-{index}"),
+                    table.key_info.account_id.as_str(),
+                    "NoSuchTable",
+                    uuid::Uuid::new_v4(),
+                    r#"{"id":{"S":"x"}}"#
+                ),
+            )
+            .await
+            .unwrap();
+    }
+
+    let count = |engine: &extenddb_storage_cassandra::CassandraEngine| {
+        let keyspace = keyspace.clone();
+        let session = engine.session_arc();
+        async move {
+            session
+                .query_with_values(
+                    &format!(
+                        "SELECT repair_id FROM {keyspace}.ttl_repair_inflight \
+                         WHERE worker_partition = ?"
+                    ),
+                    cdrs_tokio::query_values!(partition),
+                )
+                .await
+                .unwrap()
+                .response_body()
+                .unwrap()
+                .into_rows()
+                .unwrap_or_default()
+                .len()
+        }
+    };
+    assert_eq!(count(&engine).await, 300);
+
+    // One page of 256, then the remainder: exactly two passes, by construction
+    // of the resume cursor — not eventually, and not probabilistically.
+    extenddb_storage_cassandra::ttl_worker::reconcile_inflight_repairs_once(&engine)
+        .await
+        .unwrap();
+    let after_first = count(&engine).await;
+    assert!(
+        after_first <= 44,
+        "first pass must clear a full page (got {after_first} remaining)"
+    );
+    extenddb_storage_cassandra::ttl_worker::reconcile_inflight_repairs_once(&engine)
+        .await
+        .unwrap();
+    assert_eq!(
+        count(&engine).await,
+        0,
+        "the resume cursor must reach every marker within two passes"
+    );
+}
+
+/// A prefix of persistently unreconcilable outbox rows must not hide the valid
+/// records behind it: the pass pages past the failing prefix within one cycle.
+#[tokio::test]
+async fn test_outbox_pages_past_poison_prefix() {
+    use extenddb_core::types::{AttributeValue, Item};
+    use extenddb_storage::DataEngine;
+
+    let engine = setup_engine().await;
+    let table = crate::helpers::TestTable::new(&engine, "TtlPoisonPrefix", false).await;
+    activate_tables(&engine).await;
+    engine
+        .update_ttl(
+            &table.key_info.account_id,
+            &table.key_info.table_name,
+            "expires_at",
+            true,
+        )
+        .await
+        .unwrap();
+    engine
+        .create_ttl_index(
+            &table.key_info.account_id,
+            &table.key_info.table_name,
+            "expires_at",
+        )
+        .await
+        .unwrap();
+    let keyspace = engine.account_keyspace(&table.key_info.account_id);
+
+    // A real item whose outbox row will sit BEHIND the poison prefix.
+    let future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3_600;
+    let mut item = Item::new();
+    item.insert("id".to_owned(), AttributeValue::S("behind".to_owned()));
+    item.insert(
+        "expires_at".to_owned(),
+        AttributeValue::N(future.to_string()),
+    );
+    engine
+        .put_item(
+            &table.key_info,
+            item.clone(),
+            false,
+            None,
+            &Default::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // 70 rows with unparseable key_data, all in the valid row's partition and
+    // all inserted AFTER it in the wall-clock sense but with timeuuids that
+    // cluster BEFORE it cannot be forged — so instead compute the partition
+    // and pin the poison rows first is not possible either. What matters is
+    // only that a full page (64) of failing rows precedes the valid one in
+    // clustering order at scan time, which holds when the poison rows carry
+    // earlier timeuuids. now() at insert time is monotonic per coordinator,
+    // so insert the poison rows into the SAME partition and then re-write the
+    // valid row's outbox record afterwards, giving it the latest timeuuid.
+    let key_data = r#"{"id":{"S":"behind"}}"#;
+    let partition = (crc32fast_hash(key_data) % 64) as i32;
+    // Remove the put's own outbox row so ordering is fully controlled.
+    engine
+        .session_arc()
+        .query(&format!("TRUNCATE {keyspace}.ttl_reconcile_pending"))
+        .await
+        .unwrap();
+    for _ in 0..70 {
+        engine
+            .session_arc()
+            .query_with_values(
+                &format!(
+                    "INSERT INTO {keyspace}.ttl_reconcile_pending \
+                     (worker_partition, id, table_id, account_id, table_name, key_data) \
+                     VALUES (?, now(), ?, ?, ?, ?)"
+                ),
+                cdrs_tokio::query_values!(
+                    partition,
+                    table.key_info.table_id.as_str(),
+                    table.key_info.account_id.as_str(),
+                    table.key_info.table_name.as_str(),
+                    "this is not json"
+                ),
+            )
+            .await
+            .unwrap();
+    }
+    engine
+        .session_arc()
+        .query_with_values(
+            &format!(
+                "INSERT INTO {keyspace}.ttl_reconcile_pending \
+                 (worker_partition, id, table_id, account_id, table_name, key_data) \
+                 VALUES (?, now(), ?, ?, ?, ?)"
+            ),
+            cdrs_tokio::query_values!(
+                partition,
+                table.key_info.table_id.as_str(),
+                table.key_info.account_id.as_str(),
+                table.key_info.table_name.as_str(),
+                key_data
+            ),
+        )
+        .await
+        .unwrap();
+
+    // Default production page for limit=1000 is 64: the prefix fills page one
+    // exactly, so reaching the valid row requires paging, not luck.
+    extenddb_storage_cassandra::ttl_worker::reconcile_pending_older_than(&engine, 1_000, -60)
+        .await
+        .unwrap();
+
+    let remaining = engine
+        .session_arc()
+        .query_with_values(
+            &format!("SELECT id FROM {keyspace}.ttl_reconcile_pending WHERE worker_partition = ?"),
+            cdrs_tokio::query_values!(partition),
+        )
+        .await
+        .unwrap()
+        .response_body()
+        .unwrap()
+        .into_rows()
+        .unwrap_or_default()
+        .len();
+    assert_eq!(
+        remaining, 70,
+        "the valid row behind the poison prefix must be reconciled and discharged"
+    );
+}
+
+fn crc32fast_hash(value: &str) -> u32 {
+    crc32fast::hash(value.as_bytes())
+}
+
+/// The mixed-timestamp state a stale writer leaves behind: `EFFECTS_APPLYING`
+/// with a sealed owner whose base row now carries a DIFFERENT image, because
+/// the writer's unconditional batch (pinned before the seal) landed after it —
+/// its owner-null cells lost to the seal, its item cells beat the older image.
+/// Recovery must fence on the owner alone and complete: requiring the image to
+/// match would wedge the row forever behind a non-expiring owner, block
+/// generation cleanup, and (since enable/disable require a null cleanup
+/// generation) make TTL permanently un-enableable on the table.
+#[tokio::test]
+async fn test_effects_applying_with_changed_image_completes_not_wedges() {
+    use extenddb_core::metrics::MetricsCollector;
+    use extenddb_core::types::{AttributeValue, Item};
+    use extenddb_storage::DataEngine;
+
+    let engine = setup_engine().await;
+    let (table, old_item) =
+        ttl_table_with_expired_item(&engine, "TtlApplyingChangedImage", 10).await;
+    let work_id = uuid::Uuid::new_v4();
+    // Forge EFFECTS_APPLYING owning the OLD image, with the claim on the row.
+    let (generation, bucket, shard, ..) = forge_ttl_work(
+        &engine,
+        &table.key_info,
+        &old_item,
+        "EFFECTS_APPLYING",
+        work_id,
+    )
+    .await;
+
+    // The stale writer's batch: change the item under the sealed owner without
+    // touching the claim columns, exactly what an older-pinned unconditional
+    // batch does when its owner-null cells lose but its item cells win.
+    let mut changed = old_item.clone();
+    changed.insert(
+        "value".to_owned(),
+        AttributeValue::S("stale-write".to_owned()),
+    );
+    // More than two day-buckets ahead, so the changed item's re-registered
+    // queue entry can never share the old entry's (bucket, shard) partition —
+    // a +1h offset made the zero-rows assertion below time-of-day dependent
+    // (it only held within an hour of midnight UTC).
+    let future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3 * 86_400;
+    changed.insert(
+        "expires_at".to_owned(),
+        AttributeValue::N(future.to_string()),
+    );
+    let keyspace = engine.account_keyspace(&table.key_info.account_id);
+    let data_table = format!("items_{}", table.key_info.table_id.replace('-', "_"));
+    let changed_json = serde_json::to_string(&changed).unwrap();
+    engine
+        .session_arc()
+        .query_with_values(
+            &format!("UPDATE {keyspace}.{data_table} SET item_data = ? WHERE pk = ?"),
+            cdrs_tokio::query_values!(changed_json.as_str(), "drain"),
+        )
+        .await
+        .unwrap();
+
+    // The sweep must complete the work, not error out of the table pass.
+    let metrics = MetricsCollector::new();
+    extenddb_storage_cassandra::ttl_worker::sweep_once(&engine, &metrics).await;
+
+    let mut key = Item::new();
+    key.insert("id".to_owned(), AttributeValue::S("drain".to_owned()));
+    let survivor = engine
+        .get_item(&table.key_info, &key)
+        .await
+        .unwrap()
+        .expect("the changed item must survive — it postdates the recorded image");
+    assert_eq!(
+        survivor.get("value"),
+        Some(&AttributeValue::S("stale-write".to_owned()))
+    );
+    assert_eq!(
+        base_row_owner(&engine, &table.key_info, &old_item).await,
+        None,
+        "the sealed owner must be released after completion"
+    );
+    assert_eq!(
+        ttl_queue_row_count(
+            &engine,
+            &table.key_info.account_id,
+            &table.key_info.table_id,
+            generation,
+            bucket,
+            shard,
+        )
+        .await,
+        0,
+        "the must-complete row must have been completed, not wedged \
+         (the changed item re-registers in its future bucket, not this one)"
+    );
+    // The key must be writable again (no lingering fence).
+    let mut rewrite = survivor.clone();
+    rewrite.insert("value".to_owned(), AttributeValue::S("after".to_owned()));
+    engine
+        .put_item(
+            &table.key_info,
+            rewrite,
+            false,
+            None,
+            &Default::default(),
+            None,
+        )
+        .await
+        .expect("the key must be writable after recovery");
+}
+
+/// Same mixed-timestamp state as above, on a table with a synchronous GSI whose
+/// key the stale write does NOT change. The replayed effects tombstone the old
+/// image's GSI row — which is also the survivor's, since the key is shared —
+/// so recovery must rebuild it from the survivor before releasing the sealed
+/// owner, at a timestamp strictly above the replay's. Without restoration the
+/// live item is left invisible to its own index.
+#[tokio::test]
+async fn test_effects_applying_recovery_restores_shared_key_gsi_row() {
+    use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, PathElement};
+    use extenddb_core::metrics::MetricsCollector;
+    use extenddb_core::types::AttributeValue;
+    use extenddb_storage::DataEngine;
+
+    let engine = setup_engine().await;
+    let table =
+        crate::helpers::TestTable::with_gsi(&engine, "TtlGsiRestore", "StatusIndex", "status")
+            .await;
+    activate_tables(&engine).await;
+    engine
+        .session_arc()
+        .query_with_values(
+            &format!(
+                "UPDATE {}.indexes SET propagation_delay_ms = 0 \
+                 WHERE table_id = ? AND index_name = ?",
+                engine.catalog_keyspace()
+            ),
+            cdrs_tokio::query_values!(table.key_info.table_id.as_str(), "StatusIndex"),
+        )
+        .await
+        .unwrap();
+    engine
+        .update_ttl(
+            &table.key_info.account_id,
+            &table.key_info.table_name,
+            "expires_at",
+            true,
+        )
+        .await
+        .unwrap();
+    engine
+        .create_ttl_index(
+            &table.key_info.account_id,
+            &table.key_info.table_name,
+            "expires_at",
+        )
+        .await
+        .unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut old_item = std::collections::BTreeMap::new();
+    old_item.insert("id".to_owned(), AttributeValue::S("gsi-restore".to_owned()));
+    old_item.insert("status".to_owned(), AttributeValue::S("expired".to_owned()));
+    old_item.insert("value".to_owned(), AttributeValue::S("old".to_owned()));
+    old_item.insert(
+        "expires_at".to_owned(),
+        AttributeValue::N((now - 10).to_string()),
+    );
+    engine
+        .put_item(
+            &table.key_info,
+            old_item.clone(),
+            false,
+            None,
+            &ExpressionMaps::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let work_id = uuid::Uuid::new_v4();
+    let (generation, bucket, shard, ..) = forge_ttl_work(
+        &engine,
+        &table.key_info,
+        &old_item,
+        "EFFECTS_APPLYING",
+        work_id,
+    )
+    .await;
+
+    // Read back the recorded delete timestamp so the stale write can be pinned
+    // strictly below the replay's tombstones, as a real pre-seal writer is.
+    let keyspace = engine.account_keyspace(&table.key_info.account_id);
+    let work_data_json: String = {
+        use cdrs_tokio::types::IntoRustByName;
+        engine
+            .session_arc()
+            .query_with_values(
+                &format!(
+                    "SELECT work_data FROM {keyspace}.ttl_expirations \
+                     WHERE table_id = ? AND generation = ? AND bucket = ? AND shard = ?"
+                ),
+                cdrs_tokio::query_values!(
+                    table.key_info.table_id.as_str(),
+                    generation,
+                    bucket,
+                    shard
+                ),
+            )
+            .await
+            .unwrap()
+            .response_body()
+            .unwrap()
+            .into_rows()
+            .unwrap_or_default()
+            .first()
+            .and_then(|row| row.get_by_name("work_data").ok().flatten())
+            .expect("forged work data")
+    };
+    let delete_timestamp_ms =
+        serde_json::from_str::<serde_json::Value>(&work_data_json).unwrap()["delete_timestamp_ms"]
+            .as_i64()
+            .unwrap();
+
+    // The stale writer's base cells: same GSI key, changed projection, future
+    // TTL (beyond any shared day bucket), stamped below the replay tombstones.
+    let mut changed = old_item.clone();
+    changed.insert("value".to_owned(), AttributeValue::S("survivor".to_owned()));
+    changed.insert(
+        "expires_at".to_owned(),
+        AttributeValue::N((now + 3 * 86_400).to_string()),
+    );
+    let stale_timestamp = delete_timestamp_ms * 1_000 - 1_000;
+    let data_table = format!("items_{}", table.key_info.table_id.replace('-', "_"));
+    let changed_json = serde_json::to_string(&changed).unwrap();
+    engine
+        .session_arc()
+        .query_with_values(
+            &format!(
+                "UPDATE {keyspace}.{data_table} USING TIMESTAMP {stale_timestamp} \
+                 SET item_data = ? WHERE pk = ?"
+            ),
+            cdrs_tokio::query_values!(changed_json.as_str(), "gsi-restore"),
+        )
+        .await
+        .unwrap();
+
+    extenddb_storage_cassandra::ttl_worker::sweep_once(&engine, &MetricsCollector::new()).await;
+
+    // The survivor must be visible through its own GSI: the replay tombstoned
+    // the shared-key row, so only restoration can have brought it back.
+    let condition = KeyCondition {
+        pk_path: vec![PathElement::Attribute("status".to_owned())],
+        pk_value: Expr::Placeholder(":status".to_owned()),
+        sk_condition: None,
+        extra_pk_conditions: Vec::new(),
+        extra_sk_conditions: Vec::new(),
+    };
+    let mut maps = ExpressionMaps::default();
+    maps.values.insert(
+        ":status".to_owned(),
+        AttributeValue::S("expired".to_owned()),
+    );
+    let (index_rows, _) = engine
+        .query(
+            &table.key_info,
+            &condition,
+            &maps,
+            true,
+            None,
+            None,
+            Some("StatusIndex"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        index_rows.len(),
+        1,
+        "the survivor's shared-key GSI row must be restored before the owner drops"
+    );
+    assert_eq!(
+        index_rows[0].get("value"),
+        Some(&AttributeValue::S("survivor".to_owned()))
+    );
+    assert_eq!(
+        base_row_owner(&engine, &table.key_info, &old_item).await,
+        None,
+        "the sealed owner must be released"
+    );
+}
+
 /// The one phase that must go forward. At EFFECTS_APPLIED the index rows are
 /// already deleted and the REMOVE record already published, so abandoning the
 /// work would leave a live item with a missing index. Cleanup completes the base
@@ -1578,7 +2197,7 @@ async fn test_ttl_reconciles_same_expiry_after_queue_only_claim() {
         .await
         .unwrap();
 
-    extenddb_storage_cassandra::ttl_worker::reconcile_pending_once(&engine, 1_000)
+    extenddb_storage_cassandra::ttl_worker::reconcile_pending_older_than(&engine, 1_000, -60)
         .await
         .expect("conflicting outbox reconciliation is retryable");
     assert!(
@@ -1587,7 +2206,7 @@ async fn test_ttl_reconciles_same_expiry_after_queue_only_claim() {
     );
 
     extenddb_storage_cassandra::ttl_worker::sweep_once(&engine, &MetricsCollector::new()).await;
-    extenddb_storage_cassandra::ttl_worker::reconcile_pending_once(&engine, 1_000)
+    extenddb_storage_cassandra::ttl_worker::reconcile_pending_older_than(&engine, 1_000, -60)
         .await
         .expect("reconcile current image after stale work retires");
     assert_eq!(
@@ -1879,6 +2498,406 @@ async fn test_conditional_put_recreates_metadata_only_row() {
         Some(&AttributeValue::S("new".to_owned())),
         "a surviving stale row would satisfy a bare is_some() check"
     );
+}
+
+#[tokio::test]
+async fn test_outbox_restores_bucket_for_existing_pending_row() {
+    use cdrs_tokio::types::IntoRustByName;
+    use extenddb_core::types::{AttributeValue, Item};
+    use extenddb_storage::DataEngine;
+
+    let engine = setup_engine().await;
+    let table = crate::helpers::TestTable::new(&engine, "TtlRestoreMissingBucket", false).await;
+    activate_tables(&engine).await;
+    engine
+        .update_ttl(
+            &table.key_info.account_id,
+            &table.key_info.table_name,
+            "expires_at",
+            true,
+        )
+        .await
+        .unwrap();
+    engine
+        .create_ttl_index(
+            &table.key_info.account_id,
+            &table.key_info.table_name,
+            "expires_at",
+        )
+        .await
+        .unwrap();
+
+    let mut item = Item::new();
+    item.insert("id".to_owned(), AttributeValue::S("bucket-race".to_owned()));
+    item.insert(
+        "expires_at".to_owned(),
+        AttributeValue::N(
+            (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3_600)
+                .to_string(),
+        ),
+    );
+    engine
+        .put_item(
+            &table.key_info,
+            item,
+            false,
+            None,
+            &Default::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let generation = ttl_generation(
+        &engine,
+        &table.key_info.account_id,
+        &table.key_info.table_name,
+    )
+    .await;
+    let keyspace = engine.account_keyspace(&table.key_info.account_id);
+    let bucket_row = engine
+        .session_arc()
+        .query_with_values(
+            &format!(
+                "SELECT bucket, shard FROM {keyspace}.ttl_expiration_buckets \
+                 WHERE table_id = ? AND generation = ?"
+            ),
+            cdrs_tokio::query_values!(table.key_info.table_id.as_str(), generation),
+        )
+        .await
+        .unwrap()
+        .response_body()
+        .unwrap()
+        .into_rows()
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+        .unwrap();
+    let bucket: i64 = bucket_row.get_r_by_name("bucket").unwrap();
+    let shard: i32 = bucket_row.get_r_by_name("shard").unwrap();
+
+    // Manufacture the state left by a delayed timestamped write whose queue
+    // insert survived but whose bucket insert lost to a newer tombstone.
+    engine
+        .session_arc()
+        .query_with_values(
+            &format!(
+                "DELETE FROM {keyspace}.ttl_expiration_buckets WHERE table_id = ? \
+                 AND generation = ? AND bucket = ? AND shard = ?"
+            ),
+            cdrs_tokio::query_values!(table.key_info.table_id.as_str(), generation, bucket, shard),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ttl_bucket_count(
+            &engine,
+            &table.key_info.account_id,
+            &table.key_info.table_id
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        ttl_queue_row_count(
+            &engine,
+            &table.key_info.account_id,
+            &table.key_info.table_id,
+            generation,
+            bucket,
+            shard,
+        )
+        .await,
+        1
+    );
+
+    extenddb_storage_cassandra::ttl_worker::reconcile_pending_older_than(&engine, 1_000, -60)
+        .await
+        .unwrap();
+    assert_eq!(
+        ttl_bucket_count(
+            &engine,
+            &table.key_info.account_id,
+            &table.key_info.table_id
+        )
+        .await,
+        1,
+        "PENDING fast-path reconciliation must restore discoverability"
+    );
+    assert_eq!(
+        ttl_outbox_count(&engine, &table.key_info.account_id).await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn test_inflight_repair_repeats_after_late_queue_destroy() {
+    use cdrs_tokio::types::IntoRustByName;
+    use extenddb_core::types::{AttributeValue, Item};
+    use extenddb_storage::DataEngine;
+
+    let engine = setup_engine().await;
+    let table = crate::helpers::TestTable::new(&engine, "TtlInflightRepair", false).await;
+    activate_tables(&engine).await;
+    engine
+        .update_ttl(
+            &table.key_info.account_id,
+            &table.key_info.table_name,
+            "expires_at",
+            true,
+        )
+        .await
+        .unwrap();
+    engine
+        .create_ttl_index(
+            &table.key_info.account_id,
+            &table.key_info.table_name,
+            "expires_at",
+        )
+        .await
+        .unwrap();
+
+    let mut item = Item::new();
+    item.insert(
+        "id".to_owned(),
+        AttributeValue::S("late-destroy".to_owned()),
+    );
+    item.insert(
+        "expires_at".to_owned(),
+        AttributeValue::N(
+            (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3_600)
+                .to_string(),
+        ),
+    );
+    engine
+        .put_item(
+            &table.key_info,
+            item,
+            false,
+            None,
+            &Default::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    extenddb_storage_cassandra::ttl_worker::reconcile_pending_older_than(&engine, 1_000, -60)
+        .await
+        .unwrap();
+
+    let generation = ttl_generation(
+        &engine,
+        &table.key_info.account_id,
+        &table.key_info.table_name,
+    )
+    .await;
+    let keyspace = engine.account_keyspace(&table.key_info.account_id);
+    let bucket_row = engine
+        .session_arc()
+        .query_with_values(
+            &format!(
+                "SELECT bucket, shard FROM {keyspace}.ttl_expiration_buckets \
+                 WHERE table_id = ? AND generation = ?"
+            ),
+            cdrs_tokio::query_values!(table.key_info.table_id.as_str(), generation),
+        )
+        .await
+        .unwrap()
+        .response_body()
+        .unwrap()
+        .into_rows()
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+        .unwrap();
+    let bucket: i64 = bucket_row.get_r_by_name("bucket").unwrap();
+    let shard: i32 = bucket_row.get_r_by_name("shard").unwrap();
+    let mut key = Item::new();
+    key.insert(
+        "id".to_owned(),
+        AttributeValue::S("late-destroy".to_owned()),
+    );
+    let key_data = serde_json::to_string(&key).unwrap();
+    let partition = (crc32fast::hash(key_data.as_bytes()) % 64) as i32;
+    let repair_id = uuid::Uuid::new_v4();
+    engine
+        .session_arc()
+        .query_with_values(
+            &format!(
+                "INSERT INTO {keyspace}.ttl_repair_inflight_partitions \
+                 (worker_partition) VALUES (?)"
+            ),
+            cdrs_tokio::query_values!(partition),
+        )
+        .await
+        .unwrap();
+    engine
+        .session_arc()
+        .query_with_values(
+            &format!(
+                "INSERT INTO {keyspace}.ttl_repair_inflight \
+                 (worker_partition, repair_id, table_id, account_id, table_name, generation, key_data) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)"
+            ),
+            cdrs_tokio::query_values!(
+                partition,
+                repair_id,
+                table.key_info.table_id.as_str(),
+                table.key_info.account_id.as_str(),
+                table.key_info.table_name.as_str(),
+                generation,
+                key_data.as_str()
+            ),
+        )
+        .await
+        .unwrap();
+
+    for pass in 0..2 {
+        // The second deletion models a destroy that commits after an earlier
+        // repair pass. Because the inflight marker is non-dischargeable, the
+        // next pass must restore both the row and its bucket again.
+        engine
+            .session_arc()
+            .query_with_values(
+                &format!(
+                    "DELETE FROM {keyspace}.ttl_expirations WHERE table_id = ? \
+                     AND generation = ? AND bucket = ? AND shard = ?"
+                ),
+                cdrs_tokio::query_values!(
+                    table.key_info.table_id.as_str(),
+                    generation,
+                    bucket,
+                    shard
+                ),
+            )
+            .await
+            .unwrap();
+        engine
+            .session_arc()
+            .query_with_values(
+                &format!(
+                    "DELETE FROM {keyspace}.ttl_expiration_buckets WHERE table_id = ? \
+                     AND generation = ? AND bucket = ? AND shard = ?"
+                ),
+                cdrs_tokio::query_values!(
+                    table.key_info.table_id.as_str(),
+                    generation,
+                    bucket,
+                    shard
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            extenddb_storage_cassandra::ttl_worker::reconcile_inflight_repairs_once(&engine)
+                .await
+                .unwrap()
+                >= 1,
+            "the worker must process at least this test's inflight marker"
+        );
+        assert_eq!(
+            ttl_queue_row_count(
+                &engine,
+                &table.key_info.account_id,
+                &table.key_info.table_id,
+                generation,
+                bucket,
+                shard,
+            )
+            .await,
+            1,
+            "repair pass {pass} must restore a queue row after a late destroy"
+        );
+        assert_eq!(
+            ttl_bucket_count(
+                &engine,
+                &table.key_info.account_id,
+                &table.key_info.table_id
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            ttl_inflight_repair_count(&engine, &table.key_info.account_id).await,
+            1,
+            "only the destroyer may discharge an inflight marker"
+        );
+    }
+
+    engine
+        .session_arc()
+        .query_with_values(
+            &format!(
+                "DELETE FROM {keyspace}.ttl_repair_inflight \
+                 WHERE worker_partition = ? AND repair_id = ?"
+            ),
+            cdrs_tokio::query_values!(partition, repair_id),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_outbox_limit_is_fair_across_partitions() {
+    let engine = setup_engine().await;
+    let table = crate::helpers::TestTable::new(&engine, "TtlOutboxFairness", false).await;
+    activate_tables(&engine).await;
+    let keyspace = engine.account_keyspace(&table.key_info.account_id);
+
+    for partition in [0_i32, 63_i32] {
+        engine
+            .session_arc()
+            .query_with_values(
+                &format!(
+                    "INSERT INTO {keyspace}.ttl_reconcile_pending \
+                     (worker_partition, id, table_id, account_id, table_name, key_data) \
+                     VALUES (?, now(), ?, ?, ?, ?)"
+                ),
+                cdrs_tokio::query_values!(
+                    partition,
+                    "missing-table-id",
+                    table.key_info.account_id.as_str(),
+                    format!("missing-{partition}"),
+                    "{}"
+                ),
+            )
+            .await
+            .unwrap();
+    }
+
+    assert!(
+        extenddb_storage_cassandra::ttl_worker::reconcile_pending_older_than(&engine, 1, -60)
+            .await
+            .unwrap()
+            >= 2,
+        "a soft global limit must still give both edge partitions progress"
+    );
+    for partition in [0_i32, 63_i32] {
+        let rows = engine
+            .session_arc()
+            .query_with_values(
+                &format!(
+                    "SELECT id FROM {keyspace}.ttl_reconcile_pending \
+                     WHERE worker_partition = ?"
+                ),
+                cdrs_tokio::query_values!(partition),
+            )
+            .await
+            .unwrap()
+            .response_body()
+            .unwrap()
+            .into_rows()
+            .unwrap_or_default();
+        assert!(rows.is_empty(), "partition {partition} must not starve");
+    }
 }
 
 #[tokio::test]

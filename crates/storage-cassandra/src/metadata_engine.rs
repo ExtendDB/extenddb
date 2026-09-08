@@ -21,23 +21,70 @@ impl CassandraEngine {
         account_id: &str,
         table_name: &str,
     ) -> Result<Option<crate::data::ttl::TtlConfig>, StorageError> {
+        self.ttl_config_for_table_at(account_id, table_name, false)
+            .await
+    }
+
+    /// Read TTL configuration at `LOCAL_QUORUM` for an authoritative absence
+    /// decision. Durable repair records must not be discharged from a stale
+    /// replica that still reports TTL disabled or an old generation.
+    pub(crate) async fn ttl_config_for_table_quorum(
+        &self,
+        account_id: &str,
+        table_name: &str,
+    ) -> Result<Option<crate::data::ttl::TtlConfig>, StorageError> {
+        self.ttl_config_for_table_at(account_id, table_name, true)
+            .await
+    }
+
+    /// One implementation for both consistencies, so the legacy null-generation
+    /// adoption cannot drift between them. An applied adoption LWT is already
+    /// authoritative (Paxos), so no re-read is needed in that arm at either
+    /// consistency; a lost adoption race re-reads to pick up the winner.
+    async fn ttl_config_for_table_at(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        quorum: bool,
+    ) -> Result<Option<crate::data::ttl::TtlConfig>, StorageError> {
         let query = format!(
             "SELECT ttl_attribute, ttl_generation FROM {}.tables \
              WHERE account_id = ? AND table_name = ?",
             self.catalog_keyspace()
         );
-        let row = crate::cassandra_util::query_optional(
-            &self.session,
-            &query,
-            cdrs_tokio::query_values!(account_id, table_name),
-            "ttl_config_for_table",
-        )
-        .await?;
-        let Some(row) = row else {
+        let read = |context: &'static str| {
+            let query = query.clone();
+            async move {
+                let rows = if quorum {
+                    crate::cassandra_util::query_rows_quorum(
+                        &self.session,
+                        &query,
+                        cdrs_tokio::query_values!(account_id, table_name),
+                        context,
+                    )
+                    .await?
+                } else {
+                    crate::cassandra_util::query_rows(
+                        &self.session,
+                        &query,
+                        cdrs_tokio::query_values!(account_id, table_name),
+                        context,
+                    )
+                    .await?
+                };
+                Ok::<_, StorageError>(rows.into_iter().next())
+            }
+        };
+        let parse = |row: &cdrs_tokio::types::rows::Row| {
+            let attribute: Option<String> = row.get_by_name("ttl_attribute").ok().flatten();
+            let generation: Option<uuid::Uuid> = row.get_by_name("ttl_generation").ok().flatten();
+            (attribute, generation)
+        };
+
+        let Some(row) = read("ttl_config_for_table").await? else {
             return Ok(None);
         };
-        let attribute: Option<String> = row.get_by_name("ttl_attribute").ok().flatten();
-        let generation: Option<uuid::Uuid> = row.get_by_name("ttl_generation").ok().flatten();
+        let (attribute, generation) = parse(&row);
         let Some(attribute) = attribute else {
             return Ok(None);
         };
@@ -48,6 +95,7 @@ impl CassandraEngine {
             }));
         }
 
+        // Legacy row with an attribute but no generation: adopt one via LWT.
         let generation = uuid::Uuid::new_v4();
         let adopt = format!(
             "UPDATE {}.tables SET ttl_generation = ?, ttl_index_ready = false \
@@ -73,16 +121,10 @@ impl CassandraEngine {
             }));
         }
 
-        let row = crate::cassandra_util::query_optional(
-            &self.session,
-            &query,
-            cdrs_tokio::query_values!(account_id, table_name),
-            "ttl_config_for_table_recheck",
-        )
-        .await?;
+        // Lost the adoption race; re-read to pick up the winner's generation.
+        let row = read("ttl_config_for_table_recheck").await?;
         Ok(row.and_then(|row| {
-            let attribute: Option<String> = row.get_by_name("ttl_attribute").ok().flatten();
-            let generation: Option<uuid::Uuid> = row.get_by_name("ttl_generation").ok().flatten();
+            let (attribute, generation) = parse(&row);
             attribute
                 .zip(generation)
                 .map(|(attribute, generation)| crate::data::ttl::TtlConfig {
@@ -363,7 +405,7 @@ impl CassandraEngine {
             crate::data::ttl::retire_pending_ttl_work(
                 self,
                 &account_keyspace,
-                &key_info.table_id,
+                key_info,
                 config.generation,
                 &old_entry,
             )
@@ -393,6 +435,21 @@ impl CassandraEngine {
         else {
             return Ok(());
         };
+        self.reconcile_ttl_item_with_config(key_info, item, &config)
+            .await
+    }
+
+    /// [`Self::reconcile_ttl_item`] for callers that already hold the table's
+    /// TTL configuration, so reconciling does not re-read the catalog. The
+    /// worker calls this once per processed row; the caller is responsible for
+    /// the config being current, which the sweep already guarantees by
+    /// re-checking it between rows.
+    pub(crate) async fn reconcile_ttl_item_with_config(
+        &self,
+        key_info: &extenddb_core::types::TableKeyInfo,
+        item: &Item,
+        config: &crate::data::ttl::TtlConfig,
+    ) -> Result<(), StorageError> {
         let Some(entry) = crate::data::ttl::entry_for_item(key_info, item, &config.attribute)?
         else {
             return Ok(());
@@ -661,6 +718,7 @@ impl MetadataEngine for CassandraEngine {
                     "UPDATE {}.tables SET ttl_attribute = ?, ttl_generation = ?, \
                      ttl_index_ready = false WHERE account_id = ? AND table_name = ? \
                      IF table_status = 'ACTIVE' AND ttl_sweep_owner = null \
+                     AND ttl_cleanup_generation = null \
                      AND ttl_attribute = null AND ttl_generation = null",
                     self.catalog_keyspace()
                 )
@@ -670,6 +728,7 @@ impl MetadataEngine for CassandraEngine {
                      ttl_cleanup_generation = ?, ttl_index_ready = false \
                      WHERE account_id = ? AND table_name = ? \
                      IF table_status = 'ACTIVE' AND ttl_sweep_owner = null \
+                     AND ttl_cleanup_generation = null \
                      AND ttl_attribute = ? AND ttl_generation = ?",
                     self.catalog_keyspace()
                 )
@@ -1043,20 +1102,23 @@ impl MetadataEngine for CassandraEngine {
                         StorageError::Internal(format!("Parse TTL key: {error}"))
                     })?;
                     let current = self.get_item_quorum(&key_info, &key).await?;
-                    if let Some(item) = current.filter(|item| {
+                    if let Some(item) = current.as_ref().filter(|item| {
                         crate::data::ttl::ttl_epoch_seconds(item, &ttl_attribute)
                             == Some(entry.expires_at)
                     }) {
-                        expired.push(item);
-                    } else {
-                        crate::data::ttl::delete_ttl_entry(
-                            self,
-                            &account_keyspace,
-                            &key_info.table_id,
-                            config.generation,
-                            &entry,
-                        )
-                        .await?;
+                        expired.push(item.clone());
+                    } else if crate::data::ttl::retire_pending_ttl_work(
+                        self,
+                        &account_keyspace,
+                        &key_info,
+                        config.generation,
+                        &entry,
+                    )
+                    .await?
+                        && let Some(item) = current
+                    {
+                        self.reconcile_ttl_item_with_config(&key_info, &item, &config)
+                            .await?;
                     }
                 }
             }
