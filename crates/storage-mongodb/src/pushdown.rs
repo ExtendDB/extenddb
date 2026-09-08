@@ -67,20 +67,19 @@ impl Pushable {
 ///
 /// Conservative: unknown constructs return `Pushable::No`.
 pub fn is_pushable(expr: &Expr, maps: &ExpressionMaps) -> Pushable {
-    if contains_dotted_attribute(expr, maps) {
-        return Pushable::No("literal attribute name contains '.'");
+    if let Some(reason) = unsafe_attribute_reason(expr, maps) {
+        return Pushable::No(reason);
     }
     walk(expr, maps)
 }
 
-/// Return whether an expression contains a literal DynamoDB attribute name
-/// with a dot. Such a name must be read as one field in `item_data`, while a
-/// MongoDB dotted field path means nested-document traversal. The compiler
-/// cannot safely push these expressions down, so callers must use the Rust
-/// evaluator instead.
-fn contains_dotted_attribute(expr: &Expr, maps: &ExpressionMaps) -> bool {
+/// Return why an expression contains a literal DynamoDB attribute name that
+/// cannot safely be emitted as a MongoDB field path. A dot would mean nested
+/// document traversal in MongoDB, while a leading `$` would be interpreted as
+/// an operator or otherwise have special meaning in a MongoDB path.
+fn unsafe_attribute_reason(expr: &Expr, maps: &ExpressionMaps) -> Option<&'static str> {
     match expr {
-        Expr::Path(elements) => elements.iter().any(|element| match element {
+        Expr::Path(elements) => elements.iter().find_map(|element| match element {
             PathElement::Attribute(name) => {
                 let resolved = if let Some(alias) = name.strip_prefix('#') {
                     maps.resolve_name(alias).ok()
@@ -88,32 +87,34 @@ fn contains_dotted_attribute(expr: &Expr, maps: &ExpressionMaps) -> bool {
                     Some(name.as_str())
                 };
                 match resolved {
-                    Some(name) => name.contains('.'),
-                    None => true,
+                    Some(name) if name.contains('.') => Some("literal attribute name contains '.'"),
+                    Some(name) if name.starts_with('$') => {
+                        Some("literal attribute name begins with '$'")
+                    }
+                    Some(_) => None,
+                    None => Some("attribute name alias is unresolved"),
                 }
             }
-            PathElement::Index(_) => false,
+            PathElement::Index(_) => None,
         }),
         Expr::Compare { left, right, .. }
         | Expr::And(left, right)
         | Expr::Or(left, right)
         | Expr::Arithmetic { left, right, .. } => {
-            contains_dotted_attribute(left, maps) || contains_dotted_attribute(right, maps)
+            unsafe_attribute_reason(left, maps).or_else(|| unsafe_attribute_reason(right, maps))
         }
-        Expr::Not(inner) => contains_dotted_attribute(inner, maps),
-        Expr::Function { args, .. } => args.iter().any(|arg| contains_dotted_attribute(arg, maps)),
-        Expr::Between { operand, low, high } => {
-            contains_dotted_attribute(operand, maps)
-                || contains_dotted_attribute(low, maps)
-                || contains_dotted_attribute(high, maps)
-        }
-        Expr::In { operand, list } => {
-            contains_dotted_attribute(operand, maps)
-                || list
-                    .iter()
-                    .any(|item| contains_dotted_attribute(item, maps))
-        }
-        Expr::Placeholder(_) => false,
+        Expr::Not(inner) => unsafe_attribute_reason(inner, maps),
+        Expr::Function { args, .. } => args
+            .iter()
+            .find_map(|arg| unsafe_attribute_reason(arg, maps)),
+        Expr::Between { operand, low, high } => unsafe_attribute_reason(operand, maps)
+            .or_else(|| unsafe_attribute_reason(low, maps))
+            .or_else(|| unsafe_attribute_reason(high, maps)),
+        Expr::In { operand, list } => unsafe_attribute_reason(operand, maps).or_else(|| {
+            list.iter()
+                .find_map(|item| unsafe_attribute_reason(item, maps))
+        }),
+        Expr::Placeholder(_) => None,
     }
 }
 
@@ -375,6 +376,21 @@ mod tests {
         let maps = aliased_maps("a.b", AttributeValue::S("unused".into()));
 
         assert!(!is_pushable(&expr, &maps).is_yes());
+    }
+
+    #[test]
+    fn dollar_prefixed_attribute_in_condition_is_not_pushable() {
+        let expr = Expr::Compare {
+            left: Box::new(path("$foo")),
+            op: CompareOp::Eq,
+            right: Box::new(Expr::Placeholder(":value".into())),
+        };
+        let maps = maps_with(&[(":value", AttributeValue::S("value".into()))]);
+
+        assert_eq!(
+            is_pushable(&expr, &maps),
+            Pushable::No("literal attribute name begins with '$'")
+        );
     }
 
     #[test]
