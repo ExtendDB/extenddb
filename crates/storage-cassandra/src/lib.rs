@@ -28,6 +28,7 @@ mod stream_engine;
 pub mod stream_util;
 pub mod table_engine;
 mod table_helpers;
+pub mod ttl_worker;
 mod update_table;
 mod worker_store;
 pub mod workers;
@@ -108,7 +109,25 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
         let guard = workers::spawn_gsi_workers(self.engine.clone());
         let _ = self.gsi_worker_guard.set(guard);
 
-        vec![control_plane, transaction_recovery, gsi_delay_poller]
+        let ttl_engine = self.engine.clone();
+        let ttl_metrics = ctx.metrics.clone();
+        let ttl_shutdown = ctx.shutdown.clone();
+        let ttl_cleanup = tokio::spawn(async move {
+            ttl_worker::ttl_cleanup_worker(ttl_engine, ttl_metrics, ttl_shutdown).await
+        });
+        let ttl_repair_engine = self.engine.clone();
+        let ttl_repair_shutdown = ctx.shutdown.clone();
+        let ttl_repair = tokio::spawn(async move {
+            ttl_worker::ttl_repair_worker(ttl_repair_engine, ttl_repair_shutdown).await
+        });
+
+        vec![
+            control_plane,
+            transaction_recovery,
+            gsi_delay_poller,
+            ttl_cleanup,
+            ttl_repair,
+        ]
     }
 
     fn backend_info(&self) -> Option<String> {

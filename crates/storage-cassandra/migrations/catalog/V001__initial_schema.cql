@@ -46,6 +46,10 @@ CREATE TABLE IF NOT EXISTS tables (
     status_transition_at timestamp,
     stream_label text,
     ttl_index_ready boolean,
+    -- Fences TTL enable, backfill, sweep, and cleanup cycles against each other.
+    ttl_generation uuid,
+    ttl_sweep_owner uuid,
+    ttl_cleanup_generation uuid,
     PRIMARY KEY ((account_id), table_name)
 );
 CREATE INDEX IF NOT EXISTS ON tables (table_id);
