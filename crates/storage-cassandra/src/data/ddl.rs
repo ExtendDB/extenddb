@@ -434,7 +434,9 @@ impl CassandraEngine {
         base_attr_defs: &[extenddb_core::types::AttributeDefinition],
         projection: &extenddb_core::types::Projection,
     ) -> Result<(), StorageError> {
-        use crate::data::index::{insert_index_row_multi, item_has_index_keys, project_item_for_index};
+        use crate::data::index::{
+            insert_index_row_multi, item_has_index_keys, project_item_for_index,
+        };
         use cdrs_tokio::consistency::Consistency;
         use cdrs_tokio::query::BatchQueryBuilder;
 
@@ -530,8 +532,7 @@ impl CassandraEngine {
 
             // Get the token of the last pk to use as the next page cursor.
             if let Some(last_row) = rows.last() {
-                let pk: String =
-                    crate::cassandra_util::get_column(last_row, "pk", "backfill_gsi")?;
+                let pk: String = crate::cassandra_util::get_column(last_row, "pk", "backfill_gsi")?;
                 let token_query = format!(
                     "SELECT token(pk) AS tok FROM {account_keyspace}.{base_table} WHERE pk = ?"
                 );
