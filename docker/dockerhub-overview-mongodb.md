@@ -21,7 +21,7 @@ MongoDB deployment:
 
 ```console
 mkdir -p ./extenddb-data
-cat > ./extenddb-data/bootstrap.toml <<'EOF'
+cat > ./extenddb-data/extenddb.toml <<'EOF'
 [storage]
 backend = "mongodb"
 
@@ -44,13 +44,13 @@ Start the server using the generated configuration:
 ```console
 docker run --rm --name extenddb-mongodb \
   -p 18443:18443 \
-  -v "$PWD/extenddb-data:/var/lib/extenddb:ro" \
+  -v "$PWD/extenddb-data:/var/lib/extenddb" \
   --read-only \
   --tmpfs /tmp:rw,noexec,nosuid,size=64m \
   --cap-drop=ALL \
   --security-opt=no-new-privileges:true \
   docker.io/extenddb/extenddb-mongodb:latest \
-  serve --config /var/lib/extenddb/extenddb.toml
+  serve --config /var/lib/extenddb/extenddb.toml --foreground
 ```
 
 The server listens on `https://127.0.0.1:18443` by default. Initialization
