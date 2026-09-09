@@ -2874,3 +2874,228 @@ async fn a_transaction_reports_an_invalid_vector_per_item() {
 
     let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
 }
+
+// ---------------------------------------------------------------------------
+// Query and Scan naming a vector index
+// ---------------------------------------------------------------------------
+
+/// A vector index is searched only via the vector search API: Query and Scan
+/// naming it are refused with the operation-specific messages, while a name
+/// that matches no index of any kind keeps the index-not-found message.
+///
+/// Whole strings and precedence measured against Amazon DynamoDB 2026-08-20:
+/// the Query refusal carries a trailing period, the Scan one does not; on
+/// Query the KeyConditionExpression and ConsistentRead checks fire before the
+/// refusal, on Scan the refusal fires before the ConsistentRead check.
+#[tokio::test]
+async fn query_and_scan_on_a_vector_index_are_refused() {
+    if skip_unless_supported().await {
+        return;
+    }
+    let name = table_name("vi_query_scan");
+    create_vector_table(&name, 2, "COSINE", false).await;
+
+    let key_condition =
+        r#""KeyConditionExpression": "pk = :v", "ExpressionAttributeValues": {":v": {"S": "a"}}"#;
+
+    // Query: the type refusal, with the trailing period the service emits.
+    let (status, text) = call(
+        "Query",
+        &format!(r#"{{"TableName": "{name}", "IndexName": "vidx", {key_condition}}}"#),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "Query on a vector index must be refused: {text}"
+    );
+    assert!(
+        text.contains("Query operation not supported on this index type."),
+        "expected the measured whole-string refusal, trailing period included: {text}"
+    );
+
+    // Scan: the type refusal, without a trailing period. The closing quote is
+    // part of the match so a period cannot sneak in.
+    let (status, text) = call(
+        "Scan",
+        &format!(r#"{{"TableName": "{name}", "IndexName": "vidx"}}"#),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "Scan on a vector index must be refused: {text}"
+    );
+    assert!(
+        text.contains(r#"Scan operation not supported on this index type""#),
+        "expected the measured whole-string refusal, no trailing period: {text}"
+    );
+
+    // A genuinely absent index name keeps the index-not-found message on both.
+    for op in ["Query", "Scan"] {
+        let cond = if op == "Query" {
+            format!(", {key_condition}")
+        } else {
+            String::new()
+        };
+        let (status, text) = call(
+            op,
+            &format!(r#"{{"TableName": "{name}", "IndexName": "nosuchindex"{cond}}}"#),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "{op} on a nonexistent index must be refused: {text}"
+        );
+        assert!(
+            text.contains("The table does not have the specified index: nosuchindex"),
+            "{op}: a nonexistent index must stay index-not-found: {text}"
+        );
+    }
+
+    // Precedence, Query side: ConsistentRead and a missing
+    // KeyConditionExpression both fire before the vector refusal.
+    let (status, text) = call(
+        "Query",
+        &format!(
+            r#"{{"TableName": "{name}", "IndexName": "vidx", "ConsistentRead": true, {key_condition}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "response: {text}");
+    assert!(
+        text.contains("Consistent reads are not supported on global secondary indexes"),
+        "ConsistentRead must fire before the vector refusal, with the GSI wording: {text}"
+    );
+
+    let (status, text) = call(
+        "Query",
+        &format!(r#"{{"TableName": "{name}", "IndexName": "vidx"}}"#),
+    )
+    .await;
+    assert_eq!(status, 400, "response: {text}");
+    assert!(
+        text.contains(
+            "Either the KeyConditions or KeyConditionExpression parameter must be specified"
+        ),
+        "a missing KeyConditionExpression must fire before the vector refusal: {text}"
+    );
+
+    // Precedence, Scan side: the refusal fires before the ConsistentRead check.
+    let (status, text) = call(
+        "Scan",
+        &format!(r#"{{"TableName": "{name}", "IndexName": "vidx", "ConsistentRead": true}}"#),
+    )
+    .await;
+    assert_eq!(status, 400, "response: {text}");
+    assert!(
+        text.contains(r#"Scan operation not supported on this index type""#),
+        "the Scan refusal must fire before the ConsistentRead check: {text}"
+    );
+
+    // Control: the base table still answers.
+    let (status, text) = call(
+        "Query",
+        &format!(r#"{{"TableName": "{name}", {key_condition}}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "base-table Query must be unaffected: {text}");
+
+    let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+}
+
+/// Scan and Query against a vector index observed mid-backfill.
+///
+/// Measured against Amazon DynamoDB 2026-08-20, on an index in CREATING with
+/// `Backfilling: true`: Scan is refused with the GSI backfilling wording
+/// ("Cannot read from backfilling global secondary index: vidx") while Query
+/// keeps the ordinary type refusal, trailing period included. The window is
+/// held open with the backfill batch delay, the same mechanism
+/// `a_building_vector_index_is_visible_but_not_searchable` uses; the CREATING
+/// phase before the backfill starts is too short to pin at the wire and is
+/// covered by the classifier unit tests instead.
+#[tokio::test]
+async fn scan_during_backfill_gets_the_backfilling_wording() {
+    if skip_unless_supported().await {
+        return;
+    }
+    let name = table_name("vi_backfill_scan");
+    let (status, text) = call(
+        "CreateTable",
+        &format!(
+            r#"{{"TableName": "{name}",
+                "AttributeDefinitions": [{{"AttributeName": "pk", "AttributeType": "S"}}],
+                "KeySchema": [{{"AttributeName": "pk", "KeyType": "HASH"}}],
+                "BillingMode": "PAY_PER_REQUEST"}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable failed: {text}");
+    wait_for_active(&name).await;
+
+    // More than one batch, so the delay is actually reached.
+    for i in 0..600 {
+        put_vector(&name, &format!("k{i:06}"), None, &[1.0, 0.0]).await;
+    }
+
+    set_backfill_delay(3000).await;
+    let (status, text) = call(
+        "UpdateTable",
+        &format!(
+            r#"{{"TableName": "{name}", "VectorIndexUpdates": [{{"Create": {{
+                "IndexName": "vidx", "Dimensions": 2, "DistanceFunction": "COSINE",
+                "VectorAttribute": {{"AttributeName": "emb"}},
+                "Projection": {{"ProjectionType": "ALL"}}}}}}]}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "UpdateTable failed: {text}");
+
+    // Wait for the backfill to be observably in flight, so the assertions
+    // below cannot race the pre-backfill CREATING phase.
+    let mut backfilling = false;
+    for _ in 0..100 {
+        let (_, text) = call("DescribeTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+        let d: serde_json::Value = serde_json::from_str(&text).expect("json");
+        let vi = &d["Table"]["VectorIndexes"][0];
+        if vi["IndexStatus"] == "CREATING" && vi["Backfilling"] == true {
+            backfilling = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        backfilling,
+        "the index never reported CREATING with Backfilling: true; the batch \
+         delay did not hold the window open"
+    );
+
+    let (status, text) = call(
+        "Scan",
+        &format!(r#"{{"TableName": "{name}", "IndexName": "vidx"}}"#),
+    )
+    .await;
+    assert_eq!(status, 400, "Scan mid-backfill must be refused: {text}");
+    assert!(
+        text.contains("Cannot read from backfilling global secondary index: vidx"),
+        "expected the measured GSI-worded backfilling refusal: {text}"
+    );
+
+    let (status, text) = call(
+        "Query",
+        &format!(
+            r#"{{"TableName": "{name}", "IndexName": "vidx",
+                "KeyConditionExpression": "pk = :v",
+                "ExpressionAttributeValues": {{":v": {{"S": "a"}}}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "Query mid-backfill must be refused: {text}");
+    assert!(
+        text.contains("Query operation not supported on this index type."),
+        "Query mid-backfill keeps the type refusal, not the backfilling wording: {text}"
+    );
+
+    // Release the window and leave the instance quiet before deleting.
+    set_backfill_delay(0).await;
+    wait_for_vector_index_active(&name, "vidx").await;
+    let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
+}

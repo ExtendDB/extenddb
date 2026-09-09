@@ -50,6 +50,7 @@
 
 use cdrs_tokio::query::QueryValues;
 use cdrs_tokio::types::IntoRustByName;
+use cdrs_tokio::types::blob::Blob;
 use cdrs_tokio::types::value::Value;
 use extenddb_core::types::{Item, ScalarAttributeType, TableKeyInfo};
 use extenddb_storage::error::StorageError;
@@ -95,7 +96,7 @@ fn sk_to_value(sk: &SortKeyValue) -> Value {
     match sk {
         SortKeyValue::S(s) => Value::from(s.as_str()),
         SortKeyValue::N(n) => super::decimal_to_value(n),
-        SortKeyValue::B(b) => Value::from(b.clone()),
+        SortKeyValue::B(b) => Value::from(Blob::new(b.clone())),
     }
 }
 
@@ -222,11 +223,16 @@ impl crate::CassandraEngine {
         // Parse item_data JSON into items.
         let items: Vec<Item> = rows
             .into_iter()
-            .filter_map(|row| {
-                let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
-                item_data.map(json_to_item)
+            .map(|row| {
+                let item_data: Option<String> = row.get_by_name("item_data").map_err(|error| {
+                    StorageError::Internal(format!("scan parse item_data failed: {error}"))
+                })?;
+                item_data.map(json_to_item).transpose()
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, StorageError>>()?
+            .into_iter()
+            .flatten()
+            .collect();
 
         // Enforce the limit and derive the LastEvaluatedKey from the last item.
         let has_more = items.len() > actual_limit;

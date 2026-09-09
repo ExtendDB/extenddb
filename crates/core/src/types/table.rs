@@ -218,6 +218,34 @@ pub struct BillingModeSummary {
     pub last_update_to_pay_per_request_date_time: Option<f64>,
 }
 
+/// Summary of the table's throughput mode, a mirror of [`BillingModeSummary`].
+///
+/// Measured 2026-08-21 against Amazon DynamoDB: table descriptions carry this
+/// member exactly when they carry `BillingModeSummary`, with the same mode and
+/// an identical `LastUpdateToPayPerRequestDateTime`. Derive it from the
+/// billing-mode summary rather than assembling it independently, so the two
+/// members cannot disagree.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TableThroughputModeSummary {
+    #[serde(rename = "TableThroughputMode")]
+    pub table_throughput_mode: BillingMode,
+    #[serde(
+        rename = "LastUpdateToPayPerRequestDateTime",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_update_to_pay_per_request_date_time: Option<f64>,
+}
+
+impl From<&BillingModeSummary> for TableThroughputModeSummary {
+    fn from(summary: &BillingModeSummary) -> Self {
+        Self {
+            table_throughput_mode: summary.billing_mode,
+            last_update_to_pay_per_request_date_time: summary
+                .last_update_to_pay_per_request_date_time,
+        }
+    }
+}
+
 /// A key-value tag attached to a Virtual `DynamoDB` resource.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tag {
@@ -663,6 +691,21 @@ pub fn vector_index_delete_in_allocation_phase(table_name: &str, index_name: &st
     )
 }
 
+/// Refusal for a Query naming a vector index. Measured 2026-08-20; note the
+/// trailing period, which the Scan variant does not have.
+pub const VECTOR_INDEX_QUERY_NOT_SUPPORTED: &str =
+    "Query operation not supported on this index type.";
+
+/// Refusal for a Scan naming a vector index that is past its backfill.
+/// Measured 2026-08-20.
+pub const VECTOR_INDEX_SCAN_NOT_SUPPORTED: &str = "Scan operation not supported on this index type";
+
+/// Prefix of the Scan refusal while a vector index is still backfilling;
+/// continues with the index name. The service reuses the GSI wording even
+/// though the index is a vector index. Measured 2026-08-20.
+pub const VECTOR_INDEX_BACKFILLING_SCAN_PREFIX: &str =
+    "Cannot read from backfilling global secondary index: ";
+
 impl VectorIndexDescription {
     /// Reject a description whose reported state the service would never produce.
     ///
@@ -725,6 +768,16 @@ impl TableDescription {
         }
         Ok(())
     }
+
+    /// Populate `TableThroughputModeSummary` as an exact mirror of
+    /// `BillingModeSummary`.
+    ///
+    /// Called on every path that hands a description to a client, so the
+    /// measured invariant (both members together, always agreeing) holds
+    /// centrally instead of each backend assembling the mirror itself.
+    pub fn populate_table_throughput_mode_summary(&mut self) {
+        self.table_throughput_mode_summary = self.billing_mode_summary.as_ref().map(Into::into);
+    }
 }
 
 /// Full description of a Virtual `DynamoDB` table, returned by `CreateTable`,
@@ -758,6 +811,14 @@ pub struct TableDescription {
     pub provisioned_throughput: ProvisionedThroughputDescription,
     #[serde(rename = "BillingModeSummary", skip_serializing_if = "Option::is_none")]
     pub billing_mode_summary: Option<BillingModeSummary>,
+    /// Populated by the engine via `populate_table_throughput_mode_summary()`
+    /// on every path that emits a description. Backends leave this `None` and
+    /// must not assemble it independently.
+    #[serde(
+        rename = "TableThroughputModeSummary",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub table_throughput_mode_summary: Option<TableThroughputModeSummary>,
     #[serde(
         rename = "GlobalSecondaryIndexes",
         skip_serializing_if = "Option::is_none"
@@ -818,6 +879,8 @@ pub struct CreateTableInput {
     pub attribute_definitions: Vec<AttributeDefinition>,
     #[serde(rename = "BillingMode")]
     pub billing_mode: Option<BillingMode>,
+    #[serde(rename = "TableThroughputMode")]
+    pub table_throughput_mode: Option<BillingMode>,
     #[serde(rename = "ProvisionedThroughput")]
     pub provisioned_throughput: Option<ProvisionedThroughput>,
     #[serde(rename = "GlobalSecondaryIndexes")]
@@ -845,6 +908,21 @@ pub struct CreateTableInput {
 pub struct CreateTableOutput {
     #[serde(rename = "TableDescription")]
     pub table_description: TableDescription,
+}
+
+impl CreateTableInput {
+    /// Resolve `TableThroughputMode` into the billing-mode slot.
+    ///
+    /// Measured 2026-08-21 against Amazon DynamoDB: `BillingMode` wins when
+    /// both members are present (a conflict is not refused), and
+    /// `TableThroughputMode` applies only when `BillingMode` is absent. Every
+    /// downstream validation message phrases the mode as `BillingMode` either
+    /// way, which resolving here reproduces without further changes. The
+    /// member is consumed, so the storage layer only ever sees the resolved
+    /// `billing_mode`.
+    pub fn resolve_table_throughput_mode(&mut self) {
+        self.billing_mode = self.billing_mode.or(self.table_throughput_mode.take());
+    }
 }
 
 /// `DeleteTable` request body.
@@ -949,6 +1027,8 @@ pub struct UpdateTableInput {
     pub table_name: String,
     #[serde(rename = "BillingMode")]
     pub billing_mode: Option<BillingMode>,
+    #[serde(rename = "TableThroughputMode")]
+    pub table_throughput_mode: Option<BillingMode>,
     #[serde(rename = "ProvisionedThroughput")]
     pub provisioned_throughput: Option<ProvisionedThroughput>,
     #[serde(rename = "DeletionProtectionEnabled")]
@@ -975,6 +1055,18 @@ pub struct UpdateTableInput {
 pub struct UpdateTableOutput {
     #[serde(rename = "TableDescription")]
     pub table_description: TableDescription,
+}
+
+impl UpdateTableInput {
+    /// Resolve `TableThroughputMode` into the billing-mode slot.
+    ///
+    /// Same measured rule as [`CreateTableInput::resolve_table_throughput_mode`]:
+    /// `BillingMode` wins when both members are present, no conflict refusal.
+    /// The member is consumed, so the storage layer only ever sees the
+    /// resolved `billing_mode`.
+    pub fn resolve_table_throughput_mode(&mut self) {
+        self.billing_mode = self.billing_mode.or(self.table_throughput_mode.take());
+    }
 }
 
 // --- TTL ---
@@ -1103,27 +1195,56 @@ pub struct DescribeLimitsOutput {
 mod tests {
     use super::*;
 
-    /// `TableThroughputMode` is not a member of DynamoDB's CreateTable request:
-    /// the model has `BillingMode` only (verified against aws-sdk-dynamodb 1.119.0,
-    /// where the field does not appear at all). An earlier version of this type
-    /// accepted it as an alias, which meant a request that produced a
-    /// PAY_PER_REQUEST table here would be ignored by AWS and produce a
-    /// PROVISIONED table there: an accept-direction divergence, where code written
-    /// against ExtendDB breaks against the real service. Under AWS JSON 1.0 an
-    /// unknown member is ignored, which is what must happen here.
+    /// `TableThroughputMode` is accepted and honoured by Amazon DynamoDB as a
+    /// fallback alias of `BillingMode` (measured 2026-08-21: CreateTable with
+    /// only `TableThroughputMode: PAY_PER_REQUEST` returns 200 with a
+    /// PAY_PER_REQUEST `BillingModeSummary`, on plain and vector-indexed tables
+    /// alike). An earlier version of this type deliberately ignored the member
+    /// because it does not exist in the SDK model (checked against
+    /// aws-sdk-dynamodb 1.119.0, where it still does not appear); that reasoning
+    /// was sound, but the SDK model lagged the service, and the measurement
+    /// supersedes it. Do not re-remove the member on SDK-model grounds.
     #[test]
-    fn create_table_ignores_the_unknown_table_throughput_mode_member() {
+    fn create_table_honours_the_table_throughput_mode_member() {
         let json = r#"{
             "TableName": "t",
             "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
             "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
             "TableThroughputMode": "PAY_PER_REQUEST"
         }"#;
-        let input: CreateTableInput = serde_json::from_str(json).unwrap();
+        let mut input: CreateTableInput = serde_json::from_str(json).unwrap();
         assert_eq!(
-            input.billing_mode, None,
-            "an unknown member must be ignored, not treated as BillingMode"
+            input.table_throughput_mode,
+            Some(BillingMode::PayPerRequest)
         );
+        assert_eq!(input.billing_mode, None, "the member is not BillingMode");
+        input.resolve_table_throughput_mode();
+        assert_eq!(
+            input.billing_mode,
+            Some(BillingMode::PayPerRequest),
+            "alone, the member must resolve into the billing-mode slot"
+        );
+        assert_eq!(
+            input.table_throughput_mode, None,
+            "resolution consumes the member; storage sees only billing_mode"
+        );
+    }
+
+    /// Measured 2026-08-21: when both members are present, `BillingMode` wins
+    /// whatever the other member says. A conflict is not refused.
+    #[test]
+    fn create_table_billing_mode_wins_over_table_throughput_mode() {
+        let json = r#"{
+            "TableName": "t",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PROVISIONED",
+            "TableThroughputMode": "PAY_PER_REQUEST"
+        }"#;
+        let mut input: CreateTableInput = serde_json::from_str(json).unwrap();
+        input.resolve_table_throughput_mode();
+        assert_eq!(input.billing_mode, Some(BillingMode::Provisioned));
+        assert_eq!(input.table_throughput_mode, None);
     }
 
     #[test]
@@ -1138,14 +1259,65 @@ mod tests {
         assert_eq!(input.billing_mode, Some(BillingMode::PayPerRequest));
     }
 
+    /// The UpdateTable twin of the CreateTable test above: the member is
+    /// honoured as a fallback alias, resolved by the same measured rule.
     #[test]
-    fn update_table_ignores_the_unknown_table_throughput_mode_member() {
+    fn update_table_honours_the_table_throughput_mode_member() {
         let json = r#"{"TableName": "t", "TableThroughputMode": "PROVISIONED"}"#;
-        let input: UpdateTableInput = serde_json::from_str(json).unwrap();
+        let mut input: UpdateTableInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.billing_mode, None);
+        input.resolve_table_throughput_mode();
+        assert_eq!(input.billing_mode, Some(BillingMode::Provisioned));
+        assert_eq!(input.table_throughput_mode, None);
+    }
+
+    #[test]
+    fn update_table_billing_mode_wins_over_table_throughput_mode() {
+        let json = r#"{"TableName": "t", "BillingMode": "PAY_PER_REQUEST",
+                       "TableThroughputMode": "PROVISIONED"}"#;
+        let mut input: UpdateTableInput = serde_json::from_str(json).unwrap();
+        input.resolve_table_throughput_mode();
+        assert_eq!(input.billing_mode, Some(BillingMode::PayPerRequest));
         assert_eq!(
-            input.billing_mode, None,
-            "an unknown member must be ignored"
+            input.table_throughput_mode, None,
+            "the losing member is still consumed"
         );
+    }
+
+    /// The mirror is a pure function of the billing-mode summary: same mode,
+    /// same timestamp, absent when the sibling is absent.
+    #[test]
+    fn table_throughput_mode_summary_mirrors_billing_mode_summary() {
+        let mut desc = TableDescription {
+            billing_mode_summary: Some(BillingModeSummary {
+                billing_mode: BillingMode::PayPerRequest,
+                last_update_to_pay_per_request_date_time: Some(1787276378.446),
+            }),
+            ..Default::default()
+        };
+        desc.populate_table_throughput_mode_summary();
+        let ttms = desc.table_throughput_mode_summary.as_ref().unwrap();
+        assert_eq!(ttms.table_throughput_mode, BillingMode::PayPerRequest);
+        assert_eq!(
+            ttms.last_update_to_pay_per_request_date_time,
+            Some(1787276378.446)
+        );
+
+        desc.billing_mode_summary = None;
+        desc.populate_table_throughput_mode_summary();
+        assert_eq!(desc.table_throughput_mode_summary, None);
+    }
+
+    /// Wire shape: the timestamp member is omitted, not null, when absent,
+    /// matching the sibling summary's serialisation.
+    #[test]
+    fn table_throughput_mode_summary_omits_absent_timestamp() {
+        let json = serde_json::to_string(&TableThroughputModeSummary {
+            table_throughput_mode: BillingMode::PayPerRequest,
+            last_update_to_pay_per_request_date_time: None,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"TableThroughputMode":"PAY_PER_REQUEST"}"#);
     }
 
     #[test]

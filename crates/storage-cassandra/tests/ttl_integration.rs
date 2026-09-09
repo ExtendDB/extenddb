@@ -485,6 +485,7 @@ async fn test_ttl_sweep_emits_service_remove_stream_record() {
                 global_secondary_indexes: None,
                 vector_indexes: None,
                 billing_mode: None,
+                table_throughput_mode: None,
                 provisioned_throughput: None,
                 on_demand_throughput: None,
                 sse_specification: None,
@@ -2472,6 +2473,15 @@ async fn test_conditional_put_recreates_metadata_only_row() {
         .await
         .unwrap();
 
+    let (scanned, _) = engine
+        .scan(&table.key_info, None, None, None, None, None)
+        .await
+        .expect("scan must ignore a metadata-only physical row");
+    assert!(
+        scanned.is_empty(),
+        "deleted logical items must not reappear in Scan"
+    );
+
     item.insert("value".to_owned(), AttributeValue::S("new".to_owned()));
     let condition = Expr::Function {
         name: "attribute_not_exists".to_owned(),
@@ -2964,6 +2974,7 @@ async fn test_ttl_enabled_table_rejects_new_async_gsi() {
             UpdateTableInput {
                 table_name: table.key_info.table_name.clone(),
                 billing_mode: None,
+                table_throughput_mode: None,
                 provisioned_throughput: None,
                 deletion_protection_enabled: None,
                 global_secondary_index_updates: Some(vec![GlobalSecondaryIndexUpdate {

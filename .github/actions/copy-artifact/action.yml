@@ -81,11 +81,17 @@ runs:
         # immediate read 404s — failed the v0.1.8 dev propagation live).
         # Retry is only correct after our own write; the existence DECISION
         # above stays a strict single probe.
+        # A mismatch immediately after our own write can be the stale
+        # previous value (registries lag in both directions), so retry
+        # inside the window and only fail once it expires. The existence
+        # DECISION above stays a strict single probe.
+        LAST='(never read)'
         for _ in 1 2 3 4 5 6; do
           set +e; GOT=$(probe "${DST}:${TAG}"); rc=$?; set -e
           [[ $rc == 0 && "$GOT" == "$WANT" ]] && exit 0
-          [[ $rc == 0 && "$GOT" != "$WANT" ]] && { echo "::error::${DST}:${TAG} resolves to ${GOT}, expected ${WANT}"; exit 1; }
+          [[ $rc == 0 ]] && LAST="$GOT"
+          [[ $rc == 9 ]] && LAST='MISSING'
           sleep 5
         done
-        echo "::error::${DST}:${TAG} not visible with expected digest after settle window"
+        echo "::error::${DST}:${TAG} did not settle on ${WANT} within the window; last seen ${LAST}"
         exit 1

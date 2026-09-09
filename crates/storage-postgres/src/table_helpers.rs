@@ -395,6 +395,7 @@ impl PostgresEngine {
                 last_decrease_date_time: None,
             },
             billing_mode_summary,
+            table_throughput_mode_summary: None,
             global_secondary_indexes: if gsis.is_empty() { None } else { Some(gsis) },
             local_secondary_indexes: if lsis.is_empty() { None } else { Some(lsis) },
             stream_specification: stream_spec,

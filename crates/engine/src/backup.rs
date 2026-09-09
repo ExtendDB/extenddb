@@ -184,6 +184,9 @@ pub(crate) async fn handle_restore_table_from_backup(
     // cover exactly this class of path, so the omission was a latent inconsistency
     // rather than a deliberate exception.
     desc.validate_vector_index_readiness()?;
+    // Same rule as every other path that emits a table description: the
+    // throughput-mode summary mirrors the billing-mode summary.
+    desc.populate_table_throughput_mode_summary();
     serialize_output(&json!({ "TableDescription": desc }))
 }
 

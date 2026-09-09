@@ -97,7 +97,9 @@ impl TableEngine for CassandraEngine {
 
             #[allow(clippy::cast_sign_loss)]
             let last_evaluated_table_name = if names.len() > limit as usize {
-                names.pop()
+                let last = names[limit as usize - 1].clone();
+                names.truncate(limit as usize);
+                Some(last)
             } else {
                 None
             };

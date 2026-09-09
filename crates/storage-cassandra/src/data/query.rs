@@ -128,9 +128,21 @@ impl CassandraEngine {
             )
         };
 
-        // Step 1: Resolve partition key value
+        // Step 1: Resolve partition key value — composite for multi-part HASH keys.
         let pk_av = resolve_expr_to_av(&key_condition.pk_value, _maps)?;
-        let pk_text = pk_to_text(&pk_av)?.into_owned();
+        let pk_text = if key_condition.extra_pk_conditions.is_empty() {
+            pk_to_text(&pk_av)?.into_owned()
+        } else {
+            // Multi-part HASH key: netstring-encode all parts in key schema order.
+            // The write path uses composite_pk_to_text(item, index_ks) which produces
+            // the same encoding; we must match it exactly.
+            let mut parts = vec![pk_to_text(&pk_av)?.into_owned()];
+            for (_, extra_expr) in &key_condition.extra_pk_conditions {
+                let av = resolve_expr_to_av(extra_expr, _maps)?;
+                parts.push(pk_to_text(&av)?.into_owned());
+            }
+            extenddb_storage::util::encode_netstring_composite(&parts)
+        };
 
         // Step 2: Determine if there's a sort key condition
         let sk_info_opt = sk_info(&query_key_schema, &key_info.attribute_definitions);
@@ -395,37 +407,54 @@ impl CassandraEngine {
                     },
                     Some((_, sk_type)),
                 ) if start_sk.is_some() => {
-                    // LSI pagination: clustering order is (sk_*, base_pk, base_sk_*).
-                    // Must restrict sk_* = start_sk AND base_pk = base_pk AND base_sk_* > base_sk.
+                    // GSI with base SK tie-breaker.
+                    // Clustering order: (sk_*, base_pk, base_sk_*).
+                    // Three sub-queries to cover all rows after the resume point:
+                    //   Q1a: sk = start_sk AND base_pk = base_pk AND base_sk > base_sk
+                    //   Q1b: sk = start_sk AND base_pk > base_pk
+                    //   Q2:  sk > start_sk  (handled in the Query 2 block below)
                     let start_sk = start_sk.unwrap();
                     let sk_col = sk_column(sk_type);
                     let base_sk_col = format!("base_{}", sk_column(base_sk.scalar_type()));
-                    let base_cmp = if is_lsi && !forward { "<" } else { ">" };
-                    let query1 = format!(
-                        "{} AND {} = ? AND base_pk = ? AND {} {} ? ORDER BY {} {}, base_pk {}, {} {} LIMIT {}",
-                        query,
-                        sk_col,
-                        base_sk_col,
-                        base_cmp,
-                        sk_col,
-                        if forward { "ASC" } else { "DESC" },
-                        if forward { "ASC" } else { "DESC" },
-                        base_sk_col,
-                        if forward { "ASC" } else { "DESC" },
-                        fetch_limit
-                    );
+                    let dir = if forward { "ASC" } else { "DESC" };
+                    let base_sk_cmp = if forward { ">" } else { "<" };
 
-                    let rows1 = query_with_pk_sk_pk_sk(
+                    // Q1a: same sk, same base_pk, advance base_sk
+                    let query1a = format!(
+                        "{query} AND {sk_col} = ? AND base_pk = ? AND {base_sk_col} {base_sk_cmp} ? \
+                         ORDER BY {sk_col} {dir}, base_pk {dir}, {base_sk_col} {dir} LIMIT {fetch_limit}"
+                    );
+                    let rows1a = query_with_pk_sk_pk_sk(
                         &self.session_arc(),
-                        &query1,
+                        &query1a,
                         &pk_text,
                         start_sk,
                         base_pk_text,
                         base_sk,
-                        "same_sk",
+                        "same_sk_same_base_pk",
                     )
                     .await?;
-                    all_rows.extend(rows1);
+                    all_rows.extend(rows1a);
+
+                    // Q1b: same sk, advance base_pk (base_sk unconstrained)
+                    if all_rows.len() < fetch_limit {
+                        let remaining = fetch_limit - all_rows.len();
+                        let base_pk_cmp = if forward { ">" } else { "<" };
+                        let query1b = format!(
+                            "{query} AND {sk_col} = ? AND base_pk {base_pk_cmp} ? \
+                             ORDER BY {sk_col} {dir}, base_pk {dir}, {base_sk_col} {dir} LIMIT {remaining}"
+                        );
+                        let rows1b = query_with_pk_sk_pk(
+                            &self.session_arc(),
+                            &query1b,
+                            &pk_text,
+                            start_sk,
+                            base_pk_text,
+                            "same_sk_next_base_pk",
+                        )
+                        .await?;
+                        all_rows.extend(rows1b);
+                    }
                 }
                 (
                     PaginationBinds::BasePkOnly {
