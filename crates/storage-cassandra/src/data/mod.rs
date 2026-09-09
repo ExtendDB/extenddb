@@ -24,6 +24,7 @@ mod query_helpers;
 mod scan;
 pub mod transaction_ledger;
 mod transactions;
+pub(crate) mod ttl;
 mod update_item;
 
 use condition::check_condition;
@@ -137,7 +138,10 @@ pub(crate) async fn query_with_pk_sk_item(
         }
         SortKeyValue::B(b) => {
             session
-                .query_with_values(query, cdrs_tokio::query_values!(pk, Blob::new(b.clone()), item_text))
+                .query_with_values(
+                    query,
+                    cdrs_tokio::query_values!(pk, Blob::new(b.clone()), item_text),
+                )
                 .await
         }
     }
@@ -170,7 +174,10 @@ pub(crate) async fn query_with_pk_sk_txnid(
         }
         SortKeyValue::B(b) => {
             session
-                .query_with_values(query, cdrs_tokio::query_values!(pk, Blob::new(b.clone()), txn_id))
+                .query_with_values(
+                    query,
+                    cdrs_tokio::query_values!(pk, Blob::new(b.clone()), txn_id),
+                )
                 .await
         }
     }
@@ -256,7 +263,13 @@ pub(crate) async fn query_with_pk_sk_item_txnid_ts(
             session
                 .query_with_values(
                     query,
-                    cdrs_tokio::query_values!(pk, Blob::new(b.clone()), item_text, txn_id, txn_timestamp),
+                    cdrs_tokio::query_values!(
+                        pk,
+                        Blob::new(b.clone()),
+                        item_text,
+                        txn_id,
+                        txn_timestamp
+                    ),
                 )
                 .await
         }
@@ -303,7 +316,13 @@ pub(crate) async fn query_with_item_ts_pk_sk_txnid(
             session
                 .query_with_values(
                     query,
-                    cdrs_tokio::query_values!(item_text, txn_timestamp, pk, Blob::new(b.clone()), txn_id),
+                    cdrs_tokio::query_values!(
+                        item_text,
+                        txn_timestamp,
+                        pk,
+                        Blob::new(b.clone()),
+                        txn_id
+                    ),
                 )
                 .await
         }

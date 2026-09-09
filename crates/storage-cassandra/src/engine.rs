@@ -55,7 +55,24 @@ pub struct CassandraEngine {
 
     /// Stream record TTL in seconds (default: 30 hours = 108000)
     pub(crate) stream_retention_seconds: u32,
+
+    /// Bounds in-flight detached TTL claim releases. Each successful write on
+    /// a TTL-enabled table fires one off the request path; without a bound,
+    /// degraded LWT latency would let them accumulate without limit. When
+    /// saturated, releases are dropped — the claim's own TTL bounds the
+    /// residue, so dropping is safe by construction.
+    pub(crate) ttl_release_permits: Arc<tokio::sync::Semaphore>,
+
+    /// Per-(keyspace, partition) resume cursor for the inflight repair-marker
+    /// scan, so every marker is deterministically visited within a bounded
+    /// number of cycles regardless of partition size. In-process on purpose:
+    /// a restart merely restarts the traversal from the front.
+    pub(crate) ttl_repair_scan_cursors:
+        Arc<std::sync::Mutex<std::collections::HashMap<(String, i32), uuid::Uuid>>>,
 }
+
+/// Cap on concurrently in-flight detached TTL claim releases.
+const TTL_RELEASE_MAX_IN_FLIGHT: usize = 1_024;
 
 impl CassandraEngine {
     /// Create a new Cassandra storage engine.
@@ -76,6 +93,10 @@ impl CassandraEngine {
                 config.instance_id.as_deref().unwrap_or("default"),
             ),
             stream_retention_seconds: 108_000, // 30 hours; overridden by spawn_workers (Step 7)
+            ttl_release_permits: Arc::new(tokio::sync::Semaphore::new(TTL_RELEASE_MAX_IN_FLIGHT)),
+            ttl_repair_scan_cursors: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         })
     }
 

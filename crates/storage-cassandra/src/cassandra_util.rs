@@ -17,6 +17,30 @@ pub type CassandraSession = Session<
     RoundRobinLoadBalancingStrategy<TransportTcp, TcpConnectionManager>,
 >;
 
+/// Execute a lightweight transaction with explicit regional quorum and serial
+/// consistency. TTL claims and lifecycle metadata use this rather than the
+/// driver's default consistency.
+pub async fn query_lwt(
+    session: &CassandraSession,
+    query: &str,
+    values: QueryValues,
+) -> Result<cdrs_tokio::frame::Envelope, extenddb_storage::error::StorageError> {
+    use cdrs_tokio::consistency::Consistency;
+    use cdrs_tokio::statement::StatementParamsBuilder;
+
+    let params = StatementParamsBuilder::new()
+        .with_consistency(Consistency::LocalQuorum)
+        .with_serial_consistency(Consistency::LocalSerial)
+        .with_values(values)
+        .build();
+    session
+        .query_with_params(query, params)
+        .await
+        .map_err(|error| {
+            extenddb_storage::error::StorageError::Internal(format!("LWT query failed: {error}"))
+        })
+}
+
 /// Trait for errors that can be constructed from database operation failures.
 /// Implemented by [`extenddb_storage::management_store::OpError`],
 /// [`extenddb_storage::error::StorageError`], and
@@ -87,6 +111,42 @@ pub async fn query_rows<E: FromDbError>(
     Ok(body.into_rows().unwrap_or_default())
 }
 
+/// Execute a query at `LOCAL_QUORUM` and return all rows.
+///
+/// [`query_rows`] uses the driver's default consistency, which is `ONE`. Use
+/// this instead wherever an *empty* result is treated as authoritative and acted
+/// on destructively: at `ONE` a replica that has not yet received a write reads
+/// as empty, and a decision made on that read cannot be undone by a timestamp
+/// guard, because the write it missed is older than the guard.
+pub async fn query_rows_quorum<E: FromDbError>(
+    session: &Arc<CassandraSession>,
+    query: &str,
+    values: QueryValues,
+    context: &str,
+) -> Result<Vec<Row>, E> {
+    use cdrs_tokio::consistency::Consistency;
+    use cdrs_tokio::statement::StatementParamsBuilder;
+
+    let params = StatementParamsBuilder::new()
+        .with_consistency(Consistency::LocalQuorum)
+        .with_values(values)
+        .build();
+    let result = session
+        .query_with_params(query, params)
+        .await
+        .map_err(|e| {
+            tracing::error!("{context} quorum query failed: {e}");
+            E::db_error(format!("{context}: {e}"))
+        })?;
+
+    let body = result.response_body().map_err(|e| {
+        tracing::error!("{context} response_body failed: {e}");
+        E::db_error(format!("{context} response_body: {e}"))
+    })?;
+
+    Ok(body.into_rows().unwrap_or_default())
+}
+
 /// Execute a query and return the first row, if any.
 ///
 /// Similar to `sqlx::query().fetch_optional()`.
@@ -121,6 +181,36 @@ pub async fn execute<E: FromDbError>(
             E::db_error("Database error".to_owned())
         })?;
 
+    Ok(())
+}
+
+/// Execute a non-query statement at `LOCAL_QUORUM`.
+///
+/// Use this for writes that are prerequisites for a later quorum operation or
+/// whose loss would make an absence decision unsafe.
+///
+/// # Errors
+/// Returns an error if Cassandra does not acknowledge the statement at quorum.
+pub async fn execute_quorum<E: FromDbError>(
+    session: &Arc<CassandraSession>,
+    query: &str,
+    values: QueryValues,
+    context: &str,
+) -> Result<(), E> {
+    use cdrs_tokio::consistency::Consistency;
+    use cdrs_tokio::statement::StatementParamsBuilder;
+
+    let params = StatementParamsBuilder::new()
+        .with_consistency(Consistency::LocalQuorum)
+        .with_values(values)
+        .build();
+    session
+        .query_with_params(query, params)
+        .await
+        .map_err(|error| {
+            tracing::error!("{context} quorum execute failed: {error}");
+            E::db_error(format!("{context}: {error}"))
+        })?;
     Ok(())
 }
 

@@ -41,18 +41,51 @@ pub async fn fetch_indexes_for_table(
     session: &Arc<CassandraSession>,
     catalog_keyspace: &str,
 ) -> Result<Vec<IndexMeta>, StorageError> {
+    fetch_indexes_for_table_at(table_id, session, catalog_keyspace, false).await
+}
+
+/// [`fetch_indexes_for_table`] at `LOCAL_QUORUM`.
+///
+/// For paths where a stale-empty answer is acted on destructively or treated
+/// as "nothing to restore": at the default consistency a lagging replica can
+/// omit an index, and a must-complete restoration that trusts that omission
+/// leaves a live item permanently missing an index row.
+pub async fn fetch_indexes_for_table_quorum(
+    table_id: &str,
+    session: &Arc<CassandraSession>,
+    catalog_keyspace: &str,
+) -> Result<Vec<IndexMeta>, StorageError> {
+    fetch_indexes_for_table_at(table_id, session, catalog_keyspace, true).await
+}
+
+async fn fetch_indexes_for_table_at(
+    table_id: &str,
+    session: &Arc<CassandraSession>,
+    catalog_keyspace: &str,
+    quorum: bool,
+) -> Result<Vec<IndexMeta>, StorageError> {
     let query = format!(
         "SELECT index_name, index_id, index_type, key_schema, projection, propagation_delay_ms \
          FROM {catalog_keyspace}.indexes WHERE table_id = ?"
     );
 
-    let rows = query_rows(
-        session,
-        &query,
-        query_values!(table_id),
-        "fetch_indexes_for_table",
-    )
-    .await?;
+    let rows = if quorum {
+        crate::cassandra_util::query_rows_quorum(
+            session,
+            &query,
+            query_values!(table_id),
+            "fetch_indexes_for_table",
+        )
+        .await?
+    } else {
+        query_rows(
+            session,
+            &query,
+            query_values!(table_id),
+            "fetch_indexes_for_table",
+        )
+        .await?
+    };
 
     rows.into_iter()
         .map(|row| {
@@ -195,7 +228,7 @@ pub(crate) fn item_has_index_keys(item: &Item, index_ks: &[KeySchemaElement]) ->
 /// Compute the effective propagation delay for an index.
 ///
 /// Per-GSI setting overrides the system default. `Some(0)` = sync, `None` = use default.
-pub(super) fn effective_delay(idx: &IndexMeta, system_default: u64) -> u64 {
+pub(crate) fn effective_delay(idx: &IndexMeta, system_default: u64) -> u64 {
     match idx.propagation_delay_ms {
         Some(0) => 0,
         #[allow(clippy::cast_sign_loss)]

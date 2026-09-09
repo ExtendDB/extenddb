@@ -60,3 +60,64 @@ CREATE TABLE IF NOT EXISTS gsi_pending (
     index_context    text,
     PRIMARY KEY ((worker_partition), ready_at, id)
 ) WITH CLUSTERING ORDER BY (ready_at ASC, id ASC);
+
+-- Generation-fenced expiration queue.
+-- `ttl_expiration_buckets` registers which (day bucket, key shard) partitions of
+-- `ttl_expirations` hold work, so a sweep can find due partitions without
+-- scanning. Queue rows carry the durable deletion state machine: PENDING,
+-- CLAIMED, CLAIM_ABORTING, EFFECTS_APPLYING, EFFECTS_APPLIED.
+CREATE TABLE IF NOT EXISTS ttl_expiration_buckets (
+    table_id text,
+    generation uuid,
+    bucket bigint,
+    shard int,
+    PRIMARY KEY ((table_id), generation, bucket, shard)
+) WITH CLUSTERING ORDER BY (generation ASC, bucket ASC, shard ASC);
+
+CREATE TABLE IF NOT EXISTS ttl_expirations (
+    table_id text,
+    generation uuid,
+    bucket bigint,
+    shard int,
+    expires_at bigint,
+    key_hash text,
+    key_data text,
+    state text,
+    work_id uuid,
+    work_data text,
+    PRIMARY KEY ((table_id, generation, bucket, shard), expires_at, key_hash, key_data)
+) WITH CLUSTERING ORDER BY (expires_at ASC, key_hash ASC, key_data ASC);
+
+-- Durable key-only reconciliation outbox. Rows are written in the same logged
+-- batch as the base mutation, so an ordinary write's queue entry survives a
+-- crash even if the in-batch queue mutation is lost.
+CREATE TABLE IF NOT EXISTS ttl_reconcile_pending (
+    worker_partition int,
+    id timeuuid,
+    table_id text,
+    account_id text,
+    table_name text,
+    key_data text,
+    PRIMARY KEY ((worker_partition), id)
+) WITH CLUSTERING ORDER BY (id ASC);
+
+-- A repair marker is written at LOCAL_QUORUM before an active-generation queue
+-- row can be conditionally destroyed. It remains here while the destroy outcome
+-- is ambiguous. A definitive destroy response is handed off to
+-- ttl_reconcile_pending before this marker is removed. The registry is bounded
+-- to the 64 worker partitions and avoids 64 empty reads on every worker pass.
+CREATE TABLE IF NOT EXISTS ttl_repair_inflight_partitions (
+    worker_partition int PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS ttl_repair_inflight (
+    worker_partition int,
+    repair_id uuid,
+    table_id text,
+    account_id text,
+    table_name text,
+    generation uuid,
+    key_data text,
+    created_at timestamp,
+    PRIMARY KEY ((worker_partition), repair_id)
+);

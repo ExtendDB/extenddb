@@ -49,6 +49,7 @@
 //! the "token range pagination" approach approved in the workplan.
 
 use cdrs_tokio::query::QueryValues;
+use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::blob::Blob;
 use cdrs_tokio::types::value::Value;
 use extenddb_core::types::{Item, ScalarAttributeType, TableKeyInfo};
@@ -223,10 +224,15 @@ impl crate::CassandraEngine {
         let items: Vec<Item> = rows
             .into_iter()
             .map(|row| {
-                let json_str: String = cassandra_util::get_column(&row, "item_data", "scan parse")?;
-                json_to_item(json_str)
+                let item_data: Option<String> = row.get_by_name("item_data").map_err(|error| {
+                    StorageError::Internal(format!("scan parse item_data failed: {error}"))
+                })?;
+                item_data.map(json_to_item).transpose()
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, StorageError>>()?
+            .into_iter()
+            .flatten()
+            .collect();
 
         // Enforce the limit and derive the LastEvaluatedKey from the last item.
         let has_more = items.len() > actual_limit;
