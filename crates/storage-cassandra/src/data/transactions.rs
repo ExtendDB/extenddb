@@ -556,7 +556,11 @@ impl CassandraEngine {
                                     // Re-apply expression on top of winner's item.
                                     item = winner.clone();
                                     expression::apply_update_validated(
-                                        actions, &mut item, maps, &[], &[],
+                                        actions,
+                                        &mut item,
+                                        maps,
+                                        &[],
+                                        &[],
                                     )
                                     .map_err(|e| {
                                         CancellationReason::validation_error(e.to_string())
@@ -568,7 +572,11 @@ impl CassandraEngine {
                                     existing = None;
                                     item = (*key).clone();
                                     expression::apply_update_validated(
-                                        actions, &mut item, maps, &[], &[],
+                                        actions,
+                                        &mut item,
+                                        maps,
+                                        &[],
+                                        &[],
                                     )
                                     .map_err(|e| {
                                         CancellationReason::validation_error(e.to_string())
@@ -938,8 +946,7 @@ impl CassandraEngine {
         // it to commit or roll back. Returning the PREPARE-state item
         // (key-only placeholder) would cause condition expressions like
         // attribute_not_exists(pk) to fail against stale data with no ALL_OLD.
-        let prepared_txn_id: Option<uuid::Uuid> =
-            row.get_by_name("prepared_txn_id").ok().flatten();
+        let prepared_txn_id: Option<uuid::Uuid> = row.get_by_name("prepared_txn_id").ok().flatten();
         if prepared_txn_id.is_some() && prepared_txn_id != skip_txn_id {
             return self
                 .wait_for_commit_and_read(key_info, key)
@@ -1013,9 +1020,12 @@ impl CassandraEngine {
             // stale replica that has cleared prepared_txn_id but not yet
             // propagated the updated item_data from commit_put_or_update.
             if prepared_txn_id.is_none() && last_committed.is_some() {
-                let item_data: String =
-                    get_column::<String, StorageError>(&row, "item_data", "wait_for_commit_and_read")
-                        .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+                let item_data: String = get_column::<String, StorageError>(
+                    &row,
+                    "item_data",
+                    "wait_for_commit_and_read",
+                )
+                .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
                 let item: Item = serde_json::from_str(&item_data)
                     .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
                 return Ok(Some(item));
@@ -1185,14 +1195,17 @@ impl CassandraEngine {
                 ..
             } => {
                 // Re-fetch and re-apply update (idempotent)
-                let existing = self.fetch_item_for_transaction(key_info, key, Some(txn_id)).await?;
+                let existing = self
+                    .fetch_item_for_transaction(key_info, key, Some(txn_id))
+                    .await?;
                 let mut final_item = existing.clone().unwrap_or_else(|| (*key).clone());
                 expression::apply_update_validated(actions, &mut final_item, maps, &[], &[])
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
                 self.commit_put_or_update(key_info, &final_item, txn_id_bytes, txn_timestamp)
                     .await?;
-                self.commit_sync_indexes(key_info, existing.as_ref(), &final_item).await
+                self.commit_sync_indexes(key_info, existing.as_ref(), &final_item)
+                    .await
             }
             TransactWriteOp::Delete { key_info, key, .. } => {
                 let keyspace = self.account_keyspace(&key_info.account_id);
@@ -1353,8 +1366,8 @@ impl CassandraEngine {
         old_item: Option<&Item>,
         new_item: &Item,
     ) -> Result<(), StorageError> {
-        use cdrs_tokio::query::BatchQueryBuilder;
         use cdrs_tokio::consistency::Consistency;
+        use cdrs_tokio::query::BatchQueryBuilder;
 
         let catalog_keyspace = self.catalog_keyspace();
         let data_keyspace = self.account_keyspace(&key_info.account_id);
@@ -1370,7 +1383,9 @@ impl CassandraEngine {
             return Ok(());
         }
 
-        let sys_delay = self.gsi_default_delay_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let sys_delay = self
+            .gsi_default_delay_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
         let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
         super::index::sync_indexes(
             &mut batch,
@@ -1396,7 +1411,11 @@ impl CassandraEngine {
         .await?;
 
         self.session
-            .batch(batch.build().map_err(|e| StorageError::Internal(e.to_string()))?)
+            .batch(
+                batch
+                    .build()
+                    .map_err(|e| StorageError::Internal(e.to_string()))?,
+            )
             .await
             .map_err(|e| StorageError::Internal(format!("commit_sync_indexes batch: {e}")))?;
 
@@ -1443,7 +1462,9 @@ impl CassandraEngine {
 
         // We need to check if this item was created during PREPARE (created_to_prepare=true)
         // or if it was an existing item. Fetch the item to check.
-        let existing = self.fetch_item_for_transaction(key_info, key, Some(txn_id)).await?;
+        let existing = self
+            .fetch_item_for_transaction(key_info, key, Some(txn_id))
+            .await?;
 
         // If item doesn't exist, it's already been cleaned up (idempotent)
         if existing.is_none() {
