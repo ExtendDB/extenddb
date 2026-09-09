@@ -47,8 +47,9 @@ MongoDB hostname must be resolvable from the ExtendDB container:
 mongodb://user:password@mongo.example.internal:27017/?replicaSet=rs0
 ```
 
-Run `extenddb init` once using a writable state volume. The initial config
-must contain the MongoDB connection string so the initializer can connect:
+Run `extenddb init` once using a writable state volume. Write the initial
+configuration to `/var/lib/extenddb/extenddb.toml`; it must contain the
+MongoDB connection string so the initializer can connect:
 
 ```toml
 [storage]
@@ -68,7 +69,8 @@ docker run --rm \
   extenddb/extenddb-mongodb:0.1.8 \
   init --backend mongodb \
   --config /var/lib/extenddb/extenddb.toml \
-  --overwrite --bind-addr 0.0.0.0 --tls-san localhost
+  --overwrite --bind-addr 0.0.0.0 \
+  --tls-san localhost --tls-san 127.0.0.1
 
 docker run -d --name extenddb-mongodb \
   -p 127.0.0.1:18443:18443 \

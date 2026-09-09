@@ -36,7 +36,8 @@ docker run --rm \
   --config /var/lib/extenddb/extenddb.toml \
   --overwrite \
   --bind-addr 0.0.0.0 \
-  --tls-san localhost
+  --tls-san localhost \
+  --tls-san 127.0.0.1
 ```
 
 Start the server using the generated configuration:
@@ -68,11 +69,37 @@ read-only root filesystem.
 For a complete deployment guide and an optional local reference stack, see
 [`docker/README-mongodb.md`](https://github.com/ExtendDB/extenddb/blob/main/docker/README-mongodb.md).
 
-## Versioning
+## Tags and verification
 
-The image tag is the ExtendDB release version. The MongoDB server version is
-independent and is selected in your MongoDB deployment. Pin an ExtendDB
-version in production instead of relying on `latest`.
+Pin `X.Y.Z` or a digest for production; a version tag is never overwritten.
+`latest` tracks the highest release and only moves forward. Tags of the form
+`sha-<commit>` are unpromoted build candidates, not releases. Both
+`linux/amd64` and `linux/arm64` ship as one multi-architecture index.
 
-ExtendDB is licensed under the Apache License 2.0. The image includes the
-third-party license notices required by its dependencies.
+Every published image is signed with ExtendDB's release key, an elliptic-curve
+P-256 key held in the AWS Key Management Service. The public key is committed
+in the repository as
+[`extenddb-signing.pub.pem`](https://github.com/ExtendDB/extenddb/blob/main/extenddb-signing.pub.pem).
+Verify an image before deploying it:
+
+```console
+cosign verify --key extenddb-signing.pub.pem \
+  docker.io/extenddb/extenddb-mongodb:X.Y.Z
+```
+
+The same images and their signatures are mirrored by digest to
+`ghcr.io/extenddb/extenddb-mongodb` and
+`public.ecr.aws/extenddb/extenddb-mongodb`.
+
+## Note
+
+ExtendDB is an independent open source project managed by Amazon Web
+Services. It is not Amazon DynamoDB and does not contain any DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc. ExtendDB is a clean-room
+implementation that speaks the DynamoDB wire protocol; behavioral differences
+from the service are documented in
+[Differences from DynamoDB](https://github.com/ExtendDB/extenddb/blob/main/docs/differences-from-dynamodb.md).
+
+More at [extenddb.org](https://extenddb.org) and
+[github.com/ExtendDB/extenddb](https://github.com/ExtendDB/extenddb). Licensed
+under Apache-2.0.
