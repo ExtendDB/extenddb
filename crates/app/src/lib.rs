@@ -17,6 +17,7 @@
 //!         version: env!("CARGO_PKG_VERSION"),
 //!         git_hash: env!("MY_GIT_HASH"),
 //!         build_time: env!("MY_BUILD_TIME"),
+//!         test_hooks_enabled: false,
 //!     })
 //! }
 //! ```
@@ -155,6 +156,14 @@ fn print_version(build: BuildInfo) {
 
     println!("commit {}", build.git_hash);
     println!("built {}", build.build_time);
+    println!(
+        "test-hooks {}",
+        if build.test_hooks_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
 }
 
 /// Run an async subcommand with a single-threaded tokio runtime and stderr logging.
