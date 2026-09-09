@@ -326,6 +326,26 @@ def test_transact_write_conditional_put_fail(dynamodb_client, hash_table):
     resp = dynamodb_client.get_item(TableName=hash_table, Key={"pk": {"S": "cp-2"}})
     assert resp["Item"]["v"]["S"] == "old"
 
+def test_transact_write_conditional_put_fail_diag(dynamodb_client, hash_table):
+    dynamodb_client.put_item(TableName=hash_table, Item={"pk": {"S": "cp-2"}, "v": {"S": "old"}})
+    # Verify the item is readable back via get_item
+    resp = dynamodb_client.get_item(TableName=hash_table, Key={"pk": {"S": "cp-2"}})
+    print(f"\nget_item after put: {resp.get('Item')}")
+    # Now try the transaction
+    try:
+        dynamodb_client.transact_write_items(
+            TransactItems=[{"Put": {
+                "TableName": hash_table,
+                "Item": {"pk": {"S": "cp-2"}, "v": {"S": "new"}},
+                "ConditionExpression": "attribute_not_exists(pk)",
+            }}]
+        )
+        print("NO EXCEPTION - transaction succeeded (wrong)")
+        # Check what's in the item now
+        resp2 = dynamodb_client.get_item(TableName=hash_table, Key={"pk": {"S": "cp-2"}})
+        print(f"item after transaction: {resp2.get('Item')}")
+    except Exception as e:
+        print(f"EXCEPTION: {type(e).__name__}: {e}")
 
 # ---------------------------------------------------------------------------
 # TransactWriteItems — size limit and condition edge cases

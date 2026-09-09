@@ -376,8 +376,8 @@ impl CassandraEngine {
                 .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
 
                 // Read existing item
-                let existing = self
-                    .fetch_item_for_transaction(key_info, item)
+                let mut existing = self
+                    .fetch_item_for_transaction(key_info, item, None)
                     .await
                     .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
 
@@ -404,9 +404,41 @@ impl CassandraEngine {
                         .await?;
                 }
 
-                // Execute PREPARE
-                self.prepare_item(key_info, item, txn_id, txn_timestamp, existing.is_none())
-                    .await?;
+                // Execute PREPARE, with create-race retry loop.
+                let mut attempt = 0u32;
+                loop {
+                    attempt += 1;
+                    match self
+                        .prepare_item(key_info, item, txn_id, txn_timestamp, existing.is_none())
+                        .await
+                    {
+                        Ok(()) => break,
+                        Err(r) if r.code == "TransactionConflict" && attempt < 5 => {
+                            // Lost the INSERT IF NOT EXISTS race (new item) or another
+                            // transaction grabbed the row between our read and prepare.
+                            // Wait for that transaction to commit, then re-evaluate.
+                            let committed = self.wait_for_commit_and_read(key_info, item).await?;
+                            match committed {
+                                Some(winner) => {
+                                    eval_condition(
+                                        *condition,
+                                        &winner,
+                                        maps,
+                                        *return_values_on_ccf,
+                                        Some(&winner),
+                                    )?;
+                                    // Condition passed against winner — overwrite.
+                                    existing = Some(winner);
+                                }
+                                None => {
+                                    // Winner rolled back; retry the insert.
+                                    existing = None;
+                                }
+                            }
+                        }
+                        Err(r) => return Err(r),
+                    }
+                }
                 Ok(None)
             }
             TransactWriteOp::Delete {
@@ -427,7 +459,7 @@ impl CassandraEngine {
 
                 // Read existing item
                 let existing = self
-                    .fetch_item_for_transaction(key_info, key)
+                    .fetch_item_for_transaction(key_info, key, None)
                     .await
                     .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
 
@@ -464,8 +496,8 @@ impl CassandraEngine {
                 .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
 
                 // Read existing item
-                let existing = self
-                    .fetch_item_for_transaction(key_info, key)
+                let mut existing = self
+                    .fetch_item_for_transaction(key_info, key, None)
                     .await
                     .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
 
@@ -501,9 +533,53 @@ impl CassandraEngine {
                         .await?;
                 }
 
-                // Execute PREPARE
-                self.prepare_item(key_info, key, txn_id, txn_timestamp, existing.is_none())
-                    .await?;
+                // Execute PREPARE, with create-race retry loop.
+                let mut attempt = 0u32;
+                loop {
+                    attempt += 1;
+                    match self
+                        .prepare_item(key_info, key, txn_id, txn_timestamp, existing.is_none())
+                        .await
+                    {
+                        Ok(()) => break,
+                        Err(r) if r.code == "TransactionConflict" && attempt < 5 => {
+                            let committed = self.wait_for_commit_and_read(key_info, key).await?;
+                            match committed {
+                                Some(winner) => {
+                                    eval_condition(
+                                        *condition,
+                                        &winner,
+                                        maps,
+                                        *return_values_on_ccf,
+                                        Some(&winner),
+                                    )?;
+                                    // Re-apply expression on top of winner's item.
+                                    item = winner.clone();
+                                    expression::apply_update_validated(
+                                        actions, &mut item, maps, &[], &[],
+                                    )
+                                    .map_err(|e| {
+                                        CancellationReason::validation_error(e.to_string())
+                                    })?;
+                                    existing = Some(winner);
+                                }
+                                None => {
+                                    // Winner rolled back; retry the insert.
+                                    existing = None;
+                                    item = (*key).clone();
+                                    expression::apply_update_validated(
+                                        actions, &mut item, maps, &[], &[],
+                                    )
+                                    .map_err(|e| {
+                                        CancellationReason::validation_error(e.to_string())
+                                    })?;
+                                }
+                            }
+                        }
+                        Err(r) => return Err(r),
+                    }
+                }
+
                 // Return the computed final item so the caller can update the ledger blob
                 let item_json = serde_json::to_string(&item)
                     .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
@@ -526,7 +602,7 @@ impl CassandraEngine {
 
                 // Read existing item
                 let existing = self
-                    .fetch_item_for_transaction(key_info, key)
+                    .fetch_item_for_transaction(key_info, key, None)
                     .await
                     .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
 
@@ -696,23 +772,26 @@ impl CassandraEngine {
                     }
                 };
                 let pk = composite_pk_to_text(key, &key_info.key_schema)?;
+                // Store sk_col/sk_val for recovery without type-checking the value.
+                // A type mismatch is caught later by validate_key_only in
+                // prepare_single_operation; failing here would surface as
+                // StorageError::Internal instead of TransactionCanceledException.
                 let (sk_col, sk_val) = if let Some((sk_name, sk_type)) =
                     sk_info(&key_info.key_schema, &key_info.attribute_definitions)
                 {
                     let sk_value = key
                         .get(sk_name)
                         .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?;
-                    let sk = parse_sk(sk_value, sk_type)?;
                     let col = sk_column(sk_type).to_owned();
-                    // Store as the text representation used in Cassandra queries.
-                    // sk_col ("sk_s"/"sk_n"/"sk_b") encodes the type; no separate type tag needed.
-                    let val = match &sk {
-                        SortKeyValue::S(s) => s.clone(),
-                        SortKeyValue::N(n) => n.to_string(),
-                        SortKeyValue::B(b) => {
+                    let val = match sk_value {
+                        AttributeValue::S(s) => s.clone(),
+                        AttributeValue::N(n) => n.clone(),
+                        AttributeValue::B(b) => {
                             use base64::Engine as _;
                             base64::engine::general_purpose::STANDARD.encode(b)
                         }
+                        // Any other type will be caught by validate_key_only.
+                        _ => String::new(),
                     };
                     (Some(col), Some(val))
                 } else {
@@ -827,10 +906,14 @@ impl CassandraEngine {
     }
 
     /// Fetch an item for transaction (reads item_data and prepared_txn_id).
+    ///
+    /// If `skip_txn_id` is `Some(id)`, rows prepared by that transaction are
+    /// read directly (the caller owns that PREPARE and must not wait on itself).
     async fn fetch_item_for_transaction(
         &self,
         key_info: &TableKeyInfo,
         key: &Item,
+        skip_txn_id: Option<Uuid>,
     ) -> Result<Option<Item>, StorageError> {
         let keyspace = self.account_keyspace(&key_info.account_id);
         let table = data_table_name(&key_info.table_id);
@@ -841,7 +924,7 @@ impl CassandraEngine {
             &self.session,
             &keyspace,
             &table,
-            "item_data",
+            "item_data, prepared_txn_id",
             pk_text.as_str(),
             sk.as_ref(),
             sk_col.as_deref(),
@@ -851,6 +934,19 @@ impl CassandraEngine {
             return Ok(None);
         };
 
+        // If a *different* transaction has this row in PREPARE state, wait for
+        // it to commit or roll back. Returning the PREPARE-state item
+        // (key-only placeholder) would cause condition expressions like
+        // attribute_not_exists(pk) to fail against stale data with no ALL_OLD.
+        let prepared_txn_id: Option<uuid::Uuid> =
+            row.get_by_name("prepared_txn_id").ok().flatten();
+        if prepared_txn_id.is_some() && prepared_txn_id != skip_txn_id {
+            return self
+                .wait_for_commit_and_read(key_info, key)
+                .await
+                .map_err(|e| StorageError::Internal(e.message.unwrap_or_default()));
+        }
+
         let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
         let Some(item_data) = item_data else {
             return Ok(None);
@@ -858,6 +954,82 @@ impl CassandraEngine {
         Ok(Some(
             serde_json::from_str(&item_data).map_err(|e| StorageError::Internal(e.to_string()))?,
         ))
+    }
+
+    /// Wait for a concurrently-prepared item to commit or roll back, then return
+    /// its committed state.
+    ///
+    /// After losing an `INSERT IF NOT EXISTS` LWT race, the winning transaction
+    /// may still be in PREPARE state. This method polls with a single SELECT of
+    /// `item_data, prepared_txn_id` until `prepared_txn_id` is NULL, then returns:
+    /// - `Ok(Some(item))` — winner committed; use as the re-read existing item.
+    /// - `Ok(None)` — winner rolled back and deleted the row; caller should retry
+    ///   the insert.
+    ///
+    /// Returns `Err` only on infrastructure failure.
+    async fn wait_for_commit_and_read(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+    ) -> Result<Option<Item>, CancellationReason> {
+        use std::time::Duration;
+        const MAX_POLLS: u32 = 20;
+        const POLL_SLEEP_MS: u64 = 50;
+
+        let keyspace = self.account_keyspace(&key_info.account_id);
+        let table = data_table_name(&key_info.table_id);
+        let pk_text = composite_pk_to_text(key, &key_info.key_schema)
+            .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+        let (sk, sk_col) = resolve_sk(key_info, key)
+            .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+
+        for _ in 0..MAX_POLLS {
+            let row = select_by_pk(
+                &self.session,
+                &keyspace,
+                &table,
+                "item_data, prepared_txn_id, last_committed_txn_timestamp",
+                pk_text.as_str(),
+                sk.as_ref(),
+                sk_col.as_deref(),
+            )
+            .await
+            .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+
+            let Some(row) = row else {
+                // Row gone — winner rolled back and deleted it.
+                return Ok(None);
+            };
+
+            let prepared_txn_id: Option<uuid::Uuid> =
+                row.get_by_name("prepared_txn_id").ok().flatten();
+            let last_committed: Option<i64> = row
+                .get_by_name("last_committed_txn_timestamp")
+                .ok()
+                .flatten();
+
+            // Only treat the row as committed when prepared_txn_id is NULL
+            // AND last_committed_txn_timestamp is set. This guards against a
+            // stale replica that has cleared prepared_txn_id but not yet
+            // propagated the updated item_data from commit_put_or_update.
+            if prepared_txn_id.is_none() && last_committed.is_some() {
+                let item_data: String =
+                    get_column::<String, StorageError>(&row, "item_data", "wait_for_commit_and_read")
+                        .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+                let item: Item = serde_json::from_str(&item_data)
+                    .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+                return Ok(Some(item));
+            }
+
+            tokio::time::sleep(Duration::from_millis(POLL_SLEEP_MS)).await;
+        }
+
+        // Timed out waiting — treat as conflict.
+        Err(CancellationReason {
+            code: "TransactionConflict".to_owned(),
+            message: Some("Transaction is ongoing for the item".to_owned()),
+            item: None,
+        })
     }
 
     /// Check partition_max_delete_timestamp for new items.
@@ -1002,7 +1174,8 @@ impl CassandraEngine {
         match op {
             TransactWriteOp::Put { key_info, item, .. } => {
                 self.commit_put_or_update(key_info, item, txn_id_bytes.clone(), txn_timestamp)
-                    .await
+                    .await?;
+                self.commit_sync_indexes(key_info, None, item).await
             }
             TransactWriteOp::Update {
                 key_info,
@@ -1012,13 +1185,14 @@ impl CassandraEngine {
                 ..
             } => {
                 // Re-fetch and re-apply update (idempotent)
-                let existing = self.fetch_item_for_transaction(key_info, key).await?;
-                let mut final_item = existing.unwrap_or_else(|| (*key).clone());
+                let existing = self.fetch_item_for_transaction(key_info, key, Some(txn_id)).await?;
+                let mut final_item = existing.clone().unwrap_or_else(|| (*key).clone());
                 expression::apply_update_validated(actions, &mut final_item, maps, &[], &[])
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
                 self.commit_put_or_update(key_info, &final_item, txn_id_bytes, txn_timestamp)
-                    .await
+                    .await?;
+                self.commit_sync_indexes(key_info, existing.as_ref(), &final_item).await
             }
             TransactWriteOp::Delete { key_info, key, .. } => {
                 let keyspace = self.account_keyspace(&key_info.account_id);
@@ -1166,6 +1340,73 @@ impl CassandraEngine {
         Ok(())
     }
 
+    /// Sync LSI/GSI index rows after a successful commit_put_or_update.
+    ///
+    /// Runs as a separate non-LWT batch after the base-row LWT commit, since
+    /// Cassandra does not allow LWT statements to be batched with writes to
+    /// other partitions. The brief inconsistency window is acceptable for the
+    /// same reason async GSIs accept it; transaction recovery re-runs this on
+    /// crash.
+    async fn commit_sync_indexes(
+        &self,
+        key_info: &TableKeyInfo,
+        old_item: Option<&Item>,
+        new_item: &Item,
+    ) -> Result<(), StorageError> {
+        use cdrs_tokio::query::BatchQueryBuilder;
+        use cdrs_tokio::consistency::Consistency;
+
+        let catalog_keyspace = self.catalog_keyspace();
+        let data_keyspace = self.account_keyspace(&key_info.account_id);
+
+        let indexes = super::index::fetch_indexes_for_table(
+            &key_info.table_id,
+            &self.session,
+            &catalog_keyspace,
+        )
+        .await?;
+
+        if indexes.is_empty() {
+            return Ok(());
+        }
+
+        let sys_delay = self.gsi_default_delay_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+        super::index::sync_indexes(
+            &mut batch,
+            &data_keyspace,
+            &key_info.key_schema,
+            &key_info.attribute_definitions,
+            &indexes,
+            old_item,
+            Some(new_item),
+            sys_delay,
+        )?;
+
+        let async_enqueued = super::index::enqueue_async_indexes(
+            &self.session,
+            &mut batch,
+            &data_keyspace,
+            key_info,
+            &indexes,
+            old_item,
+            Some(new_item),
+            sys_delay,
+        )
+        .await?;
+
+        self.session
+            .batch(batch.build().map_err(|e| StorageError::Internal(e.to_string()))?)
+            .await
+            .map_err(|e| StorageError::Internal(format!("commit_sync_indexes batch: {e}")))?;
+
+        if async_enqueued > 0 {
+            self.gsi_queue.notify_workers();
+        }
+
+        Ok(())
+    }
+
     /// ROLLBACK a single operation: clean up prepared state.
     ///
     /// For items created during PREPARE (created_to_prepare=true): DELETE the item
@@ -1202,7 +1443,7 @@ impl CassandraEngine {
 
         // We need to check if this item was created during PREPARE (created_to_prepare=true)
         // or if it was an existing item. Fetch the item to check.
-        let existing = self.fetch_item_for_transaction(key_info, key).await?;
+        let existing = self.fetch_item_for_transaction(key_info, key, Some(txn_id)).await?;
 
         // If item doesn't exist, it's already been cleaned up (idempotent)
         if existing.is_none() {
