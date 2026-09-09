@@ -302,6 +302,12 @@ async fn gsi_process_batch(
             let id: uuid::Uuid = crate::cassandra_util::get_column(&row, "id", "gsi_worker")?;
             let table_id: String =
                 crate::cassandra_util::get_column(&row, "table_id", "gsi_worker")?;
+
+            // Skip rows for tables that are currently being backfilled.
+            if crate::propagation_hold::is_held(&engine.session, keyspace, &table_id).await? {
+                continue;
+            }
+
             let old_json: Option<String> = row.get_by_name("old_item").ok().flatten();
             let new_json: Option<String> = row.get_by_name("new_item").ok().flatten();
             let ctx_json: String =

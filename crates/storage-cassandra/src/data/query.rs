@@ -55,24 +55,18 @@ fn string_upper_bound(prefix: &str) -> String {
 }
 
 /// Compute upper bound for begins_with on binary data.
-/// Increments the last byte, extending if needed for overflow.
-fn binary_upper_bound(prefix: &[u8]) -> Vec<u8> {
+/// Returns `None` when the prefix is empty or all-0xFF (no finite upper bound).
+fn binary_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut upper = prefix.to_vec();
-
-    // Try to increment the last byte
     for i in (0..upper.len()).rev() {
-        if upper[i] < 255 {
+        if upper[i] < 0xFF {
             upper[i] += 1;
-            return upper;
+            upper.truncate(i + 1);
+            return Some(upper);
         }
-        // This byte is 255, set to 0 and continue to next byte
-        upper[i] = 0;
     }
-
-    // All bytes were 255 - prepend a 1 byte
-    let mut result = vec![1];
-    result.extend_from_slice(&upper);
-    result
+    // Empty prefix or all bytes are 0xFF — no upper bound.
+    None
 }
 
 /// Helper to determine base table sort key info for index queries.
@@ -191,16 +185,14 @@ impl CassandraEngine {
                     Some((sk_col, vec![low_sk, high_sk]))
                 }
                 SortKeyCondition::BeginsWith { prefix, .. } => {
-                    query.push_str(&format!(" AND {sk_col} >= ? AND {sk_col} < ?"));
-
                     // Resolve prefix
                     let prefix_av = resolve_expr_to_av(prefix, _maps)?;
                     let prefix_sk = parse_sk(&prefix_av, sk_type)?;
 
                     // Compute upper bound based on type
-                    let upper_sk = match &prefix_sk {
-                        SortKeyValue::S(s) => SortKeyValue::S(string_upper_bound(s)),
-                        SortKeyValue::B(b) => SortKeyValue::B(binary_upper_bound(b)),
+                    let upper_sk_opt = match &prefix_sk {
+                        SortKeyValue::S(s) => Some(SortKeyValue::S(string_upper_bound(s))),
+                        SortKeyValue::B(b) => binary_upper_bound(b).map(SortKeyValue::B),
                         SortKeyValue::N(_) => {
                             return Err(StorageError::Validation(
                                 "BeginsWith is not supported for numeric sort keys".to_owned(),
@@ -208,7 +200,14 @@ impl CassandraEngine {
                         }
                     };
 
-                    Some((sk_col, vec![prefix_sk, upper_sk]))
+                    if let Some(upper_sk) = upper_sk_opt {
+                        query.push_str(&format!(" AND {sk_col} >= ? AND {sk_col} < ?"));
+                        Some((sk_col, vec![prefix_sk, upper_sk]))
+                    } else {
+                        // No finite upper bound (empty or all-0xFF prefix) — lower bound only.
+                        query.push_str(&format!(" AND {sk_col} >= ?"));
+                        Some((sk_col, vec![prefix_sk]))
+                    }
                 }
             }
         } else {

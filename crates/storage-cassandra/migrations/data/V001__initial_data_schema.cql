@@ -45,6 +45,16 @@ CREATE TABLE IF NOT EXISTS transaction_ledger (
 -- Index for efficient age-based scanning during recovery
 CREATE INDEX IF NOT EXISTS idx_txn_started_at ON transaction_ledger (started_at);
 
+-- Index propagation hold table.
+-- A row here means the named index (and by extension the whole table) is
+-- undergoing a backfill. Workers skip gsi_pending rows for held tables until
+-- the hold is released.
+CREATE TABLE IF NOT EXISTS index_propagation_holds (
+    table_id  text,
+    index_id  text,
+    PRIMARY KEY ((table_id), index_id)
+);
+
 -- Persistent GSI propagation queue.
 -- Rows are inserted inside the same logged batch as the base write, so they
 -- survive a crash. Workers drain their partition in (ready_at, id) order

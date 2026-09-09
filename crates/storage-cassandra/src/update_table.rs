@@ -499,7 +499,6 @@ impl CassandraEngine {
                 if let Some(create) = &update.create {
                     let (index_id, _) = &gsi_creates[create_idx];
                     create_idx += 1;
-                    // TODO: backfill existing items into the new GSI.
                     self.create_index_data_table(
                         &account_ks,
                         index_id,
@@ -509,6 +508,39 @@ impl CassandraEngine {
                         base_attr_defs,
                     )
                     .await?;
+                    crate::propagation_hold::take_propagation_hold(
+                        &self.session_arc(),
+                        &account_ks,
+                        &table_id,
+                        index_id,
+                    )
+                    .await?;
+                    let backfill_result = self
+                        .backfill_gsi(
+                            &account_ks,
+                            &table_id,
+                            index_id,
+                            &create.key_schema,
+                            effective_attr_defs,
+                            &base_key_schema,
+                            &base_attr_defs,
+                            &create.projection,
+                        )
+                        .await;
+                    if let Err(e) = crate::propagation_hold::release_propagation_hold(
+                        &self.session_arc(),
+                        &account_ks,
+                        &table_id,
+                        index_id,
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            "failed to release propagation hold for index {index_id} \
+                             on table {table_id}: {e}"
+                        );
+                    }
+                    backfill_result?;
                 }
                 if update.delete.is_some() {
                     let index_id = &gsi_deletes[delete_idx];

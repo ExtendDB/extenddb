@@ -81,6 +81,23 @@ impl CassandraEngine {
             ),
             self.ttl_config_for_table(&key_info.account_id, &key_info.table_name),
         )?;
+
+        // Validate index key types and emptiness before any write work.
+        if !indexes.is_empty() {
+            let index_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = indexes
+                .iter()
+                .map(|idx| extenddb_core::validation::IndexKeyRef {
+                    index_name: &idx.index_name,
+                    key_schema: &idx.key_schema,
+                })
+                .collect();
+            extenddb_core::validation::validate_index_keys(
+                &item,
+                &index_refs,
+                &key_info.attribute_definitions,
+            )
+            .map_err(|e| StorageError::Validation(e.to_string()))?;
+        }
         let sys_delay = if indexes.is_empty() {
             0
         } else {

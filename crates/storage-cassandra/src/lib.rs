@@ -24,6 +24,7 @@ mod management_store;
 mod metadata_engine;
 pub mod migrations;
 pub mod operations;
+pub(crate) mod propagation_hold;
 mod stream_engine;
 pub mod stream_util;
 pub mod table_engine;
