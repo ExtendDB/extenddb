@@ -70,6 +70,12 @@ def _vector_table_exists(cli_env):
     )
 
 
+def _continuous_backups_table_exists(cli_env):
+    return _catalog_query(
+        cli_env, "SELECT to_regclass('public.continuous_backups') IS NOT NULL"
+    )
+
+
 def _backups_has_vector_column(cli_env):
     return _catalog_query(
         cli_env,
@@ -226,8 +232,15 @@ class TestVectorCatalogMigration:
         ledger row missing, which is exactly the state a crash leaves behind.
         Without idempotent statements the replay fails on "relation already
         exists" and no later migration can ever be applied.
+
+        The end state must be the current version even though the replayed file
+        writes an older one, because the runner converges the stored version
+        after the walk. Without that, re-applying 002 while 003 stays recorded
+        would leave the catalog at 0.0.3 with 003's schema applied, and the
+        startup gate would refuse a deployment no further migrate can repair.
         """
         _init(cli_env)
+        _patch_config_port(cli_env["config_path"], cli_env["port"])
         assert _vector_table_exists(cli_env) is True
 
         conn = _catalog_conn(cli_env)
@@ -259,7 +272,7 @@ class TestVectorCatalogMigration:
         assert f"Migration {VECTOR_MIGRATION} failed" not in output, output
 
         # The replay leaves the same end state, and the ledger is repaired.
-        assert _catalog_version(cli_env) == "0.0.3"
+        assert _catalog_version(cli_env) == CURRENT_CATALOG_VERSION
         assert _vector_table_exists(cli_env) is True
         assert _backups_has_vector_column(cli_env) is True
         conn = _catalog_conn(cli_env)
@@ -268,6 +281,64 @@ class TestVectorCatalogMigration:
                 cur.execute(
                     "SELECT COUNT(*) FROM schema_history WHERE filename = %s",
                     (VECTOR_MIGRATION,),
+                )
+                assert cur.fetchone()[0] == 1
+        finally:
+            conn.close()
+
+        # The converged version is what lets the deployment serve again, which
+        # is the point of the convergence: a crash during an upgrade must not
+        # strand the catalog behind the version gate.
+        served = _run_extenddb("serve", config=cli_env["config_path"])
+        assert served.returncode == 0, served.stdout + served.stderr
+        try:
+            assert _wait_for_server(cli_env["port"]), "replayed deployment did not serve"
+        finally:
+            _run_extenddb("stop", config=cli_env["config_path"], check=False)
+            time.sleep(1)
+
+    def test_migrate_survives_an_applied_but_unrecorded_final_migration(self, cli_env):
+        """A replay of the latest migration converges the same way.
+
+        Mirror of the test above for the last file in the chain: 003's schema
+        applied (the table is already gone), its ledger row missing, and the
+        stored version rolled back so the runner walks the list. The replay must
+        re-apply the idempotent drop, repair the ledger, and land the catalog on
+        the current version.
+        """
+        _init(cli_env)
+        assert _continuous_backups_table_exists(cli_env) is False
+
+        conn = _catalog_conn(cli_env)
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM schema_history WHERE filename = %s",
+                    (CONTINUOUS_BACKUPS_MIGRATION,),
+                )
+                cur.execute(
+                    "UPDATE settings SET value = '0.0.3' WHERE key = 'catalog_version'"
+                )
+        finally:
+            conn.close()
+
+        replayed = _run_extenddb(
+            "migrate", "--yes", *_pg_args(), config=cli_env["config_path"], check=False
+        )
+        output = replayed.stdout + replayed.stderr
+        assert replayed.returncode == 0, output
+        assert f"Applying {CONTINUOUS_BACKUPS_MIGRATION}" in output, output
+        assert f"Migration {CONTINUOUS_BACKUPS_MIGRATION} failed" not in output, output
+
+        assert _catalog_version(cli_env) == CURRENT_CATALOG_VERSION
+        assert _continuous_backups_table_exists(cli_env) is False
+        conn = _catalog_conn(cli_env)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM schema_history WHERE filename = %s",
+                    (CONTINUOUS_BACKUPS_MIGRATION,),
                 )
                 assert cur.fetchone()[0] == 1
         finally:

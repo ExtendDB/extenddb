@@ -200,6 +200,8 @@ extenddb serve --config extenddb.toml
 
 Run `extenddb migrate` without `--yes` first to see what is pending; it reports `catalog 0.0.3 -> 0.0.4` and changes nothing.
 
+Starting with this release, the migration runner writes the final catalog version itself after each run, so an upgrade interrupted between applying a migration and recording it converges on the current version when `extenddb migrate` is run again.
+
 SQLite deployments upgrade the same way: `extenddb migrate` re-applies the catalog schema, which drops the `continuous_backups` table and records catalog 0.0.4.
 
 MongoDB deployments need no action. The backend tracks its own catalog version, which does not change; the bootstrapper simply no longer creates the `continuous_backups` collection. An existing deployment keeps an orphaned, unread collection that is harmless to leave in place and safe to drop by hand (`db.getSiblingDB("extenddb_catalog").continuous_backups.drop()`).
