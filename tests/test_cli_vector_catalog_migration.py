@@ -1,12 +1,15 @@
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Catalog migration tests for the vector index schema (catalog 0.0.2 -> 0.0.3).
+"""Catalog migration tests against a live PostgreSQL deployment.
 
-These exercise the migration against a live deployment rather than asserting the
-SQL text: init one, roll its catalog back to the pre-vector shape, and check that
-the binary refuses to serve it, that `extenddb migrate` upgrades it, and that the
-upgraded deployment then serves.
+These exercise the migration chain end to end rather than asserting the SQL
+text: init a deployment, roll its catalog back to the pre-vector shape, and
+check that the binary refuses to serve it, that `extenddb migrate` upgrades it,
+and that the upgraded deployment then serves.
+
+The version the binary expects is pinned once in `CURRENT_CATALOG_VERSION`; a
+release that adds a catalog migration updates that one constant.
 
 Shared lifecycle helpers and the `cli_env` fixture live in `lifecycle_helpers.py`.
 Like the other CLI lifecycle tests these require a PostgreSQL instance
@@ -29,6 +32,14 @@ from lifecycle_helpers import (
 )
 
 VECTOR_MIGRATION = "002_vector_indexes.sql"
+CONTINUOUS_BACKUPS_MIGRATION = "003_drop_continuous_backups.sql"
+
+# The version the binary expects, written by the last catalog migration. Every
+# current-version assertion reads it from here so the next bump is one edit.
+CURRENT_CATALOG_VERSION = "0.0.4"
+
+# A version no release has reached, for the symmetric version-gate test.
+FUTURE_CATALOG_VERSION = "0.0.5"
 
 
 def _catalog_conn(cli_env):
@@ -80,7 +91,7 @@ def _roll_catalog_back_to_pre_vector(cli_env):
     """Turn a freshly initialised catalog into the shape 0.0.2 deployments have.
 
     Reproduces an upgrade rather than a fresh install, which is the case that
-    matters: a fresh install applies both migrations in order and reaches the same
+    matters: a fresh install applies the migrations in order and reaches the same
     end state trivially.
     """
     conn = _catalog_conn(cli_env)
@@ -89,8 +100,20 @@ def _roll_catalog_back_to_pre_vector(cli_env):
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS vector_indexes")
             cur.execute("ALTER TABLE backups DROP COLUMN IF EXISTS vector_indexes")
+            # A 0.0.2 deployment still has the continuous_backups table (created
+            # by 001, dropped by 003 at init), so put it back the way 001 made it.
             cur.execute(
-                "DELETE FROM schema_history WHERE filename = %s", (VECTOR_MIGRATION,)
+                "CREATE TABLE IF NOT EXISTS continuous_backups ("
+                "account_id TEXT NOT NULL, "
+                "table_name TEXT NOT NULL, "
+                "pitr_enabled BOOLEAN NOT NULL DEFAULT false, "
+                "earliest_restorable TIMESTAMPTZ, "
+                "latest_restorable TIMESTAMPTZ, "
+                "PRIMARY KEY (account_id, table_name))"
+            )
+            cur.execute(
+                "DELETE FROM schema_history WHERE filename IN (%s, %s)",
+                (VECTOR_MIGRATION, CONTINUOUS_BACKUPS_MIGRATION),
             )
             cur.execute("UPDATE settings SET value = '0.0.2' WHERE key = 'catalog_version'")
     finally:
@@ -98,10 +121,10 @@ def _roll_catalog_back_to_pre_vector(cli_env):
 
 
 class TestVectorCatalogMigration:
-    """Catalog version 0.0.3: the vector index table and the backup snapshot."""
+    """Migrations from the pre-vector catalog shape to the current version."""
 
-    def test_init_creates_the_vector_catalog_at_0_0_3(self, cli_env):
-        """A fresh init applies both catalog migrations and records the version.
+    def test_init_creates_the_catalog_at_the_current_version(self, cli_env):
+        """A fresh init applies every catalog migration and records the version.
 
         The version is what the binary checks at startup, so a migration that
         creates the table without moving the version, or the reverse, would leave
@@ -109,7 +132,7 @@ class TestVectorCatalogMigration:
         """
         _init(cli_env)
 
-        assert _catalog_version(cli_env) == "0.0.3"
+        assert _catalog_version(cli_env) == CURRENT_CATALOG_VERSION
         assert _vector_table_exists(cli_env) is True
         assert _backups_has_vector_column(cli_env) is True
 
@@ -124,6 +147,7 @@ class TestVectorCatalogMigration:
         # deployment that is already current. The statements are idempotent too,
         # so a replay after a crash between applying and recording is harmless.
         assert VECTOR_MIGRATION in tracked, tracked
+        assert CONTINUOUS_BACKUPS_MIGRATION in tracked, tracked
 
     def test_migrate_upgrades_a_pre_vector_deployment(self, cli_env):
         """A 0.0.2 deployment is refused, upgraded by migrate, and then serves."""
@@ -148,7 +172,7 @@ class TestVectorCatalogMigration:
             ) from None
         combined = refused_serve.stdout + refused_serve.stderr
         assert refused_serve.returncode != 0, combined
-        assert "0.0.3" in combined and "0.0.2" in combined, combined
+        assert CURRENT_CATALOG_VERSION in combined and "0.0.2" in combined, combined
 
         # Without --yes, migrate reports the pending upgrade and changes nothing.
         pending = _run_extenddb(
@@ -156,7 +180,7 @@ class TestVectorCatalogMigration:
         )
         pending_output = pending.stdout + pending.stderr
         assert pending.returncode != 0, pending_output
-        assert "0.0.2 -> 0.0.3" in pending_output, pending_output
+        assert f"0.0.2 -> {CURRENT_CATALOG_VERSION}" in pending_output, pending_output
         assert _vector_table_exists(cli_env) is False
         assert _catalog_version(cli_env) == "0.0.2"
 
@@ -164,7 +188,7 @@ class TestVectorCatalogMigration:
             "migrate", "--yes", *_pg_args(), config=cli_env["config_path"], check=False
         )
         assert applied.returncode == 0, applied.stdout + applied.stderr
-        assert _catalog_version(cli_env) == "0.0.3"
+        assert _catalog_version(cli_env) == CURRENT_CATALOG_VERSION
         assert _vector_table_exists(cli_env) is True
         assert _backups_has_vector_column(cli_env) is True
 
@@ -270,7 +294,8 @@ class TestVectorCatalogMigration:
             conn.autocommit = True
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE settings SET value = '0.0.4' WHERE key = 'catalog_version'"
+                    "UPDATE settings SET value = %s WHERE key = 'catalog_version'",
+                    (FUTURE_CATALOG_VERSION,),
                 )
         finally:
             conn.close()
@@ -285,8 +310,9 @@ class TestVectorCatalogMigration:
         except subprocess.TimeoutExpired:
             _run_extenddb("stop", config=cli_env["config_path"], check=False)
             raise AssertionError(
-                "serve started against a 0.0.4 catalog; the version gate is not symmetric"
+                f"serve started against a {FUTURE_CATALOG_VERSION} catalog; "
+                "the version gate is not symmetric"
             ) from None
         combined = refused.stdout + refused.stderr
         assert refused.returncode != 0, combined
-        assert "0.0.3" in combined and "0.0.4" in combined, combined
+        assert CURRENT_CATALOG_VERSION in combined and FUTURE_CATALOG_VERSION in combined, combined
