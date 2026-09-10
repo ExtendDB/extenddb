@@ -373,6 +373,35 @@ pub trait DataEngine: Send + Sync {
         index_name: Option<&str>,
     ) -> BoxFuture<'_, QueryResult>;
 
+    /// Whether `key` belongs to `segment` of a `total_segments`-way parallel
+    /// scan, under this backend's own segment-assignment function.
+    ///
+    /// Segment assignment is backend-private (Postgres hashes the partition
+    /// key with `hashtext`, MongoDB with CRC32, SQLite partitions by rowid),
+    /// so only the backend can answer this. The engine owns the rule and the
+    /// error: a `Scan` whose `ExclusiveStartKey` reports `false` here is
+    /// refused before storage is asked to scan, because resuming a segment
+    /// with another segment's key would otherwise return a silently wrong
+    /// (truncated or fabricated) page.
+    ///
+    /// `Ok(true)` means "cannot be proven foreign" rather than "proven local":
+    /// a backend whose assignment depends on storage identity rather than key
+    /// content (SQLite's rowid) MUST return `true` for a key it cannot resolve,
+    /// because DynamoDB permits an `ExclusiveStartKey` that no longer exists
+    /// and refusing it would reject legitimate resumptions after a delete.
+    ///
+    /// Required, not defaulted: a new backend must decide its answer
+    /// explicitly, since returning a constant `true` silently disables the
+    /// engine's cross-segment refusal for that backend.
+    fn scan_key_in_segment(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        segment: i64,
+        total_segments: i64,
+        index_name: Option<&str>,
+    ) -> BoxFuture<'_, Result<bool, StorageError>>;
+
     /// The vector-search implementation, if this backend has one.
     ///
     /// Defaults to `None`, so a backend that has never heard of vector search is
@@ -801,6 +830,17 @@ mod vector_opt_out_tests {
     struct MinimalDataEngine;
 
     impl DataEngine for MinimalDataEngine {
+        fn scan_key_in_segment(
+            &self,
+            _key_info: &TableKeyInfo,
+            _key: &Item,
+            _segment: i64,
+            _total_segments: i64,
+            _index_name: Option<&str>,
+        ) -> BoxFuture<'_, Result<bool, StorageError>> {
+            Box::pin(async { Ok(true) })
+        }
+
         fn put_item(
             &self,
             _key_info: &TableKeyInfo,
