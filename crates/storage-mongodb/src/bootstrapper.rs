@@ -207,7 +207,6 @@ impl Bootstrapper for MongoBootstrapper {
             "metrics",
             "login_attempts",
             "backups",
-            "continuous_backups",
         ];
 
         for coll_name in collections {

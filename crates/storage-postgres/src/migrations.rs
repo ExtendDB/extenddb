@@ -16,6 +16,10 @@ pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
         "002_vector_indexes.sql",
         include_str!("../../storage-postgres/migrations/002_vector_indexes.sql"),
     ),
+    (
+        "003_drop_continuous_backups.sql",
+        include_str!("../../storage-postgres/migrations/003_drop_continuous_backups.sql"),
+    ),
 ];
 
 /// Run catalog migrations, skipping already-applied ones.
@@ -311,10 +315,10 @@ mod tests {
     fn the_migration_count_and_the_catalog_version_agree() {
         assert_eq!(
             CATALOG_MIGRATIONS.len(),
-            2,
+            3,
             "a catalog migration was added or removed; update CATALOG_VERSION and this count"
         );
-        assert_eq!(CATALOG_VERSION.to_string(), "0.0.3");
+        assert_eq!(CATALOG_VERSION.to_string(), "0.0.4");
     }
 
     /// The version the binary expects must be the version the schema writes.

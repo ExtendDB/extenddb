@@ -4,9 +4,9 @@
 
 ## Current Status
 
-Catalog 0.0.3 is current. The 0.0.2 to 0.0.3 upgrade is the first in-place catalog upgrade ExtendDB has, and **every existing PostgreSQL deployment must run it**, including deployments that never use vector indexes: the server refuses to start against a catalog version it was not built for.
+Catalog 0.0.4 is current. **Every existing PostgreSQL and SQLite deployment must run the upgrade**: the server refuses to start against a catalog version it was not built for.
 
-See [Catalog 0.0.3](#catalog-003-current) below for what changes and the exact sequence.
+See [Catalog 0.0.4](#catalog-004-current) below for what changes and the exact sequence.
 
 ## How Catalog Upgrades Work
 
@@ -15,8 +15,9 @@ See [Catalog 0.0.3](#catalog-003-current) below for what changes and the exact s
 Migrations are SQL files in `crates/storage-postgres/migrations/`, applied in filename order:
 
 ```
-001_schema.sql            ← the complete initial schema
-002_vector_indexes.sql    ← vector index metadata, catalog 0.0.3
+001_schema.sql                    ← the complete initial schema
+002_vector_indexes.sql            ← vector index metadata, catalog 0.0.3
+003_drop_continuous_backups.sql   ← drops the unused PITR table, catalog 0.0.4
 ```
 
 The `schema_history` table tracks which files have been applied. When `extenddb migrate` runs, it:
@@ -181,7 +182,31 @@ psql -d extenddb_catalog -f catalog_backup_YYYYMMDD.sql
 
 ## Version History
 
-### Catalog 0.0.3 (Current)
+### Catalog 0.0.4 (Current)
+
+Drops the `continuous_backups` table.
+
+Point-in-time recovery is now reported honestly as unsupported. `DescribeContinuousBackups` always answers `PointInTimeRecoveryStatus: DISABLED`, `UpdateContinuousBackups` with `PointInTimeRecoveryEnabled: true` returns `ContinuousBackupsUnavailableException`, and `RestoreTableToPointInTime` resolves the source table (`TableNotFoundException` when it does not exist) and then returns `PointInTimeRecoveryUnavailableException`, the exception the service models on that operation. The engine answers these operations without consulting storage, so the per-table `pitr_enabled` flag the table stored drove nothing and the table is removed.
+
+**This release changes wire behavior.** Before 0.0.4, `UpdateContinuousBackups` accepted an enable request and `DescribeContinuousBackups` then reported `ENABLED` with a 35-day window, even though `RestoreTableToPointInTime` could never restore. Any client or infrastructure template that enables point-in-time recovery (for example a Terraform resource with `point_in_time_recovery = true`) now receives `ContinuousBackupsUnavailableException` and must stop requesting it, and a restore attempt now receives `PointInTimeRecoveryUnavailableException` instead of a generic `ValidationException`. Use on-demand backups (`CreateBackup`, `RestoreTableFromBackup`) instead.
+
+**Every PostgreSQL deployment must apply this**, because the server refuses to start against a catalog version it was not built for. Upgrade sequence:
+
+```bash
+extenddb stop --config extenddb.toml
+extenddb migrate --yes --config extenddb.toml
+extenddb serve --config extenddb.toml
+```
+
+Run `extenddb migrate` without `--yes` first to see what is pending; it reports `catalog 0.0.3 -> 0.0.4` and changes nothing.
+
+SQLite deployments upgrade the same way: `extenddb migrate` re-applies the catalog schema, which drops the `continuous_backups` table and records catalog 0.0.4.
+
+MongoDB deployments need no action. The backend tracks its own catalog version, which does not change; the bootstrapper simply no longer creates the `continuous_backups` collection. An existing deployment keeps an orphaned, unread collection that is harmless to leave in place and safe to drop by hand (`db.getSiblingDB("extenddb_catalog").continuous_backups.drop()`).
+
+The upgrade is not reversible in place: a 0.0.3 binary refuses to start against a 0.0.4 catalog, by the same check in the other direction. Roll back by restoring the catalog backup taken before the upgrade, as described above. No data of value is lost either way: the dropped table held only the meaningless per-table enable flag.
+
+### Catalog 0.0.3
 
 Adds vector index metadata:
 

@@ -225,18 +225,36 @@ async fn describe_continuous_backups() {
         .send()
         .await
         .unwrap();
-    assert!(resp.continuous_backups_description().is_some());
+    let desc = resp.continuous_backups_description().unwrap();
+    assert_eq!(desc.continuous_backups_status().as_str(), "ENABLED");
+    let pitr = desc.point_in_time_recovery_description().unwrap();
+    assert_eq!(
+        pitr.point_in_time_recovery_status().unwrap().as_str(),
+        "DISABLED"
+    );
+    assert!(
+        pitr.earliest_restorable_date_time().is_none(),
+        "a disabled recovery must not report an earliest restorable time"
+    );
+    assert!(
+        pitr.latest_restorable_date_time().is_none(),
+        "a disabled recovery must not report a latest restorable time"
+    );
 
     c.delete_table().table_name(&table).send().await.ok();
 }
 
 #[tokio::test]
-async fn enable_point_in_time_recovery() {
+async fn enable_point_in_time_recovery_is_refused() {
     let c = client();
     let table = format!("PITREnable_{}", ts());
     make_table(&table).await;
 
-    c.update_continuous_backups()
+    // Point-in-time recovery is not supported by any storage backend, so
+    // enabling it must fail with the typed exception rather than report a
+    // recovery capability that can never restore.
+    let err = c
+        .update_continuous_backups()
         .table_name(&table)
         .point_in_time_recovery_specification(
             PointInTimeRecoverySpecification::builder()
@@ -246,8 +264,14 @@ async fn enable_point_in_time_recovery() {
         )
         .send()
         .await
-        .unwrap();
+        .unwrap_err();
+    assert_eq!(
+        err_code(&err),
+        Some("ContinuousBackupsUnavailableException"),
+        "unexpected error: {err:?}"
+    );
 
+    // The refusal must not have changed anything.
     let resp = c
         .describe_continuous_backups()
         .table_name(&table)
@@ -261,19 +285,55 @@ async fn enable_point_in_time_recovery() {
         .unwrap();
     assert_eq!(
         pitr.point_in_time_recovery_status().unwrap().as_str(),
-        "ENABLED"
+        "DISABLED"
     );
 
     c.delete_table().table_name(&table).send().await.ok();
 }
 
 #[tokio::test]
-async fn restore_table_to_point_in_time() {
+async fn disable_point_in_time_recovery_reports_disabled() {
+    let c = client();
+    let table = format!("PITRDisable_{}", ts());
+    make_table(&table).await;
+
+    // Disabling recovery that was never enabled is a no-op that succeeds and
+    // returns the same description DescribeContinuousBackups reports.
+    let resp = c
+        .update_continuous_backups()
+        .table_name(&table)
+        .point_in_time_recovery_specification(
+            PointInTimeRecoverySpecification::builder()
+                .point_in_time_recovery_enabled(false)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let desc = resp.continuous_backups_description().unwrap();
+    assert_eq!(desc.continuous_backups_status().as_str(), "ENABLED");
+    assert_eq!(
+        desc.point_in_time_recovery_description()
+            .unwrap()
+            .point_in_time_recovery_status()
+            .unwrap()
+            .as_str(),
+        "DISABLED"
+    );
+
+    c.delete_table().table_name(&table).send().await.ok();
+}
+
+#[tokio::test]
+async fn restore_table_to_point_in_time_is_refused() {
     let c = client();
     let table = format!("PITRRestore_{}", ts());
     make_table(&table).await;
 
-    // PITR restore is not yet implemented — should return an error.
+    // Point-in-time recovery is not supported, so the restore must fail with
+    // the typed exception the service models on this operation rather than
+    // fabricate a restore of current state.
     let restored = format!("PITRRestored_{}", ts());
     let err = c
         .restore_table_to_point_in_time()
@@ -281,8 +341,13 @@ async fn restore_table_to_point_in_time() {
         .target_table_name(&restored)
         .use_latest_restorable_time(true)
         .send()
-        .await;
-    assert!(err.is_err(), "RestoreTableToPointInTime should return an error (not yet supported)");
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err_code(&err),
+        Some("PointInTimeRecoveryUnavailableException"),
+        "unexpected error: {err:?}"
+    );
 
     c.delete_table().table_name(&table).send().await.ok();
 }

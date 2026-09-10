@@ -95,8 +95,8 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 |-------|---------------|--------|-------|
 | Simultaneous shard readers | 2 (1 for global tables) | Not enforced | No concurrent reader tracking |
 | Max write capacity with streams (provisioned) | 40,000 WCU | Enforced | Same as table WCU limit |
-| GetRecords: max records per call | 1,000 | Not enforced | No per-call record count limit |
-| Shard iterator lifetime | 15 minutes | Not enforced | No shard iterator expiration |
+| GetRecords: max records per call | 1,000 | Enforced | `Limit` is capped at 1,000; a request without a limit reads at most 1,000 records |
+| Shard iterator lifetime | 15 minutes | Enforced | Iterators older than 15 minutes are rejected with `ExpiredIteratorException` |
 
 ## API-Level Limits
 
@@ -128,7 +128,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 
 | Limit | DynamoDB Value | Status | Notes |
 |-------|---------------|--------|-------|
-| Concurrent restores | 50 | N/A | ExtendDB does not support backup/restore |
+| Concurrent restores | 50 | Not enforced | On-demand backup and restore are supported; no concurrent-restore cap is applied. Point-in-time recovery is not supported. |
 
 ## Global Tables
 
@@ -156,12 +156,12 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | Query/Scan | 2 | 0 | 5 | 0 |
 | Batch Operations | 3 | 0 | 2 | 0 |
 | Transactions | 3 | 0 | 1 | 0 |
-| Streams | 1 | 0 | 3 | 0 |
+| Streams | 3 | 0 | 1 | 0 |
 | API-Level | 1 | 0 | 3 | 1 |
-| Import/Export/Backup | 0 | 0 | 0 | 8 |
+| Import/Export/Backup | 0 | 0 | 1 | 7 |
 | Global Tables | 0 | 0 | 0 | 2 |
 | Contributor Insights | 0 | 0 | 0 | 1 |
-| **Total** | **29** | **0** | **17** | **14** |
+| **Total** | **31** | **0** | **16** | **13** |
 
 ### Unenforced Limits Requiring Tracking
 
@@ -174,10 +174,8 @@ The following unenforced limits are tracked in `docs/technical-debt.md`:
 5. **BatchGetItem response size** (16 MB) — requires aggregate response size tracking
 6. **BatchWriteItem request size** (16 MB) — requires aggregate request size tracking
 7. **Transaction request size** (4 MB) — requires aggregate request size tracking
-8. **GetRecords max per call** (1,000) — requires record count limit in streams
-9. **Shard iterator lifetime** (15 minutes) — requires timestamp tracking on shard iterators
-10. **Tag count per resource** (50) — requires count validation in TagResource
-11. **Tag key/value length** (128/256 chars) — requires length validation in TagResource
+8. **Tag count per resource** (50): requires count validation in TagResource
+9. **Tag key/value length** (128/256 chars): requires length validation in TagResource
 
 ---
 

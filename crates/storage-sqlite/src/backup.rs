@@ -5,15 +5,12 @@
 //!
 //! A backup snapshots every item's `item_data` into `backup_items`. Restore
 //! recreates the table via `create_table` and upserts the snapshot under the
-//! engine write lock. `RestoreTableToPointInTime` is implemented as a
-//! snapshot-then-restore (then discard the temporary backup), matching the
-//! PostgreSQL backend's behaviour.
+//! engine write lock.
 
 use extenddb_core::types::{
     AttributeDefinition, BackupDescription, BackupDetails, BackupSummary, BillingMode,
-    ContinuousBackupsDescription, CreateTableInput, KeySchemaElement,
-    PointInTimeRecoveryDescription, ProvisionedThroughput, SourceTableDetails, TableDescription,
-    TableKeyInfo,
+    CreateTableInput, KeySchemaElement, ProvisionedThroughput, SourceTableDetails,
+    TableDescription, TableKeyInfo,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{BackupEngine, TableEngine};
@@ -422,116 +419,6 @@ impl BackupEngine for SqliteEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            Ok(desc)
-        })
-    }
-
-    fn describe_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-    ) -> BoxFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
-        let account_id = account_id.to_owned();
-        let table_name = table_name.to_owned();
-        Box::pin(async move {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM tables WHERE account_id = ? AND table_name = ?)",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-            if !exists {
-                return Err(StorageError::TableNotFound(table_name));
-            }
-
-            let pitr: Option<(bool,)> = sqlx::query_as(
-                "SELECT pitr_enabled FROM continuous_backups WHERE account_id = ? AND table_name = ?",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let enabled = pitr.is_some_and(|r| r.0);
-
-            #[allow(clippy::cast_precision_loss)]
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as f64;
-
-            Ok(ContinuousBackupsDescription {
-                continuous_backups_status: "ENABLED".to_owned(),
-                point_in_time_recovery_description: Some(PointInTimeRecoveryDescription {
-                    point_in_time_recovery_status: if enabled { "ENABLED" } else { "DISABLED" }
-                        .to_owned(),
-                    earliest_restorable_date_time: enabled.then_some(now - 35.0 * 24.0 * 3600.0),
-                    latest_restorable_date_time: enabled.then_some(now),
-                }),
-            })
-        })
-    }
-
-    fn update_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-        pitr_enabled: bool,
-    ) -> BoxFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
-        let account_id = account_id.to_owned();
-        let table_name = table_name.to_owned();
-        Box::pin(async move {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM tables WHERE account_id = ? AND table_name = ?)",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-            if !exists {
-                return Err(StorageError::TableNotFound(table_name));
-            }
-            {
-                // D1: every writer holds the engine write lock. Scoped so the
-                // read-only describe below runs after release.
-                let _writer = self.write_lock.lock().await;
-                sqlx::query(
-                    "INSERT INTO continuous_backups (account_id, table_name, pitr_enabled) \
-                     VALUES (?, ?, ?) \
-                     ON CONFLICT (account_id, table_name) DO UPDATE SET pitr_enabled = excluded.pitr_enabled",
-                )
-                .bind(&account_id)
-                .bind(&table_name)
-                .bind(pitr_enabled)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            }
-            self.describe_continuous_backups(&account_id, &table_name)
-                .await
-        })
-    }
-
-    fn restore_table_to_point_in_time(
-        &self,
-        account_id: &str,
-        source_table_name: &str,
-        target_table_name: &str,
-    ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
-        let account_id = account_id.to_owned();
-        let source_table_name = source_table_name.to_owned();
-        let target_table_name = target_table_name.to_owned();
-        Box::pin(async move {
-            let backup = self
-                .create_backup(&account_id, &source_table_name, "__pitr_restore__")
-                .await?;
-            let desc = self
-                .restore_table_from_backup(&account_id, &target_table_name, &backup.backup_arn)
-                .await?;
-            let _ = self.delete_backup(&account_id, &backup.backup_arn).await;
             Ok(desc)
         })
     }
