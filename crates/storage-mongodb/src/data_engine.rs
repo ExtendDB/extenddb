@@ -333,7 +333,6 @@ impl GsiIndexWriter for mongodb::Collection<Document> {
         Ok(())
     }
 }
-
 impl MongoEngine {
     fn read_transaction_options(&self) -> mongodb::options::TransactionOptions {
         transaction_options(self.transaction_read_concern(), TransactionKind::ReadOnly)
@@ -3266,7 +3265,10 @@ impl MongoEngine {
     /// read but before it claims or writes any base/index rows. The gate is
     /// controlled through the authenticated management settings API and is
     /// inert unless a test explicitly sets it to `armed`.
-    async fn wait_for_gsi_backfill_test_gate(&self, table_name: &str) -> Result<(), StorageError> {
+    pub(crate) async fn wait_for_gsi_backfill_test_gate(
+        &self,
+        table_name: &str,
+    ) -> Result<(), StorageError> {
         #[cfg(not(feature = "test-hooks"))]
         {
             let _ = table_name;
@@ -3983,6 +3985,12 @@ transaction_read_concern = "majority""#,
                     .build()
             )
         );
+    }
+
+    #[test]
+    fn restore_backfill_skips_live_claim_transaction() {
+        assert!(!uses_live_backfill_transaction(GsiBackfillMode::Restore));
+        assert!(uses_live_backfill_transaction(GsiBackfillMode::Live));
     }
 
     #[test]
