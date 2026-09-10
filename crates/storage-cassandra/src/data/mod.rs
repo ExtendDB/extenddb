@@ -57,7 +57,7 @@ pub(crate) fn json_to_item(text: String) -> Result<Item, StorageError> {
     serde_json::from_str(&text).map_err(|e| StorageError::Internal(e.to_string()))
 }
 
-/// Convert a DynamoDB numeric value (`BigDecimal`) into the cdrs-tokio
+/// Convert a DynamoDB numeric value (`BigDecimal`) into the `cdrs_tokio`
 /// `Decimal` wire type.
 ///
 /// DynamoDB's `N` type is an arbitrary-precision decimal. Cassandra's `decimal`
@@ -74,7 +74,7 @@ pub(crate) fn bigdecimal_to_cql_decimal(
     cdrs_tokio::types::decimal::Decimal::new(unscaled, scale_i32)
 }
 
-/// Bind a DynamoDB numeric value (`BigDecimal`) as a Cassandra `decimal` bound
+/// Bind a `DynamoDB` numeric value (`BigDecimal`) as a Cassandra `decimal` bound
 /// parameter `Value`.
 ///
 /// This replaces the previous workaround that bound `N` values as strings,
@@ -112,7 +112,7 @@ pub(crate) async fn query_with_pk_sk(
     }
     .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
 }
-/// Execute a query with pk, sort key, and item_data, returning the result.
+/// Execute a query with pk, sort key, and `item_data`, returning the result.
 ///
 /// Helper for INSERT/UPDATE operations.
 pub(crate) async fn query_with_pk_sk_item(

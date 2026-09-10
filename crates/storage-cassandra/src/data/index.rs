@@ -122,9 +122,9 @@ async fn fetch_indexes_for_table_at(
         .collect()
 }
 
-/// Fetch a single index by table_id and index_name (hot path for query routing).
+/// Fetch a single index by `table_id` and `index_name` (hot path for query routing).
 ///
-/// Uses the PRIMARY KEY ((table_id), index_name) for efficient single-row lookup.
+/// Uses the `PRIMARY KEY ((table_id), index_name)` for efficient single-row lookup.
 pub async fn fetch_index_by_name(
     table_id: &str,
     index_name: &str,
@@ -560,7 +560,7 @@ pub(crate) fn insert_index_row_multi(
     Ok(())
 }
 
-/// Convert a `SortKeyValue` to a cdrs_tokio bound `Value`.
+/// Convert a `SortKeyValue` to a `cdrs_tokio` bound `Value`.
 pub(crate) fn sk_to_value(sk: &SortKeyValue) -> cdrs_tokio::types::value::Value {
     match sk {
         SortKeyValue::S(s) => s.as_str().into(),
@@ -575,7 +575,7 @@ pub(crate) fn sk_to_value(sk: &SortKeyValue) -> cdrs_tokio::types::value::Value 
 ///
 /// Called by:
 /// - `process_control_plane_transitions` when table is DELETING → deleted
-/// - `update_table` when GSI is deleted via UpdateTable API
+/// - `update_table` when GSI is deleted via `UpdateTable` API
 ///
 /// Returns list of index IDs that were deleted (for caller logging/tracking).
 pub(crate) async fn delete_indexes_for_table(

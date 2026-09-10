@@ -300,6 +300,7 @@ where
 
 /// Convert millisecond timestamp to seconds as `f64` (for `creation_date_time` fields).
 #[allow(clippy::cast_precision_loss)]
+#[must_use]
 pub fn millis_to_seconds_f64(timestamp_millis: i64) -> f64 {
     timestamp_millis as f64 / 1_000.0
 }
@@ -309,6 +310,7 @@ pub fn millis_to_seconds_f64(timestamp_millis: i64) -> f64 {
 /// `SystemTime::as_millis()` returns `u128`; this cast is safe for all
 /// timestamps within the range of `i64` (until year 292,277,026).
 #[allow(clippy::cast_possible_truncation)]
+#[must_use]
 pub fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

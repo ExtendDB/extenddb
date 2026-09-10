@@ -3,6 +3,7 @@
 
 //! `StreamEngine` trait implementation for `CassandraEngine`.
 
+use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::types::{
     SequenceNumberRange, Shard, StreamDescription, StreamRecord, StreamStatus, StreamSummary,
     StreamViewType,
@@ -19,7 +20,7 @@ impl CassandraEngine {
         self.account_keyspace(account_id)
     }
 
-    /// Resolve the account keyspace for a shard by looking up the table_id
+    /// Resolve the account keyspace for a shard by looking up the `table_id`
     /// (embedded in the shard ID) via the secondary index on `tables.table_id`.
     ///
     /// Shard ID format: `shardId-{table_id}-{index:012}`
@@ -43,7 +44,6 @@ impl CassandraEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        use cdrs_tokio::types::IntoRustByName;
         let account_id: String = result
             .response_body()
             .map_err(|e| StorageError::Internal(e.to_string()))?
@@ -85,7 +85,6 @@ impl CassandraEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        use cdrs_tokio::types::IntoRustByName;
         let table_account_id: Option<String> = result
             .response_body()
             .map_err(|e| StorageError::Internal(e.to_string()))?
@@ -105,7 +104,7 @@ impl CassandraEngine {
 
 impl StreamEngine for CassandraEngine {
     /// Not used for atomic writes — see ADR-0008. Stream records are injected
-    /// directly into LOGGED BATCHes via `stream_record_statement` in each write path.
+    /// directly into LOGGED `BATCHes` via `stream_record_statement` in each write path.
     fn write_stream_record(
         &self,
         _account_id: &str,
@@ -172,7 +171,6 @@ impl StreamEngine for CassandraEngine {
             }
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            use cdrs_tokio::types::IntoRustByName;
             let rows = result
                 .response_body()
                 .map_err(|e| StorageError::Internal(e.to_string()))?
@@ -229,7 +227,6 @@ impl StreamEngine for CassandraEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            use cdrs_tokio::types::IntoRustByName;
             let rows = result
                 .response_body()
                 .map_err(|e| StorageError::Internal(e.to_string()))?
@@ -512,7 +509,6 @@ impl StreamEngine for CassandraEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            use cdrs_tokio::types::IntoRustByName;
             let rows = result
                 .response_body()
                 .map_err(|e| StorageError::Internal(e.to_string()))?
@@ -577,7 +573,6 @@ impl StreamEngine for CassandraEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            use cdrs_tokio::types::IntoRustByName;
             let rows = result
                 .response_body()
                 .map_err(|e| StorageError::Internal(e.to_string()))?

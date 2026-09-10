@@ -132,12 +132,11 @@ pub async fn reconcile_pending_older_than(
                     // row is parsed: a row with a readable id but unreadable
                     // payload must still be paged past, or it stalls the cursor on
                     // itself forever.
-                    let id: uuid::Uuid = match row.get_r_by_name("id") {
-                        Ok(id) => id,
-                        Err(_) => {
-                            tracing::warn!("TTL worker: outbox row with unreadable id skipped");
-                            continue;
-                        }
+                    let id: uuid::Uuid = if let Ok(id) = row.get_r_by_name("id") {
+                        id
+                    } else {
+                        tracing::warn!("TTL worker: outbox row with unreadable id skipped");
+                        continue;
                     };
                     page_cursor = Some(id);
                     let parsed = (|| -> Result<_, StorageError> {
@@ -297,7 +296,7 @@ pub async fn reconcile_inflight_repairs_once(
             let cursor = storage
                 .ttl_repair_scan_cursors
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&cursor_key)
                 .copied()
                 .unwrap_or(uuid::Uuid::nil());
@@ -367,7 +366,7 @@ pub async fn reconcile_inflight_repairs_once(
                 storage
                     .ttl_repair_scan_cursors
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(cursor_key, next_cursor);
             }
             if !rows.is_empty() {
@@ -751,7 +750,7 @@ async fn process_ttl_work_row(
                             sequence_number: storage
                                 .hlc
                                 .lock()
-                                .unwrap_or_else(|error| error.into_inner())
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .generate(),
                             created_at_ms: chrono::Utc::now().timestamp_millis(),
                             region: storage.region.clone(),

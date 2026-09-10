@@ -38,7 +38,7 @@ pub struct CassandraEngine {
     /// Replication factor for new keyspaces
     replication_factor: u32,
 
-    /// Datacenter name for NetworkTopologyStrategy
+    /// Datacenter name for `NetworkTopologyStrategy`
     datacenter: String,
 
     /// Wakes the control plane poller when a table enters CREATING or DELETING state
@@ -163,26 +163,30 @@ impl CassandraEngine {
     }
 
     /// Get a reference to the Cassandra session.
+    #[must_use]
     pub fn session(&self) -> &CassandraSession {
         &self.session
     }
 
     /// Get an Arc clone of the Cassandra session.
+    #[must_use]
     pub fn session_arc(&self) -> Arc<CassandraSession> {
         Arc::clone(&self.session)
     }
 
     /// Get the catalog keyspace name.
+    #[must_use]
     pub fn catalog_keyspace(&self) -> String {
         format!("{}_catalog", self.keyspace_prefix)
     }
 
     /// Get the account keyspace name for a given account ID.
+    #[must_use]
     pub fn account_keyspace(&self, account_id: &str) -> String {
         format!("{}_account_{}", self.keyspace_prefix, account_id)
     }
 
-    /// Create a keyspace with NetworkTopologyStrategy.
+    /// Create a keyspace with `NetworkTopologyStrategy`.
     pub async fn create_keyspace(&self, keyspace_name: &str) -> Result<(), StorageError> {
         let cql = format!(
             "CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class': 'NetworkTopologyStrategy', '{}': {}}}",

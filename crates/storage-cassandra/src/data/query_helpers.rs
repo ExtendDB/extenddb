@@ -97,7 +97,7 @@ pub(super) async fn query_with_pk_sk_sk(
 }
 
 /// Execute query with index PK, index SK, base PK, and base SK parameters.
-/// Used for LSI pagination: WHERE pk=? AND sk_*=? AND base_pk=? AND base_sk_*>?
+/// Used for LSI pagination: `WHERE pk=? AND sk_*=? AND base_pk=? AND base_sk_*>?`
 pub(super) async fn query_with_pk_sk_pk_sk(
     session: &Arc<crate::cassandra_util::CassandraSession>,
     query: &str,
@@ -209,7 +209,7 @@ pub(super) async fn query_with_pk_sk_pk_sk(
 }
 
 /// Execute query with index PK, index SK, and base PK parameters.
-/// Used for GSI pagination: WHERE pk=? AND sk_*=? AND base_pk>?
+/// Used for GSI pagination: `WHERE pk=? AND sk_*=? AND base_pk>?`
 pub(super) async fn query_with_pk_sk_pk(
     session: &Arc<crate::cassandra_util::CassandraSession>,
     query: &str,

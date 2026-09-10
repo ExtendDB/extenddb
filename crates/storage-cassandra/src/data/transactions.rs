@@ -3,7 +3,9 @@
 
 //! DynamoDB transaction implementations for Cassandra backend.
 
+use cdrs_tokio::consistency::Consistency;
 use cdrs_tokio::frame::Envelope;
+use cdrs_tokio::query::BatchQueryBuilder;
 use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::value::Bytes;
 use extenddb_core::expression::{self, ExpressionMaps};
@@ -15,6 +17,7 @@ use extenddb_storage::TransactGetOp;
 use extenddb_storage::TransactWriteOp;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{SortKeyValue, composite_pk_to_text, parse_sk, sk_column, sk_info};
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::CassandraEngine;
@@ -39,8 +42,8 @@ impl CassandraEngine {
     /// Implementation of `DataEngine::transact_get_items`.
     ///
     /// Uses a two-phase read protocol to ensure serializability:
-    /// 1. Read all items with timestamps and prepared_txn_id
-    /// 2. Verify timestamps and prepared_txn_id haven't changed
+    /// 1. Read all items with timestamps and `prepared_txn_id`
+    /// 2. Verify timestamps and `prepared_txn_id` haven't changed
     pub(crate) async fn transact_get_items_impl(
         &self,
         ops: &[TransactGetOp<'_>],
@@ -134,7 +137,7 @@ impl CassandraEngine {
 
     /// Read an item with full metadata for Phase 1.
     ///
-    /// Returns: Option<(Item, last_committed_txn_timestamp, prepared_txn_id)>
+    /// Returns: Option<(Item, `last_committed_txn_timestamp`, `prepared_txn_id`)>
     async fn read_item_with_metadata(
         &self,
         op: &TransactGetOp<'_>,
@@ -212,7 +215,6 @@ impl CassandraEngine {
     /// Implements a two-phase commit protocol using Lightweight Transactions (LWT):
     /// 1. PREPARE: Mark all items with transaction ID using LWT
     /// 2. COMMIT/ROLLBACK: Apply or revert changes atomically
-    /// Implementation of TransactWriteItems.
     pub(crate) async fn transact_write_items_impl(
         &self,
         ops: &[TransactWriteOp<'_>],
@@ -544,44 +546,37 @@ impl CassandraEngine {
                         Ok(()) => break,
                         Err(r) if r.code == "TransactionConflict" && attempt < 5 => {
                             let committed = self.wait_for_commit_and_read(key_info, key).await?;
-                            match committed {
-                                Some(winner) => {
-                                    eval_condition(
-                                        *condition,
-                                        &winner,
-                                        maps,
-                                        *return_values_on_ccf,
-                                        Some(&winner),
-                                    )?;
-                                    // Re-apply expression on top of winner's item.
-                                    item = winner.clone();
-                                    expression::apply_update_validated(
-                                        actions,
-                                        &mut item,
-                                        maps,
-                                        &[],
-                                        &[],
-                                    )
-                                    .map_err(|e| {
-                                        CancellationReason::validation_error(e.to_string())
-                                    })?;
-                                    existing = Some(winner);
-                                }
-                                None => {
-                                    // Winner rolled back; retry the insert.
-                                    existing = None;
-                                    item = (*key).clone();
-                                    expression::apply_update_validated(
-                                        actions,
-                                        &mut item,
-                                        maps,
-                                        &[],
-                                        &[],
-                                    )
-                                    .map_err(|e| {
-                                        CancellationReason::validation_error(e.to_string())
-                                    })?;
-                                }
+                            if let Some(winner) = committed {
+                                eval_condition(
+                                    *condition,
+                                    &winner,
+                                    maps,
+                                    *return_values_on_ccf,
+                                    Some(&winner),
+                                )?;
+                                // Re-apply expression on top of winner's item.
+                                item = winner.clone();
+                                expression::apply_update_validated(
+                                    actions,
+                                    &mut item,
+                                    maps,
+                                    &[],
+                                    &[],
+                                )
+                                .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+                                existing = Some(winner);
+                            } else {
+                                // Winner rolled back; retry the insert.
+                                existing = None;
+                                item = (*key).clone();
+                                expression::apply_update_validated(
+                                    actions,
+                                    &mut item,
+                                    maps,
+                                    &[],
+                                    &[],
+                                )
+                                .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
                             }
                         }
                         Err(r) => return Err(r),
@@ -725,7 +720,7 @@ impl CassandraEngine {
     }
 }
 
-/// Evaluate a condition expression, returning a CancellationReason on failure.
+/// Evaluate a condition expression, returning a `CancellationReason` on failure.
 fn eval_condition(
     condition: Option<&extenddb_core::expression::Expr>,
     item: &std::collections::BTreeMap<String, AttributeValue>,
@@ -751,7 +746,7 @@ fn eval_condition(
     Ok(())
 }
 
-/// Extract account_id from a TransactWriteOp.
+/// Extract `account_id` from a `TransactWriteOp`.
 fn transact_write_op_account_id<'a>(op: &'a TransactWriteOp<'_>) -> &'a str {
     match op {
         TransactWriteOp::Put { key_info, .. }
@@ -762,7 +757,7 @@ fn transact_write_op_account_id<'a>(op: &'a TransactWriteOp<'_>) -> &'a str {
 }
 
 impl CassandraEngine {
-    /// Serialize TransactWriteOps to JSON for ledger storage.
+    /// Serialize `TransactWriteOps` to JSON for ledger storage.
     /// Build initial `LedgerOp`s from the request ops.
     ///
     /// Written to the ledger before PREPARE starts. Contains pk/sk so a crash
@@ -882,7 +877,6 @@ impl CassandraEngine {
 
         // If the LWT was not applied, a concurrent request won the race.
         // Read back what was stored and return the appropriate error.
-        use cdrs_tokio::types::IntoRustByName;
         let applied: bool = result
             .response_body()
             .ok()
@@ -913,7 +907,7 @@ impl CassandraEngine {
         Ok(())
     }
 
-    /// Fetch an item for transaction (reads item_data and prepared_txn_id).
+    /// Fetch an item for transaction (reads `item_data` and `prepared_txn_id`).
     ///
     /// If `skip_txn_id` is `Some(id)`, rows prepared by that transaction are
     /// read directly (the caller owns that PREPARE and must not wait on itself).
@@ -979,7 +973,6 @@ impl CassandraEngine {
         key_info: &TableKeyInfo,
         key: &Item,
     ) -> Result<Option<Item>, CancellationReason> {
-        use std::time::Duration;
         const MAX_POLLS: u32 = 20;
         const POLL_SLEEP_MS: u64 = 50;
 
@@ -1042,7 +1035,7 @@ impl CassandraEngine {
         })
     }
 
-    /// Check partition_max_delete_timestamp for new items.
+    /// Check `partition_max_delete_timestamp` for new items.
     async fn check_partition_max_delete_timestamp(
         &self,
         key_info: &TableKeyInfo,
@@ -1093,8 +1086,8 @@ impl CassandraEngine {
 
     /// PREPARE an item: mark with transaction ID using LWT.
     ///
-    /// For existing items: UPDATE with IF prepared_txn_id = null
-    /// For new items: INSERT with IF NOT EXISTS + created_to_prepare=true
+    /// For existing items: UPDATE with IF `prepared_txn_id` = null
+    /// For new items: INSERT with IF NOT EXISTS + `created_to_prepare=true`
     async fn prepare_item(
         &self,
         key_info: &TableKeyInfo,
@@ -1103,8 +1096,6 @@ impl CassandraEngine {
         txn_timestamp: i64,
         is_new_item: bool,
     ) -> Result<(), CancellationReason> {
-        use cdrs_tokio::types::value::Bytes;
-
         let keyspace = self.account_keyspace(&key_info.account_id);
         let ddb_table = super::ddl::data_table_name(&key_info.table_id);
         let pk_text = composite_pk_to_text(key, &key_info.key_schema)
@@ -1169,16 +1160,14 @@ impl CassandraEngine {
 
     /// COMMIT a single operation: apply changes.
     ///
-    /// For Put/Update: Write final item_data, clear prepared_txn_id, set last_committed_txn_timestamp
-    /// For Delete: Update partition_max_delete_timestamp, then delete the item
+    /// For Put/Update: Write final `item_data`, clear `prepared_txn_id`, set `last_committed_txn_timestamp`
+    /// For Delete: Update `partition_max_delete_timestamp`, then delete the item
     async fn commit_single_operation(
         &self,
         op: &TransactWriteOp<'_>,
         txn_id: Uuid,
         txn_timestamp: i64,
     ) -> Result<(), StorageError> {
-        use cdrs_tokio::types::value::Bytes;
-
         let txn_id_bytes = Bytes::new(txn_id.as_bytes().to_vec());
 
         match op {
@@ -1234,7 +1223,7 @@ impl CassandraEngine {
                     })?;
 
                 // If that failed (column already has a value), try updating only if our timestamp is higher
-                if !check_lwt_applied(&result, "partition_max update").is_ok() {
+                if check_lwt_applied(&result, "partition_max update").is_err() {
                     let update_max_ts_query = format!(
                         "UPDATE {keyspace}.{ddb_table} SET partition_max_delete_timestamp = ? WHERE pk = ? \
                          IF partition_max_delete_timestamp < ?"
@@ -1353,7 +1342,7 @@ impl CassandraEngine {
         Ok(())
     }
 
-    /// Sync LSI/GSI index rows after a successful commit_put_or_update.
+    /// Sync LSI/GSI index rows after a successful `commit_put_or_update`.
     ///
     /// Runs as a separate non-LWT batch after the base-row LWT commit, since
     /// Cassandra does not allow LWT statements to be batched with writes to
@@ -1366,9 +1355,6 @@ impl CassandraEngine {
         old_item: Option<&Item>,
         new_item: &Item,
     ) -> Result<(), StorageError> {
-        use cdrs_tokio::consistency::Consistency;
-        use cdrs_tokio::query::BatchQueryBuilder;
-
         let catalog_keyspace = self.catalog_keyspace();
         let data_keyspace = self.account_keyspace(&key_info.account_id);
 
@@ -1428,15 +1414,13 @@ impl CassandraEngine {
 
     /// ROLLBACK a single operation: clean up prepared state.
     ///
-    /// For items created during PREPARE (created_to_prepare=true): DELETE the item
-    /// For existing items: Clear prepared_txn_id to restore unprepared state
+    /// For items created during PREPARE (`created_to_prepare=true)`: DELETE the item
+    /// For existing items: Clear `prepared_txn_id` to restore unprepared state
     async fn rollback_single_operation(
         &self,
         op: &TransactWriteOp<'_>,
         txn_id: Uuid,
     ) -> Result<(), StorageError> {
-        use cdrs_tokio::types::value::Bytes;
-
         // ConditionCheck doesn't prepare anything, so nothing to rollback
         if matches!(op, TransactWriteOp::ConditionCheck { .. }) {
             return Ok(());
@@ -1817,7 +1801,7 @@ impl CassandraEngine {
     }
 }
 
-/// Resolve sort key value and column name from key_info + item.
+/// Resolve sort key value and column name from `key_info` + item.
 fn resolve_sk(
     key_info: &TableKeyInfo,
     key: &Item,
@@ -1834,7 +1818,7 @@ fn resolve_sk(
     }
 }
 
-/// Resolve sort key value and column name from a TransactGetOp.
+/// Resolve sort key value and column name from a `TransactGetOp`.
 fn resolve_sk_get(
     op: &TransactGetOp<'_>,
 ) -> Result<(Option<SortKeyValue>, Option<String>), StorageError> {
@@ -1873,7 +1857,7 @@ fn ledger_sk(
 
 /// Reconstruct a `SortKeyValue` from the text representation stored in `LedgerOp`.
 ///
-/// `sk_col` encodes the type ("sk_s" → S, "sk_n" → N, "sk_b" → B).
+/// `sk_col` encodes the type ("`sk_s`" → S, "`sk_n`" → N, "`sk_b`" → B).
 fn ledger_sk_to_sort_key(sk_col: &str, sk_val: &str) -> Result<SortKeyValue, StorageError> {
     match sk_col {
         "sk_s" => Ok(SortKeyValue::S(sk_val.to_owned())),

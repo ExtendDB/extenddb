@@ -762,7 +762,7 @@ impl MetadataEngine for CassandraEngine {
                 let row = result
                     .response_body()
                     .ok()
-                    .and_then(|body| body.into_rows())
+                    .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
                     .and_then(|rows| rows.into_iter().next());
                 let Some(row) = row else { break };
                 applied = row.get_r_by_name("[applied]").unwrap_or(false);

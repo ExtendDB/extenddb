@@ -20,6 +20,7 @@ pub enum TransactionState {
 }
 
 impl TransactionState {
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Preparing => "PREPARING",
@@ -28,6 +29,7 @@ impl TransactionState {
         }
     }
 
+    #[must_use]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "PREPARING" => Some(Self::Preparing),
@@ -59,7 +61,7 @@ pub struct LedgerOp {
     pub table_id: String,
     /// Composite partition key text (as stored in Cassandra `pk` column)
     pub pk: String,
-    /// Sort key column name ("sk_s", "sk_n", "sk_b"), if table has a sort key
+    /// Sort key column name ("`sk_s`", "`sk_n`", "`sk_b`"), if table has a sort key
     pub sk_col: Option<String>,
     /// Sort key value serialized as a JSON string, if table has a sort key
     pub sk_val: Option<String>,

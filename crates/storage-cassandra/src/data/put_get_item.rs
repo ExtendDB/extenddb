@@ -210,10 +210,9 @@ impl CassandraEngine {
             if indexes.is_empty() && stream_stmt.is_none() && ttl_config.is_none() {
                 // Fast path: no batch needed.
                 let insert_query = format!(
-                    "INSERT INTO {}.{} \
-                     (pk, {}, item_data) \
-                     VALUES (?, ?, ?)",
-                    data_keyspace, ddb_table, sk_col
+                    "INSERT INTO {data_keyspace}.{ddb_table} \
+                     (pk, {sk_col}, item_data) \
+                     VALUES (?, ?, ?)"
                 );
                 query_with_pk_sk_item(
                     &self.session,
@@ -231,17 +230,15 @@ impl CassandraEngine {
                 // cells do — no separate release round trip is needed on success.
                 let insert_cql = if ttl_config.is_some() {
                     format!(
-                        "INSERT INTO {}.{} \
-                         (pk, {}, item_data, prepared_txn_id, prepared_txn_timestamp) \
-                         VALUES (?, ?, ?, null, null)",
-                        data_keyspace, ddb_table, sk_col
+                        "INSERT INTO {data_keyspace}.{ddb_table} \
+                         (pk, {sk_col}, item_data, prepared_txn_id, prepared_txn_timestamp) \
+                         VALUES (?, ?, ?, null, null)"
                     )
                 } else {
                     format!(
-                        "INSERT INTO {}.{} \
-                         (pk, {}, item_data) \
-                         VALUES (?, ?, ?)",
-                        data_keyspace, ddb_table, sk_col
+                        "INSERT INTO {data_keyspace}.{ddb_table} \
+                         (pk, {sk_col}, item_data) \
+                         VALUES (?, ?, ?)"
                     )
                 };
                 let insert_qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
@@ -266,7 +263,9 @@ impl CassandraEngine {
                     )?;
                 }
 
-                let async_enqueued = if !indexes.is_empty() {
+                let async_enqueued = if indexes.is_empty() {
+                    0
+                } else {
                     super::index::enqueue_async_indexes(
                         &self.session,
                         &mut batch,
@@ -278,8 +277,6 @@ impl CassandraEngine {
                         sys_delay,
                     )
                     .await?
-                } else {
-                    0
                 };
 
                 if let Some(config) = ttl_config.as_ref() {
@@ -428,10 +425,9 @@ impl CassandraEngine {
             if indexes.is_empty() && stream_stmt.is_none() && ttl_config.is_none() {
                 // Fast path: no batch needed.
                 let insert_query = format!(
-                    "INSERT INTO {}.{} \
+                    "INSERT INTO {data_keyspace}.{ddb_table} \
                      (pk, item_data) \
-                     VALUES (?, ?)",
-                    data_keyspace, ddb_table
+                     VALUES (?, ?)"
                 );
                 self.session
                     .query_with_values(
@@ -446,17 +442,15 @@ impl CassandraEngine {
                 // (see the sort-key path for the timestamp reasoning).
                 let insert_cql = if ttl_config.is_some() {
                     format!(
-                        "INSERT INTO {}.{} \
+                        "INSERT INTO {data_keyspace}.{ddb_table} \
                          (pk, item_data, prepared_txn_id, prepared_txn_timestamp) \
-                         VALUES (?, ?, null, null)",
-                        data_keyspace, ddb_table
+                         VALUES (?, ?, null, null)"
                     )
                 } else {
                     format!(
-                        "INSERT INTO {}.{} \
+                        "INSERT INTO {data_keyspace}.{ddb_table} \
                          (pk, item_data) \
-                         VALUES (?, ?)",
-                        data_keyspace, ddb_table
+                         VALUES (?, ?)"
                     )
                 };
                 let insert_qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
@@ -480,7 +474,9 @@ impl CassandraEngine {
                     )?;
                 }
 
-                let async_enqueued = if !indexes.is_empty() {
+                let async_enqueued = if indexes.is_empty() {
+                    0
+                } else {
                     super::index::enqueue_async_indexes(
                         &self.session,
                         &mut batch,
@@ -492,8 +488,6 @@ impl CassandraEngine {
                         sys_delay,
                     )
                     .await?
-                } else {
-                    0
                 };
 
                 if let Some(config) = ttl_config.as_ref() {
@@ -690,7 +684,9 @@ impl CassandraEngine {
             )?;
         }
 
-        let async_enqueued = if !indexes.is_empty() {
+        let async_enqueued = if indexes.is_empty() {
+            0
+        } else {
             super::index::enqueue_async_indexes(
                 &self.session,
                 &mut batch,
@@ -702,8 +698,6 @@ impl CassandraEngine {
                 sys_delay,
             )
             .await?
-        } else {
-            0
         };
 
         if let Some(stmt) = stream_stmt {

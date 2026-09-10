@@ -23,7 +23,7 @@ use crate::stream_util::stream_record_statement;
 /// its claim; `mutation_timestamp` is pinned immediately after the claim is
 /// taken, so a resumed request's cells lose to anything a later owner commits
 /// via Paxos (its item cells can still beat the older stored image, which is
-/// why EFFECTS_APPLYING recovery fences on the owner rather than the image).
+/// why `EFFECTS_APPLYING` recovery fences on the owner rather than the image).
 pub(crate) const TTL_REQUEST_CLAIM_SECONDS: u32 = 120;
 
 /// Lifetime of the base-row claim the expiration worker holds across its
@@ -355,7 +355,9 @@ impl CassandraEngine {
                     return Err(error);
                 }
 
-                let async_enqueued = if !indexes.is_empty() {
+                let async_enqueued = if indexes.is_empty() {
+                    0
+                } else {
                     match super::index::enqueue_async_indexes(
                         &self.session,
                         &mut batch,
@@ -375,8 +377,6 @@ impl CassandraEngine {
                             return Err(error);
                         }
                     }
-                } else {
-                    0
                 };
 
                 if let Some(config) = ttl_config.as_ref()
@@ -565,7 +565,9 @@ impl CassandraEngine {
                     return Err(error);
                 }
 
-                let async_enqueued = if !indexes.is_empty() {
+                let async_enqueued = if indexes.is_empty() {
+                    0
+                } else {
                     match super::index::enqueue_async_indexes(
                         &self.session,
                         &mut batch,
@@ -585,8 +587,6 @@ impl CassandraEngine {
                             return Err(error);
                         }
                     }
-                } else {
-                    0
                 };
 
                 if let Some(config) = ttl_config.as_ref()
@@ -676,7 +676,7 @@ impl CassandraEngine {
                 .await?
                 .response_body()
                 .ok()
-                .and_then(|body| body.into_rows())
+                .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
                 .and_then(|rows| rows.into_iter().next())
         } else {
             let query =

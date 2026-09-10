@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! DataEngine trait implementation for Cassandra.
+//! `DataEngine` trait implementation for Cassandra.
 //! TODO: Implement data operations.
 
 use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, UpdateAction};

@@ -12,13 +12,13 @@
 //! - Description: Text after double underscore (e.g., `initial_schema`)
 //!
 //! Flyway is a popular database migration tool that uses this naming convention.
-//! See: https://flywaydb.org/documentation/concepts/migrations#naming
+//! See: <https://flywaydb.org/documentation/concepts/migrations#naming>
 //!
 //! ## Migration Tracking
 //!
 //! Applied migrations are tracked in the `schema_history` table:
 //! - `version` (int): Extracted from filename (V001 → 1)
-//! - `description` (text): Extracted from filename (V001__initial_schema.cql → initial_schema)
+//! - `description` (text): Extracted from filename (`V001__initial_schema.cql` → `initial_schema`)
 //! - `applied_at` (timestamp): When the migration was applied
 //!
 //! Migrations are applied in order by version number. Already-applied migrations

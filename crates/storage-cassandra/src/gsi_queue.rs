@@ -65,6 +65,7 @@ pub struct GsiQueue {
 }
 
 impl GsiQueue {
+    #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             notify: Arc::new(Notify::new()),

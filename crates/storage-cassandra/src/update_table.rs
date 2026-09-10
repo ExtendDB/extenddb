@@ -324,18 +324,14 @@ impl CassandraEngine {
                         &existing,
                         "key_schema",
                         "update_table gsi delete ks",
-                    ) {
-                        if let Ok(del_ks) = serde_json::from_str::<
-                            Vec<extenddb_core::types::KeySchemaElement>,
-                        >(&ks_text)
-                        {
-                            if let Some(pos) = surviving_index_key_schemas
-                                .iter()
-                                .position(|s| *s == del_ks)
-                            {
-                                surviving_index_key_schemas.remove(pos);
-                            }
-                        }
+                    ) && let Ok(del_ks) = serde_json::from_str::<
+                        Vec<extenddb_core::types::KeySchemaElement>,
+                    >(&ks_text)
+                        && let Some(pos) = surviving_index_key_schemas
+                            .iter()
+                            .position(|s| *s == del_ks)
+                    {
+                        surviving_index_key_schemas.remove(pos);
                     }
 
                     batch = batch.add_query(
@@ -511,26 +507,26 @@ impl CassandraEngine {
                     crate::propagation_hold::take_propagation_hold(
                         &self.session_arc(),
                         &account_ks,
-                        &table_id,
+                        table_id,
                         index_id,
                     )
                     .await?;
                     let backfill_result = self
                         .backfill_gsi(
                             &account_ks,
-                            &table_id,
+                            table_id,
                             index_id,
                             &create.key_schema,
                             effective_attr_defs,
-                            &base_key_schema,
-                            &base_attr_defs,
+                            base_key_schema,
+                            base_attr_defs,
                             &create.projection,
                         )
                         .await;
                     if let Err(e) = crate::propagation_hold::release_propagation_hold(
                         &self.session_arc(),
                         &account_ks,
-                        &table_id,
+                        table_id,
                         index_id,
                     )
                     .await

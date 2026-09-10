@@ -39,6 +39,10 @@ pub use catalog_store::CassandraCatalogStore;
 pub use config::CassandraStorageConfig;
 pub use engine::{CassandraEngine, CassandraSession};
 
+use cdrs_tokio::authenticators::StaticPasswordAuthenticatorProvider;
+use cdrs_tokio::cluster::NodeTcpConfigBuilder;
+use cdrs_tokio::cluster::session::{SessionBuilder, TcpSessionBuilder};
+use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_storage::hooks::{ServerRuntimeHooks, WorkerContext};
 use extenddb_storage::server_components::{BackendError, ServerComponents};
@@ -66,7 +70,7 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
         let catalog_store = ctx.catalog_store.clone();
         let control_plane = tokio::spawn(async move {
             workers::poll_control_plane_transitions(storage_for_poller, cp_notify, catalog_store)
-                .await
+                .await;
         });
 
         let engine_for_recovery = self.engine.clone();
@@ -76,7 +80,7 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
                 std::time::Duration::from_secs(60),
                 std::time::Duration::from_secs(30),
             )
-            .await
+            .await;
         });
 
         // Read the initial GSI delay immediately so the atomic is correct from
@@ -95,10 +99,10 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
                 .ok()
                 .flatten(),
         };
-        if let Some(val) = initial_delay {
-            if let Ok(ms) = val.parse::<u64>() {
-                gsi_delay.store(ms, std::sync::atomic::Ordering::Relaxed);
-            }
+        if let Some(val) = initial_delay
+            && let Ok(ms) = val.parse::<u64>()
+        {
+            gsi_delay.store(ms, std::sync::atomic::Ordering::Relaxed);
         }
         let catalog_store_for_gsi = ctx.catalog_store.clone();
         let gsi_delay_poller =
@@ -114,12 +118,12 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
         let ttl_metrics = ctx.metrics.clone();
         let ttl_shutdown = ctx.shutdown.clone();
         let ttl_cleanup = tokio::spawn(async move {
-            ttl_worker::ttl_cleanup_worker(ttl_engine, ttl_metrics, ttl_shutdown).await
+            ttl_worker::ttl_cleanup_worker(ttl_engine, ttl_metrics, ttl_shutdown).await;
         });
         let ttl_repair_engine = self.engine.clone();
         let ttl_repair_shutdown = ctx.shutdown.clone();
         let ttl_repair = tokio::spawn(async move {
-            ttl_worker::ttl_repair_worker(ttl_repair_engine, ttl_repair_shutdown).await
+            ttl_worker::ttl_repair_worker(ttl_repair_engine, ttl_repair_shutdown).await;
         });
 
         vec![
@@ -147,6 +151,7 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
 /// ```ignore
 /// extenddb_storage::set_backend(extenddb_storage_cassandra::backend())?;
 /// ```
+#[must_use]
 pub fn backend() -> extenddb_storage::Backend {
     extenddb_storage::Backend {
         name: "cassandra",
@@ -206,11 +211,6 @@ async fn make_catalog_store_from_connection_string(
     if contact_points.is_empty() {
         return Err("No contact points provided".to_string());
     }
-
-    use cdrs_tokio::authenticators::StaticPasswordAuthenticatorProvider;
-    use cdrs_tokio::cluster::NodeTcpConfigBuilder;
-    use cdrs_tokio::cluster::session::{SessionBuilder, TcpSessionBuilder};
-    use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
 
     let mut node_builder = NodeTcpConfigBuilder::new();
     for contact_point in &contact_points {
