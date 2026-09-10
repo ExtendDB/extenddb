@@ -253,6 +253,9 @@ ExtendDB uses two lightweight processes for tracking decisions:
   new feature or subsystem. Substantial changes go through an RFC before
   implementation.
 
+Adding a storage backend? Start with [RFC-0002: Backend Plugin Policy](docs/rfcs/0002-backend-plugin-policy.md)
+and the [Backend Acceptance Criteria](docs/rfcs/0003-backend-acceptance-criteria.md).
+
 Code in protected paths is reviewed via [`.github/CODEOWNERS`](.github/CODEOWNERS).
 
 ## License
