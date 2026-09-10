@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 /// Returns `Ok(())` if the condition passes or is `None`.
 /// Returns `Err(StorageError::ConditionFailed)` if the condition fails.
 ///
-/// For non-existent items, pass an empty BTreeMap as the item.
+/// For non-existent items, pass an empty `BTreeMap` as the item.
 pub(crate) fn check_condition(
     condition: Option<&Expr>,
     item: &BTreeMap<String, AttributeValue>,

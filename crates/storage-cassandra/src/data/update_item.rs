@@ -464,7 +464,9 @@ impl CassandraEngine {
             )?;
         }
 
-        let async_enqueued = if !indexes.is_empty() {
+        let async_enqueued = if indexes.is_empty() {
+            0
+        } else {
             super::index::enqueue_async_indexes(
                 &self.session,
                 &mut batch,
@@ -476,8 +478,6 @@ impl CassandraEngine {
                 sys_delay,
             )
             .await?
-        } else {
-            0
         };
 
         if let (Some(_), Some(attribute)) = (ttl_claim, ttl_attribute) {

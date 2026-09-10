@@ -19,6 +19,7 @@ pub(crate) fn data_table_name(table_id: &str) -> String {
 }
 
 /// CQL table name for a GSI/LSI data table.
+#[must_use]
 pub fn index_table_name(index_id: &str) -> String {
     format!("index_{}", index_id.replace('-', "_"))
 }
@@ -313,10 +314,10 @@ impl CassandraEngine {
 
     /// Create a GSI/LSI data table in Cassandra.
     ///
-    /// GSI tables use (pk, sk_*, base_pk, base_sk_*) structure where:
-    /// - pk is the partition key (index PK)
-    /// - sk_* are clustering keys for ordering (index SK)
-    /// - base_pk, base_sk_* are clustering keys for uniqueness
+    /// GSI tables use (`pk`, `sk_*`, `base_pk`, `base_sk_*`) structure where:
+    /// - `pk` is the partition key (index PK)
+    /// - `sk_*` are clustering keys for ordering (index SK)
+    /// - `base_pk`, `base_sk`_* are clustering keys for uniqueness
     ///
     /// This differs from PostgreSQL where base keys come before index SK
     /// in the PRIMARY KEY constraint. Cassandra needs index SK as clustering

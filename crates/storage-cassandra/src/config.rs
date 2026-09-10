@@ -25,7 +25,7 @@ pub struct CassandraStorageConfig {
     #[serde(default = "default_replication_factor")]
     pub replication_factor: u32,
 
-    /// Datacenter name for NetworkTopologyStrategy (default: "datacenter1")
+    /// Datacenter name for `NetworkTopologyStrategy` (default: "datacenter1")
     #[serde(default = "default_datacenter")]
     pub datacenter: String,
 
@@ -33,8 +33,8 @@ pub struct CassandraStorageConfig {
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
 
-    /// Cached connection string (JDBC-style: host1,host2/keyspace_prefix)
-    /// This is computed after deserialization and cached for connection_config()
+    /// Cached connection string (JDBC-style: `host1,host2/keyspace_prefix`)
+    /// This is computed after deserialization and cached for `connection_config()`
     #[serde(skip)]
     pub cached_connection_string: Option<String>,
 
@@ -61,7 +61,7 @@ fn default_max_connections() -> u32 {
 }
 
 impl CassandraStorageConfig {
-    /// Build the connection string in JDBC-style format: host1,host2/keyspace_prefix
+    /// Build the connection string in JDBC-style format: `host1,host2/keyspace_prefix`
     fn build_connection_string(&self) -> String {
         let hosts = self.contact_points.join(",");
         format!("{}/{}", hosts, self.keyspace_prefix)
@@ -76,14 +76,15 @@ impl CassandraStorageConfig {
     }
 
     /// Rebuild the cached connection string.
-    /// Use this after modifying contact_points or keyspace_prefix.
+    /// Use this after modifying `contact_points` or `keyspace_prefix`.
     pub fn rebuild_cached_connection_string(&mut self) {
         self.cached_connection_string = Some(self.build_connection_string());
     }
 
     /// Parse a JDBC-style connection string into contact points and keyspace prefix.
-    /// Format: "host1:port1,host2:port2/keyspace_prefix"
-    /// Returns (contact_points, keyspace_prefix)
+    /// Format: "`host1:port1,host2:port2/keyspace_prefix`"
+    /// Returns (`contact_points`, `keyspace_prefix`)
+    #[must_use]
     pub fn parse_connection_string(conn_str: &str) -> (Vec<String>, String) {
         if let Some((hosts, keyspace)) = conn_str.split_once('/') {
             let contact_points = hosts.split(',').map(|s| s.trim().to_string()).collect();
@@ -96,6 +97,7 @@ impl CassandraStorageConfig {
     }
 
     /// Create default config programmatically
+    #[must_use]
     pub fn new(contact_points: Vec<String>) -> Self {
         let mut config = Self {
             contact_points,

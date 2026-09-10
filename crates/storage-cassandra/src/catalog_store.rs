@@ -40,6 +40,7 @@ pub struct CassandraCatalogStore {
 
 impl CassandraCatalogStore {
     /// Create a new catalog store wrapping the given session.
+    #[must_use]
     pub fn new(
         session: Arc<CassandraSession>,
         keyspace_prefix: String,
@@ -56,6 +57,7 @@ impl CassandraCatalogStore {
     }
 
     /// Create a new catalog store with a pre-loaded encryption key.
+    #[must_use]
     pub fn with_encryption_key(
         session: Arc<CassandraSession>,
         keyspace_prefix: String,
@@ -73,11 +75,13 @@ impl CassandraCatalogStore {
     }
 
     /// Borrow the underlying session (escape hatch for callers not yet migrated).
+    #[must_use]
     pub fn session(&self) -> &Arc<CassandraSession> {
         &self.session
     }
 
     /// Get the cached encryption key. Returns `None` if not loaded at startup.
+    #[must_use]
     pub fn encryption_key(&self) -> Option<&Arc<str>> {
         self.encryption_key.as_ref()
     }
@@ -93,7 +97,7 @@ impl CassandraCatalogStore {
     }
 
     /// Ensure an account keyspace exists (idempotent).
-    /// Creates the keyspace with NetworkTopologyStrategy if it doesn't exist.
+    /// Creates the keyspace with `NetworkTopologyStrategy` if it doesn't exist.
     pub(crate) async fn ensure_account_keyspace(&self, account_id: &str) -> OpResult<()> {
         let keyspace_name = self.account_keyspace(account_id);
 

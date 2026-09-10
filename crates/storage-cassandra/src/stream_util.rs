@@ -32,7 +32,8 @@ pub struct HybridClock {
 }
 
 impl HybridClock {
-    /// Create a new HybridClock with the given node ID.
+    /// Create a new `HybridClock` with the given node ID.
+    #[must_use]
     pub fn new(node_id: u16) -> Self {
         Self {
             last_timestamp_ms: 0,
@@ -46,6 +47,7 @@ impl HybridClock {
     /// Instance identifiers (e.g. hostname + listening address) ensure that multiple ExtendDB
     /// instances, whether on the same or different hosts, get distinct node IDs, in turn allowing
     /// tie-breaking for conflicting clock values.
+    #[must_use]
     pub fn derive_node_id(instance_id: &str) -> u16 {
         let hash = crc32fast::hash(instance_id.as_bytes());
         u16::try_from(hash % 9999 + 1).unwrap_or(1)
@@ -86,10 +88,10 @@ impl HybridClock {
     }
 }
 
-/// Thread-safe HybridClock handle.
+/// Thread-safe `HybridClock` handle.
 pub type SharedHlc = Arc<Mutex<HybridClock>>;
 
-/// Create a new SharedHlc, deriving node ID from ExtendDB's instance ID.
+/// Create a new `SharedHlc`, deriving node ID from `ExtendDB`'s instance ID.
 pub fn new_shared_hlc(instance_id: &str) -> SharedHlc {
     let node_id = HybridClock::derive_node_id(instance_id);
     tracing::info!(node_id, instance_id, "HybridClock initialized");
@@ -101,6 +103,7 @@ pub fn new_shared_hlc(instance_id: &str) -> SharedHlc {
 /// Uses CRC32 hash modulo shard count, matching the PostgreSQL reference
 /// implementation. Uses `table_id` (UUID) rather than `table_name` to
 /// prevent shard ID collisions after table deletion and recreation.
+#[must_use]
 pub fn assign_shard_id(partition_key: &str, table_id: &str) -> String {
     let hash = crc32fast::hash(partition_key.as_bytes());
     let idx = (hash as usize) % SHARDS_PER_STREAM as usize;
@@ -171,6 +174,7 @@ pub fn stream_record_statement(
 /// TTL expiration persists its identity before applying effects so that a retry
 /// rewrites the same record instead of publishing a second visible `REMOVE`.
 #[allow(clippy::too_many_arguments)]
+#[must_use]
 pub fn stream_record_statement_with_identity(
     account_keyspace: &str,
     table_id: &str,

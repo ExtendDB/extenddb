@@ -13,7 +13,7 @@ use extenddb_storage::management_store::SettingsStore;
 use crate::CassandraEngine;
 
 /// Poll `index_propagation_delay_ms` from settings every 30 seconds and update
-/// the in-memory atomic used by put_item/update_item/delete_item.
+/// the in-memory atomic used by `put_item/update_item/delete_item`.
 pub(crate) async fn poll_gsi_delay<S: SettingsStore + ?Sized>(
     store: Arc<S>,
     gsi_delay: Arc<AtomicU64>,
@@ -199,6 +199,7 @@ impl Drop for GsiWorkerGuard {
 /// Spawn GSI propagation workers — one per partition.
 ///
 /// Returns a `GsiWorkerGuard`; workers stop when it is dropped.
+#[must_use]
 pub fn spawn_gsi_workers(engine: Arc<CassandraEngine>) -> GsiWorkerGuard {
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     for worker_id in 0..crate::gsi_queue::NUM_WORKERS {

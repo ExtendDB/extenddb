@@ -9,6 +9,7 @@
 //! the normal item mutation path.
 
 use cdrs_tokio::query::BatchQueryBuilder;
+use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::types::{AttributeValue, Item, TableKeyInfo};
 use extenddb_storage::error::StorageError;
 
@@ -497,7 +498,6 @@ pub(crate) async fn insert_ttl_entry(
     )
     .await?;
     if let Some(row) = existing.first() {
-        use cdrs_tokio::types::IntoRustByName;
         let state: Option<String> = row.get_by_name("state").ok().flatten();
         if TtlWorkState::parse(state.as_deref())? == TtlWorkState::Pending {
             ensure_ttl_bucket_registration(engine, account_keyspace, table_id, generation, entry)
@@ -541,7 +541,7 @@ pub(crate) async fn insert_ttl_entry(
             "TTL reconcile LWT returned no result".to_owned(),
         ));
     };
-    use cdrs_tokio::types::IntoRustByName;
+
     let applied: bool = row
         .get_r_by_name("[applied]")
         .map_err(|error| StorageError::Internal(format!("Parse TTL reconcile result: {error}")))?;
@@ -872,8 +872,6 @@ pub(crate) async fn abort_claimed_ttl_work(
 }
 
 fn work_lwt_applied(result: &cdrs_tokio::frame::Envelope) -> Result<bool, StorageError> {
-    use cdrs_tokio::types::IntoRustByName;
-
     let rows = result
         .response_body()
         .map_err(|error| StorageError::Internal(format!("Parse TTL work LWT: {error}")))?
@@ -943,8 +941,6 @@ pub(crate) async fn load_due_ttl_work(
     now: i64,
     limit: usize,
 ) -> Result<Vec<TtlWorkRow>, StorageError> {
-    use cdrs_tokio::types::IntoRustByName;
-
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -1065,8 +1061,6 @@ pub(crate) async fn load_generation_work(
     generation: uuid::Uuid,
     limit: usize,
 ) -> Result<Vec<TtlWorkRow>, StorageError> {
-    use cdrs_tokio::types::IntoRustByName;
-
     let generation_bytes = cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec());
     let mut work = Vec::new();
     for (bucket, shard) in
@@ -1191,7 +1185,6 @@ pub(crate) async fn clear_ttl_generation(
         .await?;
         let mut partition_drained = true;
         for row in rows {
-            use cdrs_tokio::types::IntoRustByName;
             let state: Option<String> = row.get_by_name("state").ok().flatten();
             if TtlWorkState::parse(state.as_deref())? != TtlWorkState::Pending {
                 partition_drained = false;
