@@ -190,7 +190,81 @@ pub(crate) async fn handle_restore_table_from_backup(
     serialize_output(&json!({ "TableDescription": desc }))
 }
 
+/// The one message every point-in-time recovery refusal carries.
+const PITR_UNSUPPORTED_MESSAGE: &str =
+    "Point-in-time recovery is not supported by this storage backend";
+
+/// The typed refusal for enabling point-in-time recovery.
+///
+/// `ContinuousBackupsUnavailableException` is the exception the service models
+/// on `UpdateContinuousBackups`, so every SDK surfaces it as a typed error a
+/// caller can match on, unlike a generic `ValidationException` whose meaning
+/// lives only in the message text.
+fn pitr_unsupported_error() -> DynamoDbError {
+    DynamoDbError::ContinuousBackupsUnavailableException(PITR_UNSUPPORTED_MESSAGE.to_owned())
+}
+
+/// The typed refusal for `RestoreTableToPointInTime`.
+///
+/// The service models `PointInTimeRecoveryUnavailableException` on this
+/// operation and returns it whenever recovery is not enabled on the source
+/// table, which for ExtendDB is always. The message mirrors the live service's
+/// shape ("Point in time recovery is not enabled for table '<name>'").
+fn pitr_restore_unavailable_error(table_name: &str) -> DynamoDbError {
+    DynamoDbError::PointInTimeRecoveryUnavailableException(format!(
+        "Point in time recovery is not enabled for table '{table_name}'"
+    ))
+}
+
+/// The continuous-backups description every table reports.
+///
+/// `ContinuousBackupsStatus` is always `ENABLED`, matching the service, which
+/// reports `ENABLED` unconditionally. `PointInTimeRecoveryStatus` is always
+/// `DISABLED` because no storage backend implements point-in-time recovery,
+/// and the restorable-time fields are omitted, as the service omits them for
+/// a table whose recovery is disabled. Owned by the engine rather than the
+/// backends: the answer does not depend on stored state, so no backend is
+/// consulted and all three report identically.
+fn disabled_continuous_backups_description() -> extenddb_core::types::ContinuousBackupsDescription {
+    extenddb_core::types::ContinuousBackupsDescription {
+        continuous_backups_status: "ENABLED".to_owned(),
+        point_in_time_recovery_description: Some(
+            extenddb_core::types::PointInTimeRecoveryDescription {
+                point_in_time_recovery_status: "DISABLED".to_owned(),
+                earliest_restorable_date_time: None,
+                latest_restorable_date_time: None,
+            },
+        ),
+    }
+}
+
+/// Verify a table exists in the caller's account, in any lifecycle status.
+///
+/// The continuous-backups operations answer for CREATING and DELETING tables
+/// too, so this goes through `describe_table` rather than `table_key_info`,
+/// which only resolves ACTIVE tables.
+async fn require_table_exists(
+    ctx: &OperationContext,
+    table_name: &str,
+) -> Result<(), DynamoDbError> {
+    ctx.storage
+        .describe_table(
+            &ctx.account_id,
+            extenddb_core::types::DescribeTableInput {
+                table_name: table_name.to_owned(),
+            },
+        )
+        .await
+        .map_err(storage_err_to_dynamo)?;
+    Ok(())
+}
+
 /// Handle `DescribeContinuousBackups`.
+///
+/// Point-in-time recovery is not supported by any storage backend, so the
+/// engine answers directly: continuous backups report `ENABLED` (the service
+/// reports this unconditionally) with `PointInTimeRecoveryStatus: DISABLED`
+/// and no restorable-time window.
 pub(crate) async fn handle_describe_continuous_backups(
     body: Value,
     ctx: &OperationContext,
@@ -206,16 +280,20 @@ pub(crate) async fn handle_describe_continuous_backups(
             )
         })?;
 
-    let desc = ctx
-        .storage
-        .describe_continuous_backups(&ctx.account_id, table_name)
-        .await
-        .map_err(storage_err_to_dynamo)?;
+    require_table_exists(ctx, table_name).await?;
 
-    serialize_output(&json!({ "ContinuousBackupsDescription": desc }))
+    serialize_output(
+        &json!({ "ContinuousBackupsDescription": disabled_continuous_backups_description() }),
+    )
 }
 
 /// Handle `UpdateContinuousBackups`.
+///
+/// Enabling point-in-time recovery is refused with
+/// `ContinuousBackupsUnavailableException`, because no storage backend
+/// implements it and reporting it as enabled would promise a restore that can
+/// never happen. Disabling it is a no-op that returns the description already
+/// reported by `DescribeContinuousBackups`.
 pub(crate) async fn handle_update_continuous_backups(
     body: Value,
     ctx: &OperationContext,
@@ -237,32 +315,68 @@ pub(crate) async fn handle_update_continuous_backups(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    let desc = ctx
-        .storage
-        .update_continuous_backups(&ctx.account_id, table_name, pitr_enabled)
-        .await
-        .map_err(storage_err_to_dynamo)?;
+    require_table_exists(ctx, table_name).await?;
 
-    serialize_output(&json!({ "ContinuousBackupsDescription": desc }))
+    if pitr_enabled {
+        return Err(pitr_unsupported_error());
+    }
+
+    serialize_output(
+        &json!({ "ContinuousBackupsDescription": disabled_continuous_backups_description() }),
+    )
 }
 
 /// Handle `RestoreTableToPointInTime`.
 ///
-/// Point-in-time recovery is not yet implemented. The previous implementation
-/// faked a restore by snapshotting the current table state (ignoring
-/// `RestoreDateTime`), which violates tenet 1 (fidelity over features).
-/// Until real PITR is implemented, return an error.
+/// Point-in-time recovery is not supported by any storage backend. The source
+/// table is resolved first, so a missing table reports `TableNotFoundException`
+/// exactly as the live service does; an existing table is refused with
+/// `PointInTimeRecoveryUnavailableException`, the exception the service models
+/// on this operation (`ContinuousBackupsUnavailableException` belongs to
+/// `UpdateContinuousBackups`). A previous implementation faked a restore by
+/// snapshotting the current table state and ignoring `RestoreDateTime`, which
+/// violates tenet 1 (fidelity over features): a restore that silently returns
+/// the wrong data is worse than a refusal the caller can act on.
 pub(crate) async fn handle_restore_table_to_point_in_time(
-    _body: Value,
-    _ctx: &OperationContext,
+    body: Value,
+    ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
-    // TODO(fidelity): Implement real PITR using PostgreSQL temporal/history
-    // table approach — item_history table capturing every mutation, DISTINCT ON
-    // query to reconstruct state at time T, 35-day retention via background
-    // pruning.
-    Err(DynamoDbError::ValidationException(
-        "Point-in-time recovery restore is not yet supported".to_owned(),
-    ))
+    let source_table_name = body
+        .get("SourceTableName")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            DynamoDbError::ValidationException(
+                "1 validation error detected: Value null at 'sourceTableName' \
+                 failed to satisfy constraint: Member must not be null"
+                    .to_owned(),
+            )
+        })?;
+
+    // The live service resolves the source table before the recovery check, so
+    // a missing table reports TableNotFoundException rather than the
+    // unavailability error. describe_table rather than table_key_info, so
+    // tables in any lifecycle status resolve.
+    if let Err(e) = ctx
+        .storage
+        .describe_table(
+            &ctx.account_id,
+            extenddb_core::types::DescribeTableInput {
+                table_name: source_table_name.to_owned(),
+            },
+        )
+        .await
+    {
+        return Err(match e {
+            extenddb_storage::error::StorageError::TableNotFound(_) => {
+                DynamoDbError::TableNotFoundException(format!(
+                    "Table not found: {source_table_name}"
+                ))
+            }
+            other => storage_err_to_dynamo(other),
+        });
+    }
+
+    Err(pitr_restore_unavailable_error(source_table_name))
 }
 
 /// Convert storage errors to `DynamoDB` errors.
@@ -301,7 +415,10 @@ fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> DynamoDbEr
 
 #[cfg(test)]
 mod tests {
-    use super::{backup_arn_field, storage_err_to_dynamo};
+    use super::{
+        backup_arn_field, disabled_continuous_backups_description, pitr_restore_unavailable_error,
+        pitr_unsupported_error, storage_err_to_dynamo,
+    };
     use extenddb_core::error::DynamoDbError;
     use extenddb_storage::error::StorageError;
     use serde_json::json;
@@ -389,5 +506,61 @@ mod tests {
         // A shorter account id that is a prefix of the caller's must not pass.
         let body = json!({ "BackupArn": arn("12345678901") });
         assert!(backup_arn_field(&body, ACCOUNT).is_err());
+    }
+
+    /// The description reports continuous backups ENABLED (the service reports
+    /// this unconditionally) with point-in-time recovery DISABLED, and omits
+    /// both restorable-time fields on the wire: a disabled recovery has no
+    /// window, so serializing the members as null would diverge from the
+    /// service, which drops them entirely.
+    #[test]
+    fn the_continuous_backups_description_is_enabled_with_recovery_disabled() {
+        let desc = disabled_continuous_backups_description();
+        let wire = serde_json::to_value(&desc).expect("serializes");
+        assert_eq!(wire["ContinuousBackupsStatus"], "ENABLED");
+        let pitr = &wire["PointInTimeRecoveryDescription"];
+        assert_eq!(pitr["PointInTimeRecoveryStatus"], "DISABLED");
+        assert!(
+            pitr.get("EarliestRestorableDateTime").is_none(),
+            "a disabled recovery must not report an earliest restorable time"
+        );
+        assert!(
+            pitr.get("LatestRestorableDateTime").is_none(),
+            "a disabled recovery must not report a latest restorable time"
+        );
+    }
+
+    /// The enable refusal is the typed exception the service models on
+    /// `UpdateContinuousBackups`, on HTTP 400, under the standard `DynamoDB`
+    /// wire prefix, with a message naming the reason.
+    #[test]
+    fn the_enable_refusal_is_the_typed_continuous_backups_exception() {
+        let err = pitr_unsupported_error();
+        assert_eq!(err.status_code(), 400);
+        assert_eq!(
+            err.full_error_type(),
+            "com.amazonaws.dynamodb.v20120810#ContinuousBackupsUnavailableException"
+        );
+        assert_eq!(
+            err.message(),
+            "Point-in-time recovery is not supported by this storage backend"
+        );
+    }
+
+    /// The restore refusal is the typed exception the service models on
+    /// `RestoreTableToPointInTime`, distinct from the enable refusal, with a
+    /// message following the live service's shape.
+    #[test]
+    fn the_restore_refusal_is_the_typed_point_in_time_recovery_exception() {
+        let err = pitr_restore_unavailable_error("Music");
+        assert_eq!(err.status_code(), 400);
+        assert_eq!(
+            err.full_error_type(),
+            "com.amazonaws.dynamodb.v20120810#PointInTimeRecoveryUnavailableException"
+        );
+        assert_eq!(
+            err.message(),
+            "Point in time recovery is not enabled for table 'Music'"
+        );
     }
 }

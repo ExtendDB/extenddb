@@ -70,6 +70,27 @@ pub enum DynamoDbError {
     /// Returned when a shard iterator has expired (older than 15 minutes).
     #[error("{0}")]
     ExpiredIteratorException(String),
+    /// SP-ERR-002: HTTP 400. Returned when continuous backups (point-in-time
+    /// recovery) cannot be enabled. The service models this exception on
+    /// `UpdateContinuousBackups`; ExtendDB returns it there for
+    /// `PointInTimeRecoveryEnabled: true`, because no storage backend
+    /// implements point-in-time recovery.
+    #[error("{0}")]
+    ContinuousBackupsUnavailableException(String),
+    /// SP-ERR-002: HTTP 400. Returned by `RestoreTableToPointInTime` when
+    /// point-in-time recovery is not enabled for the source table, which in
+    /// ExtendDB is always: no storage backend implements point-in-time
+    /// recovery. The service models this exception on the restore operation,
+    /// distinct from `ContinuousBackupsUnavailableException`, which it models
+    /// on `UpdateContinuousBackups`.
+    #[error("{0}")]
+    PointInTimeRecoveryUnavailableException(String),
+    /// SP-ERR-002: HTTP 400. Backup-family table-not-found, distinct from
+    /// `ResourceNotFoundException`. Returned by `RestoreTableToPointInTime`
+    /// for a source table that does not exist in the caller's account,
+    /// matching the live service.
+    #[error("{0}")]
+    TableNotFoundException(String),
     #[error("{0}")]
     ServiceUnavailable(String),
     /// SP-ERR-002: Concurrent modification of the same item in a transaction.
@@ -123,6 +144,9 @@ impl DynamoDbError {
             | Self::AccessDeniedException(_)
             | Self::ExpiredTokenException(_)
             | Self::ExpiredIteratorException(_)
+            | Self::ContinuousBackupsUnavailableException(_)
+            | Self::PointInTimeRecoveryUnavailableException(_)
+            | Self::TableNotFoundException(_)
             | Self::TransactionConflictException(_)
             | Self::ProvisionedThroughputExceededException(_)
             | Self::ThrottlingException(_)
@@ -169,6 +193,13 @@ impl DynamoDbError {
             Self::UnrecognizedClientException(_) => "UnrecognizedClientException",
             Self::ExpiredTokenException(_) => "ExpiredTokenException",
             Self::ExpiredIteratorException(_) => "ExpiredIteratorException",
+            Self::ContinuousBackupsUnavailableException(_) => {
+                "ContinuousBackupsUnavailableException"
+            }
+            Self::PointInTimeRecoveryUnavailableException(_) => {
+                "PointInTimeRecoveryUnavailableException"
+            }
+            Self::TableNotFoundException(_) => "TableNotFoundException",
             Self::ServiceUnavailable(_) => "ServiceUnavailable",
             Self::TransactionConflictException(_) => "TransactionConflictException",
             Self::ProvisionedThroughputExceededException(_) => {
@@ -234,6 +265,9 @@ impl DynamoDbError {
             | Self::UnrecognizedClientException(m)
             | Self::ExpiredTokenException(m)
             | Self::ExpiredIteratorException(m)
+            | Self::ContinuousBackupsUnavailableException(m)
+            | Self::PointInTimeRecoveryUnavailableException(m)
+            | Self::TableNotFoundException(m)
             | Self::ServiceUnavailable(m)
             | Self::TransactionConflictException(m)
             | Self::ProvisionedThroughputExceededException(m)
@@ -343,6 +377,15 @@ mod tests {
             (DynamoDbError::ValidationException(String::new()), 400),
             (DynamoDbError::ExpiredTokenException(String::new()), 400),
             (DynamoDbError::ExpiredIteratorException(String::new()), 400),
+            (
+                DynamoDbError::ContinuousBackupsUnavailableException(String::new()),
+                400,
+            ),
+            (
+                DynamoDbError::PointInTimeRecoveryUnavailableException(String::new()),
+                400,
+            ),
+            (DynamoDbError::TableNotFoundException(String::new()), 400),
             (DynamoDbError::InvalidSignatureException(String::new()), 400),
         ];
         for (err, expected) in cases {

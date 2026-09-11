@@ -16,7 +16,17 @@ pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
         "002_vector_indexes.sql",
         include_str!("../../storage-postgres/migrations/002_vector_indexes.sql"),
     ),
+    (
+        "003_drop_continuous_backups.sql",
+        include_str!("../../storage-postgres/migrations/003_drop_continuous_backups.sql"),
+    ),
 ];
+
+/// The runner's convergence write, executed after the walk over
+/// [`CATALOG_MIGRATIONS`]. Same statement shape as the files' own in-file
+/// writes, parameterized on the compiled version.
+pub(crate) const SET_CATALOG_VERSION_SQL: &str =
+    "UPDATE settings SET value = $1 WHERE key = 'catalog_version'";
 
 /// Run catalog migrations, skipping already-applied ones.
 pub(crate) async fn run_catalog_migrations(pool: &PgPool) -> OpResult<()> {
@@ -41,6 +51,20 @@ pub(crate) async fn run_catalog_migrations(pool: &PgPool) -> OpResult<()> {
         // another migration lands.
         record_migration(pool, filename).await?;
     }
+    // The runner owns the final version write. Each file still writes the
+    // version it introduces, but a replay can re-apply an EARLIER file while a
+    // later one stays recorded and skipped: the re-applied file's in-file write
+    // then leaves the stored version behind the schema actually present, the
+    // startup gate refuses the catalog, and a second migrate finds nothing
+    // unrecorded and writes nothing, stranding the deployment. Converging on
+    // the compiled version after every completed walk closes that gap. The
+    // in-file writes stay until #221 moves version ownership into the runner
+    // entirely.
+    sqlx::query(SET_CATALOG_VERSION_SQL)
+        .bind(crate::CATALOG_VERSION.to_string())
+        .execute(pool)
+        .await
+        .map_err(|e| OpError::Internal(format!("Write catalog_version: {e}")))?;
     println!("    Migrations applied.");
     Ok(())
 }
@@ -311,10 +335,10 @@ mod tests {
     fn the_migration_count_and_the_catalog_version_agree() {
         assert_eq!(
             CATALOG_MIGRATIONS.len(),
-            2,
+            3,
             "a catalog migration was added or removed; update CATALOG_VERSION and this count"
         );
-        assert_eq!(CATALOG_VERSION.to_string(), "0.0.3");
+        assert_eq!(CATALOG_VERSION.to_string(), "0.0.4");
     }
 
     /// The version the binary expects must be the version the schema writes.
@@ -333,6 +357,19 @@ mod tests {
             sql.contains("catalog_version") && sql.contains(&expected),
             "{filename} must set catalog_version to {expected}"
         );
+    }
+
+    /// The convergence write must target the cell the startup gate reads.
+    ///
+    /// The runner converges the stored version on the compiled constant after
+    /// every walk, so a replay of an earlier file cannot leave the version
+    /// behind the schema actually present. That only holds while this statement
+    /// writes the same settings row the files write and the gate reads, so the
+    /// statement text is pinned against a rename of the key or the table.
+    #[test]
+    fn the_runner_convergence_write_targets_the_catalog_version_cell() {
+        assert!(super::SET_CATALOG_VERSION_SQL.starts_with("UPDATE settings"));
+        assert!(super::SET_CATALOG_VERSION_SQL.contains("key = 'catalog_version'"));
     }
 
     /// Each migration is registered under the filename it is stored as.
