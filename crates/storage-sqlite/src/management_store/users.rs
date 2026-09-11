@@ -18,6 +18,9 @@ impl SqliteCatalogStore {
     ) -> OpResult<()> {
         let user_arn = format!("arn:aws:iam::{account_id}:user/{user_name}");
 
+        // D1: every writer holds the write lock, acquired before the
+        // transaction begins so the lock never waits on a pool connection.
+        let _writer = self.lock_writes().await;
         let mut tx = self
             .pool()
             .begin_with("BEGIN IMMEDIATE")
@@ -89,6 +92,8 @@ impl SqliteCatalogStore {
     }
 
     pub(crate) async fn delete_user_impl(&self, account_id: &str, user_name: &str) -> OpResult<()> {
+        // D1: every writer holds the write lock.
+        let _writer = self.lock_writes().await;
         let result = sqlx::query("DELETE FROM iam_users WHERE account_id = ? AND user_name = ?")
             .bind(account_id)
             .bind(user_name)
@@ -232,6 +237,8 @@ impl SqliteCatalogStore {
         user_name: &str,
         password_hash: &str,
     ) -> OpResult<()> {
+        // D1: every writer holds the write lock.
+        let _writer = self.lock_writes().await;
         let result = sqlx::query(
             "UPDATE iam_users SET password_hash = ? WHERE account_id = ? AND user_name = ?",
         )
@@ -256,6 +263,9 @@ impl SqliteCatalogStore {
         user_name: &str,
         tags: &[(String, String)],
     ) -> OpResult<()> {
+        // D1: every writer holds the write lock, acquired before the
+        // transaction begins.
+        let _writer = self.lock_writes().await;
         let mut tx = self
             .pool()
             .begin_with("BEGIN IMMEDIATE")
@@ -294,6 +304,9 @@ impl SqliteCatalogStore {
         user_name: &str,
         tag_keys: &[String],
     ) -> OpResult<()> {
+        // D1: every writer holds the write lock, acquired before the
+        // transaction begins.
+        let _writer = self.lock_writes().await;
         let mut tx = self
             .pool()
             .begin_with("BEGIN IMMEDIATE")
