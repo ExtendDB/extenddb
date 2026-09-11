@@ -133,6 +133,9 @@ async fn ttl_inflight_repair_count(
 
 #[tokio::test]
 async fn test_ttl_metadata_enable_disable_and_listing() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use extenddb_core::types::{AttributeValue, TimeToLiveStatus};
 
     use extenddb_storage::DataEngine;
@@ -320,6 +323,9 @@ async fn test_ttl_metadata_enable_disable_and_listing() {
 
 #[tokio::test]
 async fn test_ttl_queue_sweep_and_stale_candidate_protection() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use std::sync::Arc;
 
     use extenddb_core::metrics::MetricsCollector;
@@ -451,6 +457,9 @@ async fn test_ttl_queue_sweep_and_stale_candidate_protection() {
 
 #[tokio::test]
 async fn test_ttl_sweep_emits_service_remove_stream_record() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use std::sync::Arc;
 
     use cdrs_tokio::types::IntoRustByName;
@@ -622,6 +631,9 @@ async fn test_ttl_sweep_emits_service_remove_stream_record() {
 
 #[tokio::test]
 async fn test_transactional_write_reconciles_ttl_queue() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use extenddb_core::expression::ExpressionMaps;
     use extenddb_core::metrics::MetricsCollector;
     use extenddb_core::types::{AttributeValue, Item, ReturnValuesOnConditionCheckFailure};
@@ -698,6 +710,9 @@ async fn test_transactional_write_reconciles_ttl_queue() {
 
 #[tokio::test]
 async fn test_ttl_claim_serializes_delayed_writer() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use extenddb_core::types::{AttributeValue, Item};
     use extenddb_storage::DataEngine;
     use extenddb_storage::error::StorageError;
@@ -852,6 +867,9 @@ async fn test_ttl_claim_serializes_delayed_writer() {
 /// against a freshly read image rather than surfaced.
 #[tokio::test]
 async fn test_concurrent_ordinary_writes_on_ttl_table_both_succeed() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use extenddb_core::types::{AttributeValue, Item};
     use extenddb_storage::DataEngine;
 
@@ -1159,6 +1177,9 @@ async fn ttl_table_with_expired_item(
 /// the deletion rather than completing it.
 #[tokio::test]
 async fn test_disable_drains_claimed_work_and_releases_its_claim() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use extenddb_storage::DataEngine;
 
     let engine = setup_engine().await;
@@ -1222,6 +1243,9 @@ async fn test_disable_drains_claimed_work_and_releases_its_claim() {
 /// treating it like `CLAIMED` would permit a crash-after-effects inconsistency.
 #[tokio::test]
 async fn test_disable_completes_effects_applying_work() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use extenddb_storage::DataEngine;
 
     let engine = setup_engine().await;
@@ -1272,6 +1296,9 @@ async fn test_disable_completes_effects_applying_work() {
 /// random page could starve markers indefinitely.
 #[tokio::test]
 async fn test_inflight_marker_traversal_covers_beyond_one_page() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     let engine = setup_engine().await;
     let table = crate::helpers::TestTable::new(&engine, "TtlMarkerTraversal", false).await;
     activate_tables(&engine).await;
@@ -1362,6 +1389,9 @@ async fn test_inflight_marker_traversal_covers_beyond_one_page() {
 /// records behind it: the pass pages past the failing prefix within one cycle.
 #[tokio::test]
 async fn test_outbox_pages_past_poison_prefix() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use extenddb_core::types::{AttributeValue, Item};
     use extenddb_storage::DataEngine;
 
@@ -1504,6 +1534,9 @@ fn crc32fast_hash(value: &str) -> u32 {
 /// row out from under it.
 #[tokio::test]
 async fn test_audit_restores_lost_queue_registration() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use extenddb_core::metrics::MetricsCollector;
     use extenddb_core::types::{AttributeValue, Item};
     use extenddb_storage::DataEngine;
@@ -1674,6 +1707,9 @@ async fn test_audit_restores_lost_queue_registration() {
 /// an LWT payload. The survivor path then completes recovery.
 #[tokio::test]
 async fn test_version_fence_refuses_changed_image() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use extenddb_core::metrics::MetricsCollector;
     use extenddb_core::types::{AttributeValue, Item};
     use extenddb_storage::DataEngine;
@@ -1880,6 +1916,9 @@ async fn test_version_fence_refuses_changed_image() {
 /// generation) make TTL permanently un-enableable on the table.
 #[tokio::test]
 async fn test_effects_applying_with_changed_image_completes_not_wedges() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use extenddb_core::metrics::MetricsCollector;
     use extenddb_core::types::{AttributeValue, Item};
     use extenddb_storage::DataEngine;
@@ -1989,6 +2028,9 @@ async fn test_effects_applying_with_changed_image_completes_not_wedges() {
 /// live item is left invisible to its own index.
 #[tokio::test]
 async fn test_effects_applying_recovery_restores_shared_key_gsi_row() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, PathElement};
     use extenddb_core::metrics::MetricsCollector;
     use extenddb_core::types::AttributeValue;
@@ -2170,6 +2212,9 @@ async fn test_effects_applying_recovery_restores_shared_key_gsi_row() {
 /// delete instead.
 #[tokio::test]
 async fn test_disable_completes_effects_applied_work() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use extenddb_storage::DataEngine;
 
     let engine = setup_engine().await;
@@ -2222,6 +2267,9 @@ async fn test_disable_completes_effects_applied_work() {
 /// the age of the table.
 #[tokio::test]
 async fn test_drained_past_bucket_registration_is_retired() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use extenddb_core::metrics::MetricsCollector;
 
     let engine = setup_engine().await;
@@ -2274,6 +2322,9 @@ async fn test_drained_past_bucket_registration_is_retired() {
 
 #[tokio::test]
 async fn test_ttl_sweep_removes_synchronous_gsi_entry() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, PathElement};
     use extenddb_core::metrics::MetricsCollector;
     use extenddb_core::types::AttributeValue;
@@ -2388,6 +2439,9 @@ async fn test_ttl_sweep_removes_synchronous_gsi_entry() {
 
 #[tokio::test]
 async fn test_ttl_enable_rejects_asynchronous_gsi() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use extenddb_storage::error::StorageError;
 
     let engine = setup_engine().await;
@@ -2422,6 +2476,9 @@ async fn test_ttl_enable_rejects_asynchronous_gsi() {
 
 #[tokio::test]
 async fn test_ttl_reconciles_same_expiry_after_queue_only_claim() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use cdrs_tokio::types::IntoRustByName;
     use extenddb_core::metrics::MetricsCollector;
     use extenddb_core::types::{AttributeValue, Item};
@@ -2689,6 +2746,9 @@ async fn test_ttl_reconciles_same_expiry_after_queue_only_claim() {
 
 #[tokio::test]
 async fn test_ttl_update_recreates_logically_absent_item() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use extenddb_core::expression::{Expr, ExpressionMaps, PathElement, UpdateAction};
     use extenddb_core::types::{AttributeValue, Item};
     use extenddb_storage::DataEngine;
@@ -2815,6 +2875,9 @@ async fn test_ttl_update_recreates_logically_absent_item() {
 
 #[tokio::test]
 async fn test_conditional_put_recreates_metadata_only_row() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use extenddb_core::expression::{Expr, PathElement};
     use extenddb_core::types::{AttributeValue, Item};
     use extenddb_storage::DataEngine;
@@ -2889,6 +2952,9 @@ async fn test_conditional_put_recreates_metadata_only_row() {
 
 #[tokio::test]
 async fn test_outbox_restores_bucket_for_existing_pending_row() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use cdrs_tokio::types::IntoRustByName;
     use extenddb_core::types::{AttributeValue, Item};
     use extenddb_storage::DataEngine;
@@ -3023,6 +3089,9 @@ async fn test_outbox_restores_bucket_for_existing_pending_row() {
 
 #[tokio::test]
 async fn test_inflight_repair_repeats_after_late_queue_destroy() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use cdrs_tokio::types::IntoRustByName;
     use extenddb_core::types::{AttributeValue, Item};
     use extenddb_storage::DataEngine;
@@ -3235,6 +3304,9 @@ async fn test_inflight_repair_repeats_after_late_queue_destroy() {
 
 #[tokio::test]
 async fn test_outbox_limit_is_fair_across_partitions() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     let engine = setup_engine().await;
     let table = crate::helpers::TestTable::new(&engine, "TtlOutboxFairness", false).await;
     activate_tables(&engine).await;
@@ -3290,6 +3362,9 @@ async fn test_outbox_limit_is_fair_across_partitions() {
 
 #[tokio::test]
 async fn test_non_ttl_put_does_not_enqueue_ttl_reconciliation() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use extenddb_core::types::{AttributeValue, Item};
     use extenddb_storage::DataEngine;
 
@@ -3318,6 +3393,9 @@ async fn test_non_ttl_put_does_not_enqueue_ttl_reconciliation() {
 
 #[tokio::test]
 async fn test_ttl_enabled_table_rejects_new_async_gsi() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     use extenddb_core::types::{
         AttributeDefinition, CreateGsiAction, GlobalSecondaryIndexUpdate, KeySchemaElement,
         KeyType, Projection, ProjectionType, ScalarAttributeType, UpdateTableInput,
