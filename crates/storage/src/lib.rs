@@ -522,6 +522,7 @@ pub trait MetadataEngine: Send + Sync {
         &self,
         account_id: &str,
         table_name: &str,
+        ttl_attribute: &str,
     ) -> BoxFuture<'_, Result<(), StorageError>>;
 
     /// Find expired items using the TTL index (ordered scan with LIMIT).

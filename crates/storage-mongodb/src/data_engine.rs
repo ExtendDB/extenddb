@@ -35,6 +35,21 @@ use crate::pushdown::{Pushable, is_pushable};
 
 use extenddb_core::types::{Projection, ProjectionType};
 
+/// Resolve a single-component update path for the native MongoDB fast path.
+/// Literal attribute names containing dots or beginning with `$` cannot be
+/// represented safely by MongoDB's ordinary update paths, so they must use
+/// the Rust/session path.
+fn native_attribute_name(path: &[PathElement], maps: &ExpressionMaps) -> Option<String> {
+    if path.len() != 1 {
+        return None;
+    }
+    let PathElement::Attribute(raw_name) = &path[0] else {
+        return None;
+    };
+    let attr_name = resolve_name_ref(raw_name, maps).ok()?;
+    (!attr_name.contains('.') && !attr_name.starts_with('$')).then(|| attr_name.into_owned())
+}
+
 #[derive(Clone, Copy)]
 enum TransactionKind {
     ReadOnly,
@@ -1598,11 +1613,7 @@ impl MongoEngine {
                     if path.len() != 1 {
                         return None;
                     }
-                    let raw_name = match &path[0] {
-                        PathElement::Attribute(name) => name,
-                        _ => return None,
-                    };
-                    let attr_name = resolve_name_ref(raw_name, maps).ok()?.into_owned();
+                    let attr_name = native_attribute_name(path, maps)?;
                     let val = match value {
                         Expr::Placeholder(name) => maps.resolve_value(name).ok()?,
                         _ => return None,
@@ -1632,11 +1643,7 @@ impl MongoEngine {
                     if path.len() != 1 {
                         return None;
                     }
-                    let raw_name = match &path[0] {
-                        PathElement::Attribute(name) => name,
-                        _ => return None,
-                    };
-                    let attr_name = resolve_name_ref(raw_name, maps).ok()?;
+                    let attr_name = native_attribute_name(path, maps)?;
                     let val = match value {
                         Expr::Placeholder(name) => maps.resolve_value(name).ok()?,
                         _ => return None, // complex expressions (if_not_exists, list_append, arithmetic)
@@ -1650,11 +1657,7 @@ impl MongoEngine {
                     if path.len() != 1 {
                         return None;
                     }
-                    let raw_name = match &path[0] {
-                        PathElement::Attribute(name) => name,
-                        _ => return None,
-                    };
-                    let attr_name = resolve_name_ref(raw_name, maps).ok()?;
+                    let attr_name = native_attribute_name(path, maps)?;
                     let field = format!("item_data.{attr_name}");
                     unset_doc.insert(field, 1);
                 }
@@ -4114,5 +4117,36 @@ transaction_read_concern = "majority""#,
         assert_eq!(lo, "ff");
         assert_eq!(hi.as_deref(), Some("fg"));
         assert!("ffab" < hi.as_deref().unwrap(), "0xFFAB must be included");
+    }
+
+    #[test]
+    fn native_update_rejects_dotted_literal_attribute_names() {
+        let mut names = std::collections::HashMap::new();
+        names.insert("name".to_owned(), "a.b".to_owned());
+        let maps = ExpressionMaps::new(names, std::collections::HashMap::new());
+        let path = vec![PathElement::Attribute("#name".to_owned())];
+
+        assert_eq!(native_attribute_name(&path, &maps), None);
+    }
+
+    #[test]
+    fn native_update_rejects_dollar_prefixed_literal_attribute_names() {
+        let mut names = std::collections::HashMap::new();
+        names.insert("name".to_owned(), "$foo".to_owned());
+        let maps = ExpressionMaps::new(names, std::collections::HashMap::new());
+        let path = vec![PathElement::Attribute("#name".to_owned())];
+
+        assert_eq!(native_attribute_name(&path, &maps), None);
+    }
+
+    #[test]
+    fn native_update_keeps_simple_attribute_names_on_fast_path() {
+        let maps = ExpressionMaps::new(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        );
+        let path = vec![PathElement::Attribute("name".to_owned())];
+
+        assert_eq!(native_attribute_name(&path, &maps), Some("name".to_owned()));
     }
 }

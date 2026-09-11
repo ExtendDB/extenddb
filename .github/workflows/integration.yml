@@ -283,11 +283,11 @@ jobs:
           EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
         run: cargo test --release -p extenddb-storage-postgres --test vector_control_plane
 
-      # The daemonized server logs to syslog; dump it so server-side failures
+       # The daemonized server logs to syslog; dump it so server-side failures
       # are diagnosable from the job log.
       - name: Dump server syslog on failure
         if: failure()
-        run: sudo journalctl -t extenddb --no-pager -n 500 || true
+       run: sudo journalctl -t extenddb --no-pager -n 500 || true
 
   # The runtime-detection proof: the same binary, against a PostgreSQL with no
   # pgvector, must refuse vector indexes over the wire. Today the job above runs
@@ -357,11 +357,11 @@ jobs:
           devtools/run-tests --extenddb --rust-integration --release
           --filter vector_index_unsupported
 
-      # The daemonized server logs to syslog; dump it so server-side failures
+       # The daemonized server logs to syslog; dump it so server-side failures
       # are diagnosable from the job log.
       - name: Dump server syslog on failure
         if: failure()
-        run: sudo journalctl -t extenddb --no-pager -n 500 || true
+       run: sudo journalctl -t extenddb --no-pager -n 500 || true
 
       # No storage-level step here on purpose. Those tests build their own
       # extension-free scratch databases, so they behave identically on either
