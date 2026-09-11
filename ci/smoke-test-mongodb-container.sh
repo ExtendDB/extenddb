@@ -63,6 +63,24 @@ compose() {
     "${COMPOSE[@]}" -f "$COMPOSE_FILE" -p "$PROJECT" "$@"
 }
 
+compose_pull_with_retry() {
+    local max_attempts=4
+    local attempt
+
+    for attempt in $(seq 1 "$max_attempts"); do
+        if compose pull "$@"; then
+            return 0
+        fi
+        if (( attempt == max_attempts )); then
+            echo "error: Compose pull failed after $max_attempts attempts" >&2
+            return 1
+        fi
+        local delay=$((5 << (attempt - 1)))
+        echo "warning: Compose pull failed; retrying in ${delay}s (attempt $((attempt + 1))/$max_attempts)" >&2
+        sleep "$delay"
+    done
+}
+
 wait_for_health() {
     local container_id="$1"
     local status=""
@@ -89,6 +107,7 @@ host_port() {
 echo "=== Building and starting MongoDB container stack ==="
 echo "  project: $PROJECT"
 echo "  image:   $EXTENDDB_MONGODB_IMAGE"
+compose_pull_with_retry mongodb mongodb-rs-init
 if [[ "$PREBUILT_IMAGE" == true ]]; then
     compose up -d --no-build
 else
