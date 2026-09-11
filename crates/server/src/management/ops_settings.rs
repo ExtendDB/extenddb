@@ -83,18 +83,33 @@ fn validate_backfill_test_gate(value: &str) -> Result<(), &'static str> {
 }
 
 #[cfg(feature = "mongodb-test-hooks")]
-fn is_table_scoped_backfill_gate_key(key: &str) -> bool {
-    let Some(table_name) = key
-        .strip_prefix(extenddb_core::settings_keys::GSI_BACKFILL_TEST_GATE)
-        .and_then(|suffix| suffix.strip_prefix(':'))
-    else {
-        return false;
-    };
+fn validate_unknown_commit_test_gate(value: &str) -> Result<(), &'static str> {
+    match value {
+        "armed" | "idle" => Ok(()),
+        _ => Err("must be one of: armed, idle"),
+    }
+}
 
-    !table_name.is_empty()
+#[cfg(feature = "mongodb-test-hooks")]
+fn table_scoped_gate_table_name<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
+    let table_name = key.strip_prefix(prefix)?.strip_prefix(':')?;
+    let valid = !table_name.is_empty()
         && table_name
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    valid.then_some(table_name)
+}
+
+#[cfg(feature = "mongodb-test-hooks")]
+fn is_table_scoped_backfill_gate_key(key: &str) -> bool {
+    table_scoped_gate_table_name(key, extenddb_core::settings_keys::GSI_BACKFILL_TEST_GATE)
+        .is_some()
+}
+
+#[cfg(feature = "mongodb-test-hooks")]
+fn is_table_scoped_unknown_commit_gate_key(key: &str) -> bool {
+    table_scoped_gate_table_name(key, extenddb_core::settings_keys::UNKNOWN_COMMIT_TEST_GATE)
+        .is_some()
 }
 
 fn validate_bool(value: &str) -> Result<(), &'static str> {
@@ -144,9 +159,15 @@ pub async fn set_setting(
         .find(|(k, _)| *k == key)
         .map(|(_, validator)| *validator);
     #[cfg(feature = "mongodb-test-hooks")]
-    let known = known.or_else(|| {
-        is_table_scoped_backfill_gate_key(key).then_some(validate_backfill_test_gate as Validator)
-    });
+    let known = known
+        .or_else(|| {
+            is_table_scoped_backfill_gate_key(key)
+                .then_some(validate_backfill_test_gate as Validator)
+        })
+        .or_else(|| {
+            is_table_scoped_unknown_commit_gate_key(key)
+                .then_some(validate_unknown_commit_test_gate as Validator)
+        });
 
     if let Some(validator) = known {
         validator(value).map_err(|reason| {
