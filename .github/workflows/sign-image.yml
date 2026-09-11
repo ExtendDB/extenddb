@@ -36,6 +36,7 @@ on:
           # itself is slated to be phased out for keyless workflow-identity
           # signing, which distinguishes tiers automatically.
           - extenddb-postgres
+          - extenddb-mongodb
           - extenddb-dev
         default: extenddb-postgres
       reason:
@@ -79,7 +80,7 @@ jobs:
         run: |
           set -euo pipefail
           case "$RAW_IMAGE" in
-            extenddb-postgres|extenddb-dev) ;;
+            extenddb-postgres|extenddb-mongodb|extenddb-dev) ;;
             *) echo "::error::image '$RAW_IMAGE' is not in the allowlist"; exit 1 ;;
           esac
           if [[ ! "$RAW_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then

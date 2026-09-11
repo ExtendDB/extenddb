@@ -4,8 +4,9 @@
 # PR-time license notices freshness check.
 #
 # SOFTWARE-LICENSE-NOTICES.html embeds the version of every workspace crate,
-# so it goes stale on any version bump or dependency change. Until now the
-# only check lived in release-image's gate, so a PR could merge fully green
+# so it goes stale on any version bump or dependency change. Each production
+# backend has its own manifest because its feature set has its own dependency
+# closure. Until now the only check lived in release-image's gate, so a PR could merge fully green
 # while leaving main unreleasable — exactly what happened with the 0.1.6
 # bump (#271, fixed by #272). This runs the SAME script with the SAME pinned
 # cargo-about (the script refuses any other version), so PR-time and
@@ -22,6 +23,7 @@ on:
       - '**/Cargo.toml'
       - 'Cargo.lock'
       - 'SOFTWARE-LICENSE-NOTICES.html'
+      - 'SOFTWARE-LICENSE-NOTICES-MONGODB.html'
       - 'SOFTWARE-LICENSE-NOTICES-DEV.html'
       - 'about.toml'
       - 'about.hbs'
@@ -35,6 +37,7 @@ on:
       - '**/Cargo.toml'
       - 'Cargo.lock'
       - 'SOFTWARE-LICENSE-NOTICES.html'
+      - 'SOFTWARE-LICENSE-NOTICES-MONGODB.html'
       - 'SOFTWARE-LICENSE-NOTICES-DEV.html'
       - 'about.toml'
       - 'about.hbs'
@@ -65,6 +68,8 @@ jobs:
         run: cargo install --locked --version 0.9.0 --features cli cargo-about
       - name: Notices must be current
         run: ./devtools/generate-software-license-notices --check
+      - name: MongoDB notices must be current
+        run: ./devtools/generate-software-license-notices --check --backend mongodb
       - name: DEV notices must be current
         # The dev image ships SOFTWARE-LICENSE-NOTICES-DEV.html for its own
         # feature set (sqlite,dev-mode). Same incident class as #271/#272: a
