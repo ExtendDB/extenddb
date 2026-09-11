@@ -29,8 +29,11 @@ inputs:
     description: 'Release the digest belongs to (vX.Y.Z); caller must have validated it'
     required: true
   key-arn:
-    description: 'KMS key ARN'
-    required: true
+    description: 'KMS key ARN (empty skips the keyed leg — rehearsal use only; production always dual-signs)'
+    default: ''
+  keyless:
+    description: 'Also sign keyless: Fulcio certificate bound to this workflow run identity, Rekor logged. Requires id-token: write in the calling job. Additive — the keyed signature is unaffected.'
+    default: 'false'
   cosign-version:
     description: 'Pinned cosign version'
     default: v3.1.3
@@ -69,6 +72,7 @@ runs:
         cosign version
 
     - name: Sign - attached, legacy tag-based storage, Rekor transparency log
+      if: inputs.key-arn != ''
       shell: bash
       env:
         IMAGE_REPO: ${{ inputs.image-repo }}
@@ -93,6 +97,34 @@ runs:
           "${EXTRA_ARGS[@]}" \
           "${IMAGE_REPO}@${DIGEST}"
 
+    - name: Sign keyless - Fulcio workflow-identity certificate, Rekor logged
+      if: inputs.keyless == 'true'
+      shell: bash
+      env:
+        IMAGE_REPO: ${{ inputs.image-repo }}
+        DIGEST: ${{ inputs.digest }}
+        RELEASE: ${{ inputs.release-tag }}
+        EXTRA_ANNOTATION: ${{ inputs.extra-annotation }}
+      run: |
+        set -euo pipefail
+        # Keyless: cosign exchanges this job's OIDC token for a short-lived
+        # Fulcio certificate whose identity is THIS workflow run; Rekor logs
+        # it. Storage stays legacy tag-based (the mirror/promote gates and
+        # published verify docs depend on the .sig tag), so the keyless
+        # signature lands as an additional layer on the same tag as the
+        # keyed one. Flag set is validated by the keyless-rehearsal
+        # workflow on real runners before any production caller enables it.
+        EXTRA_ARGS=()
+        if [[ -n "$EXTRA_ANNOTATION" ]]; then
+          [[ "$EXTRA_ANNOTATION" =~ ^[a-zA-Z0-9._-]+=.+$ ]]             || { echo "::error::extra-annotation must be key=value"; exit 1; }
+          EXTRA_ARGS+=(-a "$EXTRA_ANNOTATION")
+        fi
+        cosign sign --yes           --new-bundle-format=false           -a org.extenddb.release="${RELEASE}"           ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}           "${IMAGE_REPO}@${DIGEST}"
+
+        # Self-check: the keyless signature must verify by identity — pinned
+        # to this repository's workflows and the GitHub OIDC issuer.
+        cosign verify           --certificate-identity-regexp '^https://github\.com/ExtendDB/extenddb/\.github/workflows/.+@refs/'           --certificate-oidc-issuer https://token.actions.githubusercontent.com           "${IMAGE_REPO}@${DIGEST}" >/dev/null
+
     - name: Gate - the .sig TAG must exist (catches the storage-mode trap)
       id: confirm
       shell: bash
@@ -109,6 +141,7 @@ runs:
         echo "sig-digest=$SIG_DIGEST" >> "$GITHUB_OUTPUT"
 
     - name: Verify the signature (includes the Rekor entry)
+      if: inputs.key-arn != ''
       shell: bash
       env:
         IMAGE_REPO: ${{ inputs.image-repo }}
