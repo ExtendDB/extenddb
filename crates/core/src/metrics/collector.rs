@@ -275,6 +275,22 @@ impl MetricsCollector {
         );
     }
 
+    /// Record a queue registration the TTL audit found missing and recreated.
+    pub fn record_ttl_audit_repair(&self, table_name: &str) {
+        self.record(
+            MetricName::TtlAuditRepairedEntryCount,
+            1.0,
+            Some(table_name),
+            None,
+            None,
+        );
+    }
+
+    /// Record the number of unresolved TTL destroy markers seen in one pass.
+    pub fn record_ttl_repair_markers(&self, count: f64) {
+        self.record(MetricName::TtlRepairMarkerCount, count, None, None, None);
+    }
+
     /// Record TTL deletion staleness (seconds past expiry).
     pub fn record_ttl_staleness(&self, table_name: &str, staleness_secs: f64) {
         self.record(

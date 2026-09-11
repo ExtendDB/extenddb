@@ -3,8 +3,8 @@
 
 //! Integration tests for Cassandra TTL against a live Cassandra.
 //!
-//! Requires Cassandra on 127.0.0.1:9042. There is no Cassandra CI workflow, so
-//! these are run locally.
+//! Requires Cassandra on 127.0.0.1:9042, provided in CI by the
+//! integration-cassandra workflow's service container.
 
 #[path = "common/mod.rs"]
 mod helpers;
@@ -747,12 +747,15 @@ async fn test_ttl_claim_serializes_delayed_writer() {
     let mut key = Item::new();
     key.insert("id".to_owned(), AttributeValue::S("race".to_owned()));
 
+    // The row IS versioned (the put wrote version 1); passing None here
+    // deliberately selects the item_data-fallback fence to keep the legacy
+    // path covered — the version path has its own test.
     let first_claim = engine
-        .acquire_ttl_mutation_claim(&table.key_info, &key, Some(&old))
+        .acquire_ttl_mutation_claim(&table.key_info, &key, Some(&old), None)
         .await
         .unwrap();
     let second_claim = engine
-        .acquire_ttl_mutation_claim(&table.key_info, &key, Some(&old))
+        .acquire_ttl_mutation_claim(&table.key_info, &key, Some(&old), None)
         .await;
     assert!(matches!(
         second_claim,
@@ -1491,6 +1494,380 @@ async fn test_outbox_pages_past_poison_prefix() {
 
 fn crc32fast_hash(value: &str) -> u32 {
     crc32fast::hash(value.as_bytes())
+}
+
+/// The audit is the last line of defense for the silent-non-expiration class:
+/// a queue registration lost through any path this design did not anticipate
+/// is permanent for an item that is never written again, because only writes
+/// and the enable backfill create registrations. The audit rescans the table
+/// and repairs exactly that — simulated here by deleting a live item's queue
+/// row out from under it.
+#[tokio::test]
+async fn test_audit_restores_lost_queue_registration() {
+    use extenddb_core::metrics::MetricsCollector;
+    use extenddb_core::types::{AttributeValue, Item};
+    use extenddb_storage::DataEngine;
+
+    let engine = setup_engine().await;
+    let table = crate::helpers::TestTable::new(&engine, "TtlAuditRepair", false).await;
+    activate_tables(&engine).await;
+    engine
+        .update_ttl(
+            &table.key_info.account_id,
+            &table.key_info.table_name,
+            "expires_at",
+            true,
+        )
+        .await
+        .unwrap();
+    engine
+        .create_ttl_index(
+            &table.key_info.account_id,
+            &table.key_info.table_name,
+            "expires_at",
+        )
+        .await
+        .unwrap();
+
+    let future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3_600;
+    let mut item = Item::new();
+    item.insert("id".to_owned(), AttributeValue::S("lost".to_owned()));
+    item.insert(
+        "expires_at".to_owned(),
+        AttributeValue::N(future.to_string()),
+    );
+    engine
+        .put_item(
+            &table.key_info,
+            item.clone(),
+            false,
+            None,
+            &Default::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    // Discharge the write's own outbox row first, so the audit is the only
+    // remaining mechanism that can notice the loss below.
+    extenddb_storage_cassandra::ttl_worker::reconcile_pending_older_than(&engine, 1_000, -60)
+        .await
+        .unwrap();
+
+    // Simulate an unanticipated loss path: the registration vanishes while
+    // the item lives on.
+    let keyspace = engine.account_keyspace(&table.key_info.account_id);
+    let generation = ttl_generation(
+        &engine,
+        &table.key_info.account_id,
+        &table.key_info.table_name,
+    )
+    .await;
+    // The queue's partition key is composite; enumerate registered partitions
+    // and delete each one.
+    let partitions = |engine: &extenddb_storage_cassandra::CassandraEngine| {
+        let keyspace = keyspace.clone();
+        let table_id = table.key_info.table_id.clone();
+        let session = engine.session_arc();
+        async move {
+            use cdrs_tokio::types::IntoRustByName;
+            session
+                .query_with_values(
+                    &format!(
+                        "SELECT generation, bucket, shard FROM {keyspace}.ttl_expiration_buckets \
+                         WHERE table_id = ?"
+                    ),
+                    cdrs_tokio::query_values!(table_id.as_str()),
+                )
+                .await
+                .unwrap()
+                .response_body()
+                .unwrap()
+                .into_rows()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|row| {
+                    let generation: uuid::Uuid = row.get_r_by_name("generation").unwrap();
+                    let bucket: i64 = row.get_r_by_name("bucket").unwrap();
+                    let shard: i32 = row.get_r_by_name("shard").unwrap();
+                    (generation, bucket, shard)
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    for (row_generation, bucket, shard) in partitions(&engine).await {
+        engine
+            .session_arc()
+            .query_with_values(
+                &format!(
+                    "DELETE FROM {keyspace}.ttl_expirations WHERE table_id = ? \
+                     AND generation = ? AND bucket = ? AND shard = ?"
+                ),
+                cdrs_tokio::query_values!(
+                    table.key_info.table_id.as_str(),
+                    row_generation,
+                    bucket,
+                    shard
+                ),
+            )
+            .await
+            .unwrap();
+    }
+
+    let queue_rows = |engine: &extenddb_storage_cassandra::CassandraEngine| {
+        let keyspace = keyspace.clone();
+        let table_id = table.key_info.table_id.clone();
+        let session = engine.session_arc();
+        let partitions = partitions(engine);
+        async move {
+            let mut total = 0usize;
+            for (row_generation, bucket, shard) in partitions.await {
+                total += session
+                    .query_with_values(
+                        &format!(
+                            "SELECT key_hash FROM {keyspace}.ttl_expirations WHERE table_id = ? \
+                             AND generation = ? AND bucket = ? AND shard = ?"
+                        ),
+                        cdrs_tokio::query_values!(table_id.as_str(), row_generation, bucket, shard),
+                    )
+                    .await
+                    .unwrap()
+                    .response_body()
+                    .unwrap()
+                    .into_rows()
+                    .unwrap_or_default()
+                    .len();
+            }
+            total
+        }
+    };
+    assert_eq!(queue_rows(&engine).await, 0, "precondition: entry lost");
+
+    extenddb_storage_cassandra::ttl_worker::audit_ttl_queues_once(
+        &engine,
+        &MetricsCollector::new(),
+    )
+    .await;
+
+    assert_eq!(
+        queue_rows(&engine).await,
+        1,
+        "the audit must re-register the live item's expiration"
+    );
+    let _ = generation;
+    // And the audit must not have perturbed a healthy queue: a second pass
+    // repairs nothing and changes nothing.
+    extenddb_storage_cassandra::ttl_worker::audit_ttl_queues_once(
+        &engine,
+        &MetricsCollector::new(),
+    )
+    .await;
+    assert_eq!(queue_rows(&engine).await, 1);
+}
+
+/// The version fence engages end to end: a sweep's claim records the row's
+/// version, an image change bumps it, and the exact delete — conditioned on
+/// the recorded version — refuses the newer image without shipping the item as
+/// an LWT payload. The survivor path then completes recovery.
+#[tokio::test]
+async fn test_version_fence_refuses_changed_image() {
+    use extenddb_core::metrics::MetricsCollector;
+    use extenddb_core::types::{AttributeValue, Item};
+    use extenddb_storage::DataEngine;
+
+    let engine = setup_engine().await;
+    let (table, old_item) = ttl_table_with_expired_item(&engine, "TtlVersionFence", 10).await;
+    let keyspace = engine.account_keyspace(&table.key_info.account_id);
+    let data_table = format!("items_{}", table.key_info.table_id.replace('-', "_"));
+
+    // The put wrote version 1; confirm, since the fence depends on it.
+    let version_of = |engine: &extenddb_storage_cassandra::CassandraEngine| {
+        let keyspace = keyspace.clone();
+        let data_table = data_table.clone();
+        let session = engine.session_arc();
+        async move {
+            use cdrs_tokio::types::IntoRustByName;
+            session
+                .query_with_values(
+                    &format!("SELECT version FROM {keyspace}.{data_table} WHERE pk = ?"),
+                    cdrs_tokio::query_values!("drain"),
+                )
+                .await
+                .unwrap()
+                .response_body()
+                .unwrap()
+                .into_rows()
+                .unwrap_or_default()
+                .first()
+                .and_then(|row| {
+                    let version: Option<i64> = row.get_by_name("version").ok().flatten();
+                    version
+                })
+        }
+    };
+    assert_eq!(
+        version_of(&engine).await,
+        Some(1),
+        "ordinary put must version the row"
+    );
+
+    // Direct probes of the version-conditioned claim LWT itself: a wrong
+    // version must refuse, the right one must apply — without shipping the
+    // item as the condition value.
+    let wrong_version = engine
+        .acquire_ttl_mutation_claim(&table.key_info, &old_item, Some(&old_item), Some(999))
+        .await;
+    assert!(
+        matches!(
+            wrong_version,
+            Err(extenddb_storage::error::StorageError::TransactionConflict(
+                _
+            ))
+        ),
+        "a stale version must refuse the claim"
+    );
+    let right_version = engine
+        .acquire_ttl_mutation_claim(&table.key_info, &old_item, Some(&old_item), Some(1))
+        .await
+        .expect("the current version must admit the claim");
+    engine
+        .release_ttl_mutation_claim(&table.key_info, &old_item, right_version)
+        .await;
+
+    // Forge EFFECTS_APPLYING owning the OLD image at version 1, then land a
+    // stale-writer image change that bumps to version 2 (as any real writer's
+    // batch would), without touching the sealed owner.
+    let work_id = uuid::Uuid::new_v4();
+    let (generation, bucket, shard, ..) = forge_ttl_work(
+        &engine,
+        &table.key_info,
+        &old_item,
+        "EFFECTS_APPLYING",
+        work_id,
+    )
+    .await;
+    let mut changed = old_item.clone();
+    changed.insert("value".to_owned(), AttributeValue::S("survivor".to_owned()));
+    changed.insert(
+        "expires_at".to_owned(),
+        AttributeValue::N(
+            (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3 * 86_400)
+                .to_string(),
+        ),
+    );
+    let changed_json = serde_json::to_string(&changed).unwrap();
+    engine
+        .session_arc()
+        .query_with_values(
+            &format!("UPDATE {keyspace}.{data_table} SET item_data = ?, version = 2 WHERE pk = ?"),
+            cdrs_tokio::query_values!(changed_json.as_str(), "drain"),
+        )
+        .await
+        .unwrap();
+
+    // Forged work_data carries no expected_version (legacy blob) — set it so
+    // this test exercises the VERSION fence, not the item_data fallback.
+    let work_data = serde_json::json!({
+        "old_item": old_item,
+        "expected_version": 1,
+        "delete_timestamp_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64,
+        "stream": null
+    })
+    .to_string();
+    engine
+        .session_arc()
+        .query_with_values(
+            &format!(
+                "UPDATE {keyspace}.ttl_expirations SET work_data = ? WHERE table_id = ? \
+                 AND generation = ? AND bucket = ? AND shard = ? AND expires_at = ? \
+                 AND key_hash = ? AND key_data = ?"
+            ),
+            {
+                use cdrs_tokio::types::IntoRustByName;
+                let row = engine
+                    .session_arc()
+                    .query_with_values(
+                        &format!(
+                            "SELECT expires_at, key_hash, key_data FROM {keyspace}.ttl_expirations \
+                             WHERE table_id = ? AND generation = ? AND bucket = ? AND shard = ?"
+                        ),
+                        cdrs_tokio::query_values!(
+                            table.key_info.table_id.as_str(),
+                            generation,
+                            bucket,
+                            shard
+                        ),
+                    )
+                    .await
+                    .unwrap()
+                    .response_body()
+                    .unwrap()
+                    .into_rows()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .next()
+                    .expect("forged queue row");
+                let expires_at: i64 = row.get_r_by_name("expires_at").unwrap();
+                let key_hash: String = row.get_r_by_name("key_hash").unwrap();
+                let key_data: String = row.get_r_by_name("key_data").unwrap();
+                cdrs_tokio::query_values!(
+                    work_data.as_str(),
+                    table.key_info.table_id.as_str(),
+                    generation,
+                    bucket,
+                    shard,
+                    expires_at,
+                    key_hash.as_str(),
+                    key_data.as_str()
+                )
+            },
+        )
+        .await
+        .unwrap();
+
+    extenddb_storage_cassandra::ttl_worker::sweep_once(&engine, &MetricsCollector::new()).await;
+
+    // The version fence must have refused the delete: the survivor lives, at
+    // its bumped version, with the owner released and the work completed.
+    let mut key = Item::new();
+    key.insert("id".to_owned(), AttributeValue::S("drain".to_owned()));
+    let survivor = engine
+        .get_item(&table.key_info, &key)
+        .await
+        .unwrap()
+        .expect("the version fence must protect the newer image");
+    assert_eq!(
+        survivor.get("value"),
+        Some(&AttributeValue::S("survivor".to_owned()))
+    );
+    assert_eq!(
+        base_row_owner(&engine, &table.key_info, &old_item).await,
+        None,
+        "recovery must release the sealed owner after the survivor path"
+    );
+    assert_eq!(
+        ttl_queue_row_count(
+            &engine,
+            &table.key_info.account_id,
+            &table.key_info.table_id,
+            generation,
+            bucket,
+            shard,
+        )
+        .await,
+        0,
+        "the must-complete row must finish through the survivor path"
+    );
 }
 
 /// The mixed-timestamp state a stale writer leaves behind: `EFFECTS_APPLYING`
@@ -2810,6 +3187,7 @@ async fn test_inflight_repair_repeats_after_late_queue_destroy() {
             extenddb_storage_cassandra::ttl_worker::reconcile_inflight_repairs_once(&engine)
                 .await
                 .unwrap()
+                .1
                 >= 1,
             "the worker must process at least this test's inflight marker"
         );

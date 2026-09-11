@@ -163,7 +163,7 @@ impl CassandraEngine {
 
             let ttl_claim = if ttl_config.is_some() {
                 match self
-                    .acquire_ttl_mutation_claim(key_info, key, pre_mutation_item.as_ref())
+                    .acquire_ttl_mutation_claim(key_info, key, pre_mutation_item.as_ref(), version)
                     .await
                 {
                     Ok(claim) => claim,

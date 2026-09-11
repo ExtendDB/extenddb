@@ -68,6 +68,13 @@ pub struct LedgerOp {
     /// Final item data JSON for PUT/UPDATE (the post-mutation state to write on
     /// COMMIT). None for DELETE and CHECK, which require no item data.
     pub item_data: Option<String>,
+    /// The image the row had before this transaction touched it, captured at
+    /// PREPARE. COMMITTING recovery uses it to retire the TTL queue entry the
+    /// item had before the transaction; without it recovery is insert-only.
+    /// `#[serde(default)]` keeps ledgers written before this field readable —
+    /// their recovery simply stays insert-only, which is the old behavior.
+    #[serde(default)]
+    pub pre_commit_item_data: Option<String>,
 }
 
 /// Transaction ledger entry.
