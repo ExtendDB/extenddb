@@ -26,6 +26,8 @@ impl SqliteCatalogStore {
         let role_arn = format!("arn:aws:iam::{account_id}:role/{role_name}");
         let trust = serde_json::to_string(trust_policy)
             .map_err(|e| OpError::Internal(format!("serialize trust policy: {e}")))?;
+        // D1: every writer holds the write lock.
+        let _writer = self.lock_writes().await;
         sqlx::query(
             "INSERT INTO iam_roles (account_id, role_name, role_arn, trust_policy) \
              VALUES (?, ?, ?, ?)",
@@ -50,6 +52,8 @@ impl SqliteCatalogStore {
     }
 
     pub(crate) async fn delete_role_impl(&self, account_id: &str, role_name: &str) -> OpResult<()> {
+        // D1: every writer holds the write lock.
+        let _writer = self.lock_writes().await;
         let result = sqlx::query("DELETE FROM iam_roles WHERE account_id = ? AND role_name = ?")
             .bind(account_id)
             .bind(role_name)
@@ -160,6 +164,9 @@ impl SqliteCatalogStore {
         role_name: &str,
         tags: &[(String, String)],
     ) -> OpResult<()> {
+        // D1: every writer holds the write lock, acquired before the
+        // transaction begins.
+        let _writer = self.lock_writes().await;
         let mut tx = self
             .pool()
             .begin_with("BEGIN IMMEDIATE")
@@ -198,6 +205,9 @@ impl SqliteCatalogStore {
         role_name: &str,
         tag_keys: &[String],
     ) -> OpResult<()> {
+        // D1: every writer holds the write lock, acquired before the
+        // transaction begins.
+        let _writer = self.lock_writes().await;
         let mut tx = self
             .pool()
             .begin_with("BEGIN IMMEDIATE")
