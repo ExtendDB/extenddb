@@ -36,6 +36,7 @@ pub enum CallerIdentity {
 ///
 /// Returns the caller identity on success, or an error response on failure.
 /// Enforces per-principal lockout and per-IP rate limiting via the storage backend.
+#[allow(clippy::result_large_err)] // axum Response as rejection is this module's idiom
 pub async fn authenticate(
     headers: &HeaderMap,
     store: &dyn extenddb_storage::CatalogStore,
@@ -143,6 +144,7 @@ pub async fn authenticate(
 }
 
 /// Authenticate as admin only. Returns error if caller is not an admin.
+#[allow(clippy::result_large_err)] // axum Response as rejection is this module's idiom
 pub async fn authenticate_admin(
     headers: &HeaderMap,
     store: &dyn extenddb_storage::CatalogStore,
@@ -157,6 +159,7 @@ pub async fn authenticate_admin(
     }
 }
 
+#[allow(clippy::result_large_err)] // axum Response as rejection is this module's idiom
 async fn try_admin_auth(
     username: &str,
     password: &str,
@@ -186,6 +189,7 @@ async fn try_admin_auth(
 }
 
 #[allow(clippy::similar_names)]
+#[allow(clippy::result_large_err)] // axum Response as rejection is this module's idiom
 async fn try_iam_user_auth(
     username: &str,
     password: &str,

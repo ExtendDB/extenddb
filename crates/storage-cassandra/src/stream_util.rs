@@ -139,6 +139,7 @@ pub struct StreamRecordIdentity {
 /// - `capture` — stream view type and region from the caller
 /// - `hlc` — shared HLC for sequence number generation
 /// - `retention_seconds` — Cassandra TTL for the stream record
+#[allow(clippy::too_many_arguments)]
 pub fn stream_record_statement(
     account_keyspace: &str,
     table_id: &str,

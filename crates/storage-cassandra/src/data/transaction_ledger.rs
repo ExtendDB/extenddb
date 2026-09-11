@@ -30,6 +30,7 @@ impl TransactionState {
     }
 
     #[must_use]
+    #[allow(clippy::should_implement_trait)] // fallible; FromStr would force an error type on callers that treat unknown as None
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "PREPARING" => Some(Self::Preparing),
@@ -100,6 +101,7 @@ impl CassandraEngine {
     /// Write a new transaction ledger entry.
     ///
     /// Returns an error if the transaction ID already exists (LWT failure).
+    #[allow(clippy::too_many_arguments)]
     pub async fn write_ledger_entry(
         &self,
         keyspace: &str,
