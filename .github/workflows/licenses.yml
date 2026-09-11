@@ -7,29 +7,21 @@
 # so it goes stale on any version bump or dependency change. Each production
 # backend has its own manifest because its feature set has its own dependency
 # closure. Until now the only check lived in release-image's gate, so a PR could merge fully green
-# while leaving main unreleasable — exactly what happened with the 0.1.6
+# while leaving main unreleasable, which is what happened with the 0.1.6
 # bump (#271, fixed by #272). This runs the SAME script with the SAME pinned
 # cargo-about (the script refuses any other version), so PR-time and
 # release-time can never disagree.
 #
-# Path-filtered to the generator's actual inputs; the release gate remains
-# the unconditional backstop.
+# The pull_request and merge_group triggers are unconditional because the
+# notices-current job is a required status check: a path-filtered required
+# check never reports on a PR outside its paths, and that PR can never merge.
+# The job takes under three minutes. The push trigger keeps the path filter,
+# since it only reports on main and gates nothing.
 
 name: Licenses
 
 on:
   pull_request:
-    paths:
-      - '**/Cargo.toml'
-      - 'Cargo.lock'
-      - 'SOFTWARE-LICENSE-NOTICES.html'
-      - 'SOFTWARE-LICENSE-NOTICES-MONGODB.html'
-      - 'SOFTWARE-LICENSE-NOTICES-DEV.html'
-      - 'about.toml'
-      - 'about.hbs'
-      - 'devtools/generate-software-license-notices'
-      - 'devtools/generate-dev-license-notices'
-      - '.github/workflows/licenses.yml'
   merge_group:
   push:
     branches: [main]
