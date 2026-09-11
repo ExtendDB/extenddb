@@ -285,9 +285,19 @@ fn sqlite_server_components_factory(
                 })?;
         let enc_key = enc_key.ok_or(BackendError::MissingEncryptionKey)?;
 
-        let catalog_store: Arc<dyn extenddb_storage::CatalogStore> = Arc::new(
-            SqliteCatalogStore::with_encryption_key(catalog_pool.clone(), enc_key.clone()),
-        );
+        // The catalog store writes through the second pool over the same
+        // file, so its writers must hold the SAME lock instance as the
+        // engine's (design decision D1); an unshared lock would leave the two
+        // pools contending at the SQLite level, where a slow commit exhausts
+        // a concurrent writer's busy_timeout ("database is locked" -> 500).
+        // For an in-memory database the pools are one and the sharing is
+        // harmless. The credential store only reads and needs no lock.
+        let catalog_store: Arc<dyn extenddb_storage::CatalogStore> =
+            Arc::new(SqliteCatalogStore::with_encryption_key(
+                catalog_pool.clone(),
+                enc_key.clone(),
+                Arc::clone(&engine.write_lock),
+            ));
         let credential_store: Arc<dyn CredentialStore> =
             Arc::new(SqliteCredentialStore::new(catalog_pool, enc_key));
 
