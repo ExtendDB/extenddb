@@ -124,6 +124,7 @@ impl CassandraEngine {
         key_info: &TableKeyInfo,
         key: &Item,
         expected_item: Option<&Item>,
+        expected_version: Option<i64>,
     ) -> Result<Option<uuid::Uuid>, StorageError> {
         let claim = uuid::Uuid::new_v4();
         let applied = match expected_item {
@@ -132,6 +133,7 @@ impl CassandraEngine {
                     key_info,
                     key,
                     expected_item,
+                    expected_version,
                     claim,
                     Some(TTL_REQUEST_CLAIM_SECONDS),
                 )
@@ -216,7 +218,7 @@ impl CassandraEngine {
 
             // Always read to check prepared_txn_id for transaction conflict detection.
             let select_query = format!(
-                "SELECT item_data, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?"
+                "SELECT item_data, prepared_txn_id, version FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?"
             );
 
             let old_result =
@@ -226,18 +228,24 @@ impl CassandraEngine {
                 .response_body()
                 .map_err(|e| StorageError::Internal(format!("Parse response: {e}")))?;
 
-            let (old_item_opt, prepared_txn_id_opt) = if let Some(rows) = body.into_rows() {
-                if let Some(row) = rows.into_iter().next() {
-                    let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
-                    let prepared_txn_id: Option<uuid::Uuid> =
-                        row.get_by_name("prepared_txn_id").ok().flatten();
-                    (item_data.map(json_to_item).transpose()?, prepared_txn_id)
+            let (old_item_opt, prepared_txn_id_opt, old_version) =
+                if let Some(rows) = body.into_rows() {
+                    if let Some(row) = rows.into_iter().next() {
+                        let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+                        let prepared_txn_id: Option<uuid::Uuid> =
+                            row.get_by_name("prepared_txn_id").ok().flatten();
+                        let version: Option<i64> = row.get_by_name("version").ok().flatten();
+                        (
+                            item_data.map(json_to_item).transpose()?,
+                            prepared_txn_id,
+                            version,
+                        )
+                    } else {
+                        (None, None, None)
+                    }
                 } else {
-                    (None, None)
-                }
-            } else {
-                (None, None)
-            };
+                    (None, None, None)
+                };
 
             if let Some(expected_item) = expected_claimed_item {
                 if prepared_txn_id_opt != allowed_prepared_txn_id
@@ -273,7 +281,7 @@ impl CassandraEngine {
             let ttl_claim = if allowed_prepared_txn_id.is_some() {
                 allowed_prepared_txn_id
             } else if ttl_config.is_some() {
-                self.acquire_ttl_mutation_claim(key_info, key, old_item_opt.as_ref())
+                self.acquire_ttl_mutation_claim(key_info, key, old_item_opt.as_ref(), old_version)
                     .await?
             } else {
                 None
@@ -429,7 +437,7 @@ impl CassandraEngine {
 
             // Always read to check prepared_txn_id for transaction conflict detection
             let select_query = format!(
-                "SELECT item_data, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ?"
+                "SELECT item_data, prepared_txn_id, version FROM {data_keyspace}.{ddb_table} WHERE pk = ?"
             );
 
             let row = crate::cassandra_util::query_optional(
@@ -440,13 +448,18 @@ impl CassandraEngine {
             )
             .await?;
 
-            let (old_item_opt, prepared_txn_id_opt) = if let Some(row) = row {
+            let (old_item_opt, prepared_txn_id_opt, old_version) = if let Some(row) = row {
                 let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
                 let prepared_txn_id: Option<uuid::Uuid> =
                     row.get_by_name("prepared_txn_id").ok().flatten();
-                (item_data.map(json_to_item).transpose()?, prepared_txn_id)
+                let version: Option<i64> = row.get_by_name("version").ok().flatten();
+                (
+                    item_data.map(json_to_item).transpose()?,
+                    prepared_txn_id,
+                    version,
+                )
             } else {
-                (None, None)
+                (None, None, None)
             };
 
             if let Some(expected_item) = expected_claimed_item {
@@ -483,7 +496,7 @@ impl CassandraEngine {
             let ttl_claim = if allowed_prepared_txn_id.is_some() {
                 allowed_prepared_txn_id
             } else if ttl_config.is_some() {
-                self.acquire_ttl_mutation_claim(key_info, key, old_item_opt.as_ref())
+                self.acquire_ttl_mutation_claim(key_info, key, old_item_opt.as_ref(), old_version)
                     .await?
             } else {
                 None
@@ -642,6 +655,7 @@ impl CassandraEngine {
         key_info: &TableKeyInfo,
         key: &Item,
         expected_item: &Item,
+        expected_version: Option<i64>,
         work_id: uuid::Uuid,
     ) -> Result<bool, StorageError> {
         if self
@@ -649,6 +663,7 @@ impl CassandraEngine {
                 key_info,
                 key,
                 expected_item,
+                expected_version,
                 work_id,
                 Some(TTL_WORK_CLAIM_SECONDS),
             )
@@ -668,35 +683,57 @@ impl CassandraEngine {
                 sk_type,
             )?;
             let query = format!(
-                "SELECT item_data, prepared_txn_id FROM {keyspace}.{table} \
+                "SELECT item_data, prepared_txn_id, version FROM {keyspace}.{table} \
                  WHERE pk = ? AND {} = ?",
                 sk_column(sk_type)
             );
-            query_with_pk_sk(&self.session, &query, pk.as_str(), &sk)
-                .await?
-                .response_body()
-                .ok()
-                .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
-                .and_then(|rows| rows.into_iter().next())
-        } else {
-            let query =
-                format!("SELECT item_data, prepared_txn_id FROM {keyspace}.{table} WHERE pk = ?");
-            crate::cassandra_util::query_optional(
+            crate::cassandra_util::query_rows_quorum(
                 &self.session,
                 &query,
-                cdrs_tokio::query_values!(pk.as_str()),
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                    cdrs_tokio::types::value::Value::from(pk.as_str()),
+                    super::index::sk_to_value(&sk),
+                ]),
                 "ensure_ttl_work_claim",
             )
             .await?
+            .into_iter()
+            .next()
+        } else {
+            let query = format!(
+                "SELECT item_data, prepared_txn_id, version FROM {keyspace}.{table} WHERE pk = ?"
+            );
+            crate::cassandra_util::query_rows_quorum(
+                &self.session,
+                &query,
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                    cdrs_tokio::types::value::Value::from(pk.as_str()),
+                ]),
+                "ensure_ttl_work_claim",
+            )
+            .await?
+            .into_iter()
+            .next()
         };
         let Some(row) = row else {
             return Ok(false);
         };
-        let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
         let owner: Option<uuid::Uuid> = row.get_by_name("prepared_txn_id").ok().flatten();
-        let expected = serde_json::to_string(expected_item)
-            .map_err(|error| StorageError::Internal(error.to_string()))?;
-        Ok(owner == Some(work_id) && item_data.as_deref() == Some(expected.as_str()))
+        if owner != Some(work_id) {
+            return Ok(false);
+        }
+        match expected_version {
+            Some(expected_version) => {
+                let version: Option<i64> = row.get_by_name("version").ok().flatten();
+                Ok(version == Some(expected_version))
+            }
+            None => {
+                let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+                let expected = serde_json::to_string(expected_item)
+                    .map_err(|error| StorageError::Internal(error.to_string()))?;
+                Ok(item_data.as_deref() == Some(expected.as_str()))
+            }
+        }
     }
 
     /// Promote the exact expiration worker owner and item image to a
@@ -708,13 +745,14 @@ impl CassandraEngine {
         key_info: &TableKeyInfo,
         key: &Item,
         expected_item: &Item,
+        expected_version: Option<i64>,
         work_id: uuid::Uuid,
     ) -> Result<bool, StorageError> {
         let keyspace = self.account_keyspace(&key_info.account_id);
         let table = data_table_name(&key_info.table_id);
         let pk = composite_pk_to_text(key, &key_info.key_schema)?;
-        let expected = serde_json::to_string(expected_item)
-            .map_err(|error| StorageError::Internal(error.to_string()))?;
+        let fence = Self::image_fence(expected_version);
+        let fence_value = Self::image_fence_value(expected_item, expected_version)?;
         let owner = cdrs_tokio::types::value::Bytes::new(work_id.as_bytes().to_vec());
         let claimed_at = chrono::Utc::now().timestamp_millis();
         let result = if let Some((sk_name, sk_type)) =
@@ -731,7 +769,7 @@ impl CassandraEngine {
                     "UPDATE {keyspace}.{table} \
                      SET prepared_txn_id = ?, prepared_txn_timestamp = ? \
                      WHERE pk = ? AND {} = ? \
-                     IF prepared_txn_id = ? AND item_data = ?",
+                     IF prepared_txn_id = ? AND {fence}",
                     sk_column(sk_type)
                 ),
                 cdrs_tokio::query::QueryValues::SimpleValues(vec![
@@ -740,7 +778,7 @@ impl CassandraEngine {
                     cdrs_tokio::types::value::Value::from(pk.as_str()),
                     super::index::sk_to_value(&sk),
                     cdrs_tokio::types::value::Value::from(owner),
-                    cdrs_tokio::types::value::Value::from(expected.as_str()),
+                    fence_value,
                 ]),
             )
             .await?
@@ -750,15 +788,15 @@ impl CassandraEngine {
                 &format!(
                     "UPDATE {keyspace}.{table} \
                      SET prepared_txn_id = ?, prepared_txn_timestamp = ? \
-                     WHERE pk = ? IF prepared_txn_id = ? AND item_data = ?"
+                     WHERE pk = ? IF prepared_txn_id = ? AND {fence}"
                 ),
-                cdrs_tokio::query_values!(
-                    owner.clone(),
-                    claimed_at,
-                    pk.as_str(),
-                    owner,
-                    expected.as_str()
-                ),
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                    cdrs_tokio::types::value::Value::from(owner.clone()),
+                    cdrs_tokio::types::value::Value::from(claimed_at),
+                    cdrs_tokio::types::value::Value::from(pk.as_str()),
+                    cdrs_tokio::types::value::Value::from(owner),
+                    fence_value,
+                ]),
             )
             .await?
         };
@@ -996,11 +1034,22 @@ impl CassandraEngine {
         Ok(())
     }
 
+    /// The one destructive LWT keeps BOTH image conditions. Version alone is
+    /// not a unique image identity across writers: a transaction's server-side
+    /// `version + 1` and a stale ordinary batch's explicit `old + 1` can stamp
+    /// two different images with the same version, reachable when application
+    /// and coordinator clocks diverge by more than the request-claim lifetime.
+    /// The claims tolerate that (a mis-admitted claim only affects contention
+    /// semantics), but the delete must not — it destroys data — so it demands
+    /// owner AND version AND the exact image, restoring the property that the
+    /// old fence had with no clock assumption at all. This costs one item
+    /// payload per actual expiration, not per write.
     pub(crate) async fn delete_ttl_base_exact(
         &self,
         key_info: &TableKeyInfo,
         key: &Item,
         expected_item: &Item,
+        expected_version: Option<i64>,
         work_id: uuid::Uuid,
     ) -> Result<bool, StorageError> {
         let keyspace = self.account_keyspace(&key_info.account_id);
@@ -1008,7 +1057,19 @@ impl CassandraEngine {
         let pk = composite_pk_to_text(key, &key_info.key_schema)?;
         let expected = serde_json::to_string(expected_item)
             .map_err(|error| StorageError::Internal(error.to_string()))?;
+        let version_fence = match expected_version {
+            Some(_) => " AND version = ?",
+            None => "",
+        };
         let owner = cdrs_tokio::types::value::Bytes::new(work_id.as_bytes().to_vec());
+        let mut values = vec![
+            cdrs_tokio::types::value::Value::from(pk.as_str()),
+            cdrs_tokio::types::value::Value::from(owner),
+            cdrs_tokio::types::value::Value::from(expected.as_str()),
+        ];
+        if let Some(version) = expected_version {
+            values.push(cdrs_tokio::types::value::Value::from(version));
+        }
         let result = if let Some((sk_name, sk_type)) =
             sk_info(&key_info.key_schema, &key_info.attribute_definitions)
         {
@@ -1017,31 +1078,27 @@ impl CassandraEngine {
                     .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?,
                 sk_type,
             )?;
+            values.insert(1, super::index::sk_to_value(&sk));
             let query = format!(
                 "DELETE FROM {keyspace}.{table} WHERE pk = ? AND {} = ? \
-                 IF prepared_txn_id = ? AND item_data = ?",
+                 IF prepared_txn_id = ? AND item_data = ?{version_fence}",
                 sk_column(sk_type)
             );
             crate::cassandra_util::query_lwt(
                 &self.session,
                 &query,
-                cdrs_tokio::query::QueryValues::SimpleValues(vec![
-                    cdrs_tokio::types::value::Value::from(pk.as_str()),
-                    super::index::sk_to_value(&sk),
-                    cdrs_tokio::types::value::Value::from(owner),
-                    cdrs_tokio::types::value::Value::from(expected.as_str()),
-                ]),
+                cdrs_tokio::query::QueryValues::SimpleValues(values),
             )
             .await?
         } else {
             let query = format!(
                 "DELETE FROM {keyspace}.{table} WHERE pk = ? \
-                 IF prepared_txn_id = ? AND item_data = ?"
+                 IF prepared_txn_id = ? AND item_data = ?{version_fence}"
             );
             crate::cassandra_util::query_lwt(
                 &self.session,
                 &query,
-                cdrs_tokio::query_values!(pk.as_str(), owner, expected.as_str()),
+                cdrs_tokio::query::QueryValues::SimpleValues(values),
             )
             .await?
         };
@@ -1107,19 +1164,61 @@ impl CassandraEngine {
         ttl_lwt_applied(&result)
     }
 
+    /// The image condition a TTL claim or exact delete fences on.
+    ///
+    /// With a known `version` the fence is `version = ?` — every image write
+    /// bumps the column, writers on a TTL table are serialized by the claim
+    /// itself, so the version uniquely identifies the image without shipping
+    /// it. Rows whose version is null (they predate the column and have not
+    /// been rewritten since) fall back to `item_data` string equality, the
+    /// original fence.
+    ///
+    /// Two invariants this relies on:
+    ///
+    /// * `version` and `item_data` are always written by the same statement at
+    ///   the same timestamp, so a timestamp race between writers cannot leave
+    ///   the pair split — the fence and the image win or lose together.
+    /// * Version is NOT unique across row incarnations: delete + recreate
+    ///   restarts it at 1. That reuse is caught by the worker's in-memory
+    ///   image comparisons against `work_data.old_item` before every
+    ///   destructive step — those quorum-read comparisons are load-bearing
+    ///   for the fence and must not be removed as an optimization.
+    fn image_fence(expected_version: Option<i64>) -> &'static str {
+        match expected_version {
+            Some(_) => "version = ?",
+            None => "item_data = ?",
+        }
+    }
+
+    /// The bound value for [`Self::image_fence`].
+    fn image_fence_value(
+        expected_item: &Item,
+        expected_version: Option<i64>,
+    ) -> Result<cdrs_tokio::types::value::Value, StorageError> {
+        Ok(match expected_version {
+            Some(version) => cdrs_tokio::types::value::Value::from(version),
+            None => cdrs_tokio::types::value::Value::from(
+                serde_json::to_string(expected_item)
+                    .map_err(|error| StorageError::Internal(error.to_string()))?
+                    .as_str(),
+            ),
+        })
+    }
+
     async fn claim_ttl_item(
         &self,
         key_info: &TableKeyInfo,
         key: &Item,
         expected_item: &Item,
+        expected_version: Option<i64>,
         claim: uuid::Uuid,
         ttl_seconds: Option<u32>,
     ) -> Result<bool, StorageError> {
         let keyspace = self.account_keyspace(&key_info.account_id);
         let table = data_table_name(&key_info.table_id);
         let pk = composite_pk_to_text(key, &key_info.key_schema)?;
-        let expected = serde_json::to_string(expected_item)
-            .map_err(|error| StorageError::Internal(error.to_string()))?;
+        let fence = Self::image_fence(expected_version);
+        let fence_value = Self::image_fence_value(expected_item, expected_version)?;
         let claim_bytes = cdrs_tokio::types::value::Bytes::new(claim.as_bytes().to_vec());
         let claimed_at = chrono::Utc::now().timestamp_millis();
         let using_ttl = ttl_seconds
@@ -1138,7 +1237,7 @@ impl CassandraEngine {
                 "UPDATE {keyspace}.{table} {using_ttl}\
                  SET prepared_txn_id = ?, prepared_txn_timestamp = ? \
                  WHERE pk = ? AND {} = ? \
-                 IF prepared_txn_id = null AND item_data = ?",
+                 IF prepared_txn_id = null AND {fence}",
                 sk_column(sk_type)
             );
             crate::cassandra_util::query_lwt(
@@ -1149,7 +1248,7 @@ impl CassandraEngine {
                     cdrs_tokio::types::value::Value::from(claimed_at),
                     cdrs_tokio::types::value::Value::from(pk.as_str()),
                     super::index::sk_to_value(&sk),
-                    cdrs_tokio::types::value::Value::from(expected.as_str()),
+                    fence_value,
                 ]),
             )
             .await
@@ -1157,12 +1256,17 @@ impl CassandraEngine {
             let query = format!(
                 "UPDATE {keyspace}.{table} {using_ttl}\
                  SET prepared_txn_id = ?, prepared_txn_timestamp = ? \
-                 WHERE pk = ? IF prepared_txn_id = null AND item_data = ?"
+                 WHERE pk = ? IF prepared_txn_id = null AND {fence}"
             );
             crate::cassandra_util::query_lwt(
                 &self.session,
                 &query,
-                cdrs_tokio::query_values!(claim_bytes, claimed_at, pk.as_str(), expected.as_str()),
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                    cdrs_tokio::types::value::Value::from(claim_bytes),
+                    cdrs_tokio::types::value::Value::from(claimed_at),
+                    cdrs_tokio::types::value::Value::from(pk.as_str()),
+                    fence_value,
+                ]),
             )
             .await
         }

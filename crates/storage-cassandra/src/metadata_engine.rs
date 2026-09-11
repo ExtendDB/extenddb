@@ -16,13 +16,61 @@ const TTL_CONTROL_MAX_RETRIES: u32 = 4;
 const TTL_CONTROL_RETRY_DELAY_MS: u64 = 25;
 
 impl CassandraEngine {
+    /// How long a cached TTL configuration may serve the write path. The
+    /// audit makes staleness in either direction recoverable rather than
+    /// silent (see the cache field's documentation); the enable-quiescence
+    /// window documented in ADR-0010 must exceed this.
+    const TTL_CONFIG_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
     pub(crate) async fn ttl_config_for_table(
         &self,
         account_id: &str,
         table_name: &str,
     ) -> Result<Option<crate::data::ttl::TtlConfig>, StorageError> {
-        self.ttl_config_for_table_at(account_id, table_name, false)
-            .await
+        let cache_key = (account_id.to_owned(), table_name.to_owned());
+        if let Some((fetched_at, config)) = self
+            .ttl_config_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&cache_key)
+            && fetched_at.elapsed() < Self::TTL_CONFIG_CACHE_TTL
+        {
+            return Ok(config.clone());
+        }
+        let epoch_before = self
+            .ttl_config_cache_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        let config = self
+            .ttl_config_for_table_at(account_id, table_name, false)
+            .await?;
+        let mut cache = self
+            .ttl_config_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Opportunistic pruning keeps the map bounded by the live table count.
+        cache.retain(|_, (fetched_at, _)| fetched_at.elapsed() < Self::TTL_CONFIG_CACHE_TTL);
+        // An invalidation that ran while we were reading means this value may
+        // predate a durable lifecycle change: serve it once, do not cache it.
+        if self
+            .ttl_config_cache_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+            == epoch_before
+        {
+            cache.insert(cache_key, (std::time::Instant::now(), config.clone()));
+        }
+        Ok(config)
+    }
+
+    /// Drop the cached configuration for one table, so the host that issued a
+    /// lifecycle change observes it immediately. Other hosts converge within
+    /// the cache TTL.
+    pub(crate) fn invalidate_ttl_config_cache(&self, account_id: &str, table_name: &str) {
+        self.ttl_config_cache_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.ttl_config_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&(account_id.to_owned(), table_name.to_owned()));
     }
 
     /// Read TTL configuration at `LOCAL_QUORUM` for an authoritative absence
@@ -412,7 +460,7 @@ impl CassandraEngine {
             .await?;
         }
         if let Some(new_entry) = new_entry {
-            crate::data::ttl::insert_ttl_entry(
+            let _ = crate::data::ttl::insert_ttl_entry(
                 self,
                 &account_keyspace,
                 &key_info.table_id,
@@ -424,35 +472,23 @@ impl CassandraEngine {
         Ok(())
     }
 
-    pub(crate) async fn reconcile_ttl_item(
-        &self,
-        key_info: &extenddb_core::types::TableKeyInfo,
-        item: &Item,
-    ) -> Result<(), StorageError> {
-        let Some(config) = self
-            .ttl_config_for_table(&key_info.account_id, &key_info.table_name)
-            .await?
-        else {
-            return Ok(());
-        };
-        self.reconcile_ttl_item_with_config(key_info, item, &config)
-            .await
-    }
-
-    /// [`Self::reconcile_ttl_item`] for callers that already hold the table's
+    /// Reconcile an item's queue registration, for callers that already hold the table's
     /// TTL configuration, so reconciling does not re-read the catalog. The
     /// worker calls this once per processed row; the caller is responsible for
     /// the config being current, which the sweep already guarantees by
     /// re-checking it between rows.
+    /// Returns `true` when a missing queue registration was actually created
+    /// (a repair), `false` when it was already present or the item carries no
+    /// valid timestamp.
     pub(crate) async fn reconcile_ttl_item_with_config(
         &self,
         key_info: &extenddb_core::types::TableKeyInfo,
         item: &Item,
         config: &crate::data::ttl::TtlConfig,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         let Some(entry) = crate::data::ttl::entry_for_item(key_info, item, &config.attribute)?
         else {
-            return Ok(());
+            return Ok(false);
         };
         crate::data::ttl::insert_ttl_entry(
             self,
@@ -464,11 +500,19 @@ impl CassandraEngine {
         .await
     }
 
-    pub(crate) async fn reconcile_ttl_item_by_table_id(
+    /// [`Self::reconcile_ttl_transition`] resolved from a table id, for the
+    /// transaction recovery path, whose ledger records table ids rather than
+    /// names. Images arrive as the ledger's JSON strings; `None` old means
+    /// insert-only (pre-field ledgers), `None` new means a delete.
+    pub(crate) async fn reconcile_ttl_transition_by_table_id(
         &self,
         table_id: &str,
-        item_data: &str,
+        old_item_data: Option<&str>,
+        new_item_data: Option<&str>,
     ) -> Result<(), StorageError> {
+        if old_item_data.is_none() && new_item_data.is_none() {
+            return Ok(());
+        }
         let query = format!(
             "SELECT account_id, table_name FROM {}.tables WHERE table_id = ?",
             self.catalog_keyspace()
@@ -477,29 +521,143 @@ impl CassandraEngine {
             &self.session,
             &query,
             cdrs_tokio::query_values!(table_id),
-            "reconcile_ttl_item_by_table_id",
+            "reconcile_ttl_transition_by_table_id",
         )
         .await?;
         let Some(row) = rows.first() else {
             return Ok(());
         };
-        let account_id: String =
-            crate::cassandra_util::get_column(row, "account_id", "reconcile_ttl_item_by_table_id")?;
-        let table_name: String =
-            crate::cassandra_util::get_column(row, "table_name", "reconcile_ttl_item_by_table_id")?;
+        let account_id: String = crate::cassandra_util::get_column(
+            row,
+            "account_id",
+            "reconcile_ttl_transition_by_table_id",
+        )?;
+        let table_name: String = crate::cassandra_util::get_column(
+            row,
+            "table_name",
+            "reconcile_ttl_transition_by_table_id",
+        )?;
         let key_info = self.fetch_table_key_info(&account_id, &table_name).await?;
-        let item: Item = serde_json::from_str(item_data).map_err(|error| {
-            StorageError::Internal(format!("Parse recovered TTL item: {error}"))
-        })?;
-        self.reconcile_ttl_item(&key_info, &item).await
+        let parse = |data: Option<&str>| -> Result<Option<Item>, StorageError> {
+            data.map(|data| {
+                serde_json::from_str(data).map_err(|error| {
+                    StorageError::Internal(format!("Parse recovered TTL item: {error}"))
+                })
+            })
+            .transpose()
+        };
+        let old = parse(old_item_data)?;
+        let new = parse(new_item_data)?;
+        self.reconcile_ttl_transition(&key_info, old.as_ref(), new.as_ref())
+            .await
     }
 
-    /// Scan the table and register an expiration entry for every item that
-    /// carries a valid TTL timestamp, then publish the generation as ready.
+    /// One audit pass over a single ready table: re-register every item whose
+    /// queue entry is missing. Returns `Some(repaired_count)` when the pass
+    /// completed, `None` when it stood aside because the table's TTL
+    /// configuration moved mid-scan.
     ///
-    /// Runs under the caller's control lease. The scan has no durable cursor, so
-    /// a failure restarts it from the beginning on the next cycle; entry inserts
-    /// are conditional, so repeating the scan is idempotent.
+    /// Deliberately LEASELESS. An earlier revision held the table's control
+    /// lease for the whole scan, which suspended expiration, lifecycle
+    /// changes, and GSI creation for the scan's duration — hours on a large
+    /// table, and "the audit is rare" does not bound how long each one lasts.
+    /// The lease bought nothing the protocol does not already provide: the
+    /// audit only performs idempotent conditional registrations that defer to
+    /// claimed work, so it is safe under concurrent sweeps and backfills, and
+    /// a lifecycle change mid-scan is caught by the per-page quorum config
+    /// check (a straggler insert into a retired generation is inert dead data
+    /// in an unswept partition, the same accepted class as a stale-config
+    /// writer). Two hosts auditing the same table duplicate idempotent reads;
+    /// at the audit cadence that is cheaper than mutual exclusion.
+    ///
+    /// The healthy-item cost is one quorum read (see
+    /// [`crate::data::ttl::ttl_entry_registered`]); the full write path of
+    /// `insert_ttl_entry` runs only for items whose registration is actually
+    /// missing. Pages are paced so a large table's audit is a slow background
+    /// murmur rather than a read burst.
+    pub(crate) async fn audit_ttl_queue_for_table(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        ttl_attribute: &str,
+        metrics: &extenddb_core::metrics::MetricsCollector,
+    ) -> Result<Option<usize>, StorageError> {
+        /// Pause between scan pages: bounds steady-state audit IO pressure.
+        const AUDIT_PAGE_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
+
+        let Some(config) = self
+            .ttl_config_for_table_quorum(account_id, table_name)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if config.attribute != ttl_attribute {
+            return Ok(None);
+        }
+        let key_info = self.fetch_table_key_info(account_id, table_name).await?;
+        let account_keyspace = self.account_keyspace(account_id);
+        let mut repaired = 0usize;
+        let mut start_key = None;
+        loop {
+            // Per page, at quorum and uncached: a lifecycle change mid-scan
+            // ends the pass rather than auditing against a retired generation.
+            if self
+                .ttl_config_for_table_quorum(account_id, table_name)
+                .await?
+                != Some(config.clone())
+            {
+                return Ok(None);
+            }
+            let (items, next_key) = self
+                .scan_impl(&key_info, Some(1_000), start_key.as_ref(), None, None, None)
+                .await?;
+            for item in items {
+                if let Some(entry) =
+                    crate::data::ttl::entry_for_item(&key_info, &item, &config.attribute)?
+                {
+                    // Cheap verification first; the repair path only on a miss.
+                    if crate::data::ttl::ttl_entry_registered(
+                        self,
+                        &account_keyspace,
+                        &key_info.table_id,
+                        config.generation,
+                        &entry,
+                    )
+                    .await?
+                    {
+                        continue;
+                    }
+                    match crate::data::ttl::insert_ttl_entry(
+                        self,
+                        &account_keyspace,
+                        &key_info.table_id,
+                        config.generation,
+                        &entry,
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            repaired += 1;
+                            metrics.record_ttl_audit_repair(table_name);
+                        }
+                        Ok(false) => {}
+                        // Claimed work owns this key right now; skip rather
+                        // than fail the pass. The item has an entry (it is
+                        // being expired), so there is nothing to repair.
+                        Err(StorageError::Transient(_)) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            match next_key {
+                Some(key) => start_key = Some(key),
+                None => break,
+            }
+            tokio::time::sleep(AUDIT_PAGE_PAUSE).await;
+        }
+        Ok(Some(repaired))
+    }
+
     async fn backfill_ttl_queue(
         &self,
         account_id: &str,
@@ -800,6 +958,9 @@ impl MetadataEngine for CassandraEngine {
                     Err(StorageError::TableNotFound(table_name))
                 };
             }
+            // The lifecycle change is durable; the issuing host must not keep
+            // serving the old configuration from its cache.
+            self.invalidate_ttl_config_cache(&account_id, &table_name);
             if !enabled {
                 self.complete_ttl_cleanup(&account_id, &table_name, &table_id, cleanup_generation)
                     .await?;

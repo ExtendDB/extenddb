@@ -380,8 +380,12 @@ impl CassandraEngine {
                 .gsi_default_delay_ms
                 .load(std::sync::atomic::Ordering::Relaxed)
                 != 0;
+        // Quorum and uncached: this decides whether synchronous GSI creation
+        // takes the control lease, and a stale cached None would skip the
+        // fence during exactly the window it exists for (catalog row ACTIVE,
+        // data table not yet created).
         let ttl_enabled = self
-            .ttl_config_for_table(account_id, &input.table_name)
+            .ttl_config_for_table_quorum(account_id, &input.table_name)
             .await?
             .is_some();
         let ttl_control_owner = if !gsi_creates.is_empty() && (creating_async_gsi || ttl_enabled) {

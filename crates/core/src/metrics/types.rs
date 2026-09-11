@@ -27,6 +27,15 @@ pub enum MetricName {
     TimeToLiveDeletedItemCount,
     /// Seconds between TTL expiry and actual deletion (staleness).
     TtlDeletionStaleness,
+    /// Queue registrations the periodic TTL audit found missing and recreated.
+    /// Nonzero means some loss path fired; sustained nonzero means one is
+    /// firing repeatedly and needs investigation.
+    TtlAuditRepairedEntryCount,
+    /// Unresolved TTL destroy markers observed by the repair worker. Sustained
+    /// growth means destroys are repeatedly ending ambiguously (Cassandra
+    /// health) or a repair path is stuck; the ADR requires operators to
+    /// monitor this.
+    TtlRepairMarkerCount,
     /// P120c: HTTP request count (dimensions: operation).
     RequestCount,
     /// P120c: Storage query count (dimensions: source, category).
@@ -64,6 +73,8 @@ impl std::fmt::Display for MetricName {
             Self::ReturnedBytes => f.write_str("ReturnedBytes"),
             Self::TimeToLiveDeletedItemCount => f.write_str("TimeToLiveDeletedItemCount"),
             Self::TtlDeletionStaleness => f.write_str("TtlDeletionStaleness"),
+            Self::TtlAuditRepairedEntryCount => f.write_str("TtlAuditRepairedEntryCount"),
+            Self::TtlRepairMarkerCount => f.write_str("TtlRepairMarkerCount"),
             Self::RequestCount => f.write_str("RequestCount"),
             Self::StorageQueryCount => f.write_str("StorageQueryCount"),
             Self::StorageQueryLatency => f.write_str("StorageQueryLatency"),

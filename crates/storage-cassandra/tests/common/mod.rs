@@ -776,3 +776,29 @@ pub async fn put_item_then_lock(
             .expect("Setting prepared_txn_id should succeed");
     }
 }
+
+/// True when the suite should be skipped because no Cassandra is reachable.
+///
+/// The workspace `cargo test` job in test.yml runs with no services, so these
+/// suites probe 127.0.0.1:9042 and skip themselves when nothing is listening.
+/// The dedicated integration-cassandra workflow provides a service container
+/// and sets `EXTENDDB_TEST_CASSANDRA=required`, under which this never skips:
+/// if Cassandra is down there, setup fails loudly rather than the suite
+/// silently passing with zero tests executed (the failure mode integration.yml
+/// documents for batch_transact_authz).
+pub fn skip_without_cassandra() -> bool {
+    if std::env::var("EXTENDDB_TEST_CASSANDRA").as_deref() == Ok("required") {
+        return false;
+    }
+    let reachable = std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], 9042)),
+        std::time::Duration::from_secs(2),
+    )
+    .is_ok();
+    if !reachable {
+        eprintln!(
+            "skipping: no Cassandra at 127.0.0.1:9042 (set EXTENDDB_TEST_CASSANDRA=required to fail instead)"
+        );
+    }
+    !reachable
+}

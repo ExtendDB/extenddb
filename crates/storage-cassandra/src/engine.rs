@@ -69,7 +69,36 @@ pub struct CassandraEngine {
     /// a restart merely restarts the traversal from the front.
     pub(crate) ttl_repair_scan_cursors:
         Arc<std::sync::Mutex<std::collections::HashMap<(String, i32), uuid::Uuid>>>,
+
+    /// Short-lived cache of per-table TTL configuration for the write path.
+    ///
+    /// Every Put/Update/Delete needs the config, and reading it from the
+    /// catalog per write is one of the two remaining per-write catalog costs.
+    /// Entries live [`TTL_CONFIG_CACHE_TTL`]; staleness is bounded and safe in
+    /// both directions *because the audit exists*: a stale `None` makes a
+    /// write skip its queue mutation (the audit re-registers the item), and a
+    /// stale generation enqueues into a retired generation (dead rows;
+    /// the audit registers the live one). The enable-quiescence window in the
+    /// ADR must exceed this TTL, and `update_ttl` invalidates locally so the
+    /// issuing host is coherent immediately.
+    pub(crate) ttl_config_cache: TtlConfigCache,
+
+    /// Bumped by every TTL-config invalidation. A cache miss snapshots it
+    /// before the catalog read and declines to repopulate if it moved — so a
+    /// lifecycle change that lands mid-read cannot be shadowed by the stale
+    /// value being inserted after the invalidation ran.
+    pub(crate) ttl_config_cache_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
+
+/// `(account_id, table_name)` → `(fetched_at, config)`; see the field docs.
+pub(crate) type TtlConfigCache = Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            (String, String),
+            (std::time::Instant, Option<crate::data::ttl::TtlConfig>),
+        >,
+    >,
+>;
 
 /// Cap on concurrently in-flight detached TTL claim releases.
 const TTL_RELEASE_MAX_IN_FLIGHT: usize = 1_024;
@@ -97,6 +126,8 @@ impl CassandraEngine {
             ttl_repair_scan_cursors: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            ttl_config_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ttl_config_cache_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 

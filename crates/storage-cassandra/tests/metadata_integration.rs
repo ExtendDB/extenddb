@@ -31,6 +31,9 @@ fn tag(key: &str, value: &str) -> Tag {
 /// the cost of testing these as four separate cases.
 #[tokio::test]
 async fn test_resource_tag_lifecycle() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
     let engine = setup_engine().await;
     let arn = format!(
         "arn:aws:dynamodb:us-east-1:123456789012:table/test-{}",

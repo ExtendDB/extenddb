@@ -147,7 +147,7 @@ impl CassandraEngine {
 
             // Read old item including prepared_txn_id for transaction conflict detection
             let select_query = format!(
-                "SELECT item_data, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?"
+                "SELECT item_data, prepared_txn_id, version FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?"
             );
 
             let old_result =
@@ -157,20 +157,23 @@ impl CassandraEngine {
                 .response_body()
                 .map_err(|e| StorageError::Internal(format!("Parse response: {e}")))?;
 
-            let (old_item_opt, has_prepared_txn) = if let Some(rows) = body.into_rows() {
+            let (old_item_opt, has_prepared_txn, old_version) = if let Some(rows) = body.into_rows()
+            {
                 if let Some(row) = rows.into_iter().next() {
                     let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
                     let prepared_txn_id: Option<uuid::Uuid> =
                         row.get_by_name("prepared_txn_id").ok().flatten();
+                    let version: Option<i64> = row.get_by_name("version").ok().flatten();
                     (
                         item_data.map(json_to_item).transpose()?,
                         prepared_txn_id.is_some(),
+                        version,
                     )
                 } else {
-                    (None, false)
+                    (None, false, None)
                 }
             } else {
-                (None, false)
+                (None, false, None)
             };
 
             // Reject if item is part of an in-flight transaction
@@ -207,12 +210,16 @@ impl CassandraEngine {
                 )
             });
 
+            let next_version = old_version.unwrap_or(0) + 1;
             if indexes.is_empty() && stream_stmt.is_none() && ttl_config.is_none() {
-                // Fast path: no batch needed.
+                // Fast path: no batch needed. The version bump keeps every
+                // image write versioned, which the TTL claim protocol fences
+                // on; rows that predate the column start at 1.
                 let insert_query = format!(
-                    "INSERT INTO {data_keyspace}.{ddb_table} \
-                     (pk, {sk_col}, item_data) \
-                     VALUES (?, ?, ?)"
+                    "INSERT INTO {}.{} \
+                     (pk, {}, item_data, version) \
+                     VALUES (?, ?, ?, {})",
+                    data_keyspace, ddb_table, sk_col, next_version
                 );
                 query_with_pk_sk_item(
                     &self.session,
@@ -230,15 +237,17 @@ impl CassandraEngine {
                 // cells do — no separate release round trip is needed on success.
                 let insert_cql = if ttl_config.is_some() {
                     format!(
-                        "INSERT INTO {data_keyspace}.{ddb_table} \
-                         (pk, {sk_col}, item_data, prepared_txn_id, prepared_txn_timestamp) \
-                         VALUES (?, ?, ?, null, null)"
+                        "INSERT INTO {}.{} \
+                         (pk, {}, item_data, version, prepared_txn_id, prepared_txn_timestamp) \
+                         VALUES (?, ?, ?, {}, null, null)",
+                        data_keyspace, ddb_table, sk_col, next_version
                     )
                 } else {
                     format!(
-                        "INSERT INTO {data_keyspace}.{ddb_table} \
-                         (pk, {sk_col}, item_data) \
-                         VALUES (?, ?, ?)"
+                        "INSERT INTO {}.{} \
+                         (pk, {}, item_data, version) \
+                         VALUES (?, ?, ?, {})",
+                        data_keyspace, ddb_table, sk_col, next_version
                     )
                 };
                 let insert_qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
@@ -307,7 +316,12 @@ impl CassandraEngine {
                 // prepared, then release this exact claim on every remaining path.
                 let ttl_claim = if ttl_config.is_some() {
                     match self
-                        .acquire_ttl_mutation_claim(key_info, &item, old_item_opt.as_ref())
+                        .acquire_ttl_mutation_claim(
+                            key_info,
+                            &item,
+                            old_item_opt.as_ref(),
+                            old_version,
+                        )
                         .await
                     {
                         Ok(claim) => claim,
@@ -356,7 +370,7 @@ impl CassandraEngine {
 
             // Read old item including prepared_txn_id for transaction conflict detection
             let select_query = format!(
-                "SELECT item_data, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ?"
+                "SELECT item_data, prepared_txn_id, version FROM {data_keyspace}.{ddb_table} WHERE pk = ?"
             );
 
             let old_result = self
@@ -372,20 +386,23 @@ impl CassandraEngine {
                 .response_body()
                 .map_err(|e| StorageError::Internal(format!("Parse response: {e}")))?;
 
-            let (old_item_opt, has_prepared_txn) = if let Some(rows) = body.into_rows() {
+            let (old_item_opt, has_prepared_txn, old_version) = if let Some(rows) = body.into_rows()
+            {
                 if let Some(row) = rows.into_iter().next() {
                     let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
                     let prepared_txn_id: Option<uuid::Uuid> =
                         row.get_by_name("prepared_txn_id").ok().flatten();
+                    let version: Option<i64> = row.get_by_name("version").ok().flatten();
                     (
                         item_data.map(json_to_item).transpose()?,
                         prepared_txn_id.is_some(),
+                        version,
                     )
                 } else {
-                    (None, false)
+                    (None, false, None)
                 }
             } else {
-                (None, false)
+                (None, false, None)
             };
 
             // Reject if item is part of an in-flight transaction
@@ -422,12 +439,15 @@ impl CassandraEngine {
                 )
             });
 
+            let next_version = old_version.unwrap_or(0) + 1;
             if indexes.is_empty() && stream_stmt.is_none() && ttl_config.is_none() {
-                // Fast path: no batch needed.
+                // Fast path: no batch needed. Version bump as in the sort-key
+                // path.
                 let insert_query = format!(
-                    "INSERT INTO {data_keyspace}.{ddb_table} \
-                     (pk, item_data) \
-                     VALUES (?, ?)"
+                    "INSERT INTO {}.{} \
+                     (pk, item_data, version) \
+                     VALUES (?, ?, {})",
+                    data_keyspace, ddb_table, next_version
                 );
                 self.session
                     .query_with_values(
@@ -442,15 +462,17 @@ impl CassandraEngine {
                 // (see the sort-key path for the timestamp reasoning).
                 let insert_cql = if ttl_config.is_some() {
                     format!(
-                        "INSERT INTO {data_keyspace}.{ddb_table} \
-                         (pk, item_data, prepared_txn_id, prepared_txn_timestamp) \
-                         VALUES (?, ?, null, null)"
+                        "INSERT INTO {}.{} \
+                         (pk, item_data, version, prepared_txn_id, prepared_txn_timestamp) \
+                         VALUES (?, ?, {}, null, null)",
+                        data_keyspace, ddb_table, next_version
                     )
                 } else {
                     format!(
-                        "INSERT INTO {data_keyspace}.{ddb_table} \
-                         (pk, item_data) \
-                         VALUES (?, ?)"
+                        "INSERT INTO {}.{} \
+                         (pk, item_data, version) \
+                         VALUES (?, ?, {})",
+                        data_keyspace, ddb_table, next_version
                     )
                 };
                 let insert_qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
@@ -518,7 +540,12 @@ impl CassandraEngine {
                 // prepared, then release this exact claim on every remaining path.
                 let ttl_claim = if ttl_config.is_some() {
                     match self
-                        .acquire_ttl_mutation_claim(key_info, &item, old_item_opt.as_ref())
+                        .acquire_ttl_mutation_claim(
+                            key_info,
+                            &item,
+                            old_item_opt.as_ref(),
+                            old_version,
+                        )
                         .await
                     {
                         Ok(claim) => claim,
@@ -735,6 +762,19 @@ impl CassandraEngine {
         key_info: &TableKeyInfo,
         key: &Item,
     ) -> Result<Option<Item>, StorageError> {
+        Ok(self
+            .get_item_with_version_quorum(key_info, key)
+            .await?
+            .map(|(item, _)| item))
+    }
+
+    /// [`Self::get_item_quorum`] returning the row's `version` alongside, for
+    /// the TTL worker, whose claims fence on it.
+    pub(crate) async fn get_item_with_version_quorum(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+    ) -> Result<Option<(Item, Option<i64>)>, StorageError> {
         let data_keyspace = self.account_keyspace(&key_info.account_id);
         let ddb_table = data_table_name(&key_info.table_id);
         let pk_text = composite_pk_to_text(key, &key_info.key_schema)?;
@@ -749,7 +789,7 @@ impl CassandraEngine {
             let sk_col = sk_column(sk_type);
             (
                 format!(
-                    "SELECT item_data FROM {data_keyspace}.{ddb_table} \
+                    "SELECT item_data, version FROM {data_keyspace}.{ddb_table} \
                      WHERE pk = ? AND {sk_col} = ?"
                 ),
                 cdrs_tokio::query::QueryValues::SimpleValues(vec![
@@ -759,7 +799,7 @@ impl CassandraEngine {
             )
         } else {
             (
-                format!("SELECT item_data FROM {data_keyspace}.{ddb_table} WHERE pk = ?"),
+                format!("SELECT item_data, version FROM {data_keyspace}.{ddb_table} WHERE pk = ?"),
                 cdrs_tokio::query::QueryValues::SimpleValues(vec![
                     cdrs_tokio::types::value::Value::from(pk_text.as_str()),
                 ]),
@@ -777,7 +817,11 @@ impl CassandraEngine {
             return Ok(None);
         };
         let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
-        item_data.map(json_to_item).transpose()
+        let version: Option<i64> = row.get_by_name("version").ok().flatten();
+        Ok(item_data
+            .map(json_to_item)
+            .transpose()?
+            .map(|item| (item, version)))
     }
 
     pub(crate) async fn get_item_impl(
