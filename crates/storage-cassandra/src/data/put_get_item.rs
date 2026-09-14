@@ -118,7 +118,7 @@ impl CassandraEngine {
             .map(|k| k.attribute_name.as_str())
             .collect();
 
-        let key_not_exists_condition = is_attribute_not_exists_key(condition, &key_attr_names);
+        let key_not_exists_condition = is_attribute_not_exists_key(condition, &key_attr_names, maps);
         if key_not_exists_condition && ttl_config.is_none() {
             return self
                 .put_item_if_not_exists(
@@ -857,6 +857,7 @@ impl CassandraEngine {
 pub(crate) fn is_attribute_not_exists_key(
     condition: Option<&Expr>,
     key_attr_names: &[&str],
+    maps: &ExpressionMaps,
 ) -> bool {
     let Some(Expr::Function { name, args }) = condition else {
         return false;
@@ -873,5 +874,99 @@ pub(crate) fn is_attribute_not_exists_key(
     let extenddb_core::expression::PathElement::Attribute(attr) = &path[0] else {
         return false;
     };
-    key_attr_names.contains(&attr.as_str())
+    // Resolve expression name alias (e.g. "#p" -> "pk") before comparing.
+    let resolved = maps
+        .names
+        .get(attr.as_str())
+        .map(String::as_str)
+        .unwrap_or(attr.as_str());
+    key_attr_names.contains(&resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use extenddb_core::expression::{ExpressionMaps, PathElement};
+    use std::collections::HashMap;
+
+    fn ane_expr(attr: &str) -> Expr {
+        Expr::Function {
+            name: "attribute_not_exists".to_owned(),
+            args: vec![Expr::Path(vec![PathElement::Attribute(attr.to_owned())])],
+        }
+    }
+
+    fn maps_with_names(pairs: &[(&str, &str)]) -> ExpressionMaps {
+        let names: HashMap<String, String> =
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        ExpressionMaps::new(names, HashMap::new())
+    }
+
+    #[test]
+    fn plain_key_attr_matches() {
+        let maps = ExpressionMaps::default();
+        let expr = ane_expr("pk");
+        assert!(is_attribute_not_exists_key(Some(&expr), &["pk"], &maps));
+    }
+
+    #[test]
+    fn plain_non_key_attr_does_not_match() {
+        let maps = ExpressionMaps::default();
+        let expr = ane_expr("guard");
+        assert!(!is_attribute_not_exists_key(Some(&expr), &["pk"], &maps));
+    }
+
+    #[test]
+    fn alias_resolving_to_key_matches() {
+        // attribute_not_exists(#p) with {"#p": "pk"} must match key "pk".
+        let maps = maps_with_names(&[("#p", "pk")]);
+        let expr = ane_expr("#p");
+        assert!(is_attribute_not_exists_key(Some(&expr), &["pk"], &maps));
+    }
+
+    #[test]
+    fn alias_resolving_to_non_key_does_not_match() {
+        // attribute_not_exists(#g) with {"#g": "guard"} must not match key "pk".
+        let maps = maps_with_names(&[("#g", "guard")]);
+        let expr = ane_expr("#g");
+        assert!(!is_attribute_not_exists_key(Some(&expr), &["pk"], &maps));
+    }
+
+    #[test]
+    fn unresolved_alias_literal_does_not_match_key() {
+        // "#p" with no names map must not match key "pk" (the literal "#p" != "pk").
+        let maps = ExpressionMaps::default();
+        let expr = ane_expr("#p");
+        assert!(!is_attribute_not_exists_key(Some(&expr), &["pk"], &maps));
+    }
+
+    #[test]
+    fn none_condition_does_not_match() {
+        let maps = ExpressionMaps::default();
+        assert!(!is_attribute_not_exists_key(None, &["pk"], &maps));
+    }
+
+    #[test]
+    fn wrong_function_does_not_match() {
+        let maps = ExpressionMaps::default();
+        let expr = Expr::Function {
+            name: "attribute_exists".to_owned(),
+            args: vec![Expr::Path(vec![PathElement::Attribute("pk".to_owned())])],
+        };
+        assert!(!is_attribute_not_exists_key(Some(&expr), &["pk"], &maps));
+    }
+
+    #[test]
+    fn composite_path_does_not_match() {
+        // attribute_not_exists(a.b) — nested path, not a simple key attribute.
+        let maps = ExpressionMaps::default();
+        let expr = Expr::Function {
+            name: "attribute_not_exists".to_owned(),
+            args: vec![Expr::Path(vec![
+                PathElement::Attribute("a".to_owned()),
+                PathElement::Attribute("b".to_owned()),
+            ])],
+        };
+        assert!(!is_attribute_not_exists_key(Some(&expr), &["a"], &maps));
+    }
 }
