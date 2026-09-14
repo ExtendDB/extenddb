@@ -36,6 +36,9 @@ pub struct CassandraCatalogStore {
     /// Cached encryption key (immutable after bootstrap). Avoids
     /// per-request DB query on access key and assume-role operations.
     encryption_key: Option<Arc<str>>,
+    /// TTL in seconds applied to every metrics row on insert.
+    /// Cassandra expires rows natively; `prune_metrics` is a no-op.
+    metrics_ttl_seconds: i32,
 }
 
 impl CassandraCatalogStore {
@@ -53,6 +56,7 @@ impl CassandraCatalogStore {
             datacenter,
             replication_factor,
             encryption_key: None,
+            metrics_ttl_seconds: 86400,
         }
     }
 
@@ -71,6 +75,7 @@ impl CassandraCatalogStore {
             datacenter,
             replication_factor,
             encryption_key: Some(Arc::from(encryption_key.as_str())),
+            metrics_ttl_seconds: 86400,
         }
     }
 
@@ -400,46 +405,260 @@ use extenddb_storage::management_store::{MetricsStore, RateLimitStore};
 impl RateLimitStore for CassandraCatalogStore {
     fn count_principal_failures(
         &self,
-        _principal: &str,
-        _window_seconds: i64,
+        principal: &str,
+        window_seconds: i64,
     ) -> BoxFuture<'_, OpResult<i64>> {
-        Box::pin(async move { Ok(0) })
+        let principal = principal.to_owned();
+        let session = self.session.clone();
+        let catalog_keyspace = self.catalog_keyspace();
+        Box::pin(async move {
+            let cutoff = chrono::Utc::now()
+                - chrono::Duration::seconds(window_seconds);
+            let cutoff_ms = cutoff.timestamp_millis();
+            let query = format!(
+                "SELECT COUNT(*) FROM {catalog_keyspace}.login_attempts \
+                 WHERE principal = ? AND attempted_at > ? AND success = false \
+                 ALLOW FILTERING"
+            );
+            let result = session
+                .query_with_values(&query, cdrs_tokio::query_values!(principal.as_str(), cutoff_ms))
+                .await
+                .map_err(|e| {
+                    tracing::error!("count_principal_failures: {e}");
+                    OpError::Internal("Database error".to_owned())
+                })?;
+            let count: i64 = result
+                .response_body()
+                .map_err(|e| OpError::Internal(e.to_string()))?
+                .into_rows()
+                .and_then(|mut rows| rows.pop())
+                .and_then(|row| row.get_r_by_name("count").ok())
+                .unwrap_or(0);
+            Ok(count)
+        })
     }
 
     fn count_ip_failures(
         &self,
-        _source_ip: &str,
-        _window_seconds: i64,
+        source_ip: &str,
+        window_seconds: i64,
     ) -> BoxFuture<'_, OpResult<i64>> {
-        Box::pin(async move { Ok(0) })
+        let source_ip = source_ip.to_owned();
+        let session = self.session.clone();
+        let catalog_keyspace = self.catalog_keyspace();
+        Box::pin(async move {
+            let cutoff = chrono::Utc::now()
+                - chrono::Duration::seconds(window_seconds);
+            let cutoff_ms = cutoff.timestamp_millis();
+            // No partition key available for source_ip; ALLOW FILTERING is
+            // acceptable because cleanup_old_attempts keeps the table bounded.
+            let query = format!(
+                "SELECT COUNT(*) FROM {catalog_keyspace}.login_attempts \
+                 WHERE source_ip = ? AND attempted_at > ? AND success = false \
+                 ALLOW FILTERING"
+            );
+            let result = session
+                .query_with_values(&query, cdrs_tokio::query_values!(source_ip.as_str(), cutoff_ms))
+                .await
+                .map_err(|e| {
+                    tracing::error!("count_ip_failures: {e}");
+                    OpError::Internal("Database error".to_owned())
+                })?;
+            let count: i64 = result
+                .response_body()
+                .map_err(|e| OpError::Internal(e.to_string()))?
+                .into_rows()
+                .and_then(|mut rows| rows.pop())
+                .and_then(|row| row.get_r_by_name("count").ok())
+                .unwrap_or(0);
+            Ok(count)
+        })
     }
 
-    fn record_failed_login(&self, _principal: &str, _source_ip: Option<&str>) -> BoxFuture<'_, ()> {
-        Box::pin(async move {})
+    fn record_failed_login(&self, principal: &str, source_ip: Option<&str>) -> BoxFuture<'_, ()> {
+        let principal = principal.to_owned();
+        let source_ip = source_ip.map(str::to_owned);
+        let session = self.session.clone();
+        let catalog_keyspace = self.catalog_keyspace();
+        Box::pin(async move {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let query = format!(
+                "INSERT INTO {catalog_keyspace}.login_attempts \
+                 (principal, attempted_at, success, source_ip) VALUES (?, ?, false, ?)"
+            );
+            if let Err(e) = session
+                .query_with_values(
+                    &query,
+                    cdrs_tokio::query_values!(
+                        principal.as_str(),
+                        now_ms,
+                        source_ip.as_deref()
+                    ),
+                )
+                .await
+            {
+                tracing::error!("record_failed_login: {e}");
+            }
+        })
     }
 
-    fn cleanup_old_attempts(&self, _max_age_seconds: i64) -> BoxFuture<'_, ()> {
-        Box::pin(async move {})
+    fn cleanup_old_attempts(&self, max_age_seconds: i64) -> BoxFuture<'_, ()> {
+        let session = self.session.clone();
+        let catalog_keyspace = self.catalog_keyspace();
+        Box::pin(async move {
+            let cutoff = chrono::Utc::now()
+                - chrono::Duration::seconds(max_age_seconds);
+            let cutoff_ms = cutoff.timestamp_millis();
+            // Fetch principals with old records, then delete by partition key.
+            // Cassandra does not support DELETE ... WHERE non-pk < ? without
+            // ALLOW FILTERING; fetching principals first avoids a full scan on delete.
+            let select = format!(
+                "SELECT DISTINCT principal FROM {catalog_keyspace}.login_attempts"
+            );
+            let principals = match session.query(&select).await
+                .and_then(|r| r.response_body())
+                .map(|b| b.into_rows().unwrap_or_default())
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::error!("cleanup_old_attempts fetch principals: {e}");
+                    return;
+                }
+            };
+            let delete = format!(
+                "DELETE FROM {catalog_keyspace}.login_attempts \
+                 WHERE principal = ? AND attempted_at < ?"
+            );
+            for row in principals {
+                let Ok(principal): Result<String, _> = row.get_r_by_name("principal") else {
+                    continue;
+                };
+                if let Err(e) = session
+                    .query_with_values(
+                        &delete,
+                        cdrs_tokio::query_values!(principal.as_str(), cutoff_ms),
+                    )
+                    .await
+                {
+                    tracing::error!("cleanup_old_attempts delete for {principal}: {e}");
+                }
+            }
+        })
     }
 }
 
 use extenddb_storage::management_store::MetricsRow;
 
 impl MetricsStore for CassandraCatalogStore {
-    fn insert_metrics(&self, _rows: &[MetricsRow]) -> BoxFuture<'_, OpResult<()>> {
-        Box::pin(async move { Ok(()) })
+    fn insert_metrics(&self, rows: &[MetricsRow]) -> BoxFuture<'_, OpResult<()>> {
+        let rows = rows.to_vec();
+        let session = self.session.clone();
+        let catalog_keyspace = self.catalog_keyspace();
+        let ttl = self.metrics_ttl_seconds;
+        Box::pin(async move {
+            let query = format!(
+                "INSERT INTO {catalog_keyspace}.metrics \
+                 (bucket, metric, table_name, index_name, operation, sum, count, min, max) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL {ttl}"
+            );
+            for row in &rows {
+                #[allow(clippy::cast_possible_truncation)]
+                let bucket_ms = (row.bucket.unix_timestamp_nanos() / 1_000_000) as i64;
+                if let Err(e) = session
+                    .query_with_values(
+                        &query,
+                        cdrs_tokio::query_values!(
+                            bucket_ms,
+                            row.metric.as_str(),
+                            row.table_name.as_deref().unwrap_or(""),
+                            row.index_name.as_deref().unwrap_or(""),
+                            row.operation.as_deref().unwrap_or(""),
+                            row.sum,
+                            row.count,
+                            row.min,
+                            row.max
+                        ),
+                    )
+                    .await
+                {
+                    tracing::warn!("Failed to insert metrics row: {e}");
+                }
+            }
+            Ok(())
+        })
     }
 
     fn query_metrics(
         &self,
-        _start: time::OffsetDateTime,
-        _end: time::OffsetDateTime,
-        _table_name: Option<&str>,
-        _metric: Option<&str>,
+        start: time::OffsetDateTime,
+        end: time::OffsetDateTime,
+        table_name: Option<&str>,
+        metric: Option<&str>,
     ) -> BoxFuture<'_, OpResult<Vec<MetricsRow>>> {
-        Box::pin(async move { Ok(vec![]) })
+        let table_name = table_name.map(str::to_owned);
+        let metric = metric.map(str::to_owned);
+        let session = self.session.clone();
+        let catalog_keyspace = self.catalog_keyspace();
+        Box::pin(async move {
+            #[allow(clippy::cast_possible_truncation)]
+            let start_ms = (start.unix_timestamp_nanos() / 1_000_000) as i64;
+            #[allow(clippy::cast_possible_truncation)]
+            let end_ms = (end.unix_timestamp_nanos() / 1_000_000) as i64;
+
+            // bucket is part of the composite partition key so a range scan
+            // requires ALLOW FILTERING; the time window keeps the result bounded.
+            let query = format!(
+                "SELECT bucket, metric, table_name, index_name, operation, \
+                 sum, count, min, max \
+                 FROM {catalog_keyspace}.metrics \
+                 WHERE bucket >= ? AND bucket <= ? ALLOW FILTERING"
+            );
+            let result = session
+                .query_with_values(&query, cdrs_tokio::query_values!(start_ms, end_ms))
+                .await
+                .map_err(|e| {
+                    tracing::warn!("query_metrics: {e}");
+                    OpError::Internal("Database error".to_owned())
+                })?;
+
+            let rows = result
+                .response_body()
+                .map_err(|e| OpError::Internal(e.to_string()))?
+                .into_rows()
+                .unwrap_or_default();
+
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                use crate::cassandra_util::get_column;
+                let bucket_ms: i64 = get_column(&row, "bucket", "query_metrics")?;
+                let bucket = time::OffsetDateTime::from_unix_timestamp(bucket_ms / 1000)
+                    .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+                let metric_val: String = get_column(&row, "metric", "query_metrics")?;
+                let tn: String = get_column(&row, "table_name", "query_metrics")?;
+                let idx: String = get_column(&row, "index_name", "query_metrics")?;
+                let op: String = get_column(&row, "operation", "query_metrics")?;
+
+                if table_name.as_deref().is_some_and(|f| f != tn) { continue; }
+                if metric.as_deref().is_some_and(|f| f != metric_val) { continue; }
+
+                out.push(MetricsRow {
+                    bucket,
+                    metric: metric_val,
+                    table_name: if tn.is_empty() { None } else { Some(tn) },
+                    index_name: if idx.is_empty() { None } else { Some(idx) },
+                    operation: if op.is_empty() { None } else { Some(op) },
+                    sum: get_column(&row, "sum", "query_metrics")?,
+                    count: get_column(&row, "count", "query_metrics")?,
+                    min: get_column(&row, "min", "query_metrics")?,
+                    max: get_column(&row, "max", "query_metrics")?,
+                });
+            }
+            out.sort_by_key(|r| r.bucket);
+            Ok(out)
+        })
     }
 
+    /// No-op: Cassandra native TTL (set on insert) handles metrics expiry.
     fn prune_metrics(&self, _retention: std::time::Duration) -> BoxFuture<'_, OpResult<()>> {
         Box::pin(async move { Ok(()) })
     }

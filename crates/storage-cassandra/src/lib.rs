@@ -7,6 +7,8 @@
 //! as the underlying database. It provides a DynamoDB-compatible API backed
 //! by Cassandra's distributed architecture.
 
+pub const CATALOG_VERSION: &str = "0.0.3";
+
 mod admin_store;
 mod authorization_store;
 mod backup_engine;

@@ -5,6 +5,7 @@
 
 use crate::catalog_store::CassandraCatalogStore;
 use cdrs_tokio::types::blob::Blob;
+use cdrs_tokio::types::IntoRustByName;
 use extenddb_storage::management_store::{AccessKeyCreated, OpError, OpResult};
 
 impl CassandraCatalogStore {
@@ -86,46 +87,35 @@ impl CassandraCatalogStore {
     ) -> OpResult<()> {
         let catalog_keyspace = self.catalog_keyspace();
 
-        // Check if key exists and belongs to the correct account/user
-        let check_query = format!(
-            "SELECT access_key_id, account_id, user_name FROM {catalog_keyspace}.access_keys \
-             WHERE access_key_id = ?"
+        // Atomic ownership check + delete via LWT. Collapses "not found" and
+        // "belongs to a different account/user" into the same NotFound error.
+        let delete_query = format!(
+            "DELETE FROM {catalog_keyspace}.access_keys \
+             WHERE access_key_id = ? IF account_id = ? AND user_name = ?"
         );
 
-        let row = crate::cassandra_util::query_optional(
-            self.session(),
-            &check_query,
-            cdrs_tokio::query_values!(key_id),
-            "delete_access_key",
-        )
-        .await?;
+        let result = self
+            .session()
+            .query_with_values(
+                &delete_query,
+                cdrs_tokio::query_values!(key_id, account_id, user_name),
+            )
+            .await
+            .map_err(|e| OpError::Internal(e.to_string()))?;
 
-        match row {
-            None => return Err(OpError::NotFound("Access key not found".to_owned())),
-            Some(r) => {
-                // Verify it belongs to the specified account and user
-                let key_account: String =
-                    crate::cassandra_util::get_column(&r, "account_id", "delete_access_key")?;
-                let key_user: String =
-                    crate::cassandra_util::get_column(&r, "user_name", "delete_access_key")?;
+        let applied: bool = result
+            .response_body()
+            .map_err(|e| OpError::Internal(e.to_string()))?
+            .into_rows()
+            .and_then(|mut rows| rows.pop())
+            .and_then(|row| row.get_r_by_name("[applied]").ok())
+            .unwrap_or(false);
 
-                if key_account != account_id || key_user != user_name {
-                    return Err(OpError::NotFound("Access key not found".to_owned()));
-                }
-            }
+        if !applied {
+            return Err(OpError::NotFound("Access key not found".to_owned()));
         }
 
-        // Delete the key (by PRIMARY KEY only)
-        let delete_query =
-            format!("DELETE FROM {catalog_keyspace}.access_keys WHERE access_key_id = ?");
-
-        crate::cassandra_util::execute(
-            self.session(),
-            &delete_query,
-            cdrs_tokio::query_values!(key_id),
-            "delete_access_key",
-        )
-        .await
+        Ok(())
     }
 
     pub(crate) async fn list_access_keys_impl(
