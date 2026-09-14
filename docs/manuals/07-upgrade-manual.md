@@ -4,21 +4,13 @@
 
 ## Current Status
 
-Catalog 0.0.4 is current. **Every existing PostgreSQL and SQLite deployment must run the upgrade**: the server refuses to start against a catalog version it was not built for.
-
-See [Catalog 0.0.4](#catalog-004-current) below for what changes and the exact sequence.
+The server refuses to start against a catalog version it was not built for, so **every PostgreSQL and SQLite deployment must run `extenddb migrate` when a release changes the catalog**. The installed and expected versions are reported by the tooling, not by this manual: see [Seeing the Installed and Expected Versions](#seeing-the-installed-and-expected-versions).
 
 ## How Catalog Upgrades Work
 
 ### The Migration System
 
-Migrations are SQL files in `crates/storage-postgres/migrations/`, applied in filename order:
-
-```
-001_schema.sql                    ← the complete initial schema
-002_vector_indexes.sql            ← vector index metadata, catalog 0.0.3
-003_drop_continuous_backups.sql   ← drops the unused PITR table, catalog 0.0.4
-```
+Migrations are SQL files in `crates/storage-postgres/migrations/`, applied in filename order. Each file opens with a header comment stating what it changes and which catalog version it introduces; read the files for the per-migration details.
 
 The `schema_history` table tracks which files have been applied. When `extenddb migrate` runs, it:
 
@@ -26,6 +18,7 @@ The `schema_history` table tracks which files have been applied. When `extenddb 
 2. Checks `schema_history` for each filename
 3. Applies any unapplied migrations in order
 4. Records each applied filename in `schema_history`
+5. Writes the catalog version the binary expects, so an upgrade interrupted between applying a migration and recording it converges on the expected version when `extenddb migrate` runs again
 
 Running `extenddb migrate` on an up-to-date catalog is a no-op.
 
@@ -35,10 +28,35 @@ A single row in the `settings` table stores the catalog version:
 
 ```sql
 SELECT value FROM settings WHERE key = 'catalog_version';
--- '0.0.2'
 ```
 
 The binary embeds an expected catalog version (`CATALOG_VERSION` constant in `crates/storage-postgres/src/lib.rs`). At startup, the server compares the database value against the binary's expectation. If they don't match, the server refuses to start and directs the operator to run `extenddb migrate`.
+
+### Seeing the Installed and Expected Versions
+
+The tooling reports both versions.
+
+`extenddb verify` prints the stored version and, on a mismatch, the version the binary expects:
+
+```
+--- Checking catalog version...
+  WARN: Catalog version <stored> (binary expects <expected>)
+```
+
+`extenddb migrate` without `--yes` reports what an upgrade would apply and changes nothing:
+
+```
+--- Checking current catalog version...
+  Current version: <stored>
+...
+--yes is required to apply migrations. Pending: catalog <stored> -> <expected>.
+```
+
+A server started against a catalog it was not built for refuses with both versions in the error:
+
+```
+Catalog version mismatch: expected <expected>, found <stored>. Run 'extenddb migrate'
+```
 
 ### Version Semantics
 
@@ -125,7 +143,7 @@ The consolidated schema file is what fresh installs get. Add your new column/tab
 
 ## General Upgrade Procedure
 
-For future releases that include catalog changes:
+For releases that include catalog changes, on any backend:
 
 1. **Stop the server**
 
@@ -149,9 +167,14 @@ cargo build --release
 
 4. **Run migrations**
 
+Run without `--yes` first: it reports the stored and expected versions and what an upgrade would apply, and changes nothing. Then apply:
+
 ```bash
 extenddb migrate --config extenddb.toml
+extenddb migrate --yes --config extenddb.toml
 ```
+
+The migration may print notices for optional steps that failed (for example a database extension it could not install); see the Admin Guide for what a notice means and what to do about it.
 
 5. **Verify**
 
@@ -165,9 +188,11 @@ extenddb verify --config extenddb.toml
 extenddb serve --config extenddb.toml
 ```
 
+SQLite deployments follow the same sequence; `extenddb migrate` re-applies the catalog schema. MongoDB deployments track their own catalog version, and a release states whether it changes; the Behavior Changes section below still applies to them.
+
 ## Rollback Procedure
 
-If an upgrade fails:
+The upgrade is not reversible in place: an older binary refuses to start against a newer catalog, by the same check in the other direction. If an upgrade fails or must be undone:
 
 1. Stop the server
 2. Restore from backup:
@@ -180,62 +205,7 @@ psql -d extenddb_catalog -f catalog_backup_YYYYMMDD.sql
 
 3. Rebuild the previous version and start it
 
-## Version History
-
-### Catalog 0.0.4 (Current)
-
-Drops the `continuous_backups` table.
-
-Point-in-time recovery is now reported honestly as unsupported. `DescribeContinuousBackups` always answers `PointInTimeRecoveryStatus: DISABLED`, `UpdateContinuousBackups` with `PointInTimeRecoveryEnabled: true` returns `ContinuousBackupsUnavailableException`, and `RestoreTableToPointInTime` resolves the source table (`TableNotFoundException` when it does not exist) and then returns `PointInTimeRecoveryUnavailableException`, the exception the service models on that operation. The engine answers these operations without consulting storage, so the per-table `pitr_enabled` flag the table stored drove nothing and the table is removed.
-
-**This release changes wire behavior.** Before 0.0.4, `UpdateContinuousBackups` accepted an enable request and `DescribeContinuousBackups` then reported `ENABLED` with a 35-day window, even though `RestoreTableToPointInTime` could never restore. Any client or infrastructure template that enables point-in-time recovery (for example a Terraform resource with `point_in_time_recovery = true`) now receives `ContinuousBackupsUnavailableException` and must stop requesting it, and a restore attempt now receives `PointInTimeRecoveryUnavailableException` instead of a generic `ValidationException`. Use on-demand backups (`CreateBackup`, `RestoreTableFromBackup`) instead.
-
-**Every PostgreSQL deployment must apply this**, because the server refuses to start against a catalog version it was not built for. Upgrade sequence:
-
-```bash
-extenddb stop --config extenddb.toml
-extenddb migrate --yes --config extenddb.toml
-extenddb serve --config extenddb.toml
-```
-
-Run `extenddb migrate` without `--yes` first to see what is pending; it reports `catalog 0.0.3 -> 0.0.4` and changes nothing.
-
-Starting with this release, the migration runner writes the final catalog version itself after each run, so an upgrade interrupted between applying a migration and recording it converges on the current version when `extenddb migrate` is run again.
-
-SQLite deployments upgrade the same way: `extenddb migrate` re-applies the catalog schema, which drops the `continuous_backups` table and records catalog 0.0.4.
-
-MongoDB deployments need no action. The backend tracks its own catalog version, which does not change; the bootstrapper simply no longer creates the `continuous_backups` collection. An existing deployment keeps an orphaned, unread collection that is harmless to leave in place and safe to drop by hand (`db.getSiblingDB("extenddb_catalog").continuous_backups.drop()`).
-
-The upgrade is not reversible in place: a 0.0.3 binary refuses to start against a 0.0.4 catalog, by the same check in the other direction. Roll back by restoring the catalog backup taken before the upgrade, as described above. No data of value is lost either way: the dropped table held only the meaningless per-table enable flag.
-
-### Catalog 0.0.3
-
-Adds vector index metadata:
-
-- New `vector_indexes` table: one row per vector index, holding its dimensions, distance function, vector attribute, search schema, projection, and build state.
-- New `vector_indexes` column on `backups`: a snapshot of the source table's vector index configuration, taken when the backup is created.
-
-**Every PostgreSQL deployment must apply this**, whether or not it uses vector indexes, because the server refuses to start against a catalog version it was not built for.
-
-Upgrade sequence:
-
-```bash
-extenddb stop --config extenddb.toml
-extenddb migrate --yes --config extenddb.toml
-extenddb serve --config extenddb.toml
-```
-
-Run `extenddb migrate` without `--yes` first to see what is pending; it reports `catalog 0.0.2 -> 0.0.3` and changes nothing.
-
-The upgrade is not reversible in place: a 0.0.2 binary refuses to start against a 0.0.3 catalog, by the same check in the other direction. Roll back by restoring the catalog backup taken before the upgrade, as described above. Downgrading is safe for data written before the upgrade; vector indexes created afterwards are not representable in 0.0.2 and are lost with the restore.
-
-During the upgrade the migration also attempts to install the pgvector extension on the data database. Failure is reported as a notice and does not stop the upgrade: vector indexes are then refused at request time, and every other operation is unaffected. See the Admin Guide for what the notice means and what to do about it.
-
-### Catalog 0.0.2 (Initial Release)
-
-Complete schema: accounts, tables, indexes, tags, streams, IAM (users, groups, roles, policies, access keys, sessions, permissions boundaries), idempotency tokens, metrics, login attempts, backups, continuous backups, TTL support, settings.
-
-The first release, so all 0.0.2 deployments were fresh installs.
+Data written after the upgrade in schema shapes the previous version cannot represent is lost with the restore.
 
 ---
 
@@ -244,6 +214,14 @@ The first release, so all 0.0.2 deployments were fresh installs.
 Catalog upgrades change the schema; behavior changes alter how the running server
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
+
+### Point-in-time recovery is reported as unsupported (catalog migration required)
+
+**What changed.** `UpdateContinuousBackups` no longer accepts an enable request, and `DescribeContinuousBackups` no longer reports `ENABLED` with a 35-day window. Point-in-time recovery is reported as unsupported: describe answers `PointInTimeRecoveryStatus: DISABLED`, an enable request returns `ContinuousBackupsUnavailableException`, and `RestoreTableToPointInTime` resolves the source table (`TableNotFoundException` when it does not exist) and then returns `PointInTimeRecoveryUnavailableException`. See [Differences from DynamoDB](../differences-from-dynamodb.md) for the full surface. The catalog migration drops the `continuous_backups` table on PostgreSQL and SQLite; it held only a per-table enable flag that drove nothing.
+
+**Who is affected.** Any client or infrastructure template that enables point-in-time recovery (for example a Terraform resource with `point_in_time_recovery = true`) now receives `ContinuousBackupsUnavailableException` and must stop requesting it. A restore attempt now receives `PointInTimeRecoveryUnavailableException` instead of a generic `ValidationException`.
+
+**Migration.** Use on-demand backups (`CreateBackup`, `RestoreTableFromBackup`) instead; they are supported on every backend. MongoDB deployments need no catalog action: the bootstrapper no longer creates the `continuous_backups` collection, and an existing deployment keeps an orphaned, unread collection that is harmless to leave in place and safe to drop by hand (`db.getSiblingDB("extenddb_catalog").continuous_backups.drop()`).
 
 ### v0.1.6 — IAM: bare operators on multivalued condition keys are no-ops (BR-7085)
 

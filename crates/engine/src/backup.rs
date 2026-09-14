@@ -225,7 +225,7 @@ fn pitr_restore_unavailable_error(table_name: &str) -> DynamoDbError {
 /// a table whose recovery is disabled. Owned by the engine rather than the
 /// backends: the answer does not depend on stored state, so no backend is
 /// consulted and all three report identically.
-fn disabled_continuous_backups_description() -> extenddb_core::types::ContinuousBackupsDescription {
+fn default_continuous_backups_description() -> extenddb_core::types::ContinuousBackupsDescription {
     extenddb_core::types::ContinuousBackupsDescription {
         continuous_backups_status: "ENABLED".to_owned(),
         point_in_time_recovery_description: Some(
@@ -283,7 +283,7 @@ pub(crate) async fn handle_describe_continuous_backups(
     require_table_exists(ctx, table_name).await?;
 
     serialize_output(
-        &json!({ "ContinuousBackupsDescription": disabled_continuous_backups_description() }),
+        &json!({ "ContinuousBackupsDescription": default_continuous_backups_description() }),
     )
 }
 
@@ -322,7 +322,7 @@ pub(crate) async fn handle_update_continuous_backups(
     }
 
     serialize_output(
-        &json!({ "ContinuousBackupsDescription": disabled_continuous_backups_description() }),
+        &json!({ "ContinuousBackupsDescription": default_continuous_backups_description() }),
     )
 }
 
@@ -416,7 +416,7 @@ fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> DynamoDbEr
 #[cfg(test)]
 mod tests {
     use super::{
-        backup_arn_field, disabled_continuous_backups_description, pitr_restore_unavailable_error,
+        backup_arn_field, default_continuous_backups_description, pitr_restore_unavailable_error,
         pitr_unsupported_error, storage_err_to_dynamo,
     };
     use extenddb_core::error::DynamoDbError;
@@ -515,7 +515,7 @@ mod tests {
     /// service, which drops them entirely.
     #[test]
     fn the_continuous_backups_description_is_enabled_with_recovery_disabled() {
-        let desc = disabled_continuous_backups_description();
+        let desc = default_continuous_backups_description();
         let wire = serde_json::to_value(&desc).expect("serializes");
         assert_eq!(wire["ContinuousBackupsStatus"], "ENABLED");
         let pitr = &wire["PointInTimeRecoveryDescription"];

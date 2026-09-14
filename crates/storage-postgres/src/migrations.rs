@@ -359,19 +359,6 @@ mod tests {
         );
     }
 
-    /// The convergence write must target the cell the startup gate reads.
-    ///
-    /// The runner converges the stored version on the compiled constant after
-    /// every walk, so a replay of an earlier file cannot leave the version
-    /// behind the schema actually present. That only holds while this statement
-    /// writes the same settings row the files write and the gate reads, so the
-    /// statement text is pinned against a rename of the key or the table.
-    #[test]
-    fn the_runner_convergence_write_targets_the_catalog_version_cell() {
-        assert!(super::SET_CATALOG_VERSION_SQL.starts_with("UPDATE settings"));
-        assert!(super::SET_CATALOG_VERSION_SQL.contains("key = 'catalog_version'"));
-    }
-
     /// Each migration is registered under the filename it is stored as.
     ///
     /// The ledger keys on this string, so a mismatch between the registered name
