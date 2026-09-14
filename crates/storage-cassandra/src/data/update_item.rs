@@ -100,8 +100,7 @@ impl CassandraEngine {
                 )
                 .await;
             let (old_json, version) = match read {
-                Ok(read) => read,
-                // Another owner holds the row. On a TTL-enabled table that is
+                Ok(read) => read,                // Another owner holds the row. On a TTL-enabled table that is
                 // transient, so treat it like a lost OCC race and re-read.
                 Err(StorageError::TransactionConflict(message)) => {
                     if attempt == OCC_MAX_RETRIES {
@@ -239,8 +238,8 @@ impl CassandraEngine {
 
     /// Read `item_data`, `version`, and `prepared_txn_id` for OCC.
     ///
-    /// Returns `(existing_item, version)`. `version` is `None` for rows that
-    /// pre-date the OCC column (treated as version 0 — `IF version = null`).
+    /// Returns `(existing_item, version)`. A null `version` column (rows written
+    /// before the OCC protocol was enforced) is treated as `0`.
     ///
     /// Returns `TransactionConflict` if `prepared_txn_id` is set.
     async fn occ_read(
@@ -251,7 +250,7 @@ impl CassandraEngine {
         sk: Option<&extenddb_storage::util::SortKeyValue>,
         sk_col: Option<&'static str>,
         ttl_enabled: bool,
-    ) -> Result<(Option<Item>, Option<i64>), StorageError> {
+    ) -> Result<(Option<Item>, i64), StorageError> {
         use cdrs_tokio::types::IntoRustByName as _;
 
         let row_opt = if let (Some(sk), Some(sk_col)) = (sk, sk_col) {
@@ -280,7 +279,7 @@ impl CassandraEngine {
         };
 
         let Some(row) = row_opt else {
-            return Ok((None, None));
+            return Ok((None, 0));
         };
 
         let prepared_txn_id: Option<uuid::Uuid> = row.get_by_name("prepared_txn_id").ok().flatten();
@@ -290,7 +289,7 @@ impl CassandraEngine {
 
         // Static partition metadata can produce a physical row with no logical item.
         let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
-        let version: Option<i64> = row.get_by_name("version").ok().flatten();
+        let version: i64 = row.get_by_name("version").ok().flatten().unwrap_or(0);
 
         Ok((item_data.map(json_to_item).transpose()?, version))
     }
@@ -300,7 +299,7 @@ impl CassandraEngine {
     /// Uses `IF version = ? AND prepared_txn_id = null` for existing items, or
     /// `IF item_data = null AND prepared_txn_id = null` for logical creation.
     #[allow(clippy::too_many_arguments)]
-    async fn occ_write(
+    pub(crate) async fn occ_write(
         &self,
         data_keyspace: &str,
         ddb_table: &str,
@@ -308,7 +307,7 @@ impl CassandraEngine {
         sk: Option<&extenddb_storage::util::SortKeyValue>,
         sk_col: Option<&'static str>,
         item_json_str: &str,
-        version: Option<i64>,
+        version: i64,
         item_existed: bool,
         indexes: &[super::index::IndexMeta],
         key_info: &TableKeyInfo,
@@ -334,44 +333,35 @@ impl CassandraEngine {
             )
         });
 
-        let next_version = version.unwrap_or(0) + 1;
+        let next_version = version + 1;
 
         // Build the LWT statement used when no TTL claim owns the existing row.
         let (lwt_cql, lwt_qv) = if item_existed {
-            let version_cond = if version.is_some() {
-                "version = ?".to_owned()
-            } else {
-                "version = null".to_owned()
-            };
             if let (Some(sk), Some(sk_col)) = (sk, sk_col) {
                 let cql = format!(
                     "UPDATE {data_keyspace}.{ddb_table} SET item_data = ?, version = ? \
                      WHERE pk = ? AND {sk_col} = ? \
-                     IF {version_cond} AND prepared_txn_id = null"
+                     IF version = ? AND prepared_txn_id = null"
                 );
-                let mut vals: Vec<cdrs_tokio::types::value::Value> = vec![
+                let vals = vec![
                     item_json_str.into(),
                     next_version.into(),
                     cdrs_tokio::types::value::Value::from(pk_text),
                     super::index::sk_to_value(sk),
+                    version.into(),
                 ];
-                if let Some(version) = version {
-                    vals.push(version.into());
-                }
                 (cql, cdrs_tokio::query::QueryValues::SimpleValues(vals))
             } else {
                 let cql = format!(
                     "UPDATE {data_keyspace}.{ddb_table} SET item_data = ?, version = ? \
-                     WHERE pk = ? IF {version_cond} AND prepared_txn_id = null"
+                     WHERE pk = ? IF version = ? AND prepared_txn_id = null"
                 );
-                let mut vals: Vec<cdrs_tokio::types::value::Value> = vec![
+                let vals = vec![
                     item_json_str.into(),
                     next_version.into(),
                     cdrs_tokio::types::value::Value::from(pk_text),
+                    version.into(),
                 ];
-                if let Some(version) = version {
-                    vals.push(version.into());
-                }
                 (cql, cdrs_tokio::query::QueryValues::SimpleValues(vals))
             }
         } else if let (Some(sk), Some(sk_col)) = (sk, sk_col) {

@@ -13,7 +13,7 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{composite_pk_to_text, parse_sk, pk_to_text, sk_column, sk_info};
 
 use super::ddl::data_table_name;
-use super::{json_to_item, query_with_pk_sk, query_with_pk_sk_item};
+use super::{json_to_item, query_with_pk_sk};
 use crate::CassandraEngine;
 use crate::stream_util::stream_record_statement;
 
@@ -145,9 +145,9 @@ impl CassandraEngine {
             let sk = parse_sk(sk_value, sk_type)?;
             let sk_col = sk_column(sk_type);
 
-            // Read old item including prepared_txn_id for transaction conflict detection
+            // Read old item including version and prepared_txn_id for OCC fence.
             let select_query = format!(
-                "SELECT item_data, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?"
+                "SELECT item_data, version, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?"
             );
 
             let old_result =
@@ -157,20 +157,22 @@ impl CassandraEngine {
                 .response_body()
                 .map_err(|e| StorageError::Internal(format!("Parse response: {e}")))?;
 
-            let (old_item_opt, has_prepared_txn) = if let Some(rows) = body.into_rows() {
+            let (old_item_opt, version, has_prepared_txn) = if let Some(rows) = body.into_rows() {
                 if let Some(row) = rows.into_iter().next() {
                     let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+                    let version: i64 = row.get_by_name("version").ok().flatten().unwrap_or(0);
                     let prepared_txn_id: Option<uuid::Uuid> =
                         row.get_by_name("prepared_txn_id").ok().flatten();
                     (
                         item_data.map(json_to_item).transpose()?,
+                        version,
                         prepared_txn_id.is_some(),
                     )
                 } else {
-                    (None, false)
+                    (None, 0, false)
                 }
             } else {
-                (None, false)
+                (None, 0, false)
             };
 
             // Reject if item is part of an in-flight transaction
@@ -194,198 +196,88 @@ impl CassandraEngine {
                 Err(e) => return Err(e),
             }
 
-            let stream_stmt = stream.and_then(|cap| {
-                stream_record_statement(
+            let item_existed = old_item_opt.is_some();
+
+            let ttl_claim = if ttl_config.is_some() {
+                match self
+                    .acquire_ttl_mutation_claim(key_info, &item, old_item_opt.as_ref())
+                    .await
+                {
+                    Ok(claim) => claim,
+                    Err(StorageError::TransactionConflict(_)) if key_not_exists_condition => {
+                        return Err(StorageError::ConditionFailed(old_item_opt));
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
+            let mutation_timestamp = ttl_claim.map(|_| chrono::Utc::now().timestamp_micros());
+
+            let write_result = self
+                .occ_write(
                     &data_keyspace,
-                    &key_info.table_id,
+                    &ddb_table,
+                    pk_text.as_ref(),
+                    Some(&sk),
+                    Some(sk_col),
+                    &item_text,
+                    version,
+                    item_existed,
+                    &indexes,
                     key_info,
                     old_item_opt.as_ref(),
-                    Some(&item),
-                    cap,
-                    &self.hlc,
-                    self.stream_retention_seconds,
+                    &item,
+                    sys_delay,
+                    stream,
+                    ttl_config.as_ref().map(|c| c.attribute.as_str()),
+                    ttl_config.as_ref().map(|c| c.generation),
+                    ttl_claim,
+                    mutation_timestamp,
                 )
-            });
-
-            if indexes.is_empty() && stream_stmt.is_none() && ttl_config.is_none() {
-                // Fast path: no batch needed.
-                let insert_query = format!(
-                    "INSERT INTO {data_keyspace}.{ddb_table} \
-                     (pk, {sk_col}, item_data) \
-                     VALUES (?, ?, ?)"
-                );
-                query_with_pk_sk_item(
-                    &self.session,
-                    &insert_query,
-                    pk_text.as_ref(),
-                    &sk,
-                    &item_text,
-                )
-                .await?;
+                .await;
+            if write_result.is_err() {
+                self.release_ttl_mutation_claim(key_info, &item, ttl_claim)
+                    .await;
             } else {
-                // LOGGED BATCH: item insert + optional index updates + optional stream record.
-                // On a claimed row the base write also clears the claim columns.
-                // The batch timestamp is pinned after claim acquisition, so these
-                // nulls lose to any newer owner's Paxos cells exactly as the item
-                // cells do — no separate release round trip is needed on success.
-                let insert_cql = if ttl_config.is_some() {
-                    format!(
-                        "INSERT INTO {data_keyspace}.{ddb_table} \
-                         (pk, {sk_col}, item_data, prepared_txn_id, prepared_txn_timestamp) \
-                         VALUES (?, ?, ?, null, null)"
-                    )
-                } else {
-                    format!(
-                        "INSERT INTO {data_keyspace}.{ddb_table} \
-                         (pk, {sk_col}, item_data) \
-                         VALUES (?, ?, ?)"
-                    )
-                };
-                let insert_qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
-                    cdrs_tokio::types::value::Value::from(pk_text.as_str()),
-                    super::index::sk_to_value(&sk),
-                    item_text.as_str().into(),
-                ]);
-                let mut batch = BatchQueryBuilder::new()
-                    .with_consistency(Consistency::LocalQuorum)
-                    .add_query(insert_cql, insert_qv);
-
-                if !indexes.is_empty() {
-                    super::index::sync_indexes(
-                        &mut batch,
-                        &data_keyspace,
-                        &key_info.key_schema,
-                        &key_info.attribute_definitions,
-                        &indexes,
-                        old_item_opt.as_ref(),
-                        Some(&item),
-                        sys_delay,
-                    )?;
-                }
-
-                let async_enqueued = if indexes.is_empty() {
-                    0
-                } else {
-                    super::index::enqueue_async_indexes(
-                        &self.session,
-                        &mut batch,
-                        &data_keyspace,
-                        key_info,
-                        &indexes,
-                        old_item_opt.as_ref(),
-                        Some(&item),
-                        sys_delay,
-                    )
-                    .await?
-                };
-
-                if let Some(config) = ttl_config.as_ref() {
-                    super::ttl::add_ttl_reconciliation_mutation(
-                        &mut batch,
-                        &data_keyspace,
-                        key_info,
-                        &config.attribute,
-                        &item,
-                    )?;
-                    super::ttl::add_ttl_queue_mutations(
-                        &mut batch,
-                        &data_keyspace,
-                        key_info,
-                        &config.attribute,
-                        config.generation,
-                        old_item_opt.as_ref(),
-                        Some(&item),
-                    )?;
-                }
-
-                if let Some(stmt) = stream_stmt {
-                    batch =
-                        batch.add_query(stmt, cdrs_tokio::query::QueryValues::SimpleValues(vec![]));
-                }
-
-                // Acquire only after every fallible side-effect statement has been
-                // prepared, then release this exact claim on every remaining path.
-                let ttl_claim = if ttl_config.is_some() {
-                    match self
-                        .acquire_ttl_mutation_claim(key_info, &item, old_item_opt.as_ref())
-                        .await
-                    {
-                        Ok(claim) => claim,
-                        // An absent-row claim that cannot be taken means the row
-                        // now exists, which is exactly what this condition
-                        // forbids. Report the condition failure rather than
-                        // retrying a write that can never apply.
-                        Err(StorageError::TransactionConflict(_)) if key_not_exists_condition => {
-                            return Err(StorageError::ConditionFailed(old_item_opt));
-                        }
-                        Err(error) => return Err(error),
-                    }
-                } else {
-                    None
-                };
-                if let Some(timestamp) = ttl_claim.map(|_| chrono::Utc::now().timestamp_micros()) {
-                    batch = batch.with_timestamp(timestamp);
-                }
-
-                let built = match batch.build() {
-                    Ok(built) => built,
-                    Err(error) => {
-                        self.release_ttl_mutation_claim(key_info, &item, ttl_claim)
-                            .await;
-                        return Err(StorageError::Internal(error.to_string()));
-                    }
-                };
-                if let Err(error) = self.session.batch(built).await {
-                    self.release_ttl_mutation_claim(key_info, &item, ttl_claim)
-                        .await;
-                    return Err(StorageError::Internal(format!("Batch execution: {error}")));
-                }
-                // The batch itself released the claim at its pinned timestamp;
-                // the detached exact release covers a trailing local clock
-                // without costing the request a Paxos round.
                 self.spawn_release_ttl_claim(key_info, &item, ttl_claim);
+            }
+            let applied = write_result?;
 
-                if async_enqueued > 0 {
-                    self.gsi_queue.notify_workers();
-                }
+            if !applied {
+                // Lost OCC race — another writer changed the item between our read and write.
+                return Err(StorageError::ConditionFailed(old_item_opt));
             }
 
             Ok(if return_old { old_item_opt } else { None })
         } else {
             // PK-only table (no sort key)
 
-            // Read old item including prepared_txn_id for transaction conflict detection
+            // Read old item including version and prepared_txn_id for OCC fence.
             let select_query = format!(
-                "SELECT item_data, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ?"
+                "SELECT item_data, version, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ?"
             );
 
-            let old_result = self
-                .session
-                .query_with_values(
-                    &select_query,
-                    cdrs_tokio::query_values!(pk_text.as_ref() as &str),
+            let row = crate::cassandra_util::query_optional(
+                &self.session,
+                &select_query,
+                cdrs_tokio::query_values!(pk_text.as_ref() as &str),
+                "put_item read",
+            )
+            .await?;
+
+            let (old_item_opt, version, has_prepared_txn) = if let Some(row) = row {
+                let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+                let version: i64 = row.get_by_name("version").ok().flatten().unwrap_or(0);
+                let prepared_txn_id: Option<uuid::Uuid> =
+                    row.get_by_name("prepared_txn_id").ok().flatten();
+                (
+                    item_data.map(json_to_item).transpose()?,
+                    version,
+                    prepared_txn_id.is_some(),
                 )
-                .await
-                .map_err(|e| StorageError::Internal(format!("Select for put_item: {e}")))?;
-
-            let body = old_result
-                .response_body()
-                .map_err(|e| StorageError::Internal(format!("Parse response: {e}")))?;
-
-            let (old_item_opt, has_prepared_txn) = if let Some(rows) = body.into_rows() {
-                if let Some(row) = rows.into_iter().next() {
-                    let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
-                    let prepared_txn_id: Option<uuid::Uuid> =
-                        row.get_by_name("prepared_txn_id").ok().flatten();
-                    (
-                        item_data.map(json_to_item).transpose()?,
-                        prepared_txn_id.is_some(),
-                    )
-                } else {
-                    (None, false)
-                }
             } else {
-                (None, false)
+                (None, 0, false)
             };
 
             // Reject if item is part of an in-flight transaction
@@ -409,156 +301,56 @@ impl CassandraEngine {
                 Err(e) => return Err(e),
             }
 
-            let stream_stmt = stream.and_then(|cap| {
-                stream_record_statement(
+            let item_existed = old_item_opt.is_some();
+
+            let ttl_claim = if ttl_config.is_some() {
+                match self
+                    .acquire_ttl_mutation_claim(key_info, &item, old_item_opt.as_ref())
+                    .await
+                {
+                    Ok(claim) => claim,
+                    Err(StorageError::TransactionConflict(_)) if key_not_exists_condition => {
+                        return Err(StorageError::ConditionFailed(old_item_opt));
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
+            let mutation_timestamp = ttl_claim.map(|_| chrono::Utc::now().timestamp_micros());
+
+            let write_result = self
+                .occ_write(
                     &data_keyspace,
-                    &key_info.table_id,
+                    &ddb_table,
+                    pk_text.as_ref(),
+                    None,
+                    None,
+                    &item_text,
+                    version,
+                    item_existed,
+                    &indexes,
                     key_info,
                     old_item_opt.as_ref(),
-                    Some(&item),
-                    cap,
-                    &self.hlc,
-                    self.stream_retention_seconds,
+                    &item,
+                    sys_delay,
+                    stream,
+                    ttl_config.as_ref().map(|c| c.attribute.as_str()),
+                    ttl_config.as_ref().map(|c| c.generation),
+                    ttl_claim,
+                    mutation_timestamp,
                 )
-            });
-
-            if indexes.is_empty() && stream_stmt.is_none() && ttl_config.is_none() {
-                // Fast path: no batch needed.
-                let insert_query = format!(
-                    "INSERT INTO {data_keyspace}.{ddb_table} \
-                     (pk, item_data) \
-                     VALUES (?, ?)"
-                );
-                self.session
-                    .query_with_values(
-                        &insert_query,
-                        cdrs_tokio::query_values!(pk_text.as_ref() as &str, item_text.as_str()),
-                    )
-                    .await
-                    .map_err(|e| StorageError::Internal(format!("Insert item: {e}")))?;
+                .await;
+            if write_result.is_err() {
+                self.release_ttl_mutation_claim(key_info, &item, ttl_claim)
+                    .await;
             } else {
-                // LOGGED BATCH: item insert + optional index updates + optional stream record.
-                // On a claimed row the base write also clears the claim columns
-                // (see the sort-key path for the timestamp reasoning).
-                let insert_cql = if ttl_config.is_some() {
-                    format!(
-                        "INSERT INTO {data_keyspace}.{ddb_table} \
-                         (pk, item_data, prepared_txn_id, prepared_txn_timestamp) \
-                         VALUES (?, ?, null, null)"
-                    )
-                } else {
-                    format!(
-                        "INSERT INTO {data_keyspace}.{ddb_table} \
-                         (pk, item_data) \
-                         VALUES (?, ?)"
-                    )
-                };
-                let insert_qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
-                    cdrs_tokio::types::value::Value::from(pk_text.as_str()),
-                    item_text.as_str().into(),
-                ]);
-                let mut batch = BatchQueryBuilder::new()
-                    .with_consistency(Consistency::LocalQuorum)
-                    .add_query(insert_cql, insert_qv);
-
-                if !indexes.is_empty() {
-                    super::index::sync_indexes(
-                        &mut batch,
-                        &data_keyspace,
-                        &key_info.key_schema,
-                        &key_info.attribute_definitions,
-                        &indexes,
-                        old_item_opt.as_ref(),
-                        Some(&item),
-                        sys_delay,
-                    )?;
-                }
-
-                let async_enqueued = if indexes.is_empty() {
-                    0
-                } else {
-                    super::index::enqueue_async_indexes(
-                        &self.session,
-                        &mut batch,
-                        &data_keyspace,
-                        key_info,
-                        &indexes,
-                        old_item_opt.as_ref(),
-                        Some(&item),
-                        sys_delay,
-                    )
-                    .await?
-                };
-
-                if let Some(config) = ttl_config.as_ref() {
-                    super::ttl::add_ttl_reconciliation_mutation(
-                        &mut batch,
-                        &data_keyspace,
-                        key_info,
-                        &config.attribute,
-                        &item,
-                    )?;
-                    super::ttl::add_ttl_queue_mutations(
-                        &mut batch,
-                        &data_keyspace,
-                        key_info,
-                        &config.attribute,
-                        config.generation,
-                        old_item_opt.as_ref(),
-                        Some(&item),
-                    )?;
-                }
-
-                if let Some(stmt) = stream_stmt {
-                    batch =
-                        batch.add_query(stmt, cdrs_tokio::query::QueryValues::SimpleValues(vec![]));
-                }
-
-                // Acquire only after every fallible side-effect statement has been
-                // prepared, then release this exact claim on every remaining path.
-                let ttl_claim = if ttl_config.is_some() {
-                    match self
-                        .acquire_ttl_mutation_claim(key_info, &item, old_item_opt.as_ref())
-                        .await
-                    {
-                        Ok(claim) => claim,
-                        // An absent-row claim that cannot be taken means the row
-                        // now exists, which is exactly what this condition
-                        // forbids. Report the condition failure rather than
-                        // retrying a write that can never apply.
-                        Err(StorageError::TransactionConflict(_)) if key_not_exists_condition => {
-                            return Err(StorageError::ConditionFailed(old_item_opt));
-                        }
-                        Err(error) => return Err(error),
-                    }
-                } else {
-                    None
-                };
-                if let Some(timestamp) = ttl_claim.map(|_| chrono::Utc::now().timestamp_micros()) {
-                    batch = batch.with_timestamp(timestamp);
-                }
-
-                let built = match batch.build() {
-                    Ok(built) => built,
-                    Err(error) => {
-                        self.release_ttl_mutation_claim(key_info, &item, ttl_claim)
-                            .await;
-                        return Err(StorageError::Internal(error.to_string()));
-                    }
-                };
-                if let Err(error) = self.session.batch(built).await {
-                    self.release_ttl_mutation_claim(key_info, &item, ttl_claim)
-                        .await;
-                    return Err(StorageError::Internal(format!("Batch execution: {error}")));
-                }
-                // The batch itself released the claim at its pinned timestamp;
-                // the detached exact release covers a trailing local clock
-                // without costing the request a Paxos round.
                 self.spawn_release_ttl_claim(key_info, &item, ttl_claim);
+            }
+            let applied = write_result?;
 
-                if async_enqueued > 0 {
-                    self.gsi_queue.notify_workers();
-                }
+            if !applied {
+                return Err(StorageError::ConditionFailed(old_item_opt));
             }
 
             Ok(if return_old { old_item_opt } else { None })

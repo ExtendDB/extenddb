@@ -112,42 +112,6 @@ pub(crate) async fn query_with_pk_sk(
     }
     .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
 }
-/// Execute a query with pk, sort key, and `item_data`, returning the result.
-///
-/// Helper for INSERT/UPDATE operations.
-pub(crate) async fn query_with_pk_sk_item(
-    session: &CassandraSession,
-    query: &str,
-    pk: &str,
-    sk: &SortKeyValue,
-    item_text: &str,
-) -> Result<cdrs_tokio::frame::Envelope, StorageError> {
-    match sk {
-        SortKeyValue::S(s) => {
-            session
-                .query_with_values(query, cdrs_tokio::query_values!(pk, s.as_str(), item_text))
-                .await
-        }
-        SortKeyValue::N(n) => {
-            session
-                .query_with_values(
-                    query,
-                    cdrs_tokio::query_values!(pk, decimal_to_value(n), item_text),
-                )
-                .await
-        }
-        SortKeyValue::B(b) => {
-            session
-                .query_with_values(
-                    query,
-                    cdrs_tokio::query_values!(pk, Blob::new(b.clone()), item_text),
-                )
-                .await
-        }
-    }
-    .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
-}
-
 /// Execute a query with `(pk, sk, txn_id_bytes)` bound parameters.
 ///
 /// Used for: rollback DELETE, commit DELETE.
