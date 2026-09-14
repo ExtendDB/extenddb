@@ -1569,6 +1569,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "bytes",
+ "extenddb-backup-store",
  "futures",
  "serde",
  "tempfile",

@@ -4,11 +4,29 @@
 //! Filesystem-backed store.
 //!
 //! Keys map to paths under a root directory that is canonicalized at
-//! construction. Every operation re-resolves its target and refuses to act
-//! when the resolved path escapes the root, so a symlink planted inside the
-//! root cannot redirect reads or writes elsewhere. Writes go to a temporary
-//! sibling file and rename into place, so a crash never leaves a truncated
-//! file under its final name.
+//! construction. Every operation resolves its key one component at a time
+//! with `symlink_metadata` and refuses any component that is a symlink,
+//! whether it points inside or outside the root, so a key never resolves
+//! through a link. These checks defeat symlinks present when an operation
+//! starts. They do not defend against another local process mutating the
+//! tree while an operation runs: between a component check and the next
+//! path step the kernel re-resolves the textual path, so a process with
+//! write access inside the root can swap a checked directory for a symlink
+//! during the operation. Closing that window requires resolving through
+//! directory handles (`openat2` with `RESOLVE_BENEATH`, or an `openat` walk
+//! with `O_NOFOLLOW` at every step), which the standard library does not expose;
+//! that is left as a follow-up. The backup root must therefore not be
+//! writable by less-trusted users: a process with write access inside the
+//! root already holds full read, write, and delete over every backup in it.
+//!
+//! Writes go to a temporary sibling file and rename into place, so a crash
+//! never leaves a truncated file under its final name.
+//!
+//! Two limits of this store narrow the shared key space. A key component
+//! longer than the filesystem's name limit (`NAME_MAX`, 255 bytes on Linux)
+//! fails with an I/O error even though key validation accepts it. An object
+//! whose file name matches the temporary-file pattern (`.put-*.tmp`) can be
+//! written and read but is hidden from listings.
 
 use std::path::{Path, PathBuf};
 
@@ -55,36 +73,39 @@ impl FilesystemStore {
         Ok(Self { root: canonical })
     }
 
-    /// Map a validated key to its path under the root. Key validation has
-    /// already refused `..`, empty components, and separators, so the join
-    /// cannot step outside the root without a symlink, which the resolve
-    /// checks catch.
-    fn key_path(&self, key: &str) -> PathBuf {
+    /// Resolve a validated key to its path under the root without following
+    /// symlinks: every component is checked with `symlink_metadata` and any
+    /// symlink, intermediate or final, is refused whether it points inside
+    /// or outside the root, so `get` and `head` agree with `put`, `list`,
+    /// and `delete_prefix` on what a key names. Key validation has already
+    /// refused `..`, empty components, and separators, so with no symlink in
+    /// the walk the path cannot leave the root. Missing paths surface as
+    /// `NotFound`. The returned metadata describes the final component.
+    async fn resolve_no_follow(
+        &self,
+        key: &str,
+    ) -> Result<(PathBuf, std::fs::Metadata), StoreError> {
         let mut path = self.root.clone();
+        let mut meta = None;
         for component in key.split('/') {
             path.push(component);
-        }
-        path
-    }
-
-    /// Canonicalize `path` and refuse it when it resolves outside the root.
-    /// Missing paths surface as `NotFound`.
-    async fn resolve_within_root(&self, path: &Path) -> Result<PathBuf, StoreError> {
-        let canonical = tokio::fs::canonicalize(path).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StoreError::NotFound
-            } else {
-                StoreError::io(format!("resolve {}", path.display()), e)
+            let m = match tokio::fs::symlink_metadata(&path).await {
+                Ok(m) => m,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        || e.kind() == std::io::ErrorKind::NotADirectory =>
+                {
+                    return Err(StoreError::NotFound);
+                }
+                Err(e) => return Err(StoreError::io(format!("stat {}", path.display()), e)),
+            };
+            if m.is_symlink() {
+                return Err(symlink_refused(&path));
             }
-        })?;
-        if canonical.starts_with(&self.root) {
-            Ok(canonical)
-        } else {
-            Err(StoreError::PermissionDenied(format!(
-                "{} resolves outside the backup root",
-                path.display()
-            )))
+            meta = Some(m);
         }
+        let meta = meta.expect("a validated key has at least one component");
+        Ok((path, meta))
     }
 
     /// Prepare the directory a key's object will be written into, without
@@ -93,22 +114,24 @@ impl FilesystemStore {
     /// `create_dir_all` follows symlinks in existing path components, so
     /// checking the parent only after creating it would already have created
     /// directories on the far side of a planted symlink. Instead: walk to the
-    /// deepest existing ancestor of the destination, canonicalize it, and
-    /// refuse before creating anything when it resolves outside the root.
-    /// The remaining components are then created one at a time with
-    /// `create_dir`, re-verifying after each step that the component is a
-    /// real directory and not a symlink.
+    /// deepest existing ancestor of the destination, refusing any component
+    /// that is a symlink (in-root aliases included), and verify the ancestor
+    /// still resolves under the root. The remaining components are then
+    /// created one at a time with `create_dir`, re-verifying after each step
+    /// that the component is a real directory and not a symlink.
     async fn prepare_parent(&self, parent_components: &[&str]) -> Result<PathBuf, StoreError> {
         let mut existing = self.root.clone();
         let mut created_from = parent_components.len();
         for (index, component) in parent_components.iter().enumerate() {
             let candidate = existing.join(component);
             match tokio::fs::symlink_metadata(&candidate).await {
+                Ok(meta) if meta.is_symlink() => {
+                    return Err(symlink_refused(&candidate));
+                }
                 Ok(_) => existing = candidate,
-                // NotADirectory: an existing ancestor is a file or a symlink
-                // to one, so the walk stops there and the checks below decide
-                // (an escaping symlink is refused, an in-root file is an
-                // ancestor collision).
+                // NotADirectory: an existing ancestor is a file, so the walk
+                // stops there and the checks below decide (an in-root file
+                // is an ancestor collision).
                 Err(e)
                     if e.kind() == std::io::ErrorKind::NotFound
                         || e.kind() == std::io::ErrorKind::NotADirectory =>
@@ -123,8 +146,8 @@ impl FilesystemStore {
         }
 
         // The deepest existing ancestor is checked before anything is
-        // created: if it resolves outside the root (a planted symlink
-        // anywhere in the chain), the put is refused with nothing written.
+        // created: no component was a symlink at the walk above, and as
+        // defense in depth its canonical form must still sit under the root.
         let canonical = tokio::fs::canonicalize(&existing)
             .await
             .map_err(|e| StoreError::io(format!("resolve {}", existing.display()), e))?;
@@ -180,19 +203,12 @@ impl FilesystemStore {
         let parent = self.prepare_parent(parent_components).await?;
         let final_path = parent.join(file_name);
 
-        // If the destination already exists, refuse when it resolves outside
-        // the root, so a put cannot be redirected through a planted symlink.
+        // A symlink at the destination, in-root or escaping, is refused: a
+        // put never resolves through a link.
         match tokio::fs::symlink_metadata(&final_path).await {
-            Ok(meta) if meta.is_symlink() => match self.resolve_within_root(&final_path).await {
-                Ok(_) => {}
-                Err(StoreError::NotFound) => {
-                    return Err(StoreError::PermissionDenied(format!(
-                        "{} is a symlink that does not resolve inside the backup root",
-                        final_path.display()
-                    )));
-                }
-                Err(e) => return Err(e),
-            },
+            Ok(meta) if meta.is_symlink() => {
+                return Err(symlink_refused(&final_path));
+            }
             Ok(_) | Err(_) => {}
         }
 
@@ -241,10 +257,7 @@ impl FilesystemStore {
 
     async fn get_impl(&self, key: &str) -> Result<ByteStream, StoreError> {
         validate_key(key)?;
-        let path = self.resolve_within_root(&self.key_path(key)).await?;
-        let meta = tokio::fs::metadata(&path)
-            .await
-            .map_err(|e| StoreError::io(format!("stat {}", path.display()), e))?;
+        let (path, meta) = self.resolve_no_follow(key).await?;
         if !meta.is_file() {
             return Err(StoreError::NotFound);
         }
@@ -259,14 +272,11 @@ impl FilesystemStore {
 
     async fn head_impl(&self, key: &str) -> Result<Option<ObjectMeta>, StoreError> {
         validate_key(key)?;
-        let path = match self.resolve_within_root(&self.key_path(key)).await {
-            Ok(path) => path,
+        let (_, meta) = match self.resolve_no_follow(key).await {
+            Ok(resolved) => resolved,
             Err(StoreError::NotFound) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let meta = tokio::fs::metadata(&path)
-            .await
-            .map_err(|e| StoreError::io(format!("stat {}", path.display()), e))?;
         if !meta.is_file() {
             return Ok(None);
         }
@@ -367,6 +377,15 @@ fn map_permission(context: String, e: std::io::Error) -> StoreError {
     } else {
         StoreError::io(context, e)
     }
+}
+
+/// Refusal for a symlink found in a key's path. The message names the path
+/// under the root that was refused, never the link's target.
+fn symlink_refused(path: &Path) -> StoreError {
+    StoreError::PermissionDenied(format!(
+        "{} is a symlink; keys never resolve through symlinks",
+        path.display()
+    ))
 }
 
 /// Fsync a directory so a rename inside it is durable. Windows has no

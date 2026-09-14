@@ -10,10 +10,15 @@ filesystem implementation and an S3 implementation built on the official
 - Keys are `/`-separated component paths. Both stores reject empty
   components, `.` and `..`, backslashes, control characters, and keys over
   1024 bytes, so the two stores accept the same key space.
-- The filesystem store canonicalizes its root at construction, refuses any
-  operation whose resolved target escapes the root (symlink defense), and
-  writes through a temporary sibling file renamed into place so a crash never
-  leaves a truncated object under its final name.
+- The filesystem store canonicalizes its root at construction and resolves
+  every key one component at a time without following symlinks: a symlink
+  anywhere in a key's path, pointing inside or outside the root, is refused.
+  This defeats symlinks present when an operation starts; it does not defend
+  against another local process mutating the tree during an operation, so
+  the backup root must not be writable by less-trusted users (write access
+  inside the root already grants full read, write, and delete over every
+  backup). Writes go through a temporary sibling file renamed into place so
+  a crash never leaves a truncated object under its final name.
 - The S3 store takes credentials from the standard AWS SDK chain, uses
   multipart upload for bodies larger than the configured part size (default
   8 MiB, minimum 5 MiB), aborts the multipart upload when a put fails,

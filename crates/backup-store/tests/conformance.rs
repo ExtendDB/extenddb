@@ -477,6 +477,90 @@ mod filesystem {
         );
     }
 
+    /// An in-root directory symlink aliases one key onto another: a put
+    /// through the alias would land under the victim's prefix while list and
+    /// `delete_prefix` on the alias see nothing. The store refuses the alias
+    /// on every key-resolving operation, so all operations agree on what a
+    /// key names.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn in_root_directory_symlink_is_refused() {
+        let (dir, store) = fs_store().await;
+        store
+            .put("victim/sub/obj", chunked_body(vec![1]))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(dir.path().join("victim"), dir.path().join("alias")).unwrap();
+
+        let err = store
+            .put("alias/sub/obj2", chunked_body(vec![2]))
+            .await
+            .expect_err("put through an in-root symlink refused");
+        assert!(matches!(err, StoreError::PermissionDenied(_)), "{err}");
+        assert!(
+            !dir.path().join("victim/sub/obj2").exists(),
+            "nothing may land under the aliased prefix"
+        );
+
+        let err = store
+            .get("alias/sub/obj")
+            .await
+            .err()
+            .expect("get through an in-root symlink refused");
+        assert!(matches!(err, StoreError::PermissionDenied(_)), "{err}");
+
+        let err = store
+            .head("alias/sub/obj")
+            .await
+            .expect_err("head through an in-root symlink refused");
+        assert!(matches!(err, StoreError::PermissionDenied(_)), "{err}");
+
+        assert!(
+            list_keys(&store, "alias").await.is_empty(),
+            "the aliased prefix lists nothing"
+        );
+
+        let deleted = store.delete_prefix("alias").await.unwrap();
+        assert_eq!(deleted, 0, "delete through the alias removes nothing");
+        assert_eq!(
+            read_all(store.get("victim/sub/obj").await.unwrap()).await,
+            vec![1],
+            "the object under its real key survives"
+        );
+    }
+
+    /// An in-root file symlink planted at a key would redirect get and head
+    /// to another key's content, and a put over it would resolve through the
+    /// link. All three are refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn in_root_file_symlink_is_refused() {
+        let (dir, store) = fs_store().await;
+        store
+            .put("victim/data", chunked_body(vec![7]))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(dir.path().join("victim/data"), dir.path().join("planted"))
+            .unwrap();
+
+        let err = store.get("planted").await.err().expect("get refused");
+        assert!(matches!(err, StoreError::PermissionDenied(_)), "{err}");
+
+        let err = store.head("planted").await.expect_err("head refused");
+        assert!(matches!(err, StoreError::PermissionDenied(_)), "{err}");
+
+        let err = store
+            .put("planted", chunked_body(vec![8]))
+            .await
+            .expect_err("put over an in-root file symlink refused");
+        assert!(matches!(err, StoreError::PermissionDenied(_)), "{err}");
+        assert_eq!(
+            read_all(store.get("victim/data").await.unwrap()).await,
+            vec![7],
+            "the symlink target must be untouched"
+        );
+    }
+
     #[tokio::test]
     async fn symlinks_are_invisible_to_list() {
         let outside = tempfile::tempdir().expect("outside dir");

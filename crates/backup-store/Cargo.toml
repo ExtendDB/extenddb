@@ -20,6 +20,12 @@ tokio-util = { workspace = true, features = ["io"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
+[features]
+# Failure-injection seam for the crate's own test suite; not part of the
+# supported API surface and never enabled by production consumers.
+test-util = []
+
 [dev-dependencies]
+extenddb-backup-store = { path = ".", features = ["test-util"] }
 tempfile = "3"
 toml = { workspace = true }

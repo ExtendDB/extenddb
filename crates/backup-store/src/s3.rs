@@ -52,8 +52,10 @@ impl S3Store {
     }
 
     /// Open with an additional client interceptor. This is the failure
-    /// injection seam the test suite uses to make a chosen operation fail;
-    /// it is not part of the supported API surface.
+    /// injection seam the crate's own test suite uses to make a chosen
+    /// operation fail; it compiles only with the `test-util` feature and is
+    /// not part of the supported API surface.
+    #[cfg(feature = "test-util")]
     #[doc(hidden)]
     pub async fn open_with_interceptor(
         config: &S3StoreConfig,
