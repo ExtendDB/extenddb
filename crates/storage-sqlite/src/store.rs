@@ -574,7 +574,7 @@ mod d1_write_lock_tests {
         }))
         .expect("input");
         engine
-            .create_table_impl("000000000000", input)
+            .create_table_impl("000000000000", input, false)
             .await
             .expect("create table");
     }

@@ -1,0 +1,135 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Local development only. This stack intentionally runs MongoDB without
+# authentication and must not be used as a production deployment. The
+# MongoDB service is separate from ExtendDB so the same image can be used with
+# Atlas, a managed replica set, or an existing customer deployment.
+
+name: extenddb-mongodb-dev
+
+x-extenddb-image: &extenddb-image
+  image: ${EXTENDDB_MONGODB_IMAGE:-extenddb-mongodb:dev}
+
+x-extenddb-hardening: &extenddb-hardening
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=16m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  mongodb:
+    image: ${MONGODB_IMAGE:-mongo:7.0}
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    healthcheck:
+      test:
+        ["CMD-SHELL", "mongosh --quiet --eval 'db.runCommand({ping: 1}).ok' | grep -qx 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - mongodb-data:/data/db
+
+  mongodb-rs-init:
+    image: ${MONGODB_IMAGE:-mongo:7.0}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        until mongosh --host mongodb:27017 --quiet --eval 'db.runCommand({ping: 1}).ok' | grep -qx 1; do
+          sleep 1
+        done
+        mongosh --host mongodb:27017 --quiet --eval '
+          try {
+            rs.status();
+          } catch (e) {
+            if (e.code !== 94) {
+              throw e;
+            }
+            rs.initiate({
+              _id: "rs0",
+              members: [{ _id: 0, host: "mongodb:27017" }]
+            });
+          }
+        '
+        until mongosh --host mongodb:27017 --quiet --eval 'rs.status().myState' | grep -qx 1; do
+          sleep 1
+        done
+    restart: "no"
+
+  extenddb-volume-init:
+    <<: *extenddb-image
+    build:
+      context: .
+      dockerfile: Dockerfile.mongodb
+      args:
+        VERSION: ${EXTENDDB_VERSION:-dev}
+        VCS_REF: ${VCS_REF:-unknown}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    user: "0:0"
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["chown -R 10001:10001 /var/lib/extenddb"]
+    volumes:
+      - extenddb-state:/var/lib/extenddb
+    restart: "no"
+
+  extenddb-bootstrap:
+    <<: [*extenddb-image, *extenddb-hardening]
+    depends_on:
+      mongodb-rs-init:
+        condition: service_completed_successfully
+      extenddb-volume-init:
+        condition: service_completed_successfully
+    environment:
+      MONGO_CONNECTION_STRING: ${MONGO_CONNECTION_STRING:-mongodb://mongodb:27017/?replicaSet=rs0}
+      EXTENDDB_ADMIN_USER: ${EXTENDDB_ADMIN_USER:-admin}
+      EXTENDDB_ADMIN_PASSWORD: ${EXTENDDB_ADMIN_PASSWORD:-ExtendDBLocalAdmin123}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        CONFIG=/var/lib/extenddb/extenddb.toml
+        if [ -f "$$CONFIG" ]; then
+          echo "bootstrap: existing config detected; running migrations"
+          exec extenddb migrate --config "$$CONFIG" --yes
+        fi
+        cat > "$$CONFIG.bootstrap" <<EOF
+        [storage]
+        backend = "mongodb"
+
+        [storage.mongodb]
+        connection_string = "$$MONGO_CONNECTION_STRING"
+        EOF
+        mv "$$CONFIG.bootstrap" "$$CONFIG"
+        exec extenddb init --backend mongodb --config "$$CONFIG" --overwrite \
+          --bind-addr 0.0.0.0 --tls-san localhost --tls-san extenddb
+    volumes:
+      - extenddb-state:/var/lib/extenddb
+    restart: "no"
+
+  extenddb:
+    <<: [*extenddb-image, *extenddb-hardening]
+    depends_on:
+      extenddb-bootstrap:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${EXTENDDB_PORT:-18443}:18443"
+    volumes:
+      - extenddb-state:/var/lib/extenddb
+    stop_grace_period: 15s
+    restart: unless-stopped
+
+volumes:
+  mongodb-data:
+  extenddb-state:

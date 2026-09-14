@@ -72,6 +72,7 @@ on:
           # signed dev candidate is produced upstream (see #283 review);
           # ECR Public does not auto-create repositories on push.
           - extenddb-postgres
+          - extenddb-mongodb
         default: extenddb-postgres
 
 permissions:
@@ -79,7 +80,7 @@ permissions:
 
 # Two promotions must never race on the same repository.
 concurrency:
-  group: promote-image-extenddb-postgres
+  group: promote-image-${{ inputs.image }}
   cancel-in-progress: false
 
 env:
@@ -120,7 +121,7 @@ jobs:
           # Local allowlist enforcement: API-side choice enforcement is
           # undocumented, so the security property is proven here.
           case "${{ inputs.image }}" in
-            extenddb-postgres) ;;
+            extenddb-postgres|extenddb-mongodb) ;;
             *) echo "::error::image '${{ inputs.image }}' is not in the allowlist"; exit 1 ;;
           esac
           if [[ ! "$RAW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then

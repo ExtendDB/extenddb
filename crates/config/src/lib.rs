@@ -146,6 +146,16 @@ impl StorageConfig {
         self.config.max_catalog_connections()
     }
 
+    /// Get the explicit data-pool override, if one was configured.
+    pub fn max_connections_override(&self) -> Option<u32> {
+        self.config.max_connections_override()
+    }
+
+    /// Get the explicit catalog-pool override, if one was configured.
+    pub fn max_catalog_connections_override(&self) -> Option<u32> {
+        self.config.max_catalog_connections_override()
+    }
+
     /// Get operator-facing warnings for non-default storage settings.
     pub fn startup_warnings(&self) -> Vec<extenddb_storage::config::StartupWarning> {
         self.config.startup_warnings()
