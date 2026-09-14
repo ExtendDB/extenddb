@@ -813,7 +813,7 @@ impl CassandraEngine {
             )
             .await?
         };
-        ttl_lwt_applied(&result)
+        crate::cassandra_util::lwt_applied(&result)
     }
 
     /// Whether the base row's exact owner is `work_id`, read at `LOCAL_QUORUM`.
@@ -1096,7 +1096,7 @@ impl CassandraEngine {
             )
             .await?
         };
-        ttl_lwt_applied(&result)
+        crate::cassandra_util::lwt_applied(&result)
     }
 
     async fn claim_absent_ttl_item(
@@ -1155,7 +1155,7 @@ impl CassandraEngine {
             .await
         }
         .map_err(|error| StorageError::Internal(format!("Claim absent TTL item: {error}")))?;
-        ttl_lwt_applied(&result)
+        crate::cassandra_util::lwt_applied(&result)
     }
 
     async fn claim_ttl_item(
@@ -1218,7 +1218,7 @@ impl CassandraEngine {
             .await
         }
         .map_err(|error| StorageError::Internal(format!("Claim TTL item: {error}")))?;
-        ttl_lwt_applied(&result)
+        crate::cassandra_util::lwt_applied(&result)
     }
 
     /// Fire the exact conditional release off the request's latency path.
@@ -1437,7 +1437,7 @@ impl CassandraEngine {
             ]);
             crate::cassandra_util::query_lwt(&self.session, cql, qv).await?
         };
-        ttl_lwt_applied(&result)
+        crate::cassandra_util::lwt_applied(&result)
     }
 
     /// Run the secondary-effects LOGGED BATCH (index removals + stream record)
@@ -1513,17 +1513,3 @@ impl CassandraEngine {
     }
 }
 
-fn ttl_lwt_applied(result: &cdrs_tokio::frame::Envelope) -> Result<bool, StorageError> {
-    let rows = result
-        .response_body()
-        .map_err(|error| StorageError::Internal(format!("Parse TTL claim: {error}")))?
-        .into_rows()
-        .unwrap_or_default();
-    let Some(row) = rows.first() else {
-        return Err(StorageError::Internal(
-            "TTL claim returned no LWT result".to_owned(),
-        ));
-    };
-    row.get_r_by_name("[applied]")
-        .map_err(|error| StorageError::Internal(format!("Parse TTL claim result: {error}")))
-}

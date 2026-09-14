@@ -317,6 +317,32 @@ pub fn now_millis() -> i64 {
         .unwrap_or_default()
         .as_millis() as i64
 }
+/// Parse the `[applied]` boolean from an already-executed LWT response envelope.
+///
+/// Returns `Ok(true)` if the condition was met and the write applied,
+/// `Ok(false)` if not applied (lost race). A missing result row is treated as
+/// applied (defensive: Cassandra always returns a row for LWT statements).
+///
+/// # Errors
+/// Returns an error only if the response body cannot be parsed.
+pub fn lwt_applied(
+    result: &cdrs_tokio::frame::Envelope,
+) -> Result<bool, extenddb_storage::error::StorageError> {
+    use cdrs_tokio::types::IntoRustByName as _;
+    let body = result.response_body().map_err(|e| {
+        extenddb_storage::error::StorageError::Internal(format!("lwt_applied response_body: {e}"))
+    })?;
+    let Some(rows) = body.into_rows() else {
+        return Ok(true);
+    };
+    let Some(row) = rows.into_iter().next() else {
+        return Ok(true);
+    };
+    row.get_r_by_name("[applied]").map_err(|e| {
+        extenddb_storage::error::StorageError::Internal(format!("lwt_applied parse [applied]: {e}"))
+    })
+}
+
 ///
 /// Parses the `[applied]` column from the Cassandra LWT response.
 /// Use for `INSERT ... IF NOT EXISTS` and `UPDATE ... IF ...` statements.

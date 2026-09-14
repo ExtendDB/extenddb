@@ -46,6 +46,19 @@ impl CassandraEngine {
                     return Err(StorageError::TransactionConflict(message));
                 }
                 Err(StorageError::TransactionConflict(_)) => ttl_claim_backoff(attempt).await,
+                // Unconditional put lost the OCC race — retry against the new version.
+                // After exhausting retries, surface as TransactionConflict (same as
+                // DynamoDB's behaviour for persistent write contention).
+                Err(StorageError::ConditionFailed(_))
+                    if condition.is_none() && attempt == TTL_CLAIM_MAX_RETRIES =>
+                {
+                    return Err(StorageError::TransactionConflict(
+                        "Unconditional put lost OCC race after max retries".to_owned(),
+                    ));
+                }
+                Err(StorageError::ConditionFailed(_)) if condition.is_none() => {
+                    ttl_claim_backoff(attempt).await;
+                }
                 other => return other,
             }
         }

@@ -395,7 +395,7 @@ impl CassandraEngine {
                 .query_with_values(&lwt_cql, lwt_qv)
                 .await
                 .map_err(|e| StorageError::Internal(format!("occ_write lwt: {e}")))?;
-            if !occ_applied(&result)? {
+            if !crate::cassandra_util::lwt_applied(&result)? {
                 return Ok(false);
             }
             if indexes.is_empty() && stream_stmt.is_none() {
@@ -512,23 +512,3 @@ impl CassandraEngine {
     }
 }
 
-/// Extract `[applied]` from an LWT response. Returns `Ok(true)` if applied,
-/// `Ok(false)` if not applied (lost race), `Err` only on parse failure.
-fn occ_applied(result: &cdrs_tokio::frame::Envelope) -> Result<bool, StorageError> {
-    use cdrs_tokio::types::IntoRustByName as _;
-    let body = result
-        .response_body()
-        .map_err(|e| StorageError::Internal(format!("occ_applied response_body: {e}")))?;
-    let Some(rows) = body.into_rows() else {
-        // No rows in response means the statement was not a conditional write
-        // (shouldn't happen here) — treat as applied.
-        return Ok(true);
-    };
-    let Some(row) = rows.into_iter().next() else {
-        return Ok(true);
-    };
-    let applied: bool = row
-        .get_r_by_name("[applied]")
-        .map_err(|e| StorageError::Internal(format!("occ_applied parse [applied]: {e}")))?;
-    Ok(applied)
-}
