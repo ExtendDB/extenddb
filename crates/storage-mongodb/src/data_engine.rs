@@ -529,13 +529,12 @@ impl MongoEngine {
             .await;
 
             match attempt_res {
-                Ok(return_val) => match session.commit_transaction().await {
-                    Ok(()) => return Ok(return_val),
-                    Err(e) if is_transient_write_conflict(&e) => {
+                Ok(return_val) => match self.commit_write_transaction(&mut session, None).await? {
+                    CommitOutcome::Committed => return Ok(return_val),
+                    CommitOutcome::RerunBody => {
                         backoff_sleep(attempt).await;
                         continue;
                     }
-                    Err(e) => return Err(StorageError::Internal(e.to_string())),
                 },
                 Err(TxErr::Transient) => {
                     let _ = session.abort_transaction().await;
@@ -705,13 +704,12 @@ impl MongoEngine {
             .await;
 
             match attempt_res {
-                Ok(return_val) => match session.commit_transaction().await {
-                    Ok(()) => return Ok(return_val),
-                    Err(e) if is_transient_write_conflict(&e) => {
+                Ok(return_val) => match self.commit_write_transaction(&mut session, None).await? {
+                    CommitOutcome::Committed => return Ok(return_val),
+                    CommitOutcome::RerunBody => {
                         backoff_sleep(attempt).await;
                         continue;
                     }
-                    Err(e) => return Err(StorageError::Internal(e.to_string())),
                 },
                 Err(TxErr::Transient) => {
                     let _ = session.abort_transaction().await;
@@ -1008,14 +1006,18 @@ impl MongoEngine {
             .await;
 
             match attempt_res {
-                Ok(AttemptOk::Committed(old, new)) => match session.commit_transaction().await {
-                    Ok(()) => return Ok((old, new)),
-                    Err(e) if is_transient_write_conflict(&e) => {
-                        backoff_sleep(attempt).await;
-                        continue;
+                Ok(AttemptOk::Committed(old, new)) => {
+                    match self
+                        .commit_write_transaction(&mut session, Some(&key_info.table_name))
+                        .await?
+                    {
+                        CommitOutcome::Committed => return Ok((old, new)),
+                        CommitOutcome::RerunBody => {
+                            backoff_sleep(attempt).await;
+                            continue;
+                        }
                     }
-                    Err(e) => return Err(StorageError::Internal(e.to_string())),
-                },
+                }
                 Ok(AttemptOk::Stale) => {
                     let _ = session.abort_transaction().await;
                     backoff_sleep(attempt).await;
@@ -2310,14 +2312,15 @@ impl MongoEngine {
             .await;
 
             match outcome {
-                Ok(AttemptOutcome::Committed) => match session.commit_transaction().await {
-                    Ok(()) => return Ok(()),
-                    Err(e) if is_transient_write_conflict(&e) => {
-                        backoff_sleep(attempt).await;
-                        continue;
+                Ok(AttemptOutcome::Committed) => {
+                    match self.commit_write_transaction(&mut session, None).await? {
+                        CommitOutcome::Committed => return Ok(()),
+                        CommitOutcome::RerunBody => {
+                            backoff_sleep(attempt).await;
+                            continue;
+                        }
                     }
-                    Err(e) => return Err(StorageError::Internal(e.to_string())),
-                },
+                }
                 Ok(AttemptOutcome::CanceledReasons(reasons)) => {
                     let _ = session.abort_transaction().await;
                     return Err(StorageError::TransactionCanceled(reasons));
@@ -3237,12 +3240,9 @@ impl MongoEngine {
             .await;
 
             match attempt_result {
-                Ok(true) => match session.commit_transaction().await {
-                    Ok(()) => return Ok(()),
-                    Err(e) if is_transient_write_conflict(&e) => {
-                        backoff_sleep(attempt).await;
-                    }
-                    Err(e) => return Err(StorageError::Internal(e.to_string())),
+                Ok(true) => match self.commit_write_transaction(&mut session, None).await? {
+                    CommitOutcome::Committed => return Ok(()),
+                    CommitOutcome::RerunBody => backoff_sleep(attempt).await,
                 },
                 Ok(false) => {
                     let _ = session.abort_transaction().await;
@@ -3338,6 +3338,113 @@ impl MongoEngine {
             }
         }
     }
+    /// Commit a write transaction, retrying the commit itself when its
+    /// outcome is unknown.
+    ///
+    /// `Committed` means the commit applied; `RerunBody` means the
+    /// transaction aborted without committing and the caller's loop may
+    /// re-run its body. On UnknownTransactionCommitResult this loop
+    /// retries `commitTransaction`, which is idempotent, and never the
+    /// body. The driver already retries the commit once internally; this
+    /// bounded loop sits on top. If the retries are exhausted while the
+    /// outcome is still unknown, the returned error says so: the
+    /// transaction was not re-run, so the write applied at most once.
+    ///
+    /// `gate_table` names the table for the unknown-commit test gate and
+    /// is only passed by UpdateItem, the operation the gate is specified
+    /// for. It is ignored in builds without the `test-hooks` feature.
+    async fn commit_write_transaction(
+        &self,
+        session: &mut mongodb::ClientSession,
+        gate_table: Option<&str>,
+    ) -> Result<CommitOutcome, StorageError> {
+        #[cfg(not(feature = "test-hooks"))]
+        let _ = gate_table;
+        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+            let commit_res = session.commit_transaction().await;
+            #[cfg(feature = "test-hooks")]
+            let commit_res = self
+                .inject_unknown_commit_result(commit_res, gate_table)
+                .await;
+            match commit_res {
+                Ok(()) => return Ok(CommitOutcome::Committed),
+                Err(e) => match classify_commit_error(&e) {
+                    CommitErrorClass::RetryCommit => backoff_sleep(attempt).await,
+                    CommitErrorClass::RerunBody => return Ok(CommitOutcome::RerunBody),
+                    CommitErrorClass::Fatal => {
+                        return Err(StorageError::Internal(e.to_string()));
+                    }
+                },
+            }
+        }
+        Err(StorageError::Internal(
+            "commitTransaction outcome is unknown after retries; the transaction was not re-run"
+                .to_owned(),
+        ))
+    }
+
+    /// Consume the unknown-commit test gate for `table_name` if it is armed.
+    ///
+    /// Returns true at most once per arming: the claim is an atomic
+    /// armed-to-idle update, so concurrent commits cannot both win. The gate
+    /// is controlled through the authenticated management settings API and is
+    /// inert unless a test explicitly sets it to `armed`.
+    #[cfg(feature = "test-hooks")]
+    async fn take_unknown_commit_test_gate(&self, table_name: &str) -> bool {
+        let settings = self.catalog_db.collection::<Document>("settings");
+        let key = format!(
+            "{}:{table_name}",
+            extenddb_core::settings_keys::UNKNOWN_COMMIT_TEST_GATE
+        );
+        let armed = settings
+            .find_one(doc! { "_id": &key, "value": "armed" })
+            .await
+            .ok()
+            .flatten();
+        if armed.is_none() {
+            return false;
+        }
+        settings
+            .update_one(
+                doc! { "_id": &key, "value": "armed" },
+                doc! { "$set": { "value": "idle" } },
+            )
+            .await
+            .map(|r| r.modified_count == 1)
+            .unwrap_or(false)
+    }
+
+    /// Test hook: after a successful commit, report the outcome as unknown.
+    ///
+    /// When the unknown-commit gate is armed for `gate_table`, a successful
+    /// `commitTransaction` is replaced by a synthetic error carrying the
+    /// UnknownTransactionCommitResult label, the shape the driver produces
+    /// when the commit was sent but its reply was lost. The commit itself has
+    /// applied, so whatever the caller does next must not apply the
+    /// transaction body again.
+    #[cfg(feature = "test-hooks")]
+    async fn inject_unknown_commit_result(
+        &self,
+        commit_res: mongodb::error::Result<()>,
+        gate_table: Option<&str>,
+    ) -> mongodb::error::Result<()> {
+        let Some(table_name) = gate_table else {
+            return commit_res;
+        };
+        match commit_res {
+            Ok(()) => {
+                if self.take_unknown_commit_test_gate(table_name).await {
+                    Err(synthetic_error_with_labels(
+                        "test hook: commit applied but its outcome was reported unknown",
+                        &[mongodb::error::UNKNOWN_TRANSACTION_COMMIT_RESULT],
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            err => err,
+        }
+    }
 }
 
 /// Progress from one `backfill_gsi_batch` invocation.
@@ -3413,10 +3520,14 @@ impl From<StorageError> for TxErr {
 /// abstract labels the raw `WriteConflict` (code 112) still shows up
 /// when a same-document collision surfaces on the write itself rather
 /// than at commit — check that too. RFC-0003 §4.1 / §4.3.
+///
+/// This is the body-level classifier: it answers "may the whole
+/// transaction body be re-run?" and therefore must never match the
+/// UnknownTransactionCommitResult label, under which the commit may
+/// already have applied. Commit errors are classified by
+/// `classify_commit_error` instead.
 fn is_transient_write_conflict(e: &mongodb::error::Error) -> bool {
-    if e.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR)
-        || e.contains_label(mongodb::error::UNKNOWN_TRANSACTION_COMMIT_RESULT)
-    {
+    if e.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR) {
         return true;
     }
     matches!(*e.kind, mongodb::error::ErrorKind::Command(ref c) if c.code == 112)
@@ -3426,6 +3537,47 @@ fn is_transient_write_conflict(e: &mongodb::error::Error) -> bool {
                 mongodb::error::WriteError { code: 112, .. }
             ))
         )
+}
+
+/// How a failed `commitTransaction` must be handled.
+///
+/// MongoDB's contract for transaction commit errors:
+/// UnknownTransactionCommitResult means the commit may already have
+/// applied, and the only safe action is to retry commitTransaction
+/// itself, which is idempotent. TransientTransactionError means nothing
+/// committed and the whole transaction body may be re-run. Re-running
+/// the body after an applied commit applies a non-idempotent write such
+/// as ADD a second time while the client sees a single success.
+enum CommitErrorClass {
+    /// Retry `commitTransaction` itself. Never re-run the body.
+    RetryCommit,
+    /// Nothing committed. The transaction body may be re-run.
+    RerunBody,
+    /// Neither label: surface the error to the caller.
+    Fatal,
+}
+
+/// Classify an error returned by `commitTransaction`.
+///
+/// The unknown label takes precedence: when both labels are present the
+/// commit may have applied, so the body must not be re-run.
+fn classify_commit_error(e: &mongodb::error::Error) -> CommitErrorClass {
+    if e.contains_label(mongodb::error::UNKNOWN_TRANSACTION_COMMIT_RESULT) {
+        CommitErrorClass::RetryCommit
+    } else if e.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR) {
+        CommitErrorClass::RerunBody
+    } else {
+        CommitErrorClass::Fatal
+    }
+}
+
+/// Result of `commit_write_transaction` for the caller's retry loop.
+enum CommitOutcome {
+    /// The transaction committed. Return the attempt's success value.
+    Committed,
+    /// The transaction aborted without committing. The caller may re-run
+    /// its body in the next loop iteration.
+    RerunBody,
 }
 
 /// Detect a duplicate-key error (E11000, code 11000). Used at
@@ -3439,6 +3591,26 @@ fn is_duplicate_key(e: &mongodb::error::Error) -> bool {
             mongodb::error::WriteError { code: 11000, .. }
         ))
     )
+}
+
+/// Build a `mongodb::error::Error` carrying the given error labels.
+///
+/// The driver's `Error::new` is crate private, but `Error::new` copies the
+/// labels of a write concern error into the top-level label set, and
+/// `WriteConcernError` deserializes its labels from the `errorLabels` field.
+/// Deserializing a synthetic write concern error is therefore the one public
+/// route to a labeled error, which the test hook and the classifier unit
+/// tests both need.
+#[cfg(any(test, feature = "test-hooks"))]
+fn synthetic_error_with_labels(message: &str, labels: &[&str]) -> mongodb::error::Error {
+    let wc: mongodb::error::WriteConcernError = bson::from_document(doc! {
+        "code": 64,
+        "codeName": "WriteConcernTimeout",
+        "errmsg": message,
+        "errorLabels": labels.iter().map(|l| (*l).to_owned()).collect::<Vec<_>>(),
+    })
+    .expect("static WriteConcernError document deserializes");
+    mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteConcernError(wc)).into()
 }
 
 /// Exponential-backoff sleep with random jitter. Used inside the OCC
@@ -3860,6 +4032,80 @@ fn project_item(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Build a labelless server command error with the given code.
+    fn command_error(code: i32) -> mongodb::error::Error {
+        let command_error: mongodb::error::CommandError = bson::from_document(doc! {
+            "code": code,
+            "codeName": "SyntheticTestError",
+            "errmsg": "synthetic command error",
+        })
+        .expect("static CommandError document deserializes");
+        mongodb::error::ErrorKind::Command(command_error).into()
+    }
+
+    #[test]
+    fn unknown_commit_label_retries_the_commit_not_the_body() {
+        let e = synthetic_error_with_labels(
+            "unknown commit outcome",
+            &[mongodb::error::UNKNOWN_TRANSACTION_COMMIT_RESULT],
+        );
+        assert!(matches!(
+            classify_commit_error(&e),
+            CommitErrorClass::RetryCommit
+        ));
+        assert!(
+            !is_transient_write_conflict(&e),
+            "the body-level classifier must not match the unknown commit label"
+        );
+    }
+
+    #[test]
+    fn transient_label_reruns_the_body() {
+        let e = synthetic_error_with_labels(
+            "transaction aborted",
+            &[mongodb::error::TRANSIENT_TRANSACTION_ERROR],
+        );
+        assert!(matches!(
+            classify_commit_error(&e),
+            CommitErrorClass::RerunBody
+        ));
+        assert!(is_transient_write_conflict(&e));
+    }
+
+    #[test]
+    fn unknown_label_takes_precedence_when_both_labels_are_present() {
+        let e = synthetic_error_with_labels(
+            "both labels",
+            &[
+                mongodb::error::TRANSIENT_TRANSACTION_ERROR,
+                mongodb::error::UNKNOWN_TRANSACTION_COMMIT_RESULT,
+            ],
+        );
+        // The commit-site decision is what protects against a double
+        // apply, so the unknown label must win there. The body-level
+        // classifier still matches the transient label; only commit
+        // sites see the unknown label, and they never consult it.
+        assert!(matches!(
+            classify_commit_error(&e),
+            CommitErrorClass::RetryCommit
+        ));
+        assert!(is_transient_write_conflict(&e));
+    }
+
+    #[test]
+    fn write_conflict_code_reruns_the_body_but_never_the_commit() {
+        let e = command_error(112);
+        assert!(is_transient_write_conflict(&e));
+        assert!(matches!(classify_commit_error(&e), CommitErrorClass::Fatal));
+    }
+
+    #[test]
+    fn unrelated_command_error_is_fatal() {
+        let e = command_error(11600);
+        assert!(matches!(classify_commit_error(&e), CommitErrorClass::Fatal));
+        assert!(!is_transient_write_conflict(&e));
+    }
 
     #[derive(Default)]
     struct RecordingGsiIndexWriter {
