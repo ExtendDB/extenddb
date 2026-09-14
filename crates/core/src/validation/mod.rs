@@ -1131,15 +1131,42 @@ pub fn validate_attribute_name_sizes(
     item: &Item,
     limits: &LimitsConfig,
 ) -> Result<(), DynamoDbError> {
-    for name in item.keys() {
-        if name.len() > limits.max_attribute_name_bytes {
-            return Err(DynamoDbError::ValidationException(format!(
-                "One or more parameter values were invalid: Size of attribute name '{}' \
-                 has exceeded the maximum size limit of {} bytes",
-                truncate_for_error(name),
-                limits.max_attribute_name_bytes
-            )));
+    for (name, value) in item {
+        check_attribute_name_size(name, limits)?;
+        check_nested_attribute_name_sizes(value, limits)?;
+    }
+    Ok(())
+}
+
+fn check_attribute_name_size(name: &str, limits: &LimitsConfig) -> Result<(), DynamoDbError> {
+    if name.len() > limits.max_attribute_name_bytes {
+        return Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: Size of attribute name '{}' \
+             has exceeded the maximum size limit of {} bytes",
+            truncate_for_error(name),
+            limits.max_attribute_name_bytes
+        )));
+    }
+    Ok(())
+}
+
+fn check_nested_attribute_name_sizes(
+    value: &AttributeValue,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    match value {
+        AttributeValue::M(map) => {
+            for (name, nested) in map {
+                check_attribute_name_size(name, limits)?;
+                check_nested_attribute_name_sizes(nested, limits)?;
+            }
         }
+        AttributeValue::L(list) => {
+            for nested in list {
+                check_nested_attribute_name_sizes(nested, limits)?;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -2551,6 +2578,95 @@ mod tests {
             err.to_string().contains("Size of attribute name"),
             "unexpected error: {err}"
         );
+    }
+
+    /// Limits with a short attribute-name cap, so the nested tests can build
+    /// oversized names without 64 KB strings.
+    fn short_name_limits() -> LimitsConfig {
+        LimitsConfig {
+            max_attribute_name_bytes: 10,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn nested_map_key_exceeding_limit_rejected() {
+        let mut inner = Item::new();
+        inner.insert("b".repeat(11), AttributeValue::S("v".to_owned()));
+        let mut item = Item::new();
+        item.insert("doc".to_owned(), AttributeValue::M(inner));
+        let err = validate_attribute_name_sizes(&item, &short_name_limits()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("Size of attribute name '{}'", "b".repeat(11))),
+            "error should name the nested key: {msg}"
+        );
+    }
+
+    #[test]
+    fn map_key_nested_inside_list_exceeding_limit_rejected() {
+        let mut inner = Item::new();
+        inner.insert("c".repeat(11), AttributeValue::Bool(true));
+        let mut item = Item::new();
+        item.insert(
+            "rows".to_owned(),
+            AttributeValue::L(vec![
+                AttributeValue::S("first".to_owned()),
+                AttributeValue::M(inner),
+            ]),
+        );
+        let err = validate_attribute_name_sizes(&item, &short_name_limits()).unwrap_err();
+        assert!(
+            err.to_string().contains("Size of attribute name"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_map_key_exceeding_limit_rejected() {
+        // M -> L -> M -> M: the oversized key sits four levels down.
+        let mut leaf = Item::new();
+        leaf.insert("d".repeat(11), AttributeValue::Null);
+        let mut mid = Item::new();
+        mid.insert("ok".to_owned(), AttributeValue::M(leaf));
+        let mut top = Item::new();
+        top.insert(
+            "list".to_owned(),
+            AttributeValue::L(vec![AttributeValue::M(mid)]),
+        );
+        let mut item = Item::new();
+        item.insert("root".to_owned(), AttributeValue::M(top));
+        assert!(validate_attribute_name_sizes(&item, &short_name_limits()).is_err());
+    }
+
+    #[test]
+    fn nested_map_keys_within_limit_pass() {
+        let mut inner = Item::new();
+        inner.insert("a".repeat(10), AttributeValue::S("v".to_owned()));
+        inner.insert("short".to_owned(), AttributeValue::N("1".to_owned()));
+        let mut item = Item::new();
+        item.insert("doc".to_owned(), AttributeValue::M(inner.clone()));
+        item.insert(
+            "rows".to_owned(),
+            AttributeValue::L(vec![AttributeValue::M(inner)]),
+        );
+        assert!(validate_attribute_name_sizes(&item, &short_name_limits()).is_ok());
+    }
+
+    #[test]
+    fn nested_name_limit_counts_utf8_bytes_not_chars() {
+        // Five two-byte characters is ten bytes: at the cap. Six is over.
+        let mut at_cap = Item::new();
+        at_cap.insert("é".repeat(5), AttributeValue::Null);
+        let mut item = Item::new();
+        item.insert("doc".to_owned(), AttributeValue::M(at_cap));
+        assert!(validate_attribute_name_sizes(&item, &short_name_limits()).is_ok());
+
+        let mut over = Item::new();
+        over.insert("é".repeat(6), AttributeValue::Null);
+        let mut item = Item::new();
+        item.insert("doc".to_owned(), AttributeValue::M(over));
+        assert!(validate_attribute_name_sizes(&item, &short_name_limits()).is_err());
     }
 
     #[test]

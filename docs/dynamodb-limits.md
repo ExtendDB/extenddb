@@ -41,7 +41,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | Maximum item size | 400 KB (409,600 bytes) | Enforced | `LimitsConfig::max_item_size_bytes`, validated on PutItem and post-UpdateItem |
 | Partition key size | 1–2,048 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_partition_key_size_bytes`            |
 | Sort key size | 1–1,024 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_sort_key_size_bytes`                 |
-| Attribute name size | 1–64 KB (65,535 bytes) | Enforced | `validate_attribute_name_sizes`, `LimitsConfig::max_attribute_name_bytes`     |
+| Attribute name size | 1–64 KB (65,535 bytes) | Enforced | `validate_attribute_name_sizes`, `LimitsConfig::max_attribute_name_bytes`; applies to nested map keys at every depth as well as top-level names |
 | Attribute nesting depth | 32 levels | Enforced | `validate_item_nesting_depth`, applied on PutItem, UpdateItem, BatchWriteItem.PutRequest, TransactWriteItems.Put, ImportTable |
 | Number of attributes per item | No practical limit | Enforced | ExtendDB has no per-item attribute count limit                                |
 
