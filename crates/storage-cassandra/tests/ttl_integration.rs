@@ -271,7 +271,7 @@ async fn test_ttl_metadata_enable_disable_and_listing() {
         .await
         .expect("disable TTL metadata");
     engine
-        .drop_ttl_index(&table.key_info.account_id, &table.key_info.table_name)
+        .drop_ttl_index(&table.key_info.account_id, &table.key_info.table_name, "expires_at")
         .await
         .expect("clear TTL queue");
     assert_eq!(
