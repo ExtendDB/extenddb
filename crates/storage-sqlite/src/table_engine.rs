@@ -20,7 +20,7 @@ impl TableEngine for SqliteEngine {
         input: CreateTableInput,
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
         let account_id = account_id.to_owned();
-        Box::pin(async move { self.create_table_impl(&account_id, input).await })
+        Box::pin(async move { self.create_table_impl(&account_id, input, false).await })
     }
 
     fn delete_table(

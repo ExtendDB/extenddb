@@ -44,6 +44,30 @@ pub const LEGACY_GSI_PROPAGATION_DELAY_MS: &str = "gsi_propagation_delay_ms";
 /// or not the ordering is correct, which is worse than having no test.
 pub const VECTOR_BACKFILL_BATCH_DELAY_MS: &str = "vector_backfill_batch_delay_ms";
 
+/// Test-only gate for the MongoDB GSI backfill race tests.
+///
+/// A MongoDB test-hook build uses keys of the form
+/// `gsi_backfill_test_gate:<table-name>` and the values `armed`, `paused`,
+/// `release`, and `idle` to coordinate an external API test at the
+/// read-before-index-write boundary. The table suffix keeps parallel backfills
+/// from claiming one another's gate. Production MongoDB builds do not compile
+/// the hook.
+pub const GSI_BACKFILL_TEST_GATE: &str = "gsi_backfill_test_gate";
+
+/// Test-only gate for the MongoDB commit-retry tests.
+///
+/// A MongoDB test-hook build uses keys of the form
+/// `unknown_commit_test_gate:<table-name>` and the values `armed` and `idle`.
+/// While armed for a table, the next write commit of an UpdateItem on that
+/// table performs the real commit and then reports a synthetic error carrying
+/// the UnknownTransactionCommitResult label, once, then flips itself back to
+/// `idle`. This is the only way a test can place a client-visible write on the
+/// commit-outcome-unknown path deterministically: the real trigger is a
+/// network fault or election in the instant between sending commitTransaction
+/// and reading its reply, a window a test cannot hit on purpose. Production
+/// MongoDB builds do not compile the hook.
+pub const UNKNOWN_COMMIT_TEST_GATE: &str = "unknown_commit_test_gate";
+
 /// Minimum milliseconds an UpdateTable-created vector index stays in `CREATING`
 /// before its `ACTIVE` flip.
 ///

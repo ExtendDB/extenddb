@@ -8,6 +8,9 @@
 //! transaction afterward, with catalog cleanup if the data DDL fails. The
 //! control-plane delay (`control_plane_delay_seconds`) decides whether the
 //! table starts ACTIVE (delay 0) or CREATING with a scheduled transition.
+//!
+//! The restore path is the exception: see `defer_active` on
+//! [`SqliteEngine::create_table_impl`].
 
 use extenddb_core::types::{
     BillingMode, BillingModeSummary, CreateTableInput, GsiDescription, LsiDescription,
@@ -20,12 +23,25 @@ use crate::sqlite_util::{format_timestamp, is_unique_violation};
 use crate::store::SqliteEngine;
 
 impl SqliteEngine {
+    /// Create a table. When `defer_active` is set (the restore path), the row
+    /// is written `CREATING` with **no** scheduled transition, so the
+    /// background control-plane worker cannot flip it to `ACTIVE` while the
+    /// caller is still populating it; the caller sets `ACTIVE` itself once the
+    /// data copy completes. Normal `CreateTable` passes `false` and gets the
+    /// usual timed transition.
     pub(crate) async fn create_table_impl(
         &self,
         account_id: &str,
         input: CreateTableInput,
+        defer_active: bool,
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
+        // D1: every writer holds the engine write lock. This method runs two
+        // write transactions (catalog rows, then data-table DDL); without the
+        // lock they contend with data-plane writers at the SQLite level, and a
+        // slow DDL commit can exhaust a concurrent writer's busy_timeout,
+        // surfacing as a 500 on an unrelated request.
+        let _writer = self.write_lock.lock().await;
         let table_id = uuid::Uuid::new_v4().to_string();
         let table_arn = table_arn(&self.region, account_id, &input.table_name);
         let billing_mode = input.billing_mode.unwrap_or(BillingMode::Provisioned);
@@ -76,7 +92,14 @@ impl SqliteEngine {
         let creation_ts = format_timestamp(now);
         #[allow(clippy::cast_precision_loss)]
         let creation_epoch = now.unix_timestamp() as f64;
-        let (initial_status, status_transition_at) = if delay_secs <= 0.0 {
+        let (initial_status, status_transition_at) = if defer_active {
+            // CREATING with no scheduled transition: the control-plane worker
+            // matches only rows with a non-NULL, matured `status_transition_at`
+            // (see `worker.rs`), so it can never flip this row mid-copy. The
+            // restore caller performs the single ACTIVE flip when the copy
+            // commits.
+            ("CREATING", None)
+        } else if delay_secs <= 0.0 {
             ("ACTIVE", None)
         } else {
             (
@@ -492,6 +515,7 @@ impl SqliteEngine {
                 last_decrease_date_time: None,
             },
             billing_mode_summary,
+            table_throughput_mode_summary: None,
             global_secondary_indexes: gsis,
             local_secondary_indexes: lsis,
             stream_specification: input.stream_specification,

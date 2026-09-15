@@ -322,6 +322,7 @@ fn update_input(table: &str) -> UpdateTableInput {
         stream_specification: None,
         table_class: None,
         on_demand_throughput: None,
+        table_throughput_mode: None,
         vector_index_updates: None,
     }
 }

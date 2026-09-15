@@ -13,6 +13,17 @@ transactions on replica sets).
 
 **Minimum MongoDB version:** 7.0 (multi-document transactions, snapshot reads).
 
+**Transaction read concern:** `storage.mongodb.transaction_read_concern`
+(default `"snapshot"`) controls the read concern applied to every
+multi-document transaction this backend opens (conditional writes,
+`TransactWriteItems`, `TransactGetItems`, idempotency-token checks). The only
+accepted values are `"snapshot"`, `"majority"`, and `"local"`. Snapshot is
+the default and fidelity-preserving mode. Some MongoDB-wire-compatible
+servers (e.g. DocumentDB) reject `readConcern: snapshot` transactions with
+`CommandNotSupported` (error code 115); `"majority"` or `"local"` can be used
+for those targets, but neither provides snapshot's single point-in-time view.
+Local may also observe data that is later rolled back after failover.
+
 **Read preference:** `primary` only. `MongoEngine::new` rejects connection strings
 that request `secondary`, `secondaryPreferred`, `primaryPreferred`, or `nearest` —
 DynamoDB's `ConsistentRead=true` contract requires linearizable reads, which only
@@ -405,12 +416,11 @@ filters existing rows by `created_at` age < 600 000 ms so retention is
 correct regardless of TTL-monitor timing.
 
 The unique index closes a race window: two concurrent `TransactWriteItems`
-calls with the same token both take snapshot reads that miss the other's
-uncommitted insert; without the constraint, both would commit and the
-operation would execute twice. With it, the second inserter fails
-`E11000` and the write path resolves the winner by re-reading (still
-subject to the age filter — if the winner has just expired, the retry
-does a fresh insert).
+calls with the same token can both miss the other's uncommitted insert;
+without the constraint, both would commit and the operation would execute
+twice. With it, the second inserter fails `E11000` and the write path resolves
+the winner by re-reading (still subject to the age filter — if the winner has
+just expired, the retry does a fresh insert).
 
 ### 4.7 `_backup_{backup_id}`
 
@@ -427,7 +437,8 @@ drops the collection.
 `PutItem`, `DeleteItem`, and `UpdateItem` — when they carry a
 `ConditionExpression`, a `StreamCapture`, or write to a table with GSIs —
 run inside a MongoDB client session bound to a multi-document transaction
-with snapshot read concern and majority write concern. Within the session:
+with the configured `transaction_read_concern` (default `"snapshot"`) and
+majority write concern. Within the session:
 
 1. `find_one` the current document.
 2. Evaluate the DynamoDB condition in Rust
@@ -439,11 +450,14 @@ with snapshot read concern and majority write concern. Within the session:
    per-shard sequence-number `$inc` — also in the same session.
 6. Commit.
 
-All five happen on the same session, so a concurrent conflicting writer
-manifests as a WriteConflict at commit — which the caller retries — not
-as a stale-read anomaly. The pre-image loaded in step 1 is reused for
-`ReturnValuesOnConditionCheckFailure = ALL_OLD` and for `OldImage` on any
-attached stream capture; no follow-up read is needed.
+In snapshot mode, all steps observe one point-in-time view, so a concurrent
+conflicting writer manifests as a WriteConflict at commit — which the caller
+retries — rather than as a stale-read anomaly. Majority and local retain the
+transaction's atomic commit but weaken those snapshot semantics; reads within
+the transaction are not guaranteed to share one point-in-time view. Local may
+also read data that is later rolled back after failover. The pre-image loaded
+in step 1 is reused for `ReturnValuesOnConditionCheckFailure = ALL_OLD` and
+for `OldImage` on any attached stream capture; no follow-up read is needed.
 
 Update-as-insert (the pre-image was `None`) emits an `INSERT` stream
 event with no `OldImage`, not a `MODIFY` with a fabricated key-only stub.
@@ -726,14 +740,14 @@ body, and either commits, aborts and retries (transient), or aborts and
 returns (fatal). Retries sleep with jittered exponential backoff
 (`backoff_sleep`, base 50 µs).
 
-**UpdateItem's OCC guard on top.** Even inside the transaction snapshot,
-`UpdateItem` uses a `_v` version filter. The transaction guarantees the
-snapshot the update was computed from; the versioned replace_one
-guarantees the write only commits if the row's `_v` still matches what
-we read. If `matched_count == 0` the attempt returns `Stale` (a distinct
-signal from `Transient`) and the loop restarts. The native fast path
-always emits `$inc: {_v: 1}` so a concurrent slow-path update racing
-against a stale snapshot fails its filter and retries.
+**UpdateItem's OCC guard on top.** `UpdateItem` uses a `_v` version filter.
+In snapshot mode, the transaction supplies the point-in-time view used to
+compute the update. Under every accepted read concern, the versioned
+`replace_one` ensures the write commits only if the row's `_v` still matches
+what was read. If `matched_count == 0` the attempt returns `Stale` (a distinct
+signal from `Transient`) and the loop restarts. The native fast path always
+emits `$inc: {_v: 1}` so a concurrent slow-path update racing against a stale
+read fails its filter and retries.
 
 **Exhaustion behavior.** Single-item retry exhaustion returns
 `StorageError::Internal` (rare in practice; the retry ceiling is high).
@@ -765,9 +779,12 @@ and cannot emit ExtendDB stream records with the required `Service`
 user identity, so the backend maintains its own worker.
 
 `update_ttl` sets `ttl_attribute` on the table doc. `create_ttl_index`
-creates a sparse index on `item_data.{ttl_attribute}.N` and flips
-`ttl_index_ready: true`. The `ttl_cleanup_worker` (60s cadence) walks
-tables with `ttl_index_ready`, finds expired items in batches of 100
+creates a sparse index on `item_data.{ttl_attribute}.N` for ordinary
+attribute names and marks `ttl_index_ready: true`. The flag means that
+the table's TTL cleanup path is ready; dotted attribute names use the
+literal-field expression path instead of a physical index, but are also
+marked ready. The `ttl_cleanup_worker` (60s cadence) walks tables with
+`ttl_index_ready`, finds expired items in batches of 100
 per table, and issues `DataEngine::delete_item` with a re-check
 condition (`attribute_exists(ttl) AND ttl <= now`) to prevent races
 with concurrent writes. The delete carries a `StreamCapture` with
@@ -844,7 +861,6 @@ pub struct MongoEngine {
     catalog_db: mongodb::Database,
     data_db: mongodb::Database,
     region: String,
-    max_connections: u32,
     gsi_cache: dashmap::DashMap<String, (bool, std::time::Instant)>,
 }
 
@@ -852,9 +868,10 @@ const GSI_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 ```
 
 `MongoEngine::new` parses the connection string, rejects non-primary
-read preferences, then constructs the client with `max_pool_size =
-max_connections`. `catalog_db` and `data_db` are lightweight handles
-against the single shared client.
+read preferences, then constructs the shared data client. An explicitly
+configured `max_connections` value overrides the URI's `maxPoolSize`; when it
+is omitted, the URI remains authoritative. `catalog_db` and `data_db` are
+lightweight handles against that shared client.
 
 `gsi_cache` entries carry the observation time so a stale entry
 (`elapsed() > GSI_CACHE_TTL`) is treated as a miss and re-read from the
@@ -866,18 +883,34 @@ another ExtendDB instance sharing the catalog.
 ```toml
 [storage.mongodb]
 connection_string = "mongodb://localhost:27017/?replicaSet=rs0"
-max_connections = 50
-max_catalog_connections = 20
+# max_connections = 50           # Optional data-client pool override
+# max_catalog_connections = 20   # Optional management/authentication override
 ```
 
+Both pool settings are optional and must be at least `1` when supplied. If a
+setting is omitted, the MongoDB connection string's `maxPoolSize` remains in
+force.
+
+The shared data client, configured by `max_connections`, carries table and item
+operations as well as metadata, backup, and background-worker traffic. The
+MongoEngine's catalog handles also use this client, so catalog reads performed
+by table, metadata, backup, time-to-live, stream-cleanup, and index-backfill
+code consume this pool.
+
+The separate shared management client, configured by
+`max_catalog_connections`, carries management-store, credential, and
+authorization traffic. Catalog and authentication stores clone this client,
+so this is one combined limit rather than one independent pool per store; it
+must cover the expected management and authentication concurrency together.
+
 ```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MongoStorageConfig {
     pub connection_string: String,
-    #[serde(default = "default_max_connections")]
-    pub max_connections: u32,
-    #[serde(default = "default_max_catalog_connections")]
-    pub max_catalog_connections: u32,
+    #[serde(default, deserialize_with = "positive_opt_u32")]
+    pub max_connections: Option<u32>,
+    #[serde(default, deserialize_with = "positive_opt_u32")]
+    pub max_catalog_connections: Option<u32>,
 }
 ```
 
@@ -1054,7 +1087,7 @@ The backend implements every trait in `extenddb-storage`:
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Conditional writes | Read + evaluate + write inside a MongoDB transaction session | Snapshot atomicity delivers DDB's contract; pre-image reused for `ReturnValuesOnConditionCheckFailure = ALL_OLD` and `OldImage`. |
+| Conditional writes | Read + evaluate + write inside a MongoDB transaction session | Snapshot mode delivers DDB's isolation contract; pre-image reused for `ReturnValuesOnConditionCheckFailure = ALL_OLD` and `OldImage`. |
 | Filter pushdown | Analyzer-gated fast path; `is_pushable` certifies a subset | Compiler in `condition.rs` handles broader syntax than production uses; the analyzer is the correctness boundary. |
 | GSI live sync | Synchronous inline within the base write's session, gated by a 60s-TTL cache | Strongly-consistent GSI reads; no Change Stream recovery. |
 | GSI async backfill | `CREATING` → `ACTIVE` via `gsi_backfill_worker` with persistent `backfill_cursor` | Matches DDB's async UpdateTable contract; restart-safe. |
@@ -1067,8 +1100,8 @@ The backend implements every trait in `extenddb-storage`:
 | Stream shard ID | `shardId-{table_id}-{i:012}` | Cross-tenant isolation on same-named tables. |
 | Stream retention | 24h TTL index on `stream_records.created_at` + hourly cleanup worker | Primary enforcement at storage; worker is defense in depth. |
 | WriteConflict handling | Retry with jittered exponential backoff (50 attempts); TWI exhaustion → `TransactionCanceled` with synthetic `TransactionConflict` reasons | Bounded tail latency; DDB-canonical error surface. |
-| UpdateItem concurrency | Snapshot txn + `_v` version filter + retry; native fast-path always `$inc: {_v: 1}` | Prevents lost updates; fast path stays safe against a concurrent slow path. |
-| Idempotency retention | Unique `(account_id, token)` index + 540s TTL + 600 ms data-plane age filter | Race safety under snapshot isolation; ≤10-min worst-case retention regardless of TTL-monitor cadence. |
+| UpdateItem concurrency | Configured transaction read concern + `_v` version filter + retry; native fast-path always `$inc: {_v: 1}` | Prevents lost updates; snapshot mode additionally supplies a point-in-time read view. |
+| Idempotency retention | Unique `(account_id, token)` index + 540s TTL + 600 ms data-plane age filter | Unique-index race safety under every accepted read concern; ≤10-min worst-case retention regardless of TTL-monitor cadence. |
 | Backups | Per-backup collection via server-side `$out` aggregation | No per-item driver traffic; metadata schema decoupled from collection name. |
 | Parallel scan | Application-side `crc32(pk) % segments` + lazy cursor | Rare feature; server-side bucketing would tax every write. Lazy iteration prevents item-drops under hot-key skew. |
 | Read preference | `primary` enforced at engine startup | `ConsistentRead=true` requires linearizable reads. |
@@ -1101,6 +1134,7 @@ insert per write, inside the base write's session.
 `(pk, sk_?, base_pk, base_sk_?)` for index queries. `GetRecords`
 uses the compound `(shard_id, sequence_number)` index.
 
-**TransactWriteItems.** Multi-collection ACID transaction with
-snapshot read concern and majority write concern; up to 100 operations
+**TransactWriteItems.** Multi-collection ACID transaction with the
+configured `transaction_read_concern` (default `"snapshot"`) and
+majority write concern; up to 100 operations
 per the DDB spec. Retried on transient conflicts with jittered backoff.
