@@ -28,7 +28,7 @@ Without formal policies, we risk inconsistent quality, fragmented implementation
 
 ### Repository structure: Mono-repo with feature flags
 
-All officially supported backends live in the main `extenddb` repository as separate crates under `crates/storage-{backend}/`. Examples:
+All officially supported backends live in the main `extenddb` repository as separate crates under `crates/storage-{backend}/`. A backend may factor internal crates beneath its own directory (for example `crates/storage-{backend}/exec/`) when that separation enforces something the backend needs; the published backend crate stays at `crates/storage-{backend}/`. Examples:
 
 - `crates/storage-postgres/` (reference implementation)
 - `crates/storage-cassandra/`
@@ -221,7 +221,7 @@ External contributors may propose new backends or maintain existing ones. The pr
 
 2. **Review.** Maintainers evaluate whether the backend aligns with ExtendDB's goals and whether the contributor can sustain maintenance. Approval grants the contributor directory-level write access via GitHub CODEOWNERS.
 
-3. **Implementation.** Contributor develops the backend in `crates/storage-{backend}/` following the `Storage` trait contract. The contributor owns their backend directory but ExtendDB maintainers retain override authority for repository-wide concerns.
+3. **Implementation.** Contributor develops the backend in `crates/storage-{backend}/` following the `Storage` trait contract, optionally factoring internal crates beneath that directory. The contributor owns their backend directory but ExtendDB maintainers retain override authority for repository-wide concerns.
 
 4. **Acceptance criteria:**
    - Conformance tests pass for all required traits and for any implemented, optional traits.
@@ -243,7 +243,7 @@ To prevent accidental coupling between frontend and specific backend implementat
 
 1. The `extenddb` service binary builds successfully without any backend feature flags enabled (frontend depends only on `storage` trait crate, not concrete backends).
 
-2. Backend crates depend only on the `storage` trait and common utilities, not on each other.
+2. Backend crates depend only on the `storage` trait and common utilities, and not on another backend's crates. A backend's own internal crates may depend on each other.
 
 This will be validated via:
 ```bash
@@ -254,7 +254,7 @@ cargo build --no-default-features --bin extenddb
 
 ### Release model
 
-ExtendDB will move to a release model that includes releases through <a href="https://crates.io/">Crates.io</a>. All crates follow <a href="https://semver.org/">semantic versioning</a>. Breaking changes to `extenddb-storage` trigger coordinated releases. Binaries will also be available as GitHub releases. The project will also prioritize releasing images through Docker Hub.
+ExtendDB will move to a release model that includes releases through <a href="https://crates.io/">Crates.io</a>. All published crates follow <a href="https://semver.org/">semantic versioning</a>. Crates internal to a backend are `publish = false` and carry no semver commitment. Breaking changes to `extenddb-storage` trigger coordinated releases. Binaries will also be available as GitHub releases. The project will also prioritize releasing images through Docker Hub.
 
 ### Third-party backends outside ExtendDB organization
 
