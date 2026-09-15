@@ -976,6 +976,7 @@ impl MetadataEngine for CassandraEngine {
         &self,
         account_id: &str,
         table_name: &str,
+        _ttl_attribute: &str,
     ) -> BoxFuture<'_, Result<(), StorageError>> {
         let account_id = account_id.to_owned();
         let table_name = table_name.to_owned();
