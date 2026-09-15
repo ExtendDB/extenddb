@@ -37,6 +37,13 @@ fn redact_if_sensitive(key: &str, val: &str) -> String {
     }
 }
 
+fn display_pool_limit(value: Option<u32>) -> String {
+    value.map_or_else(
+        || "from connection string / driver default".to_owned(),
+        |n| n.to_string(),
+    )
+}
+
 /// D9: Build static configuration entries for the console settings page.
 ///
 /// Extracts key-value pairs from the parsed `AppConfig` and pre-redacts
@@ -45,6 +52,8 @@ fn redact_if_sensitive(key: &str, val: &str) -> String {
 pub fn build_config_entries(cfg: &AppConfig) -> Vec<(String, String)> {
     let r = redact_if_sensitive;
     let backend = &cfg.storage.backend;
+    let data_pool_size = display_pool_limit(cfg.storage.max_connections_override());
+    let catalog_pool_size = display_pool_limit(cfg.storage.max_catalog_connections_override());
     let mut entries = vec![
         ("server.bind_addr".into(), cfg.server.bind_addr.clone()),
         ("server.port".into(), cfg.server.port.to_string()),
@@ -72,13 +81,10 @@ pub fn build_config_entries(cfg: &AppConfig) -> Vec<(String, String)> {
             format!("storage.{backend}.connection_string"),
             r("connection_string", cfg.storage.connection_config()),
         ),
-        (
-            format!("storage.{backend}.pool_size"),
-            cfg.storage.max_connections().to_string(),
-        ),
+        (format!("storage.{backend}.pool_size"), data_pool_size),
         (
             format!("storage.{backend}.catalog_pool_size"),
-            cfg.storage.max_catalog_connections().to_string(),
+            catalog_pool_size,
         ),
         ("auth.provider".into(), cfg.auth.provider.clone()),
         ("logging.level".into(), cfg.logging.level.clone()),
@@ -128,4 +134,22 @@ pub fn build_config_entries(cfg: &AppConfig) -> Vec<(String, String)> {
     ]);
 
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_pool_limit;
+
+    #[test]
+    fn explicit_pool_limit_is_displayed() {
+        assert_eq!(display_pool_limit(Some(31)), "31");
+    }
+
+    #[test]
+    fn absent_pool_limit_identifies_its_source() {
+        assert_eq!(
+            display_pool_limit(None),
+            "from connection string / driver default"
+        );
+    }
 }

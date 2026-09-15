@@ -344,6 +344,9 @@ fn create_table_input_from_params(tcp: &TableCreationParameters) -> CreateTableI
         attribute_definitions: tcp.attribute_definitions.clone(),
         key_schema: tcp.key_schema.clone(),
         billing_mode: tcp.billing_mode,
+        // ImportTable's TableCreationParameters has no TableThroughputMode
+        // member; nothing to resolve.
+        table_throughput_mode: None,
         provisioned_throughput: tcp.provisioned_throughput.clone(),
         global_secondary_indexes: tcp.global_secondary_indexes.clone(),
         local_secondary_indexes: None,

@@ -591,6 +591,9 @@ impl VectorIndexBuild for SqliteVectorBuild {
     }
 
     async fn set_backfilling(&mut self) -> Result<(), StorageError> {
+        // D1: every writer holds the engine write lock, the build's catalog
+        // flips included.
+        let _writer = self.write_lock.lock().await;
         sqlx::query(
             "UPDATE vector_indexes SET backfilling = 1 WHERE table_id = ? AND index_id = ?",
         )
@@ -603,6 +606,9 @@ impl VectorIndexBuild for SqliteVectorBuild {
     }
 
     async fn mark_active(&mut self, skipped: usize) -> Result<(), StorageError> {
+        // D1: every writer holds the engine write lock. Taken here for the
+        // whole method, so the empty-flip branch below must not re-acquire.
+        let _writer = self.write_lock.lock().await;
         // `backfilling` is cleared to NULL rather than set to 0, because the
         // service removes the member once ACTIVE and the catalog CHECK
         // constraint enforces that pairing.
@@ -624,7 +630,6 @@ impl VectorIndexBuild for SqliteVectorBuild {
             // definition back. A delete landing in between drops the table it
             // could see, and this build then recreates one nothing references.
             // The absent catalog row is the proof the index is gone.
-            let _writer = self.write_lock.lock().await;
             crate::SqliteEngine::drop_vector_data_table_by_id(
                 &self.pool,
                 &self.table_id,
@@ -1041,5 +1046,53 @@ mod tests {
             rows, 1,
             "one base key must yield one index row, not a duplicate"
         );
+    }
+    /// The build's catalog flips are writers like any other: while the engine
+    /// write lock is held, neither may complete; after release, both must.
+    /// Mirrors the D1 tests in `store.rs` for the `SqliteEngine` writers.
+    ///
+    /// No catalog row is seeded on purpose: `set_backfilling` updates zero rows
+    /// and `mark_active` takes its empty-flip branch (which also proves that
+    /// branch cannot deadlock now that the lock spans the whole method).
+    #[tokio::test]
+    async fn build_catalog_flips_wait_for_the_write_lock() {
+        let engine = crate::SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::schema::apply(&engine.pool).await.expect("schema");
+
+        let build = || SqliteVectorBuild {
+            pool: engine.pool.clone(),
+            write_lock: std::sync::Arc::clone(&engine.write_lock),
+            gsi_notify: engine.gsi_notify(),
+            table_id: "t-d1".to_owned(),
+            index_id: "vidx-d1".to_owned(),
+            base_key_schema: Vec::new(),
+            attribute_definitions: Vec::new(),
+            meta: None,
+        };
+
+        for (name, mut ops, which) in [
+            ("set_backfilling", build(), 0_u8),
+            ("mark_active", build(), 1_u8),
+        ] {
+            let guard = engine.write_lock.lock().await;
+            let task = tokio::spawn(async move {
+                match which {
+                    0 => ops.set_backfilling().await.expect("set_backfilling"),
+                    _ => ops.mark_active(0).await.expect("mark_active"),
+                }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert!(
+                !task.is_finished(),
+                "{name} completed while the engine write lock was held (D1 violation)"
+            );
+            drop(guard);
+            tokio::time::timeout(std::time::Duration::from_secs(10), task)
+                .await
+                .unwrap_or_else(|_| panic!("{name} did not complete after lock release"))
+                .expect("writer task panicked");
+        }
     }
 }

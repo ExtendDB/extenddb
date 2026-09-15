@@ -8,6 +8,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Enables deterministic coordination hooks used only by the MongoDB integration
+# test binary. Production builds do not compile these hooks.
+test-hooks = []
+
 [dependencies]
 # Internal crates
 extenddb-core.workspace = true

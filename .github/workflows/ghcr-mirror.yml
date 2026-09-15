@@ -44,6 +44,13 @@ on:
       expected_digest:
         description: 'The verified manifest digest of that tag, e.g. sha256:<64 hex>'
         required: true
+      image:
+        description: 'Which image the artifact belongs to'
+        type: choice
+        options:
+          - extenddb-postgres
+          - extenddb-mongodb
+        default: extenddb-postgres
 
 # Copying between registries needs no repository content at all.
 permissions:
@@ -51,12 +58,12 @@ permissions:
 
 # Two mirror runs must never race on the same destination.
 concurrency:
-  group: ghcr-mirror-extenddb-postgres
+  group: ghcr-mirror-${{ inputs.image }}
   cancel-in-progress: false
 
 env:
-  SRC_REPO: docker.io/extenddb/extenddb-postgres
-  DST_REPO: ghcr.io/extenddb/extenddb-postgres
+  SRC_REPO: docker.io/extenddb/${{ inputs.image }}
+  DST_REPO: ghcr.io/extenddb/${{ inputs.image }}
 
 jobs:
   mirror:
@@ -75,8 +82,13 @@ jobs:
           # the environment, never by interpolation into script source.
           RAW_TAG: ${{ inputs.candidate_tag }}
           RAW_DIGEST: ${{ inputs.expected_digest }}
+          RAW_IMAGE: ${{ inputs.image }}
         run: |
           set -euo pipefail
+          case "$RAW_IMAGE" in
+            extenddb-postgres|extenddb-mongodb) ;;
+            *) echo "::error::image '$RAW_IMAGE' is not in the allowlist"; exit 1 ;;
+          esac
           KIND=''
           SUBJECT_DIGEST=''
           if [[ "$RAW_TAG" =~ ^sha-[0-9a-f]{40}$ ]]; then

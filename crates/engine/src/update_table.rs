@@ -27,8 +27,27 @@ pub async fn handle_update_table(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
+    // Per-member enum validation precedes everything else, including the table
+    // lookup, matching the measured service ordering.
+    crate::validate_enum_fields(
+        &body,
+        &[
+            crate::EnumField {
+                json_name: "BillingMode",
+                valid: &["PROVISIONED", "PAY_PER_REQUEST"],
+                clause: crate::EnumClause::Named("billingMode"),
+            },
+            crate::EnumField {
+                json_name: "TableThroughputMode",
+                valid: &["PROVISIONED", "PAY_PER_REQUEST"],
+                clause: crate::EnumClause::Named("tableThroughputMode"),
+            },
+        ],
+    )?;
+
     let mut input: UpdateTableInput =
         serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    input.resolve_table_throughput_mode();
 
     if input.table_name.is_empty() {
         return Err(DynamoDbError::ValidationException(
@@ -179,7 +198,7 @@ pub async fn handle_update_table(
     // Kept for the post-condition check below, since `input` is moved into the
     // backend call.
     let vector_index_updates = input.vector_index_updates.clone();
-    let desc = ctx
+    let mut desc = ctx
         .storage
         .update_table(&ctx.account_id, input)
         .await
@@ -201,6 +220,7 @@ pub async fn handle_update_table(
         .invalidate_table_key_info(&ctx.account_id, &table_name)
         .await;
 
+    desc.populate_table_throughput_mode_summary();
     let output = extenddb_core::types::UpdateTableOutput {
         table_description: desc,
     };

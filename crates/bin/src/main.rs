@@ -64,6 +64,7 @@ fn main() -> anyhow::Result<()> {
         version: env!("CARGO_PKG_VERSION"),
         git_hash: env!("EXTENDDB_GIT_HASH"),
         build_time: env!("EXTENDDB_BUILD_TIME"),
+        test_hooks_enabled: cfg!(feature = "mongodb-test-hooks"),
     })
 }
 

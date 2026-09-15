@@ -41,6 +41,7 @@ on:
     paths:
       - 'docker/dockerhub-overview.md'
       - 'docker/dockerhub-overview-dev.md'
+      - 'docker/dockerhub-overview-mongodb.md'
   workflow_dispatch:
     inputs:
       image:
@@ -49,6 +50,7 @@ on:
         type: choice
         options:
           - extenddb-postgres
+          - extenddb-mongodb
           - extenddb-dev
 
 permissions:
@@ -90,7 +92,7 @@ jobs:
           set -euo pipefail
           if [[ "$EVENT" == "workflow_dispatch" ]]; then
             case "$INPUT_IMAGE" in
-              extenddb-postgres|extenddb-dev) ;;
+              extenddb-postgres|extenddb-mongodb|extenddb-dev) ;;
               *) echo "::error::unknown image '$INPUT_IMAGE'"; exit 1 ;;
             esac
             IMAGES=$(jq -cn --arg i "$INPUT_IMAGE" '[$i]')
@@ -106,10 +108,12 @@ jobs:
             IMAGES='[]'
             if [[ -z "$CHANGED" ]]; then
               # Unresolvable range: publish both (idempotent).
-              IMAGES='["extenddb-postgres","extenddb-dev"]'
+              IMAGES='["extenddb-postgres","extenddb-mongodb","extenddb-dev"]'
             else
               grep -qx 'docker/dockerhub-overview.md' <<< "$CHANGED" \
                 && IMAGES=$(jq -c '. + ["extenddb-postgres"]' <<< "$IMAGES")
+              grep -qx 'docker/dockerhub-overview-mongodb.md' <<< "$CHANGED" \
+                && IMAGES=$(jq -c '. + ["extenddb-mongodb"]' <<< "$IMAGES")
               grep -qx 'docker/dockerhub-overview-dev.md' <<< "$CHANGED" \
                 && IMAGES=$(jq -c '. + ["extenddb-dev"]' <<< "$IMAGES")
             fi
@@ -151,6 +155,10 @@ jobs:
             extenddb-postgres)
               FILE='docker/dockerhub-overview.md'
               SHORT='DynamoDB-compatible API adapter backed by your own PostgreSQL 14+ database'
+              ;;
+            extenddb-mongodb)
+              FILE='docker/dockerhub-overview-mongodb.md'
+              SHORT='DynamoDB-compatible API adapter backed by your own MongoDB 7+ replica set'
               ;;
             extenddb-dev)
               FILE='docker/dockerhub-overview-dev.md'
@@ -260,6 +268,10 @@ jobs:
             extenddb-postgres)
               FILE='docker/dockerhub-overview.md'
               SHORT='DynamoDB-compatible API adapter backed by your own PostgreSQL 14+ database'
+              ;;
+            extenddb-mongodb)
+              FILE='docker/dockerhub-overview-mongodb.md'
+              SHORT='DynamoDB-compatible API adapter backed by your own MongoDB 7+ replica set'
               ;;
             extenddb-dev)
               FILE='docker/dockerhub-overview-dev.md'

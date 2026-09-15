@@ -12,6 +12,7 @@ license.workspace = true
 # enforced), seeded dev credential. A build-time profile for local/CI only;
 # the thin bin enforces that it is paired with a dev/CI backend.
 dev-mode = ["extenddb-config/dev-mode"]
+mongodb-test-hooks = ["extenddb-server/mongodb-test-hooks"]
 
 [dependencies]
 extenddb-auth = { workspace = true }

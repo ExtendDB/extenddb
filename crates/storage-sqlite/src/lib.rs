@@ -180,7 +180,7 @@ use crate::hooks::SqliteRuntimeHooks;
 const MAX_ITEM_SIZE_BYTES: usize = 400_000;
 
 fn sqlite_server_components_factory(
-    config: &dyn extenddb_storage::config::StorageConfig,
+    config: &(dyn extenddb_storage::config::StorageConfig + 'static),
     region: &str,
     options: extenddb_storage::server_components::ServerComponentsOptions,
 ) -> futures::future::BoxFuture<'static, Result<ServerComponents, BackendError>> {
