@@ -40,6 +40,7 @@ pub use bootstrapper::CassandraBootstrapper;
 pub use catalog_store::CassandraCatalogStore;
 pub use config::CassandraStorageConfig;
 pub use engine::{CassandraEngine, CassandraSession};
+pub use metadata_engine::TtlBackfillCursor;
 
 use cdrs_tokio::authenticators::StaticPasswordAuthenticatorProvider;
 use cdrs_tokio::cluster::NodeTcpConfigBuilder;

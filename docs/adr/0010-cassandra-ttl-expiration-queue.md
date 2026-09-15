@@ -129,7 +129,7 @@ The bar for this feature is the production readiness of the PostgreSQL TTL imple
 | --- | --- |
 | ~100 expirations per table per minute, and no increase with fleet size | Both backends use `SCAN_INTERVAL = 60s` and `BATCH_SIZE = 100`. PostgreSQL runs without a lease but every host issues the same `ORDER BY ttl LIMIT 100` query, so hosts contend for the same rows and the loser's delete fails its TTL condition. |
 | `UpdateTimeToLive` blocks instead of returning immediately | The shared handler awaits `create_ttl_index` on every backend. |
-| No `ENABLING`/`DISABLING` status | `TimeToLiveStatus` has only two variants; both backends derive status from catalog presence. |
+| `ENABLING`/`DISABLING` are reported while a change settles | The catalog already encoded the lifecycle (`ttl_index_ready`, `ttl_cleanup_generation`); `describe_ttl` surfaces it, the API call no longer waits out the backfill or the drain, and updates are rejected mid-transition. |
 | No five-year cutoff on old timestamps | PostgreSQL matches on `BETWEEN 1 AND now`; Cassandra accepts any positive `i64`. |
 | TTL deletion bypasses write-capacity accounting and throttling | Both workers call the storage layer directly, below the request capacity path. |
 | No caching of TTL configuration | Neither backend caches it. Cassandra pays a per-write catalog read because it needs the configuration on the write path at all; PostgreSQL does not need it, because expiry is derived from the item by a database index. |
@@ -161,7 +161,6 @@ The summary: with this change, Cassandra TTL matches PostgreSQL on every shared 
 Deliberately out of scope for this change, in rough priority order:
 
 * **Expiration throughput does not scale horizontally.** The sweep lease is per table even though the queue is already sharded 64 ways by key and those shards are disjoint partitions. Leasing per `(table, shard)` would allow up to 64 concurrent workers per table with no change to the claim protocol, because every queue transition is already conditional on the exact work UUID. This is the highest-value follow-up, and it would take Cassandra past the PostgreSQL rate rather than merely matching it.
-* **The backfill has no durable cursor.** A failure restarts the scan from the beginning, and the `UpdateTimeToLive` call blocks for its duration instead of reporting `ENABLING`.
 * **TTL alongside asynchronously propagated GSIs**, per the table above.
 * **Version fence hardening.** The fence now uses the `version` column; remaining follow-up is retiring the `item_data` fallback once no unversioned rows can exist (requires a fleet-wide rewrite pass or an explicit migration), after which the canonical-JSON coupling disappears entirely.
 * **Recovery-path test coverage.** The transitions this change introduced — draining a retired generation, retiring a drained bucket registration, an expired worker claim — are reasoned about but not yet covered by tests.

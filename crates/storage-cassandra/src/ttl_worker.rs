@@ -767,7 +767,11 @@ pub(crate) async fn drain_retired_generation(
     Ok(())
 }
 
-async fn retry_pending_cleanup(storage: &CassandraEngine) {
+/// Drain the retired generation's queue for every table whose disable is
+/// still finalizing (`ttl_cleanup_generation` set; the table reports
+/// DISABLING). Public for direct backend integration tests and manual
+/// operational triggering.
+pub async fn retry_pending_cleanup(storage: &CassandraEngine) {
     let pending = match storage.pending_ttl_cleanups().await {
         Ok(pending) => pending,
         Err(error) => {
@@ -785,11 +789,13 @@ async fn retry_pending_cleanup(storage: &CassandraEngine) {
     }
 }
 
-/// Retry the queue backfill for any TTL-enabled table that is not yet ready.
+/// Retry the queue backfill for any TTL-enabled table that is not yet ready
+/// (the table reports ENABLING). Resumes from the durable cursor. Public for
+/// direct backend integration tests and manual operational triggering.
 ///
 /// `create_ttl_index` takes the table's control lease internally, so a table is
 /// scanned by one host at a time even though every host runs this pass.
-async fn retry_pending_indexes(storage: &CassandraEngine) {
+pub async fn retry_pending_indexes(storage: &CassandraEngine) {
     let Ok(enabled) = MetadataEngine::all_tables_with_ttl(storage).await else {
         return;
     };

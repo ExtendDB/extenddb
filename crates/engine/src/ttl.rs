@@ -54,6 +54,35 @@ pub async fn handle_describe_time_to_live(
 /// is already in the requested state (idempotency check).
 /// Returns `ResourceNotFoundException` if the table does not exist.
 /// Returns `InternalServerError` on storage failures.
+/// Gate an `UpdateTimeToLive` request on the table's current TTL state.
+///
+/// A table mid-transition rejects further changes: the backfill and the queue
+/// drain are both keyed to the current generation, and admitting a toggle now
+/// would race them. The client retries once the transition lands (matching
+/// DynamoDB, which also refuses updates in ENABLING and DISABLING). Steady
+/// states reject only the idempotent no-op, as before.
+fn check_ttl_transition(
+    current: TimeToLiveStatus,
+    requested_enabled: bool,
+) -> Result<(), DynamoDbError> {
+    match current {
+        TimeToLiveStatus::Enabling | TimeToLiveStatus::Disabling => {
+            Err(DynamoDbError::ValidationException(
+                "Time to live is being updated for this table. Retry the request once the \
+                 current change completes."
+                    .to_owned(),
+            ))
+        }
+        TimeToLiveStatus::Enabled if requested_enabled => Err(DynamoDbError::ValidationException(
+            "TimeToLive is already enabled".to_owned(),
+        )),
+        TimeToLiveStatus::Disabled if !requested_enabled => Err(
+            DynamoDbError::ValidationException("TimeToLive is already disabled".to_owned()),
+        ),
+        _ => Ok(()),
+    }
+}
+
 pub async fn handle_update_time_to_live(
     body: Value,
     ctx: &OperationContext,
@@ -72,17 +101,10 @@ pub async fn handle_update_time_to_live(
         .await
         .map_err(storage_to_dynamo)?;
 
-    let already_enabled = current.time_to_live_status == TimeToLiveStatus::Enabled;
-    if input.time_to_live_specification.enabled && already_enabled {
-        return Err(DynamoDbError::ValidationException(
-            "TimeToLive is already enabled".to_owned(),
-        ));
-    }
-    if !input.time_to_live_specification.enabled && !already_enabled {
-        return Err(DynamoDbError::ValidationException(
-            "TimeToLive is already disabled".to_owned(),
-        ));
-    }
+    check_ttl_transition(
+        current.time_to_live_status,
+        input.time_to_live_specification.enabled,
+    )?;
 
     // Resolve the old attribute before committing the disable. If the catalog
     // is inconsistent, fail without leaving a partially applied request.
@@ -105,18 +127,44 @@ pub async fn handle_update_time_to_live(
         .map_err(storage_to_dynamo)?;
 
     if input.time_to_live_specification.enabled {
-        // Kick off index creation (CONCURRENTLY — non-blocking for other database
-        // operations on the table, but the handler awaits completion).
-        // If it fails, the TTL sweeper will retry on its next cycle.
-        let account_id = ctx.account_id.clone();
-        let table_name = input.table_name.clone();
-        let attr = input.time_to_live_specification.attribute_name.clone();
-        if let Err(e) = ctx
+        // Backends that report ENABLING (Cassandra, PostgreSQL) get the
+        // backfill kicked off in the background: it is a full table scan, and
+        // awaiting it made the API call take as long as the table is large.
+        // The caller sees ENABLING until readiness is published; if the task
+        // dies unfinished, the TTL worker's pending-index pass retries (on
+        // Cassandra, from the durable cursor). Backends that report Enabled
+        // immediately (SQLite, MongoDB) keep the awaited call: detaching it
+        // would leave a table claiming Enabled while its index does not yet
+        // exist, with no observable transition state.
+        let transitional = ctx
             .storage
-            .create_ttl_index(&account_id, &table_name, &attr)
+            .describe_ttl(&ctx.account_id, &input.table_name)
+            .await
+            .map(|d| d.time_to_live_status == TimeToLiveStatus::Enabling)
+            .unwrap_or(false);
+        if transitional {
+            let storage = ctx.storage.clone();
+            let account_id = ctx.account_id.clone();
+            let table_name = input.table_name.clone();
+            let attr = input.time_to_live_specification.attribute_name.clone();
+            tokio::spawn(async move {
+                if let Err(e) = storage
+                    .create_ttl_index(&account_id, &table_name, &attr)
+                    .await
+                {
+                    tracing::warn!("TTL queue backfill deferred for {table_name}: {e}");
+                }
+            });
+        } else if let Err(e) = ctx
+            .storage
+            .create_ttl_index(
+                &ctx.account_id,
+                &input.table_name,
+                &input.time_to_live_specification.attribute_name,
+            )
             .await
         {
-            tracing::warn!("TTL index creation deferred for {table_name}: {e}");
+            tracing::warn!("TTL index creation deferred for {}: {e}", input.table_name);
         }
     } else {
         // Disable path: metadata already updated (sweeper won't pick up this table).
@@ -209,6 +257,26 @@ mod tests {
     fn max_length_accepted() {
         let max = "a".repeat(255);
         assert!(validate_ttl_attribute_name(&max).is_ok());
+    }
+
+    #[test]
+    fn transition_gate() {
+        use TimeToLiveStatus::{Disabled, Disabling, Enabled, Enabling};
+        // Steady states admit the toggle and reject the no-op.
+        assert!(check_ttl_transition(Disabled, true).is_ok());
+        assert!(check_ttl_transition(Enabled, false).is_ok());
+        assert!(check_ttl_transition(Enabled, true).is_err());
+        assert!(check_ttl_transition(Disabled, false).is_err());
+        // Mid-transition rejects both directions.
+        for state in [Enabling, Disabling] {
+            for requested in [true, false] {
+                let error = check_ttl_transition(state, requested).unwrap_err();
+                assert!(
+                    format!("{error:?}").contains("being updated"),
+                    "expected transition rejection, got {error:?}"
+                );
+            }
+        }
     }
 
     #[test]

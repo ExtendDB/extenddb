@@ -58,6 +58,10 @@ pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
         "V003__account_scoped_idempotency.cql",
         include_str!("../migrations/catalog/V003__account_scoped_idempotency.cql"),
     ),
+    (
+        "V004__ttl_backfill_cursor.cql",
+        include_str!("../migrations/catalog/V004__ttl_backfill_cursor.cql"),
+    ),
 ];
 
 /// Embedded data migration files, applied in order.
