@@ -165,6 +165,15 @@ impl StorageConfig {
     pub fn as_trait(&self) -> &(dyn extenddb_storage::config::StorageConfig + 'static) {
         &*self.config
     }
+
+    /// Set the node's instance identifier on the underlying config.
+    ///
+    /// Backends that need a per-node identity read this via
+    /// [`extenddb_storage::config::StorageConfig::instance_id`]. Call this
+    /// before passing the config to the backend factory.
+    pub fn set_instance_id(&mut self, instance_id: &str) {
+        self.config.set_instance_id(instance_id);
+    }
 }
 
 impl<'de> serde::Deserialize<'de> for StorageConfig {

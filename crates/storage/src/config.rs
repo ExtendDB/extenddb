@@ -68,6 +68,17 @@ pub trait StorageConfig: Send + Sync + std::fmt::Debug {
     fn as_any(&self) -> &dyn std::any::Any
     where
         Self: 'static;
+
+    /// Set a per-node instance identifier used to derive backend-specific
+    /// node identities (e.g. HLC node IDs for stream sequence numbers).
+    /// Backends that do not need a node identity may ignore this.
+    fn set_instance_id(&mut self, _instance_id: &str) {}
+
+    /// Return the instance identifier previously set via [`set_instance_id`],
+    /// if any.
+    fn instance_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 impl Clone for Box<dyn StorageConfig> {
