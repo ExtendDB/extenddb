@@ -307,6 +307,15 @@ impl CassandraEngine {
                     // Do not replace the original cancellation error.
                     tracing::error!("transact_write: rollback failed for txn {txn_id}: {e}");
                 }
+                // B5: release the token so a retry with the same token can proceed.
+                if let Some((idempotency_account, token, _)) = idempotency {
+                    self.delete_idempotency_token(
+                        &self.catalog_keyspace(),
+                        idempotency_account,
+                        token,
+                    )
+                    .await;
+                }
                 Err(StorageError::TransactionCanceled(reasons))
             }
         }
@@ -827,7 +836,10 @@ impl CassandraEngine {
             .collect()
     }
 
-    /// Check and reserve an account-scoped idempotency token, scoped to `account_id`.
+    /// Check and reserve an account-scoped idempotency token.
+    ///
+    /// Returns `Ok(())` when the token is freshly reserved.
+    /// Returns `Err(IdempotentReplay)` / `Err(IdempotentMismatch)` when already present.
     async fn check_idempotency_token(
         &self,
         keyspace: &str,
@@ -836,18 +848,19 @@ impl CassandraEngine {
         fingerprint: &str,
     ) -> Result<(), StorageError> {
         let select_query = format!(
-            "SELECT fingerprint FROM {keyspace}.idempotency_tokens_by_account WHERE account_id = ? AND \"token\" = ?"
+            "SELECT fingerprint FROM {keyspace}.idempotency_tokens_by_account \
+             WHERE account_id = ? AND \"token\" = ?"
         );
 
-        let row = query_optional::<StorageError>(
+        // Fast path: token already present (common on retry).
+        if let Some(row) = query_optional::<StorageError>(
             &self.session,
             &select_query,
             cdrs_tokio::query_values!(account_id, token),
             "check_idempotency_token",
         )
-        .await?;
-
-        if let Some(row) = row {
+        .await?
+        {
             let stored_fp: String = get_column(&row, "fingerprint", "check_idempotency_token")?;
             return if stored_fp == fingerprint {
                 Err(StorageError::IdempotentReplay)
@@ -856,36 +869,22 @@ impl CassandraEngine {
             };
         }
 
-        // Insert with LWT to handle concurrent requests racing on the same token.
+        // Reserve with LWT to handle concurrent requests racing on the same token.
         let insert_query = format!(
-            "INSERT INTO {keyspace}.idempotency_tokens_by_account (account_id, \"token\", fingerprint, created_at) \
-             VALUES (?, ?, ?, ?) IF NOT EXISTS"
+            "INSERT INTO {keyspace}.idempotency_tokens_by_account \
+             (account_id, \"token\", fingerprint, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS"
         );
         let now = crate::cassandra_util::now_millis();
+        let result = crate::cassandra_util::apply_lwt(
+            &self.session,
+            &insert_query,
+            cdrs_tokio::query_values!(account_id, token, fingerprint, now),
+            "check_idempotency_token insert",
+        )
+        .await?;
 
-        let result = self
-            .session
-            .query_with_values(
-                &insert_query,
-                cdrs_tokio::query_values!(account_id, token, fingerprint, now),
-            )
-            .await
-            .map_err(|e| {
-                tracing::error!("check_idempotency_token insert: {e}");
-                StorageError::Internal("Database error".to_owned())
-            })?;
-
-        // If the LWT was not applied, a concurrent request won the race.
-        // Read back what was stored and return the appropriate error.
-        let applied: bool = result
-            .response_body()
-            .ok()
-            .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
-            .and_then(|mut rows| rows.drain(..).next())
-            .and_then(|row| row.get_r_by_name("[applied]").ok())
-            .unwrap_or(true);
-
-        if !applied {
+        if !result {
+            // Lost the LWT race — read back to return the right error.
             let row = query_optional::<StorageError>(
                 &self.session,
                 &select_query,
@@ -905,6 +904,35 @@ impl CassandraEngine {
         }
 
         Ok(())
+    }
+
+    /// Delete a previously reserved idempotency token.
+    ///
+    /// Called on every cancellation path to prevent token poisoning (B5): a
+    /// token reserved before the ledger is committed must be released if the
+    /// transaction is cancelled, so a retry with the same token can proceed.
+    async fn delete_idempotency_token(
+        &self,
+        keyspace: &str,
+        account_id: &str,
+        token: &str,
+    ) {
+        let delete_query = format!(
+            "DELETE FROM {keyspace}.idempotency_tokens_by_account \
+             WHERE account_id = ? AND \"token\" = ?"
+        );
+        if let Err(e) = crate::cassandra_util::execute::<StorageError>(
+            &self.session,
+            &delete_query,
+            cdrs_tokio::query_values!(account_id, token),
+            "delete_idempotency_token",
+        )
+        .await
+        {
+            // Non-fatal: the token will eventually expire via Cassandra TTL.
+            // Log so it is visible in ops, but do not replace the original error.
+            tracing::warn!("delete_idempotency_token failed (token will expire): {e}");
+        }
     }
 
     /// Fetch an item for transaction (reads `item_data` and `prepared_txn_id`).
