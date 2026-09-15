@@ -1500,12 +1500,20 @@ impl MongoEngine {
         //   (a) we have `limit + 1` in-segment items (so we know we
         //       need a LEK for the next page), or
         //   (b) the cursor is exhausted.
-        // mongo batches under the hood (~101 docs per network trip),
-        // so this is efficient without a hard limit — we consume at
-        // most one extra network batch beyond what we return.
-        let opts = mongodb::options::FindOptions::builder()
+        // The batch size is a network hint, not a bound: it sizes each
+        // trip to what the caller asked for, so a chunked read pulls one
+        // batch of `limit + 1` documents instead of the driver's default
+        // (101, then up to 16 MB per getMore), and a skewed segment scan
+        // keeps pulling further batches until it has its items.
+        let target = limit.map(|l| {
+            #[allow(clippy::cast_sign_loss)]
+            let l = l as usize;
+            l + 1
+        });
+        let mut opts = mongodb::options::FindOptions::builder()
             .sort(sort_doc)
             .build();
+        opts.batch_size = target.map(|t| u32::try_from(t).unwrap_or(u32::MAX));
 
         let mut cursor = coll
             .find(filter)
@@ -1514,11 +1522,6 @@ impl MongoEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let mut items: Vec<Item> = Vec::new();
-        let target = limit.map(|l| {
-            #[allow(clippy::cast_sign_loss)]
-            let l = l as usize;
-            l + 1
-        });
 
         while let Some(doc) = cursor
             .try_next()
