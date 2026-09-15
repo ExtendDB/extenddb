@@ -126,6 +126,17 @@ impl CassandraEngine {
             .await
             .map_err(|e| StorageError::Internal(format!("Delete continuous backup state: {e}")))?;
 
+        // Delete tags for this table so they don't survive recreation under the same name.
+        let delete_tags_query =
+            format!("DELETE FROM {catalog_keyspace}.tags WHERE resource_arn = ?");
+        self.session
+            .query_with_values(
+                &delete_tags_query,
+                cdrs_tokio::query_values!(description.table_arn.as_str()),
+            )
+            .await
+            .map_err(|e| StorageError::Internal(format!("Delete tags: {e}")))?;
+
         // Delete table catalog entry
         let delete_table_query = format!(
             "DELETE FROM {catalog_keyspace}.tables WHERE account_id = ? AND table_name = ?"
