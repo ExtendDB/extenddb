@@ -75,6 +75,9 @@ use extenddb_core::types::{
 
 use error::StorageError;
 
+/// Default fixed width for stream record sequence numbers in characters (left-padded).
+pub(crate) const DEFAULT_SEQ_NUMBER_WIDTH: usize = 21;
+
 // Type aliases for complex return types used in trait methods.
 /// Result of an update/put/delete that may return old and/or new item images.
 pub type ItemPairResult = Result<(Option<Item>, Option<Item>), StorageError>;
@@ -608,6 +611,14 @@ pub trait StreamEngine: Send + Sync {
 
     /// Generate the next sequence number for a shard.
     fn next_sequence_number(&self, shard_id: &str) -> BoxFuture<'_, Result<String, StorageError>>;
+
+    /// Width of sequence numbers stored by this backend, in decimal digits.
+    /// Client-supplied sequence numbers (e.g. from `GetShardIterator`) must be
+    /// zero-padded to this width before lexicographic comparison against stored
+    /// values. Defaults to 21 (PostgreSQL, SQLite, MongoDB).
+    fn sequence_number_width(&self) -> usize {
+        DEFAULT_SEQ_NUMBER_WIDTH
+    }
 
     /// Validate that a shard exists for the given stream ARN.
     ///
