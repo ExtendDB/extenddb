@@ -339,4 +339,94 @@ mod tests {
             other => panic!("Expected InvalidSignatureException, got: {other:?}"),
         }
     }
+
+    const SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+    const SIGNED_BODY: &[u8] = br#"{"TableName":"t","Item":{"pk":{"S":"signed"}}}"#;
+    const TAMPERED_BODY: &[u8] = br#"{"TableName":"t","Item":{"pk":{"S":"tampered"}}}"#;
+
+    /// Sign `body` the way a client does: the same canonical request and
+    /// string-to-sign the server reconstructs, over the body the client sent.
+    fn sign(headers: &HeaderMap, signed_headers: &str, body: &[u8]) -> ParsedAuthorization {
+        let creq = canonical::canonical_request("POST", "/", "", headers, signed_headers, body);
+        let sts = canonical::string_to_sign(
+            "20260415T120000Z",
+            "20260415/us-east-1/dynamodb/aws4_request",
+            &creq,
+        );
+        let key = signing_key::derive_signing_key(SECRET, "20260415", "us-east-1", "dynamodb");
+        let mut parsed = make_parsed("dynamodb", "20260415", signed_headers);
+        parsed.signature = signing_key::compute_signature(&key, &sts);
+        parsed
+    }
+
+    fn assert_signature_mismatch(result: Result<(), DynamoDbError>) {
+        match result {
+            Err(DynamoDbError::InvalidSignatureException(msg)) => {
+                assert!(
+                    msg.contains("does not match"),
+                    "Expected 'does not match' in: {msg}"
+                );
+            }
+            other => panic!("Expected InvalidSignatureException, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn correctly_signed_body_verifies() {
+        let headers = make_headers("20260415T120000Z");
+        let parsed = sign(&headers, "content-type;host;x-amz-date", SIGNED_BODY);
+        verify_signature(&parsed, SECRET, "POST", "/", "", &headers, SIGNED_BODY).unwrap();
+    }
+
+    #[test]
+    fn body_changed_after_signing_is_rejected() {
+        let headers = make_headers("20260415T120000Z");
+        let parsed = sign(&headers, "content-type;host;x-amz-date", SIGNED_BODY);
+        assert_signature_mismatch(verify_signature(
+            &parsed,
+            SECRET,
+            "POST",
+            "/",
+            "",
+            &headers,
+            TAMPERED_BODY,
+        ));
+    }
+
+    /// The client signs one body, sends another, and sets
+    /// x-amz-content-sha256 to the hash of the body it signed. The signature
+    /// is checked against the body received, so the header cannot be used to
+    /// make a rewritten request verify.
+    #[test]
+    fn body_changed_after_signing_is_rejected_when_header_carries_signed_hash() {
+        let mut headers = make_headers("20260415T120000Z");
+        headers.insert(
+            "x-amz-content-sha256",
+            canonical::sha256_hex(SIGNED_BODY).parse().unwrap(),
+        );
+        let signed = "content-type;host;x-amz-content-sha256;x-amz-date";
+        let parsed = sign(&headers, signed, SIGNED_BODY);
+        // Sanity: the same request with the signed body verifies.
+        verify_signature(&parsed, SECRET, "POST", "/", "", &headers, SIGNED_BODY).unwrap();
+        assert_signature_mismatch(verify_signature(
+            &parsed,
+            SECRET,
+            "POST",
+            "/",
+            "",
+            &headers,
+            TAMPERED_BODY,
+        ));
+    }
+
+    /// A header the client did not sign is not part of the canonical request
+    /// and does not affect the payload hash, so a stray or wrong value is
+    /// neither trusted nor fatal.
+    #[test]
+    fn unsigned_content_sha256_header_does_not_affect_verification() {
+        let mut headers = make_headers("20260415T120000Z");
+        headers.insert("x-amz-content-sha256", "0".repeat(64).parse().unwrap());
+        let parsed = sign(&headers, "content-type;host;x-amz-date", SIGNED_BODY);
+        verify_signature(&parsed, SECRET, "POST", "/", "", &headers, SIGNED_BODY).unwrap();
+    }
 }
