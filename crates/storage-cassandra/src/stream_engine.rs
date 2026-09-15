@@ -477,6 +477,12 @@ impl StreamEngine for CassandraEngine {
         Box::pin(async move { Ok(seq) })
     }
 
+    /// Override the stream sequence number fixed width to 23 for the HLC format:
+    ///   13-digit ms timestamp + 6-digit counter + 4-digit node ID.
+    fn sequence_number_width(&self) -> usize {
+        23
+    }
+
     fn validate_shard(
         &self,
         account_id: &str,
