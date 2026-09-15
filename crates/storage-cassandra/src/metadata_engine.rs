@@ -733,7 +733,6 @@ impl CassandraEngine {
         metadata_lwt_applied(&result)
     }
 
-
     /// Scan the table and register an expiration entry for every item that
     /// carries a valid TTL timestamp, then publish the generation as ready.
     ///
