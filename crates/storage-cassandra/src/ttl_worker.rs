@@ -1335,6 +1335,7 @@ pub async fn sweep_once(storage: &CassandraEngine, metrics: &MetricsCollector) {
                         // One row's failure must not abandon the wave or the
                         // table: its durable queue state drives its own retry.
                         Err(error) => {
+                            metrics.record_ttl_sweep_row_error(table_name);
                             tracing::warn!("TTL worker: row failed in {table_name}: {error}");
                         }
                     }

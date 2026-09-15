@@ -31,6 +31,7 @@ pub enum MetricName {
     /// Nonzero means some loss path fired; sustained nonzero means one is
     /// firing repeatedly and needs investigation.
     TtlAuditRepairedEntryCount,
+    TtlSweepRowErrorCount,
     /// Unresolved TTL destroy markers observed by the repair worker. Sustained
     /// growth means destroys are repeatedly ending ambiguously (Cassandra
     /// health) or a repair path is stuck; the ADR requires operators to
@@ -74,6 +75,7 @@ impl std::fmt::Display for MetricName {
             Self::TimeToLiveDeletedItemCount => f.write_str("TimeToLiveDeletedItemCount"),
             Self::TtlDeletionStaleness => f.write_str("TtlDeletionStaleness"),
             Self::TtlAuditRepairedEntryCount => f.write_str("TtlAuditRepairedEntryCount"),
+            Self::TtlSweepRowErrorCount => f.write_str("TtlSweepRowErrorCount"),
             Self::TtlRepairMarkerCount => f.write_str("TtlRepairMarkerCount"),
             Self::RequestCount => f.write_str("RequestCount"),
             Self::StorageQueryCount => f.write_str("StorageQueryCount"),
