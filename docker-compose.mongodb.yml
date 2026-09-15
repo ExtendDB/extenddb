@@ -22,7 +22,7 @@ x-extenddb-hardening: &extenddb-hardening
 
 services:
   mongodb:
-    image: ${MONGODB_IMAGE:-mongo:7.0}
+    image: ${MONGODB_IMAGE:-docker.io/library/mongo:7.0@sha256:b096b4cb9269f3ebcf363be63f1c50920f786879d03a1890347a3bf33f1f0df0}
     command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
     healthcheck:
       test:
@@ -34,7 +34,7 @@ services:
       - mongodb-data:/data/db
 
   mongodb-rs-init:
-    image: ${MONGODB_IMAGE:-mongo:7.0}
+    image: ${MONGODB_IMAGE:-docker.io/library/mongo:7.0@sha256:b096b4cb9269f3ebcf363be63f1c50920f786879d03a1890347a3bf33f1f0df0}
     depends_on:
       mongodb:
         condition: service_healthy
