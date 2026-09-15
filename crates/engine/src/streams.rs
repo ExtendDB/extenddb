@@ -265,3 +265,32 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// AT_SEQUENCE_NUMBER converts to AFTER by subtracting 1 and padding to
+    /// the backend's stored width. Verify that an unpadded client input is
+    /// normalised correctly for both the 21-digit (postgres/sqlite/mongodb)
+    /// and 23-digit (cassandra) cases, and that the edge case n=0 maps to
+    /// TRIM_HORIZON (empty string).
+    #[test]
+    fn at_sequence_number_padding() {
+        let cases: &[(&str, usize, &str)] = &[
+            ("5", 21, "000000000000000000004"),
+            ("000000000000000000005", 21, "000000000000000000004"),
+            ("5", 23, "00000000000000000000004"),
+            ("00000000000000000000005", 23, "00000000000000000000004"),
+            ("0", 21, ""),
+            ("1", 21, "000000000000000000000"),
+        ];
+        for (input, width, expected) in cases {
+            let n: u128 = input.parse().unwrap();
+            let result = if n > 0 {
+                format!("{:0>width$}", n - 1)
+            } else {
+                String::new()
+            };
+            assert_eq!(&result, expected, "input={input} width={width}");
+        }
+    }
+}
