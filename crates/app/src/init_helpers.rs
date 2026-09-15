@@ -3,6 +3,8 @@
 
 //! Helpers for `extenddb init`: TLS certificate generation and config file creation.
 
+use rustls::pki_types::{CertificateDer, pem::PemObject};
+
 /// Generate a self-signed TLS certificate and key if they don't already exist.
 ///
 /// `extra_sans` are additional Subject Alternative Names, such as an in-cluster
@@ -158,7 +160,7 @@ fn ensure_cert_covers_sans(
 
     let pem = std::fs::read(cert_path)
         .map_err(|e| anyhow::anyhow!("Failed to read existing certificate {cert_path}: {e}"))?;
-    let der = rustls_pemfile::certs(&mut pem.as_slice())
+    let der = CertificateDer::pem_slice_iter(&pem)
         .next()
         .ok_or_else(|| anyhow::anyhow!("No certificate found in {cert_path}"))?
         .map_err(|e| anyhow::anyhow!("Failed to parse certificate {cert_path}: {e}"))?;

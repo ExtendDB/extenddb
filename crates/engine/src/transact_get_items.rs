@@ -10,9 +10,12 @@ use serde_json::Value;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::Projection;
 use extenddb_core::types::{
-    ItemResponse, TransactGetItemsInput, TransactGetItemsOutput, item_size_bytes,
+    CancellationReason, ItemResponse, TransactGetItemsInput, TransactGetItemsOutput,
+    item_size_bytes,
 };
+use extenddb_core::validation;
 use extenddb_storage::TransactGetOp;
+use extenddb_storage::error::StorageError;
 
 use crate::OperationContext;
 use crate::capacity_helpers;
@@ -114,6 +117,29 @@ pub async fn handle_transact_get_items(
         } else {
             // No projection: transactions accept names with no expression.
             projections.push(None);
+        }
+    }
+
+    // Reject oversized primary keys as a per-item cancellation, matching real
+    // DynamoDB (TransactionCanceledException with a ValidationError reason for
+    // the offending item). Key type/emptiness is validated in the storage
+    // layer; this enforces the size limit the storage layer does not check.
+    {
+        let mut reasons: Vec<CancellationReason> = Vec::with_capacity(input.transact_items.len());
+        let mut any_oversized = false;
+        for (tgi, ki) in input.transact_items.iter().zip(key_infos.iter()) {
+            match validation::validate_key_size_limits(&tgi.get.key, &ki.key_schema, &ctx.limits) {
+                Ok(()) => reasons.push(CancellationReason::none()),
+                Err(e) => {
+                    any_oversized = true;
+                    reasons.push(CancellationReason::validation_error(e.to_string()));
+                }
+            }
+        }
+        if any_oversized {
+            return Err(storage_err_to_dynamo(StorageError::TransactionCanceled(
+                reasons,
+            )));
         }
     }
 

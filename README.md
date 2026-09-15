@@ -106,6 +106,12 @@ key_path = "/etc/extenddb/tls/key.pem"
 
 ## Running in Containers
 
+The production images contain ExtendDB only; the database (PostgreSQL 14+ and MongoDB 7+)
+runs as a separate service. See [`docker/README.md`](docker/README.md) for the PostgreSQL
+image and [`docker/README-mongodb.md`](docker/README-mongodb.md) for the MongoDB
+image, external database requirements, hardened local Compose stacks, smoke tests, and
+explicit init/migrate/serve production lifecycle.
+
 By default `extenddb serve` daemonizes itself, which doesn't play well with container runtimes and process supervisors that expect PID 1 to stay attached. Pass `--foreground` (alias `--no-daemon`) to keep the process in the foreground and stream logs to stderr instead of syslog:
 
 ```bash
@@ -191,6 +197,9 @@ Query, Scan (key conditions, filters, projections, pagination, index selection)
 ### Batch & Transactions
 BatchGetItem (100 keys), BatchWriteItem (25 ops), TransactGetItems (100 items), TransactWriteItems (100 ops)
 
+### Vector Search
+SearchVectors, and vector indexes on CreateTable and UpdateTable (cosine, Euclidean and dot product; on-demand tables only). On PostgreSQL this requires the pgvector extension on the data database; without it every vector operation is refused and nothing else is affected.
+
 ### Streams
 ListStreams, DescribeStream, GetShardIterator, GetRecords
 
@@ -252,4 +261,4 @@ Code in protected paths is reviewed via [`.github/CODEOWNERS`](.github/CODEOWNER
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. 
+This software is provided "as is" without warranty of any kind.

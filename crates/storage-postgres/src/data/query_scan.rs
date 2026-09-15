@@ -46,17 +46,34 @@ fn build_pagination_where(
             } else {
                 ""
             };
-            // LSI: base SK follows ScanIndexForward because items share the
-            // same partition and the base SK is part of the composite sort order.
-            // GSI: base SK is always ">" (ascending) because it's only a
-            // uniqueness tie-breaker, not a user-visible sort dimension.
-            let base_cmp = if is_lsi { cmp } else { ">" };
-            format!(
-                " AND ({sk_col}{collate} {cmp} ${p1} OR \
-                 ({sk_col}{collate} = ${p1} AND {base_col}{base_collate} {base_cmp} ${p2}))",
-                p1 = param_idx,
-                p2 = param_idx + 1
-            )
+            if is_lsi {
+                // LSI: every row shares the queried partition key, so the base
+                // table's sort key alone identifies a row uniquely. It is also a
+                // user-visible sort dimension, so it follows ScanIndexForward.
+                format!(
+                    " AND ({sk_col}{collate} {cmp} ${p1} OR \
+                     ({sk_col}{collate} = ${p1} AND {base_col}{base_collate} {cmp} ${p2}))",
+                    p1 = param_idx,
+                    p2 = param_idx + 1
+                )
+            } else {
+                // GSI: the tie-breaker must be the FULL base primary key. Rows in
+                // a GSI partition are unique on (index SK, base PK, base SK), not
+                // on (index SK, base SK): many base partitions can project the
+                // same index SK and the same base SK. Comparing base SK alone
+                // made a page-two query return nothing whenever the rows sharing
+                // an index SK also shared a base SK, so a paginating client
+                // silently stopped after page one. The base key stays ascending
+                // because it is a uniqueness tie-breaker, not a sort dimension.
+                format!(
+                    " AND ({sk_col}{collate} {cmp} ${p1} OR \
+                     ({sk_col}{collate} = ${p1} AND (base_pk COLLATE \"C\" > ${p2} OR \
+                     (base_pk = ${p2} AND {base_col}{base_collate} > ${p3}))))",
+                    p1 = param_idx,
+                    p2 = param_idx + 1,
+                    p3 = param_idx + 2
+                )
+            }
         } else if is_index {
             // Index with no base SK — use base_pk as tie-breaker
             format!(
@@ -227,20 +244,32 @@ impl PostgresEngine {
             };
             let dir = if forward { "ASC" } else { "DESC" };
             if let Some((_, base_sk_type)) = &base_sk_info {
-                // Index queries sub-sort by base table SK when index sort keys are equal.
+                // Index queries sub-sort by the base table key when index sort
+                // keys are equal.
                 // LSI: base SK follows ScanIndexForward (same partition, composite sort).
-                // GSI: base SK is always ASC (just a uniqueness tie-breaker).
+                // GSI: the full base primary key, ascending, because it is only a
+                // uniqueness tie-breaker. It must match the pagination predicate
+                // exactly; ordering by base SK alone leaves rows that share an
+                // index SK and a base SK in an arbitrary order, which no
+                // ExclusiveStartKey can resume from deterministically.
                 let base_col = format!("base_{}", sk_column(*base_sk_type));
                 let base_collate = if *base_sk_type == ScalarAttributeType::S {
                     " COLLATE \"C\""
                 } else {
                     ""
                 };
-                let base_dir = if is_lsi { dir } else { "ASC" };
-                let _ = write!(
-                    sql,
-                    " ORDER BY {sk_col}{collate} {dir}, {base_col}{base_collate} {base_dir}"
-                );
+                if is_lsi {
+                    let _ = write!(
+                        sql,
+                        " ORDER BY {sk_col}{collate} {dir}, {base_col}{base_collate} {dir}"
+                    );
+                } else {
+                    let _ = write!(
+                        sql,
+                        " ORDER BY {sk_col}{collate} {dir}, base_pk COLLATE \"C\" ASC, \
+                         {base_col}{base_collate} ASC"
+                    );
+                }
             } else if index_name.is_some() {
                 // Index with SK but no base SK: use base_pk as secondary sort
                 let _ = write!(
@@ -280,16 +309,32 @@ impl PostgresEngine {
             if sk_info_val.is_some()
                 && let Some((ref base_sk_name, base_sk_type)) = base_sk_info
             {
-                // Index that has its own SK, with a base-table SK tie-breaker.
-                // The index SK is bound separately (see execute_query_sql); here
-                // we bind only the base SK. (SQL has $N for base_sk.)
-                // A hash-only index falls through to the BasePkAndSk arm below,
-                // because its SQL binds base_pk AND base_sk, not base_sk alone.
-                if let Some(base_sk_val) = start_key.get(base_sk_name.as_str()) {
-                    let sk = parse_sk(base_sk_val, base_sk_type)?;
-                    PaginationBinds::BaseSkOnly { sk }
+                // Index that has its own SK, with a base-table tie-breaker. The
+                // index SK is bound separately (see execute_query_sql); the binds
+                // here supply the tie-breaker.
+                //
+                // An LSI needs the base SK alone, because every row shares the
+                // queried partition key. A GSI needs the full base primary key,
+                // because rows sharing an index SK can come from different base
+                // partitions and can also share a base SK.
+                let base_sk = start_key
+                    .get(base_sk_name.as_str())
+                    .map(|v| parse_sk(v, base_sk_type))
+                    .transpose()?;
+                if is_lsi {
+                    match base_sk {
+                        Some(sk) => PaginationBinds::BaseSkOnly { sk },
+                        None => PaginationBinds::None,
+                    }
                 } else {
-                    PaginationBinds::None
+                    let base_pk_attr = &key_info.base_key_schema[0].attribute_name;
+                    match (start_key.get(base_pk_attr.as_str()), base_sk) {
+                        (Some(pk_val), Some(sk)) => PaginationBinds::BasePkAndSk {
+                            pk_text: pk_to_text(pk_val)?.into_owned(),
+                            sk,
+                        },
+                        _ => PaginationBinds::None,
+                    }
                 }
             } else if index_name.is_some() && sk_info_val.is_some() {
                 // Index with SK but no base SK — SQL has $N for base_pk

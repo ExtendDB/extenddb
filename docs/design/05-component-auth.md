@@ -538,8 +538,26 @@ pub trait ConditionContext {
     /// Resolve a condition key to its value(s).
     /// Returns `None` when the key is absent or not applicable.
     fn resolve_key(&self, key: &str) -> Option<Vec<&str>>;
+
+    /// Returns `true` if `key` is a multivalued (set-valued) condition key.
+    /// Arity is a property of the key, not the number of values present.
+    /// `RequestContext` reports `dynamodb:Attributes` and `dynamodb:LeadingKeys`
+    /// as multivalued; all other keys (and all trust-policy keys) are single-valued.
+    fn is_multivalued_key(&self, key: &str) -> bool;
 }
 ```
+
+**Condition-key arity (single-valued vs multivalued).** AWS classifies each
+condition key as single-valued or multivalued (`ArrayOfString`) in the service
+authorization reference. For DynamoDB, `dynamodb:Attributes` and
+`dynamodb:LeadingKeys` are multivalued; everything else extenddb resolves
+(`dynamodb:Select`, `dynamodb:ReturnValues`, tag keys, etc.) is single-valued.
+A **bare** operator (one without a `ForAllValues:`/`ForAnyValue:` qualifier)
+applied to a multivalued key **never matches** — verified against real AWS IAM
+(BR-7085), and independent of how many values are present. Only the set-operator
+qualifiers evaluate multivalued keys. This is fail-safe: a bare `Deny` on such a
+key is a no-op (the author must use `ForAnyValue:` to build a denylist), and a
+bare `Allow` allowlist grants nothing (implicit deny).
 
 ### 6.3 Request Context
 
@@ -693,6 +711,7 @@ pub fn evaluate_policies(
 /// trust policy evaluation during AssumeRole (AssumeRoleContext).
 pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext) -> bool {
     let context_values = context.resolve_key(&condition.key);
+    let is_multivalued = context.is_multivalued_key(&condition.key);
 
     match &condition.operator {
         ConditionOperator::Null => {
@@ -726,12 +745,16 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
         ConditionOperator::IfExists(inner) => {
             match context_values {
                 None => true,  // key absent → condition passes
+                // bare operator on a multivalued key never matches (BR-7085)
+                Some(_) if is_multivalued => false,
                 Some(vals) => evaluate_single_value_condition(inner, &vals, &condition.values)
             }
         }
         other => {
             match context_values {
                 None => false,  // key absent → condition fails (unless IfExists)
+                // bare operator on a multivalued key never matches (BR-7085)
+                Some(_) if is_multivalued => false,
                 Some(vals) => evaluate_single_value_condition(other, &vals, &condition.values)
             }
         }
@@ -747,12 +770,12 @@ fn unwrap_if_exists(op: &ConditionOperator) -> (bool, &ConditionOperator) {
     }
 }
 
-/// Evaluate a non-set, non-IfExists condition operator against context values.
-/// For single-valued keys, `context_values` has one element.
-/// For multi-valued keys (e.g., dynamodb:LeadingKeys), all context values
-/// must satisfy the condition (implicit AND across context values).
+/// Evaluate a non-set, non-IfExists condition operator against a single-valued key.
+/// Bare operators on multivalued keys are rejected by the caller before reaching
+/// here (see condition-key arity above), so `context_values` holds one element in
+/// practice.
 ///
-/// Each context value must match at least one policy value (implicit OR
+/// The context value must match at least one policy value (implicit OR
 /// across policy values within a single condition key).
 fn evaluate_single_value_condition(
     op: &ConditionOperator,

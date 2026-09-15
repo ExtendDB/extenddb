@@ -147,9 +147,24 @@ paths = ["/path/to/exports"]
 
 ### `Path must resolve under one of the configured allowed paths`
 
-**Cause:** An import or export file path resolves outside all configured allowed directories after canonicalization. This includes symlink escapes.
+**Cause:** An import or export file path does not resolve under the calling
+account's subtree of a configured allowed directory. Files are namespaced per
+account, so the path must be under `<root>/<account id>/`, not directly under
+`<root>`. This error also covers symlink escapes and paths outside every
+configured root; the wording is deliberately identical in all three cases so it
+cannot be used to probe for another account's files.
 
-**Fix:** Ensure the file path is within one of the configured `[import]` or `[export]` paths. Do not use symlinks that point outside the allowed directories.
+**Fix:** Place the file under `<root>/<account id>/`, using the account id the
+request is authenticated as. The export directory is created for you on first
+use. Do not use symlinks that point outside the allowed directories.
+
+### `Export file already exists; choose a different FilePath`
+
+**Cause:** Export refuses to overwrite. Something already exists at the
+requested `FilePath`, so the export stopped rather than truncating it. A symlink
+at that path produces the same error rather than being followed.
+
+**Fix:** Export to a new filename, or remove the existing file first.
 
 ### `Failed to daemonize: <error>`
 
@@ -281,6 +296,34 @@ These errors occur when `auth.provider = "builtin"` is enabled.
 **Cause:** The authenticated user does not have an IAM policy granting the requested DynamoDB action. This can be an implicit deny (no matching Allow statement) or an explicit Deny.
 
 **Fix:** Attach a policy granting the required action to the user, or to a group the user belongs to. Use `extenddb manage list-user-policies` to check current policies. Remember that explicit Deny always overrides Allow.
+
+### A `Deny` on `dynamodb:Attributes` (or `dynamodb:LeadingKeys`) does not deny the request
+
+**Cause:** `dynamodb:Attributes` and `dynamodb:LeadingKeys` are *multivalued* (multi-valued) condition keys. In IAM, a **bare** condition operator (one without a `ForAnyValue:` or `ForAllValues:` qualifier) applied to a multivalued key **never matches** — regardless of the operator or how many values the request carries. This mirrors real AWS behavior exactly (verified against the IAM Policy Simulator and live DynamoDB). A policy like the following is therefore a **no-op** and grants no protection:
+
+```json
+{
+  "Effect": "Deny",
+  "Action": "dynamodb:GetItem",
+  "Resource": "*",
+  "Condition": { "StringEquals": { "dynamodb:Attributes": ["ssn"] } }
+}
+```
+
+**Fix:** Use a set qualifier. To deny a request that touches *any* of a set of attributes, use `ForAnyValue:`:
+
+```json
+{
+  "Effect": "Deny",
+  "Action": "dynamodb:GetItem",
+  "Resource": "*",
+  "Condition": { "ForAnyValue:StringEquals": { "dynamodb:Attributes": ["ssn"] } }
+}
+```
+
+To allowlist attributes (allow only when *every* requested attribute is in the set), use `ForAllValues:` on an `Allow` statement. The same rule applies to `dynamodb:LeadingKeys`.
+
+> Note: prior to v0.1.6, extenddb incorrectly treated a bare operator on these keys as an implicit AND across the requested values, so a single-attribute request appeared to be denied while a multi-attribute request leaked. That behavior diverged from AWS and gave a false sense of security. See the upgrade manual for migration guidance.
 
 ## Connection Issues
 
@@ -785,9 +828,9 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 ### GSI query returns stale data after a write
 
-**Cause:** GSI updates are applied asynchronously with a configurable propagation delay (default 10ms). This matches real DynamoDB's eventually consistent GSI behavior. Each GSI can have its own `propagation_delay_ms` setting; the system-wide default is controlled by the `gsi_propagation_delay_ms` runtime setting.
+**Cause:** GSI updates are applied asynchronously with a configurable propagation delay (default 10ms). This matches real DynamoDB's eventually consistent GSI behavior. Each GSI can have its own `propagation_delay_ms` setting; the system-wide default is controlled by the `index_propagation_delay_ms` runtime setting.
 
-**Fix:** This is expected behavior. For tests that query GSIs after writes, poll/retry the GSI query until the expected data appears. To make all GSIs synchronous for testing, set `extenddb settings set gsi_propagation_delay_ms 0`. For production-like testing, keep the default async delay.
+**Fix:** This is expected behavior. For tests that query GSIs after writes, poll/retry the GSI query until the expected data appears. To make all GSIs synchronous for testing, set `extenddb settings set index_propagation_delay_ms 0`. For production-like testing, keep the default async delay.
 
 ## Connection Pool Exhaustion
 
@@ -804,6 +847,46 @@ pool_size = 50  # default is 20
 If the problem persists, check for long-running queries or connection leaks with `SELECT * FROM pg_stat_activity WHERE datname = 'extenddb_data';`.
 
 **Known limitation:** The HTTP status code should be 503 with a `Retry-After` header. This is tracked as technical debt.
+
+---
+
+### `Vector indexes are not supported by this storage backend`
+
+**Error text:**
+```
+Vector indexes are not supported by this storage backend
+```
+
+Also `SearchVectors is not supported by this storage backend` for a search request.
+
+**Cause:** Vector indexes are stored in `vector(N)` columns, a type the
+[pgvector](https://github.com/pgvector/pgvector) extension provides, so support is a
+property of the PostgreSQL server rather than of the ExtendDB build. The server probes
+for the extension once at startup and refuses every vector operation for the rest of
+its life if it was absent. Other operations are unaffected.
+
+**Fix:** Confirm what the running server decided, by looking for one of these lines in
+its startup log:
+
+```
+pgvector 0.8.0 detected on the data database; vector index storage available
+pgvector not installed on the data database; vector indexes are not supported
+```
+
+If it is absent, install the extension for your server version (for example
+`postgresql-16-pgvector`), then create it on the **data** database, not the catalog:
+
+```sql
+CREATE EXTENSION vector;
+```
+
+`extenddb init` and `extenddb migrate` both attempt this and print a notice rather than
+failing when they cannot; a role without permission to create extensions needs a
+superuser or the database owner to run it once.
+
+**Then restart ExtendDB.** The probe result is cached at startup, so a server that
+started without the extension keeps refusing vector operations until it is restarted,
+even after the extension exists.
 
 ---
 

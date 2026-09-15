@@ -143,7 +143,7 @@ This skill presents commands but does not execute state-changing operations (`ex
 | `references/samples/02-sample-app.md` | Nine-stage lifecycle walkthrough |
 | `references/samples/03-stream-consumer.md` | Streams demo, two-client pattern |
 | **Troubleshooting** | |
-| `references/troubleshooting/01-symptom-index.md` | 16-symptom keyword-to-category lookup |
+| `references/troubleshooting/01-symptom-index.md` | 17-symptom keyword-to-category lookup |
 | `references/troubleshooting/02-postgres-symptoms.md` | Connection refused, password auth, migration |
 | `references/troubleshooting/03-catalog-symptoms.md` | Version mismatch, not initialized, already exists |
 | `references/troubleshooting/04-startup-symptoms.md` | Address in use, TLS, permissions, daemonize |

@@ -686,14 +686,20 @@ Export the Events table:
 aws dynamodb export-table-to-point-in-time \
     --table-arn "arn:aws:dynamodb:us-east-1:111122223333:table/Events" \
     --s3-bucket "local" \
-    --s3-prefix "/tmp/extenddb-exports/events.json" \
+    --s3-prefix "/tmp/extenddb-exports/111122223333/events.json" \
     --export-format DYNAMODB_JSON
 ```
+
+Export files are namespaced by account: the path sits under
+`<configured export root>/<account id>/`, which is why the account id appears in
+the prefix above. The server creates that directory on first use. Export also
+refuses to overwrite an existing file, so re-running this step needs a new
+filename (or the old file removed).
 
 Check the exported file:
 
 ```bash
-cat /tmp/extenddb-exports/events.json | python3 -m json.tool | head -40
+cat /tmp/extenddb-exports/111122223333/events.json | python3 -m json.tool | head -40
 ```
 
 ---

@@ -22,10 +22,21 @@ use crate::gsi_queue::{GsiApplyContext, GsiIndexDef, enqueue_gsi_pending};
 /// message. The async GSI worker keys off the code (e.g. `42P01`,
 /// undefined_table) to tell a dropped-index race apart from a real failure;
 /// `sqlx`'s `Display` only carries the human text, so the code must be kept.
-fn db_error(e: sqlx::Error) -> StorageError {
+pub(crate) fn db_error(e: sqlx::Error) -> StorageError {
+    StorageError::Internal(sqlstate_message(&e))
+}
+
+/// Render a database error with its SQLSTATE prefixed.
+///
+/// The prefix is the whole mechanism behind `is_undefined_table`: sqlx renders a
+/// database error as its message text alone, so a caller that formats with
+/// `to_string` throws the code away and every classifier downstream stops working.
+/// Shared so the vector path cannot format it differently from the GSI path, which
+/// is exactly how a dropped-table race turned into a permanently stalled worker.
+pub(crate) fn sqlstate_message(e: &sqlx::Error) -> String {
     match e.as_database_error().and_then(|d| d.code()) {
-        Some(code) => StorageError::Internal(format!("SQLSTATE {code}: {e}")),
-        None => StorageError::Internal(e.to_string()),
+        Some(code) => format!("SQLSTATE {code}: {e}"),
+        None => e.to_string(),
     }
 }
 
@@ -41,16 +52,45 @@ pub(crate) struct IndexMeta {
     pub(super) propagation_delay_ms: Option<i32>,
 }
 
-/// Fetch all index metadata for a table from the catalog.
-pub(crate) async fn fetch_indexes_for_table(
+/// Both index families a write has to maintain, read in one catalog visit.
+///
+/// One acquired connection for both statements rather than two trips through the
+/// pool, because every write takes this path and most tables have no vector index
+/// at all. Also the single place the two reads are ordered together, so the six
+/// write sites cannot end up disagreeing about which membership they saw.
+pub(crate) async fn fetch_write_path_indexes(
     table_id: &str,
     pool: &sqlx::PgPool,
-) -> Result<Vec<IndexMeta>, StorageError> {
+) -> Result<
+    (
+        Vec<IndexMeta>,
+        Vec<(extenddb_storage::vector_lifecycle::VectorIndexMeta, String)>,
+    ),
+    StorageError,
+> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+    let indexes = fetch_indexes_for_table(table_id, &mut *conn).await?;
+    let vector_metas =
+        crate::data::vector_index::fetch_vector_indexes_for_table(&mut *conn, table_id).await?;
+    Ok((indexes, vector_metas))
+}
+
+/// Fetch all index metadata for a table from the catalog.
+pub(crate) async fn fetch_indexes_for_table<'e, E>(
+    table_id: &str,
+    executor: E,
+) -> Result<Vec<IndexMeta>, StorageError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let rows: Vec<(String, String, String, serde_json::Value, serde_json::Value, Option<i32>)> = sqlx::query_as(
         "SELECT index_id, index_name, index_type, key_schema, projection, propagation_delay_ms FROM indexes WHERE table_id = $1",
     )
     .bind(table_id)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -225,10 +265,33 @@ pub(crate) async fn enqueue_async_indexes(
                 projection: idx.projection.clone(),
             },
         };
-        enqueue_gsi_pending(tx, &key_info.table_id, old_item, new_item, delay, &context).await?;
+        enqueue_gsi_pending(
+            tx,
+            &key_info.table_id,
+            old_item,
+            new_item,
+            delay,
+            &crate::gsi_queue::PendingApplyContext::Gsi(context),
+        )
+        .await?;
         enqueued += 1;
     }
     Ok(enqueued)
+}
+
+/// Enqueue one propagation row for any index kind.
+///
+/// Thin wrapper so the vector maintenance path does not have to reach into the
+/// queue module's naming, which still says "gsi" for historical reasons.
+pub(crate) async fn enqueue_pending_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table_id: &str,
+    old_item: Option<&Item>,
+    new_item: Option<&Item>,
+    delay_ms: u64,
+    context: &crate::gsi_queue::PendingApplyContext,
+) -> Result<(), StorageError> {
+    enqueue_gsi_pending(tx, table_id, old_item, new_item, delay_ms, context).await
 }
 
 /// Delete a row from an index table using base table key columns.

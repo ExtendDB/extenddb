@@ -68,7 +68,7 @@ The `dispatch` function routes `X-Amz-Target` operation names to handlers.
 
 ### storage
 
-Trait definitions for the storage layer. Thirteen storage traits partition backend responsibilities:
+Trait definitions for the storage layer. Thirteen required storage traits partition backend responsibilities:
 
 - **TableEngine**: Table lifecycle (create, delete, describe, list, update)
 - **DataEngine**: Item CRUD (put, get, update, delete, query, scan, batch, transact)
@@ -82,9 +82,11 @@ Trait definitions for the storage layer. Thirteen storage traits partition backe
 - **MetricsStore**: Metrics collection and retrieval
 - **RateLimitStore**: Rate limiting state
 - **AuthorizationStore**: Policy evaluation cache
+
+Two further traits are optional and belong to vector search: **VectorSearchEngine**, which a backend hands over through `as_vector_search` or declines by returning `None`, and **VectorIndexBuild**, the storage primitives the shared build lifecycle drives. A backend that implements neither refuses every vector operation and is otherwise unaffected.
 - **Bootstrapper**: Initial database setup
 
-Traits use `BoxFuture` for object safety. Backends register at compile time via the `inventory` crate and are selected at startup by name. The `RuntimeHooks` trait allows backends to spawn backend-specific workers (PostgreSQL spawns 7).
+Traits use `BoxFuture` for object safety. A binary serves exactly one backend, installed from its thin `main` via `set_backend`. The `ServerRuntimeHooks` trait allows backends to spawn backend-specific workers (PostgreSQL spawns 7).
 
 ### storage-postgres
 
@@ -170,13 +172,15 @@ extenddb uses a dual-database architecture:
 - **Catalog database** (e.g., `extenddb_catalog`): Stores table metadata, account/user/group/role/policy definitions, access keys, settings, stream metadata, and metrics. Shared across all accounts.
 - **Data database** (e.g., `extenddb_catalog_data`): Stores user items, GSI/LSI data, and stream records. Each table gets its own PostgreSQL table.
 
-The catalog version (currently 0.0.2) is stored in the `catalog_metadata` table and checked at startup. Version mismatches prevent the server from starting — run `extenddb migrate` to upgrade.
+The catalog version is 0.0.3 on PostgreSQL and SQLite, stored in the `settings` table under the key `catalog_version` and checked at startup.
+The MongoDB backend tracks its own catalog version, 0.0.2. <!-- version-literal-ok: MongoDB's backend has its own catalog version, deliberately not the compiled-in constant the documentation guard checks -->
+A mismatch between the compiled-in version and the stored one prevents the server from starting; run `extenddb migrate` to upgrade.
 
 ## Pluggable Architecture
 
 ### Storage
 
-Storage backends implement thirteen traits (see **storage** section above). The traits use `BoxFuture` for object safety. Backends register at compile time via the `inventory` crate, and the `bin` crate selects the backend by name at startup. Currently only PostgreSQL is implemented.
+Storage backends implement thirteen traits (see **storage** section above). The traits use `BoxFuture` for object safety. A binary serves exactly one backend: the thin `bin` crate installs it via `set_backend` before any subcommand runs, and the config file's `backend` key is validated against the installed name rather than selecting it. PostgreSQL, SQLite and MongoDB backends are implemented, selected by mutually exclusive Cargo features at build time.
 
 ### Authentication
 

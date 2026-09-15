@@ -1311,6 +1311,153 @@ class TestGSIOnHashOnlyBaseTable:
 
 
 @pytest.fixture(scope="class")
+def gsi_on_composite_base_table(dynamodb_client):
+    """Base table with a range key, plus a GSI with a sort key.
+
+    Two partitions in the index:
+      "tied"   - every item shares the GSI sort key AND the base range key, so
+                 the only thing distinguishing rows is the base partition key.
+      "spread" - items share the GSI sort key but have distinct base range keys.
+
+    The "tied" partition is the shape that broke: with the base range key equal
+    across rows, a tie-breaker built from the base range key alone cannot make
+    progress, so page two came back empty.
+    """
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[
+            {"AttributeName": "itemId", "AttributeType": "S"},
+            {"AttributeName": "sortId", "AttributeType": "S"},
+            {"AttributeName": "category", "AttributeType": "S"},
+            {"AttributeName": "priority", "AttributeType": "N"},
+        ],
+        key_schema=[
+            {"AttributeName": "itemId", "KeyType": "HASH"},
+            {"AttributeName": "sortId", "KeyType": "RANGE"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "CategoryPriorityGSI",
+                "KeySchema": [
+                    {"AttributeName": "category", "KeyType": "HASH"},
+                    {"AttributeName": "priority", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            },
+        ],
+    ) as name:
+        for i in range(1, 8):
+            dynamodb_client.put_item(
+                TableName=name,
+                Item={
+                    "itemId": {"S": f"item-{i}"},
+                    "sortId": {"S": "S"},
+                    "category": {"S": "tied"},
+                    "priority": {"N": "1"},
+                },
+            )
+            dynamodb_client.put_item(
+                TableName=name,
+                Item={
+                    "itemId": {"S": f"item-{i}"},
+                    "sortId": {"S": f"s-{i}"},
+                    "category": {"S": "spread"},
+                    "priority": {"N": "1"},
+                },
+            )
+        yield name
+
+
+class TestGSIOnCompositeBaseTable:
+    """GSI pagination works when the base table has a range key.
+
+    The hash-only-base equivalents live in TestGSIOnHashOnlyBaseTable and passed
+    throughout: a GSI tie-breaker built from the base partition key alone is
+    complete when that is the whole base primary key. Adding a base range key is
+    what exposed the incomplete tie-breaker.
+    """
+
+    def _collect(self, client, table, category, limit=2, forward=True):
+        def run():
+            items = []
+            start = None
+            # Bound the loop so a tie-breaker that fails to advance surfaces as a
+            # short result rather than spinning here forever.
+            for _ in range(50):
+                kwargs = {
+                    "TableName": table,
+                    "IndexName": "CategoryPriorityGSI",
+                    "KeyConditionExpression": "category = :c",
+                    "ExpressionAttributeValues": {":c": {"S": category}},
+                    "Limit": limit,
+                }
+                if not forward:
+                    kwargs["ScanIndexForward"] = False
+                if start:
+                    kwargs["ExclusiveStartKey"] = start
+                resp = client.query(**kwargs)
+                items.extend(resp["Items"])
+                if "LastEvaluatedKey" not in resp:
+                    break
+                start = resp["LastEvaluatedKey"]
+            return items
+
+        return run
+
+    def test_paginate_duplicate_gsi_and_base_sort_keys(
+        self, dynamodb_client, gsi_on_composite_base_table
+    ):
+        """All items are returned when the GSI sort key and base range key are tied.
+
+        Every row shares category, priority and sortId, so only the base partition
+        key separates them. Page one previously returned 2 of 7 with a
+        LastEvaluatedKey, and resuming from it returned nothing, so a paginating
+        client silently saw 2 items and stopped.
+        """
+        items = wait_for_gsi_items(
+            self._collect(dynamodb_client, gsi_on_composite_base_table, "tied"), 7
+        )
+        assert len(items) == 7, f"expected 7 items, got {len(items)}"
+        ids = sorted(i["itemId"]["S"] for i in items)
+        assert ids == sorted(f"item-{n}" for n in range(1, 8))
+
+    def test_paginate_duplicate_gsi_sort_keys_distinct_base_sort_keys(
+        self, dynamodb_client, gsi_on_composite_base_table
+    ):
+        """The base range key differing is not required for correctness.
+
+        Guards against a fix that only works when the base range key happens to
+        break the tie.
+        """
+        items = wait_for_gsi_items(
+            self._collect(dynamodb_client, gsi_on_composite_base_table, "spread"), 7
+        )
+        assert len(items) == 7, f"expected 7 items, got {len(items)}"
+        assert len({i["sortId"]["S"] for i in items}) == 7
+
+    def test_paginate_reverse_with_tied_sort_keys(
+        self, dynamodb_client, gsi_on_composite_base_table
+    ):
+        """Reverse pagination is complete and non-duplicating on tied sort keys.
+
+        ScanIndexForward reverses the index sort key only; the base primary key
+        tie-breaker stays ascending, so the resume predicate and the ORDER BY have
+        to agree on that. If the tie-breaker followed ScanIndexForward instead,
+        this would skip items or repeat them.
+        """
+        items = wait_for_gsi_items(
+            self._collect(
+                dynamodb_client, gsi_on_composite_base_table, "tied", limit=3, forward=False
+            ),
+            7,
+        )
+        assert len(items) == 7, f"expected 7 items, got {len(items)}"
+        ids = [i["itemId"]["S"] for i in items]
+        assert len(ids) == len(set(ids)), f"duplicates in reverse pagination: {ids}"
+
+
+
+@pytest.fixture(scope="class")
 def base_key_schema_table(dynamodb_client):
     """Table with GSI for testing base_key_schema propagation.
 

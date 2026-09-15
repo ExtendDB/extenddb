@@ -22,7 +22,7 @@ impl TableEngine for PostgresEngine {
         input: CreateTableInput,
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
         let account_id = account_id.to_string();
-        Box::pin(async move { self.create_table_impl(&account_id, input).await })
+        Box::pin(async move { self.create_table_impl(&account_id, input, false).await })
     }
 
     // H-5: Set status to DELETING with a scheduled transition to removal,

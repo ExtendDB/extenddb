@@ -200,8 +200,19 @@ Input validation is layered:
 
 Import/export file paths are validated:
 - `..` components rejected
-- Paths canonicalized
-- Symlinks detected and rejected
+- Paths namespaced per account: a caller in account `A` may only resolve paths
+  under `<root>/A` for each configured root. Containment in the bare root is not
+  sufficient, so tenants sharing an instance cannot read or overwrite each
+  other's files. The account id comes from the authenticated identity, never
+  from the request
+- Containment is decided before any filesystem access, so a path belonging to
+  another account answers identically whether or not the file exists
+- Paths canonicalized, and containment re-checked afterwards so a symlinked
+  ancestor cannot redirect out of the subtree
+- Symlinks detected and rejected, including one planted at the export filename
+- Export refuses to overwrite an existing file, so it cannot truncate a file it
+  did not create
+- Both operations record the acting account, the operation and the resolved path
 - Error messages use generic text (no raw paths leaked)
 
 ## Error Message Security

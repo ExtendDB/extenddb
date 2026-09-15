@@ -8,6 +8,9 @@
 //! transaction afterward, with catalog cleanup if the data DDL fails. The
 //! control-plane delay (`control_plane_delay_seconds`) decides whether the
 //! table starts ACTIVE (delay 0) or CREATING with a scheduled transition.
+//!
+//! The restore path is the exception: see `defer_active` on
+//! [`SqliteEngine::create_table_impl`].
 
 use extenddb_core::types::{
     BillingMode, BillingModeSummary, CreateTableInput, GsiDescription, LsiDescription,
@@ -20,12 +23,25 @@ use crate::sqlite_util::{format_timestamp, is_unique_violation};
 use crate::store::SqliteEngine;
 
 impl SqliteEngine {
+    /// Create a table. When `defer_active` is set (the restore path), the row
+    /// is written `CREATING` with **no** scheduled transition, so the
+    /// background control-plane worker cannot flip it to `ACTIVE` while the
+    /// caller is still populating it; the caller sets `ACTIVE` itself once the
+    /// data copy completes. Normal `CreateTable` passes `false` and gets the
+    /// usual timed transition.
     pub(crate) async fn create_table_impl(
         &self,
         account_id: &str,
         input: CreateTableInput,
+        defer_active: bool,
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
+        // D1: every writer holds the engine write lock. This method runs two
+        // write transactions (catalog rows, then data-table DDL); without the
+        // lock they contend with data-plane writers at the SQLite level, and a
+        // slow DDL commit can exhaust a concurrent writer's busy_timeout,
+        // surfacing as a 500 on an unrelated request.
+        let _writer = self.write_lock.lock().await;
         let table_id = uuid::Uuid::new_v4().to_string();
         let table_arn = table_arn(&self.region, account_id, &input.table_name);
         let billing_mode = input.billing_mode.unwrap_or(BillingMode::Provisioned);
@@ -76,7 +92,14 @@ impl SqliteEngine {
         let creation_ts = format_timestamp(now);
         #[allow(clippy::cast_precision_loss)]
         let creation_epoch = now.unix_timestamp() as f64;
-        let (initial_status, status_transition_at) = if delay_secs <= 0.0 {
+        let (initial_status, status_transition_at) = if defer_active {
+            // CREATING with no scheduled transition: the control-plane worker
+            // matches only rows with a non-NULL, matured `status_transition_at`
+            // (see `worker.rs`), so it can never flip this row mid-copy. The
+            // restore caller performs the single ACTIVE flip when the copy
+            // commits.
+            ("CREATING", None)
+        } else if delay_secs <= 0.0 {
             ("ACTIVE", None)
         } else {
             (
@@ -194,6 +217,68 @@ impl SqliteEngine {
             }
         }
 
+        // Vector indexes. A CreateTable's table is empty, so there is nothing to
+        // backfill and no `backfilling` member is ever reported on this path.
+        // The index's status tracks the TABLE's: measured against the service
+        // (2026-08-21, eu-west-2, three runs polling at 250ms), an index created
+        // with its table reports CREATING while the table is CREATING and
+        // reaches ACTIVE in the same DescribeTable poll as the table, with no
+        // observable gap in either direction. The control-plane worker flips
+        // both in one pass; see `process_control_plane_transitions`.
+        let mut vector_ids: Vec<String> = Vec::new();
+        if let Some(vis) = &input.vector_indexes {
+            for vi in vis {
+                let vec_attr = serde_json::to_string(&vi.vector_attribute)
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                // An empty SearchSchema is stored as absent: it means the same as
+                // omitting the member, and the service never reports an empty
+                // list. The request paths collapse it too; this covers a caller
+                // that reaches the storage trait directly.
+                let search_schema = vi
+                    .search_schema_for_storage()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let proj = vi
+                    .projection
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| StorageError::Internal(e.to_string()))?
+                    .ok_or_else(|| {
+                        // Core validation requires Projection, so reaching here
+                        // means the request bypassed validation rather than that
+                        // the caller omitted it.
+                        StorageError::Internal(
+                            "vector index reached storage without a projection".to_owned(),
+                        )
+                    })?;
+                let distance = extenddb_storage::vector_catalog::distance_function_token(
+                    vi.distance_function,
+                )?;
+                let index_id = uuid::Uuid::new_v4().to_string();
+                sqlx::query(
+                    "INSERT INTO vector_indexes \
+                     (table_id, index_name, index_id, dimensions, distance_function, \
+                      vector_attribute, search_schema, projection, index_status, backfilling) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                )
+                .bind(&table_id)
+                .bind(&vi.index_name)
+                .bind(&index_id)
+                .bind(i64::from(vi.dimensions))
+                .bind(&distance)
+                .bind(&vec_attr)
+                .bind(&search_schema)
+                .bind(&proj)
+                .bind(initial_status)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                vector_ids.push(index_id);
+            }
+        }
+
         // Tags.
         if let Some(tags) = &input.tags {
             for tag in tags {
@@ -256,6 +341,18 @@ impl SqliteEngine {
                         &lsi_ids[i],
                         &lsi.key_schema,
                         &input.attribute_definitions,
+                        &input.key_schema,
+                        &input.attribute_definitions,
+                    )
+                    .await?;
+                }
+            }
+            if input.vector_indexes.is_some() {
+                for index_id in &vector_ids {
+                    Self::create_vector_data_table(
+                        &mut data_tx,
+                        &table_id,
+                        index_id,
                         &input.key_schema,
                         &input.attribute_definitions,
                     )
@@ -368,7 +465,39 @@ impl SqliteEngine {
             })
         });
 
+        // Echo the vector indexes we just created. Built from the request plus the
+        // ids assigned above rather than re-read from the catalog, which would add
+        // a round trip to say something already known. A CreateTable's table is
+        // empty, so each index is ACTIVE with no `backfilling` member.
+        let vector_index_descs: Option<Vec<extenddb_core::types::VectorIndexDescription>> = input
+            .vector_indexes
+            .as_ref()
+            .map(|vis| {
+                vis.iter()
+                    .map(|vi| extenddb_core::types::VectorIndexDescription {
+                        index_name: vi.index_name.clone(),
+                        vector_attribute: vi.vector_attribute.clone(),
+                        dimensions: vi.dimensions,
+                        search_schema: vi.search_schema_for_storage().map(<[_]>::to_vec),
+                        distance_function: vi.distance_function,
+                        index_status: extenddb_core::types::IndexStatus::Active,
+                        backfilling: None,
+                        index_size_bytes: 0,
+                        item_count: 0,
+                        index_arn: extenddb_storage::util::index_arn(
+                            &self.region,
+                            account_id,
+                            &input.table_name,
+                            &vi.index_name,
+                        ),
+                        projection: vi.projection.clone(),
+                    })
+                    .collect()
+            })
+            .filter(|v: &Vec<_>| !v.is_empty());
+
         Ok(TableDescription {
+            restore_summary: None,
             table_name: input.table_name,
             key_schema: input.key_schema,
             attribute_definitions: input.attribute_definitions,
@@ -386,6 +515,7 @@ impl SqliteEngine {
                 last_decrease_date_time: None,
             },
             billing_mode_summary,
+            table_throughput_mode_summary: None,
             global_secondary_indexes: gsis,
             local_secondary_indexes: lsis,
             stream_specification: input.stream_specification,
@@ -398,6 +528,12 @@ impl SqliteEngine {
                 .as_ref()
                 .map(|tc| serde_json::json!({ "TableClass": tc })),
             on_demand_throughput: input.on_demand_throughput,
+            // Every field is populated deliberately, with no `..Default::default()`
+            // spread. This response is the complete description of what was just
+            // created, so a new core field should break this site and force a
+            // decision about whether create must report it, rather than silently
+            // defaulting. Sites that legitimately opt out still use the spread.
+            vector_indexes: vector_index_descs,
         })
     }
 }

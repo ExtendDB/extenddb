@@ -27,17 +27,27 @@ pub async fn handle_delete_item(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
+    // Aggregated, in the measured clause order (2026-08-24, us-east-1: both
+    // invalid enums answer "2 validation errors detected", RCC's named clause
+    // first, then ReturnValues' bare clause). A member merely disallowed for
+    // DeleteItem passes here and falls through to
+    // validate_put_delete_return_values.
     crate::validate_enum_fields(
         &body,
         &[
-            ("ReturnValues", "returnValues", &["NONE", "ALL_OLD"]),
-            (
-                "ReturnConsumedCapacity",
-                "returnConsumedCapacity",
-                &["INDEXES", "TOTAL", "NONE"],
-            ),
+            crate::EnumField {
+                json_name: "ReturnConsumedCapacity",
+                valid: &["INDEXES", "TOTAL", "NONE"],
+                clause: crate::EnumClause::Named("returnConsumedCapacity"),
+            },
+            crate::EnumField {
+                json_name: "ReturnValues",
+                valid: crate::RETURN_VALUES_MEMBERS,
+                clause: crate::EnumClause::Bare(crate::RETURN_VALUES_BARE_CLAUSE),
+            },
         ],
     )?;
+    crate::validate_put_delete_return_values(&body)?;
     let input: DeleteItemInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
@@ -74,6 +84,17 @@ pub async fn handle_delete_item(
             .as_ref()
             .map_or(0, std::collections::HashMap::len),
     )?;
+
+    // The nesting-depth limit applies to every ExpressionAttributeValue on the
+    // single-item write paths, condition-only placeholders included: measured
+    // 2026-08-24 (us-east-1), a 32-level value referenced solely by a
+    // ConditionExpression is rejected on PutItem, DeleteItem, and UpdateItem
+    // alike, while 31 levels is accepted. TransactWriteItems deliberately does
+    // NOT get this check: the same 32-level condition-only value is accepted
+    // inside a transaction on every sub-op shape (also measured).
+    if let Some(values) = &input.expression_attribute_values {
+        extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
+    }
 
     let (condition, maps) = resolve_condition(
         input.condition_expression.as_deref(),

@@ -288,3 +288,64 @@ async fn condition_nested_parentheses() {
         .await
         .unwrap();
 }
+
+// ========== Field-vs-field comparison (both operands are paths) ==========
+
+#[tokio::test]
+async fn condition_field_vs_field_true() {
+    let c = client();
+    let t = tables().await;
+    let table = &t.simple_key_string;
+    let mut item = create_item(table);
+    item.insert("lo".into(), n(5));
+    item.insert("hi".into(), n(10));
+    c.put_item()
+        .table_name(table)
+        .set_item(Some(item.clone()))
+        .send()
+        .await
+        .unwrap();
+
+    // Both operands are document paths: `lo < hi` (5 < 10) holds, so the
+    // delete proceeds. Exercises a comparison whose right-hand side is an
+    // attribute reference rather than an expression-attribute-value.
+    let key = get_key(table, &item);
+    c.delete_item()
+        .table_name(table)
+        .set_key(Some(key))
+        .condition_expression("lo < hi")
+        .send()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn condition_field_vs_field_false() {
+    let c = client();
+    let t = tables().await;
+    let table = &t.simple_key_string;
+    let mut item = create_item(table);
+    item.insert("lo".into(), n(5));
+    item.insert("hi".into(), n(10));
+    c.put_item()
+        .table_name(table)
+        .set_item(Some(item.clone()))
+        .send()
+        .await
+        .unwrap();
+
+    // `hi < lo` (10 < 5) is false, so the guard must reject the write. Pins
+    // that field-vs-field comparisons evaluate both sides as stored values,
+    // not lexically.
+    let key = get_key(table, &item);
+    let err = c
+        .delete_item()
+        .table_name(table)
+        .set_key(Some(key))
+        .condition_expression("hi < lo")
+        .send()
+        .await
+        .unwrap_err();
+
+    assert_eq!(err_code(&err), Some("ConditionalCheckFailedException"));
+}

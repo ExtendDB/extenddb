@@ -4,9 +4,11 @@
 //! Helper functions for `extenddb serve`: daemonize health checks, PID file
 //! management, config permission checks, and syslog utilities.
 
+#[cfg(unix)]
 use std::path::PathBuf;
 
 /// Platform-appropriate hint for viewing syslog output.
+#[cfg(unix)]
 fn syslog_hint() -> &'static str {
     if cfg!(target_os = "macos") {
         "Check syslog: log show --predicate 'process == \"extenddb\"' --last 5m"
@@ -19,6 +21,7 @@ fn syslog_hint() -> &'static str {
 /// and then verifies the daemon process is still alive. This catches early
 /// startup failures (bad config, missing catalog tables, TLS cert errors)
 /// that would otherwise be invisible because stderr is /dev/null after fork.
+#[cfg(unix)]
 pub fn verify_daemon_started(pid_file: &PathBuf, bind_addr: &str) -> anyhow::Result<()> {
     let hint = syslog_hint();
 
@@ -72,35 +75,50 @@ pub fn verify_daemon_started(pid_file: &PathBuf, bind_addr: &str) -> anyhow::Res
 ///
 /// Returns an error if the file permissions are too open or cannot be read.
 pub fn check_config_permissions(config_path: &str) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
 
-    let path = std::path::Path::new(config_path);
-    if !path.exists() {
-        // Config file is optional — `config::load` handles missing files.
-        return Ok(());
-    }
+        let path = std::path::Path::new(config_path);
+        if !path.exists() {
+            // Config file is optional — `config::load` handles missing files.
+            return Ok(());
+        }
 
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| anyhow::anyhow!("Cannot read config file metadata for {config_path}: {e}"))?;
-    let mode = metadata.permissions().mode() & 0o777;
-
-    if mode & 0o077 != 0 {
-        // Auto-fix like SSH does: warn and tighten permissions rather than refusing
-        // to start. The config file may contain the encryption key for credential
-        // storage, so group/other access is a security risk.
-        tracing::warn!(
-            "Config file {} has permissions {:04o}, fixing to 0600. \
-             The config file may contain the encryption key for credential storage.",
-            config_path,
-            mode,
-        );
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
-            anyhow::anyhow!(
-                "Cannot fix config file permissions for {config_path}: {e}. \
-                 Fix manually with: chmod 600 {config_path}"
-            )
+        let metadata = std::fs::metadata(path).map_err(|e| {
+            anyhow::anyhow!("Cannot read config file metadata for {config_path}: {e}")
         })?;
-    }
+        let mode = metadata.permissions().mode() & 0o777;
 
-    Ok(())
+        if mode & 0o077 != 0 {
+            // Auto-fix like SSH does: warn and tighten permissions rather than refusing
+            // to start. The config file may contain the encryption key for credential
+            // storage, so group/other access is a security risk.
+            tracing::warn!(
+                "Config file {} has permissions {:04o}, fixing to 0600. \
+                 The config file may contain the encryption key for credential storage.",
+                config_path,
+                mode,
+            );
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
+                |e| {
+                    anyhow::anyhow!(
+                        "Cannot fix config file permissions for {config_path}: {e}. \
+                         Fix manually with: chmod 600 {config_path}"
+                    )
+                },
+            )?;
+        }
+
+        Ok(())
+    }
+    // Windows has no POSIX permission bits; access control is via ACLs, which
+    // have no meaningful 0600 equivalent to enforce here. The dev/CI use case
+    // on Windows (the npm launcher) runs with an in-memory backend and no
+    // config file, so this check is a no-op rather than a porting project.
+    #[cfg(not(unix))]
+    {
+        let _ = config_path;
+        Ok(())
+    }
 }

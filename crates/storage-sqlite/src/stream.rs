@@ -44,7 +44,10 @@ impl SqliteEngine {
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         for i in 0..SHARDS_PER_STREAM {
-            let shard_id = format!("shardId-{table_name}-{i:012}");
+            // Zero-padded to 16 digits so the shard ID is always at
+            // least 28 characters (minimum length the AWS SDKs enforce for ShardId)
+            // even for the shortest legal table name.
+            let shard_id = format!("shardId-{table_name}-{i:016}");
             let start_seq = format!("{:021}", 0);
             sqlx::query(
                 "INSERT INTO stream_shards (shard_id, table_id, starting_sequence_number) \
@@ -358,6 +361,8 @@ impl StreamEngine for SqliteEngine {
         retention_hours: i64,
     ) -> BoxFuture<'_, Result<u64, StorageError>> {
         Box::pin(async move {
+            // D1: every writer holds the engine write lock.
+            let _writer = self.write_lock.lock().await;
             let cutoff = format_timestamp(
                 time::OffsetDateTime::now_utc() - time::Duration::hours(retention_hours),
             );

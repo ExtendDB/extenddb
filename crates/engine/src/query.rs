@@ -11,14 +11,19 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::PathElement;
 use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
 use extenddb_core::types::{
-    IndexType, KeyType, QueryInput, QueryOutput, Select, TableKeyInfo, extract_key, item_size_bytes,
+    IndexType, KeyType, ProjectionType, QueryInput, QueryOutput, Select, TableKeyInfo,
+    VECTOR_INDEX_QUERY_NOT_SUPPORTED, extract_key, item_size_bytes,
 };
+use extenddb_storage::error::StorageError;
 
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
-use crate::index_helpers::{combined_lek_key_schema, validate_query_exclusive_start_key};
+use crate::index_helpers::{
+    VectorIndexReadRefusal, classify_unresolved_index_read, combined_lek_key_schema,
+    validate_query_exclusive_start_key,
+};
 use crate::legacy_filter::{desugar_filter, desugar_key_conditions};
 use crate::read_helpers::apply_post_read;
 use crate::serialize_output;
@@ -38,6 +43,32 @@ pub async fn handle_query(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
+    // Pre-scanned before typed deserialization, sequentially: Query stops at
+    // the FIRST invalid enum, checking ReturnConsumedCapacity ahead of Select.
+    // Measured 2026-08-24 (us-east-1): both invalid answers "1 validation
+    // error detected" naming returnConsumedCapacity alone. (Scan is the
+    // opposite on both counts: it aggregates, select-first; see handle_scan.)
+    crate::validate_enum_fields(
+        &body,
+        &[crate::EnumField {
+            json_name: "ReturnConsumedCapacity",
+            valid: &["INDEXES", "TOTAL", "NONE"],
+            clause: crate::EnumClause::Named("returnConsumedCapacity"),
+        }],
+    )?;
+    crate::validate_enum_fields(
+        &body,
+        &[crate::EnumField {
+            json_name: "Select",
+            valid: &[
+                "SPECIFIC_ATTRIBUTES",
+                "COUNT",
+                "ALL_ATTRIBUTES",
+                "ALL_PROJECTED_ATTRIBUTES",
+            ],
+            clause: crate::EnumClause::Named("select"),
+        }],
+    )?;
     let input: QueryInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     // P118: Fetch key_info first so we can use table_id for index lookup.
@@ -48,25 +79,62 @@ pub async fn handle_query(
 
     // GSI/LSI: resolve index metadata if querying a secondary index.
     // Uses table_id from pre-fetched key_info to skip redundant table lookup (P118 #4).
-    let index_info = if let Some(ref idx_name) = input.index_name {
-        Some(
-            ctx.storage
+    // A vector index is not a row in the `indexes` catalog, so a not-found
+    // result is re-resolved against the vector index metadata before the
+    // name is treated as absent.
+    let (index_info, vector_index_named) = match input.index_name {
+        Some(ref idx_name) => {
+            match ctx
+                .storage
                 .index_info_by_table_id(&key_info.table_id, idx_name)
                 .await
-                .map_err(storage_err_to_dynamo)?,
-        )
-    } else {
-        None
+            {
+                // Defense in depth: no in-tree backend stores a vector index in
+                // `indexes`, but if one ever surfaces here it must be refused,
+                // not sent down the GSI/LSI data path.
+                Ok(info) if info.index_type == IndexType::Vector => (None, true),
+                Ok(info) => (Some(info), false),
+                Err(err @ StorageError::IndexNotFound(_)) => {
+                    match classify_unresolved_index_read(ctx, &key_info, idx_name).await? {
+                        VectorIndexReadRefusal::NotFound => {
+                            return Err(storage_err_to_dynamo(err));
+                        }
+                        // Query refuses a backfilling vector index with the same
+                        // message as an active one (measured 2026-08-20; Scan
+                        // differs). The refusal itself fires further down, after
+                        // the KeyConditionExpression checks.
+                        VectorIndexReadRefusal::Backfilling
+                        | VectorIndexReadRefusal::NotSupported => (None, true),
+                    }
+                }
+                Err(err) => return Err(storage_err_to_dynamo(err)),
+            }
+        }
+        None => (None, false),
     };
 
     // ConsistentRead is not supported on GSI queries (tenet 1: fidelity).
+    // Measured 2026-08-20: it fires for a vector index too, with the same
+    // wording, and before the vector-index refusal.
     if input.consistent_read == Some(true)
-        && let Some(ref idx) = index_info
-        && idx.index_type == IndexType::Gsi
+        && (vector_index_named
+            || index_info
+                .as_ref()
+                .is_some_and(|idx| idx.index_type == IndexType::Gsi))
     {
         return Err(DynamoDbError::ValidationException(
             "Consistent reads are not supported on global secondary indexes".to_owned(),
         ));
+    }
+
+    // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (shared with Scan).
+    if let Some(ref idx) = index_info {
+        extenddb_core::validation::validate_all_attributes_index_support(
+            input.select,
+            idx.index_type == IndexType::Gsi,
+            idx.projection.projection_type == ProjectionType::All,
+            &idx.index_name,
+        )?;
     }
 
     // Validate Limit >= 1 (REQ-QUERY-001)
@@ -92,6 +160,7 @@ pub async fn handle_query(
             global_secondary_indexes: key_info.global_secondary_indexes.clone(),
             local_secondary_indexes: key_info.local_secondary_indexes.clone(),
             stream_specification: None, // Queries don't capture stream records
+            vector_indexes: key_info.vector_indexes.clone(),
         }
     } else {
         key_info.clone()
@@ -184,6 +253,15 @@ pub async fn handle_query(
                 .to_owned(),
         ));
     };
+
+    // A vector index is searched only via the vector search API, never
+    // queried. Measured 2026-08-20: the service refuses after the
+    // KeyConditionExpression presence and syntax checks, hence below the parse.
+    if vector_index_named {
+        return Err(DynamoDbError::ValidationException(
+            VECTOR_INDEX_QUERY_NOT_SUPPORTED.to_owned(),
+        ));
+    }
 
     // Use legacy maps for key condition resolution if KeyConditions was used
     let effective_maps = if let Some(ref kc_maps) = legacy_kc_maps {
@@ -352,6 +430,7 @@ pub async fn handle_query(
             .as_ref()
             .is_some_and(|a| !a.is_empty()),
         input.index_name.is_some(),
+        extenddb_core::validation::IS_QUERY,
     )?;
 
     // When Select=ALL_PROJECTED_ATTRIBUTES, capture the index info for post-read filtering.
@@ -448,11 +527,25 @@ pub async fn handle_query(
         count: result.count,
         scanned_count: result.scanned_count,
         last_evaluated_key: result.last_evaluated_key,
-        consumed_capacity: capacity_helpers::read_capacity(
-            input.return_consumed_capacity,
-            &input.table_name,
-            rcu,
-        ),
+        // On an index query with INDEXES, the index carries the read and the
+        // table's arm is zero, aggregate = sum; a base-table query keeps the
+        // plain table-arm shape. TOTAL keeps the aggregate-only shape either
+        // way.
+        consumed_capacity: match (&index_info, input.return_consumed_capacity) {
+            (Some(info), extenddb_core::types::ReturnConsumedCapacity::Indexes) => {
+                Some(extenddb_core::types::ConsumedCapacity::read_on_index(
+                    &input.table_name,
+                    &info.index_name,
+                    rcu,
+                    info.index_type == extenddb_core::types::IndexType::Gsi,
+                ))
+            }
+            _ => capacity_helpers::read_capacity(
+                input.return_consumed_capacity,
+                &input.table_name,
+                rcu,
+            ),
+        },
     };
 
     let body = serialize_output(&output)?;

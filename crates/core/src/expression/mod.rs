@@ -17,6 +17,7 @@ mod parser_common;
 mod projection;
 mod reserved_words;
 mod resolver;
+mod search_condition;
 mod tokenizer;
 mod update_evaluator;
 mod update_parser;
@@ -33,6 +34,11 @@ pub use resolver::{
     resolve_name_ref, resolve_path, validate_begins_with_operands, validate_expression_param_usage,
     validate_ordering_operand_types, validate_unused_attributes,
 };
+pub use search_condition::{
+    MAX_INLINE_FILTER_CONDITIONS, MAX_PARTITION_KEY_CONDITIONS, MAX_SEARCH_CONDITIONS,
+    SearchCondition, validate_conditions_against_search_schema,
+    validate_search_condition_expression,
+};
 pub use tokenizer::{Token, tokenize, tokenize_for, tokenize_with_limit};
-pub use update_evaluator::apply_update;
+pub use update_evaluator::apply_update_validated;
 pub use update_parser::{parse_update, parse_update_from};

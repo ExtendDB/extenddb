@@ -50,6 +50,7 @@ Environment variables use double-underscore (`__`) as a nesting separator, prefi
 | `server.bind_addr` | `EXTENDDB__SERVER__BIND_ADDR` |
 | `storage.postgres.connection_string` | `EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING` |
 | `storage.postgres.read_replica_url` | `EXTENDDB__STORAGE__POSTGRES__READ_REPLICA_URL` |
+| `storage.sqlite.path` | `EXTENDDB__STORAGE__SQLITE__PATH` |
 | `auth.provider` | `EXTENDDB__AUTH__PROVIDER` |
 | `auth.encryption_key` | `EXTENDDB__AUTH__ENCRYPTION_KEY` |
 | `auth.aws_iam.region` | `EXTENDDB__AUTH__AWS_IAM__REGION` |

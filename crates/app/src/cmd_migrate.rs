@@ -19,7 +19,8 @@ pub struct MigrateArgs {
     #[arg(long)]
     pg_user: Option<String>,
 
-    /// `PostgreSQL` admin password
+    /// `PostgreSQL` admin password.
+    /// Prefer `EXTENDDB_PG_PASSWORD` to keep the value out of process arguments.
     #[arg(long)]
     pg_pass: Option<String>,
 
@@ -45,14 +46,40 @@ pub async fn run(args: MigrateArgs) -> anyhow::Result<()> {
     println!("Config:           {}", args.config);
     println!();
 
-    // Collect CLI args for backend-specific parsing
-    let cli_args: Vec<String> = std::env::args().collect();
+    // Collect CLI args for backend-specific parsing. The environment-sourced
+    // secret is appended only to this in-process copy, not OS-visible argv.
+    let mut cli_args: Vec<String> = std::env::args().collect();
+    crate::util::append_secret_arg(
+        &mut cli_args,
+        "--pg-pass",
+        std::env::var_os("EXTENDDB_PG_PASSWORD"),
+        "EXTENDDB_PG_PASSWORD",
+    )?;
 
     // Create bootstrapper via registry
     let bootstrap = extenddb_storage::bootstrapper::create_bootstrapper(&args.config, &cli_args)
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
+    // Serialize concurrent migrators, such as several replicas starting at
+    // once, so they don't race each other applying schema changes.
+    bootstrap
+        .acquire_migration_lock()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let result = apply_migrations(bootstrap.as_ref(), &args).await;
+    if let Err(e) = bootstrap.release_migration_lock().await {
+        tracing::warn!("Failed to release migration lock: {e:?}");
+    }
+    result
+}
+
+/// Run the version checks and apply pending migrations while the migration lock
+/// is held. Split out of `run` so that the lock is always released afterwards.
+async fn apply_migrations(
+    bootstrap: &dyn extenddb_storage::bootstrapper::Bootstrapper,
+    args: &MigrateArgs,
+) -> anyhow::Result<()> {
     // Show current catalog version.
     println!("--- Checking current catalog version...");
     let current = bootstrap
@@ -80,9 +107,46 @@ pub async fn run(args: MigrateArgs) -> anyhow::Result<()> {
         println!("  Pending: {}", data_pending.join(", "));
     }
 
-    if !catalog_pending && data_pending.is_empty() {
+    // Detect table metadata damaged by the pre-fix UpdateTable (#259), which
+    // deleted a table's own key attribute definitions when a GSI was added.
+    //
+    // Detection is read-only and runs even when the catalog version is already
+    // current: the damage is in a row's contents, not in the schema, so an
+    // up-to-date deployment is exactly the case that needs checking. Nothing is
+    // written until --yes has been given, below.
+    println!("--- Checking table key metadata...");
+    let detected = bootstrap
+        .repair_lost_sort_key_definitions(false)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let repair_pending = !detected.repaired.is_empty();
+    if !repair_pending && detected.needs_attention.is_empty() {
+        println!("  Table key metadata intact.");
+    } else {
+        for line in &detected.repaired {
+            println!("  Repairable: {line}");
+        }
+        for line in &detected.needs_attention {
+            println!("  NEEDS ATTENTION: {line}");
+        }
+    }
+
+    if !catalog_pending && data_pending.is_empty() && !repair_pending {
         println!();
-        println!("Everything is up to date (catalog version {expected}). No migrations needed.");
+        if detected.needs_attention.is_empty() {
+            println!(
+                "Everything is up to date (catalog version {expected}). No migrations needed."
+            );
+        } else {
+            // Nothing is automatically applicable, but saying "everything is up
+            // to date" straight after a NEEDS ATTENTION line would be
+            // contradictory: those tables require a human.
+            println!(
+                "No migrations needed (catalog version {expected}), but {} item(s) above \
+                 need manual attention.",
+                detected.needs_attention.len()
+            );
+        }
         return Ok(());
     }
 
@@ -93,6 +157,12 @@ pub async fn run(args: MigrateArgs) -> anyhow::Result<()> {
         }
         if !data_pending.is_empty() {
             what.push(format!("data migrations [{}]", data_pending.join(", ")));
+        }
+        if repair_pending {
+            what.push(format!(
+                "table key metadata repairs [{}]",
+                detected.repaired.join("; ")
+            ));
         }
         anyhow::bail!(
             "--yes is required to apply migrations. Pending: {}.",
@@ -114,6 +184,18 @@ pub async fn run(args: MigrateArgs) -> anyhow::Result<()> {
         .run_data_migrations()
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
+    // Apply the table key metadata repair after the schema migrations, so it never
+    // reads or writes a pre-migration catalog shape.
+    if repair_pending {
+        let applied = bootstrap
+            .repair_lost_sort_key_definitions(true)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        for line in &applied.repaired {
+            println!("  Restored sort key definition: {line}");
+        }
+    }
 
     // Read new catalog version.
     let new = bootstrap

@@ -205,6 +205,35 @@ impl PreparedOp {
         };
         capacity_helpers::item_metrics(ricm, &key_info.key_schema, item_or_key, key_info.has_lsi)
     }
+
+    /// Return a `ValidationError` cancellation reason if this op's primary key
+    /// exceeds the size limit (hash > 2048 / range > 1024 bytes by default).
+    ///
+    /// Real `DynamoDB` cancels the whole transaction with a per-item
+    /// `ValidationError` reason for an oversized key in ANY sub-op (Put,
+    /// Delete, Update, ConditionCheck). Empty-key values are handled separately
+    /// as a top-level `ValidationException`, so this checks size only.
+    pub(crate) fn oversized_key_reason(
+        &self,
+        limits: &extenddb_core::limits::LimitsConfig,
+    ) -> Option<extenddb_core::types::CancellationReason> {
+        let (key_info, item_or_key) = match self {
+            Self::Put { key_info, item, .. } => (key_info, item),
+            Self::Delete { key_info, key, .. }
+            | Self::Update { key_info, key, .. }
+            | Self::ConditionCheck { key_info, key, .. } => (key_info, key),
+        };
+        match extenddb_core::validation::validate_key_size_limits(
+            item_or_key,
+            &key_info.key_schema,
+            limits,
+        ) {
+            Ok(()) => None,
+            Err(e) => Some(extenddb_core::types::CancellationReason::validation_error(
+                e.to_string(),
+            )),
+        }
+    }
 }
 
 /// Validate `ClientRequestToken` format.

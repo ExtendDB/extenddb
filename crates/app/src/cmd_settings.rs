@@ -112,6 +112,9 @@ async fn set(store: &dyn SettingsStore, key: &str, value: &str) -> anyhow::Resul
         );
     }
 
+    // Write under the canonical name so the deprecated alias updates the row the read
+    // path consults, rather than adding a second one that is silently ignored.
+    let key = extenddb_core::settings_keys::canonical_key(key);
     store
         .set_setting(key, value)
         .await

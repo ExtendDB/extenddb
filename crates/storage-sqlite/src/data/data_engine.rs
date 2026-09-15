@@ -17,6 +17,13 @@ use futures::future::BoxFuture;
 use crate::store::SqliteEngine;
 
 impl DataEngine for SqliteEngine {
+    /// Declares vector support by handing over the implementation. `Some(self)`
+    /// only compiles because `SqliteEngine` implements `VectorSearchEngine`, so
+    /// this cannot claim a capability the backend does not have.
+    fn as_vector_search(&self) -> Option<&dyn extenddb_storage::VectorSearchEngine> {
+        Some(self)
+    }
+
     fn put_item(
         &self,
         key_info: &TableKeyInfo,

@@ -8,7 +8,6 @@ use extenddb_core::types::{
     PointInTimeRecoveryDescription, SourceTableDetails, TableDescription,
 };
 use extenddb_storage::BackupEngine;
-use extenddb_storage::TableEngine;
 use extenddb_storage::error::StorageError;
 use futures::future::BoxFuture;
 
@@ -125,6 +124,35 @@ impl BackupEngine for PostgresEngine {
             #[allow(clippy::cast_possible_wrap)]
             let actual_count = items.len() as i64;
 
+            // Snapshot the source table's vector index configuration alongside
+            // its key schema. Restore refuses a backup whose snapshot is
+            // non-empty rather than silently dropping a declared index, and it
+            // cannot ask the source table instead: the source may have been
+            // deleted, which cascade-deletes its `vector_indexes` rows.
+            //
+            // Stored in the wire's own shape behind a version marker, not as a
+            // copy of the catalog row. A snapshot outlives the schema that
+            // produced it, so freezing physical column names into it would mean a
+            // later rename or an added column silently changed the meaning of
+            // snapshots already on disk. The lifecycle columns are deliberately
+            // absent: a restored index is defined by its configuration, and its
+            // build state belongs to the table it came from.
+            let vector_indexes: Option<serde_json::Value> = sqlx::query_scalar(
+                "SELECT jsonb_build_object('Version', 1, 'VectorIndexes', \
+                     COALESCE(jsonb_agg(jsonb_build_object( \
+                         'IndexName', index_name, \
+                         'Dimensions', dimensions, \
+                         'DistanceFunction', distance_function, \
+                         'VectorAttribute', vector_attribute, \
+                         'SearchSchema', search_schema, \
+                         'Projection', projection) ORDER BY index_name), '[]'::jsonb)) \
+                 FROM vector_indexes WHERE table_id = $1",
+            )
+            .bind(&table_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
+
             // Wrap all catalog-side writes in a single transaction so a crash
             // cannot leave a backup marked AVAILABLE with partial items.
             let mut tx = self
@@ -136,8 +164,8 @@ impl BackupEngine for PostgresEngine {
             sqlx::query(
                 "INSERT INTO backups (backup_arn, backup_name, table_id, table_name, account_id, \
              backup_status, backup_size_bytes, item_count, key_schema, attribute_definitions, \
-             billing_mode) \
-             VALUES ($1, $2, $3, $4, $5, 'AVAILABLE', $6, $7, $8, $9, $10)",
+             billing_mode, vector_indexes) \
+             VALUES ($1, $2, $3, $4, $5, 'AVAILABLE', $6, $7, $8, $9, $10, $11)",
             )
             .bind(&backup_arn)
             .bind(&backup_name)
@@ -149,6 +177,7 @@ impl BackupEngine for PostgresEngine {
             .bind(&key_schema)
             .bind(&attr_defs)
             .bind(&billing_mode)
+            .bind(&vector_indexes)
             .execute(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
@@ -404,9 +433,10 @@ impl BackupEngine for PostgresEngine {
                 serde_json::Value,
                 String,
                 Option<serde_json::Value>,
+                Option<serde_json::Value>,
             ) = sqlx::query_as(
                 "SELECT table_name, key_schema, attribute_definitions, billing_mode, \
-                 provisioned_throughput \
+                 provisioned_throughput, vector_indexes \
                  FROM backups \
                  WHERE backup_arn = $1 AND account_id = $2 AND backup_status = 'AVAILABLE'",
             )
@@ -417,7 +447,54 @@ impl BackupEngine for PostgresEngine {
             .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?
             .ok_or_else(|| StorageError::Validation(format!("Backup not found: {backup_arn}")))?;
 
-            let (_orig_table, ks_json, ad_json, billing, _prov) = backup_row;
+            let (_orig_table, ks_json, ad_json, billing, _prov, vector_indexes) = backup_row;
+
+            // Restore rebuilds the target from the snapshot's key schema,
+            // attribute definitions and billing mode, and does not carry indexes
+            // across. For a source table that had vector indexes that would be
+            // silent loss of a declared index: the restored table would answer
+            // every request except a search, and the client would only find out
+            // on the first one. The service preserves vector indexes through
+            // backup and restore (measured 2026-08-19), so the conformant end
+            // state is to restore them; until then this refuses, because a typed
+            // refusal is recoverable and silent loss is not.
+            //
+            // A NULL snapshot is a backup taken before the column existed, which
+            // cannot have carried vector indexes: this backend could not create
+            // them then. An unrecognised version is refused rather than guessed
+            // at, for the same reason a declared index must not be dropped
+            // silently.
+            let vector_index_count = match vector_indexes.as_ref() {
+                None => 0,
+                Some(snapshot) => {
+                    let version = snapshot.get("Version").and_then(serde_json::Value::as_u64);
+                    if version != Some(1) {
+                        // Version skew, not a fault: a newer build wrote a shape
+                        // this one does not know. Reported the same way as the
+                        // refusal below, so a client gets a reason rather than a
+                        // 500 and the operator gets no error-level noise. Nearly
+                        // unreachable, because a shape change would normally come
+                        // with a catalog version bump that the startup gate
+                        // refuses first; the gap is a future build adding a member
+                        // without any schema change.
+                        return Err(StorageError::Unsupported(format!(
+                            "backup {backup_arn} carries a vector index snapshot this build \
+                             cannot read (version {version:?})"
+                        )));
+                    }
+                    snapshot
+                        .get("VectorIndexes")
+                        .and_then(serde_json::Value::as_array)
+                        .map_or(0, Vec::len)
+                }
+            };
+            if vector_index_count > 0 {
+                return Err(StorageError::Unsupported(format!(
+                    "backup {backup_arn} has {vector_index_count} vector index(es); \
+                     restoring a table with vector indexes is not supported by this \
+                     storage backend"
+                )));
+            }
 
             let key_schema: Vec<extenddb_core::types::KeySchemaElement> =
                 serde_json::from_value(ks_json)
@@ -449,17 +526,22 @@ impl BackupEngine for PostgresEngine {
                 sse_specification: None,
                 table_class: None,
                 on_demand_throughput: None,
+                ..Default::default()
             };
 
-            let desc = self.create_table(&account_id, create_input).await?;
+            // Create the table with the ACTIVE transition deferred: it enters
+            // CREATING with no scheduled flip, so the control-plane worker
+            // cannot mark it ACTIVE while the item copy below is still
+            // running. The explicit ACTIVE update after the copy is the only
+            // way this table leaves CREATING, so ACTIVE implies the restored
+            // data is fully present.
+            let desc = self
+                .create_table_impl(&account_id, create_input, true)
+                .await?;
 
             let new_table_id = &desc.table_id;
             let ddb_table = data_table_name(new_table_id);
             let ddb_table_unquoted = ddb_table.trim_matches('"');
-
-            // Do NOT force ACTIVE — let the control plane handle the transition
-            // (steering rule D-2: tests run with control_plane_delay_seconds > 0).
-            // The table starts in CREATING and transitions to ACTIVE after the delay.
 
             let has_sk: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM information_schema.columns \
@@ -513,10 +595,10 @@ impl BackupEngine for PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
 
-            // Mark the restored table ACTIVE immediately — the data is fully
-            // populated and the table is ready to serve requests. This matches
-            // real DynamoDB behavior where restored tables become ACTIVE once
-            // the restore completes (the CREATING status is transient).
+            // Mark the restored table ACTIVE now that the copy has fully
+            // drained. The table was created with the transition deferred, so
+            // this is the first point it can become ACTIVE, by ordering rather
+            // than by timing.
             sqlx::query(
                 "UPDATE tables SET table_status = 'ACTIVE', status_transition_at = NULL \
              WHERE account_id = $1 AND table_name = $2",

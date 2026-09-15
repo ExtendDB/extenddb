@@ -17,6 +17,24 @@
 //! `SQLITE_BUSY_SNAPSHOT` (a deferred read-then-write whose snapshot is
 //! invalidated by another pool committing) rather than surfacing it as a 500.
 //! Reads run concurrently from the pool against WAL snapshots and take no lock.
+//!
+//! "All writers" includes the control-plane paths (CreateTable's DDL, TTL
+//! metadata, tagging) and the periodic maintenance workers (table-size
+//! refresh, TTL index creation, stream-record and idempotency-token cleanup),
+//! not just the item write paths. A writer outside the lock contends at the
+//! SQLite level instead, and when its commit is slow (a large `CREATE INDEX`,
+//! a stalled fsync on a loaded CI host) a concurrent locked writer exhausts
+//! `busy_timeout` and fails an unrelated request with `database is locked`,
+//! which the engine maps to a 500. Measured 2026-08-27: an uncoordinated
+//! writer holding the file lock fails a plain `PutItem` with exactly the
+//! `InternalServerError` seen in the `run-integration-sqlite` CI flake.
+//!
+//! Deliberate exclusions from the lock, so the invariant stays auditable:
+//! init-time bootstrap in this file (runs before the server serves traffic),
+//! and the management/credential stores, which write through the separate
+//! catalog pool in `lib.rs`. For a file-backed database that second pool
+//! opens the same file, so its small single-row autocommit writes carry a
+//! residual, much smaller, version of the same contention risk.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -26,6 +44,7 @@ use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
 use tokio::sync::Mutex;
 
+use crate::INDEX_PROPAGATION_DELAY_QUERY;
 use crate::schema::CATALOG_VERSION;
 use crate::sqlite_util::sqlite_url;
 
@@ -40,13 +59,21 @@ pub struct SqliteEngine {
     pub(crate) control_plane_notify: Arc<tokio::sync::Notify>,
     /// Cached default GSI propagation delay (ms); refreshed by a worker and
     /// read on the write path to decide sync-vs-async index maintenance.
-    pub(crate) gsi_default_delay_ms: Arc<AtomicU64>,
+    pub(crate) index_propagation_delay_cache: Arc<AtomicU64>,
     /// Wakes the GSI propagation worker when a write enqueues into `gsi_pending`.
     pub(crate) gsi_notify: Arc<tokio::sync::Notify>,
     /// Serializes all writers (design decision D1). Held for the duration of
     /// every write transaction so condition checks and writes are atomic and
     /// `SQLITE_BUSY` cannot arise from competing writers.
     pub(crate) write_lock: Arc<Mutex<()>>,
+    /// Index ids whose asynchronous backfill task is currently alive in THIS
+    /// process. What tells a stuck `CREATING` index apart from one still
+    /// building: a catalog row can say `CREATING` forever, but only a live task
+    /// appears here, and the entry is removed by a drop guard so a panicking
+    /// task deregisters too. The GSI worker recovers any `CREATING` index with
+    /// no entry, because nothing else ever will until a restart, and until then
+    /// the per-table queue hold blocks every write's index maintenance.
+    pub(crate) vector_builds_running: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl SqliteEngine {
@@ -107,24 +134,26 @@ impl SqliteEngine {
             }
         }
 
-        let initial_gsi_delay: u64 = sqlx::query_as::<_, (String,)>(
-            "SELECT value FROM settings WHERE key = 'gsi_propagation_delay_ms'",
-        )
-        .fetch_optional(&pool)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|(v,)| v.parse::<u64>().ok())
-        .unwrap_or(10);
+        let initial_index_delay: u64 =
+            sqlx::query_as::<_, (String,)>(INDEX_PROPAGATION_DELAY_QUERY)
+                .fetch_optional(&pool)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|(v,)| v.parse::<u64>().ok())
+                .unwrap_or(10);
 
         Ok(Self {
             pool,
             region: region.to_owned(),
             max_item_size_bytes,
             control_plane_notify: Arc::new(tokio::sync::Notify::new()),
-            gsi_default_delay_ms: Arc::new(AtomicU64::new(initial_gsi_delay)),
+            index_propagation_delay_cache: Arc::new(AtomicU64::new(initial_index_delay)),
             gsi_notify: Arc::new(tokio::sync::Notify::new()),
             write_lock: Arc::new(Mutex::new(())),
+            vector_builds_running: Arc::new(
+                std::sync::Mutex::new(std::collections::HashSet::new()),
+            ),
         })
     }
 
@@ -151,7 +180,7 @@ impl SqliteEngine {
         let internal = |e: String| StorageError::Internal(e);
 
         // Schema (creates settings, accounts, admin_users, … and seeds
-        // catalog_version + gsi_propagation_delay_ms).
+        // catalog_version + index_propagation_delay_ms).
         crate::schema::apply(&self.pool)
             .await
             .map_err(|e| internal(format!("apply schema: {e:?}")))?;
@@ -232,10 +261,101 @@ impl SqliteEngine {
         Ok(if from_env { None } else { Some(password) })
     }
 
-    /// Current cached GSI propagation delay (ms); `0` means synchronous.
-    pub(crate) fn gsi_default_delay(&self) -> u64 {
-        self.gsi_default_delay_ms
-            .load(std::sync::atomic::Ordering::Relaxed)
+    /// Current secondary-index propagation delay (ms); `0` means synchronous.
+    ///
+    /// Reads the `index_propagation_delay_ms` setting live from the catalog so
+    /// out-of-process changes (`extenddb settings set`) take effect on the
+    /// next write, not up to 30 s later when the poll worker refreshes the
+    /// cache. `SQLite` is a local file, so this is an indexed point lookup with
+    /// negligible cost next to the write it precedes. On a read error the
+    /// cached value (still refreshed by the poll worker) is the fallback; on
+    /// success the cache is re-warmed so fallback reads stay fresh.
+    pub(crate) async fn index_propagation_delay(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        let live: Result<Option<(String,)>, _> = sqlx::query_as(INDEX_PROPAGATION_DELAY_QUERY)
+            .fetch_optional(&self.pool)
+            .await;
+        match live {
+            Ok(row) => {
+                // Missing row means the default, matching poll_gsi_delay.
+                let ms = row
+                    .and_then(|(v,)| v.parse::<u64>().ok())
+                    .unwrap_or(crate::DEFAULT_INDEX_PROPAGATION_DELAY_MS);
+                self.index_propagation_delay_cache
+                    .store(ms, Ordering::Relaxed);
+                ms
+            }
+            Err(e) => {
+                tracing::debug!("index_propagation_delay: live read failed, using cache: {e:?}");
+                self.index_propagation_delay_cache.load(Ordering::Relaxed)
+            }
+        }
+    }
+
+    /// Milliseconds to pause between batches of a vector index backfill.
+    ///
+    /// Read live for the same reason the propagation delay is: a test sets it with
+    /// `settings set` and needs it to apply to the next backfill, not up to 30 s
+    /// later. Zero when unset or unparseable, which is the production value, so a
+    /// malformed setting cannot slow a real backfill down.
+    pub(crate) async fn vector_backfill_batch_delay(&self) -> u64 {
+        let live: Result<Option<(String,)>, _> =
+            sqlx::query_as("SELECT value FROM settings WHERE key = ?")
+                .bind(extenddb_core::settings_keys::VECTOR_BACKFILL_BATCH_DELAY_MS)
+                .fetch_optional(&self.pool)
+                .await;
+        match live {
+            Ok(row) => row.and_then(|(v,)| v.parse::<u64>().ok()).unwrap_or(0),
+            Err(e) => {
+                tracing::debug!("vector_backfill_batch_delay: live read failed, using 0: {e:?}");
+                0
+            }
+        }
+    }
+
+    /// Minimum milliseconds an UpdateTable-created vector index stays `CREATING`
+    /// before its `ACTIVE` flip. See
+    /// [`extenddb_core::settings_keys::VECTOR_INDEX_MIN_CREATING_MS`] for why the
+    /// hold exists. Defaults to 1000 when unset or unparseable; zero disables it.
+    pub(crate) async fn vector_index_min_creating_ms(&self) -> u64 {
+        const DEFAULT_MS: u64 = 1_000;
+        let live: Result<Option<(String,)>, _> =
+            sqlx::query_as("SELECT value FROM settings WHERE key = ?")
+                .bind(extenddb_core::settings_keys::VECTOR_INDEX_MIN_CREATING_MS)
+                .fetch_optional(&self.pool)
+                .await;
+        match live {
+            Ok(row) => row
+                .and_then(|(v,)| v.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_MS),
+            Err(e) => {
+                tracing::debug!(
+                    "vector_index_min_creating_ms: live read failed, using {DEFAULT_MS}: {e:?}"
+                );
+                DEFAULT_MS
+            }
+        }
+    }
+
+    /// Milliseconds to hold a new vector index in the resource-allocation phase.
+    ///
+    /// A test lever, zero in production, read live for the same reason the batch
+    /// delay is. Held inside the detached build task rather than in the request
+    /// path, because the phase is only observable to a client after `UpdateTable`
+    /// has returned.
+    pub(crate) async fn vector_allocation_phase_delay(&self) -> u64 {
+        let live: Result<Option<(String,)>, _> =
+            sqlx::query_as("SELECT value FROM settings WHERE key = ?")
+                .bind(extenddb_core::settings_keys::VECTOR_ALLOCATION_PHASE_DELAY_MS)
+                .fetch_optional(&self.pool)
+                .await;
+        match live {
+            Ok(row) => row.and_then(|(v,)| v.parse::<u64>().ok()).unwrap_or(0),
+            Err(e) => {
+                tracing::debug!("vector_allocation_phase_delay: live read failed, using 0: {e:?}");
+                0
+            }
+        }
     }
 
     /// Handle to the GSI propagation notifier, woken after an enqueue.
@@ -307,5 +427,200 @@ impl SqliteEngine {
         .ok()
         .flatten()
         .map_or_else(|| "(not configured)".to_owned(), |(v,)| v)
+    }
+}
+
+#[cfg(test)]
+mod d1_write_lock_tests {
+    use super::SqliteEngine;
+    use serde_json::json;
+    use std::time::Duration;
+
+    async fn engine() -> SqliteEngine {
+        // The pool size is nominal: `SqliteEngine::new` pins in-memory
+        // databases to a single connection regardless. The tests below never
+        // hold a pool connection on the asserting side, so a writer that
+        // (incorrectly) ignores the lock is stopped by nothing at all, which
+        // is what the 200ms grace window detects.
+        let engine = SqliteEngine::new(":memory:", 2, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::schema::apply(&engine.pool).await.expect("schema");
+        sqlx::query(
+            "INSERT INTO accounts (account_id, account_name) VALUES ('000000000000', 'default')",
+        )
+        .execute(&engine.pool)
+        .await
+        .expect("account");
+        // Zero control-plane delay: tables become ACTIVE at create time, since
+        // no transition poller runs inside a unit test.
+        sqlx::query(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0')",
+        )
+        .execute(&engine.pool)
+        .await
+        .expect("settings");
+        engine
+    }
+
+    /// Assert the D1 invariant for one writer: while the engine write lock is
+    /// held, the writer must not complete; after release, it must.
+    ///
+    /// This is the discriminating shape for the 2026-08-27 `run-integration-sqlite`
+    /// flake (`PutItem` returning `InternalServerError`, server-side `database is
+    /// locked`): a writer outside the lock contends at the SQLite level, where a
+    /// slow commit exhausts a concurrent writer's 5s `busy_timeout`. Before the
+    /// fix, each writer below completed while the lock was held; with it, they
+    /// queue behind the lock and cannot collide.
+    async fn assert_serialized<F>(engine: &SqliteEngine, writer: F, name: &str)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let guard = engine.write_lock.lock().await;
+        let task = tokio::spawn(writer);
+        // Generous grace period: a writer that ignores the lock finishes these
+        // single-statement transactions in well under 200ms.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !task.is_finished(),
+            "{name} completed while the engine write lock was held (D1 violation)"
+        );
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap_or_else(|_| panic!("{name} did not complete after lock release"))
+            .expect("writer task panicked");
+    }
+
+    #[tokio::test]
+    async fn create_table_waits_for_the_write_lock() {
+        let engine = engine().await;
+        let e = engine.clone();
+        assert_serialized(
+            &engine,
+            async move {
+                create_table(&e, "d1-lock-t").await;
+            },
+            "create_table_impl",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn idempotency_token_cleanup_waits_for_the_write_lock() {
+        let engine = engine().await;
+        let e = engine.clone();
+        assert_serialized(
+            &engine,
+            async move {
+                e.cleanup_expired_idempotency_tokens_impl(0)
+                    .await
+                    .expect("cleanup");
+            },
+            "cleanup_expired_idempotency_tokens",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn tag_resource_waits_for_the_write_lock() {
+        use extenddb_storage::MetadataEngine;
+        let engine = engine().await;
+        let e = engine.clone();
+        assert_serialized(
+            &engine,
+            async move {
+                MetadataEngine::tag_resource(
+                    &e,
+                    "arn:aws:dynamodb:us-east-1:000000000000:table/d1",
+                    &[extenddb_core::types::Tag {
+                        key: "k".to_owned(),
+                        value: "v".to_owned(),
+                    }],
+                )
+                .await
+                .expect("tag");
+            },
+            "tag_resource",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stream_record_cleanup_waits_for_the_write_lock() {
+        use extenddb_storage::StreamEngine;
+        let engine = engine().await;
+        let e = engine.clone();
+        assert_serialized(
+            &engine,
+            async move {
+                StreamEngine::cleanup_expired_stream_records(&e, 0)
+                    .await
+                    .expect("cleanup");
+            },
+            "cleanup_expired_stream_records",
+        )
+        .await;
+    }
+
+    /// Create a plain table outside the lock window, for the writers whose
+    /// pre-lock reads refuse to proceed without one.
+    async fn create_table(engine: &SqliteEngine, name: &str) {
+        let input: extenddb_core::types::CreateTableInput = serde_json::from_value(json!({
+            "TableName": name,
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .expect("input");
+        engine
+            .create_table_impl("000000000000", input, false)
+            .await
+            .expect("create table");
+    }
+
+    #[tokio::test]
+    async fn delete_backup_waits_for_the_write_lock() {
+        use extenddb_storage::BackupEngine;
+        let engine = engine().await;
+        create_table(&engine, "d1-bkp-t").await;
+        // The backup must exist before the lock window: delete_backup resolves
+        // it with a read first and returns early when it is missing, which
+        // would complete without ever reaching the writes under test.
+        let details = BackupEngine::create_backup(&engine, "000000000000", "d1-bkp-t", "b")
+            .await
+            .expect("backup");
+        let e = engine.clone();
+        assert_serialized(
+            &engine,
+            async move {
+                BackupEngine::delete_backup(&e, "000000000000", &details.backup_arn)
+                    .await
+                    .expect("delete backup");
+            },
+            "delete_backup",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn update_continuous_backups_waits_for_the_write_lock() {
+        use extenddb_storage::BackupEngine;
+        let engine = engine().await;
+        // The table must exist before the lock window: the pre-lock existence
+        // check returns TableNotFound otherwise, completing without reaching
+        // the write under test.
+        create_table(&engine, "d1-pitr-t").await;
+        let e = engine.clone();
+        assert_serialized(
+            &engine,
+            async move {
+                BackupEngine::update_continuous_backups(&e, "000000000000", "d1-pitr-t", true)
+                    .await
+                    .expect("update continuous backups");
+            },
+            "update_continuous_backups",
+        )
+        .await;
     }
 }

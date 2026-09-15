@@ -148,7 +148,7 @@ only) — identical to Postgres, no change needed.
   Postgres backend's persistent-queue design rather than its `FOR UPDATE SKIP
   LOCKED` mechanics, which are unnecessary under the single-writer model.
   The effective delay is the per-GSI `propagation_delay_ms` override when set,
-  otherwise the `gsi_propagation_delay_ms` runtime setting (cached on the engine
+  otherwise the `index_propagation_delay_ms` runtime setting (cached on the engine
   and refreshed by a poller). Delay 0 ⇒ fully synchronous GSI maintenance.
   This **supersedes the earlier "synchronous because local I/O is fast"
   rationale**: that approach ignored the configured propagation delay and so did
