@@ -21,6 +21,17 @@ use crate::PostgresEngine;
 ///
 /// Self-contained: takes `param_idx` (the next available placeholder number),
 /// returns a complete SQL fragment. No mutable state leaks out.
+///
+/// Where every column of the cursor runs in the same direction as the
+/// `ORDER BY`, the predicate is a row comparison, `(a, b) > ($1, $2)`, which
+/// PostgreSQL turns into one index seek on the key index (the columns carry
+/// `COLLATE "C"`, and so do the indexes on tables created since the columns
+/// were declared that way). The equivalent `a > $1 OR (a = $1 AND b > $2)`
+/// is planned as a bitmap union that collects every row past the cursor
+/// before the `LIMIT` applies, or as an index scan filtered from the start of
+/// the partition. The reverse GSI cursor keeps the OR form: its sort key runs
+/// backwards while its base-key tie-breaker stays ascending, so it is not a
+/// row comparison.
 fn build_pagination_where(
     param_idx: u32,
     sk_info_val: Option<(&str, ScalarAttributeType)>,
@@ -29,44 +40,51 @@ fn build_pagination_where(
     is_lsi: bool,
     forward: bool,
 ) -> String {
-    if let Some((_, sk_type)) = sk_info_val {
-        let sk_col = sk_column(sk_type);
-        let collate = if sk_type == ScalarAttributeType::S {
+    let c_collate = |t: ScalarAttributeType| {
+        if t == ScalarAttributeType::S {
             " COLLATE \"C\""
         } else {
             ""
-        };
+        }
+    };
+    if let Some((_, sk_type)) = sk_info_val {
+        let sk_col = sk_column(sk_type);
+        let collate = c_collate(sk_type);
         let cmp = if forward { ">" } else { "<" };
 
         if let Some((_, base_sk_type)) = base_sk_info {
-            // Index with base SK tie-breaker
             let base_col = format!("base_{}", sk_column(*base_sk_type));
-            let base_collate = if *base_sk_type == ScalarAttributeType::S {
-                " COLLATE \"C\""
-            } else {
-                ""
-            };
+            let base_collate = c_collate(*base_sk_type);
             if is_lsi {
                 // LSI: every row shares the queried partition key, so the base
                 // table's sort key alone identifies a row uniquely. It is also a
-                // user-visible sort dimension, so it follows ScanIndexForward.
+                // user-visible sort dimension, so it follows ScanIndexForward,
+                // which makes the cursor a row comparison in both directions.
                 format!(
-                    " AND ({sk_col}{collate} {cmp} ${p1} OR \
-                     ({sk_col}{collate} = ${p1} AND {base_col}{base_collate} {cmp} ${p2}))",
+                    " AND ({sk_col}{collate}, {base_col}{base_collate}) {cmp} (${p1}, ${p2})",
                     p1 = param_idx,
                     p2 = param_idx + 1
                 )
-            } else {
+            } else if forward {
                 // GSI: the tie-breaker must be the FULL base primary key. Rows in
                 // a GSI partition are unique on (index SK, base PK, base SK), not
                 // on (index SK, base SK): many base partitions can project the
                 // same index SK and the same base SK. Comparing base SK alone
                 // made a page-two query return nothing whenever the rows sharing
                 // an index SK also shared a base SK, so a paginating client
-                // silently stopped after page one. The base key stays ascending
-                // because it is a uniqueness tie-breaker, not a sort dimension.
+                // silently stopped after page one.
                 format!(
-                    " AND ({sk_col}{collate} {cmp} ${p1} OR \
+                    " AND ({sk_col}{collate}, base_pk COLLATE \"C\", {base_col}{base_collate}) > \
+                     (${p1}, ${p2}, ${p3})",
+                    p1 = param_idx,
+                    p2 = param_idx + 1,
+                    p3 = param_idx + 2
+                )
+            } else {
+                // Reverse GSI: the base key stays ascending because it is a
+                // uniqueness tie-breaker, not a sort dimension.
+                format!(
+                    " AND ({sk_col}{collate} < ${p1} OR \
                      ({sk_col}{collate} = ${p1} AND (base_pk COLLATE \"C\" > ${p2} OR \
                      (base_pk = ${p2} AND {base_col}{base_collate} > ${p3}))))",
                     p1 = param_idx,
@@ -75,29 +93,33 @@ fn build_pagination_where(
                 )
             }
         } else if is_index {
-            // Index with no base SK — use base_pk as tie-breaker
-            format!(
-                " AND ({sk_col}{collate} {cmp} ${p1} OR \
-                 ({sk_col}{collate} = ${p1} AND base_pk COLLATE \"C\" > ${p2}))",
-                p1 = param_idx,
-                p2 = param_idx + 1
-            )
+            // Index on a hash-only base table: base_pk is the tie-breaker.
+            if forward {
+                format!(
+                    " AND ({sk_col}{collate}, base_pk COLLATE \"C\") > (${p1}, ${p2})",
+                    p1 = param_idx,
+                    p2 = param_idx + 1
+                )
+            } else {
+                format!(
+                    " AND ({sk_col}{collate} < ${p1} OR \
+                     ({sk_col}{collate} = ${p1} AND base_pk COLLATE \"C\" > ${p2}))",
+                    p1 = param_idx,
+                    p2 = param_idx + 1
+                )
+            }
         } else {
-            // Base table — simple comparison
+            // Base table: the sort key alone is the cursor.
             format!(" AND {sk_col}{collate} {cmp} ${param_idx}")
         }
     } else if is_index {
-        // Hash-only index — paginate using base table PK
+        // Hash-only index: paginate on the base table's primary key, which is
+        // the order the rows are returned in.
         if let Some((_, base_sk_type)) = base_sk_info {
             let base_sk_col = format!("base_{}", sk_column(*base_sk_type));
-            let base_sk_collate = if *base_sk_type == ScalarAttributeType::S {
-                " COLLATE \"C\""
-            } else {
-                ""
-            };
+            let base_sk_collate = c_collate(*base_sk_type);
             format!(
-                " AND (base_pk COLLATE \"C\" > ${p1} OR \
-                 (base_pk = ${p1} AND {base_sk_col}{base_sk_collate} > ${p2}))",
+                " AND (base_pk COLLATE \"C\", {base_sk_col}{base_sk_collate}) > (${p1}, ${p2})",
                 p1 = param_idx,
                 p2 = param_idx + 1
             )
@@ -635,5 +657,102 @@ impl PostgresEngine {
         };
 
         Ok((items, last_key))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const S: ScalarAttributeType = ScalarAttributeType::S;
+    const N: ScalarAttributeType = ScalarAttributeType::N;
+
+    fn base_s() -> Option<(String, ScalarAttributeType)> {
+        Some(("bsk".to_owned(), S))
+    }
+
+    /// The cursor fragments are pinned as strings because the row-comparison
+    /// and OR forms return the same rows: only a plan can tell them apart, and
+    /// a revert to the OR form would pass every wire test while losing the
+    /// index seek.
+    #[test]
+    fn base_table_cursor_is_a_single_comparison() {
+        assert_eq!(
+            build_pagination_where(3, Some(("sk", S)), &None, false, false, true),
+            " AND sk_s COLLATE \"C\" > $3"
+        );
+        assert_eq!(
+            build_pagination_where(3, Some(("sk", N)), &None, false, false, false),
+            " AND sk_n < $3"
+        );
+    }
+
+    #[test]
+    fn forward_gsi_cursor_is_a_row_comparison_over_the_full_base_key() {
+        assert_eq!(
+            build_pagination_where(3, Some(("gsk", S)), &base_s(), true, false, true),
+            " AND (sk_s COLLATE \"C\", base_pk COLLATE \"C\", base_sk_s COLLATE \"C\") > ($3, $4, $5)"
+        );
+        // Numeric index sort key with a numeric base sort key: no collation on either.
+        assert_eq!(
+            build_pagination_where(
+                3,
+                Some(("gsk", N)),
+                &Some(("bsk".to_owned(), N)),
+                true,
+                false,
+                true
+            ),
+            " AND (sk_n, base_pk COLLATE \"C\", base_sk_n) > ($3, $4, $5)"
+        );
+    }
+
+    #[test]
+    fn reverse_gsi_cursor_keeps_the_expanded_form_with_an_ascending_tie_breaker() {
+        assert_eq!(
+            build_pagination_where(3, Some(("gsk", S)), &base_s(), true, false, false),
+            " AND (sk_s COLLATE \"C\" < $3 OR (sk_s COLLATE \"C\" = $3 AND (base_pk COLLATE \"C\" > $4 OR \
+             (base_pk = $4 AND base_sk_s COLLATE \"C\" > $5))))"
+        );
+    }
+
+    #[test]
+    fn gsi_on_a_hash_only_base_table_uses_base_pk_as_the_tie_breaker() {
+        assert_eq!(
+            build_pagination_where(3, Some(("gsk", S)), &None, true, false, true),
+            " AND (sk_s COLLATE \"C\", base_pk COLLATE \"C\") > ($3, $4)"
+        );
+        assert_eq!(
+            build_pagination_where(3, Some(("gsk", S)), &None, true, false, false),
+            " AND (sk_s COLLATE \"C\" < $3 OR (sk_s COLLATE \"C\" = $3 AND base_pk COLLATE \"C\" > $4))"
+        );
+    }
+
+    #[test]
+    fn lsi_cursor_is_a_row_comparison_in_both_directions() {
+        assert_eq!(
+            build_pagination_where(3, Some(("lsk", S)), &base_s(), true, true, true),
+            " AND (sk_s COLLATE \"C\", base_sk_s COLLATE \"C\") > ($3, $4)"
+        );
+        assert_eq!(
+            build_pagination_where(3, Some(("lsk", S)), &base_s(), true, true, false),
+            " AND (sk_s COLLATE \"C\", base_sk_s COLLATE \"C\") < ($3, $4)"
+        );
+    }
+
+    #[test]
+    fn hash_only_index_cursor_is_a_row_comparison_over_the_base_key() {
+        assert_eq!(
+            build_pagination_where(3, None, &base_s(), true, false, true),
+            " AND (base_pk COLLATE \"C\", base_sk_s COLLATE \"C\") > ($3, $4)"
+        );
+        assert_eq!(
+            build_pagination_where(3, None, &None, true, false, true),
+            " AND base_pk COLLATE \"C\" > $3"
+        );
+        assert_eq!(
+            build_pagination_where(3, None, &None, false, false, true),
+            ""
+        );
     }
 }

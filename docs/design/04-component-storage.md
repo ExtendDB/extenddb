@@ -371,22 +371,32 @@ The PostgreSQL backend uses two categories of tables:
   Unicode, spaces, SQL keywords). The `_ddb_` prefix prevents collisions with
   catalog tables.
 
-- **Partition key storage**: Partition key values are always stored as TEXT.
-  String keys store directly, number keys store their string representation,
-  binary keys store base64. Partition keys only need equality comparison, so
-  text storage is correct. **Important:** Binary partition keys must use
+- **Partition key storage**: Partition key values are always stored as
+  `TEXT COLLATE "C"`. String keys store directly, number keys store their
+  string representation, binary keys store base64. Partition keys only need
+  equality comparison, so text storage is correct; the collation matters for
+  the Scan cursor, which compares `(pk, sk_s)` as a row against the index. **Important:** Binary partition keys must use
   canonical base64 encoding (standard alphabet with padding, via
   `base64::engine::general_purpose::STANDARD`) to ensure equality comparison
   is reliable. A validation step on ingest must normalize the encoding.
 
-- **Sort key storage**: Sort key values use typed columns (`sk_s TEXT`,
-  `sk_n NUMERIC`, `sk_b BYTEA`) to ensure correct ordering. Only one `sk_*`
-  column is populated per table, determined by the sort key's
+- **Sort key storage**: Sort key values use typed columns (`sk_s TEXT COLLATE
+  "C"`, `sk_n NUMERIC`, `sk_b BYTEA`) to ensure correct ordering. Only one
+  `sk_*` column is populated per table, determined by the sort key's
   `AttributeDefinition` type. The `CREATE TABLE` DDL and `PRIMARY KEY`
   constraint are generated dynamically based on the key schema.
   - `NUMERIC` ensures `2 < 10 < 100` (not lexicographic `"10" < "2"`)
   - `BYTEA` ensures correct binary comparison order
-  - `TEXT` ensures correct UTF-8 string ordering
+  - `TEXT COLLATE "C"` orders strings by UTF-8 byte value, which is the
+    service's order for string keys (measured 2026-09-16: `A < B < Z < _ < a <
+    a_z < ab < b < z < é < 中`, with `BETWEEN` and `begins_with` comparing the
+    same way). The query builders also qualify every string key predicate and
+    `ORDER BY` with `COLLATE "C"`, so results are byte-ordered on tables
+    created before the columns carried the collation; on those tables the
+    indexes cannot serve the predicates (see technical debt C-11). The same
+    columns on index tables (`pk`, `sk_s`, `base_pk`, `base_sk_s`) carry the
+    collation, so a GSI or LSI cursor is a row comparison the ordering index
+    serves in one seek.
 
 - **Item storage**: `item_data` JSONB contains the complete item including key
   attributes, matching the DynamoDB model where key attributes are part of the
@@ -695,12 +705,25 @@ WHERE (pk = $last_pk AND sk_n < $last_sk)
 ```
 
 **GSI pagination (forward scan):**
-GSI keys are not unique, so the base table primary key is used as a tiebreaker:
+GSI keys are not unique, so the base table primary key is used as a tiebreaker.
+Every column of the cursor runs in the same direction as the `ORDER BY`, so the
+predicate is one row comparison, which the ordering index on
+`(pk, sk_s, base_pk, base_sk_*)` serves as a single seek:
 ```sql
-WHERE (pk = $gsi_pk AND sk_s > $gsi_sk)
-   OR (pk = $gsi_pk AND sk_s = $gsi_sk AND base_pk > $base_pk)
-   OR (pk = $gsi_pk AND sk_s = $gsi_sk AND base_pk = $base_pk AND base_sk_n > $base_sk)
-   OR pk > $gsi_pk
+WHERE pk = $gsi_pk
+  AND (sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n) > ($gsi_sk, $base_pk, $base_sk)
+ORDER BY sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n
+```
+
+For a reverse query (`ScanIndexForward = false`) the index sort key runs
+backwards while the base-key tiebreaker stays ascending, so the cursor keeps
+the expanded form:
+```sql
+WHERE pk = $gsi_pk
+  AND (sk_s COLLATE "C" < $gsi_sk
+       OR (sk_s COLLATE "C" = $gsi_sk
+           AND (base_pk COLLATE "C" > $base_pk
+                OR (base_pk = $base_pk AND base_sk_n > $base_sk))))
 ```
 
 For GSI queries, the pagination key includes both the GSI key attributes and the base table primary key (needed to
