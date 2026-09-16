@@ -29,10 +29,6 @@ use std::path::{Path, PathBuf};
 /// decoration.
 const EXEMPT: &[(&str, &str)] = &[
     (
-        "docs/manuals/07-upgrade-manual.md",
-        "documents the 0.0.2 to 0.0.3 upgrade, so both versions appear on purpose",
-    ),
-    (
         "docs/backlog.md",
         "records completed history, including the version current at the time",
     ),

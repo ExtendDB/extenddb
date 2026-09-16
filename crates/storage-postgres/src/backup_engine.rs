@@ -1,11 +1,10 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Backup and point-in-time recovery implementation for `PostgreSQL` storage.
+//! Backup implementation for `PostgreSQL` storage.
 
 use extenddb_core::types::{
-    BackupDescription, BackupDetails, BackupSummary, ContinuousBackupsDescription,
-    PointInTimeRecoveryDescription, SourceTableDetails, TableDescription,
+    BackupDescription, BackupDetails, BackupSummary, SourceTableDetails, TableDescription,
 };
 use extenddb_storage::BackupEngine;
 use extenddb_storage::error::StorageError;
@@ -611,131 +610,6 @@ impl BackupEngine for PostgresEngine {
 
             // Return CREATING — the API response shows the initial status,
             // but the table is already ACTIVE by the time the caller polls.
-            Ok(desc)
-        })
-    }
-
-    fn describe_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-    ) -> BoxFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
-        let account_id = account_id.to_string();
-        let table_name = table_name.to_string();
-        Box::pin(async move {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM tables WHERE account_id = $1 AND table_name = $2)",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-
-            if !exists {
-                return Err(StorageError::TableNotFound(format!(
-                    "Table not found: {table_name}"
-                )));
-            }
-
-            let pitr_row: Option<(bool,)> = sqlx::query_as(
-                "SELECT pitr_enabled FROM continuous_backups \
-             WHERE account_id = $1 AND table_name = $2",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-
-            let pitr_enabled = pitr_row.is_some_and(|r| r.0);
-
-            #[allow(clippy::cast_precision_loss)]
-            let now_epoch = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as f64;
-
-            Ok(ContinuousBackupsDescription {
-                continuous_backups_status: "ENABLED".to_owned(),
-                point_in_time_recovery_description: Some(PointInTimeRecoveryDescription {
-                    point_in_time_recovery_status: if pitr_enabled {
-                        "ENABLED".to_owned()
-                    } else {
-                        "DISABLED".to_owned()
-                    },
-                    earliest_restorable_date_time: if pitr_enabled {
-                        Some(now_epoch - 35.0 * 24.0 * 3600.0)
-                    } else {
-                        None
-                    },
-                    latest_restorable_date_time: if pitr_enabled { Some(now_epoch) } else { None },
-                }),
-            })
-        })
-    }
-
-    fn update_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-        pitr_enabled: bool,
-    ) -> BoxFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
-        let account_id = account_id.to_string();
-        let table_name = table_name.to_string();
-        Box::pin(async move {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM tables WHERE account_id = $1 AND table_name = $2)",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-
-            if !exists {
-                return Err(StorageError::TableNotFound(format!(
-                    "Table not found: {table_name}"
-                )));
-            }
-
-            sqlx::query(
-                "INSERT INTO continuous_backups (account_id, table_name, pitr_enabled) \
-             VALUES ($1, $2, $3) \
-             ON CONFLICT (account_id, table_name) DO UPDATE SET pitr_enabled = $3",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .bind(pitr_enabled)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-
-            self.describe_continuous_backups(&account_id, &table_name)
-                .await
-        })
-    }
-
-    // TODO(cleanup): This method is unreachable — the engine handler returns
-    // ValidationException("not yet supported") before calling storage. Remove
-    // when real PITR is implemented or during the next storage trait cleanup.
-    fn restore_table_to_point_in_time(
-        &self,
-        account_id: &str,
-        source_table_name: &str,
-        target_table_name: &str,
-    ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
-        let account_id = account_id.to_string();
-        let source_table_name = source_table_name.to_string();
-        let target_table_name = target_table_name.to_string();
-        Box::pin(async move {
-            let backup = self
-                .create_backup(&account_id, &source_table_name, "__pitr_restore__")
-                .await?;
-            let desc = self
-                .restore_table_from_backup(&account_id, &target_table_name, &backup.backup_arn)
-                .await?;
-            let _ = self.delete_backup(&account_id, &backup.backup_arn).await;
             Ok(desc)
         })
     }

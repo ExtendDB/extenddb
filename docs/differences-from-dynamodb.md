@@ -38,6 +38,12 @@ adaptation when switching between ExtendDB and the real service.
 | Import execution | Asynchronous (background job) | Synchronous (completes before returning) |
 | Export execution | Point-in-time snapshot | Current snapshot, synchronous |
 
+## Backup and Restore
+
+| Area | DynamoDB | ExtendDB |
+|------|----------|------|
+| Point-in-time recovery (PITR) | UpdateContinuousBackups enables continuous backups; RestoreTableToPointInTime restores to any second in the retention window | Not supported. DescribeContinuousBackups reports `ContinuousBackupsStatus: ENABLED` (the service reports this unconditionally) with `PointInTimeRecoveryStatus: DISABLED` and no restorable-time window. UpdateContinuousBackups with `PointInTimeRecoveryEnabled: true` returns `ContinuousBackupsUnavailableException`. RestoreTableToPointInTime resolves the source table first (`TableNotFoundException` for a missing table, as the service reports) and then returns `PointInTimeRecoveryUnavailableException`, the exception the service models on that operation. Use on-demand backups instead: CreateBackup and RestoreTableFromBackup are supported on every backend. |
+
 ## Control Plane
 
 | Area | DynamoDB | ExtendDB |

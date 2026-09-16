@@ -21,9 +21,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use extenddb_core::types::{
-    AttributeDefinition, BackupDescription, BackupDetails, BackupSummary,
-    ContinuousBackupsDescription, GsiInput, KeySchemaElement, LsiInput,
-    PointInTimeRecoveryDescription, Projection, ProvisionedThroughput, SourceTableDetails,
+    AttributeDefinition, BackupDescription, BackupDetails, BackupSummary, GsiInput,
+    KeySchemaElement, LsiInput, Projection, ProvisionedThroughput, SourceTableDetails,
     TableDescription,
 };
 use extenddb_storage::BackupEngine;
@@ -707,115 +706,6 @@ impl BackupEngine for MongoEngine {
             // DynamoDB restore lifecycle while allowing the request to return
             // before potentially hundreds of thousands of index writes finish.
 
-            Ok(desc)
-        })
-    }
-
-    fn describe_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-    ) -> BoxFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
-        let account_id = account_id.to_string();
-        let table_name = table_name.to_string();
-        Box::pin(async move {
-            let tables_coll = self.catalog_db.collection::<Document>("tables");
-            let exists = tables_coll
-                .find_one(doc! { "_id": { "account_id": &account_id, "table_name": &table_name } })
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            if exists.is_none() {
-                return Err(StorageError::TableNotFound(table_name));
-            }
-
-            let cb_coll = self.catalog_db.collection::<Document>("continuous_backups");
-            let pitr_doc = cb_coll
-                .find_one(doc! { "account_id": &account_id, "table_name": &table_name })
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            let pitr_enabled = pitr_doc
-                .as_ref()
-                .and_then(|d| d.get_bool("pitr_enabled").ok())
-                .unwrap_or(false);
-
-            let now_epoch = now_epoch_secs();
-
-            Ok(ContinuousBackupsDescription {
-                continuous_backups_status: "ENABLED".to_owned(),
-                point_in_time_recovery_description: Some(PointInTimeRecoveryDescription {
-                    point_in_time_recovery_status: if pitr_enabled {
-                        "ENABLED".to_owned()
-                    } else {
-                        "DISABLED".to_owned()
-                    },
-                    earliest_restorable_date_time: if pitr_enabled {
-                        Some(now_epoch - 35.0 * 24.0 * 3600.0)
-                    } else {
-                        None
-                    },
-                    latest_restorable_date_time: if pitr_enabled { Some(now_epoch) } else { None },
-                }),
-            })
-        })
-    }
-
-    fn update_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-        pitr_enabled: bool,
-    ) -> BoxFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
-        let account_id = account_id.to_string();
-        let table_name = table_name.to_string();
-        Box::pin(async move {
-            let tables_coll = self.catalog_db.collection::<Document>("tables");
-            let exists = tables_coll
-                .find_one(doc! { "_id": { "account_id": &account_id, "table_name": &table_name } })
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            if exists.is_none() {
-                return Err(StorageError::TableNotFound(table_name.clone()));
-            }
-
-            let cb_coll = self.catalog_db.collection::<Document>("continuous_backups");
-            cb_coll
-                .update_one(
-                    doc! { "account_id": &account_id, "table_name": &table_name },
-                    doc! { "$set": {
-                        "account_id": &account_id,
-                        "table_name": &table_name,
-                        "pitr_enabled": pitr_enabled,
-                    }},
-                )
-                .upsert(true)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            self.describe_continuous_backups(&account_id, &table_name)
-                .await
-        })
-    }
-
-    fn restore_table_to_point_in_time(
-        &self,
-        account_id: &str,
-        source_table_name: &str,
-        target_table_name: &str,
-    ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
-        let account_id = account_id.to_string();
-        let source_table_name = source_table_name.to_string();
-        let target_table_name = target_table_name.to_string();
-        Box::pin(async move {
-            let backup = self
-                .create_backup(&account_id, &source_table_name, "__pitr_restore__")
-                .await?;
-            let desc = self
-                .restore_table_from_backup(&account_id, &target_table_name, &backup.backup_arn)
-                .await?;
-            let _ = self.delete_backup(&account_id, &backup.backup_arn).await;
             Ok(desc)
         })
     }
