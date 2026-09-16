@@ -233,7 +233,8 @@ impl<'a> PostReadAccumulator<'a> {
 /// `LastEvaluatedKey`, which is `Some` when more items exist past the chunk.
 ///
 /// The page ends when the next item would exceed [`PAGE_BYTE_BUDGET`], when
-/// `limit` items have been evaluated, or when storage is exhausted. Storage is
+/// `limit` items have been evaluated (always with a `LastEvaluatedKey`, as the
+/// service does), or when storage is exhausted. Storage is
 /// asked for at most one chunk beyond what the page needs, so the memory and
 /// time of a page depend on the page, not on the size of the table or
 /// partition behind it.
@@ -277,8 +278,12 @@ where
             }
         }
 
+        // Reaching Limit ends the page with a LastEvaluatedKey whether or not
+        // storage reports more: the service stops at Limit without looking
+        // past it (measured 2026-09-16: Limit 5 over exactly 5 items returns
+        // a key, and the next page is empty with none).
         if limit.is_some_and(|l| acc.scanned_count >= l) {
-            return Ok(acc.finish(storage_lek.is_some()));
+            return Ok(acc.finish(true));
         }
         // The budget is spent to the byte: the next item, whatever its size,
         // would not fit, so there is nothing to fetch.
@@ -481,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn limit_pages_end_at_the_limit_and_report_more_only_when_more_exists() {
+    fn limit_pages_end_at_the_limit_with_a_key_and_the_tail_page_without() {
         let s = store(20, 10);
         let p1 = run(&s, Some(7), None, None);
         assert_eq!(p1.post.count, 7);
@@ -497,10 +502,17 @@ mod tests {
         let p3 = run(&s, Some(7), p2.post.last_evaluated_key.as_ref(), None);
         assert_eq!(p3.post.count, 6);
         assert!(p3.post.last_evaluated_key.is_none());
-        // Exactly the limit: storage reports nothing past it, so no key.
+        // Exactly the limit: the service returns a key here and an empty page
+        // after it, because it stops at Limit without looking past it.
         let exact = run(&s, Some(20), None, None);
         assert_eq!(exact.post.count, 20);
-        assert!(exact.post.last_evaluated_key.is_none());
+        assert_eq!(
+            pk_of(exact.post.last_evaluated_key.as_ref().unwrap()),
+            "00000019"
+        );
+        let tail = run(&s, Some(20), exact.post.last_evaluated_key.as_ref(), None);
+        assert_eq!(tail.post.count, 0);
+        assert!(tail.post.last_evaluated_key.is_none());
         // Storage was never asked for more than the limit.
         assert!(s.reads.borrow().iter().all(|(_, n)| *n <= 20));
     }

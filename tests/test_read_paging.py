@@ -329,12 +329,17 @@ class TestLimitPaging:
         assert sks == list(range(20))
 
     def test_scan_limit_20_over_exactly_20(self, dynamodb_client, small_scan_table):
-        """One page of 20. LEK presence on an exactly-consumed Limit is
-        observed, not asserted; the value is recorded for the report."""
+        """Limit reached exactly at the end of the data: the service returns a
+        LastEvaluatedKey (it stops at Limit without looking past it) and the
+        next page is empty with none. Measured 2026-09-16."""
         resp = dynamodb_client.scan(TableName=small_scan_table, Limit=20)
         assert resp["Count"] == 20
-        present = "LastEvaluatedKey" in resp
-        print(f"OBSERVATION scan Limit=20 over 20 items: LastEvaluatedKey present={present}")
+        assert "LastEvaluatedKey" in resp
+        tail = dynamodb_client.scan(
+            TableName=small_scan_table, Limit=20, ExclusiveStartKey=resp["LastEvaluatedKey"]
+        )
+        assert tail["Count"] == 0
+        assert "LastEvaluatedKey" not in tail
 
     def test_query_limit_20_over_exactly_20(self, dynamodb_client, partition_table):
         resp = dynamodb_client.query(
@@ -344,8 +349,16 @@ class TestLimitPaging:
             Limit=20,
         )
         assert resp["Count"] == 20
-        present = "LastEvaluatedKey" in resp
-        print(f"OBSERVATION query Limit=20 over 20 items: LastEvaluatedKey present={present}")
+        assert "LastEvaluatedKey" in resp
+        tail = dynamodb_client.query(
+            TableName=partition_table,
+            KeyConditionExpression="pk = :pk",
+            ExpressionAttributeValues={":pk": {"S": "lim"}},
+            Limit=20,
+            ExclusiveStartKey=resp["LastEvaluatedKey"],
+        )
+        assert tail["Count"] == 0
+        assert "LastEvaluatedKey" not in tail
 
 
 # ---------------------------------------------------------------------------
