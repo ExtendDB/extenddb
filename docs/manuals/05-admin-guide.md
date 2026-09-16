@@ -90,7 +90,8 @@ These settings require a server restart to take effect.
 |-----|---------|-------------|
 | `bind_addr` | `127.0.0.1` | Network interface to bind |
 | `port` | `18443` | HTTP port |
-| `region` | `us-east-1` | AWS region for ARN generation |
+| `region` | `us-east-1` | AWS region for ARN generation. Requests must carry a credential scope for this region; any other region is rejected with `InvalidSignatureException`, as the service rejects a scope for a region other than the endpoint's |
+| `request_timeout_secs` | `30` | Seconds a connection may take to deliver its request headers, and seconds a request body may stall without delivering data, before the server closes it (a stalled body gets HTTP 408). The same value bounds how long an idle keep-alive connection waits for its next request, so SDK connection pools see idle connections closed after it (they reopen transparently), and it is the HTTP/2 keep-alive PING interval and timeout, so a stalled HTTP/2 connection is closed within twice the value. Must be at least 1 |
 
 #### [storage]
 

@@ -75,6 +75,16 @@ pub struct ServerConfig {
     /// Enable provisioned throughput throttling via token buckets.
     /// When `None` or `false`, all requests are allowed regardless of capacity.
     pub throttling_enabled: Option<bool>,
+    /// Seconds a connection may take to deliver its request headers, and
+    /// seconds a request body may go without delivering data, before the
+    /// server closes the connection. Bounds how long a stalled or malicious
+    /// client can hold a connection open. Default 30.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+}
+
+fn default_request_timeout_secs() -> u64 {
+    30
 }
 
 impl Default for ServerConfig {
@@ -86,6 +96,7 @@ impl Default for ServerConfig {
             run_dir: default_run_dir(),
             tls: TlsConfig::default(),
             throttling_enabled: None,
+            request_timeout_secs: default_request_timeout_secs(),
         }
     }
 }

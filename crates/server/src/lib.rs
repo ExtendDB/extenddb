@@ -45,6 +45,7 @@ pub use key_info_cache::CachedTableKeyInfoStore;
 use serde_json::json;
 use tower::ServiceBuilder;
 use tower_http::set_header::SetResponseHeaderLayer;
+use tower_http::timeout::RequestBodyTimeoutLayer;
 
 /// Application state shared across all handlers.
 pub struct AppState {
@@ -62,6 +63,8 @@ pub struct AppState {
     pub metrics: Arc<MetricsCollector>,
     /// Whether TLS is enabled (affects cookie Secure flag).
     pub tls_enabled: bool,
+    /// Header read timeout and body inactivity timeout for every connection.
+    pub request_timeout: Duration,
     /// Developer mode: authorization is opened for authenticated callers (SigV4
     /// is still verified). Only ever true in a `dev-mode` build bound to
     /// loopback; the bin's serve path enforces those preconditions.
@@ -120,6 +123,7 @@ pub async fn start_server(
     const DYNAMODB_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
     let tls_enabled = state.tls_enabled;
+    let request_timeout = state.request_timeout;
     let catalog_store = state.catalog_store.clone();
     let auth_cache_for_mgmt = state.auth_cache.clone();
     let auth_cache_for_console = state.auth_cache.clone();
@@ -199,7 +203,12 @@ pub async fn start_server(
     }
 
     // Apply security headers to all routes.
-    let app = app.layer(security_layers);
+    // A body that stops delivering data for `request_timeout` errors out, so a
+    // client that announces a Content-Length it never sends cannot hold the
+    // connection open. The handler answers that error with 408.
+    let app = app
+        .layer(security_layers)
+        .layer(RequestBodyTimeoutLayer::new(request_timeout));
 
     // Add HSTS header only when TLS is enabled.
     let app = if tls_enabled {
@@ -250,9 +259,27 @@ pub async fn start_server(
         // handshake. This gives users a helpful redirect instead of a
         // confusing TLS handshake failure.
         let redirect_acceptor = HttpsRedirectAcceptor { addr: local_addr };
-        axum_server::from_tcp_rustls(std_listener, rustls_config)?
+        let mut server = axum_server::from_tcp_rustls(std_listener, rustls_config)?
             .map(|tls| tls.acceptor(redirect_acceptor))
-            .handle(handle)
+            .handle(handle);
+        // HTTP/1: a connection that has not finished sending its request
+        // headers within `request_timeout` is closed; the same bound applies
+        // to the idle wait for the next request on a keep-alive connection.
+        server
+            .http_builder()
+            .http1()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(request_timeout);
+        // HTTP/2: a connection that stops answering PING frames is closed.
+        // A client that sends the preface and then stalls holds the
+        // connection for at most interval plus timeout.
+        server
+            .http_builder()
+            .http2()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .keep_alive_interval(Some(request_timeout))
+            .keep_alive_timeout(request_timeout);
+        server
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await?;
     } else {

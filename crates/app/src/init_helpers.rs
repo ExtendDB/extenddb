@@ -247,9 +247,10 @@ backend = "{backend}"
 [server]
 bind_addr = "{bind_addr}"
 # port = 18443                   # HTTPS port
-# region = "us-east-1"           # AWS region for ARN generation
+# region = "us-east-1"           # AWS region for ARN generation; requests must be signed for this region
 # run_dir = "{run_dir}"          # Directory for PID file
 # throttling_enabled = false     # Enable provisioned throughput throttling
+# request_timeout_secs = 30      # Close a connection whose headers or body stall this long
 
 [server.tls]
 # TLS is mandatory. The server refuses to start with enabled = false.
