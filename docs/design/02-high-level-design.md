@@ -340,15 +340,16 @@ UpdateItem is more complex than PutItem because the storage backend must also ap
 3. Dispatch to Query handler in engine
 4. Validate input: table name, key condition, index name
 5. Parse KeyConditionExpression → extract partition key value + sort key condition
-6. Call storage.query(table_name, index_name, key_condition, limit)
+6. Read from storage in chunks: storage.query(table_name, index_name, key_condition, chunk, cursor)
    - Storage backend: translate key condition to native query (e.g., SQL WHERE)
-   - Execute query with limit
-   - Return items + last evaluated key
-7. For each returned item:
-   a. If FilterExpression: evaluate against item, exclude non-matching
-   b. If ProjectionExpression: project to requested attributes only
-8. Accumulate response size; stop at 1 MB limit, set LastEvaluatedKey
-9. Calculate consumed capacity (total items read × item sizes → RCU)
+   - Execute query for one chunk after the cursor (first chunk 128 items, later chunks sized from the average item size seen so far, at most 1,024)
+   - Return items + whether more exist
+7. For each returned item, in arrival order:
+   a. Stop if the item would take evaluated bytes past 1 MB and at least one item has been evaluated (the page is full; nothing further is read from storage)
+   b. If FilterExpression: evaluate against item, exclude non-matching
+   c. If ProjectionExpression: project to requested attributes only
+8. Repeat step 6 from the last evaluated item until the page is full, Limit items have been evaluated, or storage is exhausted; set LastEvaluatedKey when more data may exist
+9. Calculate consumed capacity (evaluated item sizes → RCU)
 10. Format response (Items, Count, ScannedCount, LastEvaluatedKey, ConsumedCapacity)
 ```
 
