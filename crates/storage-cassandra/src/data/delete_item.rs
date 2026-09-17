@@ -226,13 +226,18 @@ impl CassandraEngine {
                 .response_body()
                 .map_err(|e| StorageError::Internal(format!("Parse response: {e}")))?;
 
-            let (old_item_opt, version, prepared_txn_id_opt) = if let Some(rows) = body.into_rows() {
+            let (old_item_opt, version, prepared_txn_id_opt) = if let Some(rows) = body.into_rows()
+            {
                 if let Some(row) = rows.into_iter().next() {
                     let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
                     let version: i64 = row.get_by_name("version").ok().flatten().unwrap_or(0);
                     let prepared_txn_id: Option<uuid::Uuid> =
                         row.get_by_name("prepared_txn_id").ok().flatten();
-                    (item_data.map(json_to_item).transpose()?, version, prepared_txn_id)
+                    (
+                        item_data.map(json_to_item).transpose()?,
+                        version,
+                        prepared_txn_id,
+                    )
                 } else {
                     (None, 0, None)
                 }
@@ -469,7 +474,11 @@ impl CassandraEngine {
                 let version: i64 = row.get_by_name("version").ok().flatten().unwrap_or(0);
                 let prepared_txn_id: Option<uuid::Uuid> =
                     row.get_by_name("prepared_txn_id").ok().flatten();
-                (item_data.map(json_to_item).transpose()?, version, prepared_txn_id)
+                (
+                    item_data.map(json_to_item).transpose()?,
+                    version,
+                    prepared_txn_id,
+                )
             } else {
                 (None, 0, None)
             };
@@ -1431,10 +1440,8 @@ impl CassandraEngine {
             ]);
             crate::cassandra_util::query_lwt(&self.session, cql, qv).await?
         } else {
-            let qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
-                Value::from(pk),
-                version.into(),
-            ]);
+            let qv =
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![Value::from(pk), version.into()]);
             crate::cassandra_util::query_lwt(&self.session, cql, qv).await?
         };
         crate::cassandra_util::lwt_applied(&result)
@@ -1482,8 +1489,8 @@ impl CassandraEngine {
             .await?;
         }
 
-        if let Some(cap) = stream {
-            if let Some(stmt) = crate::stream_util::stream_record_statement(
+        if let Some(cap) = stream
+            && let Some(stmt) = crate::stream_util::stream_record_statement(
                 data_keyspace,
                 &key_info.table_id,
                 key_info,
@@ -1492,10 +1499,9 @@ impl CassandraEngine {
                 cap,
                 &self.hlc,
                 self.stream_retention_seconds,
-            ) {
-                batch =
-                    batch.add_query(stmt, cdrs_tokio::query::QueryValues::SimpleValues(vec![]));
-            }
+            )
+        {
+            batch = batch.add_query(stmt, cdrs_tokio::query::QueryValues::SimpleValues(vec![]));
         }
 
         let built = batch
@@ -1512,4 +1518,3 @@ impl CassandraEngine {
         Ok(())
     }
 }
-

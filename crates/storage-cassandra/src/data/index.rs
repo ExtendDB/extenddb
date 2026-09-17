@@ -425,6 +425,7 @@ pub(crate) async fn enqueue_async_indexes(
 ///
 /// Adds a parameterized DELETE statement to the batch.
 /// Cassandra requires ALL PRIMARY KEY columns for DELETE.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn delete_index_row_multi(
     batch: &mut BatchQueryBuilder,
     account_keyspace: &str,

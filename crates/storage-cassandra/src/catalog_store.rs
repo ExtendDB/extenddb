@@ -412,8 +412,7 @@ impl RateLimitStore for CassandraCatalogStore {
         let session = self.session.clone();
         let catalog_keyspace = self.catalog_keyspace();
         Box::pin(async move {
-            let cutoff = chrono::Utc::now()
-                - chrono::Duration::seconds(window_seconds);
+            let cutoff = chrono::Utc::now() - chrono::Duration::seconds(window_seconds);
             let cutoff_ms = cutoff.timestamp_millis();
             let query = format!(
                 "SELECT COUNT(*) FROM {catalog_keyspace}.login_attempts \
@@ -421,7 +420,10 @@ impl RateLimitStore for CassandraCatalogStore {
                  ALLOW FILTERING"
             );
             let result = session
-                .query_with_values(&query, cdrs_tokio::query_values!(principal.as_str(), cutoff_ms))
+                .query_with_values(
+                    &query,
+                    cdrs_tokio::query_values!(principal.as_str(), cutoff_ms),
+                )
                 .await
                 .map_err(|e| {
                     tracing::error!("count_principal_failures: {e}");
@@ -447,8 +449,7 @@ impl RateLimitStore for CassandraCatalogStore {
         let session = self.session.clone();
         let catalog_keyspace = self.catalog_keyspace();
         Box::pin(async move {
-            let cutoff = chrono::Utc::now()
-                - chrono::Duration::seconds(window_seconds);
+            let cutoff = chrono::Utc::now() - chrono::Duration::seconds(window_seconds);
             let cutoff_ms = cutoff.timestamp_millis();
             // No partition key available for source_ip; ALLOW FILTERING is
             // acceptable because cleanup_old_attempts keeps the table bounded.
@@ -458,7 +459,10 @@ impl RateLimitStore for CassandraCatalogStore {
                  ALLOW FILTERING"
             );
             let result = session
-                .query_with_values(&query, cdrs_tokio::query_values!(source_ip.as_str(), cutoff_ms))
+                .query_with_values(
+                    &query,
+                    cdrs_tokio::query_values!(source_ip.as_str(), cutoff_ms),
+                )
                 .await
                 .map_err(|e| {
                     tracing::error!("count_ip_failures: {e}");
@@ -489,11 +493,7 @@ impl RateLimitStore for CassandraCatalogStore {
             if let Err(e) = session
                 .query_with_values(
                     &query,
-                    cdrs_tokio::query_values!(
-                        principal.as_str(),
-                        now_ms,
-                        source_ip.as_deref()
-                    ),
+                    cdrs_tokio::query_values!(principal.as_str(), now_ms, source_ip.as_deref()),
                 )
                 .await
             {
@@ -502,20 +502,21 @@ impl RateLimitStore for CassandraCatalogStore {
         })
     }
 
+    #[allow(clippy::result_large_err)] // response-body closure; boxing would ripple through cdrs plumbing
     fn cleanup_old_attempts(&self, max_age_seconds: i64) -> BoxFuture<'_, ()> {
         let session = self.session.clone();
         let catalog_keyspace = self.catalog_keyspace();
         Box::pin(async move {
-            let cutoff = chrono::Utc::now()
-                - chrono::Duration::seconds(max_age_seconds);
+            let cutoff = chrono::Utc::now() - chrono::Duration::seconds(max_age_seconds);
             let cutoff_ms = cutoff.timestamp_millis();
             // Fetch principals with old records, then delete by partition key.
             // Cassandra does not support DELETE ... WHERE non-pk < ? without
             // ALLOW FILTERING; fetching principals first avoids a full scan on delete.
-            let select = format!(
-                "SELECT DISTINCT principal FROM {catalog_keyspace}.login_attempts"
-            );
-            let principals = match session.query(&select).await
+            let select =
+                format!("SELECT DISTINCT principal FROM {catalog_keyspace}.login_attempts");
+            let principals = match session
+                .query(&select)
+                .await
                 .and_then(|r| r.response_body())
                 .map(|b| b.into_rows().unwrap_or_default())
             {
@@ -638,8 +639,12 @@ impl MetricsStore for CassandraCatalogStore {
                 let idx: String = get_column(&row, "index_name", "query_metrics")?;
                 let op: String = get_column(&row, "operation", "query_metrics")?;
 
-                if table_name.as_deref().is_some_and(|f| f != tn) { continue; }
-                if metric.as_deref().is_some_and(|f| f != metric_val) { continue; }
+                if table_name.as_deref().is_some_and(|f| f != tn) {
+                    continue;
+                }
+                if metric.as_deref().is_some_and(|f| f != metric_val) {
+                    continue;
+                }
 
                 out.push(MetricsRow {
                     bucket,

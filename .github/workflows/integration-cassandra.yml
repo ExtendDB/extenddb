@@ -1,0 +1,54 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+name: Cassandra Integration Tests
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main, feat/storage-cassandra-in-tree]
+
+permissions:
+  contents: read
+
+# The Cassandra backend's integration tests (crates/storage-cassandra/tests)
+# talk to a live node at 127.0.0.1:9042 with cassandra/cassandra credentials
+# and are not feature-gated — without this workflow they never run in CI and
+# every green result is a local claim. The TTL claim protocol in particular
+# fails silently if the stored item encoding drifts, so these tests are the
+# only automated signal for a whole class of regressions.
+#
+# A single-node container is enough: the tests create their own keyspaces
+# (RF=1) and run serially because the sweep and reconciliation passes are
+# global. The stock image uses AllowAllAuthenticator, so the credentials the
+# tests and health check send are accepted without an auth challenge.
+jobs:
+  cassandra-storage:
+    runs-on: ubuntu-latest
+    services:
+      cassandra:
+        image: cassandra:4.1
+        ports:
+          - 9042:9042
+        env:
+          CASSANDRA_CLUSTER_NAME: extenddb-ci
+          HEAP_NEWSIZE: 128M
+          MAX_HEAP_SIZE: 1024M
+        options: >-
+          --health-cmd "cqlsh -u cassandra -p cassandra -e 'SELECT release_version FROM system.local'"
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 60s
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Unit tests
+        run: cargo test -p extenddb-storage-cassandra --lib
+      - name: Metadata integration tests
+        run: cargo test -p extenddb-storage-cassandra --test metadata_integration -- --test-threads=1
+      - name: TTL integration tests
+        run: cargo test -p extenddb-storage-cassandra --test ttl_integration -- --test-threads=1

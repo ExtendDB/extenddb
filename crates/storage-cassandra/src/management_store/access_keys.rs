@@ -4,8 +4,8 @@
 //! Access key, session, and caller-tag operations for `CassandraCatalogStore`.
 
 use crate::catalog_store::CassandraCatalogStore;
-use cdrs_tokio::types::blob::Blob;
 use cdrs_tokio::types::IntoRustByName;
+use cdrs_tokio::types::blob::Blob;
 use extenddb_storage::management_store::{AccessKeyCreated, OpError, OpResult};
 
 impl CassandraCatalogStore {

@@ -131,7 +131,8 @@ impl CassandraEngine {
             .map(|k| k.attribute_name.as_str())
             .collect();
 
-        let key_not_exists_condition = is_attribute_not_exists_key(condition, &key_attr_names, maps);
+        let key_not_exists_condition =
+            is_attribute_not_exists_key(condition, &key_attr_names, maps);
         if key_not_exists_condition && ttl_config.is_none() {
             return self
                 .put_item_if_not_exists(
@@ -702,8 +703,10 @@ mod tests {
     }
 
     fn maps_with_names(pairs: &[(&str, &str)]) -> ExpressionMaps {
-        let names: HashMap<String, String> =
-            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let names: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         ExpressionMaps::new(names, HashMap::new())
     }
 

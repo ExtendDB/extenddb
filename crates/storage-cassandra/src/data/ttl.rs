@@ -420,6 +420,40 @@ impl TtlRepairGuard {
     }
 }
 
+/// Whether `entry` is registered, in any state, at `LOCAL_QUORUM`.
+///
+/// The audit's healthy-item fast path: one read, no Paxos, no bucket-registry
+/// writes. Any state counts as registered — a claimed row is being expired,
+/// which is the strongest possible form of "not lost".
+pub(crate) async fn ttl_entry_registered(
+    engine: &CassandraEngine,
+    account_keyspace: &str,
+    table_id: &str,
+    generation: uuid::Uuid,
+    entry: &TtlEntry,
+) -> Result<bool, StorageError> {
+    let rows = crate::cassandra_util::query_rows_quorum(
+        &engine.session,
+        &format!(
+            "SELECT key_hash FROM {account_keyspace}.{TTL_QUEUE_TABLE} \
+             WHERE table_id = ? AND generation = ? AND bucket = ? AND shard = ? \
+             AND expires_at = ? AND key_hash = ? AND key_data = ?"
+        ),
+        cdrs_tokio::query_values!(
+            table_id,
+            cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
+            entry.bucket,
+            entry.shard,
+            entry.expires_at,
+            entry.key_hash.as_str(),
+            entry.key_data.as_str()
+        ),
+        "ttl_entry_registered",
+    )
+    .await?;
+    Ok(!rows.is_empty())
+}
+
 async fn ensure_ttl_bucket_registration(
     engine: &CassandraEngine,
     account_keyspace: &str,
@@ -467,7 +501,7 @@ pub(crate) async fn insert_ttl_entry(
     table_id: &str,
     generation: uuid::Uuid,
     entry: &TtlEntry,
-) -> Result<(), StorageError> {
+) -> Result<bool, StorageError> {
     let generation_bytes = cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec());
 
     // Restore discoverability before the fast path, then confirm it again after
@@ -502,7 +536,7 @@ pub(crate) async fn insert_ttl_entry(
         if TtlWorkState::parse(state.as_deref())? == TtlWorkState::Pending {
             ensure_ttl_bucket_registration(engine, account_keyspace, table_id, generation, entry)
                 .await?;
-            return Ok(());
+            return Ok(false);
         }
         // Claimed work owns this key and may row-delete it while crashing
         // before its compensating reconcile. Reporting success here would
@@ -548,13 +582,13 @@ pub(crate) async fn insert_ttl_entry(
     if applied {
         ensure_ttl_bucket_registration(engine, account_keyspace, table_id, generation, entry)
             .await?;
-        return Ok(());
+        return Ok(true);
     }
     let state: Option<String> = row.get_by_name("state").ok().flatten();
     if state.as_deref() == Some("PENDING") {
         ensure_ttl_bucket_registration(engine, account_keyspace, table_id, generation, entry)
             .await?;
-        return Ok(());
+        return Ok(false);
     }
     Err(StorageError::Transient(
         "TTL reconciliation deferred by in-flight expiration work".to_owned(),

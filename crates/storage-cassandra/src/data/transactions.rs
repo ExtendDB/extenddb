@@ -280,11 +280,15 @@ impl CassandraEngine {
 
         match prepare_result {
             Ok(computed_items) => {
-                // Fill in item_data for UPDATE ops now that PREPARE has computed them
-                for (ledger_op, computed) in ledger_ops.iter_mut().zip(computed_items.iter()) {
+                // Fill in the UPDATE post-images and every op's pre-commit
+                // image now that PREPARE has read them.
+                for (ledger_op, (computed, pre_commit)) in
+                    ledger_ops.iter_mut().zip(computed_items.iter())
+                {
                     if let Some(data) = computed {
                         ledger_op.item_data = Some(data.clone());
                     }
+                    ledger_op.pre_commit_item_data = pre_commit.clone();
                 }
                 // Update ledger blob with full data before transitioning to COMMITTING
                 self.update_ledger_blob(&account_keyspace, txn_id, &ledger_ops)
@@ -330,9 +334,9 @@ impl CassandraEngine {
         ops: &[TransactWriteOp<'_>],
         txn_id: Uuid,
         txn_timestamp: i64,
-    ) -> Result<Vec<Option<String>>, Vec<CancellationReason>> {
+    ) -> Result<Vec<(Option<String>, Option<String>)>, Vec<CancellationReason>> {
         let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());
-        let mut computed: Vec<Option<String>> = Vec::with_capacity(ops.len());
+        let mut computed: Vec<(Option<String>, Option<String>)> = Vec::with_capacity(ops.len());
         let mut any_failed = false;
 
         for op in ops {
@@ -347,7 +351,7 @@ impl CassandraEngine {
                 Err(r) => {
                     any_failed = true;
                     reasons.push(r);
-                    computed.push(None);
+                    computed.push((None, None));
                 }
             }
         }
@@ -359,6 +363,16 @@ impl CassandraEngine {
         }
     }
 
+    /// Serialize a pre-commit image for ledger persistence.
+    fn pre_commit_json(existing: Option<&Item>) -> Result<Option<String>, CancellationReason> {
+        existing
+            .map(|item| {
+                serde_json::to_string(item)
+                    .map_err(|e| CancellationReason::validation_error(e.to_string()))
+            })
+            .transpose()
+    }
+
     /// Prepare a single transactional operation.
     ///
     /// Returns `Ok(Some(item_data_json))` for UPDATE (the post-mutation state),
@@ -368,7 +382,7 @@ impl CassandraEngine {
         op: &TransactWriteOp<'_>,
         txn_id: Uuid,
         txn_timestamp: i64,
-    ) -> Result<Option<String>, CancellationReason> {
+    ) -> Result<(Option<String>, Option<String>), CancellationReason> {
         match op {
             TransactWriteOp::Put {
                 key_info,
@@ -450,7 +464,7 @@ impl CassandraEngine {
                         Err(r) => return Err(r),
                     }
                 }
-                Ok(None)
+                Ok((None, Self::pre_commit_json(existing.as_ref())?))
             }
             TransactWriteOp::Delete {
                 key_info,
@@ -487,7 +501,7 @@ impl CassandraEngine {
                 // Execute PREPARE
                 self.prepare_item(key_info, key, txn_id, txn_timestamp, false)
                     .await?;
-                Ok(None)
+                Ok((None, Self::pre_commit_json(existing.as_ref())?))
             }
             TransactWriteOp::Update {
                 key_info,
@@ -595,7 +609,7 @@ impl CassandraEngine {
                 // Return the computed final item so the caller can update the ledger blob
                 let item_json = serde_json::to_string(&item)
                     .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
-                Ok(Some(item_json))
+                Ok((Some(item_json), Self::pre_commit_json(existing.as_ref())?))
             }
             TransactWriteOp::ConditionCheck {
                 key_info,
@@ -630,7 +644,7 @@ impl CassandraEngine {
                 )?;
 
                 // ConditionCheck doesn't prepare any item
-                Ok(None)
+                Ok((None, Self::pre_commit_json(existing.as_ref())?))
             }
         }
     }
@@ -831,6 +845,7 @@ impl CassandraEngine {
                     sk_col,
                     sk_val,
                     item_data,
+                    pre_commit_item_data: None,
                 })
             })
             .collect()
@@ -911,12 +926,7 @@ impl CassandraEngine {
     /// Called on every cancellation path to prevent token poisoning (B5): a
     /// token reserved before the ledger is committed must be released if the
     /// transaction is cancelled, so a retry with the same token can proceed.
-    async fn delete_idempotency_token(
-        &self,
-        keyspace: &str,
-        account_id: &str,
-        token: &str,
-    ) {
+    async fn delete_idempotency_token(&self, keyspace: &str, account_id: &str, token: &str) {
         let delete_query = format!(
             "DELETE FROM {keyspace}.idempotency_tokens_by_account \
              WHERE account_id = ? AND \"token\" = ?"
@@ -1568,19 +1578,34 @@ impl CassandraEngine {
                     }
                 }
                 for op in &ops {
-                    if matches!(op.op.as_str(), "PUT" | "UPDATE")
-                        && let Some(item_data) = op.item_data.as_deref()
-                    {
-                        // Recovery can only re-register the committed image:
-                        // the ledger does not persist the pre-commit image,
-                        // so a transaction that crashes between COMMIT and
-                        // reconciliation can leave the item's previous
-                        // expiration entry in the queue. That entry is
-                        // harmless — the worker revalidates the item before
-                        // deleting anything and retires the entry when it
-                        // comes due — but it is queue garbage until then.
-                        self.reconcile_ttl_item_by_table_id(&op.table_id, item_data)
+                    // The ledger persists the pre-commit image at PREPARE, so
+                    // recovery retires the queue entry the item had before the
+                    // transaction as well as registering the committed one —
+                    // the same transition the live commit path performs. That
+                    // covers DELETE ops too, which previously left their old
+                    // entry queued until its original due time. A ledger
+                    // written before the field exists deserializes it as None,
+                    // and recovery for it stays insert-only (the worker
+                    // revalidates before deleting anything, so the stale entry
+                    // is inert garbage, not a hazard).
+                    match op.op.as_str() {
+                        "PUT" | "UPDATE" => {
+                            self.reconcile_ttl_transition_by_table_id(
+                                &op.table_id,
+                                op.pre_commit_item_data.as_deref(),
+                                op.item_data.as_deref(),
+                            )
                             .await?;
+                        }
+                        "DELETE" => {
+                            self.reconcile_ttl_transition_by_table_id(
+                                &op.table_id,
+                                op.pre_commit_item_data.as_deref(),
+                                None,
+                            )
+                            .await?;
+                        }
+                        _ => {}
                     }
                 }
             }

@@ -3,6 +3,7 @@
 
 //! Background processing for DynamoDB TTL expiration.
 
+use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,10 +14,33 @@ use extenddb_storage::{CancellationToken, MetadataEngine, TableEngine, sleep_or_
 use crate::CassandraEngine;
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(60);
-const BATCH_SIZE: usize = 100;
+/// Queue rows one sweep cycle will process per table. The queue is 64-way
+/// sharded into independent partitions and every row transition is
+/// conditional on its exact work id, so rows are processed concurrently
+/// (see [`TTL_SWEEP_CONCURRENCY`]) and the batch can be sized by throughput
+/// need rather than by serial round-trip time. Raising this above the other
+/// backends' 100 is deliberate: their sweeps re-scan an indexed table, ours
+/// drains a queue, and the per-table lease means the work happens exactly
+/// once.
+const BATCH_SIZE: usize = 1_000;
+/// Concurrent in-flight rows per sweep. Each row costs a handful of quorum
+/// reads and LWTs; concurrency hides that latency without changing the
+/// protocol, because rows in different queue partitions are independent and
+/// two entries for the same item key resolve through the base-row claim (the
+/// loser leaves its row for the next cycle).
+const TTL_SWEEP_CONCURRENCY: usize = 16;
+/// Rows processed between lease renewals and config re-checks.
+const TTL_SWEEP_RENEW_EVERY: usize = 64;
 /// Rows drained per cleanup pass for a retired generation. Cleanup is retried
 /// every cycle until the generation is empty, so this only bounds one pass.
 const DRAIN_BATCH_SIZE: usize = 100;
+/// Interval between full audits of a TTL-enabled table's expiration queue.
+///
+/// The audit is a paged base-table scan, so it is priced like the enable
+/// backfill and run rarely. Six hours bounds how long a lost registration can
+/// go unnoticed while keeping steady-state cost at four scans per table per
+/// day.
+const AUDIT_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 pub(crate) async fn ttl_cleanup_worker(
     storage: Arc<CassandraEngine>,
@@ -38,10 +62,72 @@ pub(crate) async fn ttl_cleanup_worker(
 /// Unresolved markers are deliberately non-dischargeable and can accumulate
 /// after repeated process crashes. Keeping this pass on its own task prevents
 /// that operational debt from delaying the bounded expiration worker.
-pub(crate) async fn ttl_repair_worker(storage: Arc<CassandraEngine>, token: CancellationToken) {
+pub(crate) async fn ttl_repair_worker(
+    storage: Arc<CassandraEngine>,
+    metrics: Arc<MetricsCollector>,
+    token: CancellationToken,
+) {
     while sleep_or_shutdown(&token, SCAN_INTERVAL).await {
-        if let Err(error) = reconcile_inflight_repairs_once(&storage).await {
-            tracing::warn!("TTL worker: inflight repair reconciliation failed: {error}");
+        match reconcile_inflight_repairs_once(&storage).await {
+            Ok((observed_markers, _resolved)) => {
+                metrics.record_ttl_repair_markers(observed_markers as f64);
+            }
+            Err(error) => {
+                tracing::warn!("TTL worker: inflight repair reconciliation failed: {error}");
+            }
+        }
+    }
+}
+
+/// Periodically rescan every ready TTL table and re-register any item whose
+/// queue entry is missing.
+///
+/// This is the self-healing pass. Everything else in the TTL design tries to
+/// prevent a registration from being lost — the in-batch queue mutation, the
+/// write outbox, the destroy handshake — but a queue entry can be created only
+/// by a write or by the enable backfill, so any loss that slips through every
+/// guard is *permanent* for an item that is never written again, and nothing
+/// alarms. The audit converts that class from permanent to
+/// eventually-corrected, and its repair metric is the drift signal: a repair
+/// means some loss path fired, and sustained repairs mean one is firing
+/// repeatedly.
+pub(crate) async fn ttl_audit_worker(
+    storage: Arc<CassandraEngine>,
+    metrics: Arc<MetricsCollector>,
+    token: CancellationToken,
+) {
+    while sleep_or_shutdown(&token, AUDIT_INTERVAL).await {
+        audit_ttl_queues_once(&storage, &metrics).await;
+    }
+}
+
+/// One audit pass over every ready TTL table. Public for direct backend
+/// integration tests and manual operational triggering.
+pub async fn audit_ttl_queues_once(storage: &CassandraEngine, metrics: &MetricsCollector) {
+    let tables = match MetadataEngine::all_tables_with_ttl_index_ready(storage).await {
+        Ok(tables) => tables,
+        Err(error) => {
+            tracing::warn!("TTL audit: failed to list tables: {error}");
+            return;
+        }
+    };
+    for (account_id, table_name, attribute) in &tables {
+        match storage
+            .audit_ttl_queue_for_table(account_id, table_name, attribute, metrics)
+            .await
+        {
+            Ok(Some(repaired)) if repaired > 0 => {
+                tracing::warn!(
+                    account_id,
+                    table = %table_name,
+                    repaired,
+                    "TTL audit repaired missing queue registrations; some loss path fired"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!("TTL audit: {table_name} failed: {error}");
+            }
         }
     }
 }
@@ -55,6 +141,36 @@ pub async fn reconcile_pending_once(
 ) -> Result<usize, StorageError> {
     reconcile_pending_older_than(storage, limit, 0).await
 }
+
+/// Keyspaces the background TTL passes should visit this cycle.
+///
+/// Steady state visits only accounts that have a TTL-enabled table: on a
+/// deployment with many accounts and few TTL users, scanning every keyspace's
+/// 64 outbox partitions each minute is almost entirely empty reads. Every
+/// [`FULL_SCAN_EVERY`]th cycle widens to all account keyspaces, so rows left
+/// behind for since-disabled or since-deleted tables are still eventually
+/// drained rather than lingering forever.
+async fn ttl_scan_keyspaces(
+    storage: &CassandraEngine,
+    cycle: u64,
+) -> Result<Vec<String>, StorageError> {
+    const FULL_SCAN_EVERY: u64 = 10;
+    if cycle.is_multiple_of(FULL_SCAN_EVERY) {
+        return crate::workers::list_account_keyspaces(storage).await;
+    }
+    let tables = MetadataEngine::all_tables_with_ttl(storage).await?;
+    let mut keyspaces: Vec<String> = tables
+        .iter()
+        .map(|(account_id, _, _)| storage.account_keyspace(account_id))
+        .collect();
+    keyspaces.sort_unstable();
+    keyspaces.dedup();
+    Ok(keyspaces)
+}
+
+/// Monotonic pass counter shared by the background TTL passes, driving the
+/// periodic widening in [`ttl_scan_keyspaces`].
+static TTL_SCAN_CYCLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// [`reconcile_pending_once`] with an explicit minimum record age in seconds.
 /// A negative age is useful in tests to include a just-inserted coordinator
@@ -71,7 +187,12 @@ pub async fn reconcile_pending_older_than(
     if limit == 0 {
         return Ok(0);
     }
-    let keyspaces = crate::workers::list_account_keyspaces(storage).await?;
+    let cycle = if min_age_seconds < 0 {
+        0
+    } else {
+        TTL_SCAN_CYCLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    };
+    let keyspaces = ttl_scan_keyspaces(storage, cycle).await?;
     let slots = crate::data::ttl::TTL_SHARDS as usize;
     // A global first-N scan can starve later keyspaces forever under sustained
     // writes. Treat `limit` as a per-account soft bound and give every one of
@@ -251,9 +372,10 @@ const OUTBOX_MAX_PAGES_PER_PARTITION: usize = 8;
 /// represents operational debt and is logged for visibility.
 pub async fn reconcile_inflight_repairs_once(
     storage: &CassandraEngine,
-) -> Result<usize, StorageError> {
+) -> Result<(usize, usize), StorageError> {
     use cdrs_tokio::types::IntoRustByName;
 
+    let mut observed = 0usize;
     let mut processed = 0usize;
     for keyspace in crate::workers::list_account_keyspaces(storage).await? {
         let registry = match crate::cassandra_util::query_rows_quorum(
@@ -378,6 +500,7 @@ pub async fn reconcile_inflight_repairs_once(
                 );
             }
             for row in rows {
+                observed += 1;
                 let parsed = (|| -> Result<_, StorageError> {
                     let repair_id: uuid::Uuid =
                         row.get_r_by_name("repair_id").map_err(|error| {
@@ -480,7 +603,7 @@ pub async fn reconcile_inflight_repairs_once(
             }
         }
     }
-    Ok(processed)
+    Ok((observed, processed))
 }
 
 /// Finish or abort work that was already claimed when a TTL generation was
@@ -692,7 +815,6 @@ async fn process_ttl_work_row(
     storage: &CassandraEngine,
     key_info: &extenddb_core::types::TableKeyInfo,
     config: &crate::data::ttl::TtlConfig,
-    sweep_owner: uuid::Uuid,
     mut work: crate::data::ttl::TtlWorkRow,
 ) -> Result<bool, StorageError> {
     use crate::data::ttl::{TtlStreamPlan, TtlWorkData, TtlWorkState};
@@ -879,19 +1001,22 @@ async fn process_ttl_work_row(
         // and image. A stale replica cannot satisfy either LWT. If this task
         // was suspended past either lease, it walks away before index or stream
         // mutations become visible.
-        let lease_current = match storage
-            .renew_ttl_sweep_lease(
-                &key_info.account_id,
-                &key_info.table_name,
-                config,
-                sweep_owner,
-            )
+        // Last lifecycle gate before irreversible effects: a quorum config
+        // read, deliberately NOT a lease renewal. Sixteen concurrent rows all
+        // renewing would contend on one catalog partition's Paxos and undo
+        // the concurrency this sweep exists for; the wave loop already renews
+        // the lease between waves, and the per-row fence that matters is the
+        // seal below, whose Paxos is per item partition. This read only needs
+        // to detect that TTL was disabled or regenerated while this row was
+        // in flight.
+        let lifecycle_current = match storage
+            .ttl_config_for_table_quorum(&key_info.account_id, &key_info.table_name)
             .await
         {
-            Ok(current) => current,
+            Ok(current) => current.as_ref() == Some(config),
             Err(error) => return Err(error),
         };
-        if !lease_current {
+        if !lifecycle_current {
             return Ok(false);
         }
         let owner_current = match storage
@@ -1119,7 +1244,10 @@ pub async fn sweep_once(storage: &CassandraEngine, metrics: &MetricsCollector) {
             )
             .await?;
             let mut deleted = 0usize;
-            for row in work {
+            for wave in work.chunks(TTL_SWEEP_RENEW_EVERY) {
+                // One renewal and config check per wave instead of per row;
+                // the pre-effects gate inside process_ttl_work_row still
+                // re-verifies the config before anything irreversible.
                 if storage.ttl_config_for_table(account_id, table_name).await?
                     != Some(config.clone())
                     || !storage
@@ -1128,14 +1256,36 @@ pub async fn sweep_once(storage: &CassandraEngine, metrics: &MetricsCollector) {
                 {
                     break;
                 }
-                let expires_at = row.entry.expires_at;
-                if process_ttl_work_row(storage, &key_info, &config, owner, row).await? {
-                    deleted += 1;
-                    metrics.record_ttl_deletion(table_name);
-                    metrics.record_ttl_staleness(
-                        table_name,
-                        now_epoch.saturating_sub(expires_at) as f64,
-                    );
+                let outcomes = futures::stream::iter(wave.iter().cloned().map(|row| {
+                    let key_info = &key_info;
+                    let config = &config;
+                    async move {
+                        let expires_at = row.entry.expires_at;
+                        let outcome = process_ttl_work_row(storage, key_info, config, row).await;
+                        (expires_at, outcome)
+                    }
+                }))
+                .buffer_unordered(TTL_SWEEP_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+                for (expires_at, outcome) in outcomes {
+                    match outcome {
+                        Ok(true) => {
+                            deleted += 1;
+                            metrics.record_ttl_deletion(table_name);
+                            metrics.record_ttl_staleness(
+                                table_name,
+                                now_epoch.saturating_sub(expires_at) as f64,
+                            );
+                        }
+                        Ok(false) => {}
+                        // One row's failure must not abandon the wave or the
+                        // table: its durable queue state drives its own retry.
+                        Err(error) => {
+                            metrics.record_ttl_sweep_row_error(table_name);
+                            tracing::warn!("TTL worker: row failed in {table_name}: {error}");
+                        }
+                    }
                 }
             }
             Ok(deleted)

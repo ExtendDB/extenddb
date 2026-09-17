@@ -47,6 +47,25 @@ pub struct CassandraEngine {
     /// Default GSI propagation delay in milliseconds (for async indexes)
     pub(crate) gsi_default_delay_ms: Arc<std::sync::atomic::AtomicU64>,
 
+    /// Short-lived cache of per-table TTL configuration for the write path.
+    ///
+    /// Every Put/Update/Delete needs the config, and reading it from the
+    /// catalog per write is one of the two remaining per-write catalog costs.
+    /// Entries live [`TTL_CONFIG_CACHE_TTL`]; staleness is bounded and safe in
+    /// both directions *because the audit exists*: a stale `None` makes a
+    /// write skip its queue mutation (the audit re-registers the item), and a
+    /// stale generation enqueues into a retired generation (dead rows;
+    /// the audit registers the live one). The enable-quiescence window in the
+    /// ADR must exceed this TTL, and `update_ttl` invalidates locally so the
+    /// issuing host is coherent immediately.
+    pub(crate) ttl_config_cache: TtlConfigCache,
+
+    /// Bumped by every TTL-config invalidation. A cache miss snapshots it
+    /// before the catalog read and declines to repopulate if it moved — so a
+    /// lifecycle change that lands mid-read cannot be shadowed by the stale
+    /// value being inserted after the invalidation ran.
+    pub(crate) ttl_config_cache_epoch: Arc<std::sync::atomic::AtomicU64>,
+
     /// GSI queue handle for waking workers after async enqueues
     pub(crate) gsi_queue: Arc<crate::gsi_queue::GsiQueue>,
 
@@ -74,6 +93,16 @@ pub struct CassandraEngine {
 /// Cap on concurrently in-flight detached TTL claim releases.
 const TTL_RELEASE_MAX_IN_FLIGHT: usize = 1_024;
 
+/// `(account_id, table_name)` → `(fetched_at, config)`; see the field docs.
+pub(crate) type TtlConfigCache = Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            (String, String),
+            (std::time::Instant, Option<crate::data::ttl::TtlConfig>),
+        >,
+    >,
+>;
+
 impl CassandraEngine {
     /// Create a new Cassandra storage engine.
     pub async fn new(config: &CassandraStorageConfig, region: &str) -> Result<Self, StorageError> {
@@ -88,6 +117,8 @@ impl CassandraEngine {
             datacenter: config.datacenter.clone(),
             control_plane_notify: Arc::new(tokio::sync::Notify::new()),
             gsi_default_delay_ms: Arc::new(std::sync::atomic::AtomicU64::new(10)), // Default 10ms
+            ttl_config_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ttl_config_cache_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gsi_queue: crate::gsi_queue::GsiQueue::new(),
             hlc: crate::stream_util::new_shared_hlc(
                 config.instance_id.as_deref().unwrap_or("default"),

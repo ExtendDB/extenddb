@@ -100,7 +100,7 @@ impl CassandraEngine {
                 )
                 .await;
             let (old_json, version) = match read {
-                Ok(read) => read,                // Another owner holds the row. On a TTL-enabled table that is
+                Ok(read) => read, // Another owner holds the row. On a TTL-enabled table that is
                 // transient, so treat it like a lost OCC race and re-read.
                 Err(StorageError::TransactionConflict(message)) => {
                     if attempt == OCC_MAX_RETRIES {
@@ -511,4 +511,3 @@ impl CassandraEngine {
         Ok(true)
     }
 }
-
