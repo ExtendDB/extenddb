@@ -286,6 +286,20 @@ impl CassandraEngine {
                 // concurrent writers. Without this, a concurrent UpdateItem that
                 // read the same pre-image can race the plain DELETE.
                 if old_item_opt.is_some() {
+                    // The transaction prepare path consults this high-water mark to
+                    // order new-item PUTs against deletes in the same partition; the
+                    // claimed and transactional delete paths write it before their
+                    // delete, and this fast path must too. Written before the fence:
+                    // if the fence then refuses, a spuriously advanced mark is
+                    // harmless (it only widens a conservative check), while the
+                    // reverse order can lose the mark on a crash between the two.
+                    self.update_partition_max_delete_timestamp_at(
+                        &data_keyspace,
+                        &ddb_table,
+                        &pk_text,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await?;
                     let fence_cql = format!(
                         "DELETE FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ? \
                          IF version = ? AND prepared_txn_id = null"
@@ -523,6 +537,20 @@ impl CassandraEngine {
                 // No TTL claim and no transaction owner: use an OCC LWT to fence
                 // concurrent writers.
                 if old_item_opt.is_some() {
+                    // The transaction prepare path consults this high-water mark to
+                    // order new-item PUTs against deletes in the same partition; the
+                    // claimed and transactional delete paths write it before their
+                    // delete, and this fast path must too. Written before the fence:
+                    // if the fence then refuses, a spuriously advanced mark is
+                    // harmless (it only widens a conservative check), while the
+                    // reverse order can lose the mark on a crash between the two.
+                    self.update_partition_max_delete_timestamp_at(
+                        &data_keyspace,
+                        &ddb_table,
+                        &pk_text,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await?;
                     let fence_cql = format!(
                         "DELETE FROM {data_keyspace}.{ddb_table} WHERE pk = ? \
                          IF version = ? AND prepared_txn_id = null"
