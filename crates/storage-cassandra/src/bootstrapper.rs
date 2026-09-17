@@ -102,7 +102,7 @@ impl CassandraBootstrapper {
                     .clone()
                     .try_into()
                     .map_err(|e: toml::de::Error| {
-                        StorageError::Internal(format!("Invalid cassandra config: {e}"))
+                        StorageError::Internal(format!("Invalid Cassandra config: {e}"))
                     })?;
 
             // Check for conflicts between CLI args and config values
@@ -470,7 +470,7 @@ impl Bootstrapper for CassandraBootstrapper {
 
         // Create default account
         let account_id = generate_account_id();
-        println!("--- Creating default account '{account_id}'...");
+        println!("--- Creating default account...");
         let account_name = "default";
 
         let insert_cql = format!(
@@ -486,18 +486,18 @@ impl Bootstrapper for CassandraBootstrapper {
             .await
             .map_err(|e| OpError::Internal(format!("Create account: {e}")))?;
 
-        println!("    Account ID: {account_id}");
+        println!("    Default account created");
 
         // Create account-specific keyspace
         let account_keyspace = self.engine.account_keyspace(&account_id);
-        println!("--- Creating account keyspace '{account_keyspace}'...");
+        println!("--- Creating account keyspace...");
         self.engine
             .create_keyspace(&account_keyspace)
             .await
             .map_err(|e| OpError::Internal(format!("Create account keyspace: {e}")))?;
 
         // Run data migrations in account keyspace
-        println!("--- Running data migrations for account '{account_id}'...");
+        println!("--- Running data migrations for default account...");
         migrations::run_data_migrations(&self.engine.session_arc(), &account_keyspace).await?;
 
         Ok(())
@@ -527,7 +527,7 @@ impl Bootstrapper for CassandraBootstrapper {
             .is_some_and(|rows| !rows.is_empty());
 
         if exists {
-            println!("--- Admin user '{username}' already exists, skipping.");
+            println!("--- Admin user already exists, skipping.");
             return Ok(AdminBootstrapResult {
                 username: username.to_string(),
                 generated_password: None,
@@ -536,7 +536,7 @@ impl Bootstrapper for CassandraBootstrapper {
             });
         }
 
-        println!("--- Creating admin user '{username}'...");
+        println!("--- Creating admin user...");
 
         // Generate or use provided password
         let password = if let Some(pw) = env_password {
