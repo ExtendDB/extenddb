@@ -1669,3 +1669,100 @@ def test_query_empty_key_condition_expression_rejected(dynamodb_client):
             err["Message"]
             == "Invalid KeyConditionExpression: The expression can not be empty;"
         ), err
+
+
+# ---------------------------------------------------------------------------
+# String sort key ordering: UTF-8 byte order
+# ---------------------------------------------------------------------------
+
+
+# Sort keys whose byte order and locale order disagree. Byte order puts every
+# ASCII upper-case letter before `_`, `_` before lower case, `a_z` before `ab`,
+# and multi-byte characters last. A locale collation (en_US.utf8) interleaves
+# case, ignores `_` at the first level, and places `é` between `e` and `f`.
+BYTE_ORDER_KEYS = [
+    "A", "B", "Z", "_", "a", "a b", "a-b", "a0", "a_z", "ab", "a~", "b", "z", "\u00e9", "\u4e2d",
+]
+
+
+@pytest.fixture(scope="class")
+def byte_order_table(dynamodb_client):
+    """Hash+range (S,S) table holding BYTE_ORDER_KEYS in one partition."""
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+        ],
+        key_schema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+    ) as name:
+        for k in BYTE_ORDER_KEYS:
+            dynamodb_client.put_item(TableName=name, Item={"pk": {"S": "p"}, "sk": {"S": k}})
+        yield name
+
+
+class TestStringSortKeyByteOrder:
+    """The service orders string sort keys by UTF-8 byte value, and its range
+    conditions compare the same way. Measured 2026-09-16 with exactly these
+    keys: forward order `A B Z _ a "a b" a-b a0 a_z ab a~ b z é 中`, reverse is
+    the mirror, `BETWEEN '_' AND 'b'` returns `_` through `b`, and
+    `begins_with 'a'` returns the seven keys starting with a lower-case a."""
+
+    expected = sorted(BYTE_ORDER_KEYS, key=lambda s: s.encode("utf-8"))
+
+    def _query(self, client, table, **kwargs):
+        return client.query(
+            TableName=table,
+            KeyConditionExpression=kwargs.pop("cond", "pk = :p"),
+            ExpressionAttributeValues={":p": {"S": "p"}, **kwargs.pop("values", {})},
+            **kwargs,
+        )
+
+    def test_forward_order_is_byte_order(self, dynamodb_client, byte_order_table):
+        resp = self._query(dynamodb_client, byte_order_table)
+        assert [i["sk"]["S"] for i in resp["Items"]] == self.expected
+
+    def test_reverse_order_is_reversed_byte_order(self, dynamodb_client, byte_order_table):
+        resp = self._query(dynamodb_client, byte_order_table, ScanIndexForward=False)
+        assert [i["sk"]["S"] for i in resp["Items"]] == self.expected[::-1]
+
+    def test_between_compares_bytes(self, dynamodb_client, byte_order_table):
+        resp = self._query(
+            dynamodb_client,
+            byte_order_table,
+            cond="pk = :p AND sk BETWEEN :lo AND :hi",
+            values={":lo": {"S": "_"}, ":hi": {"S": "b"}},
+        )
+        assert [i["sk"]["S"] for i in resp["Items"]] == [
+            "_", "a", "a b", "a-b", "a0", "a_z", "ab", "a~", "b",
+        ]
+
+    def test_begins_with_compares_bytes(self, dynamodb_client, byte_order_table):
+        resp = self._query(
+            dynamodb_client,
+            byte_order_table,
+            cond="pk = :p AND begins_with(sk, :pre)",
+            values={":pre": {"S": "a"}},
+        )
+        assert [i["sk"]["S"] for i in resp["Items"]] == [
+            "a", "a b", "a-b", "a0", "a_z", "ab", "a~",
+        ]
+
+    def test_pages_of_one_visit_every_key_once_in_byte_order(
+        self, dynamodb_client, byte_order_table
+    ):
+        """A page cursor is compared the same way the page is ordered, so no
+        key is skipped or repeated across page boundaries that fall between
+        keys the two orders disagree on (`_`/`a`, `a_z`/`ab`, `z`/`é`)."""
+        seen: list[str] = []
+        kwargs: dict = {"Limit": 1}
+        while True:
+            resp = self._query(dynamodb_client, byte_order_table, **kwargs)
+            seen += [i["sk"]["S"] for i in resp["Items"]]
+            if "LastEvaluatedKey" not in resp:
+                break
+            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        assert seen == self.expected
