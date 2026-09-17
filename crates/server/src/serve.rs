@@ -347,6 +347,12 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
              soft_ttl_seconds, negative_ttl_seconds, max_entries."
         );
     }
+    if app_config.server.request_timeout_secs == 0 {
+        anyhow::bail!(
+            "Invalid [server] configuration: request_timeout_secs must be at least 1 \
+             (0 would close every connection before it could send a request)."
+        );
+    }
     if !cache_enabled {
         tracing::warn!(
             "auth.cache.enabled = false — auth/authz caches are in pass-through mode \
@@ -365,9 +371,11 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
             make_cache_cfg("credential"),
         )
     });
-    let auth: Arc<dyn extenddb_auth::AuthProvider> = Arc::new(
-        extenddb_auth::BuiltinAuthProvider::new((*cached_cred_store).clone()),
-    );
+    let auth: Arc<dyn extenddb_auth::AuthProvider> =
+        Arc::new(extenddb_auth::BuiltinAuthProvider::new(
+            (*cached_cred_store).clone(),
+            app_config.server.region.as_str(),
+        ));
 
     // Phase 3: Build the authorization cache.
     let authz_cache: Arc<crate::CachedAuthzStore> = {
@@ -559,6 +567,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         ),
         metrics: metrics.clone(),
         tls_enabled,
+        request_timeout: Duration::from_secs(app_config.server.request_timeout_secs),
         dev_mode,
         import_paths,
         export_paths,

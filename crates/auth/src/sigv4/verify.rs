@@ -17,6 +17,36 @@ use super::signing_key;
 /// Maximum allowed clock skew between client and server (±15 minutes).
 const MAX_CLOCK_SKEW_SECS: i64 = 15 * 60;
 
+/// Check the credential scope's region and service against this server.
+///
+/// The service reports every scope complaint in one message, region first,
+/// each sentence ending with a space (measured 2026-09-16: a scope wrong in
+/// both gives "Credential should be scoped to a valid region. Credential
+/// should be scoped to correct service: 'dynamodb'. "). The region is not
+/// named in the message.
+///
+/// # Errors
+///
+/// Returns `InvalidSignatureException` carrying the accumulated complaints
+/// when the region is not `expected_region` or the service is not `dynamodb`.
+pub fn check_scope(
+    parsed: &ParsedAuthorization,
+    expected_region: &str,
+) -> Result<(), DynamoDbError> {
+    let mut complaints = String::new();
+    if parsed.region != expected_region {
+        complaints.push_str("Credential should be scoped to a valid region. ");
+    }
+    if parsed.service != "dynamodb" {
+        complaints.push_str("Credential should be scoped to correct service: 'dynamodb'. ");
+    }
+    if complaints.is_empty() {
+        Ok(())
+    } else {
+        Err(DynamoDbError::InvalidSignatureException(complaints))
+    }
+}
+
 /// Verify a `SigV4` signature against the request.
 ///
 /// # Arguments
@@ -59,16 +89,6 @@ pub fn verify_signature(
     if !signed_lower.split(';').any(|h| h == "host") {
         return Err(DynamoDbError::InvalidSignatureException(
             "\"Host\" must be a \"SignedHeader\" in the AWS Authorization.".to_owned(),
-        ));
-    }
-
-    // Reject UNSIGNED-PAYLOAD: real DynamoDB requires a computed body hash
-    // for all API calls. UNSIGNED-PAYLOAD is only valid for S3.
-    if let Some(content_sha) = headers.get("x-amz-content-sha256")
-        && content_sha.as_bytes() == b"UNSIGNED-PAYLOAD"
-    {
-        return Err(DynamoDbError::InvalidSignatureException(
-            "UNSIGNED-PAYLOAD is not supported for DynamoDB operations.".to_owned(),
         ));
     }
 
@@ -300,23 +320,35 @@ mod tests {
         }
     }
 
-    /// Reject UNSIGNED-PAYLOAD for DynamoDB API calls.
+    /// A client that signs the payload line as the `UNSIGNED-PAYLOAD` literal
+    /// (an S3 convention) fails with the plain mismatch, which is what the
+    /// service returns (measured 2026-09-16): the payload line is always the
+    /// hash of the received body.
     #[test]
-    fn reject_unsigned_payload() {
-        let parsed = make_parsed(
-            "dynamodb",
-            "20260415",
-            "content-type;host;x-amz-content-sha256;x-amz-date",
-        );
+    fn unsigned_payload_literal_is_a_plain_signature_mismatch() {
         let mut headers = make_headers("20260415T120000Z");
         headers.insert("x-amz-content-sha256", "UNSIGNED-PAYLOAD".parse().unwrap());
-        let err = verify_signature(&parsed, "secret", "POST", "/", "", &headers, b"{}");
-        match err {
+        let signed = "content-type;host;x-amz-content-sha256;x-amz-date";
+        // Sign the way such a client does: the literal in place of the body hash.
+        let creq = canonical::canonical_request("POST", "/", "", &headers, signed, SIGNED_BODY)
+            .rsplit_once('\n')
+            .map(|(head, _)| format!("{head}\nUNSIGNED-PAYLOAD"))
+            .unwrap();
+        let sts = canonical::string_to_sign(
+            "20260415T120000Z",
+            "20260415/us-east-1/dynamodb/aws4_request",
+            &creq,
+        );
+        let key = signing_key::derive_signing_key(SECRET, "20260415", "us-east-1", "dynamodb");
+        let mut parsed = make_parsed("dynamodb", "20260415", signed);
+        parsed.signature = signing_key::compute_signature(&key, &sts);
+        match verify_signature(&parsed, SECRET, "POST", "/", "", &headers, SIGNED_BODY) {
             Err(DynamoDbError::InvalidSignatureException(msg)) => {
                 assert!(
-                    msg.contains("UNSIGNED-PAYLOAD"),
-                    "Expected 'UNSIGNED-PAYLOAD' in: {msg}"
+                    msg.starts_with("The request signature we calculated does not match"),
+                    "{msg}"
                 );
+                assert!(!msg.contains("UNSIGNED-PAYLOAD"), "{msg}");
             }
             other => panic!("Expected InvalidSignatureException, got: {other:?}"),
         }
