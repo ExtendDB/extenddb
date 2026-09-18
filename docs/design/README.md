@@ -17,6 +17,7 @@ This directory contains the authoritative design documents for ExtendDB (extendd
 | 09 | [Testing](09-testing.md) | Test strategy, reference suites, golden files, multi-language test suites, coverage tracking |
 | 10 | [Licenses](10-dependency-licenses.md) | Licensing summary for third-party dependencies |
 | 11 | [Scaling](11-high-availability.md) | DRAFT document on scaling ExtendDB |
+| 15 | [Backup and Restore](15-backup-restore.md) | Off-host portable backup format, backup store abstraction, snapshot engine, restore lifecycle, point-in-time recovery reported as unsupported |
 
 
 ## How to Use These Docs
