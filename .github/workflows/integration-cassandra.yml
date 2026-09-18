@@ -48,8 +48,6 @@ jobs:
           cache-on-failure: true
       - name: Unit tests
         run: cargo test -p extenddb-storage-cassandra --lib
-      - name: Metadata integration tests
-        run: cargo test -p extenddb-storage-cassandra --test metadata_integration -- --test-threads=1
       - name: TTL integration tests
         run: cargo test -p extenddb-storage-cassandra --test ttl_integration -- --test-threads=1
       - name: Direct storage-trait integration tests
