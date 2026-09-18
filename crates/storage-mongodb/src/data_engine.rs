@@ -18,7 +18,7 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
-    composite_pk_to_text, encode_netstring_composite, pk_to_text, sk_info,
+    composite_pk_to_text, encode_netstring_composite, needs_escape, pk_to_text, sk_info,
 };
 use extenddb_storage::{
     DataEngine, IdempotencyKey, ItemPairResult, QueryResult, StreamCapture, TransactGetOp,
@@ -29,7 +29,7 @@ use crate::MongoEngine;
 use crate::condition::condition_to_filter;
 use crate::data::{
     binary_sk_to_hex, composite_id, data_collection_name, document_to_item, index_document,
-    index_entry_filter, item_to_document, pk_filter, sk_field_name, sk_suffix,
+    index_entry_filter, item_to_document, json_to_item_data, pk_filter, sk_field_name, sk_suffix,
 };
 use crate::pushdown::{Pushable, is_pushable};
 
@@ -37,8 +37,9 @@ use extenddb_core::types::{Projection, ProjectionType};
 
 /// Resolve a single-component update path for the native MongoDB fast path.
 /// Literal attribute names containing dots or beginning with `$` cannot be
-/// represented safely by MongoDB's ordinary update paths, so they must use
-/// the Rust/session path.
+/// represented safely by MongoDB's ordinary update paths, and names
+/// containing U+0000 or U+0001 differ from the stored (escaped) field name,
+/// so they must use the Rust/session path.
 fn native_attribute_name(path: &[PathElement], maps: &ExpressionMaps) -> Option<String> {
     if path.len() != 1 {
         return None;
@@ -47,7 +48,8 @@ fn native_attribute_name(path: &[PathElement], maps: &ExpressionMaps) -> Option<
         return None;
     };
     let attr_name = resolve_name_ref(raw_name, maps).ok()?;
-    (!attr_name.contains('.') && !attr_name.starts_with('$')).then(|| attr_name.into_owned())
+    (!attr_name.contains('.') && !attr_name.starts_with('$') && !needs_escape(&attr_name))
+        .then(|| attr_name.into_owned())
 }
 
 #[derive(Clone, Copy)]
@@ -1651,8 +1653,11 @@ impl MongoEngine {
                         _ => return None, // complex expressions (if_not_exists, list_append, arithmetic)
                     };
                     let field = format!("item_data.{attr_name}");
+                    // The value lands inside item_data, so its nested map
+                    // keys must be in stored (escaped) form, matching what
+                    // item_to_document writes.
                     let val_json = serde_json::to_value(val).ok()?;
-                    let val_bson = bson::to_bson(&val_json).ok()?;
+                    let val_bson = json_to_item_data(val_json).ok()?;
                     set_doc.insert(field, val_bson);
                 }
                 UpdateAction::Remove { path } => {
@@ -2033,8 +2038,10 @@ impl MongoEngine {
 
         let record_json =
             serde_json::to_value(&record).map_err(|e| StorageError::Internal(e.to_string()))?;
-        let record_bson =
-            bson::to_bson(&record_json).map_err(|e| StorageError::Internal(e.to_string()))?;
+        // The record's key and image maps carry attribute names as object
+        // keys, which become BSON field names; convert through the same
+        // escaping helper as item_data.
+        let record_bson = json_to_item_data(record_json)?;
 
         // key_info already carries table_id — no need to re-read the catalog
         // just to resolve it, and re-reading inside the session against the
@@ -4383,6 +4390,21 @@ transaction_read_concern = "majority""#,
         let path = vec![PathElement::Attribute("#name".to_owned())];
 
         assert_eq!(native_attribute_name(&path, &maps), None);
+    }
+
+    #[test]
+    fn native_update_rejects_control_character_literal_attribute_names() {
+        // Stored field names carry the escaped form of U+0000 and U+0001,
+        // so a native update path built from the raw name would target a
+        // different field; these names must use the Rust/session path.
+        for name in ["a\u{0}b", "a\u{1}b"] {
+            let mut names = std::collections::HashMap::new();
+            names.insert("name".to_owned(), name.to_owned());
+            let maps = ExpressionMaps::new(names, std::collections::HashMap::new());
+            let path = vec![PathElement::Attribute("#name".to_owned())];
+
+            assert_eq!(native_attribute_name(&path, &maps), None, "{name:?}");
+        }
     }
 
     #[test]
