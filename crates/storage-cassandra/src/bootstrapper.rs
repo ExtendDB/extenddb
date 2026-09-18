@@ -41,6 +41,7 @@ struct SettingRow {
 pub struct CassandraBootstrapper {
     engine: CassandraEngine,
     config: BootstrapConfig,
+    keyspace_prefix: String,
 }
 
 impl CassandraBootstrapper {
@@ -56,6 +57,7 @@ impl CassandraBootstrapper {
         Ok(Self {
             engine,
             config: bootstrap_config,
+            keyspace_prefix: cassandra_config.keyspace_prefix.clone(),
         })
     }
 
@@ -258,7 +260,14 @@ impl Bootstrapper for CassandraBootstrapper {
             .is_some_and(|rows| !rows.is_empty());
 
         if exists {
-            println!("    User '{user}' already exists.");
+            if password.is_empty() {
+                return Err(OpError::AlreadyExists(format!(
+                    "Application role '{user}' already exists. \
+                     Supply its password with --extenddb-pass (or EXTENDDB_APP_PASSWORD) \
+                     to regenerate the config, or run 'extenddb destroy' first."
+                )));
+            }
+            println!("    User '{user}' already exists; using supplied password.");
             return Ok(());
         }
 
@@ -689,16 +698,42 @@ impl Bootstrapper for CassandraBootstrapper {
     }
 
     fn generate_backend_config_section(&self) -> String {
+        Self::backend_config_section(&self.catalog_connection_url(), &self.keyspace_prefix)
+    }
+}
+
+impl CassandraBootstrapper {
+    /// Pure helper so the output can be tested without a live Cassandra connection.
+    fn backend_config_section(contact_point: &str, keyspace_prefix: &str) -> String {
         format!(
             r#"[storage.cassandra]
-contact_points = ["{}"]
+contact_points = ["{contact_point}"]
 # username = "cassandra"          # Application user
 # password = "cassandra-password" # Application password
-keyspace_prefix = "extenddb"
+keyspace_prefix = "{keyspace_prefix}"
 replication_factor = 1           # Single node (use 3+ for production)
 datacenter = "datacenter1"
-max_connections = 10"#,
-            self.catalog_connection_url()
+max_connections = 10"#
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CassandraBootstrapper;
+
+    #[test]
+    fn backend_config_section_uses_actual_keyspace_prefix() {
+        let section =
+            CassandraBootstrapper::backend_config_section("cassandra-node-1:9042", "mycompany");
+        assert!(
+            section.contains("keyspace_prefix = \"mycompany\""),
+            "config must use the supplied prefix, got:\n{section}"
+        );
+        assert!(
+            !section.contains("keyspace_prefix = \"extenddb\""),
+            "config must not contain hardcoded 'extenddb' prefix, got:\n{section}"
+        );
+        assert!(section.contains("contact_points = [\"cassandra-node-1:9042\"]"));
     }
 }

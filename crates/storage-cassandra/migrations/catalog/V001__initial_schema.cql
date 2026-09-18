@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS indexes (
     index_status text,
     provisioned_throughput text,
     propagation_delay_ms int,
+    backfill_heartbeat timestamp,
     PRIMARY KEY ((table_id), index_name)
 );
 

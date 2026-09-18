@@ -117,6 +117,19 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
         let guard = workers::spawn_gsi_workers(self.engine.clone());
         let _ = self.gsi_worker_guard.set(guard);
 
+        // GSI backfill recovery worker.
+        let engine_for_gsi_recovery = self.engine.clone();
+        let gsi_backfill_notify = self.engine.gsi_backfill_notify.clone();
+        let gsi_backfill_recovery = tokio::spawn(async move {
+            workers::poll_gsi_backfill_recovery(
+                engine_for_gsi_recovery,
+                gsi_backfill_notify,
+                std::time::Duration::from_secs(120), // stale threshold
+                std::time::Duration::from_secs(60),  // scan interval backstop
+            )
+            .await;
+        });
+
         let ttl_engine = self.engine.clone();
         let ttl_metrics = ctx.metrics.clone();
         let ttl_shutdown = ctx.shutdown.clone();
@@ -146,6 +159,7 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
             control_plane,
             transaction_recovery,
             gsi_delay_poller,
+            gsi_backfill_recovery,
             ttl_cleanup,
             ttl_repair,
             ttl_audit,

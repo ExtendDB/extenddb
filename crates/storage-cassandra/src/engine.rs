@@ -69,6 +69,9 @@ pub struct CassandraEngine {
     /// GSI queue handle for waking workers after async enqueues
     pub(crate) gsi_queue: Arc<crate::gsi_queue::GsiQueue>,
 
+    /// Wakes the GSI backfill recovery worker when a new CREATING index is committed.
+    pub(crate) gsi_backfill_notify: Arc<tokio::sync::Notify>,
+
     /// Hybrid Logical Clock for stream sequence number generation
     pub(crate) hlc: crate::stream_util::SharedHlc,
 
@@ -120,6 +123,7 @@ impl CassandraEngine {
             ttl_config_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             ttl_config_cache_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gsi_queue: crate::gsi_queue::GsiQueue::new(),
+            gsi_backfill_notify: Arc::new(tokio::sync::Notify::new()),
             hlc: crate::stream_util::new_shared_hlc(
                 config.instance_id.as_deref().unwrap_or("default"),
             ),

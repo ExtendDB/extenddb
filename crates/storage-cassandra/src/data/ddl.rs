@@ -416,153 +416,175 @@ impl CassandraEngine {
 
         Ok(())
     }
+}
 
-    /// Backfill an existing base table into a newly created GSI data table.
-    ///
-    /// Scans the base table in token order in batches, projecting and inserting
-    /// each qualifying item into the index table. Called synchronously from
-    /// `update_table_impl` while a propagation hold is active, so workers will
-    /// not apply queued writes to this index until the hold is released.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn backfill_gsi(
-        &self,
-        account_keyspace: &str,
-        table_id: &str,
-        index_id: &str,
-        index_key_schema: &[extenddb_core::types::KeySchemaElement],
-        attr_defs: &[extenddb_core::types::AttributeDefinition],
-        base_key_schema: &[extenddb_core::types::KeySchemaElement],
-        base_attr_defs: &[extenddb_core::types::AttributeDefinition],
-        projection: &extenddb_core::types::Projection,
-    ) -> Result<(), StorageError> {
-        use crate::data::index::{
-            insert_index_row_multi, item_has_index_keys, project_item_for_index,
-        };
-        use cdrs_tokio::consistency::Consistency;
-        use cdrs_tokio::query::BatchQueryBuilder;
+/// Backfill a newly created GSI data table from the base table.
+///
+/// Free function so the spawned backfill task can call it with only an
+/// `Arc<CassandraSession>` rather than requiring the whole engine.
+///
+/// Scans the base table in token order in batches, projecting and inserting
+/// each qualifying item into the index table. Updates `backfill_heartbeat`
+/// after each batch so a recovery worker can distinguish a live (slow) build
+/// from a crashed one. Called while a propagation hold is active, so workers
+/// will not apply queued writes to this index until the hold is released.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn backfill_gsi(
+    session: &std::sync::Arc<crate::engine::CassandraSession>,
+    account_keyspace: &str,
+    catalog_keyspace: &str,
+    table_id: &str,
+    index_id: &str,
+    index_name: &str,
+    index_key_schema: &[extenddb_core::types::KeySchemaElement],
+    attr_defs: &[extenddb_core::types::AttributeDefinition],
+    base_key_schema: &[extenddb_core::types::KeySchemaElement],
+    base_attr_defs: &[extenddb_core::types::AttributeDefinition],
+    projection: &extenddb_core::types::Projection,
+) -> Result<(), StorageError> {
+    use crate::data::index::{insert_index_row_multi, item_has_index_keys, project_item_for_index};
+    use cdrs_tokio::consistency::Consistency;
+    use cdrs_tokio::query::BatchQueryBuilder;
 
-        const PAGE_SIZE: i64 = 500;
+    const PAGE_SIZE: i64 = 500;
 
-        let base_table = data_table_name(table_id);
-        let idx_table = index_table_name(index_id);
-        let idx_sks = all_sort_key_info(index_key_schema, attr_defs);
-        let base_sks = all_sort_key_info(base_key_schema, base_attr_defs);
+    let heartbeat_cql = format!(
+        "UPDATE {catalog_keyspace}.indexes SET backfill_heartbeat = toTimestamp(now()) \
+             WHERE table_id = ? AND index_name = ?"
+    );
 
-        // Token-based full-table scan matching the pattern used by scan_impl.
-        // First page: no lower bound. Subsequent pages: token(pk) > last_token.
-        let first_page_query = format!(
-            "SELECT pk, item_data FROM {account_keyspace}.{base_table} \
+    let base_table = data_table_name(table_id);
+    let idx_table = index_table_name(index_id);
+    let idx_sks = all_sort_key_info(index_key_schema, attr_defs);
+    let base_sks = all_sort_key_info(base_key_schema, base_attr_defs);
+
+    // Token-based full-table scan matching the pattern used by scan_impl.
+    // First page: no lower bound. Subsequent pages: token(pk) > last_token.
+    let first_page_query = format!(
+        "SELECT pk, item_data FROM {account_keyspace}.{base_table} \
              LIMIT {PAGE_SIZE} ALLOW FILTERING"
-        );
-        let next_page_query = format!(
-            "SELECT pk, item_data FROM {account_keyspace}.{base_table} \
+    );
+    let next_page_query = format!(
+        "SELECT pk, item_data FROM {account_keyspace}.{base_table} \
              WHERE token(pk) > ? LIMIT {PAGE_SIZE} ALLOW FILTERING"
-        );
+    );
 
-        let mut last_token: Option<i64> = None;
+    let mut last_token: Option<i64> = None;
 
-        loop {
-            let rows = if let Some(tok) = last_token {
-                crate::cassandra_util::query_rows::<StorageError>(
-                    &self.session,
-                    &next_page_query,
-                    cdrs_tokio::query_values!(tok),
-                    "backfill_gsi",
-                )
-                .await?
-            } else {
-                crate::cassandra_util::query_rows::<StorageError>(
-                    &self.session,
-                    &first_page_query,
-                    cdrs_tokio::query_values!(),
-                    "backfill_gsi",
-                )
-                .await?
-            };
+    loop {
+        let rows = if let Some(tok) = last_token {
+            crate::cassandra_util::query_rows::<StorageError>(
+                session,
+                &next_page_query,
+                cdrs_tokio::query_values!(tok),
+                "backfill_gsi",
+            )
+            .await?
+        } else {
+            crate::cassandra_util::query_rows::<StorageError>(
+                session,
+                &first_page_query,
+                cdrs_tokio::query_values!(),
+                "backfill_gsi",
+            )
+            .await?
+        };
 
-            if rows.is_empty() {
-                break;
-            }
-
-            let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
-            let mut batch_has_rows = false;
-
-            for row in &rows {
-                let item_json: String =
-                    crate::cassandra_util::get_column(row, "item_data", "backfill_gsi")?;
-                let item = super::json_to_item(item_json)?;
-
-                if !item_has_index_keys(&item, index_key_schema) {
-                    continue;
-                }
-
-                let projected =
-                    project_item_for_index(&item, index_key_schema, base_key_schema, projection);
-
-                insert_index_row_multi(
-                    &mut batch,
-                    account_keyspace,
-                    &idx_table,
-                    &item,
-                    &projected,
-                    index_key_schema,
-                    base_key_schema,
-                    &idx_sks,
-                    &base_sks,
-                )?;
-                batch_has_rows = true;
-            }
-
-            if batch_has_rows {
-                self.session
-                    .batch(
-                        batch
-                            .build()
-                            .map_err(|e| StorageError::Internal(e.to_string()))?,
-                    )
-                    .await
-                    .map_err(|e| StorageError::Internal(format!("backfill_gsi batch: {e}")))?;
-            }
-
-            // Advance the token cursor using the last pk in this page.
-            // If we got fewer rows than PAGE_SIZE we've reached the end.
-            #[allow(clippy::cast_possible_truncation)]
-            if (rows.len() as i64) < PAGE_SIZE {
-                break;
-            }
-
-            // Get the token of the last pk to use as the next page cursor.
-            if let Some(last_row) = rows.last() {
-                let pk: String = crate::cassandra_util::get_column(last_row, "pk", "backfill_gsi")?;
-                let token_query = format!(
-                    "SELECT token(pk) AS tok FROM {account_keyspace}.{base_table} WHERE pk = ?"
-                );
-                let tok_rows = crate::cassandra_util::query_rows::<StorageError>(
-                    &self.session,
-                    &token_query,
-                    cdrs_tokio::query_values!(pk.as_str()),
-                    "backfill_gsi_token",
-                )
-                .await?;
-                if let Some(tok_row) = tok_rows.first() {
-                    let tok: i64 =
-                        crate::cassandra_util::get_column(tok_row, "tok", "backfill_gsi_token")?;
-                    // Guard against token collisions: if the token hasn't
-                    // advanced, there are no more distinct partitions to scan.
-                    if Some(tok) == last_token {
-                        break;
-                    }
-                    last_token = Some(tok);
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
+        if rows.is_empty() {
+            break;
         }
 
-        Ok(())
+        let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+        let mut batch_has_rows = false;
+
+        for row in &rows {
+            let item_json: String =
+                crate::cassandra_util::get_column(row, "item_data", "backfill_gsi")?;
+            let item = super::json_to_item(item_json)?;
+
+            if !item_has_index_keys(&item, index_key_schema) {
+                continue;
+            }
+
+            let projected =
+                project_item_for_index(&item, index_key_schema, base_key_schema, projection);
+
+            insert_index_row_multi(
+                &mut batch,
+                account_keyspace,
+                &idx_table,
+                &item,
+                &projected,
+                index_key_schema,
+                base_key_schema,
+                &idx_sks,
+                &base_sks,
+            )?;
+            batch_has_rows = true;
+        }
+
+        if batch_has_rows {
+            session
+                .batch(
+                    batch
+                        .build()
+                        .map_err(|e| StorageError::Internal(e.to_string()))?,
+                )
+                .await
+                .map_err(|e| StorageError::Internal(format!("backfill_gsi batch: {e}")))?;
+        }
+
+        // Update heartbeat after each page so a recovery worker can
+        // distinguish a live (slow) backfill from a crashed one.
+        if let Err(e) = crate::cassandra_util::execute::<StorageError>(
+            session,
+            &heartbeat_cql,
+            cdrs_tokio::query_values!(table_id, index_name),
+            "backfill_gsi_heartbeat",
+        )
+        .await
+        {
+            tracing::warn!("backfill_gsi: failed to update heartbeat for {index_name}: {e}");
+        }
+
+        // Advance the token cursor using the last pk in this page.
+        // If we got fewer rows than PAGE_SIZE we've reached the end.
+        #[allow(clippy::cast_possible_truncation)]
+        if (rows.len() as i64) < PAGE_SIZE {
+            break;
+        }
+
+        // Get the token of the last pk to use as the next page cursor.
+        if let Some(last_row) = rows.last() {
+            let pk: String = crate::cassandra_util::get_column(last_row, "pk", "backfill_gsi")?;
+            let token_query = format!(
+                "SELECT token(pk) AS tok FROM {account_keyspace}.{base_table} WHERE pk = ?"
+            );
+            let tok_rows = crate::cassandra_util::query_rows::<StorageError>(
+                session,
+                &token_query,
+                cdrs_tokio::query_values!(pk.as_str()),
+                "backfill_gsi_token",
+            )
+            .await?;
+            if let Some(tok_row) = tok_rows.first() {
+                let tok: i64 =
+                    crate::cassandra_util::get_column(tok_row, "tok", "backfill_gsi_token")?;
+                // Guard against token collisions: if the token hasn't
+                // advanced, there are no more distinct partitions to scan.
+                if Some(tok) == last_token {
+                    break;
+                }
+                last_token = Some(tok);
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
     }
+
+    Ok(())
 }
 
 #[cfg(test)]

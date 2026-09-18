@@ -282,7 +282,7 @@ impl CassandraEngine {
                             "INSERT INTO {catalog_ks}.indexes \
                              (table_id, index_name, index_id, index_type, key_schema, \
                               projection, index_status, provisioned_throughput) \
-                             VALUES (?, ?, ?, 'GSI', ?, ?, 'ACTIVE', ?)"
+                             VALUES (?, ?, ?, 'GSI', ?, ?, 'CREATING', ?)"
                         ),
                         QueryValues::SimpleValues(vec![
                             Value::from(table_id.as_str()),
@@ -299,6 +299,7 @@ impl CassandraEngine {
                     // Create the data table after the batch commits (DDL can't be batched).
                     // Store what we need for post-batch DDL.
                     let _ = (effective_attr_defs, &base_key_schema, &base_attr_defs);
+                    // Propagation hold is taken before the catalog batch executes (see below).
                 }
 
                 if let Some(delete) = &update.delete {
@@ -461,9 +462,47 @@ impl CassandraEngine {
         base_key_schema: &[KeySchemaElement],
         base_attr_defs: &[AttributeDefinition],
     ) -> Result<TableDescription, StorageError> {
+        let account_ks = self.account_keyspace(account_id);
+
+        // Take propagation holds for all new GSIs BEFORE the catalog batch
+        // commits. This ensures no worker can apply a queued write to the index
+        // between the CREATING row becoming visible and the backfill completing.
+        // If the batch subsequently fails, we release the holds in the error path.
+        let mut taken_holds: Vec<String> = Vec::new();
+        if let Some(updates) = &input.global_secondary_index_updates {
+            let mut create_idx = 0usize;
+            for update in updates {
+                if update.create.is_some() {
+                    let (index_id, _) = &gsi_creates[create_idx];
+                    create_idx += 1;
+                    if let Err(e) = crate::propagation_hold::take_propagation_hold(
+                        &self.session_arc(),
+                        &account_ks,
+                        table_id,
+                        index_id,
+                    )
+                    .await
+                    {
+                        for held_id in &taken_holds {
+                            let _ = crate::propagation_hold::release_propagation_hold(
+                                &self.session_arc(),
+                                &account_ks,
+                                table_id,
+                                held_id,
+                            )
+                            .await;
+                        }
+                        return Err(e);
+                    }
+                    taken_holds.push(index_id.clone());
+                }
+            }
+        }
+
         // Execute the catalog batch atomically.
-        if batch_has_statements {
-            self.session
+        if batch_has_statements
+            && let Err(e) = self
+                .session
                 .batch(
                     batch
                         .build()
@@ -473,73 +512,84 @@ impl CassandraEngine {
                 .map_err(|e| {
                     tracing::error!("update_table batch: {e}");
                     StorageError::Internal("Database error".to_owned())
-                })?;
+                })
+        {
+            for held_id in &taken_holds {
+                let _ = crate::propagation_hold::release_propagation_hold(
+                    &self.session_arc(),
+                    &account_ks,
+                    table_id,
+                    held_id,
+                )
+                .await;
+            }
+            return Err(e);
         }
 
         // Post-batch: shard init (has its own internal batch across two keyspaces).
         if needs_shard_init {
-            let account_ks = self.account_keyspace(account_id);
             self.init_stream_shards(account_id, &input.table_name, &account_ks, table_id)
                 .await?;
         }
         let _ = needs_label_restore; // handled inside the batch above
 
-        // Post-batch: GSI data table DDL (CREATE/DROP TABLE cannot be batched).
+        // Post-batch: GSI data table DDL and async backfill.
         if let Some(updates) = &input.global_secondary_index_updates {
             let effective_attr_defs = input
                 .attribute_definitions
                 .as_deref()
-                .unwrap_or(base_attr_defs);
-            let account_ks = self.account_keyspace(account_id);
+                .unwrap_or(base_attr_defs)
+                .to_vec();
 
             let mut create_idx = 0usize;
             let mut delete_idx = 0usize;
             for update in updates {
                 if let Some(create) = &update.create {
-                    let (index_id, _) = &gsi_creates[create_idx];
+                    let (index_id, index_name) = &gsi_creates[create_idx];
                     create_idx += 1;
-                    self.create_index_data_table(
-                        &account_ks,
-                        index_id,
-                        &create.key_schema,
-                        effective_attr_defs,
-                        base_key_schema,
-                        base_attr_defs,
-                    )
-                    .await?;
-                    crate::propagation_hold::take_propagation_hold(
-                        &self.session_arc(),
-                        &account_ks,
-                        table_id,
-                        index_id,
-                    )
-                    .await?;
-                    let backfill_result = self
-                        .backfill_gsi(
+
+                    // Create the data table synchronously — it must exist before
+                    // the spawned backfill task or any worker tries to write to it.
+                    if let Err(e) = self
+                        .create_index_data_table(
+                            &account_ks,
+                            index_id,
+                            &create.key_schema,
+                            &effective_attr_defs,
+                            base_key_schema,
+                            base_attr_defs,
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            "Failed to create data table for GSI '{}' on '{}': {e}",
+                            index_name,
+                            input.table_name,
+                        );
+                        let _ = crate::cassandra_util::execute::<StorageError>(
+                            &self.session,
+                            &format!(
+                                "DELETE FROM {}.indexes WHERE table_id = ? AND index_name = ?",
+                                self.catalog_keyspace()
+                            ),
+                            cdrs_tokio::query_values!(table_id, index_name.as_str()),
+                            "cleanup_failed_gsi",
+                        )
+                        .await;
+                        let _ = crate::propagation_hold::release_propagation_hold(
+                            &self.session_arc(),
                             &account_ks,
                             table_id,
                             index_id,
-                            &create.key_schema,
-                            effective_attr_defs,
-                            base_key_schema,
-                            base_attr_defs,
-                            &create.projection,
                         )
                         .await;
-                    if let Err(e) = crate::propagation_hold::release_propagation_hold(
-                        &self.session_arc(),
-                        &account_ks,
-                        table_id,
-                        index_id,
-                    )
-                    .await
-                    {
-                        tracing::error!(
-                            "failed to release propagation hold for index {index_id} \
-                             on table {table_id}: {e}"
-                        );
+                        return Err(e);
                     }
-                    backfill_result?;
+
+                    // The backfill recovery worker picks up any CREATING index
+                    // with a null or stale heartbeat. Wake it immediately so
+                    // the new index doesn't wait for the periodic scan interval.
+                    self.gsi_backfill_notify.notify_one();
                 }
                 if update.delete.is_some() {
                     let index_id = &gsi_deletes[delete_idx];

@@ -18,7 +18,7 @@ pub(crate) async fn poll_gsi_delay<S: SettingsStore + ?Sized>(
     store: Arc<S>,
     gsi_delay: Arc<AtomicU64>,
 ) {
-    const POLL_INTERVAL: Duration = Duration::from_secs(30);
+    const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -440,6 +440,252 @@ async fn gsi_apply_index(
         engine.session.batch(built).await.map_err(|e| {
             extenddb_storage::error::StorageError::Internal(format!("gsi_apply: {e}"))
         })?;
+    }
+
+    Ok(())
+}
+
+/// Background worker that detects and recovers stale GSI backfills.
+///
+/// Woken immediately when `apply_table_update` commits a new `CREATING` index,
+/// and also sweeps periodically as a backstop. Treats a NULL `backfill_heartbeat`
+/// (never started) and a heartbeat older than `stale_threshold` (crashed) the
+/// same way: drop+recreate the data table and rerun the backfill.
+pub(crate) async fn poll_gsi_backfill_recovery(
+    engine: Arc<CassandraEngine>,
+    notify: Arc<tokio::sync::Notify>,
+    stale_threshold: Duration,
+    scan_interval: Duration,
+) {
+    loop {
+        // Wait for an explicit wake or the periodic backstop timeout.
+        let _ = tokio::time::timeout(scan_interval, notify.notified()).await;
+
+        let keyspaces = match list_account_keyspaces(&engine).await {
+            Ok(ks) => ks,
+            Err(e) => {
+                tracing::warn!("gsi_recovery: list keyspaces failed: {e}");
+                continue;
+            }
+        };
+
+        for account_ks in &keyspaces {
+            if let Err(e) = recover_stale_backfills(&engine, account_ks, stale_threshold).await {
+                tracing::warn!("gsi_recovery: {account_ks}: {e}");
+            }
+        }
+    }
+}
+
+async fn recover_stale_backfills(
+    engine: &Arc<CassandraEngine>,
+    account_ks: &str,
+    stale_threshold: Duration,
+) -> Result<(), extenddb_storage::error::StorageError> {
+    use cdrs_tokio::types::IntoRustByName as _;
+
+    let catalog_ks = engine.catalog_keyspace();
+
+    // Find all CREATING indexes whose heartbeat is stale (or NULL).
+    let cutoff_ms = (chrono::Utc::now() - stale_threshold).timestamp_millis();
+
+    // We need table_id, index_name, index_id, key_schema, projection, and the
+    // base table's key_schema + attribute_definitions.  Fetch all CREATING
+    // indexes from the catalog, then filter by heartbeat age.
+    let rows = crate::cassandra_util::query_rows::<extenddb_storage::error::StorageError>(
+        &engine.session,
+        &format!(
+            "SELECT table_id, index_name, index_id, key_schema, projection, \
+             backfill_heartbeat \
+             FROM {catalog_ks}.indexes \
+             WHERE index_status = 'CREATING' ALLOW FILTERING"
+        ),
+        cdrs_tokio::query_values!(),
+        "gsi_recovery_scan",
+    )
+    .await?;
+
+    for row in rows {
+        let heartbeat_ms: Option<i64> = row.get_by_name("backfill_heartbeat").ok().flatten();
+        let is_stale = heartbeat_ms.is_none_or(|hb| hb < cutoff_ms);
+        if !is_stale {
+            continue;
+        }
+
+        let table_id: String = crate::cassandra_util::get_column(&row, "table_id", "gsi_recovery")?;
+        let index_name: String =
+            crate::cassandra_util::get_column(&row, "index_name", "gsi_recovery")?;
+        let index_id: String = crate::cassandra_util::get_column(&row, "index_id", "gsi_recovery")?;
+        let ks_json: String =
+            crate::cassandra_util::get_column(&row, "key_schema", "gsi_recovery")?;
+        let proj_json: String =
+            crate::cassandra_util::get_column(&row, "projection", "gsi_recovery")?;
+
+        let index_key_schema: Vec<extenddb_core::types::KeySchemaElement> =
+            match serde_json::from_str(&ks_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("gsi_recovery: bad key_schema for {index_name}: {e}");
+                    continue;
+                }
+            };
+        let projection: extenddb_core::types::Projection = match serde_json::from_str(&proj_json) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("gsi_recovery: bad projection for {index_name}: {e}");
+                continue;
+            }
+        };
+
+        // Fetch base table key_schema + attribute_definitions.
+        let base_row =
+            match crate::cassandra_util::query_optional::<extenddb_storage::error::StorageError>(
+                &engine.session,
+                &format!(
+                    "SELECT key_schema, attribute_definitions \
+                 FROM {catalog_ks}.tables WHERE table_id = ? ALLOW FILTERING"
+                ),
+                cdrs_tokio::query_values!(table_id.as_str()),
+                "gsi_recovery_base",
+            )
+            .await
+            {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    tracing::warn!(
+                        "gsi_recovery: base table for index {index_name} not found, skipping"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!("gsi_recovery: fetch base table for {index_name}: {e}");
+                    continue;
+                }
+            };
+
+        let base_ks_json: String =
+            crate::cassandra_util::get_column(&base_row, "key_schema", "gsi_recovery_base")?;
+        let base_ad_json: String = crate::cassandra_util::get_column(
+            &base_row,
+            "attribute_definitions",
+            "gsi_recovery_base",
+        )?;
+        let base_key_schema: Vec<extenddb_core::types::KeySchemaElement> =
+            match serde_json::from_str(&base_ks_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("gsi_recovery: bad base key_schema for {index_name}: {e}");
+                    continue;
+                }
+            };
+        let base_attr_defs: Vec<extenddb_core::types::AttributeDefinition> =
+            match serde_json::from_str(&base_ad_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("gsi_recovery: bad base attr_defs for {index_name}: {e}");
+                    continue;
+                }
+            };
+
+        tracing::info!(
+            "gsi_recovery: recovering stale backfill for index '{index_name}' \
+             (table_id={table_id}, index_id={index_id})"
+        );
+
+        // Drop and recreate the data table so we start from a clean slate.
+        if let Err(e) = engine.drop_index_data_table(account_ks, &index_id).await {
+            tracing::warn!("gsi_recovery: drop data table for {index_name}: {e}");
+            continue;
+        }
+        if let Err(e) = engine
+            .create_index_data_table(
+                account_ks,
+                &index_id,
+                &index_key_schema,
+                &base_attr_defs,
+                &base_key_schema,
+                &base_attr_defs,
+            )
+            .await
+        {
+            tracing::warn!("gsi_recovery: recreate data table for {index_name}: {e}");
+            continue;
+        }
+
+        // Re-take the propagation hold (it may already be absent if the crash
+        // happened after the hold was released but before ACTIVE was written).
+        if let Err(e) = crate::propagation_hold::take_propagation_hold(
+            &engine.session_arc(),
+            account_ks,
+            &table_id,
+            &index_id,
+        )
+        .await
+        {
+            tracing::warn!("gsi_recovery: take hold for {index_name}: {e}");
+            continue;
+        }
+
+        // Spawn the backfill so the recovery loop is not blocked.
+        let session = engine.session_arc();
+        let gsi_queue = Arc::clone(&engine.gsi_queue);
+        let account_ks_owned = account_ks.to_owned();
+        let catalog_ks_owned = catalog_ks.clone();
+        let table_id_owned = table_id.clone();
+        let index_id_owned = index_id.clone();
+        let index_name_owned = index_name.clone();
+        tokio::spawn(async move {
+            let result = crate::data::ddl::backfill_gsi(
+                &session,
+                &account_ks_owned,
+                &catalog_ks_owned,
+                &table_id_owned,
+                &index_id_owned,
+                &index_name_owned,
+                &index_key_schema,
+                &base_attr_defs,
+                &base_key_schema,
+                &base_attr_defs,
+                &projection,
+            )
+            .await;
+
+            if let Err(e) = result {
+                tracing::error!(
+                    "gsi_recovery: backfill for '{index_name_owned}' failed again: {e}"
+                );
+            } else {
+                let flip = crate::cassandra_util::execute::<extenddb_storage::error::StorageError>(
+                    &session,
+                    &format!(
+                        "UPDATE {catalog_ks_owned}.indexes \
+                         SET index_status = 'ACTIVE' \
+                         WHERE table_id = ? AND index_name = ?"
+                    ),
+                    cdrs_tokio::query_values!(table_id_owned.as_str(), index_name_owned.as_str()),
+                    "gsi_recovery_activate",
+                )
+                .await;
+                if let Err(e) = flip {
+                    tracing::error!("gsi_recovery: failed to activate '{index_name_owned}': {e}");
+                }
+            }
+
+            if let Err(e) = crate::propagation_hold::release_propagation_hold(
+                &session,
+                &account_ks_owned,
+                &table_id_owned,
+                &index_id_owned,
+            )
+            .await
+            {
+                tracing::error!(
+                    "gsi_recovery: failed to release hold for '{index_name_owned}': {e}"
+                );
+            }
+
+            gsi_queue.notify_workers();
+        });
     }
 
     Ok(())
