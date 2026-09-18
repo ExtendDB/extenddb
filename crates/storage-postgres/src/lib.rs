@@ -406,6 +406,38 @@ impl PostgresEngine {
         Ok(())
     }
 
+    /// Refuse to serve a data database whose stored strings have not been
+    /// brought to this build's encoding.
+    ///
+    /// The escape in `extenddb_storage::util::escape_control` stores U+0001 as a
+    /// two-character sequence, and the migration that re-encodes rows written by
+    /// older builds (`004_escape_control_chars`) rewrites every row that contains
+    /// U+0001. It cannot tell a row this build wrote from a legacy one, so this
+    /// build must not write anything before the migration has run. `extenddb
+    /// init` records the migration on a fresh deployment; an upgrade runs
+    /// `extenddb migrate --yes` after stopping every older server and before
+    /// starting this one.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StorageError::Internal` naming the migration and the command to
+    /// run when the data database's `schema_history` does not record it.
+    pub async fn check_data_migrations_applied(&self) -> Result<(), StorageError> {
+        let missing = migrations::unapplied_required_data_migrations(&self.data_pool)
+            .await
+            .map_err(|e| StorageError::Connection(format!("{e:?}")))?;
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(StorageError::Internal(format!(
+            "Data migration not applied: {}. This build stores strings in a different \
+             encoding from earlier builds, so it must not serve until the existing rows \
+             have been re-encoded. Stop every older ExtendDB server that uses this data \
+             database, run 'extenddb migrate --yes', then start this server.",
+            missing.join(", ")
+        )))
+    }
+
     /// Query the data database name from the catalog for the startup banner (REQ-LOG-001).
     ///
     /// Returns `"(not configured)"` if no data database has been registered.
@@ -655,6 +687,18 @@ fn server_components_factory(
             }
             _ => BackendError::InitializationFailed(e.to_string()),
         })?;
+
+        // This build stores strings through the control-character escape, and the
+        // re-encoding migration cannot tell a row this build wrote from a row an
+        // older build wrote (both can hold U+0001). Serving before the migration
+        // has run would let the migration later rewrite this build's own rows, so
+        // refuse to start until it is recorded. `extenddb init` records it on a
+        // fresh deployment; an upgraded deployment runs `extenddb migrate --yes`
+        // with every older server stopped.
+        engine
+            .check_data_migrations_applied()
+            .await
+            .map_err(|e| BackendError::InitializationFailed(e.to_string()))?;
 
         // Rebuild any vector index a crash left CREATING, before serving: an index
         // in that state is not searchable, and nothing else will repair it.

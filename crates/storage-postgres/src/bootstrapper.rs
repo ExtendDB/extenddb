@@ -110,6 +110,9 @@ impl PostgresBootstrapper {
             .username(&self.config.app_user)
             .password(&self.config.app_password)
             .database(database)
+            // Lets a migration tell its own connections apart from a server's
+            // in pg_stat_activity (see `migrations::MIGRATE_APPLICATION_NAME`).
+            .application_name(migrations::MIGRATE_APPLICATION_NAME)
     }
 
     /// Build the connection URL for the application user and a named database.
