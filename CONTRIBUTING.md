@@ -25,7 +25,8 @@ We suggest following the workflow below for proposing and contributing improveme
 1. For large changes, refactorings, new features, or changes to API specifications, wire protocol, backend
  storage traits, authentication or authorization, schema or CLI commands, please submit an
  [RFC](docs/rfcs/README.md) as a pull request and link it to the GitHub issue. Allow time for the RFC to
- be reviewed, discussed and voted on.
+ be reviewed, discussed and voted on. If your change is a new storage backend, it must also satisfy the
+ [Backend Acceptance Criteria](docs/rfcs/0003-backend-acceptance-criteria.md).
 1. Create a fork of the [ExtendDB 'main' branch](https://github.com/ExtendDB/extenddb/tree/main).
 1. Clone your fork into your development environment.
 1. Make, build, test and self-review your changes on a feature branch on your fork.
@@ -81,6 +82,21 @@ maintainer will tell you which path fits.
 
 Some areas are protected by [`.github/CODEOWNERS`](.github/CODEOWNERS) — PRs
 touching them require approval from the listed owners.
+
+## Contributing a storage backend
+
+If you are adding a new storage backend, read these two documents before you
+write code:
+
+- [RFC-0002: Backend Plugin Policy](docs/rfcs/0002-backend-plugin-policy.md) is
+  the *process*: mono-repo structure, trait-based conformance, and the
+  acceptance and maintenance workflow.
+- [Backend Acceptance Criteria](docs/rfcs/0003-backend-acceptance-criteria.md)
+  is the *substance*: the concrete DynamoDB-behavioral invariants and
+  implementation standards your backend must satisfy (item identity, secondary
+  indexes, transactions, isolation, streams, condition expressions, query and
+  scan, multi-tenancy, error fidelity, and operational correctness), plus the
+  conformance stress tests reviewers will run.
 
 ## License
 
