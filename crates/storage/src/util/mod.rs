@@ -7,9 +7,14 @@
 //! id validation.
 
 mod arn;
+mod control_chars;
 mod key;
 
 pub use arn::{index_arn, parse_stream_arn, stream_arn, table_arn};
+pub use control_chars::{
+    escape_control, escape_json_keys, escape_json_strings, needs_escape, unescape_control,
+    unescape_json_keys, unescape_json_strings,
+};
 pub use key::SortKeyValue;
 pub use key::{
     composite_pk_to_text, effective_attribute_definitions, encode_netstring_composite,
