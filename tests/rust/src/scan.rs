@@ -324,3 +324,98 @@ async fn scan_filter_contains_binary() {
         .collect();
     assert_eq!(keys, vec!["i2"], "NOT contains b\"ell\" should match only i2");
 }
+
+/// Parallel scan validates that an `ExclusiveStartKey` belongs to the segment
+/// being scanned: a key is accepted as the start key for its own segment and
+/// rejected (ValidationException) for any other segment. Regression for the
+/// previously-missing cross-segment check, which silently returned a truncated
+/// or empty page instead of erroring.
+#[tokio::test]
+async fn parallel_scan_rejects_cross_segment_exclusive_start_key() {
+    use aws_sdk_dynamodb::types::{
+        AttributeDefinition, BillingMode, KeySchemaElement, KeyType, ScalarAttributeType,
+    };
+    let c = client();
+    let table = format!("ScanEskSeg_{}", ts());
+    c.create_table()
+        .table_name(&table)
+        .billing_mode(BillingMode::PayPerRequest)
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name(HASH_KEY_S)
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name(HASH_KEY_S)
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    wait_for_active(c, &table).await;
+
+    for i in 0..20 {
+        let mut item = std::collections::HashMap::new();
+        item.insert(HASH_KEY_S.into(), s(&i.to_string()));
+        c.put_item()
+            .table_name(&table)
+            .set_item(Some(item))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    const TOTAL: i32 = 4;
+    // Find a segment that owns at least one item, and grab one of its keys.
+    let mut owning_seg = None;
+    let mut key = None;
+    for seg in 0..TOTAL {
+        let r = c
+            .scan()
+            .table_name(&table)
+            .total_segments(TOTAL)
+            .segment(seg)
+            .send()
+            .await
+            .unwrap();
+        if let Some(first) = r.items().first() {
+            owning_seg = Some(seg);
+            key = Some(first.clone());
+            break;
+        }
+    }
+    let owning_seg = owning_seg.expect("some segment must own an item");
+    let key = key.unwrap();
+
+    // Same-segment ESK is accepted.
+    c.scan()
+        .table_name(&table)
+        .total_segments(TOTAL)
+        .segment(owning_seg)
+        .set_exclusive_start_key(Some(key.clone()))
+        .send()
+        .await
+        .expect("ESK for its own segment should be accepted");
+
+    // Cross-segment ESK is rejected with a ValidationException.
+    let other_seg = (owning_seg + 1) % TOTAL;
+    let err = c
+        .scan()
+        .table_name(&table)
+        .total_segments(TOTAL)
+        .segment(other_seg)
+        .set_exclusive_start_key(Some(key))
+        .send()
+        .await
+        .expect_err("ESK from a different segment must be rejected");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("Invalid ExclusiveStartKey"),
+        "expected cross-segment ExclusiveStartKey rejection, got: {msg}"
+    );
+}
