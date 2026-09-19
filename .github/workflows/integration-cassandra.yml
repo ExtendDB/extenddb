@@ -48,7 +48,10 @@ jobs:
           cache-on-failure: true
       - name: Unit tests
         run: cargo test -p extenddb-storage-cassandra --lib
-      - name: Metadata integration tests
-        run: cargo test -p extenddb-storage-cassandra --test metadata_integration -- --test-threads=1
       - name: TTL integration tests
         run: cargo test -p extenddb-storage-cassandra --test ttl_integration -- --test-threads=1
+      - name: Direct storage-trait integration tests
+        # Ported from the plug-in repo's tests/rust suite. Parallel-safe:
+        # each test provisions its own account and keyspace; the shared
+        # control-plane setting test restores what it mutates.
+        run: cargo test -p extenddb-storage-cassandra --test direct_integration

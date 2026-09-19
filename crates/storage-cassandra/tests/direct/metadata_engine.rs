@@ -1,16 +1,12 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Integration tests for `MetadataEngine` operations that are not TTL-specific.
+//! Direct integration tests for `MetadataEngine` operations that are not
+//! TTL-specific.
 //!
-//! These exercise the Cassandra adapter directly. The SDK-level suites under
-//! `tests/rust` and `tests/python` cover the same semantics through the API, but
-//! CI runs those against PostgreSQL, SQLite, and MongoDB only — there is no
-//! Cassandra integration workflow — so this is the only coverage that reaches
-//! the Cassandra implementation of these calls.
-
-#[path = "common/mod.rs"]
-mod helpers;
+//! The plug-in repo's four tag tests were consolidated in-tree into the single
+//! phased `test_resource_tag_lifecycle` before this suite was ported, so this
+//! module carries the consolidated form rather than both.
 
 use extenddb_core::types::Tag;
 use extenddb_storage::MetadataEngine;
