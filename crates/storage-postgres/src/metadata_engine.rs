@@ -20,8 +20,9 @@ impl MetadataEngine for PostgresEngine {
         let account_id = account_id.to_string();
         let table_name = table_name.to_string();
         Box::pin(async move {
-            let row: Option<(Option<String>,)> = sqlx::query_as(
-                "SELECT ttl_attribute FROM tables WHERE account_id = $1 AND table_name = $2",
+            let row: Option<(Option<String>, Option<bool>)> = sqlx::query_as(
+                "SELECT ttl_attribute, ttl_index_ready FROM tables \
+                 WHERE account_id = $1 AND table_name = $2",
             )
             .bind(&account_id)
             .bind(&table_name)
@@ -29,11 +30,20 @@ impl MetadataEngine for PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            let (ttl_attr,) = row.ok_or_else(|| StorageError::TableNotFound(table_name.clone()))?;
+            let (ttl_attr, index_ready) =
+                row.ok_or_else(|| StorageError::TableNotFound(table_name.clone()))?;
 
             Ok(match ttl_attr {
                 Some(attr) => TimeToLiveDescription {
-                    time_to_live_status: TimeToLiveStatus::Enabled,
+                    // Enabled only once the queue backfill has published
+                    // readiness; until then pre-existing items are still
+                    // being registered. Postgres disable tears the queue
+                    // down synchronously, so it has no Disabling state.
+                    time_to_live_status: if index_ready == Some(true) {
+                        TimeToLiveStatus::Enabled
+                    } else {
+                        TimeToLiveStatus::Enabling
+                    },
                     attribute_name: Some(attr),
                 },
                 None => TimeToLiveDescription {
@@ -290,6 +300,25 @@ impl MetadataEngine for PostgresEngine {
             let bare_table = data_table.trim_matches('"');
             let index_name = format!("idx_ttl_{bare_table}");
 
+            // A CONCURRENTLY build that fails partway leaves an INVALID
+            // index behind, and IF NOT EXISTS would silently keep it on the
+            // retry — publishing readiness over an index that indexes
+            // nothing. Drop any invalid leftover before building.
+            let invalid: Option<(bool,)> = sqlx::query_as(
+                "SELECT i.indisvalid FROM pg_index i \
+                 JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = $1",
+            )
+            .bind(&index_name)
+            .fetch_optional(&self.data_pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if invalid == Some((false,)) {
+                sqlx::query(&format!("DROP INDEX IF EXISTS \"{index_name}\""))
+                    .execute(&self.data_pool)
+                    .await
+                    .map_err(|e| StorageError::Internal(format!("Drop invalid TTL index: {e}")))?;
+            }
+
             let sql = format!(
                 "CREATE INDEX CONCURRENTLY IF NOT EXISTS \"{index_name}\" \
                  ON {data_table} (((item_data->'{ttl_attribute}'->>'N')::BIGINT)) \
@@ -300,12 +329,16 @@ impl MetadataEngine for PostgresEngine {
                 .await
                 .map_err(|e| StorageError::Internal(format!("TTL index creation failed: {e}")))?;
 
+            // Fenced on the attribute this build actually indexed: a stale
+            // task surviving a disable / re-enable-with-different-attribute
+            // must not certify the new lifecycle's readiness.
             sqlx::query(
                 "UPDATE tables SET ttl_index_ready = TRUE \
-                 WHERE account_id = $1 AND table_name = $2",
+                 WHERE account_id = $1 AND table_name = $2 AND ttl_attribute = $3",
             )
             .bind(&account_id)
             .bind(&table_name)
+            .bind(&ttl_attribute)
             .execute(&self.pool)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
