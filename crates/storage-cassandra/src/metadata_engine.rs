@@ -15,6 +15,17 @@ use crate::CassandraEngine;
 const TTL_CONTROL_MAX_RETRIES: u32 = 4;
 const TTL_CONTROL_RETRY_DELAY_MS: u64 = 25;
 
+/// Durable resume point for the TTL enable backfill, stored per table in the
+/// catalog as JSON. `generation` pins it to one enable cycle: a cursor left
+/// behind by a retired generation must never seed a resume for the next one.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TtlBackfillCursor {
+    /// Hyphenated UUID string (the local `uuid` dependency has no serde
+    /// feature, so the generation travels in its display form).
+    pub generation: String,
+    pub last_key: extenddb_core::types::Item,
+}
+
 impl CassandraEngine {
     /// How long a cached TTL configuration may serve the write path. The
     /// staleness is safe in both directions because the audit exists; see the
@@ -572,7 +583,7 @@ impl CassandraEngine {
     /// `insert_ttl_entry` runs only for items whose registration is actually
     /// missing. Pages are paced so a large table's audit is a slow background
     /// murmur rather than a read burst.
-    pub(crate) async fn audit_ttl_queue_for_table(
+    pub async fn audit_ttl_queue_for_table(
         &self,
         account_id: &str,
         table_name: &str,
@@ -655,12 +666,80 @@ impl CassandraEngine {
         Ok(Some(repaired))
     }
 
+    /// Read the durable backfill resume point, if any. Public for direct
+    /// backend integration tests; production readers are the backfill itself.
+    pub async fn ttl_backfill_cursor(
+        &self,
+        account_id: &str,
+        table_name: &str,
+    ) -> Result<Option<TtlBackfillCursor>, StorageError> {
+        let query = format!(
+            "SELECT ttl_backfill_cursor FROM {}.tables \
+             WHERE account_id = ? AND table_name = ?",
+            self.catalog_keyspace()
+        );
+        let Some(row) = crate::cassandra_util::query_optional(
+            &self.session,
+            &query,
+            cdrs_tokio::query_values!(account_id, table_name),
+            "ttl_backfill_cursor",
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let raw: Option<String> = row.get_by_name("ttl_backfill_cursor").ok().flatten();
+        // An unparseable cursor is treated as absent: the backfill falls back
+        // to a full rescan, which is always correct.
+        Ok(raw.and_then(|raw| serde_json::from_str(&raw).ok()))
+    }
+
+    /// Persist a backfill resume point. Public for direct backend integration
+    /// tests; production writers are the backfill itself.
+    ///
+    /// Returns whether the write applied. An LWT fenced on the generation, not
+    /// a plain write: a plain UPDATE is an upsert, and a backfill racing
+    /// DeleteTable would resurrect a partial catalog row for the dead table,
+    /// blocking a same-name CreateTable. A refused write means the lifecycle
+    /// moved under the scan (disable, re-enable, or table deletion) and the
+    /// backfill must stop. One Paxos round per 1,000-item page is noise next
+    /// to the page's inserts.
+    pub async fn write_ttl_backfill_cursor(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        generation: uuid::Uuid,
+        cursor: &TtlBackfillCursor,
+    ) -> Result<bool, StorageError> {
+        let raw = serde_json::to_string(cursor)
+            .map_err(|error| StorageError::Internal(format!("TTL cursor encode: {error}")))?;
+        let query = format!(
+            "UPDATE {}.tables SET ttl_backfill_cursor = ? \
+             WHERE account_id = ? AND table_name = ? IF ttl_generation = ?",
+            self.catalog_keyspace()
+        );
+        let result = crate::cassandra_util::query_lwt(
+            &self.session,
+            &query,
+            cdrs_tokio::query_values!(
+                raw.as_str(),
+                account_id,
+                table_name,
+                cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec())
+            ),
+        )
+        .await
+        .map_err(|error| StorageError::Internal(format!("TTL cursor write: {error}")))?;
+        metadata_lwt_applied(&result)
+    }
+
     /// Scan the table and register an expiration entry for every item that
     /// carries a valid TTL timestamp, then publish the generation as ready.
     ///
-    /// Runs under the caller's control lease. The scan has no durable cursor, so
-    /// a failure restarts it from the beginning on the next cycle; entry inserts
-    /// are conditional, so repeating the scan is idempotent.
+    /// Runs under the caller's control lease. Resumes from the durable
+    /// per-page cursor when one exists for this generation, so a failure
+    /// costs one replayed page rather than a rescan; entry inserts are
+    /// conditional, so replaying is idempotent.
     async fn backfill_ttl_queue(
         &self,
         account_id: &str,
@@ -671,7 +750,17 @@ impl CassandraEngine {
         let key_info = self.fetch_table_key_info(account_id, table_name).await?;
         let account_keyspace = self.account_keyspace(account_id);
 
-        let mut start_key = None;
+        // Resume from the durable cursor when it belongs to this generation.
+        // A backfill that died mid-scan (host crash, deploy) picks up at its
+        // last completed page instead of rescanning the table from the top;
+        // a cursor from a retired generation is ignored. Registrations are
+        // idempotent, so a page replayed around the crash point is harmless.
+        let mut start_key: Option<extenddb_core::types::Item> = self
+            .ttl_backfill_cursor(account_id, table_name)
+            .await?
+            .and_then(|cursor| {
+                (cursor.generation == config.generation.to_string()).then_some(cursor.last_key)
+            });
         loop {
             if self.ttl_config_for_table(account_id, table_name).await? != Some(config.clone()) {
                 return Ok(());
@@ -694,13 +783,31 @@ impl CassandraEngine {
                 }
             }
             match next_key {
-                Some(key) => start_key = Some(key),
+                Some(key) => {
+                    let applied = self
+                        .write_ttl_backfill_cursor(
+                            account_id,
+                            table_name,
+                            config.generation,
+                            &TtlBackfillCursor {
+                                generation: config.generation.to_string(),
+                                last_key: key.clone(),
+                            },
+                        )
+                        .await?;
+                    if !applied {
+                        // The generation moved or the table is gone; this
+                        // scan's registrations belong to a retired lifecycle.
+                        return Ok(());
+                    }
+                    start_key = Some(key);
+                }
                 None => break,
             }
         }
 
         let query = format!(
-            "UPDATE {}.tables SET ttl_index_ready = true \
+            "UPDATE {}.tables SET ttl_index_ready = true, ttl_backfill_cursor = null \
                  WHERE account_id = ? AND table_name = ? \
                  IF ttl_attribute = ? AND ttl_generation = ? AND table_status = 'ACTIVE'",
             self.catalog_keyspace()
@@ -791,7 +898,8 @@ impl MetadataEngine for CassandraEngine {
         let table_name = table_name.to_owned();
         Box::pin(async move {
             let query = format!(
-                "SELECT ttl_attribute FROM {}.tables WHERE account_id = ? AND table_name = ?",
+                "SELECT ttl_attribute, ttl_index_ready, ttl_cleanup_generation \
+                 FROM {}.tables WHERE account_id = ? AND table_name = ?",
                 self.catalog_keyspace()
             );
             let row = crate::cassandra_util::query_optional(
@@ -803,12 +911,22 @@ impl MetadataEngine for CassandraEngine {
             .await?
             .ok_or_else(|| StorageError::TableNotFound(table_name.clone()))?;
             let attribute: Option<String> = row.get_by_name("ttl_attribute").ok().flatten();
+            let index_ready: Option<bool> = row.get_by_name("ttl_index_ready").ok().flatten();
+            let cleanup_generation: Option<uuid::Uuid> =
+                row.get_by_name("ttl_cleanup_generation").ok().flatten();
+            // The catalog already encodes the full lifecycle; this is just the
+            // first reader to surface it. `ttl_index_ready` is published by the
+            // backfill when the queue covers every pre-existing item, and
+            // `ttl_cleanup_generation` is held until the retired generation's
+            // queue is fully drained.
+            let time_to_live_status = match (&attribute, index_ready, cleanup_generation) {
+                (Some(_), Some(true), _) => TimeToLiveStatus::Enabled,
+                (Some(_), _, _) => TimeToLiveStatus::Enabling,
+                (None, _, Some(_)) => TimeToLiveStatus::Disabling,
+                (None, _, None) => TimeToLiveStatus::Disabled,
+            };
             Ok(TimeToLiveDescription {
-                time_to_live_status: if attribute.is_some() {
-                    TimeToLiveStatus::Enabled
-                } else {
-                    TimeToLiveStatus::Disabled
-                },
+                time_to_live_status,
                 attribute_name: attribute,
             })
         })
@@ -877,7 +995,8 @@ impl MetadataEngine for CassandraEngine {
             let query = if enabled {
                 format!(
                     "UPDATE {}.tables SET ttl_attribute = ?, ttl_generation = ?, \
-                     ttl_index_ready = false WHERE account_id = ? AND table_name = ? \
+                     ttl_index_ready = false, ttl_backfill_cursor = null \
+                     WHERE account_id = ? AND table_name = ? \
                      IF table_status = 'ACTIVE' AND ttl_sweep_owner = null \
                      AND ttl_cleanup_generation = null \
                      AND ttl_attribute = null AND ttl_generation = null",
@@ -886,7 +1005,8 @@ impl MetadataEngine for CassandraEngine {
             } else {
                 format!(
                     "UPDATE {}.tables SET ttl_attribute = null, ttl_generation = null, \
-                     ttl_cleanup_generation = ?, ttl_index_ready = false \
+                     ttl_cleanup_generation = ?, ttl_index_ready = false, \
+                     ttl_backfill_cursor = null \
                      WHERE account_id = ? AND table_name = ? \
                      IF table_status = 'ACTIVE' AND ttl_sweep_owner = null \
                      AND ttl_cleanup_generation = null \
@@ -964,10 +1084,11 @@ impl MetadataEngine for CassandraEngine {
             // The lifecycle change is durable; the issuing host must not keep
             // serving the old configuration from its cache.
             self.invalidate_ttl_config_cache(&account_id, &table_name);
-            if !enabled {
-                self.complete_ttl_cleanup(&account_id, &table_name, &table_id, cleanup_generation)
-                    .await?;
-            }
+            // Disable does NOT drain the retired generation's queue here: the
+            // drain visits every leftover entry and used to make the API call
+            // take as long as the queue was deep. `ttl_cleanup_generation`
+            // stays set (the table reports DISABLING) until the worker's
+            // pending-cleanup pass finishes the drain and clears it.
             Ok(())
         })
     }

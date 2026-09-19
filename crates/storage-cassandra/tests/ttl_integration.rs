@@ -273,6 +273,10 @@ async fn test_ttl_metadata_enable_disable_and_listing() {
         )
         .await
         .expect("disable TTL metadata");
+    // The drain is deferred to the worker now; run its pass so the
+    // assertions below observe the completed drain, as they did when the
+    // disable call was synchronous.
+    extenddb_storage_cassandra::ttl_worker::retry_pending_cleanup(&engine).await;
     engine
         .drop_ttl_index(
             &table.key_info.account_id,
@@ -1204,6 +1208,10 @@ async fn test_disable_drains_claimed_work_and_releases_its_claim() {
         )
         .await
         .expect("disable succeeds even with claimed work in flight");
+    // The drain is deferred to the worker now; run its pass so the
+    // assertions below observe the completed drain, as they did when the
+    // disable call was synchronous.
+    extenddb_storage_cassandra::ttl_worker::retry_pending_cleanup(&engine).await;
 
     assert_eq!(
         base_row_owner(&engine, &table.key_info, &item).await,
@@ -1264,6 +1272,10 @@ async fn test_disable_completes_effects_applying_work() {
         )
         .await
         .expect("disable completes effects-applying work");
+    // The drain is deferred to the worker now; run its pass so the
+    // assertions below observe the completed drain, as they did when the
+    // disable call was synchronous.
+    extenddb_storage_cassandra::ttl_worker::retry_pending_cleanup(&engine).await;
 
     let mut key = extenddb_core::types::Item::new();
     key.insert(
@@ -1854,6 +1866,10 @@ async fn test_disable_completes_effects_applied_work() {
         )
         .await
         .expect("disable succeeds with effects-applied work in flight");
+    // The drain is deferred to the worker now; run its pass so the
+    // assertions below observe the completed drain, as they did when the
+    // disable call was synchronous.
+    extenddb_storage_cassandra::ttl_worker::retry_pending_cleanup(&engine).await;
 
     let mut key = extenddb_core::types::Item::new();
     key.insert(
@@ -3267,4 +3283,332 @@ async fn test_audit_restores_lost_queue_registration() {
     )
     .await;
     assert_eq!(queue_rows(&engine).await, 1);
+}
+
+/// The four lifecycle states in order, as `describe_ttl` reports them: the
+/// catalog encoded this all along, F5 is the first reader. Also proves the
+/// disable drain is genuinely deferred (DISABLING is observable) and that the
+/// worker's cleanup pass is what lands DISABLED.
+#[tokio::test]
+async fn test_ttl_lifecycle_states() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    use extenddb_core::types::{AttributeValue, TimeToLiveStatus};
+    use extenddb_storage::DataEngine;
+
+    let engine = setup_engine().await;
+    let table = crate::helpers::TestTable::new(&engine, "TtlLifecycle", false).await;
+    activate_tables(&engine).await;
+    let account = &table.key_info.account_id;
+    let name = &table.key_info.table_name;
+
+    // Something for the queue to hold so the disable drain has real work.
+    let mut item = std::collections::BTreeMap::new();
+    item.insert("id".to_owned(), AttributeValue::S("holder".to_owned()));
+    item.insert(
+        "expires_at".to_owned(),
+        AttributeValue::N((chrono::Utc::now().timestamp() + 3_600).to_string()),
+    );
+    engine
+        .put_item(
+            &table.key_info,
+            item,
+            false,
+            None,
+            &Default::default(),
+            None,
+        )
+        .await
+        .expect("put");
+
+    // ENABLING: requested, backfill not yet run.
+    engine
+        .update_ttl(account, name, "expires_at", true)
+        .await
+        .expect("enable");
+    let state = engine.describe_ttl(account, name).await.expect("describe");
+    assert_eq!(state.time_to_live_status, TimeToLiveStatus::Enabling);
+    assert_eq!(state.attribute_name.as_deref(), Some("expires_at"));
+
+    // ENABLED: backfill published readiness.
+    engine
+        .create_ttl_index(account, name, "expires_at")
+        .await
+        .expect("backfill");
+    let state = engine.describe_ttl(account, name).await.expect("describe");
+    assert_eq!(state.time_to_live_status, TimeToLiveStatus::Enabled);
+    assert!(
+        engine
+            .ttl_backfill_cursor(account, name)
+            .await
+            .expect("cursor read")
+            .is_none(),
+        "completed backfill must clear its cursor"
+    );
+
+    // DISABLING: the flip is durable but the old generation's queue is not
+    // yet drained — the API call no longer waits for that.
+    engine
+        .update_ttl(account, name, "expires_at", false)
+        .await
+        .expect("disable");
+    let state = engine.describe_ttl(account, name).await.expect("describe");
+    assert_eq!(state.time_to_live_status, TimeToLiveStatus::Disabling);
+
+    // DISABLED: the worker's pending-cleanup pass finishes the drain.
+    extenddb_storage_cassandra::ttl_worker::retry_pending_cleanup(&engine).await;
+    let state = engine.describe_ttl(account, name).await.expect("describe");
+    assert_eq!(state.time_to_live_status, TimeToLiveStatus::Disabled);
+    assert!(state.attribute_name.is_none());
+}
+
+/// Kill the backfill mid-scan and prove the durable cursor makes the retry
+/// resume instead of rescanning, and that the resumed run covers every item.
+#[tokio::test]
+async fn test_backfill_cursor_resume() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    use extenddb_core::types::{AttributeValue, TimeToLiveStatus};
+    use extenddb_storage::DataEngine;
+
+    let engine = setup_engine().await;
+    let table = crate::helpers::TestTable::new(&engine, "TtlCursorResume", false).await;
+    activate_tables(&engine).await;
+    let account = table.key_info.account_id.clone();
+    let name = table.key_info.table_name.clone();
+
+    // Three scan pages' worth of TTL-carrying items (page size is 1,000).
+    let future = chrono::Utc::now().timestamp() + 86_400;
+    for index in 0..2_500u32 {
+        let mut item = std::collections::BTreeMap::new();
+        item.insert(
+            "id".to_owned(),
+            AttributeValue::S(format!("cur-{index:05}")),
+        );
+        item.insert(
+            "expires_at".to_owned(),
+            AttributeValue::N(future.to_string()),
+        );
+        engine
+            .put_item(
+                &table.key_info,
+                item,
+                false,
+                None,
+                &Default::default(),
+                None,
+            )
+            .await
+            .expect("seed");
+    }
+
+    engine
+        .update_ttl(&account, &name, "expires_at", true)
+        .await
+        .expect("enable");
+
+    // Run the backfill on its own task and kill it once it has durably
+    // finished at least one page (cursor present), like a host dying
+    // mid-enable.
+    let engine_for_task = setup_engine().await;
+    let (task_account, task_name) = (account.clone(), name.clone());
+    let backfill = tokio::spawn(async move {
+        let _ = engine_for_task
+            .create_ttl_index(&task_account, &task_name, "expires_at")
+            .await;
+    });
+    let started = std::time::Instant::now();
+    let mut cursor = None;
+    let mut polls = 0u32;
+    for _ in 0..1_200 {
+        polls += 1;
+        cursor = engine
+            .ttl_backfill_cursor(&account, &name)
+            .await
+            .expect("cursor read");
+        if cursor.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    backfill.abort();
+    let abort_result = backfill.await;
+    assert!(
+        abort_result.err().is_some_and(|e| e.is_cancelled()),
+        "backfill task should have been killed mid-scan, not finished \
+         (cursor seen after {polls} polls / {:?}; slow machine or page size drift?)",
+        started.elapsed()
+    );
+
+    // The killed run died holding the table's control lease. In production it
+    // expires on its own (`USING TTL 900`) and the worker's next pending-index
+    // pass resumes — from the cursor, which is why a 15-minute-old death does
+    // not cost a fresh full-table scan. The test simulates the expiry instead
+    // of waiting out the clock.
+    let expire_lease = "UPDATE extenddb_ttl_test_catalog.tables SET ttl_sweep_owner = null \
+         WHERE account_id = ? AND table_name = ?";
+    engine
+        .session_arc()
+        .query_with_values(
+            expire_lease,
+            cdrs_tokio::query_values!(account.as_str(), name.as_str()),
+        )
+        .await
+        .expect("simulate lease expiry");
+    let cursor = cursor.expect("backfill should persist a cursor after its first page");
+
+    // The kill left the table mid-enable: cursor present, not ready.
+    let state = engine
+        .describe_ttl(&account, &name)
+        .await
+        .expect("describe");
+    assert_eq!(
+        state.time_to_live_status,
+        TimeToLiveStatus::Enabling,
+        "aborted backfill must not have published readiness"
+    );
+
+    // The worker's pending-index pass is the production retry path. It must
+    // resume from the persisted cursor (observable as: it completes without
+    // rewriting the cursor's first page — verified below by full coverage
+    // plus the cursor being pinned to this generation).
+    let generation = ttl_generation(&engine, &account, &name).await;
+    assert_eq!(
+        cursor.generation,
+        generation.to_string(),
+        "cursor must be pinned to the live generation"
+    );
+    extenddb_storage_cassandra::ttl_worker::retry_pending_indexes(&engine).await;
+    let state = engine
+        .describe_ttl(&account, &name)
+        .await
+        .expect("describe");
+    assert_eq!(state.time_to_live_status, TimeToLiveStatus::Enabled);
+    assert!(
+        engine
+            .ttl_backfill_cursor(&account, &name)
+            .await
+            .expect("cursor read")
+            .is_none()
+    );
+
+    // Full coverage proof: an audit pass over the finished table repairs
+    // nothing, i.e. every one of the 2,500 items is registered.
+    let metrics = extenddb_core::metrics::MetricsCollector::new();
+    let repaired = engine
+        .audit_ttl_queue_for_table(&account, &name, "expires_at", &metrics)
+        .await
+        .expect("audit")
+        .unwrap_or(0);
+    assert_eq!(
+        repaired, 0,
+        "resumed backfill left {repaired} items unregistered"
+    );
+}
+
+/// The resume is real, not a rescan: a cursor pointing at the last item makes
+/// the backfill skip everything before it (the audit then counts exactly the
+/// skipped items as missing). Companion to `test_backfill_cursor_resume`,
+/// whose full-coverage assertion a silent rescan would also satisfy.
+#[tokio::test]
+async fn test_backfill_cursor_is_honored() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    use extenddb_core::types::{AttributeValue, TimeToLiveStatus};
+    use extenddb_storage::DataEngine;
+
+    let engine = setup_engine().await;
+    let table = crate::helpers::TestTable::new(&engine, "TtlCursorHonored", false).await;
+    activate_tables(&engine).await;
+    let account = table.key_info.account_id.clone();
+    let name = table.key_info.table_name.clone();
+
+    let future = chrono::Utc::now().timestamp() + 86_400;
+    for index in 0..10u32 {
+        let mut item = std::collections::BTreeMap::new();
+        item.insert(
+            "id".to_owned(),
+            AttributeValue::S(format!("hon-{index:02}")),
+        );
+        item.insert(
+            "expires_at".to_owned(),
+            AttributeValue::N(future.to_string()),
+        );
+        engine
+            .put_item(
+                &table.key_info,
+                item,
+                false,
+                None,
+                &Default::default(),
+                None,
+            )
+            .await
+            .expect("seed");
+    }
+
+    engine
+        .update_ttl(&account, &name, "expires_at", true)
+        .await
+        .expect("enable");
+    let generation = ttl_generation(&engine, &account, &name).await;
+
+    // Plant a cursor claiming the scan already covered everything up to the
+    // item the scan returns LAST — scan order is token order, not insertion
+    // order, so ask the engine rather than assuming. Key only: the cursor is
+    // an exclusive start key, so the planted item itself is also skipped.
+    let (scanned, tail) = engine
+        .scan(&table.key_info, None, None, None, None, None)
+        .await
+        .expect("scan for token order");
+    assert!(
+        tail.is_none() && scanned.len() == 10,
+        "expected one full page"
+    );
+    let mut last_key = std::collections::BTreeMap::new();
+    last_key.insert(
+        "id".to_owned(),
+        scanned.last().expect("ten items")["id"].clone(),
+    );
+    let planted = engine
+        .write_ttl_backfill_cursor(
+            &account,
+            &name,
+            generation,
+            &extenddb_storage_cassandra::TtlBackfillCursor {
+                generation: generation.to_string(),
+                last_key,
+            },
+        )
+        .await
+        .expect("plant cursor");
+    assert!(planted, "cursor fence must admit the live generation");
+
+    // The worker's pending-index pass is the production retry entry point;
+    // proving THE WORKER honors the cursor is the point of this test.
+    extenddb_storage_cassandra::ttl_worker::retry_pending_indexes(&engine).await;
+    let state = engine
+        .describe_ttl(&account, &name)
+        .await
+        .expect("describe");
+    assert_eq!(state.time_to_live_status, TimeToLiveStatus::Enabled);
+
+    // If the cursor was honored, the backfill scanned nothing (the cursor
+    // points past the scan-last item) and the audit finds all ten items —
+    // nine predecessors plus the exclusive cursor item itself, which puts on
+    // an ENABLING table never registered because the puts predate the enable.
+    // A rescan would find zero.
+    let metrics = extenddb_core::metrics::MetricsCollector::new();
+    let repaired = engine
+        .audit_ttl_queue_for_table(&account, &name, "expires_at", &metrics)
+        .await
+        .expect("audit")
+        .unwrap_or(0);
+    assert_eq!(
+        repaired, 10,
+        "backfill did not resume from the planted cursor (repaired {repaired}, expected all 10 skipped)"
+    );
 }
