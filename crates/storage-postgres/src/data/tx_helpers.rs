@@ -12,9 +12,11 @@ use extenddb_core::types::{
 };
 use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{SortKeyValue, parse_sk, pk_to_text, sk_column, sk_info};
+use extenddb_storage::util::{SortKeyValue, sk_column, sk_info};
 
-use super::{data_table_name, json_to_item};
+use super::key_text::{parse_sk, pk_to_text};
+
+use super::{data_table_name, item_to_json, json_to_item, to_stored_json};
 
 /// Fetch a single item within an existing transaction.
 pub(super) async fn fetch_item_in_tx(
@@ -105,8 +107,7 @@ pub(super) async fn upsert_item_in_tx(
         .get(pk_name)
         .ok_or_else(|| StorageError::Internal("missing partition key".to_owned()))?;
     let pk_text = pk_to_text(pk_value)?;
-    let item_json =
-        serde_json::to_value(item).map_err(|e| StorageError::Internal(e.to_string()))?;
+    let item_json = item_to_json(item)?;
 
     if let Some((sk_name, sk_type)) = sk_info(&key_info.key_schema, &key_info.attribute_definitions)
     {
@@ -157,8 +158,7 @@ pub(super) async fn insert_item_if_absent_in_tx(
         .get(pk_name)
         .ok_or_else(|| StorageError::Internal("missing partition key".to_owned()))?;
     let pk_text = pk_to_text(pk_value)?;
-    let item_json =
-        serde_json::to_value(item).map_err(|e| StorageError::Internal(e.to_string()))?;
+    let item_json = item_to_json(item)?;
 
     let rows_affected = if let Some((sk_name, sk_type)) =
         sk_info(&key_info.key_schema, &key_info.attribute_definitions)
@@ -366,8 +366,7 @@ pub(super) async fn write_stream_record_in_tx(
         user_identity: capture.user_identity.clone(),
     };
 
-    let record_json =
-        serde_json::to_value(&record).map_err(|e| StorageError::Internal(e.to_string()))?;
+    let record_json = to_stored_json(&record)?;
 
     sqlx::query(
         "INSERT INTO stream_records (sequence_number, shard_id, table_id, event_name, record_data) \
