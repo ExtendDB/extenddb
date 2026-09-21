@@ -60,7 +60,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 
 | Limit | DynamoDB Value | Status | Notes |
 |-------|---------------|--------|-------|
-| Response size per page | 1 MB (1,048,576 bytes) | Enforced | `read_helpers.rs` enforces 1 MB page limit |
+| Response size per page | 1 MB (1,048,576 bytes) | Enforced | `read_helpers.rs` reads from storage in chunks and stops at the 1 MB page budget; applies whether or not items pass `FilterExpression` |
 | `Limit` parameter (max items evaluated) | No maximum | Enforced | Honored in query/scan |
 | Filter expression size | 4 KB | Enforced | `check_expression_size`, `LimitsConfig::max_expression_length_bytes` (raw bytes, pre-substitution) |
 | Projection expression size | 4 KB | Enforced | `check_expression_size`, `LimitsConfig::max_expression_length_bytes` |
