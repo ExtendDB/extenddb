@@ -112,14 +112,20 @@ runs:
         # own write: state DECISIONS (exists/absent, verify-before-tag) stay
         # strict single probes, so nothing here weakens the fail-closed
         # guarantees.
+        # Window sizing: ~3 minutes with backoff. The original 30s was
+        # calibrated on one observed lag and ECR Public exceeded it on the
+        # v0.1.12 dev propagation (the write was correct; the stale read
+        # outlasted the window and turned a finished release red). A long
+        # window costs nothing on the happy path — settle returns the
+        # moment the read matches.
         settle() {
-          local ref="$1" want="$2" got rc last='(never read)'
-          for _ in 1 2 3 4 5 6; do
+          local ref="$1" want="$2" got rc last='(never read)' delay
+          for delay in 5 5 10 10 15 15 20 20 30 30 30; do
             set +e; got=$(probe "$ref"); rc=$?; set -e
             [[ $rc == 0 && "$got" == "$want" ]] && return 0
             [[ $rc == 0 ]] && last="$got"
             [[ $rc == 9 ]] && last='MISSING'
-            sleep 5
+            sleep "$delay"
           done
           echo "::error::${ref} did not settle on ${want} within the window; last seen ${last}" >&2
           return 1
