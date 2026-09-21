@@ -1,6 +1,6 @@
 # Technical Debt Tracker
 
-Last updated: 2026-08-20
+Last updated: 2026-09-16
 
 ## Categories
 
@@ -48,6 +48,7 @@ Last updated: 2026-08-20
 | C-8 | Console routing could be cleaner | `server/console/mod.rs:19` | Low | P12j |
 | C-9 | `poll_log_level` function name doesn't reflect dual-level responsibility | `bin/cmd_serve.rs` | Low | P25 |
 | C-10 | Windows installer script not implemented — Linux and macOS only | — | Medium | P32 |
+| C-11 | PostgreSQL data tables created before the key columns were declared `COLLATE "C"` keep the database collation (`en_US.utf8` in the default setups) on every text key column: `pk`, `sk_s`, `base_pk`, `base_sk_s`, the numbered `skN_s` and `base_skN_s` variants of multi-part range keys, and `base_pk` and `base_sk_s` on vector index tables. Their query results are ordered correctly, because every string key predicate and `ORDER BY` carries `COLLATE "C"` explicitly, but the primary key and ordering indexes cannot serve those predicates, so a page or chunk that resumes inside a partition with a string sort key seeks on `pk` only and filters or sorts the rest of the partition. Fix: a data migration that alters those columns to `TEXT COLLATE "C"`, which rebuilds the indexes and holds an exclusive lock for the duration on large tables; the alternative is a concurrent collated index alongside the primary key, at the cost of a second copy of the key columns | `storage-postgres/data/ddl.rs` (`TEXT_KEY`), `storage-postgres/migrations.rs` (where the migration would run) | Medium | #358 |
 
 ## Security
 
