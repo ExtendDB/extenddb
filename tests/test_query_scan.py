@@ -1669,3 +1669,293 @@ def test_query_empty_key_condition_expression_rejected(dynamodb_client):
             err["Message"]
             == "Invalid KeyConditionExpression: The expression can not be empty;"
         ), err
+
+
+# ---------------------------------------------------------------------------
+# String sort key ordering: UTF-8 byte order
+# ---------------------------------------------------------------------------
+
+
+# Sort keys whose byte order and locale order disagree. Byte order puts every
+# ASCII upper-case letter before `_`, `_` before lower case, `a_z` before `ab`,
+# and multi-byte characters last. A locale collation (en_US.utf8) interleaves
+# case, ignores `_` at the first level, and places `é` between `e` and `f`.
+BYTE_ORDER_KEYS = [
+    "A", "B", "Z", "_", "a", "a b", "a-b", "a0", "a_z", "ab", "a~", "b", "z", "\u00e9", "\u4e2d",
+]
+
+
+@pytest.fixture(scope="class")
+def byte_order_table(dynamodb_client):
+    """Hash+range (S,S) table holding BYTE_ORDER_KEYS in one partition."""
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+        ],
+        key_schema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+    ) as name:
+        for k in BYTE_ORDER_KEYS:
+            dynamodb_client.put_item(TableName=name, Item={"pk": {"S": "p"}, "sk": {"S": k}})
+        yield name
+
+
+class TestStringSortKeyByteOrder:
+    """The service orders string sort keys by UTF-8 byte value, and its range
+    conditions compare the same way. Measured 2026-09-16 with exactly these
+    keys: forward order `A B Z _ a "a b" a-b a0 a_z ab a~ b z é 中`, reverse is
+    the mirror, `BETWEEN '_' AND 'b'` returns `_` through `b`, and
+    `begins_with 'a'` returns the seven keys starting with a lower-case a."""
+
+    expected = sorted(BYTE_ORDER_KEYS, key=lambda s: s.encode("utf-8"))
+
+    def _query(self, client, table, **kwargs):
+        return client.query(
+            TableName=table,
+            KeyConditionExpression=kwargs.pop("cond", "pk = :p"),
+            ExpressionAttributeValues={":p": {"S": "p"}, **kwargs.pop("values", {})},
+            **kwargs,
+        )
+
+    def test_forward_order_is_byte_order(self, dynamodb_client, byte_order_table):
+        resp = self._query(dynamodb_client, byte_order_table)
+        assert [i["sk"]["S"] for i in resp["Items"]] == self.expected
+
+    def test_reverse_order_is_reversed_byte_order(self, dynamodb_client, byte_order_table):
+        resp = self._query(dynamodb_client, byte_order_table, ScanIndexForward=False)
+        assert [i["sk"]["S"] for i in resp["Items"]] == self.expected[::-1]
+
+    def test_between_compares_bytes(self, dynamodb_client, byte_order_table):
+        resp = self._query(
+            dynamodb_client,
+            byte_order_table,
+            cond="pk = :p AND sk BETWEEN :lo AND :hi",
+            values={":lo": {"S": "_"}, ":hi": {"S": "b"}},
+        )
+        assert [i["sk"]["S"] for i in resp["Items"]] == [
+            "_", "a", "a b", "a-b", "a0", "a_z", "ab", "a~", "b",
+        ]
+
+    def test_begins_with_compares_bytes(self, dynamodb_client, byte_order_table):
+        resp = self._query(
+            dynamodb_client,
+            byte_order_table,
+            cond="pk = :p AND begins_with(sk, :pre)",
+            values={":pre": {"S": "a"}},
+        )
+        assert [i["sk"]["S"] for i in resp["Items"]] == [
+            "a", "a b", "a-b", "a0", "a_z", "ab", "a~",
+        ]
+
+    def test_pages_of_one_visit_every_key_once_in_byte_order(
+        self, dynamodb_client, byte_order_table
+    ):
+        """A page cursor is compared the same way the page is ordered, so no
+        key is skipped or repeated across page boundaries that fall between
+        keys the two orders disagree on (`_`/`a`, `a_z`/`ab`, `z`/`é`)."""
+        seen: list[str] = []
+        kwargs: dict = {"Limit": 1}
+        while True:
+            resp = self._query(dynamodb_client, byte_order_table, **kwargs)
+            seen += [i["sk"]["S"] for i in resp["Items"]]
+            if "LastEvaluatedKey" not in resp:
+                break
+            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        assert seen == self.expected
+
+
+def _gsi_walk(client, table, forward, limit=None):
+    """Run a whole GSI pagination and return the base keys in delivery order."""
+    seen: list[tuple] = []
+    kwargs: dict = {}
+    if limit:
+        kwargs["Limit"] = limit
+    for _ in range(200):
+        resp = client.query(
+            TableName=table,
+            IndexName="gsi1",
+            KeyConditionExpression="g = :g",
+            ExpressionAttributeValues={":g": {"S": "same"}},
+            ScanIndexForward=forward,
+            **kwargs,
+        )
+        for item in resp["Items"]:
+            key = (item["pk"]["S"],)
+            if "sk" in item:
+                key += (item["sk"]["S"],)
+            if "gs" in item:
+                key = (item["gs"]["S"],) + key
+            seen.append(key)
+        if "LastEvaluatedKey" not in resp:
+            return seen
+        kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+    raise AssertionError("pagination did not terminate")
+
+
+# Base partition keys inserted in an order that is neither byte order nor
+# locale order, so any accidental dependence on insertion order shows.
+INDEX_TIE_PKS = ["b", "A", "a_z", "_", "ab", "Z", "a", "\u00e9", "B", "z", "a b", "a0"]
+
+
+@pytest.fixture(scope="class")
+def hash_only_gsi_table(dynamodb_client):
+    """Base (pk S); GSI gsi1 on g (HASH only). Twelve items share g."""
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "g", "AttributeType": "S"},
+        ],
+        key_schema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "gsi1",
+                "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+    ) as name:
+        for pk in INDEX_TIE_PKS:
+            dynamodb_client.put_item(TableName=name, Item={"pk": {"S": pk}, "g": {"S": "same"}})
+        wait_for_gsi_items(lambda: _gsi_walk(dynamodb_client, name, True), len(INDEX_TIE_PKS))
+        yield name
+
+
+@pytest.fixture(scope="class")
+def hash_only_gsi_composite_table(dynamodb_client):
+    """Base (pk S, sk S); GSI gsi1 on g (HASH only). Sixteen items share g."""
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "g", "AttributeType": "S"},
+        ],
+        key_schema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "gsi1",
+                "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+    ) as name:
+        for pk in INDEX_TIE_PKS[:4]:
+            for sk in ["s2", "S1", "s_1", "s1"]:
+                dynamodb_client.put_item(
+                    TableName=name,
+                    Item={"pk": {"S": pk}, "sk": {"S": sk}, "g": {"S": "same"}},
+                )
+        wait_for_gsi_items(lambda: _gsi_walk(dynamodb_client, name, True), 16)
+        yield name
+
+
+@pytest.fixture(scope="class")
+def duplicate_gsi_sort_key_table(dynamodb_client):
+    """Base (pk S, sk S); GSI gsi1 on (g HASH, gs RANGE). Fifteen items share g
+    and cycle through three gs values, so five items tie on every gs."""
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "g", "AttributeType": "S"},
+            {"AttributeName": "gs", "AttributeType": "S"},
+        ],
+        key_schema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "gsi1",
+                "KeySchema": [
+                    {"AttributeName": "g", "KeyType": "HASH"},
+                    {"AttributeName": "gs", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+    ) as name:
+        gss = ["x", "X", "_x"]
+        n = 0
+        for pk in INDEX_TIE_PKS[:5]:
+            for sk in ["s2", "S1", "s1"]:
+                dynamodb_client.put_item(
+                    TableName=name,
+                    Item={
+                        "pk": {"S": pk},
+                        "sk": {"S": sk},
+                        "g": {"S": "same"},
+                        "gs": {"S": gss[n % 3]},
+                    },
+                )
+                n += 1
+        wait_for_gsi_items(lambda: _gsi_walk(dynamodb_client, name, True), 15)
+        yield name
+
+
+class TestIndexPaginationMirrorsAndNeverSkips:
+    """Within one index partition the service returns items in a deterministic
+    order that is not specified (it is neither byte order nor insertion
+    order), `ScanIndexForward=false` returns the exact mirror of that order at
+    every level (including among items that share an index sort key), and a
+    cursor walk at any Limit delivers every item exactly once in the same
+    order as the unpaged read. Measured 2026-09-17 on a hash-only GSI over a
+    hash-only base, a hash-only GSI over a composite base, and a GSI with a
+    sort key where five items tie on each sort-key value.
+
+    ExtendDB orders ties by the base primary key in byte order; what these
+    tests pin is the contract above, not that particular tie order.
+    """
+
+    @pytest.mark.parametrize(
+        "fixture_name, count",
+        [
+            ("hash_only_gsi_table", 12),
+            ("hash_only_gsi_composite_table", 16),
+            ("duplicate_gsi_sort_key_table", 15),
+        ],
+    )
+    def test_reverse_is_the_mirror_of_forward(self, request, dynamodb_client, fixture_name, count):
+        table = request.getfixturevalue(fixture_name)
+        forward = _gsi_walk(dynamodb_client, table, True)
+        assert len(forward) == count
+        assert len(set(forward)) == count
+        assert _gsi_walk(dynamodb_client, table, True) == forward, "order is not deterministic"
+        assert _gsi_walk(dynamodb_client, table, False) == forward[::-1]
+
+    @pytest.mark.parametrize(
+        "fixture_name",
+        ["hash_only_gsi_table", "hash_only_gsi_composite_table", "duplicate_gsi_sort_key_table"],
+    )
+    @pytest.mark.parametrize("forward", [True, False])
+    @pytest.mark.parametrize("limit", [1, 2, 3, 5])
+    def test_cursor_walk_delivers_every_item_once_in_order(
+        self, request, dynamodb_client, fixture_name, forward, limit
+    ):
+        """The defect this pins: a reverse Query on a hash-only GSI with
+        Limit 2 over six items returned `p5, p4, p5` and stopped, because the
+        page was ordered descending while its cursor compared ascending."""
+        table = request.getfixturevalue(fixture_name)
+        full = _gsi_walk(dynamodb_client, table, forward)
+        walked = _gsi_walk(dynamodb_client, table, forward, limit)
+        assert walked == full
+
+    def test_gsi_sort_key_order_is_byte_order_and_ties_mirror(
+        self, dynamodb_client, duplicate_gsi_sort_key_table
+    ):
+        """On a GSI with a sort key the sort-key sequence is UTF-8 byte order
+        (`X` < `_x` < `x`), and the run of items sharing each sort key appears
+        in reverse in the reverse read."""
+        forward = _gsi_walk(dynamodb_client, duplicate_gsi_sort_key_table, True)
+        reverse = _gsi_walk(dynamodb_client, duplicate_gsi_sort_key_table, False)
+        assert [k[0] for k in forward] == ["X"] * 5 + ["_x"] * 5 + ["x"] * 5
+        assert reverse == forward[::-1]

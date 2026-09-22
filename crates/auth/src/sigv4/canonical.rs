@@ -33,13 +33,15 @@ pub fn canonical_request(
     // CB-7: Normalize signed header names to lowercase per SigV4 spec.
     let signed_lower = signed_headers.to_ascii_lowercase();
     let canonical_headers = build_canonical_headers(headers, &signed_lower);
-    // SigV4 spec: if the client sends x-amz-content-sha256, use that value
-    // as the payload hash in the canonical request. UNSIGNED-PAYLOAD is
-    // rejected by verify_signature() before this function is called.
-    let payload_hash = headers
-        .get("x-amz-content-sha256")
-        .and_then(|v| v.to_str().ok())
-        .map_or_else(|| sha256_hex(body), str::to_owned);
+    // The payload hash is computed from the body the server received. The
+    // client's x-amz-content-sha256 header is not consulted: a request signed
+    // for one body and transmitted with another must fail verification, and
+    // trusting the header would let the sender choose the hash that the
+    // signature is checked against. When the client includes the header in
+    // SignedHeaders it is covered as an ordinary header by
+    // build_canonical_headers. UNSIGNED-PAYLOAD is rejected by
+    // verify_signature() before this function is called.
+    let payload_hash = sha256_hex(body);
 
     format!(
         "{method}\n{uri_path}\n{query_string}\n{canonical_headers}\n{signed_lower}\n{payload_hash}"
@@ -168,5 +170,38 @@ mod tests {
         assert_eq!(lines[3], "host:localhost:18443");
         assert_eq!(lines[4], "x-amz-date:20260415T120000Z");
         assert_eq!(lines[6], "host;x-amz-date"); // lowercased
+    }
+
+    /// The hashed-payload line is computed from the received body. A client
+    /// header claiming a different hash changes nothing about that line; when
+    /// the header is signed it appears among the canonical headers instead.
+    #[test]
+    fn payload_hash_comes_from_body_not_header() {
+        let signed_body = br#"{"pk":"signed"}"#;
+        let received_body = br#"{"pk":"tampered"}"#;
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "localhost:18443".parse().unwrap());
+        headers.insert("x-amz-date", "20260415T120000Z".parse().unwrap());
+        headers.insert(
+            "x-amz-content-sha256",
+            sha256_hex(signed_body).parse().unwrap(),
+        );
+
+        let creq = canonical_request(
+            "POST",
+            "/",
+            "",
+            &headers,
+            "host;x-amz-content-sha256;x-amz-date",
+            received_body,
+        );
+
+        let lines: Vec<&str> = creq.split('\n').collect();
+        assert_eq!(
+            lines[4],
+            format!("x-amz-content-sha256:{}", sha256_hex(signed_body))
+        );
+        assert_eq!(lines[8], sha256_hex(received_body));
+        assert_ne!(lines[8], sha256_hex(signed_body));
     }
 }
