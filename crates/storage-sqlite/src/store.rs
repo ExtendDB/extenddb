@@ -29,12 +29,14 @@
 //! writer holding the file lock fails a plain `PutItem` with exactly the
 //! `InternalServerError` seen in the `run-integration-sqlite` CI flake.
 //!
-//! Deliberate exclusions from the lock, so the invariant stays auditable:
-//! init-time bootstrap in this file (runs before the server serves traffic),
-//! and the management/credential stores, which write through the separate
-//! catalog pool in `lib.rs`. For a file-backed database that second pool
-//! opens the same file, so its small single-row autocommit writes carry a
-//! residual, much smaller, version of the same contention risk.
+//! The management stores (users, access keys, policies, groups, roles,
+//! accounts, admin, settings, metrics) write through the separate catalog
+//! pool in `lib.rs`, which for a file-backed database opens the same file;
+//! the server wiring shares this same lock instance into
+//! `SqliteCatalogStore`, so those writers queue with the engine's. The
+//! credential store only reads. The one deliberate exclusion from the lock,
+//! so the invariant stays auditable, is init-time bootstrap (in this file and
+//! in `bootstrapper.rs`), which runs before the server serves traffic.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -620,6 +622,157 @@ mod d1_write_lock_tests {
                     .expect("update continuous backups");
             },
             "update_continuous_backups",
+        )
+        .await;
+    }
+
+    /// Build a catalog store over the engine's pool and, critically, the
+    /// engine's OWN write lock, mirroring the server wiring in `lib.rs`. The
+    /// cached key lets access-key creation encrypt without a settings lookup.
+    fn catalog_store(engine: &SqliteEngine) -> crate::SqliteCatalogStore {
+        use base64::Engine as _;
+        let key = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        crate::SqliteCatalogStore::with_encryption_key(
+            engine.pool.clone(),
+            key,
+            std::sync::Arc::clone(&engine.write_lock),
+        )
+    }
+
+    /// The management-store writer observed losing its file lock in the
+    /// `run-integration-sqlite` flake (`put_policy: ... database is locked`,
+    /// surfacing as HTTP 500 where 204 was expected).
+    #[tokio::test]
+    async fn management_put_policy_waits_for_the_write_lock() {
+        use extenddb_storage::management_store::ManagementStore;
+        let engine = engine().await;
+        let store = catalog_store(&engine);
+        assert_serialized(
+            &engine,
+            async move {
+                ManagementStore::put_policy(
+                    &store,
+                    "000000000000",
+                    "user",
+                    "d1-user",
+                    "full",
+                    &json!({"Version": "2012-10-17", "Statement": []}),
+                )
+                .await
+                .expect("put policy");
+            },
+            "put_policy",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn management_create_user_waits_for_the_write_lock() {
+        use extenddb_storage::management_store::ManagementStore;
+        let engine = engine().await;
+        let store = catalog_store(&engine);
+        assert_serialized(
+            &engine,
+            async move {
+                ManagementStore::create_user(&store, "000000000000", "d1-user", None)
+                    .await
+                    .expect("create user");
+            },
+            "create_user",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn management_create_access_key_waits_for_the_write_lock() {
+        use extenddb_storage::management_store::ManagementStore;
+        let engine = engine().await;
+        // The owning user must exist before the lock window (foreign key);
+        // key generation and encryption also run pre-lock inside the writer.
+        sqlx::query(
+            "INSERT INTO iam_users (account_id, user_name, user_arn) \
+             VALUES ('000000000000', 'd1-key-user', 'arn:aws:iam::000000000000:user/d1-key-user')",
+        )
+        .execute(&engine.pool)
+        .await
+        .expect("user");
+        let store = catalog_store(&engine);
+        assert_serialized(
+            &engine,
+            async move {
+                ManagementStore::create_access_key(&store, "000000000000", "d1-key-user")
+                    .await
+                    .expect("create access key");
+            },
+            "create_access_key",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn management_create_account_waits_for_the_write_lock() {
+        use extenddb_storage::management_store::ManagementStore;
+        let engine = engine().await;
+        let store = catalog_store(&engine);
+        assert_serialized(
+            &engine,
+            async move {
+                ManagementStore::create_account(&store, "111111111111", "d1-acct")
+                    .await
+                    .expect("create account");
+            },
+            "create_account",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn management_create_group_waits_for_the_write_lock() {
+        use extenddb_storage::management_store::ManagementStore;
+        let engine = engine().await;
+        let store = catalog_store(&engine);
+        assert_serialized(
+            &engine,
+            async move {
+                ManagementStore::create_group(&store, "000000000000", "d1-group")
+                    .await
+                    .expect("create group");
+            },
+            "create_group",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn admin_create_waits_for_the_write_lock() {
+        use extenddb_storage::management_store::AdminStore;
+        let engine = engine().await;
+        let store = catalog_store(&engine);
+        assert_serialized(
+            &engine,
+            async move {
+                AdminStore::create_admin(&store, "d1-admin", "hash")
+                    .await
+                    .expect("create admin");
+            },
+            "create_admin",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_setting_waits_for_the_write_lock() {
+        use extenddb_storage::management_store::SettingsStore;
+        let engine = engine().await;
+        let store = catalog_store(&engine);
+        assert_serialized(
+            &engine,
+            async move {
+                SettingsStore::set_setting(&store, "d1-setting", "v")
+                    .await
+                    .expect("set setting");
+            },
+            "set_setting",
         )
         .await;
     }

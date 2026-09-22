@@ -27,22 +27,42 @@ use crate::sqlite_util::{format_timestamp, parse_timestamp};
 pub struct SqliteCatalogStore {
     pool: SqlitePool,
     encryption_key: Option<Arc<str>>,
+    /// Serializes this store's writers with the engine's (design decision D1,
+    /// see `store.rs`). For a file-backed database the catalog pool opens the
+    /// same file as the engine pool, so an uncoordinated catalog write can
+    /// hold the SQLite file write lock past a locked writer's `busy_timeout`
+    /// (and vice versa), failing an unrelated request with `database is
+    /// locked`. The server wiring in `lib.rs` shares the engine's lock here so
+    /// both sets of writers queue on one lock.
+    write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SqliteCatalogStore {
     /// Construct without a cached encryption key (settings/diagnostics-only use).
+    ///
+    /// Used by the out-of-process factories (the `settings`/`doctor` CLI
+    /// paths), where no engine exists in the process; the fresh lock still
+    /// serializes this store's own writers with each other.
     pub fn new(pool: SqlitePool) -> Self {
         Self {
             pool,
             encryption_key: None,
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
-    /// Construct with the cached AES-256-GCM encryption key (base64).
-    pub fn with_encryption_key(pool: SqlitePool, encryption_key: String) -> Self {
+    /// Construct with the cached AES-256-GCM encryption key (base64) and the
+    /// engine's write lock, so catalog writers queue with engine writers
+    /// (design decision D1).
+    pub fn with_encryption_key(
+        pool: SqlitePool,
+        encryption_key: String,
+        write_lock: Arc<tokio::sync::Mutex<()>>,
+    ) -> Self {
         Self {
             pool,
             encryption_key: Some(Arc::from(encryption_key.as_str())),
+            write_lock,
         }
     }
 
@@ -52,6 +72,16 @@ impl SqliteCatalogStore {
 
     pub(crate) fn encryption_key(&self) -> Option<&Arc<str>> {
         self.encryption_key.as_ref()
+    }
+
+    /// Acquire the write lock (design decision D1: every writer holds it for
+    /// the duration of its statement or transaction, so no two writers ever
+    /// contend at the SQLite level). Reads never take it. Callers must acquire
+    /// it before opening a transaction or running a write statement, never
+    /// while already holding a pool connection another lock holder might wait
+    /// on.
+    pub(crate) async fn lock_writes(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.write_lock.lock().await
     }
 }
 
@@ -74,6 +104,8 @@ impl SettingsStore for SqliteCatalogStore {
         let key = key.to_owned();
         let value = value.to_owned();
         Box::pin(async move {
+            // D1: every writer holds the write lock.
+            let _writer = self.lock_writes().await;
             sqlx::query(
                 "INSERT INTO settings (key, value) VALUES (?, ?) \
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -120,6 +152,9 @@ impl MetricsStore for SqliteCatalogStore {
     fn insert_metrics(&self, rows: &[MetricsRow]) -> BoxFuture<'_, OpResult<()>> {
         let rows = rows.to_vec();
         Box::pin(async move {
+            // D1: every writer holds the write lock. One acquisition for the
+            // whole batch; each row is its own autocommit statement.
+            let _writer = self.lock_writes().await;
             for row in &rows {
                 let bucket = format_timestamp(row.bucket);
                 let result = sqlx::query(
@@ -215,6 +250,8 @@ impl MetricsStore for SqliteCatalogStore {
             let cutoff = OffsetDateTime::now_utc()
                 - time::Duration::seconds(i64::try_from(retention.as_secs()).unwrap_or(i64::MAX));
             let cutoff_str = format_timestamp(cutoff);
+            // D1: every writer holds the write lock.
+            let _writer = self.lock_writes().await;
             sqlx::query("DELETE FROM metrics WHERE bucket < ?")
                 .bind(&cutoff_str)
                 .execute(&self.pool)
@@ -279,6 +316,8 @@ impl RateLimitStore for SqliteCatalogStore {
         let source_ip = source_ip.map(str::to_owned);
         Box::pin(async move {
             let now = format_timestamp(OffsetDateTime::now_utc());
+            // D1: every writer holds the write lock.
+            let _writer = self.lock_writes().await;
             let result = sqlx::query(
                 "INSERT INTO login_attempts (principal, attempted_at, success, source_ip) \
                  VALUES (?, ?, 0, ?)",
@@ -299,6 +338,8 @@ impl RateLimitStore for SqliteCatalogStore {
             let cutoff = format_timestamp(
                 OffsetDateTime::now_utc() - time::Duration::seconds(max_age_seconds),
             );
+            // D1: every writer holds the write lock.
+            let _writer = self.lock_writes().await;
             if let Err(e) = sqlx::query("DELETE FROM login_attempts WHERE attempted_at < ?")
                 .bind(&cutoff)
                 .execute(&self.pool)
