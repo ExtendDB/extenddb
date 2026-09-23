@@ -402,8 +402,10 @@ class TestGsiAddToExistingTable:
         )
         gsis = resp["TableDescription"].get("GlobalSecondaryIndexes", [])
         statuses = {g["IndexName"]: g["IndexStatus"] for g in gsis}
-        assert statuses.get("new-gsi") == "CREATING", (
-            f"Expected CREATING, got {statuses.get('new-gsi')!r}"
+        # SQL backends create GSIs synchronously so they immediately go into ACTIVE. Cassandra
+        # creates GSIs async, so GSIs are probably in CREATING immediately after table update.
+        assert statuses.get("new-gsi") in ("CREATING", "ACTIVE"), (
+            f"Expected CREATING or ACTIVE, got {statuses.get('new-gsi')!r}"
         )
         # Raises TimeoutError if the transition never arrives.
         wait_for_gsi_active(dynamodb_client, base_table, "new-gsi")
