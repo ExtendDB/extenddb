@@ -1,0 +1,5 @@
+[test]
+# Limit parallelism for integration tests that require a live Cassandra node.
+# Each test opens its own engine/session; too many concurrent connections
+# exhaust Cassandra's per-client limit and cause spurious timeouts.
+test-threads = 4
