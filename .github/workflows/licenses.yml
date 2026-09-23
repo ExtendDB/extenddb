@@ -62,6 +62,8 @@ jobs:
         run: ./devtools/generate-software-license-notices --check
       - name: MongoDB notices must be current
         run: ./devtools/generate-software-license-notices --check --backend mongodb
+      - name: Cassandra notices must be current
+        run: ./devtools/generate-software-license-notices --check --backend cassandra
       - name: DEV notices must be current
         # The dev image ships SOFTWARE-LICENSE-NOTICES-DEV.html for its own
         # feature set (sqlite,dev-mode). Same incident class as #271/#272: a
