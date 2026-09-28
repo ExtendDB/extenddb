@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Orchestrated Cassandra integration-test runner.
+#
+# Initializes and serves extenddb against a running Cassandra node, then
+# delegates the test workload to `devtools/run-tests --backend cassandra`.
+# Tears everything down on exit.
+#
+# Usage:
+#   devtools/run-cassandra-tests [OPTIONS] [-- RUN_TESTS_ARGS ...]
+#
+# Options:
+#   --contact-points HOST:PORT  Cassandra contact point (default: 127.0.0.1:9042)
+#   --port PORT             HTTPS port extenddb should bind (default: 18443)
+#   --output DIR            Directory for logs and generated config
+#                           (default: /tmp/run-cassandra-tests-<ts>)
+#   --keep                  Do not tear down the extenddb server on exit
+#   -h, --help              Show this help
+#
+# Arguments after `--` are passed to `devtools/run-tests` verbatim.
+# Default suite is `--pytest --comprehensive --parallel`.
+#
+# Examples:
+#   devtools/run-cassandra-tests
+#   devtools/run-cassandra-tests -- --pytest --filter test_put_item
+#   devtools/run-cassandra-tests --keep -- --rust --rust-integration
+#
+# Prerequisites:
+#   - A Cassandra node reachable at the contact point (default 127.0.0.1:9042)
+#     with PasswordAuthenticator enabled. The official cassandra:4.1 image does
+#     not honour CASSANDRA_AUTHENTICATOR, so patch it after starting:
+#       docker run -d --name cassandra -p 9042:9042 \
+#         -e CASSANDRA_CLUSTER_NAME=extenddb-ci \
+#         -e HEAP_NEWSIZE=128M -e MAX_HEAP_SIZE=1024M \
+#         cassandra:4.1
+#       sleep 30
+#       docker exec cassandra sed -i \
+#         's/^authenticator: .*/authenticator: PasswordAuthenticator/' \
+#         /etc/cassandra/cassandra.yaml
+#       docker restart cassandra && sleep 30
+#   - `cargo build --release --no-default-features --features cassandra` done
+#   - Python venv activated with pytest installed
+#   - `~/.extenddb/tls/` populated (from a prior `extenddb init`)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_DIR"
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+CONTACT_POINTS="127.0.0.1:9042"
+BIND_PORT=18443
+OUTPUT_DIR=""
+KEEP=false
+RUN_TESTS_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --contact-points) CONTACT_POINTS="$2"; shift 2 ;;
+        --port)           BIND_PORT="$2"; shift 2 ;;
+        --output)         OUTPUT_DIR="$2"; shift 2 ;;
+        --keep)           KEEP=true; shift ;;
+        --)               shift; RUN_TESTS_ARGS=("$@"); break ;;
+        -h|--help)        sed -n '5,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)                echo "error: unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+if [[ ${#RUN_TESTS_ARGS[@]} -eq 0 ]]; then
+    RUN_TESTS_ARGS=(--pytest --comprehensive --parallel)
+fi
+
+if [[ -z "$OUTPUT_DIR" ]]; then
+    OUTPUT_DIR="/tmp/run-cassandra-tests-$(date +%Y%m%d-%H%M%S)-$$"
+fi
+mkdir -p "$OUTPUT_DIR"
+
+CONFIG="$OUTPUT_DIR/extenddb.toml"
+SERVER_LOG="$OUTPUT_DIR/server.log"
+BINARY="./target/release/extenddb"
+
+if [[ ! -x "$BINARY" ]]; then
+    echo "error: $BINARY not found. Build first:" >&2
+    echo "  cargo build --release --no-default-features --features cassandra" >&2
+    exit 1
+fi
+
+TMP_CANON=$(realpath /tmp)
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+
+cleanup() {
+    if $KEEP; then
+        echo ""
+        echo "=== --keep set; leaving extenddb running ==="
+        echo "  server log: $SERVER_LOG"
+        echo "  tear down:  $BINARY stop --config $CONFIG"
+        return
+    fi
+    echo ""
+    echo "=== Cleanup ==="
+    if [[ -f "$CONFIG" ]] && "$BINARY" stop --config "$CONFIG" >/dev/null 2>&1; then
+        echo "  stopped extenddb server"
+    fi
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Initialize extenddb
+# ---------------------------------------------------------------------------
+
+echo "=== Initializing extenddb (Cassandra backend) ==="
+
+ADMIN_PASSWORD=$(openssl rand -base64 16)
+EXTENDDB_ADMIN_PASSWORD="$ADMIN_PASSWORD" "$BINARY" init \
+    --backend cassandra \
+    --config "$CONFIG" \
+    --cassandra-contact-points "$CONTACT_POINTS" \
+    --cassandra-user cassandra \
+    --cassandra-pass cassandra \
+    --overwrite 2>&1 | tail -3
+
+# Rewrite config with the port and paths the integration suite needs.
+cat > "$CONFIG" <<TOML
+[server]
+bind_addr = "127.0.0.1"
+port = $BIND_PORT
+region = "us-east-1"
+run_dir = "$OUTPUT_DIR"
+
+[server.tls]
+cert_path = "$HOME/.extenddb/tls/cert.pem"
+key_path  = "$HOME/.extenddb/tls/key.pem"
+
+[storage]
+backend = "cassandra"
+
+[storage.cassandra]
+contact_points = ["$CONTACT_POINTS"]
+username = "cassandra"
+password = "cassandra"
+keyspace_prefix = "extenddb"
+replication_factor = 1
+datacenter = "datacenter1"
+max_connections = 10
+
+[auth]
+provider = "builtin"
+
+[import]
+paths = ["$TMP_CANON"]
+
+[export]
+paths = ["$TMP_CANON"]
+
+[logging]
+level  = "info"
+format = "pretty"
+TOML
+
+# ---------------------------------------------------------------------------
+# Start extenddb server
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== Starting extenddb server on 127.0.0.1:$BIND_PORT ==="
+"$BINARY" serve --config "$CONFIG" >"$SERVER_LOG" 2>&1
+
+for i in $(seq 1 30); do
+    if curl -sk "https://127.0.0.1:$BIND_PORT/health" >/dev/null 2>&1; then
+        echo "  server healthy after ${i}s"
+        break
+    fi
+    sleep 1
+done
+
+if ! curl -sk "https://127.0.0.1:$BIND_PORT/health" >/dev/null 2>&1; then
+    echo "error: extenddb server did not become healthy" >&2
+    tail -30 "$SERVER_LOG" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Delegate to run-tests
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== Running test suite via devtools/run-tests --backend cassandra ==="
+echo "  passthrough args: ${RUN_TESTS_ARGS[*]}"
+echo ""
+
+export EXTENDDB_TEST_ENDPOINT="https://127.0.0.1:$BIND_PORT"
+export EXTENDDB_ADMIN_USER=admin
+export EXTENDDB_ADMIN_PASSWORD="$ADMIN_PASSWORD"
+export EXTENDDB_CONFIG="$CONFIG"
+export TMPDIR="$TMP_CANON"
+
+RC=0
+devtools/run-tests --extenddb --backend cassandra --config "$CONFIG" "${RUN_TESTS_ARGS[@]}" || RC=$?
+
+exit $RC

@@ -1,0 +1,209 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+name: Cassandra Integration Tests
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main, feat/storage-cassandra-in-tree]
+
+permissions:
+  contents: read
+
+# The Cassandra backend's integration tests (crates/storage-cassandra/tests)
+# talk to a live node at 127.0.0.1:9042 with cassandra/cassandra credentials
+# and are not feature-gated — without this workflow they never run in CI and
+# every green result is a local claim. The TTL claim protocol in particular
+# fails silently if the stored item encoding drifts, so these tests are the
+# only automated signal for a whole class of regressions.
+#
+# A single-node container is enough: the tests create their own keyspaces
+# (RF=1) and run serially because the sweep and reconciliation passes are
+# global.
+#
+# The cassandra:4.1 image does not honour CASSANDRA_AUTHENTICATOR, so each job
+# patches cassandra.yaml inside the running container and restarts it before
+# running any tests. The health-check on the service container uses the default
+# AllowAllAuthenticator credentials (no auth challenge), so the container is
+# healthy before the patch step runs; after the restart a second wait loop
+# confirms the node is back up with PasswordAuthenticator active.
+
+jobs:
+  cassandra-storage:
+    runs-on: ubuntu-latest
+    services:
+      cassandra:
+        image: cassandra:4.1
+        ports:
+          - 9042:9042
+        env:
+          CASSANDRA_CLUSTER_NAME: extenddb-ci
+          HEAP_NEWSIZE: 128M
+          MAX_HEAP_SIZE: 1024M
+        options: >-
+          --health-cmd "cqlsh -e 'SELECT release_version FROM system.local'"
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 60s
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Configure Cassandra authentication
+        run: |
+          docker exec ${{ job.services.cassandra.id }} sed -i \
+            's/^authenticator: .*/authenticator: PasswordAuthenticator/' \
+            /etc/cassandra/cassandra.yaml
+          docker restart ${{ job.services.cassandra.id }}
+          for i in $(seq 1 30); do
+            if docker exec ${{ job.services.cassandra.id }} \
+                cqlsh -u cassandra -p cassandra \
+                -e 'SELECT release_version FROM system.local' \
+                >/dev/null 2>&1; then
+              echo "Cassandra ready with PasswordAuthenticator after ${i}s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Cassandra did not become ready" >&2; exit 1
+      - name: Unit tests
+        run: cargo test -p extenddb-storage-cassandra --lib
+      - name: TTL integration tests
+        run: cargo test -p extenddb-storage-cassandra --test ttl_integration -- --test-threads=1
+        env:
+          EXTENDDB_TEST_CASSANDRA: required
+      - name: Direct storage-trait integration tests
+        # Ported from the plug-in repo's tests/rust suite. Parallel-safe:
+        # each test provisions its own account and keyspace; the shared
+        # control-plane setting test restores what it mutates.
+        run: cargo test -p extenddb-storage-cassandra --test direct_integration
+        env:
+          EXTENDDB_TEST_CASSANDRA: required
+
+  cassandra-pytest:
+    runs-on: ubuntu-latest
+    services:
+      cassandra:
+        image: cassandra:4.1
+        ports:
+          - 9042:9042
+        env:
+          CASSANDRA_CLUSTER_NAME: extenddb-ci
+          HEAP_NEWSIZE: 128M
+          MAX_HEAP_SIZE: 1024M
+        options: >-
+          --health-cmd "cqlsh -e 'SELECT release_version FROM system.local'"
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 60s
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Configure Cassandra authentication
+        run: |
+          docker exec ${{ job.services.cassandra.id }} sed -i \
+            's/^authenticator: .*/authenticator: PasswordAuthenticator/' \
+            /etc/cassandra/cassandra.yaml
+          docker restart ${{ job.services.cassandra.id }}
+          for i in $(seq 1 30); do
+            if docker exec ${{ job.services.cassandra.id }} \
+                cqlsh -u cassandra -p cassandra \
+                -e 'SELECT release_version FROM system.local' \
+                >/dev/null 2>&1; then
+              echo "Cassandra ready with PasswordAuthenticator after ${i}s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Cassandra did not become ready" >&2; exit 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Build release (cassandra backend)
+        run: cargo build --release --no-default-features --features cassandra
+      - name: Run Cassandra pytest suite
+        run: devtools/run-cassandra-tests -- --pytest --comprehensive --parallel
+
+  cassandra-rust:
+    runs-on: ubuntu-latest
+    services:
+      cassandra:
+        image: cassandra:4.1
+        ports:
+          - 9042:9042
+        env:
+          CASSANDRA_CLUSTER_NAME: extenddb-ci
+          HEAP_NEWSIZE: 128M
+          MAX_HEAP_SIZE: 1024M
+        options: >-
+          --health-cmd "cqlsh -e 'SELECT release_version FROM system.local'"
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 60s
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Configure Cassandra authentication
+        run: |
+          docker exec ${{ job.services.cassandra.id }} sed -i \
+            's/^authenticator: .*/authenticator: PasswordAuthenticator/' \
+            /etc/cassandra/cassandra.yaml
+          docker restart ${{ job.services.cassandra.id }}
+          for i in $(seq 1 30); do
+            if docker exec ${{ job.services.cassandra.id }} \
+                cqlsh -u cassandra -p cassandra \
+                -e 'SELECT release_version FROM system.local' \
+                >/dev/null 2>&1; then
+              echo "Cassandra ready with PasswordAuthenticator after ${i}s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Cassandra did not become ready" >&2; exit 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Build release (cassandra backend)
+        run: cargo build --release --no-default-features --features cassandra
+      - name: Run Cassandra rust integration suite
+        run: devtools/run-cassandra-tests -- --rust --rust-integration
+
+  cassandra-production-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Check production Cassandra feature graph
+        run: cargo check --release --no-default-features --features cassandra
+
+  cassandra-integration:
+    runs-on: ubuntu-latest
+    needs: [cassandra-storage, cassandra-pytest, cassandra-rust, cassandra-production-build]
+    if: always()
+    steps:
+      - run: |
+          if [ "${{ needs.cassandra-storage.result }}" != "success" ] || \
+             [ "${{ needs.cassandra-pytest.result }}" != "success" ] || \
+             [ "${{ needs.cassandra-rust.result }}" != "success" ] || \
+             [ "${{ needs.cassandra-production-build.result }}" != "success" ]; then
+            exit 1
+          fi
