@@ -158,8 +158,17 @@ pub struct VectorSearch<'a> {
 }
 /// TTL table info: `(account_id, table_name, ttl_attribute)`.
 pub type TtlTableInfo = (String, String, String);
-/// Stream records result: records plus an optional next shard iterator.
-pub type StreamRecordsResult = Result<(Vec<StreamRecord>, Option<String>), StorageError>;
+/// Whether a stream page can be followed by another read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamContinuation {
+    /// Keep polling; None preserves the caller's previous sequence position.
+    More(Option<String>),
+    /// The shard is closed and the page exhausts its remaining records.
+    End,
+}
+
+/// Stream records and explicit continuation, including closed-shard exhaustion.
+pub type StreamRecordsResult = Result<(Vec<StreamRecord>, StreamContinuation), StorageError>;
 /// Stream list result: summaries plus an optional next exclusive start ARN.
 pub type StreamListResult = Result<(Vec<StreamSummary>, Option<String>), StorageError>;
 
@@ -566,6 +575,10 @@ pub trait StreamEngine: Send + Sync {
     ) -> BoxFuture<'_, Result<(), StorageError>>;
 
     /// Read stream records from a shard starting after a sequence number.
+    ///
+    /// Return `End` only after observing a closed shard and exhausting its
+    /// records. An empty open shard returns `More(None)`. A final nonempty
+    /// page may return `End`; its records must still reach the caller.
     ///
     /// `account_id` is the authenticated caller's account. Implementations MUST
     /// return records only for shards whose backing table belongs to that
