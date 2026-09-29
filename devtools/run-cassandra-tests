@@ -167,6 +167,20 @@ format = "pretty"
 TOML
 
 # ---------------------------------------------------------------------------
+# Stop any existing server on the target port
+# ---------------------------------------------------------------------------
+
+echo "=== Stopping any existing extenddb server on port $BIND_PORT ==="
+"$BINARY" stop >/dev/null 2>&1 || true
+# Wait briefly for the port to free
+for i in $(seq 1 10); do
+    if ! curl -sk "https://127.0.0.1:$BIND_PORT/health" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+
+# ---------------------------------------------------------------------------
 # Start extenddb server
 # ---------------------------------------------------------------------------
 
