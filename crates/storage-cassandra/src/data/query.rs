@@ -518,12 +518,7 @@ impl CassandraEngine {
                         // only base_sk_* needs direction.
                         format!(
                             "{} AND base_pk = ? AND {} {} ? ORDER BY {} {} LIMIT {}",
-                            query,
-                            base_sk_col,
-                            base_sk_cmp,
-                            base_sk_col,
-                            dir,
-                            fetch_limit
+                            query, base_sk_col, base_sk_cmp, base_sk_col, dir, fetch_limit
                         )
                     } else {
                         format!(
