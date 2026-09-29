@@ -20,10 +20,6 @@ permissions:
 #
 # A single-node container is enough: the tests create their own keyspaces
 # (RF=1) and run serially because the sweep and reconciliation passes are
-<<<<<<< HEAD
-# global. The stock image uses AllowAllAuthenticator, so the credentials the
-# tests and health check send are accepted without an auth challenge.
-=======
 # global.
 #
 # The cassandra:4.1 image does not honour CASSANDRA_AUTHENTICATOR, so each job
@@ -33,7 +29,6 @@ permissions:
 # healthy before the patch step runs; after the restart a second wait loop
 # confirms the node is back up with PasswordAuthenticator active.
 
->>>>>>> ci/cassandra-integration-workflow
 jobs:
   cassandra-storage:
     runs-on: ubuntu-latest
@@ -47,11 +42,7 @@ jobs:
           HEAP_NEWSIZE: 128M
           MAX_HEAP_SIZE: 1024M
         options: >-
-<<<<<<< HEAD
-          --health-cmd "cqlsh -u cassandra -p cassandra -e 'SELECT release_version FROM system.local'"
-=======
           --health-cmd "cqlsh -e 'SELECT release_version FROM system.local'"
->>>>>>> ci/cassandra-integration-workflow
           --health-interval 15s
           --health-timeout 10s
           --health-retries 20
@@ -62,15 +53,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-<<<<<<< HEAD
-=======
       - name: Configure Cassandra authentication
         run: |
           docker exec ${{ job.services.cassandra.id }} sed -i \
             's/^authenticator: .*/authenticator: PasswordAuthenticator/' \
             /etc/cassandra/cassandra.yaml
           docker restart ${{ job.services.cassandra.id }}
-          for i in $(seq 1 30); do
+          for i in $(seq 1 90); do
             if docker exec ${{ job.services.cassandra.id }} \
                 cqlsh -u cassandra -p cassandra \
                 -e 'SELECT release_version FROM system.local' \
@@ -81,23 +70,17 @@ jobs:
             sleep 2
           done
           echo "Cassandra did not become ready" >&2; exit 1
->>>>>>> ci/cassandra-integration-workflow
       - name: Unit tests
         run: cargo test -p extenddb-storage-cassandra --lib
       - name: TTL integration tests
         run: cargo test -p extenddb-storage-cassandra --test ttl_integration -- --test-threads=1
-<<<<<<< HEAD
-=======
         env:
           EXTENDDB_TEST_CASSANDRA: required
->>>>>>> ci/cassandra-integration-workflow
       - name: Direct storage-trait integration tests
         # Ported from the plug-in repo's tests/rust suite. Parallel-safe:
         # each test provisions its own account and keyspace; the shared
         # control-plane setting test restores what it mutates.
         run: cargo test -p extenddb-storage-cassandra --test direct_integration
-<<<<<<< HEAD
-=======
         env:
           EXTENDDB_TEST_CASSANDRA: required
 
@@ -130,7 +113,7 @@ jobs:
             's/^authenticator: .*/authenticator: PasswordAuthenticator/' \
             /etc/cassandra/cassandra.yaml
           docker restart ${{ job.services.cassandra.id }}
-          for i in $(seq 1 30); do
+          for i in $(seq 1 90); do
             if docker exec ${{ job.services.cassandra.id }} \
                 cqlsh -u cassandra -p cassandra \
                 -e 'SELECT release_version FROM system.local' \
@@ -180,7 +163,7 @@ jobs:
             's/^authenticator: .*/authenticator: PasswordAuthenticator/' \
             /etc/cassandra/cassandra.yaml
           docker restart ${{ job.services.cassandra.id }}
-          for i in $(seq 1 30); do
+          for i in $(seq 1 90); do
             if docker exec ${{ job.services.cassandra.id }} \
                 cqlsh -u cassandra -p cassandra \
                 -e 'SELECT release_version FROM system.local' \
@@ -224,4 +207,3 @@ jobs:
              [ "${{ needs.cassandra-production-build.result }}" != "success" ]; then
             exit 1
           fi
->>>>>>> ci/cassandra-integration-workflow
