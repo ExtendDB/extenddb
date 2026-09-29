@@ -281,18 +281,10 @@ impl CassandraEngine {
             } else if ttl_config.is_some() {
                 self.acquire_ttl_mutation_claim(key_info, key, old_item_opt.as_ref())
                     .await?
-            } else {
-                // No TTL claim and no transaction owner: use an OCC LWT to fence
-                // concurrent writers. Without this, a concurrent UpdateItem that
-                // read the same pre-image can race the plain DELETE.
+            } else if condition.is_some() {
+                // Conditional delete: use an OCC LWT to atomically delete only
+                // if the row hasn't changed since we read and checked it.
                 if old_item_opt.is_some() {
-                    // The transaction prepare path consults this high-water mark to
-                    // order new-item PUTs against deletes in the same partition; the
-                    // claimed and transactional delete paths write it before their
-                    // delete, and this fast path must too. Written before the fence:
-                    // if the fence then refuses, a spuriously advanced mark is
-                    // harmless (it only widens a conservative check), while the
-                    // reverse order can lose the mark on a crash between the two.
                     self.update_partition_max_delete_timestamp_at(
                         &data_keyspace,
                         &ddb_table,
@@ -310,7 +302,6 @@ impl CassandraEngine {
                     if !fence_applied {
                         return Err(StorageError::ConditionFailed(old_item_opt));
                     }
-                    // LWT deleted the row; run secondary effects (indexes, stream) if needed.
                     if !indexes.is_empty() || stream.is_some() {
                         self.delete_item_secondary_effects(
                             &data_keyspace,
@@ -324,6 +315,8 @@ impl CassandraEngine {
                     }
                     return Ok(if return_old { old_item_opt } else { None });
                 }
+                None
+            } else {
                 None
             };
             let mutation_timestamp = chrono::Utc::now().timestamp_micros();
@@ -533,17 +526,10 @@ impl CassandraEngine {
             } else if ttl_config.is_some() {
                 self.acquire_ttl_mutation_claim(key_info, key, old_item_opt.as_ref())
                     .await?
-            } else {
-                // No TTL claim and no transaction owner: use an OCC LWT to fence
-                // concurrent writers.
+            } else if condition.is_some() {
+                // Conditional delete: use an OCC LWT to atomically delete only
+                // if the row hasn't changed since we read and checked it.
                 if old_item_opt.is_some() {
-                    // The transaction prepare path consults this high-water mark to
-                    // order new-item PUTs against deletes in the same partition; the
-                    // claimed and transactional delete paths write it before their
-                    // delete, and this fast path must too. Written before the fence:
-                    // if the fence then refuses, a spuriously advanced mark is
-                    // harmless (it only widens a conservative check), while the
-                    // reverse order can lose the mark on a crash between the two.
                     self.update_partition_max_delete_timestamp_at(
                         &data_keyspace,
                         &ddb_table,
@@ -574,6 +560,8 @@ impl CassandraEngine {
                     }
                     return Ok(if return_old { old_item_opt } else { None });
                 }
+                None
+            } else {
                 None
             };
             // Pinned here, immediately after the claim and before any further

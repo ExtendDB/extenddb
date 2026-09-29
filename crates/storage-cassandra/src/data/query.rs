@@ -250,8 +250,8 @@ impl CassandraEngine {
                 let base_pk_attr = &key_info.base_key_schema[0].attribute_name;
                 if start_key.get(base_pk_attr).is_some() {
                     if !needs_two_query_pagination {
-                        // Will be handled in Query 2 section for two-query path
-                        query.push_str(" AND base_pk > ?");
+                        let cmp = if forward { ">" } else { "<" };
+                        query.push_str(&format!(" AND base_pk {cmp} ?"));
                     }
                     None // Returning None, will use base_pk from start_key in execution
                 } else {
@@ -272,6 +272,23 @@ impl CassandraEngine {
                 let sk_col = sk_column(sk_type);
                 let direction = if forward { "ASC" } else { "DESC" };
                 query.push_str(&format!(" ORDER BY {sk_col} {direction}"));
+                if index_name.is_some() {
+                    // base_pk is a clustering key after the index SK; include it
+                    // so ties are broken consistently and the cursor is stable.
+                    query.push_str(&format!(", base_pk {direction}"));
+                    if let Some((_, base_sk_type)) = &base_sk_info_val {
+                        let base_sk_col = format!("base_{}", sk_column(*base_sk_type));
+                        query.push_str(&format!(", {base_sk_col} {direction}"));
+                    }
+                }
+            } else if is_hash_only_index {
+                // No index SK — clustering order is (base_pk, base_sk_*).
+                let direction = if forward { "ASC" } else { "DESC" };
+                query.push_str(&format!(" ORDER BY base_pk {direction}"));
+                if let Some((_, base_sk_type)) = &base_sk_info_val {
+                    let base_sk_col = format!("base_{}", sk_column(*base_sk_type));
+                    query.push_str(&format!(", {base_sk_col} {direction}"));
+                }
             }
 
             // Step 6: Add LIMIT (fetch limit + 1 to detect pagination)
@@ -495,13 +512,17 @@ impl CassandraEngine {
                         &pagination_binds
                     {
                         let base_sk_col = format!("base_{}", sk_column(base_sk.scalar_type()));
+                        let base_sk_cmp = if forward { ">" } else { "<" };
+                        let dir = if forward { "ASC" } else { "DESC" };
+                        // base_pk is equality-constrained so omit it from ORDER BY;
+                        // only base_sk_* needs direction.
                         format!(
-                            "{} AND base_pk = ? AND {} > ? ORDER BY base_pk {}, {} {} LIMIT {}",
+                            "{} AND base_pk = ? AND {} {} ? ORDER BY {} {} LIMIT {}",
                             query,
                             base_sk_col,
-                            if forward { "ASC" } else { "DESC" },
+                            base_sk_cmp,
                             base_sk_col,
-                            if forward { "ASC" } else { "DESC" },
+                            dir,
                             fetch_limit
                         )
                     } else {
@@ -539,14 +560,14 @@ impl CassandraEngine {
                 _ => {}
             }
 
-            // Query 2: next SK values (only if we haven't reached limit yet)
-            if all_rows.len() < fetch_limit
-                && sk_info_opt.is_some()
-                && let Some(start_sk) = start_sk
-            {
+            // Query 2: advance past the cursor's base_pk (hash-only index with base SK)
+            // or advance past the cursor's index SK (index with SK).
+            if all_rows.len() < fetch_limit {
                 let remaining = fetch_limit - all_rows.len();
-                let query2 = if let Some((_, sk_type)) = sk_info_opt {
-                    let sk_col = sk_column(sk_type);
+
+                if let Some(start_sk) = start_sk {
+                    // Index has a sort key — advance past start_sk.
+                    let sk_col = sk_column(sk_info_opt.unwrap().1);
                     let cmp = if forward { ">" } else { "<" };
                     let order_clause = if let Some((_, base_sk_type)) = &base_sk_info_val {
                         let base_sk_col = format!("base_{}", sk_column(*base_sk_type));
@@ -556,69 +577,52 @@ impl CassandraEngine {
                         )
                     } else {
                         format!(
-                            " ORDER BY {} {}, base_pk {} LIMIT {}",
-                            sk_col,
+                            " ORDER BY {sk_col} {}, base_pk {} LIMIT {remaining}",
                             if forward { "ASC" } else { "DESC" },
                             if forward { "ASC" } else { "DESC" },
-                            remaining
                         )
                     };
-                    format!("{query} AND {sk_col} {cmp} ?{order_clause}")
-                } else {
-                    // Hash-only index
-                    let order_clause = if let Some((_, base_sk_type)) = &base_sk_info_val {
+                    let query2 = format!("{query} AND {sk_col} {cmp} ?{order_clause}");
+                    let rows2 = query_with_pk_sk(
+                        &self.session_arc(),
+                        &query2,
+                        &pk_text,
+                        start_sk,
+                        "next_sk",
+                    )
+                    .await?;
+                    all_rows.extend(rows2);
+                } else if let PaginationBinds::BasePkOnly {
+                    pk_text: base_pk_text,
+                }
+                | PaginationBinds::BasePkAndSk {
+                    pk_text: base_pk_text,
+                    ..
+                } = &pagination_binds
+                {
+                    // Hash-only index — advance past cursor's base_pk.
+                    let dir = if forward { "ASC" } else { "DESC" };
+                    let base_pk_cmp = if forward { ">" } else { "<" };
+                    let query2 = if let Some((_, base_sk_type)) = &base_sk_info_val {
                         let base_sk_col = format!("base_{}", sk_column(*base_sk_type));
                         format!(
-                            " ORDER BY base_pk {}, {} {} LIMIT {}",
-                            if forward { "ASC" } else { "DESC" },
-                            base_sk_col,
-                            if forward { "ASC" } else { "DESC" },
-                            remaining
+                            "{query} AND base_pk {base_pk_cmp} ? ORDER BY base_pk {dir}, {base_sk_col} {dir} LIMIT {remaining}"
                         )
                     } else {
                         format!(
-                            " ORDER BY base_pk {} LIMIT {}",
-                            if forward { "ASC" } else { "DESC" },
-                            remaining
+                            "{query} AND base_pk {base_pk_cmp} ? ORDER BY base_pk {dir} LIMIT {remaining}"
                         )
                     };
-                    format!("{query} AND base_pk > ?{order_clause}")
-                };
-
-                let rows2 = match &pagination_binds {
-                    PaginationBinds::BaseSkOnly { .. }
-                    | PaginationBinds::BasePkOnly { .. }
-                    | PaginationBinds::BasePkAndSk { .. }
-                        if sk_info_opt.is_some() =>
-                    {
-                        query_with_pk_sk(
-                            &self.session_arc(),
-                            &query2,
-                            &pk_text,
-                            start_sk,
-                            "next_sk",
-                        )
-                        .await?
-                    }
-                    PaginationBinds::BasePkOnly {
-                        pk_text: base_pk_text,
-                    }
-                    | PaginationBinds::BasePkAndSk {
-                        pk_text: base_pk_text,
-                        ..
-                    } => {
-                        cassandra_util::query_rows(
-                            &self.session_arc(),
-                            &query2,
-                            cdrs_tokio::query_values!(pk_text.as_str(), base_pk_text.as_str()),
-                            "next_sk",
-                        )
-                        .await?
-                    }
-                    _ => Vec::new(),
-                };
-                all_rows.extend(rows2);
-            } // end if let Some(start_sk)
+                    let rows2 = cassandra_util::query_rows(
+                        &self.session_arc(),
+                        &query2,
+                        cdrs_tokio::query_values!(pk_text.as_str(), base_pk_text.as_str()),
+                        "next_base_pk",
+                    )
+                    .await?;
+                    all_rows.extend(rows2);
+                }
+            }
 
             all_rows
         } else {
