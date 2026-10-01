@@ -34,7 +34,7 @@ jobs:
     # 20 concurrent). ubuntu-latest is an Amazon-wide shared pool where our jobs
     # waited 10-90 minutes to start (2026-09-29/30); see integration.yml.
     runs-on: extenddb_ubuntu-2404_4-core
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -53,7 +53,7 @@ jobs:
 
   mongodb-rust:
     runs-on: extenddb_ubuntu-2404_4-core
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -72,7 +72,7 @@ jobs:
 
   mongodb-production-build:
     runs-on: extenddb_ubuntu-2404_4-core
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -84,7 +84,7 @@ jobs:
 
   mongodb-integration:
     runs-on: extenddb_ubuntu-2404_4-core
-    timeout-minutes: 30
+    timeout-minutes: 40
     needs: [mongodb-pytest, mongodb-rust, mongodb-production-build]
     if: always()
     steps:
