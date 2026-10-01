@@ -327,16 +327,8 @@ async fn opposite_request_orders_do_not_deadlock() {
     s.cleanup().await;
 }
 
-#[tokio::test]
-async fn the_earliest_invalid_op_in_request_order_is_reported() {
-    // The ops run in key order, but Amazon DynamoDB names the first invalid
-    // item of the request: [z, a] names z's index, [a, z] names a's.
-    let test = "the_earliest_invalid_op_in_request_order_is_reported";
-    if base_conn().is_none() {
-        return skip(test);
-    }
-    let s = scratch().await;
-    let maps = ExpressionMaps::default();
+/// Create a hash-key table with GSIs `gi1` on `a1` and `gi2` on `a2`.
+async fn gsi_table(s: &Scratch) -> TableKeyInfo {
     let s_attr = |name: &str| AttributeDefinition {
         attribute_name: name.to_owned(),
         attribute_type: ScalarAttributeType::S,
@@ -368,17 +360,31 @@ async fn the_earliest_invalid_op_in_request_order_is_reported() {
         )
         .await
         .expect("create the table");
-    let key_info = s
-        .engine
+    s.engine
         .table_key_info(ACCOUNT, TABLE)
         .await
-        .expect("read the key info");
-    let empty_key = |pk: &str, attr: &str| -> Item {
-        BTreeMap::from([
-            ("pk".to_owned(), AttributeValue::S(pk.to_owned())),
-            (attr.to_owned(), AttributeValue::S(String::new())),
-        ])
-    };
+        .expect("read the key info")
+}
+
+/// An item whose `attr` index key is the empty string.
+fn empty_key(pk: &str, attr: &str) -> Item {
+    BTreeMap::from([
+        ("pk".to_owned(), AttributeValue::S(pk.to_owned())),
+        (attr.to_owned(), AttributeValue::S(String::new())),
+    ])
+}
+
+#[tokio::test]
+async fn the_earliest_invalid_op_in_request_order_is_reported() {
+    // The ops run in key order, but Amazon DynamoDB names the first invalid
+    // item of the request: [z, a] names z's index, [a, z] names a's.
+    let test = "the_earliest_invalid_op_in_request_order_is_reported";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let s = scratch().await;
+    let maps = ExpressionMaps::default();
+    let key_info = gsi_table(&s).await;
     let (z, a) = (empty_key("z", "a2"), empty_key("a", "a1"));
 
     for (ops, expected) in [
@@ -397,6 +403,48 @@ async fn the_earliest_invalid_op_in_request_order_is_reported() {
             }
             other => panic!("expected a ValidationException naming {expected}, got {other:?}"),
         }
+    }
+
+    s.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_invalid_first_op_answers_without_waiting_on_later_locks() {
+    // Once the earliest invalid op is known, the rest must not run: here the
+    // next op's row is held by an outside transaction.
+    let test = "an_invalid_first_op_answers_without_waiting_on_later_locks";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let s = scratch().await;
+    let maps = ExpressionMaps::default();
+    let key_info = gsi_table(&s).await;
+    let b = item("b", "seed");
+    s.engine
+        .put_item(&key_info, b.clone(), false, None, &maps, None)
+        .await
+        .expect("seed b");
+    let table = data_table(&s.db).await;
+    let mut holder = s.db.begin().await.expect("begin the outside transaction");
+    sqlx::query(&format!("SELECT 1 FROM {table} WHERE pk = 'b' FOR UPDATE"))
+        .execute(&mut *holder)
+        .await
+        .expect("lock b");
+
+    let a = empty_key("a", "a1");
+    let ops = [put(&key_info, &a, &maps), put(&key_info, &b, &maps)];
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        s.engine.transact_write_items(&ops, None),
+    )
+    .await
+    .expect("the transaction answered without waiting on b");
+    holder.rollback().await.expect("release b");
+    match result {
+        Err(StorageError::Validation(msg)) => {
+            assert!(msg.ends_with("IndexName: gi1, IndexKey: a1"), "{msg}");
+        }
+        other => panic!("expected a ValidationException, got {other:?}"),
     }
 
     s.cleanup().await;

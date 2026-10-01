@@ -12,7 +12,9 @@ committed transaction must apply in full.
 
 ExtendDB on PostgreSQL queues contending transactions instead of canceling
 them, so there the cancellation shape checks have nothing to check and these
-tests prove only that contention never surfaces as a 5xx. The mapping of a
+tests prove only that contention never surfaces as a 5xx. Only the
+opposite-order test can deadlock; the shared-plus-private test checks the
+reason positions on Amazon DynamoDB. The mapping of a
 database-detected deadlock to TransactionConflict is pinned by the storage
 tests in crates/storage-postgres/tests/twi_conflict.rs.
 """
@@ -213,4 +215,3 @@ def test_conflict_reason_names_only_the_contended_item(
         assert codes == (expected if f["builder"] == 0 else expected[::-1]), f
     assert committed + len(failures) == attempts
     assert committed <= _counter(dynamodb_client, table, hot) <= committed + n_5xx
-
