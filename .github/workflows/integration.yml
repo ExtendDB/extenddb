@@ -9,11 +9,14 @@ permissions:
   contents: read
 
 # Supersede an in-flight run of the SAME pull request when a new push arrives,
-# so two pushes do not each hold seven slots on a capped pool. Conditional on
-# purpose: a bare `cancel-in-progress: true` would also cancel merge-group
-# runs, which evicts the entry from the merge queue and blocks the merge.
+# so two pushes do not each hold six slots on a capped pool. Everything that is
+# not a pull request gets a group unique to the run (run_id): merge-group runs
+# can share a ref (gh-readonly-queue/main/pr-N-<sha> is reused across
+# re-queues of the same PR), and GitHub concurrency replaces a PENDING run in
+# a group even with cancel-in-progress false — so keying non-PR runs by ref
+# would let one merge-group run cancel another and evict its queue entry.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
