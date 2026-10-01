@@ -18,9 +18,23 @@ permissions:
 # `run-tests --backend mongodb`, tearing everything down on exit. Both jobs
 # reuse it so CI runs the exact path developers run locally (no drift), while
 # splitting pytest and rust into parallel jobs the way integration.yml does.
+# Supersede an in-flight run of the SAME pull request when a new push arrives,
+# so repeated pushes do not stack up on a capped pool. Non-PR runs get a group
+# unique to the run (run_id): merge-group runs reuse a ref across re-queues,
+# and GitHub concurrency replaces a PENDING run in a group even with
+# cancel-in-progress false, so keying them by ref would let one merge-group
+# run cancel another and evict its queue entry.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   mongodb-pytest:
-    runs-on: ubuntu-latest
+    # Dedicated ExtendDB runner group (Ubuntu 24.04, 4 vCPU / 16 GB, capped at
+    # 20 concurrent). ubuntu-latest is an Amazon-wide shared pool where our jobs
+    # waited 10-90 minutes to start (2026-09-29/30); see integration.yml.
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -38,7 +52,8 @@ jobs:
         run: devtools/run-mongodb-tests -- --pytest --comprehensive --parallel
 
   mongodb-rust:
-    runs-on: ubuntu-latest
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -56,7 +71,8 @@ jobs:
         run: devtools/run-mongodb-tests -- --rust --rust-integration
 
   mongodb-production-build:
-    runs-on: ubuntu-latest
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -67,7 +83,8 @@ jobs:
         run: cargo check --release --no-default-features --features mongodb
 
   mongodb-integration:
-    runs-on: ubuntu-latest
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 30
     needs: [mongodb-pytest, mongodb-rust, mongodb-production-build]
     if: always()
     steps:
