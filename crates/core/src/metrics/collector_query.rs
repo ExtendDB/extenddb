@@ -6,11 +6,14 @@
 //! Split from `collector.rs` to keep both files under the 500-line limit.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::time::{Duration, Instant, SystemTime};
 
-use super::collector::{MetricsCollector, window_cutoff};
+use super::accumulator::{Accumulator, DataPoint};
+use super::collector::{MetricKey, MetricsCollector, window_cutoff};
 use super::types::{
-    Dimension, MetricName, MetricSnapshot, MetricsQuery, OperationSegments, Percentiles, TimeWindow,
+    Dimension, FlushBucket, MetricName, MetricSnapshot, MetricsQuery, OperationSegments,
+    Percentiles, TimeWindow,
 };
 
 /// Accumulator for per-operation segment sums: (auth, authz, throttle, dispatch, response, total, count).
@@ -18,6 +21,9 @@ type SegmentAccum = (f64, f64, f64, f64, f64, f64, u64);
 
 impl MetricsCollector {
     /// Query metrics and return snapshots.
+    ///
+    /// While a [`drain`](Self::drain) splits its points, the buffered points
+    /// are out of the map and this query does not see them.
     #[must_use]
     pub fn query(&self, params: &MetricsQuery) -> Vec<MetricSnapshot> {
         let now = Instant::now();
@@ -91,68 +97,44 @@ impl MetricsCollector {
     /// `FlushBucket`s for DB persistence. Points newer than `age` are kept
     /// in memory for the next flush cycle.
     ///
-    /// The write lock is held only for the partition step; aggregation into
-    /// buckets happens outside the lock to avoid blocking `record_*` calls.
-    pub fn drain(&self, age: Duration) -> Vec<super::types::FlushBucket> {
+    /// The drain takes the write lock twice: to swap the map out, and to put
+    /// the younger points back ahead of the points recorded meanwhile. Neither
+    /// step touches the points held, so `record_*` calls wait a bounded time
+    /// however many points are buffered. Between the two steps an in-memory
+    /// `query` does not see the buffered points; the server reads metrics
+    /// from its store. Concurrent drains run one at a time. The split and the
+    /// aggregation are CPU-bound: async callers should run the drain on a
+    /// blocking thread.
+    pub fn drain(&self, age: Duration) -> Vec<FlushBucket> {
         let cutoff = Instant::now().checked_sub(age).unwrap_or(Instant::now());
+        aggregate(self.drain_points(cutoff, |_| {}).0)
+    }
 
-        // Phase 1: under write lock, partition old points out and collect them.
-        let drained: Vec<(
-            super::collector::MetricKey,
-            Vec<super::collector::DataPoint>,
-        )> = {
+    /// The points of a drain, and the chunks its second locked step moved.
+    /// `between` sees the map taken by the first locked step, before the
+    /// split, without the write lock.
+    pub(super) fn drain_points(
+        &self,
+        cutoff: Instant,
+        between: impl FnOnce(&PointMap),
+    ) -> (Drained, usize) {
+        let _serial = self
+            .drain_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut held = {
             let Ok(mut map) = self.data.write() else {
-                return Vec::new();
+                return (Vec::new(), 0);
             };
-            let mut result = Vec::new();
-            for (key, acc) in map.iter_mut() {
-                let (old, new): (Vec<_>, Vec<_>) =
-                    acc.points.drain(..).partition(|p| p.timestamp <= cutoff);
-                acc.points = new;
-                if !old.is_empty() {
-                    result.push((key.clone(), old));
-                }
-            }
-            map.retain(|_, acc| !acc.points.is_empty());
-            result
+            std::mem::take(&mut *map)
         };
-
-        // Phase 2: aggregate outside the lock.
-        let mut buckets: HashMap<(super::collector::MetricKey, i64), (f64, u64, f64, f64)> =
-            HashMap::new();
-        for (key, points) in drained {
-            for dp in points {
-                let minute = truncate_to_minute(dp.wall_time);
-                let e = buckets.entry((key.clone(), minute)).or_insert((
-                    0.0,
-                    0,
-                    f64::INFINITY,
-                    f64::NEG_INFINITY,
-                ));
-                e.0 += dp.value;
-                e.1 += 1;
-                e.2 = e.2.min(dp.value);
-                e.3 = e.3.max(dp.value);
-            }
-        }
-
-        buckets
-            .into_iter()
-            .map(
-                |((key, minute), (sum, count, min, max))| super::types::FlushBucket {
-                    bucket: SystemTime::UNIX_EPOCH
-                        + Duration::from_secs(u64::try_from(minute).unwrap_or(0)),
-                    metric: key.metric,
-                    table_name: key.table_name.unwrap_or_default(),
-                    index_name: key.index_name.unwrap_or_default(),
-                    operation: key.operation.unwrap_or_default(),
-                    sum,
-                    count,
-                    min,
-                    max,
-                },
-            )
-            .collect()
+        between(&held);
+        let drained = take_expired(&mut held, cutoff);
+        let Ok(mut map) = self.data.write() else {
+            return (drained, 0);
+        };
+        let moved = reattach(&mut map, held);
+        (drained, moved)
     }
 
     /// Query average latency segments for the console deep-dive.
@@ -238,3 +220,78 @@ fn truncate_to_minute(t: SystemTime) -> i64 {
     let secs_i64 = secs as i64;
     secs_i64 - (secs_i64 % 60)
 }
+
+/// Drained points per key, in record order.
+type Drained = Vec<(MetricKey, Vec<Vec<DataPoint>>)>;
+
+pub(super) type PointMap = HashMap<MetricKey, Accumulator>;
+
+/// Removes every point at or before `cutoff` from `held`, which the caller
+/// has taken out of the collector, and drops the keys left empty.
+pub(super) fn take_expired(held: &mut PointMap, cutoff: Instant) -> Drained {
+    let mut drained = Vec::new();
+    for (key, acc) in held.iter_mut() {
+        let old = acc.take_expired(cutoff);
+        if !old.is_empty() {
+            drained.push((key.clone(), old));
+        }
+    }
+    held.retain(|_, acc| !acc.is_empty());
+    drained
+}
+
+/// The second locked step of a drain: makes `young` the map again and appends
+/// the points recorded since the first step. Returns the chunks it moved, which
+/// are only the chunks of those new points.
+pub(super) fn reattach(map: &mut PointMap, young: PointMap) -> usize {
+    let recorded = std::mem::replace(map, young);
+    let mut moved = 0;
+    for (key, acc) in recorded {
+        moved += acc.chunk_count();
+        match map.entry(key) {
+            Entry::Occupied(mut e) => e.get_mut().append(acc),
+            Entry::Vacant(e) => {
+                e.insert(acc);
+            }
+        }
+    }
+    moved
+}
+
+/// Sums drained points into 1-minute buckets per key, in record order.
+pub(super) fn aggregate(drained: Drained) -> Vec<FlushBucket> {
+    let mut out = Vec::new();
+    for (key, chunks) in drained {
+        let mut by_minute: HashMap<i64, (f64, u64, f64, f64)> = HashMap::new();
+        for dp in chunks.iter().flatten() {
+            let e = by_minute
+                .entry(truncate_to_minute(dp.wall_time))
+                .or_insert((0.0, 0, f64::INFINITY, f64::NEG_INFINITY));
+            e.0 += dp.value;
+            e.1 += 1;
+            e.2 = e.2.min(dp.value);
+            e.3 = e.3.max(dp.value);
+        }
+        out.extend(
+            by_minute
+                .into_iter()
+                .map(|(minute, (sum, count, min, max))| FlushBucket {
+                    bucket: SystemTime::UNIX_EPOCH
+                        + Duration::from_secs(u64::try_from(minute).unwrap_or(0)),
+                    metric: key.metric,
+                    table_name: key.table_name.clone().unwrap_or_default(),
+                    index_name: key.index_name.clone().unwrap_or_default(),
+                    operation: key.operation.clone().unwrap_or_default(),
+                    sum,
+                    count,
+                    min,
+                    max,
+                }),
+        );
+    }
+    out
+}
+
+#[cfg(test)]
+#[path = "drain_tests.rs"]
+mod tests;
