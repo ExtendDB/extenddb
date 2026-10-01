@@ -21,8 +21,9 @@ use std::time::Duration;
 
 use extenddb_core::expression::ExpressionMaps;
 use extenddb_core::types::{
-    AttributeDefinition, AttributeValue, BillingMode, CreateTableInput, Item, KeySchemaElement,
-    KeyType, ReturnValuesOnConditionCheckFailure, ScalarAttributeType, TableKeyInfo,
+    AttributeDefinition, AttributeValue, BillingMode, CreateTableInput, GsiInput, Item,
+    KeySchemaElement, KeyType, Projection, ProjectionType, ReturnValuesOnConditionCheckFailure,
+    ScalarAttributeType, TableKeyInfo,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{DataEngine, TableEngine, TransactWriteOp};
@@ -322,6 +323,81 @@ async fn opposite_request_orders_do_not_deadlock() {
         }
     });
     futures::future::join_all(writers).await;
+
+    s.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_earliest_invalid_op_in_request_order_is_reported() {
+    // The ops run in key order, but Amazon DynamoDB names the first invalid
+    // item of the request: [z, a] names z's index, [a, z] names a's.
+    let test = "the_earliest_invalid_op_in_request_order_is_reported";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let s = scratch().await;
+    let maps = ExpressionMaps::default();
+    let s_attr = |name: &str| AttributeDefinition {
+        attribute_name: name.to_owned(),
+        attribute_type: ScalarAttributeType::S,
+    };
+    let hash = |name: &str| KeySchemaElement {
+        attribute_name: name.to_owned(),
+        key_type: KeyType::Hash,
+    };
+    let gsi = |index: &str, attr: &str| GsiInput {
+        index_name: index.to_owned(),
+        key_schema: vec![hash(attr)],
+        projection: Projection {
+            projection_type: ProjectionType::All,
+            non_key_attributes: None,
+        },
+        provisioned_throughput: None,
+    };
+    s.engine
+        .create_table(
+            ACCOUNT,
+            CreateTableInput {
+                table_name: TABLE.to_owned(),
+                key_schema: vec![hash("pk")],
+                attribute_definitions: vec![s_attr("pk"), s_attr("a1"), s_attr("a2")],
+                billing_mode: Some(BillingMode::PayPerRequest),
+                global_secondary_indexes: Some(vec![gsi("gi1", "a1"), gsi("gi2", "a2")]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create the table");
+    let key_info = s
+        .engine
+        .table_key_info(ACCOUNT, TABLE)
+        .await
+        .expect("read the key info");
+    let empty_key = |pk: &str, attr: &str| -> Item {
+        BTreeMap::from([
+            ("pk".to_owned(), AttributeValue::S(pk.to_owned())),
+            (attr.to_owned(), AttributeValue::S(String::new())),
+        ])
+    };
+    let (z, a) = (empty_key("z", "a2"), empty_key("a", "a1"));
+
+    for (ops, expected) in [
+        (
+            [put(&key_info, &z, &maps), put(&key_info, &a, &maps)],
+            "IndexName: gi2, IndexKey: a2",
+        ),
+        (
+            [put(&key_info, &a, &maps), put(&key_info, &z, &maps)],
+            "IndexName: gi1, IndexKey: a1",
+        ),
+    ] {
+        match s.engine.transact_write_items(&ops, None).await {
+            Err(StorageError::Validation(msg)) => {
+                assert!(msg.ends_with(expected), "{msg}");
+            }
+            other => panic!("expected a ValidationException naming {expected}, got {other:?}"),
+        }
+    }
 
     s.cleanup().await;
 }

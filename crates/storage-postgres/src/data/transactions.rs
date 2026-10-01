@@ -115,6 +115,8 @@ impl PostgresEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         // A conflict abort outside the per-op loop cannot be tied to one item.
+        // Unreachable at READ COMMITTED, where the ops already hold every row
+        // lock; a stricter operator isolation can raise 40001 at commit.
         let cancel_all = |e: StorageError| conflict_cancels_all(e, ops.len());
 
         // Check the idempotency token within the transaction so token storage
@@ -131,6 +133,7 @@ impl PostgresEngine {
         let mut any_failed = false;
         let mut first_invalid: Option<(usize, String)> = None;
         let mut failed_op: Option<(usize, StorageError)> = None;
+        let mut ran = vec![false; ops.len()];
 
         // Run the ops in key order, not request order, so every transaction
         // locks its items in one global order and two cannot deadlock on each
@@ -162,10 +165,19 @@ impl PostgresEngine {
                 }
                 Err(TxnOpError::Storage(e)) => {
                     // Infrastructure error, or PostgreSQL aborted the
-                    // transaction: run no further ops.
+                    // transaction: run no further ops. A request-earlier op
+                    // that sorts later is then not validated.
                     failed_op = Some((i, e));
                     break;
                 }
+            }
+            ran[i] = true;
+            // Once every op before the earliest invalid one has run, the
+            // answer is fixed: stop instead of locking the rest.
+            if let Some((j, _)) = &first_invalid
+                && ran[..*j].iter().all(|r| *r)
+            {
+                break;
             }
         }
 
