@@ -19,8 +19,8 @@ pub(crate) fn is_fk_violation(e: &sqlx::Error) -> bool {
     false
 }
 
-/// Check if a mapped error is PostgreSQL aborting the transaction to break a
-/// lock conflict: deadlock_detected (40P01) or serialization_failure (40001).
+/// Check if a mapped error is `PostgreSQL` aborting the transaction to break a
+/// lock conflict: `deadlock_detected` (40P01) or `serialization_failure` (40001).
 /// Matches the `SQLSTATE` prefix that `data::index::db_error` writes.
 pub(crate) fn is_conflict_abort(e: &extenddb_storage::error::StorageError) -> bool {
     match e {
