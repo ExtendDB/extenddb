@@ -323,8 +323,15 @@ jobs:
       - name: Log in to ECR Public
         run: |
           set -euo pipefail
-          aws ecr-public get-login-password --region us-east-1 \
-            | skopeo login public.ecr.aws -u AWS --password-stdin
+          # Both credential stores: skopeo reads containers/auth.json, while
+          # cosign (go-containerregistry) reads ~/.docker/config.json. Without
+          # the docker login, cosign's signature read goes out ANONYMOUSLY and
+          # shares ECR Public's per-IP anonymous quota with every other GitHub
+          # runner — three "Data limit exceeded" failures on 2026-09-30.
+          TOKEN=$(aws ecr-public get-login-password --region us-east-1)
+          skopeo login public.ecr.aws -u AWS --password-stdin <<< "$TOKEN"
+          docker login public.ecr.aws -u AWS --password-stdin <<< "$TOKEN"
+          unset TOKEN
 
       - name: Promote ECR Public (shared per-registry rules)
         uses: ./.github/actions/promote-registry
@@ -339,7 +346,7 @@ jobs:
         if: always()
         run: |
           skopeo logout ghcr.io || true
-          skopeo logout public.ecr.aws || true
+          skopeo logout public.ecr.aws || true; docker logout public.ecr.aws >/dev/null 2>&1 || true
 
       - name: Summarise for the release checklist
         if: always()
