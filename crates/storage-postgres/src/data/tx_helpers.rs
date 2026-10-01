@@ -14,6 +14,7 @@ use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{SortKeyValue, parse_sk, pk_to_text, sk_column, sk_info};
 
+use super::index::db_error;
 use super::{data_table_name, json_to_item};
 
 /// Fetch a single item within an existing transaction.
@@ -86,7 +87,7 @@ pub(super) async fn fetch_item_for_update(
             .bind(pk_text.as_ref())
             .fetch_optional(&mut **tx)
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            .map_err(db_error)?;
         row.map(|(v,)| v)
     };
 
@@ -130,7 +131,7 @@ pub(super) async fn upsert_item_in_tx(
             .bind(&item_json)
             .execute(&mut **tx)
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            .map_err(db_error)?;
     }
     Ok(())
 }
@@ -183,7 +184,7 @@ pub(super) async fn insert_item_if_absent_in_tx(
             .bind(&item_json)
             .execute(&mut **tx)
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .map_err(db_error)?
             .rows_affected()
     };
     Ok(rows_affected == 1)
@@ -233,14 +234,14 @@ pub(super) async fn delete_item_in_tx(
                     .await
             }
         }
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        .map_err(db_error)?;
     } else {
         let sql = format!("DELETE FROM {ddb_table} WHERE pk = $1");
         sqlx::query(&sql)
             .bind(pk_text.as_ref())
             .execute(&mut **tx)
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            .map_err(db_error)?;
     }
     Ok(())
 }
@@ -323,7 +324,7 @@ pub(super) async fn write_stream_record_in_tx(
     .bind(&key_info.table_id)
     .fetch_all(&mut **tx)
     .await
-    .map_err(|e| StorageError::Internal(e.to_string()))?;
+    .map_err(db_error)?;
 
     if shards.is_empty() {
         // No shards — streams may not be fully set up yet. Skip silently.
@@ -339,7 +340,7 @@ pub(super) async fn write_stream_record_in_tx(
     let (seq_val,): (i64,) = sqlx::query_as("SELECT nextval('stream_seq')")
         .fetch_one(&mut **tx)
         .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        .map_err(db_error)?;
     let seq = format!("{seq_val:021}");
 
     let record = StreamRecord {
@@ -380,7 +381,7 @@ pub(super) async fn write_stream_record_in_tx(
     .bind(&record_json)
     .execute(&mut **tx)
     .await
-    .map_err(|e| StorageError::Internal(e.to_string()))?;
+    .map_err(db_error)?;
 
     Ok(())
 }
@@ -421,7 +422,7 @@ pub(super) async fn check_idempotency_token_in_tx(
     .bind(fingerprint)
     .fetch_optional(&mut **tx)
     .await
-    .map_err(|e| StorageError::Internal(e.to_string()))?;
+    .map_err(db_error)?;
 
     match row {
         Some((_, true)) | None => Ok(()),
