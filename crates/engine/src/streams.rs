@@ -9,6 +9,7 @@ use extenddb_core::types::{
     GetShardIteratorInput, GetShardIteratorOutput, ListStreamsInput, ListStreamsOutput,
     ShardIteratorType,
 };
+use extenddb_storage::StreamContinuation;
 use extenddb_storage::error::StorageError;
 use serde_json::Value;
 
@@ -227,32 +228,40 @@ pub async fn handle_get_records(
         Some(seq.to_owned())
     };
 
-    let (records, last_seq) = ctx
+    let (records, continuation) = ctx
         .storage
         .get_stream_records(&ctx.account_id, shard_id, after_sequence.as_deref(), limit)
         .await
         .map_err(storage_to_dynamo)?;
 
-    // Build next iterator — points to after the last record read.
-    // Carries a fresh creation timestamp so the 15-minute window resets.
-    let next_iterator = {
-        let next_seq = last_seq.unwrap_or_else(|| seq.to_owned());
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let next_token = format!("{shard_id}|AFTER_SEQUENCE_NUMBER|{next_seq}|{now}");
-        Some(base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            next_token,
-        ))
-    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let next_iterator = next_iterator(shard_id, seq, continuation, now);
 
     let output = GetRecordsOutput {
         records,
         next_shard_iterator: next_iterator,
     };
     serialize_output(&output)
+}
+
+fn next_iterator(
+    shard_id: &str,
+    previous_sequence: &str,
+    continuation: StreamContinuation,
+    created_at: u64,
+) -> Option<String> {
+    let StreamContinuation::More(last_sequence) = continuation else {
+        return None;
+    };
+    let sequence = last_sequence.as_deref().unwrap_or(previous_sequence);
+    let token = format!("{shard_id}|AFTER_SEQUENCE_NUMBER|{sequence}|{created_at}");
+    Some(base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        token,
+    ))
 }
 
 fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
@@ -268,6 +277,8 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// AT_SEQUENCE_NUMBER converts to AFTER by subtracting 1 and padding to
     /// the backend's stored width. Verify that an unpadded client input is
     /// normalised correctly for both the 21-digit (postgres/sqlite/mongodb)
@@ -291,6 +302,27 @@ mod tests {
                 String::new()
             };
             assert_eq!(&result, expected, "input={input} width={width}");
+        }
+    }
+
+    #[test]
+    fn closed_shard_has_no_next_iterator() {
+        assert_eq!(
+            next_iterator("shard", "7", StreamContinuation::End, 123),
+            None
+        );
+    }
+
+    #[test]
+    fn open_page_preserves_or_advances_position_and_refreshes_expiry() {
+        for (last, expected) in [(None, "7"), (Some("8".to_owned()), "8")] {
+            let token = next_iterator("shard", "7", StreamContinuation::More(last), 123).unwrap();
+            let decoded =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, token).unwrap();
+            assert_eq!(
+                String::from_utf8(decoded).unwrap(),
+                format!("shard|AFTER_SEQUENCE_NUMBER|{expected}|123")
+            );
         }
     }
 }

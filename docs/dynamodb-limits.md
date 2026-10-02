@@ -95,7 +95,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 |-------|---------------|--------|-------|
 | Simultaneous shard readers | 2 (1 for global tables) | Not enforced | No concurrent reader tracking |
 | Max write capacity with streams (provisioned) | 40,000 WCU | Enforced | Same as table WCU limit |
-| GetRecords: max records per call | 1,000 | Not enforced | No per-call record count limit |
+| GetRecords: max records per call | 1,000 | Enforced | Handler caps pages; storage rejects out-of-range limits |
 | Shard iterator lifetime | 15 minutes | Not enforced | No shard iterator expiration |
 
 ## API-Level Limits
@@ -174,10 +174,9 @@ The following unenforced limits are tracked in `docs/technical-debt.md`:
 5. **BatchGetItem response size** (16 MB) — requires aggregate response size tracking
 6. **BatchWriteItem request size** (16 MB) — requires aggregate request size tracking
 7. **Transaction request size** (4 MB) — requires aggregate request size tracking
-8. **GetRecords max per call** (1,000) — requires record count limit in streams
-9. **Shard iterator lifetime** (15 minutes) — requires timestamp tracking on shard iterators
-10. **Tag count per resource** (50) — requires count validation in TagResource
-11. **Tag key/value length** (128/256 chars) — requires length validation in TagResource
+8. **Shard iterator lifetime** (15 minutes) — requires timestamp tracking on shard iterators
+9. **Tag count per resource** (50) — requires count validation in TagResource
+10. **Tag key/value length** (128/256 chars) — requires length validation in TagResource
 
 ---
 
