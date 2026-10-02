@@ -20,6 +20,10 @@ impl SqliteCatalogStore {
     ) -> OpResult<()> {
         let doc = serde_json::to_string(document)
             .map_err(|e| OpError::Internal(format!("serialize policy: {e}")))?;
+        // D1: every writer holds the write lock. This is the writer observed
+        // losing its file lock in the run-integration-sqlite flake
+        // (`put_policy: ... database is locked`).
+        let _writer = self.lock_writes().await;
         sqlx::query(
             "INSERT INTO iam_policies \
              (account_id, principal_type, principal_name, policy_name, policy_document) \
@@ -48,6 +52,8 @@ impl SqliteCatalogStore {
         principal_name: &str,
         policy_name: &str,
     ) -> OpResult<()> {
+        // D1: every writer holds the write lock.
+        let _writer = self.lock_writes().await;
         let result = sqlx::query(
             "DELETE FROM iam_policies \
              WHERE account_id = ? AND principal_type = ? AND principal_name = ? AND policy_name = ?",
@@ -112,6 +118,8 @@ impl SqliteCatalogStore {
     ) -> OpResult<()> {
         let doc = serde_json::to_string(document)
             .map_err(|e| OpError::Internal(format!("serialize boundary: {e}")))?;
+        // D1: every writer holds the write lock.
+        let _writer = self.lock_writes().await;
         sqlx::query(
             "INSERT INTO iam_permissions_boundaries \
              (account_id, principal_type, principal_name, policy_document) \
@@ -163,6 +171,8 @@ impl SqliteCatalogStore {
         principal_type: &str,
         principal_name: &str,
     ) -> OpResult<()> {
+        // D1: every writer holds the write lock.
+        let _writer = self.lock_writes().await;
         sqlx::query(
             "DELETE FROM iam_permissions_boundaries \
              WHERE account_id = ? AND principal_type = ? AND principal_name = ?",

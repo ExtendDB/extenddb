@@ -14,6 +14,8 @@ impl AdminStore for SqliteCatalogStore {
         let admin_name = admin_name.to_owned();
         let password_hash = password_hash.to_owned();
         Box::pin(async move {
+            // D1: every writer holds the write lock.
+            let _writer = self.lock_writes().await;
             sqlx::query("INSERT INTO admin_users (admin_name, password_hash) VALUES (?, ?)")
                 .bind(&admin_name)
                 .bind(&password_hash)
@@ -57,6 +59,8 @@ impl AdminStore for SqliteCatalogStore {
     fn delete_admin(&self, admin_name: &str) -> BoxFuture<'_, OpResult<()>> {
         let admin_name = admin_name.to_owned();
         Box::pin(async move {
+            // D1: every writer holds the write lock.
+            let _writer = self.lock_writes().await;
             let result = sqlx::query("DELETE FROM admin_users WHERE admin_name = ?")
                 .bind(&admin_name)
                 .execute(self.pool())
@@ -80,6 +84,8 @@ impl AdminStore for SqliteCatalogStore {
         let admin_name = admin_name.to_owned();
         let password_hash = password_hash.to_owned();
         Box::pin(async move {
+            // D1: every writer holds the write lock.
+            let _writer = self.lock_writes().await;
             let result =
                 sqlx::query("UPDATE admin_users SET password_hash = ? WHERE admin_name = ?")
                     .bind(&password_hash)

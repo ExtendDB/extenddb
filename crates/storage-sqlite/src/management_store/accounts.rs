@@ -15,6 +15,8 @@ impl SqliteCatalogStore {
         account_id: &str,
         account_name: &str,
     ) -> OpResult<()> {
+        // D1: every writer holds the write lock.
+        let _writer = self.lock_writes().await;
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, ?)")
             .bind(account_id)
             .bind(account_name)
@@ -62,6 +64,9 @@ impl SqliteCatalogStore {
             ));
         }
 
+        // D1: every writer holds the write lock. The existence and dependency
+        // checks above are reads and run before it.
+        let _writer = self.lock_writes().await;
         sqlx::query("DELETE FROM accounts WHERE account_id = ?")
             .bind(account_id)
             .execute(self.pool())

@@ -554,6 +554,8 @@ impl ManagementStore for SqliteCatalogStore {
         let session_policy = session_policy.as_ref().map(ToString::to_string);
         let expires = format_timestamp(expires_at);
         Box::pin(async move {
+            // D1: every writer holds the write lock.
+            let _writer = self.lock_writes().await;
             sqlx::query(
                 "INSERT INTO iam_sessions \
                  (session_token, access_key_id, secret_key_encrypted, account_id, role_name, \
