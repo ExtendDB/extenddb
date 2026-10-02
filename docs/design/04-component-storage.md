@@ -18,6 +18,10 @@ backend selection based on configuration.
 **Current status**: PostgreSQL is the only supported backend. The trait architecture and plugin infrastructure provide
 the foundation for future backend implementations.
 
+Backends accepted into the ExtendDB repository must satisfy the [Backend Acceptance Criteria](../rfcs/0003-backend-acceptance-criteria.md)
+(the DynamoDB-behavioral invariants for the storage layer) and the process defined in
+[RFC-0002](../rfcs/0002-backend-plugin-policy.md).
+
 ## 2. Storage Trait Hierarchy
 
 The storage abstraction is split into focused traits following the Interface Segregation Principle. This allows
