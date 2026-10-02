@@ -1,0 +1,139 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Keyless-signing rehearsal: prove the entire keyless path on real runners
+# with ZERO production contact, before any release workflow enables it.
+#
+# Builds a scratch single-layer image in a dedicated rehearsal GHCR package,
+# signs it through the PRODUCTION code path (the sign-image composite
+# action, keyless leg), and then proves everything the rollout depends on:
+#
+#   1. Fulcio issues a certificate for this runner's OIDC identity and the
+#      signature lands in Rekor (the flag set for keyless + legacy
+#      tag-based storage is empirically validated here — cosign v3 flag
+#      interactions have bitten this repo before)
+#   2. the EXACT identity strings in the certificate are captured and
+#      printed — these are what the published verify instructions and any
+#      admission policies must pin, so they come from observation, not docs
+#   3. the .sig artifact keeps the shape every existing gate requires:
+#      single OCI manifest, simplesigning layers, tag-addressed — so
+#      promote-registry / copy-artifact / ghcr-mirror handle keyless-signed
+#      artifacts unchanged
+#   4. verification succeeds by identity (and fails for a wrong identity —
+#      the negative control)
+#
+# No KMS, no AWS, no environment, no secrets: id-token for Fulcio and
+# packages:write for the scratch package are the only capabilities.
+# Repeat runs are cheap; enable keyless in production callers only after
+# this has passed repeatedly and the captured identities are documented.
+
+name: keyless-rehearsal
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keyless-rehearsal
+  cancel-in-progress: false
+
+env:
+  REHEARSAL_REPO: ghcr.io/extenddb/keyless-rehearsal
+  COSIGN_VERSION: v3.1.3
+  COSIGN_SHA256: 4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71
+  CRANE_VERSION: v0.21.9
+  CRANE_SHA256: 5c16d8ddb971cb1d5e6ed8b1e743da8224414eeba2c2762d8f1a61b2f095699e
+
+jobs:
+  rehearse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write    # Fulcio: the certificate binds to this run's identity
+      packages: write    # scratch package only
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install pinned crane (cosign comes via the composite action)
+        run: |
+          set -euo pipefail
+          curl -sSfL -o /tmp/crane.tgz \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_SHA256}  /tmp/crane.tgz" | sha256sum --check --strict
+          tar -xzf /tmp/crane.tgz -C /tmp crane
+          sudo install -m 0755 /tmp/crane /usr/local/bin/crane
+
+      - name: Build and push a scratch rehearsal image
+        id: scratch
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          crane auth login ghcr.io -u x-access-token --password-stdin <<< "$GHCR_TOKEN"
+          WORK=$(mktemp -d)
+          echo "keyless rehearsal ${{ github.run_id }} $(date -u +%FT%TZ)" > "$WORK/marker.txt"
+          tar -cf "$WORK/layer.tar" -C "$WORK" marker.txt
+          REF="${REHEARSAL_REPO}:run-${{ github.run_id }}"
+          crane append --new_tag "$REF" -f "$WORK/layer.tar"
+          DIGEST=$(crane digest "$REF")
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "::notice::rehearsal image $REF@$DIGEST"
+
+      - name: Sign keyless through the PRODUCTION composite action
+        uses: ./.github/actions/sign-image
+        with:
+          image-repo: ${{ env.REHEARSAL_REPO }}
+          digest: ${{ steps.scratch.outputs.digest }}
+          release-tag: v0.0.0
+          keyless: 'true'
+          extra-annotation: org.extenddb.rehearsal=keyless-${{ github.run_id }}
+
+      - name: Capture the ACTUAL certificate identity (this is what verify docs pin)
+        env:
+          DIGEST: ${{ steps.scratch.outputs.digest }}
+        run: |
+          set -euo pipefail
+          SIG_TAG="sha256-${DIGEST#sha256:}.sig"
+          RAW=$(crane manifest "${REHEARSAL_REPO}:${SIG_TAG}")
+          echo '=== signature artifact shape (must satisfy the mirror/promote gates) ==='
+          jq '{mediaType, layers: [.layers[].mediaType]}' <<< "$RAW"
+          [[ "$(jq -r .mediaType <<< "$RAW")" == "application/vnd.oci.image.manifest.v1+json" ]]
+          jq -e 'all(.layers[]; .mediaType == "application/vnd.dev.cosign.simplesigning.v1+json")' <<< "$RAW" >/dev/null
+          echo '=== certificate identity, from the signature itself ==='
+          CERT=$(jq -r '.layers[-1].annotations["dev.sigstore.cosign/certificate"]' <<< "$RAW")
+          [[ -n "$CERT" && "$CERT" != "null" ]] || { echo "::error::no certificate annotation on the signature layer"; exit 1; }
+          printf '%s' "$CERT" | openssl x509 -noout -text \
+            | grep -A1 -E 'Subject Alternative Name|1.3.6.1.4.1.57264' | head -30
+
+      - name: Verify by identity — and prove the negative control
+        env:
+          DIGEST: ${{ steps.scratch.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-identity-regexp '^https://github\.com/ExtendDB/extenddb/\.github/workflows/.+@refs/' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${REHEARSAL_REPO}@${DIGEST}" | head -1
+          echo '::notice::identity verification PASSED'
+          # Negative control: a wrong identity must NOT verify.
+          if cosign verify \
+            --certificate-identity 'https://github.com/attacker/repo/.github/workflows/evil.yml@refs/heads/main' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${REHEARSAL_REPO}@${DIGEST}" >/dev/null 2>&1; then
+            echo "::error::NEGATIVE CONTROL FAILED: a wrong identity verified"
+            exit 1
+          fi
+          echo '::notice::negative control PASSED (wrong identity refused)'
+
+      - name: Clean up the rehearsal tag (best effort)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X DELETE "orgs/extenddb/packages/container/keyless-rehearsal" >/dev/null 2>&1 \
+            && echo 'rehearsal package deleted' \
+            || echo '::notice::package cleanup skipped (needs admin token); rehearsal artifacts are inert and clearly named'
