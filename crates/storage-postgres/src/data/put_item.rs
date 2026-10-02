@@ -7,12 +7,14 @@ use extenddb_core::expression::{Expr, ExpressionMaps};
 use extenddb_core::types::{Item, TableKeyInfo};
 use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{composite_pk_to_text, parse_sk, pk_to_text, sk_column, sk_info};
+use extenddb_storage::util::{sk_column, sk_info};
+
+use super::key_text::{composite_pk_to_text, parse_sk, pk_to_text};
 
 use super::index::{enqueue_async_indexes, fetch_write_path_indexes, sync_indexes};
 use super::query::check_condition;
 use super::tx_helpers::write_stream_record_in_tx;
-use super::{data_table_name, json_to_item};
+use super::{data_table_name, item_to_json, json_to_item};
 use crate::PostgresEngine;
 
 impl PostgresEngine {
@@ -30,8 +32,7 @@ impl PostgresEngine {
 
         let pk_text = composite_pk_to_text(&item, &key_info.key_schema)?;
 
-        let item_json =
-            serde_json::to_value(&item).map_err(|e| StorageError::Internal(e.to_string()))?;
+        let item_json = item_to_json(&item)?;
 
         // Both index families in one catalog visit (D-4: sync + async split for the
         // secondary indexes).

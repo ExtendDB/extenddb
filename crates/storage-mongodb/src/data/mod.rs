@@ -13,7 +13,9 @@ use extenddb_core::types::{
     AttributeDefinition, AttributeValue, Item, KeySchemaElement, ScalarAttributeType,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{composite_pk_to_text, encode_netstring_composite, sk_info};
+use extenddb_storage::util::{
+    composite_pk_to_text, encode_netstring_composite, escape_json_keys, sk_info, unescape_json_keys,
+};
 
 /// Returns the `MongoDB` collection name for a `DynamoDB` table.
 pub fn data_collection_name(table_id: &str) -> String {
@@ -32,6 +34,42 @@ pub fn composite_id(pk_text: &str, sk_text: &str) -> String {
     encode_netstring_composite(&[pk_text.to_owned(), sk_text.to_owned()])
 }
 
+/// Convert an item (base item or projected index item) to the BSON stored
+/// under `item_data`.
+///
+/// BSON field names are C strings and cannot contain U+0000, while `DynamoDB`
+/// accepts it in attribute names and map keys. Every object key in the item's
+/// JSON form is run through the shared order-preserving escape (U+0000 and
+/// U+0001 become two-character sequences, see
+/// `extenddb_storage::util::escape_control`) before the BSON conversion, so
+/// the stored document never carries a NUL field name. String values are left
+/// alone; BSON strings are length-prefixed and hold U+0000 verbatim.
+///
+/// Every conversion of an item to `item_data` BSON must go through this
+/// function or [`json_to_item_data`]; a direct `bson::to_bson` on item JSON
+/// fails in the driver at write time when a name contains U+0000.
+/// [`item_data_to_json`] reverses the escape on read.
+pub(crate) fn item_to_item_data(item: &Item) -> Result<bson::Bson, StorageError> {
+    let item_json =
+        serde_json::to_value(item).map_err(|e| StorageError::Internal(e.to_string()))?;
+    json_to_item_data(item_json)
+}
+
+/// JSON-tree variant of [`item_to_item_data`], for payloads that carry items
+/// nested inside another structure (stream records with key/image maps).
+pub(crate) fn json_to_item_data(json: serde_json::Value) -> Result<bson::Bson, StorageError> {
+    let escaped = escape_json_keys(json);
+    bson::to_bson(&escaped).map_err(|e| StorageError::Internal(e.to_string()))
+}
+
+/// Reverse of [`json_to_item_data`]: BSON read from storage back to JSON with
+/// the object-key escape undone.
+pub(crate) fn item_data_to_json(value: &bson::Bson) -> Result<serde_json::Value, StorageError> {
+    let json: serde_json::Value = bson::from_bson(value.clone())
+        .map_err(|e| StorageError::Internal(format!("BSON to JSON conversion error: {e}")))?;
+    Ok(unescape_json_keys(json))
+}
+
 /// Convert a `DynamoDB` Item to a `MongoDB` BSON document for storage.
 ///
 /// Document structure: `{ _id, pk, sk_s/sk_n/sk_b, item_data }`
@@ -42,10 +80,9 @@ pub fn item_to_document(
 ) -> Result<Document, StorageError> {
     let pk_text = composite_pk_to_text(item, key_schema)?;
 
-    // Serialize the full item as item_data
-    let item_json =
-        serde_json::to_value(item).map_err(|e| StorageError::Internal(e.to_string()))?;
-    let item_bson = bson::to_bson(&item_json).map_err(|e| StorageError::Internal(e.to_string()))?;
+    // Serialize the full item as item_data (object keys escaped, see
+    // item_to_item_data).
+    let item_bson = item_to_item_data(item)?;
 
     let mut doc = Document::new();
 
@@ -192,9 +229,7 @@ pub fn index_document(
         insert_typed_sk(&mut doc, &field, sk_type, sk_value)?;
     }
 
-    let item_json =
-        serde_json::to_value(projected).map_err(|e| StorageError::Internal(e.to_string()))?;
-    let item_bson = bson::to_bson(&item_json).map_err(|e| StorageError::Internal(e.to_string()))?;
+    let item_bson = item_to_item_data(projected)?;
     doc.insert("item_data", item_bson);
 
     Ok(doc)
@@ -254,8 +289,7 @@ pub fn document_to_item(doc: &Document) -> Result<Item, StorageError> {
         .get("item_data")
         .ok_or_else(|| StorageError::Internal("Document missing item_data field".to_string()))?;
 
-    let json_value: serde_json::Value = bson::from_bson(item_data.clone())
-        .map_err(|e| StorageError::Internal(format!("BSON to JSON conversion error: {e}")))?;
+    let json_value = item_data_to_json(item_data)?;
 
     let item: Item = serde_json::from_value(json_value)
         .map_err(|e| StorageError::Internal(format!("JSON to Item conversion error: {e}")))?;
@@ -432,6 +466,89 @@ mod tests {
 
         let err = pk_filter(&key, &schema, &attrs).unwrap_err();
         assert!(matches!(err, StorageError::Validation(_)));
+    }
+
+    /// Walk a BSON tree and assert no document field name contains U+0000.
+    fn assert_no_nul_field_names(value: &bson::Bson) {
+        match value {
+            bson::Bson::Document(doc) => {
+                for (k, v) in doc {
+                    assert!(!k.contains('\u{0}'), "field name contains NUL: {k:?}");
+                    assert_no_nul_field_names(v);
+                }
+            }
+            bson::Bson::Array(items) => {
+                for item in items {
+                    assert_no_nul_field_names(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn item_document_round_trips_control_characters_in_names() {
+        use std::collections::BTreeMap;
+
+        let (schema, attrs) = schema_pk_str_sk_num();
+
+        let mut inner = BTreeMap::new();
+        inner.insert(
+            "deep\u{0}key".to_owned(),
+            AttributeValue::S("v\u{0}".to_owned()),
+        );
+        let mut mid = BTreeMap::new();
+        mid.insert("mid\u{1}key".to_owned(), AttributeValue::M(inner));
+        let mut in_list = BTreeMap::new();
+        in_list.insert(
+            "list\u{0}\u{1}key".to_owned(),
+            AttributeValue::S("w".to_owned()),
+        );
+
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S("p".to_owned()));
+        item.insert("sk".to_owned(), AttributeValue::N("1".to_owned()));
+        item.insert(
+            "top\u{0}\u{1}name".to_owned(),
+            AttributeValue::S("x".to_owned()),
+        );
+        item.insert("map".to_owned(), AttributeValue::M(mid));
+        item.insert(
+            "list".to_owned(),
+            AttributeValue::L(vec![AttributeValue::M(in_list)]),
+        );
+
+        let doc = item_to_document(&item, &schema, &attrs).unwrap();
+        assert_no_nul_field_names(&bson::Bson::Document(doc.clone()));
+
+        let back = document_to_item(&doc).unwrap();
+        assert_eq!(back, item);
+    }
+
+    #[test]
+    fn plain_item_document_stores_raw_field_names() {
+        use std::collections::BTreeMap;
+
+        let (schema, attrs) = schema_pk_str_sk_num();
+
+        let mut inner = BTreeMap::new();
+        inner.insert("k".to_owned(), AttributeValue::S("v".to_owned()));
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S("p".to_owned()));
+        item.insert("sk".to_owned(), AttributeValue::N("1".to_owned()));
+        item.insert("attr".to_owned(), AttributeValue::M(inner));
+
+        let doc = item_to_document(&item, &schema, &attrs).unwrap();
+        let item_data = doc.get_document("item_data").unwrap();
+        let names: Vec<&str> = item_data.keys().map(String::as_str).collect();
+        assert_eq!(names, vec!["attr", "pk", "sk"]);
+        let attr_m = item_data
+            .get_document("attr")
+            .unwrap()
+            .get_document("M")
+            .unwrap();
+        let map_keys: Vec<&str> = attr_m.keys().map(String::as_str).collect();
+        assert_eq!(map_keys, vec!["k"]);
     }
 
     #[test]

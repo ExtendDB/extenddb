@@ -402,6 +402,25 @@ The PostgreSQL backend uses two categories of tables:
   attributes, matching the DynamoDB model where key attributes are part of the
   item.
 
+- **U+0000 in strings**: DynamoDB accepts the character U+0000 anywhere a
+  string appears (measured 2026-09-18: partition and sort keys, index keys,
+  values, strings in lists, map keys, attribute names; it sorts as the byte
+  0x00 and is a different key from the six-character text `\u0000`).
+  PostgreSQL `TEXT` rejects the byte and `jsonb` rejects the `\u0000` escape,
+  so every string that reaches a key column or an `item_data`, `gsi_pending`,
+  `stream_records`, or `backup_items` document goes through the escape in
+  `extenddb_storage::util::escape_control`: U+0000 is stored as U+0001 U+0001
+  and U+0001 as U+0001 U+0002; every other character is unchanged, so ordinary
+  data is stored exactly as before. The mapping preserves UTF-8 byte order and
+  prefixes, so `COLLATE "C"` comparisons, `BETWEEN`, `begins_with`, and
+  row-comparison cursors on escaped columns return the rows the raw text
+  would. SQL that addresses an attribute by name inside `item_data` (the TTL
+  index and sweep, vector search filters) uses the escaped name. The MongoDB
+  backend applies the same escape to BSON field names only, since BSON string
+  values are length-prefixed and hold the byte as is. Rows written before the
+  escape existed are re-encoded once by the operator migration
+  `004_escape_control_chars` (see the upgrade manual).
+
 - **GSI tables**: GSI tables include base table primary key columns (`base_pk`,
   `base_sk_*`) as actual SQL columns (not just inside `item_data` JSONB). This
   is required because: (1) GSI keys are not unique — two base table items can

@@ -94,8 +94,7 @@ impl StreamEngine for PostgresEngine {
         let shard_id = shard_id.to_string();
         let table_name = table_name.to_string();
         Box::pin(async move {
-            let record_json =
-                serde_json::to_value(&record).map_err(|e| StorageError::Internal(e.to_string()))?;
+            let record_json = crate::data::to_stored_json(&record)?;
 
             let table_id: String = sqlx::query_scalar(
                 "SELECT table_id FROM tables WHERE account_id = $1 AND table_name = $2",
@@ -197,9 +196,7 @@ impl StreamEngine for PostgresEngine {
 
             let records: Vec<StreamRecord> = rows
                 .into_iter()
-                .map(|(data,)| {
-                    serde_json::from_value(data).map_err(|e| StorageError::Internal(e.to_string()))
-                })
+                .map(|(data,)| crate::data::stored_json_to(data))
                 .collect::<Result<Vec<_>, _>>()?;
 
             let last_seq = records.last().map(|r| r.dynamodb.sequence_number.clone());

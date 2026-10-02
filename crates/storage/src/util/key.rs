@@ -23,9 +23,10 @@ pub enum SortKeyValue {
 ///
 /// For single-attribute keys, returns the value directly (no encoding).
 /// For multi-attribute keys, uses netstring encoding: each part is encoded as
-/// `<decimal-length>:<value>,` and concatenated. This is provably collision-free
-/// regardless of value content, and compatible with `PostgreSQL` TEXT columns
-/// (no null bytes).
+/// `<decimal-length>:<value>,` and concatenated. This is collision-free
+/// regardless of value content. The parts are the raw attribute strings; a
+/// backend whose columns cannot hold every character (PostgreSQL, see
+/// `escape_control`) escapes its key text in its own wrapper.
 pub fn composite_pk_to_text(
     item: &Item,
     key_schema: &[KeySchemaElement],
@@ -286,7 +287,7 @@ pub fn recover_sort_key_definitions(
 /// Encode multiple string parts into a single netstring-encoded composite key.
 ///
 /// Format: `<len>:<value>,<len>:<value>,...` — e.g., `"abc"` + `"de"` → `"3:abc,2:de,"`.
-/// This encoding is unambiguous for arbitrary byte content and contains no null bytes.
+/// This encoding is unambiguous for arbitrary part content; the parts are copied as given.
 #[must_use]
 pub fn encode_netstring_composite(parts: &[String]) -> String {
     let mut out = String::new();

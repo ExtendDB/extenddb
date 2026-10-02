@@ -273,7 +273,9 @@ impl MetadataEngine for PostgresEngine {
     ) -> BoxFuture<'_, Result<(), StorageError>> {
         let account_id = account_id.to_string();
         let table_name = table_name.to_string();
-        let ttl_attribute = ttl_attribute.to_string();
+        // Stored attribute names carry the same escape as the rest of item_data,
+        // so the name SQL addresses must be the stored form.
+        let ttl_attribute = extenddb_storage::util::escape_control(ttl_attribute).into_owned();
         Box::pin(async move {
             Self::validate_account_id(&account_id)?;
             let (table_id,): (String,) = sqlx::query_as(
@@ -366,7 +368,9 @@ impl MetadataEngine for PostgresEngine {
     ) -> BoxFuture<'_, Result<Vec<Item>, StorageError>> {
         let account_id = account_id.to_string();
         let table_name = table_name.to_string();
-        let ttl_attribute = ttl_attribute.to_string();
+        // Stored attribute names carry the same escape as the rest of item_data,
+        // so the name SQL addresses must be the stored form.
+        let ttl_attribute = extenddb_storage::util::escape_control(ttl_attribute).into_owned();
         Box::pin(async move {
             Self::validate_account_id(&account_id)?;
             let (table_id,): (String,) = sqlx::query_as(

@@ -212,6 +212,66 @@ The first release, so all 0.0.2 deployments were fresh installs.
 
 ---
 
+## Data Migrations
+
+Some changes rewrite rows in the data database rather than the catalog schema. These are
+implemented in Rust (`DATA_CODE_MIGRATIONS` in `crates/storage-postgres/src/migrations.rs`),
+tracked in the data database's own `schema_history` table, and applied once by
+`extenddb migrate --yes`. Running `extenddb migrate` without `--yes` lists them as pending
+and changes nothing.
+
+### 004_escape_control_chars
+
+Strings are stored through an order-preserving escape so that U+0000, which DynamoDB
+accepts anywhere a string appears, can be held in PostgreSQL `TEXT` and `jsonb` columns:
+U+0000 is stored as U+0001 U+0001, and U+0001 as U+0001 U+0002. Rows written before the
+escape existed hold their strings raw, and a raw U+0001 in such a row could be misread by
+the decoder. This migration re-encodes those rows.
+
+What it rewrites: every data table and index table (the text key columns and the
+`item_data` document), vector index tables, `gsi_pending`, `stream_records`, and
+`backup_items`. Only rows that contain U+0001 are touched; a database with none is left as
+it is, apart from the `schema_history` row.
+
+The migration scans every data and index table once (each row's `jsonb` document is
+rendered to text to find candidates), so on a large deployment it takes time proportional
+to the size of the data. It processes one table per transaction and keeps a per-table
+progress marker in `data_code_migration_progress`, so an interrupted run resumes with the
+tables that are not yet done and never rewrites a table twice.
+
+Order of operations. A server built with the escape refuses to start on a data database
+that does not record this migration, with a message naming it, because rows the new build
+writes are indistinguishable from legacy rows to the migration (both can contain U+0001) and
+would be rewritten by it. Upgrade a PostgreSQL deployment in this order:
+
+1. Stop every ExtendDB server that uses the data database. A server from an earlier release
+   still writing during the migration would leave unescaped rows behind.
+2. Run `extenddb migrate --yes` with the new binary.
+3. Start the new servers.
+
+A fresh `extenddb init` records the migration, so new deployments start without this step.
+A rolling deployment that mixes the two releases against one data database is not
+supported for this release: the new server will not start until the migration has run,
+and the old server must be stopped before it runs.
+
+`extenddb migrate --yes` refuses to run this migration while any other session is connected
+to the data database, and lists them, because a server still writing during the rewrite
+would leave rows in the wrong encoding. If the only other connections are idle ones held
+by a connection pooler, set `EXTENDDB_MIGRATE_IGNORE_CONNECTIONS=1` to skip that check.
+Nothing stops a server from an earlier release from being started against a migrated
+data database afterwards; it would read escaped rows as literal data. Do not downgrade
+past this release without restoring the data database from a backup taken before the
+migration.
+
+MongoDB. The MongoDB backend applies the same escape to BSON field names (attribute
+names and map keys) and has no migration and no startup check. Field names written by
+an earlier release are stored raw. A name containing a lone U+0001 reads back unchanged,
+as do all string values and all key strings; a name containing U+0001 immediately
+followed by U+0001 or U+0002 reads back with that pair decoded as U+0000 or U+0001.
+Deployments whose attribute names never contain U+0001 are unaffected.
+
+---
+
 ## Behavior Changes by Release
 
 Catalog upgrades change the schema; behavior changes alter how the running server

@@ -6,9 +6,9 @@
 use extenddb_core::expression::{ExpressionMaps, KeyCondition};
 use extenddb_core::types::{Item, ScalarAttributeType, TableKeyInfo};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{
-    encode_netstring_composite, parse_sk, pk_to_text, sk_column, sk_column_n, sk_info,
-};
+use extenddb_storage::util::{encode_netstring_composite, sk_column, sk_column_n, sk_info};
+
+use super::key_text::{parse_sk, pk_to_text};
 
 use super::query::{
     PaginationBinds, build_key, build_sk_sql, execute_query_sql, execute_scan_sql,
