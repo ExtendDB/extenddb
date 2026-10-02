@@ -326,7 +326,6 @@ def test_transact_write_conditional_put_fail(dynamodb_client, hash_table):
     resp = dynamodb_client.get_item(TableName=hash_table, Key={"pk": {"S": "cp-2"}})
     assert resp["Item"]["v"]["S"] == "old"
 
-
 # ---------------------------------------------------------------------------
 # TransactWriteItems — size limit and condition edge cases
 # ---------------------------------------------------------------------------

@@ -192,6 +192,32 @@ async fn disable_ttl() {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     }
 
+    // Enable returns during ENABLING now (the backfill is detached, as in
+    // DynamoDB) and updates are rejected until the transition settles, so
+    // wait for ENABLED like a real client must.
+    let mut settled = false;
+    for _ in 0..120 {
+        let resp = c
+            .describe_time_to_live()
+            .table_name(&name)
+            .send()
+            .await
+            .unwrap();
+        let status = format!(
+            "{:?}",
+            resp.time_to_live_description()
+                .unwrap()
+                .time_to_live_status()
+                .unwrap()
+        );
+        if status == "Enabled" {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert!(settled, "TTL enable did not settle within 30s");
+
     c.update_time_to_live()
         .table_name(&name)
         .time_to_live_specification(

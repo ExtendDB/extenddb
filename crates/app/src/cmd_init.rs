@@ -52,6 +52,22 @@ pub struct InitArgs {
     #[arg(long)]
     pg_pass: Option<String>,
 
+    /// Cassandra contact points (comma-separated host:port)
+    #[arg(long)]
+    cassandra_contact_points: Option<String>,
+
+    /// Cassandra admin user (for CREATE ROLE)
+    #[arg(long)]
+    cassandra_user: Option<String>,
+
+    /// Cassandra admin password
+    #[arg(long)]
+    cassandra_pass: Option<String>,
+
+    /// Cassandra keyspace prefix
+    #[arg(long)]
+    keyspace_prefix: Option<String>,
+
     /// extenddb application user
     #[arg(long)]
     extenddb_user: Option<String>,
