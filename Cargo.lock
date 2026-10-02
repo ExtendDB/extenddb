@@ -1241,6 +1241,7 @@ dependencies = [
  "extenddb-storage",
  "futures",
  "hyper",
+ "hyper-util",
  "libc",
  "metrics",
  "rand 0.9.4",
