@@ -5,6 +5,7 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/cache",
+    "crates/backup-store",
     "crates/engine",
     "crates/storage",
     "crates/config",
@@ -27,6 +28,7 @@ license = "Apache-2.0"
 # Internal crates
 extenddb-core = { path = "crates/core" }
 extenddb-cache = { path = "crates/cache" }
+extenddb-backup-store = { path = "crates/backup-store" }
 extenddb-engine = { path = "crates/engine" }
 extenddb-storage = { path = "crates/storage" }
 extenddb-config = { path = "crates/config" }
@@ -71,6 +73,16 @@ pgvector = { version = "0.4", default-features = false, features = ["sqlx"] }
 mongodb = "3"
 bson = "2.13"
 dashmap = "6"
+
+# Backup store
+# Exact pins: the aws-sdk crates release in lockstep, and these are the newest
+# versions whose declared minimum supported rustc matches the workspace
+# rust-version (1.88); later releases require a newer compiler. Their
+# transitive aws-smithy-* crates are held in Cargo.lock to matching versions
+# for the same reason. Feature set mirrors tests/rust/Cargo.toml.
+aws-config = { version = "=1.8.13", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client", "credentials-process"] }
+aws-sdk-s3 = { version = "=1.122.0", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+bytes = "1"
 
 # Crypto & checksums
 crc32fast = "1"
