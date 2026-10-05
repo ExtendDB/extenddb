@@ -112,25 +112,28 @@ impl PostgresEngine {
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-                let old: Option<(serde_json::Value,)> =
+                let mut old: Option<(serde_json::Value,)> =
                     bind_sk_fetch_optional!(&select_sql, pk_text.as_str(), &sk, &mut *tx)?;
 
-                if let Some((ref old_json,)) = old {
-                    let old_item: Item = json_to_item(old_json.clone())?;
-                    match check_condition(condition, &old_item, maps) {
-                        Ok(()) => {}
-                        Err(StorageError::ConditionFailed(_)) => {
-                            return Err(StorageError::ConditionFailed(Some(old_item)));
+                let mut attempt: u32 = 0;
+                loop {
+                    if let Some((ref old_json,)) = old {
+                        let old_item: Item = json_to_item(old_json.clone())?;
+                        match check_condition(condition, &old_item, maps) {
+                            Ok(()) => {}
+                            Err(StorageError::ConditionFailed(_)) => {
+                                return Err(StorageError::ConditionFailed(Some(old_item)));
+                            }
+                            Err(e) => return Err(e),
                         }
-                        Err(e) => return Err(e),
+                        // Row exists, condition passed: update in place.
+                        let update_sql = format!(
+                            "UPDATE {ddb_table} SET item_data = $3 WHERE pk = $1 AND {sk_col} = $2"
+                        );
+                        bind_sk_execute!(&update_sql, pk_text.as_str(), &sk, &item_json, &mut *tx)?;
+                        break;
                     }
-                    // Row exists, condition passed — update in place.
-                    let update_sql = format!(
-                        "UPDATE {ddb_table} SET item_data = $3 WHERE pk = $1 AND {sk_col} = $2"
-                    );
-                    bind_sk_execute!(&update_sql, pk_text.as_str(), &sk, &item_json, &mut *tx)?;
-                } else {
-                    // No existing item — condition checks against empty item
+                    // No existing item: the condition checks against an empty item
                     let empty = std::collections::BTreeMap::new();
                     match check_condition(condition, &empty, maps) {
                         Ok(()) => {}
@@ -139,21 +142,23 @@ impl PostgresEngine {
                         }
                         Err(e) => return Err(e),
                     }
-                    // Condition passed against empty — atomic insert, fail if someone beat us.
                     let insert_sql = format!(
                         "INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES ($1, $2, $3) \
                          ON CONFLICT (pk, {sk_col}) DO NOTHING"
                     );
                     let result =
                         bind_sk_execute!(&insert_sql, pk_text.as_str(), &sk, &item_json, &mut *tx)?;
-                    if result.rows_affected() == 0 {
-                        // Another transaction inserted between our SELECT and INSERT.
-                        // Fetch the winner to return with ConditionFailed.
-                        let winner: Option<(serde_json::Value,)> =
-                            bind_sk_fetch_optional!(&select_sql, pk_text.as_str(), &sk, &mut *tx)?;
-                        let winner_item = winner.map(|(v,)| json_to_item(v)).transpose()?;
-                        return Err(StorageError::ConditionFailed(winner_item));
+                    if result.rows_affected() == 1 {
+                        break;
                     }
+                    // Lost the create race. The insert waited for the winner to
+                    // commit, so the locking read now returns its row: this put
+                    // overwrites it, after its condition is checked against it.
+                    attempt += 1;
+                    if attempt >= MAX_CREATE_RACE_ATTEMPTS {
+                        return Err(create_race_exhausted(attempt));
+                    }
+                    old = bind_sk_fetch_optional!(&select_sql, pk_text.as_str(), &sk, &mut *tx)?;
                 }
 
                 // Sync GSI/LSI update within transaction (D-4).
@@ -269,30 +274,37 @@ impl PostgresEngine {
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-                let old: Option<(serde_json::Value,)> = sqlx::query_as(&select_sql)
-                    .bind(pk_text.as_str())
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-                if let Some((ref old_json,)) = old {
-                    let old_item: Item = json_to_item(old_json.clone())?;
-                    match check_condition(condition, &old_item, maps) {
-                        Ok(()) => {}
-                        Err(StorageError::ConditionFailed(_)) => {
-                            return Err(StorageError::ConditionFailed(Some(old_item)));
-                        }
-                        Err(e) => return Err(e),
-                    }
-                    // Row exists, condition passed — update in place.
-                    let update_sql = format!("UPDATE {ddb_table} SET item_data = $2 WHERE pk = $1");
-                    sqlx::query(&update_sql)
+                let fetch_old = async |tx: &mut sqlx::PgConnection| {
+                    sqlx::query_as::<_, (serde_json::Value,)>(&select_sql)
                         .bind(pk_text.as_str())
-                        .bind(&item_json)
-                        .execute(&mut *tx)
+                        .fetch_optional(tx)
                         .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                } else {
+                        .map_err(|e| StorageError::Internal(e.to_string()))
+                };
+                let mut old: Option<(serde_json::Value,)> = fetch_old(&mut tx).await?;
+
+                let mut attempt: u32 = 0;
+                loop {
+                    if let Some((ref old_json,)) = old {
+                        let old_item: Item = json_to_item(old_json.clone())?;
+                        match check_condition(condition, &old_item, maps) {
+                            Ok(()) => {}
+                            Err(StorageError::ConditionFailed(_)) => {
+                                return Err(StorageError::ConditionFailed(Some(old_item)));
+                            }
+                            Err(e) => return Err(e),
+                        }
+                        // Row exists, condition passed: update in place.
+                        let update_sql =
+                            format!("UPDATE {ddb_table} SET item_data = $2 WHERE pk = $1");
+                        sqlx::query(&update_sql)
+                            .bind(pk_text.as_str())
+                            .bind(&item_json)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(|e| StorageError::Internal(e.to_string()))?;
+                        break;
+                    }
                     let empty = std::collections::BTreeMap::new();
                     match check_condition(condition, &empty, maps) {
                         Ok(()) => {}
@@ -301,7 +313,6 @@ impl PostgresEngine {
                         }
                         Err(e) => return Err(e),
                     }
-                    // Condition passed against empty — atomic insert, fail if someone beat us.
                     let insert_sql = format!(
                         "INSERT INTO {ddb_table} (pk, item_data) VALUES ($1, $2) \
                          ON CONFLICT (pk) DO NOTHING"
@@ -312,16 +323,15 @@ impl PostgresEngine {
                         .execute(&mut *tx)
                         .await
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    if result.rows_affected() == 0 {
-                        // Another transaction inserted between our SELECT and INSERT.
-                        let winner: Option<(serde_json::Value,)> = sqlx::query_as(&select_sql)
-                            .bind(pk_text.as_str())
-                            .fetch_optional(&mut *tx)
-                            .await
-                            .map_err(|e| StorageError::Internal(e.to_string()))?;
-                        let winner_item = winner.map(|(v,)| json_to_item(v)).transpose()?;
-                        return Err(StorageError::ConditionFailed(winner_item));
+                    if result.rows_affected() == 1 {
+                        break;
                     }
+                    // Lost the create race: overwrite the winner, as above.
+                    attempt += 1;
+                    if attempt >= MAX_CREATE_RACE_ATTEMPTS {
+                        return Err(create_race_exhausted(attempt));
+                    }
+                    old = fetch_old(&mut tx).await?;
                 }
 
                 // Sync GSI/LSI update within transaction (D-4).
@@ -465,4 +475,18 @@ impl PostgresEngine {
 
         json_opt.map(json_to_item).transpose()
     }
+}
+
+/// Bound on insert retries when a put to a missing item keeps losing the
+/// create race to a winner that is deleted again before the re-read. Same
+/// bound as `UpdateItem`.
+const MAX_CREATE_RACE_ATTEMPTS: u32 = 5;
+
+/// The error after `MAX_CREATE_RACE_ATTEMPTS` lost create races, as `UpdateItem`
+/// reports it.
+fn create_race_exhausted(attempt: u32) -> StorageError {
+    StorageError::Internal(format!(
+        "PutItem could not create the item after {attempt} attempts: a concurrent writer \
+         repeatedly created and deleted the row"
+    ))
 }
