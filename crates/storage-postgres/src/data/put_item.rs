@@ -151,9 +151,11 @@ impl PostgresEngine {
                     if result.rows_affected() == 1 {
                         break;
                     }
-                    // Lost the create race. The insert waited for the winner to
-                    // commit, so the locking read now returns its row: this put
-                    // overwrites it, after its condition is checked against it.
+                    // Lost the create race. The winner has committed (the insert
+                    // waited for it if it was in flight). The locking read returns
+                    // its row, and this put overwrites it after checking its
+                    // condition against it. If a delete committed since, the read
+                    // returns no row and the insert is retried.
                     attempt += 1;
                     if attempt >= MAX_CREATE_RACE_ATTEMPTS {
                         return Err(create_race_exhausted(attempt));
@@ -482,8 +484,8 @@ impl PostgresEngine {
 /// bound as `UpdateItem`.
 const MAX_CREATE_RACE_ATTEMPTS: u32 = 5;
 
-/// The error after `MAX_CREATE_RACE_ATTEMPTS` lost create races, as `UpdateItem`
-/// reports it.
+/// The error after `MAX_CREATE_RACE_ATTEMPTS` lost create races. Like the one
+/// `UpdateItem` returns, it is an internal error (HTTP 500).
 fn create_race_exhausted(attempt: u32) -> StorageError {
     StorageError::Internal(format!(
         "PutItem could not create the item after {attempt} attempts: a concurrent writer \
