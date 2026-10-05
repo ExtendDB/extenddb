@@ -3584,9 +3584,7 @@ async fn test_backfill_cursor_is_honored() {
     engine
         .session_arc()
         .query_with_values(
-            &format!(
-                "DELETE FROM {account_ks}.ttl_expiration_buckets WHERE table_id = ?"
-            ),
+            &format!("DELETE FROM {account_ks}.ttl_expiration_buckets WHERE table_id = ?"),
             cdrs_tokio::query_values!(table_id.as_str()),
         )
         .await
