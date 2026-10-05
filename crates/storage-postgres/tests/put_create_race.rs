@@ -7,6 +7,8 @@
 //! overwrites the item, after its own condition is checked against it. These
 //! tests hold the competing create open in an outside transaction, so the put
 //! deterministically loses the insert and has to order itself after the winner.
+//! The last two tests also delete the winner before the put re-reads it, so the
+//! put retries its insert, and they bound those retries.
 //!
 //! Each test builds its own throwaway database, applies the shipped migrations
 //! to it, and drops it when it passes. A failing test leaves its database behind
@@ -29,7 +31,7 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::{DataEngine, TableEngine};
 use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{Connection, PgConnection, PgPool, Postgres, Transaction};
 
 const ACCOUNT: &str = "123456789012";
 const REGION: &str = "us-east-1";
@@ -225,14 +227,17 @@ async fn create_in_flight(
     (creator, pid)
 }
 
-/// Wait until a backend other than `own_pid` waits on a lock.
-async fn wait_for_lock_waiter(db: &PgPool, own_pid: i32) {
+/// Wait until a backend waits for a lock of kind `event` (`transactionid` or
+/// `advisory`) that the backend `blocker` holds.
+async fn wait_until_blocked_by(db: &PgPool, blocker: i32, event: &str) {
     for _ in 0..500 {
         let waiting: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_stat_activity \
-             WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> $1",
+             WHERE datname = current_database() AND wait_event_type = 'Lock' \
+             AND wait_event = $2 AND $1 = ANY(pg_blocking_pids(pid))",
         )
-        .bind(own_pid)
+        .bind(blocker)
+        .bind(event)
         .fetch_one(db)
         .await
         .expect("read pg_stat_activity");
@@ -241,7 +246,7 @@ async fn wait_for_lock_waiter(db: &PgPool, own_pid: i32) {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("the put never waited on the create in flight");
+    panic!("no backend waited on the {event} lock of backend {blocker}");
 }
 
 /// Run `put` (ReturnValues ALL_OLD) while the winner's create is in flight,
@@ -259,7 +264,7 @@ async fn put_after_winner(
         .engine
         .put_item(key_info, item(range, "loser"), true, condition, &maps, None);
     let commit = async {
-        wait_for_lock_waiter(&s.db, creator_pid).await;
+        wait_until_blocked_by(&s.db, creator_pid, "transactionid").await;
         creator.commit().await.expect("commit the create");
     };
     let (result, ()) =
@@ -356,5 +361,199 @@ async fn a_lost_create_race_fails_a_condition_the_winner_breaks() {
         other => panic!("expected ConditionFailed, got {other:?}"),
     }
     assert_eq!(stored_v(&s).await, "winner", "the failed put wrote nothing");
+    s.cleanup().await;
+}
+
+// The tests below take the arm where the winner is gone again when the put
+// re-reads it. A BEFORE INSERT trigger parks the put's insert on an advisory
+// lock, the gate. While the insert is parked, an outside transaction commits a
+// winner, and a second one, the locker, locks it FOR UPDATE. When the gate
+// opens, the insert loses at once: the winner is committed, and a row lock does
+// not make an insert wait. The put's locking re-read then waits on the locker,
+// which deletes the winner and commits, so the re-read returns no row.
+
+/// The advisory lock key of the gate.
+const GATE: i64 = 0x5075_7452;
+
+/// Open a connection to the scratch database outside its pools. Returns it and
+/// its backend pid.
+async fn connect(s: &Scratch) -> (PgConnection, i32) {
+    let base = base_conn().expect("caller checks base_conn() first");
+    let mut conn = PgConnection::connect(&format!("{base}/{}", s.db_name))
+        .await
+        .expect("connect to the scratch database");
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut conn)
+        .await
+        .expect("read the backend pid");
+    (conn, pid)
+}
+
+/// Make every insert into `table` pass the gate first, unless its transaction
+/// sets `test.bypass_gate`. Passing takes the gate shared and releases it, so
+/// an insert parks while a session holds the gate exclusively.
+async fn install_gate(s: &Scratch, table: &str) {
+    sqlx::raw_sql(&format!(
+        "CREATE FUNCTION pass_gate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+           IF current_setting('test.bypass_gate', true) = 'on' THEN RETURN NEW; END IF; \
+           PERFORM pg_advisory_lock_shared({GATE}); \
+           PERFORM pg_advisory_unlock_shared({GATE}); \
+           RETURN NEW; \
+         END $$; \
+         CREATE TRIGGER pass_gate BEFORE INSERT ON {table} \
+           FOR EACH ROW EXECUTE FUNCTION pass_gate();"
+    ))
+    .execute(&s.db)
+    .await
+    .expect("install the gate trigger");
+}
+
+/// Commit the item with `v` as its value, past the gate.
+async fn commit_winner(s: &Scratch, table: &str, v: &str) {
+    let mut tx = s.db.begin().await.expect("begin the winner");
+    sqlx::query("SET LOCAL test.bypass_gate = 'on'")
+        .execute(&mut *tx)
+        .await
+        .expect("bypass the gate");
+    sqlx::query(&format!(
+        "INSERT INTO {table} (pk, item_data) VALUES ('c', $1)"
+    ))
+    .bind(serde_json::to_value(item(false, v)).expect("serialize the winner"))
+    .execute(&mut *tx)
+    .await
+    .expect("insert the winner");
+    tx.commit().await.expect("commit the winner");
+}
+
+/// With the put's insert parked at the gate, make it lose to a winner `v` that
+/// is deleted before the put re-reads it. With `rearm`, the gate closes again
+/// behind the insert, so the put's next insert parks too.
+async fn lose_to_a_vanishing_winner(
+    s: &Scratch,
+    table: &str,
+    gate: &mut PgConnection,
+    v: &str,
+    rearm: bool,
+) {
+    commit_winner(s, table, v).await;
+    let (mut locker, locker_pid) = connect(s).await;
+    sqlx::query("BEGIN")
+        .execute(&mut locker)
+        .await
+        .expect("begin the locker");
+    let locked: Option<(serde_json::Value,)> = sqlx::query_as(&format!(
+        "SELECT item_data FROM {table} WHERE pk = 'c' FOR UPDATE"
+    ))
+    .fetch_optional(&mut locker)
+    .await
+    .expect("lock the winner");
+    assert!(locked.is_some(), "the locker holds the committed winner");
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(GATE)
+        .execute(&mut *gate)
+        .await
+        .expect("open the gate");
+    if rearm {
+        // Granted only after the parked insert has passed the gate.
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(GATE)
+            .execute(&mut *gate)
+            .await
+            .expect("close the gate again");
+    }
+    wait_until_blocked_by(&s.db, locker_pid, "transactionid").await;
+    sqlx::query(&format!("DELETE FROM {table} WHERE pk = 'c'"))
+        .execute(&mut locker)
+        .await
+        .expect("delete the winner");
+    sqlx::query("COMMIT")
+        .execute(&mut locker)
+        .await
+        .expect("commit the delete");
+}
+
+/// Install the gate on a fresh hash table and close it. Returns the table's
+/// key info, its data table, and the session that holds the gate.
+async fn gated_table(s: &Scratch) -> (TableKeyInfo, String, PgConnection, i32) {
+    let key_info = table(s, false).await;
+    let data = data_table(&s.db).await;
+    install_gate(s, &data).await;
+    let (mut gate, gate_pid) = connect(s).await;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(GATE)
+        .execute(&mut gate)
+        .await
+        .expect("close the gate");
+    (key_info, data, gate, gate_pid)
+}
+
+#[tokio::test]
+async fn a_put_whose_create_race_winner_is_deleted_creates_the_item() {
+    let test = "a_put_whose_create_race_winner_is_deleted_creates_the_item";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let s = scratch().await;
+    let (key_info, data, mut gate, gate_pid) = gated_table(&s).await;
+    let maps = ExpressionMaps::default();
+    let put = s
+        .engine
+        .put_item(&key_info, item(false, "loser"), true, None, &maps, None);
+    let driver = async {
+        wait_until_blocked_by(&s.db, gate_pid, "advisory").await;
+        lose_to_a_vanishing_winner(&s, &data, &mut gate, "winner", false).await;
+    };
+    let (result, ()) =
+        tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(put, driver) })
+            .await
+            .expect("the put finished");
+    assert_eq!(
+        result.expect("the retried insert succeeds"),
+        None,
+        "the winner is gone, so there is no old image"
+    );
+    assert_eq!(stored_v(&s).await, "loser");
+    s.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_put_that_keeps_losing_the_create_race_gives_up_after_five_inserts() {
+    let test = "a_put_that_keeps_losing_the_create_race_gives_up_after_five_inserts";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let s = scratch().await;
+    let (key_info, data, mut gate, gate_pid) = gated_table(&s).await;
+    let maps = ExpressionMaps::default();
+    let put = s
+        .engine
+        .put_item(&key_info, item(false, "loser"), true, None, &maps, None);
+    let driver = async {
+        for k in 1..=4 {
+            wait_until_blocked_by(&s.db, gate_pid, "advisory").await;
+            lose_to_a_vanishing_winner(&s, &data, &mut gate, &format!("w{k}"), true).await;
+        }
+        // The fifth insert loses to a winner that stays: the put gives up.
+        wait_until_blocked_by(&s.db, gate_pid, "advisory").await;
+        commit_winner(&s, &data, "w5").await;
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(GATE)
+            .execute(&mut gate)
+            .await
+            .expect("open the gate");
+    };
+    let (result, ()) =
+        tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(put, driver) })
+            .await
+            .expect("the put finished");
+    match result {
+        Err(StorageError::Internal(m)) => assert!(m.contains("after 5 attempts"), "{m}"),
+        other => panic!("expected Internal after 5 inserts, got {other:?}"),
+    }
+    assert_eq!(
+        stored_v(&s).await,
+        "w5",
+        "the put that gave up wrote nothing"
+    );
     s.cleanup().await;
 }
