@@ -559,7 +559,7 @@ async fn transact_write_items(&self, input: TransactWriteInput) -> Result<...> {
 }
 ```
 
-The ops run in table and key order. A ConditionCheck or Delete that finds no row inserts the key and deletes it again, so the key's unique index entry stays with the transaction and any concurrent create of the item waits until it commits.
+The ops run in table and key order. A ConditionCheck or Delete that finds no row inserts the key and deletes it again, so the key's unique index entry stays with the transaction and any concurrent create of the item waits until the transaction commits or rolls back.
 
 ### 5.6 Migrations
 
