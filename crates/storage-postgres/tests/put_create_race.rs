@@ -228,8 +228,9 @@ async fn create_in_flight(
 }
 
 /// Wait until a backend waits for a lock of kind `event` (`transactionid` or
-/// `advisory`) that the backend `blocker` holds.
-async fn wait_until_blocked_by(db: &PgPool, blocker: i32, event: &str) {
+/// `advisory`) that the backend `blocker` holds. Fails after 5 s, so the caller
+/// can report what the put did instead.
+async fn wait_until_blocked_by(db: &PgPool, blocker: i32, event: &str) -> Result<(), String> {
     for _ in 0..500 {
         let waiting: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_stat_activity \
@@ -242,11 +243,13 @@ async fn wait_until_blocked_by(db: &PgPool, blocker: i32, event: &str) {
         .await
         .expect("read pg_stat_activity");
         if waiting > 0 {
-            return;
+            return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("no backend waited on the {event} lock of backend {blocker}");
+    Err(format!(
+        "no backend waited on the {event} lock of backend {blocker}"
+    ))
 }
 
 /// Run `put` (ReturnValues ALL_OLD) while the winner's create is in flight,
@@ -264,13 +267,17 @@ async fn put_after_winner(
         .engine
         .put_item(key_info, item(range, "loser"), true, condition, &maps, None);
     let commit = async {
-        wait_until_blocked_by(&s.db, creator_pid, "transactionid").await;
+        let waited = wait_until_blocked_by(&s.db, creator_pid, "transactionid").await;
         creator.commit().await.expect("commit the create");
+        waited
     };
-    let (result, ()) =
+    let (result, waited) =
         tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(put, commit) })
             .await
             .expect("the put finished");
+    if let Err(e) = waited {
+        panic!("{e}; the put returned {result:?}");
+    }
     result
 }
 
@@ -409,19 +416,22 @@ async fn install_gate(s: &Scratch, table: &str) {
 }
 
 /// Commit the item with `v` as its value, past the gate.
-async fn commit_winner(s: &Scratch, table: &str, v: &str) {
+async fn commit_winner(s: &Scratch, table: &str, range: bool, v: &str) {
     let mut tx = s.db.begin().await.expect("begin the winner");
     sqlx::query("SET LOCAL test.bypass_gate = 'on'")
         .execute(&mut *tx)
         .await
         .expect("bypass the gate");
-    sqlx::query(&format!(
-        "INSERT INTO {table} (pk, item_data) VALUES ('c', $1)"
-    ))
-    .bind(serde_json::to_value(item(false, v)).expect("serialize the winner"))
-    .execute(&mut *tx)
-    .await
-    .expect("insert the winner");
+    let sql = if range {
+        format!("INSERT INTO {table} (pk, sk_s, item_data) VALUES ('c', '1', $1)")
+    } else {
+        format!("INSERT INTO {table} (pk, item_data) VALUES ('c', $1)")
+    };
+    sqlx::query(&sql)
+        .bind(serde_json::to_value(item(range, v)).expect("serialize the winner"))
+        .execute(&mut *tx)
+        .await
+        .expect("insert the winner");
     tx.commit().await.expect("commit the winner");
 }
 
@@ -431,11 +441,12 @@ async fn commit_winner(s: &Scratch, table: &str, v: &str) {
 async fn lose_to_a_vanishing_winner(
     s: &Scratch,
     table: &str,
+    range: bool,
     gate: &mut PgConnection,
     v: &str,
     rearm: bool,
-) {
-    commit_winner(s, table, v).await;
+) -> Result<(), String> {
+    commit_winner(s, table, range, v).await;
     let (mut locker, locker_pid) = connect(s).await;
     sqlx::query("BEGIN")
         .execute(&mut locker)
@@ -461,7 +472,7 @@ async fn lose_to_a_vanishing_winner(
             .await
             .expect("close the gate again");
     }
-    wait_until_blocked_by(&s.db, locker_pid, "transactionid").await;
+    wait_until_blocked_by(&s.db, locker_pid, "transactionid").await?;
     sqlx::query(&format!("DELETE FROM {table} WHERE pk = 'c'"))
         .execute(&mut locker)
         .await
@@ -470,12 +481,14 @@ async fn lose_to_a_vanishing_winner(
         .execute(&mut locker)
         .await
         .expect("commit the delete");
+    Ok(())
 }
 
-/// Install the gate on a fresh hash table and close it. Returns the table's
-/// key info, its data table, and the session that holds the gate.
-async fn gated_table(s: &Scratch) -> (TableKeyInfo, String, PgConnection, i32) {
-    let key_info = table(s, false).await;
+/// Install the gate on a fresh table, keyed on `pk` and, when `range` is set,
+/// also on `sk`, and close the gate. Returns the table's key info, its data
+/// table, and the session that holds the gate.
+async fn gated_table(s: &Scratch, range: bool) -> (TableKeyInfo, String, PgConnection, i32) {
+    let key_info = table(s, range).await;
     let data = data_table(&s.db).await;
     install_gate(s, &data).await;
     let (mut gate, gate_pid) = connect(s).await;
@@ -487,26 +500,41 @@ async fn gated_table(s: &Scratch) -> (TableKeyInfo, String, PgConnection, i32) {
     (key_info, data, gate, gate_pid)
 }
 
-#[tokio::test]
-async fn a_put_whose_create_race_winner_is_deleted_creates_the_item() {
-    let test = "a_put_whose_create_race_winner_is_deleted_creates_the_item";
+/// Release every advisory lock `gate` holds. A driver that stops early calls
+/// this, so that a parked insert goes on and the put can report its result.
+async fn open_gate_fully(gate: &mut PgConnection) {
+    sqlx::query("SELECT pg_advisory_unlock_all()")
+        .execute(gate)
+        .await
+        .expect("open the gate");
+}
+
+async fn deleted_winner_is_retried(test: &str, range: bool) {
     if base_conn().is_none() {
         return skip(test);
     }
     let s = scratch().await;
-    let (key_info, data, mut gate, gate_pid) = gated_table(&s).await;
+    let (key_info, data, mut gate, gate_pid) = gated_table(&s, range).await;
     let maps = ExpressionMaps::default();
     let put = s
         .engine
-        .put_item(&key_info, item(false, "loser"), true, None, &maps, None);
+        .put_item(&key_info, item(range, "loser"), true, None, &maps, None);
     let driver = async {
-        wait_until_blocked_by(&s.db, gate_pid, "advisory").await;
-        lose_to_a_vanishing_winner(&s, &data, &mut gate, "winner", false).await;
+        let steps = async {
+            wait_until_blocked_by(&s.db, gate_pid, "advisory").await?;
+            lose_to_a_vanishing_winner(&s, &data, range, &mut gate, "winner", false).await
+        }
+        .await;
+        open_gate_fully(&mut gate).await;
+        steps
     };
-    let (result, ()) =
+    let (result, driven) =
         tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(put, driver) })
             .await
             .expect("the put finished");
+    if let Err(e) = driven {
+        panic!("{e}; the put returned {result:?}");
+    }
     assert_eq!(
         result.expect("the retried insert succeeds"),
         None,
@@ -517,35 +545,56 @@ async fn a_put_whose_create_race_winner_is_deleted_creates_the_item() {
 }
 
 #[tokio::test]
-async fn a_put_that_keeps_losing_the_create_race_gives_up_after_five_inserts() {
-    let test = "a_put_that_keeps_losing_the_create_race_gives_up_after_five_inserts";
+async fn a_put_whose_create_race_winner_is_deleted_creates_the_item() {
+    deleted_winner_is_retried(
+        "a_put_whose_create_race_winner_is_deleted_creates_the_item",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_put_whose_create_race_winner_is_deleted_creates_the_item_on_a_range_table() {
+    deleted_winner_is_retried(
+        "a_put_whose_create_race_winner_is_deleted_creates_the_item_on_a_range_table",
+        true,
+    )
+    .await;
+}
+
+async fn create_race_churn_gives_up(test: &str, range: bool) {
     if base_conn().is_none() {
         return skip(test);
     }
     let s = scratch().await;
-    let (key_info, data, mut gate, gate_pid) = gated_table(&s).await;
+    let (key_info, data, mut gate, gate_pid) = gated_table(&s, range).await;
     let maps = ExpressionMaps::default();
     let put = s
         .engine
-        .put_item(&key_info, item(false, "loser"), true, None, &maps, None);
+        .put_item(&key_info, item(range, "loser"), true, None, &maps, None);
     let driver = async {
-        for k in 1..=4 {
-            wait_until_blocked_by(&s.db, gate_pid, "advisory").await;
-            lose_to_a_vanishing_winner(&s, &data, &mut gate, &format!("w{k}"), true).await;
+        let steps = async {
+            for k in 1..=4 {
+                wait_until_blocked_by(&s.db, gate_pid, "advisory").await?;
+                lose_to_a_vanishing_winner(&s, &data, range, &mut gate, &format!("w{k}"), true)
+                    .await?;
+            }
+            // The fifth insert loses to a winner that stays: the put gives up.
+            wait_until_blocked_by(&s.db, gate_pid, "advisory").await?;
+            commit_winner(&s, &data, range, "w5").await;
+            Ok::<(), String>(())
         }
-        // The fifth insert loses to a winner that stays: the put gives up.
-        wait_until_blocked_by(&s.db, gate_pid, "advisory").await;
-        commit_winner(&s, &data, "w5").await;
-        sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(GATE)
-            .execute(&mut gate)
-            .await
-            .expect("open the gate");
+        .await;
+        open_gate_fully(&mut gate).await;
+        steps
     };
-    let (result, ()) =
+    let (result, driven) =
         tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(put, driver) })
             .await
             .expect("the put finished");
+    if let Err(e) = driven {
+        panic!("{e}; the put returned {result:?}");
+    }
     match result {
         Err(StorageError::Internal(m)) => assert!(m.contains("after 5 attempts"), "{m}"),
         other => panic!("expected Internal after 5 inserts, got {other:?}"),
@@ -556,4 +605,22 @@ async fn a_put_that_keeps_losing_the_create_race_gives_up_after_five_inserts() {
         "the put that gave up wrote nothing"
     );
     s.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_put_that_keeps_losing_the_create_race_gives_up_after_five_inserts() {
+    create_race_churn_gives_up(
+        "a_put_that_keeps_losing_the_create_race_gives_up_after_five_inserts",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_put_that_keeps_losing_the_create_race_gives_up_after_five_inserts_on_a_range_table() {
+    create_race_churn_gives_up(
+        "a_put_that_keeps_losing_the_create_race_gives_up_after_five_inserts_on_a_range_table",
+        true,
+    )
+    .await;
 }
