@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use extenddb_core::expression::{self, ExpressionMaps};
 use extenddb_core::types::{
-    AttributeValue, CancellationReason, Item, ReturnValuesOnConditionCheckFailure,
+    AttributeValue, CancellationReason, Item, ReturnValuesOnConditionCheckFailure, TableKeyInfo,
 };
 use extenddb_core::validation;
 use extenddb_storage::error::StorageError;
@@ -541,9 +541,12 @@ async fn execute_transact_write_op(
                 &key_info.attribute_definitions,
             )
             .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
-            let existing = fetch_item_for_update(tx, key_info, key)
+            let mut existing = fetch_item_for_update(tx, key_info, key)
                 .await
                 .map_err(TxnOpError::Storage)?;
+            if existing.is_none() {
+                existing = reserve_missing_item(tx, key_info, key).await?;
+            }
             let empty = Item::new();
             eval_condition(
                 *condition,
@@ -552,14 +555,8 @@ async fn execute_transact_write_op(
                 *return_values_on_ccf,
                 existing.as_ref(),
             )?;
-            // Only delete a row the locking read actually saw (and locked).
-            // When the read found nothing there is nothing to lock, so a
-            // concurrent transaction can create and commit the item before our
-            // DELETE runs; its fresh READ COMMITTED snapshot would then see
-            // and kill the winner's row with no stream record and orphaned
-            // index rows. Deleting a nonexistent item is a no-op in the real
-            // service, so skipping the write is the faithful serialization
-            // (this delete simply ordered before the concurrent create).
+            // Deleting a missing item is a no-op. Its key is reserved, so no
+            // concurrent create can commit before this transaction ends.
             if existing.is_some() {
                 delete_item_in_tx(tx, key_info, key)
                     .await
@@ -727,9 +724,12 @@ async fn execute_transact_write_op(
                 &key_info.attribute_definitions,
             )
             .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
-            let existing = fetch_item_for_update(tx, key_info, key)
+            let mut existing = fetch_item_for_update(tx, key_info, key)
                 .await
                 .map_err(TxnOpError::Storage)?;
+            if existing.is_none() {
+                existing = reserve_missing_item(tx, key_info, key).await?;
+            }
             let empty = Item::new();
             let check_against = existing.as_ref().unwrap_or(&empty);
             eval_condition(
@@ -742,6 +742,45 @@ async fn execute_transact_write_op(
             Ok((None, None))
         }
     }
+}
+
+/// Hold the key of a missing item until commit, for an op that reads the
+/// item but does not create it (ConditionCheck, Delete).
+///
+/// A missing item has no row for `FOR UPDATE` to lock, so a concurrent
+/// transaction could create it while this one still relies on its absence.
+/// Inserting a key-only row and deleting it again leaves the key's unique
+/// index entry owned by this open transaction: every insert of the key,
+/// transactional or not, waits for this transaction to end, and no other
+/// transaction ever sees the row. Returns the item, locked, when another
+/// transaction created it first.
+async fn reserve_missing_item(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    key_info: &TableKeyInfo,
+    key: &Item,
+) -> Result<Option<Item>, TxnOpError> {
+    for _ in 0..MAX_CREATE_RACE_ATTEMPTS {
+        if insert_item_if_absent_in_tx(tx, key_info, key)
+            .await
+            .map_err(TxnOpError::Storage)?
+        {
+            delete_item_in_tx(tx, key_info, key)
+                .await
+                .map_err(TxnOpError::Storage)?;
+            return Ok(None);
+        }
+        // Lost to a concurrent create, which has committed by now: lock it.
+        if let Some(item) = fetch_item_for_update(tx, key_info, key)
+            .await
+            .map_err(TxnOpError::Storage)?
+        {
+            return Ok(Some(item));
+        }
+    }
+    // Sustained create-then-delete churn, as on the create paths.
+    Err(TxnOpError::Cancel(
+        CancellationReason::transaction_conflict(),
+    ))
 }
 
 /// Evaluate a condition expression, returning a `CancellationReason` on failure.
