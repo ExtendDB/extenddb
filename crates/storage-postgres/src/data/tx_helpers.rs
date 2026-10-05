@@ -190,12 +190,12 @@ pub(super) async fn insert_item_if_absent_in_tx(
     Ok(rows_affected == 1)
 }
 
-/// Delete an item by key within a transaction.
+/// Delete an item by key within a transaction. Returns the rows deleted.
 pub(super) async fn delete_item_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     key_info: &TableKeyInfo,
     key: &Item,
-) -> Result<(), StorageError> {
+) -> Result<u64, StorageError> {
     let ddb_table = data_table_name(&key_info.table_id);
     let pk_name = &key_info.key_schema[0].attribute_name;
     let pk_value = key
@@ -211,7 +211,7 @@ pub(super) async fn delete_item_in_tx(
         let sk = parse_sk(sk_value, sk_type)?;
         let sk_col = sk_column(sk_type);
         let sql = format!("DELETE FROM {ddb_table} WHERE pk = $1 AND {sk_col} = $2");
-        match &sk {
+        let deleted = match &sk {
             SortKeyValue::S(s) => {
                 sqlx::query(&sql)
                     .bind(pk_text.as_ref())
@@ -235,15 +235,16 @@ pub(super) async fn delete_item_in_tx(
             }
         }
         .map_err(db_error)?;
+        Ok(deleted.rows_affected())
     } else {
         let sql = format!("DELETE FROM {ddb_table} WHERE pk = $1");
-        sqlx::query(&sql)
+        let deleted = sqlx::query(&sql)
             .bind(pk_text.as_ref())
             .execute(&mut **tx)
             .await
             .map_err(db_error)?;
+        Ok(deleted.rows_affected())
     }
-    Ok(())
 }
 
 /// Write a stream record within an existing transaction.

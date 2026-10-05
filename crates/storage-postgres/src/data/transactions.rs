@@ -25,9 +25,10 @@ use super::tx_helpers::{
 use crate::PostgresEngine;
 use crate::pg_util::is_conflict_abort;
 
-/// Bound on insert retries when a transactional write to a nonexistent item
-/// keeps losing the create race to writers that then roll back. Mirrors the
-/// same bound on the non-transactional `UpdateItem` path (`update_item.rs`).
+/// Bound on insert retries when a transactional write to a nonexistent item,
+/// or the reservation of a missing key, keeps losing the create race to a
+/// winner that is deleted again before the re-read. Mirrors the same bound on
+/// the non-transactional `UpdateItem` path (`update_item.rs`).
 const MAX_CREATE_RACE_ATTEMPTS: u32 = 5;
 
 impl PostgresEngine {
@@ -752,8 +753,9 @@ async fn execute_transact_write_op(
 /// Inserting a key-only row and deleting it again leaves the key's unique
 /// index entry owned by this open transaction: every insert of the key,
 /// transactional or not, waits for this transaction to end, and no other
-/// transaction ever sees the row. Returns the item, locked, when another
-/// transaction created it first.
+/// transaction ever sees the row. PostgreSQL documents that wait in
+/// <https://www.postgresql.org/docs/current/index-unique-checks.html>.
+/// Returns the item, locked, when another transaction created it first.
 async fn reserve_missing_item(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     key_info: &TableKeyInfo,
@@ -764,9 +766,15 @@ async fn reserve_missing_item(
             .await
             .map_err(TxnOpError::Storage)?
         {
-            delete_item_in_tx(tx, key_info, key)
+            // A placeholder left behind would commit as a key-only item.
+            let deleted = delete_item_in_tx(tx, key_info, key)
                 .await
                 .map_err(TxnOpError::Storage)?;
+            if deleted != 1 {
+                return Err(TxnOpError::Storage(StorageError::Internal(format!(
+                    "deleting the reserved key removed {deleted} rows, expected 1"
+                ))));
+            }
             return Ok(None);
         }
         // Lost to a concurrent create, which has committed by now: lock it.
