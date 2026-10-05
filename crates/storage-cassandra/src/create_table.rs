@@ -30,18 +30,28 @@ impl CassandraEngine {
         let catalog_keyspace = self.catalog_keyspace();
         let now_ms = chrono::Utc::now().timestamp_millis();
 
-        let mut statements = Vec::new();
+        // Update stream_label via LWT to avoid mixing plain/LWT writes on the
+        // tables row (which was created with IF NOT EXISTS). See ADR-0021.
+        let update_label_cql = format!(
+            "UPDATE {catalog_keyspace}.tables SET stream_label = ? \
+             WHERE account_id = ? AND table_name = ? IF EXISTS"
+        );
+        crate::cassandra_util::query_lwt(
+            &self.session,
+            &update_label_cql,
+            cdrs_tokio::query_values!(label.as_str(), account_id, table_name),
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("init_stream_shards update stream_label: {e}");
+            StorageError::Internal(format!("Failed to update stream_label: {e}"))
+        })?;
 
-        // Update stream_label in catalog
-        statements.push(format!(
-            "UPDATE {catalog_keyspace}.tables SET stream_label = '{label}' \
-             WHERE account_id = '{account_id}' AND table_name = '{table_name}'"
-        ));
-
-        // Insert 4 shard rows into account keyspace
+        // Insert 4 shard rows into account keyspace (plain inserts, separate batch)
+        let mut shard_statements = Vec::new();
         for i in 0..crate::stream_util::SHARDS_PER_STREAM {
             let shard_id = format!("shardId-{table_id}-{i:012}");
-            statements.push(format!(
+            shard_statements.push(format!(
                 "INSERT INTO {account_keyspace}.stream_shards \
                  (shard_id, table_id, starting_sequence_number, created_at) \
                  VALUES ('{shard_id}', '{table_id}', '{}', {now_ms})",
@@ -49,7 +59,7 @@ impl CassandraEngine {
             ));
         }
 
-        let batch = format!("BEGIN BATCH\n{}\nAPPLY BATCH", statements.join(";\n"));
+        let batch = format!("BEGIN BATCH\n{}\nAPPLY BATCH", shard_statements.join(";\n"));
         // Note: values are interpolated rather than bound because Cassandra LOGGED BATCH
         // does not support parameterized statements spanning multiple tables.
         // All interpolated values are server-generated (UUIDs, timestamps, label from chrono).

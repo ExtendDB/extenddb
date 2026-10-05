@@ -8,7 +8,7 @@ use extenddb_storage::management_store::{OpError, OpResult, RoleDetail};
 use time::OffsetDateTime;
 
 use crate::cassandra_util::{
-    execute, get_column, get_timestamp, map_rows, query_optional, query_rows,
+    apply_lwt, execute, get_column, get_timestamp, map_rows, query_optional, query_rows,
 };
 use crate::catalog_store::CassandraCatalogStore;
 
@@ -74,16 +74,17 @@ impl CassandraCatalogStore {
         }
 
         let query = format!(
-            "DELETE FROM {}.iam_roles WHERE account_id = ? AND role_name = ?",
+            "DELETE FROM {}.iam_roles WHERE account_id = ? AND role_name = ? IF EXISTS",
             self.catalog_keyspace()
         );
-        execute(
+        apply_lwt(
             self.session(),
             &query,
             query_values!(account_id, role_name),
             "delete_role",
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     pub(crate) async fn list_roles_impl(
@@ -277,6 +278,7 @@ impl CassandraCatalogStore {
         tag_keys: &[String],
     ) -> OpResult<()> {
         for key in tag_keys {
+            // iam_role_tags uses plain INSERT — plain DELETE is safe
             let query = format!(
                 "DELETE FROM {}.iam_role_tags WHERE account_id = ? AND role_name = ? AND tag_key = ?",
                 self.catalog_keyspace()

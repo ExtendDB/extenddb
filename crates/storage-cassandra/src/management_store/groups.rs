@@ -52,17 +52,16 @@ impl CassandraCatalogStore {
         }
 
         let catalog_keyspace = self.catalog_keyspace();
-        let delete_query = format!(
-            "DELETE FROM {catalog_keyspace}.iam_groups WHERE account_id = ? AND group_name = ?"
-        );
-
-        crate::cassandra_util::execute(
+        crate::cassandra_util::apply_lwt(
             self.session(),
-            &delete_query,
+            &format!(
+                "DELETE FROM {catalog_keyspace}.iam_groups WHERE account_id = ? AND group_name = ? IF EXISTS"
+            ),
             cdrs_tokio::query_values!(account_id, group_name),
             "delete_group",
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     pub(crate) async fn list_groups_impl(
@@ -251,17 +250,16 @@ impl CassandraCatalogStore {
             return Err(OpError::NotFound("Membership not found".to_owned()));
         }
 
-        let delete_query = format!(
-            "DELETE FROM {catalog_keyspace}.iam_group_members WHERE account_id = ? AND group_name = ? AND user_name = ?"
-        );
-
-        crate::cassandra_util::execute(
+        crate::cassandra_util::apply_lwt(
             self.session(),
-            &delete_query,
+            &format!(
+                "DELETE FROM {catalog_keyspace}.iam_group_members WHERE account_id = ? AND group_name = ? AND user_name = ? IF EXISTS"
+            ),
             cdrs_tokio::query_values!(account_id, group_name, user_name),
             "remove_group_member",
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     // Helper to check if group exists

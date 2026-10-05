@@ -140,58 +140,62 @@ impl CassandraCatalogStore {
         .map(|row| crate::cassandra_util::get_column(&row, "group_name", "delete_user"))
         .collect::<Result<_, _>>()?;
 
-        // Build one logged batch with all cascade deletes.
-        let user_av = cdrs_tokio::query::QueryValues::SimpleValues(vec![
-            cdrs_tokio::types::value::Value::from(account_id),
-            cdrs_tokio::types::value::Value::from(user_name),
-        ]);
-        let mut batch = cdrs_tokio::query::BatchQueryBuilder::new()
-            .with_consistency(cdrs_tokio::consistency::Consistency::LocalQuorum)
-            .add_query(
-                format!("DELETE FROM {ks}.iam_users WHERE account_id = ? AND user_name = ?"),
-                user_av.clone(),
-            )
-            .add_query(
-                format!("DELETE FROM {ks}.iam_user_tags WHERE account_id = ? AND user_name = ?"),
-                user_av,
-            );
+        // Sequential deletes. Only tables created with IF NOT EXISTS use IF EXISTS on delete
+        // (LWT/non-LWT mixing rule). Tables with plain INSERT use plain DELETE.
+        // See ADR-0021.
+        let session = std::sync::Arc::clone(session);
+        crate::cassandra_util::apply_lwt(
+            &session,
+            &format!("DELETE FROM {ks}.iam_users WHERE account_id = ? AND user_name = ? IF EXISTS"),
+            cdrs_tokio::query_values!(account_id, user_name),
+            "delete_user iam_users",
+        )
+        .await?;
+        // iam_user_tags uses plain INSERT — plain DELETE is safe
+        crate::cassandra_util::execute(
+            &session,
+            &format!("DELETE FROM {ks}.iam_user_tags WHERE account_id = ? AND user_name = ?"),
+            cdrs_tokio::query_values!(account_id, user_name),
+            "delete_user iam_user_tags",
+        )
+        .await?;
         for key_id in &key_ids {
-            batch = batch.add_query(
-                format!("DELETE FROM {ks}.access_keys WHERE access_key_id = ?"),
+            // access_keys uses plain INSERT — plain DELETE is safe
+            crate::cassandra_util::execute(
+                &session,
+                &format!("DELETE FROM {ks}.access_keys WHERE access_key_id = ?"),
                 cdrs_tokio::query_values!(key_id.as_str()),
-            );
+                "delete_user access_keys",
+            )
+            .await?;
         }
         for policy_name in &policy_names {
-            batch = batch.add_query(
-                format!(
+            // iam_policies uses plain INSERT — plain DELETE is safe
+            crate::cassandra_util::execute(
+                &session,
+                &format!(
                     "DELETE FROM {ks}.iam_policies \
                      WHERE account_id = ? AND principal_type = 'user' \
                      AND principal_name = ? AND policy_name = ?"
                 ),
                 cdrs_tokio::query_values!(account_id, user_name, policy_name.as_str()),
-            );
+                "delete_user iam_policies",
+            )
+            .await?;
         }
         for group_name in &group_names {
-            batch = batch.add_query(
-                format!(
+            // iam_group_members uses IF NOT EXISTS — must use IF EXISTS
+            crate::cassandra_util::apply_lwt(
+                &session,
+                &format!(
                     "DELETE FROM {ks}.iam_group_members \
-                     WHERE account_id = ? AND group_name = ? AND user_name = ?"
+                     WHERE account_id = ? AND group_name = ? AND user_name = ? IF EXISTS"
                 ),
                 cdrs_tokio::query_values!(account_id, group_name.as_str(), user_name),
-            );
-        }
-
-        session
-            .batch(
-                batch
-                    .build()
-                    .map_err(|e| OpError::Internal(e.to_string()))?,
+                "delete_user iam_group_members",
             )
-            .await
-            .map_err(|e| {
-                tracing::error!("delete_user batch: {e}");
-                OpError::Internal("Database error".to_owned())
-            })?;
+            .await?;
+        }
 
         Ok(())
     }
