@@ -24,11 +24,12 @@ use std::time::Duration;
 use extenddb_core::expression::{self, Expr, ExpressionMaps};
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, BillingMode, CreateTableInput, GsiInput, Item,
-    KeySchemaElement, KeyType, Projection, ProjectionType, ReturnValuesOnConditionCheckFailure,
-    ScalarAttributeType, TableKeyInfo,
+    KeySchemaElement, KeyType, LsiInput, Projection, ProjectionType,
+    ReturnValuesOnConditionCheckFailure, ScalarAttributeType, StreamRecord, StreamSpecification,
+    StreamViewType, TableKeyInfo,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{DataEngine, TableEngine, TransactWriteOp};
+use extenddb_storage::{DataEngine, StreamCapture, TableEngine, TransactWriteOp};
 use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -203,25 +204,6 @@ async fn data_table(db: &PgPool) -> String {
     format!("\"_ddb_{id}\"")
 }
 
-/// Wait until some backend other than `own_pid` waits on a row lock.
-async fn wait_for_lock_waiter(db: &PgPool, own_pid: i32) {
-    for _ in 0..500 {
-        let waiting: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity \
-             WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> $1",
-        )
-        .bind(own_pid)
-        .fetch_one(db)
-        .await
-        .expect("read pg_stat_activity");
-        if waiting > 0 {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("the transaction never waited on the held lock");
-}
-
 #[tokio::test]
 async fn a_deadlock_cancels_with_transaction_conflict_on_the_waiting_item() {
     let test = "a_deadlock_cancels_with_transaction_conflict_on_the_waiting_item";
@@ -252,7 +234,7 @@ async fn a_deadlock_cancels_with_transaction_conflict_on_the_waiting_item() {
     let ops = [put(&key_info, &new_b, &maps), put(&key_info, &new_a, &maps)];
     let twi = s.engine.transact_write_items(&ops, None);
     let close_cycle = async {
-        wait_for_lock_waiter(&s.db, holder_pid).await;
+        wait_for_lock_waiters(&s.db, holder_pid, 1).await;
         sqlx::query(&format!("SELECT 1 FROM {table} WHERE pk = 'a' FOR UPDATE"))
             .execute(&mut *holder)
             .await
@@ -673,6 +655,191 @@ async fn a_plain_put_waits_for_a_check_of_the_missing_item() {
     .await
     .expect("read 0c");
     assert_eq!(v, "plain");
+
+    s.cleanup().await;
+}
+
+const LSI_TABLE: &str = "t_twi_lsi_stream";
+
+/// Create a (pk, sk) table with LSI `lsi1` on `lsk` and a stream.
+async fn lsi_stream_table(s: &Scratch) -> TableKeyInfo {
+    // The scratch database holds the catalog and data schemas together, so it
+    // has the catalog's copy of `stream_shards`. Drop its foreign key to
+    // `tables`, which the data database does not have.
+    sqlx::query("ALTER TABLE stream_shards DROP CONSTRAINT stream_shards_table_id_fkey")
+        .execute(&s.db)
+        .await
+        .expect("match the data schema");
+    let s_attr = |name: &str| AttributeDefinition {
+        attribute_name: name.to_owned(),
+        attribute_type: ScalarAttributeType::S,
+    };
+    let key = |name: &str, key_type: KeyType| KeySchemaElement {
+        attribute_name: name.to_owned(),
+        key_type,
+    };
+    s.engine
+        .create_table(
+            ACCOUNT,
+            CreateTableInput {
+                table_name: LSI_TABLE.to_owned(),
+                key_schema: vec![key("pk", KeyType::Hash), key("sk", KeyType::Range)],
+                attribute_definitions: vec![s_attr("pk"), s_attr("sk"), s_attr("lsk")],
+                billing_mode: Some(BillingMode::PayPerRequest),
+                local_secondary_indexes: Some(vec![LsiInput {
+                    index_name: "lsi1".to_owned(),
+                    key_schema: vec![key("pk", KeyType::Hash), key("lsk", KeyType::Range)],
+                    projection: Projection {
+                        projection_type: ProjectionType::All,
+                        non_key_attributes: None,
+                    },
+                }]),
+                stream_specification: Some(StreamSpecification {
+                    stream_enabled: true,
+                    stream_view_type: Some(StreamViewType::NewAndOldImages),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create the table");
+    s.engine
+        .table_key_info(ACCOUNT, LSI_TABLE)
+        .await
+        .expect("read the key info")
+}
+
+fn range_item(pk: &str, extra: &[(&str, &str)]) -> Item {
+    let mut item = BTreeMap::from([
+        ("pk".to_owned(), AttributeValue::S(pk.to_owned())),
+        ("sk".to_owned(), AttributeValue::S("1".to_owned())),
+    ]);
+    for (name, value) in extra {
+        item.insert((*name).to_owned(), AttributeValue::S((*value).to_owned()));
+    }
+    item
+}
+
+#[tokio::test]
+async fn a_delete_that_loses_its_reservation_removes_the_winner_everywhere() {
+    // A write transaction creates `c`, with its LSI row and stream record, and
+    // then waits on `d`, which an outside transaction holds. A Delete of the
+    // missing `c` meanwhile waits for that create. Once it commits, the Delete
+    // must remove the winner: one REMOVE record whose old image is the winner,
+    // and no LSI row left behind.
+    let test = "a_delete_that_loses_its_reservation_removes_the_winner_everywhere";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let s = scratch().await;
+    let maps = ExpressionMaps::default();
+    let key_info = lsi_stream_table(&s).await;
+    s.engine
+        .put_item(&key_info, range_item("d", &[]), false, None, &maps, None)
+        .await
+        .expect("seed d");
+    let table_id: String =
+        sqlx::query_scalar("SELECT table_id FROM tables WHERE account_id = $1 AND table_name = $2")
+            .bind(ACCOUNT)
+            .bind(LSI_TABLE)
+            .fetch_one(&s.db)
+            .await
+            .expect("look up the table id");
+    let index_id: String = sqlx::query_scalar(
+        "SELECT index_id FROM indexes WHERE table_id = $1 AND index_name = 'lsi1'",
+    )
+    .bind(&table_id)
+    .fetch_one(&s.db)
+    .await
+    .expect("look up the index id");
+    let (table, lsi) = (
+        format!("\"_ddb_{table_id}\""),
+        format!("\"_ddb_{index_id}\""),
+    );
+
+    let mut holder = s.db.begin().await.expect("begin the outside transaction");
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .expect("read the backend pid");
+    sqlx::query(&format!("SELECT 1 FROM {table} WHERE pk = 'd' FOR UPDATE"))
+        .execute(&mut *holder)
+        .await
+        .expect("lock d");
+
+    let capture = StreamCapture {
+        view_type: StreamViewType::NewAndOldImages,
+        user_identity: None,
+        region: REGION.into(),
+    };
+    let winner = range_item("c", &[("lsk", "l"), ("v", "winner")]);
+    let new_d = range_item("d", &[("v", "creator")]);
+    let stream_put = |item| TransactWriteOp::Put {
+        key_info: &key_info,
+        item,
+        condition: None,
+        maps: &maps,
+        return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+        stream: Some(capture.clone()),
+    };
+    let creator_ops = [stream_put(&winner), stream_put(&new_d)];
+    let c = range_item("c", &[]);
+    let delete_ops = [TransactWriteOp::Delete {
+        key_info: &key_info,
+        key: &c,
+        condition: None,
+        maps: &maps,
+        return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+        stream: Some(capture.clone()),
+    }];
+
+    let creator = s.engine.transact_write_items(&creator_ops, None);
+    let deleter = async {
+        // The creator has inserted c and waits on d.
+        wait_for_lock_waiters(&s.db, holder_pid, 1).await;
+        s.engine.transact_write_items(&delete_ops, None).await
+    };
+    let release = async {
+        // The Delete now waits on the creator's insert of c.
+        wait_for_lock_waiters(&s.db, holder_pid, 2).await;
+        holder.rollback().await.expect("release d");
+    };
+    let (created, deleted, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(creator, deleter, release)
+    })
+    .await
+    .expect("both transactions finished");
+    created.expect("the create commits");
+    deleted.expect("the delete commits after it");
+
+    for t in [&table, &lsi] {
+        let left: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {t} WHERE pk = 'c'"))
+            .fetch_one(&s.db)
+            .await
+            .expect("count c");
+        assert_eq!(left, 0, "c is gone from {t}");
+    }
+    let records: Vec<(serde_json::Value,)> = sqlx::query_as(
+        "SELECT record_data FROM stream_records WHERE table_id = $1 ORDER BY sequence_number",
+    )
+    .bind(&table_id)
+    .fetch_all(&s.db)
+    .await
+    .expect("read the stream records");
+    let c_events: Vec<(String, Option<Item>)> = records
+        .into_iter()
+        .map(|(data,)| serde_json::from_value::<StreamRecord>(data).expect("a stream record"))
+        .filter(|r| r.dynamodb.keys.get("pk") == Some(&AttributeValue::S("c".to_owned())))
+        .map(|r| (format!("{:?}", r.event_name), r.dynamodb.old_image))
+        .collect();
+    assert_eq!(
+        c_events,
+        [
+            ("Insert".to_owned(), None),
+            ("Remove".to_owned(), Some(winner.clone()))
+        ],
+        "the create, then the delete of the winner"
+    );
 
     s.cleanup().await;
 }

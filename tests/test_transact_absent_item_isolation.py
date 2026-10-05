@@ -61,19 +61,42 @@ def table(dynamodb_client):
         yield name
 
 
-def _key(pk: str) -> dict:
-    return {"pk": {"S": pk}}
+@pytest.fixture(scope="module")
+def range_table(dynamodb_client):
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "N"},
+        ],
+        key_schema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+    ) as name:
+        yield name
 
 
-def _put(table: str, pk: str) -> dict:
-    return {"Put": {"TableName": table, "Item": _key(pk)}}
+# The sort key of every item in the range table: a number with a fraction.
+SK = {"N": "1.50"}
 
 
-def _check_absent(table: str, pk: str) -> dict:
+def _key(pk: str, sk: dict | None = None) -> dict:
+    key = {"pk": {"S": pk}}
+    if sk is not None:
+        key["sk"] = sk
+    return key
+
+
+def _put(table: str, pk: str, sk: dict | None = None) -> dict:
+    return {"Put": {"TableName": table, "Item": _key(pk, sk)}}
+
+
+def _check_absent(table: str, pk: str, sk: dict | None = None) -> dict:
     return {
         "ConditionCheck": {
             "TableName": table,
-            "Key": _key(pk),
+            "Key": _key(pk, sk),
             "ConditionExpression": NOT_EXISTS,
         }
     }
@@ -135,11 +158,11 @@ def _race(client, t1: list[dict], t2: list[dict]) -> list[dict | None]:
     return out
 
 
-def _exists(client, table: str, pk: str) -> bool:
-    return "Item" in client.get_item(TableName=table, Key=_key(pk), ConsistentRead=True)
+def _exists(client, table: str, pk: str, sk: dict | None = None) -> bool:
+    return "Item" in client.get_item(TableName=table, Key=_key(pk, sk), ConsistentRead=True)
 
 
-def _run_rounds(dynamodb_client, raw_client, table, build) -> list[tuple]:
+def _run_rounds(dynamodb_client, raw_client, table, build, sk=None) -> list[tuple]:
     """Race `build(x, y)` on fresh keys each round.
 
     Returns one record per round: both outcomes and whether x and y exist after.
@@ -162,7 +185,7 @@ def _run_rounds(dynamodb_client, raw_client, table, build) -> list[tuple]:
             codes = [r["Code"] for r in f["reasons"]]
             assert len(codes) == 2 and set(codes) <= REASON_CODES, f
         rounds.append(
-            (r1, r2, _exists(dynamodb_client, table, x), _exists(dynamodb_client, table, y))
+            (r1, r2, _exists(dynamodb_client, table, x, sk), _exists(dynamodb_client, table, y, sk))
         )
     assert len(server_errors) <= MAX_SERVER_ERRORS, server_errors
     return rounds
@@ -184,6 +207,24 @@ def test_condition_checks_on_missing_items_do_not_write_skew(
             [_check_absent(table, y), _put(table, x)],
             [_check_absent(table, x), _put(table, y)],
         ),
+    )
+    skewed = _both_committed(rounds)
+    assert not skewed, f"{len(skewed)} of {ROUNDS} rounds committed both: {skewed[0]}"
+
+
+def test_condition_checks_on_missing_items_of_a_range_table_do_not_write_skew(
+    dynamodb_client, raw_client, range_table
+):
+    """The same race on a hash and range table, keyed by a number sort key."""
+    rounds = _run_rounds(
+        dynamodb_client,
+        raw_client,
+        range_table,
+        lambda x, y: (
+            [_check_absent(range_table, y, SK), _put(range_table, x, SK)],
+            [_check_absent(range_table, x, SK), _put(range_table, y, SK)],
+        ),
+        sk=SK,
     )
     skewed = _both_committed(rounds)
     assert not skewed, f"{len(skewed)} of {ROUNDS} rounds committed both: {skewed[0]}"
