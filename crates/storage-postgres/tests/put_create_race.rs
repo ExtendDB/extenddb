@@ -7,8 +7,9 @@
 //! overwrites the item, after its own condition is checked against it. These
 //! tests hold the competing create open in an outside transaction, so the put
 //! deterministically loses the insert and has to order itself after the winner.
-//! The last two tests also delete the winner before the put re-reads it, so the
-//! put retries its insert, and they bound those retries.
+//! The last four tests, on hash and on hash and range tables, also delete the
+//! winner before the put re-reads it, so the put retries its insert, and they
+//! bound those retries.
 //!
 //! Each test builds its own throwaway database, applies the shipped migrations
 //! to it, and drops it when it passes. A failing test leaves its database behind
