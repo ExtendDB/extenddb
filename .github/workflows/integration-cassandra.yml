@@ -11,27 +11,39 @@ on:
 permissions:
   contents: read
 
+# Supersede an in-flight run of the SAME pull request when a new push arrives,
+# so repeated pushes do not stack up on a capped pool. Non-PR runs get a group
+# unique to the run (run_id): merge-group runs reuse a ref across re-queues,
+# and GitHub concurrency replaces a PENDING run in a group even with
+# cancel-in-progress false, so keying them by ref would let one merge-group
+# run cancel another and evict its queue entry.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+
 # The Cassandra backend's integration tests (crates/storage-cassandra/tests)
-# talk to a live node at 127.0.0.1:9042 with cassandra/cassandra credentials
-# and are not feature-gated — without this workflow they never run in CI and
-# every green result is a local claim. The TTL claim protocol in particular
-# fails silently if the stored item encoding drifts, so these tests are the
-# only automated signal for a whole class of regressions.
+# talk to a live node at 127.0.0.1:9042 with default cassandra/cassandra
+# credentials. This workflow enables them to run in CI.
 #
-# A single-node container is enough: the tests create their own keyspaces
-# (RF=1) and run serially because the sweep and reconciliation passes are
-# global.
+# A single-node Cassandra installation is enough. the tests create their own
+# keyspaces with replication factor (RF) of 1 (one).
 #
-# The cassandra:4.1 image does not honour CASSANDRA_AUTHENTICATOR, so each job
-# patches cassandra.yaml inside the running container and restarts it before
-# running any tests. The health-check on the service container uses the default
-# AllowAllAuthenticator credentials (no auth challenge), so the container is
-# healthy before the patch step runs; after the restart a second wait loop
-# confirms the node is back up with PasswordAuthenticator active.
+# The cassandra:4.1 image does not recognize CASSANDRA_AUTHENTICATOR as an
+# environment variable for configuring authentication, so each job patches
+# cassandra.yaml inside the running container to enable password auth, and
+# restarts it before running any tests. The health-check on the service container
+# uses the default AllowAllAuthenticator auth (no auth challenge) before the
+# patch step runs. After the restart a second wait loop confirms the node is
+# back up with PasswordAuthenticator active.
 
 jobs:
   cassandra-storage:
-    runs-on: ubuntu-latest
+    # Dedicated ExtendDB runner group (Ubuntu 24.04, 4 vCPU / 16 GB, capped at
+    # 20 concurrent). ubuntu-latest is an Amazon-wide shared pool where our jobs
+    # waited 10-90 minutes to start (2026-09-29/30); see integration.yml.
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 45
     services:
       cassandra:
         image: cassandra:4.1
@@ -85,7 +97,8 @@ jobs:
           EXTENDDB_TEST_CASSANDRA: required
 
   cassandra-pytest:
-    runs-on: ubuntu-latest
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 45
     services:
       cassandra:
         image: cassandra:4.1
@@ -135,7 +148,8 @@ jobs:
         run: devtools/run-cassandra-tests -- --pytest --comprehensive --parallel
 
   cassandra-rust:
-    runs-on: ubuntu-latest
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 45
     services:
       cassandra:
         image: cassandra:4.1
@@ -185,7 +199,8 @@ jobs:
         run: devtools/run-cassandra-tests -- --rust --rust-integration
 
   cassandra-production-build:
-    runs-on: ubuntu-latest
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -196,7 +211,8 @@ jobs:
         run: cargo check --release --no-default-features --features cassandra
 
   cassandra-integration:
-    runs-on: ubuntu-latest
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 75
     needs: [cassandra-storage, cassandra-pytest, cassandra-rust, cassandra-production-build]
     if: always()
     steps:
