@@ -362,12 +362,12 @@ impl PostgresEngine {
 
                     if current_label.is_none() {
                         sqlx::query(
-                            "UPDATE tables SET stream_label = \
-                             to_char(NOW(), 'YYYY-MM-DD\"T\"HH24:MI:SS') \
+                            "UPDATE tables SET stream_label = $3 \
                              WHERE account_id = $1 AND table_name = $2",
                         )
                         .bind(account_id)
                         .bind(&input.table_name)
+                        .bind(extenddb_storage::util::new_stream_label())
                         .execute(&mut *tx)
                         .await
                         .map_err(|e| StorageError::Internal(e.to_string()))?;

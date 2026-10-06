@@ -305,7 +305,7 @@ jobs:
       - name: Run PostgreSQL storage-level tests
         env:
           EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
-        run: cargo test --release -p extenddb-storage-postgres --test vector_control_plane --test put_create_race --test twi_conflict
+        run: cargo test --release -p extenddb-storage-postgres --test vector_control_plane --test put_create_race --test twi_conflict --test stream_shard_retention
 
       # The daemonized server logs to syslog; dump it so server-side failures
       # are diagnosable from the job log.
