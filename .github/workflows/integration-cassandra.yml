@@ -197,7 +197,7 @@ jobs:
       - name: Build release (cassandra backend)
         run: cargo build --release --no-default-features --features cassandra
       - name: Run Cassandra rust integration suite
-        run: devtools/run-cassandra-tests -- --rust --rust-integration
+        run: devtools/run-cassandra-tests -- --rust-integration
 
   cassandra-production-build:
     runs-on: extenddb_ubuntu-2404_4-core
