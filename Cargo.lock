@@ -1353,6 +1353,7 @@ dependencies = [
  "extenddb-core",
  "extenddb-storage",
  "futures",
+ "libc",
  "rand 0.9.4",
  "serde",
  "serde_json",

@@ -74,6 +74,10 @@ pub struct SqliteEngine {
     /// no entry, because nothing else ever will until a restart, and until then
     /// the per-table queue hold blocks every write's index maintenance.
     pub(crate) vector_builds_running: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// The `extenddb serve` lock on the database file, held for as long as any
+    /// clone of the engine lives. `None` outside `serve` and for in-memory
+    /// databases.
+    pub(crate) serve_lock: Option<Arc<crate::serve_lock::ServeLock>>,
 }
 
 impl SqliteEngine {
@@ -154,6 +158,7 @@ impl SqliteEngine {
             vector_builds_running: Arc::new(
                 std::sync::Mutex::new(std::collections::HashSet::new()),
             ),
+            serve_lock: None,
         })
     }
 
