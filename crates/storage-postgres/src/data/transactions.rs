@@ -181,6 +181,10 @@ impl PostgresEngine {
             }
         }
 
+        // An invalid request fails validation even if a storage error or a
+        // conflict abort ended the loop. After an early break, a request-earlier
+        // op that sorts later was never checked, so the op named is the earliest
+        // invalid one that ran.
         if let Some((_, msg)) = first_invalid {
             return Err(StorageError::Validation(msg));
         }
