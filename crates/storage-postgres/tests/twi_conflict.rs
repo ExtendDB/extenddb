@@ -631,6 +631,20 @@ async fn a_plain_put_waits_for_a_check_of_the_missing_item() {
     let twi = s.engine.transact_write_items(&ops, None);
     let plain_put = async {
         wait_for_lock_waiters(&s.db, holder_pid, 1).await;
+        // Readers neither see the reserved key nor wait for it.
+        let read = tokio::time::timeout(Duration::from_secs(5), async {
+            let got = s.engine.get_item(&key_info, &key("0c")).await;
+            let rows: i64 =
+                sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE pk = '0c'"))
+                    .fetch_one(&s.db)
+                    .await
+                    .expect("count 0c");
+            (got, rows)
+        })
+        .await
+        .expect("a read of the reserved key does not wait");
+        assert_eq!(read.0.expect("GetItem of 0c"), None, "GetItem sees no item");
+        assert_eq!(read.1, 0, "no reader sees the placeholder row");
         s.engine
             .put_item(&key_info, item("0c", "plain"), false, None, &maps, None)
             .await
