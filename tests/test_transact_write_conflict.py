@@ -182,6 +182,7 @@ def test_opposite_order_transactions_cancel_instead_of_failing(
 
     _, n_5xx = _assert_conflict_shape(failures, 2)
     assert committed + len(failures) == attempts
+    assert attempts == WORKERS * TXNS_PER_WORKER, f"time budget cut the run at {attempts}"
     # Every committed transaction applied both updates and no canceled one
     # applied any. A 5xx leaves the outcome unknown, so it may count either way.
     n_a, n_b = _counter(dynamodb_client, table, a), _counter(dynamodb_client, table, b)
@@ -214,4 +215,5 @@ def test_conflict_reason_names_only_the_contended_item(
         expected = ["TransactionConflict", "None"]
         assert codes == (expected if f["builder"] == 0 else expected[::-1]), f
     assert committed + len(failures) == attempts
+    assert attempts == WORKERS * TXNS_PER_WORKER, f"time budget cut the run at {attempts}"
     assert committed <= _counter(dynamodb_client, table, hot) <= committed + n_5xx

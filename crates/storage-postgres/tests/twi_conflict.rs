@@ -324,6 +324,26 @@ async fn opposite_request_orders_do_not_deadlock() {
     });
     futures::future::join_all(writers).await;
 
+    // The last commit is some writer's last round, and it wrote both items.
+    let table = data_table(&s.db).await;
+    let mut tags = Vec::new();
+    for pk in ["a", "b"] {
+        let v: String = sqlx::query_scalar(&format!(
+            "SELECT item_data->'v'->>'S' FROM {table} WHERE pk = $1"
+        ))
+        .bind(pk)
+        .fetch_one(&s.db)
+        .await
+        .expect("read the item");
+        tags.push(v);
+    }
+    assert_eq!(tags[0], tags[1], "a and b come from different transactions");
+    assert!(
+        tags[0].ends_with("-r49"),
+        "last commit was not a final round: {}",
+        tags[0]
+    );
+
     s.cleanup().await;
 }
 
