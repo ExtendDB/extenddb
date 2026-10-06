@@ -427,8 +427,11 @@ pub trait DataEngine: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::TransactionCanceled`] if any condition fails.
-    /// Returns [`StorageError::Internal`] on transaction or query failure.
+    /// Returns [`StorageError::TransactionCanceled`] if any condition fails, or
+    /// with a `TransactionConflict` reason when the database aborts the
+    /// transaction to break a lock conflict (a deadlock or a serialization
+    /// failure).
+    /// Returns [`StorageError::Internal`] on any other transaction or query failure.
     /// Returns [`StorageError::IdempotentReplay`] if the token matches a previous request.
     /// Returns [`StorageError::IdempotentMismatch`] if the token exists with different ops.
     fn transact_write_items(
