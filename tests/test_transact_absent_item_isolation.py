@@ -37,12 +37,15 @@ NOT_EXISTS = "attribute_not_exists(pk)"
 REASON_CODES = {"None", "ConditionalCheckFailed", "TransactionConflict"}
 
 # TEMPORARY: MongoDB has the same write skew, and the MongoDB write-race fix
-# repairs it. That fix lands separately; remove this marker once it is on main.
-# The MongoDB test runner sets EXTENDDB_TEST_MONGODB_CONTAINER.
+# repairs it. That fix lands separately. The marker is strict, so these tests
+# fail on MongoDB once the fix is on main, until the marker is removed. Only an
+# assertion counts as the expected failure. The MongoDB test runner sets
+# EXTENDDB_TEST_MONGODB_CONTAINER.
 XFAIL_UNTIL_MONGODB_FIX = pytest.mark.xfail(
     bool(os.environ.get("EXTENDDB_TEST_MONGODB_CONTAINER", "").strip()),
     reason="MongoDB write skew on missing items, fixed by the MongoDB write-race fix",
-    strict=False,
+    raises=AssertionError,
+    strict=True,
 )
 
 
@@ -272,8 +275,9 @@ def test_deletes_of_missing_items_serialize(dynamodb_client, raw_client, table):
             [_delete(table, x), _put(table, y)],
         ),
     )
-    skewed = [r for r in _both_committed(rounds) if r[2] and r[3]]
-    assert not skewed, f"{len(skewed)} of {ROUNDS} rounds kept both items: {skewed[0]}"
+    # Both serial orders leave exactly one item: both or neither is skew.
+    skewed = [r for r in _both_committed(rounds) if r[2] == r[3]]
+    assert not skewed, f"{len(skewed)} of {ROUNDS} rounds kept both or neither: {skewed[0]}"
 
 
 def test_conditional_updates_of_missing_items_serialize(
