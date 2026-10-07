@@ -34,11 +34,16 @@ ROUNDS = 15
 
 # TEMPORARY: on MongoDB, a put without a condition on a table with no index and
 # no stream returns HTTP 500 when it loses the create race. The MongoDB
-# write-race fix repairs it. That fix lands separately; remove this marker
-# once it is on main. The MongoDB test runner sets EXTENDDB_TEST_MONGODB_CONTAINER.
+# write-race fix repairs it. That fix lands separately.
+# TODO: remove this marker once the MongoDB write-race fix is on main.
+# Only an assertion counts as the expected failure. The marker is not strict,
+# because the race does not fire in every run: these tests still pass now and
+# then on MongoDB without the fix. The MongoDB test runner sets
+# EXTENDDB_TEST_MONGODB_CONTAINER.
 XFAIL_UNTIL_MONGODB_FIX = pytest.mark.xfail(
     bool(os.environ.get("EXTENDDB_TEST_MONGODB_CONTAINER", "").strip()),
     reason="MongoDB returns HTTP 500 for a lost create race, fixed by the MongoDB write-race fix",
+    raises=AssertionError,
     strict=False,
 )
 
