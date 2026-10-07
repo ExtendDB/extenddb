@@ -488,7 +488,7 @@ const MAX_CREATE_RACE_ATTEMPTS: u32 = 5;
 /// `UpdateItem` returns, it is an internal error (HTTP 500).
 fn create_race_exhausted(attempt: u32) -> StorageError {
     StorageError::Internal(format!(
-        "PutItem could not create the item after {attempt} attempts: a concurrent writer \
-         repeatedly created and deleted the row"
+        "PutItem could not create the item after {attempt} attempts: each insert lost the \
+         create race to a concurrent writer"
     ))
 }
