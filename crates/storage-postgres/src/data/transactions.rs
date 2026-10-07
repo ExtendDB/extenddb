@@ -3,26 +3,32 @@
 
 //! Transactional read/write implementations for the `PostgreSQL` backend.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use extenddb_core::expression::{self, ExpressionMaps};
 use extenddb_core::types::{
-    AttributeValue, CancellationReason, Item, ReturnValuesOnConditionCheckFailure,
+    AttributeValue, CancellationReason, Item, ReturnValuesOnConditionCheckFailure, TableKeyInfo,
 };
 use extenddb_core::validation;
 use extenddb_storage::error::StorageError;
+use extenddb_storage::util::pk_to_text;
 use extenddb_storage::{IdempotencyKey, TransactGetOp, TransactWriteOp};
 
-use super::index::{IndexMeta, enqueue_async_indexes, fetch_write_path_indexes, sync_indexes};
+use super::index::{
+    IndexMeta, db_error, enqueue_async_indexes, fetch_write_path_indexes, sync_indexes,
+};
 use super::tx_helpers::{
     check_idempotency_token_in_tx, delete_item_in_tx, fetch_item_for_update, fetch_item_in_tx,
     insert_item_if_absent_in_tx, upsert_item_in_tx, write_stream_record_in_tx,
 };
 use crate::PostgresEngine;
+use crate::pg_util::is_conflict_abort;
 
-/// Bound on insert retries when a transactional write to a nonexistent item
-/// keeps losing the create race to writers that then roll back. Mirrors the
-/// same bound on the non-transactional `UpdateItem` path (`update_item.rs`).
+/// Bound on insert retries when a transactional write to a nonexistent item,
+/// or the reservation of a missing key, keeps losing the create race to a
+/// winner that is deleted again before the re-read. Mirrors the same bound on
+/// the non-transactional `UpdateItem` path (`update_item.rs`).
 const MAX_CREATE_RACE_ATTEMPTS: u32 = 5;
 
 impl PostgresEngine {
@@ -120,19 +126,32 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+        // A conflict abort outside the per-op loop cannot be tied to one item.
+        // Unreachable at READ COMMITTED, where the ops already hold every row
+        // lock; a stricter operator isolation can raise 40001 at commit.
+        let cancel_all = |e: StorageError| conflict_cancels_all(e, ops.len());
+
         // Check the idempotency token within the transaction so token storage
         // and data writes commit together. The token is scoped to its account.
         if let Some(key) = idempotency {
             check_idempotency_token_in_tx(&mut tx, key.account_id, key.token, key.fingerprint)
-                .await?;
+                .await
+                .map_err(cancel_all)?;
         }
 
-        let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());
+        let mut reasons: Vec<CancellationReason> = vec![CancellationReason::none(); ops.len()];
         // M-3: Collect old/new items from each op for async GSI enqueue after commit.
-        let mut op_items: Vec<(Option<Item>, Option<Item>)> = Vec::with_capacity(ops.len());
+        let mut op_items: Vec<(Option<Item>, Option<Item>)> = vec![(None, None); ops.len()];
         let mut any_failed = false;
+        let mut first_invalid: Option<(usize, String)> = None;
+        let mut failed_op: Option<(usize, StorageError)> = None;
+        let mut ran = vec![false; ops.len()];
 
-        for op in ops {
+        // Run the ops in key order, not request order, so every transaction
+        // locks its items in one global order and two cannot deadlock on each
+        // other. Results keep their request positions.
+        for i in execution_order(ops) {
+            let op = &ops[i];
             let indexes = &table_indexes[transact_op_table_name(op)];
             let reason = execute_transact_write_op(
                 &mut tx,
@@ -143,27 +162,54 @@ impl PostgresEngine {
             )
             .await;
             match reason {
-                Ok(items) => {
-                    op_items.push(items);
-                    reasons.push(CancellationReason::none());
-                }
+                Ok(items) => op_items[i] = items,
                 Err(TxnOpError::Cancel(r)) => {
-                    op_items.push((None, None));
                     any_failed = true;
-                    reasons.push(r);
+                    reasons[i] = r;
                 }
                 Err(TxnOpError::Validation(msg)) => {
-                    // Up-front input validation (e.g. empty secondary-index key):
-                    // abort the whole transaction with a top-level
-                    // ValidationException, not a per-item cancellation reason.
-                    return Err(StorageError::Validation(msg));
+                    // Up-front input validation (e.g. empty secondary-index key)
+                    // fails the request with a top-level ValidationException.
+                    // Report the earliest invalid op in request order.
+                    if first_invalid.as_ref().is_none_or(|(j, _)| i < *j) {
+                        first_invalid = Some((i, msg));
+                    }
                 }
                 Err(TxnOpError::Storage(e)) => {
-                    // Infrastructure error — abort the entire transaction
-                    // without leaking internal details into cancellation reasons.
-                    return Err(StorageError::Internal(e.to_string()));
+                    // Infrastructure error, or PostgreSQL aborted the
+                    // transaction: run no further ops. A request-earlier op
+                    // that sorts later is then not validated.
+                    failed_op = Some((i, e));
+                    break;
                 }
             }
+            ran[i] = true;
+            // Once every op before the earliest invalid one has run, the
+            // answer is fixed: stop instead of locking the rest.
+            if let Some((j, _)) = &first_invalid
+                && ran[..*j].iter().all(|r| *r)
+            {
+                break;
+            }
+        }
+
+        // An invalid request fails validation even if a storage error or a
+        // conflict abort ended the loop. After an early break, a request-earlier
+        // op that sorts later was never checked, so the op named is the earliest
+        // invalid one that ran.
+        if let Some((_, msg)) = first_invalid {
+            return Err(StorageError::Validation(msg));
+        }
+        if let Some((i, e)) = failed_op {
+            if is_conflict_abort(&e) {
+                // PostgreSQL broke a lock conflict by aborting this transaction.
+                // Cancel it with the contended item named, as the service does.
+                reasons[i] = CancellationReason::transaction_conflict();
+                return Err(StorageError::TransactionCanceled(reasons));
+            }
+            // Infrastructure error: abort without leaking internal details
+            // into cancellation reasons.
+            return Err(StorageError::Internal(e.to_string()));
         }
 
         if any_failed {
@@ -191,7 +237,8 @@ impl PostgresEngine {
                     old_item.as_ref(),
                     new_item.as_ref(),
                 )
-                .await?;
+                .await
+                .map_err(cancel_all)?;
             }
         }
 
@@ -218,7 +265,8 @@ impl PostgresEngine {
                 new_item.as_ref(),
                 sys_delay,
             )
-            .await?;
+            .await
+            .map_err(cancel_all)?;
 
             // Vector maintenance for all three write kinds in one place, rather
             // than in each branch above: this loop already visits exactly the ops
@@ -235,15 +283,14 @@ impl PostgresEngine {
                 new_item.as_ref(),
                 sys_delay,
             )
-            .await?;
+            .await
+            .map_err(cancel_all)?;
             if n > 0 || vector_n > 0 {
                 needs_notify = true;
             }
         }
 
-        tx.commit()
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        tx.commit().await.map_err(db_error).map_err(cancel_all)?;
 
         if needs_notify && let Some(ref q) = self.gsi_queue {
             q.notify_workers();
@@ -269,6 +316,43 @@ impl PostgresEngine {
 
         Ok(result.rows_affected())
     }
+}
+
+/// Map a conflict abort to a cancellation that names every item. Other
+/// errors pass through unchanged.
+fn conflict_cancels_all(e: StorageError, n_ops: usize) -> StorageError {
+    if is_conflict_abort(&e) {
+        StorageError::TransactionCanceled(vec![CancellationReason::transaction_conflict(); n_ops])
+    } else {
+        e
+    }
+}
+
+/// Request positions of `ops`, sorted by table and primary key.
+fn execution_order(ops: &[TransactWriteOp<'_>]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..ops.len()).collect();
+    order.sort_by_cached_key(|&i| lock_key(&ops[i]));
+    order
+}
+
+/// The table and the primary key values of the item an op touches.
+fn lock_key<'a>(op: &'a TransactWriteOp<'_>) -> (&'a str, Vec<Cow<'a, str>>) {
+    let (key_info, key) = match op {
+        TransactWriteOp::Put { key_info, item, .. } => (key_info, *item),
+        TransactWriteOp::Delete { key_info, key, .. }
+        | TransactWriteOp::Update { key_info, key, .. }
+        | TransactWriteOp::ConditionCheck { key_info, key, .. } => (key_info, *key),
+    };
+    let values = key_info
+        .key_schema
+        .iter()
+        .map(|k| {
+            key.get(&k.attribute_name)
+                .and_then(|v| pk_to_text(v).ok())
+                .unwrap_or_default()
+        })
+        .collect();
+    (&key_info.table_id, values)
 }
 
 /// Extract the table name from a transactional write operation.
@@ -434,11 +518,9 @@ async fn execute_transact_write_op(
                         // canceled transaction with a TransactionConflict
                         // reason, the DDB-canonical contention shape, never a
                         // 500 (matches the MongoDB backend's exhaustion path).
-                        return Err(TxnOpError::Cancel(CancellationReason {
-                            code: "TransactionConflict".to_owned(),
-                            message: Some("Transaction is ongoing for the item".to_owned()),
-                            item: None,
-                        }));
+                        return Err(TxnOpError::Cancel(
+                            CancellationReason::transaction_conflict(),
+                        ));
                     }
                 }
             }
@@ -471,9 +553,12 @@ async fn execute_transact_write_op(
                 &key_info.attribute_definitions,
             )
             .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
-            let existing = fetch_item_for_update(tx, key_info, key)
+            let mut existing = fetch_item_for_update(tx, key_info, key)
                 .await
                 .map_err(TxnOpError::Storage)?;
+            if existing.is_none() {
+                existing = reserve_missing_item(tx, key_info, key).await?;
+            }
             let empty = Item::new();
             eval_condition(
                 *condition,
@@ -482,14 +567,8 @@ async fn execute_transact_write_op(
                 *return_values_on_ccf,
                 existing.as_ref(),
             )?;
-            // Only delete a row the locking read actually saw (and locked).
-            // When the read found nothing there is nothing to lock, so a
-            // concurrent transaction can create and commit the item before our
-            // DELETE runs; its fresh READ COMMITTED snapshot would then see
-            // and kill the winner's row with no stream record and orphaned
-            // index rows. Deleting a nonexistent item is a no-op in the real
-            // service, so skipping the write is the faithful serialization
-            // (this delete simply ordered before the concurrent create).
+            // Deleting a missing item is a no-op. Its key is reserved, so no
+            // concurrent create can commit before this transaction ends.
             if existing.is_some() {
                 delete_item_in_tx(tx, key_info, key)
                     .await
@@ -623,11 +702,9 @@ async fn execute_transact_write_op(
                     if attempt >= MAX_CREATE_RACE_ATTEMPTS {
                         // Sustained create-then-delete churn. Same
                         // TransactionConflict cancellation as the Put arm.
-                        return Err(TxnOpError::Cancel(CancellationReason {
-                            code: "TransactionConflict".to_owned(),
-                            message: Some("Transaction is ongoing for the item".to_owned()),
-                            item: None,
-                        }));
+                        return Err(TxnOpError::Cancel(
+                            CancellationReason::transaction_conflict(),
+                        ));
                     }
                 }
             }
@@ -659,9 +736,12 @@ async fn execute_transact_write_op(
                 &key_info.attribute_definitions,
             )
             .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
-            let existing = fetch_item_for_update(tx, key_info, key)
+            let mut existing = fetch_item_for_update(tx, key_info, key)
                 .await
                 .map_err(TxnOpError::Storage)?;
+            if existing.is_none() {
+                existing = reserve_missing_item(tx, key_info, key).await?;
+            }
             let empty = Item::new();
             let check_against = existing.as_ref().unwrap_or(&empty);
             eval_condition(
@@ -674,6 +754,52 @@ async fn execute_transact_write_op(
             Ok((None, None))
         }
     }
+}
+
+/// Hold the key of a missing item until commit, for an op that reads the
+/// item but does not create it (ConditionCheck, Delete).
+///
+/// A missing item has no row for `FOR UPDATE` to lock, so a concurrent
+/// transaction could create it while this one still relies on its absence.
+/// Inserting a key-only row and deleting it again leaves the key's unique
+/// index entry owned by this open transaction: every insert of the key,
+/// transactional or not, waits for this transaction to end, and no other
+/// transaction ever sees the row. PostgreSQL documents that wait in
+/// <https://www.postgresql.org/docs/current/index-unique-checks.html>.
+/// Returns the item, locked, when another transaction created it first.
+async fn reserve_missing_item(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    key_info: &TableKeyInfo,
+    key: &Item,
+) -> Result<Option<Item>, TxnOpError> {
+    for _ in 0..MAX_CREATE_RACE_ATTEMPTS {
+        if insert_item_if_absent_in_tx(tx, key_info, key)
+            .await
+            .map_err(TxnOpError::Storage)?
+        {
+            // A placeholder left behind would commit as a key-only item.
+            let deleted = delete_item_in_tx(tx, key_info, key)
+                .await
+                .map_err(TxnOpError::Storage)?;
+            if deleted != 1 {
+                return Err(TxnOpError::Storage(StorageError::Internal(format!(
+                    "deleting the reserved key removed {deleted} rows, expected 1"
+                ))));
+            }
+            return Ok(None);
+        }
+        // Lost to a concurrent create, which has committed by now: lock it.
+        if let Some(item) = fetch_item_for_update(tx, key_info, key)
+            .await
+            .map_err(TxnOpError::Storage)?
+        {
+            return Ok(Some(item));
+        }
+    }
+    // Sustained create-then-delete churn, as on the create paths.
+    Err(TxnOpError::Cancel(
+        CancellationReason::transaction_conflict(),
+    ))
 }
 
 /// Evaluate a condition expression, returning a `CancellationReason` on failure.
@@ -703,4 +829,106 @@ fn eval_condition(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use extenddb_core::types::{KeySchemaElement, KeyType, TableKeyInfo};
+
+    use super::*;
+
+    fn table(id: &str) -> TableKeyInfo {
+        TableKeyInfo {
+            table_id: id.to_owned(),
+            key_schema: vec![
+                KeySchemaElement {
+                    attribute_name: "pk".to_owned(),
+                    key_type: KeyType::Hash,
+                },
+                KeySchemaElement {
+                    attribute_name: "sk".to_owned(),
+                    key_type: KeyType::Range,
+                },
+            ],
+            ..TableKeyInfo::default()
+        }
+    }
+
+    fn key(pk: &str, sk: &str) -> Item {
+        Item::from([
+            ("pk".to_owned(), AttributeValue::S(pk.to_owned())),
+            ("sk".to_owned(), AttributeValue::S(sk.to_owned())),
+        ])
+    }
+
+    fn delete<'a>(
+        key_info: &'a TableKeyInfo,
+        key: &'a Item,
+        maps: &'a ExpressionMaps,
+    ) -> TransactWriteOp<'a> {
+        TransactWriteOp::Delete {
+            key_info,
+            key,
+            condition: None,
+            maps,
+            return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+            stream: None,
+        }
+    }
+
+    /// The items each request locks, in the order it locks them.
+    fn locked(ops: &[TransactWriteOp<'_>]) -> Vec<(String, Vec<String>)> {
+        execution_order(ops)
+            .into_iter()
+            .map(|i| {
+                let (t, k) = lock_key(&ops[i]);
+                (t.to_owned(), k.into_iter().map(Cow::into_owned).collect())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn requests_lock_shared_items_in_the_same_order() {
+        let (t1, t2) = (table("t1"), table("t2"));
+        let maps = ExpressionMaps::default();
+        let (a, b, c) = (key("a", "1"), key("a", "2"), key("b", "1"));
+        let forward = [
+            delete(&t2, &a, &maps),
+            delete(&t1, &c, &maps),
+            delete(&t1, &b, &maps),
+            delete(&t1, &a, &maps),
+        ];
+        let backward = [
+            delete(&t1, &a, &maps),
+            delete(&t1, &b, &maps),
+            delete(&t1, &c, &maps),
+            delete(&t2, &a, &maps),
+        ];
+        assert_eq!(locked(&forward), locked(&backward));
+        assert_eq!(execution_order(&forward), vec![3, 2, 1, 0]);
+        assert_eq!(execution_order(&backward), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn a_conflict_abort_outside_the_ops_cancels_every_item() {
+        let deadlock = StorageError::Internal("SQLSTATE 40P01: deadlock detected".to_owned());
+        match conflict_cancels_all(deadlock, 3) {
+            StorageError::TransactionCanceled(reasons) => {
+                assert_eq!(reasons.len(), 3);
+                for r in reasons {
+                    assert_eq!(r.code, "TransactionConflict");
+                    assert_eq!(
+                        r.message.as_deref(),
+                        Some("Transaction is ongoing for the item")
+                    );
+                }
+            }
+            other => panic!("expected a cancellation, got {other:?}"),
+        }
+        let other = StorageError::Internal("SQLSTATE 23505: duplicate key".to_owned());
+        assert!(matches!(
+            conflict_cancels_all(other, 3),
+            StorageError::Internal(_)
+        ));
+    }
 }
