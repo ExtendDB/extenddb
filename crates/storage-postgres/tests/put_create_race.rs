@@ -7,9 +7,10 @@
 //! overwrites the item, after its own condition is checked against it. These
 //! tests hold the competing create open in an outside transaction, so the put
 //! deterministically loses the insert and has to order itself after the winner.
-//! The last four tests, on hash and on hash and range tables, also delete the
+//! The four gate tests, on hash and on hash and range tables, also delete the
 //! winner before the put re-reads it, so the put retries its insert, and they
-//! bound those retries.
+//! bound those retries. The last test runs the race on a table with an LSI and
+//! a stream, and checks that both get the winner as the old image.
 //!
 //! Each test builds its own throwaway database, applies the shipped migrations
 //! to it, and drops it when it passes. A failing test leaves its database behind
@@ -26,10 +27,11 @@ use std::time::Duration;
 use extenddb_core::expression::{self, Expr, ExpressionMaps};
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, BillingMode, CreateTableInput, Item, KeySchemaElement,
-    KeyType, ScalarAttributeType, TableKeyInfo,
+    KeyType, LsiInput, Projection, ProjectionType, ReturnValuesOnConditionCheckFailure,
+    ScalarAttributeType, StreamRecord, StreamSpecification, StreamViewType, TableKeyInfo,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{DataEngine, TableEngine};
+use extenddb_storage::{DataEngine, StreamCapture, TableEngine, TransactWriteOp};
 use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection, PgConnection, PgPool, Postgres, Transaction};
@@ -624,4 +626,216 @@ async fn a_put_that_keeps_losing_the_create_race_gives_up_after_five_inserts_on_
         true,
     )
     .await;
+}
+
+const LSI_TABLE: &str = "t_put_race_lsi_stream";
+
+/// Create a (pk, sk) table with LSI `lsi1` on `lsk` and a stream.
+async fn lsi_stream_table(s: &Scratch) -> TableKeyInfo {
+    // The scratch database holds the catalog and data schemas together, so it
+    // has the catalog's copy of `stream_shards`. Drop its foreign key to
+    // `tables`, which the data database does not have.
+    sqlx::query("ALTER TABLE stream_shards DROP CONSTRAINT stream_shards_table_id_fkey")
+        .execute(&s.db)
+        .await
+        .expect("match the data schema");
+    let (pk, pk_def) = s_key("pk", KeyType::Hash);
+    let (sk, sk_def) = s_key("sk", KeyType::Range);
+    let (lsk, lsk_def) = s_key("lsk", KeyType::Range);
+    s.engine
+        .create_table(
+            ACCOUNT,
+            CreateTableInput {
+                table_name: LSI_TABLE.to_owned(),
+                key_schema: vec![pk.clone(), sk],
+                attribute_definitions: vec![pk_def, sk_def, lsk_def],
+                billing_mode: Some(BillingMode::PayPerRequest),
+                local_secondary_indexes: Some(vec![LsiInput {
+                    index_name: "lsi1".to_owned(),
+                    key_schema: vec![pk, lsk],
+                    projection: Projection {
+                        projection_type: ProjectionType::All,
+                        non_key_attributes: None,
+                    },
+                }]),
+                stream_specification: Some(StreamSpecification {
+                    stream_enabled: true,
+                    stream_view_type: Some(StreamViewType::NewAndOldImages),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create the table");
+    s.engine
+        .table_key_info(ACCOUNT, LSI_TABLE)
+        .await
+        .expect("read the key info")
+}
+
+fn range_item(pk: &str, extra: &[(&str, &str)]) -> Item {
+    let mut item = BTreeMap::from([
+        ("pk".to_owned(), AttributeValue::S(pk.to_owned())),
+        ("sk".to_owned(), AttributeValue::S("1".to_owned())),
+    ]);
+    for (name, value) in extra {
+        item.insert((*name).to_owned(), AttributeValue::S((*value).to_owned()));
+    }
+    item
+}
+
+#[tokio::test]
+async fn a_lost_create_race_gives_the_lsi_and_the_stream_the_winner() {
+    // A write transaction creates `c`, with its LSI row and stream record, and
+    // then waits on `d`, which an outside transaction holds. A PutItem of `c`
+    // meanwhile loses the insert and waits for that create. Once it commits,
+    // the put must replace the winner everywhere: one LSI row for the put's
+    // `lsk`, none for the winner's, and a MODIFY record whose old image is the
+    // winner.
+    let test = "a_lost_create_race_gives_the_lsi_and_the_stream_the_winner";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let s = scratch().await;
+    let maps = ExpressionMaps::default();
+    let key_info = lsi_stream_table(&s).await;
+    s.engine
+        .put_item(&key_info, range_item("d", &[]), false, None, &maps, None)
+        .await
+        .expect("seed d");
+    let table_id: String =
+        sqlx::query_scalar("SELECT table_id FROM tables WHERE account_id = $1 AND table_name = $2")
+            .bind(ACCOUNT)
+            .bind(LSI_TABLE)
+            .fetch_one(&s.db)
+            .await
+            .expect("look up the table id");
+    let index_id: String = sqlx::query_scalar(
+        "SELECT index_id FROM indexes WHERE table_id = $1 AND index_name = 'lsi1'",
+    )
+    .bind(&table_id)
+    .fetch_one(&s.db)
+    .await
+    .expect("look up the index id");
+    let (table, lsi) = (
+        format!("\"_ddb_{table_id}\""),
+        format!("\"_ddb_{index_id}\""),
+    );
+
+    let mut holder = s.db.begin().await.expect("begin the outside transaction");
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .expect("read the backend pid");
+    sqlx::query(&format!("SELECT 1 FROM {table} WHERE pk = 'd' FOR UPDATE"))
+        .execute(&mut *holder)
+        .await
+        .expect("lock d");
+
+    let capture = StreamCapture {
+        view_type: StreamViewType::NewAndOldImages,
+        user_identity: None,
+        region: REGION.into(),
+    };
+    let winner = range_item("c", &[("lsk", "l-winner"), ("v", "winner")]);
+    let loser = range_item("c", &[("lsk", "l-loser"), ("v", "loser")]);
+    let new_d = range_item("d", &[("v", "creator")]);
+    let stream_put = |item| TransactWriteOp::Put {
+        key_info: &key_info,
+        item,
+        condition: None,
+        maps: &maps,
+        return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+        stream: Some(capture.clone()),
+    };
+    let creator_ops = [stream_put(&winner), stream_put(&new_d)];
+
+    let creator = s.engine.transact_write_items(&creator_ops, None);
+    let put = async {
+        // The creator has inserted c and waits on d.
+        wait_until_blocked_by(&s.db, holder_pid, "transactionid").await?;
+        Ok::<_, String>(
+            s.engine
+                .put_item(&key_info, loser.clone(), true, None, &maps, Some(&capture))
+                .await,
+        )
+    };
+    let release = async {
+        // The put waits on the creator's insert of c before d is released.
+        let blocked = async {
+            for _ in 0..500 {
+                let n: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() \
+                     AND wait_event_type = 'Lock' AND wait_event = 'transactionid' \
+                     AND NOT ($1 = ANY(pg_blocking_pids(pid)))",
+                )
+                .bind(holder_pid)
+                .fetch_one(&s.db)
+                .await
+                .expect("read pg_stat_activity");
+                if n > 0 {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err("the put never waited on the creator's insert".to_owned())
+        }
+        .await;
+        holder.rollback().await.expect("release d");
+        blocked
+    };
+    let (created, put_result, released) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(creator, put, release)
+    })
+    .await
+    .expect("both writes finished");
+    created.expect("the create commits");
+    let put_result = put_result.unwrap_or_else(|e| panic!("{e}"));
+    if let Err(e) = released {
+        panic!("{e}; the put returned {put_result:?}");
+    }
+    assert_eq!(
+        put_result.expect("the put commits after the winner"),
+        Some(winner.clone()),
+        "ALL_OLD returns the winner"
+    );
+
+    let lsks: Vec<String> = sqlx::query_scalar(&format!(
+        "SELECT item_data->'lsk'->>'S' FROM {lsi} WHERE pk = 'c'"
+    ))
+    .fetch_all(&s.db)
+    .await
+    .expect("read the LSI rows");
+    assert_eq!(lsks, ["l-loser"], "only the put's LSI row is left");
+    let v: String = sqlx::query_scalar(&format!(
+        "SELECT item_data->'v'->>'S' FROM {table} WHERE pk = 'c'"
+    ))
+    .fetch_one(&s.db)
+    .await
+    .expect("read c");
+    assert_eq!(v, "loser");
+
+    let records: Vec<(serde_json::Value,)> = sqlx::query_as(
+        "SELECT record_data FROM stream_records WHERE table_id = $1 ORDER BY sequence_number",
+    )
+    .bind(&table_id)
+    .fetch_all(&s.db)
+    .await
+    .expect("read the stream records");
+    let c_events: Vec<(String, Option<Item>)> = records
+        .into_iter()
+        .map(|(data,)| serde_json::from_value::<StreamRecord>(data).expect("a stream record"))
+        .filter(|r| r.dynamodb.keys.get("pk") == Some(&AttributeValue::S("c".to_owned())))
+        .map(|r| (format!("{:?}", r.event_name), r.dynamodb.old_image))
+        .collect();
+    assert_eq!(
+        c_events,
+        [
+            ("Insert".to_owned(), None),
+            ("Modify".to_owned(), Some(winner.clone()))
+        ],
+        "the create, then the put that replaced the winner"
+    );
+
+    s.cleanup().await;
 }
