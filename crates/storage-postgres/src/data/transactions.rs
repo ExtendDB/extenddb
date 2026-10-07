@@ -53,9 +53,20 @@ impl PostgresEngine {
             return Err(StorageError::TransactionCanceled(reasons));
         }
 
+        // TransactGetItems promises that every item comes from one point in
+        // time. Under the pool's default READ COMMITTED, each SELECT takes its
+        // own snapshot, so a TransactWriteItems that commits between two
+        // reads is observed half-applied. REPEATABLE READ takes one snapshot
+        // at the first read and serves every read from it. On a primary, a
+        // REPEATABLE READ transaction that only reads cannot fail with a
+        // serialization error, because those are raised only when it tries to
+        // modify a row changed since its snapshot, so no retry is added. Every
+        // write in this backend goes through this same pool, so it cannot be
+        // a hot standby in a deployment that accepts writes; on a standby a
+        // recovery conflict could cancel this read, as it could any query.
         let mut tx = self
             .data_pool
-            .begin()
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
