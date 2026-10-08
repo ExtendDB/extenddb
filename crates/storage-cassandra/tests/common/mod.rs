@@ -14,6 +14,25 @@ use extenddb_storage_cassandra::{
 };
 use std::sync::Arc;
 
+/// Keyspaces queued for async drop between tests.
+static PENDING_DROPS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn queue_keyspace_drop(keyspace: String) {
+    if let Ok(mut q) = PENDING_DROPS.lock() {
+        q.push(keyspace);
+    }
+}
+
+/// Drain all pending keyspace drops. Called at the start of each test via setup_engine().
+pub async fn flush_pending_drops(session: &Arc<CassandraSession>) {
+    let keyspaces: Vec<String> = PENDING_DROPS
+        .lock()
+        .map(|mut q| q.drain(..).collect())
+        .unwrap_or_default();
+    for ks in keyspaces {
+        let _ = session.query(format!("DROP KEYSPACE IF EXISTS {ks}")).await;
+    }
+}
 /// Returns a standard test configuration for Cassandra.
 pub fn test_config() -> CassandraStorageConfig {
     let mut config = CassandraStorageConfig {
@@ -112,12 +131,8 @@ impl TestAccount {
 
 impl Drop for TestAccount {
     fn drop(&mut self) {
-        let session = self.session.clone();
         let keyspace = format!("{}_account_{}", self.keyspace_prefix, self.account_id);
-        let query = format!("DROP KEYSPACE IF EXISTS {}", keyspace);
-        tokio::spawn(async move {
-            let _ = session.query(query).await;
-        });
+        queue_keyspace_drop(keyspace);
     }
 }
 
@@ -534,110 +549,13 @@ impl TestTable {
 
 impl Drop for TestTable {
     fn drop(&mut self) {
-        let session = self.session.clone();
-        let account_id = self.key_info.account_id.clone();
-        let table_id = self.key_info.table_id.clone();
-        let table_name = self.key_info.table_name.clone();
-        let owns_keyspace = self.owns_keyspace;
-        tokio::spawn(async move {
-            let catalog_keyspace = "extenddb_ttl_test_catalog";
-            let account_keyspace = format!("extenddb_ttl_test_account_{}", account_id);
-
-            if owns_keyspace {
-                // Drop the entire account keyspace.
-                let _ = session
-                    .query(format!("DROP KEYSPACE IF EXISTS {account_keyspace}"))
-                    .await;
-
-                // Clean up all catalog entries for this account.
-                // First collect table_ids so we can delete their index rows.
-                let select_tables =
-                    format!("SELECT table_id FROM {catalog_keyspace}.tables WHERE account_id = ?");
-                let table_ids: Vec<String> = session
-                    .query_with_values(
-                        &select_tables,
-                        cdrs_tokio::query_values!(account_id.as_str()),
-                    )
-                    .await
-                    .ok()
-                    .and_then(|f| f.response_body().ok())
-                    .and_then(|b| b.into_rows())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|row| {
-                        use cdrs_tokio::types::IntoRustByName as _;
-                        row.get_r_by_name("table_id").ok()
-                    })
-                    .collect();
-
-                for tid in &table_ids {
-                    let _ = session
-                        .query_with_values(
-                            &format!("DELETE FROM {catalog_keyspace}.indexes WHERE table_id = ?"),
-                            cdrs_tokio::query_values!(tid.as_str()),
-                        )
-                        .await;
-                }
-
-                let _ = session
-                    .query_with_values(
-                        &format!("DELETE FROM {catalog_keyspace}.tables WHERE account_id = ?"),
-                        cdrs_tokio::query_values!(account_id.as_str()),
-                    )
-                    .await;
-            } else {
-                // Drop only this table's data table and its catalog entries.
-                let data_table = format!("ddb_{}", table_id.replace("-", "_"));
-                let _ = session
-                    .query(format!(
-                        "DROP TABLE IF EXISTS {account_keyspace}.{data_table}"
-                    ))
-                    .await;
-
-                // Fetch index IDs before deleting catalog rows, then drop each index table.
-                let index_ids: Vec<String> = session
-                    .query_with_values(
-                        &format!(
-                            "SELECT index_id FROM {catalog_keyspace}.indexes WHERE table_id = ?"
-                        ),
-                        cdrs_tokio::query_values!(table_id.as_str()),
-                    )
-                    .await
-                    .ok()
-                    .and_then(|f| f.response_body().ok())
-                    .and_then(|b| b.into_rows())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|row| {
-                        use cdrs_tokio::types::IntoRustByName as _;
-                        row.get_r_by_name("index_id").ok()
-                    })
-                    .collect();
-
-                for iid in &index_ids {
-                    let idx_table = format!("index_{}", iid.replace("-", "_"));
-                    let _ = session
-                        .query(format!(
-                            "DROP TABLE IF EXISTS {account_keyspace}.{idx_table}"
-                        ))
-                        .await;
-                }
-
-                let _ = session
-                    .query_with_values(
-                        &format!("DELETE FROM {catalog_keyspace}.indexes WHERE table_id = ?"),
-                        cdrs_tokio::query_values!(table_id.as_str()),
-                    )
-                    .await;
-
-                let _ = session
-                        .query_with_values(
-                            &format!("DELETE FROM {catalog_keyspace}.tables WHERE account_id = ? AND table_name = ?"),
-                            cdrs_tokio::query_values!(account_id.as_str(), table_name.as_str()),
-                        )
-                        .await;
-            }
-        });
+        if self.owns_keyspace {
+            let account_keyspace =
+                format!("extenddb_ttl_test_account_{}", self.key_info.account_id);
+            queue_keyspace_drop(account_keyspace);
+        }
+        // owns_keyspace=false: individual table drops are skipped; the keyspace
+        // persists but is isolated by unique account_id and cleaned up next run.
     }
 }
 
@@ -670,6 +588,9 @@ pub async fn ensure_keyspace_rf(
 pub async fn setup_engine() -> CassandraEngine {
     let config = test_config();
     let engine = CassandraEngine::new(&config, "us-east-1").await.unwrap();
+
+    // Drop keyspaces queued by the previous test's Drop impls.
+    flush_pending_drops(&engine.session_arc()).await;
 
     let catalog_keyspace = format!("{}_catalog", config.keyspace_prefix);
     if !engine.keyspace_exists(&catalog_keyspace).await.unwrap() {
@@ -743,7 +664,8 @@ pub async fn put_item_then_lock(
             _ => panic!("Expected string sort key 'sort'"),
         };
         let query = format!(
-            "UPDATE {}.{} SET prepared_txn_id = ? WHERE pk = ? AND sk_s = ?",
+            "UPDATE {}.{} SET prepared_txn_id = ? WHERE pk = ? AND sk_s = ? \
+             IF prepared_txn_id = null",
             account_keyspace, data_table
         );
         engine
@@ -760,7 +682,7 @@ pub async fn put_item_then_lock(
             .expect("Setting prepared_txn_id should succeed");
     } else {
         let query = format!(
-            "UPDATE {}.{} SET prepared_txn_id = ? WHERE pk = ?",
+            "UPDATE {}.{} SET prepared_txn_id = ? WHERE pk = ? IF prepared_txn_id = null",
             account_keyspace, data_table
         );
         engine

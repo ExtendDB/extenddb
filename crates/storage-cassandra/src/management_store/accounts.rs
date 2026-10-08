@@ -107,6 +107,7 @@ impl CassandraCatalogStore {
             let created_at: i64 = row
                 .get_r_by_name("created_at")
                 .map_err(|e| OpError::Internal(format!("Parse backup timestamp: {e}")))?;
+            // backups_by_table uses plain INSERT — plain DELETE is safe
             crate::cassandra_util::execute::<OpError>(
                 self.session(),
                 &format!(
@@ -116,16 +117,18 @@ impl CassandraCatalogStore {
                 "delete_account_table_backup",
             )
             .await?;
-            crate::cassandra_util::execute::<OpError>(
+            // backups_by_arn uses IF NOT EXISTS — must use IF EXISTS
+            crate::cassandra_util::apply_lwt(
                 self.session(),
                 &format!(
-                    "DELETE FROM {catalog_keyspace}.backups_by_arn WHERE account_id = ? AND backup_arn = ?"
+                    "DELETE FROM {catalog_keyspace}.backups_by_arn WHERE account_id = ? AND backup_arn = ? IF EXISTS"
                 ),
                 cdrs_tokio::query_values!(account_id, backup_arn),
                 "delete_account_backup",
             )
             .await?;
         }
+        // backups_by_account uses plain INSERT — plain DELETE is safe
         crate::cassandra_util::execute::<OpError>(
             self.session(),
             &format!("DELETE FROM {catalog_keyspace}.backups_by_account WHERE account_id = ?"),
@@ -133,6 +136,7 @@ impl CassandraCatalogStore {
             "delete_account_backup_index",
         )
         .await?;
+        // continuous_backups uses plain INSERT — plain DELETE is safe
         crate::cassandra_util::execute::<OpError>(
             self.session(),
             &format!("DELETE FROM {catalog_keyspace}.continuous_backups WHERE account_id = ?"),
@@ -141,12 +145,9 @@ impl CassandraCatalogStore {
         )
         .await?;
 
-        // Delete account from catalog
-        let delete_query = format!("DELETE FROM {catalog_keyspace}.accounts WHERE account_id = ?");
-
-        crate::cassandra_util::execute(
+        crate::cassandra_util::apply_lwt(
             self.session(),
-            &delete_query,
+            &format!("DELETE FROM {catalog_keyspace}.accounts WHERE account_id = ? IF EXISTS"),
             cdrs_tokio::query_values!(account_id),
             "delete_account",
         )

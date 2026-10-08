@@ -1443,21 +1443,16 @@ impl MetadataEngine for CassandraEngine {
             }
             let query = format!(
                 "UPDATE {}.tables SET item_count = ?, table_size_bytes = ? \
-                 WHERE account_id = ? AND table_name = ?",
+                 WHERE account_id = ? AND table_name = ? IF EXISTS",
                 self.catalog_keyspace()
             );
-            self.session
-                .query_with_values(
-                    &query,
-                    cdrs_tokio::query_values!(
-                        count,
-                        size,
-                        account_id.as_str(),
-                        table_name.as_str()
-                    ),
-                )
-                .await
-                .map_err(|error| StorageError::Internal(format!("Refresh table size: {error}")))?;
+            crate::cassandra_util::query_lwt(
+                &self.session,
+                &query,
+                cdrs_tokio::query_values!(count, size, account_id.as_str(), table_name.as_str()),
+            )
+            .await
+            .map_err(|error| StorageError::Internal(format!("Refresh table size: {error}")))?;
             Ok(())
         })
     }

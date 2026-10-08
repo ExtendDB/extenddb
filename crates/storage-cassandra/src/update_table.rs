@@ -103,28 +103,23 @@ impl CassandraEngine {
             }
         }
 
-        // Build a LOGGED BATCH for all catalog column updates on `tables`.
-        // All statements touch the same partition (account_id, table_name) so
-        // they are atomic. Reads (no-op check, shard existence) happen before
-        // this batch; DDL (CREATE/DROP TABLE for GSIs) happens after.
-        let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
-        let mut batch_has_statements = false;
+        // Collect column updates for `tables`. These will be executed as a single
+        // LWT UPDATE ... IF EXISTS to avoid mixing plain/LWT writes on a row
+        // created with IF NOT EXISTS. See ADR-0021.
+        let mut table_cols: Vec<(&'static str, Value)> = Vec::new();
+        // Separate plain batch for `indexes` (plain INSERT/DELETE, no LWT mixing issue).
+        let mut indexes_batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+        let mut indexes_batch_has_statements = false;
 
         macro_rules! add_update {
             ($col:expr, $val:expr) => {{
-                batch = batch.add_query(
-                    format!(
-                        "UPDATE {catalog_ks}.tables SET {} = ? \
-                         WHERE account_id = ? AND table_name = ?",
-                        $col
-                    ),
-                    QueryValues::SimpleValues(vec![
-                        Value::from($val),
-                        Value::from(account_id),
-                        Value::from(input.table_name.as_str()),
-                    ]),
-                );
-                batch_has_statements = true;
+                table_cols.push(($col, Value::from($val)));
+            }};
+        }
+        macro_rules! add_index_op {
+            ($query:expr, $vals:expr) => {{
+                indexes_batch = indexes_batch.add_query($query, $vals);
+                indexes_batch_has_statements = true;
             }};
         }
 
@@ -277,7 +272,7 @@ impl CassandraEngine {
                         .map_err(|e| StorageError::Internal(e.to_string()))?
                         .unwrap_or_default();
 
-                    batch = batch.add_query(
+                    add_index_op!(
                         format!(
                             "INSERT INTO {catalog_ks}.indexes \
                              (table_id, index_name, index_id, index_type, key_schema, \
@@ -291,7 +286,7 @@ impl CassandraEngine {
                             Value::from(idx_ks_json.as_str()),
                             Value::from(proj_json.as_str()),
                             Value::from(pt_json.as_str()),
-                        ]),
+                        ])
                     );
                     gsi_creates.push((index_id, create.index_name.clone()));
                     surviving_index_key_schemas.push(create.key_schema.clone());
@@ -335,7 +330,7 @@ impl CassandraEngine {
                         surviving_index_key_schemas.remove(pos);
                     }
 
-                    batch = batch.add_query(
+                    add_index_op!(
                         format!(
                             "DELETE FROM {catalog_ks}.indexes \
                              WHERE table_id = ? AND index_name = ?"
@@ -343,7 +338,7 @@ impl CassandraEngine {
                         QueryValues::SimpleValues(vec![
                             Value::from(table_id.as_str()),
                             Value::from(delete.index_name.as_str()),
-                        ]),
+                        ])
                     );
                     gsi_deletes.push(index_id);
                 }
@@ -418,8 +413,9 @@ impl CassandraEngine {
             .apply_table_update(
                 account_id,
                 &input,
-                batch,
-                batch_has_statements,
+                table_cols,
+                indexes_batch,
+                indexes_batch_has_statements,
                 needs_shard_init,
                 needs_label_restore,
                 &table_id,
@@ -452,8 +448,9 @@ impl CassandraEngine {
         &self,
         account_id: &str,
         input: &UpdateTableInput,
-        batch: BatchQueryBuilder,
-        batch_has_statements: bool,
+        table_cols: Vec<(&'static str, Value)>,
+        indexes_batch: BatchQueryBuilder,
+        indexes_batch_has_statements: bool,
         needs_shard_init: bool,
         needs_label_restore: bool,
         table_id: &str,
@@ -463,6 +460,7 @@ impl CassandraEngine {
         base_attr_defs: &[AttributeDefinition],
     ) -> Result<TableDescription, StorageError> {
         let account_ks = self.account_keyspace(account_id);
+        let catalog_ks = self.catalog_keyspace();
 
         // Take propagation holds for all new GSIs BEFORE the catalog batch
         // commits. This ensures no worker can apply a queued write to the index
@@ -499,18 +497,85 @@ impl CassandraEngine {
             }
         }
 
-        // Execute the catalog batch atomically.
-        if batch_has_statements
+        // Execute tables update as a single LWT UPDATE ... IF EXISTS.
+        // This avoids mixing plain/LWT writes on the tables row (created with IF NOT EXISTS).
+        if !table_cols.is_empty() {
+            let set_clause = table_cols
+                .iter()
+                .map(|(col, _)| format!("{col} = ?"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let cql = format!(
+                "UPDATE {catalog_ks}.tables SET {set_clause} \
+                 WHERE account_id = ? AND table_name = ? IF EXISTS"
+            );
+            let mut vals: Vec<Value> = table_cols.into_iter().map(|(_, v)| v).collect();
+            vals.push(Value::from(account_id));
+            vals.push(Value::from(input.table_name.as_str()));
+            let result = crate::cassandra_util::query_lwt(
+                &self.session,
+                &cql,
+                QueryValues::SimpleValues(vals),
+            )
+            .await
+            .inspect_err(|_e| {
+                for held_id in &taken_holds {
+                    let session = self.session_arc();
+                    let account_ks = account_ks.clone();
+                    let held_id = held_id.clone();
+                    let table_id = table_id.to_owned();
+                    tokio::spawn(async move {
+                        let _ = crate::propagation_hold::release_propagation_hold(
+                            &session,
+                            &account_ks,
+                            &table_id,
+                            &held_id,
+                        )
+                        .await;
+                    });
+                }
+            })?;
+            // IF EXISTS returns false only if the row was deleted between our
+            // earlier SELECT and this UPDATE — treat as TableNotFound.
+            // NOTE: the tables LWT commits before the indexes batch below runs.
+            // A failure in the indexes batch leaves the table row updated with
+            // no corresponding index rows; the recovery worker does not cover
+            // this gap (it only scans existing CREATING index rows). This is a
+            // known atomicity gap — conditional batches cannot span tables in
+            // Cassandra. Tracked in ADR-0021.
+            let applied = crate::cassandra_util::lwt_applied(&result)?;
+            if !applied {
+                for held_id in &taken_holds {
+                    let session = self.session_arc();
+                    let account_ks = account_ks.clone();
+                    let held_id = held_id.clone();
+                    let table_id = table_id.to_owned();
+                    tokio::spawn(async move {
+                        let _ = crate::propagation_hold::release_propagation_hold(
+                            &session,
+                            &account_ks,
+                            &table_id,
+                            &held_id,
+                        )
+                        .await;
+                    });
+                }
+                return Err(StorageError::TableNotFound(input.table_name.clone()));
+            }
+        }
+
+        // Execute indexes batch (plain INSERT/DELETE — no LWT mixing issue).
+        if indexes_batch_has_statements
             && let Err(e) = self
                 .session
                 .batch(
-                    batch
+                    indexes_batch
                         .build()
                         .map_err(|e| StorageError::Internal(e.to_string()))?,
                 )
                 .await
                 .map_err(|e| {
-                    tracing::error!("update_table batch: {e}");
+                    tracing::error!("update_table indexes batch: {e}");
                     StorageError::Internal("Database error".to_owned())
                 })
         {
@@ -531,7 +596,7 @@ impl CassandraEngine {
             self.init_stream_shards(account_id, &input.table_name, &account_ks, table_id)
                 .await?;
         }
-        let _ = needs_label_restore; // handled inside the batch above
+        let _ = needs_label_restore; // stream_label is set via add_update! above
 
         // Post-batch: GSI data table DDL and async backfill.
         if let Some(updates) = &input.global_secondary_index_updates {

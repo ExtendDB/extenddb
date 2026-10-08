@@ -139,7 +139,8 @@ mod tests {
         // Manually update table status to ACTIVE for testing
         // (bypass control plane delay mechanism)
         let update_query = format!(
-            "UPDATE {}_catalog.tables SET table_status = 'ACTIVE' WHERE account_id = ? AND table_name = ?",
+            "UPDATE {}_catalog.tables SET table_status = 'ACTIVE' \
+             WHERE account_id = ? AND table_name = ? IF table_status = 'CREATING'",
             config.keyspace_prefix
         );
         engine

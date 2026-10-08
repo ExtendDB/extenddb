@@ -47,12 +47,4 @@ decision, write a new ADR.
 | [0018](0018-cassandra-stream-implementation.md) | Cassandra: DynamoDB Streams implementation | Accepted |
 | [0019](0019-cassandra-logical-backup-restore.md) | Cassandra: logical backup and restore | Accepted |
 | [0020](0020-cassandra-occ-update-item.md) | Cassandra: optimistic concurrency control for UpdateItem and PutItem | Accepted |
-| [0011](0011-foreign-key-emulation.md) | Cassandra: foreign key constraint emulation | Accepted |
-| [0012](0012-transaction-atomicity-patterns.md) | Cassandra: transaction and atomicity patterns for IAM catalog | Accepted |
-| [0013](0013-keyspace-awareness.md) | Cassandra: dynamic keyspace construction | Accepted |
-| [0014](0014-upsert-semantics.md) | Cassandra: natural UPSERT semantics | Accepted |
-| [0015](0015-account-keyspace-provisioning.md) | Cassandra: account keyspace provisioning timing | Accepted |
-| [0016](0016-index-table-primary-key-structure.md) | Cassandra: index table primary-key structure | Accepted |
-| [0017](0017-transaction-implementation.md) | Cassandra: TransactWriteItems / TransactGetItems implementation | Accepted |
-| [0018](0018-stream-implementation.md) | Cassandra: DynamoDB Streams implementation | Accepted |
-| [0019](0019-logical-backup-restore.md) | Cassandra: logical backup and restore | Accepted |
+| [0021](0021-cassandra-lwt-delete-atomicity-gap.md) | Cassandra: LWT delete atomicity gap and required worker/saga pattern | Accepted |

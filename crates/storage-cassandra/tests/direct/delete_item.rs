@@ -675,7 +675,8 @@ async fn test_transaction_put_rejected_by_partition_max_delete_timestamp() {
         + 600_000; // 10 minutes in the future
 
     let update_query = format!(
-        "UPDATE {}.{} SET partition_max_delete_timestamp = ? WHERE pk = ?",
+        "UPDATE {}.{} SET partition_max_delete_timestamp = ? WHERE pk = ? \
+         IF partition_max_delete_timestamp = null",
         account_keyspace, data_table
     );
     engine

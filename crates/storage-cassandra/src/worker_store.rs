@@ -71,18 +71,19 @@ impl CassandraEngine {
                 .get_r_by_name("table_name")
                 .map_err(|e| StorageError::Internal(format!("Failed to parse table_name: {e}")))?;
 
-            // Update to ACTIVE (PRIMARY KEY is account_id, table_name)
+            // Update to ACTIVE via LWT to avoid mixing plain/LWT writes on the
+            // tables row (created with IF NOT EXISTS). See ADR-0021.
             let update = format!(
                 "UPDATE {catalog_keyspace}.tables SET table_status = 'ACTIVE', status_transition_at = null \
-                 WHERE account_id = ? AND table_name = ?"
+                 WHERE account_id = ? AND table_name = ? IF table_status = 'CREATING'"
             );
-            self.session
-                .query_with_values(
-                    &update,
-                    cdrs_tokio::query_values!(account_id.as_str(), table_name.as_str()),
-                )
-                .await
-                .map_err(|e| StorageError::Internal(format!("Failed to activate table: {e}")))?;
+            crate::cassandra_util::query_lwt(
+                &self.session,
+                &update,
+                cdrs_tokio::query_values!(account_id.as_str(), table_name.as_str()),
+            )
+            .await
+            .map_err(|e| StorageError::Internal(format!("Failed to activate table: {e}")))?;
 
             transitions.push((table_name, "CREATING → active"));
         }
@@ -152,17 +153,18 @@ impl CassandraEngine {
                     StorageError::Internal(format!("Failed to delete continuous backup state: {e}"))
                 })?;
 
-            // Delete table row (PRIMARY KEY is account_id, table_name)
+            // Delete table row — LWT to avoid mixing plain/LWT writes on a row
+            // created with IF NOT EXISTS. See ADR-0021.
             let table_delete = format!(
-                "DELETE FROM {catalog_keyspace}.tables WHERE account_id = ? AND table_name = ?"
+                "DELETE FROM {catalog_keyspace}.tables WHERE account_id = ? AND table_name = ? IF EXISTS"
             );
-            self.session
-                .query_with_values(
-                    &table_delete,
-                    cdrs_tokio::query_values!(account_id.as_str(), table_name.as_str()),
-                )
-                .await
-                .map_err(|e| StorageError::Internal(format!("Failed to delete table: {e}")))?;
+            crate::cassandra_util::query_lwt(
+                &self.session,
+                &table_delete,
+                cdrs_tokio::query_values!(account_id.as_str(), table_name.as_str()),
+            )
+            .await
+            .map_err(|e| StorageError::Internal(format!("Failed to delete table: {e}")))?;
 
             // Drop base table in account keyspace
             self.drop_data_table(&account_keyspace, &table_id).await?;
