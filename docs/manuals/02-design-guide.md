@@ -216,7 +216,7 @@ No safe TTL exists because delete-recreate can happen within milliseconds. Cross
 
 ### Multi-Instance Considerations
 
-extenddb does not enforce single-instance-per-catalog. Multiple extenddb instances may share the same PostgreSQL catalog. Any in-process cache of catalog state would be invisible to other instances. PostgreSQL's own buffer pool provides memory-resident access to hot rows, making application-level caching unnecessary for most workloads.
+On SQLite, `extenddb serve` enforces one instance per database file with an exclusive lock on `<database>.lock`. On PostgreSQL and MongoDB nothing enforces it, and running several instances against one catalog is not supported: the credential and policy caches are per instance with no cross-instance invalidation, and every instance runs every background worker (see the deployment guide). Any in-process cache of catalog state would likewise be invisible to other instances. PostgreSQL's own buffer pool provides memory-resident access to hot rows, making application-level caching unnecessary for most workloads.
 
 ### Future Considerations
 

@@ -296,6 +296,16 @@ impl CancellationReason {
         }
     }
 
+    /// Create a reason for an item that another transaction holds.
+    #[must_use]
+    pub fn transaction_conflict() -> Self {
+        Self {
+            code: "TransactionConflict".to_owned(),
+            message: Some("Transaction is ongoing for the item".to_owned()),
+            item: None,
+        }
+    }
+
     /// Create a reason for a validation error.
     #[must_use]
     pub fn validation_error(msg: impl Into<String>) -> Self {

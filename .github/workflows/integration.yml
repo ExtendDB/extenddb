@@ -8,9 +8,27 @@ on:
 permissions:
   contents: read
 
+# Supersede an in-flight run of the SAME pull request when a new push arrives,
+# so two pushes do not each hold six slots on a capped pool. Everything that is
+# not a pull request gets a group unique to the run (run_id): merge-group runs
+# can share a ref (gh-readonly-queue/main/pr-N-<sha> is reused across
+# re-queues of the same PR), and GitHub concurrency replaces a PENDING run in
+# a group even with cancel-in-progress false — so keying non-PR runs by ref
+# would let one merge-group run cancel another and evict its queue entry.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   run-integration:
-    runs-on: ubuntu-latest
+    # Dedicated ExtendDB runner group (4 vCPU / 16 GB, capped at 20 concurrent),
+    # pinned to Ubuntu 24.04. ubuntu-latest is an Amazon-wide pool of 1,000
+    # concurrent jobs shared first-come first-served across every org; our jobs
+    # sat queued 10–90 minutes behind other teams' load (2026-09-29/30). Pinned
+    # rather than "latest" because ubuntu-latest migrates to 26.04 in Oct–Nov
+    # 2026 and this compiles Rust; move to 26 deliberately.
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
     services:
       postgres:
         # pgvector's own image, which is postgres:16 plus the extension. The
@@ -88,7 +106,8 @@ jobs:
         run: sudo journalctl -t extenddb --no-pager -n 500 || true
 
   run-integration-sqlite:
-    runs-on: ubuntu-latest
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
 
@@ -149,7 +168,8 @@ jobs:
     # transaction authorization regression reached main: the build compiled, so
     # a feature-matrix check passed, while nothing ever issued a request against
     # a dev-mode server. This job starts one and exercises the data plane.
-    runs-on: ubuntu-latest
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
 
@@ -197,7 +217,8 @@ jobs:
         run: python3 -m pytest tests/test_dev_mode_authorization.py -v
 
   run-rust-integration:
-    runs-on: ubuntu-latest
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -276,12 +297,15 @@ jobs:
 
       # The control plane for vector indexes is not reachable over the wire while
       # this backend declares no vector search capability, so its tests drive the
-      # storage layer directly against this job's PostgreSQL. They build their own
-      # throwaway databases; the connection string is the server, not a database.
+      # storage layer directly against this job's PostgreSQL. The PutItem create
+      # race tests hold a create open in an outside transaction, and the
+      # write-transaction conflict tests force a deadlock; both also need direct
+      # access. They build their own throwaway databases; the connection string is
+      # the server, not a database.
       - name: Run PostgreSQL storage-level tests
         env:
           EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
-        run: cargo test --release -p extenddb-storage-postgres --test vector_control_plane
+        run: cargo test --release -p extenddb-storage-postgres --test vector_control_plane --test put_create_race --test twi_conflict
 
       # The daemonized server logs to syslog; dump it so server-side failures
       # are diagnosable from the job log.
@@ -296,7 +320,8 @@ jobs:
   # EXTENDDB_EXPECT_VECTORS flips to "1". Without this job the refusal surface
   # would stop being tested at exactly that point.
   run-rust-integration-postgres-novector:
-    runs-on: ubuntu-latest
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
     services:
       postgres:
         image: postgres:16
@@ -368,7 +393,8 @@ jobs:
       # image and the job above already runs them; repeating them here would buy
       # a second release build and no coverage.
   run-rust-integration-sqlite:
-    runs-on: ubuntu-latest
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
 
     steps:
       - uses: actions/checkout@v6
@@ -434,7 +460,8 @@ jobs:
         run: sudo journalctl -t extenddb --no-pager -n 500 || true
 
   integration:
-    runs-on: ubuntu-latest
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
     needs:
       [
         run-integration,

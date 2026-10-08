@@ -5,9 +5,23 @@ on:
   push:
     branches: [main]
 
+# Supersede an in-flight run of the SAME pull request when a new push arrives,
+# so repeated pushes do not stack up on a capped pool. Non-PR runs get a group
+# unique to the run (run_id): merge-group runs reuse a ref across re-queues,
+# and GitHub concurrency replaces a PENDING run in a group even with
+# cancel-in-progress false, so keying them by ref would let one merge-group
+# run cancel another and evict its queue entry.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   clippy:
-    runs-on: ubuntu-latest
+    # Dedicated ExtendDB runner group (Ubuntu 24.04, 4 vCPU / 16 GB, capped at
+    # 20 concurrent). ubuntu-latest is an Amazon-wide shared pool where our jobs
+    # waited 10-90 minutes to start (2026-09-29/30); see integration.yml.
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.97.0

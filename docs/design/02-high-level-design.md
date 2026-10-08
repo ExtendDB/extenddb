@@ -390,6 +390,7 @@ Read-modify-write operations (UpdateItem, PutItem with conditions, DeleteItem wi
 - **Atomicity:** The condition check and the write happen against the same snapshot.
 - **Serialization:** Concurrent updates to the same item are serialized by PostgreSQL's row lock, not by any in-memory mutex.
 - **No TOCTOU races:** Another request cannot modify the item between the condition check and the write.
+- **Missing items:** A missing item has no row to lock, so `INSERT ... ON CONFLICT DO NOTHING` decides which writer creates it. A PutItem or UpdateItem that loses re-reads the winner `FOR UPDATE`, checks its condition against it, and writes after it. If the winner was deleted in the meantime, it retries the insert, up to 5 inserts in total.
 
 There is no in-memory locking (no `Mutex`, `RwLock`, or similar) on the data path. All contention is managed by PostgreSQL.
 

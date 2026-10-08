@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.12"
+version = "0.1.13"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -70,6 +70,9 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 # Vector column type for the PostgreSQL backend. The `sqlx` feature gives a typed
 # `Vector` that encodes and decodes pgvector's binary format, so embeddings keep
 # f32 bit-exactness instead of going through a hand-written text parser.
+#
+# Pinned to 0.4.1 as of 10/2026: 0.4.2 pulls in transitive dependency version bumps
+# so of which are problematic. Do not allow to float until those are resolved.
 pgvector = { version = "=0.4.1", default-features = false, features = ["sqlx"] }
 mongodb = "3"
 bson = "2.13"
