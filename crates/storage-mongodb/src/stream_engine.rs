@@ -23,7 +23,7 @@ use extenddb_core::types::{
 use extenddb_storage::StreamEngine;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{parse_stream_arn, stream_arn};
-use extenddb_storage::{StreamListResult, StreamRecordsResult};
+use extenddb_storage::{StreamContinuation, StreamListResult, StreamRecordsResult};
 
 use crate::MongoEngine;
 
@@ -293,6 +293,12 @@ impl StreamEngine for MongoEngine {
         let shard_id = shard_id.to_owned();
         let after_sequence = after_sequence.map(std::borrow::ToOwned::to_owned);
         Box::pin(async move {
+            let limit = usize::try_from(limit)
+                .ok()
+                .filter(|limit| (1..=1000).contains(limit))
+                .ok_or_else(|| {
+                    StorageError::Validation("Limit must be between 1 and 1000".to_owned())
+                })?;
             // Ownership guard: only return records if the shard's backing table
             // belongs to the calling account. `stream_shards`/`stream_records`
             // live in the data database while the `tables` catalog (which
@@ -305,6 +311,9 @@ impl StreamEngine for MongoEngine {
                 .find_one(doc! { "shard_id": &shard_id })
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let closed = shard_doc
+                .as_ref()
+                .is_some_and(|shard| shard.get_str("ending_sequence_number").is_ok());
             let owned = match shard_doc.as_ref().and_then(|d| d.get_str("table_id").ok()) {
                 // Look the table up by its globally-unique `table_id` (a
                 // top-level field), then compare the owning account_id read out
@@ -348,7 +357,7 @@ impl StreamEngine for MongoEngine {
 
             let opts = FindOptions::builder()
                 .sort(doc! { "sequence_number": 1 })
-                .limit(limit)
+                .limit((limit + 1) as i64)
                 .build();
 
             let cursor = records_coll
@@ -362,8 +371,10 @@ impl StreamEngine for MongoEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+            let has_more = docs.len() > limit;
             let records: Vec<StreamRecord> = docs
                 .into_iter()
+                .take(limit)
                 .map(|d| {
                     let record_bson = d
                         .get("record_data")
@@ -376,7 +387,12 @@ impl StreamEngine for MongoEngine {
                 .collect::<Result<Vec<_>, _>>()?;
 
             let last_seq = records.last().map(|r| r.dynamodb.sequence_number.clone());
-            Ok((records, last_seq))
+            let continuation = if closed && !has_more {
+                StreamContinuation::End
+            } else {
+                StreamContinuation::More(last_seq)
+            };
+            Ok((records, continuation))
         })
     }
 

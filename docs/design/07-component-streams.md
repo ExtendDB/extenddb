@@ -146,7 +146,8 @@ pub struct StreamCapture {
 GetRecords handler:
   1. Validate shard iterator
   2. Call storage.get_stream_records(shard_id, after_sequence, limit)
-  3. Format response with records + next shard iterator
+  3. Return records and a refreshed iterator while the shard remains readable
+  4. Omit the next iterator when a closed shard's final page is exhausted
 ```
 
 ## 6. Deferred Decisions

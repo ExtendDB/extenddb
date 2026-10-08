@@ -7,9 +7,9 @@ use extenddb_core::types::{
     SequenceNumberRange, Shard, StreamDescription, StreamRecord, StreamStatus, StreamSummary,
     StreamViewType,
 };
-use extenddb_storage::StreamEngine;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{parse_stream_arn, stream_arn};
+use extenddb_storage::{StreamContinuation, StreamEngine, StreamRecordsResult};
 use futures::future::BoxFuture;
 use sqlx::PgPool;
 
@@ -128,11 +128,17 @@ impl StreamEngine for PostgresEngine {
         shard_id: &str,
         after_sequence: Option<&str>,
         limit: i64,
-    ) -> BoxFuture<'_, Result<(Vec<StreamRecord>, Option<String>), StorageError>> {
+    ) -> BoxFuture<'_, StreamRecordsResult> {
         let account_id = account_id.to_string();
         let shard_id = shard_id.to_string();
         let after_sequence = after_sequence.map(std::string::ToString::to_string);
         Box::pin(async move {
+            let limit = usize::try_from(limit)
+                .ok()
+                .filter(|limit| (1..=1000).contains(limit))
+                .ok_or_else(|| {
+                    StorageError::Validation("Limit must be between 1 and 1000".to_owned())
+                })?;
             // Ownership guard: only return records if the shard's backing table
             // belongs to the calling account. `stream_shards`/`stream_records`
             // rows live in the data database while the `tables` catalog (which
@@ -141,14 +147,18 @@ impl StreamEngine for PostgresEngine {
             // (data pool), then table_id + account_id (catalog pool). A shard
             // iterator for a table the caller does not own is rejected as an
             // invalid shard iterator (below).
-            let shard_table_id: Option<(String,)> =
-                sqlx::query_as("SELECT table_id FROM stream_shards WHERE shard_id = $1")
-                    .bind(&shard_id)
-                    .fetch_optional(&self.data_pool)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let shard_table_id: Option<(String, Option<String>)> = sqlx::query_as(
+                "SELECT table_id, ending_sequence_number FROM stream_shards WHERE shard_id = $1",
+            )
+            .bind(&shard_id)
+            .fetch_optional(&self.data_pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let closed = shard_table_id
+                .as_ref()
+                .is_some_and(|(_, end)| end.is_some());
             let owned = match &shard_table_id {
-                Some((table_id,)) => sqlx::query_as::<_, (i32,)>(
+                Some((table_id, _)) => sqlx::query_as::<_, (i32,)>(
                     "SELECT 1 FROM tables WHERE table_id = $1 AND account_id = $2",
                 )
                 .bind(table_id)
@@ -178,7 +188,7 @@ impl StreamEngine for PostgresEngine {
                 )
                 .bind(&shard_id)
                 .bind(&after)
-                .bind(limit)
+                .bind((limit + 1) as i64)
                 .fetch_all(&self.data_pool)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?
@@ -189,21 +199,28 @@ impl StreamEngine for PostgresEngine {
                      ORDER BY sequence_number LIMIT $2",
                 )
                 .bind(&shard_id)
-                .bind(limit)
+                .bind((limit + 1) as i64)
                 .fetch_all(&self.data_pool)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?
             };
 
+            let has_more = rows.len() > limit;
             let records: Vec<StreamRecord> = rows
                 .into_iter()
+                .take(limit)
                 .map(|(data,)| {
                     serde_json::from_value(data).map_err(|e| StorageError::Internal(e.to_string()))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
             let last_seq = records.last().map(|r| r.dynamodb.sequence_number.clone());
-            Ok((records, last_seq))
+            let continuation = if closed && !has_more {
+                StreamContinuation::End
+            } else {
+                StreamContinuation::More(last_seq)
+            };
+            Ok((records, continuation))
         })
     }
 
