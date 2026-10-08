@@ -137,17 +137,18 @@ impl CassandraEngine {
             .await
             .map_err(|e| StorageError::Internal(format!("Delete tags: {e}")))?;
 
-        // Delete table catalog entry
+        // Delete table catalog entry — LWT to avoid mixing plain/LWT writes on
+        // a row created with IF NOT EXISTS. See ADR-0021.
         let delete_table_query = format!(
-            "DELETE FROM {catalog_keyspace}.tables WHERE account_id = ? AND table_name = ?"
+            "DELETE FROM {catalog_keyspace}.tables WHERE account_id = ? AND table_name = ? IF EXISTS"
         );
-        self.session
-            .query_with_values(
-                &delete_table_query,
-                cdrs_tokio::query_values!(account_id, input.table_name.as_str()),
-            )
-            .await
-            .map_err(|e| StorageError::Internal(format!("Delete table: {e}")))?;
+        crate::cassandra_util::query_lwt(
+            &self.session,
+            &delete_table_query,
+            cdrs_tokio::query_values!(account_id, input.table_name.as_str()),
+        )
+        .await
+        .map_err(|e| StorageError::Internal(format!("Delete table: {e}")))?;
 
         Ok(description)
     }

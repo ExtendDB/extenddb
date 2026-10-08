@@ -460,42 +460,31 @@ impl Bootstrapper for CassandraBootstrapper {
     async fn bootstrap_default_account(&self) -> OpResult<()> {
         let keyspace = self.engine.catalog_keyspace();
 
-        // Check if any accounts exist
-        let check_cql = format!("SELECT account_id FROM {keyspace}.accounts LIMIT 1");
-        let has_accounts = self
-            .engine
-            .session()
-            .query(check_cql)
-            .await
-            .ok()
-            .and_then(|frame| frame.response_body().ok())
-            .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
-            .is_some_and(|rows| !rows.is_empty());
+        let account_id = generate_account_id();
+        let account_name = "default";
 
-        if has_accounts {
+        let insert_cql = format!(
+            "INSERT INTO {keyspace}.accounts (account_id, account_name, created_at) \
+             VALUES (?, ?, toTimestamp(now())) IF NOT EXISTS"
+        );
+
+        let applied = crate::cassandra_util::apply_lwt(
+            &self.engine.session_arc(),
+            &insert_cql,
+            cdrs_tokio::query_values!(account_id.as_str(), account_name),
+            "bootstrap_default_account",
+        )
+        .await
+        .map_err(|e: extenddb_storage::error::StorageError| {
+            OpError::Internal(format!("Create account: {e}"))
+        })?;
+
+        if !applied {
             println!("--- Default account already exists, skipping.");
             return Ok(());
         }
 
-        // Create default account
-        let account_id = generate_account_id();
-        println!("--- Creating default account...");
-        let account_name = "default";
-
-        let insert_cql = format!(
-            "INSERT INTO {keyspace}.accounts (account_id, account_name, created_at) VALUES (?, ?, toTimestamp(now()))"
-        );
-
-        self.engine
-            .session()
-            .query_with_values(
-                insert_cql,
-                cdrs_tokio::query_values!(account_id.as_str(), account_name),
-            )
-            .await
-            .map_err(|e| OpError::Internal(format!("Create account: {e}")))?;
-
-        println!("    Default account created");
+        println!("--- Default account created");
 
         // Create account-specific keyspace
         let account_keyspace = self.engine.account_keyspace(&account_id);
@@ -522,29 +511,6 @@ impl Bootstrapper for CassandraBootstrapper {
         let username = env_user.unwrap_or("admin");
         let from_env = env_user.is_some() && env_password.is_some();
 
-        // Check if user exists
-        let check_cql =
-            format!("SELECT admin_name FROM {keyspace}.admin_users WHERE admin_name = ?");
-        let exists = self
-            .engine
-            .session()
-            .query_with_values(check_cql, cdrs_tokio::query_values!(username))
-            .await
-            .ok()
-            .and_then(|frame| frame.response_body().ok())
-            .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
-            .is_some_and(|rows| !rows.is_empty());
-
-        if exists {
-            println!("--- Admin user already exists, skipping.");
-            return Ok(AdminBootstrapResult {
-                username: username.to_string(),
-                generated_password: None,
-                already_existed: true,
-                from_env,
-            });
-        }
-
         println!("--- Creating admin user...");
 
         // Generate or use provided password
@@ -557,18 +523,31 @@ impl Bootstrapper for CassandraBootstrapper {
         // Hash password (using bcrypt in blocking task to avoid blocking async runtime)
         let password_hash = hash_password_async(password.clone()).await?;
 
-        // Insert admin user
-        let insert_cql =
-            format!("INSERT INTO {keyspace}.admin_users (admin_name, password_hash) VALUES (?, ?)");
+        // Insert admin user — IF NOT EXISTS makes this safe for concurrent bootstrap
+        let insert_cql = format!(
+            "INSERT INTO {keyspace}.admin_users (admin_name, password_hash) VALUES (?, ?) IF NOT EXISTS"
+        );
 
-        self.engine
-            .session()
-            .query_with_values(
-                insert_cql,
-                cdrs_tokio::query_values!(username, password_hash),
-            )
-            .await
-            .map_err(|e| OpError::Internal(format!("Create admin user: {e}")))?;
+        let applied = crate::cassandra_util::apply_lwt(
+            &self.engine.session_arc(),
+            &insert_cql,
+            cdrs_tokio::query_values!(username, password_hash),
+            "bootstrap_admin_user",
+        )
+        .await
+        .map_err(|e: extenddb_storage::error::StorageError| {
+            OpError::Internal(format!("Create admin user: {e}"))
+        })?;
+
+        if !applied {
+            println!("--- Admin user already exists, skipping.");
+            return Ok(AdminBootstrapResult {
+                username: username.to_string(),
+                generated_password: None,
+                already_existed: true,
+                from_env,
+            });
+        }
 
         let generated_password = if from_env { None } else { Some(password) };
 

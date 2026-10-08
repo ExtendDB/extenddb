@@ -36,7 +36,7 @@ impl CassandraEngine {
             "UPDATE {catalog_keyspace}.tables SET stream_label = ? \
              WHERE account_id = ? AND table_name = ? IF EXISTS"
         );
-        crate::cassandra_util::query_lwt(
+        let result = crate::cassandra_util::query_lwt(
             &self.session,
             &update_label_cql,
             cdrs_tokio::query_values!(label.as_str(), account_id, table_name),
@@ -46,6 +46,9 @@ impl CassandraEngine {
             tracing::error!("init_stream_shards update stream_label: {e}");
             StorageError::Internal(format!("Failed to update stream_label: {e}"))
         })?;
+        if !crate::cassandra_util::lwt_applied(&result)? {
+            return Err(StorageError::TableNotFound(table_name.to_owned()));
+        }
 
         // Insert 4 shard rows into account keyspace (plain inserts, separate batch)
         let mut shard_statements = Vec::new();
@@ -63,10 +66,23 @@ impl CassandraEngine {
         // Note: values are interpolated rather than bound because Cassandra LOGGED BATCH
         // does not support parameterized statements spanning multiple tables.
         // All interpolated values are server-generated (UUIDs, timestamps, label from chrono).
-        self.session.query(&batch).await.map_err(|e| {
+        if let Err(e) = self.session.query(&batch).await {
             tracing::error!("init_stream_shards batch: {e}");
-            StorageError::Internal(format!("Failed to initialize stream shards: {e}"))
-        })?;
+            // Clear the label so ListStreams does not report a stream with no shards.
+            let clear_cql = format!(
+                "UPDATE {catalog_keyspace}.tables SET stream_label = null \
+                 WHERE account_id = ? AND table_name = ? IF stream_label = ?"
+            );
+            let _ = crate::cassandra_util::query_lwt(
+                &self.session,
+                &clear_cql,
+                cdrs_tokio::query_values!(account_id, table_name, label.as_str()),
+            )
+            .await;
+            return Err(StorageError::Internal(format!(
+                "Failed to initialize stream shards: {e}"
+            )));
+        }
 
         Ok(label)
     }

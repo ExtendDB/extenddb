@@ -140,32 +140,38 @@ impl CassandraCatalogStore {
         .map(|row| crate::cassandra_util::get_column(&row, "group_name", "delete_user"))
         .collect::<Result<_, _>>()?;
 
-        // Sequential deletes. Only tables created with IF NOT EXISTS use IF EXISTS on delete
+        // Sequential deletes ordered so that the most security-sensitive rows
+        // are removed first. access_keys is deleted before iam_users so that
+        // a partial failure leaves orphaned catalog entries (inert) rather than
+        // live credentials whose parent user is already gone. iam_users is
+        // deleted last so the user is only "officially" absent once all
+        // dependent rows have been cleaned up, and a retry can still find the
+        // user and re-attempt any failed steps.
+        //
+        // Only tables created with IF NOT EXISTS use IF EXISTS on delete
         // (LWT/non-LWT mixing rule). Tables with plain INSERT use plain DELETE.
         // See ADR-0021.
         let session = std::sync::Arc::clone(session);
-        crate::cassandra_util::apply_lwt(
-            &session,
-            &format!("DELETE FROM {ks}.iam_users WHERE account_id = ? AND user_name = ? IF EXISTS"),
-            cdrs_tokio::query_values!(account_id, user_name),
-            "delete_user iam_users",
-        )
-        .await?;
-        // iam_user_tags uses plain INSERT — plain DELETE is safe
-        crate::cassandra_util::execute(
-            &session,
-            &format!("DELETE FROM {ks}.iam_user_tags WHERE account_id = ? AND user_name = ?"),
-            cdrs_tokio::query_values!(account_id, user_name),
-            "delete_user iam_user_tags",
-        )
-        .await?;
         for key_id in &key_ids {
-            // access_keys uses plain INSERT — plain DELETE is safe
-            crate::cassandra_util::execute(
+            // access_keys has an IF NOT EXISTS insert path (import) — use IF EXISTS on delete
+            crate::cassandra_util::apply_lwt(
                 &session,
-                &format!("DELETE FROM {ks}.access_keys WHERE access_key_id = ?"),
+                &format!("DELETE FROM {ks}.access_keys WHERE access_key_id = ? IF EXISTS"),
                 cdrs_tokio::query_values!(key_id.as_str()),
                 "delete_user access_keys",
+            )
+            .await?;
+        }
+        for group_name in &group_names {
+            // iam_group_members uses IF NOT EXISTS — must use IF EXISTS
+            crate::cassandra_util::apply_lwt(
+                &session,
+                &format!(
+                    "DELETE FROM {ks}.iam_group_members \
+                     WHERE account_id = ? AND group_name = ? AND user_name = ? IF EXISTS"
+                ),
+                cdrs_tokio::query_values!(account_id, group_name.as_str(), user_name),
+                "delete_user iam_group_members",
             )
             .await?;
         }
@@ -183,19 +189,22 @@ impl CassandraCatalogStore {
             )
             .await?;
         }
-        for group_name in &group_names {
-            // iam_group_members uses IF NOT EXISTS — must use IF EXISTS
-            crate::cassandra_util::apply_lwt(
-                &session,
-                &format!(
-                    "DELETE FROM {ks}.iam_group_members \
-                     WHERE account_id = ? AND group_name = ? AND user_name = ? IF EXISTS"
-                ),
-                cdrs_tokio::query_values!(account_id, group_name.as_str(), user_name),
-                "delete_user iam_group_members",
-            )
-            .await?;
-        }
+        // iam_user_tags uses plain INSERT — plain DELETE is safe
+        crate::cassandra_util::execute(
+            &session,
+            &format!("DELETE FROM {ks}.iam_user_tags WHERE account_id = ? AND user_name = ?"),
+            cdrs_tokio::query_values!(account_id, user_name),
+            "delete_user iam_user_tags",
+        )
+        .await?;
+        // iam_users last: user is only gone once all dependent rows are cleaned up
+        crate::cassandra_util::apply_lwt(
+            &session,
+            &format!("DELETE FROM {ks}.iam_users WHERE account_id = ? AND user_name = ? IF EXISTS"),
+            cdrs_tokio::query_values!(account_id, user_name),
+            "delete_user iam_users",
+        )
+        .await?;
 
         Ok(())
     }
@@ -413,16 +422,18 @@ impl CassandraCatalogStore {
 
         let catalog_keyspace = self.catalog_keyspace();
         let update_query = format!(
-            "UPDATE {catalog_keyspace}.iam_users SET password_hash = ? WHERE account_id = ? AND user_name = ?"
+            "UPDATE {catalog_keyspace}.iam_users SET password_hash = ? \
+             WHERE account_id = ? AND user_name = ? IF EXISTS"
         );
 
-        crate::cassandra_util::execute(
+        crate::cassandra_util::apply_lwt(
             self.session(),
             &update_query,
             cdrs_tokio::query_values!(password_hash, account_id, user_name),
             "change_user_password",
         )
         .await
+        .map(|_| ())
     }
 
     // ── User tags ──────────────────────────────────────────────────

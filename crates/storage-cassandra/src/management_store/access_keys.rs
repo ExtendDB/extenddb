@@ -52,26 +52,27 @@ impl CassandraCatalogStore {
         let catalog_keyspace = self.catalog_keyspace();
         let insert_query = format!(
             "INSERT INTO {catalog_keyspace}.access_keys (access_key_id, account_id, user_name, secret_key_encrypted, is_active, created_at) \
-             VALUES (?, ?, ?, ?, true, toTimestamp(now()))"
+             VALUES (?, ?, ?, ?, true, toTimestamp(now())) IF NOT EXISTS"
         );
 
         let encrypted_blob = cdrs_tokio::types::blob::Blob::new(encrypted);
 
-        self.session()
-            .query_with_values(
-                &insert_query,
-                cdrs_tokio::query_values!(
-                    access_key_id.as_str(),
-                    account_id,
-                    user_name,
-                    encrypted_blob
-                ),
-            )
-            .await
-            .map_err(|e| {
-                tracing::error!("create_access_key insert failed: {e}");
-                OpError::Internal("Database error".to_owned())
-            })?;
+        crate::cassandra_util::apply_lwt(
+            self.session(),
+            &insert_query,
+            cdrs_tokio::query_values!(
+                access_key_id.as_str(),
+                account_id,
+                user_name,
+                encrypted_blob
+            ),
+            "create_access_key",
+        )
+        .await
+        .map_err(|e: OpError| {
+            tracing::error!("create_access_key insert failed: {e:?}");
+            OpError::Internal("Database error".to_owned())
+        })?;
 
         Ok(AccessKeyCreated {
             access_key_id,

@@ -1609,10 +1609,13 @@ async fn test_effects_applying_with_changed_image_completes_not_wedges() {
         .session_arc()
         .query_with_values(
             &format!(
-                "UPDATE {keyspace}.{data_table} SET item_data = ? WHERE pk = ? \
-                 IF prepared_txn_id = ?"
+                // Plain unconditional write — simulates a writer whose
+                // owner-null cells lost to the seal but whose item cells won.
+                // Sequential test (--test-threads=1) so the plain/LWT mix on
+                // this partition does not cause Paxos spinning in practice.
+                "UPDATE {keyspace}.{data_table} SET item_data = ? WHERE pk = ?"
             ),
-            cdrs_tokio::query_values!(changed_json.as_str(), "drain", work_id),
+            cdrs_tokio::query_values!(changed_json.as_str(), "drain"),
         )
         .await
         .unwrap();
@@ -1743,7 +1746,7 @@ async fn test_effects_applying_recovery_restores_shared_key_gsi_row() {
         .unwrap();
 
     let work_id = uuid::Uuid::new_v4();
-    let (_generation, _bucket, _shard, ..) = forge_ttl_work(
+    let (generation, bucket, shard, ..) = forge_ttl_work(
         &engine,
         &table.key_info,
         &old_item,
@@ -1762,16 +1765,54 @@ async fn test_effects_applying_recovery_restores_shared_key_gsi_row() {
         "expires_at".to_owned(),
         AttributeValue::N((now + 3 * 86_400).to_string()),
     );
+    // Read back the recorded delete timestamp so the stale write can be pinned
+    // strictly below the replay's tombstones, as a real pre-seal writer is.
+    let work_data_json: String = {
+        use cdrs_tokio::types::IntoRustByName;
+        engine
+            .session_arc()
+            .query_with_values(
+                &format!(
+                    "SELECT work_data FROM {keyspace}.ttl_expirations \
+                     WHERE table_id = ? AND generation = ? AND bucket = ? AND shard = ?"
+                ),
+                cdrs_tokio::query_values!(
+                    table.key_info.table_id.as_str(),
+                    generation,
+                    bucket,
+                    shard
+                ),
+            )
+            .await
+            .unwrap()
+            .response_body()
+            .unwrap()
+            .into_rows()
+            .unwrap_or_default()
+            .first()
+            .and_then(|row| row.get_by_name("work_data").ok().flatten())
+            .expect("forged work data")
+    };
+    let delete_timestamp_ms =
+        serde_json::from_str::<serde_json::Value>(&work_data_json).unwrap()["delete_timestamp_ms"]
+            .as_i64()
+            .unwrap();
+    let stale_timestamp = delete_timestamp_ms * 1_000 - 1_000;
     let data_table = format!("items_{}", table.key_info.table_id.replace('-', "_"));
     let changed_json = serde_json::to_string(&changed).unwrap();
     engine
         .session_arc()
         .query_with_values(
             &format!(
-                "UPDATE {keyspace}.{data_table} SET item_data = ? WHERE pk = ? \
-                 IF prepared_txn_id = ?"
+                // USING TIMESTAMP pins this write below the seal's tombstones,
+                // simulating a pre-seal writer whose item cells survive but
+                // whose GSI row gets tombstoned by the replay. Sequential test
+                // (--test-threads=1) so the plain/LWT mix does not cause Paxos
+                // spinning in practice.
+                "UPDATE {keyspace}.{data_table} USING TIMESTAMP {stale_timestamp} \
+                 SET item_data = ? WHERE pk = ?"
             ),
-            cdrs_tokio::query_values!(changed_json.as_str(), "gsi-restore", work_id),
+            cdrs_tokio::query_values!(changed_json.as_str(), "gsi-restore"),
         )
         .await
         .unwrap();

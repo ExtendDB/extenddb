@@ -473,15 +473,15 @@ impl BackupEngine for CassandraEngine {
                     .cleanup_backup_payload(&account_id, &backup_arn, item_count)
                     .await;
                 let delete_metadata = format!(
-                    "DELETE FROM {catalog}.backups_by_arn WHERE account_id = ? AND backup_arn = ?"
+                    "DELETE FROM {catalog}.backups_by_arn \
+                     WHERE account_id = ? AND backup_arn = ? IF EXISTS"
                 );
-                let _ = self
-                    .session
-                    .query_with_values(
-                        &delete_metadata,
-                        cdrs_tokio::query_values!(account_id.as_str(), backup_arn.as_str()),
-                    )
-                    .await;
+                let _ = crate::cassandra_util::query_lwt(
+                    &self.session,
+                    &delete_metadata,
+                    cdrs_tokio::query_values!(account_id.as_str(), backup_arn.as_str()),
+                )
+                .await;
                 return Err(error);
             }
 
@@ -556,15 +556,15 @@ impl BackupEngine for CassandraEngine {
                     .cleanup_backup_payload(&account_id, &backup_arn, item_count)
                     .await;
                 let delete_metadata = format!(
-                    "DELETE FROM {catalog}.backups_by_arn WHERE account_id = ? AND backup_arn = ?"
+                    "DELETE FROM {catalog}.backups_by_arn \
+                     WHERE account_id = ? AND backup_arn = ? IF EXISTS"
                 );
-                let _ = self
-                    .session
-                    .query_with_values(
-                        &delete_metadata,
-                        cdrs_tokio::query_values!(account_id.as_str(), backup_arn.as_str()),
-                    )
-                    .await;
+                let _ = crate::cassandra_util::query_lwt(
+                    &self.session,
+                    &delete_metadata,
+                    cdrs_tokio::query_values!(account_id.as_str(), backup_arn.as_str()),
+                )
+                .await;
                 return Err(error);
             }
 
@@ -667,32 +667,36 @@ impl BackupEngine for CassandraEngine {
             }
             let original_description = backup.description()?;
             let mark_deleting = format!(
-                "UPDATE {}.backups_by_arn SET backup_status = 'DELETING' WHERE account_id = ? AND backup_arn = ?",
+                "UPDATE {}.backups_by_arn SET backup_status = 'DELETING' \
+                 WHERE account_id = ? AND backup_arn = ? \
+                 IF backup_status = 'AVAILABLE'",
                 self.catalog_keyspace()
             );
-            self.session
-                .query_with_values(
-                    &mark_deleting,
-                    cdrs_tokio::query_values!(account_id.as_str(), backup_arn.as_str()),
-                )
-                .await
-                .map_err(|e| StorageError::Internal(format!("Mark backup deleting: {e}")))?;
+            crate::cassandra_util::query_lwt(
+                &self.session,
+                &mark_deleting,
+                cdrs_tokio::query_values!(account_id.as_str(), backup_arn.as_str()),
+            )
+            .await
+            .map_err(|e| StorageError::Internal(format!("Mark backup deleting: {e}")))?;
 
             self.remove_backup_index_rows(&backup).await?;
             self.cleanup_backup_payload(&account_id, &backup_arn, backup.item_count)
                 .await?;
 
             let mark_deleted = format!(
-                "UPDATE {}.backups_by_arn SET backup_status = 'DELETED' WHERE account_id = ? AND backup_arn = ?",
+                "UPDATE {}.backups_by_arn SET backup_status = 'DELETED' \
+                 WHERE account_id = ? AND backup_arn = ? \
+                 IF backup_status = 'DELETING'",
                 self.catalog_keyspace()
             );
-            self.session
-                .query_with_values(
-                    &mark_deleted,
-                    cdrs_tokio::query_values!(account_id.as_str(), backup_arn.as_str()),
-                )
-                .await
-                .map_err(|e| StorageError::Internal(format!("Mark backup deleted: {e}")))?;
+            crate::cassandra_util::query_lwt(
+                &self.session,
+                &mark_deleted,
+                cdrs_tokio::query_values!(account_id.as_str(), backup_arn.as_str()),
+            )
+            .await
+            .map_err(|e| StorageError::Internal(format!("Mark backup deleted: {e}")))?;
 
             backup.backup_status = "DELETED".to_owned();
             Ok(BackupDescription {

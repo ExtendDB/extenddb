@@ -537,7 +537,29 @@ impl CassandraEngine {
             })?;
             // IF EXISTS returns false only if the row was deleted between our
             // earlier SELECT and this UPDATE — treat as TableNotFound.
-            if !crate::cassandra_util::lwt_applied(&result).unwrap_or(true) {
+            // NOTE: the tables LWT commits before the indexes batch below runs.
+            // A failure in the indexes batch leaves the table row updated with
+            // no corresponding index rows; the recovery worker does not cover
+            // this gap (it only scans existing CREATING index rows). This is a
+            // known atomicity gap — conditional batches cannot span tables in
+            // Cassandra. Tracked in ADR-0021.
+            let applied = crate::cassandra_util::lwt_applied(&result)?;
+            if !applied {
+                for held_id in &taken_holds {
+                    let session = self.session_arc();
+                    let account_ks = account_ks.clone();
+                    let held_id = held_id.clone();
+                    let table_id = table_id.to_owned();
+                    tokio::spawn(async move {
+                        let _ = crate::propagation_hold::release_propagation_hold(
+                            &session,
+                            &account_ks,
+                            &table_id,
+                            &held_id,
+                        )
+                        .await;
+                    });
+                }
                 return Err(StorageError::TableNotFound(input.table_name.clone()));
             }
         }
