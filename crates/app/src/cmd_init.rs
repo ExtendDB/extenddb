@@ -230,33 +230,20 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
     // Two concurrent inits cannot get this far: the second aborts earlier, at
     // `create_catalog_db`, because the database already exists. The catalog
     // database does exist by this point, so the lock connection can be opened.
+    //
+    // The lock is held through the bootstrap rows as well, not just the
+    // schema: a server that starts after the schema exists but before the
+    // encryption key is written fails with MissingEncryptionKey, and on
+    // SQLite this same lock is what keeps `serve` out until init is done.
     bootstrapper
         .acquire_migration_lock()
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let migration_result = run_init_migrations(bootstrapper.as_ref()).await;
+    let bootstrap_result = run_init_bootstrap(bootstrapper.as_ref()).await;
     if let Err(e) = bootstrapper.release_migration_lock().await {
         tracing::warn!("Failed to release migration lock: {e:?}");
     }
-    migration_result?;
-
-    bootstrapper
-        .bootstrap_encryption_key()
-        .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?; // REQ-AUTH-010
-
-    bootstrapper
-        .bootstrap_default_account()
-        .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-
-    // REQ-AUTH-003
-    let env_user = std::env::var("EXTENDDB_ADMIN_USER").ok();
-    let env_pass = std::env::var("EXTENDDB_ADMIN_PASSWORD").ok();
-    let admin_result = bootstrapper
-        .bootstrap_admin_user(env_user.as_deref(), env_pass.as_deref())
-        .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let admin_result = bootstrap_result?;
 
     if admin_result.already_existed {
         // Already printed by the bootstrap store.
@@ -312,6 +299,33 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
 
 /// Apply the catalog and data schema while the migration lock is held. Split out
 /// of `run` so that the lock is released on every path, including errors.
+/// Everything `init` does under the migration lock: the schema, then the
+/// rows a server needs before it can start (encryption key, default account,
+/// admin user).
+async fn run_init_bootstrap(
+    bootstrapper: &dyn extenddb_storage::bootstrapper::Bootstrapper,
+) -> anyhow::Result<extenddb_storage::bootstrapper::AdminBootstrapResult> {
+    run_init_migrations(bootstrapper).await?;
+
+    bootstrapper
+        .bootstrap_encryption_key()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?; // REQ-AUTH-010
+
+    bootstrapper
+        .bootstrap_default_account()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
+    // REQ-AUTH-003
+    let env_user = std::env::var("EXTENDDB_ADMIN_USER").ok();
+    let env_pass = std::env::var("EXTENDDB_ADMIN_PASSWORD").ok();
+    bootstrapper
+        .bootstrap_admin_user(env_user.as_deref(), env_pass.as_deref())
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))
+}
+
 async fn run_init_migrations(
     bootstrapper: &dyn extenddb_storage::bootstrapper::Bootstrapper,
 ) -> anyhow::Result<()> {
