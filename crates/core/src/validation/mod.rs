@@ -886,7 +886,14 @@ fn format_attr_defs(defs: &[AttributeDefinition]) -> String {
         .join(", ")
 }
 
-fn validate_provisioned_throughput(input: &CreateTableInput) -> Result<(), DynamoDbError> {
+/// Validate table-level throughput against the effective billing mode.
+///
+/// # Errors
+///
+/// Returns [`DynamoDbError::ValidationException`] when required provisioned
+/// throughput is absent or invalid, or when throughput is supplied for an
+/// on-demand table.
+pub fn validate_provisioned_throughput(input: &CreateTableInput) -> Result<(), DynamoDbError> {
     let billing = input.billing_mode.unwrap_or(BillingMode::Provisioned);
     match billing {
         BillingMode::Provisioned => {

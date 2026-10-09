@@ -42,9 +42,9 @@ mod update_item;
 pub(crate) mod vector_index;
 
 pub(crate) use index::{
-    PendingApplyContext, apply_pending_context, insert_index_row_multi, project_item_for_index,
+    PendingApplyContext, apply_pending_context, insert_index_row_multi, item_has_index_keys,
+    project_item_for_index,
 };
-pub(crate) use tx_helpers::upsert_item_in_tx;
 
 /// Quoted SQL identifier for a virtual DynamoDB table's data table.
 pub(crate) fn data_table_name(table_id: &str) -> String {

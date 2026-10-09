@@ -128,7 +128,10 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 
 | Limit | DynamoDB Value | Status | Notes |
 |-------|---------------|--------|-------|
-| Concurrent restores | 50 | N/A | ExtendDB does not support backup/restore |
+| Concurrent restores | 50 | Partial | 4 per server process on PostgreSQL (a fifth waits up to 30 s, then `LimitExceededException`); SQLite restores and backups copy in batches, each under a short write-lock hold; MongoDB has no limit | A fifth concurrent PostgreSQL restore waits up to 30 s, then fails with `LimitExceededException` |
+| Backup contents | Key schema, attribute definitions, items, indexes, billing mode, throughput, table class, SSE | Enforced | Streams, TTL, tags, and deletion protection are not restored, as on the service. Backups are stored inside the catalog database; take database-level backups for off-host copies |
+| Point-in-time recovery | 35-day window | N/A | `UpdateContinuousBackups` and `RestoreTableToPointInTime` are refused |
+| `RestoreTableFromBackup` overrides | `BillingModeOverride`, `ProvisionedThroughputOverride`, `GlobalSecondaryIndexOverride`, `LocalSecondaryIndexOverride`, `SSESpecificationOverride`, `OnDemandThroughputOverride`, `VectorIndexOverride` | Partial | A request carrying `GlobalSecondaryIndexOverride`, `LocalSecondaryIndexOverride`, `SSESpecificationOverride`, `OnDemandThroughputOverride`, or `VectorIndexOverride` returns `ValidationException` before the target table is created |
 
 ## Global Tables
 
@@ -158,7 +161,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | Transactions | 3 | 0 | 1 | 0 |
 | Streams | 1 | 0 | 3 | 0 |
 | API-Level | 1 | 0 | 3 | 1 |
-| Import/Export/Backup | 0 | 0 | 0 | 8 |
+| Import/Export/Backup | 1 | 2 | 0 | 7 |
 | Global Tables | 0 | 0 | 0 | 2 |
 | Contributor Insights | 0 | 0 | 0 | 1 |
 | **Total** | **28** | **1** | **17** | **14** |
