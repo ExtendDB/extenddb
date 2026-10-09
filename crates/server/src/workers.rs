@@ -198,7 +198,19 @@ pub(crate) async fn metrics_flush_worker(
             Duration::ZERO
         };
         let cycle_start = std::time::Instant::now();
-        let buckets = metrics.drain(drain_age);
+        // The drain aggregates every point it takes: keep it off the runtime
+        // workers so they keep polling sockets while it runs.
+        let drain_metrics = Arc::clone(&metrics);
+        let mut errored = false;
+        let buckets =
+            match tokio::task::spawn_blocking(move || drain_metrics.drain(drain_age)).await {
+                Ok(buckets) => buckets,
+                Err(e) => {
+                    tracing::warn!("Metrics drain task failed: {e}");
+                    errored = true;
+                    Vec::new()
+                }
+            };
         if !buckets.is_empty() {
             let rows: Vec<MetricsRow> = buckets
                 .iter()
@@ -240,13 +252,13 @@ pub(crate) async fn metrics_flush_worker(
             let _ = store.insert_metrics(&rows).await;
         }
         // Prune old DB rows.
-        let mut errored = false;
         if let Err(e) = store.prune_metrics(RETENTION).await {
             tracing::warn!("Failed to prune old metrics from DB: {e:?}");
-            metrics.record_worker_error(QuerySource::MetricsFlush);
             errored = true;
         }
-        if !errored {
+        if errored {
+            metrics.record_worker_error(QuerySource::MetricsFlush);
+        } else {
             #[allow(clippy::cast_precision_loss)]
             let cycle_us = cycle_start.elapsed().as_micros() as f64;
             metrics.record_worker_success(QuerySource::MetricsFlush, cycle_us);

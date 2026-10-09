@@ -10,6 +10,7 @@
 //!
 //! REQ-OBS-005: Metrics endpoint.
 
+mod accumulator;
 mod collector;
 mod collector_query;
 mod types;

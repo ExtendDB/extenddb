@@ -5,86 +5,11 @@
 //! per-key aggregation.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
+use super::accumulator::Accumulator;
 use super::types::{LatencySegments, MetricName, TimeWindow};
-
-/// A single data point recorded for a metric.
-#[derive(Debug, Clone)]
-pub(super) struct DataPoint {
-    pub(super) value: f64,
-    pub(super) timestamp: Instant,
-    /// Wall-clock time for DB persistence. Truncated to minute boundary on flush.
-    pub(super) wall_time: SystemTime,
-}
-
-/// Accumulator for a single metric+dimension combination.
-#[derive(Debug)]
-pub(super) struct Accumulator {
-    pub(super) points: Vec<DataPoint>,
-}
-
-impl Accumulator {
-    fn new() -> Self {
-        Self {
-            points: Vec::with_capacity(64),
-        }
-    }
-
-    fn record(&mut self, value: f64, now: Instant, wall_time: SystemTime) {
-        self.points.push(DataPoint {
-            value,
-            timestamp: now,
-            wall_time,
-        });
-    }
-
-    /// Prune points older than the retention window (1 day).
-    fn prune(&mut self, cutoff: Instant) {
-        self.points.retain(|p| p.timestamp >= cutoff);
-    }
-
-    pub(super) fn snapshot(&self, window: TimeWindow, now: Instant) -> Option<AccumulatorSnapshot> {
-        let cutoff = window_cutoff(window, now);
-        let values: Vec<f64> = match cutoff {
-            Some(c) => self
-                .points
-                .iter()
-                .filter(|p| p.timestamp >= c)
-                .map(|p| p.value)
-                .collect(),
-            None => self.points.iter().map(|p| p.value).collect(),
-        };
-
-        if values.is_empty() {
-            return None;
-        }
-
-        let sum: f64 = values.iter().sum();
-        #[allow(clippy::cast_possible_truncation)]
-        let count = values.len() as u64;
-        let min = values.iter().copied().fold(f64::INFINITY, f64::min);
-        let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-
-        Some(AccumulatorSnapshot {
-            sum,
-            count,
-            min,
-            max,
-            values,
-        })
-    }
-}
-
-/// Snapshot of an accumulator's data for a given time window.
-pub(super) struct AccumulatorSnapshot {
-    pub(super) sum: f64,
-    pub(super) count: u64,
-    pub(super) min: f64,
-    pub(super) max: f64,
-    pub(super) values: Vec<f64>,
-}
 
 /// Returns `None` for `AllTime` (no cutoff), or `Some(cutoff)` for bounded windows.
 pub(super) fn window_cutoff(window: TimeWindow, now: Instant) -> Option<Instant> {
@@ -115,6 +40,9 @@ pub struct MetricsCollector {
     pub(super) data: RwLock<HashMap<MetricKey, Accumulator>>,
     /// Per-operation latency segment breakdowns for the console deep-dive.
     pub(super) segments: RwLock<Vec<SegmentPoint>>,
+    /// Serializes drains, so each one takes and keeps points in record order.
+    /// `record` and `prune` never take it.
+    pub(super) drain_lock: Mutex<()>,
 }
 
 /// A single latency segment data point with metadata.
@@ -134,6 +62,7 @@ impl MetricsCollector {
         Self {
             data: RwLock::new(HashMap::new()),
             segments: RwLock::new(Vec::with_capacity(256)),
+            drain_lock: Mutex::new(()),
         }
     }
 
@@ -152,8 +81,16 @@ impl MetricsCollector {
             index_name: index_name.map(ToOwned::to_owned),
             operation: operation.map(ToOwned::to_owned),
         };
-        let now = Instant::now();
-        let wall_time = SystemTime::now();
+        self.record_point(key, value, Instant::now(), SystemTime::now());
+    }
+
+    pub(super) fn record_point(
+        &self,
+        key: MetricKey,
+        value: f64,
+        now: Instant,
+        wall_time: SystemTime,
+    ) {
         // Poisoned lock: silently skip rather than panic (async safety rule).
         let Ok(mut map) = self.data.write() else {
             return;
@@ -409,7 +346,7 @@ impl MetricsCollector {
         for acc in map.values_mut() {
             acc.prune(cutoff);
         }
-        map.retain(|_, acc| !acc.points.is_empty());
+        map.retain(|_, acc| !acc.is_empty());
         drop(map);
         // Prune segment points too.
         if let Ok(mut segs) = self.segments.write() {
