@@ -45,20 +45,15 @@ impl CassandraEngine {
                 {
                     return Err(StorageError::TransactionConflict(message));
                 }
+                // A lost OCC race (another writer committed between our read and
+                // write) surfaces as TransactionConflict from the inner call, for
+                // both conditional and unconditional puts. Retry against the new
+                // version: the inner call re-reads the current item and
+                // re-evaluates any condition against it. After exhausting retries,
+                // surface as TransactionConflict (DynamoDB's behaviour for
+                // persistent write contention). A genuine condition failure is
+                // returned as ConditionFailed *before* the write and is not retried.
                 Err(StorageError::TransactionConflict(_)) => ttl_claim_backoff(attempt).await,
-                // Unconditional put lost the OCC race — retry against the new version.
-                // After exhausting retries, surface as TransactionConflict (same as
-                // DynamoDB's behaviour for persistent write contention).
-                Err(StorageError::ConditionFailed(_))
-                    if condition.is_none() && attempt == TTL_CLAIM_MAX_RETRIES =>
-                {
-                    return Err(StorageError::TransactionConflict(
-                        "Unconditional put lost OCC race after max retries".to_owned(),
-                    ));
-                }
-                Err(StorageError::ConditionFailed(_)) if condition.is_none() => {
-                    ttl_claim_backoff(attempt).await;
-                }
                 other => return other,
             }
         }
@@ -259,8 +254,13 @@ impl CassandraEngine {
             let applied = write_result?;
 
             if !applied {
-                // Lost OCC race — another writer changed the item between our read and write.
-                return Err(StorageError::ConditionFailed(old_item_opt));
+                // Lost OCC race — another writer changed the item between our read
+                // and write. This is NOT a condition failure: re-read and retry via
+                // the outer loop, which re-evaluates any condition against the new
+                // current item.
+                return Err(StorageError::TransactionConflict(
+                    "put_item lost OCC race (sort key)".to_owned(),
+                ));
             }
 
             Ok(if return_old { old_item_opt } else { None })
@@ -364,7 +364,13 @@ impl CassandraEngine {
             let applied = write_result?;
 
             if !applied {
-                return Err(StorageError::ConditionFailed(old_item_opt));
+                // Lost OCC race — another writer changed the item between our read
+                // and write. This is NOT a condition failure: re-read and retry via
+                // the outer loop, which re-evaluates any condition against the new
+                // current item.
+                return Err(StorageError::TransactionConflict(
+                    "put_item lost OCC race (pk only)".to_owned(),
+                ));
             }
 
             Ok(if return_old { old_item_opt } else { None })
