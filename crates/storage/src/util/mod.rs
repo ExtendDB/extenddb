@@ -9,7 +9,9 @@
 mod arn;
 mod key;
 
-pub use arn::{index_arn, parse_stream_arn, stream_arn, table_arn};
+pub use arn::{
+    format_stream_label, index_arn, new_stream_label, parse_stream_arn, stream_arn, table_arn,
+};
 pub use key::SortKeyValue;
 pub use key::{
     composite_pk_to_text, effective_attribute_definitions, encode_netstring_composite,

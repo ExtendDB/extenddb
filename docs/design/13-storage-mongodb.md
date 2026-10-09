@@ -720,10 +720,14 @@ only a first-time enable rotates it. A repeat `UpdateTable`
 `{ StreamEnabled: true }` would otherwise duplicate the shard set and
 invalidate stream ARNs previously handed out to consumers.
 
-**`stream_label` format.** `YYYY-MM-DDThh:mm:ss` (second precision, no
-timezone). Byte-for-byte compatible with the PostgreSQL backend so an
-ARN issued by one backend is parseable by tooling that only ever saw
-the other. See `format_stream_label` in `table_engine.rs`.
+**`stream_label` format.** `YYYY-MM-DDThh:mm:ss.sss` (millisecond
+precision, UTC, no timezone suffix), the shape the service uses. All three
+backends call one function, `extenddb_storage::util::format_stream_label`,
+and bind the result, rather than formatting a timestamp in SQL, so an ARN
+issued by one backend is byte-for-byte parseable by tooling that only ever
+saw another. Second precision gave a table deleted and recreated within one
+second the same stream ARN. Labels written before the change keep their
+second-precision form.
 
 ### 5.6 Write conflict handling
 
