@@ -124,6 +124,17 @@ fn server_components_factory(
             details: e.to_string(),
         })?;
 
+        // A crash can leave a backup's metadata claimed by a restore or a
+        // delete that will never finish; clear those before taking requests.
+        match engine.sweep_stale_backup_claims().await {
+            Ok((0, 0)) => {}
+            Ok((restores, deletes)) => tracing::warn!(
+                "cleared {restores} stale restore claim(s) and finished {deletes} interrupted \
+                 DeleteBackup(s) left by the last shutdown"
+            ),
+            Err(e) => tracing::error!("Failed to sweep stale backup claims: {e}"),
+        }
+
         let engine = Arc::new(engine);
 
         // Create one shared catalog/management client. MongoDB Client clones

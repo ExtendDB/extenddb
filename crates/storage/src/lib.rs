@@ -9,6 +9,7 @@
 
 pub mod authorization_store;
 pub mod backend;
+pub mod backup_definition;
 pub mod bootstrapper;
 pub mod config;
 pub mod diagnostics;
@@ -24,6 +25,7 @@ pub mod vector_catalog;
 pub mod vector_lifecycle;
 
 pub use backend::{Backend, BackendAlreadySet, backend_name, set_backend, try_backend};
+pub use backup_definition::RestoreTableOverrides;
 
 pub use transact::{IdempotencyKey, TransactGetOp, TransactWriteOp};
 
@@ -700,12 +702,14 @@ pub trait BackupEngine: Send + Sync {
     ///
     /// `account_id` is the caller's account: it owns the new table *and* scopes
     /// the source backup lookup, since a backup can only be restored by the
-    /// account that owns it.
+    /// account that owns it. `overrides` explicitly supplies any validated
+    /// billing mode and provisioned throughput replacements for the new table.
     fn restore_table_from_backup(
         &self,
         account_id: &str,
         target_table_name: &str,
         backup_arn: &str,
+        overrides: RestoreTableOverrides,
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>>;
 
     /// Describe continuous backups / PITR status for a table.

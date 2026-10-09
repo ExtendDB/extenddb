@@ -11,8 +11,9 @@ use serde::Deserialize;
 /// SQLite backend configuration.
 ///
 /// `path` is the database file location; `:memory:` selects an ephemeral
-/// in-memory database. `pool_size` bounds the read connection pool (writes are
-/// serialized by the engine regardless).
+/// in-memory database. `pool_size` bounds the connection pool (writes are
+/// serialized by the engine regardless). File databases clamp this to at least
+/// two connections so a backup reader can coexist with its batched writer.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SqliteConfig {

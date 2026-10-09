@@ -546,10 +546,10 @@ Check that PostgreSQL is running and the connection string in `extenddb.toml` is
 
 <!-- version-literal-ok: the block below is an example mismatch error; 1.0.0 is the value found on disk, not a version claim -->
 ```
-Error: catalog version mismatch: found 1.0.0, expected 0.0.3
+Error: catalog version mismatch: found 1.0.0, expected 0.0.4
 ```
 
-Run `extenddb migrate --config extenddb.toml` to upgrade the catalog schema. The check is exact equality in both directions, so this also appears when a binary meets a catalog a newer build already migrated; in that case upgrade the binary rather than the catalog. See the Upgrade Manual for the version history and the stop / migrate / start sequence.
+Run `extenddb migrate --config extenddb.toml` to upgrade the catalog schema. The check is exact equality in both directions, so this also appears when a binary meets a catalog a newer build already migrated; in that case upgrade the binary rather than the catalog. `extenddb migrate` refuses a catalog newer than the binary (`catalog version X is newer than this binary's Y`) instead of stamping the older version onto it. See the Upgrade Manual for the version history and the stop / migrate / start sequence.
 
 ### Authentication Errors
 
