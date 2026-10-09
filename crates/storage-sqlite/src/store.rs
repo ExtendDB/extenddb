@@ -55,6 +55,9 @@ pub struct SqliteEngine {
     pub(crate) pool: SqlitePool,
     pub(crate) region: String,
     pub(crate) max_item_size_bytes: usize,
+    /// Whether this engine owns a single-connection in-memory database.
+    /// Backup strategy depends on this property, not on user pool sizing.
+    pub(crate) in_memory: bool,
     /// Wakes the control-plane poller when a table enters CREATING / DELETING.
     pub(crate) control_plane_notify: Arc<tokio::sync::Notify>,
     /// Cached default GSI propagation delay (ms); refreshed by a worker and
@@ -91,17 +94,19 @@ impl SqliteEngine {
         max_item_size_bytes: usize,
     ) -> Result<Self, StorageError> {
         let url = sqlite_url(path_or_url);
+        // Use the same parsed-location classifier as the serve lock. String
+        // containment misclassifies file names such as `mode=memory.db`.
+        let in_memory = crate::serve_lock::database_file(path_or_url)
+            .map_err(StorageError::Connection)?
+            .is_none();
         // An in-memory database lives only inside its own connection: a second
-        // connection opens a *separate* empty database. So for `:memory:` we pin
-        // the pool to a single connection that is never recycled (idle and
-        // lifetime timeouts disabled), guaranteeing one shared database for the
-        // process lifetime. Writes are already serialized by `write_lock`, so a
-        // single connection costs only read concurrency — acceptable for the
-        // ephemeral in-memory use case. File-backed databases keep the full WAL
-        // pool (concurrent readers alongside a single writer).
-        let in_memory = url.contains(":memory:") || url.contains("mode=memory");
+        // connection opens a *separate* empty database. So for an in-memory
+        // location we pin the pool to a single connection that is never
+        // recycled. File-backed backups hold a WAL reader while committing
+        // bounded backup-item batches, so they require a second connection
+        // even when `pool_size = 1` was configured.
         let mut opts = SqlitePoolOptions::new()
-            .max_connections(if in_memory { 1 } else { pool_size.max(1) })
+            .max_connections(if in_memory { 1 } else { pool_size.max(2) })
             .min_connections(1);
         if in_memory {
             opts = opts.idle_timeout(None).max_lifetime(None);
@@ -151,6 +156,7 @@ impl SqliteEngine {
             pool,
             region: region.to_owned(),
             max_item_size_bytes,
+            in_memory,
             control_plane_notify: Arc::new(tokio::sync::Notify::new()),
             index_propagation_delay_cache: Arc::new(AtomicU64::new(initial_index_delay)),
             gsi_notify: Arc::new(tokio::sync::Notify::new()),

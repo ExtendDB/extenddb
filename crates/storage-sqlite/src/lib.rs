@@ -213,9 +213,7 @@ fn sqlite_server_components_factory(
         // works with a persistent path too; every bootstrap step is guarded
         // (IF NOT EXISTS / INSERT OR IGNORE), so re-running on an initialized
         // file is a no-op. Production builds keep the explicit-`init` contract.
-        let in_memory = db_path == ":memory:"
-            || db_path.starts_with("file::memory:")
-            || db_path.contains("mode=memory");
+        let in_memory = engine.in_memory;
         if in_memory || options.bootstrap_if_uninitialized {
             let admin_user = std::env::var("EXTENDDB_ADMIN_USER").ok();
             let admin_password = std::env::var("EXTENDDB_ADMIN_PASSWORD").ok();
@@ -249,6 +247,33 @@ fn sqlite_server_components_factory(
                 }
             }
             Err(e) => tracing::error!("Failed to recover control plane transitions: {e}"),
+        }
+
+        // Remove any restore target a prior crash left mid-copy. Before the
+        // server takes requests, so no restore can be in flight.
+        match engine.sweep_abandoned_restores().await {
+            Ok(names) => {
+                for name in &names {
+                    tracing::warn!(
+                        "removed table '{name}': its restore did not finish before the last \
+                         shutdown"
+                    );
+                }
+            }
+            Err(e) => tracing::error!("Failed to sweep abandoned restores: {e}"),
+        }
+
+        // Likewise a backup a prior crash left CREATING: its items were only
+        // partly copied, and nothing will finish them.
+        match engine.sweep_incomplete_backups().await {
+            Ok(arns) => {
+                for arn in &arns {
+                    tracing::warn!(
+                        "removed backup {arn}: its copy did not finish before the last shutdown"
+                    );
+                }
+            }
+            Err(e) => tracing::error!("Failed to sweep incomplete backups: {e}"),
         }
 
         // Rebuild any GSI left mid-backfill (status CREATING) by a prior crash.

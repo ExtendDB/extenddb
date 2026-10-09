@@ -26,6 +26,32 @@ impl PostgresEngine {
         input: CreateTableInput,
         defer_active: bool,
     ) -> Result<TableDescription, StorageError> {
+        self.create_table_impl_inner(account_id, input, defer_active, None)
+            .await
+    }
+
+    /// Create a restore target while holding a share lock on its AVAILABLE
+    /// source backup, and record the provenance before the catalog transaction
+    /// commits. A concurrent DeleteBackup therefore orders wholly before this
+    /// transaction (and no target is created) or wholly after it (and sees a
+    /// CREATING restore that is using the backup).
+    pub(crate) async fn create_table_for_restore(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        backup_arn: &str,
+    ) -> Result<TableDescription, StorageError> {
+        self.create_table_impl_inner(account_id, input, true, Some(backup_arn))
+            .await
+    }
+
+    async fn create_table_impl_inner(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        defer_active: bool,
+        restore_source_backup_arn: Option<&str>,
+    ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
         let table_id = uuid::Uuid::new_v4().to_string();
         let table_arn = table_arn(&self.region, account_id, &input.table_name);
@@ -65,6 +91,23 @@ impl PostgresEngine {
             .begin()
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        if let Some(backup_arn) = restore_source_backup_arn {
+            let available: Option<i32> = sqlx::query_scalar(
+                "SELECT 1 FROM backups WHERE backup_arn = $1 AND account_id = $2 \
+                 AND backup_status = 'AVAILABLE' FOR SHARE",
+            )
+            .bind(backup_arn)
+            .bind(account_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if available.is_none() {
+                return Err(StorageError::Validation(format!(
+                    "Backup not found: {backup_arn}"
+                )));
+            }
+        }
 
         // Insert table metadata, returning creation timestamp and actual status.
         // Use PG error code 23505 for robust duplicate detection instead of string matching.
@@ -118,6 +161,15 @@ impl PostgresEngine {
             }
             _ => StorageError::Internal(e.to_string()),
         })?;
+
+        if let Some(backup_arn) = restore_source_backup_arn {
+            sqlx::query("INSERT INTO table_restores (table_id, source_backup_arn) VALUES ($1, $2)")
+                .bind(&table_id)
+                .bind(backup_arn)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
 
         // Insert GSI metadata
         // F-1: Store full ProvisionedThroughputDescription (not the input

@@ -4,9 +4,9 @@
 
 ## Current Status
 
-Catalog 0.0.3 is current. The 0.0.2 to 0.0.3 upgrade is the first in-place catalog upgrade ExtendDB has, and **every existing PostgreSQL deployment must run it**, including deployments that never use vector indexes: the server refuses to start against a catalog version it was not built for.
+Catalog 0.0.4 is current. **Every existing PostgreSQL and SQLite deployment must run `extenddb migrate`** to reach it: the server refuses to start against a catalog version it was not built for.
 
-See [Catalog 0.0.3](#catalog-003-current) below for what changes and the exact sequence.
+See [Catalog 0.0.4](#catalog-004-current) below for what changes and the exact sequence. <!-- version-literal-ok: names the current version and the history below -->
 
 ## How Catalog Upgrades Work
 
@@ -16,7 +16,8 @@ Migrations are SQL files in `crates/storage-postgres/migrations/`, applied in fi
 
 ```
 001_schema.sql            ← the complete initial schema
-002_vector_indexes.sql    ← vector index metadata, catalog 0.0.3
+002_vector_indexes.sql    ← vector index metadata, catalog 0.0.3 <!-- version-literal-ok: history -->
+003_backup_definitions.sql ← backup table definitions, catalog 0.0.4
 ```
 
 The `schema_history` table tracks which files have been applied. When `extenddb migrate` runs, it:
@@ -181,7 +182,30 @@ psql -d extenddb_catalog -f catalog_backup_YYYYMMDD.sql
 
 ## Version History
 
-### Catalog 0.0.3 (Current)
+### Catalog 0.0.4 (Current)
+
+Adds the table definition a backup records:
+
+- New `backup_definitions` table: one row per backup, holding the source table's global and local secondary indexes, billing mode and provisioned throughput, table class, and encryption settings. RestoreTableFromBackup recreates them. A backup taken before this upgrade has no row and restores as before, with its keys and items but no secondary indexes.
+- New `table_restores` table: one row per table created by RestoreTableFromBackup, naming the backup and the restore time. DescribeTable reports it as `RestoreSummary`, and DeleteBackup is refused with `BackupInUseException` while a restore from the backup is still running. Tables restored before this upgrade have no row and report no `RestoreSummary`.
+
+Any PostgreSQL table that the old restore bug left in `CREATING` matches the abandoned-restore sweep predicate and is removed on the first control-plane pass after the upgrade. Operators will see those names disappear from `ListTables`; that cleanup is the intended outcome.
+
+Upgrade sequence, on PostgreSQL and SQLite alike:
+
+```bash
+extenddb stop --config extenddb.toml
+extenddb migrate --yes --config extenddb.toml
+extenddb serve --config extenddb.toml
+```
+
+Run `extenddb migrate` without `--yes` first to see what is pending; it reports `catalog 0.0.3 -> 0.0.4` and changes nothing. <!-- version-literal-ok: names both ends of the upgrade -->
+
+On SQLite, both `migrate` and `serve` acquire the same exclusive lock for the database file, so migration refuses to run while a server is up; stop the server first, as the sequence above does. On startup the SQLite server also removes any restore target left in `CREATING` by a crash, which is only safe because one server at a time can hold the file. A backup keeps a WAL read snapshot open while it copies; checkpoints cannot reclaim pages needed by that snapshot, so allow disk headroom for WAL growth proportional to the backup duration and concurrent write volume.
+
+The upgrade is not reversible in place: a 0.0.3 binary refuses to start against a 0.0.4 catalog. Roll back by restoring the catalog backup taken before the upgrade, as described above. Backups live in the catalog, so that restore also removes every backup created after the upgrade. <!-- version-literal-ok: history -->
+
+### Catalog 0.0.3
 
 Adds vector index metadata:
 

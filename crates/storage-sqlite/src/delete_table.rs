@@ -37,6 +37,29 @@ impl SqliteEngine {
             return Err(StorageError::DeletionProtected(row.table_arn.clone()));
         }
 
+        // A restore target (CREATING with no scheduled transition) is being
+        // filled by RestoreTableFromBackup. The service refuses to delete a
+        // table it is still creating, and deleting this one would make the
+        // restore fail part-way; refuse until the restore finishes. An
+        // abandoned target is removed by the restore sweep, not here.
+        if row.table_status == "CREATING" {
+            let restoring: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM tables WHERE table_id = ? \
+                 AND table_status = 'CREATING' AND status_transition_at IS NULL)",
+            )
+            .bind(&row.table_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if restoring {
+                return Err(StorageError::IndexesInUse(format!(
+                    "Attempt to change a resource which is still in use: Table is being \
+                     restored: {}",
+                    row.table_name
+                )));
+            }
+        }
+
         let index_rows: Vec<IndexRow> = sqlx::query_as(&format!(
             "SELECT {INDEX_COLUMNS} FROM indexes WHERE table_id = ?"
         ))

@@ -26,8 +26,8 @@ use extenddb_core::types::{
     PointInTimeRecoveryDescription, Projection, ProvisionedThroughput, SourceTableDetails,
     TableDescription,
 };
-use extenddb_storage::BackupEngine;
 use extenddb_storage::error::StorageError;
+use extenddb_storage::{BackupEngine, RestoreTableOverrides};
 
 use crate::MongoEngine;
 use crate::data::data_collection_name;
@@ -99,6 +99,251 @@ fn restore_provisioned_throughput(
         }))
     } else {
         None
+    }
+}
+
+/// GSI throughput follows the table's billing mode the same way: a table
+/// switched from PROVISIONED to PAY_PER_REQUEST keeps its indexes' old
+/// capacities in the catalog, and restoring them would make the restored
+/// on-demand table's indexes report capacity a fresh one does not.
+fn restore_gsi_throughput(
+    billing_mode: &str,
+    gsis: Option<Vec<GsiInput>>,
+) -> Option<Vec<GsiInput>> {
+    if billing_mode == "PROVISIONED" {
+        return gsis;
+    }
+    gsis.map(|gsis| {
+        gsis.into_iter()
+            .map(|mut gsi| {
+                gsi.provisioned_throughput = None;
+
+                gsi
+            })
+            .collect()
+    })
+}
+
+/// A restore first claims backup metadata, then transfers protection to the
+/// provenance-bearing CREATING target. DeleteBackup claims the same metadata
+/// before dropping data, so neither operation can pass the other between its
+/// check and destructive action.
+fn restore_claim_filter(account_id: &str, backup_arn: &str) -> Document {
+    doc! {
+        "_id": backup_arn,
+        "account_id": account_id,
+        "backup_status": "AVAILABLE",
+        "restore_in_progress": { "$exists": false },
+        "delete_in_progress": { "$exists": false },
+    }
+}
+
+fn delete_claim_filter(account_id: &str, backup_arn: &str) -> Document {
+    doc! {
+        "_id": backup_arn,
+        "account_id": account_id,
+        "backup_status": "AVAILABLE",
+        "restore_in_progress": { "$exists": false },
+        "delete_in_progress": { "$exists": false },
+    }
+}
+
+fn restoring_target_filter(account_id: &str, backup_arn: &str) -> Document {
+    doc! {
+        "_id.account_id": account_id,
+        "restore_source_backup_arn": backup_arn,
+        "table_status": "CREATING",
+    }
+}
+
+struct BackupMetadataClaim {
+    backups: mongodb::Collection<Document>,
+    account_id: String,
+    backup_arn: String,
+    field: &'static str,
+    operation_id: String,
+    armed: bool,
+}
+
+impl BackupMetadataClaim {
+    fn new(
+        backups: mongodb::Collection<Document>,
+        account_id: &str,
+        backup_arn: &str,
+        field: &'static str,
+        operation_id: String,
+    ) -> Self {
+        Self {
+            backups,
+            account_id: account_id.to_owned(),
+            backup_arn: backup_arn.to_owned(),
+            field,
+            operation_id,
+            armed: true,
+        }
+    }
+
+    fn filter(&self) -> Document {
+        let mut filter = doc! {
+            "_id": &self.backup_arn,
+            "account_id": &self.account_id,
+        };
+        filter.insert(self.field, &self.operation_id);
+        filter
+    }
+
+    fn unset_update(field: &'static str) -> Document {
+        let mut unset = Document::new();
+        unset.insert(field, "");
+        doc! { "$unset": unset }
+    }
+
+    async fn release(&mut self) -> Result<(), StorageError> {
+        if !self.armed {
+            return Ok(());
+        }
+        self.backups
+            .update_one(self.filter(), Self::unset_update(self.field))
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        self.armed = false;
+        Ok(())
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BackupMetadataClaim {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let backups = self.backups.clone();
+        let filter = self.filter();
+        let update = Self::unset_update(self.field);
+        let backup_arn = self.backup_arn.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let _cleanup = runtime.spawn(async move {
+                if let Err(error) = backups.update_one(filter, update).await {
+                    tracing::error!(
+                        "could not clear cancelled backup metadata claim for {backup_arn}: {error}"
+                    );
+                }
+            });
+        }
+    }
+}
+
+impl MongoEngine {
+    /// Clear the backup-metadata claims a process that died mid-operation
+    /// left behind. Both markers belong to one process: `restore_in_progress`
+    /// is held only until the restore's target exists (after that the
+    /// CREATING target itself keeps DeleteBackup out), and `delete_in_progress`
+    /// only until the drop and the DELETED stamp. Neither survives a crash
+    /// usefully, and left in place each would make the backup undeletable or
+    /// unrestorable for good. Run at startup, before requests are served, so
+    /// no live claim can be swept.
+    ///
+    /// A stale restore claim is simply removed: the restore never created its
+    /// target (the marker is released once it has), so there is nothing else
+    /// to undo. A stale delete claim is finished rather than released: the
+    /// caller already received an answer or died waiting for one, the
+    /// collection drop is idempotent, and leaving the backup AVAILABLE could
+    /// point at data the crash already dropped.
+    pub async fn sweep_stale_backup_claims(&self) -> Result<(usize, usize), StorageError> {
+        let backups_coll = self.catalog_db.collection::<Document>("backups");
+        let restores = backups_coll
+            .update_many(
+                doc! { "restore_in_progress": { "$exists": true } },
+                doc! { "$unset": { "restore_in_progress": "" } },
+            )
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .modified_count;
+
+        let mut deletes = 0usize;
+        let mut pending = backups_coll
+            .find(doc! { "delete_in_progress": { "$exists": true } })
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        while let Some(meta) = pending
+            .try_next()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?
+        {
+            if let Ok(backup_id) = meta.get_str("backup_id") {
+                self.drop_collection_if_exists(&backup_collection_name(backup_id))
+                    .await?;
+            }
+            let id = meta
+                .get_str("_id")
+                .map_err(|_| StorageError::Internal("backup without _id".to_owned()))?;
+            backups_coll
+                .update_one(
+                    doc! { "_id": id },
+                    doc! {
+                        "$set": { "backup_status": "DELETED" },
+                        "$unset": { "delete_in_progress": "" },
+                    },
+                )
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            deletes += 1;
+        }
+        Ok((usize::try_from(restores).unwrap_or(usize::MAX), deletes))
+    }
+}
+
+impl MongoEngine {
+    /// Remove a partial restore target without allowing its provenance to keep
+    /// the source backup in use. The full predicate ensures cleanup can only
+    /// claim the target created by this restore.
+    async fn abort_backup_restore(
+        &self,
+        account_id: &str,
+        target_table_name: &str,
+        backup_arn: &str,
+        restore_operation_id: &str,
+    ) -> Result<bool, StorageError> {
+        let removed = self
+            .catalog_db
+            .collection::<Document>("tables")
+            .find_one_and_delete(doc! {
+                "_id": { "account_id": account_id, "table_name": target_table_name },
+                "restore_source_backup_arn": backup_arn,
+                "restore_operation_id": restore_operation_id,
+                "table_status": "CREATING",
+                "status_transition_at": bson::Bson::Null,
+            })
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let Some(removed) = removed else {
+            return Ok(false);
+        };
+        let table_id = removed
+            .get_str("table_id")
+            .map_err(|_| StorageError::Internal("restore target missing table_id".to_owned()))?;
+
+        // The catalog row is already gone, so even a failed physical cleanup
+        // cannot leave provenance that blocks DeleteBackup. Try every cleanup
+        // step before returning the first error so retries have less to do.
+        let mut cleanup_error = None;
+        let collection = data_collection_name(table_id);
+        if let Err(e) = self.drop_collection_if_exists(&collection).await {
+            cleanup_error = Some(e);
+        }
+        if let Err(e) = self.drop_index_collections_for_table(table_id).await {
+            cleanup_error.get_or_insert(e);
+        }
+        self.gsi_cache_invalidate(table_id);
+
+        if let Some(e) = cleanup_error {
+            Err(e)
+        } else {
+            Ok(true)
+        }
     }
 }
 
@@ -491,36 +736,117 @@ impl BackupEngine for MongoEngine {
         let backup_arn = backup_arn.to_string();
         Box::pin(async move {
             let desc = self.describe_backup(&account_id, &backup_arn).await?;
-
-            // Look up the physical collection name from metadata (account-scoped).
             let backups_coll = self.catalog_db.collection::<Document>("backups");
-            let meta = backups_coll
-                .find_one(doc! { "_id": &backup_arn, "account_id": &account_id })
+            let tables_coll = self.catalog_db.collection::<Document>("tables");
+
+            // Fast-path the durable half of the two-phase restore claim.
+            if let Some(target) = tables_coll
+                .find_one(restoring_target_filter(&account_id, &backup_arn))
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?
-                .ok_or_else(|| {
-                    StorageError::Validation(format!("Backup not found: {backup_arn}"))
-                })?;
+            {
+                let name = target
+                    .get_document("_id")
+                    .ok()
+                    .and_then(|id| id.get_str("table_name").ok())
+                    .unwrap_or("?");
+                return Err(StorageError::BackupInUse(format!(
+                    "Backup is being used to restore table {name}: {backup_arn}"
+                )));
+            }
 
-            // Drop the backup collection. If backup_id is absent (e.g., a
-            // pre-`$out` backup on an old catalog) we skip — nothing to drop
-            // at the collection level in that case.
+            // Atomically claim deletion only when restore has not claimed the
+            // metadata. Restore uses the inverse predicate, so once either
+            // marker is installed the other operation cannot start.
+            let delete_operation_id = uuid::Uuid::new_v4().to_string();
+            let meta = backups_coll
+                .find_one_and_update(
+                    delete_claim_filter(&account_id, &backup_arn),
+                    doc! { "$set": { "delete_in_progress": &delete_operation_id } },
+                )
+                .return_document(mongodb::options::ReturnDocument::Before)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let Some(meta) = meta else {
+                let restoring = tables_coll
+                    .find_one(restoring_target_filter(&account_id, &backup_arn))
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?
+                    .is_some();
+                let claimed_by_restore = backups_coll
+                    .find_one(doc! {
+                        "_id": &backup_arn,
+                        "account_id": &account_id,
+                        "backup_status": "AVAILABLE",
+                        "restore_in_progress": { "$exists": true },
+                    })
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?
+                    .is_some();
+                if restoring || claimed_by_restore {
+                    return Err(StorageError::BackupInUse(format!(
+                        "Backup is being used by a restore: {backup_arn}"
+                    )));
+                }
+                return Err(StorageError::Validation(format!(
+                    "Backup not found: {backup_arn}"
+                )));
+            };
+            let mut delete_claim = BackupMetadataClaim::new(
+                backups_coll.clone(),
+                &account_id,
+                &backup_arn,
+                "delete_in_progress",
+                delete_operation_id,
+            );
+
+            // A restore can transfer its marker to a target between the first
+            // target read and our metadata claim. Recheck after claiming; new
+            // restores are now excluded by delete_in_progress.
+            if let Some(target) = tables_coll
+                .find_one(restoring_target_filter(&account_id, &backup_arn))
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?
+            {
+                let name = target
+                    .get_document("_id")
+                    .ok()
+                    .and_then(|id| id.get_str("table_name").ok())
+                    .unwrap_or("?")
+                    .to_owned();
+                delete_claim.release().await?;
+                return Err(StorageError::BackupInUse(format!(
+                    "Backup is being used to restore table {name}: {backup_arn}"
+                )));
+            }
+
+            // Drop the backup collection. If backup_id is absent (for an old
+            // pre-$out backup), there is no physical collection to drop.
             if let Ok(backup_id) = meta.get_str("backup_id") {
                 let coll_name = backup_collection_name(backup_id);
                 let coll = self.data_db.collection::<Document>(&coll_name);
-                coll.drop()
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                if let Err(error) = coll.drop().await {
+                    if let Err(cleanup) = delete_claim.release().await {
+                        tracing::error!(
+                            "DeleteBackup {backup_arn} failed ({error}) and its metadata claim \
+                             could not be cleared: {cleanup}"
+                        );
+                    }
+                    return Err(StorageError::Internal(error.to_string()));
+                }
             }
 
-            // Mark backup as deleted (account-scoped)
             backups_coll
                 .update_one(
-                    doc! { "_id": &backup_arn, "account_id": &account_id },
-                    doc! { "$set": { "backup_status": "DELETED" } },
+                    delete_claim.filter(),
+                    doc! {
+                        "$set": { "backup_status": "DELETED" },
+                        "$unset": { "delete_in_progress": "" },
+                    },
                 )
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+            delete_claim.disarm();
 
             Ok(BackupDescription {
                 backup_details: BackupDetails {
@@ -537,164 +863,276 @@ impl BackupEngine for MongoEngine {
         account_id: &str,
         target_table_name: &str,
         backup_arn: &str,
+        overrides: RestoreTableOverrides,
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
         let account_id = account_id.to_string();
         let target_table_name = target_table_name.to_string();
         let backup_arn = backup_arn.to_string();
         Box::pin(async move {
             let backups_coll = self.catalog_db.collection::<Document>("backups");
+            let restore_operation_id = uuid::Uuid::new_v4().to_string();
             let backup_doc = backups_coll
-                // Scope to the calling account (defence-in-depth: the engine
-                // layer already enforces ARN ownership, and describe/delete are
-                // account-scoped at the storage layer too).
-                .find_one(doc! {
-                    "_id": &backup_arn,
-                    "account_id": &account_id,
-                    "backup_status": "AVAILABLE",
-                })
+                // This metadata marker is phase one of the restore claim. It is
+                // installed atomically with the AVAILABLE check, before any
+                // restore state is derived, and excludes DeleteBackup's claim.
+                .find_one_and_update(
+                    restore_claim_filter(&account_id, &backup_arn),
+                    doc! { "$set": { "restore_in_progress": &restore_operation_id } },
+                )
+                .return_document(mongodb::options::ReturnDocument::After)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?
                 .ok_or_else(|| {
                     StorageError::Validation(format!("Backup not found: {backup_arn}"))
                 })?;
+            let mut restore_claim = BackupMetadataClaim::new(
+                backups_coll.clone(),
+                &account_id,
+                &backup_arn,
+                "restore_in_progress",
+                restore_operation_id.clone(),
+            );
 
-            let key_schema_bson = backup_doc
-                .get_array("key_schema")
-                .map_err(|_| StorageError::Internal("missing key_schema".to_string()))?;
-            let attr_defs_bson = backup_doc
-                .get_array("attribute_definitions")
-                .map_err(|_| StorageError::Internal("missing attribute_definitions".to_string()))?;
-            let billing = backup_doc
-                .get_str("billing_mode")
-                .unwrap_or("PAY_PER_REQUEST");
+            let prepared = async {
+                let key_schema_bson = backup_doc
+                    .get_array("key_schema")
+                    .map_err(|_| StorageError::Internal("missing key_schema".to_string()))?;
+                let attr_defs_bson =
+                    backup_doc.get_array("attribute_definitions").map_err(|_| {
+                        StorageError::Internal("missing attribute_definitions".to_string())
+                    })?;
+                let billing = backup_doc
+                    .get_str("billing_mode")
+                    .unwrap_or("PAY_PER_REQUEST");
+                let effective_billing = match overrides.billing_mode {
+                    Some(extenddb_core::types::BillingMode::Provisioned) => "PROVISIONED",
+                    Some(extenddb_core::types::BillingMode::PayPerRequest) => "PAY_PER_REQUEST",
+                    None => billing,
+                };
 
-            let ks_json = serde_json::to_value(key_schema_bson)
-                .map_err(|e| StorageError::Internal(format!("serialize key_schema: {e}")))?;
-            let ad_json = serde_json::to_value(attr_defs_bson)
-                .map_err(|e| StorageError::Internal(format!("serialize attr_defs: {e}")))?;
+                let ks_json = serde_json::to_value(key_schema_bson)
+                    .map_err(|e| StorageError::Internal(format!("serialize key_schema: {e}")))?;
+                let ad_json = serde_json::to_value(attr_defs_bson)
+                    .map_err(|e| StorageError::Internal(format!("serialize attr_defs: {e}")))?;
 
-            let key_schema: Vec<extenddb_core::types::KeySchemaElement> =
-                serde_json::from_value(ks_json)
-                    .map_err(|e| StorageError::Internal(format!("parse key_schema: {e}")))?;
-            let attr_defs: Vec<extenddb_core::types::AttributeDefinition> =
-                serde_json::from_value(ad_json)
-                    .map_err(|e| StorageError::Internal(format!("parse attr_defs: {e}")))?;
+                let key_schema: Vec<extenddb_core::types::KeySchemaElement> =
+                    serde_json::from_value(ks_json)
+                        .map_err(|e| StorageError::Internal(format!("parse key_schema: {e}")))?;
+                let attr_defs: Vec<extenddb_core::types::AttributeDefinition> =
+                    serde_json::from_value(ad_json)
+                        .map_err(|e| StorageError::Internal(format!("parse attr_defs: {e}")))?;
 
-            let billing_mode = if billing == "PAY_PER_REQUEST" {
-                Some(extenddb_core::types::BillingMode::PayPerRequest)
-            } else {
-                Some(extenddb_core::types::BillingMode::Provisioned)
-            };
+                let billing_mode = if effective_billing == "PAY_PER_REQUEST" {
+                    Some(extenddb_core::types::BillingMode::PayPerRequest)
+                } else {
+                    Some(extenddb_core::types::BillingMode::Provisioned)
+                };
 
-            // New backups preserve these fields. Keep the old 5/5 fallback
-            // for backups created before the metadata was added, while
-            // correctly omitting provisioned throughput for on-demand tables.
-            let provisioned_throughput: Option<ProvisionedThroughput> =
-                decode_optional(&backup_doc, "provisioned_throughput")?;
-            let provisioned_throughput =
-                restore_provisioned_throughput(billing, provisioned_throughput);
-            let global_secondary_indexes: Option<Vec<GsiInput>> =
-                decode_optional(&backup_doc, "global_secondary_indexes")?;
-            let local_secondary_indexes: Option<Vec<LsiInput>> =
-                decode_optional(&backup_doc, "local_secondary_indexes")?;
+                // New backups preserve these fields. Keep the old 5/5 fallback
+                // for backups created before the metadata was added, while
+                // correctly omitting provisioned throughput for on-demand tables.
+                let mut provisioned_throughput: Option<ProvisionedThroughput> =
+                    decode_optional(&backup_doc, "provisioned_throughput")?;
+                if let Some(throughput) = overrides.provisioned_throughput.clone() {
+                    provisioned_throughput = Some(throughput);
+                }
+                let provisioned_throughput =
+                    restore_provisioned_throughput(effective_billing, provisioned_throughput);
+                let global_secondary_indexes: Option<Vec<GsiInput>> =
+                    decode_optional(&backup_doc, "global_secondary_indexes")?;
+                let global_secondary_indexes =
+                    restore_gsi_throughput(effective_billing, global_secondary_indexes);
+                let local_secondary_indexes: Option<Vec<LsiInput>> =
+                    decode_optional(&backup_doc, "local_secondary_indexes")?;
 
-            // Preserve the source table's TableClass / SSESpecification /
-            // OnDemandThroughput settings when recreating.
-            let table_class = backup_doc.get_str("table_class").ok().map(str::to_owned);
-            let sse_specification: Option<serde_json::Value> =
-                backup_doc.get("sse_specification").and_then(|b| {
-                    if matches!(b, mongodb::bson::Bson::Null) {
-                        None
-                    } else {
-                        bson::from_bson(b.clone()).ok()
+                // Preserve the source table's TableClass / SSESpecification /
+                // OnDemandThroughput settings when recreating.
+                let table_class = backup_doc.get_str("table_class").ok().map(str::to_owned);
+                let sse_specification: Option<serde_json::Value> =
+                    backup_doc.get("sse_specification").and_then(|b| {
+                        if matches!(b, mongodb::bson::Bson::Null) {
+                            None
+                        } else {
+                            bson::from_bson(b.clone()).ok()
+                        }
+                    });
+                let on_demand_throughput: Option<extenddb_core::types::OnDemandThroughput> =
+                    backup_doc.get("on_demand_throughput").and_then(|b| {
+                        if matches!(b, mongodb::bson::Bson::Null) {
+                            None
+                        } else {
+                            bson::from_bson(b.clone()).ok()
+                        }
+                    });
+
+                if effective_billing == "PROVISIONED"
+                    && let Some(index) = global_secondary_indexes
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .find(|index| index.provisioned_throughput.is_none())
+                {
+                    return Err(StorageError::Validation(format!(
+                        "One or more parameter values were invalid: GlobalSecondaryIndexOverride \
+                     must be specified for index: {} when BillingModeOverride is PROVISIONED",
+                        index.index_name
+                    )));
+                }
+
+                let create_input = extenddb_core::types::CreateTableInput {
+                    table_name: target_table_name.clone(),
+                    key_schema,
+                    attribute_definitions: attr_defs,
+                    billing_mode,
+                    provisioned_throughput,
+                    global_secondary_indexes,
+                    local_secondary_indexes,
+                    stream_specification: None,
+                    tags: None,
+                    deletion_protection_enabled: None,
+                    sse_specification,
+                    table_class,
+                    on_demand_throughput,
+                    // Fields for features this backend does not implement, vector
+                    // indexes today, take their defaults. Adding one to
+                    // CreateTableInput then does not break this build.
+                    ..Default::default()
+                };
+                Ok::<_, StorageError>(create_input)
+            }
+            .await;
+            let create_input = match prepared {
+                Ok(input) => input,
+                Err(error) => {
+                    if let Err(cleanup) = restore_claim.release().await {
+                        tracing::error!(
+                            "restore of {backup_arn} failed validation ({error}) and its metadata \
+                             claim could not be cleared: {cleanup}"
+                        );
                     }
-                });
-            let on_demand_throughput: Option<extenddb_core::types::OnDemandThroughput> =
-                backup_doc.get("on_demand_throughput").and_then(|b| {
-                    if matches!(b, mongodb::bson::Bson::Null) {
-                        None
-                    } else {
-                        bson::from_bson(b.clone()).ok()
+                    return Err(error);
+                }
+            };
+
+            // Provenance is part of the initial CREATING document. Keep the
+            // metadata marker until target creation returns: protection then
+            // overlaps, and DeleteBackup can observe neither an unclaimed
+            // backup nor an ownerless target.
+            let restore_at = bson::DateTime::now();
+            let created = self
+                .create_table_for_restore(
+                    &account_id,
+                    create_input,
+                    &backup_arn,
+                    restore_at,
+                    &restore_operation_id,
+                )
+                .await;
+            let mut desc = match created {
+                Ok(desc) => {
+                    if let Err(claim_error) = restore_claim.release().await {
+                        if let Err(cleanup) = self
+                            .abort_backup_restore(
+                                &account_id,
+                                &target_table_name,
+                                &backup_arn,
+                                &restore_operation_id,
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                "restore of {backup_arn} could not transfer its metadata claim \
+                                 ({claim_error}) and target cleanup failed: {cleanup}"
+                            );
+                        }
+                        return Err(claim_error);
                     }
+                    desc
+                }
+                Err(error) => {
+                    if let Err(cleanup) = self
+                        .abort_backup_restore(
+                            &account_id,
+                            &target_table_name,
+                            &backup_arn,
+                            &restore_operation_id,
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            "restore of {backup_arn} into {target_table_name} failed during \
+                             target creation ({error}), and cleanup failed: {cleanup}"
+                        );
+                    }
+                    if let Err(cleanup) = restore_claim.release().await {
+                        tracing::error!(
+                            "restore of {backup_arn} failed during target creation ({error}), and \
+                             its metadata claim could not be cleared: {cleanup}"
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            #[allow(clippy::cast_precision_loss)]
+            {
+                desc.restore_summary = Some(extenddb_core::types::RestoreSummary {
+                    source_backup_arn: Some(backup_arn.clone()),
+                    restore_date_time: restore_at.timestamp_millis() as f64 / 1000.0,
+                    restore_in_progress: true,
                 });
+            }
 
-            let create_input = extenddb_core::types::CreateTableInput {
-                table_name: target_table_name.clone(),
-                key_schema,
-                attribute_definitions: attr_defs,
-                billing_mode,
-                provisioned_throughput,
-                global_secondary_indexes,
-                local_secondary_indexes,
-                stream_specification: None,
-                tags: None,
-                deletion_protection_enabled: None,
-                sse_specification,
-                table_class,
-                on_demand_throughput,
-                // Fields for features this backend does not implement, vector
-                // indexes today, take their defaults. Adding one to
-                // CreateTableInput then does not break this build.
-                ..Default::default()
-            };
+            let copied = async {
+                // Restore items from the backup collection using server-side
+                // `$out`. The backup collection has the source document shape,
+                // so this is a direct clone with no per-item transformation.
+                let backup_id = backup_doc
+                    .get_str("backup_id")
+                    .map_err(|_| {
+                        StorageError::Internal("backup metadata missing backup_id".to_string())
+                    })?
+                    .to_owned();
+                let src_coll_name = backup_collection_name(&backup_id);
+                let src_coll = self.data_db.collection::<Document>(&src_coll_name);
+                let new_coll_name = data_collection_name(&desc.table_id);
 
-            // Create the table with the ACTIVE transition deferred: it enters
-            // CREATING with no scheduled flip, so the table cannot become
-            // ACTIVE until we schedule it below, after the data copy completes.
-            let desc = self
-                .create_table_impl(&account_id, create_input, true)
-                .await?;
+                // The test-hook gate holds the restore after its CREATING index
+                // metadata exists but before the base `$out` copy begins. This
+                // lets the integration test force a worker tick through the
+                // dangerous pre-copy window.
+                self.wait_for_gsi_backfill_test_gate(&target_table_name)
+                    .await?;
 
-            // Restore items from the backup collection using server-side `$out`.
-            // The backup collection was written by `create_backup` in the same
-            // document shape as the source data collection, so this is a
-            // direct clone — no per-item transformation needed.
-            let backup_id = backup_doc
-                .get_str("backup_id")
-                .map_err(|_| {
-                    StorageError::Internal("backup metadata missing backup_id".to_string())
-                })?
-                .to_owned();
-            let src_coll_name = backup_collection_name(&backup_id);
-            let src_coll = self.data_db.collection::<Document>(&src_coll_name);
-            let new_coll_name = data_collection_name(&desc.table_id);
+                let pipeline = vec![doc! { "$out": &new_coll_name }];
+                let out_cursor = src_coll
+                    .aggregate(pipeline)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let _drained: Vec<Document> = out_cursor
+                    .try_collect()
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            // The test-hook gate holds the restore after its CREATING index
-            // metadata exists but before the base `$out` copy begins. This
-            // lets the integration test force a worker tick through the
-            // dangerous pre-copy window.
-            self.wait_for_gsi_backfill_test_gate(&target_table_name)
-                .await?;
+                let new_data_coll = self.data_db.collection::<Document>(&new_coll_name);
+                let item_count = new_data_coll
+                    .count_documents(doc! {})
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?
+                    as i64;
 
-            let pipeline = vec![doc! { "$out": &new_coll_name }];
-            let out_cursor = src_coll
-                .aggregate(pipeline)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let _drained: Vec<Document> = out_cursor
-                .try_collect()
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            let new_data_coll = self.data_db.collection::<Document>(&new_coll_name);
-            let item_count = new_data_coll
-                .count_documents(doc! {})
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?
-                as i64;
-
-            // The base `$out` copy is complete, but restored secondary-index
-            // collections are still empty. Mark the table as pending restore
-            // completion and leave its indexes CREATING so the shared worker
-            // can backfill them in bounded, restartable batches.
-            let status_update = doc! {
-                "$set": {
-                    "item_count": item_count,
-                    "restore_backfill_pending": true,
-                },
-            };
-            let tables_coll = self.catalog_db.collection::<Document>("tables");
-            tables_coll
+                // The base `$out` copy is complete, but restored secondary-index
+                // collections are still empty. Mark the table as pending restore
+                // completion and leave its indexes CREATING so the shared worker
+                // can backfill them in bounded, restartable batches.
+                let status_update = doc! {
+                    "$set": {
+                        "item_count": item_count,
+                        "restore_backfill_pending": true,
+                    },
+                    "$unset": { "restore_operation_id": "" },
+                };
+                let tables_coll = self.catalog_db.collection::<Document>("tables");
+                tables_coll
                 .update_one(
                     doc! { "_id": { "account_id": &account_id, "table_name": &target_table_name } },
                     status_update,
@@ -702,10 +1140,38 @@ impl BackupEngine for MongoEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            // The table remains CREATING until the worker has populated every
-            // restored index. `desc` therefore reports CREATING, matching the
-            // DynamoDB restore lifecycle while allowing the request to return
-            // before potentially hundreds of thousands of index writes finish.
+                // The table remains CREATING until the worker has populated
+                // every restored index. The response therefore matches the
+                // restore lifecycle without waiting for the backfill.
+                Ok::<(), StorageError>(())
+            }
+            .await;
+
+            if let Err(e) = copied {
+                match self
+                    .abort_backup_restore(
+                        &account_id,
+                        &target_table_name,
+                        &backup_arn,
+                        &restore_operation_id,
+                    )
+                    .await
+                {
+                    Ok(true) => tracing::error!(
+                        "restore of {backup_arn} into {target_table_name} failed and the \
+                         partial target was removed: {e}"
+                    ),
+                    Ok(false) => tracing::error!(
+                        "restore of {backup_arn} into {target_table_name} failed after its \
+                         target was already removed: {e}"
+                    ),
+                    Err(cleanup) => tracing::error!(
+                        "restore of {backup_arn} into {target_table_name} failed ({e}), and \
+                         physical cleanup also failed: {cleanup}"
+                    ),
+                }
+                return Err(e);
+            }
 
             Ok(desc)
         })
@@ -813,7 +1279,12 @@ impl BackupEngine for MongoEngine {
                 .create_backup(&account_id, &source_table_name, "__pitr_restore__")
                 .await?;
             let desc = self
-                .restore_table_from_backup(&account_id, &target_table_name, &backup.backup_arn)
+                .restore_table_from_backup(
+                    &account_id,
+                    &target_table_name,
+                    &backup.backup_arn,
+                    RestoreTableOverrides::default(),
+                )
                 .await?;
             let _ = self.delete_backup(&account_id, &backup.backup_arn).await;
             Ok(desc)
@@ -823,9 +1294,39 @@ impl BackupEngine for MongoEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{insert_non_empty_array, restore_provisioned_throughput};
+    use super::{
+        delete_claim_filter, insert_non_empty_array, restore_claim_filter, restore_gsi_throughput,
+        restore_provisioned_throughput, restoring_target_filter,
+    };
     use extenddb_core::types::{GsiInput, ProvisionedThroughput};
     use mongodb::bson::Document;
+
+    #[test]
+    fn gsi_throughput_is_dropped_for_an_on_demand_table() {
+        use extenddb_core::types::{
+            GsiInput, KeySchemaElement, KeyType, Projection, ProjectionType,
+        };
+        let gsi = GsiInput {
+            index_name: "g".to_owned(),
+            key_schema: vec![KeySchemaElement {
+                attribute_name: "gpk".to_owned(),
+                key_type: KeyType::Hash,
+            }],
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
+            provisioned_throughput: Some(ProvisionedThroughput {
+                read_capacity_units: 7,
+                write_capacity_units: 8,
+            }),
+        };
+        let kept = restore_gsi_throughput("PROVISIONED", Some(vec![gsi.clone()])).expect("gsis");
+        assert!(kept[0].provisioned_throughput.is_some());
+        let dropped = restore_gsi_throughput("PAY_PER_REQUEST", Some(vec![gsi])).expect("gsis");
+        assert!(dropped[0].provisioned_throughput.is_none());
+        assert!(restore_gsi_throughput("PAY_PER_REQUEST", None).is_none());
+    }
 
     #[test]
     fn backup_omits_empty_secondary_index_metadata() {
@@ -869,5 +1370,34 @@ mod tests {
             restore_provisioned_throughput("PAY_PER_REQUEST", Some(stored)),
             None
         );
+    }
+
+    #[test]
+    fn restore_and_delete_claims_exclude_each_other() {
+        let restore = restore_claim_filter("123456789012", "backup");
+        let delete = delete_claim_filter("123456789012", "backup");
+        for filter in [&restore, &delete] {
+            assert_eq!(filter.get_str("backup_status"), Ok("AVAILABLE"));
+            assert_eq!(
+                filter
+                    .get_document("restore_in_progress")
+                    .and_then(|predicate| predicate.get_bool("$exists")),
+                Ok(false)
+            );
+            assert_eq!(
+                filter
+                    .get_document("delete_in_progress")
+                    .and_then(|predicate| predicate.get_bool("$exists")),
+                Ok(false)
+            );
+        }
+    }
+
+    #[test]
+    fn durable_restore_target_predicate_is_account_scoped_and_creating() {
+        let filter = restoring_target_filter("123456789012", "backup");
+        assert_eq!(filter.get_str("_id.account_id"), Ok("123456789012"));
+        assert_eq!(filter.get_str("restore_source_backup_arn"), Ok("backup"));
+        assert_eq!(filter.get_str("table_status"), Ok("CREATING"));
     }
 }

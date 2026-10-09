@@ -27,7 +27,7 @@ use std::str::FromStr;
 /// let parsed: CatalogVersion = "1.2.0".parse().unwrap();
 /// assert_eq!(parsed, v);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CatalogVersion {
     major: u32,
     minor: u32,
@@ -125,6 +125,15 @@ impl FromStr for CatalogVersion {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn orders_by_component() {
+        use super::CatalogVersion;
+        assert!(CatalogVersion::new(0, 0, 3) < CatalogVersion::new(0, 0, 4));
+        assert!(CatalogVersion::new(0, 0, 10) > CatalogVersion::new(0, 0, 9));
+        assert!(CatalogVersion::new(0, 1, 0) > CatalogVersion::new(0, 0, 99));
+        assert!(CatalogVersion::new(1, 0, 0) > CatalogVersion::new(0, 99, 99));
+    }
+
     use super::*;
 
     #[test]

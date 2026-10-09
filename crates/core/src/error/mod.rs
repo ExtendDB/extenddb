@@ -24,6 +24,8 @@ pub enum DynamoDbError {
     #[error("{0}")]
     BackupNotFoundException(String),
     #[error("{0}")]
+    BackupInUseException(String),
+    #[error("{0}")]
     ResourceInUseException(String),
     /// A per-table or per-account limit was exceeded.
     ///
@@ -114,6 +116,7 @@ impl DynamoDbError {
             Self::ValidationException(_)
             | Self::ResourceNotFoundException(_)
             | Self::BackupNotFoundException(_)
+            | Self::BackupInUseException(_)
             | Self::ResourceInUseException(_)
             | Self::LimitExceededException(_)
             | Self::ConditionalCheckFailedException(..)
@@ -155,6 +158,7 @@ impl DynamoDbError {
             Self::ValidationException(_) => "ValidationException",
             Self::ResourceNotFoundException(_) => "ResourceNotFoundException",
             Self::BackupNotFoundException(_) => "BackupNotFoundException",
+            Self::BackupInUseException(_) => "BackupInUseException",
             Self::ResourceInUseException(_) => "ResourceInUseException",
             Self::LimitExceededException(_) => "LimitExceededException",
             Self::ConditionalCheckFailedException(..) => "ConditionalCheckFailedException",
@@ -221,6 +225,7 @@ impl DynamoDbError {
             Self::ValidationException(m)
             | Self::ResourceNotFoundException(m)
             | Self::BackupNotFoundException(m)
+            | Self::BackupInUseException(m)
             | Self::ResourceInUseException(m)
             | Self::LimitExceededException(m)
             | Self::ConditionalCheckFailedException(m, _)
@@ -317,6 +322,7 @@ mod tests {
             (DynamoDbError::ResourceInUseException(String::new()), 400),
             (DynamoDbError::ResourceNotFoundException(String::new()), 400),
             (DynamoDbError::BackupNotFoundException(String::new()), 400),
+            (DynamoDbError::BackupInUseException(String::new()), 400),
             (DynamoDbError::SerializationException(String::new()), 400),
             (DynamoDbError::ServiceUnavailable(String::new()), 503),
             (DynamoDbError::ThrottlingException(String::new()), 400),

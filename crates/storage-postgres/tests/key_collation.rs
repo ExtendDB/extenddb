@@ -93,6 +93,7 @@ async fn scratch() -> Scratch {
     for sql in [
         include_str!("../migrations/001_schema.sql"),
         include_str!("../migrations/002_vector_indexes.sql"),
+        include_str!("../migrations/003_backup_definitions.sql"),
         include_str!("../data_migrations/001_data_schema.sql"),
         include_str!("../data_migrations/002_gsi_pending.sql"),
         include_str!("../data_migrations/003_idempotency_account_scope.sql"),

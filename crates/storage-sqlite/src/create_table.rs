@@ -35,6 +35,29 @@ impl SqliteEngine {
         input: CreateTableInput,
         defer_active: bool,
     ) -> Result<TableDescription, StorageError> {
+        self.create_table_impl_inner(account_id, input, defer_active, None)
+            .await
+    }
+
+    /// Create a restore target and record its source while both catalog rows
+    /// are protected by the same write transaction.
+    pub(crate) async fn create_table_for_restore(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        backup_arn: &str,
+    ) -> Result<TableDescription, StorageError> {
+        self.create_table_impl_inner(account_id, input, true, Some(backup_arn))
+            .await
+    }
+
+    async fn create_table_impl_inner(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        defer_active: bool,
+        restore_source_backup_arn: Option<&str>,
+    ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
         // D1: every writer holds the engine write lock. This method runs two
         // write transactions (catalog rows, then data-table DDL); without the
@@ -116,6 +139,23 @@ impl SqliteEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+        if let Some(backup_arn) = restore_source_backup_arn {
+            let available: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM backups WHERE backup_arn = ? \
+                 AND account_id = ? AND backup_status = 'AVAILABLE')",
+            )
+            .bind(backup_arn)
+            .bind(account_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if !available {
+                return Err(StorageError::Validation(format!(
+                    "Backup not found: {backup_arn}"
+                )));
+            }
+        }
+
         sqlx::query(
             "INSERT INTO tables \
              (account_id, table_name, key_schema, attribute_definitions, billing_mode, \
@@ -149,6 +189,15 @@ impl SqliteEngine {
                 StorageError::Internal(e.to_string())
             }
         })?;
+
+        if let Some(backup_arn) = restore_source_backup_arn {
+            sqlx::query("INSERT INTO table_restores (table_id, source_backup_arn) VALUES (?, ?)")
+                .bind(&table_id)
+                .bind(backup_arn)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
 
         // GSI / LSI metadata.
         let mut gsi_ids: Vec<String> = Vec::new();
