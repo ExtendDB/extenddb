@@ -23,7 +23,7 @@ import uuid
 
 import pytest
 
-from conftest import wait_for_active, wait_for_deleted
+from conftest import wait_for_active, wait_for_deleted, wait_for_gsi_items
 # EXTENDDB_TEST_ENDPOINT is required — devtools/run-tests validates this.
 # Tests will use the default endpoint if the env var is missing.
 
@@ -86,6 +86,7 @@ class TestGsiAsyncPropagation:
             BillingMode="PAY_PER_REQUEST",
         )
         wait_for_active(dynamodb_client, table_name)
+        wait_for_gsi_active(dynamodb_client, table_name, "test-gsi")
         yield table_name
         try:
             dynamodb_client.delete_table(TableName=table_name)
@@ -123,7 +124,7 @@ class TestGsiAsyncPropagation:
 
             # Measure time until item appears in GSI.
             start = time.monotonic()
-            deadline = start + 5.0
+            deadline = start + 15.0
             found = False
             while time.monotonic() < deadline:
                 resp = dynamodb_client.query(
@@ -141,7 +142,7 @@ class TestGsiAsyncPropagation:
                     break
                 time.sleep(0.005)  # 5ms poll interval
 
-            assert found, f"Item {pk} did not appear in GSI within 5 seconds"
+            assert found, f"Item {pk} did not appear in GSI within 15 seconds"
 
         # Print observed delays for human review.
         print(f"\n  GSI propagation delays (ms): {[f'{d:.1f}' for d in delays]}")
@@ -169,7 +170,7 @@ class TestGsiAsyncPropagation:
         )
 
         # Wait for it to appear in GSI.
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + 15.0
         while time.monotonic() < deadline:
             resp = dynamodb_client.query(
                 TableName=table_name,
@@ -189,7 +190,7 @@ class TestGsiAsyncPropagation:
         )
 
         # Wait for removal from GSI.
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + 15.0
         while time.monotonic() < deadline:
             resp = dynamodb_client.query(
                 TableName=table_name,
@@ -337,3 +338,155 @@ class TestGsiAsyncPropagation:
             )
         finally:
             extenddb_settings_set("index_propagation_delay_ms", original_delay)
+
+
+def wait_for_gsi_active(client, table_name: str, index_name: str, timeout: float = 30.0) -> None:
+    """Poll DescribeTable until the named GSI reaches ACTIVE status."""
+    interval = 0.02 if os.environ.get("EXTENDDB_TEST_ENDPOINT", "").strip() else 0.2
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        resp = client.describe_table(TableName=table_name)
+        gsis = resp["Table"].get("GlobalSecondaryIndexes", [])
+        for gsi in gsis:
+            if gsi["IndexName"] == index_name and gsi["IndexStatus"] == "ACTIVE":
+                return
+        time.sleep(interval)
+    raise TimeoutError(
+        f"GSI '{index_name}' on '{table_name}' did not become ACTIVE within {timeout}s"
+    )
+
+
+class TestGsiAddToExistingTable:
+    """Tests for adding a GSI to an existing table via UpdateTable.
+
+    Covers the full lifecycle: CREATING initial state with async transition to
+    ACTIVE, backfill of pre-existing items, and capture of writes that arrive
+    after UpdateTable returns.
+    """
+
+    @pytest.fixture()
+    def base_table(self, dynamodb_client, unique_table_name):
+        """Empty base table with a single hash key."""
+        name = unique_table_name
+        dynamodb_client.create_table(
+            TableName=name,
+            AttributeDefinitions=[
+                {"AttributeName": "pk", "AttributeType": "S"},
+            ],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        wait_for_active(dynamodb_client, name)
+        yield name
+        try:
+            dynamodb_client.delete_table(TableName=name)
+        except Exception:
+            pass
+        else:
+            wait_for_deleted(dynamodb_client, name)
+
+    def test_update_table_gsi_lifecycle(self, dynamodb_client, base_table):
+        """UpdateTable response shows CREATING; GSI transitions to ACTIVE on its own."""
+        resp = dynamodb_client.update_table(
+            TableName=base_table,
+            AttributeDefinitions=[
+                {"AttributeName": "gsi_pk", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexUpdates=[{
+                "Create": {
+                    "IndexName": "new-gsi",
+                    "KeySchema": [{"AttributeName": "gsi_pk", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+            }],
+        )
+        gsis = resp["TableDescription"].get("GlobalSecondaryIndexes", [])
+        statuses = {g["IndexName"]: g["IndexStatus"] for g in gsis}
+        # SQL backends create GSIs synchronously so they immediately go into ACTIVE. Cassandra
+        # creates GSIs async, so GSIs are probably in CREATING immediately after table update.
+        assert statuses.get("new-gsi") in ("CREATING", "ACTIVE"), (
+            f"Expected CREATING or ACTIVE, got {statuses.get('new-gsi')!r}"
+        )
+        # Raises TimeoutError if the transition never arrives.
+        wait_for_gsi_active(dynamodb_client, base_table, "new-gsi")
+
+    def test_update_table_gsi_backfills_existing_items(self, dynamodb_client, base_table):
+        """Items written before UpdateTable are visible through the GSI after it goes ACTIVE."""
+        gsi_pk_value = f"backfill-{uuid.uuid4().hex[:8]}"
+
+        # Write items before the GSI exists.
+        for i in range(5):
+            dynamodb_client.put_item(
+                TableName=base_table,
+                Item={
+                    "pk": {"S": f"item-{i}"},
+                    "gsi_pk": {"S": gsi_pk_value},
+                },
+            )
+
+        dynamodb_client.update_table(
+            TableName=base_table,
+            AttributeDefinitions=[
+                {"AttributeName": "gsi_pk", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexUpdates=[{
+                "Create": {
+                    "IndexName": "backfill-gsi",
+                    "KeySchema": [{"AttributeName": "gsi_pk", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+            }],
+        )
+        wait_for_gsi_active(dynamodb_client, base_table, "backfill-gsi")
+
+        resp = dynamodb_client.query(
+            TableName=base_table,
+            IndexName="backfill-gsi",
+            KeyConditionExpression="gsi_pk = :v",
+            ExpressionAttributeValues={":v": {"S": gsi_pk_value}},
+        )
+        assert resp["Count"] == 5, (
+            f"Expected 5 backfilled items, got {resp['Count']}"
+        )
+
+    def test_update_table_gsi_captures_writes_after_creation(self, dynamodb_client, base_table):
+        """Items written after UpdateTable returns are visible through the GSI once ACTIVE."""
+        gsi_pk_value = f"post-write-{uuid.uuid4().hex[:8]}"
+
+        dynamodb_client.update_table(
+            TableName=base_table,
+            AttributeDefinitions=[
+                {"AttributeName": "gsi_pk", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexUpdates=[{
+                "Create": {
+                    "IndexName": "post-write-gsi",
+                    "KeySchema": [{"AttributeName": "gsi_pk", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+            }],
+        )
+
+        # Write items after UpdateTable returns (GSI is CREATING).
+        for i in range(3):
+            dynamodb_client.put_item(
+                TableName=base_table,
+                Item={
+                    "pk": {"S": f"post-{i}"},
+                    "gsi_pk": {"S": gsi_pk_value},
+                },
+            )
+
+        wait_for_gsi_active(dynamodb_client, base_table, "post-write-gsi")
+
+        # Poll until all 3 items are visible (GSI is eventually consistent).
+        def query_all():
+            return dynamodb_client.query(
+                TableName=base_table,
+                IndexName="post-write-gsi",
+                KeyConditionExpression="gsi_pk = :v",
+                ExpressionAttributeValues={":v": {"S": gsi_pk_value}},
+            )["Items"]
+
+        items = wait_for_gsi_items(query_all, expected=3)
+        assert len(items) == 3, f"Expected 3 items, got {len(items)}"

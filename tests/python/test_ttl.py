@@ -10,6 +10,7 @@ and error paths.
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 from botocore.exceptions import ClientError
@@ -57,6 +58,16 @@ class TestTimeToLive:
             TableName=name,
             TimeToLiveSpecification={"Enabled": True, "AttributeName": "ttl"},
         )
+        # Enable returns during ENABLING now (the backfill is detached, as in
+        # DynamoDB) and updates are rejected until the transition settles, so
+        # wait for ENABLED like a real client must.
+        for _ in range(120):
+            resp = dynamodb_client.describe_time_to_live(TableName=name)
+            if resp["TimeToLiveDescription"]["TimeToLiveStatus"] == "ENABLED":
+                break
+            time.sleep(0.25)
+        else:
+            pytest.fail("TTL enable did not settle within 30s")
         dynamodb_client.update_time_to_live(
             TableName=name,
             TimeToLiveSpecification={"Enabled": False, "AttributeName": "ttl"},

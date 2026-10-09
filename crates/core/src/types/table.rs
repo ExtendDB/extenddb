@@ -1075,10 +1075,17 @@ impl UpdateTableInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TimeToLiveStatus {
-    /// TTL is enabled.
+    /// TTL is enabled and the expiration queue covers every item.
     Enabled,
+    /// TTL has been requested and the queue backfill has not yet finished.
+    /// Writes made in this state are TTL-tracked; pre-existing items are
+    /// still being registered.
+    Enabling,
     /// TTL is disabled.
     Disabled,
+    /// TTL has been disabled and the old expiration queue is still being
+    /// drained. No further expirations happen in this state.
+    Disabling,
 }
 
 /// TTL description returned by `DescribeTimeToLive` and `UpdateTimeToLive`.

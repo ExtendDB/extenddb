@@ -1,0 +1,31 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "extenddb-storage-cassandra"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+extenddb-core = { workspace = true }
+extenddb-storage = { workspace = true }
+extenddb-auth = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
+uuid = { workspace = true }
+time = { workspace = true }
+base64 = { workspace = true }
+bcrypt = { workspace = true }
+aes-gcm = { workspace = true }
+rand = { workspace = true }
+bigdecimal = { workspace = true }
+crc32fast = { workspace = true }
+zeroize = { workspace = true }
+cdrs-tokio = { workspace = true }
+chrono = { workspace = true }

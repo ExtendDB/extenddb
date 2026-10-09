@@ -1,0 +1,12 @@
+-- Copyright 2026 ExtendDB contributors
+-- SPDX-License-Identifier: Apache-2.0
+-- Durable resume point for the TTL enable backfill.
+--
+-- JSON blob {"generation": <uuid>, "last_key": <item>} written after each
+-- scanned page. A backfill that dies mid-scan (host crash, deploy) resumes
+-- from here instead of rescanning the table from the top. A cursor whose
+-- generation does not match the table's current ttl_generation is ignored.
+--
+-- NOTE for future migrations: the migration runner splits files on the
+-- semicolon character, including inside comments. Do not use one in a comment.
+ALTER TABLE tables ADD IF NOT EXISTS ttl_backfill_cursor text;
