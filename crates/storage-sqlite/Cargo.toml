@@ -35,3 +35,4 @@ rand = { workspace = true }
 bigdecimal = { workspace = true }
 crc32fast = { workspace = true }
 zeroize = { workspace = true }
+libc = { workspace = true }

@@ -36,6 +36,7 @@ mod metadata;
 mod number_key;
 mod operations;
 mod schema;
+mod serve_lock;
 mod sqlite_util;
 mod store;
 mod stream;
@@ -188,7 +189,16 @@ fn sqlite_server_components_factory(
     let pool_size = config.max_connections();
     let region = region.to_owned();
     Box::pin(async move {
-        let engine = SqliteEngine::new(&db_path, pool_size, &region, MAX_ITEM_SIZE_BYTES)
+        // One server per database file, taken before the database is opened:
+        // startup recovery below assumes no other server is using it. A file
+        // database only; an in-memory one belongs to this process alone.
+        let serve_lock = serve_lock::ServeLock::acquire_for_location(&db_path)
+            .map_err(BackendError::InitializationFailed)?
+            .map(|lock| {
+                tracing::debug!("holding serve lock {}", lock.path().display());
+                std::sync::Arc::new(lock)
+            });
+        let mut engine = SqliteEngine::new(&db_path, pool_size, &region, MAX_ITEM_SIZE_BYTES)
             .await
             .map_err(|e| BackendError::ConnectionFailed {
                 backend: "sqlite".to_owned(),
@@ -259,6 +269,7 @@ fn sqlite_server_components_factory(
             Err(e) => tracing::error!("Failed to reconcile incomplete vector indexes: {e}"),
         }
 
+        engine.serve_lock = serve_lock;
         let control_plane_notify = engine.control_plane_notify();
         let engine = Arc::new(engine);
 
@@ -303,4 +314,41 @@ fn sqlite_server_components_factory(
             runtime_hooks: Some(runtime_hooks),
         })
     })
+}
+
+#[cfg(all(test, unix))]
+mod serve_lock_tests {
+    /// The server factory itself takes the lock: a second server on the same
+    /// file fails to start while the first is up, and starts once it is gone.
+    #[tokio::test]
+    async fn a_second_server_on_one_file_is_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "extenddb-serve-lock-factory-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let config = crate::config::SqliteConfig {
+            path: dir.join("db.sqlite").to_string_lossy().into_owned(),
+            pool_size: 2,
+        };
+        let mut options = extenddb_storage::server_components::ServerComponentsOptions::default();
+        options.bootstrap_if_uninitialized = true;
+        let first = super::sqlite_server_components_factory(&config, "us-east-1", options)
+            .await
+            .expect("first server");
+        let Err(err) = super::sqlite_server_components_factory(&config, "us-east-1", options).await
+        else {
+            panic!("a second server on the same file started");
+        };
+        assert!(
+            err.to_string().contains("another extenddb process"),
+            "{err}"
+        );
+        drop(first);
+        let again = super::sqlite_server_components_factory(&config, "us-east-1", options)
+            .await
+            .expect("starts once the first is gone");
+        drop(again);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -549,15 +549,17 @@ async fn transact_write_items(&self, input: TransactWriteInput) -> Result<...> {
     for item in &input.items {
         match item {
             TransactWriteItem::Put { .. } => { /* INSERT/UPSERT within tx */ }
-            TransactWriteItem::Delete { .. } => { /* DELETE within tx */ }
+            TransactWriteItem::Delete { .. } => { /* SELECT FOR UPDATE + DELETE within tx */ }
             TransactWriteItem::Update { .. } => { /* UPDATE within tx */ }
-            TransactWriteItem::ConditionCheck { .. } => { /* SELECT + evaluate */ }
+            TransactWriteItem::ConditionCheck { .. } => { /* SELECT FOR UPDATE + evaluate */ }
         }
     }
     tx.commit().await?;
     Ok(...)
 }
 ```
+
+The ops run in table and key order. A ConditionCheck or Delete that finds no row inserts the key and deletes it again, so the key's unique index entry stays with the transaction and any concurrent create of the item waits until the transaction commits or rolls back.
 
 ### 5.6 Migrations
 

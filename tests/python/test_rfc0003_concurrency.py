@@ -26,21 +26,46 @@ The RFC-0003 stress-test scenarios covered here:
 These tests deliberately use a boto3 client with `retries={"max_attempts": 0}`
 so any InternalServerError surfaces immediately instead of being masked
 by the SDK's retry policy.
+
+Each worker thread uses its own client. A boto3 client is not safe for
+concurrent use; the shared session client, driven from 50 threads, would
+interleave requests on one TLS connection and fail at random with
+`SSLError: TLSV1_ALERT_DECODE_ERROR`, which is the SDK, not the backend.
 """
 
 from __future__ import annotations
 
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
 from botocore.exceptions import ClientError
 
-from helpers import unique_name, wait_for_active, wait_for_deleted
+from helpers import make_dynamodb_client, unique_name, wait_for_active, wait_for_deleted
 
 
 NUM_THREADS = 50
 INCREMENTS_PER_THREAD = 20  # 50 * 20 = 1_000 increments
+
+
+@pytest.fixture()
+def thread_client(endpoint_url):
+    """A callable returning the current thread's own DynamoDB client.
+
+    Built lazily, once per thread, so each of the pool's workers talks to the
+    server over connections nothing else touches.
+    """
+    local = threading.local()
+
+    def get():
+        client = getattr(local, "client", None)
+        if client is None:
+            client = make_dynamodb_client(endpoint_url)
+            local.client = client
+        return client
+
+    return get
 
 
 @pytest.fixture()
@@ -73,13 +98,13 @@ class TestRfc0003UnconditionalPutOnHotKey:
     attempts of a snapshot-txn WriteConflict loop.
     """
 
-    def test_all_writers_succeed(self, dynamodb_client, counter_table):
+    def test_all_writers_succeed(self, dynamodb_client, thread_client, counter_table):
         key = f"hot-{uuid.uuid4().hex[:8]}"
         errors: list[str] = []
 
         def _write(thread_id: int) -> None:
             try:
-                dynamodb_client.put_item(
+                thread_client().put_item(
                     TableName=counter_table,
                     Item={
                         "pk": {"S": key},
@@ -114,13 +139,13 @@ class TestRfc0003ConditionalPutOnHotKey:
     `ConditionalCheckFailedException`, not `InternalServerError`.
     """
 
-    def test_one_winner_rest_ccf(self, dynamodb_client, counter_table):
+    def test_one_winner_rest_ccf(self, dynamodb_client, thread_client, counter_table):
         key = f"race-{uuid.uuid4().hex[:8]}"
         outcomes: list[tuple[str, str]] = []  # (result, error_code)
 
         def _conditional_put(thread_id: int) -> None:
             try:
-                dynamodb_client.put_item(
+                thread_client().put_item(
                     TableName=counter_table,
                     Item={
                         "pk": {"S": key},
@@ -163,7 +188,7 @@ class TestRfc0003AtomicCounterAdd:
     calls converge at MongoDB's doc-lock level without OCC retries.
     """
 
-    def test_all_increments_apply(self, dynamodb_client, counter_table):
+    def test_all_increments_apply(self, dynamodb_client, thread_client, counter_table):
         key = f"counter-{uuid.uuid4().hex[:8]}"
         dynamodb_client.put_item(
             TableName=counter_table,
@@ -175,7 +200,7 @@ class TestRfc0003AtomicCounterAdd:
             done = 0
             for _ in range(INCREMENTS_PER_THREAD):
                 try:
-                    dynamodb_client.update_item(
+                    thread_client().update_item(
                         TableName=counter_table,
                         Key={"pk": {"S": key}},
                         UpdateExpression="ADD #c :one",
@@ -211,7 +236,7 @@ class TestRfc0003UnconditionalDeleteOnHotKey:
     are no-ops; if it doesn't, all are no-ops. Never an error.
     """
 
-    def test_all_deletes_succeed(self, dynamodb_client, counter_table):
+    def test_all_deletes_succeed(self, dynamodb_client, thread_client, counter_table):
         key = f"delkey-{uuid.uuid4().hex[:8]}"
         dynamodb_client.put_item(
             TableName=counter_table,
@@ -221,7 +246,7 @@ class TestRfc0003UnconditionalDeleteOnHotKey:
 
         def _delete(_thread_id: int) -> None:
             try:
-                dynamodb_client.delete_item(
+                thread_client().delete_item(
                     TableName=counter_table,
                     Key={"pk": {"S": key}},
                 )

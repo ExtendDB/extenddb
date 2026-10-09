@@ -297,12 +297,15 @@ jobs:
 
       # The control plane for vector indexes is not reachable over the wire while
       # this backend declares no vector search capability, so its tests drive the
-      # storage layer directly against this job's PostgreSQL. They build their own
-      # throwaway databases; the connection string is the server, not a database.
+      # storage layer directly against this job's PostgreSQL. The PutItem create
+      # race tests hold a create open in an outside transaction, and the
+      # write-transaction conflict tests force a deadlock; both also need direct
+      # access. They build their own throwaway databases; the connection string is
+      # the server, not a database.
       - name: Run PostgreSQL storage-level tests
         env:
           EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
-        run: cargo test --release -p extenddb-storage-postgres --test vector_control_plane
+        run: cargo test --release -p extenddb-storage-postgres --test vector_control_plane --test put_create_race --test twi_conflict
 
       # The daemonized server logs to syslog; dump it so server-side failures
       # are diagnosable from the job log.
