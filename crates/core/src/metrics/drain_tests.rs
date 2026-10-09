@@ -84,7 +84,7 @@ fn fill(
 }
 
 fn drain_at(c: &MetricsCollector, cutoff: Instant) -> Drained {
-    c.drain_points(cutoff, |_| {}).0
+    c.drain_points(cutoff, |_| {}, |_| {}).0
 }
 
 fn kept(c: &MetricsCollector, key: &MetricKey) -> Vec<Pt> {
@@ -103,10 +103,11 @@ fn drained_of(drained: &Drained, key: &MetricKey) -> Vec<Pt> {
 }
 
 /// Under the lock a drain moves no buffered point: the first step swaps the
-/// map out and releases the lock before the split, and the second moves back
-/// only the chunks recorded in between, the same count with 100 times more
-/// points held. `moved` is reported by the code under test, so this proves the
-/// structure of the second step, not its time.
+/// map out and releases the lock before the split, the lock stays free and the
+/// drain mutex stays held until the split is done, and the second step moves
+/// back only the chunks recorded in between, the same count with 100 times
+/// more points held. `moved` is reported by the code under test, so this
+/// proves the structure of the second step, not its time.
 #[test]
 fn drain_moves_only_newly_recorded_chunks_under_the_lock() {
     let keys = keys(7);
@@ -122,23 +123,39 @@ fn drain_moves_only_newly_recorded_chunks_under_the_lock() {
             ..keys[0].clone()
         };
         let wall = SystemTime::UNIX_EPOCH;
-        let (drained, moved) = c.drain_points(base + Duration::from_micros(half), |held| {
-            // Every point is still in the taken map (the split has not run)
-            // while the write lock is free and the collector's map is empty.
-            let unsplit: usize = held.values().map(|acc| acc.points().count()).sum();
-            assert_eq!(
-                unsplit,
-                keys.len() * per_key,
-                "split ran before the write lock was released"
-            );
-            assert!(c.data.try_write().is_ok(), "lock held before the split");
-            assert!(c.data.read().expect("lock").is_empty());
-            assert!(c.drain_lock.try_lock().is_err(), "drains not serialized");
-            for v in [1.0, 2.0, 3.0] {
-                c.record_point(keys[0].clone(), -v, late, wall);
-            }
-            c.record_point(fresh.clone(), -4.0, late, wall);
-        });
+        let (drained, moved) = c.drain_points(
+            base + Duration::from_micros(half),
+            |held| {
+                // Every point is still in the taken map (the split has not
+                // run) while the write lock is free and the collector's map is
+                // empty.
+                let unsplit: usize = held.values().map(|acc| acc.points().count()).sum();
+                assert_eq!(
+                    unsplit,
+                    keys.len() * per_key,
+                    "split ran before the write lock was released"
+                );
+                assert!(c.data.try_write().is_ok(), "lock held before the split");
+                assert!(c.data.read().expect("lock").is_empty());
+                assert!(c.drain_lock.try_lock().is_err(), "drains not serialized");
+                for v in [1.0, 2.0] {
+                    c.record_point(keys[0].clone(), -v, late, wall);
+                }
+                c.record_point(fresh.clone(), -4.0, late, wall);
+            },
+            |held| {
+                // The split is done: only the younger points are left. The
+                // write lock is still free and the drain mutex still held.
+                let young: usize = held.values().map(|acc| acc.points().count()).sum();
+                assert_eq!(young, keys.len() * (per_key - per_key / 2 - 1));
+                assert!(c.data.try_write().is_ok(), "lock held over the split");
+                assert!(
+                    c.drain_lock.try_lock().is_err(),
+                    "drain mutex released before the split ended"
+                );
+                c.record_point(keys[0].clone(), -3.0, late, wall);
+            },
+        );
         moved_by_size.push(moved);
 
         let drained_points: usize = drained

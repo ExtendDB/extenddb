@@ -102,21 +102,23 @@ impl MetricsCollector {
     /// step touches the points held, so `record_*` calls wait a bounded time
     /// however many points are buffered. Between the two steps an in-memory
     /// `query` does not see the buffered points; the server reads metrics
-    /// from its store. Concurrent drains run one at a time. The split and the
+    /// from its store. The swap, split, and put-back of concurrent drains run
+    /// one at a time; their aggregation can overlap. The split and the
     /// aggregation are CPU-bound: async callers should run the drain on a
     /// blocking thread.
     pub fn drain(&self, age: Duration) -> Vec<FlushBucket> {
         let cutoff = Instant::now().checked_sub(age).unwrap_or(Instant::now());
-        aggregate(self.drain_points(cutoff, |_| {}).0)
+        aggregate(self.drain_points(cutoff, |_| {}, |_| {}).0)
     }
 
     /// The points of a drain, and the chunks its second locked step moved.
-    /// `between` sees the map taken by the first locked step, before the
-    /// split, without the write lock.
+    /// `before_split` and `after_split` see the map taken by the first locked
+    /// step on each side of the split, without the write lock.
     pub(super) fn drain_points(
         &self,
         cutoff: Instant,
-        between: impl FnOnce(&PointMap),
+        before_split: impl FnOnce(&PointMap),
+        after_split: impl FnOnce(&PointMap),
     ) -> (Drained, usize) {
         let _serial = self
             .drain_lock
@@ -128,8 +130,9 @@ impl MetricsCollector {
             };
             std::mem::take(&mut *map)
         };
-        between(&held);
+        before_split(&held);
         let drained = take_expired(&mut held, cutoff);
+        after_split(&held);
         let Ok(mut map) = self.data.write() else {
             return (drained, 0);
         };
