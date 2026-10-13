@@ -262,7 +262,7 @@ pub(crate) async fn enqueue_gsi_pending(
     .bind(delay_interval)
     .execute(&mut **tx)
     .await
-    .map_err(|e| StorageError::Internal(e.to_string()))?;
+    .map_err(crate::data::index::db_error)?;
 
     Ok(())
 }

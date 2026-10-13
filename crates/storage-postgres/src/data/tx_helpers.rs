@@ -14,6 +14,7 @@ use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{SortKeyValue, parse_sk, pk_to_text, sk_column, sk_info};
 
+use super::index::db_error;
 use super::{data_table_name, json_to_item};
 
 /// Fetch a single item within an existing transaction.
@@ -86,7 +87,7 @@ pub(super) async fn fetch_item_for_update(
             .bind(pk_text.as_ref())
             .fetch_optional(&mut **tx)
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            .map_err(db_error)?;
         row.map(|(v,)| v)
     };
 
@@ -130,7 +131,7 @@ pub(super) async fn upsert_item_in_tx(
             .bind(&item_json)
             .execute(&mut **tx)
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            .map_err(db_error)?;
     }
     Ok(())
 }
@@ -183,18 +184,18 @@ pub(super) async fn insert_item_if_absent_in_tx(
             .bind(&item_json)
             .execute(&mut **tx)
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .map_err(db_error)?
             .rows_affected()
     };
     Ok(rows_affected == 1)
 }
 
-/// Delete an item by key within a transaction.
+/// Delete an item by key within a transaction. Returns the rows deleted.
 pub(super) async fn delete_item_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     key_info: &TableKeyInfo,
     key: &Item,
-) -> Result<(), StorageError> {
+) -> Result<u64, StorageError> {
     let ddb_table = data_table_name(&key_info.table_id);
     let pk_name = &key_info.key_schema[0].attribute_name;
     let pk_value = key
@@ -210,7 +211,7 @@ pub(super) async fn delete_item_in_tx(
         let sk = parse_sk(sk_value, sk_type)?;
         let sk_col = sk_column(sk_type);
         let sql = format!("DELETE FROM {ddb_table} WHERE pk = $1 AND {sk_col} = $2");
-        match &sk {
+        let deleted = match &sk {
             SortKeyValue::S(s) => {
                 sqlx::query(&sql)
                     .bind(pk_text.as_ref())
@@ -233,16 +234,17 @@ pub(super) async fn delete_item_in_tx(
                     .await
             }
         }
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        .map_err(db_error)?;
+        Ok(deleted.rows_affected())
     } else {
         let sql = format!("DELETE FROM {ddb_table} WHERE pk = $1");
-        sqlx::query(&sql)
+        let deleted = sqlx::query(&sql)
             .bind(pk_text.as_ref())
             .execute(&mut **tx)
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            .map_err(db_error)?;
+        Ok(deleted.rows_affected())
     }
-    Ok(())
 }
 
 /// Write a stream record within an existing transaction.
@@ -323,7 +325,7 @@ pub(super) async fn write_stream_record_in_tx(
     .bind(&key_info.table_id)
     .fetch_all(&mut **tx)
     .await
-    .map_err(|e| StorageError::Internal(e.to_string()))?;
+    .map_err(db_error)?;
 
     if shards.is_empty() {
         // No shards — streams may not be fully set up yet. Skip silently.
@@ -339,7 +341,7 @@ pub(super) async fn write_stream_record_in_tx(
     let (seq_val,): (i64,) = sqlx::query_as("SELECT nextval('stream_seq')")
         .fetch_one(&mut **tx)
         .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        .map_err(db_error)?;
     let seq = format!("{seq_val:021}");
 
     let record = StreamRecord {
@@ -380,7 +382,7 @@ pub(super) async fn write_stream_record_in_tx(
     .bind(&record_json)
     .execute(&mut **tx)
     .await
-    .map_err(|e| StorageError::Internal(e.to_string()))?;
+    .map_err(db_error)?;
 
     Ok(())
 }
@@ -421,7 +423,7 @@ pub(super) async fn check_idempotency_token_in_tx(
     .bind(fingerprint)
     .fetch_optional(&mut **tx)
     .await
-    .map_err(|e| StorageError::Internal(e.to_string()))?;
+    .map_err(db_error)?;
 
     match row {
         Some((_, true)) | None => Ok(()),

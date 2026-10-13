@@ -191,7 +191,7 @@ pub async fn serve(params: ServeParams) -> anyhow::Result<()> {
 /// any error path.
 async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     let ServeParams {
-        app_config,
+        mut app_config,
         listener: std_listener,
         pid_file,
         log_target,
@@ -287,7 +287,15 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     // to bootstrap an uninitialized catalog at serve time (zero-config use).
     let mut component_options =
         extenddb_storage::server_components::ServerComponentsOptions::default();
+
     component_options.bootstrap_if_uninitialized = dev_mode;
+
+    // Wire the node's own bind address as the instance ID so each ExtendDB node
+    // has a distinct node ID (to support logical clocks for sequences, etc.).
+    app_config
+        .storage
+        .set_instance_id(&format!("{}:{}", app_config.server.bind_addr, port));
+
     let components = extenddb_storage::create_server_components(
         app_config.storage.as_trait(),
         &app_config.server.region,

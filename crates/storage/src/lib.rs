@@ -75,6 +75,9 @@ use extenddb_core::types::{
 
 use error::StorageError;
 
+/// Default fixed width for stream record sequence numbers in characters (left-padded).
+pub(crate) const DEFAULT_SEQ_NUMBER_WIDTH: usize = 21;
+
 // Type aliases for complex return types used in trait methods.
 /// Result of an update/put/delete that may return old and/or new item images.
 pub type ItemPairResult = Result<(Option<Item>, Option<Item>), StorageError>;
@@ -373,6 +376,35 @@ pub trait DataEngine: Send + Sync {
         index_name: Option<&str>,
     ) -> BoxFuture<'_, QueryResult>;
 
+    /// Whether `key` belongs to `segment` of a `total_segments`-way parallel
+    /// scan, under this backend's own segment-assignment function.
+    ///
+    /// Segment assignment is backend-private (Postgres hashes the partition
+    /// key with `hashtext`, MongoDB with CRC32, SQLite partitions by rowid),
+    /// so only the backend can answer this. The engine owns the rule and the
+    /// error: a `Scan` whose `ExclusiveStartKey` reports `false` here is
+    /// refused before storage is asked to scan, because resuming a segment
+    /// with another segment's key would otherwise return a silently wrong
+    /// (truncated or fabricated) page.
+    ///
+    /// `Ok(true)` means "cannot be proven foreign" rather than "proven local":
+    /// a backend whose assignment depends on storage identity rather than key
+    /// content (SQLite's rowid) MUST return `true` for a key it cannot resolve,
+    /// because DynamoDB permits an `ExclusiveStartKey` that no longer exists
+    /// and refusing it would reject legitimate resumptions after a delete.
+    ///
+    /// Required, not defaulted: a new backend must decide its answer
+    /// explicitly, since returning a constant `true` silently disables the
+    /// engine's cross-segment refusal for that backend.
+    fn scan_key_in_segment(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        segment: i64,
+        total_segments: i64,
+        index_name: Option<&str>,
+    ) -> BoxFuture<'_, Result<bool, StorageError>>;
+
     /// The vector-search implementation, if this backend has one.
     ///
     /// Defaults to `None`, so a backend that has never heard of vector search is
@@ -424,8 +456,11 @@ pub trait DataEngine: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::TransactionCanceled`] if any condition fails.
-    /// Returns [`StorageError::Internal`] on transaction or query failure.
+    /// Returns [`StorageError::TransactionCanceled`] if any condition fails, or
+    /// with a `TransactionConflict` reason when the database aborts the
+    /// transaction to break a lock conflict (a deadlock or a serialization
+    /// failure).
+    /// Returns [`StorageError::Internal`] on any other transaction or query failure.
     /// Returns [`StorageError::IdempotentReplay`] if the token matches a previous request.
     /// Returns [`StorageError::IdempotentMismatch`] if the token exists with different ops.
     fn transact_write_items(
@@ -608,6 +643,14 @@ pub trait StreamEngine: Send + Sync {
 
     /// Generate the next sequence number for a shard.
     fn next_sequence_number(&self, shard_id: &str) -> BoxFuture<'_, Result<String, StorageError>>;
+
+    /// Width of sequence numbers stored by this backend, in decimal digits.
+    /// Client-supplied sequence numbers (e.g. from `GetShardIterator`) must be
+    /// zero-padded to this width before lexicographic comparison against stored
+    /// values. Defaults to 21 (PostgreSQL, SQLite, MongoDB).
+    fn sequence_number_width(&self) -> usize {
+        DEFAULT_SEQ_NUMBER_WIDTH
+    }
 
     /// Validate that a shard exists for the given stream ARN.
     ///
@@ -802,6 +845,17 @@ mod vector_opt_out_tests {
     struct MinimalDataEngine;
 
     impl DataEngine for MinimalDataEngine {
+        fn scan_key_in_segment(
+            &self,
+            _key_info: &TableKeyInfo,
+            _key: &Item,
+            _segment: i64,
+            _total_segments: i64,
+            _index_name: Option<&str>,
+        ) -> BoxFuture<'_, Result<bool, StorageError>> {
+            Box::pin(async { Ok(true) })
+        }
+
         fn put_item(
             &self,
             _key_info: &TableKeyInfo,

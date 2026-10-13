@@ -11,8 +11,7 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
 use extenddb_core::types::{
     IndexType, ProjectionType, ScanInput, ScanOutput, Select, TableKeyInfo,
-    VECTOR_INDEX_BACKFILLING_SCAN_PREFIX, VECTOR_INDEX_SCAN_NOT_SUPPORTED, extract_key,
-    item_size_bytes,
+    VECTOR_INDEX_BACKFILLING_SCAN_PREFIX, VECTOR_INDEX_SCAN_NOT_SUPPORTED,
 };
 use extenddb_storage::error::StorageError;
 
@@ -25,7 +24,7 @@ use crate::index_helpers::{
     validate_scan_exclusive_start_key,
 };
 use crate::legacy_filter::desugar_filter;
-use crate::read_helpers::apply_post_read;
+use crate::read_helpers::{PostRead, read_page};
 use crate::serialize_output;
 use crate::{DispatchMetrics, DispatchResult};
 
@@ -415,6 +414,34 @@ pub async fn handle_scan(
     // Validate ExclusiveStartKey matches the key schema
     if let Some(ref start_key) = input.exclusive_start_key {
         validate_scan_exclusive_start_key(start_key, &key_info, index_info.as_ref())?;
+
+        // Parallel scan: the ExclusiveStartKey must belong to the segment being
+        // scanned. Segment assignment is backend-private (each backend hashes or
+        // partitions differently), so the backend answers membership and the
+        // engine owns the refusal, uniformly across backends. Without this, a
+        // LastEvaluatedKey from one segment replayed against another returns a
+        // silently wrong page instead of an error. Message measured against the
+        // service (us-east-1).
+        if let (Some(seg), Some(total)) = (input.segment, input.total_segments) {
+            let in_segment = ctx
+                .storage
+                .scan_key_in_segment(
+                    &scan_key_info,
+                    start_key,
+                    seg,
+                    total,
+                    input.index_name.as_deref(),
+                )
+                .await
+                .map_err(storage_err_to_dynamo)?;
+            if !in_segment {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "The provided starting key is invalid: Invalid ExclusiveStartKey. \
+                     Please use ExclusiveStartKey with correct Segment. \
+                     TotalSegments: {total} Segment: {seg}"
+                )));
+            }
+        }
     }
 
     // Validate begins_with operand types upfront (before any rows are scanned).
@@ -427,51 +454,44 @@ pub async fn handle_scan(
         )?;
     }
 
-    // Scan storage
-    let (raw_items, storage_last_key) = ctx
-        .storage
-        .scan(
-            &scan_key_info,
-            input.limit,
-            input.exclusive_start_key.as_ref(),
-            input.segment,
-            input.total_segments,
-            input.index_name.as_deref(),
-        )
-        .await
-        .map_err(storage_err_to_dynamo)?;
-
-    // Capacity metering: RCU based on total pre-projection size of all scanned items.
-    let pre_projection_bytes: usize = raw_items.iter().map(item_size_bytes).sum();
-    let strongly_consistent = input.consistent_read == Some(true);
-    let rcu = capacity_helpers::read_capacity_units(pre_projection_bytes, strongly_consistent);
-
     // Determine which key schema to use for LastEvaluatedKey extraction.
+    // For index scans the LEK carries the index key and the base table key,
+    // and the same shape addresses each chunk read from storage.
     let lek_key_schema = combined_lek_key_schema(&key_info.key_schema, index_info.as_ref());
 
-    // For index scans, the storage layer returns a LEK with only the index key
-    // attributes. Enrich it with the base table key attributes from the last
-    // raw item so the LEK matches DynamoDB's format (all combined keys).
-    let enriched_storage_last_key = if storage_last_key.is_some() && index_info.is_some() {
-        raw_items
-            .last()
-            .map(|item| extract_key(item, &lek_key_schema))
-    } else {
-        storage_last_key
-    };
-
-    // Apply FilterExpression, ProjectionExpression, and 1 MB limit
-    let result = apply_post_read(
-        &raw_items,
-        enriched_storage_last_key,
-        &filter,
-        compiled_projection.as_ref(),
-        &combined_maps,
-        &lek_key_schema,
-        input.select.as_ref(),
+    // Read the page from storage in chunks, applying FilterExpression,
+    // ProjectionExpression, and the page budget as items arrive.
+    let post = PostRead {
+        filter: filter.as_ref(),
+        projection: compiled_projection.as_ref(),
+        maps: &combined_maps,
+        lek_key_schema: &lek_key_schema,
+        select: input.select.as_ref(),
         index_proj,
-        &key_info.key_schema,
-    )?;
+        base_key_schema: &key_info.key_schema,
+    };
+    let page = read_page(
+        input.limit,
+        input.exclusive_start_key.as_ref(),
+        &post,
+        |cursor, count| {
+            ctx.storage.scan(
+                &scan_key_info,
+                Some(count),
+                cursor,
+                input.segment,
+                input.total_segments,
+                input.index_name.as_deref(),
+            )
+        },
+    )
+    .await?;
+    let result = page.post;
+
+    // Capacity metering: RCU based on the pre-projection size of the evaluated items.
+    let pre_projection_bytes = page.evaluated_bytes;
+    let strongly_consistent = input.consistent_read == Some(true);
+    let rcu = capacity_helpers::read_capacity_units(pre_projection_bytes, strongly_consistent);
 
     let output = ScanOutput {
         items: result.items,

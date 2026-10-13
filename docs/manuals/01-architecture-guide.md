@@ -96,7 +96,7 @@ PostgreSQL implementation of all storage traits using `sqlx`. Features:
 - Schema migrations managed by version-stamped SQL files
 - Items stored as JSONB with indexed key columns
 - GSI/LSI implemented as separate PostgreSQL tables
-- Transactions use `SELECT FOR UPDATE` + single-transaction commits
+- Transactions use `SELECT FOR UPDATE` on existing items, a reserved unique key on missing items, and single-transaction commits
 - Stream records stored in a dedicated table with background cleanup
 - All queries parameterized (no dynamic SQL construction)
 

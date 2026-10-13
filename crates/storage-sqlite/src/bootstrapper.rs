@@ -20,6 +20,7 @@ use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
 
 use crate::schema::{self, CATALOG_VERSION};
+use crate::serve_lock::ServeLock;
 use crate::sqlite_util::sqlite_url;
 
 /// SQLite backend bootstrapper.
@@ -29,11 +30,41 @@ use crate::sqlite_util::sqlite_url;
 /// paths, not the hot serving path.
 pub struct SqliteBootstrapper {
     path: String,
+    /// The database-file lock held between [`Bootstrapper::acquire_migration_lock`]
+    /// and [`Bootstrapper::release_migration_lock`]; see `serve_lock`.
+    held_lock: std::sync::Mutex<Option<ServeLock>>,
 }
 
 impl SqliteBootstrapper {
     pub fn new(path: impl Into<String>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            held_lock: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Take the exclusive lock a running `extenddb serve` holds on this
+    /// database, or explain which process holds it. `Ok(None)` for an
+    /// in-memory database.
+    fn exclusive_lock(&self, what: &str) -> OpResult<Option<ServeLock>> {
+        // The lock file lives next to the database; `init` may be the one
+        // creating that directory (see `pool`).
+        if !self.is_memory()
+            && let Some(parent) = std::path::Path::new(&self.path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                OpError::Internal(format!(
+                    "create parent directory for SQLite database '{}': {e}",
+                    self.path
+                ))
+            })?;
+        }
+        ServeLock::acquire_for_location(&self.path).map_err(|e| {
+            OpError::Internal(format!(
+                "{what} needs exclusive use of the SQLite database and cannot have it: {e}"
+            ))
+        })
     }
 
     /// Build a `SqliteBootstrapper` from the config file and CLI args.
@@ -444,10 +475,37 @@ impl Bootstrapper for SqliteBootstrapper {
         Ok(row.map(|(v,)| v))
     }
 
+    /// `init` and `migrate` rewrite the schema, so they take the same
+    /// exclusive lock `extenddb serve` holds on the database file. Unlike the
+    /// trait's default contract this does not wait for the lock: the holder is
+    /// a server that runs until stopped, so waiting would hang, and the
+    /// operator is told to stop it instead.
+    async fn acquire_migration_lock(&self) -> OpResult<()> {
+        let lock = self.exclusive_lock("this command")?;
+        *self
+            .held_lock
+            .lock()
+            .map_err(|_| OpError::Internal("lock state poisoned".to_owned()))? = lock;
+        Ok(())
+    }
+
+    async fn release_migration_lock(&self) -> OpResult<()> {
+        self.held_lock
+            .lock()
+            .map_err(|_| OpError::Internal("lock state poisoned".to_owned()))?
+            .take();
+        Ok(())
+    }
+
     async fn drop_databases(&self, _data_db: &str) -> OpResult<()> {
         if self.is_memory() {
             return Ok(());
         }
+        // A server that still has the file open would keep serving an unlinked
+        // database, and a later `init` would create a second one at the same
+        // path. Refuse while any other process holds the file, and hold it
+        // ourselves until the files are gone.
+        let _lock = self.exclusive_lock("destroy")?;
         if std::path::Path::new(&self.path).exists() {
             std::fs::remove_file(&self.path)
                 .map_err(|e| OpError::Internal(format!("remove database file: {e}")))?;
@@ -496,5 +554,58 @@ impl Bootstrapper for SqliteBootstrapper {
              # pool_size = 10",
             self.path
         )
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lock_tests {
+    use super::SqliteBootstrapper;
+    use crate::serve_lock::ServeLock;
+    use extenddb_storage::bootstrapper::Bootstrapper;
+
+    /// `destroy` and `migrate` are refused while a server holds the database,
+    /// and a server is refused while `migrate` holds it.
+    #[tokio::test]
+    async fn destroy_and_migrate_are_refused_while_a_server_holds_the_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "extenddb-bootstrap-lock-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db = dir.join("db.sqlite");
+        std::fs::write(&db, b"").expect("db file");
+        let bootstrap = SqliteBootstrapper::new(db.to_string_lossy().into_owned());
+
+        let server = ServeLock::acquire(&db).expect("server lock");
+        let err = bootstrap
+            .drop_databases("unused")
+            .await
+            .expect_err("destroy under a server");
+        assert!(
+            format!("{err:?}").contains("another extenddb process"),
+            "{err:?}"
+        );
+        assert!(
+            db.exists(),
+            "destroy must not unlink a file a server has open"
+        );
+        let err = bootstrap
+            .acquire_migration_lock()
+            .await
+            .expect_err("migrate under a server");
+        assert!(
+            format!("{err:?}").contains("another extenddb process"),
+            "{err:?}"
+        );
+        drop(server);
+
+        bootstrap.acquire_migration_lock().await.expect("free now");
+        assert!(ServeLock::acquire(&db).is_err(), "serve during migrate");
+        bootstrap.release_migration_lock().await.expect("release");
+        ServeLock::acquire(&db).expect("free after release");
+
+        bootstrap.drop_databases("unused").await.expect("destroy");
+        assert!(!db.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

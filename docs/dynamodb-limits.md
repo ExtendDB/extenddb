@@ -41,7 +41,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | Maximum item size | 400 KB (409,600 bytes) | Enforced | `LimitsConfig::max_item_size_bytes`, validated on PutItem and post-UpdateItem |
 | Partition key size | 1–2,048 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_partition_key_size_bytes`            |
 | Sort key size | 1–1,024 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_sort_key_size_bytes`                 |
-| Attribute name size | 1–64 KB (65,535 bytes) | Enforced | `validate_attribute_name_sizes`, `LimitsConfig::max_attribute_name_bytes`     |
+| Attribute name size | 1–64 KB (65,535 bytes) | Partial | `validate_attribute_name_sizes`, `LimitsConfig::max_attribute_name_bytes`; top-level names and nested map keys at every depth, on PutItem, BatchWriteItem.PutRequest, TransactWriteItems.Put, and ImportTable. Not enforced on UpdateItem or TransactWriteItems.Update at any level. |
 | Attribute nesting depth | 32 levels | Enforced | `validate_item_nesting_depth`, applied on PutItem, UpdateItem, BatchWriteItem.PutRequest, TransactWriteItems.Put, ImportTable |
 | Number of attributes per item | No practical limit | Enforced | ExtendDB has no per-item attribute count limit                                |
 
@@ -60,7 +60,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 
 | Limit | DynamoDB Value | Status | Notes |
 |-------|---------------|--------|-------|
-| Response size per page | 1 MB (1,048,576 bytes) | Enforced | `read_helpers.rs` enforces 1 MB page limit |
+| Response size per page | 1 MB (1,048,576 bytes) | Enforced | `read_helpers.rs` reads from storage in chunks and stops at the 1 MB page budget; applies whether or not items pass `FilterExpression` |
 | `Limit` parameter (max items evaluated) | No maximum | Enforced | Honored in query/scan |
 | Filter expression size | 4 KB | Enforced | `check_expression_size`, `LimitsConfig::max_expression_length_bytes` (raw bytes, pre-substitution) |
 | Projection expression size | 4 KB | Enforced | `check_expression_size`, `LimitsConfig::max_expression_length_bytes` |
@@ -151,7 +151,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 |----------|----------|---------|--------------|-----|
 | Throughput | 5 | 0 | 1 | 2 |
 | Tables | 4 | 0 | 0 | 0 |
-| Items | 6 | 0 | 0 | 0 |
+| Items | 5 | 1 | 0 | 0 |
 | Secondary Indexes | 4 | 0 | 2 | 0 |
 | Query/Scan | 2 | 0 | 5 | 0 |
 | Batch Operations | 3 | 0 | 2 | 0 |
@@ -161,7 +161,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | Import/Export/Backup | 0 | 0 | 0 | 8 |
 | Global Tables | 0 | 0 | 0 | 2 |
 | Contributor Insights | 0 | 0 | 0 | 1 |
-| **Total** | **29** | **0** | **17** | **14** |
+| **Total** | **28** | **1** | **17** | **14** |
 
 ### Unenforced Limits Requiring Tracking
 

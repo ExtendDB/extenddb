@@ -92,7 +92,7 @@ macro_rules! bind_sk_fetch_optional {
                     .await
             }
         }
-        .map_err(|e| extenddb_storage::error::StorageError::Internal(e.to_string()))
+        .map_err($crate::data::index::db_error)
     };
 }
 
@@ -124,7 +124,7 @@ macro_rules! bind_sk_execute {
                     .await
             }
         }
-        .map_err(|e| extenddb_storage::error::StorageError::Internal(e.to_string()))
+        .map_err($crate::data::index::db_error)
     };
 }
 

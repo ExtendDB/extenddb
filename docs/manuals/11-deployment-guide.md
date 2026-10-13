@@ -6,7 +6,7 @@ This guide covers deploying extenddb in various environments beyond local develo
 
 ## Architecture Overview
 
-extenddb is a single Rust binary that connects to PostgreSQL. All state lives in PostgreSQL — extenddb itself is stateless (no in-process caching). This means:
+extenddb is a single Rust binary that connects to PostgreSQL. All durable state lives in PostgreSQL; extenddb keeps only short-lived credential, policy, and table-metadata caches in process. This means:
 
 - Multiple extenddb instances can share a PostgreSQL catalog (with caveats — see Multi-Instance below)
 - Standard PostgreSQL HA, backup, and replication tools provide durability
@@ -223,12 +223,13 @@ sudo systemctl start extenddb
 
 ## Multi-Instance Considerations
 
-Multiple extenddb instances can connect to the same PostgreSQL catalog. However:
+Run one extenddb instance per catalog. Multiple instances behind a load balancer are not supported in this release:
 
-- extenddb does not cache database state in-process — every request reads directly from PostgreSQL
-- This means multiple instances see consistent data without cache invalidation
-- PostgreSQL's connection pool and row-level locking handle concurrent access
-- Ensure `pool_size × instance_count + 3 × instance_count ≤ PostgreSQL max_connections`
+- Credentials, policies, and table metadata are cached in each process (see the cache TTLs in the admin guide). Nothing invalidates a cache on another instance, so a key revoked or a policy changed through one instance stays in force on the others until the TTL expires.
+- Every instance runs every background worker (TTL expiry, GSI backfill, stream retention, control-plane transitions). The workers are safe to run twice, but the work is duplicated.
+- `/health` is a liveness check that does not query the database, so a load balancer cannot use it to take an instance with a broken database connection out of rotation.
+
+On SQLite this limit is enforced: `extenddb serve` holds an exclusive lock on `<database>.lock` and a second server on the same file refuses to start. On PostgreSQL and MongoDB it is not enforced; if you start a second instance anyway, size `pool_size × instance_count + 3 × instance_count ≤ PostgreSQL max_connections`.
 
 ## Performance Tuning
 

@@ -136,6 +136,10 @@ extenddb healthcheck --endpoint https://127.0.0.1:18443 # explicit target
 
 This is a liveness check, which is what a container `HEALTHCHECK` wants: `/health` does not query the storage backend, so it reports healthy even if PostgreSQL becomes unreachable after startup. That is deliberate, since a liveness probe that failed on a database outage would restart every replica at once. A backend that is unreachable at startup does stop the server from listening, so that case is caught. There is no separate readiness endpoint yet.
 
+### One instance per database
+
+Run one `extenddb serve` per catalog. On SQLite this is enforced: the server takes an exclusive lock on `<database>.lock` next to the database file and a second server on the same file refuses to start (`init`, `migrate`, and `destroy` take the same lock while they run). On PostgreSQL and MongoDB nothing prevents a second instance, but running more than one against the same catalog is not supported in this release: every instance runs every background worker, credential and policy caches are per instance with no cross-instance invalidation (a revoked key stays valid on the other instance for up to the cache TTL), and `/health` does not check the database. See the [deployment guide](docs/manuals/11-deployment-guide.md#multi-instance-considerations).
+
 To make the generated self-signed certificate valid for the name clients use — an in-cluster service DNS name, for example — pass `--tls-san` to `init` (repeatable):
 
 ```bash

@@ -115,6 +115,26 @@ fn base_conn() -> Option<String> {
     (!conn.trim().is_empty()).then(|| conn.trim_end_matches('/').to_owned())
 }
 
+/// Every `.sql` file under `migrations/` and `data_migrations/`, each
+/// directory in filename order, so a new migration is picked up here without
+/// editing this file.
+fn shipped_migrations() -> Vec<String> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut out = Vec::new();
+    for dir in ["migrations", "data_migrations"] {
+        let mut files: Vec<_> = std::fs::read_dir(root.join(dir))
+            .expect("read the migrations directory")
+            .map(|e| e.expect("directory entry").path())
+            .filter(|p| p.extension().is_some_and(|e| e == "sql"))
+            .collect();
+        files.sort();
+        for f in files {
+            out.push(std::fs::read_to_string(&f).expect("read a migration file"));
+        }
+    }
+    out
+}
+
 /// Report the reason a test did nothing, loudly enough to notice in a log.
 fn skip(test: &str) {
     eprintln!(
@@ -157,15 +177,11 @@ async fn scratch(pgvector: Pgvector) -> Scratch {
             .expect("create the pgvector extension");
     }
 
-    for sql in [
-        include_str!("../migrations/001_schema.sql"),
-        include_str!("../migrations/002_vector_indexes.sql"),
-        include_str!("../data_migrations/001_data_schema.sql"),
-        include_str!("../data_migrations/002_gsi_pending.sql"),
-        include_str!("../data_migrations/003_idempotency_account_scope.sql"),
-        include_str!("../data_migrations/004_vector_index_state.sql"),
-    ] {
-        sqlx::raw_sql(sql)
+    // One scratch database stands in for both the catalog and the data
+    // database, so every shipped migration file from both directories is
+    // applied to it, in filename order.
+    for sql in shipped_migrations() {
+        sqlx::raw_sql(&sql)
             .execute(&catalog)
             .await
             .expect("apply a shipped migration");

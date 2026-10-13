@@ -188,7 +188,7 @@ pub(crate) async fn maintain_vector_indexes(
                 .bind(table_id)
                 .fetch_optional(&mut **tx)
                 .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                .map_err(crate::data::index::db_error)?;
         pending.is_none()
     } else {
         false
