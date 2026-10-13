@@ -34,7 +34,36 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+
+      # Local S3 endpoint for the backup-store conformance suite. moto is a
+      # pip package, so it needs no container image; MinIO stopped publishing
+      # images in 2026. The suite fails rather than skips when
+      # EXTENDDB_TEST_S3_REQUIRED is set and the endpoint is unreachable.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Start S3 mock
+        run: |
+          pip install "moto[server]==5.2.4"
+          nohup moto_server -p 9000 > moto.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9000/ > /dev/null; then exit 0; fi
+            sleep 1
+          done
+          echo "moto_server did not start"; cat moto.log; exit 1
+
+      # The AWS_* variables are scoped to the backup-store crate so they do
+      # not leak into other crates' tests (the server's dev mode reads them).
+      - run: cargo test --workspace --exclude extenddb-backup-store
+      - run: cargo test -p extenddb-backup-store
+        env:
+          EXTENDDB_TEST_S3_REQUIRED: "1"
+          EXTENDDB_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          EXTENDDB_TEST_S3_REGION: us-east-1
+          # moto accepts any credentials; these are not secrets.
+          AWS_ACCESS_KEY_ID: testing
+          AWS_SECRET_ACCESS_KEY: testing
+          AWS_REGION: us-east-1
 
   test:
     runs-on: extenddb_ubuntu-2404_4-core
