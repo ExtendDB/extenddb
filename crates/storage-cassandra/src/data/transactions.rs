@@ -33,8 +33,49 @@ use crate::data::{
 fn transaction_conflict_reason() -> CancellationReason {
     CancellationReason {
         code: "TransactionConflict".to_owned(),
-        message: Some("Transaction is in use by another operation".to_owned()),
+        // Must match the canonical conflict message used by the core transaction
+        // type (crates/core) and wait_for_commit_and_read, which clients and the
+        // integration tests assert on. Keep these in sync.
+        message: Some("Transaction is ongoing for the item".to_owned()),
         item: None,
+    }
+}
+
+/// A total-order sort key for the item a `TransactWriteOp` targets, used to pick
+/// a key-sorted PREPARE acquisition order (see `execute_prepare_phase`).
+/// `"{table_id}\u{0}{json key}"`: `Item` is a `BTreeMap`, so `serde_json`
+/// serializes it with sorted, deterministic key order; the table id prefix
+/// keeps items on different tables from interleaving by coincidence, and `\0`
+/// cannot appear in a table id. The engine layer rejects a transaction with
+/// duplicate target keys before this is reached, so within one transaction this
+/// is a total order with no ties.
+fn prepare_order_key(op: &TransactWriteOp<'_>) -> String {
+    let (table_id, key) = match op {
+        TransactWriteOp::Put { key_info, item, .. } => (&key_info.table_id, *item),
+        TransactWriteOp::Delete { key_info, key, .. }
+        | TransactWriteOp::Update { key_info, key, .. }
+        | TransactWriteOp::ConditionCheck { key_info, key, .. } => (&key_info.table_id, *key),
+    };
+    format!(
+        "{table_id}\u{0}{}",
+        serde_json::to_string(key).unwrap_or_default()
+    )
+}
+
+/// Map a `StorageError` raised while reading an item during PREPARE into a
+/// `CancellationReason`. A `TransactionConflict` (e.g. a concurrent transaction
+/// still holds the row, surfaced by `fetch_item_for_transaction` via
+/// `wait_for_commit_and_read`) must keep its code and message so the client sees
+/// `TransactionConflict`, not `ValidationError`. Everything else is a genuine
+/// validation/infra failure.
+fn prepare_read_error_reason(e: StorageError) -> CancellationReason {
+    match e {
+        StorageError::TransactionConflict(message) => CancellationReason {
+            code: "TransactionConflict".to_owned(),
+            message: Some(message),
+            item: None,
+        },
+        other => CancellationReason::validation_error(other.to_string()),
     }
 }
 
@@ -329,29 +370,43 @@ impl CassandraEngine {
     ///
     /// Returns `Ok(computed_items)` where each entry is `Some(item_data_json)` for
     /// UPDATE ops (the post-mutation state) and `None` for all other op types.
+    ///
+    /// PREPARE acquires each op's prepare marker in a key-sorted order rather than
+    /// the caller's order. Two transactions touching the same items in opposite
+    /// request order (`[a, b]` vs `[b, a]`) would otherwise each grab one marker
+    /// and block on the other, both lose and retry, repeat — a livelock that
+    /// starved throughput to a couple of transactions per second under
+    /// contention. Acquiring in a globally consistent order means both
+    /// transactions contend for the same item first: one wins cleanly, the other
+    /// cancels immediately. The engine layer already rejects a transaction with
+    /// duplicate target keys before this is reached, so the sort key is a total
+    /// order over this transaction's ops with no ties.
+    ///
+    /// `reasons` and `computed` are still indexed by the caller's original
+    /// position — only the *order markers are acquired in* changes, not the
+    /// per-op results the client sees, which DynamoDB returns positionally.
     async fn execute_prepare_phase(
         &self,
         ops: &[TransactWriteOp<'_>],
         txn_id: Uuid,
         txn_timestamp: i64,
     ) -> Result<Vec<(Option<String>, Option<String>)>, Vec<CancellationReason>> {
-        let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());
-        let mut computed: Vec<(Option<String>, Option<String>)> = Vec::with_capacity(ops.len());
+        let mut reasons: Vec<CancellationReason> = vec![CancellationReason::none(); ops.len()];
+        let mut computed: Vec<(Option<String>, Option<String>)> = vec![(None, None); ops.len()];
         let mut any_failed = false;
 
-        for op in ops {
+        let mut order: Vec<usize> = (0..ops.len()).collect();
+        order.sort_by(|&a, &b| prepare_order_key(&ops[a]).cmp(&prepare_order_key(&ops[b])));
+
+        for &i in &order {
             match self
-                .prepare_single_operation(op, txn_id, txn_timestamp)
+                .prepare_single_operation(&ops[i], txn_id, txn_timestamp)
                 .await
             {
-                Ok(item_data) => {
-                    reasons.push(CancellationReason::none());
-                    computed.push(item_data);
-                }
+                Ok(item_data) => computed[i] = item_data,
                 Err(r) => {
                     any_failed = true;
-                    reasons.push(r);
-                    computed.push((None, None));
+                    reasons[i] = r;
                 }
             }
         }
@@ -404,7 +459,7 @@ impl CassandraEngine {
                 let mut existing = self
                     .fetch_item_for_transaction(key_info, item, None)
                     .await
-                    .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+                    .map_err(prepare_read_error_reason)?;
 
                 tracing::debug!(
                     "prepare Put: table={} pk_keys={:?} existing={}",
@@ -429,7 +484,28 @@ impl CassandraEngine {
                         .await?;
                 }
 
-                // Execute PREPARE, with create-race retry loop.
+                // Execute PREPARE, with create-race retry loop: on a
+                // TransactionConflict, wait for the conflicting writer to commit
+                // or roll back, then re-evaluate our condition (if any) against
+                // its result before retrying. This is always correct — a
+                // condition gets re-checked, and an unconditional write has
+                // nothing to re-check but must still succeed (DynamoDB does not
+                // let an unconditional write fail on contention) — regardless of
+                // whether the item was absent or already existed when we read it;
+                // "already existed" does not distinguish a late arrival to a
+                // multi-writer create race from steady-state contention. An
+                // earlier version of this comment proposed gating the wait on
+                // `existing.is_none()` or on `condition.is_some()` to avoid
+                // waiting on genuinely independent contention (e.g. two
+                // transactions racing to update long-lived counters in opposite
+                // orders — see `test_opposite_order_transactions_cancel_instead_of_failing`).
+                // Both gates broke multi-writer create races past the first hop
+                // or past the first writer (a late writer that only ever sees the
+                // item as already-created never retries at all). The actual fix
+                // for that latency problem is `execute_prepare_phase`'s key-sorted
+                // PREPARE acquisition order (see its doc comment): it removes the
+                // mutual-abort livelock that made repeated waits necessary in the
+                // first place, so a single wait-and-retry here resolves quickly.
                 let mut attempt = 0u32;
                 loop {
                     attempt += 1;
@@ -439,9 +515,10 @@ impl CassandraEngine {
                     {
                         Ok(()) => break,
                         Err(r) if r.code == "TransactionConflict" && attempt < 5 => {
-                            // Lost the INSERT IF NOT EXISTS race (new item) or another
-                            // transaction grabbed the row between our read and prepare.
-                            // Wait for that transaction to commit, then re-evaluate.
+                            // Lost the INSERT IF NOT EXISTS race (new item), or
+                            // another transaction holds the prepare marker on an
+                            // existing row. Either way: wait for it to commit or
+                            // roll back, then re-evaluate our condition (if any).
                             let committed = self.wait_for_commit_and_read(key_info, item).await?;
                             match committed {
                                 Some(winner) => {
@@ -461,6 +538,8 @@ impl CassandraEngine {
                                 }
                             }
                         }
+                        // Retries exhausted: surface as a conflict, matching
+                        // DynamoDB's behaviour for persistent write contention.
                         Err(r) => return Err(r),
                     }
                 }
@@ -486,7 +565,7 @@ impl CassandraEngine {
                 let existing = self
                     .fetch_item_for_transaction(key_info, key, None)
                     .await
-                    .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+                    .map_err(prepare_read_error_reason)?;
 
                 // Evaluate condition
                 let empty = Item::new();
@@ -524,7 +603,7 @@ impl CassandraEngine {
                 let mut existing = self
                     .fetch_item_for_transaction(key_info, key, None)
                     .await
-                    .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+                    .map_err(prepare_read_error_reason)?;
 
                 // Create item from key if not exists
                 let mut item = existing.clone().unwrap_or_else(|| (*key).clone());
@@ -558,7 +637,11 @@ impl CassandraEngine {
                         .await?;
                 }
 
-                // Execute PREPARE, with create-race retry loop.
+                // Execute PREPARE, with the same create-race retry loop as the
+                // Put arm above — see its comment for why there is no gate on
+                // `existing.is_none()`/`condition.is_some()`, and why
+                // `execute_prepare_phase`'s key-sorted PREPARE order is what
+                // actually keeps contended transactions fast.
                 let mut attempt = 0u32;
                 loop {
                     attempt += 1;
@@ -602,6 +685,8 @@ impl CassandraEngine {
                                 .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
                             }
                         }
+                        // Retries exhausted: surface as a conflict, matching
+                        // DynamoDB's behaviour for persistent write contention.
                         Err(r) => return Err(r),
                     }
                 }
@@ -627,10 +712,10 @@ impl CassandraEngine {
                 .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
 
                 // Read existing item
-                let existing = self
+                let mut existing = self
                     .fetch_item_for_transaction(key_info, key, None)
                     .await
-                    .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+                    .map_err(prepare_read_error_reason)?;
 
                 // Evaluate condition
                 let empty = Item::new();
@@ -643,7 +728,60 @@ impl CassandraEngine {
                     existing.as_ref(),
                 )?;
 
-                // ConditionCheck doesn't prepare any item
+                // A ConditionCheck on an ABSENT item must still leave a
+                // conflict-detectable prepare marker, so a concurrent transaction
+                // that creates the item collides and one of them cancels (otherwise
+                // two "check absent, then write the other's key" transactions both
+                // commit — write skew). Plant the same `created_to_prepare`
+                // INSERT ... IF NOT EXISTS marker Put/Update use. The marker is a
+                // phantom row with no real item; it is removed on commit (below in
+                // commit_single_operation's ConditionCheck arm) and on rollback (the
+                // created_to_prepare DELETE path). For an item that already exists,
+                // the existing prepared_txn_id fencing provides conflict detection,
+                // so no new marker is planted.
+                if existing.is_none() {
+                    self.check_partition_max_delete_timestamp(key_info, key, txn_timestamp)
+                        .await?;
+                    let mut attempt = 0u32;
+                    loop {
+                        attempt += 1;
+                        match self
+                            .prepare_item(key_info, key, txn_id, txn_timestamp, true)
+                            .await
+                        {
+                            Ok(()) => break,
+                            Err(r) if r.code == "TransactionConflict" && attempt < 5 => {
+                                // Another transaction created/grabbed the key between
+                                // our read and prepare. Wait for it, then re-evaluate
+                                // the condition against the committed winner.
+                                let committed =
+                                    self.wait_for_commit_and_read(key_info, key).await?;
+                                match committed {
+                                    Some(winner) => {
+                                        eval_condition(
+                                            Some(condition),
+                                            &winner,
+                                            maps,
+                                            *return_values_on_ccf,
+                                            Some(&winner),
+                                        )?;
+                                        // Condition still holds against the winner,
+                                        // which now exists: no marker needed, the
+                                        // winner's row provides conflict detection.
+                                        existing = Some(winner);
+                                        break;
+                                    }
+                                    None => {
+                                        // Winner rolled back; retry the insert marker.
+                                        existing = None;
+                                    }
+                                }
+                            }
+                            Err(r) => return Err(r),
+                        }
+                    }
+                }
+
                 Ok((None, Self::pre_commit_json(existing.as_ref())?))
             }
         }
@@ -983,7 +1121,19 @@ impl CassandraEngine {
             return self
                 .wait_for_commit_and_read(key_info, key)
                 .await
-                .map_err(|e| StorageError::Internal(e.message.unwrap_or_default()));
+                .map_err(|e| {
+                    // Preserve a TransactionConflict code and message (e.g. "Transaction
+                    // is ongoing for the item" from a wait timeout) instead of flattening
+                    // every reason to Internal, which callers surface as ValidationError.
+                    if e.code == "TransactionConflict" {
+                        StorageError::TransactionConflict(
+                            e.message
+                                .unwrap_or_else(|| "TransactionConflict".to_owned()),
+                        )
+                    } else {
+                        StorageError::Internal(e.message.unwrap_or_default())
+                    }
+                });
         }
 
         let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
@@ -1329,8 +1479,68 @@ impl CassandraEngine {
                 })?;
                 Ok(())
             }
-            TransactWriteOp::ConditionCheck { .. } => Ok(()),
+            TransactWriteOp::ConditionCheck { key_info, key, .. } => {
+                self.commit_condition_check(key_info, key, txn_id).await
+            }
         }
+    }
+
+    /// COMMIT a ConditionCheck: remove the `created_to_prepare` marker left by
+    /// PREPARE for a check against an item that was absent (see
+    /// `prepare_single_operation`'s `ConditionCheck` arm). A ConditionCheck never
+    /// materializes a real item, so on commit the marker row — if any — must be
+    /// deleted rather than kept around as a phantom row with a cleared
+    /// `prepared_txn_id`, which would make the key look present to later readers.
+    /// A ConditionCheck against an item that already existed never plants a
+    /// marker, so the `IF ... AND created_to_prepare = true` guard is a no-op
+    /// there (nothing is deleted, nothing is harmed).
+    async fn commit_condition_check(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        txn_id: Uuid,
+    ) -> Result<(), StorageError> {
+        let keyspace = self.account_keyspace(&key_info.account_id);
+        let ddb_table = super::ddl::data_table_name(&key_info.table_id);
+        let pk_text = composite_pk_to_text(key, &key_info.key_schema)?;
+        let txn_id_bytes = Bytes::new(txn_id.as_bytes().to_vec());
+
+        let result = if let Some((sk_name, sk_type)) =
+            sk_info(&key_info.key_schema, &key_info.attribute_definitions)
+        {
+            let sk_value = key
+                .get(sk_name)
+                .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?;
+            let sk = parse_sk(sk_value, sk_type)?;
+            let sk_col = sk_column(sk_type);
+            let query = format!(
+                "DELETE FROM {keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ? \
+                 IF prepared_txn_id = ? AND created_to_prepare = true"
+            );
+            query_with_pk_sk_txnid(&self.session, &query, pk_text.as_str(), &sk, txn_id_bytes).await
+        } else {
+            let query = format!(
+                "DELETE FROM {keyspace}.{ddb_table} WHERE pk = ? \
+                 IF prepared_txn_id = ? AND created_to_prepare = true"
+            );
+            self.session
+                .query_with_values(
+                    &query,
+                    cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes),
+                )
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))
+        }
+        .map_err(|e| {
+            tracing::error!("commit_condition_check: {e}");
+            StorageError::Internal("Database error".to_owned())
+        })?;
+
+        // Either outcome is fine: applied means the phantom marker was removed;
+        // not-applied means there was no marker to remove (the checked item
+        // already existed, or was never prepared by this txn).
+        let _ = check_lwt_applied(&result, "commit_condition_check");
+        Ok(())
     }
 
     /// Helper to commit a Put or Update operation.
@@ -1459,11 +1669,14 @@ impl CassandraEngine {
         op: &TransactWriteOp<'_>,
         txn_id: Uuid,
     ) -> Result<(), StorageError> {
-        // ConditionCheck doesn't prepare anything, so nothing to rollback
-        if matches!(op, TransactWriteOp::ConditionCheck { .. }) {
-            return Ok(());
-        }
-
+        // A ConditionCheck on an item that existed at PREPARE time never writes a
+        // marker (the item's own prepared_txn_id fencing handles conflicts), so
+        // there is nothing to roll back for it. A ConditionCheck on an ABSENT item
+        // plants a created_to_prepare marker (see prepare_single_operation) and
+        // DOES need cleanup here — the generic logic below handles both: it reads
+        // the row (skipping this txn's own PREPARE), returns immediately if there
+        // is no row whatsoever, and otherwise deletes a created_to_prepare row or
+        // clears prepared_txn_id on a pre-existing one.
         let key_info = match op {
             TransactWriteOp::Put { key_info, .. }
             | TransactWriteOp::Delete { key_info, .. }
@@ -1627,7 +1840,8 @@ impl CassandraEngine {
     ///
     /// PUT/UPDATE: write `item_data`, clear `prepared_txn_id`, set `last_committed_txn_timestamp`.
     /// DELETE: update `partition_max_delete_timestamp`, then delete the row.
-    /// CHECK: no-op.
+    /// CHECK: delete the `created_to_prepare` marker if PREPARE planted one for an
+    /// absent item; no-op if the checked item already existed.
     async fn recover_commit_op(
         &self,
         keyspace: &str,
@@ -1636,6 +1850,36 @@ impl CassandraEngine {
         txn_timestamp: i64,
     ) -> Result<(), StorageError> {
         if op.op == "CHECK" {
+            // A ConditionCheck never materializes an item. If PREPARE planted a
+            // created_to_prepare marker (because the checked item was absent — see
+            // prepare_single_operation's ConditionCheck arm), commit must delete
+            // that phantom row rather than leave it behind. If the checked item
+            // already existed, no marker was planted and this DELETE's `IF ... AND
+            // created_to_prepare = true` guard simply does not apply — a no-op.
+            let table = data_table_name(&op.table_id);
+            let txn_id_bytes = Bytes::new(txn_id.as_bytes().to_vec());
+            let sk = ledger_sk(op)?;
+            let result = if let Some((sk_val, sk_col)) = &sk {
+                let dq = format!(
+                    "DELETE FROM {keyspace}.{table} WHERE pk = ? AND {sk_col} = ? \
+                     IF prepared_txn_id = ? AND created_to_prepare = true",
+                );
+                query_with_pk_sk_txnid(&self.session, &dq, &op.pk, sk_val, txn_id_bytes).await
+            } else {
+                let dq = format!(
+                    "DELETE FROM {keyspace}.{table} WHERE pk = ? \
+                     IF prepared_txn_id = ? AND created_to_prepare = true",
+                );
+                self.session
+                    .query_with_values(&dq, cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes))
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))
+            }
+            .map_err(|e| {
+                tracing::error!("recover_commit_op CHECK: {e}");
+                StorageError::Internal("Database error".to_owned())
+            })?;
+            let _ = check_lwt_applied(&result, "recover_commit CHECK");
             return Ok(());
         }
 
@@ -1772,17 +2016,18 @@ impl CassandraEngine {
     ///
     /// Tries DELETE with `IF prepared_txn_id = ? AND created_to_prepare = true` first.
     /// Falls back to clearing `prepared_txn_id` for pre-existing items.
-    /// CHECK: no-op.
+    /// CHECK: same as above — deletes a marker planted for an absent checked item,
+    /// a no-op if the checked item already existed.
     async fn recover_rollback_op(
         &self,
         keyspace: &str,
         op: &crate::data::transaction_ledger::LedgerOp,
         txn_id: Uuid,
     ) -> Result<(), StorageError> {
-        if op.op == "CHECK" {
-            return Ok(());
-        }
-
+        // CHECK falls through to the generic logic below: a created_to_prepare
+        // marker (planted when the checked item was absent) is deleted; a
+        // pre-existing checked item was never prepared, so neither the DELETE nor
+        // the prepared_txn_id-clear UPDATE below applies to it — both are no-ops.
         let table = data_table_name(&op.table_id);
         let txn_id_bytes = Bytes::new(txn_id.as_bytes().to_vec());
         let sk = ledger_sk(op)?;
