@@ -74,6 +74,10 @@ dashmap = "6"
 
 # Crypto & checksums
 crc32fast = "1"
+# Pinned to the versions already resolved in Cargo.lock.
+flate2 = "1.1.9"
+md-5 = "0.10.6"
+sha2 = "0.10.9"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 bigdecimal = { version = "0.4", features = ["serde"] }
