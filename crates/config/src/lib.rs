@@ -146,9 +146,33 @@ impl StorageConfig {
         self.config.max_catalog_connections()
     }
 
+    /// Get the explicit data-pool override, if one was configured.
+    pub fn max_connections_override(&self) -> Option<u32> {
+        self.config.max_connections_override()
+    }
+
+    /// Get the explicit catalog-pool override, if one was configured.
+    pub fn max_catalog_connections_override(&self) -> Option<u32> {
+        self.config.max_catalog_connections_override()
+    }
+
+    /// Get operator-facing warnings for non-default storage settings.
+    pub fn startup_warnings(&self) -> Vec<extenddb_storage::config::StartupWarning> {
+        self.config.startup_warnings()
+    }
+
     /// Get a reference to the underlying trait object for factory calls.
-    pub fn as_trait(&self) -> &dyn extenddb_storage::config::StorageConfig {
+    pub fn as_trait(&self) -> &(dyn extenddb_storage::config::StorageConfig + 'static) {
         &*self.config
+    }
+
+    /// Set the node's instance identifier on the underlying config.
+    ///
+    /// Backends that need a per-node identity read this via
+    /// [`extenddb_storage::config::StorageConfig::instance_id`]. Call this
+    /// before passing the config to the backend factory.
+    pub fn set_instance_id(&mut self, instance_id: &str) {
+        self.config.set_instance_id(instance_id);
     }
 }
 

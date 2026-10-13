@@ -155,21 +155,21 @@ class _Deployment:
                 self.admin_password = line.split("Password:", 1)[1].strip()
         _patch_port(self.config, self.port)
         # Set the system GSI delay before serving (read at startup).
-        self._run("settings", "set", "gsi_propagation_delay_ms", str(gsi_delay_ms))
+        self._run("settings", "set", "index_propagation_delay_ms", str(gsi_delay_ms))
         # Assert the delay is persisted as expected BEFORE the server starts.
         # These tests run isolated, file-backed servers with their own database,
-        # so the main devtools/run-tests setting of gsi_propagation_delay_ms=0 on
+        # so the main devtools/run-tests setting of index_propagation_delay_ms=0 on
         # the shared server cannot race or clobber this value. The read-back pins
         # that invariant rather than relying on it implicitly.
         conn = self._connect()
         try:
             row = conn.execute(
-                "SELECT value FROM settings WHERE key = 'gsi_propagation_delay_ms'"
+                "SELECT value FROM settings WHERE key = 'index_propagation_delay_ms'"
             ).fetchone()
         finally:
             conn.close()
         assert row is not None and row[0] == str(gsi_delay_ms), (
-            f"expected gsi_propagation_delay_ms={gsi_delay_ms} persisted at startup, "
+            f"expected index_propagation_delay_ms={gsi_delay_ms} persisted at startup, "
             f"got {row!r}"
         )
 

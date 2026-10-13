@@ -19,7 +19,7 @@ pub async fn handle_delete_table(
     validate_table_name(&input.table_name, &ctx.limits)?;
 
     let table_name = input.table_name.clone();
-    let table_desc = ctx
+    let mut table_desc = ctx
         .storage
         .delete_table(&ctx.account_id, input)
         .await
@@ -39,6 +39,7 @@ pub async fn handle_delete_table(
     );
     ctx.auth_cache.invalidate_resource_tags(&arn).await;
 
+    table_desc.populate_table_throughput_mode_summary();
     let output = DeleteTableOutput {
         table_description: table_desc,
     };

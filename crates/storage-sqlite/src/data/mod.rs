@@ -39,9 +39,10 @@ mod query_scan;
 mod transactions;
 mod tx_helpers;
 mod update_item;
+pub(crate) mod vector_index;
 
 pub(crate) use index::{
-    GsiApplyContext, apply_claimed_row, insert_index_row_multi, project_item_for_index,
+    PendingApplyContext, apply_pending_context, insert_index_row_multi, project_item_for_index,
 };
 pub(crate) use tx_helpers::upsert_item_in_tx;
 
@@ -53,6 +54,39 @@ pub(crate) fn data_table_name(table_id: &str) -> String {
 /// Quoted SQL identifier for a GSI/LSI data table.
 pub(crate) fn index_table_name(index_id: &str) -> String {
     format!("\"_ddb_{index_id}\"")
+}
+
+/// Quoted SQL identifier for a vector-index data table.
+///
+/// The name carries the base `table_id` as well as the `index_id` so every vector
+/// table belonging to a DynamoDB table is discoverable from the table alone. That
+/// is what lets `drop_data_table` clean them up: by the time it runs, the catalog
+/// rows have already been cascade-deleted inside the same transaction, so the
+/// index ids can no longer be read from `vector_indexes`.
+///
+/// One row per vector rather than a packed blob per partition. Measured
+/// 2026-08-06: a packed blob reads 2 to 4x faster but makes every write
+/// O(partition), since inserting one vector rewrites the whole blob (390 MB for
+/// a 100k-vector partition at 1024 dimensions). Vector indexes are maintained on
+/// every write to an indexed attribute, so that trade is not available.
+pub(crate) fn vector_table_name(table_id: &str, index_id: &str) -> String {
+    format!("\"_vidx_{table_id}_{index_id}\"")
+}
+
+/// `GLOB` pattern matching every vector data table of one DynamoDB table.
+///
+/// `GLOB` rather than `LIKE` because the pattern itself is full of underscores, and
+/// in `LIKE` an underscore is a single-character wildcard: `_vidx_<id>_%` would match
+/// far more than it appears to. It can only ever over-match, since a wildcard also
+/// matches a literal underscore, and no other table could share the UUID, so `LIKE`
+/// was safe in practice. It was not safe for the stated reason, though, and a comment
+/// that justifies the wrong half is worse than none.
+///
+/// `GLOB` treats `_` literally and uses `*` for the wildcard, so the pattern means
+/// what it reads. `table_id` is a server-generated UUID, which contains no `GLOB`
+/// metacharacters either.
+pub(crate) fn vector_table_glob_pattern(table_id: &str) -> String {
+    format!("_vidx_{table_id}_*")
 }
 
 /// All RANGE key attributes in key-schema order, paired with their scalar type.

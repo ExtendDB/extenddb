@@ -77,6 +77,65 @@ pub(crate) struct GsiApplyContext {
     pub(crate) index: GsiIndexDef,
 }
 
+/// What one `gsi_pending` row asks the worker to do: maintain a GSI, or maintain a
+/// vector index. One queue serves both so that updates to a single base item stay
+/// ordered across index kinds, which two queues drained independently could not
+/// guarantee.
+///
+/// `untagged` is load-bearing, not stylistic. A GSI context serializes to exactly
+/// the bytes it did before this enum existed, so rows already on disk from an
+/// earlier version still deserialize, and rows written now are still readable by
+/// one. That matters more than it looks: an unparseable `index_context` is treated
+/// as a poison row and *dropped*, so a tagged representation would silently discard
+/// every in-flight GSI update across an upgrade.
+///
+/// The variants are unambiguous by shape rather than by tag: a GSI context requires
+/// `index` and a vector context requires `vector`, and no writer emits the other's
+/// field, so for any context this code produces exactly one variant matches.
+/// `pending_context_tests` pins both directions, including a verbatim legacy payload.
+///
+/// To be exact rather than reassuring: a hand-corrupted payload carrying BOTH fields
+/// would match `Gsi`, because untagged tries variants in declaration order and
+/// ignores unknown fields. That is unreachable from any serializer here, and a
+/// genuinely malformed context is already dropped as a poison row, so it is a
+/// property of the representation worth knowing rather than a case to defend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum PendingApplyContext {
+    Gsi(GsiApplyContext),
+    Vector(extenddb_storage::vector_lifecycle::VectorApplyContext),
+}
+
+impl PendingApplyContext {
+    /// The base table's key schema, which both kinds carry and the queue needs in
+    /// order to place the row in its base key's partition.
+    fn base_key_schema(&self) -> &[KeySchemaElement] {
+        match self {
+            Self::Gsi(c) => &c.base_key_schema,
+            Self::Vector(c) => &c.base_key_schema,
+        }
+    }
+}
+
+/// Apply one claimed row to whichever index kind it describes.
+///
+/// Both arms tolerate a data table that no longer exists, so a base table or index
+/// dropped while a row was in flight is applied-as-skip rather than logged and
+/// dropped as unprocessable.
+pub(crate) async fn apply_pending_context(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    old_item: Option<&Item>,
+    new_item: Option<&Item>,
+    context: &PendingApplyContext,
+) -> Result<(), StorageError> {
+    match context {
+        PendingApplyContext::Gsi(c) => apply_claimed_row(tx, old_item, new_item, c).await,
+        PendingApplyContext::Vector(c) => {
+            super::vector_index::apply_vector_context(tx, old_item, new_item, c).await
+        }
+    }
+}
+
 /// Metadata for a single index, used on the write path and by the GSI worker.
 pub(crate) struct IndexMeta {
     pub(super) index_id: String,
@@ -101,7 +160,7 @@ pub(crate) async fn fetch_indexes_for_table(
     .bind(table_id)
     .fetch_all(pool)
     .await
-    .map_err(|e| StorageError::Internal(e.to_string()))?;
+    .map_err(crate::sqlite_util::map_sqlx_err)?;
 
     rows.into_iter()
         .map(|(index_id, index_name, index_type, ks, proj, delay)| {
@@ -161,27 +220,36 @@ pub(crate) async fn enqueue_async_indexes(
                 projection: idx.projection.clone(),
             },
         };
-        enqueue_gsi_pending(tx, &key_info.table_id, old_item, new_item, delay, &context).await?;
+        enqueue_pending_row(
+            tx,
+            &key_info.table_id,
+            old_item,
+            new_item,
+            delay,
+            &PendingApplyContext::Gsi(context),
+        )
+        .await?;
         enqueued += 1;
     }
     Ok(enqueued)
 }
 
-/// Insert one self-describing `gsi_pending` row for a single index inside the
-/// base write transaction (zero crash window).
+/// Insert one self-describing `gsi_pending` row inside the base write transaction
+/// (zero crash window). Shared by the GSI and vector write paths, which is what puts
+/// both index kinds in one totally ordered queue.
 ///
-/// `delay_ms` is the index's effective delay; a jitter in `[delay/2, delay]`
-/// is applied. `ready_at` is clamped to `max(now + jitter, MAX(ready_at) in the
-/// base key's partition)` so a later write that draws a smaller jitter can never
-/// become eligible before an earlier one — preserving per-key FIFO when the
-/// worker drains the partition in `id` order.
-pub(crate) async fn enqueue_gsi_pending(
+/// `delay_ms` is the effective delay; a jitter in `[delay/2, delay]` is applied.
+/// `ready_at` is clamped to `max(now + jitter, MAX(ready_at) in the base key's
+/// partition)` so a later write that draws a smaller jitter can never become
+/// eligible before an earlier one — preserving per-key FIFO when the worker drains
+/// the partition in `id` order.
+pub(crate) async fn enqueue_pending_row(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table_id: &str,
     old_item: Option<&Item>,
     new_item: Option<&Item>,
     delay_ms: u64,
-    context: &GsiApplyContext,
+    context: &PendingApplyContext,
 ) -> Result<(), StorageError> {
     let old_json = old_item
         .map(serde_json::to_string)
@@ -196,9 +264,11 @@ pub(crate) async fn enqueue_gsi_pending(
 
     // Route all updates for one base item to a single partition (per-key FIFO).
     // The base key is immutable: `new_item` carries it for puts/updates,
-    // `old_item` for deletes.
+    // `old_item` for deletes. Both context kinds describe the same base table, so
+    // a GSI row and a vector row for one item hash to the same partition and stay
+    // mutually ordered.
     let worker_partition = match new_item.or(old_item) {
-        Some(item) => partition_for(&composite_pk_to_text(item, &context.base_key_schema)?),
+        Some(item) => partition_for(&composite_pk_to_text(item, context.base_key_schema())?),
         None => 0,
     };
 
@@ -215,7 +285,7 @@ pub(crate) async fn enqueue_gsi_pending(
             .bind(worker_partition)
             .fetch_one(&mut **tx)
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            .map_err(crate::sqlite_util::map_sqlx_err)?;
     let ready_at = match part_max {
         Some(prev) if prev > candidate => prev,
         _ => candidate,
@@ -234,7 +304,7 @@ pub(crate) async fn enqueue_gsi_pending(
     .bind(&ready_at)
     .execute(&mut **tx)
     .await
-    .map_err(|e| StorageError::Internal(e.to_string()))?;
+    .map_err(crate::sqlite_util::map_sqlx_err)?;
     Ok(())
 }
 
@@ -356,7 +426,7 @@ pub(crate) async fn delete_index_row_multi(
     query
         .execute(&mut **tx)
         .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        .map_err(crate::sqlite_util::map_sqlx_err)?;
     Ok(())
 }
 
@@ -418,7 +488,7 @@ pub(crate) async fn insert_index_row_multi(
     query
         .execute(&mut **tx)
         .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        .map_err(crate::sqlite_util::map_sqlx_err)?;
     Ok(())
 }
 
@@ -434,9 +504,9 @@ pub(crate) fn index_sk_column(index: usize, sk_type: ScalarAttributeType) -> Str
 }
 
 /// True if a storage error is a "missing table" error (the `_ddb_*` index table
-/// was dropped, e.g. the base table was deleted while a `gsi_pending` row was
-/// in flight). Such rows are benignly skipped.
-fn is_no_such_table(e: &StorageError) -> bool {
+/// or a `_vidx_*` vector table was dropped, e.g. the base table was deleted
+/// while a `gsi_pending` row was in flight). Such rows are benignly skipped.
+pub(crate) fn is_no_such_table(e: &StorageError) -> bool {
     matches!(e, StorageError::Internal(msg) if msg.contains("no such table"))
 }
 
@@ -485,4 +555,257 @@ pub(crate) async fn apply_claimed_row(
         .or_else(|e| if is_no_such_table(&e) { Ok(()) } else { Err(e) })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod pending_context_tests {
+    use super::{GsiApplyContext, GsiIndexDef, PendingApplyContext};
+    use extenddb_core::types::{
+        AttributeDefinition, KeySchemaElement, KeyType, Projection, ProjectionType,
+        ScalarAttributeType,
+    };
+    use extenddb_storage::vector_lifecycle::{VectorApplyContext, VectorIndexMeta};
+
+    /// A context written by a build that predates vector rows, verbatim. It must
+    /// still deserialize.
+    ///
+    /// This is the test that protects an upgrade. A row whose `index_context` fails
+    /// to parse is treated as poison and DROPPED, so if the representation had
+    /// changed incompatibly, every GSI update in flight at the moment of the upgrade
+    /// would have been discarded silently, with the item written and its index never
+    /// catching up.
+    const LEGACY_GSI_CONTEXT: &str = r#"{
+        "base_key_schema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "attribute_definitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "index": {
+            "index_id": "idx-1",
+            "key_schema": [{"AttributeName": "gsipk", "KeyType": "HASH"}],
+            "projection": {"ProjectionType": "ALL"}
+        }
+    }"#;
+
+    fn base_ks() -> Vec<KeySchemaElement> {
+        vec![KeySchemaElement {
+            attribute_name: "pk".to_owned(),
+            key_type: KeyType::Hash,
+        }]
+    }
+
+    fn base_ad() -> Vec<AttributeDefinition> {
+        vec![AttributeDefinition {
+            attribute_name: "pk".to_owned(),
+            attribute_type: ScalarAttributeType::S,
+        }]
+    }
+
+    fn gsi_context() -> GsiApplyContext {
+        GsiApplyContext {
+            base_key_schema: base_ks(),
+            attribute_definitions: base_ad(),
+            index: GsiIndexDef {
+                index_id: "idx-1".to_owned(),
+                key_schema: vec![KeySchemaElement {
+                    attribute_name: "gsipk".to_owned(),
+                    key_type: KeyType::Hash,
+                }],
+                projection: Projection {
+                    projection_type: ProjectionType::All,
+                    non_key_attributes: None,
+                },
+            },
+        }
+    }
+
+    fn vector_context() -> VectorApplyContext {
+        VectorApplyContext {
+            base_key_schema: base_ks(),
+            attribute_definitions: base_ad(),
+            table_id: "t-1".to_owned(),
+            vector: VectorIndexMeta {
+                index_id: "vidx-1".to_owned(),
+                dimensions: 2,
+                vector_attribute_name: "emb".to_owned(),
+                projection: Projection {
+                    projection_type: ProjectionType::KeysOnly,
+                    non_key_attributes: None,
+                },
+                hash_attribute_name: Some("tenant".to_owned()),
+                search_schema_attribute_names: vec!["tenant".to_owned()],
+            },
+        }
+    }
+
+    #[test]
+    fn a_legacy_gsi_context_still_deserializes_as_a_gsi_row() {
+        let parsed: PendingApplyContext =
+            serde_json::from_str(LEGACY_GSI_CONTEXT).expect("legacy context must still parse");
+        match parsed {
+            PendingApplyContext::Gsi(c) => assert_eq!(c.index.index_id, "idx-1"),
+            PendingApplyContext::Vector(_) => {
+                panic!("a legacy GSI context must not be read as a vector row")
+            }
+        }
+    }
+
+    /// The bytes a GSI row writes today are the bytes it wrote before the enum
+    /// existed, so a row written by this build is still readable by the previous
+    /// one. `untagged` is what buys this, and this test is what keeps it.
+    #[test]
+    fn wrapping_a_gsi_context_does_not_change_its_serialized_form() {
+        let bare = serde_json::to_string(&gsi_context()).expect("bare");
+        let wrapped =
+            serde_json::to_string(&PendingApplyContext::Gsi(gsi_context())).expect("wrapped");
+        assert_eq!(
+            bare, wrapped,
+            "the queue's on-disk format must not change for GSI rows"
+        );
+    }
+
+    /// A vector context round-trips and carries no GSI discriminant field.
+    ///
+    /// Note what this does NOT guard: it still passes if `untagged` is removed, so it
+    /// is not the protection for on-disk compatibility. The two tests above are, and
+    /// both fail without `untagged`. This one pins the shape contract that makes the
+    /// discrimination possible in the first place.
+    #[test]
+    fn a_vector_context_round_trips_and_carries_no_gsi_discriminant() {
+        let json = serde_json::to_string(&PendingApplyContext::Vector(vector_context()))
+            .expect("serialize");
+        assert!(
+            !json.contains("\"index\":"),
+            "a vector context must not carry the GSI discriminant field: {json}"
+        );
+        let parsed: PendingApplyContext = serde_json::from_str(&json).expect("deserialize");
+        match parsed {
+            PendingApplyContext::Vector(c) => {
+                assert_eq!(c.vector.index_id, "vidx-1");
+                assert_eq!(c.table_id, "t-1");
+                assert_eq!(c.vector.dimensions, 2);
+                assert_eq!(c.vector.hash_attribute_name.as_deref(), Some("tenant"));
+                assert_eq!(c.vector.search_schema_attribute_names, ["tenant"]);
+                assert_eq!(
+                    c.vector.projection.projection_type,
+                    ProjectionType::KeysOnly
+                );
+            }
+            PendingApplyContext::Gsi(_) => panic!("a vector context must not be read as a GSI row"),
+        }
+    }
+
+    /// A GSI row and a vector row for the SAME base item must land in the same queue
+    /// partition, which is what makes them mutually ordered.
+    ///
+    /// This is the claim that reusing one queue buys ordering ACROSS index kinds, and
+    /// it holds only because both contexts hash the same base key rather than
+    /// anything index-specific. Asserted on the partition because the partition is the
+    /// mechanism: two kinds hashing differently would land in separate partitions,
+    /// each monotonic on its own, leaving the relative order of a GSI and a vector
+    /// update to one item unconstrained.
+    ///
+    /// Driven through the real `enqueue_pending_row` rather than a test shim, so it is
+    /// the production path being measured.
+    #[tokio::test]
+    async fn a_gsi_row_and_a_vector_row_for_one_item_share_a_partition() {
+        let engine = crate::SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::schema::apply(&engine.pool).await.expect("schema");
+
+        let the_item: extenddb_core::types::Item =
+            serde_json::from_str(r#"{"pk":{"S":"shared-key"},"emb":{"L":[{"N":"1"}]}}"#)
+                .expect("item");
+        let mut tx = engine.pool.begin_with("BEGIN IMMEDIATE").await.expect("tx");
+        for context in [
+            PendingApplyContext::Gsi(gsi_context()),
+            PendingApplyContext::Vector(vector_context()),
+        ] {
+            super::enqueue_pending_row(&mut tx, "t-1", None, Some(&the_item), 60_000, &context)
+                .await
+                .expect("enqueue");
+        }
+        tx.commit().await.expect("commit");
+
+        let partitions: Vec<(i64,)> =
+            sqlx::query_as("SELECT DISTINCT worker_partition FROM gsi_pending")
+                .fetch_all(&engine.pool)
+                .await
+                .expect("partitions");
+        assert_eq!(
+            partitions.len(),
+            1,
+            "a GSI row and a vector row for one base item must share a partition, or \
+             their relative order is unconstrained"
+        );
+        let (depth,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM gsi_pending")
+            .fetch_one(&engine.pool)
+            .await
+            .expect("depth");
+        assert_eq!(
+            depth, 2,
+            "both kinds must have enqueued, so one partition is not an artefact of a \
+             missing row"
+        );
+    }
+
+    /// A catalog created before the rename must keep honouring its operator's value.
+    ///
+    /// This is the compatibility property the whole fallback exists for, and the cost
+    /// of getting it wrong is not cosmetic: the server refuses to start on a
+    /// catalog-version mismatch rather than migrating, so nothing ever rewrites the old
+    /// row. Reading past it would silently reset a configured delay to the default, and
+    /// since 0 means synchronous, the silent change would be from strict to eventually
+    /// consistent, which is exactly the direction that turns a passing test suite into
+    /// a flaky one somewhere else.
+    #[tokio::test]
+    async fn a_pre_rename_catalog_still_honours_its_configured_delay() {
+        let engine = crate::SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::schema::apply(&engine.pool).await.expect("schema");
+
+        // Reshape the catalog to look as it did before the rename: the legacy key
+        // only, carrying a deliberately non-default value.
+        sqlx::query("DELETE FROM settings WHERE key = 'index_propagation_delay_ms'")
+            .execute(&engine.pool)
+            .await
+            .expect("drop canonical row");
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('gsi_propagation_delay_ms', '0')")
+            .execute(&engine.pool)
+            .await
+            .expect("seed legacy row");
+
+        assert_eq!(
+            engine.index_propagation_delay().await,
+            0,
+            "a value set under the pre-rename key must still be honoured, or an \
+             operator's synchronous setting silently becomes asynchronous"
+        );
+    }
+
+    /// With both rows present the canonical one wins, deterministically.
+    ///
+    /// Reachable if an operator sets the legacy key on a build that predates the
+    /// canonicalising write path and then upgrades. Without the explicit ordering the
+    /// winner would be whichever row SQLite happened to return first.
+    #[tokio::test]
+    async fn the_canonical_key_wins_when_both_are_present() {
+        let engine = crate::SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::schema::apply(&engine.pool).await.expect("schema");
+
+        sqlx::query(
+            "INSERT OR REPLACE INTO settings (key, value) \
+             VALUES ('index_propagation_delay_ms', '7'), ('gsi_propagation_delay_ms', '999')",
+        )
+        .execute(&engine.pool)
+        .await
+        .expect("seed both rows");
+
+        assert_eq!(
+            engine.index_propagation_delay().await,
+            7,
+            "the canonical key must take precedence over the deprecated alias"
+        );
+    }
 }

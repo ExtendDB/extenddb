@@ -42,7 +42,7 @@
 //!   ≠ bytewise byte ordering across mismatched lengths)
 //! - Any operand type the analyzer doesn't yet classify
 
-use extenddb_core::expression::{CompareOp, Expr, ExpressionMaps};
+use extenddb_core::expression::{CompareOp, Expr, ExpressionMaps, PathElement};
 use extenddb_core::types::AttributeValue;
 
 /// Outcome of the pushdown analyzer.
@@ -67,7 +67,55 @@ impl Pushable {
 ///
 /// Conservative: unknown constructs return `Pushable::No`.
 pub fn is_pushable(expr: &Expr, maps: &ExpressionMaps) -> Pushable {
+    if let Some(reason) = unsafe_attribute_reason(expr, maps) {
+        return Pushable::No(reason);
+    }
     walk(expr, maps)
+}
+
+/// Return why an expression contains a literal DynamoDB attribute name that
+/// cannot safely be emitted as a MongoDB field path. A dot would mean nested
+/// document traversal in MongoDB, while a leading `$` would be interpreted as
+/// an operator or otherwise have special meaning in a MongoDB path.
+fn unsafe_attribute_reason(expr: &Expr, maps: &ExpressionMaps) -> Option<&'static str> {
+    match expr {
+        Expr::Path(elements) => elements.iter().find_map(|element| match element {
+            PathElement::Attribute(name) => {
+                let resolved = if let Some(alias) = name.strip_prefix('#') {
+                    maps.resolve_name(alias).ok()
+                } else {
+                    Some(name.as_str())
+                };
+                match resolved {
+                    Some(name) if name.contains('.') => Some("literal attribute name contains '.'"),
+                    Some(name) if name.starts_with('$') => {
+                        Some("literal attribute name begins with '$'")
+                    }
+                    Some(_) => None,
+                    None => Some("attribute name alias is unresolved"),
+                }
+            }
+            PathElement::Index(_) => None,
+        }),
+        Expr::Compare { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Arithmetic { left, right, .. } => {
+            unsafe_attribute_reason(left, maps).or_else(|| unsafe_attribute_reason(right, maps))
+        }
+        Expr::Not(inner) => unsafe_attribute_reason(inner, maps),
+        Expr::Function { args, .. } => args
+            .iter()
+            .find_map(|arg| unsafe_attribute_reason(arg, maps)),
+        Expr::Between { operand, low, high } => unsafe_attribute_reason(operand, maps)
+            .or_else(|| unsafe_attribute_reason(low, maps))
+            .or_else(|| unsafe_attribute_reason(high, maps)),
+        Expr::In { operand, list } => unsafe_attribute_reason(operand, maps).or_else(|| {
+            list.iter()
+                .find_map(|item| unsafe_attribute_reason(item, maps))
+        }),
+        Expr::Placeholder(_) => None,
+    }
 }
 
 fn walk(expr: &Expr, maps: &ExpressionMaps) -> Pushable {
@@ -287,6 +335,14 @@ mod tests {
         Expr::Path(vec![PathElement::Attribute(name.to_string())])
     }
 
+    fn aliased_maps(resolved_name: &str, value: AttributeValue) -> ExpressionMaps {
+        let mut names = HashMap::new();
+        names.insert("name".to_owned(), resolved_name.to_owned());
+        let mut values = HashMap::new();
+        values.insert(":value".to_owned(), value);
+        ExpressionMaps::new(names, values)
+    }
+
     #[test]
     fn attribute_exists_is_pushable() {
         let expr = Expr::Function {
@@ -294,6 +350,62 @@ mod tests {
             args: vec![path("a")],
         };
         assert_eq!(is_pushable(&expr, &maps_with(&[])), Pushable::Yes);
+    }
+
+    #[test]
+    fn dotted_attribute_alias_is_not_pushable() {
+        let expr = Expr::Compare {
+            left: Box::new(path("#name")),
+            op: CompareOp::Eq,
+            right: Box::new(Expr::Placeholder(":value".into())),
+        };
+        let maps = aliased_maps("a.b", AttributeValue::S("value".into()));
+
+        assert_eq!(
+            is_pushable(&expr, &maps),
+            Pushable::No("literal attribute name contains '.'")
+        );
+    }
+
+    #[test]
+    fn dotted_attribute_alias_in_function_is_not_pushable() {
+        let expr = Expr::Function {
+            name: "attribute_exists".into(),
+            args: vec![path("#name")],
+        };
+        let maps = aliased_maps("a.b", AttributeValue::S("unused".into()));
+
+        assert!(!is_pushable(&expr, &maps).is_yes());
+    }
+
+    #[test]
+    fn dollar_prefixed_attribute_in_condition_is_not_pushable() {
+        let expr = Expr::Compare {
+            left: Box::new(path("$foo")),
+            op: CompareOp::Eq,
+            right: Box::new(Expr::Placeholder(":value".into())),
+        };
+        let maps = maps_with(&[(":value", AttributeValue::S("value".into()))]);
+
+        assert_eq!(
+            is_pushable(&expr, &maps),
+            Pushable::No("literal attribute name begins with '$'")
+        );
+    }
+
+    #[test]
+    fn nested_document_path_without_literal_dot_remains_pushable() {
+        let expr = Expr::Compare {
+            left: Box::new(Expr::Path(vec![
+                PathElement::Attribute("a".into()),
+                PathElement::Attribute("b".into()),
+            ])),
+            op: CompareOp::Eq,
+            right: Box::new(Expr::Placeholder(":value".into())),
+        };
+        let maps = maps_with(&[(":value", AttributeValue::S("value".into()))]);
+
+        assert_eq!(is_pushable(&expr, &maps), Pushable::Yes);
     }
 
     #[test]

@@ -15,10 +15,37 @@ pub type Validator = fn(&str) -> Result<(), &'static str>;
 pub const KNOWN_KEYS: &[(&str, Validator)] = &[
     ("allow_credential_import", validate_bool),
     ("control_plane_delay_seconds", validate_delay_seconds),
-    ("gsi_propagation_delay_ms", validate_gsi_delay_ms),
+    (
+        extenddb_core::settings_keys::INDEX_PROPAGATION_DELAY_MS,
+        validate_index_propagation_delay_ms,
+    ),
+    // Deprecated alias, still writable so an existing script or runbook keeps
+    // working. `set_setting` canonicalises it, so it updates the same row rather
+    // than creating a second one that the read path would ignore.
+    (
+        extenddb_core::settings_keys::LEGACY_GSI_PROPAGATION_DELAY_MS,
+        validate_index_propagation_delay_ms,
+    ),
     ("log_level", validate_log_level),
     ("sqlx_log_level", validate_log_level),
     ("throttling_enabled", validate_bool),
+    // A test lever, writable for the same reason the propagation delay is: the
+    // ordering property it exists to expose (a write landing mid-backfill must not
+    // be overwritten by the backfill's older snapshot) cannot be observed unless a
+    // test can slow the backfill down from outside the process.
+    (
+        extenddb_core::settings_keys::VECTOR_BACKFILL_BATCH_DELAY_MS,
+        validate_backfill_batch_delay_ms,
+    ),
+    // The sibling test lever, writable for the same reason: the allocation phase of
+    // an index build exists only between two transitions inside one UpdateTable
+    // call, so the measured refusal for a delete during that phase cannot be
+    // observed from a client unless a test can hold the phase open from outside the
+    // process. Same bound, same validator.
+    (
+        extenddb_core::settings_keys::VECTOR_ALLOCATION_PHASE_DELAY_MS,
+        validate_backfill_batch_delay_ms,
+    ),
 ];
 
 /// Read-only keys that cannot be changed via the settings API.
@@ -33,6 +60,56 @@ fn validate_log_level(value: &str) -> Result<(), &'static str> {
         "trace" | "debug" | "info" | "warn" | "error" => Ok(()),
         _ => Err("must be one of: trace, debug, info, warn, error"),
     }
+}
+
+/// Milliseconds, bounded so a mistyped value cannot wedge a backfill indefinitely.
+///
+/// The cap is generous next to any legitimate test need and small enough that the
+/// worst case is a slow backfill rather than one that never finishes.
+fn validate_backfill_batch_delay_ms(value: &str) -> Result<(), &'static str> {
+    match value.parse::<u64>() {
+        Ok(ms) if ms <= 60_000 => Ok(()),
+        Ok(_) => Err("must be between 0 and 60000 milliseconds"),
+        Err(_) => Err("must be a non-negative integer number of milliseconds"),
+    }
+}
+
+#[cfg(feature = "mongodb-test-hooks")]
+fn validate_backfill_test_gate(value: &str) -> Result<(), &'static str> {
+    match value {
+        "armed" | "paused" | "release" | "idle" => Ok(()),
+        _ => Err("must be one of: armed, paused, release, idle"),
+    }
+}
+
+#[cfg(feature = "mongodb-test-hooks")]
+fn validate_unknown_commit_test_gate(value: &str) -> Result<(), &'static str> {
+    match value {
+        "armed" | "idle" => Ok(()),
+        _ => Err("must be one of: armed, idle"),
+    }
+}
+
+#[cfg(feature = "mongodb-test-hooks")]
+fn table_scoped_gate_table_name<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
+    let table_name = key.strip_prefix(prefix)?.strip_prefix(':')?;
+    let valid = !table_name.is_empty()
+        && table_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    valid.then_some(table_name)
+}
+
+#[cfg(feature = "mongodb-test-hooks")]
+fn is_table_scoped_backfill_gate_key(key: &str) -> bool {
+    table_scoped_gate_table_name(key, extenddb_core::settings_keys::GSI_BACKFILL_TEST_GATE)
+        .is_some()
+}
+
+#[cfg(feature = "mongodb-test-hooks")]
+fn is_table_scoped_unknown_commit_gate_key(key: &str) -> bool {
+    table_scoped_gate_table_name(key, extenddb_core::settings_keys::UNKNOWN_COMMIT_TEST_GATE)
+        .is_some()
 }
 
 fn validate_bool(value: &str) -> Result<(), &'static str> {
@@ -50,7 +127,7 @@ fn validate_delay_seconds(value: &str) -> Result<(), &'static str> {
     }
 }
 
-fn validate_gsi_delay_ms(value: &str) -> Result<(), &'static str> {
+fn validate_index_propagation_delay_ms(value: &str) -> Result<(), &'static str> {
     match value.parse::<u32>() {
         Ok(0..=10000) => Ok(()),
         Ok(_) => Err("must be between 0 and 10000"),
@@ -77,8 +154,22 @@ pub async fn set_setting(
         return Err(OpError::Validation(format!("Setting '{key}' is read-only")));
     }
 
-    let known = KNOWN_KEYS.iter().find(|(k, _)| *k == key);
-    if let Some((_, validator)) = known {
+    let known = KNOWN_KEYS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, validator)| *validator);
+    #[cfg(feature = "mongodb-test-hooks")]
+    let known = known
+        .or_else(|| {
+            is_table_scoped_backfill_gate_key(key)
+                .then_some(validate_backfill_test_gate as Validator)
+        })
+        .or_else(|| {
+            is_table_scoped_unknown_commit_gate_key(key)
+                .then_some(validate_unknown_commit_test_gate as Validator)
+        });
+
+    if let Some(validator) = known {
         validator(value).map_err(|reason| {
             OpError::Validation(format!("Invalid value for '{key}': {reason}"))
         })?;
@@ -93,6 +184,9 @@ pub async fn set_setting(
         )));
     }
 
+    // Write under the canonical name, so setting the deprecated alias updates the row
+    // the read path actually consults instead of adding a second, ignored one.
+    let key = extenddb_core::settings_keys::canonical_key(key);
     store.set_setting(key, value).await?;
 
     tracing::warn!(

@@ -4,9 +4,9 @@
 
 ## Current Status
 
-ExtendDB 0.0.2 is the initial release. There is no upgrade path from a previous version — all deployments are fresh installs via `extenddb init`.
+Catalog 0.0.3 is current. The 0.0.2 to 0.0.3 upgrade is the first in-place catalog upgrade ExtendDB has, and **every existing PostgreSQL deployment must run it**, including deployments that never use vector indexes: the server refuses to start against a catalog version it was not built for.
 
-Future releases will include migrations that upgrade the catalog schema in place. The migration infrastructure is built and ready; this document describes how it works and how developers should think about adding new migrations.
+See [Catalog 0.0.3](#catalog-003-current) below for what changes and the exact sequence.
 
 ## How Catalog Upgrades Work
 
@@ -15,8 +15,8 @@ Future releases will include migrations that upgrade the catalog schema in place
 Migrations are SQL files in `crates/storage-postgres/migrations/`, applied in filename order:
 
 ```
-001_schema.sql      ← current: the complete initial schema
-002_<next>.sql      ← future: first incremental migration
+001_schema.sql            ← the complete initial schema
+002_vector_indexes.sql    ← vector index metadata, catalog 0.0.3
 ```
 
 The `schema_history` table tracks which files have been applied. When `extenddb migrate` runs, it:
@@ -181,11 +181,34 @@ psql -d extenddb_catalog -f catalog_backup_YYYYMMDD.sql
 
 ## Version History
 
-### Catalog 0.0.2 (Current — Initial Release)
+### Catalog 0.0.3 (Current)
+
+Adds vector index metadata:
+
+- New `vector_indexes` table: one row per vector index, holding its dimensions, distance function, vector attribute, search schema, projection, and build state.
+- New `vector_indexes` column on `backups`: a snapshot of the source table's vector index configuration, taken when the backup is created.
+
+**Every PostgreSQL deployment must apply this**, whether or not it uses vector indexes, because the server refuses to start against a catalog version it was not built for.
+
+Upgrade sequence:
+
+```bash
+extenddb stop --config extenddb.toml
+extenddb migrate --yes --config extenddb.toml
+extenddb serve --config extenddb.toml
+```
+
+Run `extenddb migrate` without `--yes` first to see what is pending; it reports `catalog 0.0.2 -> 0.0.3` and changes nothing.
+
+The upgrade is not reversible in place: a 0.0.2 binary refuses to start against a 0.0.3 catalog, by the same check in the other direction. Roll back by restoring the catalog backup taken before the upgrade, as described above. Downgrading is safe for data written before the upgrade; vector indexes created afterwards are not representable in 0.0.2 and are lost with the restore.
+
+During the upgrade the migration also attempts to install the pgvector extension on the data database. Failure is reported as a notice and does not stop the upgrade: vector indexes are then refused at request time, and every other operation is unaffected. See the Admin Guide for what the notice means and what to do about it.
+
+### Catalog 0.0.2 (Initial Release)
 
 Complete schema: accounts, tables, indexes, tags, streams, IAM (users, groups, roles, policies, access keys, sessions, permissions boundaries), idempotency tokens, metrics, login attempts, backups, continuous backups, TTL support, settings.
 
-No prior versions exist. All deployments are fresh installs.
+The first release, so all 0.0.2 deployments were fresh installs.
 
 ---
 

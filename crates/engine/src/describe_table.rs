@@ -19,7 +19,7 @@ pub async fn handle_describe_table(
 
     validate_table_name(&input.table_name, &ctx.limits)?;
 
-    let table_desc = ctx
+    let mut table_desc = ctx
         .storage
         .describe_table(&ctx.account_id, input)
         .await
@@ -29,6 +29,7 @@ pub async fn handle_describe_table(
     // populated; the first search would silently undercount.
     table_desc.validate_vector_index_readiness()?;
 
+    table_desc.populate_table_throughput_mode_summary();
     let output = DescribeTableOutput { table: table_desc };
     serialize_output(&output)
 }

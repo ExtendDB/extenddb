@@ -1,6 +1,6 @@
 # ADR-0003: Adopt sqlx::migrate for PostgreSQL catalog and data schema migrations
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-06-17
 - Deciders: ExtendDB CODEOWNERS
 

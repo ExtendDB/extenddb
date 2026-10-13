@@ -97,7 +97,7 @@ def wait_for_gsi_items(paginate, expected: int, timeout: float = 15.0):
 
     GSIs are eventually consistent: an item written to the base table is not
     guaranteed to be visible through a secondary index immediately — ExtendDB
-    applies the configured ``gsi_propagation_delay_ms`` (like real DynamoDB), so
+    applies the configured ``index_propagation_delay_ms`` (like real DynamoDB), so
     a read-back through a GSI right after the write can legitimately be short.
     Tests that write then page a GSI must poll rather than read once.
 

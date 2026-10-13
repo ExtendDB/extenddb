@@ -32,8 +32,9 @@ DynamoDB requires, and the Postgres backend provides:
 - Atomic stream-record capture in the same transaction as the data write.
 - Atomic idempotency-token check+store with the writes.
 
-Postgres achieves this with `BEGIN ISOLATION LEVEL SERIALIZABLE`. SQLite has no
-equivalent knob; a naive multi-connection pool with deferred `BEGIN` allows
+Postgres does not use `SERIALIZABLE` for this. Its write transactions run at `READ COMMITTED` and hold locks until they end: `SELECT ... FOR UPDATE` on every item that exists, and a reserved unique key on every missing item that a ConditionCheck or Delete reads.
+
+SQLite has no row locks to build the same thing from; a naive multi-connection pool with deferred `BEGIN` allows
 write-skew and `SQLITE_BUSY` on the read-then-write path.
 
 ### Options considered
@@ -148,7 +149,7 @@ only) — identical to Postgres, no change needed.
   Postgres backend's persistent-queue design rather than its `FOR UPDATE SKIP
   LOCKED` mechanics, which are unnecessary under the single-writer model.
   The effective delay is the per-GSI `propagation_delay_ms` override when set,
-  otherwise the `gsi_propagation_delay_ms` runtime setting (cached on the engine
+  otherwise the `index_propagation_delay_ms` runtime setting (cached on the engine
   and refreshed by a poller). Delay 0 ⇒ fully synchronous GSI maintenance.
   This **supersedes the earlier "synchronous because local I/O is fast"
   rationale**: that approach ignored the configured propagation delay and so did

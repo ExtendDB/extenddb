@@ -27,7 +27,7 @@ import botocore.config
 import pytest
 import urllib3
 
-from helpers import unique_name, wait_for_active, wait_for_deleted  # noqa: F401
+from helpers import make_dynamodb_client, unique_name, wait_for_active, wait_for_deleted  # noqa: F401
 
 # Suppress InsecureRequestWarning for self-signed TLS certs.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -65,20 +65,13 @@ def is_extenddb(endpoint_url) -> bool:
 
 @pytest.fixture(scope="session")
 def dynamodb_client(endpoint_url: str | None):
-    """Session-scoped boto3 DynamoDB client."""
-    kwargs: dict = {
-        "service_name": "dynamodb",
-        "region_name": os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
-        "config": botocore.config.Config(
-            retries={"max_attempts": 0},  # No SDK retries — we want raw errors
-        ),
-    }
-    if endpoint_url:
-        kwargs["endpoint_url"] = endpoint_url
-        if endpoint_url.startswith("https://"):
-            ca_cert = os.environ.get("EXTENDDB_CA_CERT", "")
-            kwargs["verify"] = ca_cert if ca_cert else False
-    return boto3.client(**kwargs)
+    """Session-scoped boto3 DynamoDB client.
+
+    Not safe to share across threads; a test that drives the server from a
+    thread pool builds one client per thread with
+    `helpers.make_dynamodb_client` instead.
+    """
+    return make_dynamodb_client(endpoint_url)
 
 
 @pytest.fixture(scope="session")

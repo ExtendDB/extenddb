@@ -1,0 +1,138 @@
+# ExtendDB launchers
+
+Package-manager launchers for the ExtendDB dev server: install from your
+ecosystem's package manager, get a DynamoDB-compatible endpoint on loopback in
+one call, point any AWS SDK at it.
+
+npm is the first ecosystem; pip and Maven/Gradle follow. Every launcher
+implements the SAME contract, defined here so the wrappers cannot drift.
+
+## The launcher contract
+
+Every launcher, in every language:
+
+- Spawns the platform's prebuilt `extenddb` dev binary (dev-mode build:
+  loopback-only, plain HTTP, seeded with AWS's documented example credential).
+  Resolution order: explicit option, `EXTENDDB_BINARY` env var, the platform
+  package installed alongside the wrapper, then `PATH`.
+- Configures the server exclusively through environment variables
+  (`EXTENDDB__SERVER__PORT`, `EXTENDDB__STORAGE__SQLITE__PATH`), from a scratch
+  working directory, so a config file in the project cannot leak in.
+- Storage is **file-based by default**: `./.extenddb/data.db` relative to the
+  caller's working directory, created on demand. Tables survive restarts
+  without anyone asking. The directory name is part of the contract.
+- **Memory mode is opt-in** (`--memory` on the CLI, the ecosystem's idiomatic
+  flag in the API): ephemeral, writes nothing to disk, for tests and CI.
+- Naming a persistence path while asking for memory mode is an error, never a
+  silent choice.
+- Waits for `/health` to return 200 before handing back the endpoint, and
+  returns: endpoint URL, port (ephemeral by default), region (`us-east-1`),
+  the seeded credentials, and a stop handle that terminates the child
+  (SIGTERM, then SIGKILL after 5s).
+- Does not outlive the caller: best-effort kill on process exit.
+
+## npm
+
+```bash
+npm install @extenddb/dev
+npx extenddb start            # file-backed at ./.extenddb/data.db
+npx extenddb start --memory   # ephemeral
+```
+
+```js
+const { start } = require("@extenddb/dev");
+const db = await start();                 // file-backed default
+// const db = await start({ memory: true });   ephemeral
+// const db = await start({ dbPath: "ci.db" }); explicit file
+const client = new DynamoDBClient({
+  endpoint: db.endpoint,
+  region: db.region,
+  credentials: db.credentials,
+});
+// ...
+await db.stop();
+```
+
+Platform binaries ship as `optionalDependencies`
+(`@extenddb/<platform>-<arch>`), so `npm install` is copy-only: no compiler,
+no node-gyp, no postinstall downloads. On an unsupported platform the wrapper
+falls back to `EXTENDDB_BINARY` or `PATH`.
+
+## Testing
+
+`test/launcher.test.js` runs against a real dev binary:
+
+```bash
+EXTENDDB_BINARY=/path/to/extenddb node test/launcher.test.js
+```
+
+It proves the contract's load-bearing clauses: file mode is the default and
+persists across two server lifetimes, memory mode creates no files and is
+genuinely ephemeral, and contradictory options are refused.
+
+## Releasing
+
+The launcher versions **with** the server, off the same `vMAJOR.MINOR.PATCH`
+tag the container release uses. The workspace version in the root `Cargo.toml`
+is the source of truth; the tag must match it, `npm/package.json` must match
+it too, and the publish workflow refuses anything else.
+
+The alignment is deliberate. The five platform packages ship the server
+binary, so a server release necessarily republishes all six, and the launcher
+pins its `optionalDependencies` to its own version. An independent launcher
+number could therefore only ever answer "which launcher", never the question
+users actually ask, "which server is inside this". It is the same convention
+esbuild and biome use, whose launchers pin their platform packages at the tool
+version. The accepted cost: a launcher-only fix rides the next server release
+rather than shipping under its own number.
+
+The binary every platform package ships is the slim dev-mode build:
+
+```
+cargo build --release --locked --no-default-features --features sqlite,dev-mode -p extenddb
+```
+
+Flow (mirrors the container release: candidate first, promotion is a
+deliberate second step):
+
+1. Land the release state on `main` with the workspace version bumped and
+   `npm/package.json` bumped to match, then tag that commit `vX.Y.Z` and push
+   the tag. This is the same tag the container release consumes; the two
+   publish workflows are dispatched independently against it.
+2. Dispatch the `npm-publish` workflow from `main` with the tag as input.
+   The gate validates shape, existence, ancestry against `main`, and the
+   version match. Five native runners build, smoke test, and run the full
+   launcher suite against their own binary. Only after all five pass does the
+   reviewer-gated `npm` environment release the token, and everything is
+   published with `--provenance` under the `candidate` dist-tag. Nothing
+   reaches `latest`.
+3. Verify the candidate from a clean machine:
+   `npm install @extenddb/dev@candidate` and run a smoke script in both storage
+   modes.
+4. Promote, one dist-tag move per package:
+
+   ```
+   npm dist-tag add @extenddb/dev@X.Y.Z latest
+   npm dist-tag add @extenddb/linux-x64@X.Y.Z latest        # and the other four
+   ```
+
+One-time registry and repo setup, in order: create the npm org `extenddb`.
+The launcher ships as the scoped `@extenddb/dev` rather than an unscoped
+`extenddb`, because npm's package-name similarity filter refuses the latter
+against the long-established `extend` package. Then create a granular
+automation token scoped to the `@extenddb` scope with publish permission only,
+and create the GitHub environment `npm` with deployment branch rule `main`,
+required reviewers, and the token as `NPM_TOKEN`.
+
+## Known limits
+
+- A hard-killed caller (SIGKILL, OOM) cannot run its exit handler, so the
+  spawned server survives it, holding its port and storage. `stop()` and
+  normal process exit shut it down; after a hard kill, kill the `extenddb`
+  process yourself.
+- The prebuilt Linux binaries are glibc builds. On musl systems (Alpine,
+  `node:alpine`) they fail to execute even though the file exists; build a
+  musl binary and point `EXTENDDB_BINARY` at it.
+- Two servers cannot share one database file: a second `start()` on the same
+  path fails at startup with a lock error. Use distinct `dbPath`s or memory
+  mode for parallel test workers.

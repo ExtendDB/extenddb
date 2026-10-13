@@ -1,0 +1,92 @@
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+
+# The `extenddb-dev` image: a DynamoDB-compatible endpoint over SQLite, for local
+# development and CI. It is NOT the production image — see `Dockerfile` for the
+# PostgreSQL-backed one, which this file deliberately does not share, so that
+# nothing here can alter the production build.
+#
+# Differences from the production image, all intentional:
+#   * `sqlite` backend, no external database to run alongside.
+#   * `dev-mode`: plain HTTP and open authorization (SigV4 is still enforced), so
+#     an SDK points at it with no certificate to trust. Compile-time gated to a
+#     dev backend; `postgres`/`mongodb` cannot build it.
+#   * `--profile release-slim`: stripped and LTO'd. Confined to this image so the
+#     production binaries keep readable panic backtraces.
+#   * distroless runtime: no shell, no package manager, no setuid binaries.
+
+FROM public.ecr.aws/docker/library/rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS build
+ARG VCS_REF
+ARG BUILD_DATE
+WORKDIR /src
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends cmake=3.25.1-1 \
+ && rm -rf /var/lib/apt/lists/*
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN test -n "${VCS_REF}" \
+ && test "${VCS_REF}" != unknown \
+ && test -n "${BUILD_DATE}" \
+ && test "${BUILD_DATE}" != unknown \
+ && EXTENDDB_GIT_HASH="${VCS_REF}" \
+    EXTENDDB_BUILD_TIME="${BUILD_DATE}" \
+    cargo build --locked --profile release-slim \
+      -p extenddb --no-default-features --features sqlite,dev-mode \
+ && install -d -m 0700 /state
+
+# Distroless cc: glibc, libgcc (Rust needs it for unwinding) and CA certificates,
+# with no shell and no package manager, so the
+# image carries nothing that can be exec'd into. `nonroot` runs as uid 65532;
+# there is no adduser step available here, which is why the uid differs from the
+# production image's 10001. The state directory is chowned at build time.
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:adcd20c7b4c988b73cbfbddb26d2eee574571e6d7c9ffea29b3821e0690efb77 AS runtime
+ARG VERSION
+ARG VCS_REF
+ARG BUILD_DATE
+
+COPY --from=build --chmod=0555 /src/target/release-slim/extenddb /usr/local/bin/extenddb
+# The DEV notices file: generated for this image's exact feature set
+# (sqlite,dev-mode) by devtools/generate-dev-license-notices. The production
+# SOFTWARE-LICENSE-NOTICES.html covers the postgres feature set and would omit
+# attribution for dependencies this image actually bundles (libsqlite3-sys).
+COPY --chmod=0444 LICENSE NOTICE /usr/share/doc/extenddb/
+COPY --chmod=0444 SOFTWARE-LICENSE-NOTICES-DEV.html /usr/share/doc/extenddb/SOFTWARE-LICENSE-NOTICES.html
+COPY --from=build --chown=65532:65532 /state /var/lib/extenddb
+
+LABEL org.opencontainers.image.title="ExtendDB dev (SQLite)" \
+      org.opencontainers.image.description="DynamoDB-compatible API over SQLite for local development and CI. Plain HTTP, open authorization: not for production or shared networks." \
+      org.opencontainers.image.source="https://github.com/ExtendDB/extenddb" \
+      org.opencontainers.image.url="https://github.com/ExtendDB/extenddb" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+# Zero config by design: with no config file present a dev-mode build serves from
+# built-in defaults, bootstrapping the catalog on first serve. There is therefore
+# no init step, no bootstrap sidecar and no entrypoint script.
+#
+# File-backed is the default; mount a volume at /var/lib/extenddb to keep it.
+# For an ephemeral instance, set EXTENDDB__STORAGE__SQLITE__PATH=:memory:.
+ENV HOME=/var/lib/extenddb \
+    EXTENDDB__SERVER__BIND_ADDR=0.0.0.0 \
+    EXTENDDB__SERVER__PORT=18080 \
+    EXTENDDB__STORAGE__SQLITE__PATH=/var/lib/extenddb/extenddb.sqlite \
+    EXTENDDB_DEV_ALLOW_ANY_BIND=1
+WORKDIR /var/lib/extenddb
+USER 65532:65532
+# 18080, not the project default 18443: the `1` + `8443` scheme signals TLS,
+# and this image serves plain HTTP — an HTTPS-looking port invites `https://`
+# and a connection failure that looks like a bug. `1` + `8080` applies the same
+# rule to the plain-HTTP convention, so the pair self-documents (18443 = TLS,
+# 18080 = plain). 8000 is deliberately avoided: a comparable local emulator
+# binds it, and differential testing would have the two fight for the port.
+EXPOSE 18080
+STOPSIGNAL SIGTERM
+# No --endpoint: the probe resolves its target the same way `serve` does
+# (EXTENDDB__SERVER__* overrides on built-in defaults), so a server moved with
+# EXTENDDB__SERVER__PORT is probed on that port rather than sitting unhealthy
+# forever, which would also wedge `depends_on: condition: service_healthy`.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=5 \
+  CMD ["extenddb", "healthcheck"]
+ENTRYPOINT ["/usr/local/bin/extenddb"]
+CMD ["serve", "--foreground"]

@@ -171,28 +171,67 @@ pub(crate) fn deserialize_error(e: serde_json::Error) -> DynamoDbError {
     }
 }
 
-/// Pre-validate enum fields in a JSON body and return a combined error if multiple are invalid.
-///
-/// `DynamoDB` reports all invalid enum fields together rather than stopping at the first.
-/// Each entry is `(json_field_name, api_field_name, valid_values)`.
+/// One enum field for [`validate_enum_fields`]: where to find it in the JSON
+/// body, what values are members, and how the service renders a violation.
+pub(crate) struct EnumField<'a> {
+    pub json_name: &'a str,
+    pub valid: &'a [&'a str],
+    pub clause: EnumClause<'a>,
+}
+
+/// How the service renders one enum violation inside the
+/// "N validation errors detected" envelope.
+pub(crate) enum EnumClause<'a> {
+    /// The common form: `Value 'X' at 'field' failed to satisfy constraint:
+    /// Member must satisfy enum value set: [...]`.
+    Named(&'a str),
+    /// A verbatim clause with no value or field prefix. `ReturnValues` is the
+    /// measured case: the service reports it as a bare
+    /// `Failed to satisfy constraint: Member must satisfy enum value set:
+    /// [ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]` -- no field name,
+    /// and the displayed set carries the service's own `UPDATE_NEW` typo.
+    /// Measured 2026-08-24 (us-east-1) on PutItem, DeleteItem, and UpdateItem
+    /// alike, so the text is reproduced verbatim rather than derived.
+    Bare(&'a str),
+}
+
+/// The bare clause the service renders for a `ReturnValues` enum violation.
+/// See [`EnumClause::Bare`] for why the set below does not match the accepted
+/// member list.
+pub(crate) const RETURN_VALUES_BARE_CLAUSE: &str = "Failed to satisfy constraint: \
+     Member must satisfy enum value set: [ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]";
+
+/// The `ReturnValues` members the service actually accepts (the displayed set
+/// in [`RETURN_VALUES_BARE_CLAUSE`] is NOT this list).
+pub(crate) const RETURN_VALUES_MEMBERS: &[&str] =
+    &["NONE", "ALL_OLD", "ALL_NEW", "UPDATED_OLD", "UPDATED_NEW"];
+
+/// Pre-validate enum fields in a JSON body and return a combined error if
+/// multiple are invalid, in the order listed. Whether an operation aggregates
+/// its enum violations or stops at the first is per operation on the service
+/// (PutItem/DeleteItem/Scan aggregate; UpdateItem and Query stop at the
+/// first), so callers choose by passing one list or several sequential calls.
 pub(crate) fn validate_enum_fields(
     body: &serde_json::Value,
-    fields: &[(&str, &str, &[&str])],
+    fields: &[EnumField<'_>],
 ) -> Result<(), DynamoDbError> {
     let Some(obj) = body.as_object() else {
         return Ok(());
     };
     let mut errors: Vec<String> = Vec::new();
-    for &(json_name, api_name, valid) in fields {
-        if let Some(val) = obj.get(json_name)
+    for field in fields {
+        if let Some(val) = obj.get(field.json_name)
             && let Some(s) = val.as_str()
-            && !valid.contains(&s)
+            && !field.valid.contains(&s)
         {
-            errors.push(format!(
-                "Value '{s}' at '{api_name}' failed to satisfy constraint: \
+            errors.push(match field.clause {
+                EnumClause::Named(api_name) => format!(
+                    "Value '{s}' at '{api_name}' failed to satisfy constraint: \
                          Member must satisfy enum value set: [{}]",
-                valid.join(", ")
-            ));
+                    field.valid.join(", ")
+                ),
+                EnumClause::Bare(clause) => clause.to_owned(),
+            });
         }
     }
     if errors.is_empty() {

@@ -2,7 +2,7 @@
 
 ## 1. Purpose
 
-This index maps each of the 16 known extenddb symptoms to the category file that holds the verbatim Cause and Fix from `docs/troubleshooting.md`. To use it, grep this file for the user's error text, follow the link to the category file, and present the entry to the user. The skill never executes a remediation command on the user's behalf. Requirement 14.4 applies to every entry.
+This index maps each of the 17 known extenddb symptoms to the category file that holds the verbatim Cause and Fix from `docs/troubleshooting.md`. To use it, grep this file for the user's error text, follow the link to the category file, and present the entry to the user. The skill never executes a remediation command on the user's behalf. Requirement 14.4 applies to every entry.
 
 ## 2. Symptom table
 
@@ -24,6 +24,7 @@ This index maps each of the 16 known extenddb symptoms to the category file that
 | 14 | UnrecognizedClientException | `06-auth-symptoms.md#unrecognizedclientexception` | `UnrecognizedClientException: The security token included in the request is invalid` |
 | 15 | AccessDeniedException | `06-auth-symptoms.md#accessdeniedexception` | `AccessDeniedException: User: <ARN> is not authorized to perform: <action>` |
 | 16 | Connection pool exhausted / HTTP 500 under load | `07-runtime-symptoms.md#connection-pool-exhausted` | `HTTP 500 on all requests under heavy load` |
+| 17 | Vector indexes are not supported / SearchVectors is not supported | `05-feature-gate-symptoms.md#vector-unsupported` | `Vector indexes are not supported by this storage backend` |
 
 
 ## 3. Per-entry summaries
@@ -141,6 +142,13 @@ The cause and fix summaries below are paraphrased for quick scanning. The catego
 **Cause summary:** The PostgreSQL connection pool is exhausted and new requests cannot acquire a connection within the timeout.
 **Fix summary:** Raise `pool_size` under `[storage.postgres]` in `extenddb.toml` and investigate long-running queries in `pg_stat_activity`.
 **Full entry:** `references/07-runtime-symptoms.md#connection-pool-exhausted`
+
+### Vector indexes are not supported
+
+**Error text:** `Vector indexes are not supported by this storage backend` (or `SearchVectors is not supported by this storage backend`)
+**Cause summary:** Vector indexes need the pgvector extension on the PostgreSQL data database, and the server probes for it once at startup and caches the answer.
+**Fix summary:** Install the extension for the server version, run `CREATE EXTENSION vector;` on the data database, then restart ExtendDB, because the probe result is cached at startup.
+**Full entry:** `references/05-feature-gate-symptoms.md#vector-unsupported`
 
 ## 4. Unknown-symptom fallback
 

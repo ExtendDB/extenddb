@@ -10,7 +10,25 @@ use extenddb_core::types::{
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{sk_column, sk_column_n};
 
-use super::{all_sort_key_info, data_table_name, index_table_name};
+use super::{all_sort_key_info, data_table_name, index_table_name, vector_table_name};
+
+/// Column type for every text key column (`pk`, `sk_s`, `base_pk`,
+/// `base_sk_s`, and their numbered variants).
+///
+/// Amazon DynamoDB orders string keys by UTF-8 byte value (measured
+/// 2026-09-16: `A < B < Z < _ < a < a_z < ab < b < z < é < 中`, with
+/// `BETWEEN` and `begins_with` following the same comparison). The query
+/// builders express that with `COLLATE "C"` on every string key predicate and
+/// `ORDER BY`. Declaring the columns with the same collation makes the
+/// primary key and the ordering indexes serve those predicates; a column left
+/// on the database collation (`en_US.utf8` in the default setups) forces
+/// PostgreSQL to seek on `pk` alone and filter the sort key afterwards,
+/// which re-reads a partition from its start on every page.
+///
+/// Tables created before this constant existed keep the database collation
+/// on these columns. Their results are still ordered correctly, because the
+/// predicates carry the collation explicitly; only the index use differs.
+const TEXT_KEY: &str = "TEXT COLLATE \"C\"";
 use crate::PostgresEngine;
 
 /// Row shape returned by the table-info query: (`key_schema`, `attr_defs`, status, `table_id`, `stream_spec`).
@@ -50,7 +68,7 @@ impl PostgresEngine {
         let ddl = if sk_infos.is_empty() {
             format!(
                 r"CREATE TABLE {ddb_table} (
-                    pk TEXT NOT NULL PRIMARY KEY,
+                    pk {TEXT_KEY} NOT NULL PRIMARY KEY,
                     item_data JSONB NOT NULL
                 )"
             )
@@ -59,8 +77,8 @@ impl PostgresEngine {
             let sk_col = sk_column(sk_infos[0].1);
             format!(
                 r"CREATE TABLE {ddb_table} (
-                    pk TEXT NOT NULL,
-                    sk_s TEXT,
+                    pk {TEXT_KEY} NOT NULL,
+                    sk_s {TEXT_KEY},
                     sk_n NUMERIC,
                     sk_b BYTEA,
                     item_data JSONB NOT NULL,
@@ -69,18 +87,18 @@ impl PostgresEngine {
             )
         } else {
             // Multi-part RANGE key: one typed column set per RANGE attribute
-            let mut col_defs = vec!["pk TEXT NOT NULL".to_owned()];
+            let mut col_defs = vec![format!("pk {TEXT_KEY} NOT NULL")];
             let mut pk_cols = vec!["pk".to_owned()];
             for (i, &(_, sk_type)) in sk_infos.iter().enumerate() {
                 let col = sk_column_n(i, sk_type);
                 // Add all three type columns for this SK position
                 if i == 0 {
-                    col_defs.push("sk_s TEXT".to_owned());
+                    col_defs.push(format!("sk_s {TEXT_KEY}"));
                     col_defs.push("sk_n NUMERIC".to_owned());
                     col_defs.push("sk_b BYTEA".to_owned());
                 } else {
                     let n = i + 1;
-                    col_defs.push(format!("sk{n}_s TEXT"));
+                    col_defs.push(format!("sk{n}_s {TEXT_KEY}"));
                     col_defs.push(format!("sk{n}_n NUMERIC"));
                     col_defs.push(format!("sk{n}_b BYTEA"));
                 }
@@ -151,32 +169,32 @@ impl PostgresEngine {
         let idx_sks = all_sort_key_info(index_key_schema, attr_defs);
 
         // Build column definitions
-        let mut col_defs = vec!["pk TEXT NOT NULL".to_owned()];
+        let mut col_defs = vec![format!("pk {TEXT_KEY} NOT NULL")];
 
         // Index SK columns
         for (i, &(_, _)) in idx_sks.iter().enumerate() {
             if i == 0 {
-                col_defs.push("sk_s TEXT".to_owned());
+                col_defs.push(format!("sk_s {TEXT_KEY}"));
                 col_defs.push("sk_n NUMERIC".to_owned());
                 col_defs.push("sk_b BYTEA".to_owned());
             } else {
                 let n = i + 1;
-                col_defs.push(format!("sk{n}_s TEXT"));
+                col_defs.push(format!("sk{n}_s {TEXT_KEY}"));
                 col_defs.push(format!("sk{n}_n NUMERIC"));
                 col_defs.push(format!("sk{n}_b BYTEA"));
             }
         }
 
         // Base table key columns for uniqueness
-        col_defs.push("base_pk TEXT NOT NULL".to_owned());
+        col_defs.push(format!("base_pk {TEXT_KEY} NOT NULL"));
         for (i, &(_, _)) in base_sks.iter().enumerate() {
             if i == 0 {
-                col_defs.push("base_sk_s TEXT".to_owned());
+                col_defs.push(format!("base_sk_s {TEXT_KEY}"));
                 col_defs.push("base_sk_n NUMERIC".to_owned());
                 col_defs.push("base_sk_b BYTEA".to_owned());
             } else {
                 let n = i + 1;
-                col_defs.push(format!("base_sk{n}_s TEXT"));
+                col_defs.push(format!("base_sk{n}_s {TEXT_KEY}"));
                 col_defs.push(format!("base_sk{n}_n NUMERIC"));
                 col_defs.push(format!("base_sk{n}_b BYTEA"));
             }
@@ -228,6 +246,133 @@ impl PostgresEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
         }
 
+        // Index on base table key columns for delete_index_row_multi lookups.
+        {
+            let mut base_key_cols = vec!["base_pk".to_owned()];
+            for (i, &(_, sk_type)) in base_sks.iter().enumerate() {
+                let col = if i == 0 {
+                    format!("base_{}", sk_column(sk_type))
+                } else {
+                    format!("base_{}", sk_column_n(i, sk_type))
+                };
+                base_key_cols.push(col);
+            }
+            let idx_name = format!("_ddb_{index_id}_base_key_idx");
+            let base_key_idx = format!(
+                "CREATE INDEX \"{idx_name}\" ON {idx_table} ({})",
+                base_key_cols.join(", ")
+            );
+            sqlx::query(&base_key_idx)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
+
+        Ok(())
+    }
+
+    /// Create the data table for one vector index.
+    ///
+    /// Column set is the SQLite backend's, with PostgreSQL types: `embedding` is
+    /// pgvector's own `vector(N)` rather than a blob, so distance, ordering and
+    /// the row limit all evaluate in the server and the wire carries k rows
+    /// instead of the whole candidate set.
+    ///
+    /// Keyed by the base item rather than by the partition, so one base item
+    /// yields at most one vector row and a re-put replaces it. A partition move
+    /// is therefore a delete followed by an insert, which is what the apply path
+    /// does unconditionally.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Unsupported`] when the server has no pgvector, so
+    /// a lost extension reports as a refusal rather than a fault.
+    pub(crate) async fn create_vector_data_table(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        index_id: &str,
+        dimensions: u32,
+        base_key_schema: &[KeySchemaElement],
+        base_attr_defs: &[AttributeDefinition],
+    ) -> Result<(), StorageError> {
+        let vec_table = vector_table_name(index_id);
+        let base_sks = all_sort_key_info(base_key_schema, base_attr_defs);
+
+        let mut col_defs = vec![
+            // `pk_to_text` of the HASH element's value, or the unscoped sentinel.
+            // Scoping happens on this column, never on the payload.
+            //
+            // BYTEA rather than TEXT, and not by preference: the shared unscoped
+            // sentinel begins with a NUL byte, deliberately, because no partition
+            // derived from item data can contain one. PostgreSQL cannot store a NUL
+            // in a text column at all, so a text column here rejects every row of
+            // every unscoped index. Bytes keep the shared value byte-identical
+            // across backends, which is what makes a write and a search agree.
+            "part BYTEA NOT NULL".to_owned(),
+            format!("base_pk {TEXT_KEY} NOT NULL"),
+        ];
+        for (i, &(_, sk_type)) in base_sks.iter().enumerate() {
+            let _ = sk_type;
+            if i == 0 {
+                col_defs.push(format!("base_sk_s {TEXT_KEY}"));
+                col_defs.push("base_sk_n NUMERIC".to_owned());
+                col_defs.push("base_sk_b BYTEA".to_owned());
+            } else {
+                let n = i + 1;
+                col_defs.push(format!("base_sk{n}_s {TEXT_KEY}"));
+                col_defs.push(format!("base_sk{n}_n NUMERIC"));
+                col_defs.push(format!("base_sk{n}_b BYTEA"));
+            }
+        }
+        // NOT NULL because a non-indexable item is never inserted: the apply path
+        // deletes instead, so there is no such thing as a row without a vector.
+        col_defs.push(format!("embedding vector({dimensions}) NOT NULL"));
+        // The L2 norm at write time, kept even though pgvector computes cosine
+        // itself: it is what lets the cosine expression return the measured 1.0
+        // for a zero vector, where pgvector's operator yields NaN.
+        col_defs.push("nrm DOUBLE PRECISION NOT NULL".to_owned());
+        col_defs.push("item_data JSONB NOT NULL".to_owned());
+
+        let mut pk_cols = vec!["base_pk".to_owned()];
+        for (i, &(_, sk_type)) in base_sks.iter().enumerate() {
+            pk_cols.push(format!("base_{}", sk_column_n(i, sk_type)));
+        }
+
+        let ddl = format!(
+            "CREATE TABLE {vec_table} (\n    {},\n    PRIMARY KEY ({})\n)",
+            col_defs.join(",\n    "),
+            pk_cols.join(", ")
+        );
+        sqlx::query(&ddl)
+            .execute(&mut **tx)
+            .await
+            .map_err(crate::vector::map_vector_sql_error)?;
+
+        // Every search is partition-scoped, including an unscoped index's search
+        // against the sentinel, so this index is what keeps one off a full scan.
+        // Left unnamed, as the GSI tables' ordering index is: a name built from the
+        // ids would be truncated at PostgreSQL's 63-byte identifier limit.
+        let part_idx = format!("CREATE INDEX ON {vec_table} (part)");
+        sqlx::query(&part_idx)
+            .execute(&mut **tx)
+            .await
+            .map_err(crate::vector::map_vector_sql_error)?;
+
+        // No ANN index yet: exact scan first, per ADR-0004 and the plan. Adding
+        // HNSW later is a CREATE INDEX against this same column with no table
+        // rewrite, which is why the column type is `vector(N)` from the start.
+        Ok(())
+    }
+
+    /// Drop one vector index's data table.
+    pub(crate) async fn drop_vector_data_table(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        index_id: &str,
+    ) -> Result<(), StorageError> {
+        let vec_table = vector_table_name(index_id);
+        sqlx::query(&format!("DROP TABLE IF EXISTS {vec_table}"))
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
         Ok(())
     }
 
@@ -303,6 +448,12 @@ impl PostgresEngine {
         let (global_secondary_indexes, local_secondary_indexes) =
             self.fetch_all_index_info(&table_id).await?;
         let has_lsi = !local_secondary_indexes.is_empty();
+        // Vector indexes ride on the cached key info too, so the engine can
+        // validate vector attributes on writes and charge vector write capacity.
+        // The update path already passes `key_info.vector_indexes` into the
+        // expression evaluator, so populating this is what turns that validation
+        // on: no call site changes.
+        let vector_indexes = self.fetch_vector_index_key_info(&table_id).await?;
 
         let key_info = TableKeyInfo {
             table_name: table_name.to_owned(),
@@ -315,10 +466,10 @@ impl PostgresEngine {
             global_secondary_indexes,
             local_secondary_indexes,
             stream_specification,
-            // Fields for features this backend does not implement, vector
-            // indexes today, take their defaults. Adding one to TableKeyInfo
-            // then does not break this build.
-            ..Default::default()
+            // Every field is populated, with no `..Default::default()` spread: a
+            // new core field should break this site and force a decision about
+            // whether the write path needs it, rather than silently defaulting.
+            vector_indexes,
         };
         // Catalog metadata that cannot describe its own sort key would make the
         // keyed read paths fall back to a partition-only lookup and return the
@@ -327,6 +478,30 @@ impl PostgresEngine {
             .validate_sort_key_definitions()
             .map_err(StorageError::Internal)?;
         Ok(key_info)
+    }
+
+    /// Fetch the vector indexes of a table in the shape the engine caches.
+    ///
+    /// Selects the whole row rather than the five columns this shape needs, so
+    /// that one row type and one decode path serve both this and the describe
+    /// path. The extra columns are two short tokens and a boolean, read only on a
+    /// key-info cache miss.
+    async fn fetch_vector_index_key_info(
+        &self,
+        table_id: &str,
+    ) -> Result<Vec<extenddb_core::types::VectorIndexKeyInfo>, StorageError> {
+        let rows: Vec<crate::table_helpers::VectorIndexRow> = sqlx::query_as(&format!(
+            "SELECT {} FROM vector_indexes WHERE table_id = $1 ORDER BY index_name",
+            crate::table_helpers::VECTOR_INDEX_COLUMNS
+        ))
+        .bind(table_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        extenddb_storage::vector_catalog::vector_index_key_info(
+            rows.into_iter().map(Into::into).collect(),
+        )
     }
 
     /// Fetch every secondary index defined on a table, split into

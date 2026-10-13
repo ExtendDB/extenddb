@@ -106,10 +106,11 @@ key_path = "/etc/extenddb/tls/key.pem"
 
 ## Running in Containers
 
-The PostgreSQL-backend image contains ExtendDB only; PostgreSQL 14+ runs as a
-separate service. See [`docker/README.md`](docker/README.md) for the approved
-base-image build, hardened local Compose stack, smoke test, and explicit
-init/migrate/serve production lifecycle.
+The production images contain ExtendDB only; the database (PostgreSQL 14+ and MongoDB 7+)
+runs as a separate service. See [`docker/README.md`](docker/README.md) for the PostgreSQL
+image and [`docker/README-mongodb.md`](docker/README-mongodb.md) for the MongoDB
+image, external database requirements, hardened local Compose stacks, smoke tests, and
+explicit init/migrate/serve production lifecycle.
 
 By default `extenddb serve` daemonizes itself, which doesn't play well with container runtimes and process supervisors that expect PID 1 to stay attached. Pass `--foreground` (alias `--no-daemon`) to keep the process in the foreground and stream logs to stderr instead of syslog:
 
@@ -134,6 +135,10 @@ extenddb healthcheck --endpoint https://127.0.0.1:18443 # explicit target
 ```
 
 This is a liveness check, which is what a container `HEALTHCHECK` wants: `/health` does not query the storage backend, so it reports healthy even if PostgreSQL becomes unreachable after startup. That is deliberate, since a liveness probe that failed on a database outage would restart every replica at once. A backend that is unreachable at startup does stop the server from listening, so that case is caught. There is no separate readiness endpoint yet.
+
+### One instance per database
+
+Run one `extenddb serve` per catalog. On SQLite this is enforced: the server takes an exclusive lock on `<database>.lock` next to the database file and a second server on the same file refuses to start (`init`, `migrate`, and `destroy` take the same lock while they run). On PostgreSQL and MongoDB nothing prevents a second instance, but running more than one against the same catalog is not supported in this release: every instance runs every background worker, credential and policy caches are per instance with no cross-instance invalidation (a revoked key stays valid on the other instance for up to the cache TTL), and `/health` does not check the database. See the [deployment guide](docs/manuals/11-deployment-guide.md#multi-instance-considerations).
 
 To make the generated self-signed certificate valid for the name clients use — an in-cluster service DNS name, for example — pass `--tls-san` to `init` (repeatable):
 
@@ -196,6 +201,9 @@ Query, Scan (key conditions, filters, projections, pagination, index selection)
 ### Batch & Transactions
 BatchGetItem (100 keys), BatchWriteItem (25 ops), TransactGetItems (100 items), TransactWriteItems (100 ops)
 
+### Vector Search
+SearchVectors, and vector indexes on CreateTable and UpdateTable (cosine, Euclidean and dot product; on-demand tables only). On PostgreSQL this requires the pgvector extension on the data database; without it every vector operation is refused and nothing else is affected.
+
 ### Streams
 ListStreams, DescribeStream, GetShardIterator, GetRecords
 
@@ -257,4 +265,4 @@ Code in protected paths is reviewed via [`.github/CODEOWNERS`](.github/CODEOWNER
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. 
+This software is provided "as is" without warranty of any kind.

@@ -14,6 +14,15 @@ pub enum StorageError {
     IndexNotFound(String),
     #[error("Index already exists: {0}")]
     IndexAlreadyExists(String),
+    /// A change refused because an index on the resource is mid-transition.
+    /// Carries the whole client-facing message, because the state, and
+    /// therefore the wording, is known only to the backend that holds it: a
+    /// DeleteTable refused while indexes build carries the sentence AWS
+    /// documents for that case, and a vector index deleted while its creation
+    /// is still allocating resources carries the measured phase-dependent
+    /// refusal (2026-08-19). Maps to `ResourceInUseException` verbatim.
+    #[error("{0}")]
+    IndexesInUse(String),
     #[error("Deletion protection enabled: {0}")]
     DeletionProtected(String),
     #[error("Condition check failed")]
@@ -35,6 +44,21 @@ pub enum StorageError {
     NoOpUpdate(String),
     #[error("Validation error: {0}")]
     Validation(String),
+    /// A per-table or per-account limit was exceeded. Maps to
+    /// `LimitExceededException`, which the service uses for the vector-index
+    /// count limit on `UpdateTable` (a DIFFERENT class from the
+    /// `ValidationException` `CreateTable` reports for the same limit;
+    /// measured 2026-08-13).
+    #[error("{0}")]
+    LimitExceeded(String),
+    /// A failure that is expected to succeed on retry: I/O errors, pool
+    /// timeouts, SQLITE_BUSY / SQLITE_LOCKED. Exists so queue workers can tell
+    /// "this row can never be applied" (drop it, or the whole queue stalls)
+    /// from "the database hiccuped" (retry it, or the row's index write is
+    /// silently lost). Before this distinction both collapsed to `Internal`
+    /// and the worker dropped claimed rows on transient errors.
+    #[error("{0}")]
+    Transient(String),
     #[error(
         "Catalog version mismatch: expected {expected}, found {found}. Run 'extenddb migrate' to update."
     )]

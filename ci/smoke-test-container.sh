@@ -87,6 +87,24 @@ compose() {
     "${COMPOSE[@]}" -p "$PROJECT" "$@"
 }
 
+compose_pull_with_retry() {
+    local max_attempts=4
+    local attempt
+
+    for attempt in $(seq 1 "$max_attempts"); do
+        if compose pull "$@"; then
+            return 0
+        fi
+        if (( attempt == max_attempts )); then
+            echo "error: Compose pull failed after $max_attempts attempts" >&2
+            return 1
+        fi
+        local delay=$((5 << (attempt - 1)))
+        echo "warning: Compose pull failed; retrying in ${delay}s (attempt $((attempt + 1))/$max_attempts)" >&2
+        sleep "$delay"
+    done
+}
+
 wait_for_health() {
     local container_id="$1"
     local status=""
@@ -115,6 +133,7 @@ echo "  project: $PROJECT"
 echo "  image:   $EXTENDDB_IMAGE"
 echo "  version: $EXTENDDB_VERSION"
 echo "  commit:  $VCS_REF"
+compose_pull_with_retry postgres
 if [[ "$PREBUILT_IMAGE" == "true" ]]; then
     echo "  mode:    prebuilt (build disabled)"
     compose up -d --no-build

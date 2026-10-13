@@ -39,10 +39,10 @@ extenddb uses SigV4 signature verification with a local credential store and IAM
 3. Look up the access key in the credential store
 4. Decrypt the secret key (AES-256-GCM)
 5. Compute the signing key: HMAC-SHA256 chain over date, region, service, "aws4_request"
-6. Compute the string-to-sign from the canonical request
+6. Compute the string-to-sign from the canonical request. The hashed-payload line is the SHA-256 of the body the server received; a client-supplied `x-amz-content-sha256` header is not used for it, so a request whose body was altered after signing fails at step 7
 7. Compare computed signature against the provided signature (constant-time comparison)
-8. On mismatch: return `SignatureDoesNotMatch` (HTTP 403)
-9. On unknown key: return `UnrecognizedClientException` (HTTP 403)
+8. On mismatch: return `InvalidSignatureException` (HTTP 400)
+9. On unknown key: return `UnrecognizedClientException` (HTTP 400)
 
 #### Credential Types
 

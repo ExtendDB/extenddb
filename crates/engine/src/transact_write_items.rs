@@ -181,8 +181,36 @@ pub async fn handle_transact_write_items(
     match ctx.storage.transact_write_items(&ops, idempotency).await {
         Ok(()) => {}
         Err(extenddb_storage::error::StorageError::IdempotentReplay) => {
+            // A same-token replay re-reads the stored result rather than
+            // writing, and its capacity says so: a transactional READ
+            // recomputed against each item's size (2 x ceil(size/4KB)), not
+            // the stored write magnitude relabelled. Measured: a ~1.5KB put
+            // reports 4 WCU on the first call and 2 RCU on the replay, which
+            // only agree below 1KB.
+            let consumed_capacity = match input.return_consumed_capacity {
+                extenddb_core::types::ReturnConsumedCapacity::None => None,
+                rcc => {
+                    let indexes = rcc == extenddb_core::types::ReturnConsumedCapacity::Indexes;
+                    let mut per_table_rcu: HashMap<String, f64> = HashMap::new();
+                    for op in &prepared {
+                        let rcu =
+                            capacity_helpers::read_capacity_units(op.write_bytes(), true) * 2.0;
+                        *per_table_rcu.entry(op.table_name().to_owned()).or_default() += rcu;
+                    }
+                    Some(
+                        per_table_rcu
+                            .iter()
+                            .map(|(t, cu)| {
+                                extenddb_core::types::ConsumedCapacity::transact_replay_read(
+                                    t, *cu, indexes,
+                                )
+                            })
+                            .collect(),
+                    )
+                }
+            };
             let output = TransactWriteItemsOutput {
-                consumed_capacity: None,
+                consumed_capacity,
                 item_collection_metrics: None,
             };
             return Ok(DispatchResult::body_only(serialize_output(&output)?));

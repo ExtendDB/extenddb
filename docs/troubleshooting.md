@@ -93,6 +93,14 @@ ss -tlnp | grep :18443                    # find what's using the port
 extenddb serve --port 19443 --config extenddb.toml  # use a different port
 ```
 
+### `another extenddb process is already using <database> (lock held on <database>.lock)`
+
+**Cause:** A SQLite database file has one owner at a time. `extenddb serve` takes an exclusive lock on `<database>.lock` (next to the file SQLite opens, after resolving any `sqlite:` or `file:` form, relative path, or symlink) before it opens the database and holds it until it exits. `init` (through to the admin user being written), `migrate`, and `destroy` take the same lock for as long as they run, because they rewrite or remove the file. The backend serializes writers inside one process and recovers interrupted work at startup, so a second server, or a migration or destroy under a running server, would corrupt the first one's work. Read-only commands (`settings`, `manage`, `verify`, `status`) take no lock and run alongside a server.
+
+**Fix:** Stop the other process (`extenddb stop --config <config>` for a server), or point this command at a different database (`--sqlite-path` at `init` time). The lock is released by the operating system when the holder exits, including after a crash, so a leftover `<database>.lock` file is harmless and needs no cleanup.
+
+**Scope:** The lock is `flock(2)`, taken on Linux and macOS. It is advisory, and on network filesystems (NFS, SMB) its behavior depends on the server and mount options; keep SQLite databases on local disk. On other platforms no lock is taken and the server logs a warning at startup. The directory holding the database must be writable so the lock file can be created; a database in a read-only directory now fails to start with `cannot open lock file`. The lock file is created mode 0600 like the database itself; a world-readable lock file would let any local user hold the lock and keep the server from starting.
+
 ### `Failed to load TLS certificates: <error>`
 
 **Cause:** TLS is enabled (the default) but the server could not load the certificate or private key files. Possible causes:
@@ -828,9 +836,9 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 ### GSI query returns stale data after a write
 
-**Cause:** GSI updates are applied asynchronously with a configurable propagation delay (default 10ms). This matches real DynamoDB's eventually consistent GSI behavior. Each GSI can have its own `propagation_delay_ms` setting; the system-wide default is controlled by the `gsi_propagation_delay_ms` runtime setting.
+**Cause:** GSI updates are applied asynchronously with a configurable propagation delay (default 10ms). This matches real DynamoDB's eventually consistent GSI behavior. Each GSI can have its own `propagation_delay_ms` setting; the system-wide default is controlled by the `index_propagation_delay_ms` runtime setting.
 
-**Fix:** This is expected behavior. For tests that query GSIs after writes, poll/retry the GSI query until the expected data appears. To make all GSIs synchronous for testing, set `extenddb settings set gsi_propagation_delay_ms 0`. For production-like testing, keep the default async delay.
+**Fix:** This is expected behavior. For tests that query GSIs after writes, poll/retry the GSI query until the expected data appears. To make all GSIs synchronous for testing, set `extenddb settings set index_propagation_delay_ms 0`. For production-like testing, keep the default async delay.
 
 ## Connection Pool Exhaustion
 
@@ -847,6 +855,46 @@ pool_size = 50  # default is 20
 If the problem persists, check for long-running queries or connection leaks with `SELECT * FROM pg_stat_activity WHERE datname = 'extenddb_data';`.
 
 **Known limitation:** The HTTP status code should be 503 with a `Retry-After` header. This is tracked as technical debt.
+
+---
+
+### `Vector indexes are not supported by this storage backend`
+
+**Error text:**
+```
+Vector indexes are not supported by this storage backend
+```
+
+Also `SearchVectors is not supported by this storage backend` for a search request.
+
+**Cause:** Vector indexes are stored in `vector(N)` columns, a type the
+[pgvector](https://github.com/pgvector/pgvector) extension provides, so support is a
+property of the PostgreSQL server rather than of the ExtendDB build. The server probes
+for the extension once at startup and refuses every vector operation for the rest of
+its life if it was absent. Other operations are unaffected.
+
+**Fix:** Confirm what the running server decided, by looking for one of these lines in
+its startup log:
+
+```
+pgvector 0.8.0 detected on the data database; vector index storage available
+pgvector not installed on the data database; vector indexes are not supported
+```
+
+If it is absent, install the extension for your server version (for example
+`postgresql-16-pgvector`), then create it on the **data** database, not the catalog:
+
+```sql
+CREATE EXTENSION vector;
+```
+
+`extenddb init` and `extenddb migrate` both attempt this and print a notice rather than
+failing when they cannot; a role without permission to create extensions needs a
+superuser or the database owner to run it once.
+
+**Then restart ExtendDB.** The probe result is cached at startup, so a server that
+started without the extension keeps refusing vector operations until it is restarted,
+even after the extension exists.
 
 ---
 

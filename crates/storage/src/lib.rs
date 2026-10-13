@@ -20,6 +20,8 @@ pub mod operations;
 pub mod server_components;
 pub mod settings_store;
 pub mod transact;
+pub mod vector_catalog;
+pub mod vector_lifecycle;
 
 pub use backend::{Backend, BackendAlreadySet, backend_name, set_backend, try_backend};
 
@@ -72,6 +74,9 @@ use extenddb_core::types::{
 };
 
 use error::StorageError;
+
+/// Default fixed width for stream record sequence numbers in characters (left-padded).
+pub(crate) const DEFAULT_SEQ_NUMBER_WIDTH: usize = 21;
 
 // Type aliases for complex return types used in trait methods.
 /// Result of an update/put/delete that may return old and/or new item images.
@@ -451,8 +456,11 @@ pub trait DataEngine: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::TransactionCanceled`] if any condition fails.
-    /// Returns [`StorageError::Internal`] on transaction or query failure.
+    /// Returns [`StorageError::TransactionCanceled`] if any condition fails, or
+    /// with a `TransactionConflict` reason when the database aborts the
+    /// transaction to break a lock conflict (a deadlock or a serialization
+    /// failure).
+    /// Returns [`StorageError::Internal`] on any other transaction or query failure.
     /// Returns [`StorageError::IdempotentReplay`] if the token matches a previous request.
     /// Returns [`StorageError::IdempotentMismatch`] if the token exists with different ops.
     fn transact_write_items(
@@ -549,6 +557,7 @@ pub trait MetadataEngine: Send + Sync {
         &self,
         account_id: &str,
         table_name: &str,
+        ttl_attribute: &str,
     ) -> BoxFuture<'_, Result<(), StorageError>>;
 
     /// Find expired items using the TTL index (ordered scan with LIMIT).
@@ -634,6 +643,14 @@ pub trait StreamEngine: Send + Sync {
 
     /// Generate the next sequence number for a shard.
     fn next_sequence_number(&self, shard_id: &str) -> BoxFuture<'_, Result<String, StorageError>>;
+
+    /// Width of sequence numbers stored by this backend, in decimal digits.
+    /// Client-supplied sequence numbers (e.g. from `GetShardIterator`) must be
+    /// zero-padded to this width before lexicographic comparison against stored
+    /// values. Defaults to 21 (PostgreSQL, SQLite, MongoDB).
+    fn sequence_number_width(&self) -> usize {
+        DEFAULT_SEQ_NUMBER_WIDTH
+    }
 
     /// Validate that a shard exists for the given stream ARN.
     ///

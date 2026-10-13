@@ -9,8 +9,36 @@ Fixtures live in conftest.py and are auto-discovered by pytest.
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
+
+import boto3
+import botocore.config
+
+
+def make_dynamodb_client(endpoint_url: str | None):
+    """A boto3 DynamoDB client with SDK retries off, for the configured target.
+
+    The session fixture in conftest is one of these. A test that drives the
+    server from several threads must build one per thread with this function:
+    a boto3 client is not safe for concurrent use, and sharing one across
+    threads interleaves requests on its TLS connections, which surfaces as
+    spurious `SSLError: TLSV1_ALERT_DECODE_ERROR` under load.
+    """
+    kwargs: dict = {
+        "service_name": "dynamodb",
+        "region_name": os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+        "config": botocore.config.Config(
+            retries={"max_attempts": 0},  # No SDK retries — we want raw errors
+        ),
+    }
+    if endpoint_url:
+        kwargs["endpoint_url"] = endpoint_url
+        if endpoint_url.startswith("https://"):
+            ca_cert = os.environ.get("EXTENDDB_CA_CERT", "")
+            kwargs["verify"] = ca_cert if ca_cert else False
+    return boto3.client(**kwargs)
 
 
 def wait_for_active(client, table_name: str, timeout: float = 60.0) -> None:

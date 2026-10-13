@@ -36,20 +36,36 @@ mod metadata;
 mod number_key;
 mod operations;
 mod schema;
+mod serve_lock;
 mod sqlite_util;
 mod store;
 mod stream;
 mod table_engine;
 mod table_helpers;
 mod update_table;
+mod vector_bench;
+mod vector_search;
 mod worker;
 mod workers;
 
-/// Default GSI propagation delay (milliseconds) when the
-/// `gsi_propagation_delay_ms` setting is absent. Mirrors the value seeded by
+/// Default secondary-index propagation delay (milliseconds) when the
+/// `index_propagation_delay_ms` setting is absent. Mirrors the value seeded by
 /// the catalog schema, and is the single definition used by both the live read
 /// on the write path and the background refresh worker.
-pub(crate) const DEFAULT_GSI_PROPAGATION_DELAY_MS: u64 = 10;
+pub(crate) const DEFAULT_INDEX_PROPAGATION_DELAY_MS: u64 = 10;
+
+/// Read the propagation-delay setting, preferring the canonical key and falling back
+/// to the pre-rename one.
+///
+/// A catalog created before the rename holds the operator's value under the old name,
+/// and the server refuses to start on a catalog-version mismatch rather than migrating,
+/// so no upgrade step ever rewrites that row. Reading past it would silently reset a
+/// configured delay to the default; since 0 means synchronous, the silent change would
+/// be from strict to eventually consistent. `ORDER BY ... DESC` makes the preference
+/// deterministic when both rows exist.
+pub(crate) const INDEX_PROPAGATION_DELAY_QUERY: &str = "SELECT value FROM settings \
+     WHERE key IN ('index_propagation_delay_ms', 'gsi_propagation_delay_ms') \
+     ORDER BY key = 'index_propagation_delay_ms' DESC LIMIT 1";
 
 pub use bootstrapper::SqliteBootstrapper;
 pub use catalog_store::SqliteCatalogStore;
@@ -165,7 +181,7 @@ use crate::hooks::SqliteRuntimeHooks;
 const MAX_ITEM_SIZE_BYTES: usize = 400_000;
 
 fn sqlite_server_components_factory(
-    config: &dyn extenddb_storage::config::StorageConfig,
+    config: &(dyn extenddb_storage::config::StorageConfig + 'static),
     region: &str,
     options: extenddb_storage::server_components::ServerComponentsOptions,
 ) -> futures::future::BoxFuture<'static, Result<ServerComponents, BackendError>> {
@@ -173,7 +189,16 @@ fn sqlite_server_components_factory(
     let pool_size = config.max_connections();
     let region = region.to_owned();
     Box::pin(async move {
-        let engine = SqliteEngine::new(&db_path, pool_size, &region, MAX_ITEM_SIZE_BYTES)
+        // One server per database file, taken before the database is opened:
+        // startup recovery below assumes no other server is using it. A file
+        // database only; an in-memory one belongs to this process alone.
+        let serve_lock = serve_lock::ServeLock::acquire_for_location(&db_path)
+            .map_err(BackendError::InitializationFailed)?
+            .map(|lock| {
+                tracing::debug!("holding serve lock {}", lock.path().display());
+                std::sync::Arc::new(lock)
+            });
+        let mut engine = SqliteEngine::new(&db_path, pool_size, &region, MAX_ITEM_SIZE_BYTES)
             .await
             .map_err(|e| BackendError::ConnectionFailed {
                 backend: "sqlite".to_owned(),
@@ -233,6 +258,18 @@ fn sqlite_server_components_factory(
             Err(e) => tracing::error!("Failed to reconcile incomplete GSIs: {e}"),
         }
 
+        // Same for a vector index. A separate pass rather than a shared one, because
+        // the two live in different catalog tables and are built by different code;
+        // a failure to reconcile one must not skip the other.
+        match engine.reconcile_incomplete_vector_indexes().await {
+            Ok(n) if n > 0 => {
+                tracing::info!("Reconciled {n} incomplete vector index(es) at startup");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!("Failed to reconcile incomplete vector indexes: {e}"),
+        }
+
+        engine.serve_lock = serve_lock;
         let control_plane_notify = engine.control_plane_notify();
         let engine = Arc::new(engine);
 
@@ -277,4 +314,41 @@ fn sqlite_server_components_factory(
             runtime_hooks: Some(runtime_hooks),
         })
     })
+}
+
+#[cfg(all(test, unix))]
+mod serve_lock_tests {
+    /// The server factory itself takes the lock: a second server on the same
+    /// file fails to start while the first is up, and starts once it is gone.
+    #[tokio::test]
+    async fn a_second_server_on_one_file_is_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "extenddb-serve-lock-factory-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let config = crate::config::SqliteConfig {
+            path: dir.join("db.sqlite").to_string_lossy().into_owned(),
+            pool_size: 2,
+        };
+        let mut options = extenddb_storage::server_components::ServerComponentsOptions::default();
+        options.bootstrap_if_uninitialized = true;
+        let first = super::sqlite_server_components_factory(&config, "us-east-1", options)
+            .await
+            .expect("first server");
+        let Err(err) = super::sqlite_server_components_factory(&config, "us-east-1", options).await
+        else {
+            panic!("a second server on the same file started");
+        };
+        assert!(
+            err.to_string().contains("another extenddb process"),
+            "{err}"
+        );
+        drop(first);
+        let again = super::sqlite_server_components_factory(&config, "us-east-1", options)
+            .await
+            .expect("starts once the first is gone");
+        drop(again);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

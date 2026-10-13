@@ -111,13 +111,16 @@ pub async fn handle_get_shard_iterator(
                     "SequenceNumber is required for AT_SEQUENCE_NUMBER iterator type".to_owned(),
                 )
             })?;
-            let n = raw.parse::<u64>().map_err(|_| {
+            let n = raw.parse::<u128>().map_err(|_| {
                 DynamoDbError::ValidationException("Invalid SequenceNumber".to_owned())
             })?;
             // n == 0: sequence 0 is the first possible record, so "at 0"
             // means "read from the beginning" — same as TRIM_HORIZON.
             if n > 0 {
-                format!("{:021}", n - 1)
+                // Pad to the backend's stored width so lexicographic order
+                // matches numeric order against stored sequence numbers.
+                let width = ctx.storage.sequence_number_width();
+                format!("{:0>width$}", n - 1)
             } else {
                 String::new()
             }
@@ -259,6 +262,35 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
         other => {
             tracing::error!(internal_error = %other, "storage internal error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// AT_SEQUENCE_NUMBER converts to AFTER by subtracting 1 and padding to
+    /// the backend's stored width. Verify that an unpadded client input is
+    /// normalised correctly for both the 21-digit (postgres/sqlite/mongodb)
+    /// and 23-digit (cassandra) cases, and that the edge case n=0 maps to
+    /// TRIM_HORIZON (empty string).
+    #[test]
+    fn at_sequence_number_padding() {
+        let cases: &[(&str, usize, &str)] = &[
+            ("5", 21, "000000000000000000004"),
+            ("000000000000000000005", 21, "000000000000000000004"),
+            ("5", 23, "00000000000000000000004"),
+            ("00000000000000000000005", 23, "00000000000000000000004"),
+            ("0", 21, ""),
+            ("1", 21, "000000000000000000000"),
+        ];
+        for (input, width, expected) in cases {
+            let n: u128 = input.parse().unwrap();
+            let result = if n > 0 {
+                format!("{:0>width$}", n - 1)
+            } else {
+                String::new()
+            };
+            assert_eq!(&result, expected, "input={input} width={width}");
         }
     }
 }

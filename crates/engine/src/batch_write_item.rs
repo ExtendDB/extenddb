@@ -103,6 +103,13 @@ pub async fn handle_batch_write_item(
         HashMap::new();
     let mut total_wcu: f64 = 0.0;
     let mut per_table_wcu: HashMap<String, f64> = HashMap::new();
+    // Per-table per-index write units, populated only when INDEXES is
+    // requested: attributing them needs each write's old image, which is
+    // an extra read the aggregate-only shapes never pay for.
+    let want_index_cc =
+        input.return_consumed_capacity == extenddb_core::types::ReturnConsumedCapacity::Indexes;
+    let mut per_table_gsi: HashMap<String, HashMap<String, f64>> = HashMap::new();
+    let mut per_table_lsi: HashMap<String, HashMap<String, f64>> = HashMap::new();
 
     for (table_name, reqs) in &input.request_items {
         let key_info = ctx
@@ -150,18 +157,34 @@ pub async fn handle_batch_write_item(
                 let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&put.item));
                 total_wcu += item_wcu;
                 *per_table_wcu.entry(table_name.clone()).or_default() += item_wcu;
-                let _old_item = ctx
+                let old_item = ctx
                     .storage
                     .put_item(
                         &key_info,
                         put.item.clone(),
-                        need_old_for_stream,
+                        need_old_for_stream || want_index_cc,
                         None,
                         &empty_maps,
                         stream.as_ref(),
                     )
                     .await
                     .map_err(storage_err_to_dynamo)?;
+                if want_index_cc {
+                    let (gsi, lsi) = capacity_helpers::index_write_units(
+                        old_item.as_ref(),
+                        Some(&put.item),
+                        false,
+                        &key_info,
+                    );
+                    let g = per_table_gsi.entry(table_name.clone()).or_default();
+                    for (name, cu) in gsi {
+                        *g.entry(name).or_default() += cu;
+                    }
+                    let l = per_table_lsi.entry(table_name.clone()).or_default();
+                    for (name, cu) in lsi {
+                        *l.entry(name).or_default() += cu;
+                    }
+                }
             } else if let Some(del) = &wr.delete_request {
                 validate_batch_key_only(
                     &del.key,
@@ -188,29 +211,64 @@ pub async fn handle_batch_write_item(
                 let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&del.key));
                 total_wcu += item_wcu;
                 *per_table_wcu.entry(table_name.clone()).or_default() += item_wcu;
-                let _old_item = ctx
+                let old_item = ctx
                     .storage
                     .delete_item(
                         &key_info,
                         &del.key,
-                        need_old_for_stream,
+                        need_old_for_stream || want_index_cc,
                         None,
                         &empty_maps,
                         stream.as_ref(),
                     )
                     .await
                     .map_err(storage_err_to_dynamo)?;
+                if want_index_cc {
+                    let (gsi, lsi) = capacity_helpers::index_write_units(
+                        old_item.as_ref(),
+                        None,
+                        false,
+                        &key_info,
+                    );
+                    let g = per_table_gsi.entry(table_name.clone()).or_default();
+                    for (name, cu) in gsi {
+                        *g.entry(name).or_default() += cu;
+                    }
+                    let l = per_table_lsi.entry(table_name.clone()).or_default();
+                    for (name, cu) in lsi {
+                        *l.entry(name).or_default() += cu;
+                    }
+                }
             }
         }
     }
 
-    // NOTE: per-index (INDEXES) breakdown for batch writes is deferred to the
-    // storage-layer capacity-reporting follow-up (Delete requests lack the old
-    // item needed to attribute per-index capacity). Base-table aggregate only.
-    let consumed_capacity = capacity_helpers::batch_write_capacity(
-        input.return_consumed_capacity,
-        per_table_wcu.iter().map(|(t, cu)| (t.as_str(), *cu)),
-    );
+    // With INDEXES, each per-table entry carries the arms the batch actually
+    // touched: base table plus every affected index, aggregate = their sum
+    // (pinned by the ground-truth runs of 2026-08-24: an indexed put and a
+    // sparse put in one batch answer total 3 = table 2 + gsi 1). TOTAL and
+    // NONE keep the aggregate-only shapes.
+    let consumed_capacity = if want_index_cc {
+        Some(
+            per_table_wcu
+                .iter()
+                .map(|(t, cu)| {
+                    extenddb_core::types::ConsumedCapacity::write_indexed(
+                        t,
+                        *cu,
+                        per_table_gsi.remove(t).unwrap_or_default(),
+                        per_table_lsi.remove(t).unwrap_or_default(),
+                        true,
+                    )
+                })
+                .collect(),
+        )
+    } else {
+        capacity_helpers::batch_write_capacity(
+            input.return_consumed_capacity,
+            per_table_wcu.iter().map(|(t, cu)| (t.as_str(), *cu)),
+        )
+    };
 
     // Per-item WCU already accumulated above (M-1: DynamoDB rounds per item, then sums).
     let wcu = total_wcu;

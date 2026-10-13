@@ -68,6 +68,31 @@ def _full_access_policy() -> dict:
             "Resource": "*",
         }],
     }
+
+
+class TestAccountLifecycle:
+    """Account deletion must respect table ownership dependencies."""
+
+    def test_delete_account_rejects_existing_table(self, alice_env, mgmt):
+        client, account_id = alice_env
+        table_name = f"account-delete-{uuid.uuid4().hex[:8]}"
+        client.create_table(
+            TableName=table_name,
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        wait_for_active(client, table_name)
+
+        try:
+            response = mgmt.delete_account(account_id)
+            assert response.status_code == 409, response.text
+            assert "existing tables" in response.text.lower()
+        finally:
+            client.delete_table(TableName=table_name)
+            wait_for_deleted(client, table_name)
+
+
 @pytest.fixture(scope="module")
 def auth_env():
     return _require_auth_env()

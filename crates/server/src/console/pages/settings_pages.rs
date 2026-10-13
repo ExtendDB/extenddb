@@ -30,7 +30,7 @@ const RUNTIME_DEFAULTS: &[(&str, &str)] = &[
     ("control_plane_delay_seconds", "0.25"),
     ("data_database_connection_string", "—"),
     ("data_database_name", "—"),
-    ("gsi_propagation_delay_ms", "500"),
+    ("index_propagation_delay_ms", "500"),
     ("log_level", "info"),
     ("sqlx_log_level", "warn"),
     ("throttling_enabled", "false"),

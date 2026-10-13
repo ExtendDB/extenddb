@@ -9,7 +9,7 @@
 
 The storage layer provides a trait-based abstraction for all persistent data operations. Traits are defined in the
 `storage` crate with no database-specific dependencies. Backend implementations live in separate crates (e.g.,
-`storage-postgres`) and register themselves via a factory pattern using the `inventory` crate.
+`storage-postgres`) and are installed once from a thin `main` via `set_backend`, one backend per binary.
 
 The trait-based design allows new storage backends to be added by implementing the storage traits and registering a
 factory function, with no changes needed to the `engine` or `server` crates. The factory pattern enables runtime
@@ -371,22 +371,32 @@ The PostgreSQL backend uses two categories of tables:
   Unicode, spaces, SQL keywords). The `_ddb_` prefix prevents collisions with
   catalog tables.
 
-- **Partition key storage**: Partition key values are always stored as TEXT.
-  String keys store directly, number keys store their string representation,
-  binary keys store base64. Partition keys only need equality comparison, so
-  text storage is correct. **Important:** Binary partition keys must use
+- **Partition key storage**: Partition key values are always stored as
+  `TEXT COLLATE "C"`. String keys store directly, number keys store their
+  string representation, binary keys store base64. Partition keys only need
+  equality comparison, so text storage is correct; the collation matters for
+  the Scan cursor, which compares `(pk, sk_s)` as a row against the index. **Important:** Binary partition keys must use
   canonical base64 encoding (standard alphabet with padding, via
   `base64::engine::general_purpose::STANDARD`) to ensure equality comparison
   is reliable. A validation step on ingest must normalize the encoding.
 
-- **Sort key storage**: Sort key values use typed columns (`sk_s TEXT`,
-  `sk_n NUMERIC`, `sk_b BYTEA`) to ensure correct ordering. Only one `sk_*`
-  column is populated per table, determined by the sort key's
+- **Sort key storage**: Sort key values use typed columns (`sk_s TEXT COLLATE
+  "C"`, `sk_n NUMERIC`, `sk_b BYTEA`) to ensure correct ordering. Only one
+  `sk_*` column is populated per table, determined by the sort key's
   `AttributeDefinition` type. The `CREATE TABLE` DDL and `PRIMARY KEY`
   constraint are generated dynamically based on the key schema.
   - `NUMERIC` ensures `2 < 10 < 100` (not lexicographic `"10" < "2"`)
   - `BYTEA` ensures correct binary comparison order
-  - `TEXT` ensures correct UTF-8 string ordering
+  - `TEXT COLLATE "C"` orders strings by UTF-8 byte value, which is the
+    service's order for string keys (measured 2026-09-16: `A < B < Z < _ < a <
+    a_z < ab < b < z < é < 中`, with `BETWEEN` and `begins_with` comparing the
+    same way). The query builders also qualify every string key predicate and
+    `ORDER BY` with `COLLATE "C"`, so results are byte-ordered on tables
+    created before the columns carried the collation; on those tables the
+    indexes cannot serve the predicates (see technical debt C-11). The same
+    columns on index tables (`pk`, `sk_s`, `base_pk`, `base_sk_s`) carry the
+    collation, so a GSI or LSI cursor is a row comparison the ordering index
+    serves in one seek.
 
 - **Item storage**: `item_data` JSONB contains the complete item including key
   attributes, matching the DynamoDB model where key attributes are part of the
@@ -539,15 +549,17 @@ async fn transact_write_items(&self, input: TransactWriteInput) -> Result<...> {
     for item in &input.items {
         match item {
             TransactWriteItem::Put { .. } => { /* INSERT/UPSERT within tx */ }
-            TransactWriteItem::Delete { .. } => { /* DELETE within tx */ }
+            TransactWriteItem::Delete { .. } => { /* SELECT FOR UPDATE + DELETE within tx */ }
             TransactWriteItem::Update { .. } => { /* UPDATE within tx */ }
-            TransactWriteItem::ConditionCheck { .. } => { /* SELECT + evaluate */ }
+            TransactWriteItem::ConditionCheck { .. } => { /* SELECT FOR UPDATE + evaluate */ }
         }
     }
     tx.commit().await?;
     Ok(...)
 }
 ```
+
+The ops run in table and key order. A ConditionCheck or Delete that finds no row inserts the key and deletes it again, so the key's unique index entry stays with the transaction and any concurrent create of the item waits until the transaction commits or rolls back.
 
 ### 5.6 Migrations
 
@@ -568,7 +580,7 @@ propagation delay. LSI updates are always synchronous.
 **Implementation:**
 - Each GSI has an optional `propagation_delay_ms` column in the `indexes` table
 - If `propagation_delay_ms` is `NULL` or negative, the system default is used
-  (default: 10ms, configurable via `gsi_propagation_delay_ms` setting)
+  (default: 10ms, configurable via `index_propagation_delay_ms` setting)
 - If `propagation_delay_ms` is `0`, the GSI is updated synchronously in the
   same transaction as the base table write
 - If `propagation_delay_ms` is positive, the GSI update is enqueued and applied
@@ -695,12 +707,25 @@ WHERE (pk = $last_pk AND sk_n < $last_sk)
 ```
 
 **GSI pagination (forward scan):**
-GSI keys are not unique, so the base table primary key is used as a tiebreaker:
+GSI keys are not unique, so the base table primary key is used as a tiebreaker.
+Every column of the cursor runs in the same direction as the `ORDER BY`, so the
+predicate is one row comparison, which the ordering index on
+`(pk, sk_s, base_pk, base_sk_*)` serves as a single seek:
 ```sql
-WHERE (pk = $gsi_pk AND sk_s > $gsi_sk)
-   OR (pk = $gsi_pk AND sk_s = $gsi_sk AND base_pk > $base_pk)
-   OR (pk = $gsi_pk AND sk_s = $gsi_sk AND base_pk = $base_pk AND base_sk_n > $base_sk)
-   OR pk > $gsi_pk
+WHERE pk = $gsi_pk
+  AND (sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n) > ($gsi_sk, $base_pk, $base_sk)
+ORDER BY sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n
+```
+
+For a reverse query (`ScanIndexForward = false`) the index sort key runs
+backwards while the base-key tiebreaker stays ascending, so the cursor keeps
+the expanded form:
+```sql
+WHERE pk = $gsi_pk
+  AND (sk_s COLLATE "C" < $gsi_sk
+       OR (sk_s COLLATE "C" = $gsi_sk
+           AND (base_pk COLLATE "C" > $base_pk
+                OR (base_pk = $base_pk AND base_sk_n > $base_sk))))
 ```
 
 For GSI queries, the pagination key includes both the GSI key attributes and the base table primary key (needed to
@@ -809,14 +834,56 @@ The factory receives:
 
 It returns a `Future` that resolves to `ServerComponents` or `BackendError`.
 
-### 10.3 Backend Registration with inventory
+### 10.3 Backend Installation from a Thin `main`
 
-Backends register themselves using the `inventory` crate for compile-time registration:
+There is no registry and no auto-registration. **A binary serves exactly one
+backend**, and its `main` installs that backend once before dispatching any
+subcommand:
+
+```rust
+// crates/bin/src/main.rs, the reference thin bin
+fn main() -> anyhow::Result<()> {
+    extenddb_storage::set_backend(extenddb_storage_postgres::backend())?;
+    extenddb_app::run(extenddb_app::BuildInfo { /* ... */ })
+}
+```
+
+`backend()` returns a `Backend` value carrying the backend's name and its
+factories (`bootstrapper`, `storage_config`, `operations`, `settings_store`,
+`diagnostics_store`, and the server components factory). `set_backend` stores it in
+a `OnceLock`, so a second call returns `BackendAlreadySet` and the first one wins.
+The config file's `backend` key is validated against the installed backend's name
+rather than driving dispatch, so a mistyped name is a startup error rather than an
+unknown-backend failure later.
+
+This replaced two earlier mechanisms, and the reasons are worth knowing before
+reintroducing either. `inventory`-based auto-registration relied on the linker
+preserving `submit!` statics, which only happened if the binary referenced the
+backend crate: an invisible, compiles-fine failure mode. A name-keyed registry
+fixed that but kept string dispatch, which allows a class of runtime error that
+cannot exist now, because there is nothing to look up.
+
+A backend supplies one `backend()` function returning that value. Its fields are
+factories, and the server-components one carries the body that used to live in the
+registration:
 
 ```rust
 // In crates/storage-postgres/src/lib.rs
-inventory::submit! {
-    ServerComponentsRegistration {
+pub fn backend() -> extenddb_storage::Backend {
+    extenddb_storage::Backend {
+        name: "postgres",
+        bootstrapper: |config_path, cli_args| { /* ... */ },
+        storage_config: |table| { /* ... */ },
+        operations: &operations::PostgresOperationsEngine,
+        settings_store: |config| { /* ... */ },
+        diagnostics_store: |config| { /* ... */ },
+        server_components: server_components_factory,
+    }
+}
+
+// and the factory itself, a free function with the body the registry used to hold
+fn server_components_factory(config: &StorageConfig, region: &str) -> /* ... */ {
+    {
         backend: "postgres",
         factory: |config, region| {
             Box::pin(async move {
@@ -876,9 +943,9 @@ inventory::submit! {
 }
 ```
 
-The `inventory` crate collects all registrations at compile time. The `storage`
-crate provides `create_server_components(backend_name, config, region)` which
-looks up the matching factory and invokes it.
+The installed `Backend` carries this factory, and the `storage` crate invokes it
+through the installed value. There is no lookup by name: the only backend a
+process can reach is the one its `main` installed.
 
 ### 10.4 Backend Selection in cmd_serve
 
@@ -1087,13 +1154,15 @@ In `lib.rs`:
 
 ```rust
 use extenddb_storage::{
-    ServerComponents, ServerComponentsRegistration, BackendError,
+    Backend, ServerComponents, BackendError,
     StorageConfig, StorageEngine, CatalogStore,
 };
 use extenddb_auth::{BuiltinAuthProvider, CredentialStore};
 
-inventory::submit! {
-    ServerComponentsRegistration {
+// The same shape as the PostgreSQL backend above: a `backend()` returning
+// `Backend { name, .., server_components }`, and the factory as a free function.
+fn server_components_factory(config: &StorageConfig, region: &str) -> /* ... */ {
+    {
         backend: "sqlite",
         factory: |config, region| {
             Box::pin(async move {
@@ -1154,7 +1223,7 @@ Add the new backend as a dependency:
 extenddb-storage-sqlite = { path = "../storage-sqlite" }
 ```
 
-This ensures the backend's `inventory::submit!` registration is linked into the binary.
+The dependency is what lets the thin `main` name the backend's `backend()` function; there is no linker-visibility requirement, because nothing is registered implicitly.
 
 ### 11.5 Test
 
@@ -1176,7 +1245,84 @@ cargo test --workspace
 ./devtools/run-tests --extenddb --all
 ```
 
-### 11.6 RuntimeHooks Decision Tree
+### 11.6 Vector Search Capability (Optional)
+
+Vector search is the one capability a backend may decline. Declining is a
+supported end state, not a stub: the engine refuses every vector operation with a
+message naming the missing capability rather than its cause, and no other operation is
+affected. The refusal deliberately does not name the environmental reason: that is the
+startup log's job and the troubleshooting entry's, which is why a backend needs no
+hook to produce it.
+
+**The opt-out is a single method.** `DataEngine::as_vector_search` returns
+`Option<&dyn VectorSearchEngine>` and defaults to `None`, so a backend that
+implements nothing declines by construction. A backend that participates returns
+`Some(self)` and implements `VectorSearchEngine::search_vectors`.
+
+**Fail closed, and decide it once.** Whether a backend can serve vector search may
+depend on the server it is connected to rather than on the build: the PostgreSQL
+backend probes for the pgvector extension at startup and caches the answer, then
+declines for the process lifetime if it is absent.
+
+Two refusals matter here and **neither is yours to write**. Refusing a vector index
+on a backend that cannot serve one is the engine's capability gate, which needs no
+code from a backend that simply returns `None`. Refusing to answer a search from an
+index that is still building is also the engine's, on the search path, by filtering
+to indexes that report `ACTIVE`; no backend has a status predicate in its search
+query, and adding one would duplicate a decision that already exists.
+
+**What is yours** is the case a cached answer cannot cover: re-check any
+environmental capability at the moment you persist catalog state. The PostgreSQL
+backend runs a live `SELECT NULL::vector` before recording an index, because the
+extension can be dropped after the startup probe said yes, and a catalog row with
+no storage behind it is an index that reports itself and answers nothing.
+
+**The build lifecycle is shared; the SQL is not.** `extenddb_storage::vector_lifecycle`
+owns the ordering rules for the whole build: the batched backfill, the
+`CREATING` to `ACTIVE` state machine, the poison-row policy, and the rebuild that
+crash recovery uses. A backend supplies storage primitives through
+`VectorIndexBuild` (one transactional batch, the phase flip, the publish, the
+data-table reset, the wake, and an optional heartbeat) and keeps three things of
+its own: the backfill cursor type, the propagation queue's claim predicate, and
+its stuck-build detection policy. ADR-0005 records why the split is where it is,
+and the module docs carry the measured status sequence the primitives must
+produce.
+
+**One requirement that is easy to miss: an unscoped index needs a partition
+column that can hold its sentinel.** An index with no declared search-schema HASH
+attribute stores every row under one shared sentinel value, so the scan needs no
+second code path.
+
+What makes that safe is **not** that the sentinel is unguessable. A client can
+supply the identical string as a partition key, because a string attribute is
+stored verbatim. The guarantee is structural: the partition is chosen from the
+*index's* schema rather than from the item, and each index has its own data table,
+so within one table either every row is keyed by a real hash value or every row
+uses the sentinel. The two never coexist, so there is nothing for a collision to
+leak into. Read the constant's own documentation before relying on any other
+reading of this; it is written to prevent exactly the wrong one.
+
+The sentinel begins with a NUL byte as defence in depth for the day that
+invariant changes, and that byte is what constrains the column type. It is not a
+single rule across backends: PostgreSQL rejects a NUL byte in a `TEXT`
+value outright, with an encoding error naming the untranslatable byte, so its
+column is `BYTEA` and the value is bound as bytes on both the write path and
+the search path; SQLite keeps the same value in `TEXT`, because its text bindings
+are length-delimited and tolerate an embedded NUL. Both shipped backends are
+correct and they differ, so copy the one whose engine you are targeting rather
+than assuming byte columns everywhere.
+
+The failure to know about is PostgreSQL-specific: a `TEXT` partition column there
+rejects every row of every unscoped index with SQLSTATE `22021`, and nothing
+reveals it until the first unscoped index exists.
+
+**What to test first.** The engine-level refusals are cheap to verify and are the
+contract a declining backend must satisfy; after that, the write path matters more
+than the search path, because a row that never reaches the index cannot be found
+by any query. The shared lifecycle's own tests cover the ordering rules, so a
+backend's tests are about its primitives producing the states those rules assume.
+
+### 11.7 RuntimeHooks Decision Tree
 
 **Does your backend need `ServerRuntimeHooks`?**
 
@@ -1198,7 +1344,7 @@ indexes for TTL).
 because DynamoDB handles all background work internally (TTL, streams,
 backups).
 
-### 11.7 Design Rationale
+### 11.8 Design Rationale
 
 **Why factory pattern instead of direct construction?**
 - `cmd_serve` remains backend-agnostic (no PostgreSQL imports)
