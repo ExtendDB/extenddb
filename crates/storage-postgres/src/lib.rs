@@ -24,6 +24,10 @@ mod metadata_engine;
 mod migrations;
 mod operations;
 mod pg_util;
+mod snapshot_engine;
+#[doc(hidden)]
+#[cfg(feature = "test-hooks")]
+pub use snapshot_engine::set_snapshot_fetch_batch_for_tests;
 mod stream_engine;
 mod table_engine;
 mod table_helpers;

@@ -20,12 +20,17 @@ pub mod management_store;
 pub mod operations;
 pub mod server_components;
 pub mod settings_store;
+pub mod snapshot;
+#[doc(hidden)]
+#[cfg(feature = "test-hooks")]
+pub mod snapshot_conformance;
 pub mod transact;
 pub mod vector_catalog;
 pub mod vector_lifecycle;
 
 pub use backend::{Backend, BackendAlreadySet, backend_name, set_backend, try_backend};
 pub use backup_definition::RestoreTableOverrides;
+pub use snapshot::{SnapshotEngine, SnapshotInfo, TableSnapshot};
 
 pub use transact::{IdempotencyKey, TransactGetOp, TransactWriteOp};
 
@@ -745,17 +750,26 @@ pub trait BackupEngine: Send + Sync {
 /// DynamoDB-compatible API. This trait has NO additional methods beyond
 /// the trait bounds — backend-specific concerns belong in `ServerRuntimeHooks`.
 pub trait StorageEngine:
-    TableEngine + DataEngine + MetadataEngine + StreamEngine + BackupEngine + WorkerStore + Send + Sync
+    TableEngine
+    + DataEngine
+    + MetadataEngine
+    + StreamEngine
+    + BackupEngine
+    + SnapshotEngine
+    + WorkerStore
+    + Send
+    + Sync
 {
 }
 
-// Blanket implementation: any type implementing all 6 traits is a StorageEngine
+// Blanket implementation: any type implementing all 7 traits is a StorageEngine
 impl<T> StorageEngine for T where
     T: TableEngine
         + DataEngine
         + MetadataEngine
         + StreamEngine
         + BackupEngine
+        + SnapshotEngine
         + WorkerStore
         + Send
         + Sync

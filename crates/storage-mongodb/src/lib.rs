@@ -20,6 +20,10 @@ mod management_store;
 mod metadata_engine;
 mod operations;
 pub mod pushdown;
+mod snapshot_engine;
+#[doc(hidden)]
+#[cfg(feature = "test-hooks")]
+pub use snapshot_engine::set_snapshot_fetch_batch_for_tests;
 mod stream_engine;
 mod table_engine;
 mod ttl_worker;

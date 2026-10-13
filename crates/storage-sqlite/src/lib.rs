@@ -37,6 +37,10 @@ mod number_key;
 mod operations;
 mod schema;
 mod serve_lock;
+mod snapshot_engine;
+#[doc(hidden)]
+#[cfg(feature = "test-hooks")]
+pub use snapshot_engine::set_snapshot_fetch_batch_for_tests;
 mod sqlite_util;
 mod store;
 mod stream;

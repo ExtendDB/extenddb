@@ -7,6 +7,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Compiles the `snapshot_conformance` check that each backend's tests run
+# against a real database. Production builds do not compile it.
+test-hooks = []
+
 [dependencies]
 aes-gcm = { workspace = true }
 async-trait = { workspace = true }

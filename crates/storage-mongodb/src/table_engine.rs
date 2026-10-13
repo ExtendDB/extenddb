@@ -1281,6 +1281,17 @@ impl MongoEngine {
         &self,
         doc: &Document,
     ) -> Result<TableDescription, StorageError> {
+        self.doc_to_table_description_in(doc, None).await
+    }
+
+    /// Build the description from a `tables` document. When `session` is a
+    /// snapshot session (see `snapshot_engine`), the index documents are read
+    /// through it so they come from the same snapshot as `doc`.
+    pub(crate) async fn doc_to_table_description_in(
+        &self,
+        doc: &Document,
+        session: Option<&mut mongodb::ClientSession>,
+    ) -> Result<TableDescription, StorageError> {
         let id_doc = doc
             .get_document("_id")
             .map_err(|_| StorageError::Internal("missing _id".to_string()))?;
@@ -1385,14 +1396,34 @@ impl MongoEngine {
         // Fetch indexes
         let indexes_coll = self.catalog_db.collection::<Document>("indexes");
         use futures::TryStreamExt;
-        let index_cursor = indexes_coll
-            .find(doc! { "_id.table_id": &table_id })
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-        let index_docs: Vec<Document> = index_cursor
-            .try_collect()
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let index_filter = doc! { "_id.table_id": &table_id };
+        let index_docs: Vec<Document> = match session {
+            Some(session) => {
+                let mut cursor = indexes_coll
+                    .find(index_filter)
+                    .read_concern(mongodb::options::ReadConcern::snapshot())
+                    .session(&mut *session)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let mut docs = Vec::new();
+                while let Some(d) = cursor
+                    .next(&mut *session)
+                    .await
+                    .transpose()
+                    .map_err(|e| StorageError::Internal(e.to_string()))?
+                {
+                    docs.push(d);
+                }
+                docs
+            }
+            None => indexes_coll
+                .find(index_filter)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?
+                .try_collect()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?,
+        };
 
         let mut gsis = Vec::new();
         let mut lsis = Vec::new();
