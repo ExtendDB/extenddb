@@ -293,9 +293,10 @@ impl SqliteEngine {
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
                     if label.is_none() {
                         sqlx::query(
-                            "UPDATE tables SET stream_label = strftime('%Y-%m-%dT%H:%M:%S','now') \
+                            "UPDATE tables SET stream_label = ? \
                              WHERE account_id = ? AND table_name = ?",
                         )
+                        .bind(extenddb_storage::util::new_stream_label())
                         .bind(account_id)
                         .bind(&input.table_name)
                         .execute(&mut *tx)
