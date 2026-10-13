@@ -577,9 +577,72 @@ impl CassandraEngine {
                     existing.as_ref(),
                 )?;
 
-                // Execute PREPARE
-                self.prepare_item(key_info, key, txn_id, txn_timestamp, false)
-                    .await?;
+                // A *conditional* Delete of an ABSENT item (e.g. delete-if
+                // attribute_not_exists(pk)) establishes a read-dependency on the
+                // item staying absent, exactly like a ConditionCheck. It must
+                // leave a conflict-detectable prepare marker so a concurrent
+                // transaction that creates the item collides and one of them
+                // cancels — otherwise two "delete-if-absent the other's key, then
+                // put my key" transactions both commit (write skew). Plant the
+                // same `created_to_prepare` INSERT ... IF NOT EXISTS marker
+                // ConditionCheck uses; it is a phantom row removed on commit (the
+                // Delete commit's `DELETE ... IF prepared_txn_id = ?`), on rollback,
+                // and in recovery (the generic created_to_prepare cleanup).
+                //
+                // Gated on `condition.is_some()`: an *unconditional* delete of a
+                // missing item is a no-op that must NOT plant a marker (DynamoDB
+                // lets two such deletes serialize without mutual cancellation —
+                // see test_deletes_of_missing_items_serialize). A delete of an
+                // item that already exists takes the plain UPDATE-IF marker on the
+                // real row below.
+                if condition.is_some() && existing.is_none() {
+                    self.check_partition_max_delete_timestamp(key_info, key, txn_timestamp)
+                        .await?;
+                    let mut attempt = 0u32;
+                    loop {
+                        attempt += 1;
+                        match self
+                            .prepare_item(key_info, key, txn_id, txn_timestamp, true)
+                            .await
+                        {
+                            Ok(()) => break,
+                            Err(r) if r.code == "TransactionConflict" && attempt < 5 => {
+                                // Another transaction created the key between our
+                                // read and prepare. Wait for it, then re-evaluate
+                                // the condition against the committed winner — if
+                                // the item now exists, a delete-if-not-exists
+                                // condition fails and this transaction cancels.
+                                let committed =
+                                    self.wait_for_commit_and_read(key_info, key).await?;
+                                match committed {
+                                    Some(winner) => {
+                                        eval_condition(
+                                            *condition,
+                                            &winner,
+                                            maps,
+                                            *return_values_on_ccf,
+                                            Some(&winner),
+                                        )?;
+                                        // Condition still holds against the winner,
+                                        // which now exists: no marker needed, the
+                                        // winner's row provides conflict detection.
+                                        break;
+                                    }
+                                    None => {
+                                        // Winner rolled back; retry the marker.
+                                    }
+                                }
+                            }
+                            Err(r) => return Err(r),
+                        }
+                    }
+                } else {
+                    // Delete of an existing item (mark the real row), or an
+                    // unconditional delete of a missing item (UPDATE-IF is a no-op,
+                    // leaving no marker — the serialize-only guarantee).
+                    self.prepare_item(key_info, key, txn_id, txn_timestamp, false)
+                        .await?;
+                }
                 Ok((None, Self::pre_commit_json(existing.as_ref())?))
             }
             TransactWriteOp::Update {
