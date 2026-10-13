@@ -255,6 +255,79 @@ impl crate::CassandraEngine {
         Ok((final_items, last_key))
     }
 
+    /// Implementation of `DataEngine::scan_key_in_segment`.
+    ///
+    /// Answers "does `key` belong to parallel-scan `segment`?" under the same
+    /// segment-assignment function the scan predicate uses: a key belongs to a
+    /// segment when its ring token falls within that segment's
+    /// [`segment_token_bounds`] range. The token is Cassandra's Murmur3
+    /// partitioner value, so it is computed server-side with `token(?)` — the
+    /// exact function `scan_impl`'s `WHERE token(pk) ...` predicate applies —
+    /// rather than reimplemented in Rust, which could drift from the
+    /// partitioner and silently truncate or fabricate scan pages.
+    ///
+    /// `token(?)` is a pure function of its bound argument and needs no row, so
+    /// a non-existent `ExclusiveStartKey` (permitted by DynamoDB after a delete)
+    /// is still classified correctly rather than refused.
+    ///
+    /// Returns `Ok(true)` for the whole-ring cases (`total_segments <= 1`, or
+    /// bounds absent), matching the trait's "cannot be proven foreign" rule.
+    pub(crate) async fn scan_key_in_segment_impl(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        segment: i64,
+        total_segments: i64,
+        index_name: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        // Whole ring: a single segment (or an unsegmented scan) covers every
+        // token, so every key is in it. Also covers out-of-range inputs, where
+        // `segment_token_bounds` declines to produce a predicate.
+        let Some((lower, upper)) = segment_token_bounds(Some(segment), Some(total_segments)) else {
+            return Ok(true);
+        };
+
+        // Scan-shaped `key_info`: `key_schema` names the pk of whichever table
+        // (data or index) the scan targets, matching the `pk` column the scan
+        // predicate tokenizes. We only need the pk text, not the table, because
+        // `token(?)` depends solely on its argument.
+        let scan_key_schema = if let Some(idx_name) = index_name {
+            fetch_index_by_name(
+                &key_info.table_id,
+                idx_name,
+                &self.session_arc(),
+                &self.catalog_keyspace(),
+            )
+            .await?
+            .key_schema
+        } else {
+            key_info.key_schema.clone()
+        };
+
+        let pk_text = composite_pk_to_text(key, &scan_key_schema)?;
+
+        // Evaluate the partitioner server-side. `system.local` always has
+        // exactly one row, and `token()` is independent of the queried table's
+        // schema, so this needs neither the data table to exist nor a matching
+        // row in it.
+        let rows = cassandra_util::query_rows::<StorageError>(
+            &self.session_arc(),
+            "SELECT token(?) AS t FROM system.local",
+            QueryValues::SimpleValues(vec![Value::from(pk_text.as_str())]),
+            "scan_key_in_segment",
+        )
+        .await?;
+
+        let Some(row) = rows.first() else {
+            // system.local is never empty; treat an impossible empty result as
+            // "cannot prove foreign" rather than wrongly excluding the key.
+            return Ok(true);
+        };
+        let token: i64 = cassandra_util::get_column(row, "t", "scan_key_in_segment")?;
+
+        Ok(token >= lower && token <= upper)
+    }
+
     /// Token-based two-query pagination for `scan_impl`.
     #[allow(clippy::too_many_arguments)]
     async fn scan_paginated(
