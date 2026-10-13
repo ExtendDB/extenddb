@@ -170,6 +170,15 @@ async fn apply_migrations(
         );
     }
 
+    // A migration that rewrites rows in place needs every other session off
+    // the databases it touches. Check before the first write, so a refusal
+    // leaves the catalog version where it was and an older binary can still be
+    // restarted.
+    bootstrap
+        .check_exclusive_access_for_pending_migrations()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
     if catalog_pending {
         bootstrap
             .run_catalog_migrations()
