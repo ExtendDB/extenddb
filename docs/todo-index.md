@@ -14,7 +14,6 @@ Regenerated: v0.1.6 (BR-7085)
 
 - `crates/storage/src/lib.rs:592` — Unreachable method; engine handler returns before reaching it.
 - `crates/storage-postgres/src/backup_engine.rs:640` — Unreachable method; engine handler returns before reaching it.
-- `crates/core/src/metrics/collector.rs:124` — `#[allow(dead_code)]` on field used when console adds table-scoped latency breakdown.
 
 ## TODO (issue-tracked)
 
