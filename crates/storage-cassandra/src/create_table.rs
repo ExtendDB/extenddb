@@ -26,7 +26,7 @@ impl CassandraEngine {
         account_keyspace: &str,
         table_id: &str,
     ) -> Result<String, StorageError> {
-        let label = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        let label = extenddb_storage::util::new_stream_label();
         let catalog_keyspace = self.catalog_keyspace();
         let now_ms = chrono::Utc::now().timestamp_millis();
 

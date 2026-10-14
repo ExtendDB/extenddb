@@ -193,7 +193,7 @@ impl CassandraEngine {
                     });
                     if !has_label {
                         needs_label_restore = true;
-                        let label = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+                        let label = extenddb_storage::util::new_stream_label();
                         add_update!("stream_label", label.as_str());
                     }
                 }
