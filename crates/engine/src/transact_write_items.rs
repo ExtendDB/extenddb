@@ -10,7 +10,7 @@ use serde_json::Value;
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
-use crate::expression_helpers::{build_expression_maps, parse_optional_condition};
+use crate::expression_helpers::build_expression_maps;
 use crate::serialize_output;
 use crate::stream_capture;
 use crate::transact_write_helpers::{
@@ -91,23 +91,32 @@ pub async fn handle_transact_write_items(
         }
     }
 
-    // Resolve table key info, validate inputs, parse expressions, and check
-    // for duplicate targets — all in a single pass to avoid redundant
-    // `table_key_info` lookups.
+    // Validation runs in the order the service applies it, each phase over
+    // every item before the next phase starts:
+    //   1. per item, in order: expression grammar, the semantic walk, unused
+    //      names and values, then the item's size (top-level ValidationException),
+    //   2. table lookup (ResourceNotFoundException),
+    //   3. the 4 MB request total (top-level ValidationException),
+    //   4. key schema and key size (TransactionCanceledException with a
+    //      ValidationError reason on the first offending item and None on
+    //      every other; conditions are not evaluated when any item fails here),
+    //   5. duplicate targets (top-level ValidationException).
+    // Measured against DynamoDB for #108; a request with two defects reports
+    // the earlier phase's error whichever item carries it.
+    let parsed: Vec<ParsedExpressions> = input
+        .transact_items
+        .iter()
+        .map(|twi| parse_write_expressions(twi, &ctx.limits))
+        .collect::<Result<_, _>>()?;
+
     let mut prepared: Vec<PreparedOp> = Vec::with_capacity(input.transact_items.len());
-    let mut seen_targets: HashSet<String> = HashSet::with_capacity(input.transact_items.len());
-    for twi in &input.transact_items {
-        let op = prepare_write_op(twi, ctx).await?;
-        let target_key = op.canonical_target();
-        if !seen_targets.insert(target_key) {
-            return Err(DynamoDbError::ValidationException(
-                "Transaction request cannot include multiple operations on one item".to_owned(),
-            ));
-        }
-        prepared.push(op);
+    for (twi, exprs) in input.transact_items.iter().zip(parsed) {
+        prepared.push(prepare_write_op(twi, exprs, ctx).await?);
     }
 
-    // Validate total transaction size <= 4MB
+    // The 4 MB request total comes after every table is looked up and before
+    // the key schema and duplicate checks (measured: eleven 390 KB items plus
+    // a mistyped key, a duplicate, or a false condition all report the size).
     let total_size: usize = prepared
         .iter()
         .map(super::transact_write_helpers::PreparedOp::item_size)
@@ -118,27 +127,39 @@ pub async fn handle_transact_write_items(
         ));
     }
 
-    // Reject oversized primary keys as a per-item cancellation, matching real
-    // DynamoDB: an oversized hash/range key in any sub-op returns
-    // TransactionCanceledException with a ValidationError cancellation reason
-    // for the offending item (an EMPTY key value, by contrast, is a top-level
-    // ValidationException and is handled in prepare_write_op).
+    // Key schema preflight: a key whose type does not match the schema, or a
+    // key over the size limit, cancels the transaction with a ValidationError
+    // reason on the FIRST offending item and None on every other item, even
+    // when several keys fail (measured: items 1 and 3 mistyped report
+    // [ValidationError, None, None]). (An EMPTY key value, by contrast, is a
+    // top-level ValidationException and is handled in prepare_write_op.)
+    // Running this before duplicate detection and before any condition is
+    // evaluated matches the service: the other items report None, not
+    // ConditionalCheckFailed.
+    if let Some((index, reason)) = prepared
+        .iter()
+        .enumerate()
+        .find_map(|(i, op)| op.key_schema_reason(&ctx.limits).map(|r| (i, r)))
     {
-        let mut reasons: Vec<extenddb_core::types::CancellationReason> =
-            Vec::with_capacity(prepared.len());
-        let mut any_oversized = false;
-        for op in &prepared {
-            match op.oversized_key_reason(&ctx.limits) {
-                Some(reason) => {
-                    any_oversized = true;
-                    reasons.push(reason);
+        let reasons: Vec<extenddb_core::types::CancellationReason> = (0..prepared.len())
+            .map(|i| {
+                if i == index {
+                    reason.clone()
+                } else {
+                    extenddb_core::types::CancellationReason::none()
                 }
-                None => reasons.push(extenddb_core::types::CancellationReason::none()),
-            }
-        }
-        if any_oversized {
-            return Err(storage_err_to_dynamo(
-                extenddb_storage::error::StorageError::TransactionCanceled(reasons),
+            })
+            .collect();
+        return Err(storage_err_to_dynamo(
+            extenddb_storage::error::StorageError::TransactionCanceled(reasons),
+        ));
+    }
+
+    let mut seen_targets: HashSet<String> = HashSet::with_capacity(prepared.len());
+    for op in &prepared {
+        if !seen_targets.insert(op.canonical_target()) {
+            return Err(DynamoDbError::ValidationException(
+                "Transaction request cannot include multiple operations on one item".to_owned(),
             ));
         }
     }
@@ -191,18 +212,18 @@ pub async fn handle_transact_write_items(
                 extenddb_core::types::ReturnConsumedCapacity::None => None,
                 rcc => {
                     let indexes = rcc == extenddb_core::types::ReturnConsumedCapacity::Indexes;
-                    let mut per_table_rcu: HashMap<String, f64> = HashMap::new();
+                    let mut per_table_rcu = capacity_helpers::PerTableCapacity::default();
                     for op in &prepared {
                         let rcu =
                             capacity_helpers::read_capacity_units(op.write_bytes(), true) * 2.0;
-                        *per_table_rcu.entry(op.table_name().to_owned()).or_default() += rcu;
+                        per_table_rcu.add(op.table_name(), rcu);
                     }
                     Some(
                         per_table_rcu
                             .iter()
                             .map(|(t, cu)| {
                                 extenddb_core::types::ConsumedCapacity::transact_replay_read(
-                                    t, *cu, indexes,
+                                    t, cu, indexes,
                                 )
                             })
                             .collect(),
@@ -228,12 +249,12 @@ pub async fn handle_transact_write_items(
     // Stream records are now captured atomically within the storage transaction.
 
     // Per-item WCU: round each item individually, then sum (M-1).
-    let mut per_table_wcu: HashMap<String, f64> = HashMap::new();
+    let mut per_table_wcu = capacity_helpers::PerTableCapacity::default();
     let wcu: f64 = prepared
         .iter()
         .map(|op| {
             let item_wcu = capacity_helpers::write_capacity_units(op.write_bytes()) * 2.0; // transactions cost 2x
-            *per_table_wcu.entry(op.table_name().to_owned()).or_default() += item_wcu;
+            per_table_wcu.add(op.table_name(), item_wcu);
             item_wcu
         })
         .sum();
@@ -245,10 +266,13 @@ pub async fn handle_transact_write_items(
     // only for now.
     let consumed_capacity = capacity_helpers::transact_write_capacity(
         input.return_consumed_capacity,
-        per_table_wcu.iter().map(|(t, cu)| (t.as_str(), *cu)),
+        per_table_wcu.iter(),
     );
 
-    // Collect ItemCollectionMetrics per table for write operations.
+    // Collect ItemCollectionMetrics per table for write operations. When SIZE
+    // was requested the member is present even with nothing to report (no
+    // table has a local secondary index): the service returns `{}` there
+    // (measured 2026-10-14), and omits the member only when it was not asked for.
     let mut all_icm: HashMap<String, Vec<extenddb_core::types::ItemCollectionMetrics>> =
         HashMap::new();
     for p in &prepared {
@@ -259,14 +283,14 @@ pub async fn handle_transact_write_items(
                 .push(m);
         }
     }
+    let item_collection_metrics = match input.return_item_collection_metrics {
+        extenddb_core::types::ReturnItemCollectionMetrics::None => None,
+        extenddb_core::types::ReturnItemCollectionMetrics::Size => Some(all_icm),
+    };
 
     let output = TransactWriteItemsOutput {
         consumed_capacity,
-        item_collection_metrics: if all_icm.is_empty() {
-            None
-        } else {
-            Some(all_icm)
-        },
+        item_collection_metrics,
     };
     let body = serialize_output(&output)?;
     Ok(DispatchResult {
@@ -357,11 +381,120 @@ fn assigned_vector_attributes(actions: &[UpdateAction], maps: &ExpressionMaps) -
     assigned
 }
 
-/// Parse and validate a single `TransactWriteItem`, returning a `PreparedOp`.
+/// A `TransactWriteItem`'s expressions, parsed and checked without touching
+/// storage: grammar, operand types, every `#name` and `:value` reference
+/// defined, and no unused names or values.
+struct ParsedExpressions {
+    maps: ExpressionMaps,
+    condition: Option<Expr>,
+    actions: Option<Vec<UpdateAction>>,
+}
+
+/// Phase 1 of `TransactWriteItems` validation: the expressions of one item.
+///
+/// Runs for every item before any table is looked up, so a malformed
+/// expression on item three is reported ahead of a missing table on item one.
+fn parse_write_expressions(
+    twi: &TransactWriteItem,
+    limits: &extenddb_core::limits::LimitsConfig,
+) -> Result<ParsedExpressions, DynamoDbError> {
+    use extenddb_core::expression::ExpressionKind;
+
+    let (names, values, condition_expression, update_expression) = if let Some(put) = &twi.put {
+        (
+            put.expression_attribute_names.as_ref(),
+            put.expression_attribute_values.as_ref(),
+            put.condition_expression.as_deref(),
+            None,
+        )
+    } else if let Some(del) = &twi.delete {
+        (
+            del.expression_attribute_names.as_ref(),
+            del.expression_attribute_values.as_ref(),
+            del.condition_expression.as_deref(),
+            None,
+        )
+    } else if let Some(upd) = &twi.update {
+        (
+            upd.expression_attribute_names.as_ref(),
+            upd.expression_attribute_values.as_ref(),
+            upd.condition_expression.as_deref(),
+            Some(upd.update_expression.as_str()),
+        )
+    } else if let Some(cc) = &twi.condition_check {
+        (
+            cc.expression_attribute_names.as_ref(),
+            cc.expression_attribute_values.as_ref(),
+            Some(cc.condition_expression.as_str()),
+            None,
+        )
+    } else {
+        // Unreachable: the one-operation check above already rejected this item.
+        return Err(DynamoDbError::ValidationException(
+            "TransactWriteItem must contain exactly one operation".to_owned(),
+        ));
+    };
+
+    // Inside a transaction the service checks an Update item's
+    // UpdateExpression (syntax, the ordered semantic walk, overlapping paths)
+    // before its ConditionExpression, the reverse of UpdateItem; then the
+    // unused names and values; then the item's size (measured 2026-10-14:
+    // an oversize Put with an unused value reports the value, and an
+    // oversize item one reports its size ahead of the next item's defects).
+    let maps = build_expression_maps(names, values);
+    let actions = match update_expression {
+        Some(expr) => Some(crate::expression_helpers::parse_update_expr_checked(
+            expr, &maps, limits,
+        )?),
+        None => None,
+    };
+    let condition = match condition_expression {
+        Some(expr) if !expr.is_empty() => Some(crate::expression_helpers::parse_condition_checked(
+            expr,
+            &maps,
+            limits,
+            true,
+            ExpressionKind::Condition,
+        )?),
+        _ => None,
+    };
+    // Transactions accept names/values with no expression (unlike single-item
+    // APIs); only check for unused refs when some expression is present.
+    if condition.is_some() || actions.is_some() {
+        let exprs: Vec<&Expr> = condition.iter().collect();
+        let action_refs: Vec<&UpdateAction> = actions.iter().flatten().collect();
+        extenddb_core::expression::validate_unused_attributes(
+            &maps.names,
+            &maps.values,
+            &exprs,
+            &action_refs,
+            &HashSet::new(),
+            &HashSet::new(),
+        )?;
+    }
+    if let Some(put) = &twi.put {
+        validate_item_size(&put.item, limits.max_item_size_bytes)?;
+    }
+    Ok(ParsedExpressions {
+        maps,
+        condition,
+        actions,
+    })
+}
+
+/// Phase 2 of `TransactWriteItems` validation: look the table up and validate
+/// the item or key against it, returning a `PreparedOp`.
 async fn prepare_write_op(
     twi: &TransactWriteItem,
+    exprs: ParsedExpressions,
     ctx: &OperationContext,
 ) -> Result<PreparedOp, DynamoDbError> {
+    let ParsedExpressions {
+        maps,
+        condition,
+        actions,
+    } = exprs;
+
     if let Some(put) = &twi.put {
         let key_info = ctx
             .storage
@@ -369,37 +502,8 @@ async fn prepare_write_op(
             .await
             .map_err(storage_err_to_dynamo)?;
         validate_item_nesting_depth(&put.item)?;
-        validate_item_size(&put.item, ctx.limits.max_item_size_bytes)?;
         validate_attribute_name_sizes(&put.item, &ctx.limits)?;
         validate_key_not_empty(&put.item, &key_info.key_schema)?;
-        let maps = build_expression_maps(
-            put.expression_attribute_names.as_ref(),
-            put.expression_attribute_values.as_ref(),
-        );
-        let condition = parse_optional_condition(put.condition_expression.as_deref(), &ctx.limits)?;
-        if let Some(ref expr) = condition {
-            extenddb_core::expression::validate_ordering_operand_types(expr, &maps).map_err(
-                |e| {
-                    crate::expression_helpers::prefix_expression_error(
-                        e,
-                        extenddb_core::expression::ExpressionKind::Condition,
-                    )
-                },
-            )?;
-        }
-        // Transactions accept names/values with no expression (unlike single-item
-        // APIs); only check for unused refs when a condition is present.
-        if condition.is_some() {
-            let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
-            extenddb_core::expression::validate_unused_attributes(
-                &maps.names,
-                &maps.values,
-                &exprs,
-                &[],
-                &HashSet::new(),
-                &HashSet::new(),
-            )?;
-        }
         let stream =
             stream_capture::stream_view_type(&key_info).map(|vt| extenddb_storage::StreamCapture {
                 view_type: vt,
@@ -426,32 +530,6 @@ async fn prepare_write_op(
         // DynamoDB (a top-level ValidationException), unlike a key type
         // mismatch which surfaces as a per-item cancellation reason.
         validate_key_not_empty(&del.key, &key_info.key_schema)?;
-        let maps = build_expression_maps(
-            del.expression_attribute_names.as_ref(),
-            del.expression_attribute_values.as_ref(),
-        );
-        let condition = parse_optional_condition(del.condition_expression.as_deref(), &ctx.limits)?;
-        if let Some(ref expr) = condition {
-            extenddb_core::expression::validate_ordering_operand_types(expr, &maps).map_err(
-                |e| {
-                    crate::expression_helpers::prefix_expression_error(
-                        e,
-                        extenddb_core::expression::ExpressionKind::Condition,
-                    )
-                },
-            )?;
-        }
-        if condition.is_some() {
-            let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
-            extenddb_core::expression::validate_unused_attributes(
-                &maps.names,
-                &maps.values,
-                &exprs,
-                &[],
-                &HashSet::new(),
-                &HashSet::new(),
-            )?;
-        }
         let stream =
             stream_capture::stream_view_type(&key_info).map(|vt| extenddb_storage::StreamCapture {
                 view_type: vt,
@@ -478,12 +556,7 @@ async fn prepare_write_op(
         // DynamoDB (a top-level ValidationException), unlike a key type
         // mismatch which surfaces as a per-item cancellation reason.
         validate_key_not_empty(&upd.key, &key_info.key_schema)?;
-        let maps = build_expression_maps(
-            upd.expression_attribute_names.as_ref(),
-            upd.expression_attribute_values.as_ref(),
-        );
-        let actions =
-            crate::expression_helpers::parse_update_expr(&upd.update_expression, &ctx.limits)?;
+        let actions = actions.unwrap_or_default();
         validate_no_key_updates(&actions, &key_info, &maps)?;
 
         // Validate nesting depth of EAV values that get stored via SET actions.
@@ -499,28 +572,6 @@ async fn prepare_write_op(
                 .filter_map(|name| maps.values.get(name))
                 .collect();
             validate_attribute_values_nesting_depth(stored)?;
-        }
-        let condition = parse_optional_condition(upd.condition_expression.as_deref(), &ctx.limits)?;
-        if let Some(ref expr) = condition {
-            extenddb_core::expression::validate_ordering_operand_types(expr, &maps).map_err(
-                |e| {
-                    crate::expression_helpers::prefix_expression_error(
-                        e,
-                        extenddb_core::expression::ExpressionKind::Condition,
-                    )
-                },
-            )?;
-        }
-        {
-            let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
-            extenddb_core::expression::validate_unused_attributes(
-                &maps.names,
-                &maps.values,
-                &exprs,
-                &actions.iter().collect::<Vec<_>>(),
-                &HashSet::new(),
-                &HashSet::new(),
-            )?;
         }
         let stream =
             stream_capture::stream_view_type(&key_info).map(|vt| extenddb_storage::StreamCapture {
@@ -549,31 +600,12 @@ async fn prepare_write_op(
         // DynamoDB (a top-level ValidationException), unlike a key type
         // mismatch which surfaces as a per-item cancellation reason.
         validate_key_not_empty(&cc.key, &key_info.key_schema)?;
-        let maps = build_expression_maps(
-            cc.expression_attribute_names.as_ref(),
-            cc.expression_attribute_values.as_ref(),
-        );
-        let condition =
-            crate::expression_helpers::parse_condition_expr(&cc.condition_expression, &ctx.limits)?;
-        extenddb_core::expression::validate_ordering_operand_types(&condition, &maps).map_err(
-            |e| {
-                crate::expression_helpers::prefix_expression_error(
-                    e,
-                    extenddb_core::expression::ExpressionKind::Condition,
-                )
-            },
-        )?;
-        {
-            let exprs: Vec<&extenddb_core::expression::Expr> = vec![&condition];
-            extenddb_core::expression::validate_unused_attributes(
-                &maps.names,
-                &maps.values,
-                &exprs,
-                &[],
-                &HashSet::new(),
-                &HashSet::new(),
-            )?;
-        }
+        let Some(condition) = condition else {
+            // Unreachable: parse_write_expressions parsed the required expression.
+            return Err(DynamoDbError::ValidationException(
+                "ConditionCheck requires a ConditionExpression".to_owned(),
+            ));
+        };
         return Ok(PreparedOp::ConditionCheck {
             key_info,
             key: cc.key.clone(),

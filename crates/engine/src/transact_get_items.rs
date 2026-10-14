@@ -60,34 +60,13 @@ pub async fn handle_transact_get_items(
         )));
     }
 
-    // Resolve table key info for each item
-    let mut seen_keys: HashSet<Vec<u8>> = HashSet::with_capacity(input.transact_items.len());
-    for tgi in &input.transact_items {
-        let dedup_key =
-            serde_json::to_vec(&(&tgi.get.table_name, &tgi.get.key)).unwrap_or_default();
-        if !seen_keys.insert(dedup_key) {
-            return Err(DynamoDbError::ValidationException(
-                "Transaction request cannot include multiple operations on one item".to_owned(),
-            ));
-        }
-    }
-
-    let mut key_infos = Vec::with_capacity(input.transact_items.len());
-    for tgi in &input.transact_items {
-        let key_info = ctx
-            .storage
-            .table_key_info(&ctx.account_id, &tgi.get.table_name)
-            .await
-            .map_err(storage_err_to_dynamo)?;
-        // Key type validation is deferred to the storage layer so that
-        // mismatches produce TransactionCanceledException with ValidationError
-        // cancellation reasons, matching real DynamoDB behavior.
-        key_infos.push(key_info);
-    }
-
-    // Validate and compile each projection before the transactional read, so a
-    // malformed request fails with ValidationException instead of executing the
-    // transaction. DynamoDB checks overlap before the unused-name check.
+    // Validation runs in the order the service applies it, each phase over
+    // every item before the next phase starts: projection grammar and alias
+    // resolution (top-level ValidationException), then table lookup
+    // (ResourceNotFoundException), then key schema and key size
+    // (TransactionCanceledException with a ValidationError reason per
+    // offending item), then duplicate keys (top-level ValidationException).
+    // Measured against DynamoDB for #108.
     let mut projections: Vec<Option<Projection>> = Vec::with_capacity(input.transact_items.len());
     for tgi in &input.transact_items {
         if let Some(ref proj_str) = tgi.get.projection_expression {
@@ -120,26 +99,61 @@ pub async fn handle_transact_get_items(
         }
     }
 
-    // Reject oversized primary keys as a per-item cancellation, matching real
-    // DynamoDB (TransactionCanceledException with a ValidationError reason for
-    // the offending item). Key type/emptiness is validated in the storage
-    // layer; this enforces the size limit the storage layer does not check.
-    {
-        let mut reasons: Vec<CancellationReason> = Vec::with_capacity(input.transact_items.len());
-        let mut any_oversized = false;
-        for (tgi, ki) in input.transact_items.iter().zip(key_infos.iter()) {
-            match validation::validate_key_size_limits(&tgi.get.key, &ki.key_schema, &ctx.limits) {
-                Ok(()) => reasons.push(CancellationReason::none()),
-                Err(e) => {
-                    any_oversized = true;
-                    reasons.push(CancellationReason::validation_error(e.to_string()));
+    let mut key_infos = Vec::with_capacity(input.transact_items.len());
+    for tgi in &input.transact_items {
+        let key_info = ctx
+            .storage
+            .table_key_info(&ctx.account_id, &tgi.get.table_name)
+            .await
+            .map_err(storage_err_to_dynamo)?;
+        key_infos.push(key_info);
+    }
+
+    // A key with the wrong type, extra or missing attributes, or over the size
+    // limit cancels the transaction with a ValidationError reason on the FIRST
+    // offending item and None on every other, even when several keys fail
+    // (measured 2026-10-14: items 1 and 3 mistyped report
+    // [ValidationError, None, None]).
+    let first_offender = input
+        .transact_items
+        .iter()
+        .zip(key_infos.iter())
+        .enumerate()
+        .find_map(|(i, (tgi, ki))| {
+            validation::validate_batch_key_only(
+                &tgi.get.key,
+                &ki.key_schema,
+                &ki.attribute_definitions,
+            )
+            .and_then(|()| {
+                validation::validate_key_size_limits(&tgi.get.key, &ki.key_schema, &ctx.limits)
+            })
+            .err()
+            .map(|e| (i, e))
+        });
+    if let Some((index, err)) = first_offender {
+        let reasons: Vec<CancellationReason> = (0..input.transact_items.len())
+            .map(|i| {
+                if i == index {
+                    CancellationReason::validation_error(err.to_string())
+                } else {
+                    CancellationReason::none()
                 }
-            }
-        }
-        if any_oversized {
-            return Err(storage_err_to_dynamo(StorageError::TransactionCanceled(
-                reasons,
-            )));
+            })
+            .collect();
+        return Err(storage_err_to_dynamo(StorageError::TransactionCanceled(
+            reasons,
+        )));
+    }
+
+    let mut seen_keys: HashSet<Vec<u8>> = HashSet::with_capacity(input.transact_items.len());
+    for tgi in &input.transact_items {
+        let dedup_key =
+            serde_json::to_vec(&(&tgi.get.table_name, &tgi.get.key)).unwrap_or_default();
+        if !seen_keys.insert(dedup_key) {
+            return Err(DynamoDbError::ValidationException(
+                "Transaction request cannot include multiple operations on one item".to_owned(),
+            ));
         }
     }
 
@@ -163,8 +177,7 @@ pub async fn handle_transact_get_items(
     // Capacity metering: RCU rounded per item, then summed (M-1).
     // Capacity metering: TransactGetItems costs 2 RCU per item (transactions
     // double the read cost). Missing items still cost 2 RCU.
-    let mut per_table_rcu: std::collections::HashMap<String, f64> =
-        std::collections::HashMap::new();
+    let mut per_table_rcu = capacity_helpers::PerTableCapacity::default();
     let rcu: f64 = items
         .iter()
         .zip(input.transact_items.iter())
@@ -174,7 +187,7 @@ pub async fn handle_transact_get_items(
                 None => 1.0, // minimum 1 RCU for missing item
             };
             let txn_rcu = base_rcu * 2.0; // transactions cost 2x
-            *per_table_rcu.entry(tgi.get.table_name.clone()).or_default() += txn_rcu;
+            per_table_rcu.add(&tgi.get.table_name, txn_rcu);
             txn_rcu
         })
         .sum();
@@ -200,7 +213,7 @@ pub async fn handle_transact_get_items(
 
     let consumed_capacity = capacity_helpers::transact_read_capacity(
         input.return_consumed_capacity,
-        per_table_rcu.iter().map(|(t, cu)| (t.as_str(), *cu)),
+        per_table_rcu.iter(),
     );
 
     let output = TransactGetItemsOutput {

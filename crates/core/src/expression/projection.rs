@@ -125,13 +125,13 @@ fn prefix_projection_error(err: DynamoDbError) -> DynamoDbError {
 
 /// A path element after `#name` resolution.
 #[derive(PartialEq, Eq)]
-enum ResolvedElement {
+pub(crate) enum ResolvedElement {
     Attr(String),
     Index(usize),
 }
 
 /// Resolve `#name` references in parsed paths, rejecting index-start paths.
-fn resolve_paths(
+pub(crate) fn resolve_paths(
     paths: &[Vec<PathElement>],
     maps: &ExpressionMaps,
 ) -> Result<Vec<Vec<ResolvedElement>>, DynamoDbError> {
@@ -166,11 +166,20 @@ fn resolve_paths(
 /// Reject paths where one is a prefix of another (DynamoDB's overlap rule),
 /// reporting the first offending pair in expression order. Siblings are fine.
 fn check_overlap(resolved: &[Vec<ResolvedElement>]) -> Result<(), DynamoDbError> {
+    check_overlap_for(resolved, super::ExpressionKind::Projection)
+}
+
+/// The overlap rule for any expression kind that names document paths; the
+/// message carries the kind's `Invalid <Kind>:` prefix.
+pub(crate) fn check_overlap_for(
+    resolved: &[Vec<ResolvedElement>],
+    kind: super::ExpressionKind,
+) -> Result<(), DynamoDbError> {
     for i in 0..resolved.len() {
         for j in (i + 1)..resolved.len() {
             if is_prefix(&resolved[i], &resolved[j]) || is_prefix(&resolved[j], &resolved[i]) {
                 return Err(DynamoDbError::ValidationException(format!(
-                    "Invalid ProjectionExpression: Two document paths overlap with each other; \
+                    "Invalid {kind}: Two document paths overlap with each other; \
                      must remove or rewrite one of these paths; path one: {}, path two: {}",
                     render_path(&resolved[i]),
                     render_path(&resolved[j]),

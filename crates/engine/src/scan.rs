@@ -18,7 +18,7 @@ use extenddb_storage::error::StorageError;
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
-use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
+use crate::expression_helpers::build_expression_maps;
 use crate::index_helpers::{
     VectorIndexReadRefusal, classify_unresolved_index_read, combined_lek_key_schema,
     validate_scan_exclusive_start_key,
@@ -81,6 +81,64 @@ pub async fn handle_scan(
         .is_some_and(|a| !a.is_empty());
     let has_cond_op = input.conditional_operator.is_some();
 
+    // Limit and Segment/TotalSegments are parameter-level checks the service
+    // runs ahead of every expression check (measured 2026-10-14: a Scan with
+    // an undefined filter value and Limit 0 reports the limit; with Segment
+    // and no TotalSegments it reports TotalSegments).
+    // Validate Segment/TotalSegments — DynamoDB returns different messages per direction
+    match (input.segment, input.total_segments) {
+        (Some(_), None) => {
+            return Err(DynamoDbError::ValidationException(
+                "The TotalSegments parameter is required but was not present in the request when Segment parameter is present"
+                    .to_owned(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(DynamoDbError::ValidationException(
+                "The Segment parameter is required but was not present in the request when parameter TotalSegments is present"
+                    .to_owned(),
+            ));
+        }
+        (Some(seg), Some(total)) => {
+            if total < 1 {
+                return Err(DynamoDbError::ValidationException(
+                    "The parameter TotalSegments should be greater than or equal to 1".to_owned(),
+                ));
+            }
+            if total > 1_000_000 {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "1 validation error detected: Value '{total}' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"
+                )));
+            }
+            if seg < 0 {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0"
+                )));
+            }
+            if seg > 999_999 {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value less than or equal to 999999"
+                )));
+            }
+            if seg >= total {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "The Segment parameter is zero-based and must be less than parameter TotalSegments: \
+                     Segment: {seg} is not less than TotalSegments: {total}"
+                )));
+            }
+        }
+        (None, None) => {}
+    }
+
+    // Validate Limit >= 1
+    if let Some(limit) = input.limit
+        && limit < 1
+    {
+        return Err(DynamoDbError::ValidationException(format!(
+            "1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
+        )));
+    }
+
     extenddb_core::validation::validate_no_expression_param_mixing(
         &[
             ("AttributesToGet", has_atg),
@@ -120,24 +178,31 @@ pub async fn handle_scan(
         input.scan_filter.as_ref().map_or(0, HashMap::len),
     )?;
 
-    // Parse FilterExpression or desugar legacy ScanFilter
-    let (filter, filter_maps) = if let Some(ref sf) = input.scan_filter {
-        if sf.is_empty() {
-            (
-                parse_optional_filter(input.filter_expression.as_deref(), &ctx.limits)?,
-                None,
-            )
-        } else {
+    // Parse FilterExpression or desugar legacy ScanFilter. The expression
+    // form runs the service's ordered semantic walk (references, functions,
+    // operand types) here, ahead of the projection, the unused check, and the
+    // table lookup, so an undefined `:q` is a request error even when no row
+    // would be evaluated (measured 2026-10-14 on an empty table).
+    let (filter, filter_maps) =
+        if let Some(sf) = input.scan_filter.as_ref().filter(|sf| !sf.is_empty()) {
             let cond_op = input.conditional_operator.unwrap_or_default();
             let (expr, fmaps) = desugar_filter(sf, cond_op)?;
             (Some(expr), Some(fmaps))
-        }
-    } else {
-        (
-            parse_optional_filter(input.filter_expression.as_deref(), &ctx.limits)?,
-            None,
-        )
-    };
+        } else {
+            match input.filter_expression.as_deref() {
+                Some(expr) if !expr.is_empty() => (
+                    Some(crate::expression_helpers::parse_condition_checked(
+                        expr,
+                        &maps,
+                        &ctx.limits,
+                        true,
+                        ExpressionKind::Filter,
+                    )?),
+                    None,
+                ),
+                _ => (None, None),
+            }
+        };
 
     // Parse ProjectionExpression or desugar legacy AttributesToGet
     let (effective_projection_str, extra_proj_names) = if input.projection_expression.is_some() {
@@ -299,60 +364,6 @@ pub async fn handle_scan(
         )?;
     }
 
-    // Validate Segment/TotalSegments — DynamoDB returns different messages per direction
-    match (input.segment, input.total_segments) {
-        (Some(_), None) => {
-            return Err(DynamoDbError::ValidationException(
-                "The TotalSegments parameter is required but was not present in the request when Segment parameter is present"
-                    .to_owned(),
-            ));
-        }
-        (None, Some(_)) => {
-            return Err(DynamoDbError::ValidationException(
-                "The Segment parameter is required but was not present in the request when parameter TotalSegments is present"
-                    .to_owned(),
-            ));
-        }
-        (Some(seg), Some(total)) => {
-            if total < 1 {
-                return Err(DynamoDbError::ValidationException(
-                    "The parameter TotalSegments should be greater than or equal to 1".to_owned(),
-                ));
-            }
-            if total > 1_000_000 {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "1 validation error detected: Value '{total}' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"
-                )));
-            }
-            if seg < 0 {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0"
-                )));
-            }
-            if seg > 999_999 {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value less than or equal to 999999"
-                )));
-            }
-            if seg >= total {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "The Segment parameter is zero-based and must be less than parameter TotalSegments: \
-                     Segment: {seg} is not less than TotalSegments: {total}"
-                )));
-            }
-        }
-        (None, None) => {}
-    }
-
-    // Validate Limit >= 1
-    if let Some(limit) = input.limit
-        && limit < 1
-    {
-        return Err(DynamoDbError::ValidationException(format!(
-            "1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
-        )));
-    }
-
     // For index scans, build a key_info that reflects the index's key schema.
     let scan_key_info = if let Some(ref idx) = index_info {
         TableKeyInfo {
@@ -442,16 +453,6 @@ pub async fn handle_scan(
                 )));
             }
         }
-    }
-
-    // Validate begins_with operand types upfront (before any rows are scanned).
-    if let Some(ref f) = filter {
-        extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
-            |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
-        )?;
-        extenddb_core::expression::validate_ordering_operand_types(f, &combined_maps).map_err(
-            |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
-        )?;
     }
 
     // Determine which key schema to use for LastEvaluatedKey extraction.

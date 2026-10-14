@@ -13,7 +13,7 @@ use extenddb_core::types::{PutItemInput, PutItemOutput, ReturnValues, item_size_
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::{storage_err_to_dynamo, storage_err_to_dynamo_with_ccf};
-use crate::expression_helpers::resolve_condition;
+use crate::expression_helpers::{resolve_condition, single_item_write_prefix};
 use crate::serialize_output;
 use crate::stream_capture;
 use crate::{DispatchMetrics, DispatchResult};
@@ -109,13 +109,16 @@ pub async fn handle_put_item(
         ],
         &[("ConditionExpression", has_expression)],
     )?;
+    // The single-item write APIs name no expression in the values message and
+    // wrap every expression-stage error in `1 validation error detected: `.
     extenddb_core::expression::validate_expression_param_usage(
         input.expression_attribute_names.as_ref(),
         has_expression,
         input.expression_attribute_values.as_ref(),
         has_expression,
-        &[extenddb_core::expression::ExpressionKind::Condition],
-    )?;
+        &[],
+    )
+    .map_err(single_item_write_prefix)?;
 
     // ConditionalOperator requires an Expected with two or more conditions.
     extenddb_core::validation::validate_conditional_operator_usage(
@@ -138,7 +141,8 @@ pub async fn handle_put_item(
         input.expected.as_ref(),
         input.conditional_operator,
         &ctx.limits,
-    )?;
+    )
+    .map_err(single_item_write_prefix)?;
 
     if input.expected.is_none()
         || input
@@ -147,6 +151,9 @@ pub async fn handle_put_item(
             .is_some_and(std::collections::HashMap::is_empty)
     {
         let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
+        // The condition's references, functions, and operand types were
+        // checked by `resolve_condition`; the unused check follows them and
+        // runs ahead of the table lookup, as on the service.
         extenddb_core::expression::validate_unused_attributes(
             &maps.names,
             &maps.values,
@@ -154,7 +161,8 @@ pub async fn handle_put_item(
             &[],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
-        )?;
+        )
+        .map_err(single_item_write_prefix)?;
     }
 
     let key_info = ctx
