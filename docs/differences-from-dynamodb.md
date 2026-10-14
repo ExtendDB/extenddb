@@ -46,6 +46,7 @@ adaptation when switching between ExtendDB and the real service.
 |------|----------|------|
 | Table creation delay | Returns `CREATING` immediately; transitions to `ACTIVE` typically within seconds. Same behavior for on-demand and provisioned | Configurable via `control_plane_delay_seconds` runtime setting (default: 5s) |
 | DeletionProtectionEnabled | Enforced | Enforced (accepted and stored, DeleteTable rejects when enabled) |
+| Table ARN in `TableName` | Every data-plane and table operation accepts the table's ARN (`arn:aws:dynamodb:<region>:<account>:table/<name>`) in place of its name | Bare table names only; an ARN is reported as a missing table or an invalid name. An ExtendDB table ARN carries ExtendDB's account and region, so a table that streams or replicates to Amazon DynamoDB would answer to two ARNs for one logical table. Keeping names as the only identifier avoids that collision. Transactions that address one item by name and by ARN are therefore two different (missing) targets here, where the service rejects them as duplicates. |
 
 ## Time to Live (TTL)
 
