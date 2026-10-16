@@ -29,3 +29,8 @@ crc32fast = { workspace = true }
 zeroize = { workspace = true }
 cdrs-tokio = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+# The direct tests build a WorkerContext (its log reload handle) to drive the
+# runtime hooks the way `serve` does.
+tracing-subscriber = { workspace = true }

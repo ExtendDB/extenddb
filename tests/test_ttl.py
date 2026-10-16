@@ -67,6 +67,17 @@ class TestUpdateTimeToLive:
         )
         # DynamoDB rate-limits TTL modifications; wait before disabling.
         time.sleep(6)
+        # A disable is refused while the enable is still ENABLING; on a loaded
+        # server that can outlast the fixed wait.
+        deadline = time.monotonic() + 120
+        while (
+            dynamodb_client.describe_time_to_live(TableName=ttl_table)[
+                "TimeToLiveDescription"
+            ]["TimeToLiveStatus"]
+            == "ENABLING"
+        ):
+            assert time.monotonic() < deadline, "TTL still ENABLING after 120 s"
+            time.sleep(0.5)
         # Disable.
         resp = dynamodb_client.update_time_to_live(
             TableName=ttl_table,

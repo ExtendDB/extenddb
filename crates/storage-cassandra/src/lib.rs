@@ -7,7 +7,7 @@
 //! as the underlying database. It provides a DynamoDB-compatible API backed
 //! by Cassandra's distributed architecture.
 
-pub const CATALOG_VERSION: &str = "0.0.3";
+pub const CATALOG_VERSION: &str = "0.0.4";
 
 mod admin_store;
 mod authorization_store;
@@ -36,6 +36,7 @@ mod update_table;
 mod worker_store;
 pub mod workers;
 
+pub use backup_engine::poll_abandoned_restores;
 pub use bootstrapper::CassandraBootstrapper;
 pub use catalog_store::CassandraCatalogStore;
 pub use config::CassandraStorageConfig;
@@ -59,7 +60,19 @@ use std::sync::Arc;
 struct CassandraRuntimeHooks {
     engine: Arc<CassandraEngine>,
     control_plane_notify: Arc<tokio::sync::Notify>,
-    gsi_worker_guard: std::sync::OnceLock<workers::GsiWorkerGuard>,
+}
+
+/// The runtime hooks `serve` gets for this backend (`ServerComponents::runtime_hooks`).
+///
+/// Public so the direct integration tests can drive the same object `serve`
+/// does: call `spawn_workers`, then drop the hooks, as `serve` does.
+#[must_use]
+pub fn runtime_hooks(engine: Arc<CassandraEngine>) -> Box<dyn ServerRuntimeHooks> {
+    let control_plane_notify = engine.control_plane_notify.clone();
+    Box::new(CassandraRuntimeHooks {
+        engine,
+        control_plane_notify,
+    })
 }
 
 #[async_trait::async_trait]
@@ -113,9 +126,21 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
                 async move { workers::poll_gsi_delay(catalog_store_for_gsi, gsi_delay).await },
             );
 
-        // GSI propagation workers (one per partition).
-        let guard = workers::spawn_gsi_workers(self.engine.clone());
-        let _ = self.gsi_worker_guard.set(guard);
+        // GSI propagation workers (one per partition). Their guard is owned
+        // by a task that lives until shutdown, not by these hooks: `serve`
+        // drops the hooks as soon as this returns, and a guard stored on them
+        // stopped every worker at that point, so no write to a GSI with a
+        // non-zero propagation delay ever reached the index. The handle
+        // returned for this task is the guard-holding task's: `serve`'s drain
+        // waits for it to drop the guard, which only tells the four workers
+        // to stop at their next loop iteration. It does not wait for a batch
+        // a worker is applying.
+        let gsi_guard = workers::spawn_gsi_workers(self.engine.clone());
+        let gsi_shutdown = ctx.shutdown.clone();
+        let gsi_workers = tokio::spawn(async move {
+            gsi_shutdown.cancelled().await;
+            drop(gsi_guard);
+        });
 
         // GSI backfill recovery worker.
         let engine_for_gsi_recovery = self.engine.clone();
@@ -155,14 +180,26 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
                 .await
         });
 
+        // Removes restore targets whose copy stopped heartbeating (the
+        // process running it died): once now, then periodically until
+        // shutdown.
+        let restore_sweep_engine = self.engine.clone();
+        let restore_sweep_shutdown = ctx.shutdown.clone();
+        let restore_sweep = tokio::spawn(async move {
+            backup_engine::poll_abandoned_restores(restore_sweep_engine, restore_sweep_shutdown)
+                .await;
+        });
+
         vec![
             control_plane,
             transaction_recovery,
             gsi_delay_poller,
+            gsi_workers,
             gsi_backfill_recovery,
             ttl_cleanup,
             ttl_repair,
             ttl_audit,
+            restore_sweep,
         ]
     }
 
@@ -296,7 +333,6 @@ fn server_components_factory(
                 details: e.to_string(),
             })?;
 
-        let control_plane_notify = engine.control_plane_notify.clone();
         let engine = Arc::new(engine);
 
         match engine.process_control_plane_transitions().await {
@@ -347,11 +383,7 @@ fn server_components_factory(
                 enc_key,
             ));
 
-        let runtime_hooks = Box::new(CassandraRuntimeHooks {
-            engine: engine.clone(),
-            control_plane_notify,
-            gsi_worker_guard: std::sync::OnceLock::new(),
-        });
+        let runtime_hooks = runtime_hooks(engine.clone());
 
         Ok(ServerComponents {
             engine: engine as Arc<dyn extenddb_storage::StorageEngine>,

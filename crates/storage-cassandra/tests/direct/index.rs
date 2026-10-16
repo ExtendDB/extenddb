@@ -624,6 +624,17 @@ async fn gsi_query_count(
     gsi_pk_attr: &str,
     gsi_pk_value: &str,
 ) -> usize {
+    gsi_query_count_for(engine, &table.key_info, gsi_name, gsi_pk_attr, gsi_pk_value).await
+}
+
+/// [`gsi_query_count`] for a table that is not a `TestTable`.
+async fn gsi_query_count_for(
+    engine: &CassandraEngine,
+    key_info: &extenddb_core::types::TableKeyInfo,
+    gsi_name: &str,
+    gsi_pk_attr: &str,
+    gsi_pk_value: &str,
+) -> usize {
     use extenddb_core::expression::{Expr, KeyCondition, PathElement};
     let key_condition = KeyCondition {
         pk_path: vec![PathElement::Attribute(gsi_pk_attr.to_string())],
@@ -639,7 +650,7 @@ async fn gsi_query_count(
     );
     engine
         .query(
-            &table.key_info,
+            key_info,
             &key_condition,
             &maps,
             true,
@@ -844,5 +855,187 @@ async fn test_async_gsi_worker_skips_dropped_index() {
             panic!("gsi_pending did not drain after index table was dropped");
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// What `serve` does with this backend's runtime hooks: spawn the workers,
+/// then drop the hooks (crates/server/src/serve.rs, `if let Some(hooks) =
+/// runtime_hooks { ... hooks.spawn_workers(..) }`). The GSI workers must keep
+/// applying asynchronous index writes after that. They did not: the hooks
+/// held the workers' guard, so every async GSI write of a served binary stayed
+/// in gsi_pending forever.
+///
+/// Runs under its own keyspace prefix, so the workers it starts (control
+/// plane, TTL, restore sweep, ...) cannot touch other tests' tables.
+#[tokio::test]
+async fn test_async_gsi_writes_propagate_after_the_runtime_hooks_are_dropped() {
+    use extenddb_core::types::{CreateTableInput, GsiInput, TableKeyInfo};
+    use extenddb_storage::TableEngine as _;
+    use extenddb_storage::hooks::{CancellationToken, WorkerContext};
+    use tracing_subscriber::{EnvFilter, reload};
+
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let mut config = test_config();
+    config.keyspace_prefix = format!("hooks_{}", &unique_test_id()[..12]);
+    config.cached_connection_string = None;
+    config.ensure_cached_connection_string();
+    let engine = Arc::new(CassandraEngine::new(&config, "us-east-1").await.unwrap());
+    let session = engine.session_arc();
+    let account_id = unique_test_account();
+    let catalog_ks = engine.catalog_keyspace();
+    let account_ks = engine.account_keyspace(&account_id);
+    let _drop_keyspaces =
+        crate::helpers::DropKeyspacesOnDrop(vec![catalog_ks.clone(), account_ks.clone()]);
+    for (ks, catalog) in [(&catalog_ks, true), (&account_ks, false)] {
+        engine.create_keyspace(ks).await.unwrap();
+        crate::helpers::ensure_keyspace_rf(&engine, ks)
+            .await
+            .unwrap();
+        if catalog {
+            extenddb_storage_cassandra::migrations::run_catalog_migrations(&session, ks)
+                .await
+                .unwrap();
+        } else {
+            extenddb_storage_cassandra::migrations::run_data_migrations(&session, ks)
+                .await
+                .unwrap();
+        }
+    }
+    session
+        .query_with_values(
+            format!(
+                "INSERT INTO {catalog_ks}.accounts (account_id, account_name, created_at) \
+                 VALUES (?, ?, toTimestamp(now()))"
+            ),
+            cdrs_tokio::query_values!(account_id.as_str(), "Hooks Test"),
+        )
+        .await
+        .unwrap();
+
+    let key_schema = vec![KeySchemaElement {
+        attribute_name: "id".to_string(),
+        key_type: KeyType::Hash,
+    }];
+    let attribute_definitions = vec![
+        AttributeDefinition {
+            attribute_name: "id".to_string(),
+            attribute_type: ScalarAttributeType::S,
+        },
+        AttributeDefinition {
+            attribute_name: "gpk".to_string(),
+            attribute_type: ScalarAttributeType::S,
+        },
+    ];
+    let table = engine
+        .create_table(
+            &account_id,
+            CreateTableInput {
+                table_name: "HooksGsiTable".to_string(),
+                key_schema: key_schema.clone(),
+                attribute_definitions: attribute_definitions.clone(),
+                local_secondary_indexes: None,
+                global_secondary_indexes: Some(vec![GsiInput {
+                    index_name: "GsiIdx".to_string(),
+                    key_schema: vec![KeySchemaElement {
+                        attribute_name: "gpk".to_string(),
+                        key_type: KeyType::Hash,
+                    }],
+                    projection: Projection {
+                        projection_type: ProjectionType::All,
+                        non_key_attributes: None,
+                    },
+                    provisioned_throughput: None,
+                }]),
+                vector_indexes: None,
+                billing_mode: None,
+                table_throughput_mode: None,
+                provisioned_throughput: None,
+                on_demand_throughput: None,
+                stream_specification: None,
+                sse_specification: None,
+                tags: None,
+                table_class: None,
+                deletion_protection_enabled: None,
+            },
+        )
+        .await
+        .unwrap();
+    let key_info = TableKeyInfo {
+        table_name: "HooksGsiTable".to_string(),
+        account_id: account_id.clone(),
+        table_id: table.table_id,
+        key_schema: key_schema.clone(),
+        base_key_schema: key_schema,
+        attribute_definitions,
+        has_lsi: false,
+        global_secondary_indexes: Vec::new(),
+        local_secondary_indexes: Vec::new(),
+        vector_indexes: Vec::new(),
+        stream_specification: None,
+    };
+    // Long enough that the write below is observably queued, not applied.
+    set_gsi_delay(&engine, &key_info.table_id, "GsiIdx", 1500).await;
+
+    let shutdown = CancellationToken::new();
+    let (_filter_layer, reload_handle) = reload::Layer::new(EnvFilter::new("info"));
+    let ctx = WorkerContext {
+        metrics: Arc::new(extenddb_core::metrics::MetricsCollector::new()),
+        catalog_store: Arc::new(crate::helpers::create_catalog_store(&engine, &config)),
+        reload_handle,
+        config_log_level: "info".to_string(),
+        shutdown: shutdown.clone(),
+    };
+    let hooks = extenddb_storage_cassandra::runtime_hooks(engine.clone());
+    let handles = hooks.spawn_workers(&ctx).await;
+    drop(hooks);
+
+    let mut item = Item::new();
+    item.insert("id".to_string(), AttributeValue::S("a".to_string()));
+    item.insert("gpk".to_string(), AttributeValue::S("served".to_string()));
+    engine
+        .put_item(
+            &key_info,
+            item,
+            false,
+            None,
+            &ExpressionMaps::default(),
+            None,
+        )
+        .await
+        .expect("put_item");
+    // Precondition: the write went through the asynchronous queue.
+    assert_eq!(gsi_pending_count(&engine, &account_ks).await, 1);
+    assert_eq!(
+        gsi_query_count_for(&engine, &key_info, "GsiIdx", "gpk", "served").await,
+        0,
+        "the GSI write was applied synchronously; this test needs it queued"
+    );
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut visible = 0;
+    while tokio::time::Instant::now() < deadline {
+        visible = gsi_query_count_for(&engine, &key_info, "GsiIdx", "gpk", "served").await;
+        if visible == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        visible,
+        1,
+        "async GSI write never applied once the runtime hooks were dropped \
+         (gsi_pending rows left: {})",
+        gsi_pending_count(&engine, &account_ks).await
+    );
+    assert_eq!(gsi_pending_count(&engine, &account_ks).await, 0);
+
+    shutdown.cancel();
+    for handle in handles {
+        handle.abort();
+    }
+    for ks in [&account_ks, &catalog_ks] {
+        let _ = session.query(format!("DROP KEYSPACE IF EXISTS {ks}")).await;
     }
 }

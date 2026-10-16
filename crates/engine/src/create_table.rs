@@ -103,7 +103,7 @@ pub async fn handle_create_table(
     );
     ctx.auth_cache.invalidate_resource_tags(&arn).await;
 
-    table_desc.populate_table_throughput_mode_summary();
+    table_desc.prepare_for_response();
     let output = CreateTableOutput {
         table_description: table_desc,
     };
@@ -134,6 +134,7 @@ pub(crate) fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) ->
         // state: the documented delete-table sentence and the measured
         // phase-dependent vector refusal both arrive through this one arm.
         StorageError::IndexesInUse(msg) => DynamoDbError::ResourceInUseException(msg),
+        StorageError::BackupInUse(msg) => DynamoDbError::BackupInUseException(msg),
         StorageError::LimitExceeded(msg) => DynamoDbError::LimitExceededException(msg), // Retryable by definition, so it maps like Connection: a 503 the SDKs
         // retry, rather than a 500 they surface.
         StorageError::Transient(msg) => {

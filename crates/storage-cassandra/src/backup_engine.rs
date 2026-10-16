@@ -8,20 +8,77 @@
 //! therefore implements the DynamoDB-facing API as a logical snapshot: immutable
 //! item JSON is stored in bounded partitions in the owning account keyspace,
 //! while metadata and list access paths are stored in the catalog keyspace.
+//!
+//! # Restore
+//!
+//! The engine resolves the backup into the target's `CreateTableInput` and runs
+//! every refusal; this module creates exactly that table, registers the
+//! restore, and copies the items in a detached task.
+//!
+//! Registration and DeleteBackup are serialized by lightweight transactions on
+//! one partition, the backup's own `backups_by_arn` row:
+//!
+//! * a restore adds its target to `active_restores` with
+//!   `IF backup_status = 'AVAILABLE'`;
+//! * DeleteBackup moves the backup to DELETING with
+//!   `IF backup_status = 'AVAILABLE' AND active_restores = null`.
+//!
+//! Paxos orders the two on that partition, so a restore can register only
+//! while the backup is AVAILABLE, and the backup cannot leave AVAILABLE while a
+//! restore is registered. What Cassandra cannot give is one transaction over
+//! the target's `tables` row and the backup row (they are different
+//! partitions, in general on different replicas). The target row is therefore
+//! created first (its `IF NOT EXISTS` reserves the name), and the registration
+//! second; if the registration finds the backup no longer AVAILABLE, the target
+//! is removed and the restore fails with "Backup not found". Between the two
+//! steps a concurrent DescribeTable can see a CREATING target for a restore
+//! that then fails; no restore ever copies from a backup DeleteBackup has
+//! claimed.
+//!
+//! A registration whose target is no longer a CREATING restore target of this
+//! backup (the copy activated it and then crashed before unregistering, or a
+//! cleanup removed the target and crashed before unregistering) is stale.
+//! DeleteBackup removes stale registrations before claiming the backup, so one
+//! never blocks it.
+//!
+//! From the insert of the target row until the copy ends, the restoring
+//! process refreshes `tables.restore_heartbeat` every
+//! [`RESTORE_HEARTBEAT_INTERVAL`] (first refresh immediately);
+//! [`CassandraEngine::sweep_abandoned_restores`] removes a target whose
+//! heartbeat is older than [`RESTORE_STALE_AFTER`]. The servers run it at
+//! startup and every [`RESTORE_SWEEP_INTERVAL`] ([`poll_abandoned_restores`]).
+//!
+//! `restore_table_from_backup` spawns one task that registers and then
+//! copies; the request future waits only for the registration outcome and
+//! returns the CREATING description, so a dropped request does not stop the
+//! restore.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use cdrs_tokio::consistency::Consistency;
 use cdrs_tokio::query::BatchQueryBuilder;
-use cdrs_tokio::types::{IntoRustByName, rows::Row};
+use cdrs_tokio::types::map::Map;
+use cdrs_tokio::types::{AsRust, IntoRustByName, rows::Row};
 use extenddb_core::types::{
-    BackupDescription, BackupDetails, BackupSummary, BillingMode, ContinuousBackupsDescription,
-    CreateTableInput, PointInTimeRecoveryDescription, ProvisionedThroughput, SourceTableDetails,
-    TableDescription, TableKeyInfo,
+    AttributeDefinition, BackupDescription, BackupDetails, BackupSummary,
+    ContinuousBackupsDescription, DeleteTableInput, GsiInput, KeySchemaElement, LsiInput,
+    PointInTimeRecoveryDescription, ProvisionedThroughput, SourceTableDetails, TableDescription,
+    TableKeyInfo,
 };
-use extenddb_storage::BackupEngine;
+use extenddb_storage::backup_definition::{
+    BACKUP_DEFINITION_VERSION, BackupTableDefinition, throughput_from_catalog,
+};
 use extenddb_storage::error::StorageError;
+use extenddb_storage::{BackupEngine, BackupRestoreSource, MetadataEngine, RestoreRequest};
+use futures::StreamExt;
 use futures::future::BoxFuture;
 
 use crate::CassandraEngine;
+use crate::create_table::RestoreTargetColumns;
+use crate::delete_table::DeleteTableCaller;
 
 /// Maximum number of item payloads stored in one Cassandra partition.
 ///
@@ -30,20 +87,18 @@ use crate::CassandraEngine;
 const BACKUP_ITEMS_PER_BUCKET: i64 = 64;
 const BACKUP_SCAN_PAGE_SIZE: i64 = 1_000;
 
-/// Current epoch milliseconds, used in backup identifiers and timestamps.
-fn epoch_millis() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-}
+/// Items of one bucket a restore copy writes concurrently.
+const RESTORE_WRITE_CONCURRENCY: usize = 8;
 
-/// Build the trailing `backup/<id>` component of a backup ARN.
-fn backup_id() -> String {
-    use rand::Rng;
-    let suffix: u32 = rand::rng().random();
-    format!("{}-{suffix:08x}", epoch_millis())
-}
+/// How often a running restore copy refreshes its target's heartbeat.
+pub const RESTORE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
+/// A restore target whose heartbeat is older than this is abandoned: the
+/// process copying into it is gone. Four missed heartbeats.
+pub const RESTORE_STALE_AFTER: Duration = Duration::from_secs(60);
+
+/// How often the abandoned-restore sweep runs.
+pub const RESTORE_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 
 fn bucket_count(item_count: i64) -> i64 {
     if item_count <= 0 {
@@ -51,6 +106,16 @@ fn bucket_count(item_count: i64) -> i64 {
     } else {
         (item_count + BACKUP_ITEMS_PER_BUCKET - 1) / BACKUP_ITEMS_PER_BUCKET
     }
+}
+
+fn backup_not_found(backup_arn: &str) -> StorageError {
+    StorageError::Validation(format!("Backup not found: {backup_arn}"))
+}
+
+fn backup_in_use(table_name: &str, backup_arn: &str) -> StorageError {
+    StorageError::BackupInUse(format!(
+        "Backup is being used to restore table {table_name}: {backup_arn}"
+    ))
 }
 
 #[derive(Debug)]
@@ -69,13 +134,25 @@ struct StoredBackup {
     attribute_definitions: String,
     billing_mode: String,
     provisioned_throughput: Option<String>,
-    stream_specification: Option<String>,
     table_created_at: i64,
     created_at: i64,
+    /// `BackupTableDefinition` JSON; `None` for a row written before V005.
+    definition: Option<String>,
+    /// Restore target `table_id` -> target table name, while registered.
+    active_restores: HashMap<String, String>,
 }
 
 impl StoredBackup {
     fn from_row(row: &Row) -> Result<Self, StorageError> {
+        let active_restores: Result<Option<Map>, _> = row.get_by_name("active_restores");
+        let active_restores = match active_restores {
+            Ok(Some(map)) => map
+                .as_rust::<HashMap<String, String>>()
+                .map_err(|e| StorageError::Internal(format!("Parse active_restores: {e}")))?
+                .unwrap_or_default(),
+            // Absent before V005 has been applied, and null when empty.
+            Ok(None) | Err(_) => HashMap::new(),
+        };
         Ok(Self {
             backup_arn: row
                 .get_r_by_name("backup_arn")
@@ -113,13 +190,14 @@ impl StoredBackup {
                 .get_r_by_name("billing_mode")
                 .map_err(|e| StorageError::Internal(format!("Parse billing_mode: {e}")))?,
             provisioned_throughput: row.get_by_name("provisioned_throughput").ok().flatten(),
-            stream_specification: row.get_by_name("stream_specification").ok().flatten(),
             table_created_at: row
                 .get_r_by_name("table_created_at")
                 .map_err(|e| StorageError::Internal(format!("Parse table_created_at: {e}")))?,
             created_at: row
                 .get_r_by_name("created_at")
                 .map_err(|e| StorageError::Internal(format!("Parse created_at: {e}")))?,
+            definition: row.get_by_name("definition").ok().flatten(),
+            active_restores,
         })
     }
 
@@ -141,6 +219,7 @@ impl StoredBackup {
             backup_arn: self.backup_arn.clone(),
             backup_name: self.backup_name.clone(),
             table_name: self.table_name.clone(),
+            table_id: self.table_id.clone(),
             table_arn: self.table_arn.clone(),
             backup_status: self.backup_status.clone(),
             backup_type: self.backup_type.clone(),
@@ -151,25 +230,141 @@ impl StoredBackup {
         }
     }
 
+    fn parsed_key_schema(&self) -> Result<Vec<KeySchemaElement>, StorageError> {
+        serde_json::from_str(&self.key_schema)
+            .map_err(|e| StorageError::Internal(format!("Parse key schema: {e}")))
+    }
+
+    fn parsed_attribute_definitions(&self) -> Result<Vec<AttributeDefinition>, StorageError> {
+        serde_json::from_str(&self.attribute_definitions)
+            .map_err(|e| StorageError::Internal(format!("Parse attributes: {e}")))
+    }
+
+    fn parsed_definition(&self) -> Result<Option<BackupTableDefinition>, StorageError> {
+        self.definition
+            .as_deref()
+            .map(|text| {
+                let value = serde_json::from_str(text).map_err(|e| {
+                    StorageError::Internal(format!(
+                        "backup {} table definition: {e}",
+                        self.backup_arn
+                    ))
+                })?;
+                BackupTableDefinition::from_json(value, &self.backup_arn)
+            })
+            .transpose()
+    }
+
     fn description(&self) -> Result<BackupDescription, StorageError> {
-        let key_schema = serde_json::from_str(&self.key_schema)
-            .map_err(|e| StorageError::Internal(format!("Parse key schema: {e}")))?;
         Ok(BackupDescription {
             backup_details: self.details(),
             source_table_details: SourceTableDetails {
                 table_name: self.table_name.clone(),
                 table_id: self.table_id.clone(),
                 table_arn: self.table_arn.clone(),
-                key_schema,
+                key_schema: self.parsed_key_schema()?,
                 item_count: self.item_count,
                 table_size_bytes: self.backup_size_bytes,
                 billing_mode: Some(self.billing_mode.clone()),
                 table_creation_date_time: crate::cassandra_util::millis_to_seconds_f64(
                     self.table_created_at,
                 ),
+                provisioned_throughput: None,
+                on_demand_throughput: None,
             },
+            source_table_feature_details: None,
         })
     }
+}
+
+/// Everything the detached restore copy needs, owned.
+#[derive(Clone)]
+struct RestoreJob {
+    account_id: String,
+    target_name: String,
+    table_id: String,
+    backup_arn: String,
+    item_count: i64,
+    backup_size_bytes: i64,
+    key_schema: Vec<KeySchemaElement>,
+    attribute_definitions: Vec<AttributeDefinition>,
+    owner: uuid::Uuid,
+}
+
+enum CopyError {
+    /// The target is no longer this copy's (the sweep claimed it). Whoever
+    /// claimed it removes it.
+    OwnershipLost,
+    Failed(StorageError),
+}
+
+/// A spawned task that is aborted when this value is dropped. Dropping a bare
+/// `JoinHandle` detaches its task; holding the handle in this guard instead
+/// stops the task on every exit of its owner: return, `?`, panic unwinding,
+/// or the owner's future being dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The heartbeat of one restore target, running from the moment the target
+/// row is inserted until this value is dropped.
+pub(crate) struct RestoreHeartbeat {
+    _task: AbortOnDrop,
+    lost: Arc<AtomicBool>,
+}
+
+impl RestoreHeartbeat {
+    /// Run `beat` now and then every `interval` until this value is dropped.
+    /// `beat` returns whether the target is still this process's; the first
+    /// `Ok(false)` sets [`Self::is_lost`] and stops the heartbeat. An error
+    /// is logged and the next tick tries again (the sweep, not one missed
+    /// beat, decides that a target is abandoned).
+    fn spawn<F, Fut>(interval: Duration, target_name: String, mut beat: F) -> Self
+    where
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<bool, StorageError>> + Send,
+    {
+        let lost = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&lost);
+        let task = tokio::spawn(async move {
+            // The first tick completes immediately.
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                match beat().await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        flag.store(true, Ordering::Release);
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!("Restore of table {target_name}: heartbeat failed: {error}")
+                    }
+                }
+            }
+        });
+        Self {
+            _task: AbortOnDrop(task),
+            lost,
+        }
+    }
+
+    /// Whether a heartbeat found the target no longer owned by this process.
+    fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::Acquire)
+    }
+}
+
+/// What the heartbeat's lightweight transaction is conditioned on.
+struct HeartbeatTarget {
+    account_id: String,
+    target_name: String,
+    table_id: String,
+    owner: uuid::Uuid,
 }
 
 impl CassandraEngine {
@@ -197,7 +392,7 @@ impl CassandraEngine {
             .map(StoredBackup::from_row)
             .transpose()?
             .filter(|backup| backup.account_id == account_id)
-            .ok_or_else(|| StorageError::Validation(format!("Backup not found: {backup_arn}")))?;
+            .ok_or_else(|| backup_not_found(backup_arn))?;
         Ok(backup)
     }
 
@@ -208,9 +403,7 @@ impl CassandraEngine {
     ) -> Result<StoredBackup, StorageError> {
         let backup = self.load_backup(account_id, backup_arn).await?;
         if backup.backup_status != "AVAILABLE" {
-            return Err(StorageError::Validation(format!(
-                "Backup not found: {backup_arn}"
-            )));
+            return Err(backup_not_found(backup_arn));
         }
         Ok(backup)
     }
@@ -271,48 +464,91 @@ impl CassandraEngine {
         Ok(())
     }
 
-    async fn mark_table_active_after_restore(
+    /// The definition a backup of `table_name` records, read from the table's
+    /// catalog row (billing, throughput, class, SSE, on-demand throughput),
+    /// its description (indexes, stream specification), and DescribeTimeToLive.
+    async fn backup_definition_for_table(
         &self,
         account_id: &str,
         table_name: &str,
-        table_id: &str,
-        item_count: i64,
-        table_size_bytes: i64,
-    ) -> Result<(), StorageError> {
+        table: &TableDescription,
+    ) -> Result<BackupTableDefinition, StorageError> {
         let query = format!(
-            "UPDATE {}.tables SET table_status = 'ACTIVE', status_transition_at = NULL, item_count = ?, table_size_bytes = ? WHERE account_id = ? AND table_name = ? IF table_id = ? AND table_status = 'CREATING'",
+            "SELECT billing_mode, provisioned_throughput, table_class, sse_specification, \
+             on_demand_throughput FROM {}.tables WHERE account_id = ? AND table_name = ?",
             self.catalog_keyspace()
         );
-        let result = self
-            .session
-            .query_with_values(
-                &query,
-                cdrs_tokio::query_values!(
-                    item_count,
-                    table_size_bytes,
-                    account_id,
-                    table_name,
-                    table_id
-                ),
-            )
-            .await
-            .map_err(|e| StorageError::Internal(format!("Activate restored table: {e}")))?;
-        let rows = result
-            .response_body()
-            .map_err(|e| StorageError::Internal(format!("Parse restore activation: {e}")))?
-            .into_rows()
-            .unwrap_or_default();
-        if let Some(row) = rows.first() {
-            let applied: bool = row.get_r_by_name("[applied]").map_err(|e| {
-                StorageError::Internal(format!("Parse restore activation result: {e}"))
-            })?;
-            if !applied {
-                return Err(StorageError::Internal(
-                    "Restore target changed before activation".to_owned(),
-                ));
-            }
-        }
-        Ok(())
+        let row = crate::cassandra_util::query_optional::<StorageError>(
+            &self.session,
+            &query,
+            cdrs_tokio::query_values!(account_id, table_name),
+            "backup definition",
+        )
+        .await?
+        .ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
+        let json_column = |name: &str| -> Result<Option<serde_json::Value>, StorageError> {
+            let text: Option<String> = row.get_by_name(name).ok().flatten();
+            text.map(|t| {
+                serde_json::from_str(&t)
+                    .map_err(|e| StorageError::Internal(format!("Parse {name}: {e}")))
+            })
+            .transpose()
+        };
+        let billing_mode: String = row
+            .get_r_by_name("billing_mode")
+            .map_err(|e| StorageError::Internal(format!("Parse billing_mode: {e}")))?;
+        let provisioned_throughput =
+            throughput_from_catalog(json_column("provisioned_throughput")?.as_ref());
+        let sse_specification = json_column("sse_specification")?;
+        let on_demand_throughput = json_column("on_demand_throughput")?
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| StorageError::Internal(format!("Parse on_demand_throughput: {e}")))?;
+        let table_class: Option<String> = row.get_by_name("table_class").ok().flatten();
+
+        let global_secondary_indexes = table
+            .global_secondary_indexes
+            .iter()
+            .flatten()
+            .map(|gsi| GsiInput {
+                index_name: gsi.index_name.clone(),
+                key_schema: gsi.key_schema.clone(),
+                projection: gsi.projection.clone(),
+                provisioned_throughput: gsi.provisioned_throughput.as_ref().map(|pt| {
+                    ProvisionedThroughput {
+                        read_capacity_units: pt.read_capacity_units,
+                        write_capacity_units: pt.write_capacity_units,
+                    }
+                }),
+            })
+            .collect();
+        let local_secondary_indexes = table
+            .local_secondary_indexes
+            .iter()
+            .flatten()
+            .map(|lsi| LsiInput {
+                index_name: lsi.index_name.clone(),
+                key_schema: lsi.key_schema.clone(),
+                projection: lsi.projection.clone(),
+            })
+            .collect();
+        let time_to_live = MetadataEngine::describe_ttl(self, account_id, table_name).await?;
+
+        Ok(BackupTableDefinition {
+            version: BACKUP_DEFINITION_VERSION,
+            billing_mode,
+            provisioned_throughput,
+            global_secondary_indexes,
+            local_secondary_indexes,
+            table_class,
+            sse_specification,
+            on_demand_throughput,
+            // The Cassandra backend has no vector indexes (CreateTable does
+            // not create them), so a Cassandra table never has any to record.
+            vector_index_names: Vec::new(),
+            time_to_live: Some(time_to_live),
+            stream_specification: table.stream_specification.clone(),
+        })
     }
 
     async fn table_exists_for_backup(
@@ -335,6 +571,708 @@ impl CassandraEngine {
             .unwrap_or_default();
         Ok(!rows.is_empty())
     }
+
+    // ── Restore registration ────────────────────────────────────────────────
+
+    /// Register a restore target on its source backup, only while the backup
+    /// is AVAILABLE. Returns whether it registered.
+    async fn register_restore(
+        &self,
+        account_id: &str,
+        backup_arn: &str,
+        table_id: &str,
+        target_name: &str,
+    ) -> Result<bool, StorageError> {
+        let query = format!(
+            "UPDATE {}.backups_by_arn SET active_restores[?] = ? \
+             WHERE account_id = ? AND backup_arn = ? IF backup_status = 'AVAILABLE'",
+            self.catalog_keyspace()
+        );
+        let result = crate::cassandra_util::query_lwt(
+            &self.session,
+            &query,
+            cdrs_tokio::query_values!(table_id, target_name, account_id, backup_arn),
+        )
+        .await?;
+        crate::cassandra_util::lwt_applied(&result)
+    }
+
+    async fn unregister_restore(
+        &self,
+        account_id: &str,
+        backup_arn: &str,
+        table_id: &str,
+    ) -> Result<(), StorageError> {
+        let query = format!(
+            "DELETE active_restores[?] FROM {}.backups_by_arn \
+             WHERE account_id = ? AND backup_arn = ? IF EXISTS",
+            self.catalog_keyspace()
+        );
+        crate::cassandra_util::query_lwt(
+            &self.session,
+            &query,
+            cdrs_tokio::query_values!(table_id, account_id, backup_arn),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// True if `target_name` is, right now, a CREATING restore target with
+    /// this `table_id` restoring from `backup_arn`.
+    async fn restore_target_in_progress(
+        &self,
+        account_id: &str,
+        backup_arn: &str,
+        table_id: &str,
+        target_name: &str,
+    ) -> Result<bool, StorageError> {
+        let query = format!(
+            "SELECT table_id, table_status, restore_source_backup_arn FROM {}.tables \
+             WHERE account_id = ? AND table_name = ?",
+            self.catalog_keyspace()
+        );
+        let row = crate::cassandra_util::query_rows_quorum::<StorageError>(
+            &self.session,
+            &query,
+            cdrs_tokio::query_values!(account_id, target_name),
+            "restore target",
+        )
+        .await?
+        .into_iter()
+        .next();
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let row_table_id: Option<String> = row.get_by_name("table_id").ok().flatten();
+        let status: Option<String> = row.get_by_name("table_status").ok().flatten();
+        let source: Option<String> = row.get_by_name("restore_source_backup_arn").ok().flatten();
+        Ok(row_table_id.as_deref() == Some(table_id)
+            && status.as_deref() == Some("CREATING")
+            && source.as_deref() == Some(backup_arn))
+    }
+
+    /// BackupInUse if a registered restore of `backup` is still copying;
+    /// otherwise remove every stale registration so it cannot block the
+    /// DELETING claim.
+    async fn ensure_backup_not_restoring(&self, backup: &StoredBackup) -> Result<(), StorageError> {
+        for (table_id, target_name) in &backup.active_restores {
+            if self
+                .restore_target_in_progress(
+                    &backup.account_id,
+                    &backup.backup_arn,
+                    table_id,
+                    target_name,
+                )
+                .await?
+            {
+                return Err(backup_in_use(target_name, &backup.backup_arn));
+            }
+            tracing::info!(
+                "Backup {}: clearing stale restore registration of table {target_name} \
+                 ({table_id}); the target is no longer being restored",
+                backup.backup_arn
+            );
+            self.unregister_restore(&backup.account_id, &backup.backup_arn, table_id)
+                .await?;
+        }
+        Ok(())
+    }
+
+    // ── Restore copy (detached) ─────────────────────────────────────────────
+
+    /// Start the heartbeat of the restore target `table_id`, whose row has
+    /// just been inserted. Called by the restore path of `create_table` right
+    /// after the insert, before the target's data and index DDL, so the time
+    /// that DDL takes (each statement waits for schema agreement) does not
+    /// count against [`RESTORE_STALE_AFTER`].
+    pub(crate) fn start_restore_heartbeat(
+        &self,
+        account_id: &str,
+        target_name: &str,
+        table_id: &str,
+        owner: uuid::Uuid,
+    ) -> RestoreHeartbeat {
+        let state = Arc::new((
+            self.clone(),
+            HeartbeatTarget {
+                account_id: account_id.to_owned(),
+                target_name: target_name.to_owned(),
+                table_id: table_id.to_owned(),
+                owner,
+            },
+        ));
+        RestoreHeartbeat::spawn(
+            RESTORE_HEARTBEAT_INTERVAL,
+            target_name.to_owned(),
+            move || {
+                let state = Arc::clone(&state);
+                async move { state.0.heartbeat_restore_target(&state.1).await }
+            },
+        )
+    }
+
+    async fn heartbeat_restore_target(&self, job: &HeartbeatTarget) -> Result<bool, StorageError> {
+        let query = format!(
+            "UPDATE {}.tables SET restore_heartbeat = ? WHERE account_id = ? AND table_name = ? \
+             IF table_id = ? AND table_status = 'CREATING' AND restore_owner = ?",
+            self.catalog_keyspace()
+        );
+        let result = crate::cassandra_util::query_lwt(
+            &self.session,
+            &query,
+            cdrs_tokio::query_values!(
+                crate::cassandra_util::now_millis(),
+                job.account_id.as_str(),
+                job.target_name.as_str(),
+                job.table_id.as_str(),
+                job.owner
+            ),
+        )
+        .await?;
+        crate::cassandra_util::lwt_applied(&result)
+    }
+
+    async fn activate_restore_target(
+        &self,
+        job: &RestoreJob,
+        item_count: i64,
+        table_size_bytes: i64,
+    ) -> Result<bool, StorageError> {
+        let query = format!(
+            "UPDATE {}.tables SET table_status = 'ACTIVE', status_transition_at = NULL, \
+             item_count = ?, table_size_bytes = ? WHERE account_id = ? AND table_name = ? \
+             IF table_id = ? AND table_status = 'CREATING' AND restore_owner = ?",
+            self.catalog_keyspace()
+        );
+        let result = crate::cassandra_util::query_lwt(
+            &self.session,
+            &query,
+            cdrs_tokio::query_values!(
+                item_count,
+                table_size_bytes,
+                job.account_id.as_str(),
+                job.target_name.as_str(),
+                job.table_id.as_str(),
+                job.owner
+            ),
+        )
+        .await?;
+        crate::cassandra_util::lwt_applied(&result)
+    }
+
+    /// Remove a restore target this caller has claimed (or that never had a
+    /// copy): unregister it from its backup first, so a crash between the two
+    /// steps leaves a target the sweep removes rather than a registration
+    /// that names nothing; then drop the incarnation with this `table_id`.
+    async fn remove_restore_target(
+        &self,
+        account_id: &str,
+        target_name: &str,
+        table_id: &str,
+        backup_arn: &str,
+    ) -> Result<(), StorageError> {
+        self.unregister_restore(account_id, backup_arn, table_id)
+            .await?;
+        match self
+            .delete_table_as(
+                account_id,
+                DeleteTableInput {
+                    table_name: target_name.to_owned(),
+                },
+                DeleteTableCaller::RestoreCleanup { table_id },
+            )
+            .await
+        {
+            Ok(_) | Err(StorageError::TableNotFound(_)) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The copy failed while this process still owned the target: claim it
+    /// (CREATING -> DELETING, owner-fenced) and remove it.
+    async fn abandon_restore_target(&self, job: &RestoreJob) {
+        let query = format!(
+            "UPDATE {}.tables SET table_status = 'DELETING' WHERE account_id = ? AND table_name = ? \
+             IF table_id = ? AND table_status = 'CREATING' AND restore_owner = ?",
+            self.catalog_keyspace()
+        );
+        let claimed = crate::cassandra_util::query_lwt(
+            &self.session,
+            &query,
+            cdrs_tokio::query_values!(
+                job.account_id.as_str(),
+                job.target_name.as_str(),
+                job.table_id.as_str(),
+                job.owner
+            ),
+        )
+        .await
+        .and_then(|result| crate::cassandra_util::lwt_applied(&result));
+        match claimed {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    "Restore of table {} from {}: target no longer owned by this process; \
+                     leaving it to its new owner",
+                    job.target_name,
+                    job.backup_arn
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::error!(
+                    "Restore of table {} from {}: could not claim the failed target for \
+                     removal ({error}); the abandoned-restore sweep removes it",
+                    job.target_name,
+                    job.backup_arn
+                );
+                return;
+            }
+        }
+        match self
+            .remove_restore_target(
+                &job.account_id,
+                &job.target_name,
+                &job.table_id,
+                &job.backup_arn,
+            )
+            .await
+        {
+            Ok(()) => tracing::info!(
+                "Restore of table {} from {}: removed the failed target",
+                job.target_name,
+                job.backup_arn
+            ),
+            Err(error) => tracing::error!(
+                "Restore of table {} from {}: removing the failed target failed ({error}); \
+                 the abandoned-restore sweep retries it",
+                job.target_name,
+                job.backup_arn
+            ),
+        }
+    }
+
+    async fn copy_backup_into_target(
+        &self,
+        job: &RestoreJob,
+        heartbeat: &RestoreHeartbeat,
+    ) -> Result<(i64, i64), CopyError> {
+        let key_info = TableKeyInfo {
+            table_name: job.target_name.clone(),
+            account_id: job.account_id.clone(),
+            table_id: job.table_id.clone(),
+            key_schema: job.key_schema.clone(),
+            base_key_schema: job.key_schema.clone(),
+            attribute_definitions: job.attribute_definitions.clone(),
+            // The put path reads the target's indexes from the catalog by
+            // table_id; these routing fields are not consulted by it.
+            has_lsi: false,
+            global_secondary_indexes: Vec::new(),
+            local_secondary_indexes: Vec::new(),
+            stream_specification: None,
+            vector_indexes: Vec::new(),
+        };
+        let account_keyspace = self.account_keyspace(&job.account_id);
+        let query = format!(
+            "SELECT item_data FROM {account_keyspace}.backup_items WHERE backup_arn = ? AND bucket = ?"
+        );
+        let mut restored_count = 0_i64;
+        let mut restored_size = 0_i64;
+        for bucket in 0..bucket_count(job.item_count) {
+            if heartbeat.is_lost() {
+                return Err(CopyError::OwnershipLost);
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let bucket_i32 = bucket as i32;
+            let rows = self
+                .session
+                .query_with_values(
+                    &query,
+                    cdrs_tokio::query_values!(job.backup_arn.as_str(), bucket_i32),
+                )
+                .await
+                .map_err(|e| {
+                    CopyError::Failed(StorageError::Internal(format!("Read backup payload: {e}")))
+                })?
+                .response_body()
+                .map_err(|e| {
+                    CopyError::Failed(StorageError::Internal(format!("Parse backup payload: {e}")))
+                })?
+                .into_rows()
+                .unwrap_or_default();
+            let mut items = Vec::with_capacity(rows.len());
+            for row in rows {
+                let item_data: String = row.get_r_by_name("item_data").map_err(|e| {
+                    CopyError::Failed(StorageError::Internal(format!("Parse backup item: {e}")))
+                })?;
+                #[allow(clippy::cast_possible_wrap)]
+                let item_len = item_data.len() as i64;
+                restored_size = restored_size.saturating_add(item_len);
+                let item = serde_json::from_str(&item_data).map_err(|e| {
+                    CopyError::Failed(StorageError::Internal(format!(
+                        "Deserialize backup item: {e}"
+                    )))
+                })?;
+                items.push(item);
+            }
+            let mut writes = futures::stream::iter(items)
+                .map(|item| self.put_restored_item(&key_info, item))
+                .buffer_unordered(RESTORE_WRITE_CONCURRENCY);
+            while let Some(result) = writes.next().await {
+                result.map_err(CopyError::Failed)?;
+                restored_count += 1;
+            }
+        }
+        if restored_count != job.item_count {
+            return Err(CopyError::Failed(StorageError::Internal(format!(
+                "Backup item count mismatch: expected {}, restored {restored_count}",
+                job.item_count
+            ))));
+        }
+        Ok((restored_count, job.backup_size_bytes.max(restored_size)))
+    }
+
+    /// The detached restore task: copy, then activate or remove. `heartbeat`
+    /// was started when the target row was inserted; it is dropped (which
+    /// aborts it) when the copy ends, and on every other exit from this
+    /// function, a panic or cancellation included.
+    async fn run_restore_copy(self, job: RestoreJob, heartbeat: RestoreHeartbeat) {
+        let outcome = self.copy_backup_into_target(&job, &heartbeat).await;
+        drop(heartbeat);
+        match outcome {
+            Ok((count, size)) => match self.activate_restore_target(&job, count, size).await {
+                Ok(true) => {
+                    tracing::info!(
+                        "Restored table {} from {} ({count} items); ACTIVE",
+                        job.target_name,
+                        job.backup_arn
+                    );
+                    if let Err(error) = self
+                        .unregister_restore(&job.account_id, &job.backup_arn, &job.table_id)
+                        .await
+                    {
+                        // Stale now; DeleteBackup clears it.
+                        tracing::warn!(
+                            "Restore of table {}: could not clear its registration on {}: {error}",
+                            job.target_name,
+                            job.backup_arn
+                        );
+                    }
+                }
+                Ok(false) => tracing::warn!(
+                    "Restore of table {} from {}: target claimed by another owner before \
+                     activation; not activating",
+                    job.target_name,
+                    job.backup_arn
+                ),
+                Err(error) => {
+                    tracing::error!(
+                        "Restore of table {} from {}: activation failed: {error}",
+                        job.target_name,
+                        job.backup_arn
+                    );
+                    self.abandon_restore_target(&job).await;
+                }
+            },
+            Err(CopyError::OwnershipLost) => tracing::warn!(
+                "Restore of table {} from {}: stopped; the target was claimed by the \
+                 abandoned-restore sweep",
+                job.target_name,
+                job.backup_arn
+            ),
+            Err(CopyError::Failed(error)) => {
+                tracing::error!(
+                    "Restore of table {} from {} failed: {error}",
+                    job.target_name,
+                    job.backup_arn
+                );
+                self.abandon_restore_target(&job).await;
+            }
+        }
+    }
+
+    // ── Abandoned-restore sweep ─────────────────────────────────────────────
+
+    /// Remove restore targets whose copy is gone: a CREATING or DELETING
+    /// target carrying a restore registration whose heartbeat is older than
+    /// `stale_after` (or absent). Returns the names removed.
+    ///
+    /// Each removal first claims the target with a lightweight transaction
+    /// conditioned on the heartbeat it observed, setting DELETING, a fresh
+    /// heartbeat, and this engine as owner, so a copy that heartbeats in the
+    /// meantime wins and keeps its target, a copy that comes back later finds
+    /// itself no longer owner and stops, and two sweepers do not both remove
+    /// it. The servers' periodic worker calls this with
+    /// [`RESTORE_STALE_AFTER`].
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError`] if the catalog cannot be read; a failure to remove one
+    /// target is logged and left for the next pass.
+    pub async fn sweep_abandoned_restores(
+        &self,
+        stale_after: Duration,
+    ) -> Result<Vec<String>, StorageError> {
+        let catalog = self.catalog_keyspace();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let cutoff = crate::cassandra_util::now_millis() - stale_after.as_millis() as i64;
+        let mut removed = Vec::new();
+        for status in ["CREATING", "DELETING"] {
+            // Cluster-wide filtered scan, as the control-plane poller does for
+            // CREATING tables; restore targets are few and short-lived.
+            let query = format!(
+                "SELECT account_id, table_name, table_id, table_status, \
+                 restore_source_backup_arn, restore_heartbeat FROM {catalog}.tables \
+                 WHERE table_status = ? ALLOW FILTERING"
+            );
+            let rows = crate::cassandra_util::query_rows::<StorageError>(
+                &self.session,
+                &query,
+                cdrs_tokio::query_values!(status),
+                "restore sweep",
+            )
+            .await?;
+            for row in rows {
+                let backup_arn: Option<String> =
+                    row.get_by_name("restore_source_backup_arn").ok().flatten();
+                let Some(backup_arn) = backup_arn else {
+                    continue;
+                };
+                let heartbeat: Option<i64> = row.get_by_name("restore_heartbeat").ok().flatten();
+                if heartbeat.is_some_and(|at| at >= cutoff) {
+                    continue;
+                }
+                let account_id: String = crate::cassandra_util::get_column::<_, StorageError>(
+                    &row,
+                    "account_id",
+                    "restore sweep",
+                )?;
+                let table_name: String = crate::cassandra_util::get_column::<_, StorageError>(
+                    &row,
+                    "table_name",
+                    "restore sweep",
+                )?;
+                let table_id: String = crate::cassandra_util::get_column::<_, StorageError>(
+                    &row,
+                    "table_id",
+                    "restore sweep",
+                )?;
+                match self
+                    .claim_abandoned_restore(&account_id, &table_name, &table_id, status, heartbeat)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        tracing::warn!("Restore sweep: claiming table {table_name}: {error}");
+                        continue;
+                    }
+                }
+                match self
+                    .remove_restore_target(&account_id, &table_name, &table_id, &backup_arn)
+                    .await
+                {
+                    Ok(()) => {
+                        tracing::info!(
+                            "Restore sweep: removed abandoned restore target {table_name} \
+                             (account {account_id}, restoring from {backup_arn}); its copy \
+                             stopped heartbeating"
+                        );
+                        removed.push(table_name);
+                    }
+                    Err(error) => tracing::warn!(
+                        "Restore sweep: removing abandoned restore target {table_name}: {error}; \
+                         retrying on a later pass"
+                    ),
+                }
+            }
+        }
+        Ok(removed)
+    }
+
+    async fn claim_abandoned_restore(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        table_id: &str,
+        observed_status: &str,
+        observed_heartbeat: Option<i64>,
+    ) -> Result<bool, StorageError> {
+        let catalog = self.catalog_keyspace();
+        let now = crate::cassandra_util::now_millis();
+        let result = if let Some(heartbeat) = observed_heartbeat {
+            let query = format!(
+                "UPDATE {catalog}.tables SET table_status = 'DELETING', restore_owner = ?, \
+                 restore_heartbeat = ? WHERE account_id = ? AND table_name = ? \
+                 IF table_id = ? AND table_status = ? AND restore_heartbeat = ?"
+            );
+            crate::cassandra_util::query_lwt(
+                &self.session,
+                &query,
+                cdrs_tokio::query_values!(
+                    self.restore_owner,
+                    now,
+                    account_id,
+                    table_name,
+                    table_id,
+                    observed_status,
+                    heartbeat
+                ),
+            )
+            .await?
+        } else {
+            let query = format!(
+                "UPDATE {catalog}.tables SET table_status = 'DELETING', restore_owner = ?, \
+                 restore_heartbeat = ? WHERE account_id = ? AND table_name = ? \
+                 IF table_id = ? AND table_status = ? AND restore_heartbeat = null"
+            );
+            crate::cassandra_util::query_lwt(
+                &self.session,
+                &query,
+                cdrs_tokio::query_values!(
+                    self.restore_owner,
+                    now,
+                    account_id,
+                    table_name,
+                    table_id,
+                    observed_status
+                ),
+            )
+            .await?
+        };
+        crate::cassandra_util::lwt_applied(&result)
+    }
+
+    /// Create the CREATING restore target described by `request.input` and
+    /// register the restore on its source backup. Returns the target's
+    /// description and the job the copy runs.
+    ///
+    /// Guarantee (Cassandra has no transaction spanning the target's `tables`
+    /// row and the backup's `backups_by_arn` row, so this is two
+    /// lightweight transactions, not one atomic step): the target row is
+    /// inserted first with `IF NOT EXISTS` (reserving the name, already
+    /// carrying the restore columns), then the restore is added to the
+    /// backup's `active_restores` with `IF backup_status = 'AVAILABLE'`.
+    /// DeleteBackup claims the backup with `IF backup_status = 'AVAILABLE'
+    /// AND active_restores = null` on the same partition, so Paxos orders the
+    /// two: either the registration lands first and DeleteBackup returns
+    /// BackupInUse, or DeleteBackup lands first and the registration fails,
+    /// the target is removed, and the restore returns "Backup not found". No
+    /// copy starts from a backup DeleteBackup has claimed. What is not
+    /// atomic: between the two steps a concurrent DescribeTable can see a
+    /// CREATING target of a restore that then fails, and a process exit
+    /// between them leaves a target that the abandoned-restore sweep removes
+    /// once its heartbeat (refreshed from the insert until the process
+    /// exited) is older than
+    /// [`RESTORE_STALE_AFTER`].
+    async fn register_restore_target(
+        &self,
+        account_id: &str,
+        request: RestoreRequest,
+    ) -> Result<(TableDescription, RestoreJob, RestoreHeartbeat), StorageError> {
+        let RestoreRequest {
+            backup_arn,
+            source_table_arn,
+            restore_date_time,
+            input,
+        } = request;
+        // An early, unfenced check so a missing backup does not create and
+        // then remove a target. The fenced re-check is the registration below.
+        let backup = self.load_available_backup(account_id, &backup_arn).await?;
+
+        let target_name = input.table_name.clone();
+        let key_schema = input.key_schema.clone();
+        let attribute_definitions = input.attribute_definitions.clone();
+        #[allow(clippy::cast_possible_truncation)]
+        let restore_date_time_ms = (restore_date_time * 1_000.0).round() as i64;
+        let columns = RestoreTargetColumns {
+            table_id: uuid::Uuid::new_v4().to_string(),
+            source_backup_arn: backup_arn.clone(),
+            source_table_arn,
+            restore_date_time_ms,
+            owner: self.restore_owner,
+        };
+        let table_id = columns.table_id.clone();
+
+        // Step 1: the target row (IF NOT EXISTS reserves the name), its
+        // indexes, and its data tables, exactly as `input` describes. The
+        // heartbeat starts at the row insert; on an error it has already
+        // been dropped (and so stopped) when this match sees it.
+        let (description, heartbeat) = match self
+            .create_table_for_restore_impl(account_id, input, &columns)
+            .await
+        {
+            Ok(created) => created,
+            Err(StorageError::TableAlreadyExists(name)) => {
+                return Err(StorageError::TableAlreadyExists(name));
+            }
+            Err(error) => {
+                // Part of the target may exist under our table_id.
+                if let Err(cleanup) = self
+                    .remove_restore_target(account_id, &target_name, &table_id, &backup_arn)
+                    .await
+                {
+                    tracing::warn!(
+                        "Restore of table {target_name}: removing the partly created \
+                         target failed ({cleanup}); the abandoned-restore sweep removes it"
+                    );
+                }
+                return Err(error);
+            }
+        };
+
+        // Step 2: register on the backup, fenced on AVAILABLE. See the
+        // module docs for what this does and does not guarantee.
+        let registered = self
+            .register_restore(account_id, &backup_arn, &table_id, &target_name)
+            .await;
+        if !matches!(registered, Ok(true)) {
+            drop(heartbeat);
+            if let Err(cleanup) = self
+                .remove_restore_target(account_id, &target_name, &table_id, &backup_arn)
+                .await
+            {
+                tracing::warn!(
+                    "Restore of table {target_name}: removing the unregistered target \
+                     failed ({cleanup}); the abandoned-restore sweep removes it"
+                );
+            }
+            return Err(registered
+                .err()
+                .unwrap_or_else(|| backup_not_found(&backup_arn)));
+        }
+
+        // The copy the caller's detached task runs next, with owned clones.
+        let job = RestoreJob {
+            account_id: account_id.to_owned(),
+            target_name,
+            table_id,
+            backup_arn,
+            item_count: backup.item_count,
+            backup_size_bytes: backup.backup_size_bytes,
+            key_schema,
+            attribute_definitions,
+            owner: self.restore_owner,
+        };
+        Ok((description, job, heartbeat))
+    }
+}
+
+/// The abandoned-restore sweep, for the server's worker set: one sweep at
+/// startup, then one every [`RESTORE_SWEEP_INTERVAL`], until `shutdown` is
+/// cancelled. A sweep already running when `shutdown` fires finishes first.
+pub async fn poll_abandoned_restores(
+    engine: Arc<CassandraEngine>,
+    shutdown: extenddb_storage::CancellationToken,
+) {
+    loop {
+        if let Err(error) = engine.sweep_abandoned_restores(RESTORE_STALE_AFTER).await {
+            tracing::warn!("Abandoned-restore sweep failed: {error}");
+        }
+        if !extenddb_storage::sleep_or_shutdown(&shutdown, RESTORE_SWEEP_INTERVAL).await {
+            return;
+        }
+    }
 }
 
 impl BackupEngine for CassandraEngine {
@@ -356,19 +1294,21 @@ impl BackupEngine for CassandraEngine {
             let table = self
                 .build_table_description(&account_id, &table_name)
                 .await?;
-            let backup_arn = format!(
-                "arn:aws:dynamodb:{region}:{account_id}:table/{table_name}/backup/{id}",
-                region = self.region,
-                id = backup_id()
-            );
-            let created_at = chrono::Utc::now().timestamp_millis();
+            let definition = self
+                .backup_definition_for_table(&account_id, &table_name, &table)
+                .await?;
+            let definition_json = definition.to_json()?.to_string();
+            // One instant for the ARN, BackupCreationDateTime, and the stored
+            // creation time, so the ListBackups cursor can place the ARN.
+            let id = extenddb_storage::util::new_backup_id();
+            let backup_arn =
+                extenddb_storage::util::backup_arn(&self.region, &account_id, &table_name, &id);
+            let created_at = extenddb_storage::util::backup_id_epoch_millis(&id)
+                .and_then(|ms| i64::try_from(ms).ok())
+                .ok_or_else(|| StorageError::Internal(format!("Backup id {id} has no time")))?;
             #[allow(clippy::cast_possible_truncation)]
             let table_created_at = (table.creation_date_time * 1_000.0) as i64;
-            let billing_mode = if table.billing_mode_summary.is_some() {
-                "PAY_PER_REQUEST"
-            } else {
-                "PROVISIONED"
-            };
+            let billing_mode = definition.billing_mode.as_str();
             let key_schema = serde_json::to_string(&table.key_schema)
                 .map_err(|e| StorageError::Internal(format!("Serialize key schema: {e}")))?;
             let attribute_definitions = serde_json::to_string(&table.attribute_definitions)
@@ -388,7 +1328,7 @@ impl BackupEngine for CassandraEngine {
 
             let catalog = self.catalog_keyspace();
             let insert_metadata = format!(
-                "INSERT INTO {catalog}.backups_by_arn (backup_arn, account_id, backup_name, table_id, table_name, table_arn, backup_status, backup_type, backup_size_bytes, item_count, key_schema, attribute_definitions, billing_mode, provisioned_throughput, stream_specification, table_created_at, created_at) VALUES (?, ?, ?, ?, ?, ?, 'CREATING', 'USER', ?, 0, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
+                "INSERT INTO {catalog}.backups_by_arn (backup_arn, account_id, backup_name, table_id, table_name, table_arn, backup_status, backup_type, backup_size_bytes, item_count, key_schema, attribute_definitions, billing_mode, provisioned_throughput, stream_specification, table_created_at, created_at, definition) VALUES (?, ?, ?, ?, ?, ?, 'CREATING', 'USER', ?, 0, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
             );
             self.session
                 .query_with_values(
@@ -407,7 +1347,8 @@ impl BackupEngine for CassandraEngine {
                         provisioned_throughput.as_str(),
                         stream_specification.as_deref(),
                         table_created_at,
-                        created_at
+                        created_at,
+                        definition_json.as_str()
                     ),
                 )
                 .await
@@ -603,29 +1544,24 @@ impl BackupEngine for CassandraEngine {
         Box::pin(async move {
             Self::validate_account_id(&account_id)?;
             let catalog = self.catalog_keyspace();
-            let (query, result) = if let Some(table_name) = table_name.as_deref() {
+            let result = if let Some(table_name) = table_name.as_deref() {
                 let query = format!(
-                    "SELECT backup_arn, backup_name, table_name, table_arn, backup_size_bytes, created_at FROM {catalog}.backups_by_table WHERE account_id = ? AND table_name = ?"
+                    "SELECT backup_arn FROM {catalog}.backups_by_table WHERE account_id = ? AND table_name = ?"
                 );
-                let result = self
-                    .session
+                self.session
                     .query_with_values(
                         &query,
                         cdrs_tokio::query_values!(account_id.as_str(), table_name),
                     )
-                    .await;
-                (query, result)
+                    .await
             } else {
                 let query = format!(
-                    "SELECT backup_arn, backup_name, table_name, table_arn, backup_size_bytes, created_at FROM {catalog}.backups_by_account WHERE account_id = ?"
+                    "SELECT backup_arn FROM {catalog}.backups_by_account WHERE account_id = ?"
                 );
-                let result = self
-                    .session
+                self.session
                     .query_with_values(&query, cdrs_tokio::query_values!(account_id.as_str()))
-                    .await;
-                (query, result)
+                    .await
             };
-            let _ = query;
             let rows = result
                 .map_err(|e| StorageError::Internal(format!("List backups: {e}")))?
                 .response_body()
@@ -659,26 +1595,56 @@ impl BackupEngine for CassandraEngine {
         let account_id = account_id.to_owned();
         let backup_arn = backup_arn.to_owned();
         Box::pin(async move {
+            /// Claim attempts when a restore registers or unregisters between
+            /// the registration check and the DELETING claim.
+            const CLAIM_ATTEMPTS: usize = 3;
+
             let mut backup = self.load_backup(&account_id, &backup_arn).await?;
             if backup.backup_status != "AVAILABLE" && backup.backup_status != "DELETING" {
-                return Err(StorageError::Validation(format!(
-                    "Backup not found: {backup_arn}"
-                )));
+                return Err(backup_not_found(&backup_arn));
             }
             let original_description = backup.description()?;
+            // The claim is conditioned on the registration map being empty, on
+            // the same partition the restore registers on (see the module
+            // docs), so a registered restore keeps the backup AVAILABLE.
             let mark_deleting = format!(
                 "UPDATE {}.backups_by_arn SET backup_status = 'DELETING' \
                  WHERE account_id = ? AND backup_arn = ? \
-                 IF backup_status = 'AVAILABLE'",
+                 IF backup_status = 'AVAILABLE' AND active_restores = null",
                 self.catalog_keyspace()
             );
-            crate::cassandra_util::query_lwt(
-                &self.session,
-                &mark_deleting,
-                cdrs_tokio::query_values!(account_id.as_str(), backup_arn.as_str()),
-            )
-            .await
-            .map_err(|e| StorageError::Internal(format!("Mark backup deleting: {e}")))?;
+            let mut attempt = 0;
+            while backup.backup_status == "AVAILABLE" {
+                self.ensure_backup_not_restoring(&backup).await?;
+                let result = crate::cassandra_util::query_lwt(
+                    &self.session,
+                    &mark_deleting,
+                    cdrs_tokio::query_values!(account_id.as_str(), backup_arn.as_str()),
+                )
+                .await
+                .map_err(|e| StorageError::Internal(format!("Mark backup deleting: {e}")))?;
+                if crate::cassandra_util::lwt_applied(&result)? {
+                    break;
+                }
+                attempt += 1;
+                backup = self.load_backup(&account_id, &backup_arn).await?;
+                match backup.backup_status.as_str() {
+                    "AVAILABLE" if attempt < CLAIM_ATTEMPTS => {}
+                    "AVAILABLE" => {
+                        let target = backup
+                            .active_restores
+                            .values()
+                            .next()
+                            .cloned()
+                            .unwrap_or_default();
+                        return Err(backup_in_use(&target, &backup_arn));
+                    }
+                    // A concurrent DeleteBackup claimed it; finishing the
+                    // cleanup is idempotent.
+                    "DELETING" => {}
+                    _ => return Err(backup_not_found(&backup_arn)),
+                }
+            }
 
             self.remove_backup_index_rows(&backup).await?;
             self.cleanup_backup_payload(&account_id, &backup_arn, backup.item_count)
@@ -698,13 +1664,64 @@ impl BackupEngine for CassandraEngine {
             .await
             .map_err(|e| StorageError::Internal(format!("Mark backup deleted: {e}")))?;
 
-            backup.backup_status = "DELETED".to_owned();
             Ok(BackupDescription {
                 backup_details: BackupDetails {
                     backup_status: "DELETED".to_owned(),
                     ..original_description.backup_details
                 },
                 source_table_details: original_description.source_table_details,
+                source_table_feature_details: None,
+            })
+        })
+    }
+
+    fn backup_restore_source(
+        &self,
+        account_id: &str,
+        backup_arn: &str,
+    ) -> BoxFuture<'_, Result<BackupRestoreSource, StorageError>> {
+        let account_id = account_id.to_owned();
+        let backup_arn = backup_arn.to_owned();
+        Box::pin(async move {
+            Self::validate_account_id(&account_id)?;
+            let backup = self.load_available_backup(&account_id, &backup_arn).await?;
+            let definition = backup.parsed_definition()?;
+            let provisioned_throughput = match &definition {
+                Some(definition) => definition.provisioned_throughput.clone(),
+                // A backup row written before V005: the throughput column it
+                // has always carried. That column holds {0, 0} for an
+                // on-demand source; treat a non-positive value as unrecorded,
+                // as the restore of catalog 0.0.3 did (it fell back to 5/5).
+                None => {
+                    let value = backup
+                        .provisioned_throughput
+                        .as_deref()
+                        .map(serde_json::from_str::<serde_json::Value>)
+                        .transpose()
+                        .map_err(|e| StorageError::Internal(format!("Parse throughput: {e}")))?;
+                    throughput_from_catalog(value.as_ref())
+                        .filter(|pt| pt.read_capacity_units > 0 && pt.write_capacity_units > 0)
+                }
+            };
+            Ok(BackupRestoreSource {
+                backup_arn: backup.backup_arn.clone(),
+                backup_creation_date_time: crate::cassandra_util::millis_to_seconds_f64(
+                    backup.created_at,
+                ),
+                source_table_name: backup.table_name.clone(),
+                source_table_arn: backup.table_arn.clone(),
+                source_table_id: backup.table_id.clone(),
+                key_schema: backup.parsed_key_schema()?,
+                attribute_definitions: backup.parsed_attribute_definitions()?,
+                billing_mode: backup.billing_mode.clone(),
+                provisioned_throughput,
+                item_count: backup.item_count,
+                table_size_bytes: backup.backup_size_bytes,
+                table_creation_date_time: crate::cassandra_util::millis_to_seconds_f64(
+                    backup.table_created_at,
+                ),
+                definition,
+                legacy_vector_index_count: 0,
             })
         })
     }
@@ -712,158 +1729,37 @@ impl BackupEngine for CassandraEngine {
     fn restore_table_from_backup(
         &self,
         account_id: &str,
-        target_table_name: &str,
-        backup_arn: &str,
+        request: RestoreRequest,
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
         let account_id = account_id.to_owned();
-        let target_table_name = target_table_name.to_owned();
-        let backup_arn = backup_arn.to_owned();
         Box::pin(async move {
             Self::validate_account_id(&account_id)?;
-            let backup = self.load_available_backup(&account_id, &backup_arn).await?;
-            let key_schema: Vec<extenddb_core::types::KeySchemaElement> =
-                serde_json::from_str(&backup.key_schema)
-                    .map_err(|e| StorageError::Internal(format!("Parse key schema: {e}")))?;
-            let attribute_definitions: Vec<extenddb_core::types::AttributeDefinition> =
-                serde_json::from_str(&backup.attribute_definitions)
-                    .map_err(|e| StorageError::Internal(format!("Parse attributes: {e}")))?;
-            let billing_mode = if backup.billing_mode == "PAY_PER_REQUEST" {
-                Some(BillingMode::PayPerRequest)
-            } else {
-                Some(BillingMode::Provisioned)
-            };
-            let mut provisioned_throughput: ProvisionedThroughput = backup
-                .provisioned_throughput
-                .as_deref()
-                .map(serde_json::from_str)
-                .transpose()
-                .map_err(|e| StorageError::Internal(format!("Parse throughput: {e}")))?
-                .unwrap_or(ProvisionedThroughput {
-                    read_capacity_units: 5,
-                    write_capacity_units: 5,
-                });
-            if provisioned_throughput.read_capacity_units <= 0 {
-                provisioned_throughput.read_capacity_units = 5;
-            }
-            if provisioned_throughput.write_capacity_units <= 0 {
-                provisioned_throughput.write_capacity_units = 5;
-            }
-            let stream_specification = backup
-                .stream_specification
-                .as_deref()
-                .map(serde_json::from_str)
-                .transpose()
-                .map_err(|e| StorageError::Internal(format!("Parse stream: {e}")))?;
-
-            let create_input = CreateTableInput {
-                table_name: target_table_name.clone(),
-                key_schema: key_schema.clone(),
-                attribute_definitions: attribute_definitions.clone(),
-                billing_mode,
-                provisioned_throughput: Some(provisioned_throughput),
-                global_secondary_indexes: None,
-                local_secondary_indexes: None,
-                stream_specification,
-                tags: None,
-                deletion_protection_enabled: None,
-                sse_specification: None,
-                table_class: None,
-                on_demand_throughput: None,
-                vector_indexes: None,
-                table_throughput_mode: None,
-            };
-            let description = self
-                .create_table_for_restore_impl(&account_id, create_input)
-                .await?;
-            let key_info = TableKeyInfo {
-                table_name: target_table_name.clone(),
-                account_id: account_id.clone(),
-                table_id: description.table_id.clone(),
-                key_schema: key_schema.clone(),
-                base_key_schema: key_schema,
-                attribute_definitions,
-                has_lsi: false,
-                global_secondary_indexes: Vec::new(),
-                local_secondary_indexes: Vec::new(),
-                stream_specification: description.stream_specification.clone(),
-                vector_indexes: Vec::new(),
-            };
-
-            let restore_result: Result<(i64, i64), StorageError> = async {
-                let account_keyspace = self.account_keyspace(&account_id);
-                let query = format!(
-                    "SELECT item_data FROM {account_keyspace}.backup_items WHERE backup_arn = ? AND bucket = ?"
-                );
-                let mut restored_count = 0_i64;
-                let mut restored_size = 0_i64;
-                for bucket in 0..bucket_count(backup.item_count) {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let bucket_i32 = bucket as i32;
-                    let rows = self
-                        .session
-                        .query_with_values(
-                            &query,
-                            cdrs_tokio::query_values!(backup_arn.as_str(), bucket_i32),
-                        )
-                        .await
-                        .map_err(|e| StorageError::Internal(format!("Read backup payload: {e}")))?
-                        .response_body()
-                        .map_err(|e| StorageError::Internal(format!("Parse backup payload: {e}")))?
-                        .into_rows()
-                        .unwrap_or_default();
-                    for row in rows {
-                        let item_data: String = row.get_r_by_name("item_data").map_err(|e| {
-                            StorageError::Internal(format!("Parse backup item: {e}"))
-                        })?;
-                        let item = serde_json::from_str(&item_data).map_err(|e| {
-                            StorageError::Internal(format!("Deserialize backup item: {e}"))
-                        })?;
-                        self.put_item_impl(&key_info, item, false, None, &Default::default(), None)
-                            .await?;
-                        restored_count += 1;
-                        #[allow(clippy::cast_possible_wrap)]
-                        let item_len = item_data.len() as i64;
-                        restored_size = restored_size.saturating_add(item_len);
+            // Registration and copy both run in one detached task that owns a
+            // clone of the engine and the request. The request future only
+            // waits for the registration outcome, so dropping it (a client
+            // timeout) at any await point after the first poll does not stop
+            // the restore; before the first poll nothing has been done.
+            // Contrast: if registration ran here and only the copy were
+            // spawned, a drop between creating the target and spawning would
+            // leave a CREATING target with no copy until the sweep removed it.
+            let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
+            let engine = self.clone();
+            tokio::spawn(async move {
+                match engine.register_restore_target(&account_id, request).await {
+                    Ok((description, job, heartbeat)) => {
+                        // The receiver is gone if the request was dropped;
+                        // the copy runs regardless.
+                        let _ = registered_tx.send(Ok(description));
+                        engine.run_restore_copy(job, heartbeat).await;
+                    }
+                    Err(error) => {
+                        let _ = registered_tx.send(Err(error));
                     }
                 }
-                if restored_count != backup.item_count {
-                    return Err(StorageError::Internal(format!(
-                        "Backup item count mismatch: expected {}, restored {}",
-                        backup.item_count, restored_count
-                    )));
-                }
-                Ok((restored_count, restored_size))
-            }
-            .await;
-
-            let completion = match restore_result {
-                Ok((restored_count, restored_size)) => {
-                    self.mark_table_active_after_restore(
-                        &account_id,
-                        &target_table_name,
-                        &description.table_id,
-                        restored_count,
-                        backup.backup_size_bytes.max(restored_size),
-                    )
-                    .await
-                }
-                Err(error) => Err(error),
-            };
-
-            match completion {
-                Ok(()) => Ok(description),
-                Err(error) => {
-                    let _ = self
-                        .delete_table_impl(
-                            &account_id,
-                            extenddb_core::types::DeleteTableInput {
-                                table_name: target_table_name,
-                            },
-                        )
-                        .await;
-                    Err(error)
-                }
-            }
+            });
+            registered_rx.await.map_err(|_| {
+                StorageError::Internal("restore task ended before registering".to_owned())
+            })?
         })
     }
 
@@ -906,8 +1802,8 @@ impl BackupEngine for CassandraEngine {
                     value.ok()
                 })
                 .unwrap_or(false);
-            #[allow(clippy::cast_precision_loss)]
-            let now = epoch_millis() as f64 / 1_000.0;
+            let now =
+                crate::cassandra_util::millis_to_seconds_f64(crate::cassandra_util::now_millis());
             Ok(ContinuousBackupsDescription {
                 continuous_backups_status: "ENABLED".to_owned(),
                 point_in_time_recovery_description: Some(PointInTimeRecoveryDescription {
@@ -960,19 +1856,6 @@ impl BackupEngine for CassandraEngine {
                 .await
         })
     }
-
-    fn restore_table_to_point_in_time(
-        &self,
-        _account_id: &str,
-        _source_table_name: &str,
-        _target_table_name: &str,
-    ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
-        Box::pin(async move {
-            Err(StorageError::Validation(
-                "Point-in-time recovery restore is not yet supported".to_owned(),
-            ))
-        })
-    }
 }
 
 #[cfg(test)]
@@ -980,20 +1863,103 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backup_identifier_has_timestamp_and_random_suffix() {
-        let id = backup_id();
-        let (timestamp, suffix) = id.split_once('-').expect("backup id separator");
-        assert!(!timestamp.is_empty());
-        assert!(timestamp.chars().all(|ch| ch.is_ascii_digit()));
-        assert_eq!(suffix.len(), 8);
-        assert!(suffix.chars().all(|ch| ch.is_ascii_hexdigit()));
-    }
-
-    #[test]
     fn item_buckets_are_bounded() {
         assert_eq!(bucket_count(0), 0);
         assert_eq!(bucket_count(1), 1);
         assert_eq!(bucket_count(BACKUP_ITEMS_PER_BUCKET), 1);
         assert_eq!(bucket_count(BACKUP_ITEMS_PER_BUCKET + 1), 2);
+    }
+
+    #[test]
+    fn a_restore_is_declared_abandoned_only_after_missed_heartbeats() {
+        assert!(RESTORE_STALE_AFTER >= RESTORE_HEARTBEAT_INTERVAL * 4);
+    }
+
+    use std::sync::atomic::AtomicUsize;
+
+    /// A heartbeat that counts its beats, every 10 ms, answering `owned`.
+    fn counting_heartbeat(beats: &Arc<AtomicUsize>, owned: bool) -> RestoreHeartbeat {
+        let beats = Arc::clone(beats);
+        RestoreHeartbeat::spawn(Duration::from_millis(10), "T".to_owned(), move || {
+            beats.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(owned) }
+        })
+    }
+
+    /// Wait until `beats` reaches `at_least`; panic after 5 s.
+    async fn wait_for_beats(beats: &AtomicUsize, at_least: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while beats.load(Ordering::SeqCst) < at_least {
+            assert!(std::time::Instant::now() < deadline, "heartbeat never ran");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Assert no beat happens over 20 heartbeat intervals.
+    async fn assert_stopped(beats: &AtomicUsize) {
+        let stopped_at = beats.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            beats.load(Ordering::SeqCst),
+            stopped_at,
+            "the heartbeat kept running after its owner ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_heartbeat_stops_when_the_task_owning_it_panics() {
+        let beats = Arc::new(AtomicUsize::new(0));
+        let owner = {
+            let beats = Arc::clone(&beats);
+            tokio::spawn(async move {
+                let _heartbeat = counting_heartbeat(&beats, true);
+                wait_for_beats(&beats, 3).await;
+                panic!("copy panicked");
+            })
+        };
+        let joined = owner.await;
+        assert!(
+            joined.is_err_and(|e| e.is_panic()),
+            "the owner must have panicked"
+        );
+        assert!(
+            beats.load(Ordering::SeqCst) >= 3,
+            "the heartbeat ran before the panic"
+        );
+        assert_stopped(&beats).await;
+    }
+
+    #[tokio::test]
+    async fn the_heartbeat_stops_when_the_future_owning_it_is_dropped() {
+        let beats = Arc::new(AtomicUsize::new(0));
+        let owner = {
+            let beats = Arc::clone(&beats);
+            async move {
+                let _heartbeat = counting_heartbeat(&beats, true);
+                futures::future::pending::<()>().await;
+            }
+        };
+        // Cancellation: the owning future is dropped at its await point.
+        let timed_out = tokio::time::timeout(Duration::from_millis(100), owner).await;
+        assert!(timed_out.is_err());
+        assert!(
+            beats.load(Ordering::SeqCst) >= 2,
+            "the heartbeat ran before the drop"
+        );
+        assert_stopped(&beats).await;
+    }
+
+    #[tokio::test]
+    async fn a_lost_target_stops_the_heartbeat_and_is_reported() {
+        let beats = Arc::new(AtomicUsize::new(0));
+        let heartbeat = counting_heartbeat(&beats, false);
+        wait_for_beats(&beats, 1).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !heartbeat.is_lost() {
+            assert!(std::time::Instant::now() < deadline, "loss never reported");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_stopped(&beats).await;
+        assert_eq!(beats.load(Ordering::SeqCst), 1, "one beat, then stopped");
     }
 }

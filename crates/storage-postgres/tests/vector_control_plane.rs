@@ -32,7 +32,9 @@ use extenddb_core::types::{
     VectorIndexUpdate,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{BackupEngine, DataEngine, TableEngine};
+use extenddb_storage::{
+    BackupEngine, DataEngine, RestoreRequest, RestoreTableOverrides, TableEngine,
+};
 use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -382,6 +384,51 @@ async fn set_index_phase(catalog: &PgPool, table_id: &str, index_name: &str, bac
     .execute(catalog)
     .await
     .expect("move the index into a CREATING phase");
+}
+
+/// RestoreTableFromBackup as the engine drives it (CONTRACT section 5): the
+/// restore source, the engine's refusals (`ensure_restorable`, which carries
+/// the vector-index refusal since it moved out of the backends), the
+/// resolved input, then the backend's registration. Waits for the detached
+/// copy and returns the target's final catalog status.
+async fn restore(
+    s: &Scratch,
+    target: &str,
+    backup_arn: &str,
+) -> Result<Option<String>, StorageError> {
+    let source = s.engine.backup_restore_source(ACCOUNT, backup_arn).await?;
+    source.ensure_restorable()?;
+    let input = source.restore_input(target, &RestoreTableOverrides::default())?;
+    s.engine
+        .restore_table_from_backup(
+            ACCOUNT,
+            RestoreRequest {
+                backup_arn: backup_arn.to_owned(),
+                source_table_arn: source.source_table_arn.clone(),
+                restore_date_time: source.backup_creation_date_time,
+                input,
+            },
+        )
+        .await?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT table_status FROM tables WHERE account_id = $1 AND table_name = $2",
+        )
+        .bind(ACCOUNT)
+        .bind(target)
+        .fetch_optional(&s.catalog)
+        .await
+        .expect("read the target status");
+        if status.as_deref() != Some("CREATING") {
+            return Ok(status);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{target} still CREATING"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]
@@ -931,9 +978,7 @@ async fn restoring_a_backup_that_carries_vector_indexes_is_refused() {
     // Refused, not silently degraded: restore does not carry indexes across, so
     // succeeding here would hand back a table whose declared index is missing
     // and whose client only finds out on the first search.
-    let err = s
-        .engine
-        .restore_table_from_backup(ACCOUNT, "t_restored", &details.backup_arn)
+    let err = restore(&s, "t_restored", &details.backup_arn)
         .await
         .expect_err("restoring a vector-indexed backup must be refused");
     match err {
@@ -943,6 +988,27 @@ async fn restoring_a_backup_that_carries_vector_indexes_is_refused() {
         }
         other => panic!("expected Unsupported, got {other:?}"),
     }
+
+    // The same backup without its definition row (the shape of one taken
+    // before catalog 0.0.4): its vector indexes are known only from the
+    // `backups.vector_indexes` snapshot, which the restore source must report
+    // so the engine still refuses.
+    sqlx::query("DELETE FROM backup_definitions WHERE backup_arn = $1")
+        .bind(&details.backup_arn)
+        .execute(&s.catalog)
+        .await
+        .expect("drop the definition row");
+    let legacy = s
+        .engine
+        .backup_restore_source(ACCOUNT, &details.backup_arn)
+        .await
+        .expect("legacy source");
+    assert!(legacy.definition.is_none());
+    assert_eq!(legacy.legacy_vector_index_count, 1);
+    let err = restore(&s, "t_restored", &details.backup_arn)
+        .await
+        .expect_err("a legacy vector-indexed backup must be refused");
+    assert!(matches!(err, StorageError::Unsupported(_)), "{err:?}");
 
     // The refusal must leave no half-created target table behind.
     let target: Option<(String,)> =
@@ -965,10 +1031,10 @@ async fn restoring_a_backup_that_carries_vector_indexes_is_refused() {
         .create_backup(ACCOUNT, "t_plain_source", "b_plain")
         .await
         .expect("back up a plain table");
-    s.engine
-        .restore_table_from_backup(ACCOUNT, "t_plain_restored", &plain.backup_arn)
+    let status = restore(&s, "t_plain_restored", &plain.backup_arn)
         .await
         .expect("a backup with no vector indexes must still restore");
+    assert_eq!(status.as_deref(), Some("ACTIVE"));
 
     s.cleanup().await;
 }
@@ -1284,11 +1350,25 @@ async fn a_backup_taken_before_the_snapshot_column_existed_still_restores() {
         .execute(&s.catalog)
         .await
         .expect("blank the snapshot the way a pre-migration backup has it");
+    // A pre-migration backup has no definition row either; without this the
+    // definition would make the snapshot irrelevant.
+    sqlx::query("DELETE FROM backup_definitions WHERE backup_arn = $1")
+        .bind(&details.backup_arn)
+        .execute(&s.catalog)
+        .await
+        .expect("drop the definition row");
+    let source = s
+        .engine
+        .backup_restore_source(ACCOUNT, &details.backup_arn)
+        .await
+        .expect("source");
+    assert!(source.definition.is_none());
+    assert_eq!(source.legacy_vector_index_count, 0);
 
-    s.engine
-        .restore_table_from_backup(ACCOUNT, "t_legacy_restored", &details.backup_arn)
+    let status = restore(&s, "t_legacy_restored", &details.backup_arn)
         .await
         .expect("a pre-migration backup must still restore");
+    assert_eq!(status.as_deref(), Some("ACTIVE"));
 
     s.cleanup().await;
 }

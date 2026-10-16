@@ -62,6 +62,10 @@ pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
         "V004__ttl_backfill_cursor.cql",
         include_str!("../migrations/catalog/V004__ttl_backfill_cursor.cql"),
     ),
+    (
+        "V005__backup_definitions_and_restore_registration.cql",
+        include_str!("../migrations/catalog/V005__backup_definitions_and_restore_registration.cql"),
+    ),
 ];
 
 /// Embedded data migration files, applied in order.
