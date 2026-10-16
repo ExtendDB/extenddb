@@ -9,6 +9,7 @@ use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{composite_pk_to_text, parse_sk, pk_to_text, sk_column, sk_info};
 
+use super::gsi_build::fix_up_stale_write;
 use super::index::{enqueue_async_indexes, fetch_write_path_indexes, sync_indexes};
 use super::query::check_condition;
 use super::tx_helpers::write_stream_record_in_tx;
@@ -46,12 +47,12 @@ impl PostgresEngine {
         // cached membership gate, and that is gone: an index takes effect the moment
         // its catalog row commits. What remains is a window between this read and
         // the data transaction's commit, in which an index created concurrently is
-        // missed. That window cannot be closed here, because the catalog and the
-        // data tables are different databases and no transaction spans them. It is
-        // also exactly the window the secondary indexes have, for the same reason
-        // and with the same read: parity with a GSI is the bar, and the backfill
-        // that publishes a new index is what covers writes older than it.
-        let (indexes, vector_metas) =
+        // missed. No transaction can close it, because the catalog and the data
+        // tables are different databases. For a GSI it is closed by time instead:
+        // the read's stamp lets a write that was slow to commit queue a repair
+        // for any GSI it did not see (`gsi_build::fix_up_stale_write`), and a fast
+        // write is one the backfill sees. Vector indexes still have the window.
+        let (indexes, vector_metas, stamp) =
             fetch_write_path_indexes(&key_info.table_id, &self.pool).await?;
 
         // Index key attributes present in the item must match their declared
@@ -69,7 +70,7 @@ impl PostgresEngine {
             extenddb_core::validation::validate_index_keys(
                 &item,
                 &index_refs,
-                &key_info.attribute_definitions,
+                super::index::fresh_attr_defs(&indexes, &key_info.attribute_definitions),
             )
             .map_err(|e| StorageError::Validation(e.to_string()))?;
         }
@@ -86,11 +87,15 @@ impl PostgresEngine {
         };
 
         // When there's a condition, return_old, indexes, or stream capture, we need a transaction
+        // A write that is already slow takes the transaction path even with no
+        // index to maintain, so that a repair for a GSI created meanwhile commits
+        // with the write (`gsi_build::fix_up_stale_write`) instead of after it.
         let needs_tx = condition.is_some()
             || return_old
             || !indexes.is_empty()
             || !vector_metas.is_empty()
-            || stream.is_some();
+            || stream.is_some()
+            || stamp.elapsed() > super::gsi_build::GRACE_WRITE;
 
         if let Some((sk_name, sk_type)) =
             sk_info(&key_info.key_schema, &key_info.attribute_definitions)
@@ -174,7 +179,6 @@ impl PostgresEngine {
                     sync_indexes(
                         &mut tx,
                         &key_info.key_schema,
-                        &key_info.attribute_definitions,
                         &indexes,
                         oi.as_ref(),
                         Some(&item),
@@ -235,6 +239,10 @@ impl PostgresEngine {
                 )
                 .await?;
 
+                async_enqueued +=
+                    fix_up_stale_write(&mut tx, &self.pool, stamp, key_info, &indexes, &item)
+                        .await?;
+
                 tx.commit()
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -262,6 +270,7 @@ impl PostgresEngine {
                     &item_json,
                     &self.data_pool
                 )?;
+                self.fix_up_autocommit(stamp, key_info, &item).await;
                 Ok(None)
             }
         } else {
@@ -347,7 +356,6 @@ impl PostgresEngine {
                     sync_indexes(
                         &mut tx,
                         &key_info.key_schema,
-                        &key_info.attribute_definitions,
                         &indexes,
                         oi.as_ref(),
                         Some(&item),
@@ -408,6 +416,10 @@ impl PostgresEngine {
                 )
                 .await?;
 
+                async_enqueued +=
+                    fix_up_stale_write(&mut tx, &self.pool, stamp, key_info, &indexes, &item)
+                        .await?;
+
                 tx.commit()
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -434,6 +446,7 @@ impl PostgresEngine {
                     .execute(&self.data_pool)
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
+                self.fix_up_autocommit(stamp, key_info, &item).await;
                 Ok(None)
             }
         }

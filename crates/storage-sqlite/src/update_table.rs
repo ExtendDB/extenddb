@@ -1302,6 +1302,106 @@ mod reconciler_tests {
         );
     }
 
+    /// A write that carries the key info cached before an UpdateTable added a GSI
+    /// with a sort key on a new attribute must still give the index row its sort
+    /// key. The engine drops the cached key info only when UpdateTable returns, so
+    /// writes in between carry definitions that do not know the new attribute;
+    /// with them the row was written without the sort key column, and a Query on
+    /// the full index key did not find the item.
+    #[tokio::test]
+    async fn write_with_key_info_older_than_a_new_gsi_indexes_its_sort_key() {
+        use extenddb_storage::{DataEngine, TableEngine};
+
+        let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::schema::apply(&engine.pool).await.expect("schema");
+        let account = "000000000000";
+        sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
+            .bind(account)
+            .execute(&engine.pool)
+            .await
+            .expect("account");
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('index_propagation_delay_ms', '0') \
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        )
+        .execute(&engine.pool)
+        .await
+        .expect("synchronous propagation");
+
+        let input: extenddb_core::types::CreateTableInput = serde_json::from_value(json!({
+            "TableName": "t",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .expect("input");
+        engine
+            .create_table_impl(account, input, false)
+            .await
+            .expect("create table");
+        sqlx::query("UPDATE tables SET table_status = 'ACTIVE' WHERE table_name = 't'")
+            .execute(&engine.pool)
+            .await
+            .expect("activate the table");
+        let stale = engine.table_key_info(account, "t").await.expect("key info");
+
+        let update: extenddb_core::types::UpdateTableInput = serde_json::from_value(json!({
+            "TableName": "t",
+            "AttributeDefinitions": [
+                {"AttributeName": "g", "AttributeType": "S"},
+                {"AttributeName": "r", "AttributeType": "N"}
+            ],
+            "GlobalSecondaryIndexUpdates": [{"Create": {
+                "IndexName": "gidx",
+                "KeySchema": [
+                    {"AttributeName": "g", "KeyType": "HASH"},
+                    {"AttributeName": "r", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "ALL"}
+            }}]
+        }))
+        .expect("update input");
+        engine
+            .update_table_impl(account, update)
+            .await
+            .expect("add the GSI");
+
+        let item: extenddb_core::types::Item = serde_json::from_value(json!({
+            "pk": {"S": "a"}, "g": {"S": "x"}, "r": {"N": "7"}
+        }))
+        .expect("item");
+        engine
+            .put_item(
+                &stale,
+                item,
+                false,
+                None,
+                &extenddb_core::expression::ExpressionMaps::default(),
+                None,
+            )
+            .await
+            .expect("put with the older key info");
+
+        let (index_id,): (String,) =
+            sqlx::query_as("SELECT index_id FROM indexes WHERE index_name = 'gidx'")
+                .fetch_one(&engine.pool)
+                .await
+                .expect("index id");
+        let missing: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM \"_ddb_{index_id}\" WHERE sk_n IS NULL"
+        ))
+        .fetch_one(&engine.pool)
+        .await
+        .expect("count rows without a sort key");
+        let rows: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"_ddb_{index_id}\""))
+            .fetch_one(&engine.pool)
+            .await
+            .expect("count rows");
+        assert_eq!((rows, missing), (1, 0), "one index row, with its sort key");
+    }
+
     /// A vector index left in `CREATING` by a crash must be rebuilt on startup and
     /// flipped to `ACTIVE`, with `Backfilling` cleared.
     ///

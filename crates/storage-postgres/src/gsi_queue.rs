@@ -30,11 +30,6 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tokio::sync::Notify;
 
-use crate::data::{
-    all_sort_key_info, delete_index_row_multi, index_table_name, insert_index_row_multi,
-    item_has_index_keys, project_item_for_index,
-};
-
 /// Number of worker tasks consuming from the persistent queue.
 ///
 /// Fixed invariant: a row's `worker_partition` is `hash(base_key) % NUM_WORKERS`
@@ -450,6 +445,7 @@ async fn apply_claimed_row(
         PendingApplyContext::Gsi(c) => {
             apply_index(
                 tx,
+                table_id,
                 &c.index,
                 old_item.as_ref(),
                 new_item.as_ref(),
@@ -499,39 +495,22 @@ async fn apply_claimed_row(
 /// Apply a single index's delete-old / insert-new within the transaction.
 async fn apply_index(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table_id: &str,
     idx: &GsiIndexDef,
     old_item: Option<&Item>,
     new_item: Option<&Item>,
     base_key_schema: &[KeySchemaElement],
     attr_defs: &[AttributeDefinition],
 ) -> Result<(), StorageError> {
-    let idx_table = index_table_name(&idx.index_id);
-    let idx_sks = all_sort_key_info(&idx.key_schema, attr_defs);
-    let base_sks = all_sort_key_info(base_key_schema, attr_defs);
-
-    if let Some(old) = old_item
-        && item_has_index_keys(old, &idx.key_schema)
-    {
-        delete_index_row_multi(tx, &idx_table, old, base_key_schema, &base_sks).await?;
-    }
-
-    if let Some(new) = new_item
-        && item_has_index_keys(new, &idx.key_schema)
-    {
-        let projected =
-            project_item_for_index(new, &idx.key_schema, base_key_schema, &idx.projection);
-        insert_index_row_multi(
-            tx,
-            &idx_table,
-            new,
-            &projected,
-            &idx.key_schema,
-            base_key_schema,
-            &idx_sks,
-            &base_sks,
-        )
-        .await?;
-    }
-
-    Ok(())
+    // The row says which item changed; what goes into the index is the item's
+    // state now, read under its row lock. Applying the image the row carried
+    // instead is only right if this row is the last word on the item, and three
+    // things break that: an online backfill that already wrote a newer state,
+    // a write that predated the index and told it nothing, and a second server
+    // process whose worker claims a later row for the same item first.
+    let Some(key_item) = new_item.or(old_item) else {
+        return Ok(());
+    };
+    crate::data::gsi_build::resync_base_key(tx, table_id, idx, base_key_schema, attr_defs, key_item)
+        .await
 }

@@ -300,12 +300,13 @@ jobs:
       # storage layer directly against this job's PostgreSQL. The PutItem create
       # race tests hold a create open in an outside transaction, and the
       # write-transaction conflict tests force a deadlock; both also need direct
-      # access. They build their own throwaway databases; the connection string is
-      # the server, not a database.
+      # access. The online GSI build tests reorder queue rows by hand and pause
+      # writers with a test hook. They build their own throwaway databases; the
+      # connection string is the server, not a database.
       - name: Run PostgreSQL storage-level tests
         env:
           EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
-        run: cargo test --release -p extenddb-storage-postgres --test vector_control_plane --test put_create_race --test twi_conflict --test stream_shard_retention
+        run: cargo test --release -p extenddb-storage-postgres --test vector_control_plane --test put_create_race --test twi_conflict --test stream_shard_retention --test gsi_online_build --test gsi_stale_writer
 
       # The daemonized server logs to syslog; dump it so server-side failures
       # are diagnosable from the job log.

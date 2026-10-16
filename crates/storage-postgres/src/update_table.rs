@@ -10,6 +10,9 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::util::effective_attribute_definitions;
 
 use crate::PostgresEngine;
+use crate::data::gsi_build::{
+    GsiBuild, build_gsis, drop_gsi_tables, is_transient, remove_failed_build,
+};
 
 /// Give back the build holds a failed `UpdateTable` took.
 ///
@@ -435,7 +438,7 @@ impl PostgresEngine {
                         r"INSERT INTO indexes
                            (table_id, index_name, index_id, index_type, key_schema, projection,
                             index_status, provisioned_throughput)
-                           VALUES ($1, $2, $3, 'GSI', $4, $5, 'ACTIVE', $6)",
+                           VALUES ($1, $2, $3, 'GSI', $4, $5, 'CREATING', $6)",
                     )
                     .bind(&table_id)
                     .bind(&create.index_name)
@@ -447,9 +450,9 @@ impl PostgresEngine {
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
                     created_index_ids.push(index_id);
-
-                    // Create the index data table on the data pool (P54 Bug 1).
-                    // Catalog metadata is committed first; data DDL follows.
+                    // The data table is created before this transaction commits, and
+                    // the index is published CREATING; see the block before the
+                    // commit and `data::gsi_build`.
                 }
 
                 if let Some(delete) = &update.delete {
@@ -748,6 +751,92 @@ impl PostgresEngine {
             return Err(e);
         }
 
+        // New GSIs get their data table BEFORE the catalog row commits. Every write
+        // reads the catalog fresh, so from the commit on, a write maintains this
+        // index; with the table created afterwards, writes in between failed on the
+        // missing table or queued rows the worker then dropped.
+        //
+        // Build ownership is taken here too, before the row is visible, so a peer's
+        // recovery sweep never sees a CREATING row with nobody holding it. It is an
+        // efficiency measure only: a second, concurrent build is correct, because a
+        // full backfill pass is enough on its own to publish the index.
+        let base_key_schema: Vec<KeySchemaElement> = serde_json::from_value(ks_json.clone())
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let base_attr_defs: Vec<AttributeDefinition> = serde_json::from_value(ad_json.clone())
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        // Built from the merged and pruned set rather than the request's subset: a
+        // new index may key on an attribute the base table already defined, and on
+        // a conflicting redeclaration the stored type is the one that counts.
+        let effective_attr_defs: Vec<AttributeDefinition> = merged_attr_defs_for_ddl
+            .clone()
+            .unwrap_or_else(|| base_attr_defs.clone());
+        let mut gsi_builds: Vec<GsiBuild> = Vec::new();
+        if let Some(updates) = &input.global_secondary_index_updates {
+            let creates = updates.iter().filter_map(|u| u.create.as_ref());
+            for (create, index_id) in creates.zip(&created_index_ids) {
+                let owner =
+                    crate::data::vector_index::build_ownership(&self.data_pool, index_id).await;
+                if owner.is_none() {
+                    // The build goes ahead without it: a second build of the same index
+                    // by the recovery worker is harmless to the index's contents, and
+                    // removal of a failed build is conditional on the row still being
+                    // CREATING, so a published index cannot be taken away.
+                    tracing::warn!(
+                        "could not take build ownership for GSI '{}' on '{}'; the recovery \
+                         worker may build it a second time",
+                        create.index_name,
+                        input.table_name,
+                    );
+                }
+                let made = async {
+                    let mut data_tx = self
+                        .data_pool
+                        .begin()
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    Self::create_index_data_table(
+                        &mut data_tx,
+                        index_id,
+                        &create.key_schema,
+                        &effective_attr_defs,
+                        &base_key_schema,
+                        &base_attr_defs,
+                    )
+                    .await?;
+                    data_tx
+                        .commit()
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))
+                }
+                .await;
+                if let Err(e) = made {
+                    tracing::error!(
+                        "Failed to create data table for GSI '{}' on '{}': {e}",
+                        create.index_name,
+                        input.table_name,
+                    );
+                    drop_gsi_tables(&self.data_pool, &gsi_builds).await;
+                    release_taken_holds(
+                        &self.data_pool,
+                        &table_id,
+                        &taken_holds,
+                        &input.table_name,
+                    )
+                    .await;
+                    return Err(e);
+                }
+                gsi_builds.push(GsiBuild {
+                    index_name: create.index_name.clone(),
+                    def: crate::gsi_queue::GsiIndexDef {
+                        index_id: index_id.clone(),
+                        key_schema: create.key_schema.clone(),
+                        projection: create.projection.clone(),
+                    },
+                    _owner: owner,
+                });
+            }
+        }
+
         // The commit is inside the same recovery, because it is the one remaining path
         // that can fail after a hold has been taken. A failing commit is also the
         // moment the infrastructure is already unhappy, which is the worst time to
@@ -758,86 +847,32 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))
         {
+            // A commit can fail on the way back after it took effect. Drop a new
+            // GSI's data table only if its catalog row really is absent: a CREATING
+            // row with no table would fail every synchronous write to the table
+            // until recovery re-created it.
+            let mut uncommitted = Vec::new();
+            for b in gsi_builds {
+                let present: Option<(i32,)> =
+                    sqlx::query_as("SELECT 1 FROM indexes WHERE table_id = $1 AND index_id = $2")
+                        .bind(&table_id)
+                        .bind(&b.def.index_id)
+                        .fetch_optional(&self.pool)
+                        .await
+                        .unwrap_or(Some((1,)));
+                if present.is_none() {
+                    uncommitted.push(b);
+                }
+            }
+            drop_gsi_tables(&self.data_pool, &uncommitted).await;
             release_taken_holds(&self.data_pool, &table_id, &taken_holds, &input.table_name).await;
             return Err(e);
         }
 
-        // P54 Bug 1: Execute data DDL on the data pool after catalog commit.
+        // Drop the data tables of deleted GSIs, after the catalog commit.
         if let Some(updates) = &input.global_secondary_index_updates {
-            let base_key_schema: Vec<KeySchemaElement> = serde_json::from_value(ks_json.clone())
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let base_attr_defs: Vec<AttributeDefinition> = serde_json::from_value(ad_json.clone())
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            // Build index columns from the merged and pruned set rather than the
-            // request's subset: a new index may key on an attribute the base
-            // table already defined and the request need not re-declare it, and
-            // on a conflicting redeclaration the stored type is the one the data
-            // table must be built from.
-            let effective_attr_defs = merged_attr_defs_for_ddl
-                .as_deref()
-                .unwrap_or(&base_attr_defs);
-
-            let mut create_idx = 0usize;
             let mut delete_idx = 0usize;
             for update in updates {
-                if let Some(create) = &update.create {
-                    let idx_id = &created_index_ids[create_idx];
-                    create_idx += 1;
-                    let data_result = async {
-                        let mut data_tx = self
-                            .data_pool
-                            .begin()
-                            .await
-                            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-                        Self::create_index_data_table(
-                            &mut data_tx,
-                            idx_id,
-                            &create.key_schema,
-                            effective_attr_defs,
-                            &base_key_schema,
-                            &base_attr_defs,
-                        )
-                        .await?;
-
-                        Self::backfill_gsi(
-                            &mut data_tx,
-                            &table_id,
-                            idx_id,
-                            &create.key_schema,
-                            effective_attr_defs,
-                            &base_key_schema,
-                            &base_attr_defs,
-                            &create.projection,
-                        )
-                        .await?;
-
-                        data_tx
-                            .commit()
-                            .await
-                            .map_err(|e| StorageError::Internal(e.to_string()))?;
-                        Ok::<(), StorageError>(())
-                    }
-                    .await;
-
-                    if let Err(e) = data_result {
-                        tracing::error!(
-                            "Failed to create data table for GSI '{}' on '{}', \
-                             cleaning up catalog: {e}",
-                            create.index_name,
-                            input.table_name,
-                        );
-                        let _ = sqlx::query(
-                            "DELETE FROM indexes WHERE table_id = $1 AND index_name = $2",
-                        )
-                        .bind(&table_id)
-                        .bind(&create.index_name)
-                        .execute(&self.pool)
-                        .await;
-                        return Err(e);
-                    }
-                }
-
                 if update.delete.is_some() {
                     let idx_id = &deleted_index_ids[delete_idx];
                     delete_idx += 1;
@@ -948,6 +983,75 @@ impl PostgresEngine {
                     "Failed to commit the vector data table drop on '{}': {e}",
                     input.table_name,
                 );
+            }
+        }
+
+        // Fill and publish the new GSIs, last, so a failed build cannot skip the
+        // rest of this request's post-commit work above. See `data::gsi_build` for
+        // why the wait and the barrier make the backfill see every write that did
+        // not see the index.
+        //
+        // A build that fails for a passing reason (a conflict, a timeout, a lost
+        // connection) leaves its index CREATING, with its data table, for the
+        // recovery worker to finish, and the request still succeeds, reporting the
+        // index as CREATING: the index exists, writes are maintaining it, and what
+        // is missing is a scan that can be re-run. One that would fail the same way
+        // every time is removed and reported, as before.
+        //
+        // In a task of its own, awaited here, so a client that disconnects cannot
+        // cancel the build halfway: that would leave the barrier's lock request or a
+        // page's row locks to be released whenever the pooled connection is next
+        // used.
+        if !gsi_builds.is_empty() {
+            let catalog = self.pool.clone();
+            let data = self.data_pool.clone();
+            let build_table_id = table_id.clone();
+            let table_name = input.table_name.clone();
+            let base_ks = base_key_schema.clone();
+            let attr_defs = effective_attr_defs.clone();
+            let task = tokio::spawn(async move {
+                let built = build_gsis(
+                    &catalog,
+                    &data,
+                    &build_table_id,
+                    &base_ks,
+                    &attr_defs,
+                    &gsi_builds,
+                )
+                .await;
+                let Err((first_failed, e)) = built else {
+                    return Ok(());
+                };
+                let unfinished = &gsi_builds[first_failed..];
+                if is_transient(&e) {
+                    for b in unfinished {
+                        tracing::warn!(
+                            "Could not finish building GSI '{}' on '{table_name}'; it stays \
+                             CREATING for the recovery worker to finish: {e}",
+                            b.index_name,
+                        );
+                    }
+                    return Ok(());
+                }
+                // A failure that would recur on every attempt: remove the index and
+                // report it, as before. The engine allows one index action per
+                // UpdateTable, so `unfinished` is the one build in practice; the
+                // loop is for the shape of the data, not for a second index.
+                for b in unfinished {
+                    tracing::error!(
+                        "Failed to build GSI '{}' on '{table_name}', removing it: {e}",
+                        b.index_name,
+                    );
+                    remove_failed_build(&catalog, &data, &build_table_id, b).await;
+                }
+                Err(e)
+            });
+            match task.await {
+                Ok(result) => result?,
+                Err(e) => tracing::error!(
+                    "GSI build task on '{}' ended abnormally; recovery will finish it: {e}",
+                    input.table_name
+                ),
             }
         }
 

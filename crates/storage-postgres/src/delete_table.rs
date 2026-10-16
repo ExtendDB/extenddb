@@ -113,6 +113,13 @@ impl PostgresEngine {
                 .begin()
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+            // The base table goes first. A GSI backfill page holds a share lock on
+            // base rows and then writes index rows; dropping the index tables first
+            // would wait on nothing, and the base drop would then wait on the page
+            // while the page waited on the dropped index table: a deadlock whose
+            // victim could be this transaction, after the catalog rows are gone.
+            // Dropped first, the base table waits for the page to finish.
+            Self::drop_data_table(&mut data_tx, &row.table_id).await?;
             for idx_id in &index_ids {
                 Self::drop_index_data_table(&mut data_tx, idx_id).await?;
             }
@@ -126,7 +133,6 @@ impl PostgresEngine {
                 .execute(&mut *data_tx)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
-            Self::drop_data_table(&mut data_tx, &row.table_id).await?;
 
             // Drop any still-pending GSI propagation rows for this table in the
             // same transaction that drops the tables. Workers tolerate orphans

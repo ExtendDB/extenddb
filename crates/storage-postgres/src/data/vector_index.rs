@@ -955,7 +955,7 @@ pub async fn build_ownership(data: &sqlx::PgPool, index_id: &str) -> Option<Buil
     let mut conn = match <sqlx::PgConnection as sqlx::Connection>::connect_with(&options).await {
         Ok(conn) => conn,
         Err(e) => {
-            tracing::warn!("could not open a session for vector build ownership: {e}");
+            tracing::warn!("could not open a session for index build ownership: {e}");
             return None;
         }
     };
@@ -971,7 +971,7 @@ pub async fn build_ownership(data: &sqlx::PgPool, index_id: &str) -> Option<Buil
         Ok(true) => Some(BuildOwner { _conn: conn }),
         Ok(false) => None,
         Err(e) => {
-            tracing::warn!("vector build ownership probe failed: {e}");
+            tracing::warn!("index build ownership probe failed: {e}");
             None
         }
     }
