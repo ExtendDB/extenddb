@@ -165,7 +165,7 @@ impl DynamoDbError {
             Self::InternalServerError(_) => "InternalServerError",
             Self::AccessDeniedException(_) => "AccessDeniedException",
             Self::MissingAuthenticationToken(_) => "MissingAuthenticationToken",
-            Self::IncompleteSignature(_) => "IncompleteSignature",
+            Self::IncompleteSignature(_) => "IncompleteSignatureException",
             Self::UnrecognizedClientException(_) => "UnrecognizedClientException",
             Self::ExpiredTokenException(_) => "ExpiredTokenException",
             Self::ExpiredIteratorException(_) => "ExpiredIteratorException",
