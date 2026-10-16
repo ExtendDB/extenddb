@@ -272,14 +272,25 @@ async fn generate_and_store_session(
 /// Evaluate a trust policy to determine if `caller_arn` is allowed to assume
 /// the role.
 ///
-/// Checks each Statement for `Effect: Allow` with a matching Principal and
-/// passing conditions. Principal matching supports:
+/// Follows IAM evaluation order: an explicit `Deny` that matches the caller
+/// wins over any `Allow`, exactly as the identity-policy evaluator does
+/// (`policy/evaluator.rs`, phase 1). Only if no matching `Deny` is found does
+/// a matching `Allow` grant assumption. See ADR-0022.
+///
+/// A statement "matches" when its Principal matches the caller and all of its
+/// conditions pass. Principal matching supports:
 /// - `"*"` (any caller)
 /// - `{"AWS": "arn:..."}` (single ARN)
 /// - `{"AWS": ["arn:...", ...]}` (list of ARNs)
 ///
 /// Conditions are evaluated using the policy engine's `AssumeRoleContext`,
-/// which supports `aws:PrincipalTag/*` and `sts:ExternalId` keys.
+/// which supports `aws:PrincipalTag/*` and `sts:ExternalId` keys. A statement
+/// whose `Condition` block fails to parse is treated as non-matching: it can
+/// neither grant via `Allow` nor block via `Deny`. Treating an unparseable
+/// `Deny` as "does not match" is the fail-open direction for that one
+/// statement, but a malformed trust policy is an administrator error surfaced
+/// at role creation, and matching the parse-failure handling of the `Allow`
+/// path keeps the two consistent.
 async fn evaluate_trust_policy(
     trust_policy: &Value,
     caller_arn: &str,
@@ -296,28 +307,50 @@ async fn evaluate_trust_policy(
         external_id: external_id.map(String::from),
     };
 
+    trust_decision(statements, caller_arn, &context)
+}
+
+/// Decide assumption from already-resolved statements and context.
+///
+/// Split out from `evaluate_trust_policy` so the Deny-over-Allow ordering is
+/// unit-testable without a `CatalogStore` (the store is only needed to build
+/// the context's principal tags).
+fn trust_decision(statements: &[Value], caller_arn: &str, context: &AssumeRoleContext) -> bool {
+    // Phase 1: explicit Deny. Any matching Deny statement blocks assumption
+    // outright, regardless of any Allow present in the same policy.
     for stmt in statements {
-        let effect = stmt.get("Effect").and_then(|e| e.as_str()).unwrap_or("");
-        if effect != "Allow" {
-            continue;
+        if effect_of(stmt) == "Deny" && statement_matches(stmt, caller_arn, context) {
+            return false;
         }
+    }
 
-        let principal = &stmt["Principal"];
-        if !principal_matches(principal, caller_arn) {
-            continue;
-        }
-
-        let conditions_pass = match parse_conditions(&stmt["Condition"]) {
-            Ok(conds) => conds.iter().all(|c| evaluate_condition(c, &context)),
-            Err(_) => false,
-        };
-
-        if conditions_pass {
+    // Phase 2: Allow. With no matching Deny, a matching Allow grants assumption.
+    for stmt in statements {
+        if effect_of(stmt) == "Allow" && statement_matches(stmt, caller_arn, context) {
             return true;
         }
     }
 
+    // Implicit deny: no statement granted assumption.
     false
+}
+
+/// The `Effect` string of a statement, or `""` when absent/non-string.
+fn effect_of(stmt: &Value) -> &str {
+    stmt.get("Effect").and_then(|e| e.as_str()).unwrap_or("")
+}
+
+/// Whether a trust-policy statement matches the caller: its Principal matches
+/// `caller_arn` and every condition passes. Independent of the statement's
+/// `Effect`, so both the Deny and Allow phases share one matching definition.
+fn statement_matches(stmt: &Value, caller_arn: &str, context: &AssumeRoleContext) -> bool {
+    if !principal_matches(&stmt["Principal"], caller_arn) {
+        return false;
+    }
+    match parse_conditions(&stmt["Condition"]) {
+        Ok(conds) => conds.iter().all(|c| evaluate_condition(c, context)),
+        Err(_) => false,
+    }
 }
 
 /// Check if a Principal field matches the given caller ARN.
@@ -369,5 +402,166 @@ async fn fetch_caller_tags(
             tracing::error!("fetch_caller_tags failed for {caller_arn}: {e:?}");
             std::collections::HashMap::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn ctx() -> AssumeRoleContext {
+        AssumeRoleContext {
+            principal_tags: HashMap::new(),
+            external_id: None,
+        }
+    }
+
+    fn ctx_with_tags(tags: &[(&str, &str)]) -> AssumeRoleContext {
+        AssumeRoleContext {
+            principal_tags: tags
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            external_id: None,
+        }
+    }
+
+    const CALLER: &str = "arn:aws:iam::123456789012:user/alice";
+
+    // ---- principal_matches ------------------------------------------------
+
+    #[test]
+    fn principal_wildcard_string_matches_any() {
+        assert!(principal_matches(&json!("*"), CALLER));
+    }
+
+    #[test]
+    fn principal_aws_single_arn_matches_exact() {
+        assert!(principal_matches(&json!({"AWS": CALLER}), CALLER));
+        assert!(!principal_matches(
+            &json!({"AWS": "arn:aws:iam::123456789012:user/bob"}),
+            CALLER
+        ));
+    }
+
+    #[test]
+    fn principal_aws_wildcard_matches_any() {
+        assert!(principal_matches(&json!({"AWS": "*"}), CALLER));
+    }
+
+    #[test]
+    fn principal_aws_list_matches_any_member() {
+        let p = json!({"AWS": ["arn:aws:iam::123456789012:user/bob", CALLER]});
+        assert!(principal_matches(&p, CALLER));
+        let p2 = json!({"AWS": ["arn:aws:iam::123456789012:user/bob"]});
+        assert!(!principal_matches(&p2, CALLER));
+    }
+
+    #[test]
+    fn principal_missing_aws_does_not_match() {
+        assert!(!principal_matches(
+            &json!({"Service": "ec2.amazonaws.com"}),
+            CALLER
+        ));
+        assert!(!principal_matches(&json!(null), CALLER));
+    }
+
+    // ---- effect_of --------------------------------------------------------
+
+    #[test]
+    fn effect_of_reads_string_or_defaults_empty() {
+        assert_eq!(effect_of(&json!({"Effect": "Allow"})), "Allow");
+        assert_eq!(effect_of(&json!({"Effect": "Deny"})), "Deny");
+        assert_eq!(effect_of(&json!({})), "");
+        assert_eq!(effect_of(&json!({"Effect": 5})), "");
+    }
+
+    // ---- trust_decision: core regression ---------------------------------
+
+    #[test]
+    fn allow_grants_when_principal_matches() {
+        let stmts = vec![json!({"Effect": "Allow", "Principal": {"AWS": CALLER}})];
+        assert!(trust_decision(&stmts, CALLER, &ctx()));
+    }
+
+    #[test]
+    fn no_matching_allow_is_implicit_deny() {
+        let stmts = vec![json!({
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws:iam::123456789012:user/bob"}
+        })];
+        assert!(!trust_decision(&stmts, CALLER, &ctx()));
+    }
+
+    /// The ticket regression: an explicit Deny must override a broad Allow.
+    /// Before the fix, Deny statements were skipped entirely and the caller
+    /// was granted assumption via the `Allow *`.
+    #[test]
+    fn explicit_deny_overrides_allow_regardless_of_order() {
+        // Deny listed after Allow.
+        let allow_then_deny = vec![
+            json!({"Effect": "Allow", "Principal": "*"}),
+            json!({"Effect": "Deny", "Principal": {"AWS": CALLER}}),
+        ];
+        assert!(
+            !trust_decision(&allow_then_deny, CALLER, &ctx()),
+            "explicit Deny after Allow must block assumption"
+        );
+
+        // Deny listed before Allow.
+        let deny_then_allow = vec![
+            json!({"Effect": "Deny", "Principal": {"AWS": CALLER}}),
+            json!({"Effect": "Allow", "Principal": "*"}),
+        ];
+        assert!(
+            !trust_decision(&deny_then_allow, CALLER, &ctx()),
+            "explicit Deny before Allow must block assumption"
+        );
+    }
+
+    #[test]
+    fn deny_targeting_other_principal_does_not_block() {
+        let stmts = vec![
+            json!({"Effect": "Allow", "Principal": "*"}),
+            json!({"Effect": "Deny", "Principal": {"AWS": "arn:aws:iam::123456789012:user/bob"}}),
+        ];
+        assert!(
+            trust_decision(&stmts, CALLER, &ctx()),
+            "a Deny aimed at a different principal must not block this caller"
+        );
+    }
+
+    #[test]
+    fn conditional_deny_only_blocks_when_condition_matches() {
+        // Deny alice only when her PrincipalTag/team == "contractors".
+        let stmts = vec![
+            json!({"Effect": "Allow", "Principal": "*"}),
+            json!({
+                "Effect": "Deny",
+                "Principal": {"AWS": CALLER},
+                "Condition": {"StringEquals": {"aws:PrincipalTag/team": "contractors"}}
+            }),
+        ];
+
+        // Tag matches → Deny applies → blocked.
+        assert!(!trust_decision(
+            &stmts,
+            CALLER,
+            &ctx_with_tags(&[("team", "contractors")])
+        ));
+
+        // Tag does not match → Deny inert → Allow grants.
+        assert!(trust_decision(
+            &stmts,
+            CALLER,
+            &ctx_with_tags(&[("team", "employees")])
+        ));
+    }
+
+    #[test]
+    fn empty_statement_list_denies() {
+        assert!(!trust_decision(&[], CALLER, &ctx()));
     }
 }
