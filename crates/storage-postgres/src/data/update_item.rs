@@ -8,9 +8,12 @@ use extenddb_core::types::{Item, TableKeyInfo};
 use extenddb_core::validation;
 use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{parse_sk, pk_to_text, sk_column, sk_info};
+use extenddb_storage::util::{sk_column, sk_info};
+
+use super::key_text::{parse_sk, pk_to_text};
 
 use super::index::{enqueue_async_indexes, fetch_write_path_indexes, sync_indexes};
+use super::item_to_json;
 use super::query::check_condition;
 use super::tx_helpers::write_stream_record_in_tx;
 use super::{data_table_name, json_to_item};
@@ -192,8 +195,7 @@ impl PostgresEngine {
 
             let new_item = if return_new { Some(item.clone()) } else { None };
 
-            let item_json =
-                serde_json::to_value(&item).map_err(|e| StorageError::Internal(e.to_string()))?;
+            let item_json = item_to_json(&item)?;
 
             if old_json.is_some() {
                 // Row existed and is locked by the read above, so update in place.

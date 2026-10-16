@@ -110,6 +110,9 @@ impl PostgresBootstrapper {
             .username(&self.config.app_user)
             .password(&self.config.app_password)
             .database(database)
+            // Lets a migration tell its own connections apart from a server's
+            // in pg_stat_activity (see `migrations::MIGRATE_APPLICATION_NAME`).
+            .application_name(migrations::MIGRATE_APPLICATION_NAME)
     }
 
     /// Build the connection URL for the application user and a named database.
@@ -434,6 +437,20 @@ impl Bootstrapper for PostgresBootstrapper {
     async fn pending_data_migrations(&self) -> OpResult<Vec<String>> {
         let pool = self.app_pool(&self.config.data_db).await?;
         migrations::pending_data_migrations(&pool).await
+    }
+
+    /// `004_escape_control_chars` rewrites rows in the data database and in the
+    /// catalog's `backup_items`, so while it is pending the migrate command must
+    /// be the only client of both databases. The same check runs again inside
+    /// the migration; this one runs before the catalog migrations write the new
+    /// version, so a refusal changes nothing.
+    async fn check_exclusive_access_for_pending_migrations(&self) -> OpResult<()> {
+        let data_pool = self.app_pool(&self.config.data_db).await?;
+        if !migrations::needs_exclusive_access(&data_pool).await? {
+            return Ok(());
+        }
+        let catalog_pool = self.app_pool(&self.config.catalog_db).await?;
+        migrations::refuse_if_other_clients_connected_anywhere(&catalog_pool, &data_pool).await
     }
 
     async fn record_data_connection(&self) -> OpResult<()> {
