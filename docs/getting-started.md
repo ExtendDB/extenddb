@@ -52,6 +52,9 @@ cargo build --release
 # MongoDB backend
 # (backends are mutually exclusive; disable the default postgres feature)
 cargo build --release --no-default-features --features mongodb
+
+# SQLite backend (developer mode, see "SQLite backend (developer mode)" below)
+cargo build --release --no-default-features --features sqlite
 ```
 
 Each build produces a single-backend binary. The `postgres`, `mongodb`, and
@@ -128,7 +131,15 @@ This generates a certificate with SANs: `localhost`, `127.0.0.1`, and `10.0.1.5`
 ### SQLite backend (developer mode)
 
 For local development and CI, extenddb can run against a SQLite backend instead
-of PostgreSQL. Select it at init time with `--backend sqlite`:
+of PostgreSQL. It requires its own build (the `postgres`, `mongodb`, and
+`sqlite` backends are mutually exclusive, each compiled into a single-backend
+binary — see [Build extenddb](#1-build-extenddb) above):
+
+```bash
+cargo build --release --no-default-features --features sqlite
+```
+
+Then select it at init time with `--backend sqlite`:
 
 ```bash
 ./target/release/extenddb init --backend sqlite

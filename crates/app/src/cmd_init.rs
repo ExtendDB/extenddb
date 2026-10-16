@@ -157,7 +157,8 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
     {
         anyhow::bail!(
             "this binary is built with the '{backend}' backend; \
-             --backend {requested} requires the extenddb-{requested} binary"
+             --backend {requested} requires rebuilding with \
+             `cargo build --release --no-default-features --features {requested}`"
         );
     }
     if args.backend.is_none() && Path::new(&args.config).exists() {
