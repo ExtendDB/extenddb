@@ -10,8 +10,9 @@ license.workspace = true
 
 [features]
 # Enables deterministic coordination hooks used only by the MongoDB integration
-# test binary. Production builds do not compile these hooks.
-test-hooks = []
+# test binary, the snapshot page-size setter, and the shared snapshot
+# conformance check. Production builds do not compile these hooks.
+test-hooks = ["extenddb-storage/test-hooks"]
 
 [dependencies]
 # Internal crates
@@ -61,3 +62,6 @@ dashmap.workspace = true
 # Property-based testing for the filter-pushdown parity harness
 # (crates/storage-mongodb/tests/pushdown_parity.rs).
 proptest = "1"
+# The crate's own tests need `test-hooks`; a dev-dependency on itself turns
+# the feature on for test builds only.
+extenddb-storage-mongodb = { path = ".", features = ["test-hooks"] }

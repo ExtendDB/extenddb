@@ -32,7 +32,7 @@ use extenddb_core::types::{
     VectorIndexUpdate,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{BackupEngine, DataEngine, TableEngine};
+use extenddb_storage::{BackupEngine, DataEngine, RestoreTableOverrides, TableEngine};
 use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -933,7 +933,12 @@ async fn restoring_a_backup_that_carries_vector_indexes_is_refused() {
     // and whose client only finds out on the first search.
     let err = s
         .engine
-        .restore_table_from_backup(ACCOUNT, "t_restored", &details.backup_arn)
+        .restore_table_from_backup(
+            ACCOUNT,
+            "t_restored",
+            &details.backup_arn,
+            RestoreTableOverrides::default(),
+        )
         .await
         .expect_err("restoring a vector-indexed backup must be refused");
     match err {
@@ -966,7 +971,12 @@ async fn restoring_a_backup_that_carries_vector_indexes_is_refused() {
         .await
         .expect("back up a plain table");
     s.engine
-        .restore_table_from_backup(ACCOUNT, "t_plain_restored", &plain.backup_arn)
+        .restore_table_from_backup(
+            ACCOUNT,
+            "t_plain_restored",
+            &plain.backup_arn,
+            RestoreTableOverrides::default(),
+        )
         .await
         .expect("a backup with no vector indexes must still restore");
 
@@ -1286,7 +1296,12 @@ async fn a_backup_taken_before_the_snapshot_column_existed_still_restores() {
         .expect("blank the snapshot the way a pre-migration backup has it");
 
     s.engine
-        .restore_table_from_backup(ACCOUNT, "t_legacy_restored", &details.backup_arn)
+        .restore_table_from_backup(
+            ACCOUNT,
+            "t_legacy_restored",
+            &details.backup_arn,
+            RestoreTableOverrides::default(),
+        )
         .await
         .expect("a pre-migration backup must still restore");
 

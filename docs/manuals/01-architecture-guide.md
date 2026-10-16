@@ -172,7 +172,7 @@ extenddb uses a dual-database architecture:
 - **Catalog database** (e.g., `extenddb_catalog`): Stores table metadata, account/user/group/role/policy definitions, access keys, settings, stream metadata, and metrics. Shared across all accounts.
 - **Data database** (e.g., `extenddb_catalog_data`): Stores user items, GSI/LSI data, and stream records. Each table gets its own PostgreSQL table.
 
-The catalog version is 0.0.3 on PostgreSQL and SQLite, stored in the `settings` table under the key `catalog_version` and checked at startup.
+The catalog version is 0.0.4 on PostgreSQL and SQLite, stored in the `settings` table under the key `catalog_version` and checked at startup.
 The MongoDB backend tracks its own catalog version, 0.0.2. <!-- version-literal-ok: MongoDB's backend has its own catalog version, deliberately not the compiled-in constant the documentation guard checks -->
 A mismatch between the compiled-in version and the stored one prevents the server from starting; run `extenddb migrate` to upgrade.
 

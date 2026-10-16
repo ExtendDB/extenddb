@@ -134,10 +134,18 @@ pub(crate) fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) ->
         // state: the documented delete-table sentence and the measured
         // phase-dependent vector refusal both arrive through this one arm.
         StorageError::IndexesInUse(msg) => DynamoDbError::ResourceInUseException(msg),
+        StorageError::BackupInUse(msg) => DynamoDbError::BackupInUseException(msg),
         StorageError::LimitExceeded(msg) => DynamoDbError::LimitExceededException(msg), // Retryable by definition, so it maps like Connection: a 503 the SDKs
         // retry, rather than a 500 they surface.
         StorageError::Transient(msg) => {
             tracing::warn!(transient_error = %msg, "transient storage error");
+            DynamoDbError::ServiceUnavailable("Service is temporarily unavailable".to_owned())
+        }
+        // Only backup and export jobs hold snapshots; a request that reaches
+        // this arm lost one mid-operation. The job owner restarts it; the
+        // client sees the same retryable 503 as a transient fault.
+        StorageError::SnapshotExpired(msg) => {
+            tracing::warn!(snapshot_error = %msg, "storage snapshot expired");
             DynamoDbError::ServiceUnavailable("Service is temporarily unavailable".to_owned())
         }
         StorageError::DeletionProtected(arn) => DynamoDbError::ValidationException(format!(

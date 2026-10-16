@@ -122,12 +122,30 @@ impl SqliteEngine {
         account_id: &str,
         table_name: &str,
     ) -> Result<TableDescription, StorageError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        self.build_table_description_on(&mut conn, account_id, table_name)
+            .await
+    }
+
+    /// Build the description through one connection, so a caller holding a
+    /// read transaction (the snapshot engine) reads the catalog rows from the
+    /// same snapshot as everything else it reads.
+    pub(crate) async fn build_table_description_on(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        account_id: &str,
+        table_name: &str,
+    ) -> Result<TableDescription, StorageError> {
         let row: Option<TableRow> = sqlx::query_as(&format!(
             "SELECT {TABLE_COLUMNS} FROM tables WHERE account_id = ? AND table_name = ?"
         ))
         .bind(account_id)
         .bind(table_name)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -137,7 +155,7 @@ impl SqliteEngine {
             "SELECT {INDEX_COLUMNS} FROM indexes WHERE table_id = ?"
         ))
         .bind(&row.table_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -145,12 +163,15 @@ impl SqliteEngine {
             "SELECT {VECTOR_INDEX_COLUMNS} FROM vector_indexes WHERE table_id = ?"
         ))
         .bind(&row.table_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let table_name_owned = row.table_name.clone();
+        let table_id = row.table_id.clone();
         let mut desc = self.build_table_description_from_row(account_id, row, index_rows)?;
+        desc.restore_summary =
+            Self::restore_summary_on(conn, &table_id, &desc.table_status).await?;
         let catalog_rows = vector_rows
             .into_iter()
             .map(VectorIndexRow::into_catalog_row)
@@ -386,5 +407,47 @@ fn zero_throughput() -> ProvisionedThroughputDescription {
         number_of_decreases_today: 0,
         last_increase_date_time: None,
         last_decrease_date_time: None,
+    }
+}
+
+impl SqliteEngine {
+    /// The RestoreSummary of a table created by RestoreTableFromBackup, or
+    /// `None` for any other table. In progress until the table is ACTIVE.
+    pub(crate) async fn restore_summary(
+        &self,
+        table_id: &str,
+        status: &extenddb_core::types::TableStatus,
+    ) -> Result<Option<extenddb_core::types::RestoreSummary>, StorageError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        Self::restore_summary_on(&mut conn, table_id, status).await
+    }
+
+    async fn restore_summary_on(
+        conn: &mut sqlx::SqliteConnection,
+        table_id: &str,
+        status: &extenddb_core::types::TableStatus,
+    ) -> Result<Option<extenddb_core::types::RestoreSummary>, StorageError> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT source_backup_arn, restore_date_time FROM table_restores WHERE table_id = ?",
+        )
+        .bind(table_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        Ok(row.map(|(arn, at)| {
+            #[allow(clippy::cast_precision_loss)]
+            let at = crate::sqlite_util::parse_timestamp(&at)
+                .map(|t| t.unix_timestamp_nanos() as f64 / 1e9)
+                .unwrap_or(0.0);
+            extenddb_core::types::RestoreSummary {
+                source_backup_arn: Some(arn),
+                restore_date_time: at,
+                restore_in_progress: *status == extenddb_core::types::TableStatus::Creating,
+            }
+        }))
     }
 }
