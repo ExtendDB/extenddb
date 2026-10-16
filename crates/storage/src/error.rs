@@ -51,6 +51,10 @@ pub enum StorageError {
     /// measured 2026-08-13).
     #[error("{0}")]
     LimitExceeded(String),
+    /// A backup an in-progress restore is still reading. Maps to
+    /// `BackupInUseException`.
+    #[error("{0}")]
+    BackupInUse(String),
     /// A failure that is expected to succeed on retry: I/O errors, pool
     /// timeouts, SQLITE_BUSY / SQLITE_LOCKED. Exists so queue workers can tell
     /// "this row can never be applied" (drop it, or the whole queue stalls)

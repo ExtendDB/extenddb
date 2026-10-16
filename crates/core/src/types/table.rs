@@ -197,6 +197,32 @@ pub struct SseDescription {
     pub kms_master_key_arn: Option<String>,
 }
 
+impl SseDescription {
+    /// The description ExtendDB reports for a stored `SSESpecification`.
+    ///
+    /// ExtendDB records SSE settings as metadata and does not encrypt with
+    /// KMS, so an enabled specification is reported as `ENABLED`/`KMS` with a
+    /// placeholder key ARN, and anything else as no description. This is the
+    /// shape the SQL backends already build in their table descriptions; it
+    /// lives here so `DescribeBackup` and the backends report one shape.
+    #[must_use]
+    pub fn from_specification(
+        spec: Option<&serde_json::Value>,
+        region: &str,
+        account_id: &str,
+    ) -> Option<Self> {
+        let enabled = spec?
+            .get("Enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        enabled.then(|| Self {
+            status: "ENABLED".to_owned(),
+            sse_type: Some(SseType::KMS),
+            kms_master_key_arn: Some(format!("arn:aws:kms:{region}:{account_id}:key/default")),
+        })
+    }
+}
+
 /// On-demand throughput settings for a table or index.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OnDemandThroughput {
@@ -769,13 +795,29 @@ impl TableDescription {
         Ok(())
     }
 
-    /// Populate `TableThroughputModeSummary` as an exact mirror of
-    /// `BillingModeSummary`.
+    /// Apply the rules every description handed to a client obeys. Called on
+    /// every path that does so (CreateTable, UpdateTable, DeleteTable,
+    /// DescribeTable, RestoreTableFromBackup), so each rule holds centrally
+    /// rather than in each response path or backend:
     ///
-    /// Called on every path that hands a description to a client, so the
-    /// measured invariant (both members together, always agreeing) holds
-    /// centrally instead of each backend assembling the mirror itself.
-    pub fn populate_table_throughput_mode_summary(&mut self) {
+    /// - `TableThroughputModeSummary` mirrors `BillingModeSummary`.
+    /// - `RestoreSummary` is reported only while the table is CREATING, and
+    ///   then with `RestoreInProgress: true`. The service drops it once the
+    ///   table is ACTIVE (measured on DynamoDB, and still absent 30 s later).
+    ///   Backends report the summary whenever the table has a registered
+    ///   restore.
+    pub fn prepare_for_response(&mut self) {
+        self.populate_table_throughput_mode_summary();
+        if self.table_status != TableStatus::Creating {
+            self.restore_summary = None;
+        } else if let Some(summary) = self.restore_summary.as_mut() {
+            summary.restore_in_progress = true;
+        }
+    }
+
+    /// Populate `TableThroughputModeSummary` as an exact mirror of
+    /// `BillingModeSummary`. Reached through [`Self::prepare_for_response`].
+    fn populate_table_throughput_mode_summary(&mut self) {
         self.table_throughput_mode_summary = self.billing_mode_summary.as_ref().map(Into::into);
     }
 }
@@ -811,8 +853,8 @@ pub struct TableDescription {
     pub provisioned_throughput: ProvisionedThroughputDescription,
     #[serde(rename = "BillingModeSummary", skip_serializing_if = "Option::is_none")]
     pub billing_mode_summary: Option<BillingModeSummary>,
-    /// Populated by the engine via `populate_table_throughput_mode_summary()`
-    /// on every path that emits a description. Backends leave this `None` and
+    /// Populated by the engine via `prepare_for_response()` on every path
+    /// that emits a description. Backends leave this `None` and
     /// must not assemble it independently.
     #[serde(
         rename = "TableThroughputModeSummary",
@@ -857,11 +899,22 @@ pub struct TableDescription {
 /// `RestoreTableFromBackup` reports the source backup and an in-progress flag
 /// on its response's `TableDescription`; the ground-truth runs of 2026-08-24
 /// (us-east-1 and eu-west-2) pin `SourceBackupArn` and
-/// `RestoreInProgress: true` there.
+/// `RestoreInProgress: true` there. Measured on DynamoDB: `SourceTableArn`
+/// is set, `RestoreDateTime` equals the source backup's
+/// `BackupCreationDateTime` (not the moment the restore ran), and
+/// DescribeTable stops reporting the member once the table is ACTIVE
+/// (applied to every description by `TableDescription::prepare_for_response`).
+/// Member names from botocore 1.33.13 `service-2.json` shape `RestoreSummary`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RestoreSummary {
     #[serde(rename = "SourceBackupArn", skip_serializing_if = "Option::is_none")]
     pub source_backup_arn: Option<String>,
+    #[serde(
+        rename = "SourceTableArn",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub source_table_arn: Option<String>,
     #[serde(rename = "RestoreDateTime")]
     pub restore_date_time: f64,
     #[serde(rename = "RestoreInProgress")]
@@ -1089,7 +1142,10 @@ pub enum TimeToLiveStatus {
 }
 
 /// TTL description returned by `DescribeTimeToLive` and `UpdateTimeToLive`.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+///
+/// Deserializable because a backup records it (`BackupTableDefinition`) for
+/// `DescribeBackup`'s `SourceTableFeatureDetails.TimeToLiveDescription`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TimeToLiveDescription {
     #[serde(rename = "TimeToLiveStatus")]
     pub time_to_live_status: TimeToLiveStatus,
@@ -1313,6 +1369,40 @@ mod tests {
         desc.billing_mode_summary = None;
         desc.populate_table_throughput_mode_summary();
         assert_eq!(desc.table_throughput_mode_summary, None);
+    }
+
+    /// `RestoreSummary` survives only while CREATING, with
+    /// `RestoreInProgress: true`; every other status drops it, whichever
+    /// operation returns the description.
+    #[test]
+    fn restore_summary_is_reported_only_while_creating() {
+        let restored = |status| TableDescription {
+            table_status: status,
+            restore_summary: Some(RestoreSummary {
+                source_backup_arn: Some("b".to_owned()),
+                source_table_arn: Some("t".to_owned()),
+                restore_date_time: 1.0,
+                restore_in_progress: false,
+            }),
+            ..Default::default()
+        };
+        let mut creating = restored(TableStatus::Creating);
+        creating.prepare_for_response();
+        let summary = creating.restore_summary.expect("kept while CREATING");
+        assert!(summary.restore_in_progress);
+        assert_eq!(summary.source_table_arn.as_deref(), Some("t"));
+
+        for status in [
+            TableStatus::Active,
+            TableStatus::Updating,
+            TableStatus::Deleting,
+        ] {
+            let mut done = restored(status);
+            done.prepare_for_response();
+            assert!(done.restore_summary.is_none(), "{status:?}");
+            let json = serde_json::to_value(&done).unwrap();
+            assert!(json.get("RestoreSummary").is_none(), "{status:?}");
+        }
     }
 
     /// Wire shape: the timestamp member is omitted, not null, when absent,

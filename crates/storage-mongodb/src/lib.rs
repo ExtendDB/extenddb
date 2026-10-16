@@ -9,6 +9,7 @@
 mod admin_store;
 mod authorization_store;
 mod backup_engine;
+pub use backup_engine::BackupSweep;
 mod bootstrapper;
 mod catalog_store;
 pub mod condition;
@@ -123,6 +124,17 @@ fn server_components_factory(
             backend: "mongodb".to_string(),
             details: e.to_string(),
         })?;
+
+        // A crash can leave a backup's metadata claimed by a restore or a
+        // delete that will never finish, or a restore target nothing will
+        // finish. The sweep removes only state whose heartbeat has stopped, so
+        // it is safe while another process shares this catalog; the GSI
+        // backfill worker repeats it periodically.
+        match engine.sweep_stale_backup_claims().await {
+            Ok(sweep) if sweep.is_empty() => {}
+            Ok(sweep) => tracing::warn!("startup backup sweep: {sweep}"),
+            Err(e) => tracing::error!("Failed to sweep stale backup claims: {e}"),
+        }
 
         let engine = Arc::new(engine);
 
@@ -306,6 +318,10 @@ impl GsiCache {
 }
 
 /// `MongoDB` storage backend.
+///
+/// Cloning is cheap and shares the connection pool and the GSI cache; a
+/// detached restore copy owns a clone so it outlives the request future.
+#[derive(Clone)]
 pub struct MongoEngine {
     client: mongodb::Client,
     pub(crate) catalog_db: mongodb::Database,
@@ -316,12 +332,15 @@ pub struct MongoEngine {
     /// [`GSI_CACHE_TTL`] are treated as misses and re-read from the catalog,
     /// so GSI additions/removals on other ExtendDB instances converge within
     /// the TTL window.
-    gsi_cache: GsiCache,
+    gsi_cache: Arc<GsiCache>,
     /// Read concern applied to every multi-document transaction this engine
     /// opens. Defaults to `snapshot` (real MongoDB); configurable via
     /// [`crate::config::MongoStorageConfig::transaction_read_concern`] for
     /// MongoDB-wire-compatible backends that don't support snapshot reads.
     tx_read_concern: mongodb::options::ReadConcern,
+    /// Heartbeat timing for backup claims and restore targets
+    /// (see [`backup_engine`]).
+    pub(crate) backup_liveness: backup_engine::BackupLiveness,
 }
 
 /// Build a MongoDB client from a connection string, applying the shared
@@ -392,6 +411,30 @@ fn apply_max_pool_size(options: &mut mongodb::options::ClientOptions, max_pool_s
     }
 }
 
+/// The engine's handle on the catalog database, with read preference
+/// `primary` and read concern `local` set on the database, so they apply to
+/// every catalog operation outside a transaction whatever the client's
+/// options say (inside a transaction the transaction's own options apply).
+///
+/// The backup claim protocol depends on this: DeleteBackup, a restore, and
+/// the stale-claim sweep each check the other's marker or CREATING target
+/// with a `find_one` after writing their own, and that check must see every
+/// write the primary has acknowledged. A secondary can lag, and a `majority`
+/// or `snapshot` read can miss a write acknowledged with `w: 1`.
+/// `connect_guarded` also refuses a non-primary read preference in the
+/// connection string; this does not rely on it. The write concern is not set
+/// here and follows the connection string.
+fn catalog_database(client: &mongodb::Client) -> mongodb::Database {
+    use mongodb::options::{DatabaseOptions, ReadConcern, ReadPreference, SelectionCriteria};
+    client.database_with_options(
+        "extenddb_catalog",
+        DatabaseOptions::builder()
+            .selection_criteria(SelectionCriteria::ReadPreference(ReadPreference::Primary))
+            .read_concern(ReadConcern::local())
+            .build(),
+    )
+}
+
 impl MongoEngine {
     pub async fn new(
         connection_string: &str,
@@ -401,7 +444,7 @@ impl MongoEngine {
     ) -> Result<Self, StorageError> {
         let client = connect_guarded(connection_string, max_connections, true).await?;
 
-        let catalog_db = client.database("extenddb_catalog");
+        let catalog_db = catalog_database(&client);
         let data_db = client.database("extenddb_data");
 
         Ok(Self {
@@ -409,8 +452,9 @@ impl MongoEngine {
             catalog_db,
             data_db,
             region: region.to_owned(),
-            gsi_cache: GsiCache::default(),
+            gsi_cache: Arc::default(),
             tx_read_concern,
+            backup_liveness: backup_engine::BackupLiveness::default(),
         })
     }
 
@@ -517,5 +561,55 @@ mod tests {
 
         assert!(!cache.set_if_generation("table-1", observed_generation, true));
         assert_eq!(cache.get_fresh("table-1"), None);
+    }
+
+    fn assert_primary_local(db: &mongodb::Database, from: &str) {
+        use mongodb::options::{ReadConcernLevel, ReadPreference, SelectionCriteria};
+        assert!(
+            matches!(
+                db.selection_criteria(),
+                Some(SelectionCriteria::ReadPreference(ReadPreference::Primary))
+            ),
+            "{from}: catalog read preference {:?}",
+            db.selection_criteria()
+        );
+        assert_eq!(
+            db.read_concern().map(|rc| rc.level.clone()),
+            Some(ReadConcernLevel::Local),
+            "{from}: catalog read concern"
+        );
+    }
+
+    /// R4B-3: the catalog database reads from the primary with read concern
+    /// `local` whatever the client's options say. The client here is built
+    /// without `connect_guarded`, so its secondary read preference is not
+    /// refused first. No server is contacted.
+    #[tokio::test]
+    async fn the_catalog_database_pins_primary_reads_over_the_client_options() {
+        let options = mongodb::options::ClientOptions::parse(
+            "mongodb://127.0.0.1:1/?readPreference=secondaryPreferred&readConcernLevel=majority",
+        )
+        .await
+        .expect("MongoDB URI must parse");
+        let client = mongodb::Client::with_options(options).expect("client");
+        assert!(
+            client.selection_criteria().is_some(),
+            "the client must carry the URI's read preference for this test to mean anything"
+        );
+        assert_primary_local(&super::catalog_database(&client), "catalog_database");
+    }
+
+    /// R4B-3: `MongoEngine::new` uses that database handle for the catalog.
+    #[tokio::test]
+    async fn the_engine_catalog_database_reads_from_the_primary() {
+        let engine = super::MongoEngine::new(
+            "mongodb://127.0.0.1:1/?readConcernLevel=majority",
+            "us-east-1",
+            None,
+            mongodb::options::ReadConcern::snapshot(),
+        )
+        .await
+        .expect("engine (no server is contacted)");
+        assert_primary_local(&engine.catalog_db, "MongoEngine::new");
     }
 }

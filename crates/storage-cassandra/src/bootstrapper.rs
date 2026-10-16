@@ -233,9 +233,16 @@ impl CassandraBootstrapper {
         };
         cassandra_config.ensure_cached_connection_string();
 
+        // The message alone, not `{e:?}`, which nested the variant name into it.
         Self::new(&cassandra_config, bootstrap_config)
             .await
-            .map_err(|e| StorageError::Internal(format!("{e:?}")))
+            .map_err(|e| match e {
+                OpError::Validation(m)
+                | OpError::AlreadyExists(m)
+                | OpError::NotFound(m)
+                | OpError::HasDependents(m)
+                | OpError::Internal(m) => StorageError::Internal(m),
+            })
     }
 }
 

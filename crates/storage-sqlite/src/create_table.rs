@@ -19,8 +19,16 @@ use extenddb_core::types::{
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn, table_arn};
 
-use crate::sqlite_util::{format_timestamp, is_unique_violation};
+use crate::sqlite_util::{format_epoch_seconds, format_timestamp, is_unique_violation};
 use crate::store::SqliteEngine;
+
+/// What a restore records about itself when its target is created.
+pub(crate) struct RestoreRegistration<'a> {
+    pub backup_arn: &'a str,
+    pub source_table_arn: &'a str,
+    /// Epoch seconds: the source backup's creation time.
+    pub restore_date_time: f64,
+}
 
 impl SqliteEngine {
     /// Create a table. When `defer_active` is set (the restore path), the row
@@ -34,6 +42,30 @@ impl SqliteEngine {
         account_id: &str,
         input: CreateTableInput,
         defer_active: bool,
+    ) -> Result<TableDescription, StorageError> {
+        self.create_table_impl_inner(account_id, input, defer_active, None)
+            .await
+    }
+
+    /// Create a restore target and register the restore (source backup,
+    /// source table ARN, restore time) in the write transaction that also
+    /// re-checks the backup is AVAILABLE and owned by `account_id`.
+    pub(crate) async fn create_table_for_restore(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        registration: &RestoreRegistration<'_>,
+    ) -> Result<TableDescription, StorageError> {
+        self.create_table_impl_inner(account_id, input, true, Some(registration))
+            .await
+    }
+
+    async fn create_table_impl_inner(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        defer_active: bool,
+        restore: Option<&RestoreRegistration<'_>>,
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
         // D1: every writer holds the engine write lock. This method runs two
@@ -116,6 +148,23 @@ impl SqliteEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+        if let Some(RestoreRegistration { backup_arn, .. }) = restore {
+            let available: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM backups WHERE backup_arn = ? \
+                 AND account_id = ? AND backup_status = 'AVAILABLE')",
+            )
+            .bind(backup_arn)
+            .bind(account_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if !available {
+                return Err(StorageError::Validation(format!(
+                    "Backup not found: {backup_arn}"
+                )));
+            }
+        }
+
         sqlx::query(
             "INSERT INTO tables \
              (account_id, table_name, key_schema, attribute_definitions, billing_mode, \
@@ -149,6 +198,21 @@ impl SqliteEngine {
                 StorageError::Internal(e.to_string())
             }
         })?;
+
+        if let Some(registration) = restore {
+            sqlx::query(
+                "INSERT INTO table_restores \
+                 (table_id, source_backup_arn, source_table_arn, restore_date_time) \
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(&table_id)
+            .bind(registration.backup_arn)
+            .bind(registration.source_table_arn)
+            .bind(format_epoch_seconds(registration.restore_date_time))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
 
         // GSI / LSI metadata.
         let mut gsi_ids: Vec<String> = Vec::new();

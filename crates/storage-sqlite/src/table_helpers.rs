@@ -150,7 +150,9 @@ impl SqliteEngine {
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let table_name_owned = row.table_name.clone();
+        let table_id = row.table_id.clone();
         let mut desc = self.build_table_description_from_row(account_id, row, index_rows)?;
+        desc.restore_summary = self.restore_summary(&table_id, &desc.table_status).await?;
         let catalog_rows = vector_rows
             .into_iter()
             .map(VectorIndexRow::into_catalog_row)
@@ -386,5 +388,32 @@ fn zero_throughput() -> ProvisionedThroughputDescription {
         number_of_decreases_today: 0,
         last_increase_date_time: None,
         last_decrease_date_time: None,
+    }
+}
+
+impl SqliteEngine {
+    /// The RestoreSummary of a table created by RestoreTableFromBackup, or
+    /// `None` for any other table. In progress until the table is ACTIVE.
+    pub(crate) async fn restore_summary(
+        &self,
+        table_id: &str,
+        status: &extenddb_core::types::TableStatus,
+    ) -> Result<Option<extenddb_core::types::RestoreSummary>, StorageError> {
+        let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT source_backup_arn, restore_date_time, source_table_arn \
+             FROM table_restores WHERE table_id = ?",
+        )
+        .bind(table_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        Ok(row.map(
+            |(arn, at, source_table_arn)| extenddb_core::types::RestoreSummary {
+                source_backup_arn: Some(arn),
+                source_table_arn,
+                restore_date_time: crate::sqlite_util::timestamp_epoch_seconds(&at),
+                restore_in_progress: *status == extenddb_core::types::TableStatus::Creating,
+            },
+        ))
     }
 }
