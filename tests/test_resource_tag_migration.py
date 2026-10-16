@@ -366,16 +366,18 @@ def test_resource_tag_migration_wire(deployment):
     assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
 
     # 2. Stop and run migrate WITHOUT --yes: it lists the rewrites with counts
-    #    and exits non-zero, and nothing on disk changes.
+    #    and exits 3 (work pending, as distinct from an error), and nothing on
+    #    disk changes.
     server.stop()
     before_docs = _sqlite_policy_docs(sqlite_path)
     assert any("dynamodb:ResourceTag" in d for d in before_docs)
 
     dry = _run("migrate", "--config", deployment["config"])
-    assert dry.returncode != 0, dry.stdout + dry.stderr
+    assert dry.returncode == 3, dry.stdout + dry.stderr
     out = dry.stdout + dry.stderr
     assert "Rewrite:" in out, out
-    assert "--yes is required" in out, out
+    assert "resource-tag condition-key rewrites" in out, out
+    assert "run again with --yes to apply" in out, out
     # The listing names policies and key counts, never a policy body.
     assert "key(s))" in out, out
     # Nothing changed on disk.

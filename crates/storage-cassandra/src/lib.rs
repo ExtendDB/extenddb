@@ -7,7 +7,7 @@
 //! as the underlying database. It provides a DynamoDB-compatible API backed
 //! by Cassandra's distributed architecture.
 
-pub const CATALOG_VERSION: &str = "0.0.3";
+pub const CATALOG_VERSION: &str = "0.0.4";
 
 mod admin_store;
 mod authorization_store;
@@ -36,6 +36,7 @@ mod update_table;
 mod worker_store;
 pub mod workers;
 
+pub use backup_engine::poll_abandoned_restores;
 pub use bootstrapper::CassandraBootstrapper;
 pub use catalog_store::CassandraCatalogStore;
 pub use config::CassandraStorageConfig;
@@ -155,6 +156,16 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
                 .await
         });
 
+        // Removes restore targets whose copy stopped heartbeating (the
+        // process running it died): once now, then periodically until
+        // shutdown.
+        let restore_sweep_engine = self.engine.clone();
+        let restore_sweep_shutdown = ctx.shutdown.clone();
+        let restore_sweep = tokio::spawn(async move {
+            backup_engine::poll_abandoned_restores(restore_sweep_engine, restore_sweep_shutdown)
+                .await;
+        });
+
         vec![
             control_plane,
             transaction_recovery,
@@ -163,6 +174,7 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
             ttl_cleanup,
             ttl_repair,
             ttl_audit,
+            restore_sweep,
         ]
     }
 

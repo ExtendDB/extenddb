@@ -130,6 +130,21 @@ fn canonical_resource(arn: &str, region: &str, account_id: &str) -> String {
     }
 }
 
+/// A `BackupArn` with the surrounding ASCII whitespace the engine trims
+/// before it resolves the backup (`check_backup_arn`) trimmed here too, so
+/// authorization evaluates the backup the engine acts on. Without this, a Deny
+/// on a backup ARN would be bypassed by sending the ARN with a trailing
+/// newline: authorization would evaluate `.../backup/<id>\n` and the engine
+/// act on `.../backup/<id>`.
+fn backup_arn_field(input: &Value) -> String {
+    str_field(input, "BackupArn")
+        .map(|arn| {
+            arn.trim_matches(|c: char| c.is_ascii_whitespace())
+                .to_owned()
+        })
+        .unwrap_or_default()
+}
+
 /// The resource ARN a tag operation authorizes against.
 ///
 /// `validate_tag_resource_arn_shape` has already run: the value is a table ARN,
@@ -242,7 +257,10 @@ pub(crate) fn validate_operation_arns(operation: &str, input: &Value) -> Result<
         }
         "DescribeBackup" | "DeleteBackup" => {
             if let Some(arn) = present("BackupArn")
-                && !arn_is_kind(arn, ArnKind::Backup)
+                && !arn_is_kind(
+                    arn.trim_matches(|c: char| c.is_ascii_whitespace()),
+                    ArnKind::Backup,
+                )
             {
                 return Err(DynamoDbError::ValidationException(
                     INVALID_BACKUP_ARN_MESSAGE.to_owned(),
@@ -490,7 +508,7 @@ pub(crate) fn authz_targets(
         }
         // Resource lives in BackupArn, validated to a backup before authz.
         "DescribeBackup" | "DeleteBackup" => one(canonical_resource(
-            &str_field(input, "BackupArn").unwrap_or_default(),
+            &backup_arn_field(input),
             region,
             account_id,
         )),
@@ -546,11 +564,7 @@ pub(crate) fn authz_targets(
         "RestoreTableFromBackup" => {
             let mut v = vec![(
                 operation.to_owned(),
-                canonical_resource(
-                    &str_field(input, "BackupArn").unwrap_or_default(),
-                    region,
-                    account_id,
-                ),
+                canonical_resource(&backup_arn_field(input), region, account_id),
             )];
             let target = table_resource_arn(
                 &str_field(input, "TargetTableName").unwrap_or_default(),
@@ -653,6 +667,38 @@ mod tests {
         assert_eq!(t.len(), 1, "expected one target for {op}: {t:?}");
         assert_eq!(t[0].0, op);
         t[0].1.clone()
+    }
+
+    /// The engine trims surrounding ASCII whitespace from a `BackupArn`
+    /// before it resolves the backup, so authorization evaluates the trimmed
+    /// backup and a Deny on it cannot be bypassed with a trailing newline.
+    #[test]
+    fn backup_arn_with_surrounding_whitespace_authorizes_the_trimmed_backup() {
+        let arn = format!("arn:aws:dynamodb:{R}:{A}:table/T/backup/01791976431438-73d8d5bc");
+        for spelled in [
+            format!("{arn}\n"),
+            format!(" {arn}"),
+            format!("\t{arn}\r\n"),
+        ] {
+            for op in ["DescribeBackup", "DeleteBackup"] {
+                assert!(validate_operation_arns(op, &json!({ "BackupArn": spelled })).is_ok());
+                assert_eq!(
+                    only(op, json!({ "BackupArn": spelled })),
+                    arn,
+                    "{spelled:?}"
+                );
+            }
+            let restore = authz_targets(
+                "RestoreTableFromBackup",
+                &json!({ "BackupArn": spelled, "TargetTableName": "X" }),
+                R,
+                A,
+            );
+            assert_eq!(
+                restore[0],
+                ("RestoreTableFromBackup".to_owned(), arn.clone())
+            );
+        }
     }
 
     // -- parser --

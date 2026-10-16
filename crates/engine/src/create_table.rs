@@ -103,7 +103,7 @@ pub async fn handle_create_table(
     );
     ctx.auth_cache.invalidate_resource_tags(&arn).await;
 
-    table_desc.populate_table_throughput_mode_summary();
+    table_desc.prepare_for_response();
     let output = CreateTableOutput {
         table_description: table_desc,
     };
@@ -132,6 +132,18 @@ pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> Dynamo
             ErrorMessageKey::TableInUse,
             &[&name],
         )),
+        // Only RestoreTableFromBackup raises this; its own mapping makes it
+        // TableInUseException. Elsewhere (a plain CreateTable into a name
+        // that is a CREATING restore target) the service's text is the one
+        // for a taken name, "Table already exists: <name>" (measured on
+        // DynamoDB), and the backup ARN is not disclosed to a caller
+        // authorized on the table alone.
+        StorageError::TableBeingRestored { table_name, .. } => {
+            DynamoDbError::ResourceInUseException(error_message(
+                ErrorMessageKey::TableAlreadyExists,
+                &[&table_name],
+            ))
+        }
         StorageError::IndexNotFound(name) => DynamoDbError::ValidationException(format!(
             "The table does not have the specified index: {name}"
         )),
@@ -143,6 +155,7 @@ pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> Dynamo
         // state: the documented delete-table sentence and the measured
         // phase-dependent vector refusal both arrive through this one arm.
         StorageError::IndexesInUse(msg) => DynamoDbError::ResourceInUseException(msg),
+        StorageError::BackupInUse(msg) => DynamoDbError::BackupInUseException(msg),
         StorageError::LimitExceeded(msg) => DynamoDbError::LimitExceededException(msg), // Retryable by definition, so it maps like Connection: a 503 the SDKs
         // retry, rather than a 500 they surface.
         StorageError::Transient(msg) => {

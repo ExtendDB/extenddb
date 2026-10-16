@@ -5,10 +5,19 @@
 
 use crate::error::StorageError;
 
+/// The partition of every ARN this server issues, and of the `DynamoDB` ARNs
+/// these helpers and `backup_arn` format. A backup ARN in another
+/// partition can name nothing here, so the engine refuses one as malformed.
+/// Other sites still spell `aws` out themselves (the tagging ARN parser, the
+/// PostgreSQL backup queries, the IAM and KMS ARN formats).
+pub const ARN_PARTITION: &str = "aws";
+
 /// Returns an ARN for the specified `DynamoDB` index.
 #[must_use]
 pub fn index_arn(region: &str, account_id: &str, table_name: &str, index_name: &str) -> String {
-    format!("arn:aws:dynamodb:{region}:{account_id}:table/{table_name}/index/{index_name}")
+    format!(
+        "arn:{ARN_PARTITION}:dynamodb:{region}:{account_id}:table/{table_name}/index/{index_name}"
+    )
 }
 
 /// The label that tells one stream on a table name from the next, in the
@@ -48,13 +57,15 @@ pub fn new_stream_label() -> String {
 /// Returns an ARN for the specified `DynamoDB` stream.
 #[must_use]
 pub fn stream_arn(region: &str, account_id: &str, table_name: &str, stream_label: &str) -> String {
-    format!("arn:aws:dynamodb:{region}:{account_id}:table/{table_name}/stream/{stream_label}")
+    format!(
+        "arn:{ARN_PARTITION}:dynamodb:{region}:{account_id}:table/{table_name}/stream/{stream_label}"
+    )
 }
 
 /// Returns an ARN for the specified `DynamoDB` table.
 #[must_use]
 pub fn table_arn(region: &str, account_id: &str, table_name: &str) -> String {
-    format!("arn:aws:dynamodb:{region}:{account_id}:table/{table_name}")
+    format!("arn:{ARN_PARTITION}:dynamodb:{region}:{account_id}:table/{table_name}")
 }
 
 /// Parse a stream ARN into (`table_name`, `stream_label`).

@@ -1314,3 +1314,147 @@ class TestMalformedCidrRejection:
             assert resp.status_code == 400, resp.text
         finally:
             self.mgmt.delete_user(self.account_id, user)
+
+
+# ---------------------------------------------------------------------------
+# Backups carry no resource tags
+# ---------------------------------------------------------------------------
+
+class TestBackupResourceTags:
+    """A caller allowed TagResource cannot satisfy a tag condition on a backup.
+
+    DescribeBackup, DeleteBackup and RestoreTableFromBackup are authorized on
+    the backup ARN. The service does not tag backups (TagResource takes table
+    and stream ARNs; the backup resource has no ResourceTag condition key), so
+    TagResource, UntagResource and ListTagsOfResource refuse a backup ARN, and
+    an ``aws:ResourceTag`` condition never matches a backup.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self, auth_env, mgmt, account_id, region):
+        self.endpoint = auth_env[0]
+        self.mgmt = mgmt
+        self.account_id = account_id
+        self.region = region
+
+    def _code(self, call) -> str:
+        with pytest.raises(ClientError) as exc_info:
+            call()
+        return exc_info.value.response["Error"]["Code"]
+
+    def test_tagging_a_backup_is_refused_and_grants_nothing(self):
+        user = f"bkp-tag-{uuid.uuid4().hex[:8]}"
+        ak, sk = _create_user_with_key(self.mgmt, self.account_id, user)
+        admin = f"adm-{uuid.uuid4().hex[:8]}"
+        admin_ak, admin_sk = _create_user_with_key(
+            self.mgmt, self.account_id, admin
+        )
+        resp = self.mgmt.put_user_policy(
+            self.account_id, admin, "full",
+            {"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Action": "dynamodb:*", "Resource": "*",
+            }]},
+        )
+        assert resp.status_code == 204
+        # A policy that grants DescribeBackup only on resources tagged
+        # classification=dev, and the tagging actions on table/*.
+        resp = self.mgmt.put_user_policy(
+            self.account_id, user, "bkp-tag-policy",
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["dynamodb:DescribeBackup",
+                                   "dynamodb:DescribeTable"],
+                        "Resource": "*",
+                        "Condition": {"StringEquals": {
+                            "aws:ResourceTag/classification": "dev",
+                        }},
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": ["dynamodb:TagResource",
+                                   "dynamodb:UntagResource",
+                                   "dynamodb:ListTagsOfResource"],
+                        "Resource": "arn:aws:dynamodb:*:*:table/*",
+                    },
+                ],
+            },
+        )
+        assert resp.status_code == 204
+
+        admin_client = _make_client(
+            self.endpoint, admin_ak, admin_sk, self.region
+        )
+        user_client = _make_client(self.endpoint, ak, sk, self.region)
+        table = f"abac-bkp-{uuid.uuid4().hex[:8]}"
+        backup_arn = None
+        dev = [{"Key": "classification", "Value": "dev"}]
+        try:
+            admin_client.create_table(
+                TableName=table,
+                AttributeDefinitions=[
+                    {"AttributeName": "pk", "AttributeType": "S"}
+                ],
+                KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+                BillingMode="PAY_PER_REQUEST",
+            )
+            wait_for_active(admin_client, table)
+            table_arn = admin_client.describe_table(
+                TableName=table)["Table"]["TableArn"]
+            backup_arn = admin_client.create_backup(
+                TableName=table, BackupName="abac-backup",
+            )["BackupDetails"]["BackupArn"]
+
+            def describe_backup():
+                return user_client.describe_backup(BackupArn=backup_arn)
+
+            assert self._code(describe_backup) == "AccessDeniedException"
+
+            # The step that used to succeed and turn the next call into Allow.
+            assert self._code(lambda: user_client.tag_resource(
+                ResourceArn=backup_arn, Tags=dev,
+            )) == "ValidationException"
+            assert self._code(describe_backup) == "AccessDeniedException"
+
+            # The other tagging operations refuse the backup ARN too, and so
+            # does a caller allowed dynamodb:* (nothing is stored).
+            assert self._code(lambda: user_client.untag_resource(
+                ResourceArn=backup_arn, TagKeys=["classification"],
+            )) == "ValidationException"
+            assert self._code(lambda: user_client.list_tags_of_resource(
+                ResourceArn=backup_arn,
+            )) == "ValidationException"
+            assert self._code(lambda: admin_client.tag_resource(
+                ResourceArn=backup_arn, Tags=dev,
+            )) == "ValidationException"
+            assert self._code(describe_backup) == "AccessDeniedException"
+
+            # Liveness: the same user and policy can tag the table, and the
+            # tag condition then allows DescribeTable on it. A backup does not
+            # take its table's tags.
+            assert self._code(lambda: user_client.describe_table(
+                TableName=table)) == "AccessDeniedException"
+            user_client.tag_resource(ResourceArn=table_arn, Tags=dev)
+            assert user_client.list_tags_of_resource(
+                ResourceArn=table_arn)["Tags"] == dev
+            user_client.describe_table(TableName=table)
+            assert self._code(describe_backup) == "AccessDeniedException"
+            # And the admin can still read the backup it made.
+            assert admin_client.describe_backup(BackupArn=backup_arn)[
+                "BackupDescription"]["BackupDetails"]["BackupArn"] == backup_arn
+        finally:
+            if backup_arn is not None:
+                try:
+                    admin_client.delete_backup(BackupArn=backup_arn)
+                except Exception:
+                    pass
+            try:
+                admin_client.delete_table(TableName=table)
+            except Exception:
+                pass
+            else:
+                wait_for_deleted(admin_client, table)
+            self.mgmt.delete_user(self.account_id, user)
+            self.mgmt.delete_user(self.account_id, admin)
