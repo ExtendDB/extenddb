@@ -11,7 +11,7 @@ adaptation when switching between ExtendDB and the real service.
 | Storage backend | Proprietary distributed storage | PostgreSQL (default), SQLite, or MongoDB, selected by mutually exclusive Cargo features at build time; one backend per binary |
 | Global Tables | CreateGlobalTable, replication | Not implemented (returns UnknownOperationException) |
 | DAX (Accelerator) | In-memory caching layer | Not applicable |
-| PartiQL | ExecuteStatement, BatchExecuteStatement | Not implemented (returns UnknownOperationException) |
+| PartiQL | ExecuteStatement, BatchExecuteStatement, ExecuteTransaction | Supported for all four statement types (see the PartiQL section below). Built behind a default-on `partiql` build feature. |
 | Numeric precision on partition/sort keys (MongoDB backend only) | 38 significant digits | 34 significant digits (BSON Decimal128). Values that exceed this precision are rejected at write and query time with a ValidationException rather than silently downcast. PostgreSQL backend supports the full 38 digits. |
 | Inverted numeric `BETWEEN` on a sort key (MongoDB backend only) | ValidationException ("The BETWEEN operator requires upper bound to be greater than or equal to lower bound") | Same error in all practical cases. The inversion guard compares bounds via `f64`, so a `KeyConditionExpression` `BETWEEN` whose bounds are inverted only beyond f64's ~15–17 significant digits (e.g. `BETWEEN 10000000000000002 AND 10000000000000001`) is not rejected and returns an empty result set instead. Valid ranges are never wrongly rejected. |
 | `TransactGetItems` overlapping an in-flight `TransactWriteItems` on the same item | May cancel the read with `TransactionCanceledException` and reason `TransactionConflict` | Never cancels for this reason on PostgreSQL: the read runs in one `REPEATABLE READ` snapshot taken at its first read, so it sees either all of the write or none of it and returns the pre-write state while the write is in flight. That is a legal serial order (the read ordered before the write) and the all-or-nothing guarantee holds, but a client that retries on `TransactionConflict` to observe the newest state will not get that signal here. SQLite behaves the same (one WAL snapshot); MongoDB with the default `snapshot` read concern likewise, and the row above covers the other read concerns. |
@@ -95,13 +95,31 @@ adaptation when switching between ExtendDB and the real service.
 | On-demand capacity | Automatic scaling | Fixed initial burst capacity (4000 WCU / 12000 RCU), no auto-scaling |
 | Throttling | Always on; throttles requests that exceed provisioned/burst capacity. No setting to disable | Configurable via `throttling_enabled` runtime setting (default: `true`) |
 
+## PartiQL
+
+ExtendDB implements `ExecuteStatement`, `BatchExecuteStatement`, and
+`ExecuteTransaction` as a translation over the existing data plane: a `SELECT`
+runs as a point read, a Query, or a Scan by the shape of its `WHERE`; `INSERT`,
+`UPDATE`, and `DELETE` run as the matching item writes. Behaviour was measured
+against the service in us-east-1 on 2026-10-19. The build feature `partiql` is on
+by default; with it off the three operations return `UnknownOperationException`.
+
+| Area | DynamoDB | ExtendDB |
+|------|----------|------|
+| Request-rate throttling of PartiQL operations | A PartiQL request is throttled against the table's provisioned or burst capacity like the classic operation it performs | Not throttled by table. The server's throttle is keyed on a request's top-level `TableName`, which a PartiQL request does not carry (the table is named inside the statement), so a PartiQL request is not counted against a table's token bucket. Consumed capacity is still reported. Parsing the statement in the throttle path to recover the table would duplicate the PartiQL parser outside the feature boundary, so it is deliberately not done. |
+| `SELECT ... WHERE pk = <v> AND sk IN [a, b]` consumed capacity | Billed as N point reads (for example 1.0 CU for two sort-key values) | The items returned are correct, but the read runs as one Query with a residual `IN` filter, so the reported capacity reflects the partition read (0.5 CU eventually consistent) rather than N point reads. A capacity-reporting difference only; the result set matches. |
+| PartiQL on a multi-attribute key schema | A `SELECT`, `INSERT`, `UPDATE`, or `DELETE` against a table or index whose key schema has more than one HASH or more than one RANGE attribute is refused with `ValidationException` "PartiQL statements cannot be executed on tables with multi-attribute HASH keys or multi-attribute RANGE keys." (A multi-attribute key is reachable on the service only through the few preview APIs that create one.) | Same. The base table's own key is single or composite (one HASH, optional one RANGE) in both the standard and the multi-part-key preview; the refusal applies when the statement's target (base table or named index) carries a multi-attribute key, and a write to a single-key base table is unaffected by a multi-attribute GSI on the same table. |
+| `BatchExecuteStatement` SELECT that names an index | Refused per statement with "Select statements within BatchExecuteStatement must specify the primary key in the where clause." (a batch read is a base-table point read; no index read is possible) | Same, whatever the `WHERE` names. A missing index is the per-statement "The table does not have the specified index". |
+| `ExecuteTransaction` SELECT that names an index | Refused with `ValidationException` "Validation failed in TransactStatements[i]: Reads on indices are not supported within transactions." | Same, for an existing GSI, a vector index, or a missing index. |
+| `ExecuteTransaction` read naming an unknown table | Cancels the whole transaction: `TransactionCanceledException` with a positional `ResourceNotFound` cancellation reason | Same. |
+| `ConsistentRead=true` on an index SELECT | A GSI or vector index is refused with "Strongly consistent read is not supported on Global Secondary Indexes", ahead of the vector refusal | Same ordering. |
+
 ## Operations Not Implemented
 
 The following operations return `UnknownOperationException`:
 
 - CreateGlobalTable, DescribeGlobalTable, ListGlobalTables, UpdateGlobalTable
 - DescribeGlobalTableSettings, UpdateGlobalTableSettings
-- ExecuteStatement, BatchExecuteStatement, ExecuteTransaction
 - DescribeContributorInsights, UpdateContributorInsights
 - DescribeKinesisStreamingDestination, EnableKinesisStreamingDestination, DisableKinesisStreamingDestination
 - DescribeTableReplicaAutoScaling, UpdateTableReplicaAutoScaling

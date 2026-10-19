@@ -25,6 +25,8 @@ mod import_export_io;
 mod index_helpers;
 mod legacy_filter;
 mod list_tables;
+#[cfg(feature = "partiql")]
+mod partiql;
 mod put_item;
 mod query;
 mod read_helpers;
@@ -40,6 +42,8 @@ mod ttl;
 mod update_item;
 mod update_table;
 mod vector_gate;
+#[cfg(feature = "partiql")]
+use partiql::PartiqlExecutor;
 
 pub use batch_get_item::handle_batch_get_item;
 pub use batch_write_item::handle_batch_write_item;
@@ -118,7 +122,23 @@ pub fn is_known_operation(operation: &str) -> bool {
             | "DescribeContinuousBackups"
             | "UpdateContinuousBackups"
             | "RestoreTableToPointInTime"
+    ) || is_known_partiql_operation(operation)
+}
+
+/// PartiQL operations, known only when the `partiql` feature is on. With the
+/// feature off this is always false, so the server answers them with
+/// `UnknownOperationException`.
+#[cfg(feature = "partiql")]
+fn is_known_partiql_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "ExecuteStatement" | "BatchExecuteStatement" | "ExecuteTransaction"
     )
+}
+
+#[cfg(not(feature = "partiql"))]
+fn is_known_partiql_operation(_operation: &str) -> bool {
+    false
 }
 use serde::Serialize;
 
@@ -472,6 +492,12 @@ pub async fn dispatch(
         "RestoreTableToPointInTime" => backup::handle_restore_table_to_point_in_time(body, ctx)
             .await
             .map(DispatchResult::body_only),
+        #[cfg(feature = "partiql")]
+        "ExecuteStatement" => ctx.execute_statement(body).await,
+        #[cfg(feature = "partiql")]
+        "BatchExecuteStatement" => ctx.batch_execute_statement(body).await,
+        #[cfg(feature = "partiql")]
+        "ExecuteTransaction" => ctx.execute_transaction(body).await,
         _ => Err(DynamoDbError::UnknownOperationException(String::new())),
     }
 }
