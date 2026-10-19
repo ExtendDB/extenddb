@@ -12,6 +12,7 @@ use extenddb_storage::util::{parse_sk, pk_to_text, sk_column, sk_info};
 
 use super::index::{enqueue_async_indexes, fetch_write_path_indexes, sync_indexes};
 use super::query::check_condition;
+use super::transactions::index_key_refs;
 use super::tx_helpers::write_stream_record_in_tx;
 use super::{data_table_name, json_to_item};
 use crate::PostgresEngine;
@@ -186,9 +187,29 @@ impl PostgresEngine {
             )
             .map_err(|e| StorageError::Validation(e.to_string()))?;
 
-            // Validate post-update item size (400 KB limit)
-            validation::validate_item_size(&item, self.max_item_size_bytes)
+            // Size the update the way the service does: what the statement
+            // writes plus a fixed cost per clause, against the item limit.
+            validation::validate_update_item_size(&item, actions, maps, self.max_item_size_bytes)
                 .map_err(|e| StorageError::Validation(e.to_string()))?;
+            // Secondary-index key validation on the post-update item, as the
+            // transacted Update path and the SQLite backend already do: a
+            // wrong-typed index key or an index key set to an empty value is a
+            // ValidationException, not a malformed index row.
+            if !indexes.is_empty() {
+                let idx_refs = index_key_refs(&indexes);
+                validation::validate_index_key_types(
+                    &item,
+                    &idx_refs,
+                    &key_info.attribute_definitions,
+                )
+                .map_err(|e| StorageError::Validation(e.to_string()))?;
+                validation::validate_index_key_not_empty(
+                    &item,
+                    &idx_refs,
+                    validation::SecondaryIndexEmptyContext::UpdateExpression,
+                )
+                .map_err(|e| StorageError::Validation(e.to_string()))?;
+            }
 
             let new_item = if return_new { Some(item.clone()) } else { None };
 

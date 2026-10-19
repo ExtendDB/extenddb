@@ -415,9 +415,11 @@ async fn execute_transact_write_op(
                 &key_info.attribute_definitions,
             )
             .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
-            validation::validate_item_size(&item, max_item_size_bytes).map_err(|e| {
-                TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
-            })?;
+            // A transacted Update is sized on the finished item, with the update
+            // wording in the cancellation reason.
+            validation::validate_transact_update_item_size(&item, max_item_size_bytes).map_err(
+                |e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())),
+            )?;
             // Secondary-index key validation on the post-update item: a type
             // mismatch is a cancellation reason; setting an index key to an
             // empty value is a top-level ValidationException.

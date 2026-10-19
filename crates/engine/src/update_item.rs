@@ -137,7 +137,7 @@ pub async fn handle_update_item(
         input.expected.as_ref().map_or(0, HashMap::len),
     )?;
 
-    let (condition, maps) = resolve_condition(
+    let (condition, mut maps) = resolve_condition(
         input.condition_expression.as_deref(),
         effective_expr_names.as_ref(),
         effective_expr_values.as_ref(),
@@ -145,6 +145,9 @@ pub async fn handle_update_item(
         input.conditional_operator,
         &ctx.limits,
     )?;
+    // The storage layer sizes a desugared legacy update against the item limit
+    // the way the service sizes `AttributeUpdates`, not an expression.
+    maps.legacy_attribute_updates = input.attribute_updates.is_some();
 
     // No UpdateExpression and no AttributeUpdates: no-op upsert.
     // Some("") still errors via parse_update_expr.

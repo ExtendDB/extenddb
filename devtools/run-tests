@@ -141,6 +141,10 @@ case "$BACKEND" in
         exit 1
         ;;
 esac
+# Expose the backend to the test suite so a test whose expectation is
+# backend-specific can gate itself (e.g. item-size rules enforced only on the
+# PostgreSQL and SQLite storage layers).
+export EXTENDDB_TEST_BACKEND="$BACKEND"
 
 # --- Validate: target flag required ---
 if [[ -z "$TARGET" ]]; then
