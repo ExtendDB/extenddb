@@ -26,6 +26,10 @@ use super::ast::{CompareOp, Expr, PathElement};
 pub struct ExpressionMaps {
     pub names: HashMap<String, String>,
     pub values: HashMap<String, AttributeValue>,
+    /// Set by the engine when the update arrived as legacy `AttributeUpdates`
+    /// and was desugared into an update expression. The service sizes that
+    /// form against the item limit differently from an expression.
+    pub legacy_attribute_updates: bool,
     /// Pre-parsed `BigDecimal` values for numeric placeholders.
     /// Populated eagerly by `new()` and refreshed by `pre_parse_numerics()`.
     parsed_numerics: HashMap<String, bigdecimal::BigDecimal>,
@@ -40,6 +44,7 @@ impl ExpressionMaps {
         let mut maps = Self {
             names,
             values,
+            legacy_attribute_updates: false,
             parsed_numerics: HashMap::new(),
         };
         maps.pre_parse_numerics();
