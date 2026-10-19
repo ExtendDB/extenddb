@@ -4,27 +4,36 @@
 
 This guide covers deploying extenddb in various environments beyond local development.
 
+> **Backend-specific sections.** This guide covers deployment concerns common to
+> all storage backends, and uses PostgreSQL — the default and reference backend —
+> for concrete examples. Sections headed *PostgreSQL* apply only to that backend.
+> For other backends, see their setup docs:
+> [Cassandra setup](../cassandra-setup.md) (experimental; local and production)
+> and [MongoDB setup](../local-mongodb-setup.md). SQLite does not need a separate
+> backend service; see its section in the getting-started guide.
+
 ## Architecture Overview
 
-extenddb is a single Rust binary that connects to PostgreSQL. All durable state lives in PostgreSQL; extenddb keeps only short-lived credential, policy, and table-metadata caches in process. This means:
+extenddb is a single Rust binary that connects to a storage backend. All durable state lives in the backend; extenddb keeps only short-lived credential, policy, and table-metadata caches in process. This means:
 
-- Multiple extenddb instances can share a PostgreSQL catalog (with caveats — see Multi-Instance below)
-- Standard PostgreSQL HA, backup, and replication tools provide durability
-- extenddb can run anywhere PostgreSQL is reachable
+- Multiple extenddb instances can share one backend catalog (with caveats — see Multi-Instance below)
+- The backend's own HA, backup, and replication tools provide durability
+- extenddb can run anywhere the storage backend is reachable
 
 ## Deployment Models
 
 ### Single-Node
 
-extenddb and PostgreSQL on the same host. Simplest setup, suitable for development, CI, and small workloads.
+ExtendDB and its storage backend on the same host. Simplest setup, suitable for development, CI, and small workloads.
 
 ```
-┌─────────────────────────┐
-│  Host                   │
-│  ┌─────┐  ┌──────────┐ │
-│  │ extenddb│──│PostgreSQL │ │
-│  └─────┘  └──────────┘ │
-└─────────────────────────┘
+┌──────────────────────────────┐
+│  Host                        │
+│  ┌──────────┐  ┌───────────┐ │
+│  │ ExtendDB │──│  Storage  │ │
+│  │          │  │  backend  │ │
+│  └──────────┘  └───────────┘ │
+└──────────────────────────────┘
 ```
 
 ```bash
@@ -34,51 +43,32 @@ extenddb serve --config extenddb.toml
 
 ### Separated Database
 
-extenddb on an application server, PostgreSQL on a dedicated database server or managed service.
+ExtendDB on an application server, the storage backend on a dedicated database
+server or managed service.
 
 ```
 ┌──────────┐       ┌──────────────┐
-│  App Host│──────▶│  DB Host     │
-│  extenddb    │       │  PostgreSQL  │
+│ App Host │──────▶│   DB Host    │
+│ ExtendDB │       │   Backend    │
 └──────────┘       └──────────────┘
 ```
 
-```bash
-extenddb init \
-  --pg-host db.example.com \
-  --pg-pass
-```
+Point ExtendDB at the remote backend at init time, and use an encrypted
+connection. The flags and connection-string format are backend-specific: for
+PostgreSQL see [Configuring PostgreSQL](#configuring-postgresql) below; for
+Cassandra see [Cassandra setup](../cassandra-setup.md).
 
-Configure the connection string in `extenddb.toml`:
+### Managed Database
 
-```toml
-[storage.postgres]
-connection_string = "postgresql://extenddb:<password>@db.example.com:5432/extenddb_catalog?sslmode=require"
-pool_size = 20
-```
-
-Use `sslmode=require` (or `verify-full` with a CA certificate) for encrypted database connections.
-
-### Managed PostgreSQL
-
-extenddb works with any PostgreSQL 14+ service:
-
-- **Amazon RDS for PostgreSQL** / **Amazon Aurora PostgreSQL**
-- **Google Cloud SQL for PostgreSQL**
-- **Azure Database for PostgreSQL**
-- **Self-managed PostgreSQL** with streaming replication
-
-```bash
-# Amazon RDS / Aurora example
-extenddb init \
-  --pg-host mydb.cluster-abc123.us-east-1.rds.amazonaws.com \
-  --pg-user extenddb_admin \
-  --pg-pass
-```
+ExtendDB works with managed database services as well as self-managed servers.
+The managed-service topology is the same as Separated Database: ExtendDB on an
+application host, the backend provided as a service. For the PostgreSQL managed
+services ExtendDB supports (Amazon RDS and Aurora, Google Cloud SQL, Azure
+Database), see [Configuring PostgreSQL](#configuring-postgresql).
 
 ### Containerized
 
-extenddb runs in Docker or Kubernetes. The binary has no runtime dependencies beyond libc and network access to PostgreSQL.
+ExtendDB runs in Docker or Kubernetes. The binary has no runtime dependencies beyond libc and network access to the storage backend.
 
 Example Dockerfile:
 
@@ -124,10 +114,10 @@ graceful shutdown. Outside a container, where you may want `stop` to work, add
 `--write-pid-file` — it writes the PID file to the usual `run_dir` path, which
 then has to be writable.
 
-What the health check covers: `extenddb healthcheck` exits 0 when the server is
+`extenddb healthcheck` exits 0 when the server is
 listening, completing TLS, and serving HTTP. Use it as a liveness probe, which is
 what a Docker `HEALTHCHECK` and a Kubernetes `livenessProbe` are for. `/health`
-does not query PostgreSQL, and for a liveness probe that is the behaviour you
+does not query the storage backend, and for a liveness probe that is the behaviour you
 want: one that failed on a database outage would restart every replica at once.
 A backend that is unreachable at startup does stop the server from listening, so
 container start-up failures are still caught.
@@ -141,11 +131,55 @@ For Kubernetes, run `extenddb init` as an init container or a one-time Job, then
 
 ### Air-Gapped
 
-extenddb requires no internet connectivity. All functionality is self-contained in the binary. Build on a connected host, transfer the binary and `extenddb.toml` to the air-gapped environment, and run.
+ExtendDB requires no internet connectivity. All functionality is self-contained in the binary. Build on a connected host, transfer the binary and `extenddb.toml` to the air-gapped environment, and run.
 
 Requirements in the air-gapped environment:
-- PostgreSQL 14+ (reachable from the extenddb host)
+- A supported storage backend, reachable from the ExtendDB host
 - The `extenddb` binary (statically linked or with matching libc)
+
+## Configuring PostgreSQL
+
+This section applies to the PostgreSQL backend. For Cassandra, see
+[Cassandra setup](../cassandra-setup.md); for MongoDB, see
+[MongoDB setup](../local-mongodb-setup.md).
+
+### Remote and separated databases
+
+Point ExtendDB at a remote PostgreSQL server at init time:
+
+```bash
+extenddb init \
+  --pg-host db.example.com \
+  --pg-pass
+```
+
+Configure the connection string in `extenddb.toml`:
+
+```toml
+[storage.postgres]
+connection_string = "postgresql://extenddb:<password>@db.example.com:5432/extenddb_catalog?sslmode=require"
+pool_size = 20
+```
+
+Use `sslmode=require` (or `verify-full` with a CA certificate) for encrypted
+database connections.
+
+### Managed PostgreSQL services
+
+ExtendDB works with any PostgreSQL 14+ service:
+
+- **Amazon RDS for PostgreSQL** / **Amazon Aurora PostgreSQL**
+- **Google Cloud SQL for PostgreSQL**
+- **Azure Database for PostgreSQL**
+- **Self-managed PostgreSQL** with streaming replication
+
+```bash
+# Amazon RDS / Aurora example
+extenddb init \
+  --pg-host mydb.cluster-abc123.us-east-1.rds.amazonaws.com \
+  --pg-user extenddb_admin \
+  --pg-pass
+```
 
 ## Production Checklist
 
@@ -160,15 +194,15 @@ Requirements in the air-gapped environment:
 
 - [ ] TLS is enabled by default. Verify it is not disabled in `extenddb.toml`
 - [ ] Replace the self-signed certificate with a CA-signed certificate
-- [ ] Use `sslmode=require` or `sslmode=verify-full` in the PostgreSQL connection string
+- [ ] Encrypt the connection to the storage backend. For PostgreSQL, use `sslmode=require` or `sslmode=verify-full` in the connection string
 
 ### Network
 
 - [ ] Set `bind_addr` to the appropriate interface (not `0.0.0.0` unless behind a load balancer)
-- [ ] Firewall: allow only necessary ports (extenddb port, PostgreSQL port)
+- [ ] Firewall: allow only necessary ports (extenddb port, storage backend port)
 - [ ] Consider a reverse proxy (nginx, HAProxy) for TLS termination, rate limiting, and access logging
 
-### Database
+### Database (PostgreSQL)
 
 - [ ] Use a dedicated PostgreSQL user for extenddb with minimal privileges
 - [ ] Configure PostgreSQL `max_connections` ≥ extenddb `pool_size` + 3
@@ -229,9 +263,12 @@ Run one extenddb instance per catalog. Multiple instances behind a load balancer
 - Every instance runs every background worker (TTL expiry, GSI backfill, stream retention, control-plane transitions). The workers are safe to run twice, but the work is duplicated.
 - `/health` is a liveness check that does not query the database, so a load balancer cannot use it to take an instance with a broken database connection out of rotation.
 
-On SQLite this limit is enforced: `extenddb serve` holds an exclusive lock on `<database>.lock` and a second server on the same file refuses to start. On PostgreSQL and MongoDB it is not enforced; if you start a second instance anyway, size `pool_size × instance_count + 3 × instance_count ≤ PostgreSQL max_connections`.
+On SQLite this limit is enforced: `extenddb serve` holds an exclusive lock on `<database>.lock` and a second server on the same file refuses to start. On PostgreSQL, MongoDB, and Cassandra it is not enforced. On PostgreSQL, if you start a second instance anyway, size `pool_size × instance_count + 3 × instance_count ≤ PostgreSQL max_connections`.
 
-## Performance Tuning
+## Performance Tuning (PostgreSQL)
+
+This section covers the PostgreSQL backend. For Cassandra tuning (consistency,
+token-aware routing, LWT contention), see [Cassandra setup](../cassandra-setup.md).
 
 ### Connection Pool
 

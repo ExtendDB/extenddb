@@ -38,7 +38,9 @@ See [Local Development with Docker Compose](local-dev-docker-compose.md).
 
 - **Storage backend** (one of):
   - PostgreSQL 14+ running locally (see `docs/local-postgres-setup.md`)
+  - SQLite (embedded; nothing to install)
   - MongoDB 7.0+ with replica set (see `docs/local-mongodb-setup.md`)
+  - Cassandra 4.1+ running locally (see `docs/cassandra-setup.md`)
 - Rust toolchain (1.88+)
 - AWS CLI v2 (for testing)
 - Python 3.10+ with virtual environment (see [Python Environment Setup](../README.md#python-environment-setup) in the README)
@@ -52,12 +54,15 @@ cargo build --release
 # MongoDB backend
 # (backends are mutually exclusive; disable the default postgres feature)
 cargo build --release --no-default-features --features mongodb
+
+# Cassandra backend
+cargo build --release --no-default-features --features cassandra
 ```
 
-Each build produces a single-backend binary. The `postgres`, `mongodb`, and
-`sqlite` features are mutually exclusive — a build enabling more than one is
-rejected at compile time — so to run two backends, build one binary per
-backend.
+Each build produces a single-backend binary. The `postgres`, `mongodb`,
+`sqlite`, and `cassandra` features are mutually exclusive — a build enabling
+more than one is rejected at compile time — so to run two backends, build one
+binary per backend.
 
 The binary is at `target/release/extenddb`.
 
@@ -71,11 +76,14 @@ Run `extenddb init` to create the catalog and data databases:
 
 # MongoDB
 ./target/release/extenddb init --backend mongodb
+
+# Cassandra
+./target/release/extenddb init --backend cassandra
 ```
 
 This will:
-- Create the `extenddb_catalog` database (catalog metadata)
-- Create the data database (user item data)
+- Create the `extenddb_catalog` database/keyspace (catalog metadata)
+- Create the data database/keyspace (user item data)
 - Generate an AES-256-GCM encryption key (for access key storage)
 - Create a default account and print the account ID
 - Create an `admin` user and print the credentials once
@@ -156,6 +164,49 @@ EXTENDDB__STORAGE__SQLITE__PATH=/data/other.sqlite ./target/release/extenddb ser
 
 Use `:memory:` (in the config, the environment variable, or `init
 --sqlite-path`) for an ephemeral database that is discarded on shutdown.
+
+### Cassandra backend
+
+ExtendDB can run against an Apache Cassandra cluster. The Cassandra backend is
+experimental; see [Cassandra setup](cassandra-setup.md) for its current
+limitations. Select it at init time with `--backend cassandra`:
+
+```bash
+./target/release/extenddb init --backend cassandra
+```
+
+For a local single-node cluster with authentication disabled, this needs no
+other flags. init uses development defaults: it contacts `localhost:9042`,
+creates keyspaces under the prefix `extenddb`, and sets a replication factor of
+1. It connects without authentication, which matches a stock Cassandra node
+(the default `AllowAllAuthenticator`). If the node has authentication enabled
+(for example `PasswordAuthenticator`), pass `--cassandra-user` and
+`--cassandra-pass`. init writes a `[storage.cassandra]` section to the config:
+
+```toml
+[storage.cassandra]
+contact_points = ["localhost:9042"]
+# username = "cassandra"          # Application user
+# password = "cassandra-password" # Application password
+keyspace_prefix = "extenddb"
+replication_factor = 1           # Single node (use 3+ for production)
+datacenter = "datacenter1"
+max_connections = 10
+```
+
+To override a default, pass the matching flag at init time:
+
+- `--cassandra-contact-points host1:9042,host2:9042` — one or more contact
+  points for a remote or multi-node cluster.
+- `--cassandra-user` and `--cassandra-pass` — admin credentials, if the cluster
+  requires authentication to create the keyspaces and the application role.
+- `--keyspace-prefix myapp` — a different keyspace prefix, so one cluster can
+  host more than one deployment.
+- `--replication-factor 3` — a higher replication factor for a multi-node
+  cluster.
+
+For replication strategy, datacenter topology, authentication, and production
+tuning, see `docs/cassandra-setup.md`.
 
 ### Generating a self-signed certificate manually
 
