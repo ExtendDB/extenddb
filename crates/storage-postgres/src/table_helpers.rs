@@ -5,8 +5,8 @@
 
 use extenddb_core::types::{
     AttributeDefinition, BillingMode, BillingModeSummary, GsiDescription, KeySchemaElement,
-    LsiDescription, Projection, ProvisionedThroughputDescription, SseDescription, SseType,
-    TableDescription, TableStatus,
+    LsiDescription, Projection, ProvisionedThroughputDescription, ScalarAttributeType,
+    SseDescription, SseType, TableDescription, TableStatus,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn};
@@ -100,8 +100,9 @@ impl PostgresEngine {
 
     /// Backfill existing items from the base table into a newly created GSI.
     ///
-    /// Uses batched reads with OFFSET/LIMIT to avoid loading all items into
-    /// memory at once (CB-19).
+    /// Pages the base table in batches so the whole table is not held in memory
+    /// at once. Must run inside a REPEATABLE READ transaction so the scan reads
+    /// one frozen snapshot while concurrent writers change the base table.
     // S2: Parameters mirror the SQL schema dimensions (account, table, index,
     // key schemas, attribute defs, projection). A wrapper struct would obscure
     // the call site without adding clarity.
@@ -137,63 +138,144 @@ impl PostgresEngine {
                 order_cols.extend([format!("sk{n}_s"), format!("sk{n}_n"), format!("sk{n}_b")]);
             }
         }
-        let sql = format!(
-            "SELECT item_data FROM {base_table} ORDER BY {} LIMIT $1 OFFSET $2",
-            order_cols.join(", ")
-        );
-        let mut offset: i64 = 0;
-        loop {
-            let rows: Vec<(serde_json::Value,)> = sqlx::query_as(&sql)
-                .bind(BATCH_SIZE)
-                .bind(offset)
-                .fetch_all(&mut **tx)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            if rows.is_empty() {
-                break;
+        let sql_order = order_cols.join(", ");
+        // The caller runs this inside a REPEATABLE READ transaction, so every
+        // page reads the same base-table snapshot: a concurrent insert or delete
+        // cannot shift a row across a page boundary, be read twice, or be
+        // skipped. Writes that commit after the snapshot are invisible here and
+        // are covered instead by the propagation queue, which the table's hold
+        // keeps parked until this backfill commits.
+        //
+        // A hash-only base table pages by keyset on the primary key for a linear
+        // scan. A table with a sort key pages by OFFSET over the primary-key
+        // order; the frozen snapshot makes that stable without a typed
+        // multi-column keyset predicate. The insert ignores a primary-key
+        // conflict, so a row read more than once never fails the creation.
+        if base_sks.is_empty() {
+            let mut last_pk: Option<String> = None;
+            loop {
+                let rows: Vec<(String, serde_json::Value)> = match &last_pk {
+                    Some(lp) => sqlx::query_as(&format!(
+                        "SELECT pk, item_data FROM {base_table} WHERE pk > $1 ORDER BY pk LIMIT $2"
+                    ))
+                    .bind(lp)
+                    .bind(BATCH_SIZE)
+                    .fetch_all(&mut **tx)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?,
+                    None => sqlx::query_as(&format!(
+                        "SELECT pk, item_data FROM {base_table} ORDER BY pk LIMIT $1"
+                    ))
+                    .bind(BATCH_SIZE)
+                    .fetch_all(&mut **tx)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?,
+                };
+                if rows.is_empty() {
+                    break;
+                }
+                let batch_len = i64::from(u16::try_from(rows.len()).unwrap_or(u16::MAX));
+                for (pk, item_json) in rows {
+                    last_pk = Some(pk);
+                    Self::backfill_one_row(
+                        tx,
+                        &idx_table,
+                        item_json,
+                        index_key_schema,
+                        base_key_schema,
+                        projection,
+                        &idx_sks,
+                        &base_sks,
+                    )
+                    .await?;
+                }
+                if batch_len < BATCH_SIZE {
+                    break;
+                }
             }
+        } else {
+            let sql = format!(
+                "SELECT item_data FROM {base_table} ORDER BY {sql_order} LIMIT $1 OFFSET $2"
+            );
+            let mut offset: i64 = 0;
+            loop {
+                let rows: Vec<(serde_json::Value,)> = sqlx::query_as(&sql)
+                    .bind(BATCH_SIZE)
+                    .bind(offset)
+                    .fetch_all(&mut **tx)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            // BATCH_SIZE=500, always fits in i64.
-            let batch_len = i64::from(u16::try_from(rows.len()).unwrap_or(u16::MAX));
-
-            for (item_json,) in rows {
-                let item = data::json_to_item(item_json)?;
-
-                let has_all_keys = index_key_schema
-                    .iter()
-                    .all(|ks| item.contains_key(&ks.attribute_name));
-                if !has_all_keys {
-                    continue;
+                if rows.is_empty() {
+                    break;
                 }
 
-                let projected = data::project_item_for_index(
-                    &item,
-                    index_key_schema,
-                    base_key_schema,
-                    projection,
-                );
+                // BATCH_SIZE=500, always fits in i64.
+                let batch_len = i64::from(u16::try_from(rows.len()).unwrap_or(u16::MAX));
 
-                data::insert_index_row_multi(
-                    tx,
-                    &idx_table,
-                    &item,
-                    &projected,
-                    index_key_schema,
-                    base_key_schema,
-                    &idx_sks,
-                    &base_sks,
-                )
-                .await?;
-            }
+                for (item_json,) in rows {
+                    Self::backfill_one_row(
+                        tx,
+                        &idx_table,
+                        item_json,
+                        index_key_schema,
+                        base_key_schema,
+                        projection,
+                        &idx_sks,
+                        &base_sks,
+                    )
+                    .await?;
+                }
 
-            if batch_len < BATCH_SIZE {
-                break;
+                if batch_len < BATCH_SIZE {
+                    break;
+                }
+                offset += batch_len;
             }
-            offset += batch_len;
         }
 
         Ok(())
+    }
+
+    /// Project one base-table row into the index table during a backfill.
+    ///
+    /// Skips a row that lacks the index key attributes (a sparse index), and
+    /// ignores a primary-key conflict so a row read more than once does not fail
+    /// the creation.
+    #[allow(clippy::too_many_arguments)]
+    async fn backfill_one_row(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        idx_table: &str,
+        item_json: serde_json::Value,
+        index_key_schema: &[KeySchemaElement],
+        base_key_schema: &[KeySchemaElement],
+        projection: &Projection,
+        idx_sks: &[(&str, ScalarAttributeType)],
+        base_sks: &[(&str, ScalarAttributeType)],
+    ) -> Result<(), StorageError> {
+        let item = data::json_to_item(item_json)?;
+
+        let has_all_keys = index_key_schema
+            .iter()
+            .all(|ks| item.contains_key(&ks.attribute_name));
+        if !has_all_keys {
+            return Ok(());
+        }
+
+        let projected =
+            data::project_item_for_index(&item, index_key_schema, base_key_schema, projection);
+
+        data::insert_index_row_multi_ignore_conflict(
+            tx,
+            idx_table,
+            &item,
+            &projected,
+            index_key_schema,
+            base_key_schema,
+            idx_sks,
+            base_sks,
+        )
+        .await
     }
 
     // TODO(fidelity): These two queries are not in a transaction. Under concurrent

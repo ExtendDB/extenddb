@@ -408,10 +408,17 @@ impl PostgresEngine {
         // Apply GSI updates (create/delete).
         let mut created_index_ids: Vec<String> = Vec::new();
         let mut deleted_index_ids: Vec<String> = Vec::new();
+        // Holds taken for GSIs this request creates, given back on every error
+        // path. Taken on the data database before the CREATING catalog row
+        // commits, a hold pauses this table's index propagation so a concurrent
+        // writer's maintenance for the new index waits in the queue until the
+        // backfill has committed.
+        let mut gsi_taken_holds: Vec<String> = Vec::new();
         // The merged and pruned attribute definitions persisted by this
         // UpdateTable, carried out of the catalog transaction so the post-commit
         // index DDL builds its columns from the same set the catalog now holds.
         let mut merged_attr_defs_for_ddl: Option<Vec<AttributeDefinition>> = None;
+        let gsi_catalog_result: Result<(), StorageError> = async {
         if let Some(updates) = &input.global_secondary_index_updates {
             for update in updates {
                 if let Some(create) = &update.create {
@@ -431,11 +438,19 @@ impl PostgresEngine {
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
                     let index_id = uuid::Uuid::new_v4().to_string();
+                    // Pause this table's propagation before the CREATING row
+                    // becomes visible, so a concurrent writer enqueues against an
+                    // index the queue already knows to hold back rather than
+                    // applying maintenance against a half-built index or dropping
+                    // it because the data table does not yet exist.
+                    crate::data::vector_index::take_hold(&self.data_pool, &table_id, &index_id)
+                        .await?;
+                    gsi_taken_holds.push(index_id.clone());
                     sqlx::query(
                         r"INSERT INTO indexes
                            (table_id, index_name, index_id, index_type, key_schema, projection,
                             index_status, provisioned_throughput)
-                           VALUES ($1, $2, $3, 'GSI', $4, $5, 'ACTIVE', $6)",
+                           VALUES ($1, $2, $3, 'GSI', $4, $5, 'CREATING', $6)",
                     )
                     .bind(&table_id)
                     .bind(&create.index_name)
@@ -448,8 +463,8 @@ impl PostgresEngine {
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
                     created_index_ids.push(index_id);
 
-                    // Create the index data table on the data pool (P54 Bug 1).
-                    // Catalog metadata is committed first; data DDL follows.
+                    // The index data table is created and backfilled after the
+                    // catalog commit; the catalog row stays CREATING until then.
                 }
 
                 if let Some(delete) = &update.delete {
@@ -537,6 +552,19 @@ impl PostgresEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             }
             merged_attr_defs_for_ddl = Some(effective);
+        }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = gsi_catalog_result {
+            release_taken_holds(
+                &self.data_pool,
+                &table_id,
+                &gsi_taken_holds,
+                &input.table_name,
+            )
+            .await;
+            return Err(e);
         }
 
         // Ids of the vector indexes this request deletes, so their data tables can
@@ -745,6 +773,13 @@ impl PostgresEngine {
         .await;
         if let Err(e) = vector_updates {
             release_taken_holds(&self.data_pool, &table_id, &taken_holds, &input.table_name).await;
+            release_taken_holds(
+                &self.data_pool,
+                &table_id,
+                &gsi_taken_holds,
+                &input.table_name,
+            )
+            .await;
             return Err(e);
         }
 
@@ -759,6 +794,13 @@ impl PostgresEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))
         {
             release_taken_holds(&self.data_pool, &table_id, &taken_holds, &input.table_name).await;
+            release_taken_holds(
+                &self.data_pool,
+                &table_id,
+                &gsi_taken_holds,
+                &input.table_name,
+            )
+            .await;
             return Err(e);
         }
 
@@ -787,6 +829,14 @@ impl PostgresEngine {
                         let mut data_tx = self
                             .data_pool
                             .begin()
+                            .await
+                            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+                        // Freeze the backfill on one base-table snapshot, so paging
+                        // over it is stable while concurrent writers change the base
+                        // table. Set before any statement acquires a snapshot.
+                        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                            .execute(&mut *data_tx)
                             .await
                             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -834,8 +884,52 @@ impl PostgresEngine {
                         .bind(&create.index_name)
                         .execute(&self.pool)
                         .await;
+                        // Drop the half-built data table and give the hold back so
+                        // the table's propagation resumes. Rows queued for this
+                        // index find the table gone and are consumed by the worker.
+                        if let Ok(mut cleanup_tx) = self.data_pool.begin().await {
+                            let _ = Self::drop_index_data_table(&mut cleanup_tx, idx_id).await;
+                            let _ = cleanup_tx.commit().await;
+                        }
+                        let _ = crate::data::vector_index::release_hold(
+                            &self.data_pool,
+                            &table_id,
+                            idx_id,
+                        )
+                        .await;
                         return Err(e);
                     }
+
+                    // The backfill committed: publish the index and resume
+                    // propagation. The catalog flips to ACTIVE, then the hold is
+                    // given back and the workers are woken to drain anything that
+                    // queued during the backfill. The hold is released whatever the
+                    // catalog update does, so a failed flip cannot leave the table's
+                    // propagation paused.
+                    let active_result = sqlx::query(
+                        "UPDATE indexes SET index_status = 'ACTIVE' \
+                         WHERE table_id = $1 AND index_name = $2",
+                    )
+                    .bind(&table_id)
+                    .bind(&create.index_name)
+                    .execute(&self.pool)
+                    .await;
+                    if let Err(release) =
+                        crate::data::vector_index::release_hold(&self.data_pool, &table_id, idx_id)
+                            .await
+                    {
+                        tracing::error!(
+                            "could not release the propagation hold after creating GSI '{}' on \
+                             '{}'; the table's index propagation stays paused until the orphan \
+                             sweep clears it: {release}",
+                            create.index_name,
+                            input.table_name,
+                        );
+                    }
+                    if let Some(ref q) = self.gsi_queue {
+                        q.notify_workers();
+                    }
+                    active_result.map_err(|e| StorageError::Internal(e.to_string()))?;
                 }
 
                 if update.delete.is_some() {

@@ -509,10 +509,15 @@ async fn apply_index(
     let idx_sks = all_sort_key_info(&idx.key_schema, attr_defs);
     let base_sks = all_sort_key_info(base_key_schema, attr_defs);
 
-    if let Some(old) = old_item
-        && item_has_index_keys(old, &idx.key_schema)
-    {
-        delete_index_row_multi(tx, &idx_table, old, base_key_schema, &base_sks).await?;
+    // Delete any existing index row for this base item before inserting the new
+    // image. The index holds at most one row per base primary key, so deleting by
+    // the base key (not by the key computed from the old image) removes a key the
+    // write moved away from and also a row a concurrent backfill inserted for the
+    // same item. That second case is what keeps a queued insert from colliding
+    // with a backfilled row on the `(pk, base_pk)` primary key. The base key is
+    // immutable, so either image carries it.
+    if let Some(base_image) = old_item.or(new_item) {
+        delete_index_row_multi(tx, &idx_table, base_image, base_key_schema, &base_sks).await?;
     }
 
     if let Some(new) = new_item
