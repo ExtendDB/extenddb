@@ -726,10 +726,8 @@ mod tests {
         }
         // A table ARN and a stream ARN pass the shape check.
         assert!(
-            validate_tag_resource_arn_shape(
-                "arn:aws:dynamodb:us-east-1:964157134968:table/bb"
-            )
-            .is_ok()
+            validate_tag_resource_arn_shape("arn:aws:dynamodb:us-east-1:964157134968:table/bb")
+                .is_ok()
         );
         assert!(
             validate_tag_resource_arn_shape(
@@ -749,9 +747,8 @@ mod tests {
             Err(DynamoDbError::ValidationException(ref m))
                 if m.contains("ARNs must start with 'arn:': banana")
         ));
-        let bad_type = validate_tag_resource_arn_shape(
-            "arn:aws:dynamodb:us-east-1:964157134968:banana/x",
-        );
+        let bad_type =
+            validate_tag_resource_arn_shape("arn:aws:dynamodb:us-east-1:964157134968:banana/x");
         assert!(matches!(
             bad_type,
             Err(DynamoDbError::ValidationException(ref m))
@@ -764,16 +761,11 @@ mod tests {
         // or not passes the shape check; the engine handler validates those
         // fields after authorization.
         assert!(
-            validate_tag_resource_arn_shape(
-                "arn:aws-cn:dynamodb:us-east-1:964157134968:table/bb"
-            )
-            .is_ok()
+            validate_tag_resource_arn_shape("arn:aws-cn:dynamodb:us-east-1:964157134968:table/bb")
+                .is_ok()
         );
         assert!(
-            validate_tag_resource_arn_shape(
-                "arn:aws:s3:us-east-1:964157134968:table/bb"
-            )
-            .is_ok()
+            validate_tag_resource_arn_shape("arn:aws:s3:us-east-1:964157134968:table/bb").is_ok()
         );
     }
 

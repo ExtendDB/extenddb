@@ -130,8 +130,10 @@ pub(crate) async fn authorize_request(
                     // message form. There is no specific stream to name, so the
                     // account stream space stands in for the resource.
                     let principal = authorization::principal_arn(identity);
-                    let resource =
-                        format!("arn:aws:dynamodb:{}:{account_id}:table/*/stream/*", state.region);
+                    let resource = format!(
+                        "arn:aws:dynamodb:{}:{account_id}:table/*/stream/*",
+                        state.region
+                    );
                     DynamoDbError::AccessDeniedException(authorization::deny_message(
                         &principal,
                         "dynamodb:GetRecords",
