@@ -87,6 +87,16 @@ implicitly denied.
   will now block it. This is the intended fix, but it is a behavior change for
   any deployment that (perhaps unknowingly) relied on `Deny` being ignored. There
   is no change for trust policies that contain only `Allow` statements.
+- **Upgrade impact for existing deployments:** two further changes affect
+  deployments upgrading from a build that ignored `Deny`. First, passing session
+  tags on an `AssumeRole` call now exercises `sts:TagSession`, so a role whose
+  trust policy allows only `sts:AssumeRole` denies a tagged call that previously
+  succeeded; allow `sts:TagSession` in the trust policy to keep passing tags.
+  Second, `create_role` now validates the trust document the way IAM does, so
+  automation that sent a document IAM rejects (a `Resource` field, `sts:*`, a
+  bare `"*"` principal, a missing `Principal`, and so on) starts getting a 400
+  at role creation. Existing stored roles are never re-validated, so no stored
+  role is locked out at evaluation.
 - **Condition-key resolution (three cases).** A condition key falls into one of
   three cases, in both trust-policy and identity-policy evaluation. (1) The
   context resolves the key to a value: evaluate normally. (2) The context
@@ -106,7 +116,8 @@ implicitly denied.
   such as `aws:MultiFactorAuthPresent` are absent for ExtendDB's caller model
   and keep absent-key semantics.
 - **Follow-up:** the decision logic was factored into a store-free
-  `trust_decision` helper (plus `statement_matches` / `effect_of`) so the
+  `trust_decision` helper (with `action_permitted`, `deny_statement_blocks`,
+  `allow_statement_grants` and `effect_of`) so the
   Deny-over-Allow ordering is unit-tested directly. The decision is made per
   exercised STS action: `sts:AssumeRole`, plus `sts:TagSession` when the call
   passes session tags (ExtendDB does not implement source identity, so

@@ -341,6 +341,13 @@ ARN, a list of ARNs, `{"AWS": "*"}`, a bare account id, or an account root ARN
 (`arn:aws:iam::<account>:root`); the last two match every caller in that
 account, for both `Allow` and `Deny`.
 
+Principal ARNs are matched case-sensitively: a `Deny` naming `user/Alice` does
+not block a caller asserted as `user/alice`. Assume authorizes on the trust
+policy alone. The endpoint is admin-only and the admin asserts the caller ARN;
+unlike IAM, ExtendDB does not also evaluate the caller's identity policy for
+`sts:AssumeRole`, so a role that trusts an account root grants assumption to an
+in-account caller on the strength of the trust policy by itself.
+
 What a trust-policy `Deny` does not do:
 
 - A statement whose `Condition` uses a condition key ExtendDB does not resolve,
@@ -418,6 +425,20 @@ Inline policies can be attached to users, groups, and roles:
       }]
     }'
 ```
+
+#### Condition keys in identity policies
+
+Identity-policy conditions on DynamoDB requests follow the same three-case rule
+as trust policies. A condition key the request resolves is evaluated normally. A
+key that is genuinely absent follows IAM absent-key semantics, including that a
+negated operator (`StringNotEquals`, `StringNotLike`, `ArnNotEquals`) on an
+absent single-valued key matches, so a `Deny` gated on one applies when the
+caller omits the key. A global key the service always populates but ExtendDB
+does not resolve (`aws:PrincipalOrgID`, `aws:SourceIp`, `aws:PrincipalType`,
+`aws:userid`, and the others listed for trust policies above) fails closed: a
+`Deny` on it blocks and an `Allow` on it does not grant. ExtendDB resolves
+`aws:PrincipalArn`, `aws:PrincipalAccount`, `aws:PrincipalTag/<key>` (tag key
+case-insensitive) and `dynamodb:ResourceTag/<key>` on a data-plane request.
 
 ### Permissions Boundaries
 
