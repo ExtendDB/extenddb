@@ -1122,6 +1122,35 @@ class TestTrustPolicyDeny:
         finally:
             self.mgmt.delete_user(self.account_id, user)
 
+    def test_string_not_equals_ignore_case_external_id(self):
+        # StringNotEqualsIgnoreCase is implemented, so a matching external id
+        # (any case) makes the condition false and the Deny inert; an absent
+        # external id matches the negated operator and the Deny blocks.
+        user, arn = self._caller()
+        try:
+            trust = _trust(
+                _stmt("Allow", {"AWS": arn}),
+                _stmt("Deny", {"AWS": arn},
+                      condition={"StringNotEqualsIgnoreCase": {"sts:ExternalId": "secret"}}),
+            )
+            role = f"bbr-{uuid.uuid4().hex[:8]}"
+            resp = self.mgmt.create_role(self.account_id, role, trust)
+            assert resp.status_code == 201, resp.text
+            try:
+                r = requests.post(
+                    f"{self.mgmt.base_url}/accounts/{self.account_id}/roles/{role}/assume",
+                    json={"caller_arn": arn, "session_name": "bb-session",
+                          "duration_seconds": 3600, "external_id": "SECRET"},
+                    auth=self.mgmt.admin_auth, timeout=30, verify=self.mgmt.verify,
+                )
+                assert r.status_code == ALLOW, r.text
+                assert self.mgmt.assume_role(
+                    self.account_id, role, arn, "bb-session").status_code == DENY
+            finally:
+                self.mgmt.delete_role(self.account_id, role)
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
     @pytest.mark.parametrize("trust", [
         _trust(_stmt("Allow", "arn:aws:iam::111122223333:user/x")),  # bare string ARN / non-object
         _trust({"Principal": {"AWS": "arn:aws:iam::111122223333:user/x"}, "Action": "sts:AssumeRole"}),  # missing Effect

@@ -284,6 +284,7 @@ fn is_negative_operator(op: &ConditionOperator) -> bool {
     matches!(
         op,
         ConditionOperator::StringNotEquals
+            | ConditionOperator::StringNotEqualsIgnoreCase
             | ConditionOperator::NumericNotEquals
             | ConditionOperator::DateNotEquals
             | ConditionOperator::StringNotLike
@@ -306,6 +307,9 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
         ConditionOperator::StringNotEquals => context_value != policy_value,
         ConditionOperator::StringEqualsIgnoreCase => {
             context_value.eq_ignore_ascii_case(policy_value)
+        }
+        ConditionOperator::StringNotEqualsIgnoreCase => {
+            !context_value.eq_ignore_ascii_case(policy_value)
         }
         ConditionOperator::StringLike => wildcard_match(policy_value, context_value),
         ConditionOperator::StringNotLike => !wildcard_match(policy_value, context_value),

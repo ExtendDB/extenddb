@@ -1100,8 +1100,31 @@ mod tests {
         assert!(trust_decision(&stmts, CALLER, &ctx_ext("secret"), false));
     }
 
-    // ---- fail closed on an unparseable Deny -------------------------------
+    #[test]
+    fn string_not_equals_ignore_case_external_id() {
+        // Deny alice unless the external id equals "secret" case-insensitively.
+        // With a matching id (any case) the negated condition is false, so the
+        // Deny does not apply and the Allow grants.
+        let stmts = vec![
+            allow_alice(),
+            json!({
+                "Effect": "Deny",
+                "Principal": {"AWS": CALLER},
+                "Action": "sts:AssumeRole",
+                "Condition": {"StringNotEqualsIgnoreCase": {"sts:ExternalId": "secret"}}
+            }),
+        ];
+        // Present and equal (mixed case): condition false, Deny inert, allowed.
+        assert!(trust_decision(&stmts, CALLER, &ctx_ext("SECRET"), false));
+        assert!(trust_decision(&stmts, CALLER, &ctx_ext("secret"), false));
+        // Present and different: condition true, Deny applies, blocked.
+        assert!(!trust_decision(&stmts, CALLER, &ctx_ext("other"), false));
+        // Absent: a negated operator on an absent single-valued key matches, so
+        // the Deny applies and blocks (confused-deputy guard).
+        assert!(!trust_decision(&stmts, CALLER, &ctx(), false));
+    }
 
+    // ---- fail closed on an unparseable Deny -------------------------------
     #[test]
     fn deny_with_unparseable_condition_fails_closed() {
         // An operator ExtendDB cannot evaluate must not silently drop the Deny.

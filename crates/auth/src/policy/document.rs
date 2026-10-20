@@ -93,6 +93,7 @@ pub enum ConditionOperator {
     StringEquals,
     StringNotEquals,
     StringEqualsIgnoreCase,
+    StringNotEqualsIgnoreCase,
     StringLike,
     StringNotLike,
     // Numeric
@@ -357,6 +358,7 @@ fn parse_base_operator(name: &str) -> Result<ConditionOperator, PolicyParseError
         "StringEquals" => Ok(ConditionOperator::StringEquals),
         "StringNotEquals" => Ok(ConditionOperator::StringNotEquals),
         "StringEqualsIgnoreCase" => Ok(ConditionOperator::StringEqualsIgnoreCase),
+        "StringNotEqualsIgnoreCase" => Ok(ConditionOperator::StringNotEqualsIgnoreCase),
         "StringLike" => Ok(ConditionOperator::StringLike),
         "StringNotLike" => Ok(ConditionOperator::StringNotLike),
         "NumericEquals" => Ok(ConditionOperator::NumericEquals),
