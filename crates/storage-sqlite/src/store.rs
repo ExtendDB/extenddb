@@ -688,6 +688,63 @@ mod d1_write_lock_tests {
         .await;
     }
 
+    /// The caller-tag lookup resolves tags for a `user/<name>` resource, which
+    /// is the form the server passes from the caller ARN. It also resolves a
+    /// `role/<name>` and an `assumed-role/<role>/<session>` resource to the
+    /// role's tags.
+    #[tokio::test]
+    async fn fetch_caller_tags_resolves_user_and_role() {
+        use extenddb_storage::management_store::ManagementStore;
+        let engine = engine().await;
+        let store = catalog_store(&engine);
+
+        ManagementStore::create_user(&store, "000000000000", "tag-user", None)
+            .await
+            .expect("create user");
+        ManagementStore::tag_user(
+            &store,
+            "000000000000",
+            "tag-user",
+            &[("team".to_owned(), "contractors".to_owned())],
+        )
+        .await
+        .expect("tag user");
+        let tags = ManagementStore::fetch_caller_tags(&store, "000000000000", "user/tag-user")
+            .await
+            .expect("fetch user tags");
+        assert_eq!(tags, vec![("team".to_owned(), "contractors".to_owned())]);
+
+        ManagementStore::create_role(
+            &store,
+            "000000000000",
+            "tag-role",
+            &json!({"Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Principal": {"AWS": "*"}, "Action": "sts:AssumeRole"}]}),
+        )
+        .await
+        .expect("create role");
+        ManagementStore::tag_role(
+            &store,
+            "000000000000",
+            "tag-role",
+            &[("env".to_owned(), "prod".to_owned())],
+        )
+        .await
+        .expect("tag role");
+        let role_tags = ManagementStore::fetch_caller_tags(&store, "000000000000", "role/tag-role")
+            .await
+            .expect("fetch role tags");
+        assert_eq!(role_tags, vec![("env".to_owned(), "prod".to_owned())]);
+        let assumed = ManagementStore::fetch_caller_tags(
+            &store,
+            "000000000000",
+            "assumed-role/tag-role/session1",
+        )
+        .await
+        .expect("fetch assumed-role tags");
+        assert_eq!(assumed, vec![("env".to_owned(), "prod".to_owned())]);
+    }
+
     #[tokio::test]
     async fn management_create_access_key_waits_for_the_write_lock() {
         use extenddb_storage::management_store::ManagementStore;
