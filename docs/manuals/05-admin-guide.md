@@ -424,6 +424,14 @@ upgrading:
   and read actions on the target table in addition to the restore action. A
   principal that could previously restore with only the restore permission now
   also needs those actions on the target table name.
+- **Denial messages.** An AccessDeniedException now ends with the clause the
+  service uses: "with an explicit deny in an identity-based policy" when an
+  explicit Deny matched the request, or "because no identity-based policy allows
+  the <action> action" otherwise. Earlier builds returned the common prefix with
+  no trailing clause and did not distinguish the two cases. The error code is
+  unchanged, so a client that checks the code or the substring "is not
+  authorized to perform" is unaffected; tooling that matched the full message
+  text verbatim will see the new clause.
 
 ### Permissions Boundaries
 
