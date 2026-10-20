@@ -880,7 +880,10 @@ async fn delete_table_waits_for_a_claimed_queue_row_then_drops_everything() {
 }
 
 /// UpdateItem that sets a GSI key attribute to the wrong type is refused, as the
-/// service, PutItem, and TransactWriteItems already refuse it.
+/// service, PutItem, and TransactWriteItems already refuse it. The call goes to
+/// the storage engine directly, past the engine's statement pass that reports a
+/// literal operand with the per-index `Type mismatch for Index Key` wording, so
+/// the refusal here carries the wording of the check on the written item.
 #[tokio::test]
 async fn update_item_rejects_a_wrong_typed_gsi_key() {
     let test = "update_item_rejects_a_wrong_typed_gsi_key";
@@ -915,7 +918,10 @@ async fn update_item_rejects_a_wrong_typed_gsi_key() {
     let Err(extenddb_storage::error::StorageError::Validation(msg)) = result else {
         panic!("a wrong-typed index key on UpdateItem was not a ValidationException");
     };
-    assert!(msg.contains("Type mismatch for Index Key g"), "{msg}");
+    assert!(
+        msg.contains("attempted to update the secondary index key to unsupported type"),
+        "{msg}"
+    );
     s.cleanup().await;
 }
 

@@ -82,7 +82,10 @@ impl SqliteEngine {
         // rather than silently producing a malformed / unmatchable index row.
         if !indexes.is_empty() {
             let idx_refs = index_key_refs(&indexes);
-            validation::validate_index_key_types(
+            // Literal operands were checked by the engine ahead of the condition;
+            // a value computed from the existing item is only known now and
+            // carries the service's computed-value wording.
+            validation::validate_index_key_types_after_update(
                 &item,
                 &idx_refs,
                 super::index::fresh_attr_defs(&indexes, &key_info.attribute_definitions),

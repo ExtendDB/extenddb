@@ -62,6 +62,13 @@ fn prepare_order_key(op: &TransactWriteOp<'_>) -> String {
     )
 }
 
+/// Map a key-type validation failure in PREPARE (table key, or a
+/// secondary-index key checked on a written item or a literal operand) to the
+/// internal reason the shared resolver recognises.
+fn key_type_mismatch_cancel(e: extenddb_core::error::DynamoDbError) -> CancellationReason {
+    CancellationReason::key_type_mismatch(e.to_string())
+}
+
 /// Map a `StorageError` raised while reading an item during PREPARE into a
 /// `CancellationReason`. A `TransactionConflict` (e.g. a concurrent transaction
 /// still holds the row, surfaced by `fetch_item_for_transaction` via
@@ -80,6 +87,129 @@ fn prepare_read_error_reason(e: StorageError) -> CancellationReason {
 }
 
 impl CassandraEngine {
+    /// [`validation::IndexKeyRef`] views over the indexes `key_info` carries,
+    /// GSIs first then LSIs, for secondary-index key validation inside a
+    /// transaction without a catalog read.
+    fn transact_index_key_refs(key_info: &TableKeyInfo) -> Vec<validation::IndexKeyRef<'_>> {
+        key_info
+            .global_secondary_indexes
+            .iter()
+            .chain(key_info.local_secondary_indexes.iter())
+            .map(|idx| validation::IndexKeyRef {
+                index_name: &idx.index_name,
+                key_schema: &idx.key_schema,
+            })
+            .collect()
+    }
+
+    /// A wrong-typed secondary-index key on the item a transaction Put member
+    /// writes is a per-item cancellation reason. The service reports it before
+    /// it evaluates the member's condition. Carried with the
+    /// internal key-type-mismatch reason and rewritten to `ValidationError` at
+    /// the boundary.
+    fn cancel_on_index_key_type_mismatch(
+        key_info: &TableKeyInfo,
+        written: &Item,
+    ) -> Result<(), CancellationReason> {
+        let idx_refs = Self::transact_index_key_refs(key_info);
+        if idx_refs.is_empty() {
+            return Ok(());
+        }
+        validation::validate_index_key_types(written, &idx_refs, &key_info.attribute_definitions)
+            .map_err(key_type_mismatch_cancel)
+    }
+
+    /// A literal operand an Update member assigns to a secondary-index key
+    /// must carry the key's declared type. The service checks this on the
+    /// statement itself, ahead of the member's condition and ahead of
+    /// applying any action. Same carrier code as the Put form.
+    fn cancel_on_index_key_literal_mismatch(
+        key_info: &TableKeyInfo,
+        actions: &[expression::UpdateAction],
+        maps: &ExpressionMaps,
+    ) -> Result<(), CancellationReason> {
+        let idx_refs = Self::transact_index_key_refs(key_info);
+        if idx_refs.is_empty() {
+            return Ok(());
+        }
+        validation::validate_index_key_literal_operands(
+            actions,
+            &idx_refs,
+            &key_info.attribute_definitions,
+            maps,
+        )
+        .map_err(key_type_mismatch_cancel)
+    }
+
+    /// A secondary-index key left empty on the item a transaction member
+    /// would write is a top-level `ValidationException` that aborts the whole
+    /// transaction. It is carried out of PREPARE as an internal reason and
+    /// converted by the caller once the markers placed so far have been rolled
+    /// back.
+    fn abort_on_empty_index_key(
+        key_info: &TableKeyInfo,
+        written: &Item,
+        ctx: validation::SecondaryIndexEmptyContext,
+    ) -> Result<(), CancellationReason> {
+        let idx_refs = Self::transact_index_key_refs(key_info);
+        if idx_refs.is_empty() {
+            return Ok(());
+        }
+        validation::validate_index_key_not_empty(written, &idx_refs, ctx)
+            .map_err(|e| CancellationReason::index_key_empty_abort(e.to_string()))
+    }
+
+    /// Compute the item a transacted Update member writes over `existing`,
+    /// running the checks in the order the service applies them: a literal
+    /// operand of the wrong type on a secondary-index key (a cancellation
+    /// reason) ahead of the member's condition, then the condition against the
+    /// pre-update image, then the statement itself, then on the written item a
+    /// computed index-key value of the wrong type (a cancellation reason) and
+    /// an index key left empty (a top-level abort).
+    ///
+    /// Used on the first PREPARE pass and again on every create-race retry, so
+    /// the two paths cannot drift apart.
+    fn compute_transact_update(
+        key_info: &TableKeyInfo,
+        key: &Item,
+        existing: Option<&Item>,
+        actions: &[expression::UpdateAction],
+        condition: Option<&expression::Expr>,
+        maps: &ExpressionMaps,
+        return_values_on_ccf: ReturnValuesOnConditionCheckFailure,
+    ) -> Result<Item, CancellationReason> {
+        Self::cancel_on_index_key_literal_mismatch(key_info, actions, maps)?;
+        let empty = Item::new();
+        eval_condition(
+            condition,
+            existing.unwrap_or(&empty),
+            maps,
+            return_values_on_ccf,
+            existing,
+        )?;
+        let mut item = existing.cloned().unwrap_or_else(|| key.clone());
+        expression::apply_update_validated(actions, &mut item, maps, &[], &[])
+            .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+        let idx_refs = Self::transact_index_key_refs(key_info);
+        if !idx_refs.is_empty() {
+            // A value computed from the existing item (an attribute reference,
+            // the fallback of if_not_exists) is only known now, and the service
+            // reports it with its own wording as a cancellation reason.
+            validation::validate_index_key_types_after_update(
+                &item,
+                &idx_refs,
+                &key_info.attribute_definitions,
+            )
+            .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+            Self::abort_on_empty_index_key(
+                key_info,
+                &item,
+                validation::SecondaryIndexEmptyContext::UpdateExpression,
+            )?;
+        }
+        Ok(item)
+    }
+
     /// Implementation of `DataEngine::transact_get_items`.
     ///
     /// Uses a two-phase read protocol to ensure serializability:
@@ -361,7 +491,14 @@ impl CassandraEngine {
                     )
                     .await;
                 }
-                Err(StorageError::TransactionCanceled(reasons))
+                // Key faults leave PREPARE under internal reason codes; the
+                // shared resolver applies the service's precedence across
+                // members and decides between a cancellation and a top-level
+                // ValidationException.
+                match CancellationReason::resolve_key_faults(reasons) {
+                    Ok(reasons) => Err(StorageError::TransactionCanceled(reasons)),
+                    Err(message) => Err(StorageError::Validation(message)),
+                }
             }
         }
     }
@@ -453,7 +590,7 @@ impl CassandraEngine {
                     &key_info.key_schema,
                     &key_info.attribute_definitions,
                 )
-                .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+                .map_err(key_type_mismatch_cancel)?;
 
                 // Read existing item
                 let mut existing = self
@@ -467,6 +604,16 @@ impl CassandraEngine {
                     item.keys().collect::<Vec<_>>(),
                     existing.is_some()
                 );
+
+                // On a Put member both secondary-index key checks run ahead of
+                // the condition: a wrong type is a cancellation reason, an
+                // empty value aborts the whole transaction.
+                Self::cancel_on_index_key_type_mismatch(key_info, item)?;
+                Self::abort_on_empty_index_key(
+                    key_info,
+                    item,
+                    validation::SecondaryIndexEmptyContext::Item,
+                )?;
 
                 // Evaluate condition
                 let empty = Item::new();
@@ -559,7 +706,7 @@ impl CassandraEngine {
                     &key_info.key_schema,
                     &key_info.attribute_definitions,
                 )
-                .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+                .map_err(key_type_mismatch_cancel)?;
 
                 // Read existing item
                 let existing = self
@@ -660,7 +807,7 @@ impl CassandraEngine {
                     &key_info.key_schema,
                     &key_info.attribute_definitions,
                 )
-                .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+                .map_err(key_type_mismatch_cancel)?;
 
                 // Read existing item
                 let mut existing = self
@@ -668,26 +815,16 @@ impl CassandraEngine {
                     .await
                     .map_err(prepare_read_error_reason)?;
 
-                // Create item from key if not exists
-                let mut item = existing.clone().unwrap_or_else(|| (*key).clone());
-
-                // Evaluate condition against empty item if non-existent
-                let condition_item = if existing.is_some() {
-                    &item
-                } else {
-                    &std::collections::BTreeMap::new()
-                };
-                eval_condition(
+                // Index-key checks, condition and apply, in the service's order.
+                let mut item = Self::compute_transact_update(
+                    key_info,
+                    key,
+                    existing.as_ref(),
+                    actions,
                     *condition,
-                    condition_item,
                     maps,
                     *return_values_on_ccf,
-                    existing.as_ref(),
                 )?;
-
-                // Apply update actions
-                expression::apply_update_validated(actions, &mut item, maps, &[], &[])
-                    .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
 
                 // Validate item size
                 const MAX_ITEM_SIZE_BYTES: usize = 400 * 1024;
@@ -714,39 +851,19 @@ impl CassandraEngine {
                     {
                         Ok(()) => break,
                         Err(r) if r.code == "TransactionConflict" && attempt < 5 => {
-                            let committed = self.wait_for_commit_and_read(key_info, key).await?;
-                            if let Some(winner) = committed {
-                                eval_condition(
-                                    *condition,
-                                    &winner,
-                                    maps,
-                                    *return_values_on_ccf,
-                                    Some(&winner),
-                                )?;
-                                // Re-apply expression on top of winner's item.
-                                item = winner.clone();
-                                expression::apply_update_validated(
-                                    actions,
-                                    &mut item,
-                                    maps,
-                                    &[],
-                                    &[],
-                                )
-                                .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
-                                existing = Some(winner);
-                            } else {
-                                // Winner rolled back; retry the insert.
-                                existing = None;
-                                item = (*key).clone();
-                                expression::apply_update_validated(
-                                    actions,
-                                    &mut item,
-                                    maps,
-                                    &[],
-                                    &[],
-                                )
-                                .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
-                            }
+                            // Recompute over the winner's committed image (or
+                            // over the key alone if the winner rolled back),
+                            // through the same sequence as the first pass.
+                            existing = self.wait_for_commit_and_read(key_info, key).await?;
+                            item = Self::compute_transact_update(
+                                key_info,
+                                key,
+                                existing.as_ref(),
+                                actions,
+                                *condition,
+                                maps,
+                                *return_values_on_ccf,
+                            )?;
                         }
                         // Retries exhausted: surface as a conflict, matching
                         // DynamoDB's behaviour for persistent write contention.
@@ -772,7 +889,7 @@ impl CassandraEngine {
                     &key_info.key_schema,
                     &key_info.attribute_definitions,
                 )
-                .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+                .map_err(key_type_mismatch_cancel)?;
 
                 // Read existing item
                 let mut existing = self
