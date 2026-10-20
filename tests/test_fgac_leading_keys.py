@@ -422,3 +422,104 @@ class TestLeadingKeys:
                 {"Get": {"TableName": table, "Key": self._key(OWN)}},
                 {"Get": {"TableName": table, "Key": self._key(OTHER)}}])
         assert _denied(e)
+
+    # -- GSI with a two-attribute partition key ----------------------------
+    #
+    # Live DynamoDB accepts a GSI whose partition key has two HASH attributes
+    # (g1, g2); a two-HASH base table is rejected. Measured 2026-10-20: a Query
+    # on such a GSI evaluates dynamodb:LeadingKeys against the FIRST HASH
+    # attribute's value only. Under ForAllValues:StringEquals ["alice"] a query
+    # of g1=alice was allowed for any g2 value and g1=bob was denied; a policy
+    # naming the second attribute's value ("blue") denied even g1=alice,g2=blue.
+
+    def _make_multi_hash_gsi_table(self) -> tuple[str, Any]:
+        owner = f"owner-{uuid.uuid4().hex[:8]}"
+        resp = self.mgmt.create_user(self.account_id, owner, "TestPass123!")
+        assert resp.status_code == 201, resp.text
+        self._users.append(owner)
+        resp = self.mgmt.create_access_key(self.account_id, owner)
+        assert resp.status_code == 201, resp.text
+        creds = resp.json()
+        resp = self.mgmt.put_user_policy(self.account_id, owner, "full", ALLOW_ALL)
+        assert resp.status_code == 204, resp.text
+        client = _make_client(self.endpoint, creds["access_key_id"],
+                             creds["secret_access_key"], self.region)
+        table = f"lk-mh-{uuid.uuid4().hex[:8]}"
+        client.create_table(
+            TableName=table,
+            AttributeDefinitions=[
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "g1", "AttributeType": "S"},
+                {"AttributeName": "g2", "AttributeType": "S"},
+            ],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            GlobalSecondaryIndexes=[{
+                "IndexName": "gsi2",
+                "KeySchema": [
+                    {"AttributeName": "g1", "KeyType": "HASH"},
+                    {"AttributeName": "g2", "KeyType": "HASH"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        wait_for_active(client, table)
+        for pk, g1, g2 in [("i1", "alice", "blue"), ("i2", "alice", "red"),
+                           ("i3", "bob", "blue"), ("i4", "bob", "red")]:
+            client.put_item(TableName=table, Item={
+                "pk": {"S": pk}, "g1": {"S": g1}, "g2": {"S": g2}})
+        return table, client
+
+    @pytest.fixture()
+    def mh_table(self):
+        name, owner = self._make_multi_hash_gsi_table()
+        yield name
+        try:
+            owner.delete_table(TableName=name)
+            wait_for_deleted(owner, name)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _q_gsi2(client, table, g1, g2):
+        return client.query(
+            TableName=table, IndexName="gsi2",
+            KeyConditionExpression="g1 = :a AND g2 = :b",
+            ExpressionAttributeValues={":a": {"S": g1}, ":b": {"S": g2}})
+
+    def test_multi_hash_gsi_binds_first_hash_attribute_only(self, mh_table):
+        # Policy fences the first HASH attribute (g1) to "alice".
+        c = self._user_client([("lk", self._leading_keys_policy(
+            "ForAllValues", ["alice"], mh_table))])
+        # g1=alice is allowed for either g2 value: the second attribute is not
+        # part of LeadingKeys.
+        self._q_gsi2(c, mh_table, "alice", "blue")
+        self._q_gsi2(c, mh_table, "alice", "red")
+        # g1=bob is denied regardless of g2.
+        with pytest.raises(ClientError) as e:
+            self._q_gsi2(c, mh_table, "bob", "blue")
+        assert _denied(e)
+        with pytest.raises(ClientError) as e:
+            self._q_gsi2(c, mh_table, "bob", "red")
+        assert _denied(e)
+
+    def test_multi_hash_gsi_second_attribute_value_not_in_leading_keys(self, mh_table):
+        # A policy naming the second HASH attribute's value ("blue") matches no
+        # leading key, so even g1=alice,g2=blue is denied.
+        c = self._user_client([("lk", self._leading_keys_policy(
+            "ForAllValues", ["blue"], mh_table))])
+        with pytest.raises(ClientError) as e:
+            self._q_gsi2(c, mh_table, "alice", "blue")
+        assert _denied(e)
+
+    def test_multi_hash_gsi_base_partition_key_unchanged(self, mh_table):
+        # The base table partition key still binds to its own value when the
+        # multi-attribute GSI exists.
+        c = self._user_client([("lk", self._leading_keys_policy(
+            "ForAllValues", ["i1"], mh_table))])
+        c.get_item(TableName=mh_table, Key={"pk": {"S": "i1"}})
+        c.query(TableName=mh_table, KeyConditionExpression="pk = :v",
+                ExpressionAttributeValues={":v": {"S": "i1"}})
+        with pytest.raises(ClientError) as e:
+            c.get_item(TableName=mh_table, Key={"pk": {"S": "i3"}})
+        assert _denied(e)

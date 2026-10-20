@@ -177,6 +177,56 @@ fn query_on_gsi_uses_index_partition_key() {
     assert_eq!(r, Some(vec!["galice".to_owned()]));
 }
 
+/// A table carrying a GSI whose partition key has two HASH attributes (g1, g2).
+/// ExtendDB allows this shape and so does live `DynamoDB` (a two-HASH GSI is
+/// accepted; a two-HASH base table is rejected). Measured 2026-10-20.
+fn multi_hash_gsi_table() -> TableKeyInfo {
+    TableKeyInfo {
+        table_name: "m".to_owned(),
+        key_schema: vec![ks("pk", KeyType::Hash)],
+        base_key_schema: vec![ks("pk", KeyType::Hash)],
+        global_secondary_indexes: vec![IndexInfo {
+            index_name: "gsi2".to_owned(),
+            index_id: "gsi2".to_owned(),
+            index_type: IndexType::Gsi,
+            key_schema: vec![ks("g1", KeyType::Hash), ks("g2", KeyType::Hash)],
+            projection: proj(),
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn query_on_multi_hash_gsi_uses_first_hash_attribute_only() {
+    // Measured 2026-10-20: for a Query on a GSI whose partition key has two
+    // HASH attributes, live DynamoDB evaluates dynamodb:LeadingKeys against the
+    // FIRST HASH attribute's value only. Under ForAllValues:StringEquals
+    // ["alice"] it allowed a query of g1=alice with any g2 value and denied
+    // g1=bob, so the second HASH attribute's value is not part of LeadingKeys.
+    let input = json!({
+        "TableName": "m",
+        "IndexName": "gsi2",
+        "KeyConditionExpression": "g1 = :a AND g2 = :b",
+        "ExpressionAttributeValues": {":a": {"S": "alice"}, ":b": {"S": "red"}},
+    });
+    let r = single_table_leading_keys(&input, "Query", Some(&multi_hash_gsi_table()), MAX_TOKENS);
+    assert_eq!(r, Some(vec!["alice".to_owned()]));
+}
+
+#[test]
+fn query_on_multi_hash_gsi_is_clause_order_independent() {
+    // The same query with the two HASH clauses written in the other order still
+    // yields the first HASH attribute's value.
+    let input = json!({
+        "TableName": "m",
+        "IndexName": "gsi2",
+        "KeyConditionExpression": "g2 = :b AND g1 = :a",
+        "ExpressionAttributeValues": {":a": {"S": "alice"}, ":b": {"S": "blue"}},
+    });
+    let r = single_table_leading_keys(&input, "Query", Some(&multi_hash_gsi_table()), MAX_TOKENS);
+    assert_eq!(r, Some(vec!["alice".to_owned()]));
+}
+
 // ---- query: shapes the engine rejects (key left absent) -----------------
 
 #[test]
