@@ -20,7 +20,7 @@ use super::auth::authenticate_admin;
 use super::crypto::{
     encrypt_secret, generate_secret_key, generate_session_key_id, generate_session_token,
 };
-use extenddb_auth::policy::condition::evaluate_condition;
+use extenddb_auth::policy::condition::{ConditionMatch, evaluate_statement_conditions};
 use extenddb_auth::policy::context::AssumeRoleContext;
 use extenddb_auth::policy::document::parse_conditions;
 
@@ -147,8 +147,10 @@ pub async fn assume_role(
 
     // Session tags passed on the call require sts:TagSession in the trust
     // policy, so the STS action set the decision checks depends on their
-    // presence.
+    // presence. They also populate aws:RequestTag/* and aws:TagKeys for
+    // condition evaluation.
     let has_session_tags = request.session_tags.as_ref().is_some_and(value_has_entries);
+    let request_tags = parse_session_tags(request.session_tags.as_ref());
 
     // Evaluate trust policy against the provided caller ARN.
     if !evaluate_trust_policy(
@@ -156,6 +158,7 @@ pub async fn assume_role(
         caller_arn,
         request.external_id.as_deref(),
         has_session_tags,
+        request_tags,
         &*state.catalog_store,
     )
     .await
@@ -301,6 +304,7 @@ async fn evaluate_trust_policy(
     caller_arn: &str,
     external_id: Option<&str>,
     has_session_tags: bool,
+    request_tags: std::collections::HashMap<String, String>,
     store: &dyn extenddb_storage::CatalogStore,
 ) -> bool {
     let Some(statements) = statements_vec(trust_policy) else {
@@ -311,6 +315,9 @@ async fn evaluate_trust_policy(
     let context = AssumeRoleContext {
         principal_tags,
         external_id: external_id.map(String::from),
+        principal_arn: caller_arn.to_owned(),
+        principal_account: caller_account(caller_arn).map(ToOwned::to_owned),
+        request_tags,
     };
 
     trust_decision(&statements, caller_arn, &context, has_session_tags)
@@ -425,13 +432,14 @@ enum ConditionOutcome {
 fn evaluate_conditions(stmt: &Value, context: &AssumeRoleContext) -> ConditionOutcome {
     let normalized = normalize_condition_scalars(&stmt["Condition"]);
     match parse_conditions(&normalized) {
-        Ok(conds) => {
-            if conds.iter().all(|c| evaluate_condition(c, context)) {
-                ConditionOutcome::Pass
-            } else {
-                ConditionOutcome::Fail
-            }
-        }
+        Ok(conds) => match evaluate_statement_conditions(&conds, context) {
+            ConditionMatch::Match => ConditionOutcome::Pass,
+            ConditionMatch::NoMatch => ConditionOutcome::Fail,
+            // A condition on a key STS populates but ExtendDB cannot resolve
+            // here fails closed, the same as an operator the evaluator cannot
+            // parse: a Deny blocks, an Allow does not grant.
+            ConditionMatch::Unresolvable => ConditionOutcome::Unparseable,
+        },
         Err(_) => ConditionOutcome::Unparseable,
     }
 }
@@ -530,6 +538,45 @@ fn value_has_entries(v: &Value) -> bool {
         Value::Object(o) => !o.is_empty(),
         Value::Array(a) => !a.is_empty(),
         _ => false,
+    }
+}
+
+/// Parse the request `session_tags` into a key/value map for condition
+/// evaluation (`aws:RequestTag/*`, `aws:TagKeys`). Accepts the object form
+/// `{"env": "prod"}` and the list form `[{"Key": "env", "Value": "prod"}]`.
+/// Scalar values are coerced to their string form; non-scalar values are
+/// skipped.
+fn parse_session_tags(session_tags: Option<&Value>) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    match session_tags {
+        Some(Value::Object(obj)) => {
+            for (k, v) in obj {
+                if let Some(s) = scalar_to_string(v) {
+                    map.insert(k.clone(), s);
+                }
+            }
+        }
+        Some(Value::Array(arr)) => {
+            for entry in arr {
+                let key = entry.get("Key").and_then(Value::as_str);
+                let value = entry.get("Value").and_then(scalar_to_string);
+                if let (Some(k), Some(v)) = (key, value) {
+                    map.insert(k.to_owned(), v);
+                }
+            }
+        }
+        _ => {}
+    }
+    map
+}
+
+/// A JSON scalar (string, number, bool) as its string form; `None` otherwise.
+fn scalar_to_string(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
     }
 }
 
@@ -812,6 +859,9 @@ mod tests {
         AssumeRoleContext {
             principal_tags: HashMap::new(),
             external_id: None,
+            principal_arn: CALLER.to_owned(),
+            principal_account: Some(ACCT.to_owned()),
+            request_tags: HashMap::new(),
         }
     }
 
@@ -819,6 +869,9 @@ mod tests {
         AssumeRoleContext {
             principal_tags: HashMap::new(),
             external_id: Some(id.to_owned()),
+            principal_arn: CALLER.to_owned(),
+            principal_account: Some(ACCT.to_owned()),
+            request_tags: HashMap::new(),
         }
     }
 
@@ -829,6 +882,22 @@ mod tests {
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                 .collect(),
             external_id: None,
+            principal_arn: CALLER.to_owned(),
+            principal_account: Some(ACCT.to_owned()),
+            request_tags: HashMap::new(),
+        }
+    }
+
+    fn ctx_with_request_tags(tags: &[(&str, &str)]) -> AssumeRoleContext {
+        AssumeRoleContext {
+            principal_tags: HashMap::new(),
+            external_id: None,
+            principal_arn: CALLER.to_owned(),
+            principal_account: Some(ACCT.to_owned()),
+            request_tags: tags
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
         }
     }
 
@@ -1056,6 +1125,153 @@ mod tests {
             "Action": "sts:AssumeRole",
             "Condition": {"NotIpAddress": {"aws:SourceIp": "192.0.2.0/24"}}
         })];
+        assert!(!trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    // ---- resolved keys: PrincipalArn / PrincipalAccount -------------------
+
+    #[test]
+    fn deny_principalarn_eq_self_blocks() {
+        // x04: Deny {"AWS":"*"} if StringEquals aws:PrincipalArn = caller.
+        let stmts = vec![
+            allow_alice(),
+            json!({"Effect": "Deny", "Principal": {"AWS": "*"}, "Action": "sts:AssumeRole",
+                "Condition": {"StringEquals": {"aws:PrincipalArn": CALLER}}}),
+        ];
+        assert!(!trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    #[test]
+    fn deny_principalarn_notequals_self_does_not_block() {
+        // x07: Deny {"AWS":"*"} if StringNotEquals aws:PrincipalArn = caller.
+        // The caller IS alice, so the negated condition is false and the Deny
+        // does not apply; the Allow grants.
+        let stmts = vec![
+            allow_alice(),
+            json!({"Effect": "Deny", "Principal": {"AWS": "*"}, "Action": "sts:AssumeRole",
+                "Condition": {"StringNotEquals": {"aws:PrincipalArn": CALLER}}}),
+        ];
+        assert!(trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    #[test]
+    fn allow_gate_principalarn_grants() {
+        // x01: Allow {"AWS":"*"} if StringEquals aws:PrincipalArn = caller.
+        let stmts = vec![json!({"Effect": "Allow", "Principal": {"AWS": "*"},
+            "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": {"aws:PrincipalArn": CALLER}}})];
+        assert!(trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    #[test]
+    fn allow_gate_principalaccount_grants() {
+        // x08: Allow {"AWS":"*"} if StringEquals aws:PrincipalAccount = acct.
+        let stmts = vec![json!({"Effect": "Allow", "Principal": {"AWS": "*"},
+            "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": {"aws:PrincipalAccount": ACCT}}})];
+        assert!(trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    #[test]
+    fn deny_principalaccount_notequals_in_account_does_not_block() {
+        // x09: Deny {"AWS":"*"} if StringNotEquals aws:PrincipalAccount = acct.
+        let stmts = vec![
+            allow_alice(),
+            json!({"Effect": "Deny", "Principal": {"AWS": "*"}, "Action": "sts:AssumeRole",
+                "Condition": {"StringNotEquals": {"aws:PrincipalAccount": ACCT}}}),
+        ];
+        assert!(trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    // ---- resolved keys: RequestTag / TagKeys (session tags) ---------------
+
+    #[test]
+    fn deny_requesttag_match_blocks_tagged_call() {
+        // x17: session tag env=prod, Deny if StringEquals aws:RequestTag/env.
+        let stmts = vec![
+            json!({"Effect": "Allow", "Principal": {"AWS": CALLER},
+                "Action": ["sts:AssumeRole", "sts:TagSession"]}),
+            json!({"Effect": "Deny", "Principal": {"AWS": CALLER},
+                "Action": ["sts:AssumeRole", "sts:TagSession"],
+                "Condition": {"StringEquals": {"aws:RequestTag/env": "prod"}}}),
+        ];
+        assert!(!trust_decision(
+            &stmts,
+            CALLER,
+            &ctx_with_request_tags(&[("env", "prod")]),
+            true
+        ));
+    }
+
+    #[test]
+    fn allow_gate_requesttag_grants_tagged_call() {
+        // x18: session tag env=dev, Allow if StringEquals aws:RequestTag/env.
+        let stmts = vec![json!({"Effect": "Allow", "Principal": {"AWS": CALLER},
+            "Action": ["sts:AssumeRole", "sts:TagSession"],
+            "Condition": {"StringEquals": {"aws:RequestTag/env": "dev"}}})];
+        assert!(trust_decision(
+            &stmts,
+            CALLER,
+            &ctx_with_request_tags(&[("env", "dev")]),
+            true
+        ));
+    }
+
+    #[test]
+    fn deny_tagkeys_foranyvalue_blocks_tagged_call() {
+        // x19: session tag env=prod, Deny if ForAnyValue:StringEquals
+        // aws:TagKeys = env.
+        let stmts = vec![
+            json!({"Effect": "Allow", "Principal": {"AWS": CALLER},
+                "Action": ["sts:AssumeRole", "sts:TagSession"]}),
+            json!({"Effect": "Deny", "Principal": {"AWS": CALLER},
+                "Action": ["sts:AssumeRole", "sts:TagSession"],
+                "Condition": {"ForAnyValue:StringEquals": {"aws:TagKeys": "env"}}}),
+        ];
+        assert!(!trust_decision(
+            &stmts,
+            CALLER,
+            &ctx_with_request_tags(&[("env", "prod")]),
+            true
+        ));
+    }
+
+    // ---- case 3: a key STS populates but ExtendDB cannot resolve ----------
+
+    #[test]
+    fn deny_on_unresolvable_key_fails_closed() {
+        // x13: Deny {"AWS":"*"} if StringEquals aws:PrincipalOrgID = org.
+        // ExtendDB cannot resolve the org id, so the Deny fails closed (blocks).
+        let stmts = vec![
+            allow_alice(),
+            json!({"Effect": "Deny", "Principal": {"AWS": "*"}, "Action": "sts:AssumeRole",
+                "Condition": {"StringEquals": {"aws:PrincipalOrgID": "o-abc123"}}}),
+        ];
+        assert!(!trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    #[test]
+    fn deny_negated_on_unresolvable_key_fails_closed() {
+        // x12: Deny {"AWS":"*"} if StringNotEquals aws:PrincipalOrgID = org.
+        // An unresolvable key fails closed regardless of operator, so the Deny
+        // blocks (this over-denies relative to IAM, the documented safe
+        // direction) rather than the negated-absent rule spuriously granting.
+        let stmts = vec![
+            allow_alice(),
+            json!({"Effect": "Deny", "Principal": {"AWS": "*"}, "Action": "sts:AssumeRole",
+                "Condition": {"StringNotEquals": {"aws:PrincipalOrgID": "o-abc123"}}}),
+        ];
+        assert!(!trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    #[test]
+    fn allow_gate_on_unresolvable_key_does_not_grant() {
+        // x11: Allow {"AWS":"*"} if StringEquals aws:PrincipalOrgID = org.
+        // The Allow is gated on an unresolvable key, so it does not grant and no
+        // other statement allows: implicit deny.
+        let stmts = vec![json!({"Effect": "Allow", "Principal": {"AWS": "*"},
+            "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": {"aws:PrincipalOrgID": "o-abc123"}}})];
         assert!(!trust_decision(&stmts, CALLER, &ctx(), false));
     }
 

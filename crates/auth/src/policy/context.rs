@@ -30,6 +30,54 @@ pub trait ConditionContext {
     /// present. Verified against real AWS IAM (BR-7085). Returning `false` for an
     /// unknown key preserves the normal single-valued evaluation path.
     fn is_multivalued_key(&self, key: &str) -> bool;
+
+    /// Whether `key` is one the service populates on a request of this kind but
+    /// which this context cannot resolve.
+    ///
+    /// This distinguishes a key that is genuinely absent (the service would
+    /// also have it absent, so IAM absent-key semantics apply) from a key the
+    /// service populates that ExtendDB has no value for. A statement gated on
+    /// an unresolvable key fails closed: a `Deny` blocks, an `Allow` does not
+    /// grant. The default is `false` (no unresolvable keys), so a context that
+    /// resolves every key it is asked about needs no override.
+    fn is_unresolvable_key(&self, _key: &str) -> bool {
+        false
+    }
+}
+
+/// Global condition keys the AWS services always populate on a request. A
+/// context that cannot resolve one of these treats it as unresolvable (fail
+/// closed) rather than absent, so a negated operator on it cannot spuriously
+/// match and an `Allow` gated on it cannot spuriously grant.
+///
+/// The set is the single-valued `aws:` global keys that STS always populates on
+/// an `AssumeRole` call and that IAM always populates on a `DynamoDB`
+/// data-plane request from an IAM principal. Keys that are only conditionally
+/// present (for example `aws:MultiFactorAuthPresent`, which is absent when the
+/// caller did not use MFA, or the VPC and federation keys) are deliberately not
+/// listed: they are genuinely absent for ExtendDB's caller model, and IAM
+/// absent-key semantics match the service there (measured, case e27 vs e28).
+/// Tag keys (`aws:PrincipalTag/*`, `aws:RequestTag/*`, `aws:TagKeys`,
+/// `dynamodb:ResourceTag/*`), `sts:ExternalId`, and the `dynamodb:` request
+/// keys are resolved (or genuinely absent) per context and are not listed here.
+#[must_use]
+pub fn is_service_populated_global_key(key: &str) -> bool {
+    matches!(
+        key,
+        "aws:PrincipalArn"
+            | "aws:PrincipalAccount"
+            | "aws:PrincipalOrgID"
+            | "aws:PrincipalOrgPaths"
+            | "aws:PrincipalType"
+            | "aws:userid"
+            | "aws:username"
+            | "aws:SourceIp"
+            | "aws:SecureTransport"
+            | "aws:CurrentTime"
+            | "aws:EpochTime"
+            | "aws:RequestedRegion"
+            | "aws:UserAgent"
+    )
 }
 
 /// Request parameters extracted from a `DynamoDB` operation for condition evaluation.
@@ -146,31 +194,67 @@ impl ConditionContext for RequestContext {
 
 /// Context for evaluating trust policy conditions during `AssumeRole`.
 ///
-/// Trust policies can reference `aws:PrincipalTag/*` and `sts:ExternalId`.
-/// DynamoDB-specific keys are not applicable.
+/// Trust policies can reference `aws:PrincipalTag/*`, `sts:ExternalId`, the
+/// caller identity keys `aws:PrincipalArn` / `aws:PrincipalAccount`, and the
+/// session-tag keys `aws:RequestTag/*` / `aws:TagKeys`. Other global keys STS
+/// populates on an `AssumeRole` call (for example `aws:PrincipalOrgID`,
+/// `aws:SourceIp`, `aws:MultiFactorAuthPresent`) are not resolvable here and
+/// are reported as unresolvable (fail closed). `DynamoDB`-specific keys are not
+/// applicable.
 #[derive(Debug)]
 pub struct AssumeRoleContext {
     /// Tags on the calling principal.
     pub principal_tags: HashMap<String, String>,
     /// The external ID provided in the `AssumeRole` call (if any).
     pub external_id: Option<String>,
+    /// The caller ARN (`aws:PrincipalArn`).
+    pub principal_arn: String,
+    /// The caller's account id (`aws:PrincipalAccount`), the account field of
+    /// the caller ARN. `None` when the ARN has no account field.
+    pub principal_account: Option<String>,
+    /// Session tags passed on the call (`aws:RequestTag/*`, and their keys for
+    /// `aws:TagKeys`).
+    pub request_tags: HashMap<String, String>,
 }
 
 impl ConditionContext for AssumeRoleContext {
     fn resolve_key(&self, key: &str) -> Option<Vec<&str>> {
         if let Some(tag_key) = key.strip_prefix("aws:PrincipalTag/") {
             self.principal_tags.get(tag_key).map(|v| vec![v.as_str()])
-        } else if key == "sts:ExternalId" {
-            self.external_id.as_deref().map(|v| vec![v])
+        } else if let Some(tag_key) = key.strip_prefix("aws:RequestTag/") {
+            self.request_tags.get(tag_key).map(|v| vec![v.as_str()])
         } else {
-            None
+            match key {
+                "sts:ExternalId" => self.external_id.as_deref().map(|v| vec![v]),
+                "aws:PrincipalArn" => Some(vec![self.principal_arn.as_str()]),
+                "aws:PrincipalAccount" => self.principal_account.as_deref().map(|v| vec![v]),
+                "aws:TagKeys" => {
+                    if self.request_tags.is_empty() {
+                        None
+                    } else {
+                        Some(self.request_tags.keys().map(String::as_str).collect())
+                    }
+                }
+                _ => None,
+            }
         }
     }
 
-    fn is_multivalued_key(&self, _key: &str) -> bool {
-        // Trust-policy keys (`aws:PrincipalTag/*`, `sts:ExternalId`) are all
+    fn is_multivalued_key(&self, key: &str) -> bool {
+        // `aws:TagKeys` is the set of session-tag keys (`ArrayOfString`); every
+        // other trust-policy key (`aws:PrincipalTag/*`, `aws:RequestTag/*`,
+        // `sts:ExternalId`, `aws:PrincipalArn`, `aws:PrincipalAccount`) is
         // single-valued.
-        false
+        key == "aws:TagKeys"
+    }
+
+    fn is_unresolvable_key(&self, key: &str) -> bool {
+        // Keys this context resolves (tags, external id, principal ARN and
+        // account) are never reported here (the caller only consults this when
+        // `resolve_key` returned `None`, i.e. the key is genuinely absent for a
+        // tag or external id). Any other global key STS populates on an
+        // `AssumeRole` call is unresolvable, so a Deny gated on it fails closed.
+        is_service_populated_global_key(key)
     }
 }
 
@@ -255,8 +339,62 @@ mod tests {
         let ctx = AssumeRoleContext {
             principal_tags: HashMap::new(),
             external_id: Some("ext-123".to_owned()),
+            principal_arn: "arn:aws:iam::123456789012:user/alice".to_owned(),
+            principal_account: Some("123456789012".to_owned()),
+            request_tags: HashMap::new(),
         };
         assert_eq!(ctx.resolve_key("sts:ExternalId"), Some(vec!["ext-123"]));
         assert_eq!(ctx.resolve_key("dynamodb:LeadingKeys"), None);
+    }
+
+    #[test]
+    fn assume_role_context_principal_arn_and_account() {
+        let ctx = AssumeRoleContext {
+            principal_tags: HashMap::new(),
+            external_id: None,
+            principal_arn: "arn:aws:iam::123456789012:user/alice".to_owned(),
+            principal_account: Some("123456789012".to_owned()),
+            request_tags: HashMap::new(),
+        };
+        assert_eq!(
+            ctx.resolve_key("aws:PrincipalArn"),
+            Some(vec!["arn:aws:iam::123456789012:user/alice"])
+        );
+        assert_eq!(
+            ctx.resolve_key("aws:PrincipalAccount"),
+            Some(vec!["123456789012"])
+        );
+        // A global key STS populates but this context cannot resolve is
+        // unresolvable (fail closed), not absent.
+        assert_eq!(ctx.resolve_key("aws:PrincipalOrgID"), None);
+        assert!(ctx.is_unresolvable_key("aws:PrincipalOrgID"));
+        assert!(!ctx.is_unresolvable_key("sts:ExternalId"));
+        assert!(!ctx.is_unresolvable_key("aws:PrincipalTag/team"));
+    }
+
+    #[test]
+    fn assume_role_context_request_tags_and_tag_keys() {
+        let ctx = AssumeRoleContext {
+            principal_tags: HashMap::new(),
+            external_id: None,
+            principal_arn: "arn:aws:iam::123456789012:user/alice".to_owned(),
+            principal_account: Some("123456789012".to_owned()),
+            request_tags: HashMap::from([("env".to_owned(), "prod".to_owned())]),
+        };
+        assert_eq!(ctx.resolve_key("aws:RequestTag/env"), Some(vec!["prod"]));
+        assert_eq!(ctx.resolve_key("aws:RequestTag/missing"), None);
+        assert_eq!(ctx.resolve_key("aws:TagKeys"), Some(vec!["env"]));
+        assert!(ctx.is_multivalued_key("aws:TagKeys"));
+        // With no session tags, aws:TagKeys is genuinely absent, not
+        // unresolvable.
+        let empty = AssumeRoleContext {
+            principal_tags: HashMap::new(),
+            external_id: None,
+            principal_arn: "arn:aws:iam::123456789012:user/alice".to_owned(),
+            principal_account: Some("123456789012".to_owned()),
+            request_tags: HashMap::new(),
+        };
+        assert_eq!(empty.resolve_key("aws:TagKeys"), None);
+        assert!(!empty.is_unresolvable_key("aws:TagKeys"));
     }
 }
