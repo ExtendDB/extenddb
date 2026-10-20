@@ -743,3 +743,235 @@ class TestMode1Compat:
             )
         err = exc_info.value.response["Error"]
         assert err["Code"] in ("UnrecognizedClientException", "InvalidSignatureException", "AccessDeniedException")
+
+
+# ---------------------------------------------------------------------------
+# Trust policy Deny evaluation and write-time validation
+# ---------------------------------------------------------------------------
+
+# Expected outcomes match live IAM and STS. The assume
+# endpoint returns 201 when the trust policy grants assumption and 403 when it
+# denies. create_role returns 400 when the trust document is one IAM rejects.
+
+ALLOW = 201
+DENY = 403
+REJECT = 400
+
+
+def _trust(*statements: dict) -> dict:
+    return {"Version": "2012-10-17", "Statement": list(statements)}
+
+
+def _stmt(effect: str, principal, action="sts:AssumeRole", condition=None, key="Principal") -> dict:
+    s: dict[str, Any] = {"Effect": effect, key: principal, "Action": action}
+    if condition is not None:
+        s["Condition"] = condition
+    return s
+
+
+class TestTrustPolicyDeny:
+    """Trust-policy Deny evaluation matches live IAM, on every backend."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, auth_env, mgmt, account_id, region):
+        self.endpoint = auth_env[0]
+        self.mgmt = mgmt
+        self.account_id = account_id
+        self.region = region
+
+    def _caller(self, tags: dict[str, str] | None = None) -> tuple[str, str]:
+        user = f"bbc-{uuid.uuid4().hex[:8]}"
+        resp = self.mgmt.create_user(self.account_id, user, "TestPass123!")
+        assert resp.status_code == 201, resp.text
+        if tags:
+            resp = self.mgmt.tag_user(self.account_id, user, tags)
+            assert resp.status_code in (200, 201, 204), resp.text
+        return user, f"arn:aws:iam::{self.account_id}:user/{user}"
+
+    def _assume(self, trust: dict, caller_arn: str, **assume_kwargs) -> int:
+        role = f"bbr-{uuid.uuid4().hex[:8]}"
+        resp = self.mgmt.create_role(self.account_id, role, trust)
+        assert resp.status_code == 201, f"create_role: {resp.status_code} {resp.text}"
+        try:
+            resp = self.mgmt.assume_role(
+                self.account_id, role, caller_arn, "bb-session", **assume_kwargs
+            )
+            return resp.status_code
+        finally:
+            self.mgmt.delete_role(self.account_id, role)
+
+    def test_deny_overrides_allow_both_orders(self):
+        user, arn = self._caller()
+        try:
+            allow_then_deny = _trust(_stmt("Allow", {"AWS": "*"}), _stmt("Deny", {"AWS": arn}))
+            assert self._assume(allow_then_deny, arn) == DENY
+            deny_then_allow = _trust(_stmt("Deny", {"AWS": arn}), _stmt("Allow", {"AWS": "*"}))
+            assert self._assume(deny_then_allow, arn) == DENY
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_deny_other_principal_does_not_block(self):
+        user, arn = self._caller()
+        other = f"arn:aws:iam::{self.account_id}:user/someone-else"
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": "*"}), _stmt("Deny", {"AWS": other}))
+            assert self._assume(trust, arn) == ALLOW
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_tag_deny_matches_blocks(self):
+        # Exercises the caller-tag lookup in the store (all backends).
+        user, arn = self._caller(tags={"team": "contractors"})
+        try:
+            trust = _trust(
+                _stmt("Allow", {"AWS": arn}),
+                _stmt("Deny", {"AWS": arn},
+                      condition={"StringEquals": {"aws:PrincipalTag/team": "contractors"}}),
+            )
+            assert self._assume(trust, arn) == DENY
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_tag_deny_no_match_allows(self):
+        # The tag resolves to "contractors", so a Deny gated on "employees" is
+        # inert and the Allow grants. If the store tag lookup were broken the
+        # tag would resolve to nothing and this would still allow, so pair it
+        # with test_tag_deny_matches_blocks.
+        user, arn = self._caller(tags={"team": "contractors"})
+        try:
+            trust = _trust(
+                _stmt("Allow", {"AWS": arn}),
+                _stmt("Deny", {"AWS": arn},
+                      condition={"StringEquals": {"aws:PrincipalTag/team": "employees"}}),
+            )
+            assert self._assume(trust, arn) == ALLOW
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_external_id_notequals_deny_blocks_when_absent(self):
+        user, arn = self._caller()
+        try:
+            trust = _trust(
+                _stmt("Allow", {"AWS": arn}),
+                _stmt("Deny", {"AWS": arn},
+                      condition={"StringNotEquals": {"sts:ExternalId": "secret"}}),
+            )
+            assert self._assume(trust, arn) == DENY
+            # Presenting the matching external id lifts the Deny.
+            role = f"bbr-{uuid.uuid4().hex[:8]}"
+            resp = self.mgmt.create_role(self.account_id, role, trust)
+            assert resp.status_code == 201, resp.text
+            try:
+                # external_id is a separate assume parameter.
+                r2 = requests.post(
+                    f"{self.mgmt.base_url}/accounts/{self.account_id}/roles/{role}/assume",
+                    json={"caller_arn": arn, "session_name": "bb-session",
+                          "duration_seconds": 3600, "external_id": "secret"},
+                    auth=self.mgmt.admin_auth, timeout=30, verify=self.mgmt.verify,
+                )
+                assert r2.status_code == ALLOW, r2.text
+            finally:
+                self.mgmt.delete_role(self.account_id, role)
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_account_root_principal_deny_blocks(self):
+        user, arn = self._caller()
+        root = f"arn:aws:iam::{self.account_id}:root"
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": arn}), _stmt("Deny", {"AWS": root}))
+            assert self._assume(trust, arn) == DENY
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_bare_account_id_principal_deny_blocks(self):
+        user, arn = self._caller()
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": arn}), _stmt("Deny", {"AWS": self.account_id}))
+            assert self._assume(trust, arn) == DENY
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_deny_tagsession_only_allows_plain_assume(self):
+        user, arn = self._caller()
+        try:
+            trust = _trust(
+                _stmt("Allow", {"AWS": arn}),
+                _stmt("Deny", {"AWS": arn}, action="sts:TagSession"),
+            )
+            assert self._assume(trust, arn) == ALLOW
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_session_tags_without_tagsession_denied(self):
+        user, arn = self._caller()
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": arn}))
+            assert self._assume(trust, arn, session_tags={"env": "dev"}) == DENY
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_session_tags_with_tagsession_allowed(self):
+        user, arn = self._caller()
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": arn}, action=["sts:AssumeRole", "sts:TagSession"]))
+            assert self._assume(trust, arn, session_tags={"env": "dev"}) == ALLOW
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_lowercase_deny_enforced(self):
+        user, arn = self._caller()
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": "*"}), _stmt("deny", {"AWS": arn}))
+            assert self._assume(trust, arn) == DENY
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_single_object_statement_allows(self):
+        user, arn = self._caller()
+        try:
+            trust = {"Version": "2012-10-17", "Statement": _stmt("Allow", {"AWS": arn})}
+            assert self._assume(trust, arn) == ALLOW
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    @pytest.mark.parametrize("trust", [
+        _trust(_stmt("Allow", "arn:aws:iam::111122223333:user/x")),  # bare string ARN / non-object
+        _trust({"Principal": {"AWS": "arn:aws:iam::111122223333:user/x"}, "Action": "sts:AssumeRole"}),  # missing Effect
+        _trust(_stmt("Deny", {"AWS": "arn:aws:iam::111122223333:user/x"}, key="NotPrincipal")),  # NotPrincipal
+        _trust({"Effect": "Deny", "Action": "sts:AssumeRole"}),  # missing Principal
+        _trust(_stmt("Allow", "*")),  # bare "*" principal
+        _trust(_stmt("Deny", {"AWS": "arn:aws:iam::111122223333:user/bb-*"})),  # wildcard in ARN
+        _trust({"Effect": "Deny", "Principal": {"AWS": "arn:aws:iam::111122223333:user/x"}}),  # missing Action
+        _trust(_stmt("Allow", {"AWS": "arn:aws:iam::111122223333:user/x"}, action="sts:*")),  # sts:*
+        _trust({"Effect": "Deny", "Principal": {"AWS": "arn:aws:iam::111122223333:user/x"},
+                "Action": "sts:AssumeRole", "Resource": "*"}),  # Resource present
+        _trust(_stmt("Deny", {"AWS": "arn:aws:iam::111122223333:user/x"},
+                     condition={"StringEqualz": {"aws:PrincipalTag/team": "contractors"}})),  # unknown operator
+        _trust(_stmt("Deny", {"AWS": "arn:aws:iam::111122223333:user/x"},
+                     condition={"StringEquals": "contractors"})),  # condition not object
+    ])
+    def test_create_rejects_malformed_trust_policy(self, trust):
+        role = f"bbrej-{uuid.uuid4().hex[:8]}"
+        resp = self.mgmt.create_role(self.account_id, role, trust)
+        if resp.status_code == 201:
+            self.mgmt.delete_role(self.account_id, role)
+        assert resp.status_code == REJECT, f"expected reject, got {resp.status_code}: {resp.text}"
+
+    @pytest.mark.parametrize("trust", [
+        {"Statement": [_stmt("Allow", {"AWS": "arn:aws:iam::111122223333:user/x"})]},  # missing Version
+        {"Version": "2012-10-17", "Statement": _stmt("Allow", {"AWS": "arn:aws:iam::111122223333:user/x"})},  # single object
+        _trust(_stmt("Allow", {"AWS": "arn:aws:iam::111122223333:user/x"}),
+               _stmt("Deny", {"AWS": "arn:aws:iam::111122223333:user/x"},
+                     condition={"StringEquals": {"aws:PrincipalTag/team": 5}})),  # numeric condition value
+        _trust(_stmt("Deny", {"AWS": "arn:aws:iam::111122223333:user/x"},
+                     condition={"StringEquals": {"aws:NoSuchKey": "x"}})),  # unknown condition key
+    ])
+    def test_create_accepts_iam_accepted_trust_policy(self, trust):
+        role = f"bbacc-{uuid.uuid4().hex[:8]}"
+        resp = self.mgmt.create_role(self.account_id, role, trust)
+        try:
+            assert resp.status_code == 201, f"expected accept, got {resp.status_code}: {resp.text}"
+        finally:
+            if resp.status_code == 201:
+                self.mgmt.delete_role(self.account_id, role)
