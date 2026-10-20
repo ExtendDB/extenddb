@@ -1,0 +1,238 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Explicit-Deny enforcement on resource-ARN operations.
+
+Operations that carry their resource in a field other than a top-level
+TableName (ResourceArn on the tag operations, StreamArn on stream operations,
+BackupArn on backup operations, IndexName on Query and Scan, and a table ARN in
+TableName) must authorize against that specific resource. A policy that allows
+dynamodb:* on * but explicitly Denies one action on one specific ARN must block
+that action, matching live DynamoDB (measured 2026-10-20, account
+964157134968: every case below returns AccessDeniedException while an allowed
+control on the same principal succeeds).
+
+These tests provision builtin-IAM principals through the management API, so they
+run against ExtendDB on every storage backend in CI. The equivalent behavior on
+live DynamoDB was measured with real IAM principals and recorded in the builder
+report's Service measurements section.
+
+Prerequisites:
+  - extenddb running with `auth.provider = "builtin"` on EXTENDDB_TEST_ENDPOINT
+  - Admin credentials in EXTENDDB_ADMIN_USER / EXTENDDB_ADMIN_PASSWORD
+
+REQ-TEST-001, REQ-AUTH-002
+"""
+
+from __future__ import annotations
+
+import os
+import time
+import uuid
+from typing import Any
+
+import boto3
+import pytest
+from botocore.config import Config as BotoConfig
+from botocore.exceptions import ClientError
+
+from conftest import wait_for_active
+from management_helpers import ManagementClient
+
+
+def _require_auth_env() -> tuple[str, str, str]:
+    endpoint = os.environ.get("EXTENDDB_TEST_ENDPOINT", "").strip()
+    admin_user = os.environ.get("EXTENDDB_ADMIN_USER", "").strip()
+    admin_pass = os.environ.get("EXTENDDB_ADMIN_PASSWORD", "").strip()
+    if not endpoint or not admin_user or not admin_pass:
+        pytest.fail(
+            "MISCONFIGURED: resource-ARN authz tests require EXTENDDB_TEST_ENDPOINT, "
+            "EXTENDDB_ADMIN_USER, and EXTENDDB_ADMIN_PASSWORD. "
+            "These must be set by devtools/run-tests before test execution."
+        )
+    return endpoint, admin_user, admin_pass
+
+
+def _client(endpoint: str, ak: str, sk: str, region: str, service: str = "dynamodb") -> Any:
+    kwargs: dict = dict(
+        service_name=service,
+        endpoint_url=endpoint,
+        aws_access_key_id=ak,
+        aws_secret_access_key=sk,
+        region_name=region,
+        config=BotoConfig(retries={"max_attempts": 0}),
+    )
+    if endpoint.startswith("https://"):
+        kwargs["verify"] = False
+    return boto3.client(**kwargs)
+
+
+ALLOW_ALL = {
+    "Version": "2012-10-17",
+    "Statement": [{"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"}],
+}
+
+
+def _allow_all_deny(action: str, resource: str) -> dict:
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"},
+            {"Effect": "Deny", "Action": f"dynamodb:{action}", "Resource": resource},
+        ],
+    }
+
+
+@pytest.fixture(scope="module")
+def auth_env():
+    return _require_auth_env()
+
+
+@pytest.fixture(scope="module")
+def mgmt(auth_env) -> ManagementClient:
+    endpoint, admin_user, admin_pass = auth_env
+    return ManagementClient(endpoint, admin_user, admin_pass)
+
+
+@pytest.fixture(scope="module")
+def region() -> str:
+    return os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+
+
+@pytest.fixture(scope="module")
+def account_id(mgmt) -> str:
+    acct = f"{uuid.uuid4().int % 10**12:012d}"
+    resp = mgmt.create_account(acct, f"arnauthz-{acct}")
+    assert resp.status_code == 201, resp.text
+    yield acct
+    mgmt.delete_account(acct)
+
+
+def _user_with_policy(mgmt: ManagementClient, account_id: str, policy: dict) -> tuple[str, str]:
+    """Create a fresh IAM user with the given policy and return (ak, sk)."""
+    user = f"u{uuid.uuid4().hex[:10]}"
+    assert mgmt.create_user(account_id, user, "TestPass123!").status_code == 201
+    assert mgmt.put_user_policy(account_id, user, "p", policy).status_code == 204
+    resp = mgmt.create_access_key(account_id, user)
+    assert resp.status_code == 201, resp.text
+    creds = resp.json()
+    return creds["access_key_id"], creds["secret_access_key"]
+
+
+@pytest.fixture(scope="module")
+def table(auth_env, mgmt, account_id, region):
+    """A table with a GSI, a stream, one item, and a backup. Returns the
+    canonical table, index, stream, and backup ARNs."""
+    endpoint = auth_env[0]
+    ak, sk = _user_with_policy(mgmt, account_id, ALLOW_ALL)
+    admin = _client(endpoint, ak, sk, region)
+    name = f"t{uuid.uuid4().hex[:8]}"
+    admin.create_table(
+        TableName=name,
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "g1pk", "AttributeType": "S"},
+        ],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        GlobalSecondaryIndexes=[{
+            "IndexName": "gsi1",
+            "KeySchema": [{"AttributeName": "g1pk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"},
+        }],
+        BillingMode="PAY_PER_REQUEST",
+        StreamSpecification={"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+    )
+    wait_for_active(admin, name)
+    admin.put_item(TableName=name, Item={"pk": {"S": "p1"}, "g1pk": {"S": "g1"}})
+    desc = admin.describe_table(TableName=name)["Table"]
+    table_arn = desc["TableArn"]
+    backup_arn = admin.create_backup(TableName=name, BackupName="arnbk")["BackupDetails"]["BackupArn"]
+    return {
+        "name": name,
+        "table_arn": table_arn,
+        "index_arn": table_arn + "/index/gsi1",
+        "stream_arn": desc.get("LatestStreamArn"),
+        "backup_arn": backup_arn,
+    }
+
+
+class TestExplicitDenyOnResourceArn:
+    @pytest.fixture(autouse=True)
+    def setup(self, auth_env, mgmt, account_id, region):
+        self.endpoint = auth_env[0]
+        self.mgmt = mgmt
+        self.account_id = account_id
+        self.region = region
+
+    def _ddb(self, policy: dict, service: str = "dynamodb"):
+        ak, sk = _user_with_policy(self.mgmt, self.account_id, policy)
+        return _client(self.endpoint, ak, sk, self.region, service)
+
+    def _assert_denied(self, fn):
+        with pytest.raises(ClientError) as exc:
+            fn()
+        assert exc.value.response["Error"]["Code"] == "AccessDeniedException", (
+            exc.value.response["Error"]
+        )
+
+    # -- tag operations: the ticket's core defect --
+
+    def test_tag_resource_deny_blocks(self, table):
+        d = self._ddb(_allow_all_deny("TagResource", table["table_arn"]))
+        self._assert_denied(lambda: d.tag_resource(
+            ResourceArn=table["table_arn"], Tags=[{"Key": "k", "Value": "v"}]))
+
+    def test_untag_resource_deny_blocks(self, table):
+        d = self._ddb(_allow_all_deny("UntagResource", table["table_arn"]))
+        self._assert_denied(lambda: d.untag_resource(
+            ResourceArn=table["table_arn"], TagKeys=["k"]))
+
+    def test_list_tags_deny_blocks(self, table):
+        d = self._ddb(_allow_all_deny("ListTagsOfResource", table["table_arn"]))
+        self._assert_denied(lambda: d.list_tags_of_resource(ResourceArn=table["table_arn"]))
+
+    # -- stream, backup, index operations --
+
+    def test_describe_stream_deny_blocks(self, table):
+        s = self._ddb(_allow_all_deny("DescribeStream", table["stream_arn"]), "dynamodbstreams")
+        self._assert_denied(lambda: s.describe_stream(StreamArn=table["stream_arn"]))
+
+    def test_delete_backup_deny_blocks(self, table):
+        d = self._ddb(_allow_all_deny("DeleteBackup", table["backup_arn"]))
+        self._assert_denied(lambda: d.delete_backup(BackupArn=table["backup_arn"]))
+
+    def test_query_on_index_deny_blocks(self, table):
+        d = self._ddb(_allow_all_deny("Query", table["index_arn"]))
+        self._assert_denied(lambda: d.query(
+            TableName=table["name"], IndexName="gsi1",
+            KeyConditionExpression="g1pk = :p",
+            ExpressionAttributeValues={":p": {"S": "g1"}}))
+
+    # -- fail closed: a respelled ARN cannot evade a Deny on the canonical ARN --
+
+    def test_respelled_stream_arn_cannot_bypass_deny(self, table):
+        """A Deny on the canonical stream ARN must also block a request that
+        respells the partition. ExtendDB resolves the stream in this account
+        regardless of the ARN's partition, so authorizing the respelled string
+        verbatim would bypass the Deny."""
+        respelled = table["stream_arn"].replace("arn:aws:", "arn:aws-cn:")
+        s = self._ddb(_allow_all_deny("DescribeStream", table["stream_arn"]), "dynamodbstreams")
+        self._assert_denied(lambda: s.describe_stream(StreamArn=respelled))
+
+    def test_table_arn_in_tablename_deny_blocks(self, table):
+        """A Deny on the table ARN blocks GetItem whether TableName is the bare
+        name or the table ARN."""
+        d = self._ddb(_allow_all_deny("GetItem", table["table_arn"]))
+        self._assert_denied(lambda: d.get_item(
+            TableName=table["name"], Key={"pk": {"S": "p1"}}))
+        d2 = self._ddb(_allow_all_deny("GetItem", table["table_arn"]))
+        self._assert_denied(lambda: d2.get_item(
+            TableName=table["table_arn"], Key={"pk": {"S": "p1"}}))
+
+    # -- positive control: without the Deny, the operation is allowed --
+
+    def test_allow_without_deny_permits_tagging(self, table):
+        d = self._ddb(ALLOW_ALL)
+        # Must not raise.
+        d.tag_resource(ResourceArn=table["table_arn"], Tags=[{"Key": "ctrl", "Value": "1"}])
+        time.sleep(0)
