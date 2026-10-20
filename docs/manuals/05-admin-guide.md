@@ -371,6 +371,60 @@ Inline policies can be attached to users, groups, and roles:
     }'
 ```
 
+### Resource-level authorization
+
+Every operation is authorized against the specific resource ARN, matching
+DynamoDB. The `Resource` element of a policy is matched field by field, and a
+`*` or `?` in the resource part of the ARN spans the `:` and `/` inside it.
+
+| Operation | Resource ARN authorized |
+|-----------|-------------------------|
+| Item and table operations (GetItem, PutItem, Query and Scan on the base table, CreateTable, UpdateTable, DescribeTable, and so on) | `table/<name>` |
+| Query and Scan with an `IndexName` | `table/<name>/index/<index>` |
+| TagResource, UntagResource, ListTagsOfResource | the `ResourceArn` (a table or stream ARN) |
+| DescribeStream, GetShardIterator | the `StreamArn` |
+| GetRecords | the stream the shard iterator reads |
+| ListStreams | `table/<name>/stream/*` when a table is named, else `table/*/stream/*` |
+| DescribeBackup, DeleteBackup | the `BackupArn` |
+| CreateBackup, DescribeContinuousBackups, UpdateContinuousBackups | `table/<name>` |
+| ExportTableToPointInTime | the source `table/<name>` |
+| ImportTable | the new `table/<name>` |
+| RestoreTableFromBackup | the backup ARN, plus Scan, Query, GetItem, PutItem, UpdateItem, DeleteItem and BatchWriteItem on the target `table/<name>` |
+| RestoreTableToPointInTime | the source `table/<name>`, plus the same item actions on the target `table/<name>` |
+| ListTables | `table/*` |
+
+A policy that names another partition, service, region, or account in a
+resource ARN it supplies (for example on a stream or backup operation) cannot
+evade a Deny written against the real resource: the resource is resolved in this
+deployment's account regardless of those fields.
+
+#### Compatibility notes
+
+Earlier builds authorized several of these operations against
+`table/*` instead of the specific resource. Review existing policies before
+upgrading:
+
+- **Index reads.** Query and Scan with an `IndexName` are authorized against
+  `table/<name>/index/<index>`. A policy that granted a principal only
+  `table/<name>` no longer allows reads of that table's indexes. Grant
+  `table/<name>/index/<index>` or `table/<name>/index/*` as needed. This
+  matches DynamoDB.
+- **Streams.** A policy whose resource is `table/<name>/stream/*` now matches
+  concrete stream ARNs (the stream label contains `:`, which the resource
+  wildcard now spans). A Deny on a specific stream ARN, or on a tag, backup, or
+  index ARN, now takes effect where before it was bypassed.
+- **GetRecords.** GetRecords is authorized against the stream its shard iterator
+  reads, so a principal needs `dynamodb:GetRecords` on that stream. A shard
+  iterator issued by a build before this change does not identify its stream;
+  after upgrade, GetRecords on such an iterator is denied until the client calls
+  GetShardIterator again. Shard iterators expire after 15 minutes, so the window
+  is short.
+- **Restores.** A restore writes items into its target table, so
+  RestoreTableFromBackup and RestoreTableToPointInTime require the item write
+  and read actions on the target table in addition to the restore action. A
+  principal that could previously restore with only the restore permission now
+  also needs those actions on the target table name.
+
 ### Permissions Boundaries
 
 ```bash
