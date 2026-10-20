@@ -197,6 +197,23 @@ class TestExplicitDenyOnResourceArn:
         s = self._ddb(_allow_all_deny("DescribeStream", table["stream_arn"]), "dynamodbstreams")
         self._assert_denied(lambda: s.describe_stream(StreamArn=table["stream_arn"]))
 
+    def test_describe_stream_wildcard_label_deny_blocks(self, table):
+        # A stream label contains ':'. A Deny on table/<T>/stream/* must match
+        # the concrete stream ARN, so the resource field is matched as a whole
+        # with the wildcard spanning the colons in the label.
+        wild = table["table_arn"] + "/stream/*"
+        s = self._ddb(_allow_all_deny("DescribeStream", wild), "dynamodbstreams")
+        self._assert_denied(lambda: s.describe_stream(StreamArn=table["stream_arn"]))
+
+    def test_describe_stream_wildcard_label_allow_permits(self, table):
+        # An Allow that grants only DescribeStream on table/<T>/stream/* must
+        # match the concrete stream ARN and permit the call.
+        wild = table["table_arn"] + "/stream/*"
+        policy = {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:DescribeStream", "Resource": wild}]}
+        s = self._ddb(policy, "dynamodbstreams")
+        s.describe_stream(StreamArn=table["stream_arn"])  # must not raise
+
     def test_delete_backup_deny_blocks(self, table):
         d = self._ddb(_allow_all_deny("DeleteBackup", table["backup_arn"]))
         self._assert_denied(lambda: d.delete_backup(BackupArn=table["backup_arn"]))
