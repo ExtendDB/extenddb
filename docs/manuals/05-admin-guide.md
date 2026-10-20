@@ -343,11 +343,24 @@ account, for both `Allow` and `Deny`.
 
 What a trust-policy `Deny` does not do:
 
-- A `Deny` whose `Condition` uses a condition key ExtendDB does not resolve
-  (for example `aws:SourceIp`) or an operator it does not implement (for
-  example `IpAddress`) fails closed: it blocks assumption rather than being
-  dropped. Write a `Deny` only on keys you can resolve (`aws:PrincipalTag/*`,
-  `sts:ExternalId`) unless you intend an unconditional block.
+- A statement whose `Condition` uses a condition key ExtendDB does not resolve,
+  or an operator it does not implement, fails closed: a `Deny` blocks assumption
+  and an `Allow` grants nothing, rather than the key being treated as absent.
+  ExtendDB resolves these trust-policy keys: `aws:PrincipalTag/<key>` (tag key
+  matched case-insensitively), `sts:ExternalId`, `aws:PrincipalArn`,
+  `aws:PrincipalAccount`, `aws:RequestTag/<key>` and `aws:TagKeys` (from the
+  passed session tags). It does not evaluate these global keys that STS
+  populates, so a statement depending on one fails closed: `aws:PrincipalOrgID`,
+  `aws:PrincipalOrgPaths`, `aws:PrincipalType`, `aws:userid`, `aws:username`,
+  `aws:SourceIp`, `aws:SecureTransport`, `aws:CurrentTime`, `aws:EpochTime`,
+  `aws:RequestedRegion` and `aws:UserAgent`. The practical effect: a common
+  organization-scoped trust policy (`Allow` gated on `aws:PrincipalOrgID`, or a
+  `Deny` outside the org) is refused on ExtendDB rather than silently granted.
+  The operators `IpAddress`, `NotIpAddress` and `BinaryEquals` are accepted at
+  role creation (IAM accepts them) but are not evaluated, so a statement using
+  one also fails closed. Write a conditional trust statement only on the
+  resolved keys and implemented operators unless you intend an unconditional
+  block.
 - `NotPrincipal` is not allowed in a trust policy and is rejected when the role
   is created.
 - A `Resource` field is not allowed in a trust policy and is rejected at create.
