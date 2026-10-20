@@ -35,11 +35,13 @@ pub(crate) fn extract_operation(headers: &HeaderMap) -> Result<String, DynamoDbE
         .ok_or_else(|| DynamoDbError::UnknownOperationException(String::new()))
 }
 
-/// Extract the table name from a `DynamoDB` request body.
+/// Extract the top-level `TableName` from a request body.
 ///
-/// Most operations use `TableName`. Batch and transact operations embed table
-/// names in nested structures — returns `None` for those; the caller maps
-/// `None` to `*` via `build_resource_arn`.
+/// Used to pre-fetch table key info for item operations. Batch and transact
+/// operations embed table names in nested structures and carry no top-level
+/// `TableName`, so this returns `None` for them. The authorization resource is
+/// derived separately by `authz_resource::authz_targets`, which never falls
+/// back to a `table/*` wildcard.
 pub(crate) fn extract_table_name(input: &Value) -> Option<String> {
     input
         .get("TableName")
