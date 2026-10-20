@@ -3,6 +3,8 @@
 
 //! Request parsing and authorization helpers for the `DynamoDB` wire protocol.
 
+use std::collections::HashMap;
+
 use axum::http::HeaderMap;
 use extenddb_core::error::DynamoDbError;
 use serde_json::Value;
@@ -37,8 +39,8 @@ pub(crate) fn extract_operation(headers: &HeaderMap) -> Result<String, DynamoDbE
 /// Extract the table name from a `DynamoDB` request body.
 ///
 /// Most operations use `TableName`. Batch and transact operations embed table
-/// names in nested structures — returns `None` for those; the caller maps
-/// `None` to `*` via `build_resource_arn`.
+/// names in nested structures, so this returns `None` for those; the caller
+/// maps `None` to `*` via `build_resource_arn`.
 pub(crate) fn extract_table_name(input: &Value) -> Option<String> {
     input
         .get("TableName")
@@ -106,30 +108,78 @@ pub(crate) async fn authorize_request(
     // Deny on one table be bypassed. Evaluate every (action, table) pair and
     // reject the entire request if any is denied (all-or-nothing), matching
     // DynamoDB. Verified against the AWS IAM Service Authorization Reference.
-    if let Some(targets) = batch_transact_authz_targets(operation, input) {
-        for (action_op, table) in targets {
-            let resource_arn = build_resource_arn(&state.region, account_id, Some(&table));
+    // `batch_transact_targets` returns `Some` for exactly the batch and
+    // transaction operations. Batch operations authorize once per table with
+    // the set of keys that table receives; transaction operations authorize
+    // once per item with that item's key. Each target carries the
+    // `dynamodb:LeadingKeys` value(s) the service evaluates, extracted per the
+    // table's key schema. The resource ARN per target is unchanged: each is
+    // still that table's ARN. (Measured against live DynamoDB 2026-10-20.)
+    if let Some(skeleton) =
+        crate::leading_keys::batch_transact_targets(operation, input, &HashMap::new())
+    {
+        // Fetch each distinct table's key info for partition-key extraction.
+        let tables: std::collections::BTreeSet<String> =
+            skeleton.iter().map(|t| t.table.clone()).collect();
+        let mut key_info_by_table = HashMap::new();
+        for table in tables {
+            if let Some(ki) = state
+                .table_key_info_cache
+                .get_optional(account_id, &table)
+                .await
+            {
+                key_info_by_table.insert(table, ki);
+            }
+        }
+        let targets =
+            crate::leading_keys::batch_transact_targets(operation, input, &key_info_by_table)
+                .unwrap_or(skeleton);
+
+        if targets.is_empty() {
+            // Malformed or empty body: still require the operation's action on
+            // the table wildcard, as the generic path would, then let the
+            // engine reject the body. This never silently skips authorization.
+            let resource_arn = build_resource_arn(&state.region, account_id, None);
             authorization::check_authorization(
                 state.authz_cache.as_ref(),
                 identity,
-                &action_op,
+                operation,
                 &resource_arn,
                 false,
                 extenddb_auth::policy::context::RequestParams::default(),
             )
             .await?;
+        } else {
+            for target in targets {
+                let resource_arn =
+                    build_resource_arn(&state.region, account_id, Some(&target.table));
+                let params = extenddb_auth::policy::context::RequestParams {
+                    leading_keys: target.leading_keys,
+                    ..Default::default()
+                };
+                authorization::check_authorization(
+                    state.authz_cache.as_ref(),
+                    identity,
+                    &target.action,
+                    &resource_arn,
+                    false,
+                    params,
+                )
+                .await?;
+            }
         }
         return Ok(None);
     }
 
     let resource_arn = build_resource_arn(&state.region, account_id, table_name.as_deref());
 
-    let pk_attr = key_info
-        .as_ref()
-        .map(|ki| ki.key_schema[0].attribute_name.clone());
-
     let params = extenddb_auth::policy::context::RequestParams {
-        leading_keys: extract_leading_keys(input, operation, pk_attr.as_deref()),
+        leading_keys: crate::leading_keys::single_table_leading_keys(
+            input,
+            operation,
+            key_info.as_ref(),
+            state.limits.max_expression_tokens,
+        ),
         attributes: extract_attributes(input),
         select: input
             .get("Select")
@@ -158,42 +208,6 @@ pub(crate) async fn authorize_request(
     Ok(key_info)
 }
 
-/// Extract partition key values from the request body for `dynamodb:LeadingKeys`.
-///
-/// For item-level operations (`GetItem`, `PutItem`, `DeleteItem`, `UpdateItem`),
-/// extracts the partition key value from the `Key` or `Item` using the table's
-/// key schema. For `Query`, the leading key comes from `KeyConditionExpression`
-/// values, but extracting that requires expression parsing — deferred to the
-/// engine layer.
-/// Returns `None` for table-level and batch/transact operations, or when
-/// `pk_attr` is not available.
-fn extract_leading_keys(
-    input: &Value,
-    operation: &str,
-    pk_attr: Option<&str>,
-) -> Option<Vec<String>> {
-    let pk_attr = pk_attr?;
-    match operation {
-        "GetItem" | "DeleteItem" | "UpdateItem" => extract_pk_value(input.get("Key")?, pk_attr),
-        "PutItem" => extract_pk_value(input.get("Item")?, pk_attr),
-        _ => None,
-    }
-}
-
-/// Extract the partition key value from a `DynamoDB` key/item map using the
-/// known PK attribute name.
-///
-/// `DynamoDB` keys are `{"attrName": {"S": "value"}}`. We extract the typed
-/// value of the partition key attribute as a string.
-fn extract_pk_value(map: &Value, pk_attr: &str) -> Option<Vec<String>> {
-    let obj = map.as_object()?;
-    let type_val = obj.get(pk_attr)?;
-    let type_obj = type_val.as_object()?;
-    let (_, val) = type_obj.iter().next()?;
-    let s = val.as_str().unwrap_or_default();
-    Some(vec![s.to_owned()])
-}
-
 /// Extract attribute names from the request for `dynamodb:Attributes`.
 ///
 /// Collects attribute names from `ProjectionExpression` (comma-separated list
@@ -217,69 +231,6 @@ pub(crate) fn extract_attributes(input: &Value) -> Option<Vec<String>> {
         })
         .collect();
     if names.is_empty() { None } else { Some(names) }
-}
-
-/// IAM `(action, table)` pairs to authorize for a batch/transact operation.
-///
-/// Returns `None` for non-batch/transact operations (the caller uses the
-/// single-table path). Actions follow the AWS IAM Service Authorization
-/// Reference: `BatchGetItem`/`BatchWriteItem` authorize under their own action
-/// per table; `TransactGetItems` authorizes as `GetItem` per item's table;
-/// `TransactWriteItems` authorizes per sub-op (`Put`→`PutItem`,
-/// `Delete`→`DeleteItem`, `Update`→`UpdateItem`, `ConditionCheck`→
-/// `ConditionCheckItem`). Pairs are de-duplicated. Table names are the bare
-/// operation-string form (no `dynamodb:` prefix), matching `check_authorization`
-/// which prepends `dynamodb:`.
-fn batch_transact_authz_targets(operation: &str, input: &Value) -> Option<Vec<(String, String)>> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    let mut push = |action: &str, table: &str| {
-        let pair = (action.to_owned(), table.to_owned());
-        if !out.contains(&pair) {
-            out.push(pair);
-        }
-    };
-    match operation {
-        "BatchGetItem" | "BatchWriteItem" => {
-            // RequestItems is a map keyed by table name.
-            let items = input.get("RequestItems")?.as_object()?;
-            for table in items.keys() {
-                push(operation, table);
-            }
-        }
-        "TransactGetItems" => {
-            let items = input.get("TransactItems")?.as_array()?;
-            for entry in items {
-                if let Some(t) = entry
-                    .get("Get")
-                    .and_then(|g| g.get("TableName"))
-                    .and_then(Value::as_str)
-                {
-                    push("GetItem", t);
-                }
-            }
-        }
-        "TransactWriteItems" => {
-            let items = input.get("TransactItems")?.as_array()?;
-            for entry in items {
-                for (sub, action) in [
-                    ("Put", "PutItem"),
-                    ("Delete", "DeleteItem"),
-                    ("Update", "UpdateItem"),
-                    ("ConditionCheck", "ConditionCheckItem"),
-                ] {
-                    if let Some(t) = entry
-                        .get(sub)
-                        .and_then(|s| s.get("TableName"))
-                        .and_then(Value::as_str)
-                    {
-                        push(action, t);
-                    }
-                }
-            }
-        }
-        _ => return None,
-    }
-    Some(out)
 }
 
 /// Build a `DynamoDB` table ARN for authorization.
