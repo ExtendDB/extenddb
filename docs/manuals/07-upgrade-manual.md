@@ -218,7 +218,7 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
-### v0.1.14 — IAM: dynamodb:LeadingKeys now enforced on Query, batch and transaction operations
+### v0.1.14 LeadingKeys now enforced on Query, batch and transaction operations
 
 **What changed.** `dynamodb:LeadingKeys` is now evaluated on `Query`,
 `BatchGetItem`, `BatchWriteItem`, `TransactGetItems` and `TransactWriteItems`.
