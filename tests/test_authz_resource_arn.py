@@ -8,9 +8,8 @@ TableName (ResourceArn on the tag operations, StreamArn on stream operations,
 BackupArn on backup operations, IndexName on Query and Scan, and a table ARN in
 TableName) must authorize against that specific resource. A policy that allows
 dynamodb:* on * but explicitly Denies one action on one specific ARN must block
-that action, matching live DynamoDB (measured 2026-10-20, account
-964157134968: every case below returns AccessDeniedException while an allowed
-control on the same principal succeeds).
+that action, matching live DynamoDB: every case below returns
+AccessDeniedException while an allowed control on the same principal succeeds.
 
 These tests provision builtin-IAM principals through the management API, so they
 run against ExtendDB on every storage backend in CI. The equivalent behavior on
@@ -176,7 +175,7 @@ class TestExplicitDenyOnResourceArn:
             exc.value.response["Error"]
         )
 
-    # -- tag operations: the ticket's core defect --
+    # -- tag operations: the core defect, explicit Deny on a tagged resource --
 
     def test_tag_resource_deny_blocks(self, table):
         d = self._ddb(_allow_all_deny("TagResource", table["table_arn"]))

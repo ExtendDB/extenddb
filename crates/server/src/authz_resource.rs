@@ -11,8 +11,7 @@
 //! specific table, index, stream, or backup ARN never matched. In ABAC
 //! deployments this let a caller change the tags that drive access decisions.
 //!
-//! The service evaluates these resources (measured live, 2026-10-20, account
-//! 964157134968):
+//! The service evaluates these resources (verified against live DynamoDB):
 //!
 //! | Operation | IAM action | resource |
 //! |---|---|---|
