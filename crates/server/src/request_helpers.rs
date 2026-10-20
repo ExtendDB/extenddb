@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use axum::http::HeaderMap;
 use extenddb_core::error::DynamoDbError;
+use extenddb_storage::error::StorageError;
 use serde_json::Value;
 
 use crate::AppState;
@@ -48,6 +49,35 @@ pub(crate) fn extract_table_name(input: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// Decide how a `TableKeyInfo` lookup result feeds request authorization.
+///
+/// A present table yields its key info. A missing table yields `None`: the
+/// `dynamodb:LeadingKeys` value stays absent and the engine returns
+/// `ResourceNotFoundException`, which is what the service returns for a
+/// LeadingKeys-restricted principal on a missing table (measured 2026-10-20).
+///
+/// Any other lookup failure (connection, transient, backend internal) must not
+/// reach the policy evaluator with the key absent. A
+/// `ForAllValues:StringEquals dynamodb:LeadingKeys` condition is satisfied
+/// vacuously when the key is absent, so a request whose key could not be
+/// determined would be authorized and the engine could then read the real
+/// table on its own lookup. Such a failure returns an internal error before
+/// dispatch, so no request is ever authorized on a key the server could not
+/// determine. The cache reports a missing table as
+/// `StorageError::TableNotFound` and every other fault as a distinct error, so
+/// the two are told apart here rather than collapsed to `None`.
+fn key_info_for_authz(
+    result: Result<extenddb_core::types::TableKeyInfo, StorageError>,
+) -> Result<Option<extenddb_core::types::TableKeyInfo>, DynamoDbError> {
+    match result {
+        Ok(info) => Ok(Some(info)),
+        Err(StorageError::TableNotFound(_)) => Ok(None),
+        Err(_) => Err(DynamoDbError::InternalServerError(
+            "Internal server error".to_owned(),
+        )),
+    }
+}
+
 /// Evaluate IAM policies for an authenticated identity.
 ///
 /// Returns the pre-fetched `TableKeyInfo` for single-table item-level operations
@@ -72,10 +102,7 @@ pub(crate) async fn authorize_request(
     let key_info = match operation {
         "GetItem" | "PutItem" | "DeleteItem" | "UpdateItem" | "Query" | "Scan" => {
             if let Some(ref tn) = table_name {
-                state
-                    .table_key_info_cache
-                    .get_optional(account_id, tn)
-                    .await
+                key_info_for_authz(state.table_key_info_cache.get(account_id, tn).await)?
             } else {
                 None
             }
@@ -123,10 +150,8 @@ pub(crate) async fn authorize_request(
             skeleton.iter().map(|t| t.table.clone()).collect();
         let mut key_info_by_table = HashMap::new();
         for table in tables {
-            if let Some(ki) = state
-                .table_key_info_cache
-                .get_optional(account_id, &table)
-                .await
+            if let Some(ki) =
+                key_info_for_authz(state.table_key_info_cache.get(account_id, &table).await)?
             {
                 key_info_by_table.insert(table, ki);
             }
@@ -247,7 +272,49 @@ fn build_resource_arn(region: &str, account_id: &str, table_name: Option<&str>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use extenddb_core::types::TableKeyInfo;
     use serde_json::json;
+
+    fn sample_key_info() -> TableKeyInfo {
+        TableKeyInfo {
+            table_name: "t".to_owned(),
+            account_id: "123".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn key_info_for_authz_present_table_returns_key_info() {
+        let out =
+            key_info_for_authz(Ok(sample_key_info())).expect("a present table is not an error");
+        assert!(out.is_some(), "a present table must yield its key info");
+    }
+
+    #[test]
+    fn key_info_for_authz_missing_table_returns_none() {
+        let out = key_info_for_authz(Err(StorageError::TableNotFound("t".to_owned())))
+            .expect("a missing table is not a lookup failure");
+        assert!(
+            out.is_none(),
+            "a missing table must leave the leading key absent so the engine returns not-found"
+        );
+    }
+
+    #[test]
+    fn key_info_for_authz_lookup_error_fails_closed() {
+        for err in [
+            StorageError::Transient("db hiccup".to_owned()),
+            StorageError::Connection("pool timeout".to_owned()),
+            StorageError::TableNotActive("t".to_owned()),
+            StorageError::Internal("backend fault".to_owned()),
+        ] {
+            let out = key_info_for_authz(Err(err));
+            assert!(
+                matches!(out, Err(DynamoDbError::InternalServerError(_))),
+                "a lookup failure that is not not-found must fail closed, got: {out:?}"
+            );
+        }
+    }
 
     #[test]
     fn extract_attributes_resolves_expression_attribute_names() {

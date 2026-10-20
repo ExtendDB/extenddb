@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! `CachedTableKeyInfoStore` — stale-while-revalidate cache for
+//! `CachedTableKeyInfoStore`, a stale-while-revalidate cache for
 //! `TableKeyInfo` lookups.
 //!
 //! `TableKeyInfo` is fetched per request by the auth path
@@ -10,7 +10,7 @@
 //! operations). Caching it eliminates a catalog roundtrip per request on the
 //! steady-state hot path.
 //!
-//! Negative results — `Err(TableNotFound)` or table missing — are stored as
+//! Negative results (`Err(TableNotFound)` or table missing) are stored as
 //! `None` and capped at the configured `negative_ttl` (defaults to 5s) so
 //! newly-created tables become available quickly without restart.
 //!
@@ -107,16 +107,6 @@ impl CachedTableKeyInfoStore {
             Ok(None) => Err(StorageError::TableNotFound(table_name.to_owned())),
             Err(e) => Err(e),
         }
-    }
-
-    /// Same as `get`, but returns `Ok(None)` for missing tables — matches the
-    /// `.ok()` semantic used by the auth path's `LeadingKeys` extraction.
-    pub async fn get_optional(&self, account_id: &str, table_name: &str) -> Option<TableKeyInfo> {
-        self.cache
-            .get((account_id.to_owned(), table_name.to_owned()))
-            .await
-            .ok()
-            .flatten()
     }
 
     /// Drop the cached entry for `(account_id, table_name)`.
