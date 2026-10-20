@@ -90,24 +90,18 @@ fn parse_resource_identity(arn: &str) -> Option<ResourceId> {
     let sub = match after {
         None => None,
         Some(a) => {
-            if let Some(i) = a.strip_prefix("index/") {
-                if i.is_empty() {
-                    return None;
-                }
-                Some(Sub::Index(i.to_owned()))
-            } else if let Some(s) = a.strip_prefix("stream/") {
-                if s.is_empty() {
-                    return None;
-                }
-                Some(Sub::Stream(s.to_owned()))
-            } else if let Some(b) = a.strip_prefix("backup/") {
-                if b.is_empty() {
-                    return None;
-                }
-                Some(Sub::Backup(b.to_owned()))
-            } else {
-                // An unrecognized sub-resource shape is not a nameable resource.
+            // `a` is `<kind>/<id>`, e.g. `index/gsi1`, `stream/<label>` (the
+            // label may contain ':'), or `backup/<id>`. A shape with no id, or
+            // an unrecognized kind, is not a nameable resource.
+            let (kind, id) = a.split_once('/')?;
+            if id.is_empty() {
                 return None;
+            }
+            match kind {
+                "index" => Some(Sub::Index(id.to_owned())),
+                "stream" => Some(Sub::Stream(id.to_owned())),
+                "backup" => Some(Sub::Backup(id.to_owned())),
+                _ => return None,
             }
         }
     };
