@@ -20,6 +20,8 @@
 //! | `ListStreams` (with `TableName`) | `ListStreams` | `table/<T>/stream/*` |
 //! | `ListStreams` (no `TableName`) | `ListStreams` | `table/*/stream/*` |
 //! | `DescribeBackup`/`DeleteBackup` | same | the `BackupArn` |
+//! | `ListBackups` (with `TableName`) | `ListBackups` | `table/<T>/backup/*` |
+//! | `ListBackups` (no `TableName`) | `ListBackups` | `table/*/backup/*` |
 //! | `CreateBackup`/`DescribeContinuousBackups`/`UpdateContinuousBackups` | same | the table ARN |
 //! | `ExportTableToPointInTime` | same | the `TableArn` |
 //! | `ImportTable` | same | the new table ARN |
@@ -175,6 +177,10 @@ fn stream_wildcard(region: &str, account_id: &str) -> String {
     format!("arn:{PARTITION}:{SERVICE}:{region}:{account_id}:table/*/stream/*")
 }
 
+fn backup_wildcard(region: &str, account_id: &str) -> String {
+    format!("arn:{PARTITION}:{SERVICE}:{region}:{account_id}:table/*/backup/*")
+}
+
 /// The canonical stream ARN a GetRecords request reads, decoded from its shard
 /// iterator token. Returns `None` when the iterator field is absent, does not
 /// decode, or carries no stream ARN (a token issued by a build before the
@@ -261,11 +267,23 @@ pub(crate) fn authz_targets(
                 account_id,
             ))
         }
-        // ListBackups is scoped to a table when TableName is given, else account.
-        "ListBackups" => match str_field(input, "TableName") {
-            Some(t) => one(table_resource_arn(&t, region, account_id)),
-            None => one(table_wildcard(region, account_id)),
-        },
+        // ListBackups is scoped to a table's backups when TableName is given,
+        // else to every table's backups. The service evaluates
+        // table/<T>/backup/* and table/*/backup/* (measured live), the same
+        // sub-resource shape as ListStreams, not the bare table or table/*.
+        "ListBackups" => {
+            let res = match str_field(input, "TableName") {
+                Some(t) => {
+                    let rid = ResourceId {
+                        table: table_name_only(&t),
+                        sub: Some(Sub::Backup("*".to_owned())),
+                    };
+                    canonical(region, account_id, &rid)
+                }
+                None => backup_wildcard(region, account_id),
+            };
+            one(res)
+        }
         // Export names the source table via TableArn.
         "ExportTableToPointInTime" => one(table_resource_arn(
             &str_field(input, "TableArn").unwrap_or_default(),
@@ -489,6 +507,29 @@ mod tests {
         assert_eq!(
             only("ListStreams", json!({})),
             "arn:aws:dynamodb:us-east-1:964157134968:table/*/stream/*"
+        );
+    }
+
+    #[test]
+    fn list_backups_scopes_to_table_backups_then_account() {
+        // The service evaluates ListBackups against table/<T>/backup/* with a
+        // TableName and table/*/backup/* without (measured live), not the bare
+        // table or table/*.
+        assert_eq!(
+            only("ListBackups", json!({ "TableName": "bb" })),
+            "arn:aws:dynamodb:us-east-1:964157134968:table/bb/backup/*"
+        );
+        assert_eq!(
+            only("ListBackups", json!({})),
+            "arn:aws:dynamodb:us-east-1:964157134968:table/*/backup/*"
+        );
+        // A table ARN in TableName is reduced to its table name first.
+        assert_eq!(
+            only(
+                "ListBackups",
+                json!({ "TableName": "arn:aws:dynamodb:us-east-1:964157134968:table/bb" })
+            ),
+            "arn:aws:dynamodb:us-east-1:964157134968:table/bb/backup/*"
         );
     }
 

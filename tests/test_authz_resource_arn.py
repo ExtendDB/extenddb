@@ -248,6 +248,48 @@ class TestExplicitDenyOnResourceArn:
         d = self._ddb(_allow_all_deny("DeleteBackup", table["backup_arn"]))
         self._assert_denied(lambda: d.delete_backup(BackupArn=table["backup_arn"]))
 
+    # -- ListBackups authorizes the backup sub-resource, not the table --
+    # The service evaluates table/<T>/backup/* (with TableName) and
+    # table/*/backup/* (without), measured live. A Deny on that resource must
+    # block ListBackups, and a least-privilege Allow on it must permit it; a
+    # policy written against the bare table ARN does not affect ListBackups.
+
+    def _backup_wild_table(self, table) -> str:
+        return table["table_arn"] + "/backup/*"
+
+    def _backup_wild_all(self) -> str:
+        return f"arn:aws:dynamodb:{self.region}:{self.account_id}:table/*/backup/*"
+
+    def test_list_backups_deny_backup_wildcard_with_table_blocks(self, table):
+        d = self._ddb(_allow_all_deny("ListBackups", self._backup_wild_table(table)))
+        self._assert_denied(lambda: d.list_backups(TableName=table["name"]))
+
+    def test_list_backups_deny_backup_wildcard_no_table_blocks(self, table):
+        d = self._ddb(_allow_all_deny("ListBackups", self._backup_wild_all()))
+        self._assert_denied(lambda: d.list_backups())
+
+    def test_list_backups_allow_backup_wildcard_with_table_permits(self, table):
+        policy = {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:ListBackups",
+             "Resource": self._backup_wild_table(table)}]}
+        d = self._ddb(policy)
+        d.list_backups(TableName=table["name"])  # must not raise
+
+    def test_list_backups_allow_bare_table_denies(self, table):
+        # An Allow written only on the bare table ARN does not grant ListBackups,
+        # because the service evaluates the backup sub-resource.
+        policy = {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:ListBackups",
+             "Resource": table["table_arn"]}]}
+        d = self._ddb(policy)
+        self._assert_denied(lambda: d.list_backups(TableName=table["name"]))
+
+    def test_list_backups_deny_bare_table_permits(self, table):
+        # A Deny written on the bare table ARN does not block ListBackups,
+        # because that is not the resource the service evaluates.
+        d = self._ddb(_allow_all_deny("ListBackups", table["table_arn"]))
+        d.list_backups(TableName=table["name"])  # must not raise
+
     def test_query_on_index_deny_blocks(self, table):
         d = self._ddb(_allow_all_deny("Query", table["index_arn"]))
         self._assert_denied(lambda: d.query(
