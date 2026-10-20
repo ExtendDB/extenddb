@@ -1432,6 +1432,34 @@ pub fn validate_index_key_types(
     Ok(())
 }
 
+/// Validate that secondary-index key attributes present in the item an
+/// UpdateExpression produced match their declared scalar type, reporting with
+/// the wording `DynamoDB` uses for a value computed from the existing item.
+///
+/// The service checks literal operands before the condition with the
+/// per-index `Type mismatch for Index Key` wording (see
+/// [`validate_index_key_literal_operands`]). A value that comes from an
+/// attribute reference or the fallback of `if_not_exists` is only known once
+/// the statement has been applied, and is then reported with this message,
+/// which names neither the attribute nor the index.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` on the first wrong-typed
+/// index key attribute, indexes in name order.
+pub fn validate_index_key_types_after_update(
+    item: &Item,
+    indexes: &[IndexKeyRef<'_>],
+    attr_defs: &[AttributeDefinition],
+) -> Result<(), DynamoDbError> {
+    validate_index_key_types(item, indexes, attr_defs).map_err(|_| {
+        DynamoDbError::ValidationException(
+            "The update expression attempted to update the secondary index key to unsupported type"
+                .to_owned(),
+        )
+    })
+}
+
 /// Validate that no secondary-index key attribute in `item` is an empty string
 /// or empty binary value.
 ///
@@ -1500,6 +1528,131 @@ fn ordered_indexes<'b, 'a>(indexes: &'b [IndexKeyRef<'a>]) -> Vec<&'b IndexKeyRe
     let mut ordered: Vec<&IndexKeyRef<'_>> = indexes.iter().collect();
     ordered.sort_by(|a, b| a.index_name.cmp(b.index_name));
     ordered
+}
+
+/// The type an update operand produces when it is built from literals alone,
+/// `None` when any part of it reads the item (an attribute path, or a
+/// function whose result depends on one such as `if_not_exists`).
+///
+/// `list_append` of two literals is a list; arithmetic on two literals is a
+/// number. Anything else that is literal-only is a placeholder.
+fn literal_operand_type(
+    expr: &crate::expression::Expr,
+    maps: &crate::expression::ExpressionMaps,
+) -> Option<&'static str> {
+    use crate::expression::Expr;
+    match expr {
+        Expr::Placeholder(name) => maps.values.get(name).map(attribute_value_type_tag),
+        Expr::Function { name, args } if name.eq_ignore_ascii_case("list_append") => {
+            let all_literal = args.iter().all(|a| literal_operand_type(a, maps).is_some());
+            all_literal.then_some("L")
+        }
+        Expr::Arithmetic { left, right, .. } => {
+            let both = literal_operand_type(left, maps).is_some()
+                && literal_operand_type(right, maps).is_some();
+            both.then_some("N")
+        }
+        _ => None,
+    }
+}
+
+/// Validate, before a condition is evaluated or a statement applied, that every
+/// `SET`, `ADD` or `DELETE` action whose target is a secondary-index key
+/// attribute and whose operand is built from literals alone carries a value of
+/// the key's declared type.
+///
+/// `DynamoDB` runs this check on the statement text ahead of the condition and
+/// ahead of applying the statement, so it is reported even when the condition
+/// would fail or another action in the statement could not be applied. A value
+/// that depends on the existing item (an attribute reference, the fallback of
+/// `if_not_exists`) is not checked here; the storage layer checks the written
+/// item afterwards and reports it with the computed-value wording.
+///
+/// `ADD` of a number onto a number key keeps the key's type and passes. `ADD`
+/// or `DELETE` of a set onto any index key, and `ADD` of a number onto a
+/// string or binary key, are type mismatches, because the result cannot be a
+/// scalar of the declared type. Indexes are checked in name order and actions
+/// in statement order.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with the index-key type
+/// mismatch wording naming the attribute, the expected and actual types and
+/// the alphabetically-first index that keys the attribute.
+pub fn validate_index_key_literal_operands(
+    actions: &[crate::expression::UpdateAction],
+    indexes: &[IndexKeyRef<'_>],
+    attr_defs: &[AttributeDefinition],
+    maps: &crate::expression::ExpressionMaps,
+) -> Result<(), DynamoDbError> {
+    use crate::expression::{PathElement, UpdateAction};
+    if indexes.is_empty() {
+        return Ok(());
+    }
+    let ordered = ordered_indexes(indexes);
+    for action in actions {
+        let (path, operand, is_set) = match action {
+            UpdateAction::Set { path, value } => (path, value, true),
+            UpdateAction::Add { path, value } | UpdateAction::Delete { path, value } => {
+                (path, value, false)
+            }
+            UpdateAction::Remove { .. } => continue,
+        };
+        // Only a top-level attribute can be an index key.
+        if path.len() != 1 {
+            continue;
+        }
+        let Some(PathElement::Attribute(raw)) = path.first() else {
+            continue;
+        };
+        let attr: &str = match raw.strip_prefix('#') {
+            Some(alias) => maps.resolve_name(alias)?,
+            None => raw.as_str(),
+        };
+        let Some(actual) = literal_operand_type(operand, maps) else {
+            continue;
+        };
+        for idx in &ordered {
+            for ks in idx.key_schema {
+                if ks.attribute_name != attr {
+                    continue;
+                }
+                let Some(expected) = attr_defs
+                    .iter()
+                    .find(|ad| ad.attribute_name == attr)
+                    .map(|ad| ad.attribute_type)
+                else {
+                    continue;
+                };
+                // SET must supply the declared type. ADD of a number onto a
+                // number key keeps the type and passes here (a string operand
+                // to ADD is an expression-level error the parser reports);
+                // ADD or DELETE of a set, or ADD of a number onto a string or
+                // binary key, cannot leave a scalar of the declared type.
+                let ok = if is_set {
+                    scalar_type_tag(expected) == actual
+                } else {
+                    match actual {
+                        "N" => expected == ScalarAttributeType::N,
+                        "SS" | "NS" | "BS" => false,
+                        // Any other operand type is an expression-level
+                        // operand error the evaluator reports.
+                        _ => true,
+                    }
+                };
+                if !ok {
+                    return Err(DynamoDbError::ValidationException(format!(
+                        "One or more parameter values were invalid: Type mismatch for Index Key {} Expected: {} Actual: {} IndexName: {}",
+                        attr,
+                        scalar_type_tag(expected),
+                        actual,
+                        idx.index_name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Readable flags for the `is_query` parameter of [`validate_select_projection`].

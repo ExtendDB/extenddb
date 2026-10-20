@@ -230,6 +230,30 @@ pub async fn handle_update_item(
     // Validate that no update action targets a key attribute (REQ-DATA-003)
     validate_no_key_updates(&actions, &key_info, &maps)?;
 
+    // A literal operand assigned to a secondary-index key must carry the key's
+    // declared type. DynamoDB checks this on the statement itself, ahead of
+    // the condition and ahead of applying any action, so it is reported even
+    // when the condition would fail or another action could not be applied.
+    // A value computed from the existing item is checked by the storage layer
+    // on the written item instead.
+    {
+        let idx_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = key_info
+            .global_secondary_indexes
+            .iter()
+            .chain(key_info.local_secondary_indexes.iter())
+            .map(|idx| extenddb_core::validation::IndexKeyRef {
+                index_name: &idx.index_name,
+                key_schema: &idx.key_schema,
+            })
+            .collect();
+        extenddb_core::validation::validate_index_key_literal_operands(
+            &actions,
+            &idx_refs,
+            &key_info.attribute_definitions,
+            &maps,
+        )?;
+    }
+
     let return_old = matches!(
         input.return_values,
         ReturnValues::AllOld | ReturnValues::UpdatedOld

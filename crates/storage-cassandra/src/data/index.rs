@@ -35,6 +35,20 @@ pub struct IndexMeta {
     pub propagation_delay_ms: Option<i32>,
 }
 
+/// Build [`validation::IndexKeyRef`] views over the table's indexes for
+/// secondary-index key validation on a written or updated item.
+pub(crate) fn index_key_refs(
+    indexes: &[IndexMeta],
+) -> Vec<extenddb_core::validation::IndexKeyRef<'_>> {
+    indexes
+        .iter()
+        .map(|idx| extenddb_core::validation::IndexKeyRef {
+            index_name: &idx.index_name,
+            key_schema: &idx.key_schema,
+        })
+        .collect()
+}
+
 /// Fetch all index metadata for a table from the catalog.
 pub async fn fetch_indexes_for_table(
     table_id: &str,
