@@ -430,6 +430,27 @@ fn table_name_only(value: &str) -> String {
     value.to_owned()
 }
 
+/// The table name to look up key info under when a request names its table by
+/// `value`, which may be a bare table name or a table ARN.
+///
+/// A table ARN is reduced to its table name only when it names a table in this
+/// deployment's partition, service, region and the caller's account. Any other
+/// ARN is returned unchanged, so the lookup finds no table and the engine
+/// handles the request exactly as it would without this helper.
+pub(crate) fn key_lookup_name(value: &str, region: &str, account_id: &str) -> String {
+    if let Some((partition, service, arn_region, account, _)) = arn_fields(value)
+        && partition == PARTITION
+        && service == SERVICE
+        && arn_region == region
+        && account == account_id
+        && let Some(rid) = parse_resource_identity(value)
+        && rid.sub.is_none()
+    {
+        return rid.table;
+    }
+    value.to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -898,5 +919,32 @@ mod tests {
                 .nth(4),
             Some("111111111111")
         );
+    }
+}
+
+#[cfg(test)]
+mod key_lookup_name_tests {
+    use super::key_lookup_name;
+
+    #[test]
+    fn table_arn_for_this_account_and_region_resolves_to_the_table_name() {
+        let r = "us-east-1";
+        let a = "964157134968";
+        assert_eq!(key_lookup_name("orders", r, a), "orders");
+        assert_eq!(
+            key_lookup_name("arn:aws:dynamodb:us-east-1:964157134968:table/orders", r, a),
+            "orders"
+        );
+        for other in [
+            "arn:aws:dynamodb:us-east-1:111111111111:table/orders",
+            "arn:aws:dynamodb:eu-west-1:964157134968:table/orders",
+            "arn:aws-cn:dynamodb:us-east-1:964157134968:table/orders",
+            "arn:aws:s3:us-east-1:964157134968:table/orders",
+            "arn:aws:dynamodb:us-east-1:964157134968:table/orders/index/g1",
+            "arn:aws:dynamodb:us-east-1:964157134968:backup/orders",
+            "arn:aws:dynamodb",
+        ] {
+            assert_eq!(key_lookup_name(other, r, a), other, "{other}");
+        }
     }
 }

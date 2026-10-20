@@ -470,6 +470,26 @@ class TestExplicitDenyOnResourceArn:
         self._assert_denied(lambda: d2.get_item(
             TableName=table["table_arn"], Key={"pk": {"S": "p1"}}))
 
+    def test_table_arn_in_tablename_keeps_leading_keys_fence(self, table):
+        """A principal fenced to one partition with dynamodb:LeadingKeys is
+        refused another partition when it names the table by ARN, as it is when
+        it names the table by name. Measured on DynamoDB 2026-10-20: GetItem with
+        the table ARN as TableName for a partition outside the fence returns
+        AccessDeniedException."""
+        d = self._ddb({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": "dynamodb:*",
+                "Resource": table["table_arn"],
+                "Condition": {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["p1"]}},
+            }],
+        })
+        self._assert_denied(lambda: d.get_item(
+            TableName=table["name"], Key={"pk": {"S": "other"}}))
+        self._assert_denied(lambda: d.get_item(
+            TableName=table["table_arn"], Key={"pk": {"S": "other"}}))
+
     # -- positive control: without the Deny, the operation is allowed --
 
     def test_allow_without_deny_permits_tagging(self, table):

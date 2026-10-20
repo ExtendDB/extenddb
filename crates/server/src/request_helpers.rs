@@ -67,21 +67,34 @@ pub(crate) async fn authorize_request(
 ) -> Result<Option<extenddb_core::types::TableKeyInfo>, DynamoDbError> {
     let table_name = extract_table_name(input);
 
+    // TableName may be a table ARN. dynamodb:LeadingKeys and the other item
+    // condition keys are read with the table's key schema, so key info is
+    // looked up by the table name the ARN names (this account and region only).
+    // Without this, the lookup misses, LeadingKeys is absent, and a
+    // ForAllValues condition is satisfied vacuously. The key info found this
+    // way is used for authorization only and is not handed to the engine, which
+    // resolves the request's TableName itself as before.
+    let named_by_arn = table_name.as_deref().is_some_and(|t| t.starts_with("arn:"));
+
     // P118: Fetch table_key_info for item-level operations via the SWR cache.
     // The result is used for LeadingKeys extraction here AND returned to the
     // caller to avoid a redundant fetch in the engine layer.
     let key_info = match operation {
         "GetItem" | "PutItem" | "DeleteItem" | "UpdateItem" | "Query" | "Scan" => {
             if let Some(ref tn) = table_name {
+                let lookup = authz_resource::key_lookup_name(tn, &state.region, account_id);
                 state
                     .table_key_info_cache
-                    .get_optional(account_id, tn)
+                    .get_optional(account_id, &lookup)
                     .await
             } else {
                 None
             }
         }
         _ => None,
+    };
+    let engine_key_info = |ki: Option<extenddb_core::types::TableKeyInfo>| {
+        if named_by_arn { None } else { ki }
     };
 
     // Developer mode opens authorization for the authenticated caller. SigV4
@@ -96,7 +109,7 @@ pub(crate) async fn authorize_request(
     // item operations passed. Any future operation-specific branch must be added
     // below this point, or it will reintroduce that defect.
     if state.dev_mode {
-        return Ok(key_info);
+        return Ok(engine_key_info(key_info));
     }
 
     // Tag operations validate the ResourceArn shape before the IAM decision, as
@@ -240,7 +253,7 @@ pub(crate) async fn authorize_request(
         }
     }
 
-    Ok(key_info)
+    Ok(engine_key_info(key_info))
 }
 
 /// Extract partition key values from the request body for `dynamodb:LeadingKeys`.
