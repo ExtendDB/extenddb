@@ -141,7 +141,10 @@ fn batch_and_transact_n_leading_keys_are_canonicalized() {
         {"pk": {"N": "1E1"}, "sk": {"S": "y"}},
     ]}}});
     let t = batch_transact_targets("BatchGetItem", &bg, &ki).unwrap();
-    assert_eq!(t[0].leading_keys, Some(vec!["10".to_owned(), "10".to_owned()]));
+    assert_eq!(
+        t[0].leading_keys,
+        Some(vec!["10".to_owned(), "10".to_owned()])
+    );
 
     let tg = json!({"TransactItems": [
         {"Get": {"TableName": "n", "Key": {"pk": {"N": "+10"}, "sk": {"S": "x"}}}},

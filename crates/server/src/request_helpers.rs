@@ -342,9 +342,8 @@ mod tests {
         // and the engine agree on a not-active table. It still fails closed (an
         // Err, not an authorizing Ok).
         let out = key_info_for_authz(Err(StorageError::TableNotActive("t".to_owned())));
-        let engine = extenddb_engine::storage_err_to_dynamo(StorageError::TableNotActive(
-            "t".to_owned(),
-        ));
+        let engine =
+            extenddb_engine::storage_err_to_dynamo(StorageError::TableNotActive("t".to_owned()));
         assert!(
             matches!(out, Err(ref e) if std::mem::discriminant(e) == std::mem::discriminant(&engine)),
             "TableNotActive must map to the engine's error class ({engine:?}), got: {out:?}"
