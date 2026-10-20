@@ -351,7 +351,7 @@ class TestRoleSessionTagCondition:
             "Statement": [{
                 "Effect": "Allow",
                 "Principal": {"AWS": caller_arn},
-                "Action": "sts:AssumeRole",
+                "Action": ["sts:AssumeRole", "sts:TagSession"],
             }],
         }
         resp = self.mgmt.create_role(self.account_id, role, trust_policy)
