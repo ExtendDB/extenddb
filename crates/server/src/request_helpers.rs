@@ -124,11 +124,20 @@ pub(crate) async fn authorize_request(
         let resource_arn =
             authz_resource::getrecords_stream_resource(input, &state.region, account_id)
                 .ok_or_else(|| {
-                    DynamoDbError::AccessDeniedException(
-                        "User is not authorized to perform: dynamodb:GetRecords: the shard \
-                         iterator does not identify a stream"
-                            .to_owned(),
-                    )
+                    // The iterator does not identify a stream (a token from a
+                    // build before the stream ARN was carried, or a forged
+                    // token). Fail closed with the service's implicit-deny
+                    // message form. There is no specific stream to name, so the
+                    // account stream space stands in for the resource.
+                    let principal = authorization::principal_arn(identity);
+                    let resource =
+                        format!("arn:aws:dynamodb:{}:{account_id}:table/*/stream/*", state.region);
+                    DynamoDbError::AccessDeniedException(authorization::deny_message(
+                        &principal,
+                        "dynamodb:GetRecords",
+                        &resource,
+                        false,
+                    ))
                 })?;
         authorization::check_authorization(
             state.authz_cache.as_ref(),

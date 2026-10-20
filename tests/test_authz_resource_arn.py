@@ -233,6 +233,22 @@ class TestExplicitDenyOnResourceArn:
             ShardIteratorType="TRIM_HORIZON")["ShardIterator"]
         self._assert_denied(lambda: s.get_records(ShardIterator=it))
 
+    def test_getrecords_no_stream_iterator_denied_implicit_message(self, table):
+        # An iterator that carries no stream (a token from a build before the
+        # stream ARN was carried) fails closed with the service implicit-deny
+        # message form, not an ExtendDB-specific message. ALLOW_ALL proves the
+        # denial is fail-closed, not an IAM decision.
+        s = self._ddb(ALLOW_ALL, "dynamodbstreams")
+        now = int(time.time())
+        old_raw = f"shardId-00000000000000000000-00000001|TRIM_HORIZON||{now}"
+        old = base64.standard_b64encode(old_raw.encode()).decode()
+        with pytest.raises(ClientError) as exc:
+            s.get_records(ShardIterator=old)
+        err = exc.value.response["Error"]
+        assert err["Code"] == "AccessDeniedException", err
+        assert "because no identity-based policy allows the dynamodb:GetRecords action" in err.get(
+            "Message", ""), err
+
     def test_getrecords_forged_shard_reads_nothing(self, table):
         # A token that names the allowed stream ARN but a shard that does not
         # belong to it must not read: the engine confirms the shard belongs to
