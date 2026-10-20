@@ -124,6 +124,16 @@ fn parse_resource_identity(arn: &str) -> Option<ResourceId> {
     })
 }
 
+/// Split an ARN into its (partition, service, region, account, resource)
+/// fields, ignoring nothing: the resource keeps any `:` and `/` it contains.
+/// Returns `None` when the string is not shaped like an ARN with five
+/// colon-separated fields after the `arn:` prefix.
+fn arn_fields(arn: &str) -> Option<(&str, &str, &str, &str, &str)> {
+    let rest = arn.strip_prefix("arn:")?;
+    let mut it = rest.splitn(5, ':');
+    Some((it.next()?, it.next()?, it.next()?, it.next()?, it.next()?))
+}
+
 /// Build a canonical ARN for this deployment from a resource identity.
 fn canonical(region: &str, account_id: &str, rid: &ResourceId) -> String {
     let base = format!(
@@ -183,24 +193,44 @@ fn backup_wildcard(region: &str, account_id: &str) -> String {
 }
 
 /// Validate the shape of a tag operation's `ResourceArn` before authorization,
-/// as the service does: tags are accepted only on a table or a stream, so an
-/// index ARN (or any other sub-resource ARN) is rejected with
-/// ValidationException for every principal, before the IAM decision. A table or
-/// stream ARN passes; the partition, service, region, account, and existence of
-/// the resource are checked later (after authorization) by the engine handler.
+/// as the service does (measured live). The service returns ValidationException
+/// to every principal, before the IAM decision, for an ARN that does not start
+/// with `arn:`, a DynamoDB ARN whose resource is not a table or stream, or an
+/// index ARN (tags are accepted only on a table or stream). A table or stream
+/// ARN passes; so does a foreign-service ARN (for example an S3 bucket), which
+/// authorization then denies. The partition, service, region, account, and
+/// existence of a table ARN are checked after authorization by the engine
+/// handler, so for those a no-permissions principal is denied first and only an
+/// authorized principal sees the shape error.
 pub(crate) fn validate_tag_resource_arn_shape(arn: &str) -> Result<(), DynamoDbError> {
-    if let Some(rid) = parse_resource_identity(arn) {
-        match rid.sub {
-            None | Some(Sub::Stream(_)) => {}
-            Some(Sub::Index(_)) | Some(Sub::Backup(_)) => {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "One or more parameter values were invalid: Invalid resource arn \
-                     provided, only table or stream is accepted. Provided resource arn: {arn}"
-                )));
+    if !arn.starts_with("arn:") {
+        return Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: ARNs must start with 'arn:': {arn}"
+        )));
+    }
+    match parse_resource_identity(arn) {
+        Some(ResourceId {
+            sub: None | Some(Sub::Stream(_)),
+            ..
+        }) => Ok(()),
+        Some(_) => Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: Invalid resource arn \
+             provided, only table or stream is accepted. Provided resource arn: {arn}"
+        ))),
+        None => {
+            // Not a table/... resource. A DynamoDB-service ARN is reported as
+            // not a DynamoDB resource; a foreign-service ARN is left to
+            // authorization, which denies it (measured live).
+            if arn_fields(arn).map(|f| f.1) == Some(SERVICE) {
+                Err(DynamoDbError::ValidationException(format!(
+                    "One or more parameter values were invalid: Provided Arn is not a \
+                     DynamoDB resource arn: {arn}"
+                )))
+            } else {
+                Ok(())
             }
         }
     }
-    Ok(())
 }
 
 /// The canonical stream ARN a GetRecords request reads, decoded from its shard
@@ -704,6 +734,44 @@ mod tests {
         assert!(
             validate_tag_resource_arn_shape(
                 "arn:aws:dynamodb:us-east-1:964157134968:table/bb/stream/2026-10-20T16:17:40.188"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn tag_resource_arn_shape_matches_service_ordering() {
+        // Measured live. ValidationException before authorization, every
+        // principal:
+        let not_arn = validate_tag_resource_arn_shape("banana");
+        assert!(matches!(
+            not_arn,
+            Err(DynamoDbError::ValidationException(ref m))
+                if m.contains("ARNs must start with 'arn:': banana")
+        ));
+        let bad_type = validate_tag_resource_arn_shape(
+            "arn:aws:dynamodb:us-east-1:964157134968:banana/x",
+        );
+        assert!(matches!(
+            bad_type,
+            Err(DynamoDbError::ValidationException(ref m))
+                if m.contains("Provided Arn is not a DynamoDB resource arn")
+        ));
+        // A foreign-service ARN whose resource is not a table passes the shape
+        // check and is left to authorization (which denies it).
+        assert!(validate_tag_resource_arn_shape("arn:aws:s3:::mybucket").is_ok());
+        // A table ARN whose partition, service, or region is this deployment's
+        // or not passes the shape check; the engine handler validates those
+        // fields after authorization.
+        assert!(
+            validate_tag_resource_arn_shape(
+                "arn:aws-cn:dynamodb:us-east-1:964157134968:table/bb"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_tag_resource_arn_shape(
+                "arn:aws:s3:us-east-1:964157134968:table/bb"
             )
             .is_ok()
         );

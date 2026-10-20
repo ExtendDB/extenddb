@@ -25,6 +25,33 @@ fn split_dynamodb_arn(arn: &str) -> Option<(&str, &str, &str)> {
     Some((region, account, resource))
 }
 
+/// Split any ARN into `(partition, service, region, account, resource)`. The
+/// resource keeps any `:` and `/` it contains. Returns `None` when the string
+/// does not have the five colon-separated fields after the `arn:` prefix.
+fn arn_fields(arn: &str) -> Option<(&str, &str, &str, &str, &str)> {
+    let rest = arn.strip_prefix("arn:")?;
+    let mut parts = rest.splitn(5, ':');
+    Some((
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+    ))
+}
+
+/// True for a `table/...` resource whose sub-resource is anything other than a
+/// stream (an index, a backup, or an unknown kind). Tags are accepted only on a
+/// table or a stream.
+fn tag_subresource_not_table_or_stream(resource: &str) -> bool {
+    let Some(tail) = resource.strip_prefix("table/") else {
+        return false;
+    };
+    let mut segs = tail.split('/');
+    let _table = segs.next();
+    !matches!(segs.next(), None | Some("") | Some("stream"))
+}
+
 /// Extract the table name from a `DynamoDB` table ARN.
 ///
 /// Expected format: `arn:aws:dynamodb:{region}:{account}:table/{name}[/...]`
@@ -43,14 +70,18 @@ fn extract_table_name_from_arn(arn: &str) -> Option<&str> {
 /// | Input | Result |
 /// |---|---|
 /// | Does not start with `arn:` | `ValidationException` (ARNs must start with `arn:`) |
-/// | Valid ARN for another service | `AccessDeniedException` |
-/// | `DynamoDB` ARN naming a non-table resource | `ValidationException` (not a `DynamoDB` resource arn) |
+/// | `DynamoDB` ARN whose resource is not a table | `ValidationException` (not a `DynamoDB` resource arn) |
+/// | Non-`DynamoDB`-service ARN whose resource is not a table | `AccessDeniedException` |
+/// | Table ARN naming an index or other sub-resource | `ValidationException` (only table or stream is accepted) |
 /// | Account differs from the caller's | `AccessDeniedException` |
-/// | Region differs from this deployment's | `ValidationException` (invalid `TableArn`) |
+/// | Table ARN with a different partition, service, or region | `ValidationException` (invalid `TableArn`) |
 /// | Table does not exist | `ResourceNotFoundException` |
 ///
-/// Account is checked before region, matching the service: a cross-account ARN
-/// is denied without revealing whether its region is valid.
+/// Account is checked before the partition, service, and region, matching the
+/// service: a cross-account ARN is denied without revealing whether its other
+/// fields are valid. For a table ARN, a no-permissions principal is denied by
+/// authorization before this runs; the partition, service, region, and
+/// existence errors therefore surface only for an authorized principal.
 async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), DynamoDbError> {
     if !arn.starts_with("arn:") {
         return Err(DynamoDbError::ValidationException(format!(
@@ -58,29 +89,46 @@ async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), 
         )));
     }
 
-    // An ARN for another service is denied rather than reported as malformed:
-    // authorization is evaluated against the resource before its shape is
-    // inspected further.
-    let Some((arn_region, arn_account, resource)) = split_dynamodb_arn(arn) else {
+    // A string that is not shaped like an ARN (fewer than the five
+    // colon-separated fields) is denied rather than reported as malformed.
+    let Some((partition, service, region, account, resource)) = arn_fields(arn) else {
         return Err(DynamoDbError::AccessDeniedException(
             "Access is denied".to_owned(),
         ));
     };
 
     if !resource.starts_with("table/") {
-        return Err(DynamoDbError::ValidationException(format!(
-            "One or more parameter values were invalid: \
-             Provided Arn is not a DynamoDB resource arn: {arn}"
-        )));
-    }
-
-    if arn_account != ctx.account_id.as_ref() {
+        // A DynamoDB ARN whose resource is not a table (a bare index, an
+        // export, and so on) is reported as not a DynamoDB resource. An ARN for
+        // another service is denied rather than reported as malformed, as the
+        // service does.
+        if service == "dynamodb" {
+            return Err(DynamoDbError::ValidationException(format!(
+                "One or more parameter values were invalid: \
+                 Provided Arn is not a DynamoDB resource arn: {arn}"
+            )));
+        }
         return Err(DynamoDbError::AccessDeniedException(
             "Access is denied".to_owned(),
         ));
     }
 
-    if arn_region != ctx.region.as_ref() {
+    // Tags are accepted only on a table or a stream; an index or other
+    // sub-resource is rejected.
+    if tag_subresource_not_table_or_stream(resource) {
+        return Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: Invalid resource arn \
+             provided, only table or stream is accepted. Provided resource arn: {arn}"
+        )));
+    }
+
+    if account != ctx.account_id.as_ref() {
+        return Err(DynamoDbError::AccessDeniedException(
+            "Access is denied".to_owned(),
+        ));
+    }
+
+    if partition != "aws" || service != "dynamodb" || region != ctx.region.as_ref() {
         return Err(DynamoDbError::ValidationException(format!(
             "Invalid TableArn: Invalid ResourceArn provided as input {arn}"
         )));

@@ -331,6 +331,75 @@ class TestExplicitDenyOnResourceArn:
         self._assert_validation(lambda: d.list_tags_of_resource(
             ResourceArn=table["index_arn"]), self._INDEX_MSG)
 
+    # -- TagResource ResourceArn error ordering, measured live, every row --
+    # ValidationException before authorization (every principal) for a malformed
+    # or non-table/stream ARN; for an admin, a table ARN with a wrong partition,
+    # service, or region is ValidationException where a no-permissions principal
+    # is denied by authorization. Every case is a refusal.
+
+    def _ordering_variants(self, table) -> dict:
+        parts = table["table_arn"].split(":")  # arn:aws:dynamodb:region:acct:table/name
+        region, account = parts[3], parts[4]
+        other_region = "us-west-2" if region != "us-west-2" else "us-east-1"
+        return {
+            "not_an_arn": "banana",
+            "bad_resource_type": f"arn:aws:dynamodb:{region}:{account}:banana/x",
+            "wrong_partition": table["table_arn"].replace("arn:aws:", "arn:aws-cn:", 1),
+            "wrong_service": table["table_arn"].replace(":dynamodb:", ":s3:", 1),
+            "cross_account": f"arn:aws:dynamodb:{region}:111122223333:table/{table['name']}",
+            "cross_region": f"arn:aws:dynamodb:{other_region}:{account}:table/{table['name']}",
+            "nonexistent": f"arn:aws:dynamodb:{region}:{account}:table/{table['name']}-nope-xyz",
+            "index_arn_for_tag": table["index_arn"],
+        }
+
+    def _assert_code(self, fn, code: str, substr: str = ""):
+        with pytest.raises(ClientError) as exc:
+            fn()
+        err = exc.value.response["Error"]
+        assert err["Code"] == code, err
+        if substr:
+            assert substr in err.get("Message", ""), err
+
+    def test_tag_ordering_noperm_matches_service(self, table):
+        v = self._ordering_variants(table)
+        noperm = {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:ListTables", "Resource": "*"}]}
+        expect = {
+            "not_an_arn": ("ValidationException", "ARNs must start with 'arn:'"),
+            "bad_resource_type": ("ValidationException", "Provided Arn is not a DynamoDB resource arn"),
+            "wrong_partition": ("AccessDeniedException", ""),
+            "wrong_service": ("AccessDeniedException", ""),
+            "cross_account": ("AccessDeniedException", ""),
+            "cross_region": ("AccessDeniedException", ""),
+            "nonexistent": ("AccessDeniedException", ""),
+            "index_arn_for_tag": ("ValidationException", "only table or stream is accepted"),
+        }
+        for label, arn in v.items():
+            code, substr = expect[label]
+            d = self._ddb(noperm)
+            self._assert_code(
+                lambda a=arn, dd=d: dd.tag_resource(ResourceArn=a, Tags=[{"Key": "k", "Value": "v"}]),
+                code, substr)
+
+    def test_tag_ordering_admin_matches_service(self, table):
+        v = self._ordering_variants(table)
+        expect = {
+            "not_an_arn": ("ValidationException", "ARNs must start with 'arn:'"),
+            "bad_resource_type": ("ValidationException", "Provided Arn is not a DynamoDB resource arn"),
+            "wrong_partition": ("ValidationException", "Invalid TableArn"),
+            "wrong_service": ("ValidationException", "Invalid TableArn"),
+            "cross_account": ("AccessDeniedException", ""),
+            "cross_region": ("ValidationException", "Invalid TableArn"),
+            "nonexistent": ("ResourceNotFoundException", ""),
+            "index_arn_for_tag": ("ValidationException", "only table or stream is accepted"),
+        }
+        for label, arn in v.items():
+            code, substr = expect[label]
+            d = self._ddb(ALLOW_ALL)
+            self._assert_code(
+                lambda a=arn, dd=d: dd.tag_resource(ResourceArn=a, Tags=[{"Key": "k", "Value": "v"}]),
+                code, substr)
+
     # -- permission chains: a Deny anywhere in the chain blocks the operation --
 
     def test_restore_from_backup_deny_target_item_action_blocks(self, table):
