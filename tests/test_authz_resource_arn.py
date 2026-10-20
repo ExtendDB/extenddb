@@ -175,6 +175,13 @@ class TestExplicitDenyOnResourceArn:
             exc.value.response["Error"]
         )
 
+    def _assert_validation(self, fn, substr: str):
+        with pytest.raises(ClientError) as exc:
+            fn()
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException", err
+        assert substr in err.get("Message", ""), err
+
     # -- tag operations: the core defect, explicit Deny on a tagged resource --
 
     def test_tag_resource_deny_blocks(self, table):
@@ -296,6 +303,33 @@ class TestExplicitDenyOnResourceArn:
             TableName=table["name"], IndexName="gsi1",
             KeyConditionExpression="g1pk = :p",
             ExpressionAttributeValues={":p": {"S": "g1"}}))
+
+    # -- tag operations on an index ARN: ValidationException for every principal
+    # The service accepts tags only on a table or stream; an index ARN is a
+    # ValidationException before the IAM decision, for a principal with full
+    # access and for one with none.
+
+    _INDEX_MSG = "only table or stream is accepted"
+
+    def test_tag_ops_on_index_arn_rejected_admin(self, table):
+        d = self._ddb(ALLOW_ALL)
+        self._assert_validation(lambda: d.tag_resource(
+            ResourceArn=table["index_arn"], Tags=[{"Key": "k", "Value": "v"}]), self._INDEX_MSG)
+        self._assert_validation(lambda: d.untag_resource(
+            ResourceArn=table["index_arn"], TagKeys=["k"]), self._INDEX_MSG)
+        self._assert_validation(lambda: d.list_tags_of_resource(
+            ResourceArn=table["index_arn"]), self._INDEX_MSG)
+
+    def test_tag_ops_on_index_arn_rejected_noperm(self, table):
+        noperm = {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:ListTables", "Resource": "*"}]}
+        d = self._ddb(noperm)
+        self._assert_validation(lambda: d.tag_resource(
+            ResourceArn=table["index_arn"], Tags=[{"Key": "k", "Value": "v"}]), self._INDEX_MSG)
+        self._assert_validation(lambda: d.untag_resource(
+            ResourceArn=table["index_arn"], TagKeys=["k"]), self._INDEX_MSG)
+        self._assert_validation(lambda: d.list_tags_of_resource(
+            ResourceArn=table["index_arn"]), self._INDEX_MSG)
 
     # -- permission chains: a Deny anywhere in the chain blocks the operation --
 

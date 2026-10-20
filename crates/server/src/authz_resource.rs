@@ -43,6 +43,7 @@
 //! `Allow` on `*` still reaches so the engine returns its normal validation
 //! error, while no Deny on a specific resource is silently skipped.
 
+use extenddb_core::error::DynamoDbError;
 use serde_json::Value;
 
 /// Partition and service are fixed to this deployment's; see module docs.
@@ -179,6 +180,27 @@ fn stream_wildcard(region: &str, account_id: &str) -> String {
 
 fn backup_wildcard(region: &str, account_id: &str) -> String {
     format!("arn:{PARTITION}:{SERVICE}:{region}:{account_id}:table/*/backup/*")
+}
+
+/// Validate the shape of a tag operation's `ResourceArn` before authorization,
+/// as the service does: tags are accepted only on a table or a stream, so an
+/// index ARN (or any other sub-resource ARN) is rejected with
+/// ValidationException for every principal, before the IAM decision. A table or
+/// stream ARN passes; the partition, service, region, account, and existence of
+/// the resource are checked later (after authorization) by the engine handler.
+pub(crate) fn validate_tag_resource_arn_shape(arn: &str) -> Result<(), DynamoDbError> {
+    if let Some(rid) = parse_resource_identity(arn) {
+        match rid.sub {
+            None | Some(Sub::Stream(_)) => {}
+            Some(Sub::Index(_)) | Some(Sub::Backup(_)) => {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "One or more parameter values were invalid: Invalid resource arn \
+                     provided, only table or stream is accepted. Provided resource arn: {arn}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The canonical stream ARN a GetRecords request reads, decoded from its shard
@@ -652,6 +674,39 @@ mod tests {
         // specific Deny is silently skipped.
         assert_eq!(only("TagResource", json!({})), "");
         assert_eq!(only("DescribeStream", json!({})), "");
+    }
+
+    #[test]
+    fn tag_resource_arn_shape_rejects_index_and_backup() {
+        // Tags are accepted only on a table or a stream; an index or backup
+        // sub-resource is rejected with the service's message.
+        for arn in [
+            "arn:aws:dynamodb:us-east-1:964157134968:table/bb/index/gsi1",
+            "arn:aws:dynamodb:us-east-1:964157134968:table/bb/backup/01-ab",
+        ] {
+            assert!(
+                matches!(
+                    validate_tag_resource_arn_shape(arn),
+                    Err(DynamoDbError::ValidationException(ref m))
+                        if m.contains("only table or stream is accepted")
+                            && m.contains(arn)
+                ),
+                "expected ValidationException for {arn}"
+            );
+        }
+        // A table ARN and a stream ARN pass the shape check.
+        assert!(
+            validate_tag_resource_arn_shape(
+                "arn:aws:dynamodb:us-east-1:964157134968:table/bb"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_tag_resource_arn_shape(
+                "arn:aws:dynamodb:us-east-1:964157134968:table/bb/stream/2026-10-20T16:17:40.188"
+            )
+            .is_ok()
+        );
     }
 
     // Differential corpus: every stream ARN the engine's parser accepts must be

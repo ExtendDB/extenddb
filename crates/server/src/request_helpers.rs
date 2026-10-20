@@ -97,6 +97,20 @@ pub(crate) async fn authorize_request(
         return Ok(key_info);
     }
 
+    // Tag operations validate the ResourceArn shape before the IAM decision, as
+    // the service does: an index ARN (tags are accepted only on a table or
+    // stream) is rejected with ValidationException for every principal, before
+    // authorization. A table or stream ARN passes; its account, region, and
+    // existence are checked after authorization by the engine tag handler.
+    if matches!(
+        operation,
+        "TagResource" | "UntagResource" | "ListTagsOfResource"
+    ) && let Some(arn) = input.get("ResourceArn").and_then(Value::as_str)
+        && !arn.is_empty()
+    {
+        authz_resource::validate_tag_resource_arn_shape(arn)?;
+    }
+
     // GetRecords carries its resource only inside the opaque shard iterator, not
     // in a request body field. Decode the iterator for the stream ARN and
     // authorize against that specific stream, as the service does. Fail closed
