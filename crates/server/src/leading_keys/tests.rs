@@ -93,6 +93,72 @@ fn binary_partition_key_is_the_base64_text() {
     assert_eq!(r, Some(vec!["AQI=".to_owned()]));
 }
 
+#[test]
+fn n_leading_key_is_canonicalized_to_service_form() {
+    // Live DynamoDB canonicalizes an N key before the LeadingKeys comparison:
+    // under a policy fencing to "10", a request pk of 010, 10.0, 1E1 or +10 is
+    // allowed, so the extraction must yield the canonical "10" (measured
+    // 2026-10-20).
+    for spelling in ["010", "10.0", "1E1", "+10"] {
+        let input = json!({"TableName": "n", "Key": {"pk": {"N": spelling}, "sk": {"S": "x"}}});
+        let r = single_table_leading_keys(&input, "GetItem", Some(&num_table()), MAX_TOKENS);
+        assert_eq!(r, Some(vec!["10".to_owned()]), "spelling {spelling}");
+    }
+}
+
+#[test]
+fn n_leading_key_zero_spellings_canonicalize_to_zero() {
+    // Under a fence to "0" the service allows -0, 00 and 0.0; each normalizes to
+    // the canonical "0" (measured 2026-10-20).
+    for spelling in ["-0", "00", "0.0"] {
+        let input = json!({"TableName": "n", "Key": {"pk": {"N": spelling}, "sk": {"S": "x"}}});
+        let r = single_table_leading_keys(&input, "GetItem", Some(&num_table()), MAX_TOKENS);
+        assert_eq!(r, Some(vec!["0".to_owned()]), "spelling {spelling}");
+    }
+}
+
+#[test]
+fn query_n_leading_key_is_canonicalized() {
+    // The Query path shares the same extraction, so a non-canonical N in a key
+    // condition is normalized to the service form.
+    let input = json!({
+        "TableName": "n",
+        "KeyConditionExpression": "pk = :v",
+        "ExpressionAttributeValues": {":v": {"N": "1E1"}},
+    });
+    let r = single_table_leading_keys(&input, "Query", Some(&num_table()), MAX_TOKENS);
+    assert_eq!(r, Some(vec!["10".to_owned()]));
+}
+
+#[test]
+fn batch_and_transact_n_leading_keys_are_canonicalized() {
+    // Batch and transaction targets extract through the same path, so their N
+    // keys are normalized to the service form as well.
+    let ki = HashMap::from([("n".to_owned(), num_table())]);
+
+    let bg = json!({"RequestItems": {"n": {"Keys": [
+        {"pk": {"N": "010"}, "sk": {"S": "x"}},
+        {"pk": {"N": "1E1"}, "sk": {"S": "y"}},
+    ]}}});
+    let t = batch_transact_targets("BatchGetItem", &bg, &ki).unwrap();
+    assert_eq!(t[0].leading_keys, Some(vec!["10".to_owned(), "10".to_owned()]));
+
+    let tg = json!({"TransactItems": [
+        {"Get": {"TableName": "n", "Key": {"pk": {"N": "+10"}, "sk": {"S": "x"}}}},
+    ]});
+    let t = batch_transact_targets("TransactGetItems", &tg, &ki).unwrap();
+    assert_eq!(t[0].leading_keys, Some(vec!["10".to_owned()]));
+}
+
+#[test]
+fn malformed_n_leading_key_is_absent() {
+    // An N the engine would reject as malformed is not a determinable partition
+    // value, so the key is left absent and the engine returns ValidationException.
+    let input = json!({"TableName": "n", "Key": {"pk": {"N": "1.2.3"}, "sk": {"S": "x"}}});
+    let r = single_table_leading_keys(&input, "GetItem", Some(&num_table()), MAX_TOKENS);
+    assert_eq!(r, None);
+}
+
 // ---- query: the defect ---------------------------------------------------
 
 #[test]

@@ -30,9 +30,10 @@
 //! - `TransactGetItems`/`TransactWriteItems`: one authorization per item, each
 //!   with that single item's partition key.
 //!
-//! N and B partition keys compare as the request's canonical scalar string (an
-//! N of `10` is the string `10`, a B is its base64 text), which is what
-//! `extract_typed_value` yields.
+//! An N partition key is compared in its normalized form (an N of `10`, `010`,
+//! `10.0` or `1E1` is the string `10`), matching the value the engine stores
+//! and the value the service evaluates. A B partition key is its base64 text
+//! and an S key is the string as sent.
 
 use std::collections::HashMap;
 
@@ -63,9 +64,25 @@ fn hash_attr(schema: &[extenddb_core::types::KeySchemaElement]) -> Option<&str> 
 
 /// Turn a `DynamoDB` typed scalar (`{"S": "v"}`, `{"N": "10"}`, `{"B": "AQI="}`)
 /// into the string the service compares for LeadingKeys.
+///
+/// An N value is normalized to the canonical number string before comparison;
+/// S and B are compared as sent. The engine normalizes an N key on write and
+/// lookup, so `010`, `10.0`, `1E1`, `+10` and `-0` all address the stored
+/// partition, and live `DynamoDB` compares the request's normalized value
+/// against the policy value (measured 2026-10-20). Comparing the raw request
+/// string instead would deny a principal its own partition for a non-canonical
+/// spelling, and would serve a partition under a non-canonical fence value the
+/// service treats as matching nothing. The policy value is left exactly as
+/// written, which is what the service does. An N value the engine would reject
+/// as malformed yields `None` here, so the engine returns `ValidationException`
+/// before any data flows.
 fn extract_typed_value(type_val: &Value) -> Option<String> {
-    let (_, inner) = type_val.as_object()?.iter().next()?;
-    Some(inner.as_str().unwrap_or_default().to_owned())
+    let (type_tag, inner) = type_val.as_object()?.iter().next()?;
+    let raw = inner.as_str().unwrap_or_default();
+    if type_tag == "N" {
+        return extenddb_core::validation::number::validate_and_normalize_number(raw).ok();
+    }
+    Some(raw.to_owned())
 }
 
 /// Extract the partition key value from a `Key`/`Item` map given the partition

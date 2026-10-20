@@ -523,3 +523,134 @@ class TestLeadingKeys:
         with pytest.raises(ClientError) as e:
             c.get_item(TableName=mh_table, Key={"pk": {"S": "i3"}})
         assert _denied(e)
+
+    # -- Numeric (N) partition key canonicalization ------------------------
+    #
+    # ExtendDB normalizes an N value on write and lookup, so 10, 010, 10.0, 1E1
+    # and +10 all address the stored partition 10. Live DynamoDB compares the
+    # request's normalized N value against the policy value, and leaves the
+    # policy value as written (measured 2026-10-20, review/lk-2/oracle-ncanon.json
+    # and this builder's oracle-ncanon-ops.json for the batch and transaction
+    # paths). So dynamodb:LeadingKeys extraction must normalize the request N:
+    #   - under a canonical fence ["10"], every non-canonical spelling of 10 is
+    #     the principal's own partition and is allowed;
+    #   - under a non-canonical fence ["1E1"], nothing matches, because the
+    #     policy value is not normalized and no request normalizes to "1E1".
+
+    def _make_num_table(self) -> tuple[str, Any]:
+        owner = f"owner-{uuid.uuid4().hex[:8]}"
+        resp = self.mgmt.create_user(self.account_id, owner, "TestPass123!")
+        assert resp.status_code == 201, resp.text
+        self._users.append(owner)
+        resp = self.mgmt.create_access_key(self.account_id, owner)
+        assert resp.status_code == 201, resp.text
+        creds = resp.json()
+        resp = self.mgmt.put_user_policy(self.account_id, owner, "full", ALLOW_ALL)
+        assert resp.status_code == 204, resp.text
+        client = _make_client(self.endpoint, creds["access_key_id"],
+                             creds["secret_access_key"], self.region)
+        table = f"lk-n-{uuid.uuid4().hex[:8]}"
+        client.create_table(
+            TableName=table,
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "N"}],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        wait_for_active(client, table)
+        client.put_item(TableName=table, Item={
+            "pk": {"N": "10"}, "secret": {"S": "ten-secret"}})
+        client.put_item(TableName=table, Item={
+            "pk": {"N": "20"}, "secret": {"S": "twenty-secret"}})
+        return table, client
+
+    @pytest.fixture()
+    def num_table(self):
+        name, owner = self._make_num_table()
+        yield name
+        try:
+            owner.delete_table(TableName=name)
+            wait_for_deleted(owner, name)
+        except Exception:
+            pass
+
+    # Every non-canonical spelling of the principal's own numeric partition is
+    # allowed under a canonical fence, and the other partition stays denied.
+    NONCANON_OWN = ["010", "10.0", "1E1", "1.0E1", "+10"]
+
+    def test_num_item_ops_canonical_fence_allows_noncanonical_own(self, num_table):
+        c = self._user_client([("lk", self._leading_keys_policy(
+            "ForAllValues", ["10"], num_table))])
+        for spelling in self.NONCANON_OWN:
+            c.get_item(TableName=num_table, Key={"pk": {"N": spelling}})
+        # The other partition stays denied whatever the spelling.
+        with pytest.raises(ClientError) as e:
+            c.get_item(TableName=num_table, Key={"pk": {"N": "20"}})
+        assert _denied(e)
+        with pytest.raises(ClientError) as e:
+            c.get_item(TableName=num_table, Key={"pk": {"N": "2.0E1"}})
+        assert _denied(e)
+
+    def test_num_query_canonical_fence_allows_noncanonical_own(self, num_table):
+        c = self._user_client([("lk", self._leading_keys_policy(
+            "ForAllValues", ["10"], num_table))])
+        for spelling in self.NONCANON_OWN:
+            c.query(TableName=num_table, KeyConditionExpression="pk = :v",
+                    ExpressionAttributeValues={":v": {"N": spelling}})
+        with pytest.raises(ClientError) as e:
+            c.query(TableName=num_table, KeyConditionExpression="pk = :v",
+                    ExpressionAttributeValues={":v": {"N": "20"}})
+        assert _denied(e)
+
+    def test_num_batch_canonical_fence_allows_noncanonical_own(self, num_table):
+        c = self._user_client([("lk", self._leading_keys_policy(
+            "ForAllValues", ["10"], num_table))])
+        c.batch_get_item(RequestItems={
+            num_table: {"Keys": [{"pk": {"N": "1E1"}}, {"pk": {"N": "10.0"}}]}})
+        c.batch_write_item(RequestItems={
+            num_table: [{"PutRequest": {"Item": {"pk": {"N": "+10"}}}}]})
+        with pytest.raises(ClientError) as e:
+            c.batch_get_item(RequestItems={num_table: {"Keys": [{"pk": {"N": "20"}}]}})
+        assert _denied(e)
+        # A mixed own+other batch under ForAllValues is denied: the other key
+        # does not normalize to 10.
+        with pytest.raises(ClientError) as e:
+            c.batch_get_item(RequestItems={
+                num_table: {"Keys": [{"pk": {"N": "010"}}, {"pk": {"N": "20"}}]}})
+        assert _denied(e)
+
+    def test_num_transact_canonical_fence_allows_noncanonical_own(self, num_table):
+        c = self._user_client([("lk", self._leading_keys_policy(
+            "ForAllValues", ["10"], num_table))])
+        c.transact_get_items(TransactItems=[
+            {"Get": {"TableName": num_table, "Key": {"pk": {"N": "1E1"}}}}])
+        c.transact_write_items(TransactItems=[
+            {"Put": {"TableName": num_table, "Item": {"pk": {"N": "10.0"}}}}])
+        with pytest.raises(ClientError) as e:
+            c.transact_get_items(TransactItems=[
+                {"Get": {"TableName": num_table, "Key": {"pk": {"N": "20"}}}}])
+        assert _denied(e)
+
+    def test_num_noncanonical_fence_matches_nothing(self, num_table):
+        # The policy value ["1E1"] is not normalized by the service, so no
+        # request normalizes to it: every operation is denied, including a
+        # request spelled 1E1 that reads canonical partition 10. Before the fix
+        # ExtendDB served partition 10 here.
+        c = self._user_client([("lk", self._leading_keys_policy(
+            "ForAllValues", ["1E1"], num_table))])
+        with pytest.raises(ClientError) as e:
+            c.get_item(TableName=num_table, Key={"pk": {"N": "1E1"}})
+        assert _denied(e)
+        with pytest.raises(ClientError) as e:
+            c.get_item(TableName=num_table, Key={"pk": {"N": "10"}})
+        assert _denied(e)
+        with pytest.raises(ClientError) as e:
+            c.query(TableName=num_table, KeyConditionExpression="pk = :v",
+                    ExpressionAttributeValues={":v": {"N": "1E1"}})
+        assert _denied(e)
+        with pytest.raises(ClientError) as e:
+            c.batch_get_item(RequestItems={num_table: {"Keys": [{"pk": {"N": "1E1"}}]}})
+        assert _denied(e)
+        with pytest.raises(ClientError) as e:
+            c.transact_get_items(TransactItems=[
+                {"Get": {"TableName": num_table, "Key": {"pk": {"N": "1E1"}}}}])
+        assert _denied(e)
