@@ -218,6 +218,55 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### v0.1.14 — IAM: dynamodb:LeadingKeys now enforced on Query, batch and transaction operations
+
+**What changed.** `dynamodb:LeadingKeys` is now evaluated on `Query`,
+`BatchGetItem`, `BatchWriteItem`, `TransactGetItems` and `TransactWriteItems`.
+Before this release those five operations carried no LeadingKeys value, so a
+`ForAllValues:StringEquals dynamodb:LeadingKeys` condition on them was satisfied
+vacuously and a principal fenced to its own partition could read or write any
+partition through them. The item operations (`GetItem`, `PutItem`, `UpdateItem`,
+`DeleteItem`) already enforced the key and are unchanged.
+
+Details of how the key is bound, matching real AWS:
+
+- A `Query` on the base table or a local secondary index binds LeadingKeys to
+  the partition key value in the key condition (an LSI shares the base table's
+  partition key).
+- A `Query` on a global secondary index binds LeadingKeys to the queried
+  index's partition key value (its first HASH attribute), not the base table's.
+- `BatchGetItem` and `BatchWriteItem` are authorized per table over the set of
+  keys that table receives; `TransactGetItems` and `TransactWriteItems` are
+  authorized per item. A `ForAnyValue` condition therefore passes a mixed batch
+  but not a mixed transaction.
+- `Scan` and `SearchVectors` carry no LeadingKeys, because they target no single
+  partition. A `ForAllValues` condition does not fence them (it is satisfied
+  vacuously); fence a full-table read with `ForAnyValue:StringEquals` or a
+  `Null` guard (`"Null": {"dynamodb:LeadingKeys": "false"}`) on the statement.
+- A numeric (`N`) partition key is compared in its normalized form, so `10`,
+  `010`, `10.0` and `1E1` are one partition. The policy value is matched as
+  written, so a fence value must be the canonical number (`"10"`, not `"1E1"`).
+
+**Who is affected.** Any deployment with a principal whose policy fences
+`dynamodb:LeadingKeys` with `ForAllValues:StringEquals` and whose Query, batch or
+transaction requests previously crossed its own partition. After upgrade those
+cross-partition requests return `AccessDeniedException`. Own-partition access is
+unchanged.
+
+**Migration.** No catalog migration is required. Before upgrading, audit
+LeadingKeys policies with `extenddb manage list-user-policies` /
+`list-role-policies` and confirm:
+
+- A fence intended to cover reads and writes names the partition values the
+  principal legitimately uses on Query, batch and transaction, not only item
+  operations.
+- Any policy relying on `Scan` or `SearchVectors` being fenced by a
+  `ForAllValues` LeadingKeys condition is rewritten to `ForAnyValue` or adds a
+  `Null` guard, since neither operation is fenced by `ForAllValues`.
+- A numeric LeadingKeys value is written in canonical form.
+
+---
+
 ### v0.1.6 — IAM: bare operators on multivalued condition keys are no-ops (BR-7085)
 
 **What changed.** A **bare** condition operator (no `ForAnyValue:` / `ForAllValues:`
