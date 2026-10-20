@@ -604,8 +604,11 @@ class TestLeadingKeys:
     def test_num_batch_canonical_fence_allows_noncanonical_own(self, num_table):
         c = self._user_client([("lk", self._leading_keys_policy(
             "ForAllValues", ["10"], num_table))])
-        c.batch_get_item(RequestItems={
-            num_table: {"Keys": [{"pk": {"N": "1E1"}}, {"pk": {"N": "10.0"}}]}})
+        # Each non-canonical spelling of the own partition is allowed. 1E1 and
+        # 10.0 both normalize to partition 10, so they cannot share one batch
+        # (the engine rejects duplicate keys), hence one key per request.
+        c.batch_get_item(RequestItems={num_table: {"Keys": [{"pk": {"N": "1E1"}}]}})
+        c.batch_get_item(RequestItems={num_table: {"Keys": [{"pk": {"N": "10.0"}}]}})
         c.batch_write_item(RequestItems={
             num_table: [{"PutRequest": {"Item": {"pk": {"N": "+10"}}}}]})
         with pytest.raises(ClientError) as e:
@@ -621,10 +624,15 @@ class TestLeadingKeys:
     def test_num_transact_canonical_fence_allows_noncanonical_own(self, num_table):
         c = self._user_client([("lk", self._leading_keys_policy(
             "ForAllValues", ["10"], num_table))])
+        # The write and transaction request handlers allow the spellings 010,
+        # +10 and 1.0E1 of the own partition (measured live, oracle-ncanon-ops.json).
+        # Two other spellings of the same partition (10.0 and 1E1) are a measured
+        # service divergence on those handlers and are recorded in the report, so
+        # they are not asserted here.
         c.transact_get_items(TransactItems=[
-            {"Get": {"TableName": num_table, "Key": {"pk": {"N": "1E1"}}}}])
+            {"Get": {"TableName": num_table, "Key": {"pk": {"N": "+10"}}}}])
         c.transact_write_items(TransactItems=[
-            {"Put": {"TableName": num_table, "Item": {"pk": {"N": "10.0"}}}}])
+            {"Put": {"TableName": num_table, "Item": {"pk": {"N": "1.0E1"}}}}])
         with pytest.raises(ClientError) as e:
             c.transact_get_items(TransactItems=[
                 {"Get": {"TableName": num_table, "Key": {"pk": {"N": "20"}}}}])
