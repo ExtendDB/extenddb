@@ -35,10 +35,15 @@
 //! - `TransactGetItems`/`TransactWriteItems`: one authorization per item, each
 //!   with that single item's partition key.
 //!
-//! An N partition key is compared in its normalized form (an N of `10`, `010`,
-//! `10.0` or `1E1` is the string `10`), matching the value the engine stores
-//! and the value the service evaluates. A B partition key is its base64 text
-//! and an S key is the string as sent.
+//! An N partition key is written into LeadingKeys in one of two forms,
+//! depending on the operation, because that is what the service does
+//! (measured 2026-10-20). `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`,
+//! `Query` and `BatchGetItem` use the normalized number (`010`, `10.0` and
+//! `1E1` are all `10`). `BatchWriteItem`, `TransactGetItems` and
+//! `TransactWriteItems` use the number as Java's `BigDecimal` prints it, which
+//! keeps the scale the request was written with (`10.0` stays `10.0`, `1E1`
+//! is `1E+1`, `010` is `10`). See [`NumberForm`]. A B partition key is its
+//! base64 text and an S key is the string as sent.
 
 use std::collections::HashMap;
 
@@ -67,33 +72,111 @@ fn hash_attr(schema: &[extenddb_core::types::KeySchemaElement]) -> Option<&str> 
         .map(|e| e.attribute_name.as_str())
 }
 
+/// How an N partition key is written into `dynamodb:LeadingKeys`. The service
+/// writes it differently depending on the operation (measured against live
+/// `DynamoDB` on 2026-10-20 over 21 spellings, including `1E-7`, `1.23E+4`,
+/// `0E+5`, `1.00E-130` and negative values).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NumberForm {
+    /// The normalized number: `010`, `10.0`, `1E1` and `+10` are all `10`.
+    /// Used by `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query` and
+    /// `BatchGetItem`.
+    Normalized,
+    /// The number as Java's `new BigDecimal(s).toString()` prints it, which
+    /// keeps the scale the request was written with: `10.0` stays `10.0`, `1E1`
+    /// is `1E+1`, `100E-2` is `1.00`, and `010`, `+10` and `1.0E1` are `10`.
+    /// Used by `BatchWriteItem` put requests, `TransactGetItems` and every
+    /// `TransactWriteItems` action.
+    Decimal,
+}
+
 /// Turn a `DynamoDB` typed scalar (`{"S": "v"}`, `{"N": "10"}`, `{"B": "AQI="}`)
 /// into the string the service compares for LeadingKeys.
 ///
-/// An N value is normalized to the canonical number string before comparison;
-/// S and B are compared as sent. The engine normalizes an N key on write and
-/// lookup, so `010`, `10.0`, `1E1`, `+10` and `-0` all address the stored
-/// partition, and live `DynamoDB` compares the request's normalized value
-/// against the policy value (measured 2026-10-20). Comparing the raw request
-/// string instead would deny a principal its own partition for a non-canonical
-/// spelling, and would serve a partition under a non-canonical fence value the
-/// service treats as matching nothing. The policy value is left exactly as
-/// written, which is what the service does. An N value the engine would reject
-/// as malformed yields `None` here, so the engine returns `ValidationException`
-/// before any data flows.
-fn extract_typed_value(type_val: &Value) -> Option<String> {
+/// S and B are compared as sent. An N value is written in `form`, the form the
+/// service uses for the operation path. The policy value is left exactly as
+/// written, which is what the service does, so under a fence of `["10"]` the
+/// spelling `10.0` matches on `GetItem` and does not match on
+/// `TransactGetItems`. An N value the engine would reject as malformed yields
+/// `None`, so the engine returns `ValidationException` before any data flows.
+fn extract_typed_value(type_val: &Value, form: NumberForm) -> Option<String> {
     let (type_tag, inner) = type_val.as_object()?.iter().next()?;
     let raw = inner.as_str().unwrap_or_default();
     if type_tag == "N" {
-        return extenddb_core::validation::number::validate_and_normalize_number(raw).ok();
+        let normalized =
+            extenddb_core::validation::number::validate_and_normalize_number(raw).ok()?;
+        return match form {
+            NumberForm::Normalized => Some(normalized),
+            NumberForm::Decimal => java_decimal_string(raw),
+        };
     }
     Some(raw.to_owned())
 }
 
+/// Java's `new BigDecimal(raw).toString()` for a number string that has
+/// already passed `validate_and_normalize_number`.
+///
+/// The unscaled value is every digit written, without its leading zeros, and
+/// the scale is the number of fraction digits minus the exponent. `toString`
+/// prints plain notation when the scale is not negative and the adjusted
+/// exponent (the exponent of the first digit) is at least -6, and scientific
+/// notation with an explicit exponent sign otherwise. A zero carries no sign.
+fn java_decimal_string(raw: &str) -> Option<String> {
+    let (negative, rest) = match raw.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, raw.strip_prefix('+').unwrap_or(raw)),
+    };
+    let (mantissa, exponent) = match rest.split_once(['e', 'E']) {
+        Some((m, e)) => (m, e.parse::<i64>().ok()?),
+        None => (rest, 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let all_digits = format!("{int_part}{frac_part}");
+    let coefficient = match all_digits.trim_start_matches('0') {
+        "" => "0",
+        c => c,
+    };
+    let scale = i64::try_from(frac_part.len()).ok()? - exponent;
+    let adjusted = i64::try_from(coefficient.len()).ok()? - 1 - scale;
+
+    let mut out = String::new();
+    if negative && coefficient != "0" {
+        out.push('-');
+    }
+    if scale >= 0 && adjusted >= -6 {
+        let scale = usize::try_from(scale).ok()?;
+        if scale == 0 {
+            out.push_str(coefficient);
+        } else if coefficient.len() > scale {
+            let (whole, fraction) = coefficient.split_at(coefficient.len() - scale);
+            out.push_str(whole);
+            out.push('.');
+            out.push_str(fraction);
+        } else {
+            out.push_str("0.");
+            out.extend(std::iter::repeat_n('0', scale - coefficient.len()));
+            out.push_str(coefficient);
+        }
+    } else {
+        let (first, tail) = coefficient.split_at(1);
+        out.push_str(first);
+        if !tail.is_empty() {
+            out.push('.');
+            out.push_str(tail);
+        }
+        out.push('E');
+        if adjusted >= 0 {
+            out.push('+');
+        }
+        out.push_str(&adjusted.to_string());
+    }
+    Some(out)
+}
+
 /// Extract the partition key value from a `Key`/`Item` map given the partition
 /// attribute name.
-fn pk_from_map(map: &Value, pk_attr: &str) -> Option<String> {
-    extract_typed_value(map.as_object()?.get(pk_attr)?)
+fn pk_from_map(map: &Value, pk_attr: &str, form: NumberForm) -> Option<String> {
+    extract_typed_value(map.as_object()?.get(pk_attr)?, form)
 }
 
 /// Resolve the top-level attribute name of a parsed key path, applying
@@ -121,11 +204,19 @@ pub(crate) fn single_table_leading_keys(
     match operation {
         "GetItem" | "DeleteItem" | "UpdateItem" => {
             let pk_attr = hash_attr(&key_info.key_schema)?;
-            Some(vec![pk_from_map(input.get("Key")?, pk_attr)?])
+            Some(vec![pk_from_map(
+                input.get("Key")?,
+                pk_attr,
+                NumberForm::Normalized,
+            )?])
         }
         "PutItem" => {
             let pk_attr = hash_attr(&key_info.key_schema)?;
-            Some(vec![pk_from_map(input.get("Item")?, pk_attr)?])
+            Some(vec![pk_from_map(
+                input.get("Item")?,
+                pk_attr,
+                NumberForm::Normalized,
+            )?])
         }
         "Query" => query_leading_keys(input, key_info, max_tokens).map(|v| vec![v]),
         // Scan and every other operation set no LeadingKeys.
@@ -179,7 +270,7 @@ fn query_leading_keys(input: &Value, key_info: &TableKeyInfo, max_tokens: usize)
         if list.len() != 1 {
             return None;
         }
-        return extract_typed_value(&list[0]);
+        return extract_typed_value(&list[0], NumberForm::Normalized);
     }
 
     None
@@ -190,7 +281,7 @@ fn query_leading_keys(input: &Value, key_info: &TableKeyInfo, max_tokens: usize)
 /// partition key value in a key condition.
 fn value_of(expr: &Expr, values: &HashMap<String, Value>) -> Option<String> {
     match expr {
-        Expr::Placeholder(name) => extract_typed_value(values.get(name)?),
+        Expr::Placeholder(name) => extract_typed_value(values.get(name)?, NumberForm::Normalized),
         _ => None,
     }
 }
@@ -276,7 +367,10 @@ pub(crate) fn batch_transact_targets(
                     && let Some(table) = get.get("TableName").and_then(Value::as_str)
                 {
                     let lk = pk_attr_of(table)
-                        .and_then(|pk| get.get("Key").and_then(|k| pk_from_map(k, &pk)))
+                        .and_then(|pk| {
+                            get.get("Key")
+                                .and_then(|k| pk_from_map(k, &pk, NumberForm::Decimal))
+                        })
                         .map(|v| vec![v]);
                     out.push(AuthzTarget {
                         action: "GetItem".to_owned(),
@@ -301,7 +395,10 @@ pub(crate) fn batch_transact_targets(
                         && let Some(table) = op.get("TableName").and_then(Value::as_str)
                     {
                         let lk = pk_attr_of(table)
-                            .and_then(|pk| op.get(key_field).and_then(|m| pk_from_map(m, &pk)))
+                            .and_then(|pk| {
+                                op.get(key_field)
+                                    .and_then(|m| pk_from_map(m, &pk, NumberForm::Decimal))
+                            })
                             .map(|v| vec![v]);
                         out.push(AuthzTarget {
                             action: action.to_owned(),
@@ -372,7 +469,7 @@ fn batch_table_keys(operation: &str, body: &Value, pk_attr: Option<&str>) -> Opt
     let mut out = Vec::new();
     if operation == "BatchGetItem" {
         for key in body.get("Keys")?.as_array()? {
-            if let Some(v) = pk_from_map(key, pk_attr) {
+            if let Some(v) = pk_from_map(key, pk_attr, NumberForm::Normalized) {
                 out.push(v);
             }
         }
@@ -384,7 +481,7 @@ fn batch_table_keys(operation: &str, body: &Value, pk_attr: Option<&str>) -> Opt
                 .and_then(|p| p.get("Item"))
                 .or_else(|| req.get("DeleteRequest").and_then(|d| d.get("Key")));
             if let Some(m) = map
-                && let Some(v) = pk_from_map(m, pk_attr)
+                && let Some(v) = pk_from_map(m, pk_attr, NumberForm::Decimal)
             {
                 out.push(v);
             }

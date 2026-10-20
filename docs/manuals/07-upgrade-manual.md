@@ -243,9 +243,16 @@ Details of how the key is bound, matching real AWS:
   partition. A `ForAllValues` condition does not fence them (it is satisfied
   vacuously); fence a full-table read with `ForAnyValue:StringEquals` or a
   `Null` guard (`"Null": {"dynamodb:LeadingKeys": "false"}`) on the statement.
-- A numeric (`N`) partition key is compared in its normalized form, so `10`,
-  `010`, `10.0` and `1E1` are one partition. The policy value is matched as
-  written, so a fence value must be the canonical number (`"10"`, not `"1E1"`).
+- A numeric (`N`) partition key is written into LeadingKeys the way the
+  service writes it, which depends on the operation. `GetItem`, `PutItem`,
+  `UpdateItem`, `DeleteItem`, `Query` and `BatchGetItem` use the normalized
+  number, so `10`, `010`, `10.0` and `1E1` all compare as `"10"`.
+  `BatchWriteItem`, `TransactGetItems` and `TransactWriteItems` keep the scale
+  the request was written with, as Java's `BigDecimal` prints it: `010` and
+  `1.0E1` compare as `"10"`, `10.0` as `"10.0"` and `1E1` as `"1E+1"`. The
+  policy value is matched as written. Under a fence of `["10"]`, a client that
+  sends `10.0` or `1E1` is allowed on the first group and denied on the second,
+  as on DynamoDB.
 
 **Who is affected.** Any deployment with a principal whose policy fences
 `dynamodb:LeadingKeys` with `ForAllValues:StringEquals` and whose Query, batch or

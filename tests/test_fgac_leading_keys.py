@@ -524,18 +524,17 @@ class TestLeadingKeys:
             c.get_item(TableName=mh_table, Key={"pk": {"S": "i3"}})
         assert _denied(e)
 
-    # -- Numeric (N) partition key canonicalization ------------------------
+    # -- Numeric (N) partition key rendering --------------------------------
     #
-    # ExtendDB normalizes an N value on write and lookup, so 10, 010, 10.0, 1E1
-    # and +10 all address the stored partition 10. Live DynamoDB compares the
-    # request's normalized N value against the policy value, and leaves the
-    # policy value as written (measured 2026-10-20, review/lk-2/oracle-ncanon.json
-    # and this builder's oracle-ncanon-ops.json for the batch and transaction
-    # paths). So dynamodb:LeadingKeys extraction must normalize the request N:
-    #   - under a canonical fence ["10"], every non-canonical spelling of 10 is
-    #     the principal's own partition and is allowed;
-    #   - under a non-canonical fence ["1E1"], nothing matches, because the
-    #     policy value is not normalized and no request normalizes to "1E1".
+    # The service writes an N partition key into dynamodb:LeadingKeys in one of
+    # two forms, depending on the operation, and matches the policy value as
+    # written (measured against live DynamoDB on 2026-10-20 over 21 spellings):
+    #   - GetItem, PutItem, UpdateItem, DeleteItem, Query and BatchGetItem use
+    #     the normalized number, so 010, 10.0, 1E1, 1.0E1 and +10 are all "10";
+    #   - BatchWriteItem (put and delete), TransactGetItems and every
+    #     TransactWriteItems action use the number as Java's BigDecimal prints
+    #     it: 010, +10 and 1.0E1 are "10", 10.0 is "10.0", 1E1 is "1E+1".
+    # A fence of ["1E1"] matches nothing on either path.
 
     def _make_num_table(self) -> tuple[str, Any]:
         owner = f"owner-{uuid.uuid4().hex[:8]}"
@@ -601,16 +600,15 @@ class TestLeadingKeys:
                     ExpressionAttributeValues={":v": {"N": "20"}})
         assert _denied(e)
 
-    def test_num_batch_canonical_fence_allows_noncanonical_own(self, num_table):
+    def test_num_batch_get_canonical_fence_allows_noncanonical_own(self, num_table):
         c = self._user_client([("lk", self._leading_keys_policy(
             "ForAllValues", ["10"], num_table))])
-        # Each non-canonical spelling of the own partition is allowed. 1E1 and
-        # 10.0 both normalize to partition 10, so they cannot share one batch
-        # (the engine rejects duplicate keys), hence one key per request.
-        c.batch_get_item(RequestItems={num_table: {"Keys": [{"pk": {"N": "1E1"}}]}})
-        c.batch_get_item(RequestItems={num_table: {"Keys": [{"pk": {"N": "10.0"}}]}})
-        c.batch_write_item(RequestItems={
-            num_table: [{"PutRequest": {"Item": {"pk": {"N": "+10"}}}}]})
+        # BatchGetItem compares the normalized number. 1E1 and 10.0 both
+        # normalize to partition 10, so they cannot share one batch (the
+        # engine rejects duplicate keys), hence one key per request.
+        for spelling in self.NONCANON_OWN:
+            c.batch_get_item(RequestItems={
+                num_table: {"Keys": [{"pk": {"N": spelling}}]}})
         with pytest.raises(ClientError) as e:
             c.batch_get_item(RequestItems={num_table: {"Keys": [{"pk": {"N": "20"}}]}})
         assert _denied(e)
@@ -621,22 +619,121 @@ class TestLeadingKeys:
                 num_table: {"Keys": [{"pk": {"N": "010"}}, {"pk": {"N": "20"}}]}})
         assert _denied(e)
 
-    def test_num_transact_canonical_fence_allows_noncanonical_own(self, num_table):
+    # TransactGetItems, every TransactWriteItems action and BatchWriteItem put
+    # requests compare the number as Java's BigDecimal prints it, which keeps
+    # the scale the request was written with: 10.0 stays "10.0" and 1E1 is
+    # "1E+1", while 010, +10 and 1.0E1 are "10".
+    DECIMAL_SAME = ["10", "010", "+10", "1.0E1"]
+    DECIMAL_DIFFERENT = ["10.0", "1E1"]
+
+    def _decimal_path_ops(self, c, table: str, spelling: str) -> dict:
+        key = {"pk": {"N": spelling}}
+        return {
+            "transact_get": lambda: c.transact_get_items(TransactItems=[
+                {"Get": {"TableName": table, "Key": key}}]),
+            "transact_put": lambda: c.transact_write_items(TransactItems=[
+                {"Put": {"TableName": table, "Item": key}}]),
+            "transact_update": lambda: c.transact_write_items(TransactItems=[
+                {"Update": {"TableName": table, "Key": key,
+                            "UpdateExpression": "SET a = :x",
+                            "ExpressionAttributeValues": {":x": {"S": "y"}}}}]),
+            "transact_delete": lambda: c.transact_write_items(TransactItems=[
+                {"Delete": {"TableName": table, "Key": key}}]),
+            "transact_condition_check": lambda: c.transact_write_items(TransactItems=[
+                {"ConditionCheck": {"TableName": table, "Key": key,
+                                    "ConditionExpression":
+                                        "attribute_exists(pk) OR attribute_not_exists(pk)"}}]),
+            "batch_write_put": lambda: c.batch_write_item(RequestItems={
+                table: [{"PutRequest": {"Item": key}}]}),
+            "batch_write_delete": lambda: c.batch_write_item(RequestItems={
+                table: [{"DeleteRequest": {"Key": key}}]}),
+        }
+
+    def test_num_decimal_path_canonical_fence(self, num_table):
         c = self._user_client([("lk", self._leading_keys_policy(
             "ForAllValues", ["10"], num_table))])
-        # The write and transaction request handlers allow the spellings 010,
-        # +10 and 1.0E1 of the own partition (measured live, oracle-ncanon-ops.json).
-        # Two other spellings of the same partition (10.0 and 1E1) are a measured
-        # service divergence on those handlers and are recorded in the report, so
-        # they are not asserted here.
-        c.transact_get_items(TransactItems=[
-            {"Get": {"TableName": num_table, "Key": {"pk": {"N": "+10"}}}}])
-        c.transact_write_items(TransactItems=[
-            {"Put": {"TableName": num_table, "Item": {"pk": {"N": "1.0E1"}}}}])
+        for spelling in self.DECIMAL_SAME:
+            for name, op in self._decimal_path_ops(c, num_table, spelling).items():
+                op()
+        for spelling in self.DECIMAL_DIFFERENT:
+            for name, op in self._decimal_path_ops(c, num_table, spelling).items():
+                with pytest.raises(ClientError) as e:
+                    op()
+                assert _denied(e), (spelling, name)
         with pytest.raises(ClientError) as e:
             c.transact_get_items(TransactItems=[
                 {"Get": {"TableName": num_table, "Key": {"pk": {"N": "20"}}}}])
         assert _denied(e)
+
+    def test_num_decimal_fence_matches_only_the_decimal_path(self, num_table):
+        # A fence written as "10.0" matches a request spelled 10.0 on the
+        # decimal path and matches nothing on the normalized path, where every
+        # spelling of 10 is "10". The same holds for "1E+1" and the spelling 1E1.
+        for fence, spelling in (("10.0", "10.0"), ("1E+1", "1E1")):
+            c = self._user_client([("lk", self._leading_keys_policy(
+                "ForAllValues", [fence], num_table))])
+            for name, op in self._decimal_path_ops(c, num_table, spelling).items():
+                op()
+            for other in ("10", "010", "1.0E1"):
+                with pytest.raises(ClientError) as e:
+                    c.transact_get_items(TransactItems=[
+                        {"Get": {"TableName": num_table, "Key": {"pk": {"N": other}}}}])
+                assert _denied(e), (fence, other)
+            with pytest.raises(ClientError) as e:
+                c.get_item(TableName=num_table, Key={"pk": {"N": spelling}})
+            assert _denied(e), fence
+            with pytest.raises(ClientError) as e:
+                c.query(TableName=num_table, KeyConditionExpression="pk = :v",
+                        ExpressionAttributeValues={":v": {"N": spelling}})
+            assert _denied(e), fence
+            with pytest.raises(ClientError) as e:
+                c.batch_get_item(RequestItems={
+                    num_table: {"Keys": [{"pk": {"N": spelling}}]}})
+            assert _denied(e), fence
+
+    def test_num_deny_statement_follows_the_operation_form(self, num_table):
+        # A Deny on ["10"] matches every spelling of 10 on the normalized path,
+        # and on the decimal path only the spellings whose decimal form is "10".
+        arn = f"arn:aws:dynamodb:{self.region}:{self.account_id}:table/{num_table}"
+        c = self._user_client([("lk", {
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect": "Allow", "Action": "dynamodb:*", "Resource": arn},
+                {"Effect": "Deny", "Action": "dynamodb:*", "Resource": arn,
+                 "Condition": {"ForAnyValue:StringEquals": {"dynamodb:LeadingKeys": ["10"]}}},
+            ]})])
+        for spelling in ("10", "10.0"):
+            with pytest.raises(ClientError) as e:
+                c.get_item(TableName=num_table, Key={"pk": {"N": spelling}})
+            assert _denied(e), spelling
+            with pytest.raises(ClientError) as e:
+                c.delete_item(TableName=num_table, Key={"pk": {"N": spelling}})
+            assert _denied(e), spelling
+        decimal_ops = ("transact_get", "batch_write_put", "batch_write_delete")
+        ops_10_0 = self._decimal_path_ops(c, num_table, "10.0")
+        for name in decimal_ops:
+            ops_10_0[name]()
+        ops_10 = self._decimal_path_ops(c, num_table, "10")
+        for name in decimal_ops:
+            with pytest.raises(ClientError) as e:
+                ops_10[name]()
+            assert _denied(e), name
+
+    def test_num_decimal_path_edge_spellings(self, num_table):
+        # The decimal form of each spelling, as the service matched it on
+        # TransactGetItems. The normalized form of each differs, so GetItem is
+        # denied under the same fence.
+        cases = {"100E-2": "1.00", "0.0000001": "1E-7", "123E2": "1.23E+4",
+                 "-5.50": "-5.50", "+1.5E+3": "1.5E+3", "12.3400E-1": "1.23400",
+                 "1.00E-130": "1.00E-130", "80E-1": "8.0"}
+        c = self._user_client([("lk", self._leading_keys_policy(
+            "ForAllValues", sorted(cases.values()), num_table))])
+        for spelling in cases:
+            c.transact_get_items(TransactItems=[
+                {"Get": {"TableName": num_table, "Key": {"pk": {"N": spelling}}}}])
+            with pytest.raises(ClientError) as e:
+                c.get_item(TableName=num_table, Key={"pk": {"N": spelling}})
+            assert _denied(e), spelling
 
     def test_num_noncanonical_fence_matches_nothing(self, num_table):
         # The policy value ["1E1"] is not normalized by the service, so no

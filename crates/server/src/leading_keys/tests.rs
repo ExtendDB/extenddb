@@ -94,11 +94,9 @@ fn binary_partition_key_is_the_base64_text() {
 }
 
 #[test]
-fn n_leading_key_is_canonicalized_to_service_form() {
-    // Live DynamoDB canonicalizes an N key before the LeadingKeys comparison:
-    // under a policy fencing to "10", a request pk of 010, 10.0, 1E1 or +10 is
-    // allowed, so the extraction must yield the canonical "10" (measured
-    // 2026-10-20).
+fn n_leading_key_is_normalized_on_item_operations() {
+    // GetItem compares the normalized number: under a policy fencing to "10",
+    // a request pk of 010, 10.0, 1E1 or +10 is allowed (measured 2026-10-20).
     for spelling in ["010", "10.0", "1E1", "+10"] {
         let input = json!({"TableName": "n", "Key": {"pk": {"N": spelling}, "sk": {"S": "x"}}});
         let r = single_table_leading_keys(&input, "GetItem", Some(&num_table()), MAX_TOKENS);
@@ -107,9 +105,9 @@ fn n_leading_key_is_canonicalized_to_service_form() {
 }
 
 #[test]
-fn n_leading_key_zero_spellings_canonicalize_to_zero() {
-    // Under a fence to "0" the service allows -0, 00 and 0.0; each normalizes to
-    // the canonical "0" (measured 2026-10-20).
+fn n_leading_key_zero_spellings_normalize_to_zero() {
+    // Under a fence to "0" the service allows -0, 00 and 0.0 on GetItem; each
+    // normalizes to "0" (measured 2026-10-20).
     for spelling in ["-0", "00", "0.0"] {
         let input = json!({"TableName": "n", "Key": {"pk": {"N": spelling}, "sk": {"S": "x"}}});
         let r = single_table_leading_keys(&input, "GetItem", Some(&num_table()), MAX_TOKENS);
@@ -118,9 +116,7 @@ fn n_leading_key_zero_spellings_canonicalize_to_zero() {
 }
 
 #[test]
-fn query_n_leading_key_is_canonicalized() {
-    // The Query path shares the same extraction, so a non-canonical N in a key
-    // condition is normalized to the service form.
+fn query_n_leading_key_is_normalized() {
     let input = json!({
         "TableName": "n",
         "KeyConditionExpression": "pk = :v",
@@ -131,11 +127,8 @@ fn query_n_leading_key_is_canonicalized() {
 }
 
 #[test]
-fn batch_and_transact_n_leading_keys_are_canonicalized() {
-    // Batch and transaction targets extract through the same path, so their N
-    // keys are normalized to the service form as well.
+fn batch_get_n_leading_keys_are_normalized() {
     let ki = HashMap::from([("n".to_owned(), num_table())]);
-
     let bg = json!({"RequestItems": {"n": {"Keys": [
         {"pk": {"N": "010"}, "sk": {"S": "x"}},
         {"pk": {"N": "1E1"}, "sk": {"S": "y"}},
@@ -145,12 +138,99 @@ fn batch_and_transact_n_leading_keys_are_canonicalized() {
         t[0].leading_keys,
         Some(vec!["10".to_owned(), "10".to_owned()])
     );
+}
 
-    let tg = json!({"TransactItems": [
-        {"Get": {"TableName": "n", "Key": {"pk": {"N": "+10"}, "sk": {"S": "x"}}}},
-    ]});
-    let t = batch_transact_targets("TransactGetItems", &tg, &ki).unwrap();
-    assert_eq!(t[0].leading_keys, Some(vec!["10".to_owned()]));
+#[test]
+fn batch_write_n_leading_keys_keep_the_written_scale() {
+    // BatchWriteItem put and delete requests both compare the number as Java's
+    // BigDecimal prints it (measured 2026-10-20, 25 of 25 attempts each).
+    let ki = HashMap::from([("n".to_owned(), num_table())]);
+    let bw = json!({"RequestItems": {"n": [
+        {"PutRequest": {"Item": {"pk": {"N": "10.0"}, "sk": {"S": "x"}}}},
+        {"DeleteRequest": {"Key": {"pk": {"N": "1E1"}, "sk": {"S": "y"}}}},
+        {"PutRequest": {"Item": {"pk": {"N": "010"}, "sk": {"S": "z"}}}},
+    ]}});
+    let t = batch_transact_targets("BatchWriteItem", &bw, &ki).unwrap();
+    assert_eq!(
+        t[0].leading_keys,
+        Some(vec!["10.0".to_owned(), "1E+1".to_owned(), "10".to_owned()])
+    );
+}
+
+#[test]
+fn transact_n_leading_keys_keep_the_written_scale() {
+    // TransactGetItems and every TransactWriteItems action compare the number
+    // as Java's BigDecimal prints it: under a fence of "10", 10.0 and 1E1 are
+    // denied and 010, +10 and 1.0E1 are allowed (measured 2026-10-20).
+    let ki = HashMap::from([("n".to_owned(), num_table())]);
+    for (spelling, expected) in [
+        ("10.0", "10.0"),
+        ("1E1", "1E+1"),
+        ("010", "10"),
+        ("+10", "10"),
+        ("1.0E1", "10"),
+    ] {
+        let tg = json!({"TransactItems": [
+            {"Get": {"TableName": "n", "Key": {"pk": {"N": spelling}, "sk": {"S": "x"}}}},
+        ]});
+        let t = batch_transact_targets("TransactGetItems", &tg, &ki).unwrap();
+        assert_eq!(
+            t[0].leading_keys,
+            Some(vec![expected.to_owned()]),
+            "{spelling}"
+        );
+
+        let tw = json!({"TransactItems": [
+            {"Put": {"TableName": "n", "Item": {"pk": {"N": spelling}, "sk": {"S": "x"}}}},
+            {"Update": {"TableName": "n", "Key": {"pk": {"N": spelling}, "sk": {"S": "y"}}}},
+            {"Delete": {"TableName": "n", "Key": {"pk": {"N": spelling}, "sk": {"S": "z"}}}},
+            {"ConditionCheck": {"TableName": "n", "Key": {"pk": {"N": spelling}, "sk": {"S": "w"}}}},
+        ]});
+        let t = batch_transact_targets("TransactWriteItems", &tw, &ki).unwrap();
+        for target in &t {
+            assert_eq!(
+                target.leading_keys,
+                Some(vec![expected.to_owned()]),
+                "{spelling} {}",
+                target.action
+            );
+        }
+    }
+}
+
+#[test]
+fn java_decimal_string_matches_the_measured_service_values() {
+    // Each pair is a request spelling and the LeadingKeys value the service
+    // matched on TransactGetItems and BatchWriteItem puts (measured 2026-10-20).
+    for (spelling, expected) in [
+        ("100E-2", "1.00"),
+        ("0.0000001", "1E-7"),
+        ("0.000001", "0.000001"),
+        ("123E2", "1.23E+4"),
+        ("-5.50", "-5.50"),
+        ("0.00", "0.00"),
+        ("0E5", "0E+5"),
+        (".5", "0.5"),
+        ("5.", "5"),
+        ("+1.5E+3", "1.5E+3"),
+        ("3e1", "3E+1"),
+        ("12.3400E-1", "1.23400"),
+        ("-0", "0"),
+        ("1.00E-130", "1.00E-130"),
+        ("7E0", "7"),
+        ("80E-1", "8.0"),
+        ("10.0", "10.0"),
+        ("1E1", "1E+1"),
+        ("1.0E1", "10"),
+        ("010", "10"),
+        ("+10", "10"),
+    ] {
+        assert_eq!(
+            java_decimal_string(spelling).as_deref(),
+            Some(expected),
+            "spelling {spelling}"
+        );
+    }
 }
 
 #[test]
@@ -545,7 +625,7 @@ fn engine_partition_value(
                 "EQ requires exactly one value".to_owned(),
             ));
         }
-        return extract_typed_value(&list[0])
+        return extract_typed_value(&list[0], NumberForm::Normalized)
             .ok_or_else(|| DynamoDbError::ValidationException("bad value".to_owned()));
     } else {
         return Err(DynamoDbError::ValidationException(
@@ -579,7 +659,7 @@ fn engine_partition_value(
             let v = values
                 .get(n)
                 .ok_or_else(|| DynamoDbError::ValidationException("unresolved value".to_owned()))?;
-            extract_typed_value(v)
+            extract_typed_value(v, NumberForm::Normalized)
                 .ok_or_else(|| DynamoDbError::ValidationException("bad value".to_owned()))
         }
         _ => Err(DynamoDbError::ValidationException(
