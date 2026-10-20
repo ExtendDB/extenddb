@@ -26,6 +26,7 @@ REQ-TEST-001, REQ-AUTH-002
 
 from __future__ import annotations
 
+import base64
 import os
 import time
 import uuid
@@ -213,6 +214,36 @@ class TestExplicitDenyOnResourceArn:
             {"Effect": "Allow", "Action": "dynamodb:DescribeStream", "Resource": wild}]}
         s = self._ddb(policy, "dynamodbstreams")
         s.describe_stream(StreamArn=table["stream_arn"])  # must not raise
+
+    def test_getrecords_exact_stream_deny_blocks(self, table):
+        # GetShardIterator stays allowed; GetRecords against the same stream is
+        # denied, because GetRecords is authorized against the stream the
+        # iterator reads, not a table/*/stream/* wildcard.
+        s = self._ddb(_allow_all_deny("GetRecords", table["stream_arn"]), "dynamodbstreams")
+        desc = s.describe_stream(StreamArn=table["stream_arn"])["StreamDescription"]
+        shard_id = desc["Shards"][0]["ShardId"]
+        it = s.get_shard_iterator(
+            StreamArn=table["stream_arn"], ShardId=shard_id,
+            ShardIteratorType="TRIM_HORIZON")["ShardIterator"]
+        self._assert_denied(lambda: s.get_records(ShardIterator=it))
+
+    def test_getrecords_forged_shard_reads_nothing(self, table):
+        # A token that names the allowed stream ARN but a shard that does not
+        # belong to it must not read: the engine confirms the shard belongs to
+        # the stream before reading. The real shard reads; the forged one errors.
+        s = self._ddb({"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"}]}, "dynamodbstreams")
+        desc = s.describe_stream(StreamArn=table["stream_arn"])["StreamDescription"]
+        shard_id = desc["Shards"][0]["ShardId"]
+        real_it = s.get_shard_iterator(
+            StreamArn=table["stream_arn"], ShardId=shard_id,
+            ShardIteratorType="TRIM_HORIZON")["ShardIterator"]
+        s.get_records(ShardIterator=real_it)  # control: real shard reads
+        now = int(time.time())
+        forged_raw = f"shardId-forged-0000000000000000|AFTER_SEQUENCE_NUMBER||{now}|{table['stream_arn']}"
+        forged = base64.standard_b64encode(forged_raw.encode()).decode()
+        with pytest.raises(ClientError):
+            s.get_records(ShardIterator=forged)
 
     def test_delete_backup_deny_blocks(self, table):
         d = self._ddb(_allow_all_deny("DeleteBackup", table["backup_arn"]))

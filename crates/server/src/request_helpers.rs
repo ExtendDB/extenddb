@@ -97,6 +97,35 @@ pub(crate) async fn authorize_request(
         return Ok(key_info);
     }
 
+    // GetRecords carries its resource only inside the opaque shard iterator, not
+    // in a request body field. Decode the iterator for the stream ARN and
+    // authorize against that specific stream, as the service does. Fail closed
+    // when the token is absent, does not decode, or carries no stream ARN (an
+    // iterator from an older build, or a forged token): the engine separately
+    // confirms the shard belongs to that stream before reading, so a token that
+    // names an allowed stream but a different stream's shard reads nothing.
+    if operation == "GetRecords" {
+        let resource_arn =
+            authz_resource::getrecords_stream_resource(input, &state.region, account_id)
+                .ok_or_else(|| {
+                    DynamoDbError::AccessDeniedException(
+                        "User is not authorized to perform: dynamodb:GetRecords: the shard \
+                         iterator does not identify a stream"
+                            .to_owned(),
+                    )
+                })?;
+        authorization::check_authorization(
+            state.authz_cache.as_ref(),
+            identity,
+            "GetRecords",
+            &resource_arn,
+            false,
+            extenddb_auth::policy::context::RequestParams::default(),
+        )
+        .await?;
+        return Ok(None);
+    }
+
     // Batch and transaction operations address multiple tables in nested request
     // structures with no top-level TableName. DynamoDB authorizes each of them
     // per table, against that table's specific ARN, using the IAM action the

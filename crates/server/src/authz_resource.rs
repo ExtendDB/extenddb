@@ -165,6 +165,23 @@ fn stream_wildcard(region: &str, account_id: &str) -> String {
     format!("arn:{PARTITION}:{SERVICE}:{region}:{account_id}:table/*/stream/*")
 }
 
+/// The canonical stream ARN a GetRecords request reads, decoded from its shard
+/// iterator token. Returns `None` when the iterator field is absent, does not
+/// decode, or carries no stream ARN (a token issued by a build before the
+/// stream ARN was carried, or a forged token), so `authorize_request` fails
+/// closed rather than authorizing against a wildcard a specific-stream Deny
+/// would miss.
+pub(crate) fn getrecords_stream_resource(
+    input: &Value,
+    region: &str,
+    account_id: &str,
+) -> Option<String> {
+    let token = input.get("ShardIterator").and_then(Value::as_str)?;
+    let decoded = extenddb_engine::decode_shard_iterator(token)?;
+    let stream_arn = decoded.stream_arn?;
+    Some(canonical_or_raw(&stream_arn, region, account_id))
+}
+
 fn str_field(input: &Value, key: &str) -> Option<String> {
     input
         .get(key)
@@ -200,10 +217,11 @@ pub(crate) fn authz_targets(
             region,
             account_id,
         )),
-        // GetRecords carries only an opaque shard iterator; the stream identity
-        // is not in the request body (see report, Divergences kept). Authorize
-        // against the account's stream space so an account-wide or action-wide
-        // Deny is enforced.
+        // GetRecords carries only an opaque shard iterator, not the stream in a
+        // body field, so it is handled in `authorize_request` by decoding the
+        // iterator for the stream ARN and failing closed when it is absent.
+        // `authz_targets` is never called for it; map it to the account stream
+        // space as a defensive non-bypass resource should it ever be reached.
         "GetRecords" => one(stream_wildcard(region, account_id)),
         "ListStreams" => {
             let res = match str_field(input, "TableName") {
