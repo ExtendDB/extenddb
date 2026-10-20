@@ -87,6 +87,24 @@ implicitly denied.
   will now block it. This is the intended fix, but it is a behavior change for
   any deployment that (perhaps unknowingly) relied on `Deny` being ignored. There
   is no change for trust policies that contain only `Allow` statements.
+- **Condition-key resolution (three cases).** A condition key falls into one of
+  three cases, in both trust-policy and identity-policy evaluation. (1) The
+  context resolves the key to a value: evaluate normally. (2) The context
+  resolves it as absent the same way the service would: IAM absent-key
+  semantics apply, including that a negated operator on an absent single-valued
+  key matches. (3) The service always populates the key but the context cannot
+  resolve it: the statement fails closed whatever the operator, so a `Deny`
+  blocks and an `Allow` does not grant, rather than the key being treated as
+  absent (which would let a negated operator spuriously match). The
+  `AssumeRoleContext` resolves `aws:PrincipalArn`, `aws:PrincipalAccount`,
+  `aws:PrincipalTag/*` (tag key matched case-insensitively), `aws:RequestTag/*`,
+  `aws:TagKeys` and `sts:ExternalId`; the always-populated global keys it does
+  not resolve (`aws:PrincipalOrgID`, `aws:PrincipalOrgPaths`,
+  `aws:PrincipalType`, `aws:userid`, `aws:username`, `aws:SourceIp`,
+  `aws:SecureTransport`, `aws:CurrentTime`, `aws:EpochTime`,
+  `aws:RequestedRegion`, `aws:UserAgent`) are case 3. Conditionally-present keys
+  such as `aws:MultiFactorAuthPresent` are absent for ExtendDB's caller model
+  and keep absent-key semantics.
 - **Follow-up:** the decision logic was factored into a store-free
   `trust_decision` helper (plus `statement_matches` / `effect_of`) so the
   Deny-over-Allow ordering is unit-tested directly. The decision is made per
