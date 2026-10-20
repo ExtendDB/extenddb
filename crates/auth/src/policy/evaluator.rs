@@ -77,6 +77,35 @@ pub fn evaluate_policies_arc(
     )
 }
 
+/// Returns true if an explicit Deny statement in any identity policy,
+/// permissions boundary, or session policy matches the action, resource and
+/// context. The server uses this only to choose the AccessDenied message form;
+/// it does not change the authorization decision, which `evaluate_policies_arc`
+/// already made.
+#[must_use]
+pub fn explicit_deny_matches_arc(
+    identity_policies: &[std::sync::Arc<PolicyDocument>],
+    permissions_boundary: Option<&PolicyDocument>,
+    session_policy: Option<&PolicyDocument>,
+    action: &str,
+    resource_arn: &str,
+    context: &impl ConditionContext,
+) -> bool {
+    identity_policies
+        .iter()
+        .map(std::sync::Arc::as_ref)
+        .chain(permissions_boundary)
+        .chain(session_policy)
+        .any(|policy| {
+            policy.statements.iter().any(|stmt| {
+                stmt.effect == Effect::Deny
+                    && action_matches(stmt, action)
+                    && resource_matches(stmt, resource_arn)
+                    && conditions_match(stmt, context)
+            })
+        })
+}
+
 fn evaluate_with<'a, I>(
     identity_policies: I,
     permissions_boundary: Option<&'a PolicyDocument>,

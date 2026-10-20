@@ -317,3 +317,23 @@ class TestExplicitDenyOnResourceArn:
         # Must not raise.
         d.tag_resource(ResourceArn=table["table_arn"], Tags=[{"Key": "ctrl", "Value": "1"}])
         time.sleep(0)
+
+    # -- AccessDenied message form matches the service (both forms) --
+
+    def test_explicit_deny_message_form(self, table):
+        d = self._ddb(_allow_all_deny("TagResource", table["table_arn"]))
+        with pytest.raises(ClientError) as exc:
+            d.tag_resource(ResourceArn=table["table_arn"], Tags=[{"Key": "k", "Value": "v"}])
+        msg = exc.value.response["Error"]["Message"]
+        assert "with an explicit deny in an identity-based policy" in msg, msg
+
+    def test_implicit_deny_message_form(self, table):
+        # A principal allowed only ListTables is denied GetItem with the
+        # implicit-deny message form.
+        policy = {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:ListTables", "Resource": "*"}]}
+        d = self._ddb(policy)
+        with pytest.raises(ClientError) as exc:
+            d.get_item(TableName=table["name"], Key={"pk": {"S": "p1"}})
+        msg = exc.value.response["Error"]["Message"]
+        assert "because no identity-based policy allows the dynamodb:GetItem action" in msg, msg

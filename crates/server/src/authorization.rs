@@ -18,7 +18,9 @@ use std::collections::HashMap;
 
 use extenddb_auth::AuthIdentity;
 use extenddb_auth::policy::context::{RequestContext, RequestParams};
-use extenddb_auth::policy::evaluator::{AuthzDecision, evaluate_policies_arc};
+use extenddb_auth::policy::evaluator::{
+    AuthzDecision, evaluate_policies_arc, explicit_deny_matches_arc,
+};
 use extenddb_core::error::DynamoDbError;
 use extenddb_storage::management_store::OpError;
 
@@ -133,9 +135,20 @@ async fn check_user_authorization(
             resource = resource_arn,
             "Authorization denied"
         );
-        Err(DynamoDbError::AccessDeniedException(format!(
-            "User: arn:aws:iam::{account_id}:user/{user_name} is not authorized \
-             to perform: {action} on resource: {resource_arn}"
+        let principal = format!("arn:aws:iam::{account_id}:user/{user_name}");
+        let explicit = explicit_deny_matches_arc(
+            &identity_policies,
+            boundary.as_deref(),
+            None,
+            &action,
+            resource_arn,
+            &context,
+        );
+        Err(DynamoDbError::AccessDeniedException(deny_message(
+            &principal,
+            &action,
+            resource_arn,
+            explicit,
         )))
     }
 }
@@ -186,9 +199,21 @@ async fn check_role_authorization(
             resource = resource_arn,
             "Authorization denied"
         );
-        Err(DynamoDbError::AccessDeniedException(format!(
-            "User: arn:aws:iam::{account_id}:assumed-role/{role_name}/{session_name} \
-             is not authorized to perform: {action} on resource: {resource_arn}"
+        let principal =
+            format!("arn:aws:iam::{account_id}:assumed-role/{role_name}/{session_name}");
+        let explicit = explicit_deny_matches_arc(
+            &identity_slice,
+            boundary.as_deref(),
+            session_policy.as_deref(),
+            &action,
+            resource_arn,
+            &context,
+        );
+        Err(DynamoDbError::AccessDeniedException(deny_message(
+            &principal,
+            &action,
+            resource_arn,
+            explicit,
         )))
     }
 }
@@ -196,6 +221,23 @@ async fn check_role_authorization(
 // ---------------------------------------------------------------------------
 // Helpers — translate cache results to authorization-layer types
 // ---------------------------------------------------------------------------
+
+/// Build the AccessDeniedException message in the form the service uses, which
+/// depends on why the request was denied. `action` already carries the
+/// `dynamodb:` prefix. An explicit Deny statement yields "with an explicit deny
+/// in an identity-based policy"; any other denial yields "because no
+/// identity-based policy allows the <action> action", measured against live
+/// DynamoDB.
+fn deny_message(principal: &str, action: &str, resource_arn: &str, explicit: bool) -> String {
+    let head = format!(
+        "User: {principal} is not authorized to perform: {action} on resource: {resource_arn}"
+    );
+    if explicit {
+        format!("{head} with an explicit deny in an identity-based policy")
+    } else {
+        format!("{head} because no identity-based policy allows the {action} action")
+    }
+}
 
 /// Translate an `OpResult` from the cache into a `DynamoDbError`.
 ///
@@ -277,4 +319,32 @@ async fn fetch_session_data_and_tags(
         }
     }
     Ok((session_policy, tags))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::deny_message;
+
+    const P: &str = "arn:aws:iam::964157134968:user/alice";
+    const R: &str = "arn:aws:dynamodb:us-east-1:964157134968:table/bb";
+
+    #[test]
+    fn explicit_deny_message_matches_service() {
+        assert_eq!(
+            deny_message(P, "dynamodb:TagResource", R, true),
+            "User: arn:aws:iam::964157134968:user/alice is not authorized to perform: \
+             dynamodb:TagResource on resource: arn:aws:dynamodb:us-east-1:964157134968:table/bb \
+             with an explicit deny in an identity-based policy"
+        );
+    }
+
+    #[test]
+    fn implicit_deny_message_matches_service() {
+        assert_eq!(
+            deny_message(P, "dynamodb:GetItem", R, false),
+            "User: arn:aws:iam::964157134968:user/alice is not authorized to perform: \
+             dynamodb:GetItem on resource: arn:aws:dynamodb:us-east-1:964157134968:table/bb \
+             because no identity-based policy allows the dynamodb:GetItem action"
+        );
+    }
 }
