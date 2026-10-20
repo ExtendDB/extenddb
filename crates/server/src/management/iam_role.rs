@@ -66,10 +66,17 @@ pub async fn create_role(
         ));
     }
 
-    if body.trust_policy.get("Version").is_none() || body.trust_policy.get("Statement").is_none() {
+    if body.trust_policy.get("Statement").is_none() {
         return op_err_to_response(OpError::Validation(
-            "Trust policy must contain Version and Statement".to_owned(),
+            "Trust policy must contain a Statement".to_owned(),
         ));
+    }
+    // Validate the trust document the way IAM validates an AssumeRole trust
+    // policy, so a document IAM would reject is not stored and then dropped at
+    // evaluation. The error text is ExtendDB's own; the accepted and rejected
+    // sets match IAM.
+    if let Err(msg) = super::assume_role::validate_trust_policy(&body.trust_policy) {
+        return op_err_to_response(OpError::Validation(format!("Invalid trust policy: {msg}")));
     }
 
     match state

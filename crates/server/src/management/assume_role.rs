@@ -145,15 +145,26 @@ pub async fn assume_role(
         }
     };
 
+    // Session tags passed on the call require sts:TagSession in the trust
+    // policy, so the STS action set the decision checks depends on their
+    // presence.
+    let has_session_tags = request.session_tags.as_ref().is_some_and(value_has_entries);
+
     // Evaluate trust policy against the provided caller ARN.
     if !evaluate_trust_policy(
         &trust_policy,
         caller_arn,
         request.external_id.as_deref(),
+        has_session_tags,
         &*state.catalog_store,
     )
     .await
     {
+        tracing::warn!(
+            target: "extenddb::audit::manage",
+            "assume-role denied: account={}, role={}, caller={}",
+            account_id, role_name, caller_arn,
+        );
         return (
             StatusCode::FORBIDDEN,
             "Caller is not authorized to assume this role",
@@ -269,35 +280,30 @@ async fn generate_and_store_session(
 // Trust policy evaluation
 // ---------------------------------------------------------------------------
 
-/// Evaluate a trust policy to determine if `caller_arn` is allowed to assume
-/// the role.
+/// Evaluate a trust policy to decide whether `caller_arn` may assume the role,
+/// given the external id and whether session tags were passed.
 ///
-/// Follows IAM evaluation order: an explicit `Deny` that matches the caller
-/// wins over any `Allow`, exactly as the identity-policy evaluator does
-/// (`policy/evaluator.rs`, phase 1). Only if no matching `Deny` is found does
-/// a matching `Allow` grant assumption. See ADR-0022.
+/// Follows IAM order per requested STS action. An `AssumeRole` call exercises
+/// `sts:AssumeRole`; passing session tags additionally exercises
+/// `sts:TagSession`. ExtendDB does not implement source identity, so
+/// `sts:SetSourceIdentity` is never exercised. Assumption is granted only when
+/// every exercised action has a matching `Allow` and no matching `Deny`, with
+/// an explicit `Deny` winning over any `Allow` (ADR-0022).
 ///
-/// A statement "matches" when its Principal matches the caller and all of its
-/// conditions pass. Principal matching supports:
-/// - `"*"` (any caller)
-/// - `{"AWS": "arn:..."}` (single ARN)
-/// - `{"AWS": ["arn:...", ...]}` (list of ARNs)
-///
-/// Conditions are evaluated using the policy engine's `AssumeRoleContext`,
-/// which supports `aws:PrincipalTag/*` and `sts:ExternalId` keys. A statement
-/// whose `Condition` block fails to parse is treated as non-matching: it can
-/// neither grant via `Allow` nor block via `Deny`. Treating an unparseable
-/// `Deny` as "does not match" is the fail-open direction for that one
-/// statement, but a malformed trust policy is an administrator error surfaced
-/// at role creation, and matching the parse-failure handling of the `Allow`
-/// path keeps the two consistent.
+/// A statement matches an action when its `Principal` matches the caller, its
+/// `Action`/`NotAction` matches the action, and its `Condition` block passes. A
+/// `Deny` whose condition fails to parse fails closed: it blocks, so a
+/// malformed stored `Deny` cannot silently grant assumption. Documents are
+/// validated at write time (`validate_trust_policy`), so a well-formed store
+/// does not reach the fail-closed path in normal operation.
 async fn evaluate_trust_policy(
     trust_policy: &Value,
     caller_arn: &str,
     external_id: Option<&str>,
+    has_session_tags: bool,
     store: &dyn extenddb_storage::CatalogStore,
 ) -> bool {
-    let Some(statements) = trust_policy.get("Statement").and_then(|s| s.as_array()) else {
+    let Some(statements) = statements_vec(trust_policy) else {
         return false;
     };
 
@@ -307,73 +313,460 @@ async fn evaluate_trust_policy(
         external_id: external_id.map(String::from),
     };
 
-    trust_decision(statements, caller_arn, &context)
+    trust_decision(&statements, caller_arn, &context, has_session_tags)
 }
 
-/// Decide assumption from already-resolved statements and context.
-///
-/// Split out from `evaluate_trust_policy` so the Deny-over-Allow ordering is
-/// unit-testable without a `CatalogStore` (the store is only needed to build
-/// the context's principal tags).
-fn trust_decision(statements: &[Value], caller_arn: &str, context: &AssumeRoleContext) -> bool {
-    // Phase 1: explicit Deny. Any matching Deny statement blocks assumption
-    // outright, regardless of any Allow present in the same policy.
+/// The statements of a policy document as an owned list. `Statement` may be a
+/// single object or an array; both are supported, matching IAM. Returns `None`
+/// when `Statement` is absent or neither an object nor an array.
+fn statements_vec(trust_policy: &Value) -> Option<Vec<Value>> {
+    match trust_policy.get("Statement") {
+        Some(Value::Array(arr)) => Some(arr.clone()),
+        Some(obj @ Value::Object(_)) => Some(vec![obj.clone()]),
+        _ => None,
+    }
+}
+
+/// Decide assumption from resolved statements and context. Split out so the
+/// per-action Deny-over-Allow ordering is unit-testable without a store.
+fn trust_decision(
+    statements: &[Value],
+    caller_arn: &str,
+    context: &AssumeRoleContext,
+    has_session_tags: bool,
+) -> bool {
+    requested_actions(has_session_tags)
+        .iter()
+        .all(|action| action_permitted(statements, caller_arn, context, action))
+}
+
+/// The STS actions an `AssumeRole` request exercises.
+fn requested_actions(has_session_tags: bool) -> Vec<&'static str> {
+    let mut actions = vec!["sts:AssumeRole"];
+    if has_session_tags {
+        actions.push("sts:TagSession");
+    }
+    actions
+}
+
+/// Whether a single STS action is permitted: a matching explicit `Deny` blocks
+/// it; otherwise a matching `Allow` grants it; with neither it is implicitly
+/// denied.
+fn action_permitted(
+    statements: &[Value],
+    caller_arn: &str,
+    context: &AssumeRoleContext,
+    action: &str,
+) -> bool {
     for stmt in statements {
-        if effect_of(stmt) == "Deny" && statement_matches(stmt, caller_arn, context) {
+        if effect_of(stmt).eq_ignore_ascii_case("Deny")
+            && deny_statement_blocks(stmt, caller_arn, context, action)
+        {
             return false;
         }
     }
-
-    // Phase 2: Allow. With no matching Deny, a matching Allow grants assumption.
     for stmt in statements {
-        if effect_of(stmt) == "Allow" && statement_matches(stmt, caller_arn, context) {
+        if effect_of(stmt).eq_ignore_ascii_case("Allow")
+            && allow_statement_grants(stmt, caller_arn, context, action)
+        {
             return true;
         }
     }
-
-    // Implicit deny: no statement granted assumption.
     false
 }
 
-/// The `Effect` string of a statement, or `""` when absent/non-string.
+/// The `Effect` string of a statement, or `""` when absent/non-string. Compared
+/// case-insensitively by the caller, matching the identity-policy parser.
 fn effect_of(stmt: &Value) -> &str {
     stmt.get("Effect").and_then(|e| e.as_str()).unwrap_or("")
 }
 
-/// Whether a trust-policy statement matches the caller: its Principal matches
-/// `caller_arn` and every condition passes. Independent of the statement's
-/// `Effect`, so both the Deny and Allow phases share one matching definition.
-fn statement_matches(stmt: &Value, caller_arn: &str, context: &AssumeRoleContext) -> bool {
-    if !principal_matches(&stmt["Principal"], caller_arn) {
+/// Whether a `Deny` blocks the action: its principal and action match and its
+/// condition passes. A condition that fails to parse fails closed (blocks).
+fn deny_statement_blocks(
+    stmt: &Value,
+    caller_arn: &str,
+    context: &AssumeRoleContext,
+    action: &str,
+) -> bool {
+    if !principal_matches(&stmt["Principal"], caller_arn) || !action_matches(stmt, action) {
         return false;
     }
-    match parse_conditions(&stmt["Condition"]) {
-        Ok(conds) => conds.iter().all(|c| evaluate_condition(c, context)),
-        Err(_) => false,
+    matches!(
+        evaluate_conditions(stmt, context),
+        ConditionOutcome::Pass | ConditionOutcome::Unparseable
+    )
+}
+
+/// Whether an `Allow` grants the action: principal, action and condition all
+/// match. A condition that fails to parse does not grant.
+fn allow_statement_grants(
+    stmt: &Value,
+    caller_arn: &str,
+    context: &AssumeRoleContext,
+    action: &str,
+) -> bool {
+    if !principal_matches(&stmt["Principal"], caller_arn) || !action_matches(stmt, action) {
+        return false;
+    }
+    matches!(evaluate_conditions(stmt, context), ConditionOutcome::Pass)
+}
+
+/// Outcome of a statement's `Condition` block for a given context.
+enum ConditionOutcome {
+    Pass,
+    Fail,
+    Unparseable,
+}
+
+/// Evaluate a statement's `Condition` block. Scalar condition values (numbers,
+/// booleans) are coerced to strings, matching IAM. An unknown operator or a
+/// structurally invalid block is reported as `Unparseable`.
+fn evaluate_conditions(stmt: &Value, context: &AssumeRoleContext) -> ConditionOutcome {
+    let normalized = normalize_condition_scalars(&stmt["Condition"]);
+    match parse_conditions(&normalized) {
+        Ok(conds) => {
+            if conds.iter().all(|c| evaluate_condition(c, context)) {
+                ConditionOutcome::Pass
+            } else {
+                ConditionOutcome::Fail
+            }
+        }
+        Err(_) => ConditionOutcome::Unparseable,
     }
 }
 
-/// Check if a Principal field matches the given caller ARN.
+/// Whether a statement's `Action`/`NotAction` covers `action`, case-insensitive
+/// and with `*` and prefix wildcards. A statement with neither field covers no
+/// action.
+fn action_matches(stmt: &Value, action: &str) -> bool {
+    if let Some(actions) = action_list(stmt.get("Action")) {
+        actions.iter().any(|p| action_pattern_matches(p, action))
+    } else if let Some(not_actions) = action_list(stmt.get("NotAction")) {
+        !not_actions
+            .iter()
+            .any(|p| action_pattern_matches(p, action))
+    } else {
+        false
+    }
+}
+
+/// A statement's action field as a list of patterns, or `None` when absent.
+fn action_list(v: Option<&Value>) -> Option<Vec<String>> {
+    match v {
+        Some(Value::String(s)) => Some(vec![s.clone()]),
+        Some(Value::Array(arr)) => Some(
+            arr.iter()
+                .filter_map(|a| a.as_str().map(ToOwned::to_owned))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Match an action pattern against an action, case-insensitive. Supports `*`
+/// (any action) and a trailing-`*` prefix wildcard such as `sts:*`.
+fn action_pattern_matches(pattern: &str, action: &str) -> bool {
+    let p = pattern.to_ascii_lowercase();
+    let a = action.to_ascii_lowercase();
+    if p == "*" {
+        return true;
+    }
+    if let Some(prefix) = p.strip_suffix('*') {
+        return a.starts_with(prefix);
+    }
+    p == a
+}
+
+/// Whether a Principal field matches the caller ARN. Supports `"*"`, `{"AWS":
+/// "<arn>"|"*"|"<account-id>"|"<account-root-arn>"}` and lists thereof.
+/// Account-id and account-root principals match any caller in that account.
+/// Objects without an `AWS` key (for example `Service` principals) never match
+/// an IAM user or assumed-role caller.
 fn principal_matches(principal: &Value, caller_arn: &str) -> bool {
     match principal {
-        // "*" matches any caller.
-        Value::String(s) if s == "*" => true,
-        // {"AWS": "arn:..."} or {"AWS": ["arn:...", ...]}
-        Value::Object(map) => {
-            if let Some(aws) = map.get("AWS") {
-                match aws {
-                    Value::String(arn) => arn == "*" || arn == caller_arn,
-                    Value::Array(arns) => arns
-                        .iter()
-                        .any(|a| a.as_str().is_some_and(|s| s == "*" || s == caller_arn)),
-                    _ => false,
-                }
-            } else {
-                false
-            }
-        }
+        Value::String(s) => s == "*",
+        Value::Object(map) => match map.get("AWS") {
+            Some(Value::String(arn)) => principal_entry_matches(arn, caller_arn),
+            Some(Value::Array(arns)) => arns
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|a| principal_entry_matches(a, caller_arn)),
+            _ => false,
+        },
         _ => false,
     }
+}
+
+/// Whether one `AWS` principal entry matches the caller. Exact ARN, `"*"`, bare
+/// account id, and account-root ARN (`arn:aws:iam::<account>:root`) all match.
+fn principal_entry_matches(entry: &str, caller_arn: &str) -> bool {
+    if entry == "*" || entry == caller_arn {
+        return true;
+    }
+    if let Some(account) = caller_account(caller_arn) {
+        if entry == account {
+            return true;
+        }
+        if let Some(root_account) = entry
+            .strip_prefix("arn:aws:iam::")
+            .and_then(|r| r.strip_suffix(":root"))
+            && root_account == account
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The account id field of an ARN (`arn:partition:service:region:account:...`).
+fn caller_account(caller_arn: &str) -> Option<&str> {
+    caller_arn.split(':').nth(4).filter(|s| !s.is_empty())
+}
+
+/// Whether a JSON value is a non-empty object or array.
+fn value_has_entries(v: &Value) -> bool {
+    match v {
+        Value::Object(o) => !o.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        _ => false,
+    }
+}
+
+/// Coerce scalar condition values (numbers, booleans) to strings, matching
+/// IAM's handling of condition values, so a numeric or boolean value parses and
+/// evaluates as its string form rather than being rejected.
+fn normalize_condition_scalars(v: &Value) -> Value {
+    match v {
+        Value::Number(n) => Value::String(n.to_string()),
+        Value::Bool(b) => Value::String(b.to_string()),
+        Value::Array(a) => Value::Array(a.iter().map(normalize_condition_scalars).collect()),
+        Value::Object(o) => Value::Object(
+            o.iter()
+                .map(|(k, val)| (k.clone(), normalize_condition_scalars(val)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trust policy write-time validation
+// ---------------------------------------------------------------------------
+
+/// Allowed actions in an `AssumeRole` trust policy, lowercase for comparison.
+const STS_TRUST_ACTIONS: [&str; 3] = ["sts:assumerole", "sts:tagsession", "sts:setsourceidentity"];
+
+/// Validate a trust policy document at write time, rejecting the documents IAM
+/// rejects for an `AssumeRole` trust policy and accepting those it accepts. The
+/// error text is ExtendDB's own; the accepted and rejected sets match IAM.
+///
+/// Rejects: missing or non-string `Effect` and values other than Allow/Deny;
+/// `NotPrincipal`; a missing `Principal`; a bare string principal (including
+/// `"*"`); an `AWS` principal ARN containing a wildcard; a missing
+/// `Action`/`NotAction`; an action outside the STS trust set; a
+/// `Resource`/`NotResource` field; and a `Condition` with an unknown operator
+/// or invalid structure. Accepts a missing `Version`, a single-object
+/// `Statement`, numeric condition values and unknown condition keys.
+pub(crate) fn validate_trust_policy(trust_policy: &Value) -> Result<(), String> {
+    let Some(statements) = statements_vec(trust_policy) else {
+        return Err("Trust policy must contain a Statement object or array".to_owned());
+    };
+    if statements.is_empty() {
+        return Err("Trust policy Statement must not be empty".to_owned());
+    }
+    for stmt in &statements {
+        validate_trust_statement(stmt)?;
+    }
+    Ok(())
+}
+
+/// A statement field, treating JSON null as absent.
+fn non_null(v: Option<&Value>) -> Option<&Value> {
+    v.filter(|v| !v.is_null())
+}
+
+fn validate_trust_statement(stmt: &Value) -> Result<(), String> {
+    match stmt.get("Effect").and_then(Value::as_str) {
+        Some(e) if e.eq_ignore_ascii_case("Allow") || e.eq_ignore_ascii_case("Deny") => {}
+        Some(e) => return Err(format!("invalid Effect: {e}")),
+        None => return Err("statement is missing Effect".to_owned()),
+    }
+
+    if non_null(stmt.get("NotPrincipal")).is_some() {
+        return Err("NotPrincipal is not allowed in a trust policy".to_owned());
+    }
+    match non_null(stmt.get("Principal")) {
+        None => return Err("statement is missing Principal".to_owned()),
+        Some(p) => validate_trust_principal(p)?,
+    }
+
+    match (
+        non_null(stmt.get("Action")),
+        non_null(stmt.get("NotAction")),
+    ) {
+        (None, None) => return Err("statement is missing Action".to_owned()),
+        (Some(_), Some(_)) => return Err("statement has both Action and NotAction".to_owned()),
+        (Some(a), None) | (None, Some(a)) => validate_trust_actions(a)?,
+    }
+
+    if non_null(stmt.get("Resource")).is_some() || non_null(stmt.get("NotResource")).is_some() {
+        return Err("Resource is not allowed in a trust policy".to_owned());
+    }
+
+    if let Some(cond) = non_null(stmt.get("Condition")) {
+        validate_trust_condition(cond)?;
+    }
+
+    Ok(())
+}
+
+/// Validate a `Condition` block at write time. Accepts the full IAM operator
+/// vocabulary (including operators ExtendDB's evaluator does not implement, such
+/// as `IpAddress`; a `Deny` using one of those fails closed at evaluation).
+/// Rejects an invalid operator name, a non-object block, and a non-object
+/// operator entry. Accepts string, number and boolean values and unknown
+/// condition keys, matching IAM.
+fn validate_trust_condition(cond: &Value) -> Result<(), String> {
+    let obj = cond
+        .as_object()
+        .ok_or_else(|| "Condition must be an object".to_owned())?;
+    for (op_name, keys) in obj {
+        if !is_known_iam_condition_operator(op_name) {
+            return Err(format!("invalid Condition operator: {op_name}"));
+        }
+        let keys_obj = keys
+            .as_object()
+            .ok_or_else(|| format!("Condition {op_name} must be an object"))?;
+        for vals in keys_obj.values() {
+            validate_condition_values(vals)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_condition_values(v: &Value) -> Result<(), String> {
+    let is_scalar = |x: &Value| x.is_string() || x.is_number() || x.is_boolean();
+    match v {
+        _ if is_scalar(v) => Ok(()),
+        Value::Array(arr) if arr.iter().all(is_scalar) => Ok(()),
+        _ => Err("condition value must be a string, number, boolean or array of those".to_owned()),
+    }
+}
+
+/// Whether `name` is a known IAM condition operator (base name, after stripping
+/// a `ForAllValues:`/`ForAnyValue:` prefix and an `IfExists` suffix). Used only
+/// by write-time validation so the accepted operator set matches IAM even for
+/// operators ExtendDB does not evaluate.
+fn is_known_iam_condition_operator(name: &str) -> bool {
+    let base = name
+        .strip_prefix("ForAllValues:")
+        .or_else(|| name.strip_prefix("ForAnyValue:"))
+        .unwrap_or(name);
+    let base = base.strip_suffix("IfExists").unwrap_or(base);
+    matches!(
+        base,
+        "StringEquals"
+            | "StringNotEquals"
+            | "StringEqualsIgnoreCase"
+            | "StringNotEqualsIgnoreCase"
+            | "StringLike"
+            | "StringNotLike"
+            | "NumericEquals"
+            | "NumericNotEquals"
+            | "NumericLessThan"
+            | "NumericLessThanEquals"
+            | "NumericGreaterThan"
+            | "NumericGreaterThanEquals"
+            | "DateEquals"
+            | "DateNotEquals"
+            | "DateLessThan"
+            | "DateLessThanEquals"
+            | "DateGreaterThan"
+            | "DateGreaterThanEquals"
+            | "Bool"
+            | "BinaryEquals"
+            | "IpAddress"
+            | "NotIpAddress"
+            | "ArnEquals"
+            | "ArnLike"
+            | "ArnNotEquals"
+            | "ArnNotLike"
+            | "Null"
+    )
+}
+
+fn validate_trust_principal(principal: &Value) -> Result<(), String> {
+    match principal {
+        Value::String(_) => {
+            Err("Principal must be an object such as {\"AWS\": \"<arn>\"}".to_owned())
+        }
+        Value::Object(map) => {
+            if map.is_empty() {
+                return Err("Principal object must not be empty".to_owned());
+            }
+            if let Some(aws) = non_null(map.get("AWS")) {
+                for entry in principal_entry_strings(aws)? {
+                    validate_aws_principal_entry(&entry)?;
+                }
+            }
+            Ok(())
+        }
+        _ => Err("invalid Principal value".to_owned()),
+    }
+}
+
+fn principal_entry_strings(v: &Value) -> Result<Vec<String>, String> {
+    match v {
+        Value::String(s) => Ok(vec![s.clone()]),
+        Value::Array(arr) => arr
+            .iter()
+            .map(|a| {
+                a.as_str()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| "principal entry must be a string".to_owned())
+            })
+            .collect(),
+        _ => Err("principal value must be a string or array of strings".to_owned()),
+    }
+}
+
+fn validate_aws_principal_entry(entry: &str) -> Result<(), String> {
+    if entry == "*" {
+        return Ok(());
+    }
+    if entry.contains('*') {
+        return Err(format!(
+            "wildcard is not allowed in a principal ARN: {entry}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_trust_actions(actions: &Value) -> Result<(), String> {
+    let list = match actions {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(arr) => arr
+            .iter()
+            .map(|a| {
+                a.as_str()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| "Action entry must be a string".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => return Err("Action must be a string or array of strings".to_owned()),
+    };
+    if list.is_empty() {
+        return Err("Action must not be empty".to_owned());
+    }
+    for a in &list {
+        if !STS_TRUST_ACTIONS.contains(&a.to_ascii_lowercase().as_str()) {
+            return Err(format!(
+                "trust policy Action must be one of sts:AssumeRole, sts:TagSession, sts:SetSourceIdentity: {a}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -411,10 +804,21 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
 
+    const ACCT: &str = "123456789012";
+    const CALLER: &str = "arn:aws:iam::123456789012:user/alice";
+    const BOB: &str = "arn:aws:iam::123456789012:user/bob";
+
     fn ctx() -> AssumeRoleContext {
         AssumeRoleContext {
             principal_tags: HashMap::new(),
             external_id: None,
+        }
+    }
+
+    fn ctx_ext(id: &str) -> AssumeRoleContext {
+        AssumeRoleContext {
+            principal_tags: HashMap::new(),
+            external_id: Some(id.to_owned()),
         }
     }
 
@@ -428,7 +832,10 @@ mod tests {
         }
     }
 
-    const CALLER: &str = "arn:aws:iam::123456789012:user/alice";
+    /// Allow alice to assume (sts:AssumeRole).
+    fn allow_alice() -> Value {
+        json!({"Effect": "Allow", "Principal": {"AWS": CALLER}, "Action": "sts:AssumeRole"})
+    }
 
     // ---- principal_matches ------------------------------------------------
 
@@ -440,10 +847,7 @@ mod tests {
     #[test]
     fn principal_aws_single_arn_matches_exact() {
         assert!(principal_matches(&json!({"AWS": CALLER}), CALLER));
-        assert!(!principal_matches(
-            &json!({"AWS": "arn:aws:iam::123456789012:user/bob"}),
-            CALLER
-        ));
+        assert!(!principal_matches(&json!({"AWS": BOB}), CALLER));
     }
 
     #[test]
@@ -453,10 +857,22 @@ mod tests {
 
     #[test]
     fn principal_aws_list_matches_any_member() {
-        let p = json!({"AWS": ["arn:aws:iam::123456789012:user/bob", CALLER]});
-        assert!(principal_matches(&p, CALLER));
-        let p2 = json!({"AWS": ["arn:aws:iam::123456789012:user/bob"]});
-        assert!(!principal_matches(&p2, CALLER));
+        assert!(principal_matches(&json!({"AWS": [BOB, CALLER]}), CALLER));
+        assert!(!principal_matches(&json!({"AWS": [BOB]}), CALLER));
+    }
+
+    #[test]
+    fn principal_account_root_matches_any_caller_in_account() {
+        let root = format!("arn:aws:iam::{ACCT}:root");
+        assert!(principal_matches(&json!({"AWS": root}), CALLER));
+        let other_root = "arn:aws:iam::999999999999:root";
+        assert!(!principal_matches(&json!({"AWS": other_root}), CALLER));
+    }
+
+    #[test]
+    fn principal_bare_account_id_matches_any_caller_in_account() {
+        assert!(principal_matches(&json!({"AWS": ACCT}), CALLER));
+        assert!(!principal_matches(&json!({"AWS": "999999999999"}), CALLER));
     }
 
     #[test]
@@ -468,7 +884,7 @@ mod tests {
         assert!(!principal_matches(&json!(null), CALLER));
     }
 
-    // ---- effect_of --------------------------------------------------------
+    // ---- effect_of (case-insensitive compare at call sites) ---------------
 
     #[test]
     fn effect_of_reads_string_or_defaults_empty() {
@@ -478,90 +894,405 @@ mod tests {
         assert_eq!(effect_of(&json!({"Effect": 5})), "");
     }
 
-    // ---- trust_decision: core regression ---------------------------------
+    #[test]
+    fn effect_lowercase_deny_blocks() {
+        // IAM accepts and enforces a lowercase "deny".
+        let stmts = vec![
+            json!({"Effect": "Allow", "Principal": "*", "Action": "sts:AssumeRole"}),
+            json!({"Effect": "deny", "Principal": {"AWS": CALLER}, "Action": "sts:AssumeRole"}),
+        ];
+        assert!(!trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    // ---- action_matches ---------------------------------------------------
+
+    #[test]
+    fn action_matches_exact_and_wildcards() {
+        let a = json!({"Action": "sts:AssumeRole"});
+        assert!(action_matches(&a, "sts:AssumeRole"));
+        assert!(!action_matches(&a, "sts:TagSession"));
+        let star = json!({"Action": "*"});
+        assert!(action_matches(&star, "sts:AssumeRole"));
+        let prefix = json!({"Action": "sts:*"});
+        assert!(action_matches(&prefix, "sts:AssumeRole"));
+        let list = json!({"Action": ["sts:AssumeRole", "sts:TagSession"]});
+        assert!(action_matches(&list, "sts:TagSession"));
+        let none = json!({"Principal": "*"});
+        assert!(!action_matches(&none, "sts:AssumeRole"));
+    }
+
+    #[test]
+    fn action_matches_not_action() {
+        let na = json!({"NotAction": "sts:TagSession"});
+        assert!(action_matches(&na, "sts:AssumeRole"));
+        assert!(!action_matches(&na, "sts:TagSession"));
+    }
+
+    // ---- trust_decision: Deny-over-Allow core ----------------------------
 
     #[test]
     fn allow_grants_when_principal_matches() {
-        let stmts = vec![json!({"Effect": "Allow", "Principal": {"AWS": CALLER}})];
-        assert!(trust_decision(&stmts, CALLER, &ctx()));
+        assert!(trust_decision(&[allow_alice()], CALLER, &ctx(), false));
     }
 
     #[test]
     fn no_matching_allow_is_implicit_deny() {
-        let stmts = vec![json!({
-            "Effect": "Allow",
-            "Principal": {"AWS": "arn:aws:iam::123456789012:user/bob"}
-        })];
-        assert!(!trust_decision(&stmts, CALLER, &ctx()));
+        let stmts =
+            vec![json!({"Effect": "Allow", "Principal": {"AWS": BOB}, "Action": "sts:AssumeRole"})];
+        assert!(!trust_decision(&stmts, CALLER, &ctx(), false));
     }
 
     /// The ticket regression: an explicit Deny must override a broad Allow.
-    /// Before the fix, Deny statements were skipped entirely and the caller
-    /// was granted assumption via the `Allow *`.
     #[test]
     fn explicit_deny_overrides_allow_regardless_of_order() {
-        // Deny listed after Allow.
         let allow_then_deny = vec![
-            json!({"Effect": "Allow", "Principal": "*"}),
-            json!({"Effect": "Deny", "Principal": {"AWS": CALLER}}),
+            json!({"Effect": "Allow", "Principal": "*", "Action": "sts:AssumeRole"}),
+            json!({"Effect": "Deny", "Principal": {"AWS": CALLER}, "Action": "sts:AssumeRole"}),
         ];
-        assert!(
-            !trust_decision(&allow_then_deny, CALLER, &ctx()),
-            "explicit Deny after Allow must block assumption"
-        );
+        assert!(!trust_decision(&allow_then_deny, CALLER, &ctx(), false));
 
-        // Deny listed before Allow.
         let deny_then_allow = vec![
-            json!({"Effect": "Deny", "Principal": {"AWS": CALLER}}),
-            json!({"Effect": "Allow", "Principal": "*"}),
+            json!({"Effect": "Deny", "Principal": {"AWS": CALLER}, "Action": "sts:AssumeRole"}),
+            json!({"Effect": "Allow", "Principal": "*", "Action": "sts:AssumeRole"}),
         ];
-        assert!(
-            !trust_decision(&deny_then_allow, CALLER, &ctx()),
-            "explicit Deny before Allow must block assumption"
-        );
+        assert!(!trust_decision(&deny_then_allow, CALLER, &ctx(), false));
     }
 
     #[test]
     fn deny_targeting_other_principal_does_not_block() {
         let stmts = vec![
-            json!({"Effect": "Allow", "Principal": "*"}),
-            json!({"Effect": "Deny", "Principal": {"AWS": "arn:aws:iam::123456789012:user/bob"}}),
+            json!({"Effect": "Allow", "Principal": "*", "Action": "sts:AssumeRole"}),
+            json!({"Effect": "Deny", "Principal": {"AWS": BOB}, "Action": "sts:AssumeRole"}),
         ];
-        assert!(
-            trust_decision(&stmts, CALLER, &ctx()),
-            "a Deny aimed at a different principal must not block this caller"
-        );
+        assert!(trust_decision(&stmts, CALLER, &ctx(), false));
     }
 
     #[test]
-    fn conditional_deny_only_blocks_when_condition_matches() {
-        // Deny alice only when her PrincipalTag/team == "contractors".
+    fn deny_on_account_root_blocks_caller() {
+        let root = format!("arn:aws:iam::{ACCT}:root");
         let stmts = vec![
-            json!({"Effect": "Allow", "Principal": "*"}),
+            allow_alice(),
+            json!({"Effect": "Deny", "Principal": {"AWS": root}, "Action": "sts:AssumeRole"}),
+        ];
+        assert!(!trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    #[test]
+    fn deny_on_bare_account_id_blocks_caller() {
+        let stmts = vec![
+            allow_alice(),
+            json!({"Effect": "Deny", "Principal": {"AWS": ACCT}, "Action": "sts:AssumeRole"}),
+        ];
+        assert!(!trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    // ---- conditional Deny -------------------------------------------------
+
+    #[test]
+    fn conditional_deny_only_blocks_when_tag_matches() {
+        let stmts = vec![
+            json!({"Effect": "Allow", "Principal": "*", "Action": "sts:AssumeRole"}),
             json!({
                 "Effect": "Deny",
                 "Principal": {"AWS": CALLER},
+                "Action": "sts:AssumeRole",
                 "Condition": {"StringEquals": {"aws:PrincipalTag/team": "contractors"}}
             }),
         ];
-
-        // Tag matches → Deny applies → blocked.
         assert!(!trust_decision(
             &stmts,
             CALLER,
-            &ctx_with_tags(&[("team", "contractors")])
+            &ctx_with_tags(&[("team", "contractors")]),
+            false
         ));
-
-        // Tag does not match → Deny inert → Allow grants.
         assert!(trust_decision(
             &stmts,
             CALLER,
-            &ctx_with_tags(&[("team", "employees")])
+            &ctx_with_tags(&[("team", "employees")]),
+            false
         ));
+    }
+
+    #[test]
+    fn external_id_notequals_deny_blocks_when_external_id_absent() {
+        // Confused-deputy guard: Deny unless the caller presents the external
+        // id. With no external id the negated condition holds, so Deny blocks.
+        let stmts = vec![
+            allow_alice(),
+            json!({
+                "Effect": "Deny",
+                "Principal": {"AWS": CALLER},
+                "Action": "sts:AssumeRole",
+                "Condition": {"StringNotEquals": {"sts:ExternalId": "secret"}}
+            }),
+        ];
+        assert!(!trust_decision(&stmts, CALLER, &ctx(), false));
+        assert!(!trust_decision(&stmts, CALLER, &ctx_ext("wrong"), false));
+        assert!(trust_decision(&stmts, CALLER, &ctx_ext("secret"), false));
+    }
+
+    // ---- fail closed on an unparseable Deny -------------------------------
+
+    #[test]
+    fn deny_with_unparseable_condition_fails_closed() {
+        // An operator ExtendDB cannot evaluate must not silently drop the Deny.
+        let stmts = vec![
+            allow_alice(),
+            json!({
+                "Effect": "Deny",
+                "Principal": {"AWS": CALLER},
+                "Action": "sts:AssumeRole",
+                "Condition": {"NotIpAddress": {"aws:SourceIp": "192.0.2.0/24"}}
+            }),
+        ];
+        assert!(!trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    #[test]
+    fn allow_with_unparseable_condition_does_not_grant() {
+        let stmts = vec![json!({
+            "Effect": "Allow",
+            "Principal": {"AWS": CALLER},
+            "Action": "sts:AssumeRole",
+            "Condition": {"NotIpAddress": {"aws:SourceIp": "192.0.2.0/24"}}
+        })];
+        assert!(!trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    // ---- Action and session tags -----------------------------------------
+
+    #[test]
+    fn deny_tagsession_only_does_not_block_plain_assume() {
+        let stmts = vec![
+            allow_alice(),
+            json!({"Effect": "Deny", "Principal": {"AWS": CALLER}, "Action": "sts:TagSession"}),
+        ];
+        assert!(trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    #[test]
+    fn deny_setsourceidentity_only_does_not_block_plain_assume() {
+        let stmts = vec![
+            allow_alice(),
+            json!({"Effect": "Deny", "Principal": {"AWS": CALLER}, "Action": "sts:SetSourceIdentity"}),
+        ];
+        assert!(trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    #[test]
+    fn allow_tagsession_only_does_not_grant_plain_assume() {
+        let stmts = vec![
+            json!({"Effect": "Allow", "Principal": {"AWS": CALLER}, "Action": "sts:TagSession"}),
+        ];
+        assert!(!trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    #[test]
+    fn session_tags_require_tagsession_allow() {
+        // Allow covers only sts:AssumeRole; passing session tags needs
+        // sts:TagSession, which no Allow grants, so the call is denied.
+        assert!(!trust_decision(&[allow_alice()], CALLER, &ctx(), true));
+        // Allow covers both actions: granted.
+        let both = vec![json!({
+            "Effect": "Allow", "Principal": {"AWS": CALLER},
+            "Action": ["sts:AssumeRole", "sts:TagSession"]
+        })];
+        assert!(trust_decision(&both, CALLER, &ctx(), true));
+    }
+
+    #[test]
+    fn deny_tagsession_blocks_tagged_call_but_allows_plain() {
+        let stmts = vec![
+            json!({"Effect": "Allow", "Principal": {"AWS": CALLER}, "Action": ["sts:AssumeRole", "sts:TagSession"]}),
+            json!({"Effect": "Deny", "Principal": {"AWS": CALLER}, "Action": "sts:TagSession"}),
+        ];
+        assert!(!trust_decision(&stmts, CALLER, &ctx(), true));
+        assert!(trust_decision(&stmts, CALLER, &ctx(), false));
     }
 
     #[test]
     fn empty_statement_list_denies() {
-        assert!(!trust_decision(&[], CALLER, &ctx()));
+        assert!(!trust_decision(&[], CALLER, &ctx(), false));
+    }
+
+    // ---- statements_vec: single-object Statement --------------------------
+
+    #[test]
+    fn single_object_statement_is_one_statement() {
+        let doc = json!({"Version": "2012-10-17", "Statement": {
+            "Effect": "Allow", "Principal": {"AWS": CALLER}, "Action": "sts:AssumeRole"
+        }});
+        let stmts = statements_vec(&doc).expect("single object Statement");
+        assert_eq!(stmts.len(), 1);
+        assert!(trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    #[test]
+    fn missing_statement_is_none() {
+        assert!(statements_vec(&json!({"Version": "2012-10-17"})).is_none());
+    }
+
+    // ---- validate_trust_policy: accept set --------------------------------
+
+    fn ok(doc: Value) {
+        assert!(validate_trust_policy(&doc).is_ok(), "should accept: {doc}");
+    }
+
+    fn rejected(doc: Value) {
+        assert!(validate_trust_policy(&doc).is_err(), "should reject: {doc}");
+    }
+
+    #[test]
+    fn validate_accepts_well_formed() {
+        ok(json!({"Version": "2012-10-17", "Statement": [allow_alice()]}));
+    }
+
+    #[test]
+    fn validate_accepts_missing_version() {
+        ok(json!({"Statement": [allow_alice()]}));
+    }
+
+    #[test]
+    fn validate_accepts_single_object_statement() {
+        ok(json!({"Version": "2012-10-17", "Statement": allow_alice()}));
+    }
+
+    #[test]
+    fn validate_accepts_lowercase_effect() {
+        ok(
+            json!({"Statement": [{"Effect": "deny", "Principal": {"AWS": CALLER}, "Action": "sts:AssumeRole"}]}),
+        );
+    }
+
+    #[test]
+    fn validate_accepts_numeric_condition_value() {
+        ok(json!({"Statement": [{
+            "Effect": "Deny", "Principal": {"AWS": CALLER}, "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": {"aws:PrincipalTag/team": 5}}
+        }]}));
+    }
+
+    #[test]
+    fn validate_accepts_unknown_condition_key() {
+        ok(json!({"Statement": [{
+            "Effect": "Deny", "Principal": {"AWS": CALLER}, "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": {"aws:NoSuchKey": "x"}}
+        }]}));
+    }
+
+    #[test]
+    fn validate_accepts_known_iam_operator_extenddb_does_not_evaluate() {
+        // NotIpAddress is a valid IAM operator; IAM accepts the document.
+        ok(json!({"Statement": [{
+            "Effect": "Deny", "Principal": {"AWS": CALLER}, "Action": "sts:AssumeRole",
+            "Condition": {"NotIpAddress": {"aws:SourceIp": "192.0.2.0/24"}}
+        }]}));
+    }
+
+    #[test]
+    fn validate_accepts_aws_wildcard_principal_and_account() {
+        ok(
+            json!({"Statement": [{"Effect": "Deny", "Principal": {"AWS": "*"}, "Action": "sts:AssumeRole"}]}),
+        );
+        ok(
+            json!({"Statement": [{"Effect": "Deny", "Principal": {"AWS": ACCT}, "Action": "sts:AssumeRole"}]}),
+        );
+    }
+
+    #[test]
+    fn validate_accepts_tagsession_and_setsourceidentity_actions() {
+        ok(
+            json!({"Statement": [{"Effect": "Allow", "Principal": {"AWS": CALLER},
+            "Action": ["sts:AssumeRole", "sts:TagSession", "sts:SetSourceIdentity"]}]}),
+        );
+    }
+
+    // ---- validate_trust_policy: reject set --------------------------------
+
+    #[test]
+    fn validate_rejects_missing_statement() {
+        rejected(json!({"Version": "2012-10-17"}));
+    }
+
+    #[test]
+    fn validate_rejects_missing_effect() {
+        rejected(
+            json!({"Statement": [{"Principal": {"AWS": CALLER}, "Action": "sts:AssumeRole"}]}),
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_effect() {
+        rejected(
+            json!({"Statement": [{"Effect": "Permit", "Principal": {"AWS": CALLER}, "Action": "sts:AssumeRole"}]}),
+        );
+    }
+
+    #[test]
+    fn validate_rejects_not_principal() {
+        rejected(
+            json!({"Statement": [{"Effect": "Deny", "NotPrincipal": {"AWS": BOB}, "Action": "sts:AssumeRole"}]}),
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_principal() {
+        rejected(json!({"Statement": [{"Effect": "Deny", "Action": "sts:AssumeRole"}]}));
+    }
+
+    #[test]
+    fn validate_rejects_bare_star_principal() {
+        rejected(
+            json!({"Statement": [{"Effect": "Allow", "Principal": "*", "Action": "sts:AssumeRole"}]}),
+        );
+    }
+
+    #[test]
+    fn validate_rejects_wildcard_in_principal_arn() {
+        rejected(json!({"Statement": [{"Effect": "Deny",
+            "Principal": {"AWS": format!("arn:aws:iam::{ACCT}:user/dev-*")}, "Action": "sts:AssumeRole"}]}));
+    }
+
+    #[test]
+    fn validate_rejects_missing_action() {
+        rejected(json!({"Statement": [{"Effect": "Deny", "Principal": {"AWS": CALLER}}]}));
+    }
+
+    #[test]
+    fn validate_rejects_sts_star_action() {
+        rejected(
+            json!({"Statement": [{"Effect": "Allow", "Principal": {"AWS": CALLER}, "Action": "sts:*"}]}),
+        );
+    }
+
+    #[test]
+    fn validate_rejects_non_sts_action() {
+        rejected(
+            json!({"Statement": [{"Effect": "Allow", "Principal": {"AWS": CALLER}, "Action": "dynamodb:GetItem"}]}),
+        );
+    }
+
+    #[test]
+    fn validate_rejects_resource_present() {
+        rejected(
+            json!({"Statement": [{"Effect": "Deny", "Principal": {"AWS": CALLER},
+            "Action": "sts:AssumeRole", "Resource": "*"}]}),
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unknown_condition_operator() {
+        rejected(
+            json!({"Statement": [{"Effect": "Deny", "Principal": {"AWS": CALLER}, "Action": "sts:AssumeRole",
+            "Condition": {"StringEqualz": {"aws:PrincipalTag/team": "contractors"}}}]}),
+        );
+    }
+
+    #[test]
+    fn validate_rejects_condition_not_object() {
+        rejected(
+            json!({"Statement": [{"Effect": "Deny", "Principal": {"AWS": CALLER}, "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": "contractors"}}]}),
+        );
     }
 }

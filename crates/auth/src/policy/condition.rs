@@ -109,7 +109,15 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
             Some(vals) => evaluate_single_value_condition(inner, &vals, &expanded_values),
         },
         other => match context_values {
-            None => false,
+            // A negated operator on an absent single-valued key evaluates true
+            // in AWS IAM: the key has no value, so it cannot equal the policy
+            // value, so "not equals" holds. This makes a Deny gated on
+            // StringNotEquals apply when the caller omits the key (the
+            // confused-deputy guard). Measured on live IAM/STS and DynamoDB.
+            // Bare operators on multivalued keys
+            // never match, present or absent (BR-7085), so the rule is scoped
+            // to single-valued keys.
+            None => is_negative_operator(other) && !is_multivalued,
             // Bare operator on a multivalued key never matches (BR-7085). This is
             // fail-safe: a bare Deny becomes a no-op (matching AWS, which forces the
             // author to use ForAnyValue:), and a bare Allow allowlist stops granting.

@@ -373,3 +373,19 @@ fn for_any_value_string_not_equals_one_outside_set() {
         &ctx
     ));
 }
+
+#[test]
+fn bare_negative_op_multivalued_absent_no_match() {
+    // BR-7085 preserved: a bare negated operator on an ABSENT multivalued key
+    // still never matches. The negated-absent rule is scoped to single-valued
+    // keys; multivalued keys require ForAllValues/ForAnyValue.
+    let ctx = TestContext::new();
+    assert!(!evaluate_condition(
+        &cond(
+            ConditionOperator::StringNotEquals,
+            "dynamodb:Attributes",
+            vec!["ssn"]
+        ),
+        &ctx
+    ));
+}
