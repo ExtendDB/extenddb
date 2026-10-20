@@ -5,14 +5,19 @@
 //!
 //! IAM evaluates `dynamodb:LeadingKeys` against the partition key value(s) a
 //! request touches. The server populates the key for every operation that
-//! reaches the engine with data to return or a write to make, so a
-//! `ForAllValues`/`ForAnyValue` LeadingKeys condition is never evaluated with
-//! the key absent on such a request. Operations the engine rejects before any
-//! data flows (an unparseable or non-equality key condition, a missing key
-//! condition, an unresolved placeholder name, a table that does not exist) are
-//! left with the key absent on purpose: the engine returns `ValidationException`
-//! or `ResourceNotFoundException`, which is what live `DynamoDB` returns for
-//! those shapes even under a LeadingKeys policy (measured 2026-10-20).
+//! targets one or more specific partitions, so a `ForAllValues`/`ForAnyValue`
+//! LeadingKeys condition on such a request is evaluated against the partitions
+//! it reads or writes, not vacuously. `Scan` and `SearchVectors` target no
+//! single partition: they reach the engine, return data, and carry no
+//! LeadingKeys, so a `ForAllValues` condition is satisfied vacuously (the read
+//! is allowed) and an operator fences them with `ForAnyValue` or a `Null`
+//! guard, which is how the service treats a `Scan`. Operations the engine
+//! rejects before any data flows (an unparseable or non-equality key condition,
+//! a missing key condition, an unresolved placeholder name, a table that does
+//! not exist) are left with the key absent on purpose: the engine returns
+//! `ValidationException` or `ResourceNotFoundException`, which is what live
+//! `DynamoDB` returns for those shapes even under a LeadingKeys policy (measured
+//! 2026-10-20).
 //!
 //! Behaviour measured against live `DynamoDB`:
 //!
@@ -23,8 +28,8 @@
 //! - `Query` on a global secondary index: the index's partition key value from
 //!   the key condition. The service binds LeadingKeys to the queried index's
 //!   partition key, not the base table's.
-//! - `Scan`: no LeadingKeys (the service sets none; a scan targets no
-//!   partition).
+//! - `Scan` and `SearchVectors`: no LeadingKeys (neither targets a single
+//!   partition, so the service sets none).
 //! - `BatchGetItem`/`BatchWriteItem`: one authorization per (action, table)
 //!   with the set of every key that table receives in the request.
 //! - `TransactGetItems`/`TransactWriteItems`: one authorization per item, each
