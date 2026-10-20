@@ -823,4 +823,88 @@ mod tests {
             }
         }
     }
+
+    // Backup and table ARNs: the engine's backup resolver does not parse the
+    // ARN into components; it reads the account field (field 4) and the backend
+    // matches the whole stored ARN exactly (WHERE backup_arn = ? AND account_id
+    // = ?). So the bypass is closed by two things, not by a shared parser: this
+    // layer canonicalizes the partition, service, region, and account before a
+    // Deny is evaluated, and the backend matches the exact stored ARN. This test
+    // pins the canonicalization half for backup and table ARNs: every respelling
+    // of a backup or table ARN resolves to the same table and sub-resource and
+    // canonicalizes to this deployment's ARN, so a Deny on the real resource is
+    // always evaluated against the real resource.
+    #[test]
+    fn authz_parser_canonicalizes_backup_and_table_arns() {
+        let region = "us-east-1";
+        let account = "964157134968";
+        // (input, expected table, expected sub)
+        let cases = [
+            // backup ARN, exact and respelled in each field the engine ignores
+            (
+                "arn:aws:dynamodb:us-east-1:964157134968:table/bb/backup/01-ab",
+                "bb",
+                Some(Sub::Backup("01-ab".to_owned())),
+            ),
+            (
+                "arn:aws-cn:dynamodb:us-east-1:964157134968:table/bb/backup/01-ab",
+                "bb",
+                Some(Sub::Backup("01-ab".to_owned())),
+            ),
+            (
+                "arn:aws:s3:us-east-1:964157134968:table/bb/backup/01-ab",
+                "bb",
+                Some(Sub::Backup("01-ab".to_owned())),
+            ),
+            (
+                "arn:aws:dynamodb:eu-west-1:964157134968:table/bb/backup/01-ab",
+                "bb",
+                Some(Sub::Backup("01-ab".to_owned())),
+            ),
+            (
+                "arn:aws:dynamodb:us-east-1:111111111111:table/bb/backup/01-ab",
+                "bb",
+                Some(Sub::Backup("01-ab".to_owned())),
+            ),
+            // table ARN, exact and respelled
+            (
+                "arn:aws:dynamodb:us-east-1:964157134968:table/bb",
+                "bb",
+                None,
+            ),
+            (
+                "arn:aws-cn:dynamodb:eu-west-1:111111111111:table/bb",
+                "bb",
+                None,
+            ),
+        ];
+        for (input, table, sub) in cases {
+            let rid = parse_resource_identity(input)
+                .unwrap_or_else(|| panic!("authz parser rejected {input}"));
+            assert_eq!(rid.table, table, "table mismatch for {input}");
+            assert_eq!(rid.sub, sub, "sub mismatch for {input}");
+            let want = match &sub {
+                Some(Sub::Backup(b)) => {
+                    format!("arn:aws:dynamodb:{region}:{account}:table/{table}/backup/{b}")
+                }
+                None => format!("arn:aws:dynamodb:{region}:{account}:table/{table}"),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                canonical(region, account, &rid),
+                want,
+                "canonical mismatch for {input}"
+            );
+        }
+        // The engine backup resolver reads only the account field (ARN field 4)
+        // and denies a mismatch; canonicalization here uses the deployment's
+        // account, so a respelled account cannot resolve to another account's
+        // backup while evading a Deny on the real one.
+        assert_eq!(
+            "arn:aws:dynamodb:us-east-1:111111111111:table/bb/backup/01-ab"
+                .split(':')
+                .nth(4),
+            Some("111111111111")
+        );
+    }
 }
