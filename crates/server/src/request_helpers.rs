@@ -61,20 +61,26 @@ pub(crate) fn extract_table_name(input: &Value) -> Option<String> {
 /// `ForAllValues:StringEquals dynamodb:LeadingKeys` condition is satisfied
 /// vacuously when the key is absent, so a request whose key could not be
 /// determined would be authorized and the engine could then read the real
-/// table on its own lookup. Such a failure returns an internal error before
-/// dispatch, so no request is ever authorized on a key the server could not
-/// determine. The cache reports a missing table as
+/// table on its own lookup. Such a failure returns an error before dispatch, so
+/// no request is ever authorized on a key the server could not determine.
+///
+/// The error is classified by the engine's own `storage_err_to_dynamo`, so the
+/// server and the engine return the same wire error for the same storage fault:
+/// a transient or connection fault is `ServiceUnavailable` (503, SDK-retryable),
+/// the catalog and backend-internal faults are `InternalServerError` (500), and
+/// a not-active table is `ResourceInUseException`. Using one mapper keeps a
+/// database hiccup from returning 503 when the engine hits it and 500 when
+/// authorization hits it first. The cache reports a missing table as
 /// `StorageError::TableNotFound` and every other fault as a distinct error, so
-/// the two are told apart here rather than collapsed to `None`.
+/// the two are told apart here rather than collapsed to `None`. Every fault
+/// class fails closed: none authorizes the request.
 fn key_info_for_authz(
     result: Result<extenddb_core::types::TableKeyInfo, StorageError>,
 ) -> Result<Option<extenddb_core::types::TableKeyInfo>, DynamoDbError> {
     match result {
         Ok(info) => Ok(Some(info)),
         Err(StorageError::TableNotFound(_)) => Ok(None),
-        Err(_) => Err(DynamoDbError::InternalServerError(
-            "Internal server error".to_owned(),
-        )),
+        Err(e) => Err(extenddb_engine::storage_err_to_dynamo(e)),
     }
 }
 
@@ -302,18 +308,54 @@ mod tests {
 
     #[test]
     fn key_info_for_authz_lookup_error_fails_closed() {
-        for err in [
+        // Each non-not-found fault fails closed, classified the same way the
+        // engine classifies it: transient and connection faults are retryable
+        // 503s, the catalog and backend-internal faults are 500s, and a
+        // not-active table is the engine's ResourceInUseException. None yields
+        // an Ok(Some)/Ok(None) that would authorize the request.
+        let service_unavailable = [
             StorageError::Transient("db hiccup".to_owned()),
             StorageError::Connection("pool timeout".to_owned()),
-            StorageError::TableNotActive("t".to_owned()),
-            StorageError::Internal("backend fault".to_owned()),
-        ] {
-            let out = key_info_for_authz(Err(err));
+        ];
+        for err in service_unavailable {
+            let out = key_info_for_authz(Err(err.clone()));
             assert!(
-                matches!(out, Err(DynamoDbError::InternalServerError(_))),
-                "a lookup failure that is not not-found must fail closed, got: {out:?}"
+                matches!(out, Err(DynamoDbError::ServiceUnavailable(_))),
+                "a transient or connection fault must map to ServiceUnavailable, got: {out:?} for {err:?}"
             );
         }
+
+        let internal = [
+            StorageError::Internal("backend fault".to_owned()),
+            StorageError::CatalogVersionMismatch {
+                expected: "3".to_owned(),
+                found: "2".to_owned(),
+            },
+            StorageError::CatalogNotInitialized,
+        ];
+        for err in internal {
+            let out = key_info_for_authz(Err(err.clone()));
+            assert!(
+                matches!(out, Err(DynamoDbError::InternalServerError(_))),
+                "a catalog or backend-internal fault must map to InternalServerError, got: {out:?} for {err:?}"
+            );
+        }
+
+        // TableNotActive maps to whatever the engine maps it to, so the server
+        // and the engine agree on a not-active table. It still fails closed (an
+        // Err, not an authorizing Ok).
+        let out = key_info_for_authz(Err(StorageError::TableNotActive("t".to_owned())));
+        let engine = extenddb_engine::storage_err_to_dynamo(StorageError::TableNotActive(
+            "t".to_owned(),
+        ));
+        assert!(
+            matches!(out, Err(ref e) if std::mem::discriminant(e) == std::mem::discriminant(&engine)),
+            "TableNotActive must map to the engine's error class ({engine:?}), got: {out:?}"
+        );
+        assert!(
+            matches!(engine, DynamoDbError::ResourceInUseException(_)),
+            "the engine maps TableNotActive to ResourceInUseException, got: {engine:?}"
+        );
     }
 
     #[test]

@@ -44,6 +44,7 @@ mod vector_gate;
 pub use batch_get_item::handle_batch_get_item;
 pub use batch_write_item::handle_batch_write_item;
 pub use create_table::handle_create_table;
+pub use create_table::storage_err_to_dynamo;
 pub use delete_item::handle_delete_item;
 pub use delete_table::handle_delete_table;
 pub use describe_endpoints::handle_describe_endpoints;
