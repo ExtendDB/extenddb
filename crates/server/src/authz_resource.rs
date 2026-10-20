@@ -93,27 +93,25 @@ fn parse_resource_identity(arn: &str) -> Option<ResourceId> {
     let resource = it.next()?;
 
     let tail = resource.strip_prefix("table/")?;
-    let (table, after) = match tail.split_once('/') {
-        Some((t, a)) => (t, Some(a)),
-        None => (tail, None),
-    };
+    // `tail` is `<table>[/<kind>/<id...>]`. Table names contain no `/`. A
+    // trailing slash with nothing after it (`table/T/`) is treated as the bare
+    // table, matching the engine tag handler. An empty sub-resource id
+    // (`table/T/stream/`) is kept as an empty id, matching the engine stream
+    // parser, so an input the engine accepts is never authorized verbatim here.
+    let mut segs = tail.split('/');
+    let table = segs.next()?;
     if table.is_empty() {
         return None;
     }
-    let sub = match after {
-        None => None,
-        Some(a) => {
-            // `a` is `<kind>/<id>`, e.g. `index/gsi1`, `stream/<label>` (the
-            // label may contain ':'), or `backup/<id>`. A shape with no id, or
-            // an unrecognized kind, is not a nameable resource.
-            let (kind, id) = a.split_once('/')?;
-            if id.is_empty() {
-                return None;
-            }
+    let sub = match segs.next() {
+        None | Some("") => None,
+        Some(kind) => {
+            let id = segs.collect::<Vec<&str>>().join("/");
             match kind {
-                "index" => Some(Sub::Index(id.to_owned())),
-                "stream" => Some(Sub::Stream(id.to_owned())),
-                "backup" => Some(Sub::Backup(id.to_owned())),
+                "index" => Some(Sub::Index(id)),
+                "stream" => Some(Sub::Stream(id)),
+                "backup" => Some(Sub::Backup(id)),
+                // An unrecognized sub-resource kind is not a nameable resource.
                 _ => return None,
             }
         }
@@ -614,5 +612,52 @@ mod tests {
         // specific Deny is silently skipped.
         assert_eq!(only("TagResource", json!({})), "");
         assert_eq!(only("DescribeStream", json!({})), "");
+    }
+
+    // Differential corpus: every stream ARN the engine's parser accepts must be
+    // canonicalized by the authorization parser to the same table and label.
+    // If the engine accepted an input the authz parser rejected,
+    // `canonical_or_raw` would authorize the raw string and a Deny on the real
+    // resource would be skipped. The engine stream parser is the storage crate's
+    // `parse_stream_arn`.
+    #[test]
+    fn authz_parser_canonicalizes_every_engine_accepted_stream_arn() {
+        use extenddb_storage::util::parse_stream_arn;
+        let corpus = [
+            "arn:aws:dynamodb:us-east-1:123:table/T/stream/2026-10-20T16:17:40.188",
+            // respelled partition, service, region, account
+            "arn:aws-cn:dynamodb:us-east-1:123:table/T/stream/2026-10-20T16:17:40.188",
+            "arn:aws:s3:us-east-1:123:table/T/stream/2026-10-20T16:17:40.188",
+            "arn:aws:dynamodb:eu-west-1:123:table/T/stream/2026-10-20T16:17:40.188",
+            "arn:aws:dynamodb:us-east-1:999999999999:table/T/stream/2026-10-20T16:17:40.188",
+            // extra path segments and a label containing '/'
+            "arn:aws:dynamodb:us-east-1:123:table/T/stream/a/b",
+            // trailing slash, empty label
+            "arn:aws:dynamodb:us-east-1:123:table/T/stream/",
+            // uppercase resource type and leading whitespace (engine rejects)
+            "arn:aws:dynamodb:us-east-1:123:Table/T/stream/x",
+            "arn:aws:dynamodb:us-east-1:123: table/T/stream/x",
+            // not a stream at all
+            "arn:aws:dynamodb:us-east-1:123:table/T",
+            "banana",
+        ];
+        for input in corpus {
+            if let Ok((table, label)) = parse_stream_arn(input) {
+                let rid = parse_resource_identity(input).unwrap_or_else(|| {
+                    panic!("engine accepted {input} but authz parser rejected it")
+                });
+                assert_eq!(rid.table, table, "table mismatch for {input}");
+                assert_eq!(
+                    rid.sub,
+                    Some(Sub::Stream(label.clone())),
+                    "label mismatch for {input}"
+                );
+                assert_eq!(
+                    canonical("us-east-1", "964157134968", &rid),
+                    format!("arn:aws:dynamodb:us-east-1:964157134968:table/{table}/stream/{label}"),
+                    "canonical mismatch for {input}"
+                );
+            }
+        }
     }
 }
