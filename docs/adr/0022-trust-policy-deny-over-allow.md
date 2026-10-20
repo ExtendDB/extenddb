@@ -89,9 +89,24 @@ implicitly denied.
   is no change for trust policies that contain only `Allow` statements.
 - **Follow-up:** the decision logic was factored into a store-free
   `trust_decision` helper (plus `statement_matches` / `effect_of`) so the
-  Deny-over-Allow ordering is unit-tested directly. A statement whose
-  `Condition` block fails to parse is treated as non-matching in both the `Deny`
-  and `Allow` phases, matching the pre-existing `Allow`-path handling.
+  Deny-over-Allow ordering is unit-tested directly. The decision is made per
+  exercised STS action: `sts:AssumeRole`, plus `sts:TagSession` when the call
+  passes session tags (ExtendDB does not implement source identity, so
+  `sts:SetSourceIdentity` is never exercised). `Effect` is compared
+  case-insensitively, `Action`/`NotAction` are matched, and account principals
+  (`{"AWS": "<account>:root"}` and a bare account id) match any caller in the
+  account. A statement whose `Condition` block fails to parse is handled
+  asymmetrically: an unparseable `Allow` does not grant, and an unparseable
+  `Deny` fails closed, so it blocks rather than being silently dropped. A
+  malformed `Deny` therefore cannot grant assumption.
+- **Write-time validation:** trust documents are validated when a role is
+  created, so a document IAM would reject (a missing or invalid `Effect`,
+  `NotPrincipal`, a missing `Principal`, a bare-string or wildcard-ARN
+  principal, a missing `Action`, an action outside the STS trust set, a
+  `Resource` field, or an unknown or malformed `Condition`) is not stored and
+  then dropped at evaluation. Documents IAM accepts (a missing `Version`, a
+  single-object `Statement`, numeric condition values, unknown condition keys)
+  are accepted.
 - **Commitment:** trust-policy and identity-policy evaluation should stay aligned
   on evaluation order; a future change to one should consider the other.
 

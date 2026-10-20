@@ -391,7 +391,11 @@ extenddb manage --user admin --password <pw> assume-role \
 
 Flow:
 1. Load role, extract trust policy
-2. Evaluate trust policy: caller ARN must match a Principal in an Allow statement, conditions must pass
+2. Evaluate the trust policy in IAM order: a matching explicit Deny blocks
+   assumption, otherwise a matching Allow grants it, decided per exercised STS
+   action (sts:AssumeRole, plus sts:TagSession when session tags are passed).
+   Principal, Action/NotAction, and Condition must match; a Deny whose Condition
+   does not parse fails closed.
 3. Generate temporary credentials (ASIA* access key + secret + session token)
 4. Merge tags: role tags + session tags (session wins on conflict)
 5. Store session in `iam_sessions`

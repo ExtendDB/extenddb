@@ -323,6 +323,41 @@ Access key prefixes: `AKIAEXTENDDB` (long-lived), `ASIAEXTENDDB` (temporary/Assu
     delete-role --account-id 123456789012 --role-name data-reader
 ```
 
+#### What a trust-policy Deny matches
+
+A role's trust policy decides who may assume the role. It is evaluated in IAM
+order: a matching explicit `Deny` blocks assumption before any `Allow` is
+considered, and with no matching `Allow` assumption is implicitly denied. The
+decision is made for each STS action the call exercises: `sts:AssumeRole`
+always, and `sts:TagSession` as well when the call passes session tags. Passing
+session tags to a role whose trust policy does not allow `sts:TagSession` is
+denied. ExtendDB does not implement source identity, so `sts:SetSourceIdentity`
+is never part of the decision.
+
+A statement matches when its `Principal` matches the caller, its `Action` (or
+`NotAction`) covers the action, and all `Condition` blocks pass. `Effect` is
+compared case-insensitively (`"deny"` works). A `Principal` matches on an exact
+ARN, a list of ARNs, `{"AWS": "*"}`, a bare account id, or an account root ARN
+(`arn:aws:iam::<account>:root`); the last two match every caller in that
+account, for both `Allow` and `Deny`.
+
+What a trust-policy `Deny` does not do:
+
+- A `Deny` whose `Condition` uses a condition key ExtendDB does not resolve
+  (for example `aws:SourceIp`) or an operator it does not implement (for
+  example `IpAddress`) fails closed: it blocks assumption rather than being
+  dropped. Write a `Deny` only on keys you can resolve (`aws:PrincipalTag/*`,
+  `sts:ExternalId`) unless you intend an unconditional block.
+- `NotPrincipal` is not allowed in a trust policy and is rejected when the role
+  is created.
+- A `Resource` field is not allowed in a trust policy and is rejected at create.
+- An `Action` outside the STS trust set (`sts:AssumeRole`, `sts:TagSession`,
+  `sts:SetSourceIdentity`), including `sts:*`, is rejected at create.
+- A bare `"*"` principal string, or a wildcard inside a principal ARN
+  (`user/dev-*`), is rejected at create. A principal naming a user or role that
+  does not exist is accepted; the statement simply matches no caller (an `Allow`
+  on it grants nothing, a `Deny` on it blocks no one).
+
 ### Policies
 
 Inline policies can be attached to users, groups, and roles:
