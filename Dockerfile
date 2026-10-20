@@ -20,16 +20,20 @@ RUN test -n "${VCS_REF}" \
     cargo build --locked --release \
       -p extenddb --no-default-features --features postgres
 
-FROM public.ecr.aws/debian/debian:bookworm-slim@sha256:1f6767130e3479e42348856acee11bbe78d26cc558b4bf52ac5106f3fcf594ff AS runtime
+FROM public.ecr.aws/debian/debian:bookworm-slim@sha256:8eeeb3e089a27d34c398a5580fe479b71a457cba535f59d85e52a303610ec583 AS runtime
 ARG VERSION
 ARG VCS_REF
 ARG BUILD_DATE
+# The base digest is a point-in-time snapshot. apt-get upgrade applies the
+# bookworm-security updates published since that snapshot was taken, so a
+# release build does not ship a package Debian has already fixed.
 RUN test -n "${VERSION}" \
  && test -n "${VCS_REF}" \
  && test "${VCS_REF}" != unknown \
  && test -n "${BUILD_DATE}" \
  && test "${BUILD_DATE}" != unknown \
  && apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
  && apt-get install -y --no-install-recommends \
       ca-certificates \
       tini=0.19.0-1+b3 \
