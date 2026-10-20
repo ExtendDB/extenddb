@@ -110,6 +110,10 @@ pub struct RequestParams {
     pub return_consumed_capacity: Option<String>,
     /// The enclosing operation for batch/transact sub-operations.
     pub enclosing_operation: Option<String>,
+    /// The caller ARN (`aws:PrincipalArn`), when known.
+    pub principal_arn: Option<String>,
+    /// The caller's account id (`aws:PrincipalAccount`), when known.
+    pub principal_account: Option<String>,
 }
 
 /// Context for evaluating conditions on `DynamoDB` operations.
@@ -136,6 +140,10 @@ pub struct RequestContext {
     pub full_table_scan: Option<bool>,
     /// The enclosing operation for batch/transact sub-operations.
     pub enclosing_operation: Option<String>,
+    /// The caller ARN (`aws:PrincipalArn`), when known.
+    pub principal_arn: Option<String>,
+    /// The caller's account id (`aws:PrincipalAccount`), when known.
+    pub principal_account: Option<String>,
 }
 
 impl RequestContext {
@@ -161,6 +169,8 @@ impl RequestContext {
             return_consumed_capacity: params.return_consumed_capacity,
             full_table_scan: if is_scan { Some(true) } else { None },
             enclosing_operation: params.enclosing_operation,
+            principal_arn: params.principal_arn,
+            principal_account: params.principal_account,
         }
     }
 }
@@ -192,6 +202,8 @@ impl ConditionContext for RequestContext {
                 "dynamodb:EnclosingOperation" => {
                     self.enclosing_operation.as_deref().map(|v| vec![v])
                 }
+                "aws:PrincipalArn" => self.principal_arn.as_deref().map(|v| vec![v]),
+                "aws:PrincipalAccount" => self.principal_account.as_deref().map(|v| vec![v]),
                 _ => None,
             }
         }
@@ -202,6 +214,17 @@ impl ConditionContext for RequestContext {
         // `ArrayOfString` (multivalued); all other DynamoDB keys and tag keys are
         // single-valued. Verified against real AWS IAM (BR-7085).
         matches!(key, "dynamodb:LeadingKeys" | "dynamodb:Attributes")
+    }
+
+    fn is_unresolvable_key(&self, key: &str) -> bool {
+        // A global key the service always populates on a data-plane request but
+        // that this context does not resolve (for example aws:PrincipalOrgID,
+        // aws:SourceIp) is unresolvable, so a Deny on it fails closed and an
+        // Allow on it does not grant. aws:PrincipalArn and aws:PrincipalAccount
+        // are resolved above, so they never reach here. Conditionally-present
+        // keys (MFA, VPC, federation) are not in the set and keep absent-key
+        // semantics.
+        is_service_populated_global_key(key)
     }
 }
 

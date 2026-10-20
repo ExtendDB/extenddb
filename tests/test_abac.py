@@ -436,3 +436,103 @@ class TestRoleSessionTagCondition:
         finally:
             self.mgmt.delete_user(self.account_id, user)
             self.mgmt.delete_role(self.account_id, role)
+
+
+class TestUnresolvableGlobalKey:
+    """Identity policies gated on a global key the service populates but
+    ExtendDB cannot resolve (for example aws:PrincipalOrgID). Such a statement
+    fails closed: a Deny blocks and an Allow does not grant, whatever the
+    operator, so a negated operator cannot spuriously grant. A key ExtendDB does
+    resolve (aws:PrincipalArn) evaluates normally.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self, auth_env, mgmt, account_id, region):
+        self.endpoint = auth_env[0]
+        self.mgmt = mgmt
+        self.account_id = account_id
+        self.region = region
+
+    def _admin_table(self) -> tuple[Any, str]:
+        admin = f"ur-adm-{uuid.uuid4().hex[:8]}"
+        ak, sk = _create_user_with_key(self.mgmt, self.account_id, admin)
+        resp = self.mgmt.put_user_policy(
+            self.account_id, admin, "full",
+            {"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"}]},
+        )
+        assert resp.status_code == 204
+        client = _make_client(self.endpoint, ak, sk, self.region)
+        table = f"urk-{uuid.uuid4().hex[:8]}"
+        client.create_table(
+            TableName=table,
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        wait_for_active(client, table)
+        client.put_item(TableName=table, Item={"pk": {"S": "k1"}, "data": {"S": "v1"}})
+        return client, table
+
+    def test_deny_on_unresolvable_orgid_blocks_fail_closed(self):
+        admin_client, table = self._admin_table()
+        user = f"urk-deny-{uuid.uuid4().hex[:8]}"
+        ak, sk = _create_user_with_key(self.mgmt, self.account_id, user)
+        resp = self.mgmt.put_user_policy(
+            self.account_id, user, "p",
+            {"Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"},
+                {"Effect": "Deny", "Action": "dynamodb:GetItem", "Resource": "*",
+                 "Condition": {"StringEquals": {"aws:PrincipalOrgID": "o-example1"}}}]},
+        )
+        assert resp.status_code == 204
+        client = _make_client(self.endpoint, ak, sk, self.region)
+        try:
+            with pytest.raises(ClientError) as exc:
+                client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
+            assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+            # The Deny names only GetItem, so PutItem still succeeds.
+            client.put_item(TableName=table, Item={"pk": {"S": "k2"}, "data": {"S": "v2"}})
+        finally:
+            admin_client.delete_table(TableName=table)
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_negated_allow_on_unresolvable_orgid_does_not_grant(self):
+        admin_client, table = self._admin_table()
+        user = f"urk-neg-{uuid.uuid4().hex[:8]}"
+        ak, sk = _create_user_with_key(self.mgmt, self.account_id, user)
+        resp = self.mgmt.put_user_policy(
+            self.account_id, user, "p",
+            {"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": "*",
+                "Condition": {"StringNotEquals": {"aws:PrincipalOrgID": "o-example1"}}}]},
+        )
+        assert resp.status_code == 204
+        client = _make_client(self.endpoint, ak, sk, self.region)
+        try:
+            with pytest.raises(ClientError) as exc:
+                client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
+            assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+        finally:
+            admin_client.delete_table(TableName=table)
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_allow_gated_on_resolved_principal_arn_grants(self):
+        admin_client, table = self._admin_table()
+        user = f"urk-arn-{uuid.uuid4().hex[:8]}"
+        ak, sk = _create_user_with_key(self.mgmt, self.account_id, user)
+        user_arn = f"arn:aws:iam::{self.account_id}:user/{user}"
+        resp = self.mgmt.put_user_policy(
+            self.account_id, user, "p",
+            {"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": "*",
+                "Condition": {"StringEquals": {"aws:PrincipalArn": user_arn}}}]},
+        )
+        assert resp.status_code == 204
+        client = _make_client(self.endpoint, ak, sk, self.region)
+        try:
+            out = client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
+            assert out["Item"]["data"]["S"] == "v1"
+        finally:
+            admin_client.delete_table(TableName=table)
+            self.mgmt.delete_user(self.account_id, user)

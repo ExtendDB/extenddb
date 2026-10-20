@@ -108,6 +108,9 @@ async fn check_user_authorization(
     // so we deref through the Arc and clone once. This is the only place
     // where the tag map allocation is unavoidable; future iterations could
     // change RequestContext to hold Arc<HashMap<...>> for true zero-copy.
+    let mut params = params;
+    params.principal_arn = Some(format!("arn:aws:iam::{account_id}:user/{user_name}"));
+    params.principal_account = Some(account_id.to_owned());
     let context = RequestContext::build(
         (*principal_tags).clone(),
         (*resource_tags).clone(),
@@ -160,6 +163,11 @@ async fn check_role_authorization(
         wrap_tags(cache.fetch_resource_tags(resource_arn)),
     )?;
 
+    let mut params = params;
+    params.principal_arn = Some(format!(
+        "arn:aws:sts::{account_id}:assumed-role/{role_name}/{session_name}"
+    ));
+    params.principal_account = Some(account_id.to_owned());
     let context = RequestContext::build(principal_tags, (*resource_tags).clone(), is_scan, params);
 
     // Convert the Arc<Vec<...>> to a slice for the evaluator. We materialize
