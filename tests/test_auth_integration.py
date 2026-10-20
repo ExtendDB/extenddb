@@ -1072,6 +1072,56 @@ class TestTrustPolicyDeny:
         finally:
             self.mgmt.delete_user(self.account_id, user)
 
+    # -- Tag key is resolved case-insensitively (stored `Team`, policy `team`) --
+
+    def test_tag_key_case_insensitive_positive_deny_blocks(self):
+        user, arn = self._caller(tags={"Team": "contractors"})
+        try:
+            trust = _trust(
+                _stmt("Allow", {"AWS": arn}),
+                _stmt("Deny", {"AWS": arn},
+                      condition={"StringEquals": {"aws:PrincipalTag/team": "contractors"}}),
+            )
+            assert self._assume(trust, arn) == DENY
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_tag_key_case_insensitive_positive_allow_grants(self):
+        user, arn = self._caller(tags={"Team": "contractors"})
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": arn},
+                                 condition={"StringEquals": {"aws:PrincipalTag/team": "contractors"}}))
+            assert self._assume(trust, arn) == ALLOW
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_tag_key_case_insensitive_negated_allow_does_not_overgrant(self):
+        # The tag resolves case-insensitively to "contractors", so StringNotEquals
+        # is false and the Allow does not grant. If the key were matched
+        # case-sensitively the tag would read as absent, the negated-absent rule
+        # would fire, and the excluded contractor would be granted.
+        user, arn = self._caller(tags={"Team": "contractors"})
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": arn},
+                                 condition={"StringNotEquals": {"aws:PrincipalTag/team": "contractors"}}))
+            assert self._assume(trust, arn) == DENY
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_tag_key_case_insensitive_negated_deny_does_not_overdeny(self):
+        # StringNotEquals is false on the resolved tag, so the Deny is inert and
+        # the Allow grants. Case-sensitive matching would over-deny here.
+        user, arn = self._caller(tags={"Team": "contractors"})
+        try:
+            trust = _trust(
+                _stmt("Allow", {"AWS": arn}),
+                _stmt("Deny", {"AWS": arn},
+                      condition={"StringNotEquals": {"aws:PrincipalTag/team": "contractors"}}),
+            )
+            assert self._assume(trust, arn) == ALLOW
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
     @pytest.mark.parametrize("trust", [
         _trust(_stmt("Allow", "arn:aws:iam::111122223333:user/x")),  # bare string ARN / non-object
         _trust({"Principal": {"AWS": "arn:aws:iam::111122223333:user/x"}, "Action": "sts:AssumeRole"}),  # missing Effect

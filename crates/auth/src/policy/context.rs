@@ -60,6 +60,19 @@ pub trait ConditionContext {
 /// Tag keys (`aws:PrincipalTag/*`, `aws:RequestTag/*`, `aws:TagKeys`,
 /// `dynamodb:ResourceTag/*`), `sts:ExternalId`, and the `dynamodb:` request
 /// keys are resolved (or genuinely absent) per context and are not listed here.
+/// Look up a tag map by key, case-insensitively on the key.
+///
+/// AWS resolves tag condition keys (`aws:PrincipalTag/<k>`, `aws:RequestTag/<k>`,
+/// `dynamodb:ResourceTag/<k>`) without regard to the case of `<k>`; a tag stored
+/// as `Team` is matched by a policy naming `team`. Tag values stay
+/// case-sensitive. IAM forbids two tag keys that differ only in case, so a
+/// case-insensitive match is unambiguous.
+fn ci_tag_lookup<'a>(map: &'a HashMap<String, String>, tag_key: &str) -> Option<Vec<&'a str>> {
+    map.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(tag_key))
+        .map(|(_, v)| vec![v.as_str()])
+}
+
 #[must_use]
 pub fn is_service_populated_global_key(key: &str) -> bool {
     matches!(
@@ -155,9 +168,9 @@ impl RequestContext {
 impl ConditionContext for RequestContext {
     fn resolve_key(&self, key: &str) -> Option<Vec<&str>> {
         if let Some(tag_key) = key.strip_prefix("aws:PrincipalTag/") {
-            self.principal_tags.get(tag_key).map(|v| vec![v.as_str()])
+            ci_tag_lookup(&self.principal_tags, tag_key)
         } else if let Some(tag_key) = key.strip_prefix("dynamodb:ResourceTag/") {
-            self.resource_tags.get(tag_key).map(|v| vec![v.as_str()])
+            ci_tag_lookup(&self.resource_tags, tag_key)
         } else {
             match key {
                 "dynamodb:LeadingKeys" => self
@@ -220,9 +233,9 @@ pub struct AssumeRoleContext {
 impl ConditionContext for AssumeRoleContext {
     fn resolve_key(&self, key: &str) -> Option<Vec<&str>> {
         if let Some(tag_key) = key.strip_prefix("aws:PrincipalTag/") {
-            self.principal_tags.get(tag_key).map(|v| vec![v.as_str()])
+            ci_tag_lookup(&self.principal_tags, tag_key)
         } else if let Some(tag_key) = key.strip_prefix("aws:RequestTag/") {
-            self.request_tags.get(tag_key).map(|v| vec![v.as_str()])
+            ci_tag_lookup(&self.request_tags, tag_key)
         } else {
             match key {
                 "sts:ExternalId" => self.external_id.as_deref().map(|v| vec![v]),
@@ -289,6 +302,48 @@ mod tests {
             ctx.resolve_key("dynamodb:ResourceTag/Team"),
             Some(vec!["Alpha"])
         );
+    }
+
+    #[test]
+    fn request_context_tag_key_is_case_insensitive() {
+        // The service resolves the tag key case-insensitively; the value stays
+        // case-sensitive. Stored `Team`, policy names `team`.
+        let ctx = RequestContext::build(
+            HashMap::from([("Team".to_owned(), "contractors".to_owned())]),
+            HashMap::from([("Env".to_owned(), "Prod".to_owned())]),
+            false,
+            RequestParams::default(),
+        );
+        assert_eq!(
+            ctx.resolve_key("aws:PrincipalTag/team"),
+            Some(vec!["contractors"])
+        );
+        assert_eq!(
+            ctx.resolve_key("aws:PrincipalTag/TEAM"),
+            Some(vec!["contractors"])
+        );
+        assert_eq!(
+            ctx.resolve_key("dynamodb:ResourceTag/env"),
+            Some(vec!["Prod"])
+        );
+        // The value is not case-folded, only the key.
+        assert_eq!(ctx.resolve_key("aws:PrincipalTag/missing"), None);
+    }
+
+    #[test]
+    fn assume_role_context_tag_key_is_case_insensitive() {
+        let ctx = AssumeRoleContext {
+            principal_tags: HashMap::from([("Team".to_owned(), "contractors".to_owned())]),
+            external_id: None,
+            principal_arn: "arn:aws:iam::123456789012:user/alice".to_owned(),
+            principal_account: Some("123456789012".to_owned()),
+            request_tags: HashMap::from([("Env".to_owned(), "prod".to_owned())]),
+        };
+        assert_eq!(
+            ctx.resolve_key("aws:PrincipalTag/team"),
+            Some(vec!["contractors"])
+        );
+        assert_eq!(ctx.resolve_key("aws:RequestTag/env"), Some(vec!["prod"]));
     }
 
     #[test]
