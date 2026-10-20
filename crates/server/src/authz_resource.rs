@@ -48,6 +48,19 @@ use serde_json::Value;
 const PARTITION: &str = "aws";
 const SERVICE: &str = "dynamodb";
 
+/// The item actions the service requires on the target table of a restore, in
+/// addition to the restore action itself (measured live). A Deny on any of
+/// these for the target table name blocks a restore into it.
+const RESTORE_TARGET_ACTIONS: &[&str] = &[
+    "Scan",
+    "Query",
+    "GetItem",
+    "PutItem",
+    "UpdateItem",
+    "DeleteItem",
+    "BatchWriteItem",
+];
+
 /// A `DynamoDB` resource identity: a table and an optional sub-resource.
 #[derive(Debug, PartialEq, Eq)]
 enum Sub {
@@ -271,22 +284,49 @@ pub(crate) fn authz_targets(
                 .unwrap_or_default();
             one(table_resource_arn(t, region, account_id))
         }
-        // RestoreTableFromBackup's primary action is evaluated on the source
-        // backup ARN (measured live: the first permission the service requires
-        // is dynamodb:RestoreTableFromBackup on the BackupArn). So a Deny on the
-        // backup ARN blocks the restore.
-        "RestoreTableFromBackup" => one(canonical_or_raw(
-            &str_field(input, "BackupArn").unwrap_or_default(),
-            region,
-            account_id,
-        )),
-        // RestoreTableToPointInTime's primary action is evaluated on the source
-        // table (SourceTableArn or SourceTableName).
+        // RestoreTableFromBackup requires dynamodb:RestoreTableFromBackup on the
+        // source backup ARN and the item actions on the target table it writes
+        // (measured live). A Deny on the backup ARN, or on any item action for
+        // the target table, blocks the restore.
+        "RestoreTableFromBackup" => {
+            let mut v = vec![(
+                operation.to_owned(),
+                canonical_or_raw(
+                    &str_field(input, "BackupArn").unwrap_or_default(),
+                    region,
+                    account_id,
+                ),
+            )];
+            let target = table_resource_arn(
+                &str_field(input, "TargetTableName").unwrap_or_default(),
+                region,
+                account_id,
+            );
+            for a in RESTORE_TARGET_ACTIONS {
+                v.push(((*a).to_owned(), target.clone()));
+            }
+            v
+        }
+        // RestoreTableToPointInTime requires dynamodb:RestoreTableToPointInTime
+        // on the source table and the item actions on the target table it
+        // writes (measured live).
         "RestoreTableToPointInTime" => {
             let source = str_field(input, "SourceTableArn")
                 .or_else(|| str_field(input, "SourceTableName"))
                 .unwrap_or_default();
-            one(table_resource_arn(&source, region, account_id))
+            let mut v = vec![(
+                operation.to_owned(),
+                table_resource_arn(&source, region, account_id),
+            )];
+            let target = table_resource_arn(
+                &str_field(input, "TargetTableName").unwrap_or_default(),
+                region,
+                account_id,
+            );
+            for a in RESTORE_TARGET_ACTIONS {
+                v.push(((*a).to_owned(), target.clone()));
+            }
+            v
         }
         // Query and Scan on an index authorize the index ARN.
         "Query" | "Scan" => {
@@ -511,23 +551,46 @@ mod tests {
     #[test]
     fn restore_export_import_use_measured_resource() {
         let backup = "arn:aws:dynamodb:us-east-1:964157134968:table/bb/backup/01-ab";
-        // RestoreTableFromBackup: primary action on the backup ARN.
-        assert_eq!(
-            only(
-                "RestoreTableFromBackup",
-                json!({ "TargetTableName": "restored", "BackupArn": backup })
-            ),
-            backup
+        // RestoreTableFromBackup: the restore action on the backup ARN plus the
+        // seven item actions on the target table.
+        let rfb = authz_targets(
+            "RestoreTableFromBackup",
+            &json!({ "TargetTableName": "restored", "BackupArn": backup }),
+            R,
+            A,
         );
-        // RestoreTableToPointInTime: on the source table.
-        assert_eq!(
-            only(
-                "RestoreTableToPointInTime",
-                json!({ "SourceTableName": "bb", "TargetTableName": "pitr" })
-            ),
-            "arn:aws:dynamodb:us-east-1:964157134968:table/bb"
+        assert!(rfb.contains(&("RestoreTableFromBackup".to_owned(), backup.to_owned())));
+        let target = "arn:aws:dynamodb:us-east-1:964157134968:table/restored".to_owned();
+        for a in RESTORE_TARGET_ACTIONS {
+            assert!(
+                rfb.contains(&((*a).to_owned(), target.clone())),
+                "RestoreTableFromBackup missing {a} on target"
+            );
+        }
+        assert_eq!(rfb.len(), 1 + RESTORE_TARGET_ACTIONS.len());
+
+        // RestoreTableToPointInTime: the restore action on the source table
+        // plus the seven item actions on the target table.
+        let pitr = authz_targets(
+            "RestoreTableToPointInTime",
+            &json!({ "SourceTableName": "bb", "TargetTableName": "pitr" }),
+            R,
+            A,
         );
-        // ExportTableToPointInTime: on the source table (TableArn field).
+        assert!(pitr.contains(&(
+            "RestoreTableToPointInTime".to_owned(),
+            "arn:aws:dynamodb:us-east-1:964157134968:table/bb".to_owned()
+        )));
+        let ptarget = "arn:aws:dynamodb:us-east-1:964157134968:table/pitr".to_owned();
+        for a in RESTORE_TARGET_ACTIONS {
+            assert!(
+                pitr.contains(&((*a).to_owned(), ptarget.clone())),
+                "RestoreTableToPointInTime missing {a} on target"
+            );
+        }
+        assert_eq!(pitr.len(), 1 + RESTORE_TARGET_ACTIONS.len());
+
+        // ExportTableToPointInTime: only the export action on the source table.
         assert_eq!(
             only(
                 "ExportTableToPointInTime",
@@ -535,7 +598,7 @@ mod tests {
             ),
             "arn:aws:dynamodb:us-east-1:964157134968:table/bb"
         );
-        // ImportTable: on the new table.
+        // ImportTable: only the import action on the new table.
         assert_eq!(
             only(
                 "ImportTable",

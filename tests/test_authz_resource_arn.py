@@ -256,6 +256,39 @@ class TestExplicitDenyOnResourceArn:
             KeyConditionExpression="g1pk = :p",
             ExpressionAttributeValues={":p": {"S": "g1"}}))
 
+    # -- permission chains: a Deny anywhere in the chain blocks the operation --
+
+    def test_restore_from_backup_deny_target_item_action_blocks(self, table):
+        # A restore writes items into the target table, so the service (and now
+        # ExtendDB) require the item actions on the target. A Deny on PutItem for
+        # the target table name blocks the restore.
+        target = table["table_arn"] + "-rfb"
+        d = self._ddb(_allow_all_deny("PutItem", target))
+        self._assert_denied(lambda: d.restore_table_from_backup(
+            TargetTableName=table["name"] + "-rfb", BackupArn=table["backup_arn"]))
+
+    def test_restore_to_point_in_time_deny_target_item_action_blocks(self, table):
+        target = table["table_arn"] + "-pitr"
+        d = self._ddb(_allow_all_deny("PutItem", target))
+        self._assert_denied(lambda: d.restore_table_to_point_in_time(
+            SourceTableName=table["name"], TargetTableName=table["name"] + "-pitr"))
+
+    def test_export_deny_table_blocks(self, table):
+        d = self._ddb(_allow_all_deny("ExportTableToPointInTime", table["table_arn"]))
+        self._assert_denied(lambda: d.export_table_to_point_in_time(
+            TableArn=table["table_arn"], S3Bucket="bb-arn-nobucket"))
+
+    def test_import_deny_new_table_blocks(self, table):
+        new_table = table["table_arn"] + "-imp"
+        d = self._ddb(_allow_all_deny("ImportTable", new_table))
+        self._assert_denied(lambda: d.import_table(
+            S3BucketSource={"S3Bucket": "bb-arn-nobucket"},
+            InputFormat="DYNAMODB_JSON",
+            TableCreationParameters={
+                "TableName": table["name"] + "-imp", "BillingMode": "PAY_PER_REQUEST",
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}]}))
+
     # -- fail closed: a respelled ARN cannot evade a Deny on the canonical ARN --
 
     def test_respelled_stream_arn_cannot_bypass_deny(self, table):
