@@ -29,7 +29,7 @@ adaptation when switching between ExtendDB and the real service.
 | SourceIdentity, TransitiveTagKeys | Supported | Not implemented |
 | Resource policies | Supported | Not implemented (deferred) |
 | Resource-level authorization | Per-resource ARN (table, index, stream, backup) | Matches: table and item operations use the table ARN, Query and Scan with an IndexName use the index ARN, stream operations use the stream ARN, backup operations use the backup ARN, and the tag operations use the supplied ResourceArn. A policy granting only `table/<name>` does not allow that table's index reads, as on DynamoDB. |
-| DescribeEndpoints authentication | Endpoint discovery returns without authentication | Requires authentication (SigV4) like every other operation, and is authorized against `*`. A caller whose policy does not allow `dynamodb:DescribeEndpoints` on `*` is denied, where DynamoDB answers without authentication. ExtendDB does not leave the operation unauthenticated. |
+| DescribeEndpoints authorization | Requires a signed request but checks no IAM permission: a caller whose policy allows only `dynamodb:ListTables` gets the endpoint list | Requires a signed request and authorizes `dynamodb:DescribeEndpoints` on `*`, so a caller whose policy does not allow that action is denied |
 
 ## Import and Export
 
