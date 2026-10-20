@@ -141,19 +141,16 @@ pub(crate) async fn authorize_request(
     // Deny on one table be bypassed. Evaluate every (action, table) pair and
     // reject the entire request if any is denied (all-or-nothing), matching
     // DynamoDB. Verified against the AWS IAM Service Authorization Reference.
-    // `batch_transact_targets` returns `Some` for exactly the batch and
+    // `batch_transact_tables` returns `Some` for exactly the batch and
     // transaction operations. Batch operations authorize once per table with
     // the set of keys that table receives; transaction operations authorize
     // once per item with that item's key. Each target carries the
     // `dynamodb:LeadingKeys` value(s) the service evaluates, extracted per the
     // table's key schema. The resource ARN per target is unchanged: each is
     // still that table's ARN. (Measured against live DynamoDB 2026-10-20.)
-    if let Some(skeleton) =
-        crate::leading_keys::batch_transact_targets(operation, input, &HashMap::new())
-    {
-        // Fetch each distinct table's key info for partition-key extraction.
-        let tables: std::collections::BTreeSet<String> =
-            skeleton.iter().map(|t| t.table.clone()).collect();
+    if let Some(tables) = crate::leading_keys::batch_transact_tables(operation, input) {
+        // Fetch each distinct table's key info for partition-key extraction,
+        // then build the targets once from the populated map.
         let mut key_info_by_table = HashMap::new();
         for table in tables {
             if let Some(ki) =
@@ -164,7 +161,7 @@ pub(crate) async fn authorize_request(
         }
         let targets =
             crate::leading_keys::batch_transact_targets(operation, input, &key_info_by_table)
-                .unwrap_or(skeleton);
+                .unwrap_or_default();
 
         if targets.is_empty() {
             // Malformed or empty body: still require the operation's action on

@@ -312,6 +312,53 @@ pub(crate) fn batch_transact_targets(
     }
 }
 
+/// The distinct table names a batch or transaction operation addresses, or
+/// `None` for any other operation (and for a batch or transaction request whose
+/// items container is absent). The `Some`/`None` result mirrors
+/// `batch_transact_targets`, so the caller gates the batch and transaction
+/// branch on this and then builds the per-target authorizations once. Walking
+/// the body for table names here avoids building a throwaway set of full
+/// targets only to discover which tables to fetch key info for.
+pub(crate) fn batch_transact_tables(
+    operation: &str,
+    input: &Value,
+) -> Option<std::collections::BTreeSet<String>> {
+    let mut tables = std::collections::BTreeSet::new();
+    match operation {
+        "BatchGetItem" | "BatchWriteItem" => {
+            for table in input.get("RequestItems")?.as_object()?.keys() {
+                tables.insert(table.clone());
+            }
+        }
+        "TransactGetItems" => {
+            for entry in input.get("TransactItems")?.as_array()? {
+                if let Some(table) = entry
+                    .get("Get")
+                    .and_then(|g| g.get("TableName"))
+                    .and_then(Value::as_str)
+                {
+                    tables.insert(table.to_owned());
+                }
+            }
+        }
+        "TransactWriteItems" => {
+            for entry in input.get("TransactItems")?.as_array()? {
+                for sub in ["Put", "Delete", "Update", "ConditionCheck"] {
+                    if let Some(table) = entry
+                        .get(sub)
+                        .and_then(|o| o.get("TableName"))
+                        .and_then(Value::as_str)
+                    {
+                        tables.insert(table.to_owned());
+                    }
+                }
+            }
+        }
+        _ => return None,
+    }
+    Some(tables)
+}
+
 /// Collect the partition key values a single table receives in a batch request.
 /// Returns `None` when the table's key schema is unknown (the engine then
 /// rejects), or when no key yields a value.
