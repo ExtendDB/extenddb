@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::AppState;
 use crate::authorization;
+use crate::authz_resource;
 
 /// Extract operation name from X-Amz-Target header.
 /// Accepts both `DynamoDB_20120810` and `DynamoDBStreams_20120810` wire-format prefixes.
@@ -108,7 +109,11 @@ pub(crate) async fn authorize_request(
     // DynamoDB. Verified against the AWS IAM Service Authorization Reference.
     if let Some(targets) = batch_transact_authz_targets(operation, input) {
         for (action_op, table) in targets {
-            let resource_arn = build_resource_arn(&state.region, account_id, Some(&table));
+            // The RequestItems key (or TransactItems TableName) may be a bare
+            // name or a table ARN; canonicalize either to this deployment's
+            // table ARN so a respelled ARN cannot evade a per-table Deny.
+            let resource_arn =
+                authz_resource::table_resource_arn(&table, &state.region, account_id);
             authorization::check_authorization(
                 state.authz_cache.as_ref(),
                 identity,
@@ -122,38 +127,62 @@ pub(crate) async fn authorize_request(
         return Ok(None);
     }
 
-    let resource_arn = build_resource_arn(&state.region, account_id, table_name.as_deref());
+    // Derive the (action, resource ARN) pairs the service authorizes this
+    // operation against. The resource comes from the field the operation
+    // actually carries it in (ResourceArn, StreamArn, BackupArn, TableArn,
+    // IndexName, or a table ARN in TableName), canonicalized to this
+    // deployment, never a `table/*` fallback. See `authz_resource`.
+    let targets = authz_resource::authz_targets(operation, input, &state.region, account_id);
+    let is_scan = operation == "Scan";
 
-    let pk_attr = key_info
-        .as_ref()
-        .map(|ki| ki.key_schema[0].attribute_name.clone());
-
-    let params = extenddb_auth::policy::context::RequestParams {
-        leading_keys: extract_leading_keys(input, operation, pk_attr.as_deref()),
-        attributes: extract_attributes(input),
-        select: input
-            .get("Select")
-            .and_then(|v| v.as_str())
-            .map(ToOwned::to_owned),
-        return_values: input
-            .get("ReturnValues")
-            .and_then(|v| v.as_str())
-            .map(ToOwned::to_owned),
-        return_consumed_capacity: input
-            .get("ReturnConsumedCapacity")
-            .and_then(|v| v.as_str())
-            .map(ToOwned::to_owned),
-        ..Default::default()
-    };
-    authorization::check_authorization(
-        state.authz_cache.as_ref(),
-        identity,
-        operation,
-        &resource_arn,
-        operation == "Scan",
-        params,
-    )
-    .await?;
+    if targets.len() == 1 {
+        // Single-resource operations carry the request params the policy engine
+        // reads for item-level condition keys; build them exactly as before.
+        let pk_attr = key_info
+            .as_ref()
+            .map(|ki| ki.key_schema[0].attribute_name.clone());
+        let params = extenddb_auth::policy::context::RequestParams {
+            leading_keys: extract_leading_keys(input, operation, pk_attr.as_deref()),
+            attributes: extract_attributes(input),
+            select: input
+                .get("Select")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned),
+            return_values: input
+                .get("ReturnValues")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned),
+            return_consumed_capacity: input
+                .get("ReturnConsumedCapacity")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned),
+            ..Default::default()
+        };
+        let (action, resource_arn) = &targets[0];
+        authorization::check_authorization(
+            state.authz_cache.as_ref(),
+            identity,
+            action,
+            resource_arn,
+            is_scan,
+            params,
+        )
+        .await?;
+    } else {
+        // Multi-permission operations (restore). Each pair is authorized with
+        // default params; a Deny on any required resource fails the request.
+        for (action, resource_arn) in &targets {
+            authorization::check_authorization(
+                state.authz_cache.as_ref(),
+                identity,
+                action,
+                resource_arn,
+                false,
+                extenddb_auth::policy::context::RequestParams::default(),
+            )
+            .await?;
+        }
+    }
 
     Ok(key_info)
 }
@@ -280,17 +309,6 @@ fn batch_transact_authz_targets(operation: &str, input: &Value) -> Option<Vec<(S
         _ => return None,
     }
     Some(out)
-}
-
-/// Build a `DynamoDB` table ARN for authorization.
-///
-/// If no table name is available (e.g. `ListTables`, `DescribeEndpoints`),
-/// uses `*` as the resource.
-fn build_resource_arn(region: &str, account_id: &str, table_name: Option<&str>) -> String {
-    match table_name {
-        Some(name) => format!("arn:aws:dynamodb:{region}:{account_id}:table/{name}"),
-        None => format!("arn:aws:dynamodb:{region}:{account_id}:table/*"),
-    }
 }
 
 #[cfg(test)]

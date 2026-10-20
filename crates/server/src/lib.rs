@@ -10,6 +10,7 @@
 
 pub(crate) mod authorization;
 pub mod authz_cache;
+pub(crate) mod authz_resource;
 pub mod console;
 pub mod dev_credentials;
 mod handler;
