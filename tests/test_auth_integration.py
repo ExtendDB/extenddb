@@ -1276,15 +1276,34 @@ class TestTrustPolicyDeny:
 
     # -- Resolved request-wide keys on the trust path (T8) ------------------
 
-    def test_trust_unicode_key_does_not_grant(self):
-        # The trust path matches ASCII-case only (no Unicode folding). A
-        # Latin-1 key (sharp s) is stored but reads absent, so an Allow gated on
-        # aws:SecureTran[sharp-s]port does not grant, matching live STS (which
-        # also leaves it absent).
+    def test_trust_folding_rolesessionname_key_does_not_grant(self):
+        # The trust path matches ASCII-case only (no Unicode folding). The
+        # key "sts:RoleSe\u00dfionName" (sharp s) case-folds to
+        # "sts:rolesessionname", the real key, so under Unicode folding an Allow
+        # gated on it would match the session name "bb-session" and grant. On
+        # the ASCII-only path the key reads absent, the Allow does not fire, and
+        # the assume is denied, matching live STS. This folds to a real key, so
+        # it fails on a folding build and passes here (unlike the old sharp-s
+        # SecureTransport key, which folds to "...transsport" and never matched).
         user, arn = self._caller()
         try:
             trust = _trust(_stmt("Allow", {"AWS": arn},
-                                 condition={"Bool": {"aws:SecureTran\u00dfport": "true"}}))
+                                 condition={"StringEquals": {
+                                     "sts:RoleSe\u00dfionName": "bb-session"}}))
+            assert self._assume(trust, arn) == DENY
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_trust_folding_principaltag_key_does_not_grant(self):
+        # Companion row: "aws:PrincipalTag/cla\u00df" folds to
+        # "aws:PrincipalTag/class". The caller is tagged class=prod, so under
+        # Unicode folding an Allow gated on it would match and grant; on the
+        # ASCII-only path the key reads absent and the assume is denied.
+        user, arn = self._caller(tags={"class": "prod"})
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": arn},
+                                 condition={"StringEquals": {
+                                     "aws:PrincipalTag/cla\u00df": "prod"}}))
             assert self._assume(trust, arn) == DENY
         finally:
             self.mgmt.delete_user(self.account_id, user)
