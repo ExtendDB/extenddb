@@ -329,6 +329,7 @@ async fn evaluate_trust_policy(
     };
 
     let principal_tags = fetch_caller_tags(caller_arn, store).await;
+    let caller_created_at = fetch_caller_created_at(caller_arn, store).await;
     let (current_time, epoch_time) = extenddb_auth::policy::context::request_time_strings();
     let context = AssumeRoleContext {
         principal_tags,
@@ -343,8 +344,12 @@ async fn evaluate_trust_policy(
         source_ip: source_ip.map(ToOwned::to_owned),
         user_agent: user_agent.map(ToOwned::to_owned),
         // aws:userid of the caller (an AIDA... id for a user, role-id:session
-        // for a role session), derived from the caller ARN.
-        userid: extenddb_auth::policy::principal_id::userid_for_caller_arn(caller_arn),
+        // for a role session), derived from the caller ARN and the caller
+        // principal's creation time so a recreated principal gets a new id.
+        userid: extenddb_auth::policy::principal_id::userid_for_caller_arn(
+            caller_arn,
+            caller_created_at.as_deref(),
+        ),
         // aws:ResourceAccount is the account that owns the role being assumed.
         resource_account: Some(account_id.to_owned()),
         current_time,
@@ -893,6 +898,37 @@ async fn fetch_caller_tags(
         Err(e) => {
             tracing::error!("fetch_caller_tags failed for {caller_arn}: {e:?}");
             std::collections::HashMap::new()
+        }
+    }
+}
+
+/// Resolve the caller principal's creation time (RFC 3339), part of its
+/// `aws:userid`. A user ARN resolves the user's creation time, an assumed-role
+/// ARN the role's. `None` when the caller is not a local principal (an external
+/// ARN), where `aws:userid` is then derived without it.
+async fn fetch_caller_created_at(
+    caller_arn: &str,
+    store: &dyn extenddb_storage::CatalogStore,
+) -> Option<String> {
+    let parts: Vec<&str> = caller_arn.splitn(6, ':').collect();
+    if parts.len() < 6 {
+        return None;
+    }
+    let account_id = parts[4];
+    let resource = parts[5];
+    let result = if let Some(user_name) = resource.strip_prefix("user/") {
+        store.fetch_user_created_at(account_id, user_name).await
+    } else if let Some(rest) = resource.strip_prefix("assumed-role/") {
+        let role = rest.split('/').next().unwrap_or("");
+        store.fetch_role_created_at(account_id, role).await
+    } else {
+        Ok(None)
+    };
+    match result {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("fetch_caller_created_at failed for {caller_arn}: {e:?}");
+            None
         }
     }
 }

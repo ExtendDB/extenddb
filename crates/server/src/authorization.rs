@@ -85,14 +85,15 @@ async fn check_user_authorization(
 ) -> Result<(), DynamoDbError> {
     let action = format!("dynamodb:{operation}");
 
-    // Fetch all 5 authz inputs concurrently — they are independent cache
+    // Fetch all authz inputs concurrently; they are independent cache
     // lookups (or DB queries, on cold start). All come back pre-parsed.
-    let (user_policies, group_policies, boundary, principal_tags, resource_tags) = tokio::try_join!(
+    let (user_policies, group_policies, boundary, principal_tags, resource_tags, created_at) = tokio::try_join!(
         wrap_policies(cache.fetch_user_policies(account_id, user_name)),
         wrap_policies(cache.fetch_user_group_policies(account_id, user_name)),
         wrap_boundary(cache.fetch_user_boundary(account_id, user_name)),
         wrap_tags(cache.fetch_user_tags(account_id, user_name)),
         wrap_tags(cache.fetch_resource_tags(resource_arn)),
+        wrap_created_at(cache.fetch_user_created_at(account_id, user_name)),
     )?;
 
     // Combine identity policies. Each side is an `Arc<Vec<Arc<PolicyDocument>>>`;
@@ -114,7 +115,9 @@ async fn check_user_authorization(
     params.principal_type = Some("User".to_owned());
     params.username = Some(user_name.to_owned());
     params.userid = Some(extenddb_auth::policy::principal_id::user_unique_id(
-        account_id, user_name,
+        account_id,
+        user_name,
+        created_at.as_deref().map(String::as_str).unwrap_or_default(),
     ));
     // The target table's owner account. ExtendDB builds the resource ARN with
     // the caller's account, so the resource account is that account.
@@ -164,11 +167,12 @@ async fn check_role_authorization(
 ) -> Result<(), DynamoDbError> {
     let action = format!("dynamodb:{operation}");
 
-    let (identity_policies, boundary, (session_policy, principal_tags), resource_tags) = tokio::try_join!(
+    let (identity_policies, boundary, (session_policy, principal_tags), resource_tags, role_created_at) = tokio::try_join!(
         wrap_policies(cache.fetch_role_policies(account_id, role_name)),
         wrap_boundary(cache.fetch_role_boundary(account_id, role_name)),
         fetch_session_data_and_tags(cache, account_id, role_name, session_name),
         wrap_tags(cache.fetch_resource_tags(resource_arn)),
+        wrap_created_at(cache.fetch_role_created_at(account_id, role_name)),
     )?;
 
     let mut params = params;
@@ -183,6 +187,7 @@ async fn check_role_authorization(
         account_id,
         role_name,
         session_name,
+        role_created_at.as_deref().map(String::as_str).unwrap_or_default(),
     ));
     params.resource_account = Some(account_id.to_owned());
     let context = RequestContext::build(principal_tags, (*resource_tags).clone(), is_scan, params);
@@ -262,6 +267,14 @@ async fn wrap_boundary(
 async fn wrap_tags(
     fut: impl std::future::Future<Output = extenddb_storage::management_store::OpResult<TagMap>>,
 ) -> Result<TagMap, DynamoDbError> {
+    fut.await.map_err(op_err_to_dynamo)
+}
+
+async fn wrap_created_at(
+    fut: impl std::future::Future<
+        Output = extenddb_storage::management_store::OpResult<Option<std::sync::Arc<String>>>,
+    >,
+) -> Result<Option<std::sync::Arc<String>>, DynamoDbError> {
     fut.await.map_err(op_err_to_dynamo)
 }
 

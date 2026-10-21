@@ -77,6 +77,27 @@ pub trait AuthorizationStore: Send + Sync {
 
     /// Fetch tags for a resource ARN (for condition key evaluation).
     fn fetch_resource_tags(&self, arn: &str) -> BoxFuture<'_, OpResult<Vec<(String, String)>>>;
+
+    /// Fetch a user's creation time (`iam_users.created_at`) as RFC 3339 UTC.
+    ///
+    /// Returns `None` if the user does not exist. The value is a stable part of
+    /// the user's `aws:userid` derivation, so a user deleted and recreated with
+    /// the same name (a new creation time) gets a new id, as IAM does.
+    fn fetch_user_created_at(
+        &self,
+        account_id: &str,
+        user_name: &str,
+    ) -> BoxFuture<'_, OpResult<Option<String>>>;
+
+    /// Fetch a role's creation time (`iam_roles.created_at`) as RFC 3339 UTC.
+    ///
+    /// Returns `None` if the role does not exist. Used the same way as
+    /// [`AuthorizationStore::fetch_user_created_at`] for a role's `aws:userid`.
+    fn fetch_role_created_at(
+        &self,
+        account_id: &str,
+        role_name: &str,
+    ) -> BoxFuture<'_, OpResult<Option<String>>>;
 }
 
 /// Session data returned by [`AuthorizationStore::fetch_session_data`].

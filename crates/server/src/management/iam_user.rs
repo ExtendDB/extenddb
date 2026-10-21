@@ -207,6 +207,10 @@ pub async fn delete_user(
                 .auth_cache
                 .invalidate_user_tags(&account_id, &user_name)
                 .await;
+            state
+                .auth_cache
+                .invalidate_user_created_at(&account_id, &user_name)
+                .await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => op_err_to_response(OpError::from_storage(e)),

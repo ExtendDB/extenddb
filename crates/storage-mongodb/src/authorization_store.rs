@@ -357,4 +357,63 @@ impl AuthorizationStore for MongoCatalogStore {
                 .collect())
         })
     }
+
+    fn fetch_user_created_at(
+        &self,
+        account_id: &str,
+        user_name: &str,
+    ) -> BoxFuture<'_, OpResult<Option<String>>> {
+        let account_id = account_id.to_owned();
+        let user_name = user_name.to_owned();
+        Box::pin(async move {
+            let coll = self.catalog_db().collection::<Document>("iam_users");
+            let doc = coll
+                .find_one(doc! { "account_id": &account_id, "user_name": &user_name })
+                .await
+                .map_err(|e| {
+                    tracing::error!("fetch_user_created_at: {e}");
+                    OpError::Internal("Database error".to_owned())
+                })?;
+            Ok(doc.and_then(|d| {
+                d.get_datetime("created_at")
+                    .ok()
+                    .and_then(|dt| bson_datetime_to_rfc3339(dt))
+            }))
+        })
+    }
+
+    fn fetch_role_created_at(
+        &self,
+        account_id: &str,
+        role_name: &str,
+    ) -> BoxFuture<'_, OpResult<Option<String>>> {
+        let account_id = account_id.to_owned();
+        let role_name = role_name.to_owned();
+        Box::pin(async move {
+            let coll = self.catalog_db().collection::<Document>("iam_roles");
+            let doc = coll
+                .find_one(doc! { "account_id": &account_id, "role_name": &role_name })
+                .await
+                .map_err(|e| {
+                    tracing::error!("fetch_role_created_at: {e}");
+                    OpError::Internal("Database error".to_owned())
+                })?;
+            Ok(doc.and_then(|d| {
+                d.get_datetime("created_at")
+                    .ok()
+                    .and_then(|dt| bson_datetime_to_rfc3339(dt))
+            }))
+        })
+    }
+}
+
+/// Format a BSON datetime as RFC 3339 UTC, matching how the other backends
+/// return `created_at` for the `aws:userid` derivation and `aws:TokenIssueTime`.
+fn bson_datetime_to_rfc3339(dt: &mongodb::bson::DateTime) -> Option<String> {
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(dt.timestamp_millis()) * 1_000_000)
+        .ok()
+        .and_then(|odt| {
+            odt.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
 }

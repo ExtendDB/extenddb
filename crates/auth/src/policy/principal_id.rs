@@ -66,22 +66,38 @@ fn id_body(parts: &[&str]) -> String {
 }
 
 /// The `aws:userid` value for an IAM user: its unique id, an `AIDA...` string.
+///
+/// `created_at` is the user's creation time (any stable representation, in
+/// practice RFC 3339). Including it means a user deleted and recreated with the
+/// same name gets a different id, as IAM issues a new unique id each time.
 #[must_use]
-pub fn user_unique_id(account_id: &str, user_name: &str) -> String {
-    format!("AIDA{}", id_body(&["user", account_id, user_name]))
+pub fn user_unique_id(account_id: &str, user_name: &str, created_at: &str) -> String {
+    format!("AIDA{}", id_body(&["user", account_id, user_name, created_at]))
 }
 
 /// A role's unique id, an `AROA...` string. Used as the first half of a role
-/// session's `aws:userid`.
+/// session's `aws:userid`. `created_at` is the role's creation time, so a
+/// recreated role gets a new id.
 #[must_use]
-pub fn role_unique_id(account_id: &str, role_name: &str) -> String {
-    format!("AROA{}", id_body(&["role", account_id, role_name]))
+pub fn role_unique_id(account_id: &str, role_name: &str, created_at: &str) -> String {
+    format!("AROA{}", id_body(&["role", account_id, role_name, created_at]))
 }
 
 /// The `aws:userid` value for a role session: `<role-id>:<session-name>`.
+///
+/// `role_created_at` is the role's creation time (not the session's): the role
+/// id half changes when the role is recreated, matching IAM.
 #[must_use]
-pub fn role_session_userid(account_id: &str, role_name: &str, session_name: &str) -> String {
-    format!("{}:{session_name}", role_unique_id(account_id, role_name))
+pub fn role_session_userid(
+    account_id: &str,
+    role_name: &str,
+    session_name: &str,
+    role_created_at: &str,
+) -> String {
+    format!(
+        "{}:{session_name}",
+        role_unique_id(account_id, role_name, role_created_at)
+    )
 }
 
 /// The `aws:userid` value for a caller identified by ARN, for the trust path.
@@ -89,22 +105,26 @@ pub fn role_session_userid(account_id: &str, role_name: &str, session_name: &str
 /// An IAM user ARN (`arn:aws:iam::<account>:user/<name>`) resolves to the
 /// user's `AIDA...` id; an assumed-role ARN
 /// (`arn:aws:sts::<account>:assumed-role/<role>/<session>`) to
-/// `<role-id>:<session>`. Any other ARN form returns `None`, so a trust policy
-/// conditioning on `aws:userid` for such a caller fails to match rather than
-/// resolving to a fabricated value.
+/// `<role-id>:<session>`. `created_at` is the caller principal's creation time
+/// (the user's for a user ARN, the role's for an assumed-role ARN), looked up
+/// by the caller; when the caller is not a known local principal it is `None`
+/// and the id is derived without it. Any other ARN form returns `None`, so a
+/// trust policy conditioning on `aws:userid` for such a caller fails to match
+/// rather than resolving to a fabricated value.
 #[must_use]
-pub fn userid_for_caller_arn(caller_arn: &str) -> Option<String> {
+pub fn userid_for_caller_arn(caller_arn: &str, created_at: Option<&str>) -> Option<String> {
     let parts: Vec<&str> = caller_arn.splitn(6, ':').collect();
     if parts.len() < 6 {
         return None;
     }
     let account = parts[4];
     let resource = parts[5];
+    let created_at = created_at.unwrap_or("");
     if let Some(user_name) = resource.strip_prefix("user/") {
-        Some(user_unique_id(account, user_name))
+        Some(user_unique_id(account, user_name, created_at))
     } else if let Some(rest) = resource.strip_prefix("assumed-role/") {
         let (role, session) = rest.split_once('/')?;
-        Some(role_session_userid(account, role, session))
+        Some(role_session_userid(account, role, session, created_at))
     } else {
         None
     }
@@ -114,9 +134,12 @@ pub fn userid_for_caller_arn(caller_arn: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    const T1: &str = "2026-10-21T00:00:00Z";
+    const T2: &str = "2026-10-21T01:00:00Z";
+
     #[test]
     fn user_id_has_the_service_prefix_and_length() {
-        let id = user_unique_id("123456789012", "alice");
+        let id = user_unique_id("123456789012", "alice", T1);
         assert!(id.starts_with("AIDA"), "{id}");
         assert_eq!(id.len(), 4 + BODY_LEN);
         assert!(
@@ -127,7 +150,7 @@ mod tests {
 
     #[test]
     fn role_id_has_the_service_prefix_and_length() {
-        let id = role_unique_id("123456789012", "app-role");
+        let id = role_unique_id("123456789012", "app-role", T1);
         assert!(id.starts_with("AROA"), "{id}");
         assert_eq!(id.len(), 4 + BODY_LEN);
     }
@@ -135,30 +158,44 @@ mod tests {
     #[test]
     fn ids_are_stable_and_unique() {
         assert_eq!(
-            user_unique_id("123456789012", "alice"),
-            user_unique_id("123456789012", "alice")
+            user_unique_id("123456789012", "alice", T1),
+            user_unique_id("123456789012", "alice", T1)
         );
         assert_ne!(
-            user_unique_id("123456789012", "alice"),
-            user_unique_id("123456789012", "bob")
+            user_unique_id("123456789012", "alice", T1),
+            user_unique_id("123456789012", "bob", T1)
         );
         assert_ne!(
-            user_unique_id("123456789012", "alice"),
-            user_unique_id("999999999999", "alice")
+            user_unique_id("123456789012", "alice", T1),
+            user_unique_id("999999999999", "alice", T1)
         );
         // A user and a role with the same name get different ids (different
         // type prefix and domain separation).
         assert_ne!(
-            user_unique_id("123456789012", "shared"),
-            role_unique_id("123456789012", "shared")
+            user_unique_id("123456789012", "shared", T1),
+            role_unique_id("123456789012", "shared", T1)
+        );
+    }
+
+    #[test]
+    fn recreating_a_principal_changes_its_id() {
+        // Same account and name, different creation time: a new id, as IAM
+        // issues on delete and recreate.
+        assert_ne!(
+            user_unique_id("123456789012", "alice", T1),
+            user_unique_id("123456789012", "alice", T2)
+        );
+        assert_ne!(
+            role_unique_id("123456789012", "app-role", T1),
+            role_unique_id("123456789012", "app-role", T2)
         );
     }
 
     #[test]
     fn role_session_userid_is_role_id_colon_session() {
-        let rid = role_unique_id("123456789012", "app-role");
+        let rid = role_unique_id("123456789012", "app-role", T1);
         assert_eq!(
-            role_session_userid("123456789012", "app-role", "sess-1"),
+            role_session_userid("123456789012", "app-role", "sess-1", T1),
             format!("{rid}:sess-1")
         );
     }
@@ -166,17 +203,20 @@ mod tests {
     #[test]
     fn userid_for_caller_arn_covers_user_and_role_session() {
         assert_eq!(
-            userid_for_caller_arn("arn:aws:iam::123456789012:user/alice"),
-            Some(user_unique_id("123456789012", "alice"))
+            userid_for_caller_arn("arn:aws:iam::123456789012:user/alice", Some(T1)),
+            Some(user_unique_id("123456789012", "alice", T1))
         );
         assert_eq!(
-            userid_for_caller_arn("arn:aws:sts::123456789012:assumed-role/app-role/sess-1"),
-            Some(role_session_userid("123456789012", "app-role", "sess-1"))
+            userid_for_caller_arn(
+                "arn:aws:sts::123456789012:assumed-role/app-role/sess-1",
+                Some(T1)
+            ),
+            Some(role_session_userid("123456789012", "app-role", "sess-1", T1))
         );
         assert_eq!(
-            userid_for_caller_arn("arn:aws:iam::123456789012:root"),
+            userid_for_caller_arn("arn:aws:iam::123456789012:root", Some(T1)),
             None
         );
-        assert_eq!(userid_for_caller_arn("not-an-arn"), None);
+        assert_eq!(userid_for_caller_arn("not-an-arn", None), None);
     }
 }

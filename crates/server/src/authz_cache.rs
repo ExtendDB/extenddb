@@ -111,6 +111,11 @@ pub struct CachedAuthzStore {
     role_tags: SwrCache<(String, String), TagMap, OpError>,
     session_data: SwrCache<(String, String, String), Arc<CachedSessionData>, OpError>,
     resource_tags: SwrCache<String, TagMap, OpError>,
+    /// Principal creation time (RFC 3339), part of the `aws:userid` derivation.
+    /// Invalidated with the principal's other entries so a delete and recreate
+    /// resolves a fresh id.
+    user_created_at: SwrCache<(String, String), Arc<String>, OpError>,
+    role_created_at: SwrCache<(String, String), Arc<String>, OpError>,
 }
 
 impl CachedAuthzStore {
@@ -153,6 +158,9 @@ impl CachedAuthzStore {
                 extenddb_cache::SwrCache::new(loader, cache_cfg)
             }
         }
+        // The principal creation-time caches reuse the per-principal tag cache
+        // sizing; capture it before the field initializers consume it.
+        let created_at_cfg = cfg.principal_tags.clone();
         Self {
             user_policies: mk_cache(
                 make_user_policies_loader(inner.clone()),
@@ -192,6 +200,22 @@ impl CachedAuthzStore {
             session_data: mk_cache(
                 make_session_data_loader(inner.clone()),
                 cfg.session_data,
+                pass_through,
+            ),
+            user_created_at: mk_cache(
+                make_user_created_at_loader(inner.clone()),
+                extenddb_cache::SwrCacheConfig {
+                    name: "user_created_at",
+                    ..created_at_cfg.clone()
+                },
+                pass_through,
+            ),
+            role_created_at: mk_cache(
+                make_role_created_at_loader(inner.clone()),
+                extenddb_cache::SwrCacheConfig {
+                    name: "role_created_at",
+                    ..created_at_cfg
+                },
                 pass_through,
             ),
             resource_tags: mk_cache(
@@ -315,6 +339,30 @@ impl CachedAuthzStore {
             .unwrap_or_else(|| Arc::new(HashMap::new())))
     }
 
+    /// Fetch a user's creation time (RFC 3339), part of its `aws:userid`.
+    /// `None` if the user does not exist.
+    pub async fn fetch_user_created_at(
+        &self,
+        account_id: &str,
+        user_name: &str,
+    ) -> OpResult<Option<Arc<String>>> {
+        self.user_created_at
+            .get((account_id.to_owned(), user_name.to_owned()))
+            .await
+    }
+
+    /// Fetch a role's creation time (RFC 3339), part of its `aws:userid`.
+    /// `None` if the role does not exist.
+    pub async fn fetch_role_created_at(
+        &self,
+        account_id: &str,
+        role_name: &str,
+    ) -> OpResult<Option<Arc<String>>> {
+        self.role_created_at
+            .get((account_id.to_owned(), role_name.to_owned()))
+            .await
+    }
+
     // ── Invalidation API ───────────────────────────────────────────────
 
     pub async fn invalidate_user_policies(&self, account_id: &str, user_name: &str) {
@@ -360,6 +408,12 @@ impl CachedAuthzStore {
             .await;
     }
 
+    pub async fn invalidate_user_created_at(&self, account_id: &str, user_name: &str) {
+        self.user_created_at
+            .invalidate(&(account_id.to_owned(), user_name.to_owned()))
+            .await;
+    }
+
     pub async fn invalidate_role_policies(&self, account_id: &str, role_name: &str) {
         self.role_policies
             .invalidate(&(account_id.to_owned(), role_name.to_owned()))
@@ -374,6 +428,12 @@ impl CachedAuthzStore {
 
     pub async fn invalidate_role_tags(&self, account_id: &str, role_name: &str) {
         self.role_tags
+            .invalidate(&(account_id.to_owned(), role_name.to_owned()))
+            .await;
+    }
+
+    pub async fn invalidate_role_created_at(&self, account_id: &str, role_name: &str) {
+        self.role_created_at
             .invalidate(&(account_id.to_owned(), role_name.to_owned()))
             .await;
     }
@@ -452,6 +512,12 @@ impl CachedAuthzStore {
         if let Err(e) = self.user_tags.invalidate_if(pred_user.clone()) {
             log_err("user_tags", e);
         }
+        if let Err(e) = self.user_created_at.invalidate_if(pred_user.clone()) {
+            log_err("user_created_at", e);
+        }
+        if let Err(e) = self.role_created_at.invalidate_if(pred_user.clone()) {
+            log_err("role_created_at", e);
+        }
         if let Err(e) = self.role_policies.invalidate_if(pred_user.clone()) {
             log_err("role_policies", e);
         }
@@ -483,6 +549,8 @@ impl CachedAuthzStore {
         self.role_tags.invalidate_all();
         self.session_data.invalidate_all();
         self.resource_tags.invalidate_all();
+        self.user_created_at.invalidate_all();
+        self.role_created_at.invalidate_all();
     }
 
     /// Snapshot per-sub-cache counters for export to `/auth-cache-metrics`.
@@ -568,6 +636,14 @@ impl extenddb_auth::AuthzCacheInvalidator for CachedAuthzStore {
         Box::pin(self.invalidate_user_tags(account_id, user_name))
     }
 
+    fn invalidate_user_created_at<'a>(
+        &'a self,
+        account_id: &'a str,
+        user_name: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(self.invalidate_user_created_at(account_id, user_name))
+    }
+
     fn invalidate_role_policies<'a>(
         &'a self,
         account_id: &'a str,
@@ -590,6 +666,14 @@ impl extenddb_auth::AuthzCacheInvalidator for CachedAuthzStore {
         role_name: &'a str,
     ) -> BoxFuture<'a, ()> {
         Box::pin(self.invalidate_role_tags(account_id, role_name))
+    }
+
+    fn invalidate_role_created_at<'a>(
+        &'a self,
+        account_id: &'a str,
+        role_name: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(self.invalidate_role_created_at(account_id, role_name))
     }
 
     fn invalidate_session<'a>(
@@ -639,6 +723,7 @@ type BoundaryLoader = Loader<(String, String), Arc<PolicyDocument>, OpError>;
 type TagsLoader = Loader<(String, String), TagMap, OpError>;
 type SessionLoader = Loader<(String, String, String), Arc<CachedSessionData>, OpError>;
 type ResourceTagsLoader = Loader<String, TagMap, OpError>;
+type CreatedAtLoader = Loader<(String, String), Arc<String>, OpError>;
 
 // Policy loaders surface `Ok(None)` when the underlying store returns an
 // empty Vec — same rationale as the tag loaders below. "Principal exists
@@ -777,6 +862,34 @@ fn make_resource_tags_loader(inner: Arc<dyn AuthorizationStore>) -> ResourceTags
             .boxed()
         },
     )
+}
+
+fn make_user_created_at_loader(inner: Arc<dyn AuthorizationStore>) -> CreatedAtLoader {
+    Arc::new(move |(account_id, user_name): (String, String)|
+        -> BoxFuture<'static, OpResult<Option<Arc<String>>>> {
+        let inner = inner.clone();
+        async move {
+            Ok(inner
+                .fetch_user_created_at(&account_id, &user_name)
+                .await?
+                .map(Arc::new))
+        }
+        .boxed()
+    })
+}
+
+fn make_role_created_at_loader(inner: Arc<dyn AuthorizationStore>) -> CreatedAtLoader {
+    Arc::new(move |(account_id, role_name): (String, String)|
+        -> BoxFuture<'static, OpResult<Option<Arc<String>>>> {
+        let inner = inner.clone();
+        async move {
+            Ok(inner
+                .fetch_role_created_at(&account_id, &role_name)
+                .await?
+                .map(Arc::new))
+        }
+        .boxed()
+    })
 }
 
 fn make_session_data_loader(inner: Arc<dyn AuthorizationStore>) -> SessionLoader {
@@ -1011,6 +1124,22 @@ mod tests {
                 .cloned()
                 .unwrap_or_default();
             Box::pin(async move { Ok(v) })
+        }
+
+        fn fetch_user_created_at(
+            &self,
+            _account_id: &str,
+            _user_name: &str,
+        ) -> BoxFuture<'_, OpResult<Option<String>>> {
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn fetch_role_created_at(
+            &self,
+            _account_id: &str,
+            _role_name: &str,
+        ) -> BoxFuture<'_, OpResult<Option<String>>> {
+            Box::pin(async move { Ok(None) })
         }
     }
 

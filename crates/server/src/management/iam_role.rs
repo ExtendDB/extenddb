@@ -169,6 +169,10 @@ pub async fn delete_role(
                 .auth_cache
                 .invalidate_role_sessions(&account_id, &role_name)
                 .await;
+            state
+                .auth_cache
+                .invalidate_role_created_at(&account_id, &role_name)
+                .await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => op_err_to_response(OpError::from_storage(e)),
