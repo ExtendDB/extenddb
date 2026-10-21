@@ -276,9 +276,6 @@ pub(crate) fn validate_iam_tags(tags: &[(String, String)]) -> Result<(), String>
     Ok(())
 }
 
-/// One character of IAM's tag grammar: a Unicode letter or number, an ASCII
-/// space, or one of `_ . : / = + - @`. Combining marks and other punctuation
-/// are excluded, matching the service's `[\p{L}\p{Z}\p{N}_.:/=+\-@]`.
 /// Whether `c` is admissible in an IAM tag key or value.
 ///
 /// IAM's tag grammar is `[\p{L}\p{Z}\p{N}_.:/=+\-@]`: any Unicode Letter
@@ -289,6 +286,12 @@ pub(crate) fn validate_iam_tags(tags: &[(String, String)]) -> Result<(), String>
 /// Other_Alphabetic combining marks such as U+0345 (category Mn) that IAM
 /// rejects, and an ASCII-space-only separator check rejects the `\p{Z}`
 /// separators (U+00A0, U+2002, U+3000 and the rest) that IAM accepts.
+///
+/// `unicode-properties` carries Unicode 15.1 general categories; the case-fold
+/// table in `extenddb_auth` is Unicode 15.0.0. Unicode 15.1 added only uncased
+/// characters (CJK Unified Ideographs Extension I and five ideographic
+/// description characters), so its case folding is identical to 15.0.0 and
+/// the fold table holds under either version.
 fn is_iam_tag_char(c: char) -> bool {
     use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
     matches!(c, '_' | '.' | ':' | '/' | '=' | '+' | '-' | '@')
