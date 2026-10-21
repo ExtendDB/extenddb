@@ -175,6 +175,7 @@ impl PolicyDocument {
         let version = raw["Version"].as_str().unwrap_or("2012-10-17").to_owned();
         let statements = parse_statements(&raw["Statement"])?;
         validate_statement_cidrs(&statements)?;
+        validate_statement_sids(&statements)?;
         Ok(Self {
             version,
             statements,
@@ -220,6 +221,28 @@ fn validate_statement_cidrs(statements: &[Statement]) -> Result<(), PolicyParseE
                     }
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// Reject a `Sid` outside the service's charset.
+///
+/// Measured on live IAM (`PutUserPolicy` and `CreateRole`): a `Sid` is accepted
+/// only when it is empty or entirely ASCII letters and digits (`[A-Za-z0-9]`),
+/// regardless of length; a hyphen, underscore, space, dot or any non-ASCII
+/// character (including Latin-1 such as an accented letter) is rejected with
+/// `MalformedPolicyDocument`. `from_json` is the identity-policy write and read
+/// path, so this rejects such a `Sid` at write and fails a stored identity
+/// policy closed at read.
+fn validate_statement_sids(statements: &[Statement]) -> Result<(), PolicyParseError> {
+    for stmt in statements {
+        if let Some(sid) = &stmt.sid
+            && !sid.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            return Err(PolicyParseError(format!(
+                "invalid Sid (must be ASCII letters and digits only): {sid}"
+            )));
         }
     }
     Ok(())
@@ -632,6 +655,32 @@ mod tests {
             "Action":"dynamodb:GetItem","Resource":"*",
             "Condition":{"IpAddress":{"aws:SourceIp":["10.0.0.0/8","2001:db8::/32"]}}}]}"#;
         assert!(PolicyDocument::from_json(json).is_ok());
+    }
+
+    #[test]
+    fn reject_non_alphanumeric_sid() {
+        for sid in ["Sid-X", "Sid_X", "Sid X", "Sid.X", "Sid\u{00e9}"] {
+            let json = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Sid":"{sid}","Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*"}}]}}"#
+            );
+            assert!(
+                PolicyDocument::from_json(&json).is_err(),
+                "should reject Sid {sid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_alphanumeric_or_empty_sid() {
+        for sid in ["Abc123", "", "aaaaaaaaaaaaaaaaaaaa"] {
+            let json = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Sid":"{sid}","Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*"}}]}}"#
+            );
+            assert!(
+                PolicyDocument::from_json(&json).is_ok(),
+                "should accept Sid {sid:?}"
+            );
+        }
     }
 
     #[test]

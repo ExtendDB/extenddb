@@ -736,6 +736,17 @@ pub(crate) fn validate_trust_policy(trust_policy: &Value) -> Result<(), String> 
     if json_has_char_above_latin1(trust_policy) {
         return Err("Trust policy must not contain a character above U+00FF".to_owned());
     }
+    // Measured on live IAM CreateRole: a Sid is accepted only when it is empty
+    // or entirely ASCII letters and digits; a hyphen, underscore, space, dot or
+    // non-ASCII character is rejected with MalformedPolicyDocument. Identity
+    // PutUserPolicy applies the same rule (see validate_statement_sids).
+    for stmt in &statements {
+        if let Some(sid) = stmt.get("Sid").and_then(serde_json::Value::as_str)
+            && !sid.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            return Err("Trust policy Sid must be ASCII letters and digits only".to_owned());
+        }
+    }
     for stmt in &statements {
         validate_trust_statement(stmt)?;
     }
@@ -1638,6 +1649,32 @@ mod tests {
     #[test]
     fn validate_accepts_single_object_statement() {
         ok(json!({"Version": "2012-10-17", "Statement": allow_alice()}));
+    }
+
+    #[test]
+    fn validate_rejects_non_alphanumeric_sid() {
+        for sid in ["Sid-X", "Sid_X", "Sid X", "Sid.X", "Sid\u{00e9}"] {
+            let doc = json!({"Version": "2012-10-17",
+                "Statement": [{"Sid": sid, "Effect": "Allow",
+                    "Principal": {"AWS": CALLER}, "Action": "sts:AssumeRole"}]});
+            assert!(
+                validate_trust_policy(&doc).is_err(),
+                "should reject Sid {sid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_alphanumeric_or_empty_sid() {
+        for sid in ["Abc123", "", "aaaaaaaaaa"] {
+            let doc = json!({"Version": "2012-10-17",
+                "Statement": [{"Sid": sid, "Effect": "Allow",
+                    "Principal": {"AWS": CALLER}, "Action": "sts:AssumeRole"}]});
+            assert!(
+                validate_trust_policy(&doc).is_ok(),
+                "should accept Sid {sid:?}"
+            );
+        }
     }
 
     #[test]
