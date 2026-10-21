@@ -446,14 +446,17 @@ pub struct AssumeRoleContext {
 
 impl ConditionContext for AssumeRoleContext {
     fn resolve_key(&self, key: &str) -> Option<Vec<&str>> {
-        // Condition key names are resolved under Unicode full case folding,
-        // matching the live service, including the tag prefixes.
+        // The live AssumeRole trust path matches condition key names and tag
+        // keys ASCII-case-insensitively only; unlike the DynamoDB request path
+        // it does NOT apply Unicode case folding (measured: a key spelled with a
+        // non-ASCII letter reads absent on live STS). Normalize with
+        // `to_ascii_lowercase`, not `case_fold`.
         if let Some(sub) = strip_prefix_ci(key, "aws:PrincipalTag/") {
-            tag_lookup(&self.principal_tags, sub, super::casefold::case_fold)
+            tag_lookup(&self.principal_tags, sub, str::to_ascii_lowercase)
         } else if let Some(sub) = strip_prefix_ci(key, "aws:RequestTag/") {
-            tag_lookup(&self.request_tags, sub, super::casefold::case_fold)
+            tag_lookup(&self.request_tags, sub, str::to_ascii_lowercase)
         } else {
-            match super::casefold::case_fold(key).as_str() {
+            match key.to_ascii_lowercase().as_str() {
                 "sts:externalid" => self.external_id.as_deref().map(|v| vec![v]),
                 "sts:rolesessionname" => self.session_name.as_deref().map(|v| vec![v]),
                 "aws:principalarn" => Some(vec![self.principal_arn.as_str()]),
@@ -490,8 +493,9 @@ impl ConditionContext for AssumeRoleContext {
         // `aws:TagKeys` is the set of session-tag keys (`ArrayOfString`); every
         // other trust-policy key (`aws:PrincipalTag/*`, `aws:RequestTag/*`,
         // `sts:ExternalId`, `aws:PrincipalArn`, `aws:PrincipalAccount`) is
-        // single-valued. Matched under Unicode full case folding, like the service.
-        super::casefold::case_fold(key) == "aws:tagkeys"
+        // single-valued. Matched ASCII-case-insensitively, like the live trust
+        // path (no Unicode folding).
+        key.eq_ignore_ascii_case("aws:TagKeys")
     }
 
     fn is_unresolvable_key(&self, key: &str) -> bool {
@@ -820,17 +824,22 @@ mod tests {
     }
 
     #[test]
-    fn assume_role_context_key_name_unicode_case_folds() {
+    fn assume_role_context_folds_ascii_only_not_unicode() {
+        // The trust path matches ASCII-case-insensitively only; it does NOT
+        // Unicode-fold, unlike the identity path. A key name or tag key spelled
+        // with a non-ASCII letter that would fold to a resolvable ASCII key
+        // reads as absent, matching live STS.
         let ctx = ar_ctx(
             HashMap::from([("class".to_owned(), "x".to_owned())]),
             Some("ext-123".to_owned()),
             HashMap::new(),
         );
+        assert_eq!(ctx.resolve_key("STS:EXTERNALID"), Some(vec!["ext-123"]));
+        assert_eq!(ctx.resolve_key("aws:PrincipalTag/CLASS"), Some(vec!["x"]));
+        // Non-ASCII spellings do NOT resolve on the trust path.
         assert_eq!(ctx.resolve_key("sts:External\u{0131}d"), None);
-        assert_eq!(
-            ctx.resolve_key("aws:PrincipalTag/cla\u{00df}"),
-            Some(vec!["x"])
-        );
+        assert_eq!(ctx.resolve_key("aws:PrincipalTag/cla\u{00df}"), None);
+        assert_eq!(ctx.resolve_key("aws:Reque\u{fb05}edRegion"), None);
     }
 
     #[test]

@@ -1276,15 +1276,31 @@ class TestTrustPolicyDeny:
 
     # -- Resolved request-wide keys on the trust path (T8) ------------------
 
-    def test_keyname_unicode_longs_securetransport_resolves(self):
-        # aws:SecureTran[long-s]port folds to securetransport=true under
-        # Unicode case folding, so the positive gate grants. ASCII-only folding
-        # would read the key absent and the Allow would not grant.
+    def test_trust_unicode_key_does_not_grant(self):
+        # The trust path matches ASCII-case only (no Unicode folding). A
+        # Latin-1 key (sharp s) is stored but reads absent, so an Allow gated on
+        # aws:SecureTran[sharp-s]port does not grant, matching live STS (which
+        # also leaves it absent).
         user, arn = self._caller()
         try:
             trust = _trust(_stmt("Allow", {"AWS": arn},
-                                 condition={"Bool": {"aws:SecureTran\u017fport": "true"}}))
-            assert self._assume(trust, arn) == ALLOW
+                                 condition={"Bool": {"aws:SecureTran\u00dfport": "true"}}))
+            assert self._assume(trust, arn) == DENY
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_trust_rejects_char_above_latin1(self):
+        # The service will not store a trust policy with a code point above
+        # U+00FF (CreateRole InternalFailure); ExtendDB rejects it at create.
+        user, arn = self._caller()
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": arn},
+                                 condition={"StringEquals": {"aws:Reque\u0100edRegion": "us-east-1"}}))
+            role = f"bbr-{uuid.uuid4().hex[:8]}"
+            resp = self.mgmt.create_role(self.account_id, role, trust)
+            if resp.status_code == 201:
+                self.mgmt.delete_role(self.account_id, role)
+            assert resp.status_code == REJECT, resp.text
         finally:
             self.mgmt.delete_user(self.account_id, user)
 

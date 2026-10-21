@@ -684,10 +684,34 @@ pub(crate) fn validate_trust_policy(trust_policy: &Value) -> Result<(), String> 
     if statements.is_empty() {
         return Err("Trust policy Statement must not be empty".to_owned());
     }
+    // The live service does not store a trust policy that contains a character
+    // above U+00FF anywhere in the document (a key name, a value, a Sid, or a
+    // tag key): CreateRole returns InternalFailure (MalformedPolicyDocument for
+    // a Sid). Latin-1 characters (up to U+00FF, including the sharp s and
+    // accented letters) are stored, though a non-ASCII condition key name or
+    // tag key then reads as absent at evaluation (the trust path matches
+    // ASCII-case only). Reject a document with a character above U+00FF to
+    // match what the service will store.
+    if json_has_char_above_latin1(trust_policy) {
+        return Err("Trust policy must not contain a character above U+00FF".to_owned());
+    }
     for stmt in &statements {
         validate_trust_statement(stmt)?;
     }
     Ok(())
+}
+
+/// Whether any object key or string value in `v` contains a code point above
+/// U+00FF. The live service will not store a trust policy with one.
+fn json_has_char_above_latin1(v: &Value) -> bool {
+    match v {
+        Value::String(s) => s.chars().any(|c| c as u32 > 0xFF),
+        Value::Array(a) => a.iter().any(json_has_char_above_latin1),
+        Value::Object(o) => o
+            .iter()
+            .any(|(k, val)| k.chars().any(|c| c as u32 > 0xFF) || json_has_char_above_latin1(val)),
+        _ => false,
+    }
 }
 
 /// A statement field, treating JSON null as absent.
@@ -1697,6 +1721,31 @@ mod tests {
         rejected(
             json!({"Statement": [{"Effect": "Deny", "Principal": {"AWS": CALLER},
             "Action": "sts:AssumeRole", "Resource": "*"}]}),
+        );
+    }
+
+    #[test]
+    fn validate_rejects_char_above_latin1() {
+        // The service will not store a trust policy with a code point above
+        // U+00FF (CreateRole InternalFailure). A key name with U+0100 is
+        // rejected; a Latin-1 key (sharp s) is accepted (stored, reads absent
+        // at evaluation).
+        rejected(
+            json!({"Statement": [{"Effect": "Allow", "Principal": {"AWS": CALLER},
+            "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": {"aws:Reque\u{0100}edRegion": "us-east-1"}}}]}),
+        );
+        // A high code point in a value is rejected too.
+        rejected(
+            json!({"Statement": [{"Effect": "Allow", "Principal": {"AWS": CALLER},
+            "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": {"aws:RequestedRegion": "us-east-1\u{212a}"}}}]}),
+        );
+        // Latin-1 is accepted.
+        ok(
+            json!({"Statement": [{"Effect": "Allow", "Principal": {"AWS": CALLER},
+            "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": {"aws:Reque\u{00df}edRegion": "us-east-1"}}}]}),
         );
     }
 
