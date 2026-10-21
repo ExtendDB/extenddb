@@ -479,7 +479,12 @@ this caller):
 
 - Organization keys: `aws:PrincipalOrgID`, `aws:PrincipalOrgPaths`,
   `aws:ResourceOrgID`, `aws:ResourceOrgPaths`, `aws:SourceOrgID`,
-  `aws:SourceOrgPaths` (a standalone account has no organization).
+  `aws:SourceOrgPaths` (a standalone account has no organization). An ExtendDB
+  account belongs to no organization, so a condition on an organization key
+  behaves as it does for a standalone AWS account: the key is absent, a `Deny`
+  that tests `aws:PrincipalOrgID` with a positive operator does not match (and
+  so does not block), and a negated operator on it matches. Do not carry an
+  organization-scoped `Deny` over from AWS expecting it to block on ExtendDB.
 - Role-session and federation keys ExtendDB does not model:
   `aws:MultiFactorAuthAge`, `aws:FederatedProvider`,
   `aws:SourceIdentity`, `aws:AssumedRoot`, `aws:SignInSessionArn`.
