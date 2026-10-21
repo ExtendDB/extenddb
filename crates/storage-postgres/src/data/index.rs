@@ -205,8 +205,46 @@ pub(super) fn effective_delay(idx: &IndexMeta, system_default: u64) -> u64 {
 /// index is `ACTIVE`, a non-zero effective delay keeps it on the queue and a zero
 /// delay returns it to synchronous maintenance. LSIs are never deferred and are
 /// filtered by the caller.
-pub(super) fn gsi_defers_to_queue(idx: &IndexMeta, system_default: u64) -> bool {
-    idx.index_status != "ACTIVE" || effective_delay(idx, system_default) != 0
+///
+/// A zero delay ACTIVE index is still deferred while rows for it remain in the
+/// queue. The backfill of a freshly created index leaves a backlog that drains
+/// after the flip to ACTIVE; a synchronous write applied inline during that
+/// window would write the newest image, and an older queued row drained after it
+/// would delete by base key and reinsert the stale image. Deferring the write to
+/// the queue while a backlog exists keeps per base key order across the queue to
+/// inline handover; once the backlog drains, maintenance returns to the inline
+/// path. The backlog probe runs only in the synchronous case, so the default
+/// non-zero delay never pays for it.
+pub(super) async fn gsi_defers_to_queue(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    idx: &IndexMeta,
+    system_default: u64,
+) -> Result<bool, StorageError> {
+    if idx.index_status != "ACTIVE" || effective_delay(idx, system_default) != 0 {
+        return Ok(true);
+    }
+    index_has_queued_rows(tx, &idx.index_id).await
+}
+
+/// Whether the propagation queue still holds a row targeting this index.
+///
+/// The index id is globally unique, so the row's own target id in the context is
+/// enough to match without the table id. A vector context carries no `index`
+/// member, so it never matches a GSI id.
+async fn index_has_queued_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    index_id: &str,
+) -> Result<bool, StorageError> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS( \
+             SELECT 1 FROM gsi_pending WHERE (index_context->'index'->>'index_id') = $1 \
+         )",
+    )
+    .bind(index_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|e| StorageError::Internal(e.to_string()))?;
+    Ok(exists)
 }
 
 /// Synchronously update index tables for indexes with zero propagation delay.
@@ -225,7 +263,7 @@ pub(crate) async fn sync_indexes(
     system_default_delay: u64,
 ) -> Result<(), StorageError> {
     for idx in indexes {
-        if idx.index_type != "LSI" && gsi_defers_to_queue(idx, system_default_delay) {
+        if idx.index_type != "LSI" && gsi_defers_to_queue(tx, idx, system_default_delay).await? {
             continue; // Async or still being created, handled by the queue. LSIs are always synchronous.
         }
         let idx_table = index_table_name(&idx.index_id);
@@ -288,7 +326,7 @@ pub(crate) async fn enqueue_async_indexes(
         if idx.index_type == "LSI" {
             continue; // LSIs are always synchronous.
         }
-        if !gsi_defers_to_queue(idx, system_default_delay) {
+        if !gsi_defers_to_queue(tx, idx, system_default_delay).await? {
             continue; // Synchronous, ACTIVE GSI, handled in-transaction by sync_indexes.
         }
         // A GSI still being created with a zero configured delay still needs a

@@ -496,6 +496,90 @@ async fn apply_claimed_row(
     Ok(())
 }
 
+/// Apply the queue rows already enqueued for one index, in `id` order, under the
+/// caller's hold.
+///
+/// Called at the end of a GSI creation, after the backfill commits and before
+/// the catalog flips the index to ACTIVE. The table's propagation hold is still
+/// held, so the queue worker is parked and every concurrent write still enqueues
+/// rather than maintaining the index inline. Applying the backlog here means no
+/// row queued during the backfill is left to drain after the flip. That matters
+/// for a zero delay index: once it is ACTIVE a write maintains it inline, and an
+/// older queued row drained after a newer inline write would delete by base key
+/// and reinsert the stale image.
+///
+/// Bounded by a snapshot of the current maximum `id` for this index, so it
+/// terminates even while writers keep enqueuing. Rows that arrive after the
+/// snapshot are left for the worker, which runs once the hold is released, and
+/// they are newer than anything applied here. The filter keys on the row's own
+/// target index id (`index_context->'index'->>'index_id'`), so a second index
+/// building on the same table is left untouched. The worker is parked, so these
+/// rows face no other claimant and no row lock is needed.
+pub(crate) async fn drain_index_pending_before_activation(
+    pool: &PgPool,
+    table_id: &str,
+    index_id: &str,
+) -> Result<(), StorageError> {
+    let max_id: Option<i64> = sqlx::query_scalar(
+        "SELECT MAX(id) FROM gsi_pending \
+         WHERE table_id = $1 AND (index_context->'index'->>'index_id') = $2",
+    )
+    .bind(table_id)
+    .bind(index_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| StorageError::Internal(e.to_string()))?;
+    let Some(max_id) = max_id else {
+        return Ok(());
+    };
+
+    loop {
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let row: Option<ClaimedRow> = sqlx::query_as(
+            "SELECT id, table_id, old_item, new_item, index_context FROM gsi_pending \
+             WHERE table_id = $1 AND id <= $2 \
+             AND (index_context->'index'->>'index_id') = $3 \
+             ORDER BY id LIMIT 1",
+        )
+        .bind(table_id)
+        .bind(max_id)
+        .bind(index_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        let Some((id, row_table_id, old_json, new_json, ctx_json)) = row else {
+            let _ = tx.rollback().await;
+            break;
+        };
+
+        apply_claimed_row(
+            u64::MAX,
+            &mut tx,
+            id,
+            &row_table_id,
+            old_json,
+            new_json,
+            ctx_json,
+        )
+        .await?;
+
+        sqlx::query("DELETE FROM gsi_pending WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+    }
+    Ok(())
+}
+
 /// Apply a single index's delete-old / insert-new within the transaction.
 async fn apply_index(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,

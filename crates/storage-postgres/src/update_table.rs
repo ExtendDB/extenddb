@@ -900,6 +900,46 @@ impl PostgresEngine {
                         return Err(e);
                     }
 
+                    // Drain the rows that queued for this index during the
+                    // backfill before the flip to ACTIVE. The hold still parks the
+                    // worker and still forces concurrent writes onto the queue, so
+                    // this applies the backlog in id order while no inline write
+                    // can run. After the flip a zero delay index maintains writes
+                    // inline, and a queued row drained then could land after a newer
+                    // inline write and reinsert a stale image.
+                    if let Err(e) = crate::gsi_queue::drain_index_pending_before_activation(
+                        &self.data_pool,
+                        &table_id,
+                        idx_id,
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            "Failed to drain the propagation queue for GSI '{}' on '{}', \
+                             cleaning up catalog: {e}",
+                            create.index_name,
+                            input.table_name,
+                        );
+                        let _ = sqlx::query(
+                            "DELETE FROM indexes WHERE table_id = $1 AND index_name = $2",
+                        )
+                        .bind(&table_id)
+                        .bind(&create.index_name)
+                        .execute(&self.pool)
+                        .await;
+                        if let Ok(mut cleanup_tx) = self.data_pool.begin().await {
+                            let _ = Self::drop_index_data_table(&mut cleanup_tx, idx_id).await;
+                            let _ = cleanup_tx.commit().await;
+                        }
+                        let _ = crate::data::vector_index::release_hold(
+                            &self.data_pool,
+                            &table_id,
+                            idx_id,
+                        )
+                        .await;
+                        return Err(e);
+                    }
+
                     // The backfill committed: publish the index and resume
                     // propagation. The catalog flips to ACTIVE, then the hold is
                     // given back and the workers are woken to drain anything that

@@ -107,6 +107,13 @@ fn skip() {
 }
 
 async fn scratch() -> Scratch {
+    scratch_with_delay("5").await
+}
+
+/// Build a scratch database and engine with a chosen propagation delay. Delay
+/// `"5"` keeps writes on the asynchronous queue; `"0"` makes an ACTIVE index
+/// maintain writes inline, which is the path the zero delay race lives on.
+async fn scratch_with_delay(delay_ms: &str) -> Scratch {
     let base = base_conn().expect("caller checks base_conn() first");
     let db_name = format!("eddb_gsir_{}", uuid::Uuid::new_v4().simple())[..24].to_owned();
     let admin = PgPoolOptions::new()
@@ -137,12 +144,13 @@ async fn scratch() -> Scratch {
         .execute(&db)
         .await
         .expect("pin the control-plane delay to zero");
-    // A small, non-zero propagation delay keeps writes on the asynchronous queue,
-    // which is the path the race lives on.
-    sqlx::query("UPDATE settings SET value = '5' WHERE key = 'index_propagation_delay_ms'")
+    // The propagation delay the caller chose. A non-zero delay keeps writes on
+    // the asynchronous queue; zero returns an ACTIVE index to inline maintenance.
+    sqlx::query("UPDATE settings SET value = $1 WHERE key = 'index_propagation_delay_ms'")
+        .bind(delay_ms)
         .execute(&db)
         .await
-        .expect("set a small propagation delay");
+        .expect("set the propagation delay");
     sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES ($1, $2)")
         .bind(ACCOUNT)
         .bind(format!("acct-{db_name}"))
@@ -446,6 +454,26 @@ async fn gsi_creation_converges_under_concurrent_writers() {
         return skip();
     }
     let s = scratch().await;
+    for iter in 0..10 {
+        if let Err(e) = run_once(&s, iter).await {
+            panic!("iteration {iter}: {e}");
+        }
+    }
+    s.cleanup().await;
+}
+
+/// Finding 4. The same race with the propagation delay pinned to zero, so an
+/// ACTIVE index maintains writes inline rather than through the queue. The
+/// creation drains the rows queued during the backfill before the flip to
+/// ACTIVE, so no older queued row drains after an inline write and reinserts a
+/// stale image. Without the pre-flip drain the index diverges from the base
+/// projection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gsi_creation_converges_under_concurrent_writers_zero_delay() {
+    if base_conn().is_none() {
+        return skip();
+    }
+    let s = scratch_with_delay("0").await;
     for iter in 0..10 {
         if let Err(e) = run_once(&s, iter).await {
             panic!("iteration {iter}: {e}");
