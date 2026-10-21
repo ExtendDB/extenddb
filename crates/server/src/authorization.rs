@@ -113,6 +113,12 @@ async fn check_user_authorization(
     params.principal_account = Some(account_id.to_owned());
     params.principal_type = Some("User".to_owned());
     params.username = Some(user_name.to_owned());
+    params.userid = Some(extenddb_auth::policy::principal_id::user_unique_id(
+        account_id, user_name,
+    ));
+    // The target table's owner account. ExtendDB builds the resource ARN with
+    // the caller's account, so the resource account is that account.
+    params.resource_account = Some(account_id.to_owned());
     let context = RequestContext::build(
         (*principal_tags).clone(),
         (*resource_tags).clone(),
@@ -173,6 +179,12 @@ async fn check_role_authorization(
     // A role session's principal type is AssumedRole; the service does not
     // populate aws:username for it, so username stays None (absent).
     params.principal_type = Some("AssumedRole".to_owned());
+    params.userid = Some(extenddb_auth::policy::principal_id::role_session_userid(
+        account_id,
+        role_name,
+        session_name,
+    ));
+    params.resource_account = Some(account_id.to_owned());
     let context = RequestContext::build(principal_tags, (*resource_tags).clone(), is_scan, params);
 
     // Convert the Arc<Vec<...>> to a slice for the evaluator. We materialize

@@ -152,7 +152,13 @@ pub async fn assume_role(
     let has_session_tags = request.session_tags.as_ref().is_some_and(value_has_entries);
     let request_tags = parse_session_tags(request.session_tags.as_ref());
 
-    // Evaluate trust policy against the provided caller ARN.
+    // Evaluate trust policy against the provided caller ARN. aws:SourceIp and
+    // aws:UserAgent are the AssumeRole connection's peer address and User-Agent,
+    // which is what STS records for the call.
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(ToOwned::to_owned);
     if !evaluate_trust_policy(
         &trust_policy,
         caller_arn,
@@ -161,6 +167,9 @@ pub async fn assume_role(
         request_tags,
         &state.region,
         state.secure_transport,
+        Some(source_ip.as_str()),
+        user_agent.as_deref(),
+        &account_id,
         &*state.catalog_store,
     )
     .await
@@ -310,6 +319,9 @@ async fn evaluate_trust_policy(
     request_tags: std::collections::HashMap<String, String>,
     region: &str,
     secure_transport: bool,
+    source_ip: Option<&str>,
+    user_agent: Option<&str>,
+    account_id: &str,
     store: &dyn extenddb_storage::CatalogStore,
 ) -> bool {
     let Some(statements) = statements_vec(trust_policy) else {
@@ -328,6 +340,13 @@ async fn evaluate_trust_policy(
         secure_transport,
         principal_type: caller_principal_type(caller_arn).map(ToOwned::to_owned),
         username: caller_username(caller_arn).map(ToOwned::to_owned),
+        source_ip: source_ip.map(ToOwned::to_owned),
+        user_agent: user_agent.map(ToOwned::to_owned),
+        // aws:userid of the caller (an AIDA... id for a user, role-id:session
+        // for a role session), derived from the caller ARN.
+        userid: extenddb_auth::policy::principal_id::userid_for_caller_arn(caller_arn),
+        // aws:ResourceAccount is the account that owns the role being assumed.
+        resource_account: Some(account_id.to_owned()),
         current_time,
         epoch_time,
     };
@@ -903,6 +922,10 @@ mod tests {
             secure_transport: true,
             principal_type: Some("User".to_owned()),
             username: Some("alice".to_owned()),
+            source_ip: Some("203.0.113.9".to_owned()),
+            user_agent: Some("aws-cli/2.0 Botocore/1.0".to_owned()),
+            userid: Some("AIDAEXAMPLEALICEUSERID".to_owned()),
+            resource_account: Some(ACCT.to_owned()),
             current_time: "2026-01-01T00:00:00Z".to_owned(),
             epoch_time: "1767225600".to_owned(),
         }
@@ -1162,14 +1185,15 @@ mod tests {
     // ---- fail closed on an unparseable Deny -------------------------------
     #[test]
     fn deny_with_unparseable_condition_fails_closed() {
-        // An operator ExtendDB cannot evaluate must not silently drop the Deny.
+        // BinaryEquals is a valid IAM operator the evaluator does not implement,
+        // so a Deny using it must not be silently dropped.
         let stmts = vec![
             allow_alice(),
             json!({
                 "Effect": "Deny",
                 "Principal": {"AWS": CALLER},
                 "Action": "sts:AssumeRole",
-                "Condition": {"NotIpAddress": {"aws:SourceIp": "192.0.2.0/24"}}
+                "Condition": {"BinaryEquals": {"aws:PrincipalTag/x": "AAAA"}}
             }),
         ];
         assert!(!trust_decision(&stmts, CALLER, &ctx(), false));
@@ -1181,9 +1205,55 @@ mod tests {
             "Effect": "Allow",
             "Principal": {"AWS": CALLER},
             "Action": "sts:AssumeRole",
-            "Condition": {"NotIpAddress": {"aws:SourceIp": "192.0.2.0/24"}}
+            "Condition": {"BinaryEquals": {"aws:PrincipalTag/x": "AAAA"}}
         })];
         assert!(!trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    // ---- resolved SourceIp / UserAgent on the trust path ------------------
+    #[test]
+    fn trust_ipaddress_source_ip_matches_caller() {
+        // The caller address is 203.0.113.9 (mk_ctx). IpAddress on the enclosing
+        // range grants; a range the caller is not in does not. Matches live STS.
+        let in_range = vec![json!({"Effect": "Allow", "Principal": {"AWS": CALLER},
+            "Action": "sts:AssumeRole",
+            "Condition": {"IpAddress": {"aws:SourceIp": "203.0.113.0/24"}}})];
+        assert!(trust_decision(&in_range, CALLER, &ctx(), false));
+        let out_of_range = vec![json!({"Effect": "Allow", "Principal": {"AWS": CALLER},
+            "Action": "sts:AssumeRole",
+            "Condition": {"IpAddress": {"aws:SourceIp": "198.51.100.0/24"}}})];
+        assert!(!trust_decision(&out_of_range, CALLER, &ctx(), false));
+    }
+
+    #[test]
+    fn trust_notipaddress_deny_blocks_caller_outside_range() {
+        // Deny unless the caller is inside 203.0.113.0/24. The caller is inside,
+        // so NotIpAddress is false and the Deny does not apply.
+        let stmts = vec![
+            allow_alice(),
+            json!({"Effect": "Deny", "Principal": {"AWS": "*"}, "Action": "sts:AssumeRole",
+                "Condition": {"NotIpAddress": {"aws:SourceIp": "203.0.113.0/24"}}}),
+        ];
+        assert!(trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    #[test]
+    fn trust_useragent_stringlike_grants() {
+        let stmts = vec![json!({"Effect": "Allow", "Principal": {"AWS": CALLER},
+            "Action": "sts:AssumeRole",
+            "Condition": {"StringLike": {"aws:UserAgent": "*Botocore*"}}})];
+        assert!(trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    #[test]
+    fn trust_userid_resolves_from_caller_arn() {
+        // The caller ARN is an IAM user, so aws:userid is the derived AIDA id.
+        let ctx = ctx();
+        let expected = ctx.userid.clone().expect("userid set in mk_ctx");
+        let stmts = vec![json!({"Effect": "Allow", "Principal": {"AWS": CALLER},
+            "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": {"aws:userid": expected}}})];
+        assert!(trust_decision(&stmts, CALLER, &ctx, false));
     }
 
     // ---- resolved keys: PrincipalArn / PrincipalAccount -------------------
@@ -1294,26 +1364,29 @@ mod tests {
         ));
     }
 
-    // ---- case 3: a key STS populates but ExtendDB cannot resolve ----------
+    // ---- organization keys: absent for a standalone account (R1) ----------
 
     #[test]
-    fn deny_on_unresolvable_key_fails_closed() {
-        // x13: Deny {"AWS":"*"} if StringEquals aws:PrincipalOrgID = org.
-        // ExtendDB cannot resolve the org id, so the Deny fails closed (blocks).
+    fn deny_on_absent_org_key_does_not_block() {
+        // Deny {"AWS":"*"} if StringEquals aws:PrincipalOrgID = org. An ExtendDB
+        // account is a standalone AWS account, so the organization key is absent;
+        // StringEquals on an absent single-valued key does not match, so the Deny
+        // does not apply and the Allow grants. Matches IAM for a standalone
+        // account.
         let stmts = vec![
             allow_alice(),
             json!({"Effect": "Deny", "Principal": {"AWS": "*"}, "Action": "sts:AssumeRole",
                 "Condition": {"StringEquals": {"aws:PrincipalOrgID": "o-abc123"}}}),
         ];
-        assert!(!trust_decision(&stmts, CALLER, &ctx(), false));
+        assert!(trust_decision(&stmts, CALLER, &ctx(), false));
     }
 
     #[test]
-    fn deny_negated_on_unresolvable_key_fails_closed() {
-        // x12: Deny {"AWS":"*"} if StringNotEquals aws:PrincipalOrgID = org.
-        // An unresolvable key fails closed regardless of operator, so the Deny
-        // blocks (this over-denies relative to IAM, the documented safe
-        // direction) rather than the negated-absent rule spuriously granting.
+    fn deny_negated_on_absent_org_key_blocks() {
+        // Deny {"AWS":"*"} if StringNotEquals aws:PrincipalOrgID = org. The key
+        // is absent for a standalone account, and a negated operator on an absent
+        // single-valued key matches, so the Deny applies and blocks. Matches IAM
+        // for a standalone account (the key is genuinely absent, not fail-closed).
         let stmts = vec![
             allow_alice(),
             json!({"Effect": "Deny", "Principal": {"AWS": "*"}, "Action": "sts:AssumeRole",
@@ -1323,10 +1396,10 @@ mod tests {
     }
 
     #[test]
-    fn allow_gate_on_unresolvable_key_does_not_grant() {
-        // x11: Allow {"AWS":"*"} if StringEquals aws:PrincipalOrgID = org.
-        // The Allow is gated on an unresolvable key, so it does not grant and no
-        // other statement allows: implicit deny.
+    fn allow_gate_on_absent_org_key_does_not_grant() {
+        // Allow {"AWS":"*"} if StringEquals aws:PrincipalOrgID = org. The key is
+        // absent, so the positive operator does not match and the Allow does not
+        // grant: implicit deny. Matches IAM for a standalone account.
         let stmts = vec![json!({"Effect": "Allow", "Principal": {"AWS": "*"},
             "Action": "sts:AssumeRole",
             "Condition": {"StringEquals": {"aws:PrincipalOrgID": "o-abc123"}}})];
@@ -1456,10 +1529,12 @@ mod tests {
 
     #[test]
     fn validate_accepts_known_iam_operator_extenddb_does_not_evaluate() {
-        // NotIpAddress is a valid IAM operator; IAM accepts the document.
+        // BinaryEquals is a valid IAM operator the evaluator does not implement;
+        // IAM accepts the document, and a Deny using it fails closed at
+        // evaluation.
         ok(json!({"Statement": [{
             "Effect": "Deny", "Principal": {"AWS": CALLER}, "Action": "sts:AssumeRole",
-            "Condition": {"NotIpAddress": {"aws:SourceIp": "192.0.2.0/24"}}
+            "Condition": {"BinaryEquals": {"aws:PrincipalTag/x": "AAAA"}}
         }]}));
     }
 

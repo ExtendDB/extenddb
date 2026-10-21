@@ -61,6 +61,8 @@ pub(crate) async fn authorize_request(
     input: &Value,
     operation: &str,
     account_id: &str,
+    source_ip: Option<&str>,
+    user_agent: Option<&str>,
 ) -> Result<Option<extenddb_core::types::TableKeyInfo>, DynamoDbError> {
     let table_name = extract_table_name(input);
 
@@ -118,6 +120,8 @@ pub(crate) async fn authorize_request(
                 extenddb_auth::policy::context::RequestParams {
                     region: Some(state.region.to_string()),
                     secure_transport: state.tls_enabled,
+                    source_ip: source_ip.map(ToOwned::to_owned),
+                    user_agent: user_agent.map(ToOwned::to_owned),
                     ..Default::default()
                 },
             )
@@ -149,6 +153,8 @@ pub(crate) async fn authorize_request(
             .map(ToOwned::to_owned),
         region: Some(state.region.to_string()),
         secure_transport: state.tls_enabled,
+        source_ip: source_ip.map(ToOwned::to_owned),
+        user_agent: user_agent.map(ToOwned::to_owned),
         ..Default::default()
     };
     authorization::check_authorization(
