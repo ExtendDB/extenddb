@@ -1554,6 +1554,12 @@ pub(crate) static CASE_FOLD: &[(u32, &str)] = &[
 /// itself.
 #[must_use]
 pub fn case_fold(s: &str) -> String {
+    // Fast path: an all-ASCII key (the overwhelmingly common case) folds
+    // to its ASCII lowercase without touching the table, since every ASCII
+    // letter's fold is its ASCII lowercase.
+    if s.is_ascii() {
+        return s.to_ascii_lowercase();
+    }
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         let cp = c as u32;
@@ -1578,10 +1584,7 @@ mod tests {
     #[test]
     fn table_sorted_and_unique() {
         for w in CASE_FOLD.windows(2) {
-            assert!(
-                w[0].0 < w[1].0,
-                "table must be sorted and unique by code point"
-            );
+            assert!(w[0].0 < w[1].0, "table must be sorted and unique by code point");
         }
     }
 
@@ -1604,5 +1607,23 @@ mod tests {
         assert_eq!(case_fold("\u{0131}"), "\u{0131}"); // dotless i
         // Dotted I folds to 'i' plus a combining dot, not plain 'i'.
         assert_eq!(case_fold("\u{0130}"), "i\u{0307}");
+    }
+
+    #[test]
+    fn ascii_fast_path_matches_table() {
+        // The ASCII fast path must agree with a per-code-point table fold
+        // on every ASCII string.
+        for s in ["", "AWS:SecureTransport", "dynamodb:LeadingKeys",
+                  "aws:PrincipalTag/Team", "MiXeD123_.-/", "abc"] {
+            let table: String = s.chars().map(|c| {
+                let cp = c as u32;
+                match CASE_FOLD.binary_search_by(|&(k, _)| k.cmp(&cp)) {
+                    Ok(i) => CASE_FOLD[i].1.to_owned(),
+                    Err(_) => c.to_string(),
+                }
+            }).collect();
+            assert_eq!(case_fold(s), table, "fast path diverged on {s:?}");
+            assert_eq!(case_fold(s), s.to_ascii_lowercase());
+        }
     }
 }
