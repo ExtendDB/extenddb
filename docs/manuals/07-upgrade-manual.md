@@ -228,7 +228,7 @@ vacuously and a principal fenced to its own partition could read or write any
 partition through them. The item operations (`GetItem`, `PutItem`, `UpdateItem`,
 `DeleteItem`) already enforced the key and are unchanged.
 
-Details of how the key is bound, matching real AWS:
+Details of how the key is bound, matching DynamoDB:
 
 - A `Query` on the base table or a local secondary index binds LeadingKeys to
   the partition key value in the key condition (an LSI shares the base table's
@@ -270,7 +270,10 @@ LeadingKeys policies with `extenddb manage list-user-policies` /
 - Any policy relying on `Scan` or `SearchVectors` being fenced by a
   `ForAllValues` LeadingKeys condition is rewritten to `ForAnyValue` or adds a
   `Null` guard, since neither operation is fenced by `ForAllValues`.
-- A numeric LeadingKeys value is written in canonical form.
+- A numeric LeadingKeys value is written in the form each operation compares
+  (see the numeric partition key item above). A fence of `["10"]` covers every
+  spelling of 10 on the item operations, Query and BatchGetItem, and the
+  spellings `10`, `010`, `+10` and `1.0E1` on batch writes and transactions.
 
 ---
 
