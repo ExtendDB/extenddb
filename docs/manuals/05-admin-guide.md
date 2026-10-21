@@ -457,7 +457,11 @@ Resolved (evaluated against the request value):
   `aws:username` (user caller only), `aws:userid`.
 - `aws:ResourceAccount`.
 - `aws:SourceIp` (connection peer address; `IpAddress` and `NotIpAddress` do
-  IPv4 and IPv6 CIDR membership).
+  IPv4 and IPv6 CIDR membership). This is the address of the TCP connection the
+  request arrived on. Behind a reverse proxy or load balancer that is the
+  proxy's address for every caller, and ExtendDB does not read `X-Forwarded-For`
+  (the header is caller-supplied and spoofable), so an `aws:SourceIp` condition
+  is meaningful only when clients connect to ExtendDB directly.
 - `aws:UserAgent` (`User-Agent` header).
 - `aws:SecureTransport`, `aws:RequestedRegion`, `aws:CurrentTime`,
   `aws:EpochTime`.
