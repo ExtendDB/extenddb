@@ -39,6 +39,9 @@ use futures::future::BoxFuture;
 pub struct CachedSessionData {
     pub session_policy: Option<Arc<PolicyDocument>>,
     pub session_tags: HashMap<String, String>,
+    /// The session issue time (`aws:TokenIssueTime`), RFC 3339 UTC, or `None`
+    /// if the stored value could not be read.
+    pub token_issue_time: Option<String>,
 }
 
 /// Configuration for the authorization cache. Each sub-cache is sized
@@ -910,6 +913,7 @@ fn make_session_data_loader(inner: Arc<dyn AuthorizationStore>) -> SessionLoader
             Ok(Some(Arc::new(CachedSessionData {
                 session_policy,
                 session_tags,
+                token_issue_time: data.created_at,
             })))
         }
         .boxed()
@@ -1287,6 +1291,7 @@ mod tests {
             Some(SessionData {
                 session_policy: Some(allow_policy("dynamodb:Query")),
                 session_tags: vec![("Project".to_owned(), "Atlas".to_owned())],
+                created_at: None,
             }),
         );
         let cache = CachedAuthzStore::new(inner.clone(), fast_authz_cfg());
@@ -1324,6 +1329,7 @@ mod tests {
                 Some(SessionData {
                     session_policy: None,
                     session_tags: vec![],
+                    created_at: None,
                 }),
             );
         }
@@ -1333,6 +1339,7 @@ mod tests {
             Some(SessionData {
                 session_policy: None,
                 session_tags: vec![],
+                created_at: None,
             }),
         );
         let cache = CachedAuthzStore::new(inner.clone(), fast_authz_cfg());

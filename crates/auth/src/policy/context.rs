@@ -149,6 +149,10 @@ pub struct RequestParams {
     /// ExtendDB this is the account in the resource ARN, which is the caller's
     /// account (ExtendDB resources are same-account).
     pub resource_account: Option<String>,
+    /// The session issue time (`aws:TokenIssueTime`), RFC 3339 UTC, set only for
+    /// a role-session caller. `None` for an IAM user, where the service leaves
+    /// the key absent.
+    pub token_issue_time: Option<String>,
 }
 
 /// Context for evaluating conditions on `DynamoDB` operations.
@@ -196,6 +200,9 @@ pub struct RequestContext {
     pub userid: Option<String>,
     /// The target resource owner account (`aws:ResourceAccount`).
     pub resource_account: Option<String>,
+    /// The session issue time (`aws:TokenIssueTime`) for a role-session caller;
+    /// `None` for an IAM user (absent key).
+    pub token_issue_time: Option<String>,
     /// The request time formatted for `aws:CurrentTime` (RFC 3339 UTC).
     pub current_time: String,
     /// The request time formatted for `aws:EpochTime` (whole seconds).
@@ -236,6 +243,7 @@ impl RequestContext {
             user_agent: params.user_agent,
             userid: params.userid,
             resource_account: params.resource_account,
+            token_issue_time: params.token_issue_time,
             current_time,
             epoch_time,
         }
@@ -290,6 +298,7 @@ impl ConditionContext for RequestContext {
                 "aws:UserAgent" => self.user_agent.as_deref().map(|v| vec![v]),
                 "aws:userid" => self.userid.as_deref().map(|v| vec![v]),
                 "aws:ResourceAccount" => self.resource_account.as_deref().map(|v| vec![v]),
+                "aws:TokenIssueTime" => self.token_issue_time.as_deref().map(|v| vec![v]),
                 // ExtendDB is not an AWS service calling on a principal's behalf,
                 // so these are always false, matching the service for a direct
                 // caller.
@@ -489,6 +498,34 @@ mod tests {
         assert_eq!(ctx.resolve_key("aws:PrincipalOrgID"), None);
         assert!(!ctx.is_unresolvable_key("aws:PrincipalOrgID"));
         assert!(!ctx.is_unresolvable_key("aws:PrincipalOrgPaths"));
+    }
+
+    #[test]
+    fn request_context_token_issue_time_present_for_role_session_absent_for_user() {
+        // A role session carries aws:TokenIssueTime (the session issue time).
+        let role_ctx = RequestContext::build(
+            HashMap::new(),
+            HashMap::new(),
+            false,
+            RequestParams {
+                token_issue_time: Some("2026-10-21T02:20:39Z".to_owned()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            role_ctx.resolve_key("aws:TokenIssueTime"),
+            Some(vec!["2026-10-21T02:20:39Z"])
+        );
+        // An IAM user leaves it absent: resolve_key returns None and the key is
+        // not fail-closed (standard absent-key semantics apply).
+        let user_ctx = RequestContext::build(
+            HashMap::new(),
+            HashMap::new(),
+            false,
+            RequestParams::default(),
+        );
+        assert_eq!(user_ctx.resolve_key("aws:TokenIssueTime"), None);
+        assert!(!user_ctx.is_unresolvable_key("aws:TokenIssueTime"));
     }
 
     #[test]

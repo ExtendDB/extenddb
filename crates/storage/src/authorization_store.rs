@@ -107,4 +107,8 @@ pub struct SessionData {
     pub session_policy: Option<String>,
     /// Session tags as `(key, value)` pairs.
     pub session_tags: Vec<(String, String)>,
+    /// The session issue time (`iam_sessions.created_at`) formatted as RFC 3339
+    /// UTC, which is the value of `aws:TokenIssueTime` for the role session.
+    /// `None` only if the stored value could not be read or parsed.
+    pub created_at: Option<String>,
 }

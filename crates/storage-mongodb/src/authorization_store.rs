@@ -263,6 +263,10 @@ impl AuthorizationStore for MongoCatalogStore {
             Ok(Some(SessionData {
                 session_policy,
                 session_tags,
+                created_at: session_doc
+                    .get_datetime("created_at")
+                    .ok()
+                    .and_then(|d| bson_datetime_to_rfc3339(d)),
             }))
         })
     }

@@ -261,7 +261,7 @@ impl AuthorizationStore for CassandraCatalogStore {
 
         Box::pin(async move {
             let query = format!(
-                "SELECT session_policy, session_tags FROM {catalog_keyspace}.iam_sessions \
+                "SELECT session_policy, session_tags, created_at FROM {catalog_keyspace}.iam_sessions \
                  WHERE account_id = ? AND role_name = ? AND session_name = ? ALLOW FILTERING"
             );
 
@@ -323,6 +323,15 @@ impl AuthorizationStore for CassandraCatalogStore {
             Ok(Some(SessionData {
                 session_policy,
                 session_tags,
+                created_at: crate::cassandra_util::get_timestamp::<OpError>(
+                    row,
+                    "created_at",
+                    "fetch_session_data",
+                )
+                .ok()
+                .and_then(|dt| {
+                    dt.format(&time::format_description::well_known::Rfc3339).ok()
+                }),
             }))
         })
     }

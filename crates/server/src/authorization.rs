@@ -167,7 +167,7 @@ async fn check_role_authorization(
 ) -> Result<(), DynamoDbError> {
     let action = format!("dynamodb:{operation}");
 
-    let (identity_policies, boundary, (session_policy, principal_tags), resource_tags, role_created_at) = tokio::try_join!(
+    let (identity_policies, boundary, (session_policy, principal_tags, token_issue_time), resource_tags, role_created_at) = tokio::try_join!(
         wrap_policies(cache.fetch_role_policies(account_id, role_name)),
         wrap_boundary(cache.fetch_role_boundary(account_id, role_name)),
         fetch_session_data_and_tags(cache, account_id, role_name, session_name),
@@ -190,6 +190,8 @@ async fn check_role_authorization(
         role_created_at.as_deref().map(String::as_str).unwrap_or_default(),
     ));
     params.resource_account = Some(account_id.to_owned());
+    // aws:TokenIssueTime for a role session is the session's issue time.
+    params.token_issue_time = token_issue_time;
     let context = RequestContext::build(principal_tags, (*resource_tags).clone(), is_scan, params);
 
     // Convert the Arc<Vec<...>> to a slice for the evaluator. We materialize
@@ -287,6 +289,7 @@ async fn fetch_session_data_and_tags(
     (
         Option<std::sync::Arc<extenddb_auth::policy::document::PolicyDocument>>,
         HashMap<String, String>,
+        Option<String>,
     ),
     DynamoDbError,
 > {
@@ -306,13 +309,15 @@ async fn fetch_session_data_and_tags(
     // is absent — acceptable; merging into-place is the simplest semantics.
     let mut tags: HashMap<String, String> = (*role_tags).clone();
     let mut session_policy = None;
+    let mut token_issue_time = None;
     if let Some(data) = session_data {
         session_policy = data.session_policy.clone();
+        token_issue_time = data.token_issue_time.clone();
         // Merge session tags (session wins on conflict). The session_data
         // value is shared via Arc; iterate borrowed and clone-on-insert.
         for (k, v) in &data.session_tags {
             tags.insert(k.clone(), v.clone());
         }
     }
-    Ok((session_policy, tags))
+    Ok((session_policy, tags, token_issue_time))
 }
