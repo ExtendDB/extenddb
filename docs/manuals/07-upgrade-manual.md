@@ -317,12 +317,25 @@ key, then to the smallest fold-matching key by code point, every time, rather
 than at random. A policy naming one of the keys exactly is unaffected.
 
 **Tag write rules match the service.** `TagUser`, `TagRole` and `AssumeRole`
-session tags now reject a tag key or value outside IAM's grammar (a combining
-mark, `#`, `!`, and other punctuation), a key over 128 or value over 256
-characters, the reserved `aws:` key prefix, and two keys that differ only in
-ASCII case. A tag already stored that the new rule would reject stays in place and
-keeps evaluating as before; only new writes are checked. Re-tagging a principal
-that carries such a tag requires correcting the tag first.
+session tags now reject a tag key or value outside IAM's grammar
+`[\p{L}\p{Z}\p{N}_.:/=+\-@]`: any Unicode Letter (Lu, Ll, Lt, Lm, Lo), Number
+(Nd, Nl, No) or Separator (Zs, Zl, Zp) by general category, plus the listed
+symbols. A combining mark (such as U+0345, category Mn), `#`, `!` and other
+punctuation, a key over 128 or value over 256 characters, the reserved `aws:`
+key prefix, and two keys that differ only in ASCII case are all rejected. Only
+the tags named in a given request are validated, so a tag already stored that
+the new rule would reject stays in place and keeps evaluating, and does not
+block setting other tags on the same principal; it is rejected only when a later
+request includes it again. Live IAM behaves the same way: a tag request
+validates only its own tags.
+
+**Policy Sid charset.** A policy `Sid` is now accepted only when it is empty or
+entirely ASCII letters and digits, on both the trust write (`CreateRole`) and
+the identity-policy write (`PutUserPolicy`), matching the service, which rejects
+any other `Sid` (a hyphen, underscore, space, dot or non-ASCII character) with
+`MalformedPolicyDocument`. The `Sid` is a statement label and does not affect
+evaluation, so a policy already stored with a non-conforming `Sid` keeps
+evaluating unchanged; only a new write is checked.
 
 **More CIDR forms.** `IpAddress`/`NotIpAddress` now accept a leading-zero octet
 and read it as decimal (`010.0.0.0/8` is `10.0.0.0/8`, not octal), matching the
