@@ -517,3 +517,30 @@ class TestExplicitDenyOnResourceArn:
             d.get_item(TableName=table["name"], Key={"pk": {"S": "p1"}})
         msg = exc.value.response["Error"]["Message"]
         assert "because no identity-based policy allows the dynamodb:GetItem action" in msg, msg
+
+    # -- DescribeEndpoints: signed request, no IAM permission ----------------
+
+    def test_describe_endpoints_needs_no_iam_permission(self):
+        # DynamoDB checks the signature on DescribeEndpoints but evaluates no
+        # IAM policy: a user with no policy, one allowed only ListTables, and
+        # ones with an explicit Deny on dynamodb:DescribeEndpoints or on
+        # dynamodb:* all get the endpoint list (measured 2026-10-20).
+        user = f"u{uuid.uuid4().hex[:10]}"
+        assert self.mgmt.create_user(self.account_id, user, "TestPass123!").status_code == 201
+        resp = self.mgmt.create_access_key(self.account_id, user)
+        assert resp.status_code == 201, resp.text
+        creds = resp.json()
+        no_policy = _client(self.endpoint, creds["access_key_id"],
+                            creds["secret_access_key"], self.region)
+        clients = [
+            no_policy,
+            self._ddb({"Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Action": "dynamodb:ListTables", "Resource": "*"}]}),
+            self._ddb(_allow_all_deny("DescribeEndpoints", "*")),
+            self._ddb({"Version": "2012-10-17", "Statement": [
+                {"Effect": "Deny", "Action": "dynamodb:*", "Resource": "*"}]}),
+        ]
+        for c in clients:
+            endpoints = c.describe_endpoints()["Endpoints"]
+            assert len(endpoints) == 1, endpoints
+            assert endpoints[0]["Address"], endpoints

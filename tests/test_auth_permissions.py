@@ -1122,7 +1122,7 @@ class TestDenyAllServiceOperations:
         return creds["access_key_id"], creds["secret_access_key"]
 
     def test_explicit_deny_all_service_operations(self):
-        """Deny with 'dynamodb:*' blocks all operations even with a separate Allow."""
+        """Deny with 'dynamodb:*' blocks every authorized operation even with a separate Allow."""
         user = f"u-{uuid.uuid4().hex[:8]}"
         ak, sk = self._user_with_key(user)
         self.mgmt.put_user_policy(self.account_id, user, "allow-all", _full_policy())
@@ -1136,9 +1136,10 @@ class TestDenyAllServiceOperations:
                 client.list_tables()
             assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
 
-            with pytest.raises(ClientError) as exc:
-                client.describe_endpoints()
-            assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+            # DescribeEndpoints needs a signed request but no IAM permission,
+            # so a Deny on dynamodb:* does not block it (measured on DynamoDB
+            # 2026-10-20).
+            client.describe_endpoints()
         finally:
             self.mgmt.delete_user(self.account_id, user)
 

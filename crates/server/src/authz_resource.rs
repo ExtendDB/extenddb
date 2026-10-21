@@ -408,8 +408,9 @@ pub(crate) fn authz_targets(
             }
         }
         // Account-level operations. ListTables is evaluated against the table
-        // wildcard; DescribeLimits and DescribeEndpoints have no resource and
-        // are evaluated against "*" (measured live).
+        // wildcard and DescribeLimits against "*" (measured live).
+        // DescribeEndpoints is not authorized at all (see authorize_request);
+        // its "*" entry is kept so the resource map covers every operation.
         "ListTables" => one(table_wildcard(region, account_id)),
         "DescribeLimits" | "DescribeEndpoints" => one("*".to_owned()),
         // Generic single-table operations keyed by TableName (name or ARN).

@@ -112,6 +112,14 @@ pub(crate) async fn authorize_request(
         return Ok(engine_key_info(key_info));
     }
 
+    // DescribeEndpoints needs a signed request (SigV4 verification already ran
+    // upstream) but no IAM permission, as on DynamoDB: a caller with no policy,
+    // or with an explicit Deny on dynamodb:DescribeEndpoints or dynamodb:*, gets
+    // the endpoint list (measured 2026-10-20).
+    if operation == "DescribeEndpoints" {
+        return Ok(None);
+    }
+
     // Tag operations validate the ResourceArn shape before the IAM decision, as
     // the service does: an index ARN (tags are accepted only on a table or
     // stream) is rejected with ValidationException for every principal, before
