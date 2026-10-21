@@ -175,11 +175,29 @@ impl PolicyDocument {
         let version = raw["Version"].as_str().unwrap_or("2012-10-17").to_owned();
         let statements = parse_statements(&raw["Statement"])?;
         validate_statement_cidrs(&statements)?;
-        validate_statement_sids(&statements)?;
         Ok(Self {
             version,
             statements,
         })
+    }
+
+    /// Parse a policy document for a write (`PutUserPolicy`, `PutRolePolicy`,
+    /// a managed or boundary policy) and apply the checks the service applies
+    /// only when a policy is written.
+    ///
+    /// Everything `from_json` checks, plus the `Sid` charset. The `Sid` check
+    /// runs at write only: a `Sid` is a statement label that does not affect
+    /// evaluation, so a policy stored before this check existed must keep
+    /// parsing on the request path rather than fail the principal closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PolicyParseError` if `from_json` rejects the document or a
+    /// statement `Sid` is outside the service's charset.
+    pub fn from_json_for_write(json: &str) -> Result<Self, PolicyParseError> {
+        let doc = Self::from_json(json)?;
+        validate_statement_sids(&doc.statements)?;
+        Ok(doc)
     }
 }
 
@@ -232,9 +250,8 @@ fn validate_statement_cidrs(statements: &[Statement]) -> Result<(), PolicyParseE
 /// only when it is empty or entirely ASCII letters and digits (`[A-Za-z0-9]`),
 /// regardless of length; a hyphen, underscore, space, dot or any non-ASCII
 /// character (including Latin-1 such as an accented letter) is rejected with
-/// `MalformedPolicyDocument`. `from_json` is the identity-policy write and read
-/// path, so this rejects such a `Sid` at write and fails a stored identity
-/// policy closed at read.
+/// `MalformedPolicyDocument`. Applied by `from_json_for_write` only, never on
+/// the request path, so a stored policy with such a `Sid` keeps evaluating.
 fn validate_statement_sids(statements: &[Statement]) -> Result<(), PolicyParseError> {
     for stmt in statements {
         if let Some(sid) = &stmt.sid
@@ -664,8 +681,14 @@ mod tests {
                 r#"{{"Version":"2012-10-17","Statement":[{{"Sid":"{sid}","Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*"}}]}}"#
             );
             assert!(
-                PolicyDocument::from_json(&json).is_err(),
-                "should reject Sid {sid:?}"
+                PolicyDocument::from_json_for_write(&json).is_err(),
+                "should reject Sid {sid:?} at write"
+            );
+            // A policy stored before the check existed still parses on the
+            // request path, so its principal is not locked out.
+            assert!(
+                PolicyDocument::from_json(&json).is_ok(),
+                "stored policy with Sid {sid:?} must still parse"
             );
         }
     }
@@ -677,7 +700,7 @@ mod tests {
                 r#"{{"Version":"2012-10-17","Statement":[{{"Sid":"{sid}","Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*"}}]}}"#
             );
             assert!(
-                PolicyDocument::from_json(&json).is_ok(),
+                PolicyDocument::from_json_for_write(&json).is_ok(),
                 "should accept Sid {sid:?}"
             );
         }
