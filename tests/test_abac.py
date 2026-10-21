@@ -893,6 +893,21 @@ class TestTagCollisionDeterministic(_TaggedTableBase):
         finally:
             self.mgmt.delete_user(self.account_id, user)
 
+    def test_rejects_invalid_and_dup_tag_keys_at_write(self):
+        # A combining-mark tag key and the reserved aws: prefix are rejected
+        # at write (ValidationError on the service); two keys differing only
+        # in ASCII case are a duplicate.
+        user = f"gk-tv-{uuid.uuid4().hex[:8]}"
+        assert self.mgmt.create_user(self.account_id, user, "TestPass123!").status_code == 201
+        try:
+            assert self.mgmt.tag_user(self.account_id, user, {"Equipe\u0301": "x"}).status_code == 400
+            assert self.mgmt.tag_user(self.account_id, user, {"aws:team": "x"}).status_code == 400
+            assert self.mgmt.tag_user(self.account_id, user, {"Team": "1", "team": "2"}).status_code == 400
+            # a valid tag is accepted
+            assert self.mgmt.tag_user(self.account_id, user, {"team": "prod"}).status_code in (200, 201, 204)
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
 
 # ---------------------------------------------------------------------------
 # aws:TokenIssueTime (role sessions) and aws:userid across recreate

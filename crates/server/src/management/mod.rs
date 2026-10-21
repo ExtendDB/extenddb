@@ -247,6 +247,45 @@ pub(crate) fn duplicate_tag_key_ci(tags: &[(String, String)]) -> Option<String> 
     None
 }
 
+/// Validate a tag set against the live IAM service's tag rules, returning an
+/// error string for the first violation. Each key is 1-128 characters and each
+/// value at most 256 characters (counted in characters, not bytes), drawn from
+/// IAM's grammar (`[\p{L}\p{Z}\p{N}_.:/=+\-@]`, which excludes combining
+/// marks and most punctuation), and a key must not use the reserved `aws:`
+/// prefix. The empty value and a leading or trailing space are allowed, matching
+/// the service.
+pub(crate) fn validate_iam_tags(tags: &[(String, String)]) -> Result<(), String> {
+    for (k, v) in tags {
+        let n = k.chars().count();
+        if n == 0 || n > 128 {
+            return Err("tag key must be 1-128 characters".to_owned());
+        }
+        if k.to_ascii_lowercase().starts_with("aws:") {
+            return Err("tag key must not begin with the reserved prefix aws:".to_owned());
+        }
+        if !k.chars().all(is_iam_tag_char) {
+            return Err(format!("tag key contains an invalid character: {k}"));
+        }
+        if v.chars().count() > 256 {
+            return Err("tag value must not exceed 256 characters".to_owned());
+        }
+        if !v.chars().all(is_iam_tag_char) {
+            return Err("tag value contains an invalid character".to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// One character of IAM's tag grammar: a Unicode letter or number, an ASCII
+/// space, or one of `_ . : / = + - @`. Combining marks and other punctuation
+/// are excluded, matching the service's `[\p{L}\p{Z}\p{N}_.:/=+\-@]`.
+fn is_iam_tag_char(c: char) -> bool {
+    c.is_alphabetic()
+        || c.is_numeric()
+        || c == ' '
+        || matches!(c, '_' | '.' | ':' | '/' | '=' | '+' | '-' | '@')
+}
+
 /// Validate admin name: 1-64 chars, alphanumeric, hyphens, or underscores.
 fn is_valid_admin_name(name: &str) -> bool {
     !name.is_empty()
@@ -254,4 +293,52 @@ fn is_valid_admin_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+#[cfg(test)]
+mod tag_validation_tests {
+    use super::{duplicate_tag_key_ci, validate_iam_tags};
+
+    fn t(k: &str, v: &str) -> Vec<(String, String)> {
+        vec![(k.to_owned(), v.to_owned())]
+    }
+
+    #[test]
+    fn accepts_service_valid_tags() {
+        assert!(validate_iam_tags(&t("team", "prod")).is_ok());
+        assert!(validate_iam_tags(&t("a_.:/=+-@b", "v_.:/=+-@")).is_ok());
+        assert!(validate_iam_tags(&t("my team", "east coast")).is_ok()); // space ok
+        assert!(validate_iam_tags(&t("team", "")).is_ok()); // empty value ok
+        assert!(validate_iam_tags(&t(" team", "prod")).is_ok()); // leading space ok
+        assert!(validate_iam_tags(&t("equipe\u{00e9}", "prod")).is_ok()); // precomposed letter
+    }
+
+    #[test]
+    fn rejects_service_invalid_tags() {
+        assert!(validate_iam_tags(&t("Equipe\u{0301}", "prod")).is_err()); // combining mark
+        assert!(validate_iam_tags(&t("a#b", "prod")).is_err());
+        assert!(validate_iam_tags(&t("a!b", "prod")).is_err());
+        assert!(validate_iam_tags(&t("aws:team", "prod")).is_err()); // reserved prefix
+        assert!(validate_iam_tags(&t("AWS:team", "prod")).is_err()); // case-insensitive prefix
+        assert!(validate_iam_tags(&t(&"k".repeat(129), "prod")).is_err()); // key too long
+        assert!(validate_iam_tags(&t("team", &"v".repeat(257))).is_err()); // value too long
+        assert!(validate_iam_tags(&t("team", "v\u{0301}")).is_err()); // combining mark in value
+    }
+
+    #[test]
+    fn duplicate_ascii_case_key_detected() {
+        let dup = duplicate_tag_key_ci(&[
+            ("Team".to_owned(), "1".to_owned()),
+            ("team".to_owned(), "2".to_owned()),
+        ]);
+        assert_eq!(dup.as_deref(), Some("team"));
+        // mass and sharp-s differ by more than ASCII case: distinct, allowed.
+        assert!(
+            duplicate_tag_key_ci(&[
+                ("mass".to_owned(), "A".to_owned()),
+                ("ma\u{00df}".to_owned(), "B".to_owned()),
+            ])
+            .is_none()
+        );
+    }
 }

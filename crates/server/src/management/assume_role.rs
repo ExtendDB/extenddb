@@ -152,6 +152,20 @@ pub async fn assume_role(
     let has_session_tags = request.session_tags.as_ref().is_some_and(value_has_entries);
     let request_tags = parse_session_tags(request.session_tags.as_ref());
 
+    if let Some(st) = request.session_tags.as_ref() {
+        let pairs = session_tag_pairs(st);
+        if let Err(e) = super::validate_iam_tags(&pairs) {
+            return (StatusCode::BAD_REQUEST, e).into_response();
+        }
+        if let Some(dup) = super::duplicate_tag_key_ci(&pairs) {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("Duplicate session tag keys found (tag keys are case insensitive): {dup}"),
+            )
+                .into_response();
+        }
+    }
+
     // Evaluate trust policy against the provided caller ARN. aws:SourceIp and
     // aws:UserAgent are the AssumeRole connection's peer address and User-Agent,
     // which is what STS records for the call.
@@ -601,6 +615,33 @@ fn value_has_entries(v: &Value) -> bool {
         Value::Array(a) => !a.is_empty(),
         _ => false,
     }
+}
+
+/// Extract session-tag `(key, value)` pairs preserving every entry (including
+/// keys that collide by ASCII case), for write validation. Object and list
+/// forms; scalar values coerced to strings.
+fn session_tag_pairs(session_tags: &Value) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    match session_tags {
+        Value::Object(obj) => {
+            for (k, v) in obj {
+                if let Some(s) = scalar_to_string(v) {
+                    pairs.push((k.clone(), s));
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for entry in arr {
+                let key = entry.get("Key").and_then(Value::as_str);
+                let value = entry.get("Value").and_then(scalar_to_string);
+                if let (Some(k), Some(v)) = (key, value) {
+                    pairs.push((k.to_owned(), v));
+                }
+            }
+        }
+        _ => {}
+    }
+    pairs
 }
 
 /// Parse the request `session_tags` into a key/value map for condition

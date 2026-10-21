@@ -231,15 +231,8 @@ pub async fn tag_user(
     }
 
     for tag in &body.tags {
-        if tag.key.is_empty() || tag.key.len() > 128 {
-            return (StatusCode::BAD_REQUEST, "tag key must be 1-128 characters").into_response();
-        }
-        if tag.value.len() > 256 {
-            return (
-                StatusCode::BAD_REQUEST,
-                "tag value must not exceed 256 characters",
-            )
-                .into_response();
+        if tag.key.is_empty() {
+            return (StatusCode::BAD_REQUEST, "tag key must not be empty").into_response();
         }
     }
 
@@ -249,6 +242,9 @@ pub async fn tag_user(
         .map(|t| (t.key.clone(), t.value.clone()))
         .collect();
 
+    if let Err(e) = super::validate_iam_tags(&tags) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
     if let Some(dup) = super::duplicate_tag_key_ci(&tags) {
         return (
             StatusCode::BAD_REQUEST,
