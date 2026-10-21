@@ -16,7 +16,7 @@ use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::build_expression_maps;
-use crate::request_limits::{self, MAX_BATCH_GET_KEYS};
+use crate::request_limits;
 use crate::serialize_output;
 use crate::{DispatchMetrics, DispatchResult};
 
@@ -36,39 +36,15 @@ pub async fn handle_batch_get_item(
     let input: BatchGetItemInput =
         serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
-    // Validate: RequestItems must not be empty. The message is the request
-    // model's length constraint (measured; note "Value at", with no value
-    // echoed). BatchWriteItem keeps its distinct required-parameter sentence,
-    // which is likewise measured.
-    if input.request_items.is_empty() {
-        return Err(DynamoDbError::ValidationException(
-            "1 validation error detected: Value at 'RequestItems' failed to satisfy \
-             constraint: Member must have length greater than or equal to 1"
-                .to_owned(),
-        ));
-    }
-
-    // Validate: per-table keys <= 100
-    for (table_name, ka) in &input.request_items {
-        if ka.keys.len() > MAX_BATCH_GET_KEYS {
-            return Err(request_limits::batch_get_table_too_many(table_name));
-        }
-    }
-
-    // Validate: total keys across all tables <= 100
-    let total_keys: usize = input.request_items.values().map(|ka| ka.keys.len()).sum();
-    if total_keys > MAX_BATCH_GET_KEYS {
-        return Err(request_limits::batch_get_too_many());
-    }
-
-    // Validate: each table must have at least one key
-    for (table_name, ka) in &input.request_items {
-        if ka.keys.is_empty() {
-            return Err(DynamoDbError::ValidationException(format!(
-                "1 validation error detected: Value '[]' at 'requestItems.{table_name}.member.keys' failed to satisfy constraint: Member must have length greater than or equal to 1"
-            )));
-        }
-    }
+    // Validate the table and key counts: RequestItems not empty, at most 100
+    // tables, at most 100 keys per table and in total, at least one key per
+    // table. The server runs the same checks before authorization.
+    let counts: Vec<(&str, Option<usize>)> = input
+        .request_items
+        .iter()
+        .map(|(table_name, ka)| (table_name.as_str(), Some(ka.keys.len())))
+        .collect();
+    request_limits::check_batch_counts("BatchGetItem", &counts)?;
 
     // Reject mixing expression and non-expression parameters anywhere in the
     // request. The check is request-wide: ProjectionExpression on one table and

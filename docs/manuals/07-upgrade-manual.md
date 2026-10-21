@@ -255,11 +255,15 @@ Details of how the key is bound, matching DynamoDB:
   policy value is matched as written. Under a fence of `["10"]`, a client that
   sends `10.0` or `1E1` is allowed on the first group and denied on the second,
   as on DynamoDB.
-- A `TransactWriteItems` or `TransactGetItems` with more than 100 items, a
-  `BatchWriteItem` with more than 25 requests and a `BatchGetItem` with more
-  than 100 keys return `ValidationException` before any policy is evaluated, as
-  on DynamoDB. Before this release a principal without permission on the table
-  received `AccessDeniedException` for such a request.
+- A request outside the count limits of the batch and transaction operations
+  returns `ValidationException` before any policy is evaluated, as on DynamoDB:
+  a `TransactWriteItems` or `TransactGetItems` with no items or more than 100,
+  a `BatchGetItem` or `BatchWriteItem` with an empty `RequestItems` or a table
+  with no keys or requests, a `BatchGetItem` with more than 100 tables or keys
+  and a `BatchWriteItem` with more than 25 tables or requests. Before this
+  release a principal without permission on the table received
+  `AccessDeniedException` for each of these requests except an empty
+  `TransactItems` or `RequestItems`.
 
 **Who is affected.** Any deployment with a principal whose policy fences
 `dynamodb:LeadingKeys` with `ForAllValues:StringEquals` and whose Query, batch or

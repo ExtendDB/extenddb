@@ -75,14 +75,15 @@ def _require_auth_env() -> tuple[str, str, str]:
 
 
 def _make_client(endpoint_url: str, access_key: str, secret_key: str,
-                 region: str) -> Any:
+                 region: str, *, parameter_validation: bool = True) -> Any:
     kwargs: dict = dict(
         service_name="dynamodb",
         endpoint_url=endpoint_url,
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
         region_name=region,
-        config=BotoConfig(retries={"max_attempts": 0}),
+        config=BotoConfig(retries={"max_attempts": 0},
+                          parameter_validation=parameter_validation),
     )
     if endpoint_url.startswith("https://"):
         kwargs["verify"] = False
@@ -143,7 +144,8 @@ class TestLeadingKeys:
 
     # -- helpers -----------------------------------------------------------
 
-    def _user_client(self, policies: list[tuple[str, dict]]) -> Any:
+    def _user_client(self, policies: list[tuple[str, dict]], *,
+                     parameter_validation: bool = True) -> Any:
         """Create a user with the given named policies, return a client."""
         name = f"lk-{uuid.uuid4().hex[:8]}"
         resp = self.mgmt.create_user(self.account_id, name, "TestPass123!")
@@ -156,7 +158,8 @@ class TestLeadingKeys:
             resp = self.mgmt.put_user_policy(self.account_id, name, pname, doc)
             assert resp.status_code == 204, resp.text
         return _make_client(self.endpoint, creds["access_key_id"],
-                            creds["secret_access_key"], self.region)
+                            creds["secret_access_key"], self.region,
+                            parameter_validation=parameter_validation)
 
     def _leading_keys_policy(self, qualifier: str, values: list[str],
                              table: str) -> dict:
@@ -1064,20 +1067,24 @@ class TestLeadingKeys:
             except Exception:
                 pass
 
-    # -- Oversized batch and transaction requests ---------------------------
+    # -- Batch and transaction requests outside the count limits ------------
     #
     # Measured against live DynamoDB on 2026-10-21: a TransactWriteItems or
     # TransactGetItems with 101 items, a BatchWriteItem with 26 requests on one
     # table or across two, and a BatchGetItem with 101 keys on one table or
     # across two each returned ValidationException to a principal with no
     # policy, to a principal whose LeadingKeys fence excluded every key, to one
-    # whose fence included them and to the owner. The size check comes before
-    # authorization.
+    # whose fence included them and to the owner. So did an empty TransactItems
+    # or RequestItems and a table with no keys or requests. A BatchGetItem with
+    # 101 tables and a BatchWriteItem with 26 tables, one item each, returned
+    # ValidationException to a principal with no policy and to the owner, and
+    # the same BatchGetItem with 100 tables returned AccessDeniedException to
+    # the principal with no policy. The count checks come before authorization.
 
     def test_oversized_requests_fail_validation_before_authorization(self, table, num_table):
-        no_policy = self._user_client([])
+        no_policy = self._user_client([], parameter_validation=False)
         fenced_out = self._user_client([("lk", self._fence_policy(
-            ["nobody"], [table, num_table]))])
+            ["nobody"], [table, num_table]))], parameter_validation=False)
         other_key = self._key(OTHER)
         cases = {
             "TransactWriteItems": lambda c: c.transact_write_items(TransactItems=[
@@ -1103,6 +1110,18 @@ class TestLeadingKeys:
                 table: {"Keys": [{"pk": {"S": OTHER}, "sk": {"S": f"o{i}"}}
                                  for i in range(60)]},
                 num_table: {"Keys": [{"pk": {"N": str(1000 + i)}} for i in range(41)]}}),
+            "BatchGetItem 101 tables": lambda c: c.batch_get_item(RequestItems={
+                f"{table}-{i}": {"Keys": [other_key]} for i in range(101)}),
+            "BatchWriteItem 26 tables": lambda c: c.batch_write_item(RequestItems={
+                f"{table}-{i}": [{"PutRequest": {"Item": other_key}}] for i in range(26)}),
+            "TransactWriteItems empty": lambda c: c.transact_write_items(TransactItems=[]),
+            "TransactGetItems empty": lambda c: c.transact_get_items(TransactItems=[]),
+            "BatchWriteItem empty": lambda c: c.batch_write_item(RequestItems={}),
+            "BatchGetItem empty": lambda c: c.batch_get_item(RequestItems={}),
+            "BatchWriteItem table with no requests": lambda c: c.batch_write_item(
+                RequestItems={table: []}),
+            "BatchGetItem table with no keys": lambda c: c.batch_get_item(
+                RequestItems={table: {"Keys": []}}),
         }
         failures = []
         for label, send in cases.items():

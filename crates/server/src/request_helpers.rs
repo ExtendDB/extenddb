@@ -154,13 +154,15 @@ pub(crate) async fn authorize_request(
     // Targets with the same (action, table, LeadingKeys) are evaluated once,
     // since the decision depends only on those three for a given identity.
     if let Some(tables) = crate::leading_keys::batch_transact_tables(operation, input) {
-        // An oversized request is refused before any key info is read or any
-        // policy is evaluated, with the engine's own size error. DynamoDB does
-        // the same: a 101-item transaction, a 26-request BatchWriteItem or a
-        // 101-key BatchGetItem returns ValidationException even to a principal
-        // with no permissions (measured 2026-10-21). Checking first also bounds
-        // the work below by the operation's item limit instead of by the body
-        // size.
+        // A request outside the operation's count limits is refused before any
+        // key info is read or any policy is evaluated, with the engine's own
+        // error. DynamoDB does the same: an empty or 101-item transaction, an
+        // empty RequestItems, a table with no keys or requests, more than 100
+        // tables or keys in a BatchGetItem and more than 25 tables or requests
+        // in a BatchWriteItem each return ValidationException, including to a
+        // principal with no permissions (measured 2026-10-21). Checking first
+        // also bounds the tables read and the policies evaluated below by those
+        // limits instead of by the body size.
         extenddb_engine::check_request_item_counts(operation, input)?;
 
         // Read each distinct table's key info from storage, not the cache, and
@@ -177,9 +179,10 @@ pub(crate) async fn authorize_request(
                 .unwrap_or_default();
 
         if targets.is_empty() {
-            // Malformed or empty body: still require the operation's action on
-            // the table wildcard, as the generic path would, then let the
-            // engine reject the body. This never silently skips authorization.
+            // Malformed body (the count checks above have already refused an
+            // empty one): still require the operation's action on the table
+            // wildcard, as the generic path would, then let the engine reject
+            // the body. This never silently skips authorization.
             let resource_arn = build_resource_arn(&state.region, account_id, None);
             authorization::check_authorization(
                 state.authz_cache.as_ref(),

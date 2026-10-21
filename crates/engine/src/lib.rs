@@ -370,17 +370,21 @@ impl OperationContext {
     /// missing table stays missing for the rest of the request even if it has
     /// since become ACTIVE, because authorization left `dynamodb:LeadingKeys`
     /// absent for it and an absent key satisfies a `ForAllValues` condition.
+    /// The snapshot is authoritative for every table it names: an entry for
+    /// another account is an internal error, never a reason to read the table
+    /// again.
     fn authorized_table_key_info(
         &self,
         table_name: &str,
     ) -> Option<Result<TableKeyInfo, extenddb_storage::error::StorageError>> {
-        match self.authorized_key_info.get(table_name)? {
-            Some(ki) if *ki.account_id == *self.account_id => Some(Ok(ki.clone())),
-            Some(_) => None,
-            None => Some(Err(extenddb_storage::error::StorageError::TableNotFound(
-                table_name.to_owned(),
+        use extenddb_storage::error::StorageError;
+        Some(match self.authorized_key_info.get(table_name)? {
+            Some(ki) if *ki.account_id == *self.account_id => Ok(ki.clone()),
+            Some(_) => Err(StorageError::Internal(format!(
+                "authorized key info for table {table_name} belongs to another account"
             ))),
-        }
+            None => Err(StorageError::TableNotFound(table_name.to_owned())),
+        })
     }
 
     /// `TableKeyInfo` for a single-table operation: the auth layer's snapshot

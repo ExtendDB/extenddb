@@ -11,7 +11,7 @@ use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_condition};
-use crate::request_limits::{self, MAX_TRANSACT_ITEMS};
+use crate::request_limits;
 use crate::serialize_output;
 use crate::stream_capture;
 use crate::transact_write_helpers::{
@@ -53,18 +53,9 @@ pub async fn handle_transact_write_items(
         .map(|t| compute_fingerprint(&body, t))
         .unwrap_or_default();
 
-    if input.transact_items.is_empty() {
-        return Err(DynamoDbError::ValidationException(
-            "1 validation error detected: Value '[]' at 'transactItems' failed to satisfy constraint: Member must have length greater than or equal to 1".to_owned(),
-        ));
-    }
-
-    if input.transact_items.len() > MAX_TRANSACT_ITEMS {
-        return Err(request_limits::transact_items_too_many(
-            input.transact_items.len(),
-            "TransactWriteItem",
-        ));
-    }
+    // At least one and at most 100 items. The server runs the same check
+    // before authorization.
+    request_limits::check_transact_count(input.transact_items.len(), "TransactWriteItem")?;
 
     // Validate each item has exactly one operation
     for (i, twi) in input.transact_items.iter().enumerate() {

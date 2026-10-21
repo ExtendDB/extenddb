@@ -21,7 +21,7 @@ use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::build_expression_maps;
-use crate::request_limits::{self, MAX_TRANSACT_ITEMS};
+use crate::request_limits;
 use crate::serialize_output;
 use crate::{DispatchMetrics, DispatchResult};
 
@@ -40,18 +40,9 @@ pub async fn handle_transact_get_items(
     let input: TransactGetItemsInput =
         serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
-    if input.transact_items.is_empty() {
-        return Err(DynamoDbError::ValidationException(
-            "1 validation error detected: Value '[]' at 'transactItems' failed to satisfy constraint: Member must have length greater than or equal to 1".to_owned(),
-        ));
-    }
-
-    if input.transact_items.len() > MAX_TRANSACT_ITEMS {
-        return Err(request_limits::transact_items_too_many(
-            input.transact_items.len(),
-            "TransactGetItem",
-        ));
-    }
+    // At least one and at most 100 items. The server runs the same check
+    // before authorization.
+    request_limits::check_transact_count(input.transact_items.len(), "TransactGetItem")?;
 
     // Resolve table key info for each item
     let mut seen_keys: HashSet<Vec<u8>> = HashSet::with_capacity(input.transact_items.len());

@@ -21,7 +21,7 @@ use extenddb_core::validation::{
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
-use crate::request_limits::{self, MAX_BATCH_WRITE_ITEMS};
+use crate::request_limits;
 use crate::serialize_output;
 use crate::stream_capture;
 use crate::{DispatchMetrics, DispatchResult};
@@ -42,37 +42,15 @@ pub async fn handle_batch_write_item(
     let input: BatchWriteItemInput =
         serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
-    // Validate: RequestItems must not be empty
-    if input.request_items.is_empty() {
-        return Err(DynamoDbError::ValidationException(
-            "The requestItems parameter is required for BatchWriteItem".to_owned(),
-        ));
-    }
-
-    // Validate: per-table operations <= 25
-    for (table_name, reqs) in &input.request_items {
-        if reqs.len() > MAX_BATCH_WRITE_ITEMS {
-            return Err(request_limits::batch_write_table_too_many(
-                table_name,
-                reqs.len(),
-            ));
-        }
-    }
-
-    // Validate: total operations across all tables <= 25
-    let total_ops: usize = input.request_items.values().map(std::vec::Vec::len).sum();
-    if total_ops > MAX_BATCH_WRITE_ITEMS {
-        return Err(request_limits::batch_write_too_many());
-    }
-
-    // Validate: each table must have at least one request
-    for (table_name, reqs) in &input.request_items {
-        if reqs.is_empty() {
-            return Err(DynamoDbError::ValidationException(format!(
-                "1 validation error detected: Value '[]' at 'requestItems.{table_name}.member' failed to satisfy constraint: Member must have length greater than or equal to 1"
-            )));
-        }
-    }
+    // Validate the table and request counts: RequestItems not empty, at most
+    // 25 tables, at most 25 requests per table and in total, at least one
+    // request per table. The server runs the same checks before authorization.
+    let counts: Vec<(&str, Option<usize>)> = input
+        .request_items
+        .iter()
+        .map(|(table_name, reqs)| (table_name.as_str(), Some(reqs.len())))
+        .collect();
+    request_limits::check_batch_counts("BatchWriteItem", &counts)?;
 
     // Validate: each WriteRequest has exactly one of PutRequest or DeleteRequest
     for reqs in input.request_items.values() {
