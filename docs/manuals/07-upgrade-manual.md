@@ -250,6 +250,23 @@ The same applies to `dynamodb:LeadingKeys`. Audit existing policies with
 `extenddb manage list-user-policies` / `list-role-policies` and update any that use bare
 operators on these keys. No catalog migration is required for this change.
 
+### IAM: `aws:TokenIssueTime` on MongoDB role sessions created before the upgrade
+
+**What changed.** ExtendDB now resolves `aws:TokenIssueTime` for a role session from
+the session's recorded creation time. On the MongoDB backend the session store did not
+record a creation time before this release.
+
+**Who is affected.** MongoDB deployments only. A role session established before the
+upgrade has no stored creation time, so `aws:TokenIssueTime` is absent for that session
+until it expires and is re-established. The three SQL and the Cassandra backends already
+recorded the session creation time and are not affected.
+
+**Impact.** The direction is over-deny only and self-heals: a policy that gates on
+`aws:TokenIssueTime` (a presence check or a `Date` comparison) denies a pre-upgrade
+MongoDB session that it would grant, and resolves correctly once the session is
+re-established. No catalog migration is required; new sessions record the creation time
+automatically.
+
 ---
 
 ## License
