@@ -35,6 +35,12 @@ pub(crate) struct GsiApplyContext {
     pub(crate) base_key_schema: Vec<KeySchemaElement>,
     pub(crate) attribute_definitions: Vec<AttributeDefinition>,
     pub(crate) index: GsiIndexDef,
+    /// Write timestamp for the index rows this entry produces: the base-row
+    /// version the enqueuing write committed. Absent on entries written
+    /// before the field existed; the worker then lets the coordinator stamp
+    /// them, as it always did.
+    #[serde(default)]
+    pub(crate) index_stamp: Option<i64>,
 }
 
 /// Routes all updates for a given base item to one worker (FNV-1a, stable

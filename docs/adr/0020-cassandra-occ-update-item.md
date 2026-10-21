@@ -1,6 +1,6 @@
 # ADR-0020: Optimistic Concurrency Control for UpdateItem and PutItem
 
-- Status: Accepted
+- Status: Accepted, amended by ADR-0023 (the version value and the transaction COMMIT statement)
 - Date: 2026-08-31
 - Deciders: ExtendDB Cassandra plugin contributors
 
@@ -24,8 +24,8 @@ Version-based OCC via LWT (option 1).
 
 - Closes the race atomically at the storage layer with no external dependency.
 - The LWT condition must include both `version = ?` and `prepared_txn_id = NULL`. Checking `version` alone is insufficient: a transaction could PREPARE the row (setting `prepared_txn_id`) without changing `version`, and a concurrent non-transactional writer's `IF version = ?` would then succeed and overwrite a prepared item, corrupting the in-flight transaction.
-- Existing rows with `version = NULL` are treated as version 0; the first write uses `IF version = NULL AND prepared_txn_id = NULL`.
-- Transaction COMMIT must increment `version` (`version = version + 1`) so that a non-transactional writer that read a pre-transaction version cannot overwrite committed transaction data. The `IF prepared_txn_id = ?` guard on COMMIT ensures the blind increment is safe.
+- Existing rows with `version = NULL` fence on `IF version = NULL AND prepared_txn_id = NULL`.
+- Transaction COMMIT must change `version` so that a non-transactional writer that read a pre-transaction version cannot overwrite committed transaction data. The `IF prepared_txn_id = ?` guard on COMMIT makes the write safe. ADR-0023 replaced the original `version = version + 1` with a value the commit binds: on a row PREPARE created, the arithmetic on a null `version` left it null, and the ordinary write paths, which read a null as `0`, could not fence the row.
 - Transaction PREPARE and ROLLBACK do not touch `version`; PREPARE sets `prepared_txn_id` (which blocks non-transactional writers via their LWT condition), and ROLLBACK leaves `version` at the pre-PREPARE value since the item was not modified.
 
 ## Retry policy
@@ -40,7 +40,7 @@ Version-based OCC via LWT (option 1).
 
 - A `version bigint` column is added to all data tables via migration.
 - `update_item_impl` and the conditional `put_item_impl` path use an OCC retry loop.
-- `commit_put_or_update` in the transaction system adds `version = version + 1` to the COMMIT UPDATE.
+- `commit_put_or_update` in the transaction system sets `version` in the COMMIT UPDATE (to the value ADR-0023 defines).
 - Under high contention (many concurrent writers to the same item), tail latency increases due to retries. The retry ceiling (20) and bounded backoff (max 16 ms window) prevent unbounded latency growth.
 
 ---
