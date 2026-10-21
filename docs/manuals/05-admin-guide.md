@@ -124,7 +124,7 @@ In-memory stale-while-revalidate caches eliminate the per-request catalog roundt
 | `negative_ttl_seconds` | `5` | Negative-cache TTL for "not found" results. |
 | `max_entries` | `10000` | Per-cache LRU cap. |
 
-Statistics are exposed at `/management/auth-cache-metrics` (JSON, admin-authenticated). The per-cache `pass_through` flag distinguishes "cache disabled" from "cache cold."
+Statistics are exposed at `/management/auth-cache-metrics` (JSON, admin-authenticated). The per-cache `pass_through` flag distinguishes "cache disabled" from "cache cold." The report includes every authorization sub-cache, among them the two principal creation-time caches (`user_created_at`, `role_created_at`) consulted on each user and role-session request to derive `aws:userid` and `aws:TokenIssueTime`.
 
 **Invalidation timing**:
 

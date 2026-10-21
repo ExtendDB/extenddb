@@ -571,6 +571,8 @@ impl CachedAuthzStore {
             role_tags: self.role_tags.metrics().snapshot(),
             session_data: self.session_data.metrics().snapshot(),
             resource_tags: self.resource_tags.metrics().snapshot(),
+            user_created_at: self.user_created_at.metrics().snapshot(),
+            role_created_at: self.role_created_at.metrics().snapshot(),
         })
     }
 
@@ -596,6 +598,8 @@ pub struct AuthzCacheMetricsSnapshot {
     pub role_tags: extenddb_cache::SwrMetricsSnapshot,
     pub session_data: extenddb_cache::SwrMetricsSnapshot,
     pub resource_tags: extenddb_cache::SwrMetricsSnapshot,
+    pub user_created_at: extenddb_cache::SwrMetricsSnapshot,
+    pub role_created_at: extenddb_cache::SwrMetricsSnapshot,
 }
 
 impl extenddb_auth::AuthzCacheInvalidator for CachedAuthzStore {
