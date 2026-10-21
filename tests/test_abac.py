@@ -1081,3 +1081,63 @@ class TestMultiFactorAuthPresentRoleSession(_TaggedTableBase):
         # The key is absent for an IAM user, so Null true grants.
         assert self._get(table, self._allow_get_if(
             {"Null": {"aws:MultiFactorAuthPresent": "true"}})) == "ALLOW"
+
+
+class TestMalformedCidrRejection:
+    """A malformed CIDR in an IpAddress/NotIpAddress condition is rejected
+    at identity-policy and permissions-boundary write, matching the live service
+    (MalformedPolicyDocument). The trust path accepts it (see
+    test_auth_integration)."""
+
+    MALFORMED = ["10.0.0.0/33", "999.0.0.0/8", "not-a-cidr", "10.0.0.0/"]
+
+    @pytest.fixture(autouse=True)
+    def setup(self, auth_env, mgmt, account_id, region):
+        self.mgmt = mgmt
+        self.account_id = account_id
+
+    @staticmethod
+    def _policy(cidr, op="IpAddress"):
+        return {"Version": "2012-10-17", "Statement": [{
+            "Effect": "Deny", "Action": "dynamodb:GetItem", "Resource": "*",
+            "Condition": {op: {"aws:SourceIp": cidr}}}]}
+
+    def test_put_user_policy_rejects_malformed_cidr(self):
+        user = f"cidr-u-{uuid.uuid4().hex[:8]}"
+        assert self.mgmt.create_user(self.account_id, user, "TestPass123!").status_code == 201
+        try:
+            for cidr in self.MALFORMED:
+                resp = self.mgmt.put_user_policy(self.account_id, user, "p", self._policy(cidr))
+                assert resp.status_code == 400, f"{cidr}: {resp.status_code} {resp.text}"
+            # NotIpAddress too.
+            resp = self.mgmt.put_user_policy(
+                self.account_id, user, "p", self._policy("10.0.0.0/33", "NotIpAddress"))
+            assert resp.status_code == 400, resp.text
+            # A well-formed CIDR is accepted.
+            resp = self.mgmt.put_user_policy(self.account_id, user, "p", self._policy("10.0.0.0/8"))
+            assert resp.status_code == 204, resp.text
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_put_role_policy_rejects_malformed_cidr(self):
+        role = f"cidr-r-{uuid.uuid4().hex[:8]}"
+        trust = {"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{self.account_id}:root"},
+            "Action": "sts:AssumeRole"}]}
+        assert self.mgmt.create_role(self.account_id, role, trust).status_code == 201
+        try:
+            resp = self.mgmt.put_role_policy(
+                self.account_id, role, "p", self._policy("10.0.0.0/33"))
+            assert resp.status_code == 400, resp.text
+        finally:
+            self.mgmt.delete_role(self.account_id, role)
+
+    def test_set_user_boundary_rejects_malformed_cidr(self):
+        user = f"cidr-b-{uuid.uuid4().hex[:8]}"
+        assert self.mgmt.create_user(self.account_id, user, "TestPass123!").status_code == 201
+        try:
+            resp = self.mgmt.set_user_boundary(
+                self.account_id, user, self._policy("not-a-cidr"))
+            assert resp.status_code == 400, resp.text
+        finally:
+            self.mgmt.delete_user(self.account_id, user)

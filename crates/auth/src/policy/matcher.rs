@@ -141,6 +141,37 @@ pub fn arn_match(pattern: &str, value: &str) -> bool {
 /// `NotIpAddress` (both evaluate false), rather than letting `NotIpAddress`
 /// pass by negation. Measured live on this account: an IPv4 `IpAddress` range
 /// and an IPv4 `NotIpAddress` range both fail to apply for an IPv6 caller.
+/// Whether `cidr` is a well-formed IPv4 or IPv6 network in `address/prefix`
+/// form, or a bare address.
+///
+/// The live service validates `IpAddress` and `NotIpAddress` values in an
+/// identity or managed policy at write ("legacy parsing"), rejecting a bad
+/// address, a bad or empty prefix, or a prefix out of range for the family
+/// (`/33` on IPv4, `/129` on IPv6) with `MalformedPolicyDocument`. This mirrors
+/// the parse rules `ip_in_cidr` applies, so a value that passes here is one it
+/// can evaluate.
+#[must_use]
+pub fn is_valid_cidr(cidr: &str) -> bool {
+    use std::net::IpAddr;
+
+    let (net_str, prefix_str) = match cidr.split_once('/') {
+        Some((n, p)) => (n, Some(p)),
+        None => (cidr, None),
+    };
+    let net: IpAddr = match net_str.parse() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    match prefix_str {
+        None => true,
+        Some(p) => match (net, p.parse::<u32>()) {
+            (IpAddr::V4(_), Ok(prefix)) => prefix <= 32,
+            (IpAddr::V6(_), Ok(prefix)) => prefix <= 128,
+            _ => false,
+        },
+    }
+}
+
 #[must_use]
 pub fn ip_in_cidr(cidr: &str, addr: &str) -> Option<bool> {
     use std::net::IpAddr;
@@ -361,5 +392,23 @@ mod tests {
         assert_eq!(ip_in_cidr("not-a-cidr", "203.0.113.9"), None);
         assert_eq!(ip_in_cidr("203.0.113.0/24", "not-an-ip"), None);
         assert_eq!(ip_in_cidr("203.0.113.0/33", "203.0.113.9"), None);
+    }
+
+    #[test]
+    fn valid_cidr_accepts_well_formed_and_rejects_malformed() {
+        // Well-formed (accepted at write).
+        assert!(is_valid_cidr("10.0.0.0/8"));
+        assert!(is_valid_cidr("0.0.0.0/0"));
+        assert!(is_valid_cidr("203.0.113.9"));
+        assert!(is_valid_cidr("203.0.113.9/32"));
+        assert!(is_valid_cidr("2001:db8::/32"));
+        assert!(is_valid_cidr("::/0"));
+        // Malformed, the exact set the live service rejects with
+        // MalformedPolicyDocument.
+        assert!(!is_valid_cidr("10.0.0.0/33"));
+        assert!(!is_valid_cidr("999.0.0.0/8"));
+        assert!(!is_valid_cidr("not-a-cidr"));
+        assert!(!is_valid_cidr("10.0.0.0/"));
+        assert!(!is_valid_cidr("2001:db8::/129"));
     }
 }

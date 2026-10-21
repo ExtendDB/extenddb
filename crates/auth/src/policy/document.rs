@@ -174,11 +174,55 @@ impl PolicyDocument {
         let raw: Value = serde_json::from_str(json).map_err(|e| PolicyParseError(e.to_string()))?;
         let version = raw["Version"].as_str().unwrap_or("2012-10-17").to_owned();
         let statements = parse_statements(&raw["Statement"])?;
+        validate_statement_cidrs(&statements)?;
         Ok(Self {
             version,
             statements,
         })
     }
+}
+
+/// Unwrap a condition operator to its base, dropping any `ForAllValues:` /
+/// `ForAnyValue:` prefix and `IfExists` suffix.
+fn base_operator(op: &ConditionOperator) -> &ConditionOperator {
+    match op {
+        ConditionOperator::ForAllValues(inner)
+        | ConditionOperator::ForAnyValue(inner)
+        | ConditionOperator::IfExists(inner) => base_operator(inner),
+        other => other,
+    }
+}
+
+/// Reject a malformed CIDR in an `IpAddress` or `NotIpAddress` condition value.
+///
+/// The live service validates these values when an identity or managed policy
+/// is written ("legacy parsing") and rejects a malformed one with
+/// `MalformedPolicyDocument`. `PolicyDocument::from_json` is the identity-policy
+/// write and read path, so this rejects a malformed value at write and fails a
+/// stored identity policy closed at read (it no longer parses, so the request
+/// is denied). The trust-policy path does not use `from_json`: the live trust
+/// write accepts a malformed CIDR and the trust evaluator drops the statement,
+/// which ExtendDB already matches, so trust policies are intentionally not
+/// validated here.
+fn validate_statement_cidrs(statements: &[Statement]) -> Result<(), PolicyParseError> {
+    for stmt in statements {
+        for cond in &stmt.conditions {
+            if matches!(
+                base_operator(&cond.operator),
+                ConditionOperator::IpAddress | ConditionOperator::NotIpAddress
+            ) {
+                for v in &cond.values {
+                    if !super::matcher::is_valid_cidr(v) {
+                        return Err(PolicyParseError(format!(
+                            "malformed CIDR in condition {}: {v}",
+                            cond.key
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Parse the Statement field — may be a single object or an array.
@@ -555,5 +599,38 @@ mod tests {
             &doc.statements[0].principal_match,
             Some(PrincipalMatch::Principals(p)) if p == &["*"]
         ));
+    }
+
+    #[test]
+    fn reject_malformed_cidr_in_ipaddress() {
+        // The live service rejects these at identity-policy write with
+        // MalformedPolicyDocument; from_json is the write and read path.
+        for cidr in ["10.0.0.0/33", "999.0.0.0/8", "not-a-cidr", "10.0.0.0/"] {
+            let json = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny",
+                "Action":"dynamodb:GetItem","Resource":"*",
+                "Condition":{{"IpAddress":{{"aws:SourceIp":"{cidr}"}}}}}}]}}"#
+            );
+            assert!(
+                PolicyDocument::from_json(&json).is_err(),
+                "should reject malformed CIDR {cidr}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_malformed_cidr_in_notipaddress_and_set_operator() {
+        let json = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny",
+            "Action":"dynamodb:GetItem","Resource":"*",
+            "Condition":{"ForAnyValue:NotIpAddress":{"aws:SourceIp":"10.0.0.0/33"}}}]}"#;
+        assert!(PolicyDocument::from_json(json).is_err());
+    }
+
+    #[test]
+    fn accept_well_formed_cidr() {
+        let json = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+            "Action":"dynamodb:GetItem","Resource":"*",
+            "Condition":{"IpAddress":{"aws:SourceIp":["10.0.0.0/8","2001:db8::/32"]}}}]}"#;
+        assert!(PolicyDocument::from_json(json).is_ok());
     }
 }

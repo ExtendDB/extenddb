@@ -1381,6 +1381,9 @@ class TestTrustPolicyDeny:
                      condition={"StringEquals": {"aws:PrincipalTag/team": 5}})),  # numeric condition value
         _trust(_stmt("Deny", {"AWS": "arn:aws:iam::111122223333:user/x"},
                      condition={"StringEquals": {"aws:NoSuchKey": "x"}})),  # unknown condition key
+        _trust(_stmt("Allow", {"AWS": "arn:aws:iam::111122223333:user/x"}),
+               _stmt("Deny", {"AWS": "arn:aws:iam::111122223333:user/x"},
+                     condition={"IpAddress": {"aws:SourceIp": "10.0.0.0/33"}})),  # malformed CIDR (trust accepts)
     ])
     def test_create_accepts_iam_accepted_trust_policy(self, trust):
         role = f"bbacc-{uuid.uuid4().hex[:8]}"
@@ -1390,3 +1393,18 @@ class TestTrustPolicyDeny:
         finally:
             if resp.status_code == 201:
                 self.mgmt.delete_role(self.account_id, role)
+
+    def test_malformed_cidr_trust_deny_drops_matching_service(self):
+        # Live STS accepts a malformed CIDR in a trust policy and drops the Deny
+        # (the condition never matches), so assumption is granted. ExtendDB
+        # matches: the trust write accepts it and ip_in_cidr returns no match.
+        user, arn = self._caller()
+        try:
+            trust = _trust(
+                _stmt("Allow", {"AWS": arn}),
+                _stmt("Deny", {"AWS": "*"},
+                      condition={"IpAddress": {"aws:SourceIp": "10.0.0.0/33"}}),
+            )
+            assert self._assume(trust, arn) == ALLOW
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
