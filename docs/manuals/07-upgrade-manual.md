@@ -226,7 +226,9 @@ Before this release those five operations carried no LeadingKeys value, so a
 `ForAllValues:StringEquals dynamodb:LeadingKeys` condition on them was satisfied
 vacuously and a principal fenced to its own partition could read or write any
 partition through them. The item operations (`GetItem`, `PutItem`, `UpdateItem`,
-`DeleteItem`) already enforced the key and are unchanged.
+`DeleteItem`) already enforced the key; they change only for a numeric (`N`)
+partition key, which is now normalized (see below). Before this release the
+item operations compared the number exactly as the request spelled it.
 
 Details of how the key is bound, matching DynamoDB:
 
@@ -253,12 +255,24 @@ Details of how the key is bound, matching DynamoDB:
   policy value is matched as written. Under a fence of `["10"]`, a client that
   sends `10.0` or `1E1` is allowed on the first group and denied on the second,
   as on DynamoDB.
+- A `TransactWriteItems` or `TransactGetItems` with more than 100 items, a
+  `BatchWriteItem` with more than 25 requests and a `BatchGetItem` with more
+  than 100 keys return `ValidationException` before any policy is evaluated, as
+  on DynamoDB. Before this release a principal without permission on the table
+  received `AccessDeniedException` for such a request.
 
 **Who is affected.** Any deployment with a principal whose policy fences
 `dynamodb:LeadingKeys` with `ForAllValues:StringEquals` and whose Query, batch or
 transaction requests previously crossed its own partition. After upgrade those
 cross-partition requests return `AccessDeniedException`. Own-partition access is
-unchanged.
+unchanged, except for numeric partition keys.
+
+A principal with a numeric LeadingKeys fence sees a change on the item
+operations even if it never uses Query, batch or transactions. Under a fence of
+`["10"]`, a `GetItem` on `010`, `10.0` or `1E1` was denied and is now allowed.
+Under a fence written in a non-canonical form, such as `["010"]` or `["1E1"]`,
+a request spelled the same way was allowed and is now denied: the policy value
+is matched as written and no request is normalized to it.
 
 **Migration.** No catalog migration is required. Before upgrading, audit
 LeadingKeys policies with `extenddb manage list-user-policies` /
@@ -273,7 +287,9 @@ LeadingKeys policies with `extenddb manage list-user-policies` /
 - A numeric LeadingKeys value is written in the form each operation compares
   (see the numeric partition key item above). A fence of `["10"]` covers every
   spelling of 10 on the item operations, Query and BatchGetItem, and the
-  spellings `10`, `010`, `+10` and `1.0E1` on batch writes and transactions.
+  spellings `10`, `010`, `+10` and `1.0E1` on batch writes and transactions. A
+  fence value written as `010`, `10.0` or `1E1` matches nothing on the item
+  operations, Query and BatchGetItem; rewrite it as `10`.
 
 ---
 
