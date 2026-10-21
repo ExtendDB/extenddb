@@ -838,6 +838,25 @@ class TestConditionKeyNameUnicodeFold(_TaggedTableBase):
             {"ForAllValues:StringEquals": {f"dynamodb:Leading{self.KV}eys": ["zzz"]}})) == "DENY"
 
 
+class TestLeadingZeroCidr(_TaggedTableBase):
+    """A leading-zero octet in an IpAddress CIDR is accepted at write and
+    read as decimal at evaluation, matching the live service (072 is 72, not
+    octal 58; 0110 is 110). The test client connects from 127.0.0.1."""
+
+    def test_leading_zero_octet_accepted_and_matches_decimal(self, table):
+        # 0127.0.0.0/8 is the 127.0.0.0/8 network (decimal); the loopback caller
+        # is in it, so the gate grants. Before the fix the write was rejected.
+        assert self._get(table, self._allow_get_if(
+            {"IpAddress": {"aws:SourceIp": "0127.0.0.0/8"}})) == "ALLOW"
+
+    def test_leading_zero_octet_not_octal(self, table):
+        # 0177.0.0.0/8 read as decimal is 177.0.0.0/8, which does not contain the
+        # loopback caller; octal 0177 would be 127 and would match. The service
+        # reads decimal, so the gate does not grant.
+        assert self._get(table, self._allow_get_if(
+            {"IpAddress": {"aws:SourceIp": "0177.0.0.0/8"}})) == "DENY"
+
+
 # ---------------------------------------------------------------------------
 # aws:TokenIssueTime (role sessions) and aws:userid across recreate
 # ---------------------------------------------------------------------------

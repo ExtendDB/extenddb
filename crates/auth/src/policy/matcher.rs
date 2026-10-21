@@ -152,23 +152,66 @@ pub fn arn_match(pattern: &str, value: &str) -> bool {
 /// can evaluate.
 #[must_use]
 pub fn is_valid_cidr(cidr: &str) -> bool {
-    use std::net::IpAddr;
-
     let (net_str, prefix_str) = match cidr.split_once('/') {
         Some((n, p)) => (n, Some(p)),
         None => (cidr, None),
     };
-    let net: IpAddr = match net_str.parse() {
-        Ok(n) => n,
-        Err(_) => return false,
+    let net = match parse_network(net_str) {
+        Some(n) => n,
+        None => return false,
     };
     match prefix_str {
         None => true,
         Some(p) => match (net, p.parse::<u32>()) {
-            (IpAddr::V4(_), Ok(prefix)) => prefix <= 32,
-            (IpAddr::V6(_), Ok(prefix)) => prefix <= 128,
+            (std::net::IpAddr::V4(_), Ok(prefix)) => prefix <= 32,
+            (std::net::IpAddr::V6(_), Ok(prefix)) => prefix <= 128,
             _ => false,
         },
+    }
+}
+
+/// Parse an IPv4 address/network literal reading each octet as DECIMAL, so a
+/// leading-zero octet is the same value as without it (`072` is 72, not octal
+/// 58, and `0110` is 110). Measured: the live service reads a leading-zero octet
+/// in an `IpAddress` value as decimal. Rejects a wrong octet count, an empty or
+/// non-digit octet, or an octet greater than 255.
+fn parse_ipv4_decimal(s: &str) -> Option<std::net::Ipv4Addr> {
+    let mut octets = [0u8; 4];
+    let mut parts = s.split('.');
+    for octet in &mut octets {
+        let part = parts.next()?;
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let val: u32 = part.parse().ok()?;
+        if val > 255 {
+            return None;
+        }
+        *octet = u8::try_from(val).ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(std::net::Ipv4Addr::from(octets))
+}
+
+/// Parse a CIDR network literal, matching the live service. An IPv4 literal is
+/// read with decimal octets (`parse_ipv4_decimal`); an IPv6 literal is parsed by
+/// the standard library (upper-case hex accepted), but an IPv4-mapped IPv6
+/// address (`::ffff:a.b.c.d`) is rejected, because the service rejects it with
+/// `MalformedPolicyDocument` and accepting it would store an `IpAddress` Deny
+/// that silently never matches (the caller source IP is canonicalized to a bare
+/// IPv4 of a different family).
+fn parse_network(net_str: &str) -> Option<std::net::IpAddr> {
+    use std::net::{IpAddr, Ipv6Addr};
+    if net_str.contains(':') {
+        let v6: Ipv6Addr = net_str.parse().ok()?;
+        if v6.to_ipv4_mapped().is_some() {
+            return None;
+        }
+        Some(IpAddr::V6(v6))
+    } else {
+        parse_ipv4_decimal(net_str).map(IpAddr::V4)
     }
 }
 
@@ -181,7 +224,7 @@ pub fn ip_in_cidr(cidr: &str, addr: &str) -> Option<bool> {
         Some((n, p)) => (n, Some(p)),
         None => (cidr, None),
     };
-    let net: IpAddr = net_str.parse().ok()?;
+    let net: IpAddr = parse_network(net_str)?;
     match (ip, net) {
         (IpAddr::V4(ip), IpAddr::V4(net)) => {
             let prefix: u32 = match prefix_str {
@@ -392,6 +435,42 @@ mod tests {
         assert_eq!(ip_in_cidr("not-a-cidr", "203.0.113.9"), None);
         assert_eq!(ip_in_cidr("203.0.113.0/24", "not-an-ip"), None);
         assert_eq!(ip_in_cidr("203.0.113.0/33", "203.0.113.9"), None);
+    }
+
+    #[test]
+    fn valid_cidr_rejects_mapped_ipv6_and_accepts_upper_and_padded() {
+        // The service rejects an IPv4-mapped IPv6 literal in a policy CIDR with
+        // MalformedPolicyDocument (measured).
+        assert!(!is_valid_cidr("::ffff:10.0.0.0/120"));
+        assert!(!is_valid_cidr("::ffff:72.21.196.65/128"));
+        assert!(!is_valid_cidr("::ffff:10.0.0.0"));
+        // Upper-case IPv6 hex and a zero-padded prefix are accepted (match service).
+        assert!(is_valid_cidr("2001:DB8::/32"));
+        assert!(is_valid_cidr("10.0.0.0/08"));
+        // Genuine IPv6 networks are still accepted.
+        assert!(is_valid_cidr("2001:db8::/32"));
+        assert!(is_valid_cidr("::/0"));
+        // A leading-zero octet is accepted and read as decimal (measured: the
+        // service reads 072 as 72, 0110 as 110).
+        assert!(is_valid_cidr("010.0.0.0/8"));
+        assert!(is_valid_cidr("072.021.196.065/32"));
+        assert!(is_valid_cidr("0110.0.0.0/8"));
+        // An octet over 255 is still rejected.
+        assert!(!is_valid_cidr("10.0.0.256/8"));
+        assert!(!is_valid_cidr("0256.0.0.0/8"));
+        assert!(!is_valid_cidr("10.0.0.0/33"));
+    }
+
+    #[test]
+    fn ip_in_cidr_reads_leading_zero_octet_as_decimal() {
+        // 072.0.0.0/8 is the 72.0.0.0/8 network (decimal), not octal 58.
+        assert_eq!(ip_in_cidr("072.0.0.0/8", "72.21.196.65"), Some(true));
+        assert_eq!(ip_in_cidr("072.0.0.0/8", "58.0.0.1"), Some(false));
+        // 0110.0.0.0/8 is decimal 110, not octal 72.
+        assert_eq!(ip_in_cidr("0110.0.0.0/8", "110.1.2.3"), Some(true));
+        assert_eq!(ip_in_cidr("0110.0.0.0/8", "72.1.2.3"), Some(false));
+        // A mapped IPv6 network does not parse, so neither operator applies.
+        assert_eq!(ip_in_cidr("::ffff:10.0.0.0/120", "10.0.0.1"), None);
     }
 
     #[test]
