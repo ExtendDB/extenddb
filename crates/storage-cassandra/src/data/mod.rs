@@ -26,6 +26,7 @@ pub mod transaction_ledger;
 mod transactions;
 pub(crate) mod ttl;
 mod update_item;
+pub mod version;
 
 use condition::check_condition;
 use extenddb_core::expression;
@@ -233,59 +234,6 @@ pub(crate) async fn query_with_pk_sk_item_txnid_ts(
                         item_text,
                         txn_id,
                         txn_timestamp
-                    ),
-                )
-                .await
-        }
-    }
-    .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
-}
-
-/// Execute a query with `(item_text, txn_timestamp, pk, sk, txn_id_bytes)` bound parameters.
-///
-/// Used for: commit PUT/UPDATE.
-pub(crate) async fn query_with_item_ts_pk_sk_txnid(
-    session: &CassandraSession,
-    query: &str,
-    item_text: &str,
-    txn_timestamp: i64,
-    pk: &str,
-    sk: &SortKeyValue,
-    txn_id: cdrs_tokio::types::value::Bytes,
-) -> Result<cdrs_tokio::frame::Envelope, StorageError> {
-    match sk {
-        SortKeyValue::S(s) => {
-            session
-                .query_with_values(
-                    query,
-                    cdrs_tokio::query_values!(item_text, txn_timestamp, pk, s.as_str(), txn_id),
-                )
-                .await
-        }
-        SortKeyValue::N(n) => {
-            session
-                .query_with_values(
-                    query,
-                    cdrs_tokio::query_values!(
-                        item_text,
-                        txn_timestamp,
-                        pk,
-                        decimal_to_value(n),
-                        txn_id
-                    ),
-                )
-                .await
-        }
-        SortKeyValue::B(b) => {
-            session
-                .query_with_values(
-                    query,
-                    cdrs_tokio::query_values!(
-                        item_text,
-                        txn_timestamp,
-                        pk,
-                        Blob::new(b.clone()),
-                        txn_id
                     ),
                 )
                 .await

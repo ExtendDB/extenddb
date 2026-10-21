@@ -25,8 +25,7 @@ use crate::cassandra_util::{get_column, query_optional};
 use crate::data::ddl::data_table_name;
 use crate::data::transaction_ledger::{LedgerOp, TransactionState};
 use crate::data::{
-    query_with_item_ts_pk_sk_txnid, query_with_pk_sk_item_txnid_ts, query_with_pk_sk_txnid,
-    query_with_txnid_ts_pk_sk, select_by_pk,
+    query_with_pk_sk_item_txnid_ts, query_with_pk_sk_txnid, query_with_txnid_ts_pk_sk, select_by_pk,
 };
 
 /// Create a transaction conflict cancellation reason.
@@ -1156,6 +1155,20 @@ impl CassandraEngine {
         key: &Item,
         skip_txn_id: Option<Uuid>,
     ) -> Result<Option<Item>, StorageError> {
+        self.fetch_item_and_version_for_transaction(key_info, key, skip_txn_id)
+            .await
+            .map(|(item, _)| item)
+    }
+
+    /// [`Self::fetch_item_for_transaction`] that also returns the row's
+    /// `version`, which COMMIT needs to compute the version it stores and the
+    /// write timestamp of the index rows it produces (`data::version`).
+    async fn fetch_item_and_version_for_transaction(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        skip_txn_id: Option<Uuid>,
+    ) -> Result<(Option<Item>, Option<i64>), StorageError> {
         let keyspace = self.account_keyspace(&key_info.account_id);
         let table = data_table_name(&key_info.table_id);
         let pk_text = composite_pk_to_text(key, &key_info.key_schema)?;
@@ -1165,15 +1178,16 @@ impl CassandraEngine {
             &self.session,
             &keyspace,
             &table,
-            "item_data, prepared_txn_id",
+            "item_data, version, prepared_txn_id",
             pk_text.as_str(),
             sk.as_ref(),
             sk_col.as_deref(),
         )
         .await?
         else {
-            return Ok(None);
+            return Ok((None, None));
         };
+        let version: Option<i64> = row.get_by_name("version").ok().flatten();
 
         // If a *different* transaction has this row in PREPARE state, wait for
         // it to commit or roll back. Returning the PREPARE-state item
@@ -1181,9 +1195,12 @@ impl CassandraEngine {
         // attribute_not_exists(pk) to fail against stale data with no ALL_OLD.
         let prepared_txn_id: Option<uuid::Uuid> = row.get_by_name("prepared_txn_id").ok().flatten();
         if prepared_txn_id.is_some() && prepared_txn_id != skip_txn_id {
+            // The row is owned by another transaction; its version is whatever
+            // that transaction leaves, so only the committed image is reported.
             return self
                 .wait_for_commit_and_read(key_info, key)
                 .await
+                .map(|item| (item, None))
                 .map_err(|e| {
                     // Preserve a TransactionConflict code and message (e.g. "Transaction
                     // is ongoing for the item" from a wait timeout) instead of flattening
@@ -1201,10 +1218,14 @@ impl CassandraEngine {
 
         let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
         let Some(item_data) = item_data else {
-            return Ok(None);
+            return Ok((None, version));
         };
-        Ok(Some(
-            serde_json::from_str(&item_data).map_err(|e| StorageError::Internal(e.to_string()))?,
+        Ok((
+            Some(
+                serde_json::from_str(&item_data)
+                    .map_err(|e| StorageError::Internal(e.to_string()))?,
+            ),
+            version,
         ))
     }
 
@@ -1423,9 +1444,23 @@ impl CassandraEngine {
 
         match op {
             TransactWriteOp::Put { key_info, item, .. } => {
-                self.commit_put_or_update(key_info, item, txn_id_bytes.clone(), txn_timestamp)
+                // This transaction holds the row's PREPARE fence, so the image
+                // and version read here are the ones the commit replaces. The
+                // old image is what tells the index sync which rows to remove.
+                let (existing, version) = self
+                    .fetch_item_and_version_for_transaction(key_info, item, Some(txn_id))
                     .await?;
-                self.commit_sync_indexes(key_info, None, item).await
+                let next_version = super::version::next_row_version(version);
+                self.commit_put_or_update(
+                    key_info,
+                    item,
+                    txn_id_bytes.clone(),
+                    txn_timestamp,
+                    next_version,
+                )
+                .await?;
+                self.commit_sync_indexes(key_info, existing.as_ref(), Some(item), next_version)
+                    .await
             }
             TransactWriteOp::Update {
                 key_info,
@@ -1435,22 +1470,39 @@ impl CassandraEngine {
                 ..
             } => {
                 // Re-fetch and re-apply update (idempotent)
-                let existing = self
-                    .fetch_item_for_transaction(key_info, key, Some(txn_id))
+                let (existing, version) = self
+                    .fetch_item_and_version_for_transaction(key_info, key, Some(txn_id))
                     .await?;
                 let mut final_item = existing.clone().unwrap_or_else(|| (*key).clone());
                 expression::apply_update_validated(actions, &mut final_item, maps, &[], &[])
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-                self.commit_put_or_update(key_info, &final_item, txn_id_bytes, txn_timestamp)
-                    .await?;
-                self.commit_sync_indexes(key_info, existing.as_ref(), &final_item)
-                    .await
+                let next_version = super::version::next_row_version(version);
+                self.commit_put_or_update(
+                    key_info,
+                    &final_item,
+                    txn_id_bytes,
+                    txn_timestamp,
+                    next_version,
+                )
+                .await?;
+                self.commit_sync_indexes(
+                    key_info,
+                    existing.as_ref(),
+                    Some(&final_item),
+                    next_version,
+                )
+                .await
             }
             TransactWriteOp::Delete { key_info, key, .. } => {
                 let keyspace = self.account_keyspace(&key_info.account_id);
                 let ddb_table = super::ddl::data_table_name(&key_info.table_id);
                 let pk_text = composite_pk_to_text(key, &key_info.key_schema)?;
+                // The image whose index rows the delete has to remove, read
+                // under this transaction's fence.
+                let (existing, version) = self
+                    .fetch_item_and_version_for_transaction(key_info, key, Some(txn_id))
+                    .await?;
 
                 // Step 1: Update partition_max_delete_timestamp
                 // First, try to update if it's null (most common case - first delete in partition)
@@ -1540,7 +1592,18 @@ impl CassandraEngine {
                 check_lwt_applied(&result, "commit_single_operation").map_err(|_| {
                     StorageError::Internal("Transaction conflict during commit".to_owned())
                 })?;
-                Ok(())
+                match existing {
+                    Some(existing) => {
+                        self.commit_sync_indexes(
+                            key_info,
+                            Some(&existing),
+                            None,
+                            super::version::next_row_version(version),
+                        )
+                        .await
+                    }
+                    None => Ok(()),
+                }
             }
             TransactWriteOp::ConditionCheck { key_info, key, .. } => {
                 self.commit_condition_check(key_info, key, txn_id).await
@@ -1607,12 +1670,18 @@ impl CassandraEngine {
     }
 
     /// Helper to commit a Put or Update operation.
+    ///
+    /// `next_version` is the version the row stores from here on
+    /// (`data::version`). It is bound as a value rather than computed in CQL:
+    /// `version + 1` on a row that PREPARE created leaves `version` null, and
+    /// no ordinary write can then pass the `IF version = ?` fence.
     async fn commit_put_or_update(
         &self,
         key_info: &TableKeyInfo,
         final_item: &Item,
         txn_id_bytes: Bytes,
         txn_timestamp: i64,
+        next_version: i64,
     ) -> Result<(), StorageError> {
         let keyspace = self.account_keyspace(&key_info.account_id);
         let ddb_table = super::ddl::data_table_name(&key_info.table_id);
@@ -1629,17 +1698,30 @@ impl CassandraEngine {
             let sk_col = sk_column(sk_type);
 
             let query = format!(
-                "UPDATE {keyspace}.{ddb_table} SET item_data = ?, prepared_txn_id = NULL, version = version + 1, last_committed_txn_timestamp = ? \
+                "UPDATE {keyspace}.{ddb_table} SET item_data = ?, prepared_txn_id = NULL, version = ?, last_committed_txn_timestamp = ? \
                  WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ?"
             );
-            query_with_item_ts_pk_sk_txnid(&self.session, &query, &item_text, txn_timestamp, pk_text.as_str(), &sk, txn_id_bytes).await
+            self.session
+                .query_with_values(
+                    &query,
+                    cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                        item_text.as_str().into(),
+                        next_version.into(),
+                        txn_timestamp.into(),
+                        cdrs_tokio::types::value::Value::from(pk_text.as_str()),
+                        super::index::sk_to_value(&sk),
+                        txn_id_bytes.into(),
+                    ]),
+                )
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))
         } else {
             let query = format!(
-                "UPDATE {keyspace}.{ddb_table} SET item_data = ?, prepared_txn_id = NULL, version = version + 1, last_committed_txn_timestamp = ? \
+                "UPDATE {keyspace}.{ddb_table} SET item_data = ?, prepared_txn_id = NULL, version = ?, last_committed_txn_timestamp = ? \
                  WHERE pk = ? IF prepared_txn_id = ?"
             );
             self.session
-                .query_with_values(&query, cdrs_tokio::query_values!(item_text, txn_timestamp, pk_text.as_str(), txn_id_bytes))
+                .query_with_values(&query, cdrs_tokio::query_values!(item_text, next_version, txn_timestamp, pk_text.as_str(), txn_id_bytes))
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
         }
@@ -1653,18 +1735,20 @@ impl CassandraEngine {
         Ok(())
     }
 
-    /// Sync LSI/GSI index rows after a successful `commit_put_or_update`.
+    /// Sync LSI/GSI index rows after a committed Put, Update or Delete.
     ///
     /// Runs as a separate non-LWT batch after the base-row LWT commit, since
     /// Cassandra does not allow LWT statements to be batched with writes to
-    /// other partitions. The brief inconsistency window is acceptable for the
-    /// same reason async GSIs accept it; transaction recovery re-runs this on
-    /// crash.
+    /// other partitions. The batch is stamped with `stamp`, the version the
+    /// commit stored (or, for a delete, the version-domain value above the
+    /// deleted row), so its rows resolve in base-row commit order against any
+    /// other writer's index batch (`data::version`).
     async fn commit_sync_indexes(
         &self,
         key_info: &TableKeyInfo,
         old_item: Option<&Item>,
-        new_item: &Item,
+        new_item: Option<&Item>,
+        stamp: i64,
     ) -> Result<(), StorageError> {
         let catalog_keyspace = self.catalog_keyspace();
         let data_keyspace = self.account_keyspace(&key_info.account_id);
@@ -1683,7 +1767,9 @@ impl CassandraEngine {
         let sys_delay = self
             .gsi_default_delay_ms
             .load(std::sync::atomic::Ordering::Relaxed);
-        let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+        let mut batch = BatchQueryBuilder::new()
+            .with_consistency(Consistency::LocalQuorum)
+            .with_timestamp(stamp);
         super::index::sync_indexes(
             &mut batch,
             &data_keyspace,
@@ -1691,7 +1777,7 @@ impl CassandraEngine {
             &key_info.attribute_definitions,
             &indexes,
             old_item,
-            Some(new_item),
+            new_item,
             sys_delay,
         )?;
 
@@ -1702,8 +1788,9 @@ impl CassandraEngine {
             key_info,
             &indexes,
             old_item,
-            Some(new_item),
+            new_item,
             sys_delay,
+            stamp,
         )
         .await?;
 
@@ -1828,7 +1915,8 @@ impl CassandraEngine {
     /// individual item operations are logged but do not abort recovery of the
     /// remaining items; the ledger entry is deleted only when all items have
     /// been processed successfully.
-    pub(crate) async fn recover_transaction(
+    #[doc(hidden)]
+    pub async fn recover_transaction(
         &self,
         keyspace: &str,
         txn_id: Uuid,
@@ -1844,16 +1932,20 @@ impl CassandraEngine {
 
         match state {
             Some(TransactionState::Committing) => {
+                let mut committed: Vec<Option<i64>> = Vec::with_capacity(ops.len());
                 for op in &ops {
-                    if let Err(e) = self
+                    match self
                         .recover_commit_op(keyspace, op, txn_id, txn_timestamp)
                         .await
                     {
-                        tracing::error!("recover_transaction commit op {txn_id}: {e}");
-                        return Err(e);
+                        Ok(stamp) => committed.push(stamp),
+                        Err(e) => {
+                            tracing::error!("recover_transaction commit op {txn_id}: {e}");
+                            return Err(e);
+                        }
                     }
                 }
-                for op in &ops {
+                for (op, stamp) in ops.iter().zip(committed) {
                     // The ledger persists the pre-commit image at PREPARE, so
                     // recovery retires the queue entry the item had before the
                     // transaction as well as registering the committed one —
@@ -1864,22 +1956,46 @@ impl CassandraEngine {
                     // and recovery for it stays insert-only (the worker
                     // revalidates before deleting anything, so the stale entry
                     // is inert garbage, not a hazard).
-                    match op.op.as_str() {
-                        "PUT" | "UPDATE" => {
+                    // Index rows are synced only for a row this recovery pass
+                    // committed itself (`stamp` is the version it stored). When
+                    // the commit fence did not apply, the row was committed
+                    // earlier or has since been rewritten by a later writer,
+                    // whose own index batch carries a higher stamp; re-syncing
+                    // the ledger's image would put stale rows above it.
+                    match (op.op.as_str(), stamp) {
+                        ("PUT" | "UPDATE", stamp) => {
                             self.reconcile_ttl_transition_by_table_id(
                                 &op.table_id,
                                 op.pre_commit_item_data.as_deref(),
                                 op.item_data.as_deref(),
                             )
                             .await?;
+                            if let Some(stamp) = stamp {
+                                self.recover_index_rows_by_table_id(
+                                    &op.table_id,
+                                    op.pre_commit_item_data.as_deref(),
+                                    op.item_data.as_deref(),
+                                    stamp,
+                                )
+                                .await?;
+                            }
                         }
-                        "DELETE" => {
+                        ("DELETE", stamp) => {
                             self.reconcile_ttl_transition_by_table_id(
                                 &op.table_id,
                                 op.pre_commit_item_data.as_deref(),
                                 None,
                             )
                             .await?;
+                            if let Some(stamp) = stamp {
+                                self.recover_index_rows_by_table_id(
+                                    &op.table_id,
+                                    op.pre_commit_item_data.as_deref(),
+                                    None,
+                                    stamp,
+                                )
+                                .await?;
+                            }
                         }
                         _ => {}
                     }
@@ -1899,19 +2015,98 @@ impl CassandraEngine {
         self.delete_ledger_entry(keyspace, txn_id).await
     }
 
+    /// The `version` of one base row, by its stored key text. Used by recovery,
+    /// which has the ledger's key text rather than an item.
+    async fn read_version_by_pk(
+        &self,
+        keyspace: &str,
+        table: &str,
+        pk: &str,
+        sk: Option<&(extenddb_storage::util::SortKeyValue, String)>,
+    ) -> Result<Option<i64>, StorageError> {
+        let row = select_by_pk(
+            &self.session,
+            keyspace,
+            table,
+            "version",
+            pk,
+            sk.map(|(value, _)| value),
+            sk.map(|(_, col)| col.as_str()),
+        )
+        .await?;
+        Ok(row.and_then(|row| row.get_by_name("version").ok().flatten()))
+    }
+
+    /// Re-run the index-row sync a committed operation would have performed
+    /// had the process survived, from the two images the ledger kept: the
+    /// pre-commit image recorded at PREPARE and the committed image. `stamp`
+    /// is the version this recovery pass stored on the base row, so the batch
+    /// is ordered against other writers' index batches exactly as the live
+    /// commit's would have been. Callers only reach here when the recovery
+    /// commit fence applied; a row a later writer owns is left to that writer.
+    /// A ledger written before the pre-image field exists has no old image and
+    /// the sync is insert-only: a key the transaction moved leaves its old row
+    /// behind, the same class of leftover as before this sync existed.
+    async fn recover_index_rows_by_table_id(
+        &self,
+        table_id: &str,
+        old_item_data: Option<&str>,
+        new_item_data: Option<&str>,
+        stamp: i64,
+    ) -> Result<(), StorageError> {
+        if old_item_data.is_none() && new_item_data.is_none() {
+            return Ok(());
+        }
+        let query = format!(
+            "SELECT account_id, table_name FROM {}.tables WHERE table_id = ?",
+            self.catalog_keyspace()
+        );
+        let rows = crate::cassandra_util::query_rows(
+            &self.session,
+            &query,
+            cdrs_tokio::query_values!(table_id),
+            "recover_index_rows_by_table_id",
+        )
+        .await?;
+        let Some(row) = rows.first() else {
+            return Ok(());
+        };
+        let account_id: String =
+            crate::cassandra_util::get_column(row, "account_id", "recover_index_rows_by_table_id")?;
+        let table_name: String =
+            crate::cassandra_util::get_column(row, "table_name", "recover_index_rows_by_table_id")?;
+        let key_info = self.fetch_table_key_info(&account_id, &table_name).await?;
+        let parse = |data: Option<&str>| -> Result<Option<Item>, StorageError> {
+            data.map(|data| {
+                serde_json::from_str(data).map_err(|error| {
+                    StorageError::Internal(format!("Parse recovered item: {error}"))
+                })
+            })
+            .transpose()
+        };
+        let old = parse(old_item_data)?;
+        let new = parse(new_item_data)?;
+        self.commit_sync_indexes(&key_info, old.as_ref(), new.as_ref(), stamp)
+            .await
+    }
+
     /// Commit a single operation during recovery.
     ///
     /// PUT/UPDATE: write `item_data`, clear `prepared_txn_id`, set `last_committed_txn_timestamp`.
     /// DELETE: update `partition_max_delete_timestamp`, then delete the row.
     /// CHECK: delete the `created_to_prepare` marker if PREPARE planted one for an
     /// absent item; no-op if the checked item already existed.
+    ///
+    /// Returns the version stamp this call committed the row under, or `None`
+    /// when its fence did not apply (the row was committed before the crash, or
+    /// a later writer has since taken it) and for CHECK, which writes no item.
     async fn recover_commit_op(
         &self,
         keyspace: &str,
         op: &crate::data::transaction_ledger::LedgerOp,
         txn_id: Uuid,
         txn_timestamp: i64,
-    ) -> Result<(), StorageError> {
+    ) -> Result<Option<i64>, StorageError> {
         if op.op == "CHECK" {
             // A ConditionCheck never materializes an item. If PREPARE planted a
             // created_to_prepare marker (because the checked item was absent — see
@@ -1943,7 +2138,7 @@ impl CassandraEngine {
                 StorageError::Internal("Database error".to_owned())
             })?;
             let _ = check_lwt_applied(&result, "recover_commit CHECK");
-            return Ok(());
+            return Ok(None);
         }
 
         let table = data_table_name(&op.table_id);
@@ -1959,26 +2154,39 @@ impl CassandraEngine {
                     ))
                 })?;
 
+                // The row is still fenced by this transaction (or the commit
+                // already landed and the fence below does not apply), so the
+                // version read here is the one the commit replaces. Bound as a
+                // value for the same reason as `commit_put_or_update`.
+                let next_version = super::version::next_row_version(
+                    self.read_version_by_pk(keyspace, &table, &op.pk, sk.as_ref())
+                        .await?,
+                );
+
                 let result = if let Some((sk_val, sk_col)) = &sk {
                     let query = format!(
                         "UPDATE {keyspace}.{table} SET item_data = ?, prepared_txn_id = NULL, \
-                         version = version + 1, last_committed_txn_timestamp = ? \
+                         version = ?, last_committed_txn_timestamp = ? \
                          WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ?",
                     );
-                    query_with_item_ts_pk_sk_txnid(
-                        &self.session,
-                        &query,
-                        item_data,
-                        txn_timestamp,
-                        &op.pk,
-                        sk_val,
-                        txn_id_bytes,
-                    )
-                    .await
+                    self.session
+                        .query_with_values(
+                            &query,
+                            cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                                item_data.into(),
+                                next_version.into(),
+                                txn_timestamp.into(),
+                                cdrs_tokio::types::value::Value::from(op.pk.as_str()),
+                                super::index::sk_to_value(sk_val),
+                                txn_id_bytes.into(),
+                            ]),
+                        )
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))
                 } else {
                     let query = format!(
                         "UPDATE {keyspace}.{table} SET item_data = ?, prepared_txn_id = NULL, \
-                         version = version + 1, last_committed_txn_timestamp = ? \
+                         version = ?, last_committed_txn_timestamp = ? \
                          WHERE pk = ? IF prepared_txn_id = ?",
                     );
                     self.session
@@ -1986,6 +2194,7 @@ impl CassandraEngine {
                             &query,
                             cdrs_tokio::query_values!(
                                 item_data,
+                                next_version,
                                 txn_timestamp,
                                 op.pk.as_str(),
                                 txn_id_bytes
@@ -1999,11 +2208,20 @@ impl CassandraEngine {
                     StorageError::Internal("Database error".to_owned())
                 })?;
 
-                // LWT may not apply if item was already committed (idempotent)
-                let _ = check_lwt_applied(&result, "recover_commit PUT/UPDATE");
-                Ok(())
+                // The fence does not apply when the row was already committed
+                // (idempotent replay) or a later writer owns it; either way
+                // this pass did not write the row and reports no stamp.
+                Ok(check_lwt_applied(&result, "recover_commit PUT/UPDATE")
+                    .is_ok()
+                    .then_some(next_version))
             }
             "DELETE" => {
+                // The stamp the index tombstones carry if this pass deletes the
+                // row: above the row's current version, as the live path's is.
+                let delete_stamp = super::version::next_row_version(
+                    self.read_version_by_pk(keyspace, &table, &op.pk, sk.as_ref())
+                        .await?,
+                );
                 // Step 1: update partition_max_delete_timestamp
                 let update_null = format!(
                     "UPDATE {keyspace}.{table} SET partition_max_delete_timestamp = ? \
@@ -2066,8 +2284,11 @@ impl CassandraEngine {
                     StorageError::Internal("Database error".to_owned())
                 })?;
 
-                let _ = check_lwt_applied(&result, "recover_commit DELETE");
-                Ok(())
+                // Same rule as PUT/UPDATE: a delete that did not apply left the
+                // row to whoever holds it now, so its index rows are theirs.
+                Ok(check_lwt_applied(&result, "recover_commit DELETE")
+                    .is_ok()
+                    .then_some(delete_stamp))
             }
             other => Err(StorageError::Internal(format!(
                 "unknown op in ledger: {other}"

@@ -383,7 +383,8 @@ async fn gsi_apply_index(
 ) -> Result<(), extenddb_storage::error::StorageError> {
     use crate::data::ddl::all_sort_key_info;
     use crate::data::index::{
-        delete_index_row_multi, insert_index_row_multi, item_has_index_keys, project_item_for_index,
+        delete_index_row_multi, insert_index_row_multi, item_has_index_keys,
+        project_item_for_index, same_index_row,
     };
     use cdrs_tokio::consistency::Consistency;
     use cdrs_tokio::query::BatchQueryBuilder;
@@ -393,10 +394,27 @@ async fn gsi_apply_index(
     let idx_sks = all_sort_key_info(&idx.key_schema, &context.attribute_definitions);
     let base_sks = all_sort_key_info(&context.base_key_schema, &context.attribute_definitions);
 
+    // The entry's stamp is the base-row version its write committed, so a
+    // later version's tombstone beats an earlier version's insert on the index
+    // table even when the worker applies the entries in the other order.
     let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+    if let Some(stamp) = context.index_stamp {
+        batch = batch.with_timestamp(stamp);
+    }
 
-    if let Some(old) = old_item
-        && item_has_index_keys(old, &idx.key_schema)
+    let old_indexed = old_item.filter(|old| item_has_index_keys(old, &idx.key_schema));
+    let new_indexed = new_item.filter(|new| item_has_index_keys(new, &idx.key_schema));
+    // Same rule as sync_indexes: one row deleted and re-inserted at one
+    // timestamp ends up deleted, so an unchanged index row is only rewritten.
+    let same_row = match (old_indexed, new_indexed) {
+        (Some(old), Some(new)) => {
+            same_index_row(old, new, &idx.key_schema, &context.base_key_schema)
+        }
+        _ => false,
+    };
+
+    if let Some(old) = old_indexed
+        && !same_row
     {
         delete_index_row_multi(
             &mut batch,
@@ -410,9 +428,7 @@ async fn gsi_apply_index(
         )?;
     }
 
-    if let Some(new) = new_item
-        && item_has_index_keys(new, &idx.key_schema)
-    {
+    if let Some(new) = new_indexed {
         let projected = project_item_for_index(
             new,
             &idx.key_schema,
