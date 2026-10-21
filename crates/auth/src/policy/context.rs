@@ -58,68 +58,38 @@ fn ci_tag_lookup<'a>(map: &'a HashMap<String, String>, tag_key: &str) -> Option<
         .map(|(_, v)| vec![v.as_str()])
 }
 
-/// Global `aws:` condition keys that are legitimately absent for ExtendDB's
-/// caller model: the live service also leaves them unset on the equivalent
-/// request, so IAM absent-key semantics apply to them (a negated operator on an
-/// absent one matches; an `Allow` gated on its presence does not grant).
-/// Measured live on a plain IAM user request and on an assumed-role session.
+/// Documented AWS global condition keys the live service populates for a
+/// request from one of ExtendDB's callers but that this build cannot resolve to
+/// the value the service would have. A statement using one fails closed: a
+/// `Deny` blocks and an `Allow` does not grant, instead of the key being
+/// treated as absent (where a negated operator on an absent single-valued key
+/// would spuriously match).
 ///
-/// This is an allowlist, the inverse of the earlier denylist. Any other
-/// unresolved `aws:` global key (for example `aws:PrincipalOrgID`,
-/// `aws:SourceIp`, or a key AWS adds later) is treated as unresolvable and fails
-/// closed, so the evaluator does not have to track the full, growing set of
-/// keys the service populates. `aws:username` and `aws:TagKeys` are listed
-/// because each is resolved when present and legitimately absent otherwise (no
-/// user name on a role session; no session tags on a plain call).
-#[must_use]
-pub fn is_absent_ok_global_key(key: &str) -> bool {
-    matches!(
-        key,
-        "aws:MultiFactorAuthPresent"
-            | "aws:MultiFactorAuthAge"
-            | "aws:TokenIssueTime"
-            | "aws:SourceVpc"
-            | "aws:SourceVpce"
-            | "aws:VpcSourceIp"
-            | "aws:SourceArn"
-            | "aws:SourceAccount"
-            | "aws:SourceOrgID"
-            | "aws:SourceOrgPaths"
-            | "aws:CalledVia"
-            | "aws:CalledViaFirst"
-            | "aws:CalledViaLast"
-            | "aws:FederatedProvider"
-            | "aws:Referer"
-            | "aws:SourceIdentity"
-            | "aws:Ec2InstanceSourceVpc"
-            | "aws:Ec2InstanceSourcePrivateIPv4"
-            | "aws:username"
-            | "aws:TagKeys"
-    )
-}
+/// This set is empty. ExtendDB resolves every global key the live service
+/// populates for a signed IAM-user or assumed-role request, or an `AssumeRole`
+/// call: the principal identity keys, `aws:userid`, the request time, region,
+/// TLS state, source address, user agent, principal and resource account, and
+/// the tag keys. Every other `aws:` global key is one the service leaves absent
+/// for a standalone AWS account reached by a direct caller (the organization,
+/// VPC-endpoint, federation, MFA, service-principal and cross-service keys), or
+/// one the service does not recognize; the service treats both as absent.
+/// ExtendDB does the same by not listing them here, so an unresolved key keeps
+/// IAM absent-key semantics. The slice stays so a future global key the service
+/// begins populating before ExtendDB resolves it can be made to fail closed by
+/// listing it.
+const FAIL_CLOSED_GLOBAL_KEYS: &[&str] = &[];
 
 /// Whether an unresolved condition key must fail closed for the context that
 /// could not resolve it. Consulted only after `resolve_key` returned `None`.
 ///
-/// Only `aws:` global keys fail closed. `dynamodb:` and `sts:` keys keep
-/// absent-key semantics (a genuinely absent one simply does not match). A tag
-/// sub-key (`aws:PrincipalTag/`, `aws:RequestTag/`, `aws:ResourceTag/`) is
-/// genuinely absent when unresolved, so it keeps absent-key semantics too. A
-/// key on the absent-ok allowlist is legitimately absent. Every other `aws:`
-/// key is one the service may populate but this context has no value for, so it
-/// is unresolvable and the statement using it fails closed.
+/// A key fails closed only when it is on [`FAIL_CLOSED_GLOBAL_KEYS`] (currently
+/// empty). Every other unresolved key, `aws:` global, `dynamodb:`,
+/// `sts:` or a tag sub-key, keeps absent-key semantics: a genuinely absent key
+/// does not match, and a negated operator on an absent single-valued key
+/// matches, which is what the live service does for a key it does not populate.
 #[must_use]
 pub fn aws_key_is_unresolvable(key: &str) -> bool {
-    if !key.starts_with("aws:") {
-        return false;
-    }
-    if key.starts_with("aws:PrincipalTag/")
-        || key.starts_with("aws:RequestTag/")
-        || key.starts_with("aws:ResourceTag/")
-    {
-        return false;
-    }
-    !is_absent_ok_global_key(key)
+    FAIL_CLOSED_GLOBAL_KEYS.contains(&key)
 }
 
 /// The request time as the pair (`aws:CurrentTime` as RFC 3339 UTC,
@@ -166,6 +136,19 @@ pub struct RequestParams {
     /// The IAM user name (`aws:username`) for a user caller; `None` for a role
     /// session, where the service does not populate it.
     pub username: Option<String>,
+    /// The caller's source IP (`aws:SourceIp`): the peer address of the
+    /// connection the request arrived on. `None` when it could not be
+    /// determined, where it keeps absent-key semantics.
+    pub source_ip: Option<String>,
+    /// The caller's `User-Agent` header (`aws:UserAgent`), when present.
+    pub user_agent: Option<String>,
+    /// The caller's principal unique id (`aws:userid`): an `AIDA...` id for a
+    /// user, `<role-id>:<session-name>` for a role session.
+    pub userid: Option<String>,
+    /// The account that owns the target resource (`aws:ResourceAccount`). For
+    /// ExtendDB this is the account in the resource ARN, which is the caller's
+    /// account (ExtendDB resources are same-account).
+    pub resource_account: Option<String>,
 }
 
 /// Context for evaluating conditions on `DynamoDB` operations.
@@ -205,6 +188,14 @@ pub struct RequestContext {
     /// The IAM user name (`aws:username`) for a user caller; `None` for a role
     /// session.
     pub username: Option<String>,
+    /// The caller's source IP (`aws:SourceIp`).
+    pub source_ip: Option<String>,
+    /// The caller's `User-Agent` header (`aws:UserAgent`).
+    pub user_agent: Option<String>,
+    /// The caller's principal unique id (`aws:userid`).
+    pub userid: Option<String>,
+    /// The target resource owner account (`aws:ResourceAccount`).
+    pub resource_account: Option<String>,
     /// The request time formatted for `aws:CurrentTime` (RFC 3339 UTC).
     pub current_time: String,
     /// The request time formatted for `aws:EpochTime` (whole seconds).
@@ -241,6 +232,10 @@ impl RequestContext {
             secure_transport: params.secure_transport,
             principal_type: params.principal_type,
             username: params.username,
+            source_ip: params.source_ip,
+            user_agent: params.user_agent,
+            userid: params.userid,
+            resource_account: params.resource_account,
             current_time,
             epoch_time,
         }
@@ -291,6 +286,10 @@ impl ConditionContext for RequestContext {
                 "aws:EpochTime" => Some(vec![self.epoch_time.as_str()]),
                 "aws:PrincipalType" => self.principal_type.as_deref().map(|v| vec![v]),
                 "aws:username" => self.username.as_deref().map(|v| vec![v]),
+                "aws:SourceIp" => self.source_ip.as_deref().map(|v| vec![v]),
+                "aws:UserAgent" => self.user_agent.as_deref().map(|v| vec![v]),
+                "aws:userid" => self.userid.as_deref().map(|v| vec![v]),
+                "aws:ResourceAccount" => self.resource_account.as_deref().map(|v| vec![v]),
                 // ExtendDB is not an AWS service calling on a principal's behalf,
                 // so these are always false, matching the service for a direct
                 // caller.
@@ -355,6 +354,18 @@ pub struct AssumeRoleContext {
     /// The calling IAM user's name (`aws:username`); `None` when the caller is
     /// not an IAM user (for example a role session), where it is absent.
     pub username: Option<String>,
+    /// The caller's source IP (`aws:SourceIp`): the peer address of the
+    /// `AssumeRole` connection, which is what STS records.
+    pub source_ip: Option<String>,
+    /// The caller's `User-Agent` header (`aws:UserAgent`) on the `AssumeRole`
+    /// call.
+    pub user_agent: Option<String>,
+    /// The caller's principal unique id (`aws:userid`), derived from the caller
+    /// ARN. `None` for a caller ARN that is neither a user nor an assumed-role
+    /// session.
+    pub userid: Option<String>,
+    /// The account that owns the role being assumed (`aws:ResourceAccount`).
+    pub resource_account: Option<String>,
     /// The request time formatted for `aws:CurrentTime` (RFC 3339 UTC).
     pub current_time: String,
     /// The request time formatted for `aws:EpochTime` (whole seconds).
@@ -382,6 +393,10 @@ impl ConditionContext for AssumeRoleContext {
                 "aws:EpochTime" => Some(vec![self.epoch_time.as_str()]),
                 "aws:PrincipalType" => self.principal_type.as_deref().map(|v| vec![v]),
                 "aws:username" => self.username.as_deref().map(|v| vec![v]),
+                "aws:SourceIp" => self.source_ip.as_deref().map(|v| vec![v]),
+                "aws:UserAgent" => self.user_agent.as_deref().map(|v| vec![v]),
+                "aws:userid" => self.userid.as_deref().map(|v| vec![v]),
+                "aws:ResourceAccount" => self.resource_account.as_deref().map(|v| vec![v]),
                 "aws:ViaAWSService" => Some(vec!["false"]),
                 "aws:PrincipalIsAWSService" => Some(vec!["false"]),
                 "aws:TagKeys" => {
@@ -436,9 +451,44 @@ mod tests {
             secure_transport: true,
             principal_type: Some("User".to_owned()),
             username: Some("alice".to_owned()),
+            source_ip: Some("203.0.113.9".to_owned()),
+            user_agent: Some("aws-sdk-rust".to_owned()),
+            userid: Some("AIDAEXAMPLEUSERID1234".to_owned()),
+            resource_account: Some("123456789012".to_owned()),
             current_time: "2026-01-01T00:00:00Z".to_owned(),
             epoch_time: "1767225600".to_owned(),
         }
+    }
+
+    #[test]
+    fn request_context_resolves_new_round3_keys() {
+        let ctx = RequestContext::build(
+            HashMap::new(),
+            HashMap::new(),
+            false,
+            RequestParams {
+                source_ip: Some("203.0.113.9".to_owned()),
+                user_agent: Some("Botocore/1.0".to_owned()),
+                userid: Some("AIDAEXAMPLEUSERID1234".to_owned()),
+                resource_account: Some("123456789012".to_owned()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctx.resolve_key("aws:SourceIp"), Some(vec!["203.0.113.9"]));
+        assert_eq!(ctx.resolve_key("aws:UserAgent"), Some(vec!["Botocore/1.0"]));
+        assert_eq!(
+            ctx.resolve_key("aws:userid"),
+            Some(vec!["AIDAEXAMPLEUSERID1234"])
+        );
+        assert_eq!(
+            ctx.resolve_key("aws:ResourceAccount"),
+            Some(vec!["123456789012"])
+        );
+        // Organization keys are absent for a standalone account, not
+        // unresolvable: they return None and do not fail closed.
+        assert_eq!(ctx.resolve_key("aws:PrincipalOrgID"), None);
+        assert!(!ctx.is_unresolvable_key("aws:PrincipalOrgID"));
+        assert!(!ctx.is_unresolvable_key("aws:PrincipalOrgPaths"));
     }
 
     #[test]
@@ -571,10 +621,10 @@ mod tests {
             ctx.resolve_key("aws:PrincipalAccount"),
             Some(vec!["123456789012"])
         );
-        // A global key STS populates but this context cannot resolve is
-        // unresolvable (fail closed), not absent.
+        // An organization key is absent for a standalone account, not
+        // unresolvable: it returns None and keeps absent-key semantics.
         assert_eq!(ctx.resolve_key("aws:PrincipalOrgID"), None);
-        assert!(ctx.is_unresolvable_key("aws:PrincipalOrgID"));
+        assert!(!ctx.is_unresolvable_key("aws:PrincipalOrgID"));
         assert!(!ctx.is_unresolvable_key("sts:ExternalId"));
         assert!(!ctx.is_unresolvable_key("aws:PrincipalTag/team"));
     }
@@ -681,59 +731,40 @@ mod tests {
     }
 
     #[test]
-    fn unresolvable_classification_matches_the_revised_rule() {
-        // Service-populated aws: keys ExtendDB does not resolve fail closed.
+    fn no_documented_global_key_fails_closed_after_round3() {
+        // The fail-closed set is empty. Every aws: global key is either resolved
+        // by the context or kept absent (absent-key semantics), matching the
+        // service; none is reported unresolvable. This includes the keys round
+        // two failed closed on (the organization keys, aws:userid, aws:SourceIp,
+        // aws:UserAgent), the keys the service leaves absent for a direct caller,
+        // an unknown key, tag sub-keys and non-aws: keys.
         for k in [
             "aws:PrincipalOrgID",
             "aws:PrincipalOrgPaths",
+            "aws:ResourceOrgID",
+            "aws:ResourceOrgPaths",
+            "aws:SourceOrgID",
+            "aws:SourceOrgPaths",
             "aws:userid",
             "aws:SourceIp",
             "aws:UserAgent",
-            "aws:NoSuchGlobalKey",
-        ] {
-            assert!(aws_key_is_unresolvable(k), "{k} should be unresolvable");
-        }
-        // Legitimately-absent keys keep absent-key semantics.
-        for k in [
+            "aws:ResourceAccount",
             "aws:MultiFactorAuthPresent",
             "aws:MultiFactorAuthAge",
             "aws:TokenIssueTime",
             "aws:SourceVpc",
             "aws:SourceVpce",
             "aws:VpcSourceIp",
-            "aws:SourceArn",
-            "aws:SourceAccount",
-            "aws:SourceOrgID",
-            "aws:SourceOrgPaths",
-            "aws:CalledVia",
-            "aws:CalledViaFirst",
-            "aws:CalledViaLast",
             "aws:FederatedProvider",
-            "aws:Referer",
-            "aws:SourceIdentity",
-            "aws:Ec2InstanceSourceVpc",
-            "aws:Ec2InstanceSourcePrivateIPv4",
-            "aws:username",
-            "aws:TagKeys",
-        ] {
-            assert!(is_absent_ok_global_key(k), "{k} should be absent-ok");
-            assert!(
-                !aws_key_is_unresolvable(k),
-                "{k} should not be unresolvable"
-            );
-        }
-        // Tag sub-keys and non-aws: keys are never unresolvable.
-        for k in [
+            "aws:PrincipalServiceName",
+            "aws:NoSuchGlobalKey",
             "aws:PrincipalTag/team",
             "aws:RequestTag/env",
             "aws:ResourceTag/env",
             "dynamodb:LeadingKeys",
             "sts:ExternalId",
         ] {
-            assert!(
-                !aws_key_is_unresolvable(k),
-                "{k} should not be unresolvable"
-            );
+            assert!(!aws_key_is_unresolvable(k), "{k} must not fail closed");
         }
     }
 }

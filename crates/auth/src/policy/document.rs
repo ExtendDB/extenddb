@@ -119,6 +119,9 @@ pub enum ConditionOperator {
     ArnNotEquals,
     ArnLike,
     ArnNotLike,
+    // IP address (CIDR membership, IPv4 and IPv6)
+    IpAddress,
+    NotIpAddress,
     // Set operators (prefix applied to any of the above)
     ForAllValues(Box<ConditionOperator>),
     ForAnyValue(Box<ConditionOperator>),
@@ -379,6 +382,8 @@ fn parse_base_operator(name: &str) -> Result<ConditionOperator, PolicyParseError
         "ArnNotEquals" => Ok(ConditionOperator::ArnNotEquals),
         "ArnLike" => Ok(ConditionOperator::ArnLike),
         "ArnNotLike" => Ok(ConditionOperator::ArnNotLike),
+        "IpAddress" => Ok(ConditionOperator::IpAddress),
+        "NotIpAddress" => Ok(ConditionOperator::NotIpAddress),
         _ => Err(PolicyParseError(format!("unknown operator: {name}"))),
     }
 }

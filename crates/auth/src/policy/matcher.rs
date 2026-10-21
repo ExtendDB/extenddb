@@ -126,6 +126,66 @@ pub fn arn_match(pattern: &str, value: &str) -> bool {
         .all(|(p, v)| wildcard_match(p, v))
 }
 
+/// Whether `addr` falls inside the CIDR `cidr`, for the `IpAddress` and
+/// `NotIpAddress` condition operators.
+///
+/// `cidr` is an IPv4 or IPv6 network in `address/prefix` form, or a bare
+/// address (treated as a full-length prefix). Returns:
+/// - `Some(true)` when `addr` and `cidr` are the same family and `addr` is in
+///   the network,
+/// - `Some(false)` when they are the same family and `addr` is not in it,
+/// - `None` when either value does not parse or the families differ.
+///
+/// The family-mismatch `None` matters: the live service, given an IPv4 policy
+/// range and an IPv6 caller (or the reverse), matches neither `IpAddress` nor
+/// `NotIpAddress` (both evaluate false), rather than letting `NotIpAddress`
+/// pass by negation. Measured live on this account: an IPv4 `IpAddress` range
+/// and an IPv4 `NotIpAddress` range both fail to apply for an IPv6 caller.
+#[must_use]
+pub fn ip_in_cidr(cidr: &str, addr: &str) -> Option<bool> {
+    use std::net::IpAddr;
+
+    let ip: IpAddr = addr.parse().ok()?;
+    let (net_str, prefix_str) = match cidr.split_once('/') {
+        Some((n, p)) => (n, Some(p)),
+        None => (cidr, None),
+    };
+    let net: IpAddr = net_str.parse().ok()?;
+    match (ip, net) {
+        (IpAddr::V4(ip), IpAddr::V4(net)) => {
+            let prefix: u32 = match prefix_str {
+                Some(p) => p.parse().ok()?,
+                None => 32,
+            };
+            if prefix > 32 {
+                return None;
+            }
+            let mask: u32 = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            Some((u32::from(ip) & mask) == (u32::from(net) & mask))
+        }
+        (IpAddr::V6(ip), IpAddr::V6(net)) => {
+            let prefix: u32 = match prefix_str {
+                Some(p) => p.parse().ok()?,
+                None => 128,
+            };
+            if prefix > 128 {
+                return None;
+            }
+            let mask: u128 = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            Some((u128::from(ip) & mask) == (u128::from(net) & mask))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,5 +327,39 @@ mod tests {
             "arn:aws:dynamodb:*:*:table/Orders",
             "arn:aws:dynamodb:us-east-1:123:table/Users"
         ));
+    }
+
+    // --- ip_in_cidr ---
+
+    #[test]
+    fn ipv4_membership() {
+        assert_eq!(ip_in_cidr("203.0.113.0/24", "203.0.113.9"), Some(true));
+        assert_eq!(ip_in_cidr("203.0.113.0/24", "203.0.114.9"), Some(false));
+        assert_eq!(ip_in_cidr("0.0.0.0/0", "52.94.133.133"), Some(true));
+        // Bare address is a full-length (/32) prefix.
+        assert_eq!(ip_in_cidr("52.94.133.133", "52.94.133.133"), Some(true));
+        assert_eq!(ip_in_cidr("52.94.133.133/32", "52.94.133.134"), Some(false));
+    }
+
+    #[test]
+    fn ipv6_membership() {
+        assert_eq!(ip_in_cidr("2001:db8::/32", "2001:db8::1"), Some(true));
+        assert_eq!(ip_in_cidr("2001:db8::/32", "2001:dead::1"), Some(false));
+        assert_eq!(ip_in_cidr("::/0", "2001:db8::1"), Some(true));
+    }
+
+    #[test]
+    fn family_mismatch_is_none() {
+        // An IPv4 range and an IPv6 caller (and the reverse) are incomparable:
+        // neither IpAddress nor NotIpAddress applies.
+        assert_eq!(ip_in_cidr("203.0.113.0/24", "2001:db8::1"), None);
+        assert_eq!(ip_in_cidr("2001:db8::/32", "203.0.113.9"), None);
+    }
+
+    #[test]
+    fn malformed_is_none() {
+        assert_eq!(ip_in_cidr("not-a-cidr", "203.0.113.9"), None);
+        assert_eq!(ip_in_cidr("203.0.113.0/24", "not-an-ip"), None);
+        assert_eq!(ip_in_cidr("203.0.113.0/33", "203.0.113.9"), None);
     }
 }

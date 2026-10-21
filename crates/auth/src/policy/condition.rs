@@ -290,6 +290,7 @@ fn is_negative_operator(op: &ConditionOperator) -> bool {
             | ConditionOperator::StringNotLike
             | ConditionOperator::ArnNotEquals
             | ConditionOperator::ArnNotLike
+            | ConditionOperator::NotIpAddress
     )
 }
 
@@ -348,6 +349,17 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
         ConditionOperator::ArnNotEquals => context_value != policy_value,
         ConditionOperator::ArnLike => super::matcher::arn_match(policy_value, context_value),
         ConditionOperator::ArnNotLike => !super::matcher::arn_match(policy_value, context_value),
+        // IpAddress matches only when the caller address and the policy range
+        // are the same family and the address is in the range. NotIpAddress
+        // matches only when they are the same family and the address is not in
+        // the range. A family mismatch or a malformed value makes both false,
+        // matching the live service.
+        ConditionOperator::IpAddress => {
+            super::matcher::ip_in_cidr(policy_value, context_value) == Some(true)
+        }
+        ConditionOperator::NotIpAddress => {
+            super::matcher::ip_in_cidr(policy_value, context_value) == Some(false)
+        }
         // Null, ForAllValues, ForAnyValue, IfExists handled by caller
         _ => false,
     }
