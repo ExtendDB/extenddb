@@ -283,6 +283,16 @@ request is denied rather than the statement being ignored. Audit stored policies
 `extenddb manage list-user-policies` / `list-role-policies` and correct any malformed CIDR
 before upgrading so a legitimate request is not denied.
 
+**What a stored malformed-CIDR policy does after upgrade.** The failure is
+whole-document and scoped to the principal that owns the policy. Every request by
+that principal is denied until the policy is corrected, including a request that a
+different, valid policy of the same principal would allow (the malformed document
+fails the request closed before the valid policy can grant). The caller receives
+`AccessDeniedException` with the message "Not authorized to perform this action
+(policy evaluation error)", not a server error: a parse failure on the authorization
+path is mapped to a deny, not to `InternalServerError`. A different principal whose
+policies are all well formed is unaffected.
+
 **Trust policies are unchanged.** The live service accepts a malformed CIDR in a trust
 policy at write and drops the statement at evaluation; ExtendDB matches this, so a trust
 policy is not rejected for a malformed CIDR. No catalog migration is required.
