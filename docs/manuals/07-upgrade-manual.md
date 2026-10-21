@@ -267,6 +267,26 @@ MongoDB session that it would grant, and resolves correctly once the session is
 re-established. No catalog migration is required; new sessions record the creation time
 automatically.
 
+### IAM: a malformed CIDR in an identity policy is rejected at write
+
+**What changed.** A condition value for `IpAddress` or `NotIpAddress` that is not a
+valid CIDR or address (for example `10.0.0.0/33`, `999.0.0.0/8`, `not-a-cidr`,
+`10.0.0.0/`) is now rejected when an identity policy or a permissions boundary is
+written, with a `MalformedPolicyDocument`-class error, matching the service. Before
+this release the value was accepted and the statement silently did nothing (an
+`IpAddress` or `NotIpAddress` `Deny` never blocked).
+
+**Who is affected.** Any deployment that stored an identity policy or permissions
+boundary with a malformed CIDR. New writes with a malformed value now fail. A policy
+already stored with a malformed value evaluates fail closed: it no longer parses, so the
+request is denied rather than the statement being ignored. Audit stored policies with
+`extenddb manage list-user-policies` / `list-role-policies` and correct any malformed CIDR
+before upgrading so a legitimate request is not denied.
+
+**Trust policies are unchanged.** The live service accepts a malformed CIDR in a trust
+policy at write and drops the statement at evaluation; ExtendDB matches this, so a trust
+policy is not rejected for a malformed CIDR. No catalog migration is required.
+
 ---
 
 ## License
