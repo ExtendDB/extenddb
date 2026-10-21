@@ -16,11 +16,9 @@ use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::build_expression_maps;
+use crate::request_limits::{self, MAX_BATCH_GET_KEYS};
 use crate::serialize_output;
 use crate::{DispatchMetrics, DispatchResult};
-
-/// Maximum number of keys across all tables in a single `BatchGetItem` request.
-const MAX_BATCH_GET_KEYS: usize = 100;
 
 /// Handle a `BatchGetItem` request.
 ///
@@ -53,19 +51,14 @@ pub async fn handle_batch_get_item(
     // Validate: per-table keys <= 100
     for (table_name, ka) in &input.request_items {
         if ka.keys.len() > MAX_BATCH_GET_KEYS {
-            return Err(DynamoDbError::ValidationException(format!(
-                "1 validation error detected: Value at 'RequestItems.{table_name}.member.Keys' failed to satisfy constraint: \
-                 Member must have length less than or equal to 100"
-            )));
+            return Err(request_limits::batch_get_table_too_many(table_name));
         }
     }
 
     // Validate: total keys across all tables <= 100
     let total_keys: usize = input.request_items.values().map(|ka| ka.keys.len()).sum();
     if total_keys > MAX_BATCH_GET_KEYS {
-        return Err(DynamoDbError::ValidationException(
-            "Too many items requested for the BatchGetItem call".to_owned(),
-        ));
+        return Err(request_limits::batch_get_too_many());
     }
 
     // Validate: each table must have at least one key
@@ -189,8 +182,7 @@ pub async fn handle_batch_get_item(
 
     for (table_name, ka) in &input.request_items {
         let key_info = ctx
-            .storage
-            .table_key_info(&ctx.account_id, table_name)
+            .table_key_info_uncached(table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
 

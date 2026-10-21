@@ -33,7 +33,8 @@
 //! - `BatchGetItem`/`BatchWriteItem`: one authorization per (action, table)
 //!   with the set of every key that table receives in the request.
 //! - `TransactGetItems`/`TransactWriteItems`: one authorization per item, each
-//!   with that single item's partition key.
+//!   with that single item's partition key. Items that give the same (action,
+//!   table, key) are authorized once.
 //!
 //! An N partition key is written into LeadingKeys in one of two forms,
 //! depending on the operation, because that is what the service does
@@ -53,7 +54,7 @@ use serde_json::Value;
 
 /// A single `(action, table)` authorization to perform for a batch or
 /// transaction operation, carrying the LeadingKeys the service would evaluate.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct AuthzTarget {
     /// The bare operation string the action maps to (no `dynamodb:` prefix).
     pub action: String,
@@ -333,16 +334,30 @@ fn values_map(input: &Value) -> HashMap<String, Value> {
 /// transaction operations authorize once per item with that item's key, which
 /// is how the service evaluates a `ForAnyValue` condition differently for the
 /// two (a batch of one own and one other key passes `ForAnyValue`; a
-/// transaction of the same two does not).
+/// transaction of the same two does not). Transaction items that give the same
+/// target are returned once, in the order of their first occurrence: the
+/// decision for a target depends only on its action, table and LeadingKeys, so
+/// a hundred `ConditionCheck`s on one partition need one evaluation.
+///
+/// `key_info_by_table` is the authorization snapshot; a `None` entry is a table
+/// that does not exist, whose targets carry no LeadingKeys (the engine returns
+/// `ResourceNotFoundException`).
 pub(crate) fn batch_transact_targets(
     operation: &str,
     input: &Value,
-    key_info_by_table: &HashMap<String, TableKeyInfo>,
+    key_info_by_table: &HashMap<String, Option<TableKeyInfo>>,
 ) -> Option<Vec<AuthzTarget>> {
     let pk_attr_of = |table: &str| -> Option<String> {
         key_info_by_table
             .get(table)
+            .and_then(Option::as_ref)
             .and_then(|ki| hash_attr(&ki.key_schema).map(ToOwned::to_owned))
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut push_unique = |out: &mut Vec<AuthzTarget>, target: AuthzTarget| {
+        if seen.insert(target.clone()) {
+            out.push(target);
+        }
     };
 
     match operation {
@@ -372,11 +387,14 @@ pub(crate) fn batch_transact_targets(
                                 .and_then(|k| pk_from_map(k, &pk, NumberForm::Decimal))
                         })
                         .map(|v| vec![v]);
-                    out.push(AuthzTarget {
-                        action: "GetItem".to_owned(),
-                        table: table.to_owned(),
-                        leading_keys: lk,
-                    });
+                    push_unique(
+                        &mut out,
+                        AuthzTarget {
+                            action: "GetItem".to_owned(),
+                            table: table.to_owned(),
+                            leading_keys: lk,
+                        },
+                    );
                 }
             }
             Some(out)
@@ -400,11 +418,14 @@ pub(crate) fn batch_transact_targets(
                                     .and_then(|m| pk_from_map(m, &pk, NumberForm::Decimal))
                             })
                             .map(|v| vec![v]);
-                        out.push(AuthzTarget {
-                            action: action.to_owned(),
-                            table: table.to_owned(),
-                            leading_keys: lk,
-                        });
+                        push_unique(
+                            &mut out,
+                            AuthzTarget {
+                                action: action.to_owned(),
+                                table: table.to_owned(),
+                                leading_keys: lk,
+                            },
+                        );
                     }
                 }
             }

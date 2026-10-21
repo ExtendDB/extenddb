@@ -106,7 +106,7 @@ pub(crate) async fn handle_request(
 
     // --- Authz segment ---
     let authz_start = std::time::Instant::now();
-    let pre_fetched_key_info;
+    let authorized_key_info;
     {
         if state.catalog_store.is_none() {
             tracing::error!("Authorization required but catalog_store is not configured");
@@ -118,7 +118,7 @@ pub(crate) async fn handle_request(
             );
         }
         match authorize_request(&state, &identity, &input, &operation, &account_id).await {
-            Ok(ki) => pre_fetched_key_info = ki,
+            Ok(ki) => authorized_key_info = ki,
             Err(e) => return error_response(&e, &request_id),
         }
     }
@@ -133,7 +133,7 @@ pub(crate) async fn handle_request(
         account_id,
         import_paths: state.import_paths.clone(),
         export_paths: state.export_paths.clone(),
-        pre_fetched_key_info,
+        authorized_key_info,
         auth_cache: state.auth_cache.clone(),
         table_key_info_lookup: Some(
             state.table_key_info_cache.clone() as Arc<dyn extenddb_storage::TableKeyInfoLookup>

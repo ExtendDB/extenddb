@@ -21,12 +21,10 @@ use extenddb_core::validation::{
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
+use crate::request_limits::{self, MAX_BATCH_WRITE_ITEMS};
 use crate::serialize_output;
 use crate::stream_capture;
 use crate::{DispatchMetrics, DispatchResult};
-
-/// Maximum number of write requests across all tables in a single `BatchWriteItem`.
-const MAX_BATCH_WRITE_ITEMS: usize = 25;
 
 /// Handle a `BatchWriteItem` request.
 ///
@@ -54,25 +52,17 @@ pub async fn handle_batch_write_item(
     // Validate: per-table operations <= 25
     for (table_name, reqs) in &input.request_items {
         if reqs.len() > MAX_BATCH_WRITE_ITEMS {
-            let items_repr = reqs
-                .iter()
-                .map(|_| "WriteRequest")
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(DynamoDbError::ValidationException(format!(
-                "1 validation error detected: Value '{{{table_name}=[{items_repr}]}}' at 'requestItems' failed to satisfy constraint: \
-                 Map value must satisfy constraint: [Member must have length less than or equal to 25, \
-                 Member must have length greater than or equal to 1]"
-            )));
+            return Err(request_limits::batch_write_table_too_many(
+                table_name,
+                reqs.len(),
+            ));
         }
     }
 
     // Validate: total operations across all tables <= 25
     let total_ops: usize = input.request_items.values().map(std::vec::Vec::len).sum();
     if total_ops > MAX_BATCH_WRITE_ITEMS {
-        return Err(DynamoDbError::ValidationException(
-            "Too many items requested for the BatchWriteItem call".to_owned(),
-        ));
+        return Err(request_limits::batch_write_too_many());
     }
 
     // Validate: each table must have at least one request
@@ -113,8 +103,7 @@ pub async fn handle_batch_write_item(
 
     for (table_name, reqs) in &input.request_items {
         let key_info = ctx
-            .storage
-            .table_key_info(&ctx.account_id, table_name)
+            .table_key_info_uncached(table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
 

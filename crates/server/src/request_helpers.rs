@@ -3,8 +3,6 @@
 
 //! Request parsing and authorization helpers for the `DynamoDB` wire protocol.
 
-use std::collections::HashMap;
-
 use axum::http::HeaderMap;
 use extenddb_core::error::DynamoDbError;
 use extenddb_storage::error::StorageError;
@@ -86,9 +84,14 @@ fn key_info_for_authz(
 
 /// Evaluate IAM policies for an authenticated identity.
 ///
-/// Returns the pre-fetched `TableKeyInfo` for single-table item-level operations
-/// (P118 optimization #2). The caller passes this into `OperationContext` to
-/// avoid a redundant catalog roundtrip in the engine layer.
+/// Returns the `TableKeyInfo` authorization read for each table it evaluated,
+/// including a `None` for a table it found missing (P118 optimization #2). The
+/// caller passes this into `OperationContext::authorized_key_info`, and the
+/// engine resolves those tables from it instead of reading the catalog again.
+/// Authorization and the engine therefore act on one snapshot: a table that
+/// authorization saw as missing, and so evaluated with `dynamodb:LeadingKeys`
+/// absent, is missing to the engine for the rest of the request, even if it has
+/// become ACTIVE in between.
 ///
 /// All authorization data is fetched via `state.authz_cache`, which sits on
 /// top of the underlying `AuthorizationStore` and serves cached, pre-parsed
@@ -99,26 +102,26 @@ pub(crate) async fn authorize_request(
     input: &Value,
     operation: &str,
     account_id: &str,
-) -> Result<Option<extenddb_core::types::TableKeyInfo>, DynamoDbError> {
+) -> Result<extenddb_engine::AuthorizedKeyInfo, DynamoDbError> {
     let table_name = extract_table_name(input);
+    let mut authorized_key_info = extenddb_engine::AuthorizedKeyInfo::new();
 
     // P118: Fetch table_key_info for item-level operations via the SWR cache.
     // The result is used for LeadingKeys extraction here AND returned to the
     // caller to avoid a redundant fetch in the engine layer.
-    let key_info = match operation {
-        "GetItem" | "PutItem" | "DeleteItem" | "UpdateItem" | "Query" | "Scan" => {
-            if let Some(ref tn) = table_name {
-                key_info_for_authz(state.table_key_info_cache.get(account_id, tn).await)?
-            } else {
-                None
-            }
-        }
-        _ => None,
-    };
+    if let Some(ref tn) = table_name
+        && matches!(
+            operation,
+            "GetItem" | "PutItem" | "DeleteItem" | "UpdateItem" | "Query" | "Scan"
+        )
+    {
+        let ki = key_info_for_authz(state.table_key_info_cache.get(account_id, tn).await)?;
+        authorized_key_info.insert(tn.clone(), ki);
+    }
 
     // Developer mode opens authorization for the authenticated caller. SigV4
     // verification already ran upstream, so the request is authenticated; only
-    // the IAM policy decision is skipped. key_info is still returned so the
+    // the IAM policy decision is skipped. The key info is still returned so the
     // engine layer can reuse it.
     //
     // This check is deliberately positioned ahead of EVERY authorization branch
@@ -128,7 +131,7 @@ pub(crate) async fn authorize_request(
     // item operations passed. Any future operation-specific branch must be added
     // below this point, or it will reintroduce that defect.
     if state.dev_mode {
-        return Ok(key_info);
+        return Ok(authorized_key_info);
     }
 
     // Batch and transaction operations address multiple tables in nested request
@@ -148,19 +151,29 @@ pub(crate) async fn authorize_request(
     // `dynamodb:LeadingKeys` value(s) the service evaluates, extracted per the
     // table's key schema. The resource ARN per target is unchanged: each is
     // still that table's ARN. (Measured against live DynamoDB 2026-10-20.)
+    // Targets with the same (action, table, LeadingKeys) are evaluated once,
+    // since the decision depends only on those three for a given identity.
     if let Some(tables) = crate::leading_keys::batch_transact_tables(operation, input) {
-        // Fetch each distinct table's key info for partition-key extraction,
-        // then build the targets once from the populated map.
-        let mut key_info_by_table = HashMap::new();
+        // An oversized request is refused before any key info is read or any
+        // policy is evaluated, with the engine's own size error. DynamoDB does
+        // the same: a 101-item transaction, a 26-request BatchWriteItem or a
+        // 101-key BatchGetItem returns ValidationException even to a principal
+        // with no permissions (measured 2026-10-21). Checking first also bounds
+        // the work below by the operation's item limit instead of by the body
+        // size.
+        extenddb_engine::check_request_item_counts(operation, input)?;
+
+        // Read each distinct table's key info from storage, not the cache, and
+        // hand what was read to the engine. The engine resolves these tables
+        // from the snapshot, so it never acts on a table authorization saw as
+        // missing, and it sees the catalog as fresh as these handlers always
+        // read it.
         for table in tables {
-            if let Some(ki) =
-                key_info_for_authz(state.table_key_info_cache.get(account_id, &table).await)?
-            {
-                key_info_by_table.insert(table, ki);
-            }
+            let ki = key_info_for_authz(state.storage.table_key_info(account_id, &table).await)?;
+            authorized_key_info.insert(table, ki);
         }
         let targets =
-            crate::leading_keys::batch_transact_targets(operation, input, &key_info_by_table)
+            crate::leading_keys::batch_transact_targets(operation, input, &authorized_key_info)
                 .unwrap_or_default();
 
         if targets.is_empty() {
@@ -196,16 +209,20 @@ pub(crate) async fn authorize_request(
                 .await?;
             }
         }
-        return Ok(None);
+        return Ok(authorized_key_info);
     }
 
     let resource_arn = build_resource_arn(&state.region, account_id, table_name.as_deref());
+    let key_info = table_name
+        .as_ref()
+        .and_then(|tn| authorized_key_info.get(tn))
+        .and_then(Option::as_ref);
 
     let params = extenddb_auth::policy::context::RequestParams {
         leading_keys: crate::leading_keys::single_table_leading_keys(
             input,
             operation,
-            key_info.as_ref(),
+            key_info,
             state.limits.max_expression_tokens,
         ),
         attributes: extract_attributes(input),
@@ -233,7 +250,7 @@ pub(crate) async fn authorize_request(
     )
     .await?;
 
-    Ok(key_info)
+    Ok(authorized_key_info)
 }
 
 /// Extract attribute names from the request for `dynamodb:Attributes`.

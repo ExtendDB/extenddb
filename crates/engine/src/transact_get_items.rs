@@ -21,11 +21,9 @@ use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::build_expression_maps;
+use crate::request_limits::{self, MAX_TRANSACT_ITEMS};
 use crate::serialize_output;
 use crate::{DispatchMetrics, DispatchResult};
-
-/// Maximum number of items in a single `TransactGetItems` request.
-const MAX_TRANSACT_GET_ITEMS: usize = 100;
 
 /// Handle a `TransactGetItems` request.
 ///
@@ -48,16 +46,11 @@ pub async fn handle_transact_get_items(
         ));
     }
 
-    if input.transact_items.len() > MAX_TRANSACT_GET_ITEMS {
-        return Err(DynamoDbError::ValidationException(format!(
-            "1 validation error detected: Value '[{}]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100",
-            input
-                .transact_items
-                .iter()
-                .map(|_| "TransactGetItem")
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
+    if input.transact_items.len() > MAX_TRANSACT_ITEMS {
+        return Err(request_limits::transact_items_too_many(
+            input.transact_items.len(),
+            "TransactGetItem",
+        ));
     }
 
     // Resolve table key info for each item
@@ -75,8 +68,7 @@ pub async fn handle_transact_get_items(
     let mut key_infos = Vec::with_capacity(input.transact_items.len());
     for tgi in &input.transact_items {
         let key_info = ctx
-            .storage
-            .table_key_info(&ctx.account_id, &tgi.get.table_name)
+            .table_key_info_uncached(&tgi.get.table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
         // Key type validation is deferred to the storage layer so that
