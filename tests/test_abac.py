@@ -864,34 +864,52 @@ class TestTagCollisionDeterministic(_TaggedTableBase):
 
     SHARP = "\u00df"
 
-    def test_fold_colliding_tag_resolves_exact_key(self, table):
+    CHECKS = 20
+
+    def _resolve_once(self, table, policy_key):
+        """Create a FRESH user tagged {mass:A, ma\u00df:B}, allow GetItem when
+        aws:PrincipalTag/<policy_key> == A, and return "ALLOW" or "DENY".
+
+        A fresh user per check is the point: the principal's tag map is cached
+        per user, so one user sees a single HashMap order and hides the
+        nondeterminism. Each fresh user gets its own order, so resolution that
+        is not pinned to the exact (then smallest-by-code-point) key shows up as
+        a DENY on some fraction of users.
+        """
         user = f"gk-coll-{uuid.uuid4().hex[:8]}"
         ak, sk = _create_user_with_key(self.mgmt, self.account_id, user)
         try:
-            r = self.mgmt.tag_user(self.account_id, user, {"mass": "A", f"ma{self.SHARP}": "B"})
-            assert r.status_code in (200, 201, 204), r.text
+            assert self.mgmt.tag_user(
+                self.account_id, user, {"mass": "A", f"ma{self.SHARP}": "B"}
+            ).status_code in (200, 201, 204)
+            assert self.mgmt.put_user_policy(self.account_id, user, "p", {
+                "Version": "2012-10-17", "Statement": [{
+                    "Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": "*",
+                    "Condition": {"StringEquals": {
+                        f"aws:PrincipalTag/{policy_key}": "A"}}}]}).status_code == 204
             client = _make_client(self.endpoint, ak, sk, self.region)
-
-            def outcomes_for(value):
-                assert self.mgmt.put_user_policy(self.account_id, user, "p", {
-                    "Version": "2012-10-17", "Statement": [{
-                        "Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": "*",
-                        "Condition": {"StringEquals": {"aws:PrincipalTag/mass": value}}}]}).status_code == 204
-                seen = set()
-                for _ in range(20):
-                    try:
-                        client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
-                        seen.add("ALLOW")
-                    except ClientError as exc:
-                        assert exc.response["Error"]["Code"] == "AccessDeniedException"
-                        seen.add("DENY")
-                return seen
-
-            # Exact key mass=A resolves A every time; =B denies every time.
-            assert outcomes_for("A") == {"ALLOW"}
-            assert outcomes_for("B") == {"DENY"}
+            try:
+                client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
+                return "ALLOW"
+            except ClientError as exc:
+                assert exc.response["Error"]["Code"] == "AccessDeniedException"
+                return "DENY"
         finally:
             self.mgmt.delete_user(self.account_id, user)
+
+    def test_fold_colliding_exact_key_resolves_deterministically(self, table):
+        # aws:PrincipalTag/mass must resolve the byte-exact stored key (mass=A),
+        # so every one of CHECKS fresh users allows.
+        results = [self._resolve_once(table, "mass") for _ in range(self.CHECKS)]
+        assert set(results) == {"ALLOW"}, results
+
+    def test_fold_colliding_no_exact_key_resolves_deterministically(self, table):
+        # aws:PrincipalTag/MASS has no byte-exact key; it folds to "mass",
+        # colliding with mass and ma\u00df. The rule picks the smallest
+        # fold-matching key by code point (mass < ma\u00df), so A resolves and
+        # every one of CHECKS fresh users allows.
+        results = [self._resolve_once(table, "MASS") for _ in range(self.CHECKS)]
+        assert set(results) == {"ALLOW"}, results
 
     def test_rejects_invalid_and_dup_tag_keys_at_write(self):
         # A combining-mark tag key and the reserved aws: prefix are rejected
