@@ -119,14 +119,18 @@ implicitly denied.
   (both false for a direct caller), the tag keys (`aws:PrincipalTag/*`,
   `aws:RequestTag/*`, `aws:ResourceTag/*` on the identity path,
   `dynamodb:ResourceTag/*`, each matched case-insensitively on the key),
-  `sts:ExternalId` and `aws:TagKeys`. Every other `aws:` global key is absent,
+  `sts:ExternalId` and `aws:TagKeys`, and, for a role-session caller only,
+  `aws:TokenIssueTime` (the session issue time) and `aws:MultiFactorAuthPresent`
+  (`false` for a session assumed without MFA), both absent for an IAM user.
+  Every other `aws:` global key is absent,
   which is what the service does for a key it does not populate for this caller
   and for a key it does not recognize: the organization keys
   (`aws:PrincipalOrgID`, `aws:PrincipalOrgPaths`, and the resource and source
   organization keys), because an ExtendDB account is a standalone AWS account
-  where IAM leaves them unset; the VPC-endpoint, federation, MFA,
-  service-principal and cross-service keys, which the service does not populate
-  for a direct IAM-user or assumed-role caller over a public endpoint; and any
+  where IAM leaves them unset; the VPC-endpoint, federation, service-principal
+  and cross-service keys, and `aws:MultiFactorAuthAge`, which the service does
+  not populate for a direct IAM-user or assumed-role caller over a public
+  endpoint; and any
   unknown or future `aws:` key. The evaluator keeps an explicit (currently
   empty) fail-closed list, so a future global key the service begins populating
   before ExtendDB resolves it can be made to fail closed by listing it, rather

@@ -466,6 +466,9 @@ Resolved (evaluated against the request value):
 - `aws:PrincipalTag/<key>`, `aws:RequestTag/<key>` (trust path),
   `aws:ResourceTag/<key>`, `dynamodb:ResourceTag/<key>`, `aws:TagKeys`,
   `sts:ExternalId` (trust path).
+- Role-session only (absent for an IAM user, matching the service):
+  `aws:TokenIssueTime` (the session issue time) and
+  `aws:MultiFactorAuthPresent` (`false` for a session assumed without MFA).
 
 Absent (keep IAM absent-key semantics, as the service leaves them unset for
 this caller):
@@ -473,9 +476,11 @@ this caller):
 - Organization keys: `aws:PrincipalOrgID`, `aws:PrincipalOrgPaths`,
   `aws:ResourceOrgID`, `aws:ResourceOrgPaths`, `aws:SourceOrgID`,
   `aws:SourceOrgPaths` (a standalone account has no organization).
-- Role-session and federation keys ExtendDB does not model: `aws:TokenIssueTime`,
-  `aws:MultiFactorAuthPresent`, `aws:MultiFactorAuthAge`, `aws:FederatedProvider`,
+- Role-session and federation keys ExtendDB does not model:
+  `aws:MultiFactorAuthAge`, `aws:FederatedProvider`,
   `aws:SourceIdentity`, `aws:AssumedRoot`, `aws:SignInSessionArn`.
+  (`aws:TokenIssueTime` and `aws:MultiFactorAuthPresent` are resolved for a
+  role session; see the resolved list above.)
 - Network keys for VPC endpoints: `aws:SourceVpc`, `aws:SourceVpcArn`,
   `aws:SourceVpce`, `aws:VpcSourceIp`, `aws:VpceAccount`, `aws:VpceOrgID`,
   `aws:VpceOrgPaths`, `aws:Ec2InstanceSourceVpc`,
@@ -496,8 +501,18 @@ added rather than silently granting through a negated operator. An operator the
 evaluator does not implement (for example `BinaryEquals`) still fails closed.
 
 `aws:TokenIssueTime` is populated by the service for a role session and absent
-for an IAM user. ExtendDB treats it as absent for both, which can only
-over-deny a role-session policy that gates on its presence, never over-grant.
+for an IAM user. ExtendDB resolves it for a role session from the session issue
+time and leaves it absent for an IAM user, matching the service. A policy that
+gates on its presence or compares it with a `Date` operator behaves as it does
+on AWS for a role session.
+
+`aws:MultiFactorAuthPresent` is populated by the service for a role session
+(`false` for a session assumed without MFA) and absent for an IAM user with
+long-term keys. ExtendDB resolves it to `false` for a role session and leaves it
+absent for an IAM user, so the common deny-without-MFA guard
+(`Deny if Bool aws:MultiFactorAuthPresent=false`) applies to a role session and
+is inert for an IAM user, matching the service. `aws:MultiFactorAuthAge` stays
+absent, as the service leaves it unset for a non-MFA session.
 
 ### Permissions Boundaries
 
