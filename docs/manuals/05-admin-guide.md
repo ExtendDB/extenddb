@@ -513,7 +513,9 @@ evaluator does not implement (for example `BinaryEquals`) still fails closed.
 for an IAM user. ExtendDB resolves it for a role session from the session issue
 time and leaves it absent for an IAM user, matching the service. A policy that
 gates on its presence or compares it with a `Date` operator behaves as it does
-on AWS for a role session.
+on AWS for a role session. This resolution is on the DynamoDB request path; in a
+trust policy evaluated during `AssumeRole` the key is absent, as it is on the
+service for an `AssumeRole` caller using long-term credentials.
 
 `aws:MultiFactorAuthPresent` is populated by the service for a role session
 (`false` for a session assumed without MFA) and absent for an IAM user with
@@ -521,7 +523,10 @@ long-term keys. ExtendDB resolves it to `false` for a role session and leaves it
 absent for an IAM user, so the common deny-without-MFA guard
 (`Deny if Bool aws:MultiFactorAuthPresent=false`) applies to a role session and
 is inert for an IAM user, matching the service. `aws:MultiFactorAuthAge` stays
-absent, as the service leaves it unset for a non-MFA session.
+absent, as the service leaves it unset for a non-MFA session. Like
+`aws:TokenIssueTime`, `aws:MultiFactorAuthPresent` is resolved on the DynamoDB
+request path only; in a trust policy it is absent, as on the service for an
+`AssumeRole` caller using long-term credentials.
 
 ### Permissions Boundaries
 
