@@ -211,6 +211,14 @@ pub async fn tag_role(
         .map(|t| (t.key.clone(), t.value.clone()))
         .collect();
 
+    if let Some(dup) = super::duplicate_tag_key_ci(&tags) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("Duplicate tag keys found (tag keys are case insensitive): {dup}"),
+        )
+            .into_response();
+    }
+
     match state
         .catalog_store
         .tag_role(&account_id, &role_name, &tags)

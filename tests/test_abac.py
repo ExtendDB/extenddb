@@ -857,6 +857,43 @@ class TestLeadingZeroCidr(_TaggedTableBase):
             {"IpAddress": {"aws:SourceIp": "0177.0.0.0/8"}})) == "DENY"
 
 
+class TestTagCollisionDeterministic(_TaggedTableBase):
+    """Two stored tag keys that fold to the same string (mass and ma\u00df)
+    must resolve deterministically to the exact key, every time, not at random
+    HashMap order."""
+
+    SHARP = "\u00df"
+
+    def test_fold_colliding_tag_resolves_exact_key(self, table):
+        user = f"gk-coll-{uuid.uuid4().hex[:8]}"
+        ak, sk = _create_user_with_key(self.mgmt, self.account_id, user)
+        try:
+            r = self.mgmt.tag_user(self.account_id, user, {"mass": "A", f"ma{self.SHARP}": "B"})
+            assert r.status_code in (200, 201, 204), r.text
+            client = _make_client(self.endpoint, ak, sk, self.region)
+
+            def outcomes_for(value):
+                assert self.mgmt.put_user_policy(self.account_id, user, "p", {
+                    "Version": "2012-10-17", "Statement": [{
+                        "Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": "*",
+                        "Condition": {"StringEquals": {"aws:PrincipalTag/mass": value}}}]}).status_code == 204
+                seen = set()
+                for _ in range(20):
+                    try:
+                        client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
+                        seen.add("ALLOW")
+                    except ClientError as exc:
+                        assert exc.response["Error"]["Code"] == "AccessDeniedException"
+                        seen.add("DENY")
+                return seen
+
+            # Exact key mass=A resolves A every time; =B denies every time.
+            assert outcomes_for("A") == {"ALLOW"}
+            assert outcomes_for("B") == {"DENY"}
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+
 # ---------------------------------------------------------------------------
 # aws:TokenIssueTime (role sessions) and aws:userid across recreate
 # ---------------------------------------------------------------------------

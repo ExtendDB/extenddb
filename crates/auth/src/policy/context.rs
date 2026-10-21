@@ -45,37 +45,49 @@ pub trait ConditionContext {
     }
 }
 
-/// Look up a tag map by key, case-insensitively on the key.
-/// AWS resolves tag condition keys (`aws:PrincipalTag/<k>`, `aws:RequestTag/<k>`,
-/// `aws:ResourceTag/<k>`, `dynamodb:ResourceTag/<k>`) without regard to the case
-/// of `<k>`, under Unicode full case folding; a tag stored as `Team` is matched
-/// by a policy naming `team`, and `cla\u{00df}` matches `class`. Tag values stay
-/// case-sensitive. IAM forbids two tag keys that differ only in case, so a
-/// case-insensitive match is unambiguous.
+/// Look up a tag map by key, matching the live service.
 ///
-/// `folded_tag_key` is already case-folded by the caller; each stored key is
-/// folded before comparison.
-fn ci_tag_lookup<'a>(
+/// Resolve a tag condition key against a stored tag map, deterministically.
+///
+/// The live service stores two tag keys that differ by more than ASCII case
+/// (for example `mass` and `ma\u{00df}`) as distinct keys, and resolves a policy
+/// key to the exact stored key when one matches exactly. ExtendDB mirrors that:
+/// a byte-exact stored key wins; otherwise the key is resolved under `norm`
+/// (Unicode case folding on the identity path, ASCII case on the trust path),
+/// and when several stored keys normalize to the same string the smallest by
+/// code point is chosen, so resolution is deterministic rather than depending on
+/// `HashMap` iteration order.
+///
+/// `sub_key` is the original (un-normalized) tag sub-key from the policy.
+fn tag_lookup<'a>(
     map: &'a HashMap<String, String>,
-    folded_tag_key: &str,
+    sub_key: &str,
+    norm: impl Fn(&str) -> String,
 ) -> Option<Vec<&'a str>> {
+    if let Some(v) = map.get(sub_key) {
+        return Some(vec![v.as_str()]);
+    }
+    let want = norm(sub_key);
     map.iter()
-        .find(|(k, _)| super::casefold::case_fold(k) == folded_tag_key)
+        .filter(|(k, _)| norm(k) == want)
+        .min_by(|a, b| a.0.cmp(b.0))
         .map(|(_, v)| vec![v.as_str()])
 }
 
-/// Strip `prefix` from the front of an already case-folded key, returning the
-/// remainder (the folded tag sub-key) when it matches.
+/// Strip a tag prefix (`aws:PrincipalTag/`, `aws:RequestTag/`,
+/// `aws:ResourceTag/`, `dynamodb:ResourceTag/`) from the front of `key`
+/// ASCII-case-insensitively, returning the original (un-normalized) tag sub-key.
 ///
-/// The live service resolves a condition key name without regard to case,
-/// including the tag prefix (`aws:PrincipalTag/`, `aws:RequestTag/`,
-/// `aws:ResourceTag/`, `dynamodb:ResourceTag/`), under Unicode full case
-/// folding. The caller folds the whole key first, so `prefix` is given in its
-/// folded (lower-case ASCII) form and a plain prefix match suffices. The
-/// returned sub-key is the folded form, which `ci_tag_lookup` compares against
-/// each folded stored key.
-fn strip_folded_prefix<'a>(folded_key: &'a str, folded_prefix: &str) -> Option<&'a str> {
-    folded_key.strip_prefix(folded_prefix)
+/// The prefix is ASCII, so the service (and ExtendDB) match it without regard to
+/// ASCII case; the returned sub-key keeps its original bytes so `tag_lookup` can
+/// prefer a byte-exact stored key.
+fn strip_prefix_ci<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = key.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
+        key.get(prefix.len()..)
+    } else {
+        None
+    }
 }
 
 /// Documented AWS global condition keys the live service populates for a
@@ -286,23 +298,21 @@ impl RequestContext {
 impl ConditionContext for RequestContext {
     fn resolve_key(&self, key: &str) -> Option<Vec<&str>> {
         // Condition key names are resolved under Unicode full case folding,
-        // matching the live service: `aws:securetransport`, `AWS:SecureTransport`
-        // and `aws:SecureTran\u{017f}port` resolve the same, and
-        // `aws:principaltag/team` the same as `aws:PrincipalTag/team`. Fold the
-        // whole key once; the tag prefix is matched in its folded form and the
-        // folded sub-key is compared against each folded stored tag key.
-        let folded = super::casefold::case_fold(key);
-        if let Some(tag_key) = strip_folded_prefix(&folded, "aws:principaltag/") {
-            ci_tag_lookup(&self.principal_tags, tag_key)
-        } else if let Some(tag_key) = strip_folded_prefix(&folded, "aws:resourcetag/") {
+        // Tag keys are resolved deterministically: a byte-exact stored key
+        // wins, else the smallest fold-matching stored key. The tag prefix is
+        // ASCII and matched case-insensitively. Non-tag key names are matched
+        // under Unicode full case folding, matching the live DynamoDB path.
+        if let Some(sub) = strip_prefix_ci(key, "aws:PrincipalTag/") {
+            tag_lookup(&self.principal_tags, sub, super::casefold::case_fold)
+        } else if let Some(sub) = strip_prefix_ci(key, "aws:ResourceTag/") {
             // The service evaluates resource tags as aws:ResourceTag/*. ExtendDB
             // resolves them from the same resource-tag map it uses for
-            // dynamodb:ResourceTag/*, case-folded on the key.
-            ci_tag_lookup(&self.resource_tags, tag_key)
-        } else if let Some(tag_key) = strip_folded_prefix(&folded, "dynamodb:resourcetag/") {
-            ci_tag_lookup(&self.resource_tags, tag_key)
+            // dynamodb:ResourceTag/*.
+            tag_lookup(&self.resource_tags, sub, super::casefold::case_fold)
+        } else if let Some(sub) = strip_prefix_ci(key, "dynamodb:ResourceTag/") {
+            tag_lookup(&self.resource_tags, sub, super::casefold::case_fold)
         } else {
-            match folded.as_str() {
+            match super::casefold::case_fold(key).as_str() {
                 "dynamodb:leadingkeys" => self
                     .leading_keys
                     .as_ref()
@@ -438,13 +448,12 @@ impl ConditionContext for AssumeRoleContext {
     fn resolve_key(&self, key: &str) -> Option<Vec<&str>> {
         // Condition key names are resolved under Unicode full case folding,
         // matching the live service, including the tag prefixes.
-        let folded = super::casefold::case_fold(key);
-        if let Some(tag_key) = strip_folded_prefix(&folded, "aws:principaltag/") {
-            ci_tag_lookup(&self.principal_tags, tag_key)
-        } else if let Some(tag_key) = strip_folded_prefix(&folded, "aws:requesttag/") {
-            ci_tag_lookup(&self.request_tags, tag_key)
+        if let Some(sub) = strip_prefix_ci(key, "aws:PrincipalTag/") {
+            tag_lookup(&self.principal_tags, sub, super::casefold::case_fold)
+        } else if let Some(sub) = strip_prefix_ci(key, "aws:RequestTag/") {
+            tag_lookup(&self.request_tags, sub, super::casefold::case_fold)
         } else {
-            match folded.as_str() {
+            match super::casefold::case_fold(key).as_str() {
                 "sts:externalid" => self.external_id.as_deref().map(|v| vec![v]),
                 "sts:rolesessionname" => self.session_name.as_deref().map(|v| vec![v]),
                 "aws:principalarn" => Some(vec![self.principal_arn.as_str()]),
@@ -599,6 +608,43 @@ mod tests {
             Some(vec!["Eng"])
         );
         assert_eq!(ctx.resolve_key("aws:PrincipalTag/Missing"), None);
+    }
+
+    #[test]
+    fn tag_lookup_fold_collision_is_deterministic_exact_wins() {
+        // mass and ma\u{00df} both fold to "mass". The exact stored key must win
+        // every time, and a non-exact fold-matching policy key must resolve to
+        // the smallest stored key by code point, regardless of HashMap seed.
+        let sharp = "ma\u{00df}";
+        for _ in 0..64 {
+            let mut m = HashMap::new();
+            m.insert("mass".to_owned(), "A".to_owned());
+            m.insert(sharp.to_owned(), "B".to_owned());
+            // exact byte match wins
+            assert_eq!(
+                tag_lookup(&m, "mass", crate::policy::casefold::case_fold),
+                Some(vec!["A"])
+            );
+            assert_eq!(
+                tag_lookup(&m, sharp, crate::policy::casefold::case_fold),
+                Some(vec!["B"])
+            );
+            // no exact: MASS folds to mass, matches both; smallest key "mass" wins
+            assert_eq!(
+                tag_lookup(&m, "MASS", crate::policy::casefold::case_fold),
+                Some(vec!["A"])
+            );
+            // ASCII normalizer (trust path): "mass" exact wins; sharp s is not
+            // folded to ss, so ma\u{00df} is a distinct key resolved exactly.
+            assert_eq!(
+                tag_lookup(&m, "mass", str::to_ascii_lowercase),
+                Some(vec!["A"])
+            );
+            assert_eq!(
+                tag_lookup(&m, sharp, str::to_ascii_lowercase),
+                Some(vec!["B"])
+            );
+        }
     }
 
     #[test]
@@ -780,14 +826,7 @@ mod tests {
             Some("ext-123".to_owned()),
             HashMap::new(),
         );
-        // sts:External[s->ſ]... long s in externalId: sts:External[ı]d would NOT
-        // fold; use the st-ligature-free long s in a resolvable spot.
-        assert_eq!(
-            ctx.resolve_key("sts:External\u{0131}d"),
-            None,
-            "dotless i must not fold to i"
-        );
-        // Tag key folds: cla[ß] -> class.
+        assert_eq!(ctx.resolve_key("sts:External\u{0131}d"), None);
         assert_eq!(
             ctx.resolve_key("aws:PrincipalTag/cla\u{00df}"),
             Some(vec!["x"])

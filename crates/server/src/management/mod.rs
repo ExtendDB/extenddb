@@ -227,6 +227,26 @@ pub(crate) fn is_valid_iam_name(name: &str) -> bool {
         })
 }
 
+/// Reject a tag set with two keys that collide under ASCII case folding.
+///
+/// The live service treats tag keys as case insensitive for uniqueness: a
+/// `TagUser`/`TagRole`/`TagResource` request carrying both `Team` and `team`
+/// is rejected ("Duplicate tag keys found. Please note that Tag keys are case
+/// insensitive."). Two keys that differ by more than ASCII case (for example
+/// `mass` and `ma\u{00df}`) are distinct and allowed. Returns the duplicate key
+/// when found.
+pub(crate) fn duplicate_tag_key_ci(tags: &[(String, String)]) -> Option<String> {
+    let mut seen: Vec<String> = Vec::with_capacity(tags.len());
+    for (k, _) in tags {
+        let lower = k.to_ascii_lowercase();
+        if seen.contains(&lower) {
+            return Some(k.clone());
+        }
+        seen.push(lower);
+    }
+    None
+}
+
 /// Validate admin name: 1-64 chars, alphanumeric, hyphens, or underscores.
 fn is_valid_admin_name(name: &str) -> bool {
     !name.is_empty()
