@@ -453,3 +453,94 @@ async fn gsi_creation_converges_under_concurrent_writers() {
     }
     s.cleanup().await;
 }
+
+/// Create a base table keyed on `pk` (HASH) with a `g1` attribute, so a GSI on
+/// `g1` can be manufactured over it. Returns the table id.
+async fn create_base_table(s: &Scratch, table: &str) -> String {
+    s.engine
+        .create_table(
+            ACCOUNT,
+            CreateTableInput {
+                table_name: table.to_owned(),
+                key_schema: vec![KeySchemaElement {
+                    attribute_name: "pk".to_owned(),
+                    key_type: KeyType::Hash,
+                }],
+                attribute_definitions: vec![AttributeDefinition {
+                    attribute_name: "pk".to_owned(),
+                    attribute_type: ScalarAttributeType::S,
+                }],
+                billing_mode: Some(BillingMode::PayPerRequest),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create the base table");
+    table_id(&s.db, table).await
+}
+
+/// Insert a catalog row for a GSI stuck mid-creation: `index_status = 'CREATING'`
+/// on `g1` (HASH), KEYS_ONLY. Returns the index id.
+async fn insert_creating_gsi(db: &PgPool, tid: &str, index_name: &str) -> String {
+    let iid = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO indexes \
+         (table_id, index_name, index_id, index_type, key_schema, projection, index_status) \
+         VALUES ($1, $2, $3, 'GSI', $4, $5, 'CREATING')",
+    )
+    .bind(tid)
+    .bind(index_name)
+    .bind(&iid)
+    .bind(serde_json::json!([{"AttributeName": "g1", "KeyType": "HASH"}]))
+    .bind(serde_json::json!({"ProjectionType": "KEYS_ONLY"}))
+    .execute(db)
+    .await
+    .expect("insert a CREATING GSI catalog row");
+    iid
+}
+
+/// Finding 1. The orphan-hold sweep runs against the live set of building
+/// indexes. A GSI under creation holds a row in `vector_index_holds` and a
+/// `CREATING` row in `indexes`, and its backfill can outlive the sweep's age
+/// bound. The sweep must leave that hold in place; releasing it would let the
+/// propagation queue drain onto the half-built index.
+///
+/// The hold here is aged past the one-minute bound by hand, so the test does not
+/// wait, and the sweep is driven through the reconciler path the stuck-build
+/// worker and startup both use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn creating_gsi_hold_survives_the_orphan_sweep() {
+    if base_conn().is_none() {
+        return skip();
+    }
+    let s = scratch().await;
+    let tid = create_base_table(&s, "gsi_hold_sweep").await;
+    let iid = insert_creating_gsi(&s.db, &tid, "gsi_slow").await;
+    sqlx::query(
+        "INSERT INTO vector_index_holds (table_id, index_id, created_at) \
+         VALUES ($1, $2, NOW() - INTERVAL '2 minutes')",
+    )
+    .bind(&tid)
+    .bind(&iid)
+    .execute(&s.db)
+    .await
+    .expect("insert an aged hold for the creating GSI");
+
+    extenddb_storage_postgres::reconcile_incomplete_vector_indexes(&s.engine)
+        .await
+        .expect("run the reconciler path that performs the orphan sweep");
+
+    let holds: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM vector_index_holds WHERE table_id = $1 AND index_id = $2",
+    )
+    .bind(&tid)
+    .bind(&iid)
+    .fetch_one(&s.db)
+    .await
+    .expect("count the hold");
+    assert_eq!(
+        holds, 1,
+        "the orphan sweep released a live GSI creation's hold"
+    );
+    s.cleanup().await;
+}
