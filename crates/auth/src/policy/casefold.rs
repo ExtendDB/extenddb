@@ -1584,7 +1584,10 @@ mod tests {
     #[test]
     fn table_sorted_and_unique() {
         for w in CASE_FOLD.windows(2) {
-            assert!(w[0].0 < w[1].0, "table must be sorted and unique by code point");
+            assert!(
+                w[0].0 < w[1].0,
+                "table must be sorted and unique by code point"
+            );
         }
     }
 
@@ -1613,15 +1616,24 @@ mod tests {
     fn ascii_fast_path_matches_table() {
         // The ASCII fast path must agree with a per-code-point table fold
         // on every ASCII string.
-        for s in ["", "AWS:SecureTransport", "dynamodb:LeadingKeys",
-                  "aws:PrincipalTag/Team", "MiXeD123_.-/", "abc"] {
-            let table: String = s.chars().map(|c| {
-                let cp = c as u32;
-                match CASE_FOLD.binary_search_by(|&(k, _)| k.cmp(&cp)) {
-                    Ok(i) => CASE_FOLD[i].1.to_owned(),
-                    Err(_) => c.to_string(),
-                }
-            }).collect();
+        for s in [
+            "",
+            "AWS:SecureTransport",
+            "dynamodb:LeadingKeys",
+            "aws:PrincipalTag/Team",
+            "MiXeD123_.-/",
+            "abc",
+        ] {
+            let table: String = s
+                .chars()
+                .map(|c| {
+                    let cp = c as u32;
+                    match CASE_FOLD.binary_search_by(|&(k, _)| k.cmp(&cp)) {
+                        Ok(i) => CASE_FOLD[i].1.to_owned(),
+                        Err(_) => c.to_string(),
+                    }
+                })
+                .collect();
             assert_eq!(case_fold(s), table, "fast path diverged on {s:?}");
             assert_eq!(case_fold(s), s.to_ascii_lowercase());
         }

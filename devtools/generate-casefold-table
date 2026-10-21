@@ -18,6 +18,7 @@ recorded in the generated file header. Run from the repository root:
 No Unicode data file is vendored; the data comes from the Python standard
 library.
 """
+import subprocess
 import sys
 import unicodedata
 
@@ -143,7 +144,18 @@ def main():
     w("    }")
     w("}")
     w("")
-    sys.stdout.write("\n".join(out))
+    source = "\n".join(out)
+    # Format through rustfmt so the generated file is rustfmt-clean and
+    # regeneration is idempotent with `cargo fmt --check`.
+    try:
+        r = subprocess.run(
+            ["rustfmt", "--edition", "2024", "--emit", "stdout"],
+            input=source, capture_output=True, text=True, check=True,
+        )
+        source = r.stdout
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+    sys.stdout.write(source)
 
 
 if __name__ == "__main__":
