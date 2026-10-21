@@ -32,8 +32,8 @@ use std::time::Duration;
 use extenddb_core::expression::ExpressionMaps;
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, BillingMode, CreateGsiAction, CreateTableInput,
-    GlobalSecondaryIndexUpdate, Item, KeySchemaElement, KeyType, Projection, ProjectionType,
-    ScalarAttributeType, TableKeyInfo, UpdateTableInput,
+    DescribeTableInput, GlobalSecondaryIndexUpdate, Item, KeySchemaElement, KeyType, Projection,
+    ProjectionType, ScalarAttributeType, TableKeyInfo, UpdateTableInput,
 };
 use extenddb_storage::{DataEngine, TableEngine};
 use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
@@ -570,5 +570,82 @@ async fn creating_gsi_hold_survives_the_orphan_sweep() {
         holds, 1,
         "the orphan sweep released a live GSI creation's hold"
     );
+    s.cleanup().await;
+}
+
+/// Finding 3. A Query or Scan on a GSI that is still CREATING must be refused
+/// with the service's exact ValidationException text rather than served the
+/// half built index data table, and DescribeTable must report Backfilling true
+/// for that window. After the flip to ACTIVE the index resolves and reports no
+/// Backfilling member.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn creating_gsi_refuses_reads_and_reports_backfilling() {
+    if base_conn().is_none() {
+        return skip();
+    }
+    let s = scratch().await;
+    let tid = create_base_table(&s, "gsi_read_refusal").await;
+    let _iid = insert_creating_gsi(&s.db, &tid, "gsi_slow").await;
+
+    match s.engine.index_info_by_table_id(&tid, "gsi_slow").await {
+        Err(extenddb_storage::error::StorageError::Validation(msg)) => assert_eq!(
+            msg,
+            "Cannot read from backfilling global secondary index: gsi_slow"
+        ),
+        other => panic!("expected a backfilling read refusal, got {other:?}"),
+    }
+
+    let desc = s
+        .engine
+        .describe_table(
+            ACCOUNT,
+            DescribeTableInput {
+                table_name: "gsi_read_refusal".to_owned(),
+            },
+        )
+        .await
+        .expect("describe the table while the GSI is creating");
+    let gsi = desc
+        .global_secondary_indexes
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .find(|g| g.index_name == "gsi_slow")
+        .expect("the creating GSI is described");
+    assert_eq!(gsi.index_status, "CREATING");
+    assert_eq!(gsi.backfilling, Some(true));
+
+    sqlx::query(
+        "UPDATE indexes SET index_status = 'ACTIVE' WHERE table_id = $1 AND index_name = 'gsi_slow'",
+    )
+    .bind(&tid)
+    .execute(&s.db)
+    .await
+    .expect("flip the GSI to ACTIVE");
+
+    s.engine
+        .index_info_by_table_id(&tid, "gsi_slow")
+        .await
+        .expect("an ACTIVE GSI resolves for reads");
+    let desc = s
+        .engine
+        .describe_table(
+            ACCOUNT,
+            DescribeTableInput {
+                table_name: "gsi_read_refusal".to_owned(),
+            },
+        )
+        .await
+        .expect("describe the table after the GSI is active");
+    let gsi = desc
+        .global_secondary_indexes
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .find(|g| g.index_name == "gsi_slow")
+        .expect("the active GSI is described");
+    assert_eq!(gsi.index_status, "ACTIVE");
+    assert_eq!(gsi.backfilling, None);
+
     s.cleanup().await;
 }

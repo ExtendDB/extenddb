@@ -556,6 +556,7 @@ impl PostgresEngine {
                     index_name: g.index_name.clone(),
                     key_schema: g.key_schema.clone(),
                     projection: g.projection.clone(),
+                    backfilling: None,
                     index_status: "ACTIVE".to_owned(),
                     provisioned_throughput: Some(ProvisionedThroughputDescription {
                         read_capacity_units: g

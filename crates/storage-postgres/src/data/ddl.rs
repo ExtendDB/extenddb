@@ -599,8 +599,8 @@ impl PostgresEngine {
         table_id: &str,
         index_name: &str,
     ) -> Result<IndexInfo, StorageError> {
-        let idx_row: Option<(String, String, serde_json::Value, serde_json::Value)> = sqlx::query_as(
-            "SELECT index_type, index_id, key_schema, projection FROM indexes WHERE table_id = $1 AND index_name = $2",
+        let idx_row: Option<(String, String, serde_json::Value, serde_json::Value, String)> = sqlx::query_as(
+            "SELECT index_type, index_id, key_schema, projection, index_status FROM indexes WHERE table_id = $1 AND index_name = $2",
         )
         .bind(table_id)
         .bind(index_name)
@@ -608,7 +608,7 @@ impl PostgresEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let (idx_type_str, idx_id, ks_json, proj_json) =
+        let (idx_type_str, idx_id, ks_json, proj_json, index_status) =
             idx_row.ok_or_else(|| StorageError::IndexNotFound(index_name.to_owned()))?;
 
         let index_type = match idx_type_str.as_str() {
@@ -620,6 +620,18 @@ impl PostgresEngine {
                 )));
             }
         };
+
+        // A GSI is readable only once its backfill has committed and it is
+        // ACTIVE. While it is CREATING the data table is half built, so a Query or
+        // Scan must be refused rather than served partial rows. The message is the
+        // one the service returns for this case, and the generic storage error arm
+        // in the engine maps Validation to ValidationException verbatim.
+        if index_type == IndexType::Gsi && index_status != "ACTIVE" {
+            return Err(StorageError::Validation(format!(
+                "{}{index_name}",
+                extenddb_core::types::VECTOR_INDEX_BACKFILLING_SCAN_PREFIX
+            )));
+        }
 
         let key_schema: Vec<KeySchemaElement> =
             serde_json::from_value(ks_json).map_err(|e| StorageError::Internal(e.to_string()))?;

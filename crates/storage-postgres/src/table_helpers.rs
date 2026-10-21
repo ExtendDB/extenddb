@@ -378,6 +378,9 @@ impl PostgresEngine {
                     index_name: idx.index_name.clone(),
                     key_schema: ks,
                     projection: proj,
+                    // Present and true only while the index is still being built;
+                    // absent once it is ACTIVE, matching the service.
+                    backfilling: (idx.index_status == "CREATING").then_some(true),
                     index_status: idx.index_status,
                     provisioned_throughput: pt.or(Some(ProvisionedThroughputDescription {
                         read_capacity_units: 0,
