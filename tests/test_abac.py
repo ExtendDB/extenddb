@@ -536,3 +536,151 @@ class TestUnresolvableGlobalKey:
         finally:
             admin_client.delete_table(TableName=table)
             self.mgmt.delete_user(self.account_id, user)
+
+
+# ---------------------------------------------------------------------------
+# Revised global-key rule: resolvable keys, service-populated keys, allowlist
+# ---------------------------------------------------------------------------
+
+def _run_get(mgmt: ManagementClient, endpoint: str, region: str, account_id: str,
+             table: str, policy: dict) -> str:
+    """Create a fresh user with `policy`, call GetItem on `table`, return the
+    outcome, and clean the user up. ExtendDB serves fresh policy on write, so no
+    retry is needed."""
+    user = f"gk-{uuid.uuid4().hex[:8]}"
+    ak, sk = _create_user_with_key(mgmt, account_id, user)
+    resp = mgmt.put_user_policy(account_id, user, "p", policy)
+    assert resp.status_code == 204, resp.text
+    client = _make_client(endpoint, ak, sk, region)
+    try:
+        client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
+        return "ALLOW"
+    except ClientError as exc:
+        assert exc.response["Error"]["Code"] == "AccessDeniedException", exc.response["Error"]
+        return "DENY"
+    finally:
+        mgmt.delete_user(account_id, user)
+
+
+class _TaggedTableBase:
+    """Shared env=prod tagged table for the global-key tests."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, auth_env, mgmt, account_id, region):
+        self.endpoint = auth_env[0]
+        self.mgmt = mgmt
+        self.account_id = account_id
+        self.region = region
+
+    @pytest.fixture
+    def table(self):
+        admin = f"gk-adm-{uuid.uuid4().hex[:8]}"
+        ak, sk = _create_user_with_key(self.mgmt, self.account_id, admin)
+        resp = self.mgmt.put_user_policy(
+            self.account_id, admin, "full",
+            {"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"}]},
+        )
+        assert resp.status_code == 204
+        admin_client = _make_client(self.endpoint, ak, sk, self.region)
+        name = f"gk-{uuid.uuid4().hex[:8]}"
+        admin_client.create_table(
+            TableName=name,
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            BillingMode="PAY_PER_REQUEST",
+            Tags=[{"Key": "env", "Value": "prod"}],
+        )
+        wait_for_active(admin_client, name)
+        admin_client.put_item(TableName=name, Item={"pk": {"S": "k1"}, "data": {"S": "v1"}})
+        yield name
+        try:
+            admin_client.delete_table(TableName=name)
+            wait_for_deleted(admin_client, name)
+        except Exception:
+            pass
+        self.mgmt.delete_user(self.account_id, admin)
+
+    def _get(self, table: str, policy: dict) -> str:
+        return _run_get(self.mgmt, self.endpoint, self.region, self.account_id, table, policy)
+
+    @staticmethod
+    def _allow_get_if(condition: dict) -> dict:
+        return {"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": "*",
+            "Condition": condition}]}
+
+    @staticmethod
+    def _allow_all_deny_get_if(condition: dict) -> dict:
+        return {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"},
+            {"Effect": "Deny", "Action": "dynamodb:GetItem", "Resource": "*",
+             "Condition": condition}]}
+
+
+class TestResolvableGlobalKeys(_TaggedTableBase):
+    """Guard statements on keys ExtendDB resolves no longer fail closed.
+    All four grant, matching live DynamoDB."""
+
+    def test_securetransport_deny_guard_allows(self, table):
+        # Deny if not over TLS; the request is over TLS so the deny is inert.
+        assert self._get(table, self._allow_all_deny_get_if(
+            {"Bool": {"aws:SecureTransport": "false"}})) == "ALLOW"
+
+    def test_requestedregion_deny_guard_allows(self, table):
+        # Deny if region is not the server region; it is, so the deny is inert.
+        assert self._get(table, self._allow_all_deny_get_if(
+            {"StringNotEquals": {"aws:RequestedRegion": self.region}})) == "ALLOW"
+
+    def test_principaltype_user_allows(self, table):
+        assert self._get(table, self._allow_get_if(
+            {"StringEquals": {"aws:PrincipalType": "User"}})) == "ALLOW"
+
+    def test_currenttime_allows(self, table):
+        assert self._get(table, self._allow_get_if(
+            {"DateGreaterThan": {"aws:CurrentTime": "2020-01-01T00:00:00Z"}})) == "ALLOW"
+
+
+class TestServicePopulatedGlobalKeys(_TaggedTableBase):
+    """The allowlist: keys the service populates evaluate as present, and
+    an unknown aws: key fails closed."""
+
+    def test_viaawsservice_negated_allow_denies(self, table):
+        # ViaAWSService is present and false; StringNotEquals=false is false, so
+        # the Allow does not grant. Live DynamoDB: DENY.
+        assert self._get(table, self._allow_get_if(
+            {"StringNotEquals": {"aws:ViaAWSService": "false"}})) == "DENY"
+
+    def test_principalisawsservice_negated_allow_denies(self, table):
+        assert self._get(table, self._allow_get_if(
+            {"StringNotEquals": {"aws:PrincipalIsAWSService": "false"}})) == "DENY"
+
+    def test_resourcetag_negated_allow_denies(self, table):
+        # Table tagged env=prod; StringNotEquals env=prod is false. Live: DENY.
+        assert self._get(table, self._allow_get_if(
+            {"StringNotEquals": {"aws:ResourceTag/env": "prod"}})) == "DENY"
+
+    def test_resourcetag_positive_allow_grants(self, table):
+        # aws:ResourceTag/env resolves to prod. Live: ALLOW.
+        assert self._get(table, self._allow_get_if(
+            {"StringEquals": {"aws:ResourceTag/env": "prod"}})) == "ALLOW"
+
+    def test_mfa_boolifexists_allows_non_mfa_caller(self, table):
+        # A non-MFA caller has aws:MultiFactorAuthPresent absent; BoolIfExists
+        # passes when the key is absent. Live: ALLOW.
+        assert self._get(table, self._allow_get_if(
+            {"BoolIfExists": {"aws:MultiFactorAuthPresent": "false"}})) == "ALLOW"
+
+    def test_unknown_key_negated_allow_fails_closed(self, table):
+        # An unknown aws: key is unresolvable, so the Allow does not grant even
+        # under a negated operator. ExtendDB denies here while live DynamoDB
+        # allows (treating the key as absent); this is the deliberate
+        # fail-closed over-denial recorded in the report's open questions.
+        assert self._get(table, self._allow_get_if(
+            {"StringNotEquals": {"aws:NoSuchGlobalKey": "x"}})) == "DENY"
+
+    def test_unknown_key_deny_fails_closed(self, table):
+        # A Deny gated on an unknown aws: key fails closed and blocks. Live
+        # DynamoDB also denies here (the negated-absent rule applies the Deny).
+        assert self._get(table, self._allow_all_deny_get_if(
+            {"StringNotEquals": {"aws:NoSuchGlobalKey": "x"}})) == "DENY"

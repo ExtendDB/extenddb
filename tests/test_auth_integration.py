@@ -1122,6 +1122,53 @@ class TestTrustPolicyDeny:
         finally:
             self.mgmt.delete_user(self.account_id, user)
 
+    # -- Resolved request-wide keys on the trust path (T8) ------------------
+
+    def test_tls_guard_does_not_block_over_tls(self):
+        # Allow, plus Deny if Bool aws:SecureTransport=false. The call is over
+        # TLS so SecureTransport is true, the deny does not fire, assumption is
+        # granted. Live STS: ALLOW. Round one failed closed on this guard.
+        user, arn = self._caller()
+        try:
+            trust = _trust(
+                _stmt("Allow", {"AWS": arn}),
+                _stmt("Deny", {"AWS": "*"},
+                      condition={"Bool": {"aws:SecureTransport": "false"}}),
+            )
+            assert self._assume(trust, arn) == ALLOW
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_secure_transport_true_grants(self):
+        user, arn = self._caller()
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": arn},
+                                 condition={"Bool": {"aws:SecureTransport": "true"}}))
+            assert self._assume(trust, arn) == ALLOW
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_principaltype_user_grants(self):
+        # The caller is an IAM user, so aws:PrincipalType is User. Live STS: ALLOW.
+        user, arn = self._caller()
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": arn},
+                                 condition={"StringEquals": {"aws:PrincipalType": "User"}}))
+            assert self._assume(trust, arn) == ALLOW
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_principaltype_assumedrole_does_not_grant(self):
+        # The caller is a user, so PrincipalType=AssumedRole does not match and
+        # the gated Allow does not grant. Live STS: DENY.
+        user, arn = self._caller()
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": arn},
+                                 condition={"StringEquals": {"aws:PrincipalType": "AssumedRole"}}))
+            assert self._assume(trust, arn) == DENY
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
     def test_string_not_equals_ignore_case_external_id(self):
         # StringNotEqualsIgnoreCase is implemented, so a matching external id
         # (any case) makes the condition false and the Deny inert; an absent
