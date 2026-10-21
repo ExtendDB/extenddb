@@ -225,6 +225,23 @@ pub(crate) fn item_has_index_keys(item: &Item, index_ks: &[KeySchemaElement]) ->
         .all(|ks| item.contains_key(&ks.attribute_name))
 }
 
+/// Whether two images of one base item map to the same index-table row.
+///
+/// The index row's primary key is the index key attributes followed by the
+/// base key attributes, so the rows coincide exactly when every one of those
+/// attributes has the same value in both images.
+pub(crate) fn same_index_row(
+    old: &Item,
+    new: &Item,
+    index_ks: &[KeySchemaElement],
+    base_ks: &[KeySchemaElement],
+) -> bool {
+    index_ks
+        .iter()
+        .chain(base_ks.iter())
+        .all(|ks| old.get(&ks.attribute_name) == new.get(&ks.attribute_name))
+}
+
 /// Compute the effective propagation delay for an index.
 ///
 /// Per-GSI setting overrides the system default. `Some(0)` = sync, `None` = use default.
@@ -264,9 +281,22 @@ pub fn sync_indexes(
         let idx_sks = all_sort_key_info(&idx.key_schema, attr_defs);
         let base_sks = all_sort_key_info(base_key_schema, attr_defs);
 
+        let old_indexed = old_item.filter(|old| item_has_index_keys(old, &idx.key_schema));
+        let new_indexed = new_item.filter(|new| item_has_index_keys(new, &idx.key_schema));
+
+        // Every statement in a batch shares the batch's write timestamp, and
+        // a tombstone wins over a cell at the same timestamp, so deleting and
+        // re-inserting one index row in the same batch leaves the row deleted.
+        // When the old and new images address the same index row, the INSERT
+        // alone rewrites every column of that row.
+        let same_row = match (old_indexed, new_indexed) {
+            (Some(old), Some(new)) => same_index_row(old, new, &idx.key_schema, base_key_schema),
+            _ => false,
+        };
+
         // Delete old index row if the old item had index keys
-        if let Some(old) = old_item
-            && item_has_index_keys(old, &idx.key_schema)
+        if let Some(old) = old_indexed
+            && !same_row
         {
             delete_index_row_multi(
                 batch,
@@ -281,9 +311,7 @@ pub fn sync_indexes(
         }
 
         // Insert new index row if the new item has index keys
-        if let Some(new) = new_item
-            && item_has_index_keys(new, &idx.key_schema)
-        {
+        if let Some(new) = new_indexed {
             let projected =
                 project_item_for_index(new, &idx.key_schema, base_key_schema, &idx.projection);
             insert_index_row_multi(
@@ -308,6 +336,11 @@ pub fn sync_indexes(
 /// Must be called before the batch is executed so the pending rows commit
 /// atomically with the base write. LSIs and delay=0 GSIs are skipped (they are
 /// handled synchronously by `sync_indexes`).
+///
+/// `index_stamp` is the write timestamp the worker gives the index rows when
+/// it applies the entry: the base-row version this mutation produced (see
+/// `data::version`), so entries for one item resolve in version order on the
+/// index table whatever order the worker meets them in.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn enqueue_async_indexes(
     session: &std::sync::Arc<crate::cassandra_util::CassandraSession>,
@@ -318,6 +351,7 @@ pub(crate) async fn enqueue_async_indexes(
     old_item: Option<&extenddb_core::types::Item>,
     new_item: Option<&extenddb_core::types::Item>,
     system_default_delay: u64,
+    index_stamp: i64,
 ) -> Result<usize, StorageError> {
     use crate::gsi_queue::{GsiApplyContext, GsiIndexDef, jitter_delay_ms, partition_for};
     use extenddb_storage::util::composite_pk_to_text;
@@ -341,6 +375,7 @@ pub(crate) async fn enqueue_async_indexes(
                 key_schema: idx.key_schema.clone(),
                 projection: idx.projection.clone(),
             },
+            index_stamp: Some(index_stamp),
         };
 
         let context_json =

@@ -9,7 +9,9 @@ use extenddb_core::types::{
 };
 use extenddb_storage_cassandra::CassandraEngine;
 
-use crate::helpers::{ensure_test_account, test_config, unique_test_account, unique_test_id};
+use crate::helpers::{
+    ensure_test_account, setup_engine, test_config, unique_test_account, unique_test_id,
+};
 
 #[tokio::test]
 async fn test_create_and_drop_index_table() {
@@ -845,4 +847,590 @@ async fn test_async_gsi_worker_skips_dropped_index() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Index rows follow the base item: the same-row rule and version stamps.
+// ---------------------------------------------------------------------------
+
+/// Base pk (S) / sk (N) with one GSI on `gsi_pk`, for direct `sync_indexes` tests.
+struct SyncIndexFixture {
+    engine: CassandraEngine,
+    account_keyspace: String,
+    index_id: String,
+    base_key_schema: Vec<KeySchemaElement>,
+    base_attr_defs: Vec<AttributeDefinition>,
+    indexes: Vec<extenddb_storage_cassandra::data::index::IndexMeta>,
+}
+
+impl SyncIndexFixture {
+    async fn new() -> Self {
+        let config = test_config();
+        let engine = CassandraEngine::new(&config, "us-east-1").await.unwrap();
+        let account_id = unique_test_account();
+        let index_id = unique_test_id();
+        ensure_test_account(&engine, &account_id).await.unwrap();
+        let account_keyspace = engine.account_keyspace(&account_id);
+
+        let base_key_schema = vec![
+            KeySchemaElement {
+                attribute_name: "pk".to_owned(),
+                key_type: KeyType::Hash,
+            },
+            KeySchemaElement {
+                attribute_name: "sk".to_owned(),
+                key_type: KeyType::Range,
+            },
+        ];
+        let base_attr_defs = vec![
+            AttributeDefinition {
+                attribute_name: "pk".to_owned(),
+                attribute_type: ScalarAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "sk".to_owned(),
+                attribute_type: ScalarAttributeType::N,
+            },
+            AttributeDefinition {
+                attribute_name: "gsi_pk".to_owned(),
+                attribute_type: ScalarAttributeType::S,
+            },
+        ];
+        let index_key_schema = vec![KeySchemaElement {
+            attribute_name: "gsi_pk".to_owned(),
+            key_type: KeyType::Hash,
+        }];
+        engine
+            .create_index_data_table(
+                &account_keyspace,
+                &index_id,
+                &index_key_schema,
+                &[AttributeDefinition {
+                    attribute_name: "gsi_pk".to_owned(),
+                    attribute_type: ScalarAttributeType::S,
+                }],
+                &base_key_schema,
+                &base_attr_defs,
+            )
+            .await
+            .unwrap();
+        let indexes = vec![extenddb_storage_cassandra::data::index::IndexMeta {
+            index_name: "sync_gsi".to_owned(),
+            index_id: index_id.clone(),
+            index_type: "GSI".to_owned(),
+            key_schema: index_key_schema,
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
+            propagation_delay_ms: Some(0),
+        }];
+        Self {
+            engine,
+            account_keyspace,
+            index_id,
+            base_key_schema,
+            base_attr_defs,
+            indexes,
+        }
+    }
+
+    fn item(gsi_pk: &str, data: &str) -> Item {
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S("p".to_owned()));
+        item.insert("sk".to_owned(), AttributeValue::N("1".to_owned()));
+        item.insert("gsi_pk".to_owned(), AttributeValue::S(gsi_pk.to_owned()));
+        item.insert("data".to_owned(), AttributeValue::S(data.to_owned()));
+        item
+    }
+
+    /// The batch `sync_indexes` builds for old -> new, stamped at `stamp`.
+    fn batch(
+        &self,
+        old: Option<&Item>,
+        new: Option<&Item>,
+        stamp: Option<i64>,
+    ) -> cdrs_tokio::query::BatchQueryBuilder {
+        let mut batch = cdrs_tokio::query::BatchQueryBuilder::new();
+        if let Some(stamp) = stamp {
+            batch = batch.with_timestamp(stamp);
+        }
+        extenddb_storage_cassandra::data::index::sync_indexes(
+            &mut batch,
+            &self.account_keyspace,
+            &self.base_key_schema,
+            &self.base_attr_defs,
+            &self.indexes,
+            old,
+            new,
+            1000,
+        )
+        .unwrap();
+        batch
+    }
+
+    async fn apply(&self, batch: cdrs_tokio::query::BatchQueryBuilder) {
+        self.engine
+            .session()
+            .batch(batch.build().unwrap())
+            .await
+            .unwrap();
+    }
+
+    /// `data` of the index row for `gsi_pk`, if the row exists.
+    async fn index_row_data(&self, gsi_pk: &str) -> Option<String> {
+        use cdrs_tokio::types::IntoRustByName as _;
+        let idx_table = format!("index_{}", self.index_id.replace('-', "_"));
+        let cql = format!(
+            "SELECT item_data FROM {}.{} WHERE pk = ? AND base_pk = ? AND base_sk_n = 1",
+            self.account_keyspace, idx_table
+        );
+        let result = self
+            .engine
+            .session()
+            .query_with_values(&cql, cdrs_tokio::query_values!(gsi_pk, "p"))
+            .await
+            .unwrap();
+        let rows = result
+            .response_body()
+            .unwrap()
+            .into_rows()
+            .unwrap_or_default();
+        let row = rows.into_iter().next()?;
+        let json: String = row.get_r_by_name("item_data").unwrap();
+        let image: Item = serde_json::from_str(&json).unwrap();
+        match image.get("data") {
+            Some(AttributeValue::S(data)) => Some(data.clone()),
+            other => panic!("unexpected data attribute {other:?}"),
+        }
+    }
+
+    async fn drop(self) {
+        self.engine
+            .drop_index_data_table(&self.account_keyspace, &self.index_id)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn test_sync_indexes_rewrites_an_unchanged_index_row_with_one_statement() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    // Every statement in a batch carries the batch's timestamp and a tombstone
+    // wins a tie, so a DELETE and an INSERT of one row in one batch would
+    // leave the row deleted. An unchanged index row is rewritten by the
+    // INSERT alone; a changed one still gets the DELETE of the old row.
+    let f = SyncIndexFixture::new().await;
+    let v1 = SyncIndexFixture::item("g", "v1");
+    let v2 = SyncIndexFixture::item("g", "v2");
+    let moved = SyncIndexFixture::item("h", "v3");
+
+    let same_row = f.batch(Some(&v1), Some(&v2), None).build().unwrap();
+    assert_eq!(
+        same_row.request.queries.len(),
+        1,
+        "unchanged row: INSERT only"
+    );
+
+    let changed_row = f.batch(Some(&v2), Some(&moved), None).build().unwrap();
+    assert_eq!(
+        changed_row.request.queries.len(),
+        2,
+        "moved row: DELETE and INSERT"
+    );
+
+    f.apply(f.batch(None, Some(&v1), Some(1_000))).await;
+    f.apply(f.batch(Some(&v1), Some(&v2), Some(2_000))).await;
+    assert_eq!(f.index_row_data("g").await.as_deref(), Some("v2"));
+
+    f.apply(f.batch(Some(&v2), Some(&moved), Some(3_000))).await;
+    assert_eq!(f.index_row_data("g").await, None);
+    assert_eq!(f.index_row_data("h").await.as_deref(), Some("v3"));
+    f.drop().await;
+}
+
+#[tokio::test]
+async fn test_version_stamps_order_index_mutations_whatever_their_arrival_order() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    // Two writers commit base versions v1 (gsi_pk = a) then v2 (gsi_pk = b),
+    // but their index batches reach Cassandra in the other order. The v2
+    // batch deletes the row for a and inserts b; the late v1 batch inserts a.
+    // With the batches stamped by version, a's late insert loses to the
+    // tombstone the newer version left, so the index agrees with the base
+    // item: only b.
+    let f = SyncIndexFixture::new().await;
+    let v1 = SyncIndexFixture::item("a", "v1");
+    let v2 = SyncIndexFixture::item("b", "v2");
+    let stamp_v1 = extenddb_storage_cassandra::data::version::next_row_version(None);
+    let stamp_v2 = extenddb_storage_cassandra::data::version::next_row_version(Some(stamp_v1));
+    assert!(stamp_v2 > stamp_v1);
+
+    f.apply(f.batch(Some(&v1), Some(&v2), Some(stamp_v2))).await;
+    f.apply(f.batch(None, Some(&v1), Some(stamp_v1))).await;
+
+    assert_eq!(
+        f.index_row_data("a").await,
+        None,
+        "the older version's row came back"
+    );
+    assert_eq!(f.index_row_data("b").await.as_deref(), Some("v2"));
+
+    // The same two batches with no stamps resolve by arrival order and leave
+    // both rows: this is the defect the stamps remove.
+    f.apply(f.batch(Some(&v2), None, Some(stamp_v2 + 1))).await;
+    f.apply(f.batch(Some(&v1), None, Some(stamp_v2 + 1))).await;
+    f.apply(f.batch(Some(&v1), Some(&v2), None)).await;
+    f.apply(f.batch(None, Some(&v1), None)).await;
+    assert_eq!(f.index_row_data("a").await.as_deref(), Some("v1"));
+    assert_eq!(f.index_row_data("b").await.as_deref(), Some("v2"));
+    f.drop().await;
+}
+
+#[tokio::test]
+async fn test_async_gsi_worker_keeps_the_row_across_a_same_key_update() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    // The worker applies each pending entry as delete-old plus insert-new in
+    // one batch. For an update that keeps the GSI key, that pair addresses one
+    // row, and the worker must rewrite it rather than delete it.
+    let config = test_config();
+    let engine = Arc::new(CassandraEngine::new(&config, "us-east-1").await.unwrap());
+    let table =
+        crate::helpers::TestTable::with_gsi(&engine, "AsyncGsiSameKeyTable", "GsiIdx", "gpk").await;
+    set_gsi_delay(&engine, &table.key_info.table_id, "GsiIdx", 50).await;
+    let account_keyspace = engine.account_keyspace(&table.key_info.account_id);
+
+    let mut v1 = Item::new();
+    v1.insert("id".to_string(), AttributeValue::S("X".to_string()));
+    v1.insert("gpk".to_string(), AttributeValue::S("same".to_string()));
+    v1.insert("data".to_string(), AttributeValue::S("v1".to_string()));
+    let mut v2 = v1.clone();
+    v2.insert("data".to_string(), AttributeValue::S("v2".to_string()));
+    let maps = ExpressionMaps::default();
+    engine
+        .put_item(&table.key_info, v1, false, None, &maps, None)
+        .await
+        .expect("put v1");
+    engine
+        .put_item(&table.key_info, v2, false, None, &maps, None)
+        .await
+        .expect("put v2");
+    assert_eq!(gsi_pending_count(&engine, &account_keyspace).await, 2);
+
+    let _worker_guard = extenddb_storage_cassandra::workers::spawn_gsi_workers(engine.clone());
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    while gsi_pending_count(&engine, &account_keyspace).await != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "gsi_pending did not drain within timeout"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    assert_eq!(
+        gsi_query_count(&engine, &table, "GsiIdx", "gpk", "same").await,
+        1,
+        "the GSI row was deleted by the same-key update"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Every write path stamps its index batch with the version it stored.
+// ---------------------------------------------------------------------------
+
+/// `(version, WRITETIME(item_data))` of the base row, and `WRITETIME(item_data)`
+/// of the LSI row for `priority`, for the item `(id, sort)` on a `with_lsi` table.
+async fn stamps(
+    engine: &CassandraEngine,
+    table: &crate::helpers::TestTable,
+    lsi_name: &str,
+    id: &str,
+    sort: i64,
+    priority: i64,
+) -> (Option<i64>, Option<i64>) {
+    use cdrs_tokio::types::IntoRustByName as _;
+    let keyspace = engine.account_keyspace(&table.key_info.account_id);
+    let table_id = &table.key_info.table_id;
+    let data_table = format!("items_{}", table_id.replace('-', "_"));
+    let cql = format!("SELECT version FROM {keyspace}.{data_table} WHERE pk = ? AND sk_n = ?");
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<
+        extenddb_storage::error::StorageError,
+    >(
+        &engine.session_arc(),
+        &cql,
+        cdrs_tokio::query_values!(id, sort),
+        "stamps base",
+    )
+    .await
+    .unwrap();
+    let version: Option<i64> = rows
+        .into_iter()
+        .next()
+        .and_then(|row| row.get_by_name("version").ok().flatten());
+
+    let catalog = engine.catalog_keyspace();
+    let cql =
+        format!("SELECT index_id FROM {catalog}.indexes WHERE table_id = ? AND index_name = ?");
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<
+        extenddb_storage::error::StorageError,
+    >(
+        &engine.session_arc(),
+        &cql,
+        cdrs_tokio::query_values!(table_id.as_str(), lsi_name),
+        "stamps index id",
+    )
+    .await
+    .unwrap();
+    let index_id: String = rows[0].get_r_by_name("index_id").unwrap();
+    let idx_table = extenddb_storage_cassandra::data::ddl::index_table_name(&index_id);
+    // LSI row key: pk = id, sk_n = priority, base_pk = id, base_sk_n = sort.
+    let cql = format!(
+        "SELECT WRITETIME(item_data) AS wt FROM {keyspace}.{idx_table} \
+         WHERE pk = ? AND sk_n = ? AND base_pk = ? AND base_sk_n = ?"
+    );
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<
+        extenddb_storage::error::StorageError,
+    >(
+        &engine.session_arc(),
+        &cql,
+        cdrs_tokio::query_values!(id, priority, id, sort),
+        "stamps index",
+    )
+    .await
+    .unwrap();
+    let index_wt: Option<i64> = rows
+        .into_iter()
+        .next()
+        .and_then(|row| row.get_by_name("wt").ok().flatten());
+    (version, index_wt)
+}
+
+fn lsi_item(id: &str, sort: i64, priority: i64, data: &str) -> Item {
+    let mut item = Item::new();
+    item.insert("id".to_string(), AttributeValue::S(id.to_string()));
+    item.insert("sort".to_string(), AttributeValue::N(sort.to_string()));
+    item.insert(
+        "priority".to_string(),
+        AttributeValue::N(priority.to_string()),
+    );
+    item.insert("data".to_string(), AttributeValue::S(data.to_string()));
+    item
+}
+
+#[tokio::test]
+async fn test_every_write_path_stamps_the_index_row_with_the_stored_version() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    // The guard behind issue #414 is the stamp each call site puts on its index
+    // batch: the version the base-row LWT stored. On one node the batches
+    // arrive in commit order anyway, so the ordering itself cannot be observed
+    // over the wire; what can be observed is the stamp. For each write path
+    // the LSI row's write timestamp must equal the base row's version.
+    use extenddb_core::expression::{Expr, PathElement, UpdateAction};
+    use extenddb_core::types::ReturnValuesOnConditionCheckFailure;
+    use extenddb_storage::TransactWriteOp;
+
+    let engine = Arc::new(setup_engine().await);
+    let table = crate::helpers::TestTable::with_lsi(
+        &engine,
+        "StampedWritesTable",
+        "LsiPriority",
+        "priority",
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    engine.process_control_plane_transitions().await.unwrap();
+    let maps = ExpressionMaps::default();
+
+    let check = |path: &'static str, got: (Option<i64>, Option<i64>)| {
+        let (version, index_wt) = got;
+        assert!(version.is_some(), "{path}: base row has no version");
+        assert_eq!(
+            index_wt, version,
+            "{path}: index row timestamp differs from the stored version"
+        );
+        version.unwrap()
+    };
+
+    // put_item creating the item
+    engine
+        .put_item(
+            &table.key_info,
+            lsi_item("a", 1, 10, "v1"),
+            false,
+            None,
+            &maps,
+            None,
+        )
+        .await
+        .unwrap();
+    let v1 = check(
+        "put_item create",
+        stamps(&engine, &table, "LsiPriority", "a", 1, 10).await,
+    );
+
+    // put_item with attribute_not_exists on the key (the IF NOT EXISTS fast path)
+    let not_exists = Expr::Function {
+        name: "attribute_not_exists".to_string(),
+        args: vec![Expr::Path(vec![PathElement::Attribute("id".to_string())])],
+    };
+    engine
+        .put_item(
+            &table.key_info,
+            lsi_item("b", 1, 10, "v1"),
+            false,
+            Some(&not_exists),
+            &maps,
+            None,
+        )
+        .await
+        .unwrap();
+    check(
+        "put_item if not exists",
+        stamps(&engine, &table, "LsiPriority", "b", 1, 10).await,
+    );
+
+    // put_item over an existing item (occ_write), same index key
+    engine
+        .put_item(
+            &table.key_info,
+            lsi_item("a", 1, 10, "v2"),
+            false,
+            None,
+            &maps,
+            None,
+        )
+        .await
+        .unwrap();
+    let v2 = check(
+        "put_item overwrite",
+        stamps(&engine, &table, "LsiPriority", "a", 1, 10).await,
+    );
+    assert!(v2 > v1);
+
+    // update_item moving the index key
+    let mut key = Item::new();
+    key.insert("id".to_string(), AttributeValue::S("a".to_string()));
+    key.insert("sort".to_string(), AttributeValue::N("1".to_string()));
+    let actions = vec![UpdateAction::Set {
+        path: vec![PathElement::Attribute("priority".to_string())],
+        value: Expr::Placeholder("p".to_string()),
+    }];
+    let mut values = std::collections::HashMap::new();
+    values.insert("p".to_string(), AttributeValue::N("20".to_string()));
+    let update_maps = ExpressionMaps::new(std::collections::HashMap::new(), values);
+    engine
+        .update_item(
+            &table.key_info,
+            &key,
+            &actions,
+            false,
+            false,
+            None,
+            &update_maps,
+            None,
+        )
+        .await
+        .unwrap();
+    let v3 = check(
+        "update_item",
+        stamps(&engine, &table, "LsiPriority", "a", 1, 20).await,
+    );
+    assert!(v3 > v2);
+    assert_eq!(
+        stamps(&engine, &table, "LsiPriority", "a", 1, 10).await.1,
+        None,
+        "update_item left the old index row"
+    );
+
+    // transactional Put over the existing item
+    let put = lsi_item("a", 1, 30, "v4");
+    let ops = vec![TransactWriteOp::Put {
+        key_info: &table.key_info,
+        item: &put,
+        condition: None,
+        maps: &maps,
+        return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+        stream: None,
+    }];
+    engine.transact_write_items(&ops, None).await.unwrap();
+    let v4 = check(
+        "transaction put",
+        stamps(&engine, &table, "LsiPriority", "a", 1, 30).await,
+    );
+    assert!(v4 > v3);
+    assert_eq!(
+        stamps(&engine, &table, "LsiPriority", "a", 1, 20).await.1,
+        None
+    );
+
+    // transactional Update
+    values = std::collections::HashMap::new();
+    values.insert("p".to_string(), AttributeValue::N("40".to_string()));
+    let update_maps = ExpressionMaps::new(std::collections::HashMap::new(), values);
+    let ops = vec![TransactWriteOp::Update {
+        key_info: &table.key_info,
+        key: &key,
+        actions: &actions,
+        condition: None,
+        maps: &update_maps,
+        return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+        stream: None,
+    }];
+    engine.transact_write_items(&ops, None).await.unwrap();
+    let v5 = check(
+        "transaction update",
+        stamps(&engine, &table, "LsiPriority", "a", 1, 40).await,
+    );
+    assert!(v5 > v4);
+
+    // delete_item: the tombstone's timestamp is not readable, so observe that
+    // the index row is gone and that a create landing afterwards is stamped
+    // above the deleted row's version (the create takes the clock, which has
+    // moved past the version the delete read).
+    engine
+        .delete_item(&table.key_info, &key, false, None, &maps, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        stamps(&engine, &table, "LsiPriority", "a", 1, 40).await,
+        (None, None)
+    );
+    engine
+        .put_item(
+            &table.key_info,
+            lsi_item("a", 1, 50, "v6"),
+            false,
+            None,
+            &maps,
+            None,
+        )
+        .await
+        .unwrap();
+    let v6 = check(
+        "put_item after delete",
+        stamps(&engine, &table, "LsiPriority", "a", 1, 50).await,
+    );
+    assert!(v6 > v5);
+
+    // transactional Delete
+    let ops = vec![TransactWriteOp::Delete {
+        key_info: &table.key_info,
+        key: &key,
+        condition: None,
+        maps: &maps,
+        return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+        stream: None,
+    }];
+    engine.transact_write_items(&ops, None).await.unwrap();
+    assert_eq!(
+        stamps(&engine, &table, "LsiPriority", "a", 1, 50).await,
+        (None, None)
+    );
 }
