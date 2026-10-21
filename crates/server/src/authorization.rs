@@ -244,22 +244,6 @@ pub(crate) fn deny_message(
     }
 }
 
-/// The principal ARN the service names in an AccessDenied message for an
-/// authenticated identity.
-pub(crate) fn principal_arn(identity: &AuthIdentity) -> String {
-    match identity {
-        AuthIdentity::User {
-            account_id,
-            user_name,
-        } => format!("arn:aws:iam::{account_id}:user/{user_name}"),
-        AuthIdentity::RoleSession {
-            account_id,
-            role_name,
-            session_name,
-        } => format!("arn:aws:iam::{account_id}:assumed-role/{role_name}/{session_name}"),
-    }
-}
-
 /// Translate an `OpResult` from the cache into a `DynamoDbError`.
 ///
 /// Parse failures are reported by the cache as `OpError::Internal("policy
@@ -344,8 +328,7 @@ async fn fetch_session_data_and_tags(
 
 #[cfg(test)]
 mod tests {
-    use super::{deny_message, principal_arn};
-    use extenddb_auth::AuthIdentity;
+    use super::deny_message;
 
     const P: &str = "arn:aws:iam::964157134968:user/alice";
     const R: &str = "arn:aws:dynamodb:us-east-1:964157134968:table/bb";
@@ -368,41 +351,5 @@ mod tests {
              dynamodb:GetItem on resource: arn:aws:dynamodb:us-east-1:964157134968:table/bb \
              because no identity-based policy allows the dynamodb:GetItem action"
         );
-    }
-
-    #[test]
-    fn principal_arn_forms() {
-        assert_eq!(
-            principal_arn(&AuthIdentity::User {
-                account_id: "964157134968".to_owned(),
-                user_name: "alice".to_owned(),
-            }),
-            "arn:aws:iam::964157134968:user/alice"
-        );
-        assert_eq!(
-            principal_arn(&AuthIdentity::RoleSession {
-                account_id: "964157134968".to_owned(),
-                role_name: "data-reader".to_owned(),
-                session_name: "s1".to_owned(),
-            }),
-            "arn:aws:iam::964157134968:assumed-role/data-reader/s1"
-        );
-    }
-
-    #[test]
-    fn getrecords_fail_closed_uses_implicit_deny_form() {
-        // The GetRecords fail-closed denial (an iterator with no stream) uses
-        // the service implicit-deny message form, not an ExtendDB-specific one.
-        let principal = principal_arn(&AuthIdentity::User {
-            account_id: "964157134968".to_owned(),
-            user_name: "alice".to_owned(),
-        });
-        let resource = "arn:aws:dynamodb:us-east-1:964157134968:table/*/stream/*";
-        let msg = deny_message(&principal, "dynamodb:GetRecords", resource, false);
-        assert!(
-            msg.ends_with("because no identity-based policy allows the dynamodb:GetRecords action"),
-            "{msg}"
-        );
-        assert!(msg.contains("is not authorized to perform: dynamodb:GetRecords on resource:"));
     }
 }

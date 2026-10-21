@@ -236,9 +236,8 @@ pub(crate) fn validate_tag_resource_arn_shape(arn: &str) -> Result<(), DynamoDbE
 /// The canonical stream ARN a GetRecords request reads, decoded from its shard
 /// iterator token. Returns `None` when the iterator field is absent, does not
 /// decode, or carries no stream ARN (a token issued by a build before the
-/// stream ARN was carried, or a forged token), so `authorize_request` fails
-/// closed rather than authorizing against a wildcard a specific-stream Deny
-/// would miss.
+/// stream ARN was carried, or a forged token); `authorize_request` then answers
+/// with the service's "Invalid ShardIterator" ValidationException.
 pub(crate) fn getrecords_stream_resource(
     input: &Value,
     region: &str,
@@ -286,10 +285,11 @@ pub(crate) fn authz_targets(
             account_id,
         )),
         // GetRecords carries only an opaque shard iterator, not the stream in a
-        // body field, so it is handled in `authorize_request` by decoding the
-        // iterator for the stream ARN and failing closed when it is absent.
-        // `authz_targets` is never called for it; map it to the account stream
-        // space as a defensive non-bypass resource should it ever be reached.
+        // body field, so it is handled in `authorize_request`: the iterator is
+        // decoded for the stream ARN, and an iterator that names no stream gets
+        // ValidationException "Invalid ShardIterator". `authz_targets` is never
+        // called for it; the account stream space is mapped here only so the
+        // table covers every operation.
         "GetRecords" => one(stream_wildcard(region, account_id)),
         "ListStreams" => {
             let res = match str_field(input, "TableName") {

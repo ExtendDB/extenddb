@@ -233,21 +233,36 @@ class TestExplicitDenyOnResourceArn:
             ShardIteratorType="TRIM_HORIZON")["ShardIterator"]
         self._assert_denied(lambda: s.get_records(ShardIterator=it))
 
-    def test_getrecords_no_stream_iterator_denied_implicit_message(self, table):
-        # An iterator that carries no stream (a token from a build before the
-        # stream ARN was carried) fails closed with the service implicit-deny
-        # message form, not an ExtendDB-specific message. ALLOW_ALL proves the
-        # denial is fail-closed, not an IAM decision.
-        s = self._ddb(ALLOW_ALL, "dynamodbstreams")
+    def test_getrecords_iterator_naming_no_stream_is_invalid(self, table):
+        # DynamoDB answers a shard iterator it did not issue with
+        # ValidationException "Invalid ShardIterator" before authorization,
+        # whatever the caller's policy (measured 2026-10-20 for an allow-all
+        # principal, a principal allowed only ListTables, and one with an
+        # explicit Deny on GetRecords for every stream). An iterator that names
+        # no stream (a token from a build before the stream ARN was carried, a
+        # random base64 string, or plain text) gets the same answer.
         now = int(time.time())
-        old_raw = f"shardId-00000000000000000000-00000001|TRIM_HORIZON||{now}"
-        old = base64.standard_b64encode(old_raw.encode()).decode()
-        with pytest.raises(ClientError) as exc:
-            s.get_records(ShardIterator=old)
-        err = exc.value.response["Error"]
-        assert err["Code"] == "AccessDeniedException", err
-        assert "because no identity-based policy allows the dynamodb:GetRecords action" in err.get(
-            "Message", ""), err
+        tokens = [
+            base64.standard_b64encode(
+                f"shardId-00000000000000000000-00000001|TRIM_HORIZON||{now}".encode()).decode(),
+            base64.standard_b64encode(uuid.uuid4().bytes * 8).decode(),
+            "not-a-real-iterator-" + "x" * 40,
+        ]
+        stream_wildcard = f"arn:aws:dynamodb:{self.region}:{self.account_id}:table/*/stream/*"
+        policies = [
+            ALLOW_ALL,
+            {"Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Action": "dynamodb:ListTables", "Resource": "*"}]},
+            _allow_all_deny("GetRecords", stream_wildcard),
+        ]
+        for policy in policies:
+            s = self._ddb(policy, "dynamodbstreams")
+            for token in tokens:
+                with pytest.raises(ClientError) as exc:
+                    s.get_records(ShardIterator=token)
+                err = exc.value.response["Error"]
+                assert err["Code"] == "ValidationException", (policy, token, err)
+                assert err.get("Message") == "Invalid ShardIterator", (policy, token, err)
 
     def test_getrecords_forged_shard_reads_nothing(self, table):
         # A token that names the allowed stream ARN but a shard that does not

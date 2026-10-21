@@ -416,9 +416,10 @@ upgrading:
 - **GetRecords.** GetRecords is authorized against the stream its shard iterator
   reads, so a principal needs `dynamodb:GetRecords` on that stream. A shard
   iterator issued by a build before this change does not identify its stream;
-  after upgrade, GetRecords on such an iterator is denied until the client calls
-  GetShardIterator again. Shard iterators expire after 15 minutes, so the window
-  is short.
+  after upgrade, GetRecords on such an iterator returns `ValidationException`
+  with the message `Invalid ShardIterator`, which is what DynamoDB returns for
+  any iterator it did not issue. The client calls GetShardIterator again. Shard
+  iterators expire after 15 minutes, so the window is short.
 - **Restores.** A restore writes items into its target table, so
   RestoreTableFromBackup and RestoreTableToPointInTime require the item write
   and read actions on the target table in addition to the restore action. A

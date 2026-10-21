@@ -136,31 +136,23 @@ pub(crate) async fn authorize_request(
 
     // GetRecords carries its resource only inside the opaque shard iterator, not
     // in a request body field. Decode the iterator for the stream ARN and
-    // authorize against that specific stream, as the service does. Fail closed
-    // when the token is absent, does not decode, or carries no stream ARN (an
-    // iterator from an older build, or a forged token): the engine separately
-    // confirms the shard belongs to that stream before reading, so a token that
-    // names an allowed stream but a different stream's shard reads nothing.
+    // authorize against that specific stream, as the service does. The engine
+    // separately confirms the shard belongs to that stream before reading, so a
+    // token that names an allowed stream but a different stream's shard reads
+    // nothing.
+    //
+    // An iterator that does not decode or names no stream (a forged token, or
+    // one issued by a build before the stream ARN was carried) is rejected with
+    // ValidationException "Invalid ShardIterator" before authorization. The
+    // service answers every iterator it did not issue that way, whatever the
+    // caller's policy: an allow-all principal, a principal allowed only
+    // ListTables, and one with an explicit Deny on GetRecords for every stream
+    // all get it (measured 2026-10-20).
     if operation == "GetRecords" {
         let resource_arn =
             authz_resource::getrecords_stream_resource(input, &state.region, account_id)
                 .ok_or_else(|| {
-                    // The iterator does not identify a stream (a token from a
-                    // build before the stream ARN was carried, or a forged
-                    // token). Fail closed with the service's implicit-deny
-                    // message form. There is no specific stream to name, so the
-                    // account stream space stands in for the resource.
-                    let principal = authorization::principal_arn(identity);
-                    let resource = format!(
-                        "arn:aws:dynamodb:{}:{account_id}:table/*/stream/*",
-                        state.region
-                    );
-                    DynamoDbError::AccessDeniedException(authorization::deny_message(
-                        &principal,
-                        "dynamodb:GetRecords",
-                        &resource,
-                        false,
-                    ))
+                    DynamoDbError::ValidationException("Invalid ShardIterator".to_owned())
                 })?;
         authorization::check_authorization(
             state.authz_cache.as_ref(),
