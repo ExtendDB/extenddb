@@ -35,6 +35,35 @@ pub struct IndexMeta {
     pub propagation_delay_ms: Option<i32>,
 }
 
+/// Refuse an empty binary/string secondary-index key on a post-update item,
+/// in `UpdateExpression` context (no `IndexName`/`IndexKey` suffix on the
+/// message). Shared by the standalone and transacted Cassandra update paths
+/// (issue #410); the `PutItem` path uses the fuller `validate_index_keys`
+/// (type + emptiness, `Item` context) instead.
+///
+/// Returns the core `DynamoDbError` so each caller maps it to its own error
+/// type (`StorageError::Validation` or `CancellationReason::validation_error`).
+pub fn check_update_index_keys_not_empty(
+    item: &Item,
+    indexes: &[IndexMeta],
+) -> Result<(), extenddb_core::error::DynamoDbError> {
+    if indexes.is_empty() {
+        return Ok(());
+    }
+    let index_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = indexes
+        .iter()
+        .map(|idx| extenddb_core::validation::IndexKeyRef {
+            index_name: &idx.index_name,
+            key_schema: &idx.key_schema,
+        })
+        .collect();
+    extenddb_core::validation::validate_index_key_not_empty(
+        item,
+        &index_refs,
+        extenddb_core::validation::SecondaryIndexEmptyContext::UpdateExpression,
+    )
+}
+
 /// Fetch all index metadata for a table from the catalog.
 pub async fn fetch_indexes_for_table(
     table_id: &str,

@@ -154,6 +154,12 @@ impl CassandraEngine {
             validation::validate_item_size(&item, MAX_ITEM_SIZE_BYTES)
                 .map_err(|e| StorageError::Validation(e.to_string()))?;
 
+            // Refuse an empty binary/string secondary-index key on the
+            // post-update item, matching the PutItem path and the service
+            // (issue #410).
+            super::index::check_update_index_keys_not_empty(&item, &indexes)
+                .map_err(|e| StorageError::Validation(e.to_string()))?;
+
             let new_item = if return_new { Some(item.clone()) } else { None };
 
             let item_json =

@@ -694,6 +694,27 @@ impl CassandraEngine {
                 validation::validate_item_size(&item, MAX_ITEM_SIZE_BYTES)
                     .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
 
+                // Refuse an empty binary/string secondary-index key on the
+                // post-update item (issue #410). Without this the transacted
+                // Update silently wrote the empty key.
+                //
+                // FOLLOW-UP (noted, not done here): this reads the table's index
+                // metadata, and the commit phase reads it again in
+                // commit_sync_indexes. Threading the fetched indexes from
+                // prepare through to commit would remove the second catalog read,
+                // but that changes prepare_single_operation's return contract and
+                // the prepare->commit data flow (LWT machinery), so it is left as
+                // a separate optimization rather than a rider on this fix.
+                let indexes = super::index::fetch_indexes_for_table(
+                    &key_info.table_id,
+                    &self.session,
+                    &self.catalog_keyspace(),
+                )
+                .await
+                .map_err(prepare_read_error_reason)?;
+                super::index::check_update_index_keys_not_empty(&item, &indexes)
+                    .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+
                 // For new items, check partition_max_delete_timestamp
                 if existing.is_none() {
                     self.check_partition_max_delete_timestamp(key_info, &item, txn_timestamp)
