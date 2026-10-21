@@ -297,6 +297,40 @@ policies are all well formed is unaffected.
 policy at write and drops the statement at evaluation; ExtendDB matches this, so a trust
 policy is not rejected for a malformed CIDR. No catalog migration is required.
 
+### IAM: condition key names and tag keys, and more CIDR forms
+
+**Condition key names and tag keys fold under Unicode on the request path.** A
+stored identity policy whose condition key name or tag key contains a non-ASCII
+letter that folds to a resolvable key (for example the long s folding to `s`, the
+st ligature to `st`, or the sharp s to `ss`) now resolves that key on a DynamoDB
+request, matching the service. For such a stored policy a `Deny` gated on the
+Unicode-spelled key now applies where it previously did not, and a negated `Allow`
+gated on it no longer grants. A policy using only ASCII key names is unaffected.
+The trust (`AssumeRole`) path matches key names and tag keys ASCII-case only and
+does not fold, as the service does; a trust policy whose condition key name or tag
+key contains a non-ASCII letter has that key read as absent on the trust path.
+
+**Tag keys that fold to the same string resolve deterministically.** If a
+principal carries two tag keys that fold to the same string (for example `mass`
+and `ma\u{00df}`), `aws:PrincipalTag/<key>` now resolves to the byte-exact stored
+key, then to the smallest fold-matching key by code point, every time, rather
+than at random. A policy naming one of the keys exactly is unaffected.
+
+**Tag write rules match the service.** `TagUser`, `TagRole` and `AssumeRole`
+session tags now reject a tag key or value outside IAM's grammar (a combining
+mark, `#`, `!`, and other punctuation), a key over 128 or value over 256
+characters, the reserved `aws:` key prefix, and two keys that differ only in
+ASCII case. A tag already stored that the new rule would reject stays in place and
+keeps evaluating as before; only new writes are checked. Re-tagging a principal
+that carries such a tag requires correcting the tag first.
+
+**More CIDR forms.** `IpAddress`/`NotIpAddress` now accept a leading-zero octet
+and read it as decimal (`010.0.0.0/8` is `10.0.0.0/8`, not octal), matching the
+service, and reject an IPv4-mapped IPv6 literal (`::ffff:a.b.c.d`) at the identity
+and boundary write (the service rejects it; accepting it would store an
+`IpAddress` `Deny` that silently never matched). No catalog migration is required
+for any of these changes.
+
 ---
 
 ## License
