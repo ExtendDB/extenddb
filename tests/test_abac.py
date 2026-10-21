@@ -22,6 +22,8 @@ REQ-TEST-001, REQ-AUTH-002
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import os
 import uuid
 from typing import Any
@@ -749,3 +751,216 @@ class TestRound3GlobalKeys(_TaggedTableBase):
     def test_principalorgid_negated_allow_grants(self, table):
         assert self._get(table, self._allow_get_if(
             {"StringNotEquals": {"aws:PrincipalOrgID": "o-example1"}})) == "ALLOW"
+
+
+# ---------------------------------------------------------------------------
+# aws:TokenIssueTime (role sessions) and aws:userid across recreate
+# ---------------------------------------------------------------------------
+
+# The service id derivation, reproduced here so a policy can be pinned to the
+# exact id of a principal's first incarnation. It hashes the principal type,
+# account, name and creation time, then base32-encodes the first 17 characters,
+# with an AIDA (user) or AROA (role) prefix. The creation time is read verbatim
+# from the management list response, the same RFC 3339 string the server hashes.
+_B32_LEN = 17
+
+
+def _id_body(parts: list[str]) -> str:
+    h = hashlib.sha256()
+    for p in parts:
+        h.update(p.encode("utf-8"))
+        h.update(b"\x00")
+    return base64.b32encode(h.digest()).decode("ascii").rstrip("=")[:_B32_LEN]
+
+
+def _derive_user_id(account_id: str, user_name: str, created_at: str) -> str:
+    return "AIDA" + _id_body(["user", account_id, user_name, created_at])
+
+
+def _derive_role_id(account_id: str, role_name: str, created_at: str) -> str:
+    return "AROA" + _id_body(["role", account_id, role_name, created_at])
+
+
+def _user_created_at(mgmt: ManagementClient, account_id: str, user_name: str) -> str:
+    resp = mgmt.list_users(account_id)
+    assert resp.status_code == 200, resp.text
+    for e in resp.json():
+        if e["user_name"] == user_name:
+            return e["created_at"]
+    raise AssertionError(f"user {user_name} not found in list_users")
+
+
+def _role_created_at(mgmt: ManagementClient, account_id: str, role_name: str) -> str:
+    resp = mgmt.list_roles(account_id)
+    assert resp.status_code == 200, resp.text
+    for e in resp.json():
+        if e["role_name"] == role_name:
+            return e["created_at"]
+    raise AssertionError(f"role {role_name} not found in list_roles")
+
+
+class TestTokenIssueTimeRoleSession(_TaggedTableBase):
+    """aws:TokenIssueTime is the session issue time for a role session and
+    is absent for an IAM user. Measured live against STS/DynamoDB."""
+
+    def _role_session_get(self, table: str, condition: dict) -> str:
+        """Create a user and a role whose identity policy allows GetItem under
+        `condition`, assume the role, GetItem with the session credentials, and
+        return the outcome."""
+        user = f"tit-caller-{uuid.uuid4().hex[:8]}"
+        role = f"tit-role-{uuid.uuid4().hex[:8]}"
+        resp = self.mgmt.create_user(self.account_id, user, "TestPass123!")
+        assert resp.status_code == 201, resp.text
+        caller_arn = f"arn:aws:iam::{self.account_id}:user/{user}"
+        trust = {"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": {"AWS": caller_arn},
+            "Action": "sts:AssumeRole"}]}
+        resp = self.mgmt.create_role(self.account_id, role, trust)
+        assert resp.status_code == 201, resp.text
+        resp = self.mgmt.put_role_policy(
+            self.account_id, role, "p",
+            {"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": "*",
+                "Condition": condition}]})
+        assert resp.status_code == 204, resp.text
+        try:
+            resp = self.mgmt.assume_role(
+                self.account_id, role, caller_arn, "sess1")
+            assert resp.status_code == 201, resp.text
+            creds = resp.json()
+            client = boto3.client(
+                "dynamodb", endpoint_url=self.endpoint,
+                aws_access_key_id=creds["access_key_id"],
+                aws_secret_access_key=creds["secret_access_key"],
+                aws_session_token=creds["session_token"],
+                region_name=self.region,
+                config=BotoConfig(retries={"max_attempts": 0}),
+                verify=not self.endpoint.startswith("https://"))
+            try:
+                client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
+                return "ALLOW"
+            except ClientError as exc:
+                assert exc.response["Error"]["Code"] == "AccessDeniedException", exc.response["Error"]
+                return "DENY"
+        finally:
+            self.mgmt.delete_role(self.account_id, role)
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_role_session_token_issue_time_present_denies_null_true(self, table):
+        # Present for a role session, so Null true is false and the Allow does
+        # not grant.
+        assert self._role_session_get(
+            table, {"Null": {"aws:TokenIssueTime": "true"}}) == "DENY"
+
+    def test_role_session_token_issue_time_after_recent_past_grants(self, table):
+        # The session was issued just now, which is after a point an hour ago.
+        past = "2000-01-01T00:00:00Z"
+        assert self._role_session_get(
+            table, {"DateGreaterThan": {"aws:TokenIssueTime": past}}) == "ALLOW"
+
+    def test_role_session_token_issue_time_before_far_future_denies(self, table):
+        # The session issue time is not after a point far in the future.
+        future = "2999-01-01T00:00:00Z"
+        assert self._role_session_get(
+            table, {"DateGreaterThan": {"aws:TokenIssueTime": future}}) == "DENY"
+
+    def test_user_token_issue_time_absent_null_true_grants(self, table):
+        # An IAM user leaves aws:TokenIssueTime absent, so Null true grants.
+        assert self._get(table, self._allow_get_if(
+            {"Null": {"aws:TokenIssueTime": "true"}})) == "ALLOW"
+
+    def test_user_token_issue_time_absent_date_operator_denies(self, table):
+        # A positive Date operator on the absent key does not match, so the
+        # Allow does not grant.
+        assert self._get(table, self._allow_get_if(
+            {"DateGreaterThan": {"aws:TokenIssueTime": "2000-01-01T00:00:00Z"}})) == "DENY"
+
+
+class TestUserIdRecreate(_TaggedTableBase):
+    """aws:userid changes when a principal is deleted and recreated with
+    the same name, so a policy pinned to the first incarnation's id denies the
+    second. Measured live against IAM/DynamoDB."""
+
+    def test_user_id_changes_on_recreate(self, table):
+        name = f"uidrc-{uuid.uuid4().hex[:8]}"
+        # First incarnation: pin a policy to its id, confirm it grants.
+        ak, sk = _create_user_with_key(self.mgmt, self.account_id, name)
+        created1 = _user_created_at(self.mgmt, self.account_id, name)
+        uid1 = _derive_user_id(self.account_id, name, created1)
+        pol = self._allow_get_if({"StringEquals": {"aws:userid": uid1}})
+        assert self.mgmt.put_user_policy(self.account_id, name, "p", pol).status_code == 204
+        client = _make_client(self.endpoint, ak, sk, self.region)
+        try:
+            client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
+            first = "ALLOW"
+        except ClientError as exc:
+            assert exc.response["Error"]["Code"] == "AccessDeniedException", exc.response["Error"]
+            first = "DENY"
+        assert first == "ALLOW", "policy pinned to the first incarnation id should grant"
+
+        # Delete and recreate with the same name: a new id.
+        self.mgmt.delete_user(self.account_id, name)
+        ak2, sk2 = _create_user_with_key(self.mgmt, self.account_id, name)
+        created2 = _user_created_at(self.mgmt, self.account_id, name)
+        assert created2 != created1, "recreated user should have a new creation time"
+        # Reattach the SAME policy (still pinned to uid1).
+        assert self.mgmt.put_user_policy(self.account_id, name, "p", pol).status_code == 204
+        client2 = _make_client(self.endpoint, ak2, sk2, self.region)
+        try:
+            client2.get_item(TableName=table, Key={"pk": {"S": "k1"}})
+            second = "ALLOW"
+        except ClientError as exc:
+            assert exc.response["Error"]["Code"] == "AccessDeniedException", exc.response["Error"]
+            second = "DENY"
+        finally:
+            self.mgmt.delete_user(self.account_id, name)
+        assert second == "DENY", "recreated principal must not match the old id"
+
+    def test_role_id_changes_on_recreate(self, table):
+        caller = f"ridrc-caller-{uuid.uuid4().hex[:8]}"
+        role = f"ridrc-{uuid.uuid4().hex[:8]}"
+        assert self.mgmt.create_user(self.account_id, caller, "TestPass123!").status_code == 201
+        caller_arn = f"arn:aws:iam::{self.account_id}:user/{caller}"
+        trust = {"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": {"AWS": caller_arn},
+            "Action": "sts:AssumeRole"}]}
+
+        def assume_and_get(expected_userid: str) -> str:
+            pol = {"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": "*",
+                "Condition": {"StringEquals": {"aws:userid": expected_userid}}}]}
+            assert self.mgmt.put_role_policy(self.account_id, role, "p", pol).status_code == 204
+            resp = self.mgmt.assume_role(self.account_id, role, caller_arn, "sess1")
+            assert resp.status_code == 201, resp.text
+            creds = resp.json()
+            client = boto3.client(
+                "dynamodb", endpoint_url=self.endpoint,
+                aws_access_key_id=creds["access_key_id"],
+                aws_secret_access_key=creds["secret_access_key"],
+                aws_session_token=creds["session_token"],
+                region_name=self.region,
+                config=BotoConfig(retries={"max_attempts": 0}),
+                verify=not self.endpoint.startswith("https://"))
+            try:
+                client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
+                return "ALLOW"
+            except ClientError as exc:
+                assert exc.response["Error"]["Code"] == "AccessDeniedException", exc.response["Error"]
+                return "DENY"
+
+        try:
+            assert self.mgmt.create_role(self.account_id, role, trust).status_code == 201
+            created1 = _role_created_at(self.mgmt, self.account_id, role)
+            uid1 = _derive_role_id(self.account_id, role, created1) + ":sess1"
+            assert assume_and_get(uid1) == "ALLOW", "role session should match the pinned id"
+
+            # Recreate the role with the same name: a new role id.
+            self.mgmt.delete_role(self.account_id, role)
+            assert self.mgmt.create_role(self.account_id, role, trust).status_code == 201
+            created2 = _role_created_at(self.mgmt, self.account_id, role)
+            assert created2 != created1, "recreated role should have a new creation time"
+            # The policy is still pinned to the first incarnation id.
+            assert assume_and_get(uid1) == "DENY", "recreated role must not match the old id"
+        finally:
+            self.mgmt.delete_role(self.account_id, role)
+            self.mgmt.delete_user(self.account_id, caller)
